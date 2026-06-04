@@ -37,6 +37,15 @@ type Settings struct {
 	// silent default.
 	BillPartialOnAbort bool `yaml:"billPartialOnAbort"`
 
+	// Registry configures model→upstream dispatch (M4). These are plain
+	// fields here; main.go translates them into a registry.Resolver so config
+	// stays free of a dependency on the registry package.
+	Registry RegistrySettings `yaml:"registry"`
+
+	// Emit configures the durable metering emitter (M2). main.go translates
+	// these into an emit.Config for the same reason.
+	Emit EmitSettings `yaml:"emit"`
+
 	// --- Parsed settings (populated by parse) ---
 
 	ListenAddr  string        `yaml:"-"`
@@ -48,6 +57,35 @@ type Settings struct {
 	configDir string
 }
 
+// RegistrySettings is the YAML shape for model dispatch. Mirrors
+// registry.Config without importing it (avoids a config→registry dependency).
+type RegistrySettings struct {
+	// Strategy: "static" (default), "convention", "cached", or "chain".
+	Strategy string `yaml:"strategy"`
+
+	// ConventionTemplate is the URL template with {id} substituted, e.g.
+	// "http://model-{id}.inference.svc.cluster.local:8000".
+	ConventionTemplate string `yaml:"conventionTemplate"`
+
+	// CacheSize, and the positive/negative TTLs for the cached resolver.
+	CacheSize        int    `yaml:"cacheSize"`
+	CachePositiveTTL string `yaml:"cachePositiveTTL"`
+	CacheNegativeTTL string `yaml:"cacheNegativeTTL"`
+
+	// Parsed durations.
+	PositiveTTL time.Duration `yaml:"-"`
+	NegativeTTL time.Duration `yaml:"-"`
+}
+
+// EmitSettings is the YAML shape for the durable emitter. Mirrors emit.Config
+// without importing it.
+type EmitSettings struct {
+	// ValkeyAddr is the Valkey/Redis address. Empty disables Valkey (WAL-only).
+	ValkeyAddr string `yaml:"valkeyAddr"`
+	StreamName string `yaml:"streamName"`
+	WALPath    string `yaml:"walPath"`
+}
+
 // Load reads, defaults, and parses a settings YAML file.
 func Load(settingsFile string) (*Settings, error) {
 	s := &Settings{
@@ -56,6 +94,16 @@ func Load(settingsFile string) (*Settings, error) {
 		DefaultUpstream:    "http://localhost:8000",
 		IdleTimeoutStr:     "10m",
 		BillPartialOnAbort: true,
+		Registry: RegistrySettings{
+			Strategy:         "static",
+			CacheSize:        4096,
+			CachePositiveTTL: "5m",
+			CacheNegativeTTL: "10s",
+		},
+		Emit: EmitSettings{
+			StreamName: "phoebe:metering",
+			WALPath:    "/var/lib/phoebe/metering-wal.jsonl",
+		},
 	}
 
 	absFilePath, err := filepath.Abs(settingsFile)
@@ -92,5 +140,33 @@ func (s *Settings) parse() error {
 	}
 
 	s.ListenAddr = fmt.Sprintf(":%d", s.ListenPort)
+
+	if err := s.Registry.parse(); err != nil {
+		return err
+	}
+	return nil
+}
+
+func (r *RegistrySettings) parse() error {
+	var err error
+	if r.CachePositiveTTL != "" {
+		if r.PositiveTTL, err = time.ParseDuration(r.CachePositiveTTL); err != nil {
+			return fmt.Errorf("invalid registry.cachePositiveTTL: %w", err)
+		}
+	}
+	if r.CacheNegativeTTL != "" {
+		if r.NegativeTTL, err = time.ParseDuration(r.CacheNegativeTTL); err != nil {
+			return fmt.Errorf("invalid registry.cacheNegativeTTL: %w", err)
+		}
+	}
+	switch r.Strategy {
+	case "", "static", "convention", "cached", "chain":
+		// ok
+	default:
+		return fmt.Errorf("invalid registry.strategy %q (want static|convention|cached|chain)", r.Strategy)
+	}
+	if (r.Strategy == "convention" || r.Strategy == "chain") && r.ConventionTemplate == "" {
+		return fmt.Errorf("registry.strategy %q requires conventionTemplate", r.Strategy)
+	}
 	return nil
 }

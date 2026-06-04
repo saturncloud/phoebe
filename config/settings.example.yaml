@@ -16,3 +16,25 @@ idleTimeout: "10m"
 # Explicit policy: whether a client-aborted request still bills its partial
 # token count.
 billPartialOnAbort: true
+
+# Model → upstream dispatch (M4).
+registry:
+  # static     — always use defaultUpstream (above). Single-model / dev.
+  # convention — derive the upstream from a Service-naming template; new models
+  #              are reachable with no redeploy.
+  # cached     — control-plane lookup with an LRU + TTL cache (lookup currently
+  #              degrades to the convention template until the Atlas resource
+  #              path is wired).
+  # chain      — cached, falling back to convention if the lookup errors.
+  strategy: "static"
+  conventionTemplate: "http://model-{id}.inference.svc.cluster.local:8000"
+  cacheSize: 4096
+  cachePositiveTTL: "5m"
+  cacheNegativeTTL: "10s"   # short, so a newly-created model is reachable fast
+
+# Durable metering emit (M2). Valkey Streams hot path → local-disk WAL fallback
+# → structured-log floor. Leave valkeyAddr empty to run WAL-only.
+emit:
+  valkeyAddr: "localhost:6379"
+  streamName: "phoebe:metering"
+  walPath: "/var/lib/phoebe/metering-wal.jsonl"
