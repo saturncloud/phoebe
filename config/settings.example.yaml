@@ -1,0 +1,18 @@
+# Example interceptor settings. Copy to a real location and pass with -f.
+debug: false
+
+# Port the interceptor listens on (behind Traefik).
+listenPort: 8080
+
+# Fallback upstream when a model's upstream can't be resolved from the
+# registry. In the walking-skeleton phase this is the single engine/router URL.
+# May point at an engine directly (Shape A) or at a router (Shape B) — the
+# interceptor behaves identically either way.
+defaultUpstream: "http://localhost:8000"
+
+# Long idle timeout: token streams can idle between chunks.
+idleTimeout: "10m"
+
+# Explicit policy: whether a client-aborted request still bills its partial
+# token count.
+billPartialOnAbort: true

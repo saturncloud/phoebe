@@ -1,0 +1,26 @@
+# build artifacts
+/bin/
+*.exe
+*.o
+*.a
+*.so
+
+# test / coverage
+*.out
+.coverage
+
+# editor files
+**/.idea/
+**/.vscode/
+
+# misc
+*.DS_Store
+*.log
+
+# credentials and key material
+*.pem
+*.env
+config/settings.yaml
+
+# go workspace
+vendor/
