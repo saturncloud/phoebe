@@ -4,7 +4,10 @@ import (
 	"bytes"
 	"io"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/saturncloud/phoebe/internal/capture"
 )
@@ -136,24 +139,176 @@ func TestTeeStreamingSplitAcrossReads(t *testing.T) {
 	}
 }
 
+// TestTeeAbortFinalizes verifies that markAborted + Close produces Aborted=true
+// with no usage. The onDone callback is passed at construction so markAborted
+// can fire it directly — this matches the real proxy path.
 func TestTeeAbortFinalizes(t *testing.T) {
-	// Simulate a client abort: only partial stream arrives, then Close.
 	partial := `data: {"choices":[{"index":0,"delta":{"content":"Hel"}}]}
 
 `
-	cr := newCaptureReader(io.NopCloser(strings.NewReader(partial)), true, func(capture.Result) {})
+	var got capture.Result
+	cr := newCaptureReader(io.NopCloser(strings.NewReader(partial)), true, func(r capture.Result) {
+		got = r
+	})
 	buf := make([]byte, 8)
 	_, _ = cr.Read(buf) // partial read
 	cr.markAborted()
-	var got capture.Result
-	cr.onDone = func(r capture.Result) { got = r }
+	// Close is a no-op for done (finish already fired from markAborted), but
+	// we call it to mirror the real path.
 	_ = cr.Close()
 
 	if !got.Aborted {
-		t.Fatal("Aborted not set after markAborted + Close")
+		t.Fatal("Aborted not set after markAborted")
 	}
 	if got.UsageFound {
 		t.Fatal("partial stream should not have usage")
+	}
+}
+
+// TestTeeOnDoneFiresExactlyOnce ensures the callback is invoked exactly once
+// even when markAborted, Read-EOF, and Close all converge.
+func TestTeeOnDoneFiresExactlyOnce(t *testing.T) {
+	var count int32
+	cr := newCaptureReader(io.NopCloser(strings.NewReader(vllmStream)), true, func(capture.Result) {
+		atomic.AddInt32(&count, 1)
+	})
+
+	var wg sync.WaitGroup
+	wg.Add(3)
+
+	// Three concurrent paths that all try to fire finish().
+	go func() { defer wg.Done(); _, _ = io.ReadAll(cr) }()                        // normal EOF path
+	go func() { defer wg.Done(); cr.markAborted() }()                             // abort path
+	go func() { defer wg.Done(); time.Sleep(time.Millisecond); _ = cr.Close() }() // close path
+
+	wg.Wait()
+
+	if n := atomic.LoadInt32(&count); n != 1 {
+		t.Fatalf("onDone fired %d times, want exactly 1", n)
+	}
+}
+
+// TestTeeMarkAbortedAfterEOFIsNoop verifies that if the stream completed
+// cleanly (EOF) before markAborted is called, the already-fired onDone is NOT
+// re-fired and the original Aborted=false result stands.
+func TestTeeMarkAbortedAfterEOFIsNoop(t *testing.T) {
+	var results []capture.Result
+	cr := newCaptureReader(io.NopCloser(strings.NewReader(vllmStream)), true, func(r capture.Result) {
+		results = append(results, r)
+	})
+	// Drain to EOF — onDone fires here with Aborted=false.
+	_, _ = io.ReadAll(cr)
+	_ = cr.Close()
+
+	// Now simulate a late context-cancel: markAborted should be a no-op.
+	cr.markAborted()
+
+	if len(results) != 1 {
+		t.Fatalf("onDone fired %d times, want 1", len(results))
+	}
+	if results[0].Aborted {
+		t.Fatal("clean completion should not be marked aborted by a late cancel")
+	}
+}
+
+// TestTeeAbortWithPartialUsage verifies that if some SSE chunks (including a
+// usage block) arrived before the abort, the result carries both Aborted=true
+// and the captured usage.
+//
+// We call markAborted() directly before Close() to simulate the abort path
+// where finish() has not yet run. We use a blocking source so that io.ReadAll
+// (or the equivalent) never returns EOF on its own, ensuring finish() is only
+// triggered by markAborted().
+func TestTeeAbortWithPartialUsage(t *testing.T) {
+	streamWithUsage := `data: {"choices":[{"index":0,"delta":{},"finish_reason":"length"}]}
+
+data: {"choices":[],"usage":{"prompt_tokens":100,"total_tokens":130,"completion_tokens":30}}
+
+`
+	// blockAfterReader is an io.ReadCloser that returns the given bytes then
+	// blocks forever (simulating a stream with more data still to come).
+	src := &blockAfterReader{data: []byte(streamWithUsage)}
+
+	var got capture.Result
+	cr := newCaptureReader(src, true, func(r capture.Result) {
+		got = r
+	})
+
+	// Drain the pre-loaded bytes in a goroutine; it will block after them.
+	readDone := make(chan struct{})
+	go func() {
+		defer close(readDone)
+		buf := make([]byte, 4096)
+		for {
+			_, err := cr.Read(buf)
+			if err != nil {
+				return
+			}
+		}
+	}()
+
+	// Give the goroutine time to consume the pre-loaded bytes.
+	time.Sleep(5 * time.Millisecond)
+
+	// Abort: sets Aborted=true and fires finish() while Read is still blocked.
+	cr.markAborted()
+
+	// Unblock Read by closing the source.
+	src.unblock()
+	<-readDone
+
+	if !got.Aborted {
+		t.Fatal("expected Aborted=true")
+	}
+	if !got.UsageFound {
+		t.Fatal("expected UsageFound=true — usage block was present before abort")
+	}
+	if got.Usage.PromptTokens != 100 || got.Usage.CompletionTokens != 30 {
+		t.Fatalf("unexpected token counts: %+v", got.Usage)
+	}
+}
+
+// blockAfterReader yields its pre-loaded data then blocks until unblock() is
+// called, at which point further reads return io.ErrClosedPipe.
+type blockAfterReader struct {
+	data    []byte
+	pos     int
+	mu      sync.Mutex
+	closeCh chan struct{}
+	once    sync.Once
+}
+
+func (b *blockAfterReader) init() {
+	b.once.Do(func() { b.closeCh = make(chan struct{}) })
+}
+
+func (b *blockAfterReader) Read(p []byte) (int, error) {
+	b.init()
+	b.mu.Lock()
+	if b.pos < len(b.data) {
+		n := copy(p, b.data[b.pos:])
+		b.pos += n
+		b.mu.Unlock()
+		return n, nil
+	}
+	b.mu.Unlock()
+	// No more pre-loaded data: block until unblock() is called.
+	<-b.closeCh
+	return 0, io.ErrClosedPipe
+}
+
+func (b *blockAfterReader) Close() error {
+	b.unblock()
+	return nil
+}
+
+func (b *blockAfterReader) unblock() {
+	b.init()
+	// Close the channel idempotently.
+	select {
+	case <-b.closeCh:
+	default:
+		close(b.closeCh)
 	}
 }
 
