@@ -59,13 +59,53 @@ func TestHealthz(t *testing.T) {
 	}
 }
 
-func TestProxyMissingResourceID(t *testing.T) {
-	srv := newTestServer(t, &url.URL{Scheme: "http", Host: "localhost:1"})
-	rr := httptest.NewRecorder()
-	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", nil)
-	srv.Handler().ServeHTTP(rr, req)
-	if rr.Code != http.StatusBadRequest {
-		t.Fatalf("missing resource id: got %d, want 400", rr.Code)
+// TestProxyBillingGate verifies the fail-closed billing-identity gate: a
+// request missing the auth-id and/or resource-id headers is rejected with 400
+// (we never serve traffic we can't attribute), and the error names what's
+// missing. An emitter is checked to ensure nothing is billed for a reject.
+func TestProxyBillingGate(t *testing.T) {
+	tests := []struct {
+		name       string
+		authID     string
+		resourceID string
+		wantStatus int
+		wantInBody string
+	}{
+		{"missing both", "", "", http.StatusBadRequest, identity.HeaderAuthID},
+		{"missing auth-id", "", "model-abc", http.StatusBadRequest, identity.HeaderAuthID},
+		{"missing resource-id", "auth-1", "", http.StatusBadRequest, identity.HeaderResourceID},
+		{"both present", "auth-1", "model-abc", http.StatusOK, ""},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				_, _ = w.Write([]byte(`{"ok":true}`))
+			}))
+			defer backend.Close()
+			upstream, _ := url.Parse(backend.URL)
+			em := &recordingEmitter{}
+			srv := newTestServerE(t, upstream, em)
+
+			rr := httptest.NewRecorder()
+			req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", nil)
+			if tt.authID != "" {
+				req.Header.Set(identity.HeaderAuthID, tt.authID)
+			}
+			if tt.resourceID != "" {
+				req.Header.Set(identity.HeaderResourceID, tt.resourceID)
+			}
+			srv.Handler().ServeHTTP(rr, req)
+
+			if rr.Code != tt.wantStatus {
+				t.Fatalf("status = %d, want %d", rr.Code, tt.wantStatus)
+			}
+			if tt.wantInBody != "" && !strings.Contains(rr.Body.String(), tt.wantInBody) {
+				t.Fatalf("body %q does not name missing field %q", rr.Body.String(), tt.wantInBody)
+			}
+			if tt.wantStatus == http.StatusBadRequest && len(em.all()) != 0 {
+				t.Fatalf("rejected request should emit no billing event, got %d", len(em.all()))
+			}
+		})
 	}
 }
 
@@ -80,6 +120,7 @@ func TestProxyForwardsToUpstream(t *testing.T) {
 
 	rr := httptest.NewRecorder()
 	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", nil)
+	req.Header.Set(identity.HeaderAuthID, "auth-key-7")
 	req.Header.Set(identity.HeaderResourceID, "model-abc")
 	srv.Handler().ServeHTTP(rr, req)
 
@@ -100,6 +141,7 @@ func TestProxyNotFound(t *testing.T) {
 
 	rr := httptest.NewRecorder()
 	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", nil)
+	req.Header.Set(identity.HeaderAuthID, "auth-1")
 	req.Header.Set(identity.HeaderResourceID, "gone")
 	srv.Handler().ServeHTTP(rr, req)
 

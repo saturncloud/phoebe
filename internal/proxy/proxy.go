@@ -79,8 +79,16 @@ func (s *Server) handleHealth(w http.ResponseWriter, _ *http.Request) {
 func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request) {
 	id := identity.FromRequest(r)
 
-	if id.ResourceID == "" {
-		http.Error(w, "missing "+identity.HeaderResourceID, http.StatusBadRequest)
+	// Billing-identity gate: fail closed if we lack what we need to attribute
+	// consumption. A billing product must not serve traffic it can't bill — a
+	// missing identity header means the edge contract is broken (auth-server
+	// not emitting it, or Traefik not allowlisting it), not a normal request.
+	// Report every missing field at once so the misconfiguration is obvious.
+	if missing := missingBillingFields(id); len(missing) > 0 {
+		s.log.Warn.Printf("rejecting unbillable request: missing %s (request_id=%s)",
+			strings.Join(missing, ", "), r.Header.Get(requestIDHeader))
+		http.Error(w, "missing required billing identity: "+strings.Join(missing, ", "),
+			http.StatusBadRequest)
 		return
 	}
 
@@ -213,6 +221,23 @@ func (s *Server) emit(ctx context.Context, id identity.Identity, requestID strin
 		Aborted:          res.Aborted,
 	}
 	s.emitter.Emit(ctx, e)
+}
+
+// missingBillingFields returns the names of the identity headers required to
+// bill a request that are absent. Empty result means the request is billable.
+//
+// AuthID (token / API-key id) is the attribution key; ResourceID identifies
+// the model being billed. Both are mandatory. UserID/GroupID are resolved
+// downstream from AuthID and are NOT required here.
+func missingBillingFields(id identity.Identity) []string {
+	var missing []string
+	if id.AuthID == "" {
+		missing = append(missing, identity.HeaderAuthID)
+	}
+	if id.ResourceID == "" {
+		missing = append(missing, identity.HeaderResourceID)
+	}
+	return missing
 }
 
 // isEventStream reports whether the response is an SSE stream.
