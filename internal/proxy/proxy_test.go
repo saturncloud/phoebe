@@ -142,8 +142,10 @@ func TestProxyStreamingEndToEnd(t *testing.T) {
 	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions",
 		strings.NewReader(`{"model":"m","stream":true,"messages":[]}`))
 	req.Header.Set(identity.HeaderResourceID, "model-abc")
+	req.Header.Set(identity.HeaderResourceType, "deployment")
 	req.Header.Set(identity.HeaderGroupID, "org-1")
 	req.Header.Set(identity.HeaderUserID, "user-1")
+	req.Header.Set(identity.HeaderAuthID, "auth-key-7")
 	req.Header.Set("X-Request-Id", "req-123")
 
 	srv.Handler().ServeHTTP(rr, req)
@@ -165,6 +167,12 @@ func TestProxyStreamingEndToEnd(t *testing.T) {
 	e := events[0]
 	if e.RequestID != "req-123" || e.GroupID != "org-1" || e.UserID != "user-1" || e.Model != "model-abc" {
 		t.Fatalf("event identity wrong: %+v", e)
+	}
+	if e.AuthID != "auth-key-7" {
+		t.Fatalf("event AuthID = %q, want auth-key-7", e.AuthID)
+	}
+	if e.ResourceID != "model-abc" || e.ResourceType != "deployment" {
+		t.Fatalf("event resource fields wrong: id=%q type=%q", e.ResourceID, e.ResourceType)
 	}
 	if e.PromptTokens != 2006 || e.CompletionTokens != 300 || e.CachedTokens != 1920 {
 		t.Fatalf("event token counts wrong: %+v", e)

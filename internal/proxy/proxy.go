@@ -197,10 +197,15 @@ func (s *Server) emit(ctx context.Context, id identity.Identity, requestID strin
 	}
 
 	e := metering.Event{
-		RequestID:        requestID,
-		GroupID:          id.GroupID,
-		UserID:           id.UserID,
-		Model:            id.ResourceID,
+		RequestID: requestID,
+		// Identity captured verbatim — attribution resolved downstream.
+		AuthID:       id.AuthID,
+		UserID:       id.UserID,
+		GroupID:      id.GroupID,
+		ResourceID:   id.ResourceID,
+		ResourceType: id.ResourceType,
+		Model:        id.ResourceID,
+
 		PromptTokens:     res.Usage.PromptTokens,
 		CachedTokens:     res.Usage.CachedTokens(),
 		CompletionTokens: res.Usage.CompletionTokens,
