@@ -66,6 +66,18 @@ type captureReader struct {
 	// finishedCh so it exits on either a client disconnect or a clean
 	// completion — preventing goroutine leaks on normal (non-aborted) requests.
 	finishedCh chan struct{}
+
+	// logBuf, when non-nil, accumulates a COPY of the forwarded response bytes
+	// for M5 I/O logging — bounded by logCap. It is allocated ONLY when the
+	// request passed the iolog policy gate; for the overwhelming common case
+	// (logging off) it stays nil and the Read path pays zero extra cost.
+	//
+	// logBuf is written only from Read (the single ReverseProxy copy goroutine)
+	// and read only from finish()/the onDone callback after Read is done, so it
+	// needs no separate lock beyond the mu already taken for streaming scans.
+	logBuf       *bytes.Buffer
+	logCap       int  // max bytes to retain in logBuf
+	logTruncated bool // true once we hit the cap and stopped appending
 }
 
 func newCaptureReader(src io.ReadCloser, streamed bool, onDone func(capture.Result)) *captureReader {
@@ -76,6 +88,49 @@ func newCaptureReader(src io.ReadCloser, streamed bool, onDone func(capture.Resu
 		result:     capture.Result{Streamed: streamed},
 		finishedCh: make(chan struct{}),
 	}
+}
+
+// enableBodyLog turns on response-body capture for M5 I/O logging, retaining up
+// to capBytes of the forwarded response. Call BEFORE the body is read (i.e. in
+// ModifyResponse). A non-positive cap disables capture. This is the ONLY way
+// logBuf becomes non-nil, so requests that don't opt in never allocate it.
+func (c *captureReader) enableBodyLog(capBytes int) {
+	if capBytes <= 0 {
+		return
+	}
+	c.logBuf = &bytes.Buffer{}
+	c.logCap = capBytes
+}
+
+// capturedBody returns the buffered response body and whether it was truncated
+// at the cap. Returns ("", false) if body logging was not enabled. Safe to call
+// from onDone (Read has finished by then).
+func (c *captureReader) capturedBody() (body string, truncated bool) {
+	if c.logBuf == nil {
+		return "", false
+	}
+	return c.logBuf.String(), c.logTruncated
+}
+
+// appendLog copies up to the remaining cap of p into logBuf. Forward-verbatim
+// is unaffected: the client already got these exact bytes; this only buffers a
+// bounded COPY for the log. Once the cap is hit we stop appending and flag
+// truncation — we never grow logBuf unbounded on a large/streamed response.
+func (c *captureReader) appendLog(p []byte) {
+	if c.logBuf == nil {
+		return
+	}
+	remaining := c.logCap - c.logBuf.Len()
+	if remaining <= 0 {
+		c.logTruncated = true
+		return
+	}
+	if len(p) > remaining {
+		c.logBuf.Write(p[:remaining])
+		c.logTruncated = true
+		return
+	}
+	c.logBuf.Write(p)
 }
 
 func (c *captureReader) Read(p []byte) (int, error) {
@@ -89,6 +144,10 @@ func (c *captureReader) Read(p []byte) (int, error) {
 			c.scanSSELines()
 			c.mu.Unlock()
 		}
+		// M5: when body logging is enabled for this request, retain a bounded
+		// COPY of the forwarded bytes. No-op (nil logBuf) when logging is off,
+		// so the common path is unchanged.
+		c.appendLog(p[:n])
 	}
 	if err == io.EOF {
 		c.finish()

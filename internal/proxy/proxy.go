@@ -22,10 +22,12 @@ import (
 	"net/http"
 	"net/http/httputil"
 	"strings"
+	"time"
 
 	"github.com/saturncloud/phoebe/internal/capture"
 	"github.com/saturncloud/phoebe/internal/config"
 	"github.com/saturncloud/phoebe/internal/identity"
+	"github.com/saturncloud/phoebe/internal/iolog"
 	"github.com/saturncloud/phoebe/internal/logging"
 	"github.com/saturncloud/phoebe/internal/metering"
 	"github.com/saturncloud/phoebe/internal/registry"
@@ -41,17 +43,59 @@ type Server struct {
 	log      *logging.Logger
 	resolver registry.Resolver
 	emitter  metering.Emitter
+
+	// ioPolicy gates M5 body capture (opt-in + sampling). ioSink receives the
+	// captured Records. Both default to the inert pair (deny-all policy +
+	// NopSink) when not supplied, so the hot path is unchanged unless I/O
+	// logging is explicitly wired in main.go.
+	ioPolicy     iolog.Policy
+	ioSink       iolog.Sink
+	ioMaxBodyLen int
 }
 
-// New constructs a Server from its dependencies.
+// New constructs a Server from its dependencies. I/O logging is OFF: the policy
+// denies every request and the sink is a NopSink, so no bodies are buffered.
+// Use NewWithIOLog to enable M5 body capture.
 func New(s *config.Settings, log *logging.Logger, resolver registry.Resolver, emitter metering.Emitter) *Server {
 	return &Server{
 		settings: s,
 		log:      log,
 		resolver: resolver,
 		emitter:  emitter,
+		// denyAllPolicy + NopSink = logging fully inert; ShouldLog is never true
+		// so no request ever buffers a body. This is the fail-closed default.
+		ioPolicy:     denyAllPolicy{},
+		ioSink:       iolog.NopSink{},
+		ioMaxBodyLen: iolog.DefaultMaxBodyBytes,
 	}
 }
+
+// NewWithIOLog constructs a Server with M5 I/O logging wired in. policy decides
+// per request whether to capture bodies; sink receives the Records. maxBodyLen
+// caps the buffered response-body copy (<=0 uses the default). When logging is
+// disabled, callers pass denyAllPolicy/NopSink via New instead.
+func NewWithIOLog(s *config.Settings, log *logging.Logger, resolver registry.Resolver, emitter metering.Emitter,
+	policy iolog.Policy, sink iolog.Sink, maxBodyLen int) *Server {
+	srv := New(s, log, resolver, emitter)
+	if policy != nil {
+		srv.ioPolicy = policy
+	}
+	if sink != nil {
+		srv.ioSink = sink
+	}
+	if maxBodyLen > 0 {
+		srv.ioMaxBodyLen = maxBodyLen
+	}
+	return srv
+}
+
+// denyAllPolicy is the default Policy when I/O logging is off: ShouldLog is
+// always false, so the proxy never buffers a request or response body. Keeping
+// this as a real Policy (rather than a nil check on the hot path) means the
+// gate is a single uniform call site.
+type denyAllPolicy struct{}
+
+func (denyAllPolicy) ShouldLog(identity.Identity, string) bool { return false }
 
 // Handler returns the http.Handler for the interceptor.
 func (s *Server) Handler() http.Handler {
@@ -104,14 +148,39 @@ func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	requestID := r.Header.Get(requestIDHeader)
+
+	// M5 I/O-logging gate — computed ONCE. Everything that adds hot-path cost
+	// (capturing the request body, buffering the response) is guarded by this
+	// single boolean. When false (the default, and the common case), the proxy
+	// behaves exactly as it did before M5: no extra read, no extra allocation.
+	shouldLog := s.ioPolicy.ShouldLog(id, requestID)
+
+	// Capture the ORIGINAL client request body for fidelity — BEFORE
+	// forceIncludeUsage rewrites it. We log what the tenant actually sent, not
+	// phoebe's internal include_usage injection: when a tenant is debugging a
+	// bad response, "what did my client send?" is the useful question, and the
+	// rewrite is an implementation detail they never wrote. captureRequestBody
+	// reads the body once and restores it so forceIncludeUsage re-reads the
+	// same bytes (no double-read). Only runs when shouldLog is true.
+	var reqBody string
+	var startTime time.Time
+	if shouldLog {
+		startTime = time.Now()
+		reqBody, err = captureRequestBody(r)
+		if err != nil {
+			s.log.Error.Printf("capture request body: %v", err)
+			http.Error(w, "bad request body", http.StatusBadRequest)
+			return
+		}
+	}
+
 	// Force streaming usage so we never under-bill a streamed response.
 	if err := forceIncludeUsage(r); err != nil {
 		s.log.Error.Printf("rewrite request body: %v", err)
 		http.Error(w, "bad request body", http.StatusBadRequest)
 		return
 	}
-
-	requestID := r.Header.Get(requestIDHeader)
 
 	rp := httputil.NewSingleHostReverseProxy(upstream)
 
@@ -130,12 +199,42 @@ func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request) {
 
 	rp.ModifyResponse = func(resp *http.Response) error {
 		streamed := isEventStream(resp)
+		statusCode := resp.StatusCode
 
 		onDone := func(res capture.Result) {
+			// Metering (durable) always fires.
 			s.emit(r.Context(), id, requestID, res)
+			// M5 I/O logging (best-effort) only when this request opted in.
+			if shouldLog {
+				respBody, truncated := cr.capturedBody()
+				rec := iolog.Record{
+					RequestID:         requestID,
+					AuthID:            id.AuthID,
+					UserID:            id.UserID,
+					GroupID:           id.GroupID,
+					ResourceID:        id.ResourceID,
+					ResourceType:      id.ResourceType,
+					Model:             id.ResourceID,
+					RequestBody:       reqBody,
+					ResponseBody:      respBody,
+					ResponseTruncated: truncated,
+					StatusCode:        statusCode,
+					Streamed:          res.Streamed,
+					LatencyMs:         time.Since(startTime).Milliseconds(),
+					Timestamp:         time.Now(),
+				}
+				// Sink.Log is async/non-blocking and best-effort — it never
+				// blocks this completion callback or the client response.
+				s.ioSink.Log(r.Context(), rec)
+			}
 		}
 
 		cr = newCaptureReader(resp.Body, streamed, onDone)
+		// Enable bounded response-body capture ONLY for opted-in requests.
+		// For everything else logBuf stays nil and Read pays no extra cost.
+		if shouldLog {
+			cr.enableBodyLog(s.ioMaxBodyLen)
+		}
 		resp.Body = cr
 
 		// Abort-watcher goroutine: races between the client context being
