@@ -5,10 +5,35 @@ This directory holds the schema for phoebe's billing tables, which live in the
 
 - `billing_event` — the system-of-record table that phoebe's Postgres drainer
   (`cmd/drainer`) writes raw, pre-rating metering records into.
-- `model_price` + `rated_usage` — the **rating** (revenue) schema: the
-  effective-dated price book and the per-(auth_id, model, hour) cost rollup that
-  the rater batch job (`cmd/rater`) joins and writes. Money is stored as INTEGER
-  micro-USD (1e-6 USD), never float.
+- `model_price` + `derivation_policy` + `rated_usage` — the **rating v2** (revenue)
+  schema: the effective-dated price book (keyed on a stable `model_id`), the single
+  global fine-tune derivation policy, and the per-(auth_id, model_id, hour) cost
+  rollup that the rater batch job (`cmd/rater`) joins and writes. **Money is stored
+  as `NUMERIC(20,9)` — exact decimal, never float and never an integer micro/nano
+  scalar — and ALL money math happens in SQL, not Go.**
+
+### Rating v2 money model (read before touching a number)
+
+- Every money column is `NUMERIC(20,9)`: 9 fractional digits (nano-USD), 11
+  integer digits. A sub-$1/1M price like `$0.15/1M = 0.000000150` USD/token is
+  exact; an integer micro/nano unit would round it or coarsen it.
+- The rater **computes per-event cost AND sums it in a single `INSERT … SELECT`**.
+  Go never holds a running money total; it only carries `NUMERIC` values as text.
+- `model_price` is keyed on `model_id` (a stable model identity, **not** a
+  deployment id or display name). A fine-tune with a NULL rate sets `derived_from`
+  to its base's `model_id` and inherits the base's effective rate transformed by
+  `derivation_policy` — a pointer, not a copy (a base price change auto-propagates).
+  One hop only (a chain > 1 hop is treated as unpriced).
+- `derivation_policy` is the **single global** rule (`identity | multiplier |
+  markup`), effective-dated. Per-base override is a deliberate v1 non-goal.
+- Effective-dating is **forward-only, non-overlapping**, enforced by GiST `EXCLUDE`
+  constraints (`btree_gist`): at most one price/policy row matches per instant, so
+  the rating join can never fan out and silently over-bill.
+- **Audit:** `model_price`/`derivation_policy` are append-only-effective-dated
+  (never UPDATE a price — insert a new effective row and close the old); that
+  history IS the audit trail, and `created_by` records who set it. The write-path
+  authz ("operator-only") is an Atlas/control-plane concern — **out of scope for
+  phoebe**; the DB merely records `created_by`.
 
 ## Why the schema lives here but is *applied* by Atlas (migration ownership)
 
@@ -31,9 +56,9 @@ a **ready-to-copy Alembic file**, not a migrator phoebe executes:
 | --- | --- |
 | `0001_billing_event.sql` | Plain DDL. Reference + local-dev convenience (`psql -f`). Not the production apply path. |
 | `atlas/b1f0c2d3e4a5_add_billing_event.py` | A real Alembic `upgrade()`/`downgrade()` following Atlas conventions. The production artifact. |
-| `0002_rating.sql` | Plain DDL for `model_price` + `rated_usage` (the rating tables). Reference + local-dev. |
+| `0002_rating.sql` | Plain DDL for `model_price` + `derivation_policy` + `rated_usage` (the rating v2 tables, NUMERIC money, GiST exclusion constraints). Reference + local-dev. Notes `CREATE EXTENSION btree_gist`. |
 | `atlas/c2f1a3b4d5e6_add_rating.py` | The Alembic artifact for the rating tables. `down_revision = "b1f0c2d3e4a5"` — it chains **after** `billing_event`, so the phoebe revision graph is linear: `…current Atlas head… → billing_event → rating`. |
-| `seed_example_prices.sql` | **PLACEHOLDER, non-binding** example price book for local dev. NOT a schema migration and NOT for prod — Hugo sets real prices as data. |
+| `seed_example_prices.sql` | **PLACEHOLDER, non-binding** example price book for local dev (a base model, a derived fine-tune, and a global derivation policy). NOT a schema migration and NOT for prod — an operator sets real prices as data. |
 
 ### Migration chain
 
@@ -78,7 +103,14 @@ without a matching entry there simply won't be written:
 
 - `billing_event`: `0001_billing_event.sql` ↔ `atlas/b1f0c2d3e4a5_…` ↔
   `internal/drain/store.go` (`upsertColumns`).
-- `rated_usage`: `0002_rating.sql` ↔ `atlas/c2f1a3b4d5e6_…` ↔
-  `internal/rating/store.go` (`upsertColumns`).
-- `model_price` is read-only to phoebe (rating SELECTs it; Hugo writes prices as
-  data), so it has no Go upsert column list — only the `.sql`/Alembic pair.
+- `rated_usage`: `0002_rating.sql` ↔ `atlas/c2f1a3b4d5e6_…` ↔ the `INSERT INTO
+  rated_usage (…)` column list in `internal/rating/store.go` (`rateWindowSQL`).
+- `model_price` and `derivation_policy` are read-only to phoebe (rating SELECTs
+  them; an operator writes prices/policy as data), so they have no Go upsert column
+  list — only the `.sql`/Alembic pair.
+
+> Note: the rater filters `billing_event` on `model_id` (the v2 price key). The
+> drainer's `billing_event` carries the metering identity verbatim; whichever
+> column the rating join keys on (`model_id`) must be populated by the upstream
+> metering path for an event to be attributable — an absent `model_id` is counted
+> as **unattributable** and surfaced loudly, never silently dropped.

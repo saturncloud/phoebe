@@ -1,7 +1,9 @@
 // Command rater is phoebe's REVENUE path batch job. It reads a window of raw
-// metering rows from billing_event, joins the effective-dated price book
-// (model_price), computes per-event cost in integer micro-USD, and upserts
-// per-(auth_id, model, hour) cost rollups into rated_usage.
+// metering rows from billing_event and, ENTIRELY IN SQL, joins the effective-dated
+// price book (model_price, keyed on model_id) plus the global fine-tune derivation
+// policy (derivation_policy), computes per-event cost as exact NUMERIC, sums it,
+// and upserts per-(auth_id, model_id, hour) cost rollups into rated_usage. No money
+// math happens in Go — the rater binary is orchestration only.
 //
 // It is a ONE-SHOT BATCH job (run by cron / a k8s CronJob), NOT a daemon: it
 // rates one window and exits. Exit codes:
@@ -10,7 +12,7 @@
 //	1  fatal error (config, DB, etc.) — nothing or partial; safe to re-run
 //	2  window rated BUT an anomaly leaked (fail-loud): some events were unpriced
 //	   (backfill the price book and re-rate) and/or some rows were unattributable
-//	   — NULL auth_id/model, which the interceptor's billing gate should reject
+//	   — NULL auth_id/model_id, which the interceptor's billing gate should reject
 //	   before metering, so a nonzero count means revenue is leaking upstream.
 //	   Distinct code so a CronJob can alert on "lost revenue / lost data"
 //	   separately from "job broke".
@@ -20,8 +22,8 @@
 //
 // Config, like the drainer: a YAML settings file (flag -f) for pool knobs, and
 // the DATABASE_URL env var (Atlas convention) for Postgres. The rater does NOT
-// run migrations — it assumes billing_event/model_price/rated_usage exist (see
-// migrations/README.md).
+// run migrations — it assumes billing_event/model_price/derivation_policy/
+// rated_usage exist (see migrations/README.md).
 package main
 
 import (

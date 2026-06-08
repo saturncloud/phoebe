@@ -2,54 +2,18 @@ package rating
 
 import (
 	"context"
-	"regexp"
+	"strings"
 	"testing"
 
 	"github.com/DATA-DOG/go-sqlmock"
 )
 
-// TestPostgresStore_LoadPrices verifies the price-book query scans rows and maps
-// a NULL effective_to to the zero Time (open-ended).
-func TestPostgresStore_LoadPrices(t *testing.T) {
-	db, mock, err := sqlmock.New()
-	if err != nil {
-		t.Fatalf("sqlmock: %v", err)
-	}
-	defer db.Close()
-	store := NewPostgresStore(db)
-
-	from := mustTime("2026-01-01T00:00:00Z")
-	rows := sqlmock.NewRows([]string{"model", "prompt_price_micro", "cached_price_micro", "completion_price_micro", "effective_from", "effective_to"}).
-		AddRow("m", int64(3), int64(1), int64(10), from, nil). // open-ended
-		AddRow("m", int64(5), int64(2), int64(15), from, mustTime("2026-06-01T00:00:00Z"))
-
-	mock.ExpectQuery(regexp.QuoteMeta(
-		"SELECT model, prompt_price_micro, cached_price_micro, completion_price_micro, effective_from, effective_to FROM model_price",
-	)).WillReturnRows(rows)
-
-	prices, err := store.LoadPrices(context.Background())
-	if err != nil {
-		t.Fatalf("LoadPrices: %v", err)
-	}
-	if len(prices) != 2 {
-		t.Fatalf("got %d prices, want 2", len(prices))
-	}
-	if !prices[0].EffectiveTo.IsZero() {
-		t.Fatalf("row 0 effective_to = %v, want zero (NULL → open-ended)", prices[0].EffectiveTo)
-	}
-	if prices[1].EffectiveTo.IsZero() {
-		t.Fatal("row 1 effective_to is zero, want the closed bound")
-	}
-	if err := mock.ExpectationsWereMet(); err != nil {
-		t.Fatalf("unmet: %v", err)
-	}
-}
-
-// TestPostgresStore_ReadWindow verifies the window query filters on the coalesced
-// rating instant and that scanned rows map to RatedEvent. A well-formed window
-// (no NULL auth_id/model) reports zero unattributable rows.
-func TestPostgresStore_ReadWindow(t *testing.T) {
-	db, mock, err := sqlmock.New()
+// TestPostgresStore_RateWindowSQL asserts the rate-and-sum statement: it carries
+// the effective-dated resolution CTE, the LATERAL own/base/policy joins, the
+// billable-prompt formula, the SUM into rollups, and the idempotent upsert. We
+// match on stable fragments rather than the whole (large) statement.
+func TestPostgresStore_RateWindowSQL(t *testing.T) {
+	db, mock, err := sqlmock.New(sqlmock.QueryMatcherOption(sqlmock.QueryMatcherRegexp))
 	if err != nil {
 		t.Fatalf("sqlmock: %v", err)
 	}
@@ -58,44 +22,94 @@ func TestPostgresStore_ReadWindow(t *testing.T) {
 
 	start := mustTime("2026-06-08T10:00:00Z")
 	end := mustTime("2026-06-08T11:00:00Z")
-	at := mustTime("2026-06-08T10:15:00Z")
 
-	rows := sqlmock.NewRows([]string{"auth_id", "model", "prompt_tokens", "cached_tokens", "completion_tokens", "aborted", "rating_ts"}).
-		AddRow("a", "m", int64(100), int64(30), int64(50), false, at)
-
-	// Match on the stable head of the statement.
-	mock.ExpectQuery("SELECT auth_id, model, prompt_tokens, cached_tokens, completion_tokens, aborted").
-		WithArgs(start, end).
+	rows := sqlmock.NewRows([]string{"rollups_written", "events_rated", "total_cost"}).
+		AddRow(2, 5, "0.001234500")
+	mock.ExpectQuery(`INSERT INTO rated_usage`).
+		WithArgs(start.UTC(), end.UTC()).
 		WillReturnRows(rows)
 
-	events, unattributable, err := store.ReadWindow(context.Background(), start, end)
+	res, err := store.RateWindow(context.Background(), start, end)
 	if err != nil {
-		t.Fatalf("ReadWindow: %v", err)
+		t.Fatalf("RateWindow: %v", err)
 	}
-	if unattributable != 0 {
-		t.Fatalf("unattributable = %d, want 0 (no NULL rows)", unattributable)
-	}
-	if len(events) != 1 {
-		t.Fatalf("got %d events, want 1", len(events))
-	}
-	e := events[0]
-	if e.AuthID != "a" || e.Model != "m" || e.PromptTokens != 100 || e.CachedTokens != 30 || e.CompletionTokens != 50 {
-		t.Fatalf("event mapped wrong: %+v", e)
-	}
-	if !e.At.Equal(at) {
-		t.Fatalf("event At = %v, want %v (coalesced rating instant)", e.At, at)
+	if res.RollupsWritten != 2 || res.EventsRated != 5 || res.TotalCost != "0.001234500" {
+		t.Fatalf("result = %+v, want 2/5/0.001234500", res)
 	}
 	if err := mock.ExpectationsWereMet(); err != nil {
 		t.Fatalf("unmet: %v", err)
 	}
 }
 
-// TestPostgresStore_ReadWindowCountsUnattributable verifies that in-window rows
-// with a NULL auth_id or NULL model are NOT returned as rateable events but ARE
-// counted (and skipped) — the fail-loud-not-silent contract. The query no longer
-// filters NULLs in SQL; the Go scan loop detects them via sql.NullString.
-func TestPostgresStore_ReadWindowCountsUnattributable(t *testing.T) {
-	db, mock, err := sqlmock.New()
+// TestRateWindowSQL_Shape locks the load-bearing SQL fragments into the statement
+// constant itself (no DB needed): the half-open effective-dating predicate, the
+// one-hop derived-from resolution, the policy CASE, the billable-prompt clamp +
+// formula, and the idempotent ON CONFLICT.
+func TestRateWindowSQL_Shape(t *testing.T) {
+	wantFragments := []string{
+		// window membership on the coalesced rating instant
+		"COALESCE(event_ts, created_at) >= $1",
+		"COALESCE(event_ts, created_at) <  $2",
+		// half-open effective-dating predicate (appears for own, derived, base)
+		"effective_from <= ev.ev_ts",
+		"ev.ev_ts < mp.effective_to",
+		// own-rate escape hatch (carries a rate) + derived (no own rate)
+		"mp.prompt_price IS NOT NULL",
+		"mp.prompt_price IS NULL",
+		"mp.derived_from IS NOT NULL",
+		// one-hop resolution: base is looked up by the model's derived_from
+		"mp.model_id = der.derived_from",
+		// derivation policy applied in SQL (CASE on function)
+		"WHEN 'multiplier' THEN base.prompt_price * pol.factor",
+		"WHEN 'markup'     THEN base.prompt_price + pol.markup",
+		// the global policy lookup (no per-base scope)
+		"FROM derivation_policy dp",
+		// billable-prompt clamp + the cost formula (cached charged once)
+		"GREATEST(ev.prompt_tokens - ev.cached_tokens, 0)",
+		"billable_prompt   * prompt_price",
+		"cached_tokens     * cached_price",
+		"completion_tokens * completion_price",
+		// priced + attributable filter (never $0-bill unpriced/unattributable)
+		"WHERE prompt_price IS NOT NULL",
+		"AND auth_id  IS NOT NULL",
+		"AND model_id IS NOT NULL",
+		// idempotent upsert on the natural key
+		"ON CONFLICT (auth_id, model_id, window_start) DO UPDATE SET",
+	}
+	for _, f := range wantFragments {
+		if !strings.Contains(rateWindowSQL, f) {
+			t.Errorf("rateWindowSQL missing fragment: %q", f)
+		}
+	}
+}
+
+// TestCountAnomaliesSQL_Shape locks the anomaly-count query: it shares the SAME
+// resolution CTE (so "unpriced" means the same thing as in the insert) and counts
+// unpriced (priced=NULL, attributable) vs unattributable (NULL auth/model) without
+// double-attributing a row.
+func TestCountAnomaliesSQL_Shape(t *testing.T) {
+	wantFragments := []string{
+		"COUNT(*) FILTER (",
+		"WHERE prompt_price IS NULL",
+		"AND auth_id  IS NOT NULL",
+		"AND model_id IS NOT NULL",
+		"WHERE auth_id IS NULL OR model_id IS NULL",
+		"FROM resolved",
+	}
+	for _, f := range wantFragments {
+		if !strings.Contains(countAnomaliesSQL, f) {
+			t.Errorf("countAnomaliesSQL missing fragment: %q", f)
+		}
+	}
+	// Both statements must be built on the identical resolution CTE.
+	if !strings.Contains(rateWindowSQL, "WITH ev AS (") || !strings.Contains(countAnomaliesSQL, "WITH ev AS (") {
+		t.Fatal("rate/anomaly statements must both build on resolvedEventsCTE")
+	}
+}
+
+// TestPostgresStore_CountAnomalies scans the two counts.
+func TestPostgresStore_CountAnomalies(t *testing.T) {
+	db, mock, err := sqlmock.New(sqlmock.QueryMatcherOption(sqlmock.QueryMatcherRegexp))
 	if err != nil {
 		t.Fatalf("sqlmock: %v", err)
 	}
@@ -104,137 +118,19 @@ func TestPostgresStore_ReadWindowCountsUnattributable(t *testing.T) {
 
 	start := mustTime("2026-06-08T10:00:00Z")
 	end := mustTime("2026-06-08T11:00:00Z")
-	at := mustTime("2026-06-08T10:15:00Z")
 
-	rows := sqlmock.NewRows([]string{"auth_id", "model", "prompt_tokens", "cached_tokens", "completion_tokens", "aborted", "rating_ts"}).
-		AddRow("a", "m", int64(100), int64(30), int64(50), false, at). // well-formed
-		AddRow(nil, "m", int64(10), int64(0), int64(5), false, at).    // NULL auth_id
-		AddRow("a", nil, int64(20), int64(0), int64(5), false, at)     // NULL model
+	mock.ExpectQuery(`COUNT\(\*\) FILTER`).
+		WithArgs(start.UTC(), end.UTC()).
+		WillReturnRows(sqlmock.NewRows([]string{"unpriced", "unattributable"}).AddRow(3, 1))
 
-	mock.ExpectQuery("SELECT auth_id, model, prompt_tokens, cached_tokens, completion_tokens, aborted").
-		WithArgs(start, end).
-		WillReturnRows(rows)
-
-	events, unattributable, err := store.ReadWindow(context.Background(), start, end)
+	a, err := store.CountAnomalies(context.Background(), start, end)
 	if err != nil {
-		t.Fatalf("ReadWindow: %v", err)
+		t.Fatalf("CountAnomalies: %v", err)
 	}
-	if unattributable != 2 {
-		t.Fatalf("unattributable = %d, want 2 (NULL auth_id + NULL model rows counted, not dropped)", unattributable)
-	}
-	if len(events) != 1 {
-		t.Fatalf("got %d events, want 1 (only the well-formed row is rateable)", len(events))
-	}
-	if events[0].AuthID != "a" || events[0].Model != "m" {
-		t.Fatalf("returned event mapped wrong: %+v", events[0])
+	if a.UnpricedEvents != 3 || a.UnattributableEvents != 1 {
+		t.Fatalf("anomalies = %+v, want 3/1", a)
 	}
 	if err := mock.ExpectationsWereMet(); err != nil {
 		t.Fatalf("unmet: %v", err)
-	}
-}
-
-// TestPostgresStore_UpsertRollupsSQL verifies the rollup upsert emits a single
-// parameterised INSERT ... ON CONFLICT (auth_id, model, window_start) DO UPDATE
-// inside a transaction — the idempotency mechanism. id is a generated 32-char hex
-// (matched by pattern, not value).
-func TestPostgresStore_UpsertRollupsSQL(t *testing.T) {
-	db, mock, err := sqlmock.New()
-	if err != nil {
-		t.Fatalf("sqlmock: %v", err)
-	}
-	defer db.Close()
-	store := NewPostgresStore(db)
-
-	ws := mustTime("2026-06-08T10:00:00Z")
-	we := mustTime("2026-06-08T11:00:00Z")
-	rollups := []Rollup{{
-		AuthID: "a", Model: "m",
-		WindowStart: ws, WindowEnd: we,
-		PromptTokens: 110, CachedTokens: 30, CompletionTokens: 55,
-		BillablePromptTokens: 80, CostMicroUSD: 820, EventCount: 2,
-	}}
-
-	mock.ExpectBegin()
-	mock.ExpectExec(regexp.QuoteMeta(
-		"INSERT INTO rated_usage (id, auth_id, model, window_start, window_end, prompt_tokens, cached_tokens, completion_tokens, billable_prompt_tokens, cost_micro_usd, event_count) VALUES",
-	)).
-		// id is generated hex → match any 32 hex chars; the rest are exact.
-		WithArgs(
-			sqlmock.AnyArg(), // id
-			"a", "m",
-			ws.UTC(), we.UTC(),
-			int64(110), int64(30), int64(55), int64(80), int64(820), 2,
-		).
-		WillReturnResult(sqlmock.NewResult(0, 1))
-	mock.ExpectCommit()
-
-	if err := store.UpsertRollups(context.Background(), rollups); err != nil {
-		t.Fatalf("UpsertRollups: %v", err)
-	}
-	if err := mock.ExpectationsWereMet(); err != nil {
-		t.Fatalf("unmet: %v", err)
-	}
-}
-
-// TestPostgresStore_UpsertOnConflictClause locks the ON CONFLICT DO UPDATE clause
-// (the idempotency contract) into the emitted SQL.
-func TestPostgresStore_UpsertOnConflictClause(t *testing.T) {
-	db, mock, err := sqlmock.New()
-	if err != nil {
-		t.Fatalf("sqlmock: %v", err)
-	}
-	defer db.Close()
-	store := NewPostgresStore(db)
-
-	mock.ExpectBegin()
-	mock.ExpectExec("ON CONFLICT \\(auth_id, model, window_start\\) DO UPDATE SET").
-		WillReturnResult(sqlmock.NewResult(0, 1))
-	mock.ExpectCommit()
-
-	err = store.UpsertRollups(context.Background(), []Rollup{{
-		AuthID: "a", Model: "m",
-		WindowStart: mustTime("2026-06-08T10:00:00Z"),
-		WindowEnd:   mustTime("2026-06-08T11:00:00Z"),
-	}})
-	if err != nil {
-		t.Fatalf("UpsertRollups: %v", err)
-	}
-	if err := mock.ExpectationsWereMet(); err != nil {
-		t.Fatalf("unmet: %v", err)
-	}
-}
-
-// TestPostgresStore_UpsertEmptyNoop proves an empty batch issues no SQL.
-func TestPostgresStore_UpsertEmptyNoop(t *testing.T) {
-	db, mock, err := sqlmock.New()
-	if err != nil {
-		t.Fatalf("sqlmock: %v", err)
-	}
-	defer db.Close()
-	store := NewPostgresStore(db)
-
-	if err := store.UpsertRollups(context.Background(), nil); err != nil {
-		t.Fatalf("UpsertRollups(nil): %v", err)
-	}
-	if err := mock.ExpectationsWereMet(); err != nil {
-		t.Fatalf("unexpected SQL: %v", err)
-	}
-}
-
-// TestNewID returns distinct 32-char hex ids.
-func TestNewID(t *testing.T) {
-	seen := map[string]bool{}
-	for i := 0; i < 100; i++ {
-		id, err := newID()
-		if err != nil {
-			t.Fatal(err)
-		}
-		if len(id) != 32 {
-			t.Fatalf("id %q len %d, want 32", id, len(id))
-		}
-		if seen[id] {
-			t.Fatalf("duplicate id %q", id)
-		}
-		seen[id] = true
 	}
 }
