@@ -1,9 +1,14 @@
-# phoebe migrations — `billing_event`
+# phoebe migrations — `billing_event` + rating (`model_price`, `rated_usage`)
 
-This directory holds the schema for `billing_event`, the system-of-record table
-that phoebe's Postgres drainer (`cmd/drainer`) writes raw, pre-rating metering
-records into. The table lives in the **shared Atlas Postgres**, alongside the
-rest of the Saturn schema.
+This directory holds the schema for phoebe's billing tables, which live in the
+**shared Atlas Postgres** alongside the rest of the Saturn schema:
+
+- `billing_event` — the system-of-record table that phoebe's Postgres drainer
+  (`cmd/drainer`) writes raw, pre-rating metering records into.
+- `model_price` + `rated_usage` — the **rating** (revenue) schema: the
+  effective-dated price book and the per-(auth_id, model, hour) cost rollup that
+  the rater batch job (`cmd/rater`) joins and writes. Money is stored as INTEGER
+  micro-USD (1e-6 USD), never float.
 
 ## Why the schema lives here but is *applied* by Atlas (migration ownership)
 
@@ -26,6 +31,21 @@ a **ready-to-copy Alembic file**, not a migrator phoebe executes:
 | --- | --- |
 | `0001_billing_event.sql` | Plain DDL. Reference + local-dev convenience (`psql -f`). Not the production apply path. |
 | `atlas/b1f0c2d3e4a5_add_billing_event.py` | A real Alembic `upgrade()`/`downgrade()` following Atlas conventions. The production artifact. |
+| `0002_rating.sql` | Plain DDL for `model_price` + `rated_usage` (the rating tables). Reference + local-dev. |
+| `atlas/c2f1a3b4d5e6_add_rating.py` | The Alembic artifact for the rating tables. `down_revision = "b1f0c2d3e4a5"` — it chains **after** `billing_event`, so the phoebe revision graph is linear: `…current Atlas head… → billing_event → rating`. |
+| `seed_example_prices.sql` | **PLACEHOLDER, non-binding** example price book for local dev. NOT a schema migration and NOT for prod — Hugo sets real prices as data. |
+
+### Migration chain
+
+The two phoebe Alembic files form a linear chain:
+
+```
+<current Atlas head>  →  b1f0c2d3e4a5 (billing_event)  →  c2f1a3b4d5e6 (rating)
+```
+
+When copying them into `saturn/alembic/versions/`, only `billing_event`'s
+`down_revision` needs re-pointing to the then-current Atlas head; `rating` always
+chains off `billing_event` via its pinned `down_revision = "b1f0c2d3e4a5"`.
 
 ## How to apply it to the shared Atlas Postgres
 
@@ -50,9 +70,15 @@ a **ready-to-copy Alembic file**, not a migrator phoebe executes:
 - `request_id` is `varchar(255)` (an engine/OpenAI request id, **not** an Atlas
   32-char hex), and is the primary key / idempotency key.
 
-## Keeping the two in sync
+## Keeping the .sql and Alembic in sync
 
-`0001_billing_event.sql` and the Alembic file describe the *same* table. If you
-change one, change the other. The drainer's column list lives in
-`internal/drain/store.go` (`upsertColumns`) and must also match — a column added
-to the table without a matching entry there simply won't be written.
+Each `.sql` and its Alembic file describe the *same* table(s). If you change one,
+change the other. The Go column lists must also match — a column added to a table
+without a matching entry there simply won't be written:
+
+- `billing_event`: `0001_billing_event.sql` ↔ `atlas/b1f0c2d3e4a5_…` ↔
+  `internal/drain/store.go` (`upsertColumns`).
+- `rated_usage`: `0002_rating.sql` ↔ `atlas/c2f1a3b4d5e6_…` ↔
+  `internal/rating/store.go` (`upsertColumns`).
+- `model_price` is read-only to phoebe (rating SELECTs it; Hugo writes prices as
+  data), so it has no Go upsert column list — only the `.sql`/Alembic pair.
