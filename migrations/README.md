@@ -57,20 +57,27 @@ a **ready-to-copy Alembic file**, not a migrator phoebe executes:
 | `0001_billing_event.sql` | Plain DDL. Reference + local-dev convenience (`psql -f`). Not the production apply path. |
 | `atlas/b1f0c2d3e4a5_add_billing_event.py` | A real Alembic `upgrade()`/`downgrade()` following Atlas conventions. The production artifact. |
 | `0002_rating.sql` | Plain DDL for `model_price` + `derivation_policy` + `rated_usage` (the rating v2 tables, NUMERIC money, GiST exclusion constraints). Reference + local-dev. Notes `CREATE EXTENSION btree_gist`. |
-| `atlas/c2f1a3b4d5e6_add_rating.py` | The Alembic artifact for the rating tables. `down_revision = "b1f0c2d3e4a5"` — it chains **after** `billing_event`, so the phoebe revision graph is linear: `…current Atlas head… → billing_event → rating`. |
+| `atlas/c2f1a3b4d5e6_add_rating.py` | The Alembic artifact for the rating tables. Chains after `billing_event`. |
+| `0002_io_log.sql` | Plain DDL for `io_log` (M5 per-tenant I/O-logging store: request/response bodies + `body_tsv` GIN full-text). Reference + local-dev. |
+| `atlas/c2e1d3f4a5b6_add_io_log.py` | The Alembic artifact for `io_log`. Chains after `billing_event` (re-point when landing alongside rating — see below). |
 | `seed_example_prices.sql` | **PLACEHOLDER, non-binding** example price book for local dev (a base model, a derived fine-tune, and a global derivation policy). NOT a schema migration and NOT for prod — an operator sets real prices as data. |
 
-### Migration chain
+### Migration chain (IMPORTANT when landing these together)
 
-The two phoebe Alembic files form a linear chain:
+Both `rating` and `io_log` were authored on their own branches and pin
+`down_revision = "b1f0c2d3e4a5"` (billing_event). That's a **fork**, which Alembic
+rejects as two heads. When applying more than one, **linearize them** so there's
+exactly one head:
 
 ```
-<current Atlas head>  →  b1f0c2d3e4a5 (billing_event)  →  c2f1a3b4d5e6 (rating)
+<current Atlas head> → b1f0c2d3e4a5 (billing_event)
+                     → c2f1a3b4d5e6 (rating)
+                     → c2e1d3f4a5b6 (io_log)   ← re-point its down_revision to rating
 ```
 
-When copying them into `saturn/alembic/versions/`, only `billing_event`'s
-`down_revision` needs re-pointing to the then-current Atlas head; `rating` always
-chains off `billing_event` via its pinned `down_revision = "b1f0c2d3e4a5"`.
+Order among rating/io_log doesn't matter functionally (different tables); only
+that the graph stays linear. `billing_event`'s own `down_revision` re-points to
+the then-current Atlas head at copy time.
 
 ## How to apply it to the shared Atlas Postgres
 
@@ -105,6 +112,8 @@ without a matching entry there simply won't be written:
   `internal/drain/store.go` (`upsertColumns`).
 - `rated_usage`: `0002_rating.sql` ↔ `atlas/c2f1a3b4d5e6_…` ↔ the `INSERT INTO
   rated_usage (…)` column list in `internal/rating/store.go` (`rateWindowSQL`).
+- `io_log`: `0002_io_log.sql` ↔ `atlas/c2e1d3f4a5b6_…` ↔ the insert column list in
+  `internal/iolog/postgres.go`.
 - `model_price` and `derivation_policy` are read-only to phoebe (rating SELECTs
   them; an operator writes prices/policy as data), so they have no Go upsert column
   list — only the `.sql`/Alembic pair.
