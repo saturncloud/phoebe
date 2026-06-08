@@ -2,6 +2,7 @@ package proxy
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"io"
 	"sync"
@@ -30,16 +31,18 @@ var sseDone = []byte("[DONE]")
 //
 // # Concurrency model
 //
-// Read is called from ReverseProxy's copy goroutine. markAborted is called from
-// the abort-watcher goroutine (launched by handleProxy) when the client context
-// is cancelled. mu guards result and done so both paths are race-free.
+// Read is called from ReverseProxy's copy goroutine; Close from its teardown.
+// finish() runs at most once (guarded by `done` under mu) and fires onDone.
 //
-// Ordering guarantee: markAborted sets result.Aborted=true and then calls
-// finish() — both paths acquire mu before touching result or done. Therefore:
-//   - If the abort-watcher wins: result.Aborted=true is visible to onDone.
-//   - If Read/Close wins first: finish() already ran, markAborted sees
-//     done=true and skips the second fire. The stream completed cleanly before
-//     context cancel — Aborted=false is correct.
+// Abort determination is race-free because it does NOT depend on goroutine
+// ordering: finish() reads the request context's Err() as the single source of
+// truth. The client request context is cancelled by net/http the instant the
+// client disconnects, and ReverseProxy cancels the upstream from that same
+// context — so by the time Close()/finish() runs on an abort, ctx.Err() is
+// already non-nil. Whoever calls finish() first therefore observes the correct
+// Aborted value. (The earlier design used a separate abort-watcher goroutine
+// racing Close(); if Close() won, onDone fired with Aborted=false and the
+// partial-bill event was lost. Reading ctx eliminates that race.)
 //
 // scan (the SSE line buffer) is only ever accessed from Read (the single
 // ReverseProxy copy goroutine) and from the non-streaming branch of finish(),
@@ -48,6 +51,10 @@ var sseDone = []byte("[DONE]")
 type captureReader struct {
 	src      io.ReadCloser
 	streamed bool
+
+	// ctx is the client request context. A non-nil ctx.Err() at finish time
+	// means the client disconnected (or the deadline passed) — i.e. an abort.
+	ctx context.Context
 
 	// scan holds bytes not yet split into complete SSE lines (streaming) or
 	// the whole accumulating body (non-streaming). Only touched from Read and
@@ -60,21 +67,15 @@ type captureReader struct {
 	result capture.Result
 	onDone func(capture.Result)
 	done   bool
-
-	// finishedCh is closed by finish() when onDone fires. The abort-watcher
-	// goroutine in handleProxy selects on both r.Context().Done() and
-	// finishedCh so it exits on either a client disconnect or a clean
-	// completion — preventing goroutine leaks on normal (non-aborted) requests.
-	finishedCh chan struct{}
 }
 
-func newCaptureReader(src io.ReadCloser, streamed bool, onDone func(capture.Result)) *captureReader {
+func newCaptureReader(ctx context.Context, src io.ReadCloser, streamed bool, onDone func(capture.Result)) *captureReader {
 	return &captureReader{
-		src:        src,
-		streamed:   streamed,
-		onDone:     onDone,
-		result:     capture.Result{Streamed: streamed},
-		finishedCh: make(chan struct{}),
+		ctx:      ctx,
+		src:      src,
+		streamed: streamed,
+		onDone:   onDone,
+		result:   capture.Result{Streamed: streamed},
 	}
 }
 
@@ -169,10 +170,10 @@ func (c *captureReader) inspectChunk(payload []byte) {
 	}
 }
 
-// finish parses the non-streaming body (if any) and fires onDone exactly once.
-// Safe to call from multiple goroutines; the done guard under mu ensures
-// onDone fires at most once even if Read (EOF path), Close, and markAborted
-// all converge.
+// finish parses the non-streaming body (if any), determines abort from the
+// request context, and fires onDone exactly once. Safe to call from multiple
+// goroutines; the done guard under mu ensures onDone fires at most once even if
+// Read (EOF path) and Close converge.
 func (c *captureReader) finish() {
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -187,30 +188,17 @@ func (c *captureReader) finish() {
 		c.inspectChunk(bytes.TrimSpace(c.scan.Bytes()))
 	}
 
+	// The client request context is the single source of truth for abort: if it
+	// is cancelled/expired by the time we finalise, the client disconnected
+	// before the response completed. Reading it HERE (rather than relying on a
+	// separate goroutine to set the flag before finish runs) makes the abort
+	// determination independent of goroutine scheduling — whichever path reaches
+	// finish() first observes the same, correct value.
+	if c.ctx != nil && c.ctx.Err() != nil {
+		c.result.Aborted = true
+	}
+
 	if c.onDone != nil {
 		c.onDone(c.result)
-	}
-	// Signal the abort-watcher goroutine that we're done so it can exit
-	// without leaking on normal (non-aborted) completions.
-	close(c.finishedCh)
-}
-
-// markAborted records that the client disconnected before the response
-// completed and ensures the finalisation callback fires with Aborted=true.
-// It is safe to call from any goroutine concurrently with Read/Close.
-//
-// If finish() has not yet run, markAborted sets the abort flag and triggers
-// it — onDone will see Aborted=true. If finish() already ran (a clean EOF
-// arrived before the context cancel), the stream completed normally and we do
-// NOT re-fire onDone; a clean completion with Aborted=false is correct.
-func (c *captureReader) markAborted() {
-	c.mu.Lock()
-	c.result.Aborted = true
-	alreadyDone := c.done
-	c.mu.Unlock()
-
-	if !alreadyDone {
-		// finish() re-acquires mu and fires onDone with Aborted=true now set.
-		c.finish()
 	}
 }
