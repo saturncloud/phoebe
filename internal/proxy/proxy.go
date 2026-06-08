@@ -121,13 +121,6 @@ func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request) {
 	// must not be cut by a write deadline.
 	rp.FlushInterval = -1
 
-	// cr is set by ModifyResponse and read by the abort-watcher goroutine.
-	// The assignment happens-before ServeHTTP returns ModifyResponse (which
-	// happens before the watcher goroutine can call markAborted, because the
-	// watcher is launched inside ModifyResponse). No extra synchronisation
-	// needed for this pointer itself.
-	var cr *captureReader
-
 	rp.ModifyResponse = func(resp *http.Response) error {
 		streamed := isEventStream(resp)
 
@@ -135,24 +128,11 @@ func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request) {
 			s.emit(r.Context(), id, requestID, res)
 		}
 
-		cr = newCaptureReader(resp.Body, streamed, onDone)
-		resp.Body = cr
-
-		// Abort-watcher goroutine: races between the client context being
-		// cancelled (client disconnect) and the captureReader signalling that
-		// it already fired onDone (normal completion). This two-arm select
-		// prevents goroutine leaks on non-aborted requests: once finish() runs
-		// (EOF or normal close), finishedCh is closed and the goroutine exits
-		// without calling markAborted.
-		go func() {
-			select {
-			case <-r.Context().Done():
-				cr.markAborted()
-			case <-cr.finishedCh:
-				// Stream completed normally; nothing to do.
-			}
-		}()
-
+		// The captureReader reads r.Context() to decide Aborted at finalisation
+		// time — so a client disconnect is detected without a separate watcher
+		// goroutine racing the body's Close(). On abort, ReverseProxy cancels
+		// this context, so by the time finish() runs ctx.Err() is non-nil.
+		resp.Body = newCaptureReader(r.Context(), resp.Body, streamed, onDone)
 		return nil
 	}
 

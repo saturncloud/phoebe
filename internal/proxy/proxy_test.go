@@ -9,6 +9,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/saturncloud/phoebe/internal/config"
 	"github.com/saturncloud/phoebe/internal/identity"
@@ -34,6 +35,28 @@ func (r *recordingEmitter) all() []metering.Event {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	return append([]metering.Event(nil), r.events...)
+}
+
+func (r *recordingEmitter) count() int {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return len(r.events)
+}
+
+// waitForEvents polls until at least n events have been emitted, or the timeout
+// elapses, and returns the events. Emit happens ASYNCHRONOUSLY from the abort-
+// watcher / onDone goroutines, so a test must not read events immediately after
+// ServeHTTP returns — a fixed sleep is flaky under CI load. Poll instead so the
+// test is deterministic regardless of scheduling. Returns whatever was captured
+// if it times out, letting the caller assert and report the shortfall.
+func (r *recordingEmitter) waitForEvents(n int, timeout time.Duration) []metering.Event {
+	deadline := time.Now().Add(timeout)
+	for {
+		if r.count() >= n || time.Now().After(deadline) {
+			return r.all()
+		}
+		time.Sleep(time.Millisecond)
+	}
 }
 
 func newTestServer(t *testing.T, upstream *url.URL) *Server {
