@@ -38,13 +38,15 @@ type Rollup struct {
 //     Rating snapshots it once per run.
 //   - ReadWindow returns the billing_event rows whose rating instant (event_ts,
 //     or created_at when event_ts is null) falls in [start, end). Half-open so
-//     adjacent windows never double-count a boundary event.
+//     adjacent windows never double-count a boundary event. It also returns the
+//     count of in-window rows skipped for a NULL auth_id/model — unattributable
+//     rows the rater must surface loudly rather than silently drop.
 //   - UpsertRollups writes the rollups idempotently: ON CONFLICT on the
 //     (auth_id, model, window_start) unique key it REPLACES the row, so a re-run
 //     of the same window reconciles rather than doubles.
 type Store interface {
 	LoadPrices(ctx context.Context) ([]Price, error)
-	ReadWindow(ctx context.Context, start, end time.Time) ([]RatedEvent, error)
+	ReadWindow(ctx context.Context, start, end time.Time) (events []RatedEvent, unattributable int, err error)
 	UpsertRollups(ctx context.Context, rollups []Rollup) error
 	Ping(ctx context.Context) error
 	Close() error
@@ -132,44 +134,62 @@ func (s *PostgresStore) LoadPrices(ctx context.Context) ([]Price, error) {
 // coalesced instant so window membership and price selection agree.
 //
 // auth_id and model are NOT NULL on a real metering row, but billing_event leaves
-// them nullable; a row with a NULL auth_id or model cannot be attributed/priced,
-// so we exclude it here (it is surfaced as a drained-but-unattributable record
-// elsewhere, not silently rated). This keeps rating's input well-formed.
-func (s *PostgresStore) ReadWindow(ctx context.Context, start, end time.Time) ([]RatedEvent, error) {
+// them nullable; a row with a NULL auth_id or model cannot be attributed/priced.
+// We do NOT filter such rows out in SQL: that would make them vanish silently —
+// the same silent-revenue-loss path we forbid for unpriced events. Instead we
+// scan every in-window row and, when auth_id or model is NULL, COUNT it and skip
+// it (never rate it). The count is returned as `unattributable` and surfaced in
+// the Result as UnattributableEvents, triggering the same loud ERROR log and
+// exit-nonzero path as unpriced events. This should never be nonzero (the
+// interceptor's fail-closed billing gate rejects requests missing auth_id before
+// they are metered) — which is exactly why a nonzero count must be loud: it means
+// something upstream is broken and revenue is leaking.
+func (s *PostgresStore) ReadWindow(ctx context.Context, start, end time.Time) ([]RatedEvent, int, error) {
 	const q = `
 		SELECT auth_id, model, prompt_tokens, cached_tokens, completion_tokens, aborted,
 		       COALESCE(event_ts, created_at) AS rating_ts
 		FROM billing_event
 		WHERE COALESCE(event_ts, created_at) >= $1
-		  AND COALESCE(event_ts, created_at) <  $2
-		  AND auth_id IS NOT NULL
-		  AND model   IS NOT NULL`
+		  AND COALESCE(event_ts, created_at) <  $2`
 	rows, err := s.db.QueryContext(ctx, q, start, end)
 	if err != nil {
-		return nil, fmt.Errorf("rating: read window [%s,%s): %w", start.UTC().Format(time.RFC3339), end.UTC().Format(time.RFC3339), err)
+		return nil, 0, fmt.Errorf("rating: read window [%s,%s): %w", start.UTC().Format(time.RFC3339), end.UTC().Format(time.RFC3339), err)
 	}
 	defer func() { _ = rows.Close() }()
 
 	var out []RatedEvent
+	var unattributable int
 	for rows.Next() {
-		var e RatedEvent
+		var (
+			e      RatedEvent
+			authID sql.NullString
+			model  sql.NullString
+		)
 		if err := rows.Scan(
-			&e.AuthID,
-			&e.Model,
+			&authID,
+			&model,
 			&e.PromptTokens,
 			&e.CachedTokens,
 			&e.CompletionTokens,
 			&e.Aborted,
 			&e.At,
 		); err != nil {
-			return nil, fmt.Errorf("rating: scan event: %w", err)
+			return nil, 0, fmt.Errorf("rating: scan event: %w", err)
 		}
+		if !authID.Valid || !model.Valid {
+			// Unattributable: cannot be priced or attributed. Count it (never rate
+			// it) so the rater surfaces it loudly instead of dropping it silently.
+			unattributable++
+			continue
+		}
+		e.AuthID = authID.String
+		e.Model = model.String
 		out = append(out, e)
 	}
 	if err := rows.Err(); err != nil {
-		return nil, fmt.Errorf("rating: iterate events: %w", err)
+		return nil, 0, fmt.Errorf("rating: iterate events: %w", err)
 	}
-	return out, nil
+	return out, unattributable, nil
 }
 
 // upsertColumns is the column order shared by the INSERT and the per-row value

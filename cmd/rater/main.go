@@ -6,11 +6,14 @@
 // It is a ONE-SHOT BATCH job (run by cron / a k8s CronJob), NOT a daemon: it
 // rates one window and exits. Exit codes:
 //
-//	0  window rated, every event priced
+//	0  window rated, every event priced and attributed
 //	1  fatal error (config, DB, etc.) — nothing or partial; safe to re-run
-//	2  window rated BUT some events were unpriced (fail-loud) — re-run after
-//	   backfilling the price book. Distinct code so a CronJob can alert on "lost
-//	   revenue" separately from "job broke".
+//	2  window rated BUT an anomaly leaked (fail-loud): some events were unpriced
+//	   (backfill the price book and re-rate) and/or some rows were unattributable
+//	   — NULL auth_id/model, which the interceptor's billing gate should reject
+//	   before metering, so a nonzero count means revenue is leaking upstream.
+//	   Distinct code so a CronJob can alert on "lost revenue / lost data"
+//	   separately from "job broke".
 //
 // Re-running any window is safe and idempotent (rollups upsert on the natural
 // key), so cron overlap or manual re-rating never double-counts.
@@ -46,9 +49,9 @@ type raterSettings struct {
 
 // exit codes (see package doc).
 const (
-	exitOK       = 0
-	exitFatal    = 1
-	exitUnpriced = 2
+	exitOK      = 0
+	exitFatal   = 1
+	exitAnomaly = 2 // window rated but something leaked: unpriced and/or unattributable
 )
 
 func main() {
@@ -99,10 +102,12 @@ func run() int {
 		return exitFatal
 	}
 
-	if res.HasUnpriced() {
-		// The window was rated and rollups were written, but some events could
-		// not be priced. Non-zero exit so a CronJob surfaces lost revenue.
-		return exitUnpriced
+	if res.HasAnomaly() {
+		// The window was rated and rollups were written, but something leaked:
+		// events that could not be priced and/or rows that could not be attributed
+		// (NULL auth_id/model). Non-zero exit so a CronJob surfaces the lost
+		// revenue / lost data.
+		return exitAnomaly
 	}
 	return exitOK
 }

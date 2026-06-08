@@ -46,8 +46,8 @@ func TestPostgresStore_LoadPrices(t *testing.T) {
 }
 
 // TestPostgresStore_ReadWindow verifies the window query filters on the coalesced
-// rating instant and excludes NULL auth_id/model, and that scanned rows map to
-// RatedEvent.
+// rating instant and that scanned rows map to RatedEvent. A well-formed window
+// (no NULL auth_id/model) reports zero unattributable rows.
 func TestPostgresStore_ReadWindow(t *testing.T) {
 	db, mock, err := sqlmock.New()
 	if err != nil {
@@ -63,14 +63,17 @@ func TestPostgresStore_ReadWindow(t *testing.T) {
 	rows := sqlmock.NewRows([]string{"auth_id", "model", "prompt_tokens", "cached_tokens", "completion_tokens", "aborted", "rating_ts"}).
 		AddRow("a", "m", int64(100), int64(30), int64(50), false, at)
 
-	// Match on the stable head of the statement + the WHERE coalesce/null guards.
+	// Match on the stable head of the statement.
 	mock.ExpectQuery("SELECT auth_id, model, prompt_tokens, cached_tokens, completion_tokens, aborted").
 		WithArgs(start, end).
 		WillReturnRows(rows)
 
-	events, err := store.ReadWindow(context.Background(), start, end)
+	events, unattributable, err := store.ReadWindow(context.Background(), start, end)
 	if err != nil {
 		t.Fatalf("ReadWindow: %v", err)
+	}
+	if unattributable != 0 {
+		t.Fatalf("unattributable = %d, want 0 (no NULL rows)", unattributable)
 	}
 	if len(events) != 1 {
 		t.Fatalf("got %d events, want 1", len(events))
@@ -81,6 +84,49 @@ func TestPostgresStore_ReadWindow(t *testing.T) {
 	}
 	if !e.At.Equal(at) {
 		t.Fatalf("event At = %v, want %v (coalesced rating instant)", e.At, at)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Fatalf("unmet: %v", err)
+	}
+}
+
+// TestPostgresStore_ReadWindowCountsUnattributable verifies that in-window rows
+// with a NULL auth_id or NULL model are NOT returned as rateable events but ARE
+// counted (and skipped) — the fail-loud-not-silent contract. The query no longer
+// filters NULLs in SQL; the Go scan loop detects them via sql.NullString.
+func TestPostgresStore_ReadWindowCountsUnattributable(t *testing.T) {
+	db, mock, err := sqlmock.New()
+	if err != nil {
+		t.Fatalf("sqlmock: %v", err)
+	}
+	defer db.Close()
+	store := NewPostgresStore(db)
+
+	start := mustTime("2026-06-08T10:00:00Z")
+	end := mustTime("2026-06-08T11:00:00Z")
+	at := mustTime("2026-06-08T10:15:00Z")
+
+	rows := sqlmock.NewRows([]string{"auth_id", "model", "prompt_tokens", "cached_tokens", "completion_tokens", "aborted", "rating_ts"}).
+		AddRow("a", "m", int64(100), int64(30), int64(50), false, at). // well-formed
+		AddRow(nil, "m", int64(10), int64(0), int64(5), false, at).    // NULL auth_id
+		AddRow("a", nil, int64(20), int64(0), int64(5), false, at)     // NULL model
+
+	mock.ExpectQuery("SELECT auth_id, model, prompt_tokens, cached_tokens, completion_tokens, aborted").
+		WithArgs(start, end).
+		WillReturnRows(rows)
+
+	events, unattributable, err := store.ReadWindow(context.Background(), start, end)
+	if err != nil {
+		t.Fatalf("ReadWindow: %v", err)
+	}
+	if unattributable != 2 {
+		t.Fatalf("unattributable = %d, want 2 (NULL auth_id + NULL model rows counted, not dropped)", unattributable)
+	}
+	if len(events) != 1 {
+		t.Fatalf("got %d events, want 1 (only the well-formed row is rateable)", len(events))
+	}
+	if events[0].AuthID != "a" || events[0].Model != "m" {
+		t.Fatalf("returned event mapped wrong: %+v", events[0])
 	}
 	if err := mock.ExpectationsWereMet(); err != nil {
 		t.Fatalf("unmet: %v", err)

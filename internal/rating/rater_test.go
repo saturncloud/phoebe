@@ -29,15 +29,26 @@ func newFakeStore(prices []Price, events []RatedEvent) *fakeStore {
 
 func (f *fakeStore) LoadPrices(_ context.Context) ([]Price, error) { return f.prices, nil }
 
-func (f *fakeStore) ReadWindow(_ context.Context, start, end time.Time) ([]RatedEvent, error) {
+// ReadWindow mirrors PostgresStore.ReadWindow: it returns in-window events AND
+// the count of rows skipped for a NULL auth_id/model. An empty AuthID or Model on
+// a fixture event models the NULL (unattributable) case — counted, never returned
+// as a rateable event — so the Rater's loud/exit-nonzero path can be exercised
+// without Postgres.
+func (f *fakeStore) ReadWindow(_ context.Context, start, end time.Time) ([]RatedEvent, int, error) {
 	var out []RatedEvent
+	var unattributable int
 	for _, e := range f.events {
 		at := e.At
-		if !at.Before(start) && at.Before(end) {
-			out = append(out, e)
+		if at.Before(start) || !at.Before(end) {
+			continue
 		}
+		if e.AuthID == "" || e.Model == "" {
+			unattributable++
+			continue
+		}
+		out = append(out, e)
 	}
-	return out, nil
+	return out, unattributable, nil
 }
 
 func (f *fakeStore) UpsertRollups(_ context.Context, rollups []Rollup) error {
@@ -187,6 +198,47 @@ func TestRater_MissingPriceFailsLoudNotZero(t *testing.T) {
 	for k := range store.table {
 		if k.model == "unpriced" {
 			t.Fatal("a rollup exists for the unpriced model — it must NOT be $0-billed")
+		}
+	}
+}
+
+// TestRater_UnattributableEventsCountedNotSilent: a window containing rows with a
+// NULL auth_id and/or NULL model must NOT be rated, MUST be counted in
+// Result.UnattributableEvents, and MUST trigger the loud anomaly / exit-nonzero
+// path — never silently dropped. This is the fail-closed twin of the unpriced
+// case: a nonzero count means the upstream billing gate leaked.
+func TestRater_UnattributableEventsCountedNotSilent(t *testing.T) {
+	at := mustTime("2026-06-08T10:15:00Z")
+	events := []RatedEvent{
+		{AuthID: "a", Model: "m", PromptTokens: 100, CompletionTokens: 50, At: at}, // priced + attributed
+		{AuthID: "", Model: "m", PromptTokens: 100, CompletionTokens: 50, At: at},  // NULL auth_id
+		{AuthID: "a", Model: "", PromptTokens: 100, CompletionTokens: 50, At: at},  // NULL model
+	}
+	store := newFakeStore([]Price{priceM()}, events)
+	r := New(store, testLogger())
+	res, err := r.Run(context.Background(), mustTime("2026-06-08T10:00:00Z"), mustTime("2026-06-08T11:00:00Z"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res.UnattributableEvents != 2 {
+		t.Fatalf("unattributable = %d, want 2 (NULL auth_id + NULL model rows)", res.UnattributableEvents)
+	}
+	if res.EventsRated != 1 {
+		t.Fatalf("rated = %d, want 1 (only the well-formed row may be rated)", res.EventsRated)
+	}
+	if !res.HasUnattributable() {
+		t.Fatal("HasUnattributable() = false, want true (must surface the leak)")
+	}
+	if !res.HasAnomaly() {
+		t.Fatal("HasAnomaly() = false, want true (drives cmd/rater exit 2)")
+	}
+	// The unattributable rows must NOT have become rollups (no $0/garbage rows).
+	if res.RollupsWritten != 1 || len(store.table) != 1 {
+		t.Fatalf("rollups written=%d table=%d, want 1/1 (unattributable rows must not be rated)", res.RollupsWritten, len(store.table))
+	}
+	for k := range store.table {
+		if k.authID == "" || k.model == "" {
+			t.Fatalf("a rollup exists with empty auth/model %+v — unattributable rows must never be rated", k)
 		}
 	}
 }

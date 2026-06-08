@@ -29,14 +29,29 @@ type Result struct {
 	WindowEnd      time.Time
 	EventsRead     int
 	EventsRated    int
-	UnpricedEvents int   // events whose model had NO price at their time (NOT $0-billed)
-	RollupsWritten int   // distinct (auth_id, model, hour) rows upserted
-	TotalCostMicro int64 // sum of all rollup costs, micro-USD
+	UnpricedEvents int // events whose model had NO price at their time (NOT $0-billed)
+	// UnattributableEvents counts billing_event rows in-window with a NULL
+	// auth_id/model — cannot be attributed; counted, never rated. Nonzero =
+	// upstream billing-gate leak (the interceptor should reject these before they
+	// are metered), so it is loud and exit-nonzero, exactly like UnpricedEvents.
+	UnattributableEvents int
+	RollupsWritten       int   // distinct (auth_id, model, hour) rows upserted
+	TotalCostMicro       int64 // sum of all rollup costs, micro-USD
 }
 
 // HasUnpriced reports whether any event could not be priced. The caller treats
 // this as a non-zero (loud) outcome even though the run "succeeded".
 func (r Result) HasUnpriced() bool { return r.UnpricedEvents > 0 }
+
+// HasUnattributable reports whether any in-window row was skipped for a NULL
+// auth_id/model. Like HasUnpriced, a true value is a loud, exit-nonzero outcome.
+func (r Result) HasUnattributable() bool { return r.UnattributableEvents > 0 }
+
+// HasAnomaly reports whether the run rated cleanly but something leaked: events
+// that could not be priced OR rows that could not be attributed. Both are the
+// same class of fail-loud signal (the window "succeeded" yet revenue/data went
+// uncaptured), so cmd/rater exits non-zero on either.
+func (r Result) HasAnomaly() bool { return r.HasUnpriced() || r.HasUnattributable() }
 
 // rollupKey is the aggregation grain: one cost bucket per API key, per model, per
 // hour — matching rated_usage's unique constraint and Atlas's hourly grain.
@@ -73,11 +88,19 @@ func (r *Rater) Run(ctx context.Context, windowStart, windowEnd time.Time) (Resu
 	}
 	book := NewPriceBook(prices)
 
-	events, err := r.store.ReadWindow(ctx, windowStart, windowEnd)
+	events, unattributable, err := r.store.ReadWindow(ctx, windowStart, windowEnd)
 	if err != nil {
 		return res, err
 	}
 	res.EventsRead = len(events)
+	// Unattributable rows (NULL auth_id/model) are skipped at the store seam but
+	// must be surfaced, not dropped: count them so the loud summary + exit-nonzero
+	// path below fires. Nonzero here means the upstream billing gate leaked.
+	res.UnattributableEvents = unattributable
+	if res.HasUnattributable() {
+		r.log.Error.Printf("rating: window [%s,%s) has %d UNATTRIBUTABLE billing_event rows (NULL auth_id/model) — these cannot be rated; the interceptor's billing gate should reject them before metering, so a nonzero count means revenue is leaking upstream",
+			windowStart.Format(time.RFC3339), windowEnd.Format(time.RFC3339), res.UnattributableEvents)
+	}
 
 	// Aggregate priced events into per-key rollups.
 	rollups := make(map[rollupKey]*Rollup)
@@ -126,11 +149,13 @@ func (r *Rater) Run(ctx context.Context, windowStart, windowEnd time.Time) (Resu
 	}
 	res.RollupsWritten = len(out)
 
-	// Loud summary. Unpriced events are an ERROR (lost-revenue signal), not info.
-	if res.HasUnpriced() {
-		r.log.Error.Printf("rating: window [%s,%s) rated %d/%d events into %d rollups, total=%d micro-USD; %d UNPRICED events dropped — backfill prices and re-rate",
+	// Loud summary. Unpriced AND unattributable events are ERRORs (lost-revenue /
+	// lost-data signals), not info — both surface here and drive the exit-nonzero
+	// path in cmd/rater so a CronJob alerts.
+	if res.HasAnomaly() {
+		r.log.Error.Printf("rating: window [%s,%s) rated %d/%d events into %d rollups, total=%d micro-USD; %d UNPRICED events dropped (backfill prices and re-rate), %d UNATTRIBUTABLE rows skipped (NULL auth_id/model — upstream billing-gate leak)",
 			windowStart.Format(time.RFC3339), windowEnd.Format(time.RFC3339),
-			res.EventsRated, res.EventsRead, res.RollupsWritten, res.TotalCostMicro, res.UnpricedEvents)
+			res.EventsRated, res.EventsRead, res.RollupsWritten, res.TotalCostMicro, res.UnpricedEvents, res.UnattributableEvents)
 	} else {
 		r.log.Info.Printf("rating: window [%s,%s) rated %d events into %d rollups, total=%d micro-USD",
 			windowStart.Format(time.RFC3339), windowEnd.Format(time.RFC3339),
