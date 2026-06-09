@@ -22,7 +22,7 @@ func TestPolicy_OffByDefault(t *testing.T) {
 
 // TestPolicy_EnabledButZeroRate verifies Enabled alone captures nothing.
 func TestPolicy_EnabledButZeroRate(t *testing.T) {
-	p := NewStaticPolicy(true, 0.0, nil, nil)
+	p := NewStaticPolicy(true, 0.0, nil, nil, true)
 	for i := range 100 {
 		if p.ShouldLog(idWith("a1", "g1"), fmt.Sprintf("req-%d", i)) {
 			t.Fatalf("rate 0.0 must never log, but req-%d logged", i)
@@ -33,7 +33,7 @@ func TestPolicy_EnabledButZeroRate(t *testing.T) {
 // TestPolicy_RateOneAlwaysLogs verifies the upper boundary: rate 1.0 logs every
 // eligible request.
 func TestPolicy_RateOneAlwaysLogs(t *testing.T) {
-	p := NewStaticPolicy(true, 1.0, nil, nil)
+	p := NewStaticPolicy(true, 1.0, nil, nil, true)
 	for i := range 100 {
 		if !p.ShouldLog(idWith("a1", "g1"), fmt.Sprintf("req-%d", i)) {
 			t.Fatalf("rate 1.0 must always log, but req-%d did not", i)
@@ -45,7 +45,7 @@ func TestPolicy_RateOneAlwaysLogs(t *testing.T) {
 // only matching tenants are eligible (and then sampled).
 func TestPolicy_AllowlistHit(t *testing.T) {
 	// rate 1.0 so eligibility is the only variable.
-	p := NewStaticPolicy(true, 1.0, []string{"opted-auth"}, nil)
+	p := NewStaticPolicy(true, 1.0, []string{"opted-auth"}, nil, false)
 
 	if !p.ShouldLog(idWith("opted-auth", "g1"), "req-1") {
 		t.Error("auth_id in allowlist should log")
@@ -57,7 +57,7 @@ func TestPolicy_AllowlistHit(t *testing.T) {
 
 // TestPolicy_AllowlistByGroup verifies group-id opt-in works independently.
 func TestPolicy_AllowlistByGroup(t *testing.T) {
-	p := NewStaticPolicy(true, 1.0, nil, []string{"opted-group"})
+	p := NewStaticPolicy(true, 1.0, nil, []string{"opted-group"}, false)
 
 	if !p.ShouldLog(idWith("a1", "opted-group"), "req-1") {
 		t.Error("group_id in allowlist should log")
@@ -67,19 +67,32 @@ func TestPolicy_AllowlistByGroup(t *testing.T) {
 	}
 }
 
-// TestPolicy_EmptyAllowlistMeansAll verifies an empty allowlist makes every
-// tenant eligible (operator-wide debug sampling).
-func TestPolicy_EmptyAllowlistMeansAll(t *testing.T) {
-	p := NewStaticPolicy(true, 1.0, nil, nil)
+// TestPolicy_EmptyAllowlistMeansNone is the fail-closed guard: with logging
+// enabled and rate 1.0 but NO allowlist and NO AllowAllTenants, nothing is
+// captured. Forgetting the allowlist must never silently capture every tenant's
+// (possibly-PII) bodies.
+func TestPolicy_EmptyAllowlistMeansNone(t *testing.T) {
+	p := NewStaticPolicy(true, 1.0, nil, nil, false)
+	for i := range 100 {
+		if p.ShouldLog(idWith("any-auth", "any-group"), fmt.Sprintf("req-%d", i)) {
+			t.Fatalf("empty allowlist must capture NO ONE (fail-closed), but req-%d logged", i)
+		}
+	}
+}
+
+// TestPolicy_AllowAllTenantsIsExplicit verifies fleet-wide capture happens ONLY
+// via the explicit flag, not as an emergent property of an empty allowlist.
+func TestPolicy_AllowAllTenantsIsExplicit(t *testing.T) {
+	p := NewStaticPolicy(true, 1.0, nil, nil, true)
 	if !p.ShouldLog(idWith("any-auth", "any-group"), "req-1") {
-		t.Error("empty allowlist must treat all tenants as eligible")
+		t.Error("AllowAllTenants=true must make every tenant eligible")
 	}
 }
 
 // TestPolicy_DeterministicSampling verifies the same request id always yields
 // the same decision — reproducibility, the reason we hash instead of rand.
 func TestPolicy_DeterministicSampling(t *testing.T) {
-	p := NewStaticPolicy(true, 0.5, nil, nil)
+	p := NewStaticPolicy(true, 0.5, nil, nil, true)
 	id := idWith("a1", "g1")
 	for i := range 50 {
 		reqID := fmt.Sprintf("stable-req-%d", i)
@@ -97,7 +110,7 @@ func TestPolicy_DeterministicSampling(t *testing.T) {
 func TestPolicy_SampleRateApproximate(t *testing.T) {
 	const n = 20000
 	const rate = 0.25
-	p := NewStaticPolicy(true, rate, nil, nil)
+	p := NewStaticPolicy(true, rate, nil, nil, true)
 	id := idWith("a1", "g1")
 	kept := 0
 	for i := range n {
@@ -117,7 +130,7 @@ func TestPolicy_SampleRateApproximate(t *testing.T) {
 // (does not flip the gate to always-on).
 func TestPolicy_EmptyRequestIDNotSampled(t *testing.T) {
 	// rate < 1 so the hash path (not the >=1 short-circuit) is exercised.
-	p := NewStaticPolicy(true, 0.9999, nil, nil)
+	p := NewStaticPolicy(true, 0.9999, nil, nil, true)
 	if p.ShouldLog(idWith("a1", "g1"), "") {
 		t.Error("empty request id must not be sampled (fail closed)")
 	}
@@ -130,7 +143,7 @@ func TestPolicy_ImplementsInterface(t *testing.T) {
 	if p.ShouldLog(idWith("a", "g"), "r") {
 		t.Error("zero-value policy via interface must not log")
 	}
-	p = NewStaticPolicy(false, 0, nil, nil)
+	p = NewStaticPolicy(false, 0, nil, nil, true)
 	if p.ShouldLog(idWith("a", "g"), "r") {
 		t.Error("disabled policy via interface must not log")
 	}

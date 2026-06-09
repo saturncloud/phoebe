@@ -99,6 +99,14 @@ def upgrade():
             "(prompt_price IS NOT NULL AND cached_price IS NOT NULL AND completion_price IS NOT NULL)",
             name="model_price_rate_all_or_none_ck",
         ),
+        # effective_from must strictly precede effective_to. An equal-bound row is
+        # an EMPTY tstzrange that overlaps nothing (so the no-overlap exclusion
+        # wouldn't catch it) yet the rater's [from, to) predicate never matches it
+        # — a silently inert dead price row. Reject at write time.
+        sa.CheckConstraint(
+            "effective_to IS NULL OR effective_from < effective_to",
+            name="model_price_effective_order_ck",
+        ),
     )
     op.create_index(
         "model_price_model_id_effective_from_ix",
@@ -114,7 +122,7 @@ def upgrade():
     op.execute(
         "ALTER TABLE model_price ADD CONSTRAINT model_price_no_overlap "
         "EXCLUDE USING gist (model_id WITH =, "
-        "tsrange(effective_from, effective_to) WITH &&)"
+        "tstzrange(effective_from, effective_to) WITH &&)"
     )
 
     # --- derivation_policy: the single GLOBAL fine-tune derivation rule ---
@@ -153,7 +161,7 @@ def upgrade():
     op.execute(
         "ALTER TABLE derivation_policy ADD CONSTRAINT derivation_policy_no_overlap "
         "EXCLUDE USING gist ((0) WITH =, "
-        "tsrange(effective_from, effective_to) WITH &&)"
+        "tstzrange(effective_from, effective_to) WITH &&)"
     )
 
     # --- rated_usage: the per-(auth_id, model_id, hour) cost rollup ---

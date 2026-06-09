@@ -108,15 +108,29 @@ CREATE TABLE model_price (
         (prompt_price IS NOT NULL AND cached_price IS NOT NULL AND completion_price IS NOT NULL)
     ),
 
+    -- effective_from must strictly precede effective_to. An equal-bound row is an
+    -- EMPTY tstzrange, which overlaps nothing — so the no-overlap exclusion below
+    -- would NOT reject it even sitting inside another row's window, yet the rater's
+    -- [from, to) predicate never matches it either: a silently inert "dead" price
+    -- row that can mask an operator's intended price. Reject it at write time.
+    CONSTRAINT model_price_effective_order_ck
+        CHECK (effective_to IS NULL OR effective_from < effective_to),
+
     -- FORWARD-ONLY, NON-OVERLAPPING effective-dating, enforced in the DB: for any
     -- (model_id, instant) AT MOST ONE row matches. Two overlapping price rows for a
     -- model would let the rating join FAN OUT and silently OVER-bill (double-count
     -- an event); this GiST exclusion makes that data state IMPOSSIBLE to insert.
-    -- tsrange is half-open [from, to); a NULL effective_to is the unbounded upper.
+    -- tstzrange is half-open [from, to); a NULL effective_to is the unbounded upper.
+    -- MUST be tstzrange, not tsrange: the columns are TIMESTAMPTZ, and tsrange would
+    -- coerce them to local timestamp using the session TimeZone, making the overlap
+    -- check (and thus this whole no-overlap guarantee) session-TZ-dependent. The
+    -- rater's price lookups use LIMIT 1 with no ORDER BY, trusting this constraint
+    -- for at-most-one-match — that bedrock cannot be TZ-sensitive. tstzrange compares
+    -- in absolute time.
     CONSTRAINT model_price_no_overlap
         EXCLUDE USING gist (
             model_id WITH =,
-            tsrange(effective_from, effective_to) WITH &&
+            tstzrange(effective_from, effective_to) WITH &&
         )
 );
 
@@ -172,7 +186,7 @@ CREATE TABLE derivation_policy (
     CONSTRAINT derivation_policy_no_overlap
         EXCLUDE USING gist (
             (0) WITH =,
-            tsrange(effective_from, effective_to) WITH &&
+            tstzrange(effective_from, effective_to) WITH &&
         )
 );
 

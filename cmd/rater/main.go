@@ -142,6 +142,19 @@ func resolveWindow(since, until string, now time.Time) (time.Time, time.Time, er
 	if !start.Before(end) {
 		return time.Time{}, time.Time{}, errInvertedWindow(start, end)
 	}
+	// Both bounds MUST be hour-aligned. The rollup buckets by date_trunc('hour')
+	// and the upsert REPLACES a bucket's totals (not additive — that is what makes
+	// a re-run idempotent), so a sub-hour bound would rate only part of a
+	// date-trunc'd hour and overwrite that hour's complete rollup with a partial
+	// sum → silent under-bill. The default window is hour-aligned by construction;
+	// this fences the explicit --since/--until path. Fail loud rather than snap,
+	// so an operator never silently re-rates hours they did not name.
+	if !start.Truncate(time.Hour).Equal(start) {
+		return time.Time{}, time.Time{}, errUnalignedWindow("since", start)
+	}
+	if !end.Truncate(time.Hour).Equal(end) {
+		return time.Time{}, time.Time{}, errUnalignedWindow("until", end)
+	}
 	return start, end, nil
 }
 

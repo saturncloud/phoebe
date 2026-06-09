@@ -108,9 +108,16 @@ type IOLogSettings struct {
 	SampleRate float64 `yaml:"sampleRate"`
 
 	// AllowAuthIDs / AllowGroupIDs are the per-tenant opt-in allowlists. Empty
-	// means "all tenants eligible" (subject to Enabled + SampleRate).
+	// opts in NO ONE (fail-closed) — forgetting the allowlist must not capture
+	// every tenant's bodies. For deliberate fleet-wide debug capture, set
+	// allowAllTenants: true explicitly.
 	AllowAuthIDs  []string `yaml:"allowAuthIds"`
 	AllowGroupIDs []string `yaml:"allowGroupIds"`
+
+	// AllowAllTenants is the EXPLICIT fleet-wide opt-in (debug only). An empty
+	// allowlist never means "everyone"; this flag must be set to capture across
+	// all tenants (still subject to Enabled + SampleRate).
+	AllowAllTenants bool `yaml:"allowAllTenants"`
 
 	// DatabaseURL is the Postgres DSN for the io_log store. Required when
 	// Enabled is true; ignored otherwise.

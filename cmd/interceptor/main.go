@@ -166,7 +166,7 @@ func buildIOLog(s *config.Settings, log *logging.Logger) (iolog.Policy, iolog.Si
 		return nil, nil, 0, func() {}
 	}
 
-	policy := iolog.NewStaticPolicy(c.Enabled, c.SampleRate, c.AllowAuthIDs, c.AllowGroupIDs)
+	policy := iolog.NewStaticPolicy(c.Enabled, c.SampleRate, c.AllowAuthIDs, c.AllowGroupIDs, c.AllowAllTenants)
 
 	cfg := iolog.DefaultConfig()
 	cfg.DatabaseURL = c.DatabaseURL

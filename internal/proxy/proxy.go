@@ -115,13 +115,12 @@ func (s *Server) handleHealth(w http.ResponseWriter, _ *http.Request) {
 // handleProxy is the single capture point: identity → registry → upstream,
 // with the streaming tee capturing usage as the response flows to the client.
 //
-// Abort detection (M3): after ModifyResponse wraps the body in a captureReader,
-// a watcher goroutine blocks on r.Context().Done(). On cancellation it calls
-// cr.markAborted(), which sets Aborted=true and triggers finish() if it hasn't
-// fired yet — guaranteeing onDone sees Aborted=true. ReverseProxy cancels the
-// upstream request context on client disconnect, which also causes the upstream
-// body reads to fail and Close() to be called; the once-guard in finish()
-// ensures onDone fires exactly once regardless of which path reaches it first.
+// Abort detection (M3): the captureReader reads r.Context().Err() at
+// finalization (finish()) to decide Aborted — no separate watcher goroutine.
+// ReverseProxy cancels the upstream request context on client disconnect, which
+// fails the body reads and triggers Close(); by the time finish() runs, ctx.Err()
+// is non-nil, so onDone sees Aborted=true. The once-guard in finish() ensures
+// onDone fires exactly once regardless of whether EOF or Close reaches it first.
 func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request) {
 	id := identity.FromRequest(r)
 
@@ -211,14 +210,14 @@ func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request) {
 			if shouldLog {
 				respBody, truncated := cr.capturedBody()
 				rec := iolog.Record{
-					RequestID:         requestID,
-					AuthID:            id.AuthID,
-					UserID:            id.UserID,
-					GroupID:           id.GroupID,
-					ResourceID:        id.ResourceID,
-					ResourceType:      id.ResourceType,
+					RequestID:    requestID,
+					AuthID:       id.AuthID,
+					UserID:       id.UserID,
+					GroupID:      id.GroupID,
+					ResourceID:   id.ResourceID,
+					ResourceType: id.ResourceType,
 					// Engine-reported model name, not the routing resource id.
-					Model: res.Model,
+					Model:             res.Model,
 					RequestBody:       reqBody,
 					ResponseBody:      respBody,
 					ResponseTruncated: truncated,

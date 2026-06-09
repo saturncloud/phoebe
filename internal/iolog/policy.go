@@ -39,8 +39,8 @@ type Policy interface {
 //   - AllowAuthIDs    auth_ids that are opted in. A request whose AuthID is in
 //   - AllowGroupIDs   this set (or whose GroupID is in AllowGroupIDs) is subject
 //     to sampling; everything else is never logged. An EMPTY
-//     allowlist means "all tenants" (subject to Enabled+rate),
-//     so an operator can flip on fleet-wide sampling for debug.
+//     allowlist opts in NO ONE (fail-closed). Fleet-wide debug
+//     capture requires the EXPLICIT AllowAllTenants flag.
 //
 // Replace StaticPolicy with a ControlPlanePolicy (per-tenant Enabled + rate
 // fetched + cached from Atlas) once that contract is confirmed. The proxy
@@ -54,20 +54,32 @@ type StaticPolicy struct {
 	// 0.0 (the zero value) never logs; 1.0 always logs an opted-in request.
 	SampleRate float64
 
-	// AllowAuthIDs / AllowGroupIDs are the per-tenant opt-in allowlists. Empty
-	// (the zero value) means "no allowlist" → all tenants are eligible.
+	// AllowAuthIDs / AllowGroupIDs are the per-tenant opt-in allowlists. A request
+	// is eligible iff its AuthID is in AllowAuthIDs OR its GroupID is in
+	// AllowGroupIDs. EMPTY (the zero value) opts in NO ONE — this is fail-closed:
+	// the most sensitive data in the system (prompts/completions, possibly PII)
+	// must never be captured by accident. Forgetting to set an allowlist must mean
+	// "capture nobody," not "capture everybody."
 	AllowAuthIDs  map[string]struct{}
 	AllowGroupIDs map[string]struct{}
+
+	// AllowAllTenants is the EXPLICIT fleet-wide opt-in (subject to Enabled+rate).
+	// Capturing every tenant's bodies is a deliberate, dangerous choice (debug
+	// only), so it must be stated outright — it is NOT the emergent meaning of an
+	// empty allowlist. False (the zero value) keeps the allowlist authoritative.
+	AllowAllTenants bool
 }
 
 // NewStaticPolicy builds a StaticPolicy from plain config values, converting the
-// allowlist slices into sets. A nil/empty allowlist means "all tenants".
-func NewStaticPolicy(enabled bool, sampleRate float64, allowAuthIDs, allowGroupIDs []string) StaticPolicy {
+// allowlist slices into sets. An empty allowlist opts in NO ONE; pass
+// allowAllTenants=true for the explicit (debug-only) fleet-wide opt-in.
+func NewStaticPolicy(enabled bool, sampleRate float64, allowAuthIDs, allowGroupIDs []string, allowAllTenants bool) StaticPolicy {
 	return StaticPolicy{
-		Enabled:       enabled,
-		SampleRate:    sampleRate,
-		AllowAuthIDs:  toSet(allowAuthIDs),
-		AllowGroupIDs: toSet(allowGroupIDs),
+		Enabled:         enabled,
+		SampleRate:      sampleRate,
+		AllowAuthIDs:    toSet(allowAuthIDs),
+		AllowGroupIDs:   toSet(allowGroupIDs),
+		AllowAllTenants: allowAllTenants,
 	}
 }
 
@@ -107,22 +119,20 @@ func (p StaticPolicy) ShouldLog(id identity.Identity, requestID string) bool {
 	return sampled(requestID, p.SampleRate)
 }
 
-// optedIn reports whether this identity is eligible for sampling. With no
-// allowlists configured, every tenant is eligible (operator-wide debug). With
-// either list set, the request must match by AuthID OR GroupID.
+// optedIn reports whether this identity is eligible for sampling. FAIL-CLOSED:
+// with no allowlists and no explicit AllowAllTenants, NO ONE is eligible.
+// Fleet-wide capture requires the explicit AllowAllTenants flag; an empty
+// allowlist never means "everyone." Otherwise the request must match by AuthID
+// OR GroupID.
 func (p StaticPolicy) optedIn(id identity.Identity) bool {
-	if p.AllowAuthIDs == nil && p.AllowGroupIDs == nil {
+	if p.AllowAllTenants {
 		return true
 	}
-	if p.AllowAuthIDs != nil {
-		if _, ok := p.AllowAuthIDs[id.AuthID]; ok {
-			return true
-		}
+	if _, ok := p.AllowAuthIDs[id.AuthID]; ok {
+		return true
 	}
-	if p.AllowGroupIDs != nil {
-		if _, ok := p.AllowGroupIDs[id.GroupID]; ok {
-			return true
-		}
+	if _, ok := p.AllowGroupIDs[id.GroupID]; ok {
+		return true
 	}
 	return false
 }

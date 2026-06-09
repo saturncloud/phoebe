@@ -41,3 +41,9 @@ func errInvertedWindow(start, end time.Time) error {
 		msg: "empty/inverted window [" + start.Format(time.RFC3339) + "," + end.Format(time.RFC3339) + "): start must be before end",
 	}
 }
+
+func errUnalignedWindow(which string, t time.Time) error {
+	return &windowError{
+		msg: "--" + which + " " + t.Format(time.RFC3339) + " is not hour-aligned: the rater's grain is the whole hour (rollups bucket by date_trunc('hour') and the upsert REPLACES a bucket), so a sub-hour window would overwrite a complete hourly rollup with a partial sum — pass hour-aligned bounds (minutes/seconds = 0)",
+	}
+}
