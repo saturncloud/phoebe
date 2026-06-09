@@ -62,7 +62,11 @@ func (s *oracleStore) resolveWindow(start, end time.Time) (map[rollupKey]oracleR
 			an.UnpricedEvents++ // ErrNoPrice or ErrDerivationChain: never $0-billed
 			continue
 		}
-		cost := Rate(e, rate)
+		// Accumulate the EXACT (unrounded) per-event cost. Rounding happens ONCE
+		// per rollup below, mirroring the SQL's SUM(...) → NUMERIC(20,9). Summing
+		// pre-rounded per-event values here would be round-then-sum and could
+		// diverge from production by up to ~1 nano/event on sub-nano residues.
+		cost := rateExact(e, rate)
 		hour := e.At.UTC().Truncate(time.Hour)
 		k := rollupKey{authID: e.AuthID, modelID: e.ModelID, windowStart: hour}
 		ru := out[k]
@@ -72,6 +76,12 @@ func (s *oracleStore) resolveWindow(start, end time.Time) (map[rollupKey]oracleR
 		ru.billable += BillablePromptTokens(e.PromptTokens, e.CachedTokens)
 		ru.cost = ru.cost.Add(cost)
 		ru.eventCount++
+		out[k] = ru
+	}
+	// Round each rollup's exact summed cost ONCE — the quantize the DB applies
+	// when the SUM lands in the NUMERIC(20,9) column.
+	for k, ru := range out {
+		ru.cost = ru.cost.Round(moneyScale)
 		out[k] = ru
 	}
 	return out, an
@@ -290,13 +300,17 @@ func TestRater_InvertedWindow(t *testing.T) {
 	}
 }
 
-// TestConformance_SQLModelMatchesRateOracle is the CONFORMANCE test: over a fixture
-// window mixing base, derived (multiplier), effective-dated, cached-subset, and
-// unpriced/unattributable rows, the rollup totals the store produced (its in-Go
-// model of the SQL resolve→cost→sum) must equal an INDEPENDENT per-event Rate()
-// computation, row-for-row. The SQL is the production path; Rate() is the oracle;
-// this pins them together. (A separate //go:build integration test runs the REAL
-// SQL against a live Postgres over the same fixture — see store_integration_test.go.)
+// TestConformance_SQLModelMatchesRateOracle checks the in-Go model's INTERNAL
+// consistency: over a fixture mixing base, derived (multiplier), effective-dated,
+// cached-subset, and unpriced/unattributable rows, the rollup the oracleStore
+// builds (resolve→exact-cost→sum→round-once) equals an independent recomputation,
+// row-for-row. NOTE: this does NOT exercise the production SQL — both sides are
+// pure Go. The SQL is pinned to the oracle by the //go:build integration tests in
+// store_integration_test.go, which run the REAL rateWindowSQL against a live
+// Postgres (TestConformance_SQLModelMatchesRateOracle conformance + the sub-nano
+// rounding-order guard). Those run in CI's integration-test job (Postgres
+// service). This in-Go test is the fast inner check; the integration tests are the
+// real pin.
 func TestConformance_SQLModelMatchesRateOracle(t *testing.T) {
 	book := NewPriceBook(
 		[]PriceRow{

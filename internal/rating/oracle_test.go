@@ -97,17 +97,27 @@ type RatedEvent struct {
 // rate — the conservative, never-credit reading of a malformed record.
 //
 // Aborted events are rated NORMALLY: an aborted stream still served real tokens.
-// The result is rounded to moneyScale (9dp) half-up so it equals the DB NUMERIC.
+//
+// ROUNDING — match production exactly (sum-then-round, NOT round-then-sum):
+// the SQL rater SUMs the exact per-event products across the whole rollup and
+// rounds the SUM once when it lands in NUMERIC(20,9). So the oracle must NOT
+// round per event and then sum — that (round-then-sum) can differ from the SQL
+// by up to ~1 nano per event when a per-token rate has a sub-nano residue (e.g.
+// a derived price like base 0.000000001 × 1.5). rateExact returns the UNROUNDED
+// exact cost; the rollup sums those and rounds once (see the oracle store and
+// quantize). Rate() is the single-event convenience form (sum of one = round
+// once), kept for per-event unit tests where there is no cross-event sum.
 func Rate(e RatedEvent, r Rate3) Dec {
-	billablePrompt := BillablePromptTokens(e.PromptTokens, e.CachedTokens)
+	return rateExact(e, r).Round(moneyScale)
+}
 
-	// Exact rational accumulation: tokens (integers) times per-token NUMERIC rates,
-	// summed with no rounding until the final quantize. No float anywhere.
-	cost := r.Prompt.MulInt(billablePrompt).
+// rateExact is the exact (unrounded) per-event cost — the addend the rollup sums
+// before its single final rounding. No float anywhere.
+func rateExact(e RatedEvent, r Rate3) Dec {
+	billablePrompt := BillablePromptTokens(e.PromptTokens, e.CachedTokens)
+	return r.Prompt.MulInt(billablePrompt).
 		Add(r.Cached.MulInt(e.CachedTokens)).
 		Add(r.Completion.MulInt(e.CompletionTokens))
-
-	return cost.Round(moneyScale)
 }
 
 // BillablePromptTokens returns prompt - cached, clamped at 0. Exposed so the same

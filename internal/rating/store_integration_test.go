@@ -63,7 +63,7 @@ CREATE TABLE model_price (
         (prompt_price IS NULL     AND cached_price IS NULL     AND completion_price IS NULL) OR
         (prompt_price IS NOT NULL AND cached_price IS NOT NULL AND completion_price IS NOT NULL)),
     CONSTRAINT model_price_no_overlap EXCLUDE USING gist (
-        model_id WITH =, tsrange(effective_from, effective_to) WITH &&)
+        model_id WITH =, tstzrange(effective_from, effective_to) WITH &&)
 );
 
 CREATE TABLE derivation_policy (
@@ -76,7 +76,7 @@ CREATE TABLE derivation_policy (
     created_by     VARCHAR(255),
     created_at     TIMESTAMPTZ NOT NULL DEFAULT now(),
     CONSTRAINT derivation_policy_no_overlap EXCLUDE USING gist (
-        (0) WITH =, tsrange(effective_from, effective_to) WITH &&)
+        (0) WITH =, tstzrange(effective_from, effective_to) WITH &&)
 );
 
 CREATE TABLE rated_usage (
@@ -199,6 +199,107 @@ func TestIntegration_RateWindow_ConformsToOracle(t *testing.T) {
 	}
 	if res2.RollupsWritten != 2 || MustDec(res2.TotalCost).String() != MustDec(res.TotalCost).String() {
 		t.Fatalf("re-run not idempotent: %+v vs %+v", res2, res)
+	}
+}
+
+// TestConformance_SubNanoRoundingMatchesSQL is the rounding-order conformance
+// guard. It builds a rollup of MULTIPLE events whose per-token cost has a
+// sub-nano residue (a derived price = base 0.000000001 × 1.5 = 0.0000000015 per
+// token), so round-then-sum and sum-then-round DISAGREE. It asserts the SQL's
+// rated_usage.cost equals the oracle computed as sum-of-exact-then-round-once —
+// the production behavior — and that this differs from the naive
+// round-each-event-then-sum, proving the test actually exercises the divergence.
+func TestConformance_SubNanoRoundingMatchesSQL(t *testing.T) {
+	dsn := os.Getenv("PHOEBE_TEST_DATABASE_URL")
+	if dsn == "" {
+		t.Skip("PHOEBE_TEST_DATABASE_URL not set; skipping live-Postgres conformance")
+	}
+	ctx := context.Background()
+	db, err := sql.Open("pgx", dsn)
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	defer db.Close()
+
+	const sch = "phoebe_rating_subnano_it"
+	exec(t, db, "DROP SCHEMA IF EXISTS "+sch+" CASCADE")
+	exec(t, db, "CREATE SCHEMA "+sch)
+	exec(t, db, "SET search_path TO "+sch)
+	defer func() { exec(t, db, "DROP SCHEMA IF EXISTS "+sch+" CASCADE") }()
+	exec(t, db, schemaDDL)
+
+	hour := mustTime("2026-06-08T10:00:00Z")
+
+	// Base "b": prompt_price = 1 nano (0.000000001). Derived "f": 1.5× → 0.0000000015
+	// per prompt token — a sub-nano residue. cached/completion priced 0 so the cost
+	// is purely prompt × 1.5-nano.
+	exec(t, db, `INSERT INTO model_price (id, model_id, prompt_price, cached_price, completion_price, effective_from) VALUES
+		('p1','b',0.000000001,0,0,'2026-01-01T00:00:00Z')`)
+	exec(t, db, `INSERT INTO model_price (id, model_id, derived_from, effective_from) VALUES
+		('p2','f','b','2026-01-01T00:00:00Z')`)
+	exec(t, db, `INSERT INTO derivation_policy (id, function, factor, effective_from) VALUES
+		('d1','multiplier',1.5,'2026-01-01T00:00:00Z')`)
+
+	// Three single-prompt-token events for "f" in ONE rollup. Per event the exact
+	// cost is 0.0000000015; round-EACH-then-sum = 0.000000002×3 = 0.000000006.
+	// Sum-exact-then-round = round(0.0000000045) = 0.000000005 (half-up, 4.5→5).
+	// 0.000000005 != 0.000000006 — the orders genuinely diverge here.
+	events := []RatedEvent{
+		{AuthID: "a", ModelID: "f", PromptTokens: 1, At: hour.Add(1 * time.Minute)},
+		{AuthID: "a", ModelID: "f", PromptTokens: 1, At: hour.Add(2 * time.Minute)},
+		{AuthID: "a", ModelID: "f", PromptTokens: 1, At: hour.Add(3 * time.Minute)},
+	}
+	for i, e := range events {
+		if _, err := db.ExecContext(ctx,
+			`INSERT INTO billing_event (request_id, auth_id, model, prompt_tokens, cached_tokens, completion_tokens, event_ts)
+			 VALUES ($1,$2,$3,$4,$5,$6,$7)`,
+			fmt.Sprintf("sn-req-%d", i), e.AuthID, e.ModelID,
+			e.PromptTokens, e.CachedTokens, e.CompletionTokens, e.At); err != nil {
+			t.Fatalf("seed event %d: %v", i, err)
+		}
+	}
+
+	store := NewPostgresStore(db)
+	if _, err := store.RateWindow(ctx, hour, hour.Add(time.Hour)); err != nil {
+		t.Fatalf("RateWindow: %v", err)
+	}
+
+	var gotCost string
+	if err := db.QueryRowContext(ctx,
+		`SELECT cost::text FROM rated_usage WHERE auth_id='a' AND model_id='f' AND window_start=$1`,
+		hour).Scan(&gotCost); err != nil {
+		t.Fatalf("read rated_usage: %v", err)
+	}
+
+	// Oracle: sum the EXACT per-event costs, round ONCE (production behavior).
+	book := NewPriceBook(
+		[]PriceRow{
+			{ModelID: "b", HasRate: true, Prompt: MustDec("0.000000001"), Cached: MustDec("0"), Completion: MustDec("0"),
+				EffectiveFrom: mustTime("2026-01-01T00:00:00Z")},
+			derivedRow("f", "b"),
+		},
+		[]PolicyRow{{Func: PolicyMultiplier, Factor: MustDec("1.5"), EffectiveFrom: mustTime("2026-01-01T00:00:00Z")}},
+	)
+	exactSum := Dec{}
+	roundEachSum := Dec{}
+	for _, e := range events {
+		rate, err := book.ResolvePrice(e.ModelID, e.At)
+		if err != nil {
+			t.Fatalf("oracle resolve: %v", err)
+		}
+		exactSum = exactSum.Add(rateExact(e, rate))
+		roundEachSum = roundEachSum.Add(Rate(e, rate)) // round-per-event (the WRONG order)
+	}
+	wantRoundOnce := exactSum.Round(moneyScale).String()
+
+	if MustDec(gotCost).String() != wantRoundOnce {
+		t.Errorf("SQL cost = %s, sum-exact-then-round-once oracle = %s", gotCost, wantRoundOnce)
+	}
+	// Guard the guard: confirm the fixture actually distinguishes the two orders,
+	// so this test can't silently stop testing what it claims to.
+	if roundEachSum.String() == wantRoundOnce {
+		t.Fatalf("fixture does not exercise the rounding divergence (round-each=%s == round-once=%s); pick rates with a real sub-nano residue",
+			roundEachSum.String(), wantRoundOnce)
 	}
 }
 

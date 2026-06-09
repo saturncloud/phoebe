@@ -32,7 +32,11 @@
 // The Go cost formula — Rate(), the Dec exact-decimal type, the in-memory
 // PriceBook resolver, ApplyPolicy — is an ORACLE: a reference reimplementation
 // used ONLY to pin the SQL. It lives entirely in _test.go files (oracle_test.go,
-// resolve_test.go) so the compiler guarantees it never ships in a binary. A
-// conformance test asserts the SQL output matches the oracle row-for-row. If you
-// are looking for "what bills a customer," it is the SQL in store.go — not the Go.
+// resolve_test.go) so the compiler guarantees it never ships in a binary. The
+// //go:build integration tests in store_integration_test.go run the REAL
+// rateWindowSQL against a live Postgres and assert it matches the oracle
+// row-for-row — including the sum-then-round behavior (the oracle sums the EXACT
+// per-event costs and rounds ONCE, exactly as the SQL's SUM→NUMERIC(20,9) does).
+// Those run in CI's integration-test job. If you are looking for "what bills a
+// customer," it is the SQL in store.go — not the Go.
 package rating
