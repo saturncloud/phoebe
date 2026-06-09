@@ -136,13 +136,24 @@ Phoebe.Emit (non-blocking, off hot path)
   product shipped/embeddable for neoclouds, the permissive license avoids
   Redis's SSPL/AGPL. Same Streams API. (Mirrors the org's OpenSearch-over-
   Elasticsearch posture.)
-- **WAL loss on pod death is ACCEPTABLE.** Because Postgres is the system of
-  record and reconciliation is the backstop, a Phoebe pod dying with un-shipped
-  WAL events during a Valkey outage is a tolerable, bounded, double-failure loss.
-  **This is what lets Phoebe be a stateless `Deployment`** — no StatefulSet, no
-  per-replica PVC, `emptyDir` WAL is fine. Do not "fix" the WAL by demanding
-  durable per-replica storage; that re-couples Phoebe to stateful infra for no
-  benefit.
+- **WAL loss on pod death is ACCEPTABLE — but in-process loss during a drain is NOT.**
+  Two distinct losses, only one is tolerated:
+  - *Pod death* with un-shipped WAL events during a Valkey outage is a tolerable,
+    bounded, double-failure loss — Postgres is the system of record and
+    reconciliation is the backstop. **This is what lets Phoebe be a stateless
+    `Deployment`** — no StatefulSet, no per-replica PVC, `emptyDir` WAL is fine.
+    Do not "fix" *this* by demanding durable per-replica storage; that re-couples
+    Phoebe to stateful infra for no benefit.
+  - *A live, healthy pod silently dropping an event during a drain is a bug, not a
+    tolerated loss.* The drain therefore **rotates, it does not truncate**: it
+    atomically renames the WAL aside to a `.draining` snapshot and opens a fresh
+    WAL, then ships the snapshot and deletes it on success. An append concurrent
+    with the (network) ship lands in the fresh WAL, never in the snapshot — so a
+    successful drop can never destroy an unshipped event. A read-then-`Truncate(0)`
+    would have zeroed exactly those concurrent appends, which during a Valkey
+    outage (when the WAL is hot) is continuous. A snapshot orphaned by a crash
+    mid-ship is re-shipped on the next tick (at-least-once; consumer dedups on
+    `request_id`). See `internal/emit/wal.go` `rotate`/`dropRotated`/`recoverRotated`.
 
 **Status:** Valkey emit + WAL + log floor are BUILT (`internal/emit`). The
 Postgres drainer and reconciliation are NOT yet built (see §8).

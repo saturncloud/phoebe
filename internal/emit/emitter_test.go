@@ -18,6 +18,15 @@ import (
 	"github.com/saturncloud/phoebe/internal/metering"
 )
 
+// readAll reads every event currently in the LIVE wal (test helper — the
+// production drain path uses rotate(), which is what the lossless guarantee
+// depends on; this just lets tests inspect the live file's contents).
+func (w *wal) readAll() ([]metering.Event, error) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	return readEvents(w.f)
+}
+
 // ---- helpers ----------------------------------------------------------------
 
 func testLogger() *logging.Logger { return logging.New(logging.DEBUG) }
@@ -58,6 +67,11 @@ func makeEvent(id string) metering.Event {
 }
 
 // drainWALEvents reads all events from the WAL file at path.
+// drainWALEvents returns every event still durably held by the WAL system at
+// `path`: the live file PLUS any rotated-aside `.draining` snapshot left by a
+// drain that didn't complete (e.g. Valkey down mid-ship). With rotation, an
+// un-shipped event lives in the snapshot, not the live file — both are "still in
+// the WAL" from a durability standpoint, so the helper reads both.
 func drainWALEvents(t *testing.T, path string) []metering.Event {
 	t.Helper()
 	w, err := openWAL(path)
@@ -68,6 +82,13 @@ func drainWALEvents(t *testing.T, path string) []metering.Event {
 	events, err := w.readAll()
 	if err != nil {
 		t.Fatalf("wal readAll: %v", err)
+	}
+	if snap := w.recoverRotated(); snap != "" {
+		snapEvents, err := readEventsAt(snap)
+		if err != nil {
+			t.Fatalf("read snapshot: %v", err)
+		}
+		events = append(snapEvents, events...)
 	}
 	return events
 }
@@ -130,7 +151,7 @@ func TestWAL_AppendAndRead(t *testing.T) {
 	}
 }
 
-func TestWAL_TruncateClearsFile(t *testing.T) {
+func TestWAL_RotateClearsLiveFile(t *testing.T) {
 	w, err := openWAL(filepath.Join(t.TempDir(), "wal.jsonl"))
 	if err != nil {
 		t.Fatal(err)
@@ -142,16 +163,113 @@ func TestWAL_TruncateClearsFile(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	if err := w.truncate(); err != nil {
+	events, snap, err := w.rotate()
+	if err != nil {
 		t.Fatal(err)
 	}
+	if len(events) != 5 {
+		t.Fatalf("rotate returned %d events, want 5", len(events))
+	}
+	// The live file is now empty; the snapshot holds the rotated events.
 	got, err := w.readAll()
 	if err != nil {
 		t.Fatal(err)
 	}
 	if len(got) != 0 {
-		t.Fatalf("after truncate: got %d events, want 0", len(got))
+		t.Fatalf("after rotate: live wal has %d events, want 0", len(got))
 	}
+	if err := w.dropRotated(snap); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(snap); !os.IsNotExist(err) {
+		t.Fatalf("snapshot %s should be gone after drop", snap)
+	}
+}
+
+// TestWAL_RotateDoesNotLoseConcurrentAppend is the regression guard for the
+// lost-event race: an append that lands DURING the ship window (after rotate,
+// before drop) must survive — it belongs to the fresh WAL, not the snapshot
+// being shipped, so dropping the snapshot cannot destroy it. The old
+// read-then-Truncate(0) would have zeroed it.
+func TestWAL_RotateDoesNotLoseConcurrentAppend(t *testing.T) {
+	w, err := openWAL(filepath.Join(t.TempDir(), "wal.jsonl"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer w.close() //nolint:errcheck
+
+	// Pre-existing events to be drained.
+	for i := range 3 {
+		if err := w.append(makeEvent(fmt.Sprintf("old%d", i))); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	// Rotate aside (simulating the start of a drain).
+	snap, drained := mustRotate(t, w)
+	if len(drained) != 3 {
+		t.Fatalf("drained %d events, want 3", len(drained))
+	}
+
+	// Append DURING the "ship window" — after rotate, before drop.
+	if err := w.append(makeEvent("during-ship")); err != nil {
+		t.Fatal(err)
+	}
+
+	// Complete the drain by dropping the snapshot.
+	if err := w.dropRotated(snap); err != nil {
+		t.Fatal(err)
+	}
+
+	// The during-ship event must still be in the live WAL — NOT destroyed.
+	got, err := w.readAll()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 1 || got[0].RequestID != "during-ship" {
+		t.Fatalf("lost the concurrent append: live wal = %+v, want exactly [during-ship]", got)
+	}
+}
+
+// TestWAL_RecoverRotatedReshipsOrphan proves a snapshot orphaned by a crash
+// between rotate and drop is recovered (re-shipped), not lost.
+func TestWAL_RecoverRotatedReshipsOrphan(t *testing.T) {
+	dir := t.TempDir()
+	w, err := openWAL(filepath.Join(dir, "wal.jsonl"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer w.close() //nolint:errcheck
+
+	for i := range 2 {
+		if err := w.append(makeEvent(fmt.Sprintf("orphan%d", i))); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// Rotate but never drop — simulates a crash mid-ship.
+	if _, _, err := w.rotate(); err != nil {
+		t.Fatal(err)
+	}
+	if got := w.recoverRotated(); got == "" {
+		t.Fatal("recoverRotated found no orphaned snapshot, want one")
+	}
+	// The orphaned snapshot still holds the 2 events.
+	evs, err := readEventsAt(w.recoverRotated())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(evs) != 2 {
+		t.Fatalf("orphan snapshot has %d events, want 2", len(evs))
+	}
+}
+
+func mustRotate(t *testing.T, w *wal) (string, []metering.Event) {
+	t.Helper()
+	events, snap, err := w.rotate()
+	if err != nil {
+		t.Fatalf("rotate: %v", err)
+	}
+	return snap, events
 }
 
 func TestWAL_ConcurrentAppend(t *testing.T) {
