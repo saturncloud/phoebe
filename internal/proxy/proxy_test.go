@@ -230,7 +230,7 @@ func TestProxyStreamingEndToEnd(t *testing.T) {
 		t.Fatalf("expected 1 metering event, got %d", len(events))
 	}
 	e := events[0]
-	if e.RequestID != "req-123" || e.GroupID != "org-1" || e.UserID != "user-1" || e.Model != "model-abc" {
+	if e.RequestID != "req-123" || e.GroupID != "org-1" || e.UserID != "user-1" {
 		t.Fatalf("event identity wrong: %+v", e)
 	}
 	if e.AuthID != "auth-key-7" {
@@ -238,6 +238,16 @@ func TestProxyStreamingEndToEnd(t *testing.T) {
 	}
 	if e.ResourceID != "model-abc" || e.ResourceType != "deployment" {
 		t.Fatalf("event resource fields wrong: id=%q type=%q", e.ResourceID, e.ResourceType)
+	}
+	// Model is the ENGINE-REPORTED name from the response body ("llama-3-8b"),
+	// NOT the routing resource id ("model-abc"). Pricing keys on this; getting
+	// it from the resource id would leave every event unpriced. This assertion
+	// is the regression guard for that bug.
+	if e.Model != "llama-3-8b" {
+		t.Fatalf("event Model = %q, want llama-3-8b (engine name, not resource id)", e.Model)
+	}
+	if e.Model == e.ResourceID {
+		t.Fatal("event Model must not equal ResourceID — the price key is the engine model name, not the deployment id")
 	}
 	if e.PromptTokens != 2006 || e.CompletionTokens != 300 || e.CachedTokens != 1920 {
 		t.Fatalf("event token counts wrong: %+v", e)

@@ -25,13 +25,16 @@ func cancelledCtx() context.Context {
 // realistic vLLM streaming response: content chunks, then a chunk carrying
 // finish_reason (empty delta), then the usage chunk (choices: []), then [DONE].
 // This ordering is the LiteLLM trap — we must NOT stop at finish_reason.
-const vllmStream = `data: {"id":"c1","object":"chat.completion.chunk","choices":[{"index":0,"delta":{"role":"assistant","content":"Hello"}}]}
+// Every chunk carries the engine-reported "model" at the top level — exactly as
+// vLLM/OpenAI emit it. That name (NOT the X-Saturn-Resource-Id routing id) is
+// rating's price key, so the fixture must include it.
+const vllmStream = `data: {"id":"c1","object":"chat.completion.chunk","model":"llama-3-8b","choices":[{"index":0,"delta":{"role":"assistant","content":"Hello"}}]}
 
-data: {"id":"c1","object":"chat.completion.chunk","choices":[{"index":0,"delta":{"content":" world"}}]}
+data: {"id":"c1","object":"chat.completion.chunk","model":"llama-3-8b","choices":[{"index":0,"delta":{"content":" world"}}]}
 
-data: {"id":"c1","object":"chat.completion.chunk","choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}
+data: {"id":"c1","object":"chat.completion.chunk","model":"llama-3-8b","choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}
 
-data: {"id":"c1","object":"chat.completion.chunk","choices":[],"usage":{"prompt_tokens":2006,"total_tokens":2306,"completion_tokens":300,"prompt_tokens_details":{"cached_tokens":1920}}}
+data: {"id":"c1","object":"chat.completion.chunk","model":"llama-3-8b","choices":[],"usage":{"prompt_tokens":2006,"total_tokens":2306,"completion_tokens":300,"prompt_tokens_details":{"cached_tokens":1920}}}
 
 data: [DONE]
 

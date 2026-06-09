@@ -15,6 +15,16 @@ import "github.com/saturncloud/phoebe/internal/metering"
 // was never seen (UsageFound=false) — the emitter decides policy on those
 // (e.g. reconcile later), but the tee always reports what it observed.
 type Result struct {
+	// Model is the engine-reported model name (the `model` field every
+	// OpenAI/vLLM response carries), captured from the response body itself —
+	// NOT the request's routing identity. This is rating's stable price key
+	// (model_id); the X-Saturn-Resource-Id on the request is an ephemeral
+	// deployment id and must NOT be used to price. Empty if the upstream never
+	// emitted a parseable model (non-OpenAI response, abort before any chunk),
+	// in which case the event is unattributable-by-model and rating fails it
+	// loud rather than billing it at a wrong price.
+	Model string
+
 	// Usage is the engine's usage block. Zero-valued if UsageFound is false.
 	Usage metering.Usage
 

@@ -9,9 +9,11 @@
 //   - stream each SSE chunk to the client immediately (per-chunk flush, never
 //     buffer-then-forward), capturing the trailing usage block and finish_reason
 //     as the bytes pass through
-//   - detect client disconnect via the request context and call markAborted()
-//     on the captureReader before its onDone fires, so the emitted event has
-//     Aborted=true
+//   - detect client disconnect by reading the request context at finalization
+//     (captureReader.finish reads ctx.Err()), so the emitted event has
+//     Aborted=true without a separate watcher goroutine racing the body Close
+//   - capture the engine-reported model name from the response body as the
+//     stable price key (Event.Model), distinct from the routing resource id
 //   - apply BillPartialOnAbort policy in emit: if aborted and usage present,
 //     always bill; if aborted and no usage, bill only if BillPartialOnAbort;
 //     if not aborted and no usage, log for reconciliation only
@@ -199,8 +201,12 @@ func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request) {
 		var cr *captureReader
 
 		onDone := func(res capture.Result) {
-			// Metering (durable) always fires.
-			s.emit(r.Context(), id, requestID, res)
+			// Metering (durable) always fires. Use a context DECOUPLED from the
+			// client request: onDone runs on the abort path precisely BECAUSE
+			// r.Context() was cancelled (that is how Aborted is detected), and
+			// an aborted request is the one we most need to durably bill. A
+			// cancelled context must never be able to drop that emit.
+			s.emit(context.WithoutCancel(r.Context()), id, requestID, res)
 			// M5 I/O logging (best-effort) only when this request opted in.
 			if shouldLog {
 				respBody, truncated := cr.capturedBody()
@@ -211,7 +217,8 @@ func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request) {
 					GroupID:           id.GroupID,
 					ResourceID:        id.ResourceID,
 					ResourceType:      id.ResourceType,
-					Model:             id.ResourceID,
+					// Engine-reported model name, not the routing resource id.
+					Model: res.Model,
 					RequestBody:       reqBody,
 					ResponseBody:      respBody,
 					ResponseTruncated: truncated,
@@ -296,7 +303,12 @@ func (s *Server) emit(ctx context.Context, id identity.Identity, requestID strin
 		GroupID:      id.GroupID,
 		ResourceID:   id.ResourceID,
 		ResourceType: id.ResourceType,
-		Model:        id.ResourceID,
+		// Model is the ENGINE-REPORTED name (rating's stable price key),
+		// captured from the response body — NOT id.ResourceID, which is the
+		// ephemeral deployment id and prices nothing. Empty when the upstream
+		// emitted no parseable model; rating then fails the event loud rather
+		// than billing it wrong.
+		Model: res.Model,
 
 		PromptTokens:     res.Usage.PromptTokens,
 		CachedTokens:     res.Usage.CachedTokens(),

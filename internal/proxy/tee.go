@@ -204,19 +204,31 @@ func (c *captureReader) inspectSSELine(line []byte) {
 }
 
 // chunk is the minimal shape we read from an SSE chunk or a non-streaming body.
+//
+// Model is the engine's OWN answer to "what served this request" — every
+// OpenAI/vLLM chunk and body carries it at the top level. It is the stable
+// price key (rating's model_id), distinct from the request's routing identity
+// (X-Saturn-Resource-Id, an ephemeral deployment id). We capture it from the
+// authoritative source — the engine response — rather than trusting the caller.
 type chunk struct {
+	Model   string `json:"model"`
 	Choices []struct {
 		FinishReason *string `json:"finish_reason"`
 	} `json:"choices"`
 	Usage *metering.Usage `json:"usage"`
 }
 
-// inspectChunk parses token counts and finish_reason from a chunk payload.
-// Must be called with mu held.
+// inspectChunk parses the engine model name, token counts, and finish_reason
+// from a chunk payload. Must be called with mu held.
 func (c *captureReader) inspectChunk(payload []byte) {
 	var ch chunk
 	if err := json.Unmarshal(payload, &ch); err != nil {
 		return // not a chunk we understand; ignore
+	}
+	// The model name is identical across every chunk of a response; the first
+	// non-empty one wins and later chunks reaffirm it.
+	if ch.Model != "" {
+		c.result.Model = ch.Model
 	}
 	for _, choice := range ch.Choices {
 		if choice.FinishReason != nil && *choice.FinishReason != "" {

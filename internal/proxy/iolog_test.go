@@ -136,7 +136,7 @@ func TestIOLog_ShouldLogFalse_NoBuffering(t *testing.T) {
 // response bodies, identity, and status is produced when the gate passes.
 func TestIOLog_ShouldLogTrue_ProducesRecord(t *testing.T) {
 	const reqBody = `{"model":"m","messages":[{"role":"user","content":"hi"}]}`
-	const respBody = `{"id":"x","choices":[{"finish_reason":"stop"}],"usage":{"prompt_tokens":1,"completion_tokens":2}}`
+	const respBody = `{"id":"x","model":"llama-3-8b","choices":[{"finish_reason":"stop"}],"usage":{"prompt_tokens":1,"completion_tokens":2}}`
 	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		// Confirm upstream still receives a readable body (no double-read break).
 		got, _ := io.ReadAll(r.Body)
@@ -169,8 +169,12 @@ func TestIOLog_ShouldLogTrue_ProducesRecord(t *testing.T) {
 	if rec.AuthID != "auth-key-7" || rec.GroupID != "org-1" || rec.UserID != "user-1" {
 		t.Errorf("identity wrong: %+v", rec)
 	}
-	if rec.ResourceID != "model-abc" || rec.ResourceType != "deployment" || rec.Model != "model-abc" {
+	if rec.ResourceID != "model-abc" || rec.ResourceType != "deployment" {
 		t.Errorf("resource fields wrong: %+v", rec)
+	}
+	// Model is the engine-reported name from the response body, not the resource id.
+	if rec.Model != "llama-3-8b" {
+		t.Errorf("Model = %q, want llama-3-8b (engine name, not resource id)", rec.Model)
 	}
 	// Request body is the ORIGINAL client body (no include_usage injection).
 	if rec.RequestBody != reqBody {
