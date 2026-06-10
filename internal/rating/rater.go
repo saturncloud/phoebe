@@ -8,12 +8,12 @@ import (
 	"github.com/saturncloud/phoebe/internal/logging"
 )
 
-// Rater is ORCHESTRATION ONLY. It resolves the window, runs the SQL statements
-// (the resolve→sum→upsert insert, and the anomaly count), surfaces anomalies, and
-// reports a Result. It holds NO money value and does NO per-event math — all
-// pricing, the billable-prompt formula, the derivation policy, and the summation
-// happen in SQL (see Store / store.go). This is the deliberate v2 shape: money in
-// the database, Go as the conductor.
+// Rater is ORCHESTRATION ONLY. It resolves the window, runs the SINGLE SQL
+// statement (resolve→sum→upsert, with the anomaly counts computed in the same
+// snapshot), surfaces anomalies, and reports a Result. It holds NO money value and
+// does NO per-event math — all pricing, the billable-prompt formula, the derivation
+// policy, and the summation happen in SQL (see Store / store.go). This is the
+// deliberate v2 shape: money in the database, Go as the conductor.
 type Rater struct {
 	store Store
 	log   *logging.Logger
@@ -53,16 +53,18 @@ func (r Result) HasUnattributable() bool { return r.UnattributableEvents > 0 }
 // class of fail-loud signal, so cmd/rater exits non-zero on either.
 func (r Result) HasAnomaly() bool { return r.HasUnpriced() || r.HasUnattributable() }
 
-// Run rates [windowStart, windowEnd): it counts anomalies and runs the SQL
-// resolve→sum→upsert, then surfaces the outcome.
+// Run rates [windowStart, windowEnd): it runs the SINGLE SQL statement that
+// resolves, sums, upserts AND counts the anomalies in one snapshot, then surfaces
+// the outcome.
 //
 // FAIL-LOUD ON MISSING PRICE / UNATTRIBUTABLE (the fail-closed rule): an event
 // whose model has no resolvable price at its time, and a row with a NULL
 // auth_id/model_id, are NOT summed into any rollup — the SQL excludes them. They
-// are COUNTED (CountAnomalies, sharing the SAME resolution as the insert) and
-// logged loudly (ERROR), and drive cmd/rater's exit-nonzero path. They never
-// become $0 rollups (a $0 rollup is indistinguishable from "served, but free" and
-// silently loses revenue / hides an upstream leak).
+// are COUNTED by the SAME statement that writes the rollups (one snapshot, so a
+// row the drainer commits mid-run can never be excluded-but-uncounted), logged
+// loudly (ERROR), and drive cmd/rater's exit-nonzero path. They never become $0
+// rollups (a $0 rollup is indistinguishable from "served, but free" and silently
+// loses revenue / hides an upstream leak).
 //
 // IDEMPOTENCY: the SQL recomputes each rollup from scratch and upserts ON CONFLICT
 // DO UPDATE, so re-running a window reconciles to the correct totals and never
@@ -76,14 +78,15 @@ func (r *Rater) Run(ctx context.Context, windowStart, windowEnd time.Time) (Resu
 		return res, fmt.Errorf("rating: empty/inverted window [%s,%s)", windowStart.Format(time.RFC3339), windowEnd.Format(time.RFC3339))
 	}
 
-	// Count anomalies first (over the same resolution the insert uses), so the loud
-	// signals are known even if the insert writes zero rows.
-	anomalies, err := r.store.CountAnomalies(ctx, windowStart, windowEnd)
+	rr, err := r.store.RateWindow(ctx, windowStart, windowEnd)
 	if err != nil {
 		return res, err
 	}
-	res.UnpricedEvents = anomalies.UnpricedEvents
-	res.UnattributableEvents = anomalies.UnattributableEvents
+	res.EventsRated = rr.EventsRated
+	res.RollupsWritten = rr.RollupsWritten
+	res.TotalCost = rr.TotalCost
+	res.UnpricedEvents = rr.UnpricedEvents
+	res.UnattributableEvents = rr.UnattributableEvents
 
 	if res.HasUnattributable() {
 		r.log.Error.Printf("rating: window [%s,%s) has %d UNATTRIBUTABLE billing_event rows (NULL auth_id/model_id) — these cannot be rated; the interceptor's billing gate should reject them before metering, so a nonzero count means revenue is leaking upstream",
@@ -93,14 +96,6 @@ func (r *Rater) Run(ctx context.Context, windowStart, windowEnd time.Time) (Resu
 		r.log.Error.Printf("rating: window [%s,%s) has %d UNPRICED events (no resolvable price at event time — own rate, or base via derived_from through the global policy, all absent; or a derived_from chain > 1 hop) — these are NOT billed; set/backfill a price and re-rate this window",
 			windowStart.Format(time.RFC3339), windowEnd.Format(time.RFC3339), res.UnpricedEvents)
 	}
-
-	rr, err := r.store.RateWindow(ctx, windowStart, windowEnd)
-	if err != nil {
-		return res, err
-	}
-	res.EventsRated = rr.EventsRated
-	res.RollupsWritten = rr.RollupsWritten
-	res.TotalCost = rr.TotalCost
 
 	if res.HasAnomaly() {
 		r.log.Error.Printf("rating: window [%s,%s) rated %d events into %d rollups, total=%s USD; %d UNPRICED events dropped (backfill prices and re-rate), %d UNATTRIBUTABLE rows skipped (NULL auth_id/model_id — upstream billing-gate leak)",
