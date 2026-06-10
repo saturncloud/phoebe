@@ -176,7 +176,12 @@ func eventArgs(e metering.Event) []any {
 		nullStr(e.GroupID),
 		nullStr(e.ResourceID),
 		nullStr(e.ResourceType),
-		e.Model, // NOT NULL in practice but no DB constraint; store verbatim.
+		// Model is "" when the upstream never reported one (capture gap), so it
+		// goes through nullStr like every other identity column: the rater's
+		// unattributable predicate is `model_id IS NULL`, and a stored ''
+		// would dodge it and be misreported as UNPRICED (wrong runbook —
+		// "backfill prices" instead of "fix the capture gap").
+		nullStr(e.Model),
 		nullStr(e.Adapter),
 		e.PromptTokens,
 		e.CachedTokens,
