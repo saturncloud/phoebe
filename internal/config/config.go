@@ -89,7 +89,12 @@ type EmitSettings struct {
 	// ValkeyAddr is the Valkey/Redis address. Empty disables Valkey (WAL-only).
 	ValkeyAddr string `yaml:"valkeyAddr"`
 	StreamName string `yaml:"streamName"`
-	WALPath    string `yaml:"walPath"`
+	// WALPath is the WAL DIRECTORY (the WAL is a tidwall/wal segment log). A
+	// legacy single-file JSONL WAL from a pre-upgrade release found at this
+	// exact path is imported on startup and renamed aside to
+	// "<walPath>.imported" — do not change the configured path across the
+	// upgrade, or the old file's events won't be found.
+	WALPath string `yaml:"walPath"`
 }
 
 // IOLogSettings is the YAML shape for the M5 I/O-logging subsystem. Mirrors
