@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"sync/atomic"
 	"time"
 
 	"github.com/redis/go-redis/v9"
@@ -25,7 +26,16 @@ type Drainer struct {
 	// than on every loop pass.
 	lastClaim time.Time
 	now       func() time.Time
+
+	// poisoned counts events that could not be stored even row-at-a-time
+	// against a healthy store and were dropped (logged + ACK'd). A non-zero
+	// value means billing rows were lost to the log; see upsertRowAtATime.
+	poisoned atomic.Uint64
 }
+
+// Poisoned returns the number of events dropped as store-poison (failed their
+// own single-row INSERT while the store was reachable) since start.
+func (d *Drainer) Poisoned() uint64 { return d.poisoned.Load() }
 
 // New constructs a Drainer. The group is created lazily on Run (XGROUP CREATE
 // ... MKSTREAM) so the drainer can start before the emitter has produced
@@ -156,17 +166,32 @@ func (d *Drainer) process(ctx context.Context, msgs []redis.XMessage) (int, erro
 		ackIDs = append(ackIDs, m.ID)
 	}
 
+	stored := len(events)
 	if len(events) > 0 {
-		// Store MUST commit before we ACK. If the store fails we return the
-		// error WITHOUT acking the good entries, so the whole batch redelivers.
+		// Store MUST commit before we ACK. The single batch statement is the
+		// fast path; if it fails we do NOT treat the error as wholesale
+		// transient — the batch INSERT is all-or-nothing, so one persistently
+		// bad row (e.g. a value the schema rejects) would fail it forever and
+		// the un-ACK'd batch would redeliver forever, starving every innocent
+		// event batched with it. Fall back to row-at-a-time to isolate it.
 		if err := d.store.Upsert(ctx, events); err != nil {
-			return 0, fmt.Errorf("store batch of %d: %w", len(events), err)
+			d.log.Warn.Printf("drainer: batch upsert of %d failed, isolating row-at-a-time: %v", len(events), err)
+			var rerr error
+			ackIDs, stored, rerr = d.upsertRowAtATime(ctx, events, ackIDs)
+			if rerr != nil {
+				// Store outage (or cancellation), not a bad row. ACK only what
+				// is known durable; the rest stays pending and redelivers.
+				if aerr := d.ack(ctx, ackIDs); aerr != nil {
+					d.log.Warn.Printf("drainer: ack after partial row-at-a-time: %v", aerr)
+				}
+				return stored, fmt.Errorf("store batch of %d: %w", len(events), rerr)
+			}
 		}
 		if err := d.ack(ctx, ackIDs); err != nil {
 			// The store committed but the ACK failed. Safe: the entries
 			// redeliver and the idempotent upsert no-ops them. Surface as error
 			// so the loop backs off, but the data is already durable.
-			return len(events), fmt.Errorf("ack after store: %w", err)
+			return stored, fmt.Errorf("ack after store: %w", err)
 		}
 	}
 
@@ -178,7 +203,53 @@ func (d *Drainer) process(ctx context.Context, msgs []redis.XMessage) (int, erro
 		}
 	}
 
-	return len(events), nil
+	return stored, nil
+}
+
+// upsertRowAtATime is the poison-isolation slow path, taken only after a batch
+// Upsert failed. Each event is retried in its own statement: rows that succeed
+// are durable as usual; a row that fails ON ITS OWN while the store is
+// otherwise healthy can never be stored, so it is POISON — logged loudly (the
+// full event JSON at ERROR, same spirit as the decode-poison path in process:
+// the log line becomes the only remaining copy of a billing record), counted,
+// and included in the returned ack set so the stream keeps draining instead of
+// redelivering it forever.
+//
+// "Otherwise healthy" is the fail-closed guard: a store OUTAGE also fails
+// every individual row, and declaring those poison would ACK-and-drop an
+// entire batch of good billing data. So after an individual failure we Ping;
+// if the store is unreachable we abort the walk and return an error — the
+// caller ACKs only the rows already stored and the remainder redelivers.
+//
+// Returns the stream ids safe to ACK (stored rows + poison rows), the number
+// of rows actually stored, and a non-nil error only for outage/cancellation.
+func (d *Drainer) upsertRowAtATime(ctx context.Context, events []metering.Event, ids []string) (ackable []string, stored int, err error) {
+	ackable = make([]string, 0, len(events))
+	for i := range events {
+		uerr := d.store.Upsert(ctx, events[i:i+1])
+		if uerr == nil {
+			ackable = append(ackable, ids[i])
+			stored++
+			continue
+		}
+		if ctx.Err() != nil {
+			return ackable, stored, ctx.Err()
+		}
+		if perr := d.store.Ping(ctx); perr != nil {
+			return ackable, stored, fmt.Errorf("store unreachable during row-at-a-time (row error: %v): %w", uerr, perr)
+		}
+		// POISON: the store is up but this row cannot be inserted. Log the
+		// full event so it is recoverable from logs, count it, ACK it.
+		raw, merr := json.Marshal(events[i])
+		if merr != nil {
+			raw = []byte(fmt.Sprintf("%+v", events[i]))
+		}
+		n := d.poisoned.Add(1)
+		d.log.Error.Printf("drainer: drop poison row id=%s request_id=%s (total poisoned=%d): %v event=%s",
+			ids[i], events[i].RequestID, n, uerr, raw)
+		ackable = append(ackable, ids[i])
+	}
+	return ackable, stored, nil
 }
 
 // ack XACKs the given IDs in one call. Empty input is a no-op.
