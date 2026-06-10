@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"fmt"
 	"os/signal"
 	"syscall"
 	"time"
@@ -25,6 +26,13 @@ func (e *configError) Unwrap() error { return e.err }
 
 func errInvalidDuration(key string, err error) error {
 	return &configError{key: key, err: err}
+}
+
+func errInvalidTrailingHours(n int) error {
+	return &configError{
+		key: "rateTrailingHours",
+		err: fmt.Errorf("%d is out of range: must be >= 1 (the trailing-window width in complete hours; shrinking it below 1 would rate nothing, and the wider it is the more late-drained events each run catches)", n),
+	}
 }
 
 // windowError is a semantic error for a bad/inverted rating window.
