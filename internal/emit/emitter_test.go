@@ -1,6 +1,7 @@
 package emit
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -1069,6 +1070,112 @@ func TestEmitter_CloseFlushesInFlight(t *testing.T) {
 	got := streamLen(t, rdb, cfg.StreamName)
 	if got != n {
 		t.Errorf("after Close: stream len = %d, want %d", got, n)
+	}
+}
+
+// ---- DurableEmitter: Emit racing Close never strands an event ----------------
+
+// TestEmitter_CloseVsEmit_NeverStrands: the old workers exited via
+// `default: return` the moment the channel was momentarily empty, and Emit
+// kept queueing into the buffered channel after Close — stranding events with
+// no WAL entry and no log floor. Now every emitted event must end up in
+// Valkey, the WAL, or the log floor (here rdb is nil, so: WAL or floor).
+func TestEmitter_CloseVsEmit_NeverStrands(t *testing.T) {
+	cfg := testConfig(t, nil)
+	cfg.ChanBuf = 8 // small buffer: maximize the strand window
+	cfg.WorkerCount = 2
+	cfg.ShipInterval = time.Hour
+
+	// Capture the ERROR stream to count log-floor emissions. The log.Logger's
+	// internal mutex serializes concurrent writes to the buffer.
+	var floorBuf bytes.Buffer
+	logger := logging.New(logging.ERROR)
+	logger.Error.SetOutput(&floorBuf)
+
+	em, err := New(cfg, logger, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	const goroutines = 8
+	const perG = 50
+	want := map[string]bool{}
+	for g := range goroutines {
+		for i := range perG {
+			want[fmt.Sprintf("race-g%d-e%d", g, i)] = true
+		}
+	}
+
+	start := make(chan struct{})
+	var wg sync.WaitGroup
+	for g := range goroutines {
+		wg.Add(1)
+		go func(g int) {
+			defer wg.Done()
+			<-start
+			for i := range perG {
+				em.Emit(context.Background(), makeEvent(fmt.Sprintf("race-g%d-e%d", g, i)))
+			}
+		}(g)
+	}
+
+	// Close races the emitters.
+	closeRes := make(chan error, 1)
+	go func() {
+		<-start
+		closeRes <- em.Close(context.Background())
+	}()
+
+	close(start)
+	wg.Wait()
+	if err := <-closeRes; err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+
+	// Account for every event: WAL ∪ floor must cover the full emitted set.
+	got := map[string]bool{}
+	for _, ev := range drainWALEvents(t, cfg.WALPath) {
+		got[ev.RequestID] = true
+	}
+	for _, line := range strings.Split(floorBuf.String(), "\n") {
+		if i := strings.Index(line, "METERING_FLOOR request_id="); i >= 0 {
+			rest := line[i+len("METERING_FLOOR request_id="):]
+			got[rest[:strings.Index(rest, " ")]] = true
+		}
+	}
+	var missing []string
+	for id := range want {
+		if !got[id] {
+			missing = append(missing, id)
+		}
+	}
+	if len(missing) > 0 {
+		t.Fatalf("%d events stranded (in neither WAL nor log floor), e.g. %v", len(missing), missing[:min(5, len(missing))])
+	}
+}
+
+// TestEmitter_EmitAfterClose_NotLost: an Emit arriving strictly after Close
+// must not panic (closed channel) and must land somewhere durable — the WAL
+// is closed by then, so the log floor.
+func TestEmitter_EmitAfterClose_NotLost(t *testing.T) {
+	cfg := testConfig(t, nil)
+
+	var floorBuf bytes.Buffer
+	logger := logging.New(logging.ERROR)
+	logger.Error.SetOutput(&floorBuf)
+
+	em, err := New(cfg, logger, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := em.Close(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+
+	em.Emit(context.Background(), makeEvent("late-arrival"))
+
+	if !strings.Contains(floorBuf.String(), "METERING_FLOOR request_id=late-arrival") {
+		t.Fatal("event emitted after Close did not reach the log floor")
 	}
 }
 

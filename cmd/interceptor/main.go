@@ -4,6 +4,7 @@ import (
 	"context"
 	"flag"
 	"net/url"
+	"os"
 	"time"
 
 	"github.com/redis/go-redis/v9"
@@ -37,14 +38,21 @@ func main() {
 	}
 
 	emitter, closeEmitter := buildEmitter(settings, log)
-	defer closeEmitter()
-
 	ioPolicy, ioSink, ioMaxBody, closeIOLog := buildIOLog(settings, log)
-	defer closeIOLog()
 
 	srv := proxy.NewWithIOLog(settings, log, resolver, emitter, ioPolicy, ioSink, ioMaxBody)
-	if err := srv.Run(); err != nil {
-		log.Error.Fatalf("server error: %v", err)
+	srvErr := srv.Run()
+
+	// Cleanup must run UNCONDITIONALLY before exit. log.Fatalf here would
+	// os.Exit and skip deferred closes, stranding buffered metering events
+	// (no WAL flush, no log floor) and unflushed I/O-log batches — so collect
+	// the error, close everything, then exit nonzero.
+	closeIOLog()
+	closeEmitter()
+
+	if srvErr != nil {
+		log.Error.Printf("server error: %v", srvErr)
+		os.Exit(1)
 	}
 }
 

@@ -36,6 +36,13 @@ type DurableEmitter struct {
 	wg     sync.WaitGroup
 	stopCh chan struct{}
 
+	// closeMu + closed guard the Emit/Close race: Emit sends on ch under the
+	// read lock, Close closes ch under the write lock — so a send can never
+	// hit a closed channel, and an Emit that observes closed goes straight to
+	// the WAL instead of a channel no worker will ever drain again.
+	closeMu sync.RWMutex
+	closed  bool
+
 	// shipFn ships one batch to Valkey, returning true iff ALL events landed.
 	// Defaults to shipBatch; tests inject failures here to exercise the
 	// drain's partial-progress behaviour without timing games.
@@ -95,29 +102,55 @@ func NewWithClock(cfg Config, log *logging.Logger, rdb redis.Cmdable, now func()
 }
 
 // Emit satisfies metering.Emitter. It stamps TimestampUnixMs, then tries to
-// hand the event to the worker channel. If the channel is full it falls
-// directly to the WAL (and to the log floor if the WAL also fails). It never
-// blocks the caller.
+// hand the event to the worker channel. If the channel is full — or the
+// emitter is closed, so no worker will ever drain the channel again — it
+// falls directly to the WAL (and to the log floor if the WAL also fails).
+// It never blocks the caller, and an Emit racing Close never strands an
+// event: it always lands in Valkey, the WAL, or the log floor.
 func (e *DurableEmitter) Emit(_ context.Context, ev metering.Event) {
 	ev.TimestampUnixMs = e.now().UnixMilli()
 
-	// Fast path: hand off to channel.
-	select {
-	case e.ch <- ev:
-		return
-	default:
-		// Channel full — fall through to WAL directly.
+	// Fast path: hand off to channel. The read lock pairs with Close's write
+	// lock so the send cannot race the close(e.ch).
+	e.closeMu.RLock()
+	if !e.closed {
+		select {
+		case e.ch <- ev:
+			e.closeMu.RUnlock()
+			return
+		default:
+			// Channel full — fall through to WAL directly.
+		}
 	}
+	e.closeMu.RUnlock()
 
 	e.walOrLog(ev)
 }
 
-// Close drains in-flight events, stops background goroutines, and closes the
-// WAL file. The provided context bounds the drain wait.
+// Close flushes every in-flight event, stops background goroutines, makes a
+// final attempt to ship the WAL, and closes it. The provided context bounds
+// the wait. Order matters for the no-stranding guarantee:
+//
+//  1. mark closed + close(e.ch) under the write lock — subsequent Emits go
+//     straight to the WAL/floor, and no send can hit the closed channel;
+//  2. workers range the channel to completion, so every queued event is
+//     processed (xadd, falling to WAL/floor on error) — the old code's
+//     `default: return` exited the instant the channel was momentarily
+//     empty, stranding events a racing Emit had just queued;
+//  3. only after the workers are done, a final drainWAL ships what fell to
+//     disk during shutdown, then the WAL is closed.
 func (e *DurableEmitter) Close(ctx context.Context) error {
-	close(e.stopCh)
-	// Drain the channel by closing it after signalling workers.
-	// Workers exit when stopCh is closed; remaining items are processed.
+	e.closeMu.Lock()
+	if e.closed {
+		e.closeMu.Unlock()
+		return nil
+	}
+	e.closed = true
+	close(e.ch)
+	e.closeMu.Unlock()
+
+	close(e.stopCh) // stop the shipper ticker
+
 	done := make(chan struct{})
 	go func() {
 		e.wg.Wait()
@@ -128,31 +161,18 @@ func (e *DurableEmitter) Close(ctx context.Context) error {
 	case <-ctx.Done():
 		return ctx.Err()
 	}
+
+	e.drainWAL()
 	return e.wal.close()
 }
 
-// worker drains the event channel and ships each event to Valkey.
-// Falls to WAL on XADD error.
+// worker drains the event channel and ships each event to Valkey, falling to
+// the WAL on XADD error. It exits only when the channel is closed AND fully
+// drained — never on "momentarily empty", which would strand racing Emits.
 func (e *DurableEmitter) worker() {
 	defer e.wg.Done()
-	for {
-		select {
-		case ev, ok := <-e.ch:
-			if !ok {
-				return
-			}
-			e.xadd(ev)
-		case <-e.stopCh:
-			// Drain remaining events before exiting.
-			for {
-				select {
-				case ev := <-e.ch:
-					e.xadd(ev)
-				default:
-					return
-				}
-			}
-		}
+	for ev := range e.ch {
+		e.xadd(ev)
 	}
 }
 
@@ -225,8 +245,8 @@ func (e *DurableEmitter) shipper() {
 		case <-ticker.C:
 			e.drainWAL()
 		case <-e.stopCh:
-			// Final drain on shutdown.
-			e.drainWAL()
+			// No final drain here: Close runs it after the workers have
+			// flushed the channel, so shutdown-window events ship too.
 			return
 		}
 	}
