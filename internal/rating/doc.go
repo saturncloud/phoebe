@@ -21,6 +21,20 @@
 //     rate transformed by the global derivation policy — a POINTER, not a copy.
 //   - A model with no resolvable price FAILS LOUD (ErrNoPrice) — it is NEVER
 //     silently billed $0 (that is lost revenue). This is the fail-closed rule.
+//     The anomaly counts come from the SAME SQL statement (same snapshot) as the
+//     rollup upsert, so a row committed mid-run can never be excluded from the
+//     rollups yet missed by the counts.
+//   - LATE-DRAINED EVENTS ARE RE-CAUGHT by the trailing default window: cmd/rater
+//     re-rates the trailing N complete hours (default 24) every run, and the
+//     upsert REPLACES each hour bucket with a recomputed total, so an event that
+//     lands in an already-rated hour (Valkey outage → WAL recovery) is folded in
+//     by a later run without double-counting. RESIDUAL RISK: an event arriving
+//     more than N hours late still slips the default window — the reconciliation
+//     backstop sketched in DESIGN.md is the eventual answer; until then, widen
+//     rateTrailingHours or re-rate the hour explicitly via --since/--until.
+//   - Hour bucketing is SESSION-TZ-INDEPENDENT (date_trunc over a UTC wall-clock
+//     timestamp), so rollup keys can never disagree across sessions and re-rates
+//     can never create overlapping buckets.
 //
 // PRODUCTION vs ORACLE — where the money math lives:
 //

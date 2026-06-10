@@ -202,19 +202,20 @@ def upgrade():
         unique=False,
     )
 
-    # The rater filters billing_event on its rating instant COALESCE(event_ts,
-    # created_at); index event_ts (partial — it is nullable) to support the scan.
-    op.create_index(
-        "billing_event_event_ts_ix",
-        "billing_event",
-        ["event_ts"],
-        unique=False,
-        postgresql_where=sa.text("event_ts IS NOT NULL"),
+    # The rater filters billing_event on its RATING INSTANT, COALESCE(event_ts,
+    # created_at). The index must be on that EXACT expression: Postgres matches
+    # index expressions structurally, so an index on bare (event_ts) — partial or
+    # not — can never serve the COALESCE predicate and the rater would seq-scan a
+    # table that only grows. Raw SQL because expression indexes are clumsy through
+    # op.create_index.
+    op.execute(
+        "CREATE INDEX billing_event_rating_instant_ix "
+        "ON billing_event ((COALESCE(event_ts, created_at)))"
     )
 
 
 def downgrade():
-    op.drop_index("billing_event_event_ts_ix", table_name="billing_event")
+    op.execute("DROP INDEX billing_event_rating_instant_ix")
     op.drop_index("rated_usage_auth_id_window_start_ix", table_name="rated_usage")
     op.drop_table("rated_usage")
     op.execute("ALTER TABLE derivation_policy DROP CONSTRAINT derivation_policy_no_overlap")

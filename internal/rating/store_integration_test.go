@@ -21,6 +21,7 @@ import (
 	"database/sql"
 	"fmt"
 	"os"
+	"strings"
 	"testing"
 	"time"
 
@@ -45,6 +46,11 @@ CREATE TABLE billing_event (
     event_ts          TIMESTAMPTZ,
     created_at        TIMESTAMPTZ NOT NULL DEFAULT now()
 );
+
+-- Expression index on the rater's scan predicate, mirroring migration 0002: an
+-- index on bare (event_ts) cannot serve COALESCE(event_ts, created_at).
+CREATE INDEX billing_event_rating_instant_ix
+    ON billing_event ((COALESCE(event_ts, created_at)));
 
 CREATE TABLE model_price (
     id               VARCHAR(32) PRIMARY KEY,
@@ -146,7 +152,7 @@ func TestIntegration_RateWindow_ConformsToOracle(t *testing.T) {
 
 	store := NewPostgresStore(db)
 
-	// Anomalies: 1 unpriced + 1 unattributable.
+	// CountAnomalies (the ad-hoc/ops query) still agrees: 1 unpriced + 1 unattr.
 	an, err := store.CountAnomalies(ctx, hour, hour.Add(time.Hour))
 	if err != nil {
 		t.Fatalf("CountAnomalies: %v", err)
@@ -155,13 +161,21 @@ func TestIntegration_RateWindow_ConformsToOracle(t *testing.T) {
 		t.Fatalf("anomalies = %+v, want 1/1", an)
 	}
 
-	// Run the REAL rating SQL.
+	// Run the REAL rating SQL. The anomaly counts ride the SAME statement.
 	res, err := store.RateWindow(ctx, hour, hour.Add(time.Hour))
 	if err != nil {
 		t.Fatalf("RateWindow: %v", err)
 	}
 	if res.RollupsWritten != 2 {
 		t.Fatalf("rollups = %d, want 2", res.RollupsWritten)
+	}
+	if res.UnpricedEvents != 1 || res.UnattributableEvents != 1 {
+		t.Fatalf("RateWindow anomaly counts = %d/%d, want 1/1 (single-snapshot accounting)", res.UnpricedEvents, res.UnattributableEvents)
+	}
+	// Single-snapshot accounting invariant: every in-window event lands in exactly
+	// one bucket of rated / unpriced / unattributable.
+	if got := res.EventsRated + res.UnpricedEvents + res.UnattributableEvents; got != len(events) {
+		t.Fatalf("rated+unpriced+unattributable = %d, want %d", got, len(events))
 	}
 
 	// Oracle: independent Rate() over the priced+attributable events.
@@ -192,6 +206,9 @@ func TestIntegration_RateWindow_ConformsToOracle(t *testing.T) {
 		}
 	}
 
+	// Deterministic surrogate ids: capture before the re-run.
+	idsBefore := readRatedUsageIDs(t, db)
+
 	// Idempotency: re-run, totals unchanged, still 2 rows.
 	res2, err := store.RateWindow(ctx, hour, hour.Add(time.Hour))
 	if err != nil {
@@ -200,6 +217,40 @@ func TestIntegration_RateWindow_ConformsToOracle(t *testing.T) {
 	if res2.RollupsWritten != 2 || MustDec(res2.TotalCost).String() != MustDec(res.TotalCost).String() {
 		t.Fatalf("re-run not idempotent: %+v vs %+v", res2, res)
 	}
+
+	// deterministic-id: a re-run regenerates the SAME ids (md5 of the natural key,
+	// no random component), so id stability is part of the idempotency contract.
+	idsAfter := readRatedUsageIDs(t, db)
+	if len(idsBefore) != len(idsAfter) {
+		t.Fatalf("row count changed across re-run: %d → %d", len(idsBefore), len(idsAfter))
+	}
+	for k, id := range idsBefore {
+		if idsAfter[k] != id {
+			t.Errorf("rollup %s id changed across re-run: %s → %s (id must be deterministic)", k, id, idsAfter[k])
+		}
+	}
+}
+
+// readRatedUsageIDs returns natural-key → id for every rated_usage row.
+func readRatedUsageIDs(t *testing.T, db *sql.DB) map[string]string {
+	t.Helper()
+	rows, err := db.Query(`SELECT auth_id || '|' || model_id || '|' || extract(epoch FROM window_start)::bigint::text, id FROM rated_usage`)
+	if err != nil {
+		t.Fatalf("read rated_usage ids: %v", err)
+	}
+	defer rows.Close()
+	out := map[string]string{}
+	for rows.Next() {
+		var k, id string
+		if err := rows.Scan(&k, &id); err != nil {
+			t.Fatalf("scan: %v", err)
+		}
+		out[k] = id
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatalf("rows: %v", err)
+	}
+	return out
 }
 
 // TestConformance_SubNanoRoundingMatchesSQL is the rounding-order conformance
@@ -300,6 +351,133 @@ func TestConformance_SubNanoRoundingMatchesSQL(t *testing.T) {
 	if roundEachSum.String() == wantRoundOnce {
 		t.Fatalf("fixture does not exercise the rounding divergence (round-each=%s == round-once=%s); pick rates with a real sub-nano residue",
 			roundEachSum.String(), wantRoundOnce)
+	}
+}
+
+// TestIntegration_UTCBucketing_SessionTZIndependent: utc-bucketing. The hour
+// bucket must NOT depend on the session TimeZone. A fractional-offset session
+// (Asia/Kolkata, +05:30) running the rater must produce window_start values on
+// EXACT UTC hour boundaries, and a re-run from a UTC session must hit the SAME
+// ON CONFLICT keys — no duplicate/overlapping rollups (which would double-bill on
+// re-rate). The schema fixed this class for the exclusion constraint (tstzrange);
+// this pins the bucketing expression.
+func TestIntegration_UTCBucketing_SessionTZIndependent(t *testing.T) {
+	dsn := os.Getenv("PHOEBE_TEST_DATABASE_URL")
+	if dsn == "" {
+		t.Skip("PHOEBE_TEST_DATABASE_URL not set; skipping live-Postgres conformance")
+	}
+	ctx := context.Background()
+	db, err := sql.Open("pgx", dsn)
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	defer db.Close()
+	// One connection so SET TIME ZONE / search_path stick for every statement.
+	db.SetMaxOpenConns(1)
+
+	const sch = "phoebe_rating_tz_it"
+	exec(t, db, "DROP SCHEMA IF EXISTS "+sch+" CASCADE")
+	exec(t, db, "CREATE SCHEMA "+sch)
+	exec(t, db, "SET search_path TO "+sch)
+	defer func() { exec(t, db, "DROP SCHEMA IF EXISTS "+sch+" CASCADE") }()
+	exec(t, db, schemaDDL)
+
+	hour := mustTime("2026-06-08T10:00:00Z")
+	exec(t, db, `INSERT INTO model_price (id, model_id, prompt_price, cached_price, completion_price, effective_from) VALUES
+		('p1','b',0.000005,0.0000005,0.00002,'2026-01-01T00:00:00Z')`)
+	if _, err := db.ExecContext(ctx,
+		`INSERT INTO billing_event (request_id, auth_id, model, prompt_tokens, cached_tokens, completion_tokens, event_ts)
+		 VALUES ('tz-req-0','a','b',100,0,50,$1)`, hour.Add(30*time.Minute)); err != nil {
+		t.Fatalf("seed event: %v", err)
+	}
+
+	store := NewPostgresStore(db)
+
+	// Rate from a FRACTIONAL-OFFSET session. The broken expression
+	// date_trunc('hour', ev_ts) would truncate in IST and write
+	// window_start = 10:30Z (16:00 IST) instead of 10:00Z.
+	exec(t, db, "SET TIME ZONE 'Asia/Kolkata'")
+	if _, err := store.RateWindow(ctx, hour, hour.Add(time.Hour)); err != nil {
+		t.Fatalf("RateWindow (IST session): %v", err)
+	}
+
+	var ws time.Time
+	if err := db.QueryRowContext(ctx,
+		`SELECT window_start FROM rated_usage WHERE auth_id='a' AND model_id='b'`).Scan(&ws); err != nil {
+		t.Fatalf("read window_start: %v", err)
+	}
+	if !ws.UTC().Equal(hour) {
+		t.Fatalf("window_start = %s, want exact UTC hour boundary %s (session-TZ leaked into bucketing)",
+			ws.UTC().Format(time.RFC3339), hour.Format(time.RFC3339))
+	}
+
+	// Re-run from a UTC session: must hit the SAME conflict key — exactly one row,
+	// same id, no duplicate/overlapping rollup.
+	idsIST := readRatedUsageIDs(t, db)
+	exec(t, db, "SET TIME ZONE 'UTC'")
+	if _, err := store.RateWindow(ctx, hour, hour.Add(time.Hour)); err != nil {
+		t.Fatalf("RateWindow (UTC session): %v", err)
+	}
+	var n int
+	if err := db.QueryRowContext(ctx, `SELECT COUNT(*) FROM rated_usage`).Scan(&n); err != nil {
+		t.Fatalf("count rated_usage: %v", err)
+	}
+	if n != 1 {
+		t.Fatalf("rated_usage has %d rows after IST-then-UTC re-rate, want 1 (duplicate buckets double-bill)", n)
+	}
+	idsUTC := readRatedUsageIDs(t, db)
+	for k, id := range idsIST {
+		if idsUTC[k] != id {
+			t.Errorf("rollup %s id changed across sessions: %s → %s", k, id, idsUTC[k])
+		}
+	}
+}
+
+// TestIntegration_RatingInstantIndexServesScan: the expression index on
+// COALESCE(event_ts, created_at) must actually serve the rater's window
+// predicate (the bare event_ts index it replaced could not, leaving a seq scan
+// on an ever-growing table). enable_seqscan=off forces the planner to use an
+// index if one is usable, so a seq scan in the plan means no index matched.
+func TestIntegration_RatingInstantIndexServesScan(t *testing.T) {
+	dsn := os.Getenv("PHOEBE_TEST_DATABASE_URL")
+	if dsn == "" {
+		t.Skip("PHOEBE_TEST_DATABASE_URL not set; skipping live-Postgres conformance")
+	}
+	db, err := sql.Open("pgx", dsn)
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	defer db.Close()
+	db.SetMaxOpenConns(1) // SET/search_path must stick
+
+	const sch = "phoebe_rating_ix_it"
+	exec(t, db, "DROP SCHEMA IF EXISTS "+sch+" CASCADE")
+	exec(t, db, "CREATE SCHEMA "+sch)
+	exec(t, db, "SET search_path TO "+sch)
+	defer func() { exec(t, db, "DROP SCHEMA IF EXISTS "+sch+" CASCADE") }()
+	exec(t, db, schemaDDL)
+
+	exec(t, db, "SET enable_seqscan = off")
+	rows, err := db.Query(`EXPLAIN SELECT * FROM billing_event
+		WHERE COALESCE(event_ts, created_at) >= '2026-06-08T10:00:00Z'
+		  AND COALESCE(event_ts, created_at) <  '2026-06-08T11:00:00Z'`)
+	if err != nil {
+		t.Fatalf("explain: %v", err)
+	}
+	defer rows.Close()
+	var plan string
+	for rows.Next() {
+		var line string
+		if err := rows.Scan(&line); err != nil {
+			t.Fatalf("scan: %v", err)
+		}
+		plan += line + "\n"
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatalf("rows: %v", err)
+	}
+	if !strings.Contains(plan, "billing_event_rating_instant_ix") {
+		t.Fatalf("plan does not use billing_event_rating_instant_ix (the index cannot serve the rater's predicate):\n%s", plan)
 	}
 }
 

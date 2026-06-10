@@ -20,10 +20,22 @@
 // Re-running any window is safe and idempotent (rollups upsert on the natural
 // key), so cron overlap or manual re-rating never double-counts.
 //
-// Config, like the drainer: a YAML settings file (flag -f) for pool knobs, and
-// the DATABASE_URL env var (Atlas convention) for Postgres. The rater does NOT
-// run migrations — it assumes billing_event/model_price/derivation_policy/
-// rated_usage exist (see migrations/README.md).
+// THE DEFAULT WINDOW IS THE TRAILING N COMPLETE HOURS, [floor(now)-N*1h,
+// floor(now)), N = rateTrailingHours (default 24). It is deliberately NOT just the
+// last hour: events can be DRAINED LATE (a Valkey outage recovered from the WAL)
+// with an event_ts in an hour that was already rated, and a last-hour-only cron
+// would never revisit that hour — silent revenue loss. Re-rating closed hours is
+// safe BY CONSTRUCTION: the upsert REPLACES each (auth_id, model_id, hour) bucket
+// with a freshly recomputed total, so the late event is folded in and nothing
+// doubles. RESIDUAL RISK, stated honestly: an event arriving MORE than N hours
+// late still slips past the default window (the DESIGN.md reconciliation backstop
+// is the eventual answer; until then, widen rateTrailingHours or re-rate the hour
+// explicitly with --since/--until).
+//
+// Config, like the drainer: a YAML settings file (flag -f) for pool knobs and
+// rateTrailingHours, and the DATABASE_URL env var (Atlas convention) for Postgres.
+// The rater does NOT run migrations — it assumes billing_event/model_price/
+// derivation_policy/rated_usage exist (see migrations/README.md).
 package main
 
 import (
@@ -44,10 +56,21 @@ import (
 type raterSettings struct {
 	Debug bool `yaml:"debug"`
 
+	// RateTrailingHours is N in the default window [floor(now)-N*1h, floor(now)):
+	// how many complete trailing hours each run (re-)rates, to catch late-drained
+	// events (see the package doc). Default 24; must be >= 1. A pointer so an
+	// explicit 0 fails loud instead of silently meaning "default".
+	RateTrailingHours *int `yaml:"rateTrailingHours"`
+
 	MaxOpenConns    int    `yaml:"maxOpenConns"`
 	MaxIdleConns    int    `yaml:"maxIdleConns"`
 	ConnMaxLifetime string `yaml:"connMaxLifetime"`
 }
+
+// defaultRateTrailingHours is the default N for the trailing window. 24 trades a
+// cheap re-rate of already-correct hours (the upsert is a no-op REPLACE) for a full
+// day of late-drain tolerance.
+const defaultRateTrailingHours = 24
 
 // exit codes (see package doc).
 const (
@@ -64,22 +87,22 @@ func main() {
 // (os.Exit skips defers).
 func run() int {
 	settingsFile := flag.String("f", "/etc/saturn/config/rater.yaml", "Settings YAML file path")
-	since := flag.String("since", "", "Window start, RFC3339 (default: start of the last complete hour)")
+	since := flag.String("since", "", "Window start, RFC3339 (default: floor(now) minus rateTrailingHours)")
 	until := flag.String("until", "", "Window end, RFC3339 (default: start of the current hour)")
 	flag.Parse()
 
 	log := logging.New(logging.INFO)
 
-	cfg, debug, err := loadConfig(*settingsFile)
+	cfg, opts, err := loadConfig(*settingsFile)
 	if err != nil {
 		log.Error.Printf("rater: load config: %v", err)
 		return exitFatal
 	}
-	if debug {
+	if opts.debug {
 		log.SetLevel(logging.DEBUG)
 	}
 
-	windowStart, windowEnd, err := resolveWindow(*since, *until, time.Now())
+	windowStart, windowEnd, err := resolveWindow(*since, *until, opts.trailingHours, time.Now())
 	if err != nil {
 		log.Error.Printf("rater: %v", err)
 		return exitFatal
@@ -114,15 +137,25 @@ func run() int {
 	return exitOK
 }
 
-// resolveWindow computes [start, end). Defaults (both flags empty) rate the LAST
-// COMPLETE hour: [floor(now)-1h, floor(now)). This is the natural CronJob cadence
-// — run at :05 past the hour to rate the hour that just closed. Either flag may be
-// given explicitly (RFC3339); both must parse and start must be before end.
-func resolveWindow(since, until string, now time.Time) (time.Time, time.Time, error) {
+// resolveWindow computes [start, end). Defaults (both flags empty) rate the
+// TRAILING trailingHours COMPLETE hours: [floor(now)-N*1h, floor(now)). The
+// natural CronJob cadence is still hourly (run at :05 past the hour); each run
+// re-rates the last N closed hours so an event DRAINED LATE into an already-rated
+// hour (Valkey outage → WAL recovery) is picked up by a later run instead of being
+// lost forever. Re-rating a closed hour is safe by construction: the upsert
+// REPLACES each (auth_id, model_id, hour) bucket with a recomputed total, so
+// re-runs reconcile and never double-count. An event arriving more than N hours
+// late still slips (residual risk; see the package doc — reconciliation is the
+// backstop). Either flag may be given explicitly (RFC3339) and WINS over the
+// default; both must parse, be hour-aligned, and start must be before end.
+func resolveWindow(since, until string, trailingHours int, now time.Time) (time.Time, time.Time, error) {
+	if trailingHours < 1 {
+		return time.Time{}, time.Time{}, errInvalidTrailingHours(trailingHours)
+	}
 	now = now.UTC()
 	currentHour := now.Truncate(time.Hour)
 
-	start := currentHour.Add(-time.Hour)
+	start := currentHour.Add(-time.Duration(trailingHours) * time.Hour)
 	end := currentHour
 
 	if since != "" {
@@ -158,21 +191,34 @@ func resolveWindow(since, until string, now time.Time) (time.Time, time.Time, er
 	return start, end, nil
 }
 
+// raterOptions are the non-pool knobs loadConfig resolves from the settings file.
+type raterOptions struct {
+	debug         bool
+	trailingHours int // validated >= 1, defaulted to defaultRateTrailingHours
+}
+
 // loadConfig reads the YAML settings file, applies rating.DefaultConfig, then
 // overlays DATABASE_URL from the environment. A missing settings file is
 // tolerated (all defaults + env), so the rater can run env-only.
-func loadConfig(path string) (rating.Config, bool, error) {
+func loadConfig(path string) (rating.Config, raterOptions, error) {
 	cfg := rating.DefaultConfig()
+	opts := raterOptions{trailingHours: defaultRateTrailingHours}
 
 	var s raterSettings
 	if data, err := os.ReadFile(path); err == nil {
 		if err := yaml.Unmarshal(data, &s); err != nil {
-			return cfg, false, err
+			return cfg, opts, err
 		}
 	} else if !os.IsNotExist(err) {
-		return cfg, false, err
+		return cfg, opts, err
 	}
 
+	if s.RateTrailingHours != nil {
+		if *s.RateTrailingHours < 1 {
+			return cfg, opts, errInvalidTrailingHours(*s.RateTrailingHours)
+		}
+		opts.trailingHours = *s.RateTrailingHours
+	}
 	if s.MaxOpenConns > 0 {
 		cfg.MaxOpenConns = s.MaxOpenConns
 	}
@@ -182,7 +228,7 @@ func loadConfig(path string) (rating.Config, bool, error) {
 	if s.ConnMaxLifetime != "" {
 		v, err := time.ParseDuration(s.ConnMaxLifetime)
 		if err != nil {
-			return cfg, false, errInvalidDuration("connMaxLifetime", err)
+			return cfg, opts, errInvalidDuration("connMaxLifetime", err)
 		}
 		cfg.ConnMaxLifetime = v
 	}
@@ -190,5 +236,6 @@ func loadConfig(path string) (rating.Config, bool, error) {
 	// DATABASE_URL (Atlas convention) is the authoritative Postgres source.
 	cfg.DatabaseURL = os.Getenv("DATABASE_URL")
 
-	return cfg, s.Debug, nil
+	opts.debug = s.Debug
+	return cfg, opts, nil
 }

@@ -14,7 +14,9 @@ import (
 // conformance test has a faithful reference of the SQL's resolve→cost→sum.
 //
 // It models rated_usage as a map keyed by the natural key, REPLACING on upsert
-// (mirroring ON CONFLICT DO UPDATE), so idempotency is observable.
+// (mirroring ON CONFLICT DO UPDATE), so idempotency is observable. Like the
+// production statement, RateWindow returns the anomaly counts from the SAME
+// resolve pass as the rollups (one snapshot).
 type oracleStore struct {
 	book   *PriceBook
 	events []RatedEvent
@@ -89,7 +91,10 @@ func (s *oracleStore) resolveWindow(start, end time.Time) (map[rollupKey]oracleR
 
 func (s *oracleStore) RateWindow(_ context.Context, start, end time.Time) (RateResult, error) {
 	s.rateCalls++
-	rollups, _ := s.resolveWindow(start.UTC(), end.UTC())
+	// ONE resolve pass produces the rollups AND the anomaly counts, mirroring the
+	// production SQL's single-statement/single-snapshot shape: a row can never be
+	// excluded from the rollups yet missed by the counts.
+	rollups, an := s.resolveWindow(start.UTC(), end.UTC())
 	total := Dec{}
 	var rated int
 	for k, ru := range rollups {
@@ -97,7 +102,12 @@ func (s *oracleStore) RateWindow(_ context.Context, start, end time.Time) (RateR
 		total = total.Add(ru.cost)
 		rated += ru.eventCount
 	}
-	res := RateResult{RollupsWritten: len(rollups), EventsRated: rated}
+	res := RateResult{
+		RollupsWritten:       len(rollups),
+		EventsRated:          rated,
+		UnpricedEvents:       an.UnpricedEvents,
+		UnattributableEvents: an.UnattributableEvents,
+	}
 	if len(rollups) > 0 {
 		res.TotalCost = total.String()
 	} else {
@@ -182,6 +192,46 @@ func TestRater_IdempotentRerunNoDoubling(t *testing.T) {
 	}
 	if store.rateCalls != 2 {
 		t.Fatalf("RateWindow called %d times, want 2", store.rateCalls)
+	}
+}
+
+// TestRater_LateArrivalRatedByTrailingWindow: an event whose event_ts falls in
+// hour H but which is DRAINED only after H was already rated (Valkey outage → WAL
+// recovery) is picked up by a later run whose window still covers H — the
+// trailing-window contract cmd/rater's default implements. The re-rate REPLACES
+// H's bucket (never doubles), so late events are folded in idempotently.
+func TestRater_LateArrivalRatedByTrailingWindow(t *testing.T) {
+	hourH := mustTime("2026-06-08T10:00:00Z")
+	store := newOracleStore(bookM(), nil) // nothing drained yet
+	r := New(store, testLogger())
+
+	// Run 1: the H+1-cadence cron rates hour H — the late event has NOT been
+	// drained yet, so the run sees nothing. With a last-hour-only default this
+	// event would now be lost forever.
+	res1, err := r.Run(context.Background(), hourH, hourH.Add(time.Hour))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res1.EventsRated != 0 || res1.RollupsWritten != 0 {
+		t.Fatalf("run1 rated=%d rollups=%d, want 0/0 (event not drained yet)", res1.EventsRated, res1.RollupsWritten)
+	}
+
+	// The event lands late: drained after H was rated, event_ts still inside H.
+	store.events = append(store.events, RatedEvent{
+		AuthID: "a", ModelID: "m", PromptTokens: 100, CompletionTokens: 50, At: hourH.Add(15 * time.Minute),
+	})
+
+	// Run 2: the next default run rates the TRAILING window, which still covers H.
+	res2, err := r.Run(context.Background(), hourH.Add(-23*time.Hour), hourH.Add(2*time.Hour))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res2.EventsRated != 1 || res2.RollupsWritten != 1 {
+		t.Fatalf("run2 rated=%d rollups=%d, want 1/1 (late event caught by trailing window)", res2.EventsRated, res2.RollupsWritten)
+	}
+	k := rollupKey{authID: "a", modelID: "m", windowStart: hourH}
+	if _, ok := store.table[k]; !ok {
+		t.Fatal("no rollup for hour H — the late-drained event was lost")
 	}
 }
 
@@ -358,6 +408,19 @@ func TestConformance_SQLModelMatchesRateOracle(t *testing.T) {
 	}
 	if res.UnpricedEvents != 1 || res.UnattributableEvents != 1 {
 		t.Fatalf("anomalies = unpriced %d / unattr %d, want 1/1", res.UnpricedEvents, res.UnattributableEvents)
+	}
+	// SINGLE-SNAPSHOT ACCOUNTING INVARIANT: rated + unpriced + unattributable must
+	// PARTITION the in-window events — every event is in exactly one bucket. In
+	// production this holds because the counts come from the same statement (same
+	// snapshot) as the upsert; here the oracle mirrors that with one resolve pass.
+	if got := res.EventsRated + res.UnpricedEvents + res.UnattributableEvents; got != len(events) {
+		t.Fatalf("rated(%d) + unpriced(%d) + unattributable(%d) = %d, want %d (every in-window event accounted exactly once)",
+			res.EventsRated, res.UnpricedEvents, res.UnattributableEvents, got, len(events))
+	}
+	// The fail-loud counts must come from RateWindow's snapshot, not a separate
+	// CountAnomalies statement (which could see a different snapshot).
+	if store.countCalls != 0 {
+		t.Fatalf("Run called CountAnomalies %d times, want 0 (counts must come from the rating statement's snapshot)", store.countCalls)
 	}
 	if res.RollupsWritten != len(want) {
 		t.Fatalf("rollups = %d, want %d", res.RollupsWritten, len(want))

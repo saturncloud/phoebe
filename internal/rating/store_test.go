@@ -23,8 +23,8 @@ func TestPostgresStore_RateWindowSQL(t *testing.T) {
 	start := mustTime("2026-06-08T10:00:00Z")
 	end := mustTime("2026-06-08T11:00:00Z")
 
-	rows := sqlmock.NewRows([]string{"rollups_written", "events_rated", "total_cost"}).
-		AddRow(2, 5, "0.001234500")
+	rows := sqlmock.NewRows([]string{"rollups_written", "events_rated", "total_cost", "unpriced_events", "unattributable_events"}).
+		AddRow(2, 5, "0.001234500", 3, 1)
 	mock.ExpectQuery(`INSERT INTO rated_usage`).
 		WithArgs(start.UTC(), end.UTC()).
 		WillReturnRows(rows)
@@ -35,6 +35,9 @@ func TestPostgresStore_RateWindowSQL(t *testing.T) {
 	}
 	if res.RollupsWritten != 2 || res.EventsRated != 5 || res.TotalCost != "0.001234500" {
 		t.Fatalf("result = %+v, want 2/5/0.001234500", res)
+	}
+	if res.UnpricedEvents != 3 || res.UnattributableEvents != 1 {
+		t.Fatalf("anomaly counts = %d/%d, want 3/1 (must ride the same statement)", res.UnpricedEvents, res.UnattributableEvents)
 	}
 	if err := mock.ExpectationsWereMet(); err != nil {
 		t.Fatalf("unmet: %v", err)
@@ -73,8 +76,25 @@ func TestRateWindowSQL_Shape(t *testing.T) {
 		"WHERE prompt_price IS NOT NULL",
 		"AND auth_id  IS NOT NULL",
 		"AND model_id IS NOT NULL",
+		// session-TZ-independent hour bucket (date_trunc on a tstz truncates in the
+		// session TZ; a fractional-offset session would shift ON CONFLICT keys)
+		"date_trunc('hour', ev_ts AT TIME ZONE 'UTC') AT TIME ZONE 'UTC'",
+		// deterministic natural-key surrogate id (re-runs regenerate the same id);
+		// epoch keeps the hash input session-TZ-independent
+		"md5(auth_id || '|' || model_id || '|' || extract(epoch FROM window_start)::bigint::text)",
+		// deterministic lock order across concurrent raters (no ABBA deadlock)
+		"ORDER BY auth_id, model_id, window_start",
 		// idempotent upsert on the natural key
 		"ON CONFLICT (auth_id, model_id, window_start) DO UPDATE SET",
+		// the anomaly counts ride the SAME statement (one snapshot) as the upsert
+		"AS unpriced_events",
+		"AS unattributable_events",
+	}
+	// The session-TZ-DEPENDENT bucket must be gone everywhere (window_start,
+	// window_end, GROUP BY): a bare date_trunc('hour', ev_ts) anywhere would let a
+	// fractional-offset session write off-boundary buckets.
+	if strings.Contains(rateWindowSQL, "date_trunc('hour', ev_ts)") {
+		t.Error("rateWindowSQL still contains the session-TZ-dependent date_trunc('hour', ev_ts)")
 	}
 	for _, f := range wantFragments {
 		if !strings.Contains(rateWindowSQL, f) {
@@ -104,6 +124,25 @@ func TestCountAnomaliesSQL_Shape(t *testing.T) {
 	// Both statements must be built on the identical resolution CTE.
 	if !strings.Contains(rateWindowSQL, "WITH ev AS (") || !strings.Contains(countAnomaliesSQL, "WITH ev AS (") {
 		t.Fatal("rate/anomaly statements must both build on resolvedEventsCTE")
+	}
+}
+
+// TestEnsureUTCTimeZone: the belt-and-braces DSN pin appends timezone=UTC unless
+// the operator already chose a TZ (we never fight an explicit DSN). The bucketing
+// expression in rateWindowSQL is the load-bearing TZ fix; this is defense in depth.
+func TestEnsureUTCTimeZone(t *testing.T) {
+	cases := []struct{ in, want string }{
+		{"postgres://u:p@h/db", "postgres://u:p@h/db?timezone=UTC"},
+		{"postgres://u:p@h/db?sslmode=disable", "postgres://u:p@h/db?sslmode=disable&timezone=UTC"},
+		{"host=h dbname=db", "host=h dbname=db timezone=UTC"},
+		// already pinned (either case) → untouched
+		{"postgres://u:p@h/db?timezone=America/New_York", "postgres://u:p@h/db?timezone=America/New_York"},
+		{"host=h TimeZone=UTC", "host=h TimeZone=UTC"},
+	}
+	for _, c := range cases {
+		if got := ensureUTCTimeZone(c.in); got != c.want {
+			t.Errorf("ensureUTCTimeZone(%q) = %q, want %q", c.in, got, c.want)
+		}
 	}
 }
 

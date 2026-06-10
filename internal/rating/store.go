@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"fmt"
+	"strings"
 	"time"
 
 	// pgx stdlib driver registers itself as "pgx" with database/sql. Same choice as
@@ -19,15 +20,19 @@ import (
 // The v2 contract is SQL-SIDE and money-in-SQL: there is no LoadPrices /
 // per-event Rate loop. The whole window is rated, summed, and upserted by the DB.
 //
-//   - RateWindow runs the single INSERT ... SELECT that resolves the effective
-//     price (own rate, or base-via-derived_from through the global policy),
-//     computes per-event cost AND sums it per (auth_id, model_id, hour) into
-//     rated_usage, idempotently (ON CONFLICT DO UPDATE recomputes from scratch).
-//     It returns how many rollups were written and the rated event/total.
-//   - CountAnomalies counts, for the same window, the events that could NOT be
-//     priced (no resolvable rate / chain > 1 hop) and the rows that are
-//     unattributable (NULL auth_id/model_id) — the fail-loud signals. These are
+//   - RateWindow runs the SINGLE statement that resolves the effective price (own
+//     rate, or base-via-derived_from through the global policy), computes per-event
+//     cost AND sums it per (auth_id, model_id, hour) into rated_usage, idempotently
+//     (ON CONFLICT DO UPDATE recomputes from scratch) — AND, in the same statement,
+//     counts the fail-loud anomalies: events that could NOT be priced (no resolvable
+//     rate / chain > 1 hop) and rows that are unattributable (NULL auth_id/model_id).
+//     ONE statement means ONE snapshot: a row the drainer commits mid-run can never
+//     be excluded from the rollups yet missed by the anomaly counts (two separate
+//     READ COMMITTED statements could disagree exactly that way). Anomalous rows are
 //     NEVER summed into a rollup; they are counted and surfaced.
+//   - CountAnomalies re-counts the anomalies for an arbitrary window (ad-hoc / ops
+//     use). The rater's fail-loud contract does NOT depend on it — Run gets its
+//     counts from RateWindow's single snapshot.
 type Store interface {
 	RateWindow(ctx context.Context, start, end time.Time) (RateResult, error)
 	CountAnomalies(ctx context.Context, start, end time.Time) (Anomalies, error)
@@ -35,12 +40,18 @@ type Store interface {
 	Close() error
 }
 
-// RateResult is what the INSERT ... SELECT reports back about the priced traffic.
+// RateResult is what the single rating statement reports back: the priced traffic
+// (rollups/events/total) AND the anomaly counts from the SAME snapshot.
 // TotalCost is a NUMERIC carried as a string (money never becomes a Go number).
 type RateResult struct {
 	RollupsWritten int
 	EventsRated    int
 	TotalCost      string // NUMERIC as text; "" when no rollups
+
+	// Fail-loud counts, from the same statement/snapshot as the upsert above, so
+	// they can never disagree with what the rollups excluded.
+	UnpricedEvents       int
+	UnattributableEvents int
 }
 
 // Anomalies are the fail-loud counts for a window: events that could not be priced
@@ -65,7 +76,7 @@ func OpenPostgres(ctx context.Context, cfg Config) (*PostgresStore, error) {
 		return nil, fmt.Errorf("rating: DATABASE_URL is empty (Postgres holds billing_event and the price book; the rater cannot run without it)")
 	}
 
-	db, err := sql.Open("pgx", cfg.DatabaseURL)
+	db, err := sql.Open("pgx", ensureUTCTimeZone(cfg.DatabaseURL))
 	if err != nil {
 		return nil, fmt.Errorf("rating: open postgres: %w", err)
 	}
@@ -82,6 +93,24 @@ func OpenPostgres(ctx context.Context, cfg Config) (*PostgresStore, error) {
 	return s, nil
 }
 
+// ensureUTCTimeZone pins the session TimeZone to UTC via the DSN, unless the DSN
+// already sets one. Belt-and-braces only: the rating SQL is written to be
+// session-TZ-independent (see the bucketing expression in rateWindowSQL), so this
+// is defense in depth, not the load-bearing fix. pgx passes unrecognized
+// parameters (URL query or keyword form) to the server as run-time parameters.
+func ensureUTCTimeZone(dsn string) string {
+	if strings.Contains(strings.ToLower(dsn), "timezone") {
+		return dsn // the operator pinned a TZ explicitly; don't fight it
+	}
+	if strings.Contains(dsn, "://") { // URL form
+		if strings.Contains(dsn, "?") {
+			return dsn + "&timezone=UTC"
+		}
+		return dsn + "?timezone=UTC"
+	}
+	return dsn + " timezone=UTC" // keyword=value form
+}
+
 // NewPostgresStore wraps an existing *sql.DB. Used by tests (sqlmock) and callers
 // owning the pool lifecycle.
 func NewPostgresStore(db *sql.DB) *PostgresStore {
@@ -93,9 +122,10 @@ func (s *PostgresStore) Close() error                   { return s.db.Close() }
 
 // resolvedEventsCTE is the heart of the v2 rater: a CTE that, for every
 // billing_event row in [$1, $2), resolves the effective per-token rate and the
-// per-event cost ENTIRELY IN SQL. It is shared verbatim by RateWindow (which SUMs
-// and upserts the priced rows) and CountAnomalies (which counts the rows that did
-// NOT resolve), so the two ALWAYS agree on what "priced" means.
+// per-event cost ENTIRELY IN SQL. It is shared verbatim by rateWindowSQL (which
+// SUMs and upserts the priced rows AND counts the rows that did NOT resolve, in
+// one statement/snapshot) and countAnomaliesSQL (the ad-hoc/ops counting query),
+// so the two ALWAYS agree on what "priced" means.
 //
 // Resolution, AS-OF each event's rating instant ev_ts = COALESCE(event_ts,
 // created_at):
@@ -228,32 +258,61 @@ resolved AS (
 
 // rateWindowSQL appends, to the resolution CTE, the INSERT ... SELECT that SUMs the
 // PRICED, ATTRIBUTABLE events per (auth_id, model_id, hour) into rated_usage and
-// upserts idempotently.
+// upserts idempotently — AND the anomaly counts over the SAME CTEs.
 //
 // PRICED  = prompt_price IS NOT NULL (resolution succeeded).
 // ATTRIB. = auth_id IS NOT NULL AND model_id IS NOT NULL.
-// Unpriced / unattributable rows are EXCLUDED here (never $0-billed) and counted
-// separately by CountAnomalies.
+// Unpriced / unattributable rows are EXCLUDED from the rollups (never $0-billed)
+// and counted by the final SELECT below.
+//
+// ONE STATEMENT, ONE SNAPSHOT (the fail-loud guarantee): the upsert and the anomaly
+// counts are CTEs of a single statement, and in Postgres every CTE of a statement —
+// including a data-modifying CTE — sees the same snapshot. So a billing_event row
+// the drainer commits while the rater runs is either visible to BOTH the rollups
+// and the counts, or to NEITHER; it can never be excluded-from-rollups-but-uncounted
+// (which two separate READ COMMITTED statements allowed, silently defeating the
+// exit-nonzero contract).
 //
 // MONEY IS COMPUTED AND SUMMED IN SQL — the cost expression multiplies token
 // counts by the NUMERIC rates and SUM()s, so Go never touches a money value except
-// to read the resulting NUMERIC text. The hour bucket is date_trunc('hour', ev_ts).
+// to read the resulting NUMERIC text.
+//
+// THE HOUR BUCKET MUST BE SESSION-TZ-INDEPENDENT: date_trunc('hour', tstz) truncates
+// in the session TimeZone, so a fractional-offset session (e.g. +05:30) would shift
+// bucket boundaries — window_start off by 30 minutes and ON CONFLICT keys that
+// DISAGREE across sessions, i.e. overlapping rollups and a double-bill on re-rate.
+// Same hazard class the schema already closed for the exclusion constraint (see the
+// tstzrange-not-tsrange comment in migrations/0002_rating.sql). The expression
+//
+//	date_trunc('hour', ev_ts AT TIME ZONE 'UTC') AT TIME ZONE 'UTC'
+//
+// converts to a UTC wall-clock timestamp, truncates, and converts back — identical
+// on every session TZ. (Preferred over the 3-arg date_trunc(..., 'UTC'), which is
+// PG14+ only; this form works on all supported Postgres versions.)
 //
 // IDEMPOTENCY: ON CONFLICT (auth_id, model_id, window_start) DO UPDATE replaces the
 // stored sums/cost with the freshly recomputed ones, so a re-run reconciles to the
-// correct totals and never doubles. The surrogate id is generated in SQL
-// (gen_random_bytes) and used ONLY on INSERT — on conflict the existing row's id is
-// kept, since the natural key identifies the row.
+// correct totals and never doubles. The surrogate id is DETERMINISTIC: md5 of the
+// natural key (auth_id|model_id|epoch(window_start)), so a re-run inserts the SAME
+// id for the same rollup — there is no random id that could PK-collide differently
+// across runs. epoch() rather than ::text keeps the hash input session-TZ-
+// independent (timestamptz::text renders in the session TZ). A cross-key md5
+// collision (or a crafted '|' embedding) would abort the statement with a PK error
+// and exit the run loudly — never a wrong bill.
 //
-// RETURNING feeds an outer aggregate so the call reports rollups written + the
-// rated event count + the total cost (NUMERIC text), without Go summing money.
+// The upsert's SELECT is ORDERed BY the natural key so concurrent raters lock the
+// conflicting rows in the same order — no ABBA deadlock between overlapping runs.
+//
+// RETURNING feeds the final SELECT so one round-trip reports rollups written, rated
+// event count, total cost (NUMERIC text), and both anomaly counts.
 const rateWindowSQL = resolvedEventsCTE + `,
 priced AS (
     SELECT
         auth_id,
         model_id,
-        date_trunc('hour', ev_ts)                       AS window_start,
-        date_trunc('hour', ev_ts) + interval '1 hour'   AS window_end,
+        -- Session-TZ-independent hour bucket; see the statement comment.
+        date_trunc('hour', ev_ts AT TIME ZONE 'UTC') AT TIME ZONE 'UTC'                     AS window_start,
+        date_trunc('hour', ev_ts AT TIME ZONE 'UTC') AT TIME ZONE 'UTC' + interval '1 hour' AS window_end,
         SUM(prompt_tokens)::bigint                       AS prompt_tokens,
         SUM(cached_tokens)::bigint                       AS cached_tokens,
         SUM(completion_tokens)::bigint                   AS completion_tokens,
@@ -269,7 +328,7 @@ priced AS (
     WHERE prompt_price IS NOT NULL          -- priced only
       AND auth_id  IS NOT NULL              -- attributable only
       AND model_id IS NOT NULL
-    GROUP BY auth_id, model_id, date_trunc('hour', ev_ts)
+    GROUP BY auth_id, model_id, date_trunc('hour', ev_ts AT TIME ZONE 'UTC') AT TIME ZONE 'UTC'
 ),
 upserted AS (
     INSERT INTO rated_usage (
@@ -278,17 +337,19 @@ upserted AS (
         cost, event_count
     )
     SELECT
-        -- 32-char hex surrogate; only used on INSERT (natural key identifies the row
-        -- on conflict). md5(...) yields exactly 32 hex chars with NO extension
-        -- dependency (gen_random_bytes needs pgcrypto). Uniqueness is not load-
-        -- bearing here — the natural-key unique constraint is — so a hash of
-        -- random()+clock is sufficient; collisions would only surface as a benign
-        -- PK retry, never a billing error.
-        md5(random()::text || clock_timestamp()::text),
+        -- DETERMINISTIC 32-char hex surrogate: md5 of the natural key, so re-rating
+        -- a window regenerates the SAME id (no random component to collide
+        -- differently across runs; no extension dependency — gen_random_bytes needs
+        -- pgcrypto). On conflict the existing row's id is kept anyway; see the
+        -- statement comment for the (statement-aborting, never wrong-bill)
+        -- cross-key-collision caveat.
+        md5(auth_id || '|' || model_id || '|' || extract(epoch FROM window_start)::bigint::text),
         auth_id, model_id, window_start, window_end,
         prompt_tokens, cached_tokens, completion_tokens, billable_prompt_tokens,
         cost, event_count
     FROM priced
+    -- Deterministic lock order across concurrent raters (no ABBA deadlock).
+    ORDER BY auth_id, model_id, window_start
     ON CONFLICT (auth_id, model_id, window_start) DO UPDATE SET
         window_end             = EXCLUDED.window_end,
         prompt_tokens          = EXCLUDED.prompt_tokens,
@@ -301,19 +362,29 @@ upserted AS (
     RETURNING event_count, cost
 )
 SELECT
-    COUNT(*)::int                       AS rollups_written,
-    COALESCE(SUM(event_count), 0)::int  AS events_rated,
-    COALESCE(SUM(cost), 0)::numeric     AS total_cost
-FROM upserted`
+    (SELECT COUNT(*)::int                      FROM upserted) AS rollups_written,
+    (SELECT COALESCE(SUM(event_count), 0)::int FROM upserted) AS events_rated,
+    (SELECT COALESCE(SUM(cost), 0)::numeric    FROM upserted) AS total_cost,
+    -- Anomaly counts from the SAME snapshot as the upsert. An unattributable row is
+    -- counted ONLY as unattributable (the more specific signal), never also as
+    -- unpriced, so the counts partition the in-window rows:
+    --   events_rated + unpriced + unattributable == total in-window events.
+    (SELECT COUNT(*)::int FROM resolved
+      WHERE prompt_price IS NULL
+        AND auth_id  IS NOT NULL
+        AND model_id IS NOT NULL)                             AS unpriced_events,
+    (SELECT COUNT(*)::int FROM ev
+      WHERE auth_id IS NULL OR model_id IS NULL)              AS unattributable_events`
 
-// RateWindow runs the resolve→sum→upsert statement for [start, end) and reports the
-// rollups written, events rated, and total cost (NUMERIC text). All money math is
-// in SQL.
+// RateWindow runs the single resolve→sum→upsert→count statement for [start, end)
+// and reports the rollups written, events rated, total cost (NUMERIC text), and the
+// fail-loud anomaly counts — all from one snapshot. All money math is in SQL.
 func (s *PostgresStore) RateWindow(ctx context.Context, start, end time.Time) (RateResult, error) {
 	var res RateResult
 	var total string
 	err := s.db.QueryRowContext(ctx, rateWindowSQL, start.UTC(), end.UTC()).
-		Scan(&res.RollupsWritten, &res.EventsRated, &total)
+		Scan(&res.RollupsWritten, &res.EventsRated, &total,
+			&res.UnpricedEvents, &res.UnattributableEvents)
 	if err != nil {
 		return RateResult{}, fmt.Errorf("rating: rate window [%s,%s): %w",
 			start.UTC().Format(time.RFC3339), end.UTC().Format(time.RFC3339), err)
@@ -327,6 +398,11 @@ func (s *PostgresStore) RateWindow(ctx context.Context, start, end time.Time) (R
 // returned NULL rates) among ATTRIBUTABLE rows, and rows that are UNATTRIBUTABLE
 // (NULL auth_id/model_id). It shares resolvedEventsCTE with the rating insert so
 // "unpriced" means exactly the same thing in both.
+//
+// NOTE: the rater's fail-loud contract does NOT use this — Run gets its anomaly
+// counts from rateWindowSQL's single snapshot (a separate statement could miss a
+// row committed between the two). This query exists for ad-hoc / ops inspection of
+// a window without writing rollups.
 //
 // An unattributable row cannot be priced either, but it is counted ONLY as
 // unattributable (the distinct, more-specific signal) so the two counts don't
