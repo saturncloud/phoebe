@@ -231,10 +231,11 @@ CREATE TABLE rated_usage (
 CREATE INDEX rated_usage_auth_id_window_start_ix
     ON rated_usage (auth_id, window_start);
 
--- The rater scans billing_event by its rating instant COALESCE(event_ts,
--- created_at) over a one-hour window. billing_event already indexes created_at;
--- the rater filters on event_ts too, so index it (partial: event_ts is nullable
--- and the COALESCE falls back to created_at when null).
-CREATE INDEX IF NOT EXISTS billing_event_event_ts_ix
-    ON billing_event (event_ts)
-    WHERE event_ts IS NOT NULL;
+-- The rater scans billing_event by its RATING INSTANT, COALESCE(event_ts,
+-- created_at), over the rating window. The index must be on that EXACT
+-- expression: Postgres matches index expressions structurally, so an index on
+-- bare (event_ts) — partial or not — can never serve a COALESCE(event_ts,
+-- created_at) predicate, and the rater would seq-scan billing_event (a table
+-- that only grows) on every run.
+CREATE INDEX IF NOT EXISTS billing_event_rating_instant_ix
+    ON billing_event ((COALESCE(event_ts, created_at)));
