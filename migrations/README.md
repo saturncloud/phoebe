@@ -118,6 +118,12 @@ without a matching entry there simply won't be written:
   them; an operator writes prices/policy as data), so they have no Go upsert column
   list — only the `.sql`/Alembic pair.
 
+> Backfill note (empty-model fix): drainer rows written before the
+> `nullStr(e.Model)` fix stored `model = ''` instead of NULL when the upstream
+> reported no model, hiding them from the rater's `model_id IS NULL`
+> unattributable bucket. Reconcile once with:
+> `UPDATE billing_event SET model = NULL WHERE model = '';`
+
 > Note: the rater filters `billing_event` on `model_id` (the v2 price key). The
 > drainer's `billing_event` carries the metering identity verbatim; whichever
 > column the rating join keys on (`model_id`) must be populated by the upstream

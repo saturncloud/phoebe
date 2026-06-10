@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"fmt"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -40,9 +41,11 @@ type PostgresSink struct {
 	wg     sync.WaitGroup
 	stopCh chan struct{}
 
-	// dropped counts records dropped on channel overflow. Exposed via Dropped()
+	// dropped counts records LOST for any reason — channel overflow OR a failed
+	// INSERT (both lose the record just as completely). Exposed via Dropped()
 	// for observability; a steadily rising value means the sink can't keep up
-	// (raise WorkerCount/ChanBuf or lower the sample rate).
+	// (raise WorkerCount/ChanBuf or lower the sample rate) or the inserts are
+	// failing (check the warn logs for the error).
 	dropped atomic.Uint64
 }
 
@@ -139,8 +142,8 @@ func insertArgs(rec Record) []any {
 		nullStr(rec.ResourceID),
 		nullStr(rec.ResourceType),
 		nullStr(rec.Model),
-		rec.RequestBody,
-		rec.ResponseBody,
+		sanitizeBody(rec.RequestBody),
+		sanitizeBody(rec.ResponseBody),
 		rec.ResponseTruncated,
 		rec.StatusCode,
 		rec.Streamed,
@@ -156,6 +159,17 @@ func nullStr(s string) any {
 		return nil
 	}
 	return s
+}
+
+// sanitizeBody makes a captured body storable in a Postgres TEXT column:
+// Postgres rejects invalid UTF-8 outright and additionally rejects NUL (0x00)
+// even though it is a valid UTF-8 code point. Bodies are tenant-controlled
+// bytes, so either would fail the INSERT and silently lose the whole record —
+// sanitize instead. Invalid sequences become U+FFFD (a visible marker of where
+// bytes were mangled); NULs are removed (Postgres has no representable form).
+func sanitizeBody(s string) string {
+	s = strings.ToValidUTF8(s, "�")
+	return strings.ReplaceAll(s, "\x00", "")
 }
 
 // Log hands the record to the worker channel without blocking. On a full buffer
@@ -175,7 +189,8 @@ func (s *PostgresSink) Log(_ context.Context, rec Record) {
 	}
 }
 
-// Dropped returns the number of records dropped on overflow since start.
+// Dropped returns the number of records lost since start — dropped on channel
+// overflow or lost to a failed INSERT.
 func (s *PostgresSink) Dropped() uint64 { return s.dropped.Load() }
 
 // worker drains the channel and inserts each record.
@@ -203,12 +218,15 @@ func (s *PostgresSink) worker() {
 	}
 }
 
-// insert writes one record. On error it logs and drops (best-effort).
+// insert writes one record. On error it logs and drops (best-effort) — and
+// COUNTS the drop: a failed INSERT loses the record just as completely as a
+// channel overflow, and an uncounted loss is how capture gaps stay invisible.
 func (s *PostgresSink) insert(rec Record) {
 	ctx, cancel := context.WithTimeout(context.Background(), s.cfg.WriteTimeout)
 	defer cancel()
 	if _, err := s.db.ExecContext(ctx, s.insertQ, insertArgs(rec)...); err != nil {
-		s.log.Warn.Printf("iolog: insert request_id=%s: %v (dropped)", rec.RequestID, err)
+		n := s.dropped.Add(1)
+		s.log.Warn.Printf("iolog: insert request_id=%s: %v (dropped, total dropped=%d)", rec.RequestID, err, n)
 	}
 }
 

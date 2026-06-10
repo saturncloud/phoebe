@@ -104,6 +104,44 @@ func TestPostgresStore_UpsertRollsBackOnExecError(t *testing.T) {
 	}
 }
 
+// TestPostgresStore_EmptyModelStoredAsNull locks the anomaly-bucket contract:
+// an event whose upstream never reported a model (capture.Result.Model == "")
+// must bind model as NULL, not '' — the rater's unattributable predicate is
+// `model_id IS NULL`, and a stored '' would dodge it and be misreported as
+// UNPRICED (wrong runbook: "backfill prices" instead of "capture gap").
+func TestPostgresStore_EmptyModelStoredAsNull(t *testing.T) {
+	db, mock, err := sqlmock.New()
+	if err != nil {
+		t.Fatalf("sqlmock: %v", err)
+	}
+	defer db.Close()
+	store := NewPostgresStore(db)
+
+	mock.ExpectBegin()
+	mock.ExpectExec("INSERT INTO billing_event").
+		WithArgs(
+			"req-no-model", "auth-1", nil, nil, nil, nil,
+			nil, // model: "" must bind NULL
+			nil, 1, 0, 2, nil, nil, false, nil,
+		).
+		WillReturnResult(sqlmock.NewResult(0, 1))
+	mock.ExpectCommit()
+
+	err = store.Upsert(context.Background(), []metering.Event{{
+		RequestID:        "req-no-model",
+		AuthID:           "auth-1",
+		Model:            "", // upstream never reported a model
+		PromptTokens:     1,
+		CompletionTokens: 2,
+	}})
+	if err != nil {
+		t.Fatalf("Upsert: %v", err)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Fatalf("unmet expectations: %v", err)
+	}
+}
+
 // TestEventArgs_NullsEmptyIdentities locks the encoding contract: empty identity
 // strings bind as NULL (so billing GROUP BY auth_id never gets a spurious ""
 // bucket), token counts always bind (never nil), and event_ts is NULL when the

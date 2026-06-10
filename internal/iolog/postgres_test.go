@@ -136,6 +136,66 @@ func TestPostgresSink_InsertErrorDoesNotPanic(t *testing.T) {
 	}
 }
 
+// TestPostgresSink_NulAndInvalidUTF8BodySanitized verifies bodies are made
+// safe for Postgres TEXT before INSERT: PG rejects NUL bytes and invalid
+// UTF-8, and an insert that failed over tenant-controlled bytes would drop the
+// record. NULs are removed; invalid sequences become U+FFFD.
+func TestPostgresSink_NulAndInvalidUTF8BodySanitized(t *testing.T) {
+	cfg := DefaultConfig()
+	s, mock, db := newMockSink(t, cfg)
+	defer db.Close()
+
+	rec := sampleRecord("req-nul")
+	rec.RequestBody = "a\x00b"      // NUL byte: PG TEXT rejects it outright
+	rec.ResponseBody = "x\xff\xfey" // invalid UTF-8
+	mock.ExpectExec(regexp.QuoteMeta("INSERT INTO io_log")).
+		WithArgs(
+			rec.RequestID,
+			rec.AuthID,
+			sqlmock.AnyArg(),
+			rec.GroupID,
+			rec.ResourceID,
+			sqlmock.AnyArg(),
+			rec.Model,
+			"ab",  // NUL removed
+			"x�y", // the run of invalid bytes replaced with one U+FFFD
+			rec.ResponseTruncated,
+			rec.StatusCode,
+			rec.Streamed,
+			rec.LatencyMs,
+			sqlmock.AnyArg(),
+		).
+		WillReturnResult(sqlmock.NewResult(1, 1))
+
+	s.Log(context.Background(), rec)
+	if err := s.Close(context.Background()); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Errorf("unmet sqlmock expectations: %v", err)
+	}
+}
+
+// TestPostgresSink_InsertFailureCountsDropped verifies a failed INSERT is a
+// counted loss, not just a log line — an invisible drop is how capture gaps
+// hide. The dropped counter covers BOTH overflow and insert failure.
+func TestPostgresSink_InsertFailureCountsDropped(t *testing.T) {
+	cfg := DefaultConfig()
+	s, mock, db := newMockSink(t, cfg)
+	defer db.Close()
+
+	mock.ExpectExec(regexp.QuoteMeta("INSERT INTO io_log")).
+		WillReturnError(fmt.Errorf("invalid byte sequence for encoding \"UTF8\""))
+
+	s.Log(context.Background(), sampleRecord("req-fail"))
+	if err := s.Close(context.Background()); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+	if got := s.Dropped(); got != 1 {
+		t.Fatalf("Dropped() = %d after failed insert, want 1", got)
+	}
+}
+
 // ---- PostgresSink: async / non-blocking --------------------------------------
 
 // TestPostgresSink_LogIsNonBlocking verifies Log returns fast even when the

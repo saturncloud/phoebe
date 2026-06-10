@@ -23,9 +23,14 @@ type fakeStore struct {
 	rows     map[string]metering.Event // keyed by request_id — proves dedup
 	calls    int                       // number of Upsert invocations
 	failNext int                       // fail this many upcoming Upsert calls
+	failIDs  map[string]bool           // poison: any batch containing one of these request_ids fails
+	failAll  bool                      // outage: every Upsert fails
+	pingErr  error                     // outage: Ping result
 }
 
-func newFakeStore() *fakeStore { return &fakeStore{rows: map[string]metering.Event{}} }
+func newFakeStore() *fakeStore {
+	return &fakeStore{rows: map[string]metering.Event{}, failIDs: map[string]bool{}}
+}
 
 func (f *fakeStore) Upsert(_ context.Context, events []metering.Event) error {
 	f.mu.Lock()
@@ -34,6 +39,15 @@ func (f *fakeStore) Upsert(_ context.Context, events []metering.Event) error {
 	if f.failNext > 0 {
 		f.failNext--
 		return errors.New("fakeStore: induced failure")
+	}
+	if f.failAll {
+		return errors.New("fakeStore: store down")
+	}
+	// All-or-nothing like the real batch INSERT: one bad row fails the call.
+	for _, e := range events {
+		if f.failIDs[e.RequestID] {
+			return errors.New("fakeStore: bad row " + e.RequestID)
+		}
 	}
 	for _, e := range events {
 		// Idempotent on request_id: first write wins, duplicates are no-ops.
@@ -44,8 +58,12 @@ func (f *fakeStore) Upsert(_ context.Context, events []metering.Event) error {
 	return nil
 }
 
-func (f *fakeStore) Ping(context.Context) error { return nil }
-func (f *fakeStore) Close() error               { return nil }
+func (f *fakeStore) Ping(context.Context) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.pingErr
+}
+func (f *fakeStore) Close() error { return nil }
 
 func (f *fakeStore) rowCount() int {
 	f.mu.Lock()
@@ -364,6 +382,138 @@ func TestDrain_PoisonEntryIsDropped(t *testing.T) {
 	if p := pendingCount(t, rdb, cfg.StreamName, cfg.Group); p != 0 {
 		t.Fatalf("pending = %d, want 0 (poison must be ACK'd, not stuck)", p)
 	}
+}
+
+// TestDrain_PoisonRowIsolatedFromBatch proves one persistently-bad row cannot
+// wedge its batch: the batch INSERT fails, the row-at-a-time fallback stores
+// every good row, and the poison row is dropped (logged + counted) and ACK'd —
+// the stream fully drains instead of redelivering the batch forever.
+func TestDrain_PoisonRowIsolatedFromBatch(t *testing.T) {
+	_, rdb := startMiniredis(t)
+	cfg := testConfig(rdb.Options().Addr)
+	store := newFakeStore()
+	store.failIDs["poison-row"] = true
+
+	good := []string{"good-1", "good-2", "good-3", "good-4"}
+	xaddEvent(t, rdb, cfg.StreamName, sampleEvent(good[0]))
+	xaddEvent(t, rdb, cfg.StreamName, sampleEvent(good[1]))
+	xaddEvent(t, rdb, cfg.StreamName, sampleEvent("poison-row"))
+	xaddEvent(t, rdb, cfg.StreamName, sampleEvent(good[2]))
+	xaddEvent(t, rdb, cfg.StreamName, sampleEvent(good[3]))
+
+	d := New(cfg, testLogger(), rdb, store)
+	runUntil(t, d, func() bool {
+		return store.rowCount() == 4 && pendingCount(t, rdb, cfg.StreamName, cfg.Group) == 0
+	}, 2*time.Second)
+
+	store.mu.Lock()
+	for _, id := range good {
+		if _, ok := store.rows[id]; !ok {
+			t.Errorf("good row %q not stored — poison starved its batch", id)
+		}
+	}
+	_, poisonStored := store.rows["poison-row"]
+	store.mu.Unlock()
+	if poisonStored {
+		t.Error("poison row was stored, want dropped")
+	}
+	if p := pendingCount(t, rdb, cfg.StreamName, cfg.Group); p != 0 {
+		t.Fatalf("pending = %d, want 0 (poison must be ACK'd, never redelivered forever)", p)
+	}
+	if got := d.Poisoned(); got != 1 {
+		t.Fatalf("Poisoned() = %d, want 1 (loss must be counted)", got)
+	}
+}
+
+// TestDrain_AllGoodBatchFastPathSingleUpsert proves the poison fallback does
+// not change the common case: an all-good batch is stored with exactly ONE
+// batch Upsert call — no row-at-a-time statements.
+func TestDrain_AllGoodBatchFastPathSingleUpsert(t *testing.T) {
+	_, rdb := startMiniredis(t)
+	cfg := testConfig(rdb.Options().Addr)
+	store := newFakeStore()
+
+	for i := 0; i < 5; i++ {
+		xaddEvent(t, rdb, cfg.StreamName, sampleEvent("fast-"+string(rune('a'+i))))
+	}
+
+	d := New(cfg, testLogger(), rdb, store)
+	runUntil(t, d, func() bool {
+		return store.rowCount() == 5 && pendingCount(t, rdb, cfg.StreamName, cfg.Group) == 0
+	}, 2*time.Second)
+
+	store.mu.Lock()
+	calls := store.calls
+	store.mu.Unlock()
+	if calls != 1 {
+		t.Fatalf("Upsert called %d times for one all-good batch, want 1 (fast path)", calls)
+	}
+	if got := d.Poisoned(); got != 0 {
+		t.Fatalf("Poisoned() = %d, want 0", got)
+	}
+}
+
+// TestDrain_StoreOutageDuringFallbackDoesNotAck guards the fail-closed side of
+// poison isolation: when the store is DOWN, the batch failure and every
+// individual failure are an OUTAGE, not poison — nothing may be ACK'd (that
+// would silently drop a whole batch of billing data). The entries stay pending
+// and drain normally after the store recovers.
+func TestDrain_StoreOutageDuringFallbackDoesNotAck(t *testing.T) {
+	_, rdb := startMiniredis(t)
+	cfg := testConfig(rdb.Options().Addr)
+	store := newFakeStore()
+	store.failAll = true
+	store.pingErr = errors.New("store down")
+
+	xaddEvent(t, rdb, cfg.StreamName, sampleEvent("outage-1"))
+	xaddEvent(t, rdb, cfg.StreamName, sampleEvent("outage-2"))
+
+	// Phase 1: run against the dead store until the fallback has been tried
+	// (batch call + at least one individual call), then stop.
+	d := New(cfg, testLogger(), rdb, store)
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() { done <- d.Run(ctx) }()
+
+	deadline := time.After(2 * time.Second)
+	for {
+		store.mu.Lock()
+		tried := store.calls >= 2
+		store.mu.Unlock()
+		if tried {
+			break
+		}
+		select {
+		case <-deadline:
+			cancel()
+			<-done
+			t.Fatal("fallback was never attempted")
+		case <-time.After(2 * time.Millisecond):
+		}
+	}
+	cancel()
+	<-done
+
+	if got := store.rowCount(); got != 0 {
+		t.Fatalf("rows = %d, want 0 during outage", got)
+	}
+	if p := pendingCount(t, rdb, cfg.StreamName, cfg.Group); p != 2 {
+		t.Fatalf("pending = %d, want 2 (outage must NOT be misread as poison and ACK'd)", p)
+	}
+	if got := d.Poisoned(); got != 0 {
+		t.Fatalf("Poisoned() = %d, want 0 — outage rows are not poison", got)
+	}
+
+	// Phase 2: store recovers; the un-ACK'd entries must redeliver and land.
+	store.mu.Lock()
+	store.failAll = false
+	store.pingErr = nil
+	store.mu.Unlock()
+
+	d2 := New(cfg, testLogger(), rdb, store)
+	runUntil(t, d2, func() bool {
+		return store.rowCount() == 2 && pendingCount(t, rdb, cfg.StreamName, cfg.Group) == 0
+	}, 2*time.Second)
 }
 
 // TestEnsureGroup_Idempotent proves ensureGroup tolerates BUSYGROUP (already
