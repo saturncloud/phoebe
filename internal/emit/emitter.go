@@ -17,7 +17,7 @@ import (
 // ladder:
 //
 //  1. Valkey Streams (XADD) — hot buffer, async, non-blocking
-//  2. Local-disk WAL — fsync'd JSONL, survives Valkey outages
+//  2. Local-disk WAL — fsync'd sequential log (tidwall/wal), survives Valkey outages
 //  3. Structured log — last resort if disk also fails; log pipeline can recover
 //
 // Emit is always non-blocking: it hands the event to an internal channel and
@@ -35,6 +35,11 @@ type DurableEmitter struct {
 	now    func() time.Time
 	wg     sync.WaitGroup
 	stopCh chan struct{}
+
+	// shipFn ships one batch to Valkey, returning true iff ALL events landed.
+	// Defaults to shipBatch; tests inject failures here to exercise the
+	// drain's partial-progress behaviour without timing games.
+	shipFn func([]metering.Event) bool
 }
 
 // New creates and starts a DurableEmitter.
@@ -47,7 +52,7 @@ func New(cfg Config, log *logging.Logger, rdb redis.Cmdable) (*DurableEmitter, e
 		return nil, fmt.Errorf("emit.New: logger must not be nil")
 	}
 
-	w, err := openWAL(cfg.WALPath)
+	w, err := openWAL(cfg.WALPath, log)
 	if err != nil {
 		return nil, fmt.Errorf("emit.New: %w", err)
 	}
@@ -61,6 +66,7 @@ func New(cfg Config, log *logging.Logger, rdb redis.Cmdable) (*DurableEmitter, e
 		now:    time.Now,
 		stopCh: make(chan struct{}),
 	}
+	e.shipFn = e.shipBatch
 
 	n := cfg.WorkerCount
 	if n <= 0 {
@@ -226,82 +232,47 @@ func (e *DurableEmitter) shipper() {
 	}
 }
 
-// drainWAL rotates the WAL aside to an immutable snapshot, ships every event in
-// the snapshot to Valkey, and deletes the snapshot on full success. Rotation (vs
-// read-then-truncate) is what makes this lossless: appends concurrent with the
-// network ship land in the fresh WAL, never in the snapshot being shipped, so a
-// successful drop can never destroy an unshipped event. Partial success leaves
-// the snapshot in place to be re-shipped next tick — at-least-once delivery,
-// deduped at the consumer by request_id.
+// drainWAL ships the WAL's unshipped entries to Valkey in ShipBatchSize
+// batches, truncating after EACH successfully shipped batch — so progress made
+// before a mid-drain failure is retained, never re-done wholesale. On a ship
+// failure it stops: the remaining entries stay in the log and the next tick
+// resumes from the watermark. Entries are only ever reclaimed after their
+// batch is confirmed shipped, and concurrent appends land at higher indexes
+// that truncation never touches — loss during a drain is structurally
+// impossible. Delivery is at-least-once; the drainer dedups on request_id.
 func (e *DurableEmitter) drainWAL() {
 	if e.rdb == nil {
 		return
 	}
 
-	// Re-ship any snapshot orphaned by a crash between rotate and drop.
-	if snap := e.wal.recoverRotated(); snap != "" {
-		e.shipSnapshot(snap)
-	}
-
-	events, snapPath, err := e.wal.rotate()
-	if err != nil {
-		e.log.Error.Printf("emit: wal rotate: %v", err)
-		// rotate may still have produced a snapshot + a prefix of events; if so,
-		// fall through to ship what we got rather than abandon them.
-		if snapPath == "" {
-			return
-		}
-	}
-	if snapPath == "" || len(events) == 0 {
-		return
-	}
-	e.shipRotated(events, snapPath)
-}
-
-// shipRotated ships the events from a freshly-rotated snapshot and drops the
-// snapshot file on full success.
-func (e *DurableEmitter) shipRotated(events []metering.Event, snapPath string) {
 	batchSize := e.cfg.ShipBatchSize
 	if batchSize <= 0 {
 		batchSize = 256
 	}
 
-	allShipped := true
-	for i := 0; i < len(events); i += batchSize {
-		end := i + batchSize
-		if end > len(events) {
-			end = len(events)
+	for {
+		events, through, skipped, err := e.wal.pending(batchSize)
+		if err != nil {
+			e.log.Error.Printf("emit: wal read for drain: %v", err)
+			return
 		}
-		if !e.shipBatch(events[i:end]) {
-			allShipped = false
-			break
+		if skipped > 0 {
+			e.log.Error.Printf("emit: wal drain: skipped %d corrupt entries (undecodable; truncating past them)", skipped)
+		}
+		if through == 0 {
+			return // nothing unshipped
+		}
+		if len(events) > 0 && !e.shipFn(events) {
+			return // ship failed — entries remain; next tick resumes here
+		}
+		if err := e.wal.markShipped(through); err != nil {
+			e.log.Error.Printf("emit: wal truncate after ship: %v", err)
+			return
+		}
+		if len(events) > 0 {
+			e.log.Info.Printf("emit: wal drained batch (%d events shipped)", len(events))
 		}
 	}
-
-	if allShipped {
-		if err := e.wal.dropRotated(snapPath); err != nil {
-			e.log.Error.Printf("emit: wal drop snapshot after drain: %v", err)
-		} else {
-			e.log.Info.Printf("emit: wal drained (%d events shipped)", len(events))
-		}
-	}
-}
-
-// shipSnapshot reads an orphaned snapshot file (left by a crash between rotate
-// and drop) and re-ships it, dropping it on full success. Best-effort: a read
-// error logs and leaves the file for the next attempt.
-func (e *DurableEmitter) shipSnapshot(snapPath string) {
-	events, err := readEventsAt(snapPath)
-	if err != nil {
-		e.log.Error.Printf("emit: read orphaned snapshot %s: %v", snapPath, err)
-		return
-	}
-	if len(events) == 0 {
-		_ = e.wal.dropRotated(snapPath)
-		return
-	}
-	e.log.Info.Printf("emit: recovering %d events from orphaned wal snapshot", len(events))
-	e.shipRotated(events, snapPath)
 }
 
 // shipBatch ships a slice of events to Valkey. Returns true iff ALL succeeded.
