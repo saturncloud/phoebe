@@ -106,8 +106,8 @@ func TestPostgresStore_UpsertRollsBackOnExecError(t *testing.T) {
 
 // TestPostgresStore_EmptyModelStoredAsNull locks the anomaly-bucket contract:
 // an event whose upstream never reported a model (capture.Result.Model == "")
-// must bind model as NULL, not '' — the rater's unattributable predicate is
-// `model_id IS NULL`, and a stored '' would dodge it and be misreported as
+// must bind model as NULL, not ” — the rater's unattributable predicate is
+// `model_id IS NULL`, and a stored ” would dodge it and be misreported as
 // UNPRICED (wrong runbook: "backfill prices" instead of "capture gap").
 func TestPostgresStore_EmptyModelStoredAsNull(t *testing.T) {
 	db, mock, err := sqlmock.New()
