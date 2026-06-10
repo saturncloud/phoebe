@@ -8,6 +8,7 @@ import (
 	"net/url"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -127,6 +128,111 @@ func TestProxyBillingGate(t *testing.T) {
 			}
 			if tt.wantStatus == http.StatusBadRequest && len(em.all()) != 0 {
 				t.Fatalf("rejected request should emit no billing event, got %d", len(em.all()))
+			}
+		})
+	}
+}
+
+// TestProxyRequestID_GeneratedWhenAbsent guards the served-but-never-billed
+// hole: X-Request-Id is client-controlled and the drainer poison-drops events
+// with an empty request_id, so a client that simply omits the header must NOT
+// escape billing. The proxy generates an id, uses it on the metering event,
+// forwards it upstream, and echoes it to the client for correlation.
+func TestProxyRequestID_GeneratedWhenAbsent(t *testing.T) {
+	var mu sync.Mutex
+	var upstreamSaw string
+	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		upstreamSaw = r.Header.Get("X-Request-Id")
+		mu.Unlock()
+		_, _ = w.Write([]byte(`{"model":"m1","choices":[{"finish_reason":"stop"}],"usage":{"prompt_tokens":1,"completion_tokens":2,"total_tokens":3}}`))
+	}))
+	defer backend.Close()
+	upstream, _ := url.Parse(backend.URL)
+	em := &recordingEmitter{}
+	srv := newTestServerE(t, upstream, em)
+
+	rr := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions",
+		strings.NewReader(`{"model":"m","messages":[]}`))
+	req.Header.Set(identity.HeaderAuthID, "auth-1")
+	req.Header.Set(identity.HeaderResourceID, "model-abc")
+	// Deliberately NO X-Request-Id.
+	srv.Handler().ServeHTTP(rr, req)
+
+	if rr.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200 (absent id must be generated, not rejected)", rr.Code)
+	}
+	events := em.waitForEvents(1, 2*time.Second)
+	if len(events) != 1 {
+		t.Fatalf("expected 1 metering event, got %d", len(events))
+	}
+	id := events[0].RequestID
+	if !strings.HasPrefix(id, "phoebe-") || len(id) != len("phoebe-")+32 {
+		t.Fatalf("generated request id = %q, want phoebe-<32 hex>", id)
+	}
+	if !validRequestID(id) {
+		t.Fatalf("generated id %q fails our own validity gate", id)
+	}
+	mu.Lock()
+	saw := upstreamSaw
+	mu.Unlock()
+	if saw != id {
+		t.Fatalf("upstream saw request id %q, event has %q — correlation broken", saw, id)
+	}
+	if got := rr.Header().Get("X-Request-Id"); got != id {
+		t.Fatalf("response X-Request-Id = %q, want %q (client must learn the generated id)", got, id)
+	}
+}
+
+// TestProxyRequestID_RejectsInvalid is the fail-closed gate on the billing
+// idempotency PK: an oversize id would poison the drainer's batch INSERT
+// (VARCHAR(255)), and non-printable bytes are a billing-integrity attack, not
+// a normal request. Invalid ids get a 400 before any upstream work and emit
+// no billing event.
+func TestProxyRequestID_RejectsInvalid(t *testing.T) {
+	tests := []struct {
+		name       string
+		requestID  string
+		wantStatus int
+	}{
+		{"valid passes", "req-abc.123_OK", http.StatusOK},
+		{"max length passes", strings.Repeat("a", 200), http.StatusOK},
+		{"over max length rejected", strings.Repeat("a", 201), http.StatusBadRequest},
+		{"space rejected", "req 123", http.StatusBadRequest},
+		{"control byte rejected", "req\x01id", http.StatusBadRequest},
+		{"DEL byte rejected", "req\x7fid", http.StatusBadRequest},
+		{"non-ASCII rejected", "rëq-1", http.StatusBadRequest},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			var upstreamHits int32
+			backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				atomic.AddInt32(&upstreamHits, 1)
+				_, _ = w.Write([]byte(`{"ok":true}`))
+			}))
+			defer backend.Close()
+			upstream, _ := url.Parse(backend.URL)
+			em := &recordingEmitter{}
+			srv := newTestServerE(t, upstream, em)
+
+			rr := httptest.NewRecorder()
+			req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", nil)
+			req.Header.Set(identity.HeaderAuthID, "auth-1")
+			req.Header.Set(identity.HeaderResourceID, "model-abc")
+			req.Header.Set("X-Request-Id", tt.requestID)
+			srv.Handler().ServeHTTP(rr, req)
+
+			if rr.Code != tt.wantStatus {
+				t.Fatalf("status = %d, want %d", rr.Code, tt.wantStatus)
+			}
+			if tt.wantStatus == http.StatusBadRequest {
+				if n := atomic.LoadInt32(&upstreamHits); n != 0 {
+					t.Fatalf("invalid id reached upstream %d times, want 0 (reject before forwarding)", n)
+				}
+				if got := em.count(); got != 0 {
+					t.Fatalf("rejected request emitted %d billing events, want 0", got)
+				}
 			}
 		})
 	}
