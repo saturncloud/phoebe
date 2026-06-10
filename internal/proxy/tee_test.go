@@ -9,6 +9,7 @@ import (
 	"sync/atomic"
 	"testing"
 	"time"
+	"unicode/utf8"
 
 	"github.com/saturncloud/phoebe/internal/capture"
 )
@@ -172,6 +173,39 @@ func TestTeeAbortFinalizes(t *testing.T) {
 	}
 	if got.UsageFound {
 		t.Fatal("partial stream should not have usage")
+	}
+}
+
+// TestTeeBodyLogTruncationKeepsRuneBoundary guards the M5 capture contract
+// with Postgres: when the body-log cap lands mid-rune, the buffered copy must
+// back up to a rune boundary so it stays valid UTF-8 — a split multibyte rune
+// would make the io_log TEXT insert fail and drop the whole record.
+func TestTeeBodyLogTruncationKeepsRuneBoundary(t *testing.T) {
+	body := "abc日本語テキスト" // 3 ASCII bytes then 3-byte runes
+	cr := newCaptureReader(context.Background(), io.NopCloser(strings.NewReader(body)), false, func(capture.Result) {})
+	// Cap of 5 lands two bytes INTO the 3-byte rune 日 (bytes 3..5).
+	cr.enableBodyLog(5)
+	if _, err := io.ReadAll(cr); err != nil {
+		t.Fatalf("read: %v", err)
+	}
+	_ = cr.Close()
+
+	got, truncated := cr.capturedBody()
+	if !truncated {
+		t.Fatal("body over cap must be flagged truncated")
+	}
+	if !utf8.ValidString(got) {
+		t.Fatalf("truncated body is invalid UTF-8: %q — would fail the Postgres TEXT insert", got)
+	}
+	if got != "abc" {
+		t.Fatalf("captured body = %q, want %q (cut backed up to the rune start)", got, "abc")
+	}
+
+	// Once truncated, nothing more may be appended (the boundary backup leaves
+	// headroom below the cap; it must not be refilled by later reads).
+	cr.appendLog([]byte("ZZZ"))
+	if after, _ := cr.capturedBody(); after != got {
+		t.Fatalf("appendLog after truncation grew the buffer: %q -> %q", got, after)
 	}
 }
 

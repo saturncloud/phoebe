@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"io"
 	"sync"
+	"unicode/utf8"
 
 	"github.com/saturncloud/phoebe/internal/capture"
 	"github.com/saturncloud/phoebe/internal/metering"
@@ -118,7 +119,7 @@ func (c *captureReader) capturedBody() (body string, truncated bool) {
 // bounded COPY for the log. Once the cap is hit we stop appending and flag
 // truncation — we never grow logBuf unbounded on a large/streamed response.
 func (c *captureReader) appendLog(p []byte) {
-	if c.logBuf == nil {
+	if c.logBuf == nil || c.logTruncated {
 		return
 	}
 	remaining := c.logCap - c.logBuf.Len()
@@ -127,7 +128,18 @@ func (c *captureReader) appendLog(p []byte) {
 		return
 	}
 	if len(p) > remaining {
-		c.logBuf.Write(p[:remaining])
+		// Truncating at a raw byte offset can split a multibyte rune, leaving
+		// the buffered copy invalid UTF-8 — which Postgres TEXT rejects, so
+		// the whole io_log record would later fail to insert over a log
+		// artifact. Back up to the rune start (a rune spans at most utf8.UTFMax
+		// bytes, so at most 3 continuation bytes precede the cut; non-UTF-8
+		// payloads bound the backup the same way and are sanitised at the
+		// sink instead).
+		cut := remaining
+		for cut > 0 && remaining-cut < utf8.UTFMax-1 && !utf8.RuneStart(p[cut]) {
+			cut--
+		}
+		c.logBuf.Write(p[:cut])
 		c.logTruncated = true
 		return
 	}
