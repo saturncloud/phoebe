@@ -34,6 +34,9 @@ registry:
 
 # Durable metering emit (M2). Valkey Streams hot path → local-disk WAL fallback
 # → structured-log floor. Leave valkeyAddr empty to run WAL-only.
+# walPath is a DIRECTORY (tidwall/wal segment log); the historical .jsonl name
+# is kept on purpose — a pre-upgrade single-file JSONL WAL found at this exact
+# path is auto-imported on startup and renamed aside to "<walPath>.imported".
 emit:
   valkeyAddr: "localhost:6379"
   streamName: "phoebe:metering"

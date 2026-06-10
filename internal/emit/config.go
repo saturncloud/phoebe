@@ -2,7 +2,7 @@
 // three-level durability ladder:
 //
 //  1. Valkey/Redis Streams (hot buffer, async, low-latency)
-//  2. Local-disk WAL (append-only JSONL, fsync'd, for when Valkey is down)
+//  2. Local-disk WAL (fsync'd sequential log via tidwall/wal, for when Valkey is down)
 //  3. Structured log (last resort if even the WAL fails)
 //
 // Emit is always non-blocking from the caller's perspective; background workers
@@ -29,20 +29,25 @@ type Config struct {
 	// Set lower in tests to avoid slow retries when Valkey is down.
 	XADDTimeout time.Duration
 
-	// WAL settings
-	WALPath       string        // path of the append-only JSONL file
+	// WAL settings.
+	// WALPath is the WAL DIRECTORY (tidwall/wal is directory-based). A legacy
+	// single-file JSONL WAL found at this exact path is imported into the new
+	// log on startup and renamed aside to "<path>.imported".
+	WALPath       string
 	ShipInterval  time.Duration // how often the shipper retries draining the WAL
-	ShipBatchSize int           // max events per drain pass
+	ShipBatchSize int           // max events per ship batch during a drain
 }
 
 // DefaultConfig returns a Config with safe, production-ready defaults.
 func DefaultConfig() Config {
 	return Config{
-		ValkeyAddr:    "localhost:6379",
-		StreamName:    "phoebe:metering",
-		StreamMaxLen:  1_000_000,
-		WorkerCount:   4,
-		ChanBuf:       8192,
+		ValkeyAddr:   "localhost:6379",
+		StreamName:   "phoebe:metering",
+		StreamMaxLen: 1_000_000,
+		WorkerCount:  4,
+		ChanBuf:      8192,
+		// Kept at the historical file path on purpose: it is now the WAL
+		// directory, and a pre-upgrade JSONL file found here is auto-imported.
 		WALPath:       "/tmp/phoebe-metering-wal.jsonl",
 		ShipInterval:  5 * time.Second,
 		ShipBatchSize: 256,

@@ -145,15 +145,26 @@ Phoebe.Emit (non-blocking, off hot path)
     Do not "fix" *this* by demanding durable per-replica storage; that re-couples
     Phoebe to stateful infra for no benefit.
   - *A live, healthy pod silently dropping an event during a drain is a bug, not a
-    tolerated loss.* The drain therefore **rotates, it does not truncate**: it
-    atomically renames the WAL aside to a `.draining` snapshot and opens a fresh
-    WAL, then ships the snapshot and deletes it on success. An append concurrent
-    with the (network) ship lands in the fresh WAL, never in the snapshot — so a
-    successful drop can never destroy an unshipped event. A read-then-`Truncate(0)`
-    would have zeroed exactly those concurrent appends, which during a Valkey
-    outage (when the WAL is hot) is continuous. A snapshot orphaned by a crash
-    mid-ship is re-shipped on the next tick (at-least-once; consumer dedups on
-    `request_id`). See `internal/emit/wal.go` `rotate`/`dropRotated`/`recoverRotated`.
+    tolerated loss.* The WAL is **`github.com/tidwall/wal`** (chosen over the
+    earlier hand-rolled file: small, MIT-licensed, widely tested, go1.13 — and
+    the hand-rolled rotate-to-snapshot scheme had real loss modes: a fixed
+    snapshot path that a later rotation clobbered during multi-tick outages,
+    whole-snapshot deletion after partial reads, and a 64KB line limit).
+    Entries are appended at strictly increasing indexes (fsync per write); the
+    shipper reads unshipped entries in batches and reclaims space with
+    `TruncateFront` **only after each batch is confirmed shipped**, advancing a
+    shipped-through watermark. Loss during a drain is structurally impossible:
+    an entry is only ever deleted by truncation behind the confirmed-shipped
+    index, and an append concurrent with the (network) ship lands at a higher
+    index that the truncation never touches. Partial-outage progress is kept
+    batch-by-batch rather than all-or-nothing. One wrinkle: tidwall/wal cannot
+    truncate to empty, so a fully-shipped log retains its final entry and the
+    watermark lives in memory — after a restart that single entry is re-shipped
+    once (at-least-once; consumer dedups on `request_id`). A WAL directory that
+    fails to open is quarantined aside to `<dir>.corrupt.<ts>` (bounded, loudly
+    logged loss — serving is never blocked by a corrupt buffer), and a legacy
+    single-file JSONL WAL found at the configured path is auto-imported on
+    upgrade. See `internal/emit/wal.go` `append`/`pending`/`markShipped`.
 
 **Status:** Valkey emit + WAL + log floor are BUILT (`internal/emit`). The
 Postgres drainer and reconciliation are NOT yet built (see §8).
