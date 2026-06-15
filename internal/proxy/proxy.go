@@ -251,11 +251,19 @@ func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request) {
 		// Cap the LOGGED request-body copy at the same bound as the response copy
 		// (s.ioMaxBodyLen) — an uncapped body flows into to_tsvector and fails the
 		// INSERT past ~1 MiB. The forwarded request keeps the full body.
-		reqBody, reqTruncated, err = captureRequestBody(r, s.ioMaxBodyLen)
+		var reqOrigLen int
+		reqBody, reqTruncated, reqOrigLen, err = captureRequestBody(r, s.ioMaxBodyLen)
 		if err != nil {
 			s.log.Error.Printf("capture request body: %v", err)
 			http.Error(w, "bad request body", http.StatusBadRequest)
 			return
+		}
+		// Hard truncation is intentional (an uncapped body fails the to_tsvector
+		// INSERT), but make it OBSERVABLE: an operator should be able to see that
+		// a captured body was cut, and by how much.
+		if reqTruncated {
+			s.log.Warn.Printf("iolog: request body truncated for capture request_id=%s (%d → %d bytes)",
+				requestID, reqOrigLen, s.ioMaxBodyLen)
 		}
 	}
 
