@@ -1,7 +1,7 @@
 //go:build integration
 
 // Package rating integration test: runs the REAL v2 rating SQL (resolvedEventsCTE
-// + rateWindowSQL + countAnomaliesSQL) against a LIVE Postgres, then asserts the
+// + rateWindowSQL) against a LIVE Postgres, then asserts the
 // rated_usage rows the SQL wrote equal the pure Rate() oracle row-for-row over the
 // same fixture. This is the production-path half of the conformance pair (the
 // in-Go model lives in rater_test.go's TestConformance_SQLModelMatchesRateOracle).
@@ -151,15 +151,6 @@ func TestIntegration_RateWindow_ConformsToOracle(t *testing.T) {
 	}
 
 	store := NewPostgresStore(db)
-
-	// CountAnomalies (the ad-hoc/ops query) still agrees: 1 unpriced + 1 unattr.
-	an, err := store.CountAnomalies(ctx, hour, hour.Add(time.Hour))
-	if err != nil {
-		t.Fatalf("CountAnomalies: %v", err)
-	}
-	if an.UnpricedEvents != 1 || an.UnattributableEvents != 1 {
-		t.Fatalf("anomalies = %+v, want 1/1", an)
-	}
 
 	// Run the REAL rating SQL. The anomaly counts ride the SAME statement.
 	res, err := store.RateWindow(ctx, hour, hour.Add(time.Hour))

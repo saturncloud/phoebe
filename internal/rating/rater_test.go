@@ -21,9 +21,8 @@ type oracleStore struct {
 	book   *PriceBook
 	events []RatedEvent
 
-	table      map[rollupKey]oracleRollup // natural key → row
-	rateCalls  int
-	countCalls int
+	table     map[rollupKey]oracleRollup // natural key → row
+	rateCalls int
 }
 
 type rollupKey struct {
@@ -114,12 +113,6 @@ func (s *oracleStore) RateWindow(_ context.Context, start, end time.Time) (RateR
 		res.TotalCost = "0.000000000"
 	}
 	return res, nil
-}
-
-func (s *oracleStore) CountAnomalies(_ context.Context, start, end time.Time) (Anomalies, error) {
-	s.countCalls++
-	_, an := s.resolveWindow(start.UTC(), end.UTC())
-	return an, nil
 }
 
 func testLogger() *logging.Logger { return logging.New(logging.ERROR) }
@@ -416,11 +409,6 @@ func TestConformance_SQLModelMatchesRateOracle(t *testing.T) {
 	if got := res.EventsRated + res.UnpricedEvents + res.UnattributableEvents; got != int64(len(events)) {
 		t.Fatalf("rated(%d) + unpriced(%d) + unattributable(%d) = %d, want %d (every in-window event accounted exactly once)",
 			res.EventsRated, res.UnpricedEvents, res.UnattributableEvents, got, len(events))
-	}
-	// The fail-loud counts must come from RateWindow's snapshot, not a separate
-	// CountAnomalies statement (which could see a different snapshot).
-	if store.countCalls != 0 {
-		t.Fatalf("Run called CountAnomalies %d times, want 0 (counts must come from the rating statement's snapshot)", store.countCalls)
 	}
 	if res.RollupsWritten != int64(len(want)) {
 		t.Fatalf("rollups = %d, want %d", res.RollupsWritten, len(want))

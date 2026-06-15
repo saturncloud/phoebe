@@ -30,12 +30,8 @@ import (
 //     be excluded from the rollups yet missed by the anomaly counts (two separate
 //     READ COMMITTED statements could disagree exactly that way). Anomalous rows are
 //     NEVER summed into a rollup; they are counted and surfaced.
-//   - CountAnomalies re-counts the anomalies for an arbitrary window (ad-hoc / ops
-//     use). The rater's fail-loud contract does NOT depend on it — Run gets its
-//     counts from RateWindow's single snapshot.
 type Store interface {
 	RateWindow(ctx context.Context, start, end time.Time) (RateResult, error)
-	CountAnomalies(ctx context.Context, start, end time.Time) (Anomalies, error)
 	Ping(ctx context.Context) error
 	Close() error
 }
@@ -58,8 +54,10 @@ type RateResult struct {
 }
 
 // Anomalies are the fail-loud counts for a window: events that could not be priced
-// and rows that could not be attributed. Both drive the exit-nonzero path. int64
-// to match RateResult's widened counts (a wide backfill window can exceed 2^31).
+// and rows that could not be attributed. Both drive the exit-nonzero path. They
+// ride RateWindow's single snapshot (RateResult carries the same two counts); this
+// named pair is the resolve-pass result the test oracle mirrors. int64 to match
+// RateResult's widened counts (a wide backfill window can exceed 2^31).
 type Anomalies struct {
 	UnpricedEvents       int64
 	UnattributableEvents int64
@@ -126,10 +124,10 @@ func (s *PostgresStore) Close() error                   { return s.db.Close() }
 
 // resolvedEventsCTE is the heart of the v2 rater: a CTE that, for every
 // billing_event row in [$1, $2), resolves the effective per-token rate and the
-// per-event cost ENTIRELY IN SQL. It is shared verbatim by rateWindowSQL (which
-// SUMs and upserts the priced rows AND counts the rows that did NOT resolve, in
-// one statement/snapshot) and countAnomaliesSQL (the ad-hoc/ops counting query),
-// so the two ALWAYS agree on what "priced" means.
+// per-event cost ENTIRELY IN SQL. It is consumed by rateWindowSQL, which SUMs and
+// upserts the priced rows AND counts the rows that did NOT resolve in one
+// statement/snapshot, so the rollups and the anomaly counts always agree on what
+// "priced" means.
 //
 // Resolution, AS-OF each event's rating instant ev_ts = COALESCE(event_ts,
 // created_at):
@@ -399,43 +397,4 @@ func (s *PostgresStore) RateWindow(ctx context.Context, start, end time.Time) (R
 	}
 	res.TotalCost = total
 	return res, nil
-}
-
-// countAnomaliesSQL appends, to the resolution CTE, a single counting query over
-// the SAME window and SAME resolution: events that could NOT be priced (resolution
-// returned NULL rates) among ATTRIBUTABLE rows, and rows that are UNATTRIBUTABLE
-// (NULL auth_id/model_id). It shares resolvedEventsCTE with the rating insert so
-// "unpriced" means exactly the same thing in both.
-//
-// NOTE: the rater's fail-loud contract does NOT use this — Run gets its anomaly
-// counts from rateWindowSQL's single snapshot (a separate statement could miss a
-// row committed between the two). This query exists for ad-hoc / ops inspection of
-// a window without writing rollups.
-//
-// An unattributable row cannot be priced either, but it is counted ONLY as
-// unattributable (the distinct, more-specific signal) so the two counts don't
-// double-attribute the same row.
-const countAnomaliesSQL = resolvedEventsCTE + `
-SELECT
-    COUNT(*) FILTER (
-        WHERE prompt_price IS NULL
-          AND auth_id  IS NOT NULL
-          AND model_id IS NOT NULL
-    )::int AS unpriced,
-    COUNT(*) FILTER (
-        WHERE auth_id IS NULL OR model_id IS NULL
-    )::int AS unattributable
-FROM resolved`
-
-// CountAnomalies counts the fail-loud signals for [start, end): unpriced events and
-// unattributable rows. Nonzero either way drives the exit-nonzero / loud-log path.
-func (s *PostgresStore) CountAnomalies(ctx context.Context, start, end time.Time) (Anomalies, error) {
-	var a Anomalies
-	err := s.db.QueryRowContext(ctx, countAnomaliesSQL, start.UTC(), end.UTC()).
-		Scan(&a.UnpricedEvents, &a.UnattributableEvents)
-	if err != nil {
-		return Anomalies{}, fmt.Errorf("rating: count anomalies [%s,%s): %w",
-			start.UTC().Format(time.RFC3339), end.UTC().Format(time.RFC3339), err)
-	}
-	return a, nil
 }
