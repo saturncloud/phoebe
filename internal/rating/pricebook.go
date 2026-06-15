@@ -212,13 +212,26 @@ func buildPriceBook(f PriceFile, fineTunes map[string]fineTuneEntry) (*PriceBook
 		}
 	}
 
-	// Every declared derived_from must point at a known base — one hop only. A
-	// fine-tune deriving from another fine-tune (a base that is itself derived and
-	// has no own rate) is rejected at load: v1 never recurses, and a dangling base
-	// would silently make the fine-tune unpriceable.
+	// Every declared derived_from must point at a TRUE derivation base — one hop only
+	// (E3). Two failure modes are rejected at LOAD:
+	//   - a dangling target (not in pb.base): the fine-tune would be unpriceable; and
+	//   - a target that IS in pb.base but is itself a fine-tune — an own-rate ft: entry,
+	//     or another derivedFrom key. An own-rate fine-tune lives in pb.base, so a bare
+	//     presence check would ACCEPT `ft:child derived_from: ft:ownrate` (a fine-tune of
+	//     a fine-tune); with a small premium that derived rate can bill $0, and the
+	//     round-to-zero guard (validateDerivedRatesNonZero) iterates only TRUE bases, so
+	//     it never covers that key. isDerivationBase is the single one-hop predicate the
+	//     SQL projection (derivedRates) and the oracle (ResolveEvent) already share; the
+	//     loader must enforce it too, or the file-declared path is a second hop the
+	//     event path forbids. Closing it here ALSO closes the $0-derived-fine-tune hole:
+	//     a file-declared derived_from can then only point at a true base, so its derived
+	//     projection IS covered by validateDerivedRatesNonZero below.
 	for ft, base := range pb.derivedFrom {
 		if _, ok := pb.base[base]; !ok {
 			return nil, fmt.Errorf("rating: fine_tunes[%q] derived_from %q which is not a priced base model", ft, base)
+		}
+		if !isDerivationBase(base, pb.derivedFrom) {
+			return nil, fmt.Errorf("rating: fine_tunes[%q] derived_from %q which is itself a fine-tune; E3 allows ONE hop only — derive from a true base model", ft, base)
 		}
 	}
 

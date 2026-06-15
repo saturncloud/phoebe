@@ -224,6 +224,32 @@ fine_tune_premium:
 		}
 	}
 
+	// FILE-DECLARED derived_from path (FIX 1): a fine-tune declaring derived_from a TRUE
+	// base, with a premium that zeroes the base, must ALSO be rejected. Before FIX 1 the
+	// round-to-zero guard only iterated true bases via validateDerivedRatesNonZero, which
+	// it still does — but the point here is that once the one-hop loader gap is closed a
+	// file-declared derived_from can ONLY point at a true base, so this derived projection
+	// IS covered. factor "0" drives the base to a derived $0 → REJECT.
+	rejectDerivedFromZeroed := `
+version: 1
+base_models:
+  "base":
+    prompt:     "0.000003"
+    cached:     "0.0000003"
+    completion: "0.00001"
+fine_tunes:
+  "ft:child":
+    derived_from: "base"
+fine_tune_premium:
+  policy: multiplier
+  factor: "0"
+`
+	if _, err := ParsePriceBook([]byte(rejectDerivedFromZeroed)); err == nil {
+		t.Errorf("derived_from-a-true-base with a factor-0 premium loaded; want rejection (every ft: of that base would bill $0)")
+	} else if !strings.Contains(err.Error(), "rounds to $0") {
+		t.Errorf("derived_from-zeroed: err = %v, want a round-to-$0 rejection", err)
+	}
+
 	// LEGIT loads: each keeps an intended-nonzero (or intentionally free) derived rate.
 	for _, tc := range []struct{ name, yaml string }{
 		{
@@ -285,6 +311,78 @@ fine_tune_premium:
 		if _, err := ParsePriceBook([]byte(tc.yaml)); err != nil {
 			t.Errorf("%s: load failed, want success: %v", tc.name, err)
 		}
+	}
+}
+
+// TestLoad_FineTuneDerivingFromFineTuneRejected (one-hop-loader-rejects-ft-of-ft):
+// FIX 1 — the one-hop rule on the FILE-DECLARED derived_from path. Before this fix the
+// loader only checked that a derived_from target was PRESENT in pb.base, but an own-rate
+// fine-tune IS in pb.base — so `ft:child derived_from: ft:ownrate` (a fine-tune deriving
+// from a fine-tune) was ACCEPTED, and with a small premium it bills $0, never caught by
+// the round-to-zero guard (which iterates only true bases). The loader must reject a
+// derived_from whose target is itself a fine-tune (an own-rate ft:, or a derivedFrom key):
+// E3 allows ONE hop only — derive from a TRUE base model. This closes the $0-derived-
+// fine-tune hole at LOAD, never at bill time.
+func TestLoad_FineTuneDerivingFromFineTuneRejected(t *testing.T) {
+	// ft:child derives from ft:ownrate (an own-rate fine-tune) → a SECOND hop. Reject.
+	const ftOfOwnRateFt = `
+version: 1
+base_models:
+  "meta-llama/Llama-3.1-8B-Instruct":
+    prompt:     "0.000004"
+    cached:     "0"
+    completion: "0"
+fine_tunes:
+  "ft:ownrate":
+    rate:
+      prompt:     "0.00001"
+      cached:     "0"
+      completion: "0"
+  "ft:child":
+    derived_from: "ft:ownrate"
+fine_tune_premium:
+  policy: multiplier
+  factor: "1.5"
+`
+	if _, err := ParsePriceBook([]byte(ftOfOwnRateFt)); err == nil {
+		t.Fatal("ft:child derived_from an own-rate ft: loaded; want rejection (one hop only — no fine-tune-of-fine-tune)")
+	} else if !strings.Contains(err.Error(), "one hop") && !strings.Contains(err.Error(), "fine-tune") {
+		t.Fatalf("err = %v, want a one-hop rejection naming the fine-tune derivation target", err)
+	}
+
+	// ft:child derives from ft:mid, which itself declares a derived_from (a chain) → a
+	// SECOND hop on the derivedFrom-key arm of isDerivationBase. Reject.
+	const ftOfDerivedFt = `
+version: 1
+base_models:
+  "base":
+    prompt:     "0.000004"
+    cached:     "0"
+    completion: "0"
+fine_tunes:
+  "ft:mid":
+    derived_from: "base"
+  "ft:child":
+    derived_from: "ft:mid"
+`
+	if _, err := ParsePriceBook([]byte(ftOfDerivedFt)); err == nil {
+		t.Fatal("ft:child derived_from a derived ft: loaded; want rejection (multi-hop chain forbidden)")
+	}
+
+	// CONTROL: ft:child deriving from a TRUE base still loads (the one legitimate hop).
+	const oneHopOK = `
+version: 1
+base_models:
+  "base":
+    prompt:     "0.000004"
+    cached:     "0"
+    completion: "0"
+fine_tunes:
+  "ft:child":
+    derived_from: "base"
+`
+	if _, err := ParsePriceBook([]byte(oneHopOK)); err != nil {
+		t.Fatalf("ft:child deriving from a true base must load (the one legitimate hop): %v", err)
 	}
 }
 
