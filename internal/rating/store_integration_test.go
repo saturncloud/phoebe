@@ -174,7 +174,7 @@ func TestIntegration_RateWindow_ConformsToOracle(t *testing.T) {
 	}
 	// Single-snapshot accounting invariant: every in-window event lands in exactly
 	// one bucket of rated / unpriced / unattributable.
-	if got := res.EventsRated + res.UnpricedEvents + res.UnattributableEvents; got != len(events) {
+	if got := res.EventsRated + res.UnpricedEvents + res.UnattributableEvents; got != int64(len(events)) {
 		t.Fatalf("rated+unpriced+unattributable = %d, want %d", got, len(events))
 	}
 

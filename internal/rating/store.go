@@ -44,21 +44,25 @@ type Store interface {
 // (rollups/events/total) AND the anomaly counts from the SAME snapshot.
 // TotalCost is a NUMERIC carried as a string (money never becomes a Go number).
 type RateResult struct {
-	RollupsWritten int
-	EventsRated    int
+	// int64 (not int): these are COUNT/SUM over an arbitrary backfill window, so a
+	// wide window can exceed 2^31. Widened with the ::bigint SQL casts to avoid a
+	// silent 32-bit overflow.
+	RollupsWritten int64
+	EventsRated    int64
 	TotalCost      string // NUMERIC as text; "" when no rollups
 
 	// Fail-loud counts, from the same statement/snapshot as the upsert above, so
 	// they can never disagree with what the rollups excluded.
-	UnpricedEvents       int
-	UnattributableEvents int
+	UnpricedEvents       int64
+	UnattributableEvents int64
 }
 
 // Anomalies are the fail-loud counts for a window: events that could not be priced
-// and rows that could not be attributed. Both drive the exit-nonzero path.
+// and rows that could not be attributed. Both drive the exit-nonzero path. int64
+// to match RateResult's widened counts (a wide backfill window can exceed 2^31).
 type Anomalies struct {
-	UnpricedEvents       int
-	UnattributableEvents int
+	UnpricedEvents       int64
+	UnattributableEvents int64
 }
 
 // PostgresStore reads billing_event + model_price + derivation_policy and writes
@@ -362,18 +366,22 @@ upserted AS (
     RETURNING event_count, cost
 )
 SELECT
-    (SELECT COUNT(*)::int                      FROM upserted) AS rollups_written,
-    (SELECT COALESCE(SUM(event_count), 0)::int FROM upserted) AS events_rated,
-    (SELECT COALESCE(SUM(cost), 0)::numeric    FROM upserted) AS total_cost,
+    -- ::bigint, not ::int: a very wide backfill window can sum more than 2^31
+    -- events (or write more than 2^31 rollup rows), which a 32-bit cast would
+    -- silently overflow into a negative/garbage count and defeat the rated-count
+    -- reconciliation. The cost is already NUMERIC. Scanned into int64 in Go.
+    (SELECT COUNT(*)::bigint                      FROM upserted) AS rollups_written,
+    (SELECT COALESCE(SUM(event_count), 0)::bigint FROM upserted) AS events_rated,
+    (SELECT COALESCE(SUM(cost), 0)::numeric       FROM upserted) AS total_cost,
     -- Anomaly counts from the SAME snapshot as the upsert. An unattributable row is
     -- counted ONLY as unattributable (the more specific signal), never also as
     -- unpriced, so the counts partition the in-window rows:
     --   events_rated + unpriced + unattributable == total in-window events.
-    (SELECT COUNT(*)::int FROM resolved
+    (SELECT COUNT(*)::bigint FROM resolved
       WHERE prompt_price IS NULL
         AND auth_id  IS NOT NULL
         AND model_id IS NOT NULL)                             AS unpriced_events,
-    (SELECT COUNT(*)::int FROM ev
+    (SELECT COUNT(*)::bigint FROM ev
       WHERE auth_id IS NULL OR model_id IS NULL)              AS unattributable_events`
 
 // RateWindow runs the single resolve→sum→upsert→count statement for [start, end)

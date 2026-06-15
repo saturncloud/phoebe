@@ -96,14 +96,14 @@ func (s *oracleStore) RateWindow(_ context.Context, start, end time.Time) (RateR
 	// excluded from the rollups yet missed by the counts.
 	rollups, an := s.resolveWindow(start.UTC(), end.UTC())
 	total := Dec{}
-	var rated int
+	var rated int64
 	for k, ru := range rollups {
 		s.table[k] = ru // REPLACE — ON CONFLICT DO UPDATE
 		total = total.Add(ru.cost)
-		rated += ru.eventCount
+		rated += int64(ru.eventCount)
 	}
 	res := RateResult{
-		RollupsWritten:       len(rollups),
+		RollupsWritten:       int64(len(rollups)),
 		EventsRated:          rated,
 		UnpricedEvents:       an.UnpricedEvents,
 		UnattributableEvents: an.UnattributableEvents,
@@ -413,7 +413,7 @@ func TestConformance_SQLModelMatchesRateOracle(t *testing.T) {
 	// PARTITION the in-window events — every event is in exactly one bucket. In
 	// production this holds because the counts come from the same statement (same
 	// snapshot) as the upsert; here the oracle mirrors that with one resolve pass.
-	if got := res.EventsRated + res.UnpricedEvents + res.UnattributableEvents; got != len(events) {
+	if got := res.EventsRated + res.UnpricedEvents + res.UnattributableEvents; got != int64(len(events)) {
 		t.Fatalf("rated(%d) + unpriced(%d) + unattributable(%d) = %d, want %d (every in-window event accounted exactly once)",
 			res.EventsRated, res.UnpricedEvents, res.UnattributableEvents, got, len(events))
 	}
@@ -422,7 +422,7 @@ func TestConformance_SQLModelMatchesRateOracle(t *testing.T) {
 	if store.countCalls != 0 {
 		t.Fatalf("Run called CountAnomalies %d times, want 0 (counts must come from the rating statement's snapshot)", store.countCalls)
 	}
-	if res.RollupsWritten != len(want) {
+	if res.RollupsWritten != int64(len(want)) {
 		t.Fatalf("rollups = %d, want %d", res.RollupsWritten, len(want))
 	}
 	for k, w := range want {
