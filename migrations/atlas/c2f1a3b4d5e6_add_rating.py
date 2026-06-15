@@ -96,6 +96,22 @@ def upgrade():
         unique=False,
     )
 
+    # The reconcile DELETE (re-rate convergence, the `deleted` CTE in
+    # internal/rating/store.go) filters rated_usage on window_start ALONE
+    # (window_start >= $1 AND window_start < $2), then anti-joins priced. Every other
+    # index on this table LEADS with auth_id, so window_start is only a TRAILING column
+    # and cannot serve a window_start-only range scan — without this index the reconcile
+    # would seq-scan rated_usage and take a full-trailing-window lock footprint on EVERY
+    # run (the default window re-rates 24 closed hours). A window_start-leading index
+    # turns the reconcile DELETE into an index range scan over exactly the in-scope
+    # hours. Mirrors migrations/0002_rating.sql.
+    op.create_index(
+        "rated_usage_window_start_ix",
+        "rated_usage",
+        ["window_start"],
+        unique=False,
+    )
+
     # The rater filters billing_event on its RATING INSTANT, COALESCE(event_ts,
     # created_at). The index must be on that EXACT expression: Postgres matches index
     # expressions structurally, so an index on bare (event_ts) can never serve the
@@ -132,5 +148,15 @@ def downgrade():
     # re-run downgrade must not error on an already-dropped index). Keeps up/down/up
     # idempotent.
     op.execute("DROP INDEX IF EXISTS billing_event_rating_instant_ix")
-    op.drop_index("rated_usage_auth_id_window_start_ix", table_name="rated_usage")
+    # Drop indexes in reverse create order. if_exists=True on BOTH so a
+    # partially-applied or re-run downgrade is idempotent (matches the upgrade's
+    # idempotent ADD COLUMN IF NOT EXISTS / DROP INDEX IF EXISTS): a downgrade that
+    # already removed an index, or one running against a DB where create_table's
+    # implicit drop already took it, must not error.
+    op.drop_index(
+        "rated_usage_window_start_ix", table_name="rated_usage", if_exists=True
+    )
+    op.drop_index(
+        "rated_usage_auth_id_window_start_ix", table_name="rated_usage", if_exists=True
+    )
     op.drop_table("rated_usage")

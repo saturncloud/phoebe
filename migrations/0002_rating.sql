@@ -88,6 +88,18 @@ CREATE TABLE rated_usage (
 CREATE INDEX rated_usage_auth_id_window_start_ix
     ON rated_usage (auth_id, window_start);
 
+-- The reconcile DELETE (re-rate convergence, the `deleted` CTE in
+-- internal/rating/store.go) filters rated_usage on window_start ALONE
+-- (window_start >= $1 AND window_start < $2), then anti-joins priced. Every other
+-- index here LEADS with auth_id, so window_start is only a TRAILING column and
+-- cannot serve a window_start-only range scan — the reconcile would seq-scan
+-- rated_usage and take a full-trailing-window lock footprint on EVERY run (the
+-- default window re-rates 24 closed hours). This window_start-leading index makes
+-- the reconcile DELETE an index range scan over exactly the [window_start) hours in
+-- scope. Mirrors the Alembic rating migration.
+CREATE INDEX rated_usage_window_start_ix
+    ON rated_usage (window_start);
+
 -- The rater scans billing_event by its RATING INSTANT, COALESCE(event_ts,
 -- created_at), over the rating window. The index must be on that EXACT
 -- expression: Postgres matches index expressions structurally, so an index on

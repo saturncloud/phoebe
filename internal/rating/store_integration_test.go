@@ -63,7 +63,13 @@ CREATE TABLE rated_usage (
     event_count             BIGINT NOT NULL,
     rated_at                TIMESTAMPTZ NOT NULL DEFAULT now(),
     CONSTRAINT rated_usage_auth_model_window_uq UNIQUE (auth_id, model_id, window_start)
-);`
+);
+
+-- Mirror the production indexes (migrations/0002_rating.sql): the auth-leading index
+-- for billing queries, and the window_start-leading index the reconcile DELETE needs
+-- (it filters window_start alone; every auth-leading index leaves it trailing).
+CREATE INDEX rated_usage_auth_id_window_start_ix ON rated_usage (auth_id, window_start);
+CREATE INDEX rated_usage_window_start_ix ON rated_usage (window_start);`
 
 // conformanceBook is the fixture price book shared by the conformance tests: base
 // "b" with its own rate, fine-tune "f" derived from "b", 1.5× premium.
@@ -587,8 +593,8 @@ func TestIntegration_FineTuneAmbiguousBaseModelFailsLoud(t *testing.T) {
 	}
 }
 
-// TestIntegration_ReRateReconciles runs the REAL SQL to pin FIX 2: re-rate RECONCILES
-// (deletes superseded rollups), it is NOT upsert-only. Run A bills a CLEAN single-base
+// TestIntegration_ReRateReconciles runs the REAL SQL to pin the reconcile semantics:
+// re-rate RECONCILES (deletes superseded rollups), it is NOT upsert-only. Run A bills a CLEAN single-base
 // ft: rollup. Then a second, distinct base_model arrives for the SAME ft: id in the same
 // window, making it ambiguous; run B excludes it from priced and must DELETE the stale
 // rated_usage row in the SAME statement — never leave it billing at its run-A cost. A
@@ -949,6 +955,61 @@ func TestIntegration_RatingInstantIndexServesScan(t *testing.T) {
 	}
 	if !strings.Contains(plan, "billing_event_rating_instant_ix") {
 		t.Fatalf("plan does not use billing_event_rating_instant_ix:\n%s", plan)
+	}
+}
+
+// TestIntegration_ReconcileDeleteUsesWindowStartIndex: the reconcile DELETE (the
+// `deleted` CTE) filters rated_usage on window_start ALONE. Every other index leads
+// with auth_id, leaving window_start trailing → no index can serve a
+// window_start-only range scan, so without rated_usage_window_start_ix the reconcile
+// seq-scans rated_usage (and takes a full-trailing-window lock footprint) on every
+// run. This pins that the window_start-leading index exists AND the planner CAN use
+// it for the reconcile's exact predicate (seqscan disabled, so a remaining seq scan
+// would mean no usable index).
+func TestIntegration_ReconcileDeleteUsesWindowStartIndex(t *testing.T) {
+	dsn := os.Getenv("PHOEBE_TEST_DATABASE_URL")
+	if dsn == "" {
+		t.Skip("PHOEBE_TEST_DATABASE_URL not set; skipping live-Postgres conformance")
+	}
+	db, err := sql.Open("pgx", dsn)
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	defer db.Close()
+	db.SetMaxOpenConns(1)
+
+	const sch = "phoebe_rating_winix_it"
+	exec(t, db, "DROP SCHEMA IF EXISTS "+sch+" CASCADE")
+	exec(t, db, "CREATE SCHEMA "+sch)
+	exec(t, db, "SET search_path TO "+sch)
+	defer func() { exec(t, db, "DROP SCHEMA IF EXISTS "+sch+" CASCADE") }()
+	exec(t, db, schemaDDL)
+
+	// EXPLAIN the reconcile DELETE's table-access predicate (window_start range
+	// alone — the `deleted` CTE's filter on rated_usage). enable_seqscan=off forces
+	// the planner to use an index if one CAN serve it; a remaining Seq Scan means no
+	// usable index (the bug this index fixes).
+	exec(t, db, "SET enable_seqscan = off")
+	rows, err := db.Query(`EXPLAIN SELECT 1 FROM rated_usage
+		WHERE window_start >= '2026-06-08T10:00:00Z'
+		  AND window_start <  '2026-06-08T11:00:00Z'`)
+	if err != nil {
+		t.Fatalf("explain: %v", err)
+	}
+	defer rows.Close()
+	var plan string
+	for rows.Next() {
+		var line string
+		if err := rows.Scan(&line); err != nil {
+			t.Fatalf("scan: %v", err)
+		}
+		plan += line + "\n"
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatalf("rows: %v", err)
+	}
+	if !strings.Contains(plan, "rated_usage_window_start_ix") {
+		t.Fatalf("reconcile DELETE predicate does not use rated_usage_window_start_ix (window_start-only scan would seq-scan):\n%s", plan)
 	}
 }
 
