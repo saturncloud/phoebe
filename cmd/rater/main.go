@@ -20,10 +20,46 @@
 //	   (the E3 ft-uniqueness violation: a uuid4 checkpoint id cannot carry two bases,
 //	   so this is broken base_model propagation, never a priceable rollup). Any of
 //	   these means revenue is leaking upstream. Distinct code so a CronJob can alert
-//	   on "lost revenue / lost data" separately from "job broke".
+//	   on "lost revenue / lost data" separately from "job broke". A ROUTINE run (the
+//	   default trailing-hours window, no --since/--until) that RECONCILE-DELETED a
+//	   previously-billed rated_usage row ALSO exits 2: on a routine cadence a prior
+//	   bill vanishing means data was lost / an upstream regression dropped events —
+//	   page someone (see exitCode and the reconcile-exit contract below).
 //
 // Re-running any window is safe and idempotent (rollups upsert on the natural
 // key), so cron overlap or manual re-rating never double-counts.
+//
+// THE RECONCILE-DELETE EXIT CONTRACT (option (c): loud on routine, quiet on
+// backfill). A run that DELETES a previously-billed rated_usage row
+// (ReconciledDeletions > 0) is a REVENUE CHANGE — a customer's prior bill just got
+// rewritten. Whether that is alarming depends on WHY the window was chosen:
+//   - DEFAULT trailing-hours window (no --since/--until): a routine cron run should
+//     NOT be rewriting prior bills. If it does, events that billed before have
+//     vanished from billing_event (data loss) or an upstream regression now drops
+//     them (e.g. base_model stopped propagating → rollups went unpriced/ambiguous).
+//     That is an ERROR + exit 2 — treat it like the other anomalies and page.
+//   - EXPLICIT --since/--until window (operator backfill, e.g. after a late price
+//     fix): convergence is exactly what the operator asked for — INFO + exit 0.
+//
+// The gate is ReconciledDeletions > 0 && !windowExplicit. The semantics are
+// UNCHANGED either way ("what the latest run says is what bills" — store.go always
+// reconciles); this is purely the observability/exit contract. The decision lives
+// HERE, in cmd/rater, because only here is it known whether the window was explicit;
+// it is deliberately NOT folded into Result.HasAnomaly() (that would make explicit
+// backfills exit nonzero too).
+//
+// SINGLE-FLIGHT ASSUMPTION (deployment contract, enforced OUTSIDE this repo). The
+// rater MUST run single-flight: no two rater processes rating overlapping windows
+// concurrently. The reconcile DELETE (the `deleted` CTE in store.go) and the
+// ordered upsert are deadlock-safe ONLY under single-flight — the upsert's
+// ORDER BY prevents a rater self-deadlocking against its own rows, but two
+// concurrent raters could still take row locks in opposing orders across the
+// DELETE/INSERT pair (a classic ABBA hazard). The deployment MUST forbid
+// concurrency: the Atlas CronJob sets `concurrencyPolicy: Forbid` so a slow run is
+// never overlapped by the next tick. That manifest lives in the Atlas repo, not
+// here; this rater does NOT add delete-lock-ordering machinery because single-flight
+// makes the hazard unreachable. If you ever run the rater outside that CronJob,
+// preserve single-flight some other way (an advisory lock, a queue) before doing so.
 //
 // THE DEFAULT WINDOW IS THE TRAILING N COMPLETE HOURS, [floor(now)-N*1h,
 // floor(now)), N = rateTrailingHours (default 24). It is deliberately NOT just the
@@ -92,6 +128,26 @@ const (
 	exitAnomaly = 2 // window rated but something leaked: unpriced and/or unattributable
 )
 
+// exitCode maps a completed rating run to its process exit code, encoding the
+// reconcile-delete contract (see the package doc). A run that rated cleanly but
+// leaked an anomaly (unpriced / unattributable / ambiguous-base) ALWAYS exits
+// exitAnomaly. A reconcile-delete (reconciledDeletions > 0) exits exitAnomaly TOO —
+// but ONLY when the window was the default trailing-hours window (windowExplicit ==
+// false): on a routine run a prior bill vanishing is alarming (data loss / upstream
+// regression). When the operator chose the window explicitly (--since/--until),
+// reconcile-deletes are intended convergence (a backfill) and do NOT raise the exit
+// code on their own. This is the single place the routine-vs-backfill decision is
+// made, because only cmd/rater knows whether the window was explicit.
+func exitCode(reconciledDeletions int64, windowExplicit, hasAnomaly bool) int {
+	if hasAnomaly {
+		return exitAnomaly
+	}
+	if reconciledDeletions > 0 && !windowExplicit {
+		return exitAnomaly
+	}
+	return exitOK
+}
+
 func main() {
 	os.Exit(run())
 }
@@ -133,7 +189,7 @@ func run() int {
 		return exitFatal
 	}
 
-	windowStart, windowEnd, err := resolveWindow(*since, *until, opts.trailingHours, time.Now())
+	windowStart, windowEnd, windowExplicit, err := resolveWindow(*since, *until, opts.trailingHours, time.Now())
 	if err != nil {
 		log.Error.Printf("rater: %v", err)
 		return exitFatal
@@ -158,15 +214,12 @@ func run() int {
 		return exitFatal
 	}
 
-	if res.HasAnomaly() {
-		// The window was rated and rollups were written, but something leaked:
-		// events that could not be priced, rows that could not be attributed (NULL
-		// auth_id/model), and/or an ft: rollup spanning multiple base_models (the E3
-		// ft-uniqueness violation). Non-zero exit so a CronJob surfaces the lost
-		// revenue / lost data.
-		return exitAnomaly
-	}
-	return exitOK
+	// Exit code encodes BOTH the leaked-anomaly signal (unpriced / unattributable /
+	// ambiguous-base — always nonzero) AND the reconcile-delete contract: a routine
+	// run (default window) that rewrote a prior bill is alarming and exits nonzero,
+	// while an explicit backfill (--since/--until) that did so is intended and exits
+	// 0. See exitCode and the package doc.
+	return exitCode(res.ReconciledDeletions, windowExplicit, res.HasAnomaly())
 }
 
 // resolveWindow computes [start, end). Defaults (both flags empty) rate the
@@ -180,9 +233,16 @@ func run() int {
 // late still slips (residual risk; see the package doc — reconciliation is the
 // backstop). Either flag may be given explicitly (RFC3339) and WINS over the
 // default; both must parse, be hour-aligned, and start must be before end.
-func resolveWindow(since, until string, trailingHours int, now time.Time) (time.Time, time.Time, error) {
+//
+// The third return is windowExplicit: TRUE if EITHER --since or --until was set, i.e.
+// the operator named the window rather than taking the trailing-hours default. It is
+// the single source of truth for the routine-vs-backfill distinction the
+// reconcile-delete exit contract turns on (see exitCode + the package doc): a
+// reconcile-delete on a routine (default) window is alarming; on an explicit backfill
+// it is intended convergence.
+func resolveWindow(since, until string, trailingHours int, now time.Time) (time.Time, time.Time, bool, error) {
 	if trailingHours < 1 {
-		return time.Time{}, time.Time{}, errInvalidTrailingHours(trailingHours)
+		return time.Time{}, time.Time{}, false, errInvalidTrailingHours(trailingHours)
 	}
 	now = now.UTC()
 	currentHour := now.Truncate(time.Hour)
@@ -190,22 +250,27 @@ func resolveWindow(since, until string, trailingHours int, now time.Time) (time.
 	start := currentHour.Add(-time.Duration(trailingHours) * time.Hour)
 	end := currentHour
 
+	// Either flag set means the operator chose the window — an explicit backfill, not
+	// the routine trailing-hours cadence. Captured BEFORE parsing so it reflects
+	// operator INTENT (a flag was passed) independent of the parsed values.
+	windowExplicit := since != "" || until != ""
+
 	if since != "" {
 		t, err := time.Parse(time.RFC3339, since)
 		if err != nil {
-			return time.Time{}, time.Time{}, errBadWindow("since", since, err)
+			return time.Time{}, time.Time{}, false, errBadWindow("since", since, err)
 		}
 		start = t.UTC()
 	}
 	if until != "" {
 		t, err := time.Parse(time.RFC3339, until)
 		if err != nil {
-			return time.Time{}, time.Time{}, errBadWindow("until", until, err)
+			return time.Time{}, time.Time{}, false, errBadWindow("until", until, err)
 		}
 		end = t.UTC()
 	}
 	if !start.Before(end) {
-		return time.Time{}, time.Time{}, errInvertedWindow(start, end)
+		return time.Time{}, time.Time{}, false, errInvertedWindow(start, end)
 	}
 	// Both bounds MUST be hour-aligned. The rollup buckets by date_trunc('hour')
 	// and the upsert REPLACES a bucket's totals (not additive — that is what makes
@@ -215,12 +280,12 @@ func resolveWindow(since, until string, trailingHours int, now time.Time) (time.
 	// this fences the explicit --since/--until path. Fail loud rather than snap,
 	// so an operator never silently re-rates hours they did not name.
 	if !start.Truncate(time.Hour).Equal(start) {
-		return time.Time{}, time.Time{}, errUnalignedWindow("since", start)
+		return time.Time{}, time.Time{}, false, errUnalignedWindow("since", start)
 	}
 	if !end.Truncate(time.Hour).Equal(end) {
-		return time.Time{}, time.Time{}, errUnalignedWindow("until", end)
+		return time.Time{}, time.Time{}, false, errUnalignedWindow("until", end)
 	}
-	return start, end, nil
+	return start, end, windowExplicit, nil
 }
 
 // raterOptions are the non-pool knobs loadConfig resolves from the settings file.
