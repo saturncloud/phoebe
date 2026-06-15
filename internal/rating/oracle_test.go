@@ -11,21 +11,20 @@
 // premium policy (PolicyFunc / ApplyPolicy), and the ErrNoPrice sentinel are
 // PRODUCTION types now (the YAML price loader parses into them) and live in
 // decimal.go / policy.go. This file holds only the oracle-specific surface:
-// RatedEvent, the billable-prompt formula, the Rate cost function, and the
-// derivation-chain sentinel.
+// RatedEvent, the billable-prompt formula, and the Rate cost function.
+//
+// ONE-HOP DERIVATION is enforced at LOAD, not at rate time: buildPriceBook
+// (pricebook.go) rejects a derived_from that points at a base which is itself derived
+// (a multi-hop chain) and a dangling derived_from, and ResolveEvent never derives from
+// a base that is itself a derived fine-tune. So a chain longer than one hop can never
+// reach the oracle — there is no runtime "derivation chain" sentinel to return (an
+// earlier ErrDerivationChain was documented as returned but never was; it was dead
+// surface and is removed).
 package rating
 
 import (
-	"errors"
 	"time"
 )
-
-// ErrDerivationChain is returned by the oracle when a fine-tune's derived_from
-// points at a base that is itself a fine-tune (a chain longer than one hop). v1
-// supports ONE hop only; a deeper chain is treated as an error (and counted as
-// unpriced), never recursed. Distinct from ErrNoPrice so the anomaly can be
-// reported specifically, but it drives the same fail-loud path.
-var ErrDerivationChain = errors.New("rating: derived_from chain exceeds one hop (unsupported in v1)")
 
 // RatedEvent is the minimal slice of a billing_event that rating needs. It is
 // decoupled from metering.Event so the pure money math has no dependency on the

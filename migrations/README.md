@@ -40,11 +40,15 @@ projects the rates into a transient TEMP table, rates the last complete hour, an
   write-path authz ("operator-only") is an out-of-band concern (who can edit the
   file), not a phoebe DB concern.
 
-> **Fine-tune base-linkage gap (flagged):** `billing_event` carries only the
-> engine-reported model NAME, not a fine-tune→base link. A base-direct model prices
-> fully; an `ft:<checkpoint>` id prices only if the price file declares its
-> `derived_from` (or its own rate). Until the metering path plumbs the base onto the
-> event, an unlinked `ft:` id is **unpriced** (fail loud, never $0).
+> **Fine-tune base linkage (closed):** `billing_event` now carries a `base_model`
+> column — the HF base id a fine-tune derives from (E3), stamped by Atlas at deploy and
+> injected on the `X-Saturn-Base-Model` header. The rater prices an `ft:<checkpoint>`
+> id (which the price file never names) at base × premium by resolving through this
+> column. A base-direct model still prices off its own rate. An `ft:` id with a NULL
+> `base_model` is a propagation bug, not a free model: it is **unpriced** (fail loud,
+> never $0). The column is declared in the `billing_event` create migration and added
+> idempotently in the rating migration (`ADD COLUMN IF NOT EXISTS`) for any
+> already-applied `billing_event`.
 
 ## Why the schema lives here but is *applied* by Atlas (migration ownership)
 

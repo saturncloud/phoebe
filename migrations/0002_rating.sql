@@ -70,7 +70,11 @@ CREATE TABLE rated_usage (
     applied_cached_rate     NUMERIC(20, 9) NOT NULL DEFAULT 0,
     applied_completion_rate NUMERIC(20, 9) NOT NULL DEFAULT 0,
 
-    event_count             INTEGER NOT NULL,
+    -- BIGINT (not INTEGER): an hourly rollup's event count is small in practice, but
+    -- the SQL SUM(event_count) over a wide backfill window is widened to ::bigint, and
+    -- the column it sums must match — an INTEGER column silently caps a hot
+    -- (auth, model, hour) bucket at 2^31 events.
+    event_count             BIGINT NOT NULL,
 
     rated_at                TIMESTAMPTZ NOT NULL DEFAULT now(),
 

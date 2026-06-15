@@ -42,7 +42,10 @@ type RateResult struct {
 	// silent 32-bit overflow.
 	RollupsWritten int64
 	EventsRated    int64
-	TotalCost      string // NUMERIC as text; "" when no rollups
+	// TotalCost is the window's summed cost as NUMERIC text (money never becomes a Go
+	// number). The SQL COALESCEs the SUM to 0, so an empty window returns "0", not ""
+	// — never an empty string.
+	TotalCost string
 
 	// Fail-loud counts, from the same statement/snapshot as the upsert, so they can
 	// never disagree with what the rollups excluded.
@@ -261,7 +264,7 @@ priced AS (
         MIN(prompt_price)                                AS applied_prompt_rate,
         MIN(cached_price)                                AS applied_cached_rate,
         MIN(completion_price)                            AS applied_completion_rate,
-        COUNT(*)::int                                    AS event_count
+        COUNT(*)::bigint                                 AS event_count
     FROM resolved
     WHERE prompt_price IS NOT NULL          -- priced only
       AND auth_id  IS NOT NULL              -- attributable only

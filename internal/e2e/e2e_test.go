@@ -471,7 +471,7 @@ func TestE2E_StreamedRequestBecomesMoney(t *testing.T) {
 		nRollups                                     int
 		ruAuthID, ruModelID, cost                    string
 		ruPrompt, ruCached, ruCompletion, ruBillable int64
-		eventCount                                   int
+		eventCount                                   int64 // BIGINT column
 	)
 	if err := h.db.QueryRow("SELECT COUNT(*) FROM rated_usage").Scan(&nRollups); err != nil {
 		t.Fatalf("count rated_usage: %v", err)

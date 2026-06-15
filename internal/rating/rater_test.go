@@ -408,13 +408,15 @@ func TestRater_InvertedWindow(t *testing.T) {
 	}
 }
 
-// TestConformance_SQLModelMatchesRateOracle checks the in-Go model's INTERNAL
-// consistency: over a fixture mixing base, derived (multiplier), cached-subset, and
+// TestOracleModel_SelfConsistent checks the in-Go oracle's INTERNAL consistency — it
+// runs NO SQL. Over a fixture mixing base, derived (multiplier), cached-subset, and
 // unpriced/unattributable rows, the rollup the oracleStore builds
-// (resolve→exact-cost→sum→round-once) equals an independent recomputation,
-// row-for-row. The production SQL is pinned to this oracle by the //go:build
-// integration tests in store_integration_test.go.
-func TestConformance_SQLModelMatchesRateOracle(t *testing.T) {
+// (resolve→quantize→exact-cost→sum→round-once) equals an independent recomputation,
+// row-for-row. The REAL SQL-vs-oracle conformance is the //go:build integration test
+// TestIntegration_RateWindow_ConformsToOracle in store_integration_test.go; this one
+// only pins that the oracle agrees with itself (so a faithful reference exists to pin
+// the SQL against).
+func TestOracleModel_SelfConsistent(t *testing.T) {
 	book := newTestBook(
 		map[string]Rate3{"b": rate3("0.000005", "0.0000005", "0.00002")},
 		map[string]string{"f": "b"},

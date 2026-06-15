@@ -70,7 +70,10 @@ def upgrade():
         sa.Column("applied_prompt_rate", MONEY, nullable=False, server_default="0"),
         sa.Column("applied_cached_rate", MONEY, nullable=False, server_default="0"),
         sa.Column("applied_completion_rate", MONEY, nullable=False, server_default="0"),
-        sa.Column("event_count", sa.Integer(), nullable=False),
+        # BigInteger (not Integer): SUM(event_count) over a backfill window is widened
+        # to ::bigint in the rater, and the column it sums must match (an Integer column
+        # caps a hot (auth, model, hour) bucket at 2^31).
+        sa.Column("event_count", sa.BigInteger(), nullable=False),
         sa.Column(
             "rated_at",
             sa.DateTime(timezone=True),

@@ -94,7 +94,7 @@ fine_tune_premium:
 }
 
 // TestLoad_FineTuneIdentityPremium: with no premium block (identity default), an ft:
-// inherits its base exactly — the pointer-not-copy rule.
+// resolves to its base's rate exactly (no markup, no multiplier).
 func TestLoad_FineTuneIdentityPremium(t *testing.T) {
 	const y = `
 version: 1
@@ -227,10 +227,14 @@ fine_tune_premium:
 	}
 }
 
-// TestLoad_MalformedYAMLFailsClosed (malformed-yaml-fails-closed): a bad price file —
-// not YAML, wrong version, unknown key, float-shaped rate, negative rate, missing
-// rate component, empty book, dangling derived_from — is an ERROR. The rater refuses
-// to run rather than rate at $0 or a wrong rate.
+// TestLoad_MalformedYAMLFailsClosed (malformed-yaml-fails-closed): a bad price file is
+// an ERROR — the rater refuses to run rather than rate at $0 or a wrong rate. The
+// table enumerates every malformed shape it pins, including an INCONSISTENT PREMIUM
+// POLICY: not YAML, wrong/absent version, unknown key, typo'd rate key, float-shaped
+// (exponent) rate, negative rate, missing rate component, empty base_models, a base id
+// using the ft: prefix, a dangling derived_from, a fine-tune with no linkage, a
+// multiplier policy with no factor, a markup policy that also sets factor, an unknown
+// policy name, and a negative GPU floor.
 func TestLoad_MalformedYAMLFailsClosed(t *testing.T) {
 	cases := []struct {
 		name string

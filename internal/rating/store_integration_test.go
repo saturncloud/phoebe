@@ -4,8 +4,8 @@
 // a LIVE Postgres, pricing from a YAML PriceBook (E1), then asserts the rated_usage
 // rows the SQL wrote — including the APPLIED per-token rates frozen onto each row —
 // equal the pure Rate() oracle row-for-row over the same fixture. This is the
-// production-path half of the conformance pair (the in-Go model lives in
-// rater_test.go's TestConformance_SQLModelMatchesRateOracle).
+// production-path half of the conformance pair (the in-Go oracle self-consistency
+// check lives in rater_test.go's TestOracleModel_SelfConsistent).
 //
 // Gated behind the `integration` build tag AND a non-empty PHOEBE_TEST_DATABASE_URL.
 // Run with:
@@ -60,7 +60,7 @@ CREATE TABLE rated_usage (
     applied_prompt_rate     NUMERIC(20,9) NOT NULL DEFAULT 0,
     applied_cached_rate     NUMERIC(20,9) NOT NULL DEFAULT 0,
     applied_completion_rate NUMERIC(20,9) NOT NULL DEFAULT 0,
-    event_count             INTEGER NOT NULL,
+    event_count             BIGINT NOT NULL,
     rated_at                TIMESTAMPTZ NOT NULL DEFAULT now(),
     CONSTRAINT rated_usage_auth_model_window_uq UNIQUE (auth_id, model_id, window_start)
 );`
