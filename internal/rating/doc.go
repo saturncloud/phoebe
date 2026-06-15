@@ -37,6 +37,10 @@
 //     then immutable and self-auditing; re-rating is a deliberate, audited re-run, never
 //     a silent consequence of editing the file. "We never reprice traffic you've already
 //     served" holds by construction.
+//   - ROUNDING is QUANTIZE-THEN-MULTIPLY (the ratified spec — see ROUNDING below):
+//     the per-token rate is quantized to 9dp BEFORE it multiplies token counts, so the
+//     stored 9dp rate × tokens EXACTLY reconstructs the billed cost (a forced
+//     consequence of storing the applied rate on the row).
 //   - A model with no resolvable price FAILS LOUD (ErrNoPrice / the unpriced count) —
 //     NEVER silently billed $0 (that is lost revenue). The E4 create-time price gate
 //     should prevent unpriced traffic from ever being served, but the rater keeps this
@@ -63,19 +67,49 @@
 // shipping a fine-tune→base map in the file. The pricing/premium machinery is complete
 // and tested; only the linkage source is pending.
 //
+// ROUNDING — QUANTIZE-THEN-MULTIPLY (the ratified money spec; read before touching
+// any cost math):
+//
+// The applied per-token rate is FROZEN onto each rated_usage row (E1). For that row
+// to be self-auditing — for "stored rate × tokens" to EXACTLY reconstruct the billed
+// cost — the rate that multiplies must be a value the row can actually hold: a 9dp
+// NUMERIC(20,9). So rating quantizes the per-token RATE to 9dp FIRST, then multiplies
+// by integer token counts:
+//
+//  1. the global fine-tune premium is applied to the EXACT base rate (exact Dec /
+//     big.Rat — zero error);
+//  2. the FINAL per-token rate is QUANTIZED to 9dp (moneyScale) — this is the value
+//     projected into the SQL price table and stored as the applied rate on the row;
+//  3. cost = quantized-rate × tokens (an exact product at 9dp, since tokens are
+//     integers), summed across the rollup.
+//
+// This DELIBERATELY differs from sum-then-round (sum the exact per-event products,
+// round the SUM once). They diverge only on a sub-nano premium residue: a 1-nano base
+// × 1.5 = 0.0000000015 quantizes to 0.000000002 and bills at the 2-nano rate. Hugo
+// RATIFIED quantize-then-multiply because it is what storing the applied rate on the
+// row REQUIRES — sum-then-round would leave a row whose stored 9dp rate cannot
+// reproduce its own cost (the un-storable 0.0000000015 is lost), breaking the
+// self-audit. The choice is intentional, not an artefact. See Rate3.Quantized()
+// (policy.go) and the proven-teeth residue conformance tests in
+// store_integration_test.go (TestConformance_PremiumQuantizedBeforeBilling,
+// TestConformance_OracleQuantizesBeforeMultiply_OnResidue).
+//
 // PRODUCTION vs ORACLE — where the money math lives:
 //
 // The production rater is PURE SQL (store.go): one INSERT…SELECT joins the
-// YAML-projected price table, computes per-event cost, and SUMs it, all in Postgres.
-// No Go code multiplies a price or holds a money total on the production path (the
-// fine-tune premium is the one exception — it is applied in exact Dec when the prices
-// are projected, then handed to SQL as a NUMERIC string).
+// YAML-projected price table (whose rates are ALREADY 9dp-quantized — step 2 above
+// happens in Go when the book is projected), computes per-event cost, and SUMs it,
+// all in Postgres. No Go code multiplies a price or holds a money total on the
+// production path (the fine-tune premium is the one exception — it is applied in exact
+// Dec when the prices are projected, then quantized and handed to SQL as a 9dp NUMERIC
+// string).
 //
 // The Go cost formula — Rate(), rateExact, BillablePromptTokens — is an ORACLE: a
 // reference reimplementation used ONLY to pin the SQL. It lives in _test.go files
 // (oracle_test.go) so the compiler guarantees it never ships in a binary. The
-// //go:build integration tests in store_integration_test.go run the REAL rateWindowSQL
-// against a live Postgres and assert it matches the oracle row-for-row, including the
-// sum-then-round behavior. If you are looking for "what bills a customer," it is the
-// SQL in store.go and the prices in the YAML file — not the Go.
+// conformance callers pass Rate() the QUANTIZED rate (r.Quantized()), mirroring
+// production exactly. The //go:build integration tests in store_integration_test.go
+// run the REAL rateWindowSQL against a live Postgres and assert it matches the oracle
+// row-for-row, including on a sub-nano residue. If you are looking for "what bills a
+// customer," it is the SQL in store.go and the prices in the YAML file — not the Go.
 package rating

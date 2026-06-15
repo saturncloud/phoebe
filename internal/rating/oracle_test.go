@@ -71,12 +71,22 @@ type RatedEvent struct {
 //
 // Aborted events are rated NORMALLY: an aborted stream still served real tokens.
 //
-// ROUNDING — match production exactly (sum-then-round, NOT round-then-sum):
-// the SQL rater SUMs the exact per-event products across the whole rollup and
-// rounds the SUM once when it lands in NUMERIC(20,9). So the oracle must NOT
-// round per event and then sum. rateExact returns the UNROUNDED exact cost; the
-// rollup sums those and rounds once. Rate() is the single-event convenience form
-// (sum of one = round once), kept for per-event unit tests.
+// ROUNDING — quantize-then-multiply (the ratified spec; see doc.go's ROUNDING
+// section for why). Production stores the applied per-token rate on the
+// rated_usage row (E1), so the rate must be the 9dp NUMERIC(20,9) value the row
+// can hold — the premium is applied to the EXACT base rate, then the FINAL
+// per-token rate is QUANTIZED to 9dp, and cost = quantized-rate × tokens. So the
+// oracle's caller passes an ALREADY-QUANTIZED rate (r.Quantized()): Rate then
+// multiplies that 9dp rate by integer token counts (an exact product at 9dp) and
+// sums. There is no sub-nano residue to round away — the trailing Round here is a
+// no-op on a quantized rate, kept only so a caller that (incorrectly) passes an
+// un-quantized rate still lands on a representable money value rather than a
+// big.Rat with an enormous denominator.
+//
+// IMPORTANT: Rate is faithful to production ONLY when fed a quantized rate. The
+// conformance tests pass r.Quantized(); see TestConformance_PremiumQuantizedBeforeBilling
+// for the residue case (1-nano base × 1.5 → 0.000000002 bills) that distinguishes
+// quantize-then-multiply from the old sum-then-round.
 func Rate(e RatedEvent, r Rate3) Dec {
 	return rateExact(e, r).Round(moneyScale)
 }

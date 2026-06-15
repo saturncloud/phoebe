@@ -134,12 +134,20 @@ func TestIntegration_RateWindow_ConformsToOracle(t *testing.T) {
 
 	// Oracle: independent Rate() over the priced+attributable events; also assert the
 	// applied-rate columns equal the resolved rate (applied-rate-stored-on-row).
+	//
+	// QUANTIZE-THEN-MULTIPLY: production bills the 9dp-QUANTIZED per-token rate (the
+	// NUMERIC(20,9) projected into rating_price and frozen onto the row), so the
+	// oracle MUST be fed rate.Quantized() — feeding the un-quantized resolved rate
+	// would silently mis-calibrate the conformance guard against the day a sub-nano
+	// premium residue appears (see TestConformance_PremiumQuantizedBeforeBilling and
+	// the residue fixture below).
 	for _, e := range []RatedEvent{events[0], events[1]} {
 		rate, err := book.Resolve(e.ModelID)
 		if err != nil {
 			t.Fatalf("oracle resolve %s: %v", e.ModelID, err)
 		}
-		wantCost := Rate(e, rate).String()
+		billed := rate.Quantized() // the rate production actually bills and stores
+		wantCost := Rate(e, billed).String()
 		var gotCost, gotPrompt, gotCached, gotCompletion string
 		err = db.QueryRowContext(ctx,
 			`SELECT cost::text, applied_prompt_rate::text, applied_cached_rate::text, applied_completion_rate::text
@@ -151,13 +159,14 @@ func TestIntegration_RateWindow_ConformsToOracle(t *testing.T) {
 		if MustDec(gotCost).String() != wantCost {
 			t.Errorf("model %s: SQL cost = %s, oracle Rate() = %s", e.ModelID, gotCost, wantCost)
 		}
-		// The row carries the EXACT rate it was billed at (premium already applied).
-		if MustDec(gotPrompt).String() != rate.Prompt.String() ||
-			MustDec(gotCached).String() != rate.Cached.String() ||
-			MustDec(gotCompletion).String() != rate.Completion.String() {
-			t.Errorf("model %s applied rates = %s/%s/%s, want %s/%s/%s (frozen rate must equal resolved rate)",
+		// The row carries the EXACT 9dp rate it was billed at (premium applied, then
+		// quantized).
+		if MustDec(gotPrompt).String() != billed.Prompt.String() ||
+			MustDec(gotCached).String() != billed.Cached.String() ||
+			MustDec(gotCompletion).String() != billed.Completion.String() {
+			t.Errorf("model %s applied rates = %s/%s/%s, want %s/%s/%s (frozen rate must equal quantized resolved rate)",
 				e.ModelID, gotPrompt, gotCached, gotCompletion,
-				rate.Prompt, rate.Cached, rate.Completion)
+				billed.Prompt, billed.Cached, billed.Completion)
 		}
 	}
 
@@ -292,6 +301,107 @@ func TestConformance_PremiumQuantizedBeforeBilling(t *testing.T) {
 	wantCost := billed.Prompt.MulInt(3).Round(moneyScale).String()
 	if MustDec(gotCost).String() != wantCost {
 		t.Errorf("SQL cost = %s, want %s (stored 9dp rate × tokens)", gotCost, wantCost)
+	}
+}
+
+// TestConformance_OracleQuantizesBeforeMultiply_OnResidue is the proven-teeth guard
+// for the ratified quantize-then-multiply spec. It rates a sub-nano-residue
+// fine-tune through the REAL SQL, then asserts the SQL cost equals the QUANTIZED
+// oracle — AND demonstrates the test has teeth by computing the UN-quantized oracle
+// cost the same way the old (mis-calibrated) oracle did and proving it DISAGREES
+// with what the SQL bills. If the oracle ever reverts to feeding Rate() the
+// un-quantized rate, this test goes RED, so the latent miscalibration can never be
+// reintroduced silently.
+//
+// Residue: base prompt 0.000000001 (1 nano) × 1.5 premium = 0.0000000015 (exact).
+//   - quantize-then-multiply (production + ratified oracle): rate → 0.000000002,
+//     cost over N tokens = 0.000000002 × N.
+//   - sum-then-round (the OLD oracle, un-quantized rate): cost = 0.0000000015 × N
+//     rounded once. For N=3: 0.0000000045 → 0.000000005 (rounds DOWN to 5 nano),
+//     vs production's 0.000000006 (6 nano). They DIFFER — that gap is the teeth.
+func TestConformance_OracleQuantizesBeforeMultiply_OnResidue(t *testing.T) {
+	dsn := os.Getenv("PHOEBE_TEST_DATABASE_URL")
+	if dsn == "" {
+		t.Skip("PHOEBE_TEST_DATABASE_URL not set; skipping live-Postgres conformance")
+	}
+	ctx := context.Background()
+	db, err := sql.Open("pgx", dsn)
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	defer db.Close()
+
+	const sch = "phoebe_rating_residue_it"
+	exec(t, db, "DROP SCHEMA IF EXISTS "+sch+" CASCADE")
+	exec(t, db, "CREATE SCHEMA "+sch)
+	exec(t, db, "SET search_path TO "+sch)
+	defer func() { exec(t, db, "DROP SCHEMA IF EXISTS "+sch+" CASCADE") }()
+	exec(t, db, schemaDDL)
+
+	hour := mustTime("2026-06-08T10:00:00Z")
+	book := newTestBook(
+		map[string]Rate3{"b": rate3("0.000000001", "0", "0")},
+		map[string]string{"f": "b"},
+		PolicyMultiplier, MustDec("1.5"), Dec{},
+	)
+
+	// Three single-prompt-token "f" events in one rollup (N=3, where the two
+	// rounding models DIVERGE: 6 nano vs 5 nano).
+	events := []RatedEvent{
+		{AuthID: "a", ModelID: "f", PromptTokens: 1, At: hour.Add(1 * time.Minute)},
+		{AuthID: "a", ModelID: "f", PromptTokens: 1, At: hour.Add(2 * time.Minute)},
+		{AuthID: "a", ModelID: "f", PromptTokens: 1, At: hour.Add(3 * time.Minute)},
+	}
+	for i, e := range events {
+		if _, err := db.ExecContext(ctx,
+			`INSERT INTO billing_event (request_id, auth_id, model, prompt_tokens, cached_tokens, completion_tokens, event_ts)
+			 VALUES ($1,$2,$3,$4,$5,$6,$7)`,
+			fmt.Sprintf("res-req-%d", i), e.AuthID, e.ModelID,
+			e.PromptTokens, e.CachedTokens, e.CompletionTokens, e.At); err != nil {
+			t.Fatalf("seed event %d: %v", i, err)
+		}
+	}
+
+	store := NewPostgresStore(db)
+	if _, err := store.RateWindow(ctx, book, hour, hour.Add(time.Hour)); err != nil {
+		t.Fatalf("RateWindow: %v", err)
+	}
+
+	var gotCost string
+	if err := db.QueryRowContext(ctx,
+		`SELECT cost::text FROM rated_usage WHERE auth_id='a' AND model_id='f' AND window_start=$1`,
+		hour).Scan(&gotCost); err != nil {
+		t.Fatalf("read rated_usage: %v", err)
+	}
+
+	resolved, err := book.Resolve("f")
+	if err != nil {
+		t.Fatalf("oracle resolve: %v", err)
+	}
+
+	// The RATIFIED oracle: quantize the per-token rate, THEN multiply. This is what
+	// the SQL must match.
+	quantized := Rate(events[0], resolved.Quantized()).
+		Add(Rate(events[1], resolved.Quantized())).
+		Add(Rate(events[2], resolved.Quantized())).String()
+	if quantized != "0.000000006" {
+		t.Fatalf("quantized oracle cost = %s, want 0.000000006 (0.000000002 × 3)", quantized)
+	}
+	if MustDec(gotCost).String() != quantized {
+		t.Errorf("SQL cost = %s, quantized oracle = %s — production and the ratified oracle must agree", gotCost, quantized)
+	}
+
+	// TEETH: the OLD, mis-calibrated oracle fed Rate() the UN-quantized resolved
+	// rate (sum-then-round). Recompute it that way and prove it DISAGREES with what
+	// the SQL bills — so a revert to the un-quantized oracle would flip this test RED.
+	unquantized := rateExact(events[0], resolved).
+		Add(rateExact(events[1], resolved)).
+		Add(rateExact(events[2], resolved)).Round(moneyScale).String()
+	if unquantized != "0.000000005" {
+		t.Fatalf("un-quantized oracle cost = %s, want 0.000000005 (0.0000000045 rounds half-up to 5 nano)", unquantized)
+	}
+	if unquantized == MustDec(gotCost).String() {
+		t.Fatal("un-quantized oracle MATCHES the SQL on a residue fixture — the conformance guard has no teeth (the spec divergence is undetectable)")
 	}
 }
 
