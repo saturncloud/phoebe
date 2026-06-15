@@ -42,6 +42,11 @@ type RateResult struct {
 	// silent 32-bit overflow.
 	RollupsWritten int64
 	EventsRated    int64
+	// ReconciledDeletions is how many stale rated_usage rows this run DELETED because
+	// they billed in a prior run but fell out of the current priced set (re-rate
+	// convergence — "what the latest run says is what bills"). 0 on a first run or a
+	// clean identical re-run; nonzero only when a re-rate supersedes prior billing.
+	ReconciledDeletions int64
 	// TotalCost is the window's summed cost as NUMERIC text (money never becomes a Go
 	// number). The SQL COALESCEs the SUM to 0, so an empty window returns "0", not ""
 	// — never an empty string.
@@ -191,10 +196,17 @@ CREATE TEMP TABLE rating_derived (
 // HOUR BUCKET IS SESSION-TZ-INDEPENDENT (date_trunc on a UTC wall-clock timestamp),
 // so rollup keys can never disagree across sessions and re-rates can't overlap.
 //
-// IDEMPOTENCY: ON CONFLICT (auth_id, model_id, window_start) DO UPDATE replaces the
-// stored sums/cost/applied-rates with the freshly recomputed ones. The surrogate id
-// is DETERMINISTIC (md5 of the LENGTH-PREFIXED natural key — injective, so no '|' in a
-// field can collide two keys), so a re-run regenerates the SAME id.
+// IDEMPOTENCY IS RECONCILE, NOT UPSERT-ONLY: a re-run of a window makes rated_usage
+// EXACTLY what the latest run says. ON CONFLICT (auth_id, model_id, window_start) DO
+// UPDATE replaces a surviving rollup's sums/cost/applied-rates with the freshly
+// recomputed ones (the surrogate id is DETERMINISTIC — md5 of the LENGTH-PREFIXED
+// natural key, injective, so no '|' in a field can collide two keys — so a re-run
+// regenerates the SAME id). AND the `deleted` CTE removes any in-window rated_usage
+// row this run did NOT reproduce in priced (it became ambiguous/unpriced, or its
+// events vanished), so a rollup that billed clean in a prior run cannot keep billing
+// at its stale cost. A clean re-run with identical data reproduces every prior row, so
+// the delete matches nothing — a no-op. (Was upsert-only; reconcile is Hugo's decision,
+// "what the latest run says is what bills.")
 //
 // ONE STATEMENT, ONE SNAPSHOT: the upsert and the anomaly counts are CTEs of a
 // single statement, so a billing_event the drainer commits mid-run is visible to
@@ -305,6 +317,34 @@ grouped AS (
 priced AS (
     SELECT * FROM grouped WHERE NOT ambiguous_base
 ),
+-- RECONCILE (re-rate deletes superseded rollups): a rated_usage row whose
+-- (auth_id, model_id, window_start) falls IN this run's window but is NOT in the
+-- current priced set is STALE — it billed CLEAN in a prior run, but the latest run
+-- now excludes it (it became ambiguous-base, or unpriced, or its events vanished).
+-- "What the latest run says is what bills," so it is DELETED, atomically with the
+-- upsert below, in the SAME snapshot. Without this, an upsert-only re-run leaves the
+-- stale row billing at its old cost forever.
+--
+-- WINDOW PREDICATE: cmd/rater passes HOUR-ALIGNED [$1,$2) bounds (enforced there),
+-- and a rollup buckets to the UTC hour of ev_ts for ev_ts in [$1,$2), so every
+-- in-scope bucket lies in [$1,$2). Delete ONLY window_start in that half-open range —
+-- never an adjacent hour the run did not rate. The run rates the FULL window, so any
+-- in-window rated_usage row this run did not reproduce in priced IS superseded; the
+-- NOT EXISTS against priced is the exact "not reproduced" test (keyed on the same
+-- natural key as the unique constraint). A clean re-run with identical data reproduces
+-- every row in priced, so NOTHING matches the delete — idempotent no-op.
+deleted AS (
+    DELETE FROM rated_usage ru
+    WHERE ru.window_start >= $1
+      AND ru.window_start <  $2
+      AND NOT EXISTS (
+          SELECT 1 FROM priced p
+          WHERE p.auth_id      = ru.auth_id
+            AND p.model_id     = ru.model_id
+            AND p.window_start = ru.window_start
+      )
+    RETURNING ru.id
+),
 upserted AS (
     INSERT INTO rated_usage (
         id, auth_id, model_id, window_start, window_end,
@@ -347,6 +387,10 @@ SELECT
     (SELECT COUNT(*)::bigint                      FROM upserted) AS rollups_written,
     (SELECT COALESCE(SUM(event_count), 0)::bigint FROM upserted) AS events_rated,
     (SELECT COALESCE(SUM(cost), 0)::numeric       FROM upserted) AS total_cost,
+    -- Stale rollups DELETED by the reconcile (re-rate convergence). Rows that billed
+    -- in a prior run but fell out of priced this run; surfaced so a re-rate that
+    -- supersedes prior billing is observable, not silent.
+    (SELECT COUNT(*)::bigint FROM deleted)                       AS reconciled_deletions,
     -- Anomaly counts from the SAME snapshot as the upsert. An unattributable row is
     -- counted ONLY as unattributable (the more specific signal), never also as
     -- unpriced, so the counts partition the in-window rows:
@@ -408,7 +452,7 @@ func (s *PostgresStore) RateWindow(ctx context.Context, book *PriceBook, start, 
 	var res RateResult
 	var total string
 	err = tx.QueryRowContext(ctx, rateWindowSQL, start.UTC(), end.UTC(), ftLikePattern).
-		Scan(&res.RollupsWritten, &res.EventsRated, &total,
+		Scan(&res.RollupsWritten, &res.EventsRated, &total, &res.ReconciledDeletions,
 			&res.UnpricedEvents, &res.UnattributableEvents, &res.AmbiguousBaseEvents)
 	if err != nil {
 		return RateResult{}, fmt.Errorf("rating: rate window [%s,%s): %w",

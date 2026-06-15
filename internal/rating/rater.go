@@ -46,6 +46,7 @@ type Result struct {
 	UnattributableEvents int64  // in-window rows with NULL auth_id/model_id (upstream leak)
 	AmbiguousBaseEvents  int64  // events under an ft: rollup spanning >1 base_model (E3 violation)
 	RollupsWritten       int64  // distinct (auth_id, model_id, hour) rows upserted
+	ReconciledDeletions  int64  // stale in-window rollups DELETED because this re-run no longer produces them
 	TotalCost            string // sum of all rollup costs, NUMERIC as text
 }
 
@@ -85,9 +86,13 @@ func (r Result) HasAnomaly() bool {
 // rollups (a $0 rollup is indistinguishable from "served, but free" and silently
 // loses revenue / hides an upstream leak).
 //
-// IDEMPOTENCY: the SQL recomputes each rollup from scratch and upserts ON CONFLICT
-// DO UPDATE, so re-running a window reconciles to the correct totals and never
-// double-counts. See store.go.
+// IDEMPOTENCY IS RECONCILE (Hugo's decision — "what the latest run says is what
+// bills"): the SQL recomputes each rollup from scratch and upserts ON CONFLICT DO
+// UPDATE, AND deletes any in-window rated_usage row this run did NOT reproduce in
+// priced (one that fell out to ambiguous/unpriced, or whose events vanished). So a
+// re-run converges rated_usage to exactly the latest run's output — never
+// double-counts, and never leaves a superseded rollup billing at its stale cost. A
+// clean identical re-run is a no-op (same rows upserted, nothing deleted). See store.go.
 func (r *Rater) Run(ctx context.Context, windowStart, windowEnd time.Time) (Result, error) {
 	windowStart = windowStart.UTC()
 	windowEnd = windowEnd.UTC()
@@ -103,6 +108,7 @@ func (r *Rater) Run(ctx context.Context, windowStart, windowEnd time.Time) (Resu
 	}
 	res.EventsRated = rr.EventsRated
 	res.RollupsWritten = rr.RollupsWritten
+	res.ReconciledDeletions = rr.ReconciledDeletions
 	res.TotalCost = rr.TotalCost
 	res.UnpricedEvents = rr.UnpricedEvents
 	res.UnattributableEvents = rr.UnattributableEvents
@@ -119,6 +125,14 @@ func (r *Rater) Run(ctx context.Context, windowStart, windowEnd time.Time) (Resu
 	if res.HasUnpriced() {
 		r.log.Error.Printf("rating: window [%s,%s) has %d UNPRICED events (model_id absent from the price file — no base entry; or an ft: id whose base_model is empty/unpriced, which for a fine-tune is a base_model PROPAGATION BUG, not a free model) — these are NOT billed; the create-time price gate should prevent this, so a nonzero count means an unpriced model was served (or base_model stopped propagating). Add the price/fix the header and re-rate this window",
 			windowStart.Format(time.RFC3339), windowEnd.Format(time.RFC3339), res.UnpricedEvents)
+	}
+
+	// A re-rate that SUPERSEDES prior billing (deleted stale rollups) is significant —
+	// not an anomaly, but it changes a customer's bill, so surface it. 0 on a first run
+	// or a clean identical re-run.
+	if res.ReconciledDeletions > 0 {
+		r.log.Info.Printf("rating: window [%s,%s) reconcile DELETED %d stale rollup(s) that prior runs billed but this run no longer produces (became ambiguous/unpriced, or their events vanished) — 'what the latest run says is what bills'",
+			windowStart.Format(time.RFC3339), windowEnd.Format(time.RFC3339), res.ReconciledDeletions)
 	}
 
 	if res.HasAnomaly() {

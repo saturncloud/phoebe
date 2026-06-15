@@ -116,7 +116,24 @@ func (s *oracleStore) resolveWindow(start, end time.Time) (map[rollupKey]oracleR
 
 func (s *oracleStore) RateWindow(_ context.Context, _ *PriceBook, start, end time.Time) (RateResult, error) {
 	s.rateCalls++
-	rollups, an := s.resolveWindow(start.UTC(), end.UTC())
+	start, end = start.UTC(), end.UTC()
+	rollups, an := s.resolveWindow(start, end)
+
+	// RECONCILE (mirror store.go's `deleted` CTE): DELETE any in-window rollup this run
+	// did NOT reproduce in priced — it billed in a prior run but fell out (became
+	// ambiguous/unpriced, or its events vanished). "What the latest run says is what
+	// bills." The window predicate is the same half-open [start,end) on window_start.
+	var deletions int64
+	for k := range s.table {
+		if k.windowStart.Before(start) || !k.windowStart.Before(end) {
+			continue // out of this run's window — untouched
+		}
+		if _, survives := rollups[k]; !survives {
+			delete(s.table, k)
+			deletions++
+		}
+	}
+
 	total := Dec{}
 	var rated int64
 	for k, ru := range rollups {
@@ -127,6 +144,7 @@ func (s *oracleStore) RateWindow(_ context.Context, _ *PriceBook, start, end tim
 	res := RateResult{
 		RollupsWritten:       int64(len(rollups)),
 		EventsRated:          rated,
+		ReconciledDeletions:  deletions,
 		UnpricedEvents:       an.UnpricedEvents,
 		UnattributableEvents: an.UnattributableEvents,
 		AmbiguousBaseEvents:  an.AmbiguousBaseEvents,
@@ -202,6 +220,193 @@ func TestRater_IdempotentRerunNoDoubling(t *testing.T) {
 	}
 	if store.rateCalls != 2 {
 		t.Fatalf("RateWindow called %d times, want 2", store.rateCalls)
+	}
+}
+
+// TestRater_ReRateDeletesSupersededRollup (re-rate-reconciles-deletes-superseded):
+// FIX 2 — re-rate RECONCILES, not upsert-only (Hugo's decision). Run A bills an ft:
+// rollup CLEAN (one base in the window). Then data mutates so run B makes that same ft:
+// id AMBIGUOUS (a second, distinct base_model arrives in the window) — it falls out of
+// priced. The stale rollup from run A must be DELETED by run B, not left billing at its
+// old cost. "What the latest run says is what bills."
+func TestRater_ReRateDeletesSupersededRollup(t *testing.T) {
+	book := newTestBook(
+		map[string]Rate3{
+			"cheap/base":     rate3("0.000001", "0", "0"),
+			"expensive/base": rate3("0.000009", "0", "0"),
+		},
+		nil, PolicyMultiplier, MustDec("1.5"), Dec{},
+	)
+	at := mustTime("2026-06-08T10:15:00Z")
+	ws, we := mustTime("2026-06-08T10:00:00Z"), mustTime("2026-06-08T11:00:00Z")
+
+	// Run A: a single-base ft: rollup — CLEAN, bills.
+	store := newOracleStore(book, []RatedEvent{
+		{AuthID: "a", ModelID: "ft:dupe", BaseModel: "cheap/base", PromptTokens: 1000, At: at},
+	})
+	r := New(store, book, testLogger())
+	resA, err := r.Run(context.Background(), ws, we)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if resA.RollupsWritten != 1 || resA.ReconciledDeletions != 0 {
+		t.Fatalf("run A: rollups=%d deletions=%d, want 1/0", resA.RollupsWritten, resA.ReconciledDeletions)
+	}
+	dupeKey := rollupKey{authID: "a", modelID: "ft:dupe", windowStart: ws}
+	if _, ok := store.table[dupeKey]; !ok {
+		t.Fatal("run A: clean ft:dupe rollup must exist before re-rate")
+	}
+
+	// Mutate data: a SECOND, distinct base_model arrives for the SAME ft: id in the same
+	// window → ambiguous. Run B excludes it from priced.
+	store.events = append(store.events,
+		RatedEvent{AuthID: "a", ModelID: "ft:dupe", BaseModel: "expensive/base", PromptTokens: 1000, At: at.Add(5 * time.Minute)})
+	resB, err := r.Run(context.Background(), ws, we)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// THE INVARIANT: the stale ft:dupe rollup is GONE, not stale-billing at its run-A cost.
+	if _, ok := store.table[dupeKey]; ok {
+		t.Fatal("run B: ft:dupe became ambiguous but its stale rollup SURVIVED — upsert-only leaves it billing forever (reconcile must delete it)")
+	}
+	if resB.ReconciledDeletions != 1 {
+		t.Fatalf("run B: reconciled deletions = %d, want 1 (the superseded rollup)", resB.ReconciledDeletions)
+	}
+	if !resB.HasAmbiguousBase() {
+		t.Fatal("run B: the two-base ft:dupe must be flagged ambiguous")
+	}
+	if len(store.table) != 0 {
+		t.Fatalf("run B: table has %d rows, want 0 (the only rollup was superseded)", len(store.table))
+	}
+}
+
+// TestRater_ReRateSupersedesOneKeepsAnotherSameWindow: in ONE window, a re-rate must
+// DELETE a superseded rollup while UPDATING a surviving one — the delete-set and
+// upsert-set are disjoint, so the reconcile must touch only the superseded key. Guards
+// the SQL's two modifying CTEs (deleted + upserted) against clobbering a co-window row.
+func TestRater_ReRateSupersedesOneKeepsAnotherSameWindow(t *testing.T) {
+	book := newTestBook(
+		map[string]Rate3{
+			"cheap/base":     rate3("0.000001", "0", "0"),
+			"expensive/base": rate3("0.000009", "0", "0"),
+		},
+		nil, PolicyMultiplier, MustDec("1.5"), Dec{},
+	)
+	at := mustTime("2026-06-08T10:15:00Z")
+	ws, we := mustTime("2026-06-08T10:00:00Z"), mustTime("2026-06-08T11:00:00Z")
+	// Run A: TWO clean single-base ft: rollups (ft:keep and ft:gone).
+	store := newOracleStore(book, []RatedEvent{
+		{AuthID: "a", ModelID: "ft:keep", BaseModel: "cheap/base", PromptTokens: 1000, At: at},
+		{AuthID: "a", ModelID: "ft:gone", BaseModel: "cheap/base", PromptTokens: 1000, At: at},
+	})
+	r := New(store, book, testLogger())
+	if _, err := r.Run(context.Background(), ws, we); err != nil {
+		t.Fatal(err)
+	}
+	if len(store.table) != 2 {
+		t.Fatalf("run A: table=%d, want 2", len(store.table))
+	}
+	// Run B: ft:gone gains a second base (ambiguous → superseded); ft:keep unchanged.
+	store.events = append(store.events,
+		RatedEvent{AuthID: "a", ModelID: "ft:gone", BaseModel: "expensive/base", PromptTokens: 1000, At: at.Add(5 * time.Minute)})
+	resB, err := r.Run(context.Background(), ws, we)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if resB.ReconciledDeletions != 1 {
+		t.Fatalf("run B: deletions = %d, want 1 (only ft:gone superseded)", resB.ReconciledDeletions)
+	}
+	if _, gone := store.table[rollupKey{authID: "a", modelID: "ft:gone", windowStart: ws}]; gone {
+		t.Fatal("ft:gone rollup survived — it became ambiguous and must be deleted")
+	}
+	if _, keep := store.table[rollupKey{authID: "a", modelID: "ft:keep", windowStart: ws}]; !keep {
+		t.Fatal("ft:keep rollup was deleted — a surviving co-window rollup must be UPDATED, not clobbered")
+	}
+	if len(store.table) != 1 {
+		t.Fatalf("run B: table=%d, want 1 (ft:keep only)", len(store.table))
+	}
+}
+
+// TestRater_ReRateDeletesVanishedRollup: the other supersede path — a rollup whose
+// events vanish entirely on re-rate (e.g. an event was deleted/corrected upstream) is
+// also DELETED, not left billing. Confirms the reconcile keys on "not reproduced by
+// this run," not specifically on ambiguity.
+func TestRater_ReRateDeletesVanishedRollup(t *testing.T) {
+	at := mustTime("2026-06-08T10:15:00Z")
+	ws, we := mustTime("2026-06-08T10:00:00Z"), mustTime("2026-06-08T11:00:00Z")
+	store := newOracleStore(bookM(), []RatedEvent{
+		{AuthID: "a", ModelID: "m", PromptTokens: 100, CompletionTokens: 50, At: at},
+	})
+	r := New(store, bookM(), testLogger())
+	if _, err := r.Run(context.Background(), ws, we); err != nil {
+		t.Fatal(err)
+	}
+	if len(store.table) != 1 {
+		t.Fatalf("run A: table=%d, want 1", len(store.table))
+	}
+	// All events for the window vanish.
+	store.events = nil
+	resB, err := r.Run(context.Background(), ws, we)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if resB.ReconciledDeletions != 1 || len(store.table) != 0 {
+		t.Fatalf("run B: deletions=%d table=%d, want 1/0 (vanished rollup must be deleted)", resB.ReconciledDeletions, len(store.table))
+	}
+}
+
+// TestRater_ReRateIdenticalDataIsNoOp (re-rate-identical-data-no-op): the idempotency
+// floor of the reconcile. Re-running with IDENTICAL data deletes NOTHING (every prior
+// rollup is reproduced in priced) and upserts the same rows — the reconcile must not
+// spuriously delete-then-reinsert or churn. Also guards a SECOND window's rollup from
+// being touched by a re-rate scoped to the FIRST window.
+func TestRater_ReRateIdenticalDataIsNoOp(t *testing.T) {
+	at := mustTime("2026-06-08T10:15:00Z")
+	ws, we := mustTime("2026-06-08T10:00:00Z"), mustTime("2026-06-08T11:00:00Z")
+	store := newOracleStore(bookM(), []RatedEvent{
+		{AuthID: "a", ModelID: "m", PromptTokens: 100, CachedTokens: 30, CompletionTokens: 50, At: at},
+		{AuthID: "b", ModelID: "m", PromptTokens: 200, At: at.Add(10 * time.Minute)},
+	})
+	r := New(store, bookM(), testLogger())
+
+	res1, err := r.Run(context.Background(), ws, we)
+	if err != nil {
+		t.Fatal(err)
+	}
+	res2, err := r.Run(context.Background(), ws, we)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res1.ReconciledDeletions != 0 || res2.ReconciledDeletions != 0 {
+		t.Fatalf("identical re-run deleted rows: A=%d B=%d, want 0/0 (no spurious deletes)", res1.ReconciledDeletions, res2.ReconciledDeletions)
+	}
+	if res1.TotalCost != res2.TotalCost {
+		t.Fatalf("identical re-run total changed: %s → %s", res1.TotalCost, res2.TotalCost)
+	}
+	if len(store.table) != 2 {
+		t.Fatalf("table has %d rows after identical re-run, want 2 (no churn)", len(store.table))
+	}
+
+	// A rollup in a DIFFERENT (adjacent) window must NOT be touched by a re-rate scoped to
+	// [ws,we): the reconcile's window predicate is half-open and hour-scoped.
+	otherHour := mustTime("2026-06-08T12:00:00Z")
+	store.events = append(store.events,
+		RatedEvent{AuthID: "a", ModelID: "m", PromptTokens: 5, At: otherHour.Add(5 * time.Minute)})
+	if _, err := r.Run(context.Background(), otherHour, otherHour.Add(time.Hour)); err != nil {
+		t.Fatal(err)
+	}
+	// Now re-rate ONLY the first window again: the 12:00 rollup must survive untouched.
+	resFirst, err := r.Run(context.Background(), ws, we)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if resFirst.ReconciledDeletions != 0 {
+		t.Fatalf("re-rate of [10:00,11:00) deleted %d rows, want 0 (must not touch the 12:00 rollup)", resFirst.ReconciledDeletions)
+	}
+	otherKey := rollupKey{authID: "a", modelID: "m", windowStart: otherHour}
+	if _, ok := store.table[otherKey]; !ok {
+		t.Fatal("a re-rate of the first window deleted an out-of-window (12:00) rollup — the window predicate leaked")
 	}
 }
 

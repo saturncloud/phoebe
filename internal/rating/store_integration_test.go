@@ -587,6 +587,182 @@ func TestIntegration_FineTuneAmbiguousBaseModelFailsLoud(t *testing.T) {
 	}
 }
 
+// TestIntegration_ReRateReconciles runs the REAL SQL to pin FIX 2: re-rate RECONCILES
+// (deletes superseded rollups), it is NOT upsert-only. Run A bills a CLEAN single-base
+// ft: rollup. Then a second, distinct base_model arrives for the SAME ft: id in the same
+// window, making it ambiguous; run B excludes it from priced and must DELETE the stale
+// rated_usage row in the SAME statement — never leave it billing at its run-A cost. A
+// third, identical re-run must be a no-op (deletes nothing). This is the live-Postgres
+// proof that the `deleted` CTE fires atomically with the upsert.
+func TestIntegration_ReRateReconciles(t *testing.T) {
+	dsn := os.Getenv("PHOEBE_TEST_DATABASE_URL")
+	if dsn == "" {
+		t.Skip("PHOEBE_TEST_DATABASE_URL not set; skipping live-Postgres conformance")
+	}
+	ctx := context.Background()
+	db, err := sql.Open("pgx", dsn)
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	defer db.Close()
+
+	const sch = "phoebe_rating_reconcile_it"
+	exec(t, db, "DROP SCHEMA IF EXISTS "+sch+" CASCADE")
+	exec(t, db, "CREATE SCHEMA "+sch)
+	exec(t, db, "SET search_path TO "+sch)
+	defer func() { exec(t, db, "DROP SCHEMA IF EXISTS "+sch+" CASCADE") }()
+	exec(t, db, schemaDDL)
+
+	hour := mustTime("2026-06-08T10:00:00Z")
+	book := newTestBook(
+		map[string]Rate3{
+			"cheap/base":     rate3("0.000001", "0", "0"),
+			"expensive/base": rate3("0.000009", "0", "0"),
+		},
+		nil, PolicyMultiplier, MustDec("1.5"), Dec{},
+	)
+	store := NewPostgresStore(db)
+
+	// Run A: a single-base ft: rollup (ft:dupe) PLUS a co-window survivor (ft:keep).
+	// Both clean → billed. ft:keep must survive run B's reconcile untouched.
+	if _, err := db.ExecContext(ctx,
+		`INSERT INTO billing_event (request_id, auth_id, model, base_model, prompt_tokens, completion_tokens, event_ts)
+		 VALUES ('rc-1','a','ft:dupe','cheap/base',1000,0,$1),
+		        ('rc-keep','a','ft:keep','cheap/base',1000,0,$1)`, hour.Add(5*time.Minute)); err != nil {
+		t.Fatalf("seed rc-1/rc-keep: %v", err)
+	}
+	resA, err := store.RateWindow(ctx, book, hour, hour.Add(time.Hour))
+	if err != nil {
+		t.Fatalf("run A: %v", err)
+	}
+	if resA.RollupsWritten != 2 || resA.ReconciledDeletions != 0 {
+		t.Fatalf("run A: rollups=%d deletions=%d, want 2/0", resA.RollupsWritten, resA.ReconciledDeletions)
+	}
+	var nA int
+	if err := db.QueryRowContext(ctx, `SELECT COUNT(*) FROM rated_usage WHERE model_id='ft:dupe'`).Scan(&nA); err != nil {
+		t.Fatalf("count after A: %v", err)
+	}
+	if nA != 1 {
+		t.Fatalf("after run A, ft:dupe rollups = %d, want 1 (clean rollup must bill)", nA)
+	}
+
+	// Mutate: a SECOND base_model for the SAME ft: id → ambiguous.
+	if _, err := db.ExecContext(ctx,
+		`INSERT INTO billing_event (request_id, auth_id, model, base_model, prompt_tokens, completion_tokens, event_ts)
+		 VALUES ('rc-2','a','ft:dupe','expensive/base',1000,0,$1)`, hour.Add(10*time.Minute)); err != nil {
+		t.Fatalf("seed rc-2: %v", err)
+	}
+	resB, err := store.RateWindow(ctx, book, hour, hour.Add(time.Hour))
+	if err != nil {
+		t.Fatalf("run B: %v", err)
+	}
+	if resB.AmbiguousBaseEvents != 2 {
+		t.Fatalf("run B: ambiguous = %d, want 2 (two-base ft:dupe)", resB.AmbiguousBaseEvents)
+	}
+	if resB.ReconciledDeletions != 1 {
+		t.Fatalf("run B: reconciled deletions = %d, want 1 (the stale clean rollup must be deleted)", resB.ReconciledDeletions)
+	}
+	// THE INVARIANT: NO rated_usage row survives for the now-ambiguous ft:dupe.
+	var nB int
+	if err := db.QueryRowContext(ctx, `SELECT COUNT(*) FROM rated_usage WHERE model_id='ft:dupe'`).Scan(&nB); err != nil {
+		t.Fatalf("count after B: %v", err)
+	}
+	if nB != 0 {
+		t.Fatalf("after run B, ft:dupe rollups = %d, want 0 — the stale rollup is STILL BILLING (upsert-only bug; reconcile must delete it)", nB)
+	}
+	// The co-window ft:keep rollup must SURVIVE run B (delete-set and upsert-set are
+	// disjoint — the two modifying CTEs must not clobber a surviving co-window row).
+	var nKeep int
+	if err := db.QueryRowContext(ctx, `SELECT COUNT(*) FROM rated_usage WHERE model_id='ft:keep'`).Scan(&nKeep); err != nil {
+		t.Fatalf("count ft:keep after B: %v", err)
+	}
+	if nKeep != 1 {
+		t.Fatalf("after run B, ft:keep rollups = %d, want 1 (a surviving co-window rollup must be UPDATED, not deleted)", nKeep)
+	}
+
+	// Run C: re-run with IDENTICAL data → no-op (deletes nothing; nothing to reconcile).
+	resC, err := store.RateWindow(ctx, book, hour, hour.Add(time.Hour))
+	if err != nil {
+		t.Fatalf("run C: %v", err)
+	}
+	if resC.ReconciledDeletions != 0 {
+		t.Fatalf("run C (identical re-run): deletions = %d, want 0 (no spurious deletes)", resC.ReconciledDeletions)
+	}
+}
+
+// TestIntegration_ReRateReconcileLeavesOtherWindowsUntouched proves the reconcile's
+// window predicate is correct: a re-rate of ONE hour must DELETE only superseded rollups
+// IN that hour, never touch a clean rollup in an adjacent hour. Guards the [start,end)
+// half-open window_start predicate against deleting out-of-scope billing.
+func TestIntegration_ReRateReconcileLeavesOtherWindowsUntouched(t *testing.T) {
+	dsn := os.Getenv("PHOEBE_TEST_DATABASE_URL")
+	if dsn == "" {
+		t.Skip("PHOEBE_TEST_DATABASE_URL not set; skipping live-Postgres conformance")
+	}
+	ctx := context.Background()
+	db, err := sql.Open("pgx", dsn)
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	defer db.Close()
+
+	const sch = "phoebe_rating_reconcile_win_it"
+	exec(t, db, "DROP SCHEMA IF EXISTS "+sch+" CASCADE")
+	exec(t, db, "CREATE SCHEMA "+sch)
+	exec(t, db, "SET search_path TO "+sch)
+	defer func() { exec(t, db, "DROP SCHEMA IF EXISTS "+sch+" CASCADE") }()
+	exec(t, db, schemaDDL)
+
+	hour10 := mustTime("2026-06-08T10:00:00Z")
+	hour12 := mustTime("2026-06-08T12:00:00Z")
+	book := newTestBook(
+		map[string]Rate3{"b": rate3("0.000005", "0", "0")},
+		nil, PolicyIdentity, Dec{}, Dec{},
+	)
+	store := NewPostgresStore(db)
+
+	// Seed a clean rollup in BOTH the 10:00 and 12:00 hours; rate each window.
+	if _, err := db.ExecContext(ctx,
+		`INSERT INTO billing_event (request_id, auth_id, model, prompt_tokens, completion_tokens, event_ts)
+		 VALUES ('w10','a','b',100,0,$1), ('w12','a','b',100,0,$2)`,
+		hour10.Add(5*time.Minute), hour12.Add(5*time.Minute)); err != nil {
+		t.Fatalf("seed windows: %v", err)
+	}
+	if _, err := store.RateWindow(ctx, book, hour10, hour10.Add(time.Hour)); err != nil {
+		t.Fatalf("rate 10:00: %v", err)
+	}
+	if _, err := store.RateWindow(ctx, book, hour12, hour12.Add(time.Hour)); err != nil {
+		t.Fatalf("rate 12:00: %v", err)
+	}
+
+	// Now DELETE the 10:00 event upstream so a re-rate of [10:00,11:00) supersedes its
+	// rollup, and re-rate ONLY that window.
+	if _, err := db.ExecContext(ctx, `DELETE FROM billing_event WHERE request_id='w10'`); err != nil {
+		t.Fatalf("delete w10: %v", err)
+	}
+	resRe, err := store.RateWindow(ctx, book, hour10, hour10.Add(time.Hour))
+	if err != nil {
+		t.Fatalf("re-rate 10:00: %v", err)
+	}
+	if resRe.ReconciledDeletions != 1 {
+		t.Fatalf("re-rate 10:00: deletions = %d, want 1 (the vanished 10:00 rollup)", resRe.ReconciledDeletions)
+	}
+	// The 12:00 rollup must be UNTOUCHED.
+	var n12, n10 int
+	if err := db.QueryRowContext(ctx, `SELECT COUNT(*) FROM rated_usage WHERE window_start=$1`, hour12).Scan(&n12); err != nil {
+		t.Fatalf("count 12:00: %v", err)
+	}
+	if err := db.QueryRowContext(ctx, `SELECT COUNT(*) FROM rated_usage WHERE window_start=$1`, hour10).Scan(&n10); err != nil {
+		t.Fatalf("count 10:00: %v", err)
+	}
+	if n10 != 0 {
+		t.Fatalf("10:00 rollups = %d, want 0 (superseded)", n10)
+	}
+	if n12 != 1 {
+		t.Fatalf("12:00 rollups = %d, want 1 (an adjacent-window rollup must NOT be deleted by a 10:00 re-rate)", n12)
+	}
+}
+
 // TestIntegration_OneHopFineTuneCannotDeriveFromFineTune runs the REAL SQL to pin E3's
 // one-hop rule (FIX 3): an own-rate fine-tune is NOT a derivation base. An ft: event
 // whose base_model points at another own-rate ft: must NOT price (a second hop) — it

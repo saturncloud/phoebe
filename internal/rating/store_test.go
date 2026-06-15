@@ -40,8 +40,8 @@ func TestPostgresStore_RateWindowSQL(t *testing.T) {
 	mock.ExpectExec(`INSERT INTO rating_derived`).
 		WithArgs("m", "0.000003000", "0.000000300", "0.000010000").
 		WillReturnResult(sqlmock.NewResult(0, 1))
-	rows := sqlmock.NewRows([]string{"rollups_written", "events_rated", "total_cost", "unpriced_events", "unattributable_events", "ambiguous_base_events"}).
-		AddRow(2, 5, "0.001234500", 3, 1, 4)
+	rows := sqlmock.NewRows([]string{"rollups_written", "events_rated", "total_cost", "reconciled_deletions", "unpriced_events", "unattributable_events", "ambiguous_base_events"}).
+		AddRow(2, 5, "0.001234500", 0, 3, 1, 4)
 	// The statement binds $3 = the ft: LIKE pattern (single-sourced from fineTunePrefix).
 	mock.ExpectQuery(`INSERT INTO rated_usage`).
 		WithArgs(start.UTC(), end.UTC(), ftLikePattern).
@@ -57,6 +57,9 @@ func TestPostgresStore_RateWindowSQL(t *testing.T) {
 	}
 	if res.UnpricedEvents != 3 || res.UnattributableEvents != 1 || res.AmbiguousBaseEvents != 4 {
 		t.Fatalf("anomaly counts = %d/%d/%d, want 3/1/4 (must ride the same statement)", res.UnpricedEvents, res.UnattributableEvents, res.AmbiguousBaseEvents)
+	}
+	if res.ReconciledDeletions != 0 {
+		t.Fatalf("reconciled deletions = %d, want 0 (the projected count must scan into the result)", res.ReconciledDeletions)
 	}
 	if err := mock.ExpectationsWereMet(); err != nil {
 		t.Fatalf("unmet: %v", err)
@@ -121,6 +124,15 @@ func TestRateWindowSQL_Shape(t *testing.T) {
 		"ORDER BY auth_id, model_id, window_start",
 		// idempotent upsert on the natural key
 		"ON CONFLICT (auth_id, model_id, window_start) DO UPDATE SET",
+		// RE-RATE RECONCILES (FIX 2): the `deleted` CTE removes any in-window rollup this
+		// run did NOT reproduce in priced, atomically with the upsert — so a superseded
+		// rollup cannot keep billing at its stale cost. Window-scoped + NOT EXISTS priced.
+		"DELETE FROM rated_usage ru",
+		"ru.window_start >= $1",
+		"ru.window_start <  $2",
+		"NOT EXISTS (",
+		"FROM priced p",
+		"AS reconciled_deletions",
 		// the anomaly counts ride the SAME statement (one snapshot) as the upsert
 		"AS unpriced_events",
 		"AS unattributable_events",

@@ -47,12 +47,24 @@
 //     fail-loud backstop. The anomaly counts come from the SAME SQL statement (same
 //     snapshot) as the rollup upsert, so a row committed mid-run can never be excluded
 //     from the rollups yet missed by the counts.
+//   - RE-RATE RECONCILES, NOT UPSERT-ONLY (Hugo's decision — "what the latest run says
+//     is what bills"): re-running a window converges rated_usage to EXACTLY the latest
+//     run's output. Surviving rollups are upsert-REPLACED with their recomputed totals,
+//     AND any in-window rollup the run no longer produces — one that fell out to
+//     ambiguous-base / unpriced, or whose events vanished — is DELETED in the SAME
+//     statement, so a rollup that billed clean in a prior run cannot keep billing at its
+//     stale cost. A clean identical re-run is a no-op (same rows upserted, nothing
+//     deleted). This is NOT a reprice of served traffic: the applied rate is still frozen
+//     per row, and a re-rate is a deliberate, audited re-run, never a silent consequence
+//     of editing the file — what changes on re-rate is WHICH rollups exist, computed from
+//     the current events + file, not the historical rate of an unchanged rollup.
 //   - LATE-DRAINED EVENTS ARE RE-CAUGHT by the trailing default window: cmd/rater
-//     re-rates the trailing N complete hours (default 24) every run, and the upsert
-//     REPLACES each hour bucket with a recomputed total, so an event landing in an
-//     already-rated hour is folded in without double-counting. RESIDUAL RISK: an event
-//     arriving more than N hours late still slips the window; widen rateTrailingHours or
-//     re-rate explicitly via --since/--until.
+//     re-rates the trailing N complete hours (default 24) every run, and the reconcile
+//     above REPLACES each surviving hour bucket with a recomputed total (and deletes any
+//     superseded bucket), so an event landing in an already-rated hour is folded in
+//     without double-counting. RESIDUAL RISK: an event arriving more than N hours late
+//     still slips the window; widen rateTrailingHours or re-rate explicitly via
+//     --since/--until.
 //   - Hour bucketing is SESSION-TZ-INDEPENDENT (date_trunc over a UTC wall-clock
 //     timestamp), so rollup keys can never disagree across sessions and re-rates can
 //     never create overlapping buckets.
