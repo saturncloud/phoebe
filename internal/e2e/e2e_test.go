@@ -255,23 +255,34 @@ func (h *harness) drainUntilRows(t *testing.T, n int, timeout time.Duration) {
 	}
 }
 
-// seedPrice inserts the model_price row for the engine model name. effective_from
-// is in the past relative to the test events (which are stamped time.Now by the
-// emitter), so resolution always finds it.
-func (h *harness) seedPrice(t *testing.T) {
+// priceBookYAML is the YAML price file for the e2e rater (E1): prices are a config
+// file now, not DB rows. It prices the ENGINE model name with the same rates the
+// old model_price seed used, so the expected cost is unchanged.
+const priceBookYAML = `
+version: 1
+base_models:
+  "llama-3-8b":
+    prompt:     "0.000005"
+    cached:     "0.0000005"
+    completion: "0.00002"
+`
+
+// priceBook parses the e2e YAML price file into a PriceBook (fail-closed if the
+// fixture is malformed).
+func (h *harness) priceBook(t *testing.T) *rating.PriceBook {
 	t.Helper()
-	if _, err := h.db.Exec(
-		`INSERT INTO model_price (id, model_id, prompt_price, cached_price, completion_price, effective_from)
-		 VALUES ('e2e-price-0001', $1, 0.000005, 0.0000005, 0.00002, $2)`,
-		testModelName, time.Now().UTC().Add(-24*time.Hour)); err != nil {
-		t.Fatalf("seed model_price: %v", err)
+	pb, err := rating.ParsePriceBook([]byte(priceBookYAML))
+	if err != nil {
+		t.Fatalf("parse e2e price book: %v", err)
 	}
+	return pb
 }
 
 // rateEventHour reads the stored event's rating instant back from billing_event,
-// truncates it to its UTC hour, and runs a real rating.Rater over exactly that
-// hour window — so the test never races a wall-clock hour boundary.
-func (h *harness) rateEventHour(t *testing.T) rating.Result {
+// truncates it to its UTC hour, and runs a real rating.Rater (priced from the YAML
+// PriceBook) over exactly that hour window — so the test never races a wall-clock
+// hour boundary.
+func (h *harness) rateEventHour(t *testing.T, book *rating.PriceBook) rating.Result {
 	t.Helper()
 	var evTS time.Time
 	if err := h.db.QueryRow(
@@ -280,7 +291,7 @@ func (h *harness) rateEventHour(t *testing.T) rating.Result {
 	}
 	hour := evTS.UTC().Truncate(time.Hour)
 
-	rater := rating.New(rating.NewPostgresStore(h.db), h.log)
+	rater := rating.New(rating.NewPostgresStore(h.db), book, h.log)
 	res, err := rater.Run(context.Background(), hour, hour.Add(time.Hour))
 	if err != nil {
 		t.Fatalf("rater.Run: %v", err)
@@ -433,9 +444,8 @@ func TestE2E_StreamedRequestBecomesMoney(t *testing.T) {
 		t.Error("billing_event.aborted = true for a completed stream")
 	}
 
-	// 4. Rater: seed the price for the ENGINE name, rate the event's hour.
-	h.seedPrice(t)
-	res := h.rateEventHour(t)
+	// 4. Rater: price the ENGINE name from the YAML price file, rate the event's hour.
+	res := h.rateEventHour(t, h.priceBook(t))
 
 	// 5. The money. Expected cost, hand-derived from the fixture and the seeded
 	//    prices (mirrors the Rate() oracle's billable-prompt formula, computed
@@ -530,10 +540,9 @@ func TestE2E_ModellessEventIsUnattributable(t *testing.T) {
 		t.Fatal("billing_event.model is not NULL for a model-less event — '' dodges the rater's unattributable predicate")
 	}
 
-	// Price book seeded so an event misfiled as "unpriced" could only mean the
+	// Price book loaded so an event misfiled as "unpriced" could only mean the
 	// bucket logic itself is wrong, not a missing price.
-	h.seedPrice(t)
-	res := h.rateEventHour(t)
+	res := h.rateEventHour(t, h.priceBook(t))
 
 	if res.UnattributableEvents != 1 {
 		t.Errorf("UnattributableEvents = %d, want 1 (the model-less event)", res.UnattributableEvents)

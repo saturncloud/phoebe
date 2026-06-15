@@ -8,20 +8,26 @@ import (
 	"github.com/saturncloud/phoebe/internal/logging"
 )
 
-// Rater is ORCHESTRATION ONLY. It resolves the window, runs the SINGLE SQL
-// statement (resolve→sum→upsert, with the anomaly counts computed in the same
-// snapshot), surfaces anomalies, and reports a Result. It holds NO money value and
-// does NO per-event math — all pricing, the billable-prompt formula, the derivation
-// policy, and the summation happen in SQL (see Store / store.go). This is the
-// deliberate v2 shape: money in the database, Go as the conductor.
+// Rater is ORCHESTRATION ONLY. It holds the loaded price book (from the YAML file),
+// resolves the window, runs the SINGLE SQL statement (project prices → resolve → sum
+// → upsert, with the anomaly counts in the same snapshot), surfaces anomalies, and
+// reports a Result. It does NO per-event money math — the billable-prompt formula
+// and the cost summation happen in SQL (see Store / store.go); the fine-tune premium
+// is applied in exact Dec when the book is projected. Money in the database, Go as
+// the conductor.
+//
+// THE PRICE BOOK IS LOADED ONCE, AT CONSTRUCTION, and frozen for the run: a single
+// rater run rates against one immutable snapshot of the file, so a mid-run file edit
+// can never split a window across two price sets (E1: the row freezes its own rate).
 type Rater struct {
 	store Store
+	book  *PriceBook
 	log   *logging.Logger
 }
 
-// New constructs a Rater over a Store.
-func New(store Store, log *logging.Logger) *Rater {
-	return &Rater{store: store, log: log}
+// New constructs a Rater over a Store and a loaded PriceBook (the YAML price file).
+func New(store Store, book *PriceBook, log *logging.Logger) *Rater {
+	return &Rater{store: store, book: book, log: log}
 }
 
 // Result summarises one rating run. It is returned to the caller AND logged, so an
@@ -80,7 +86,7 @@ func (r *Rater) Run(ctx context.Context, windowStart, windowEnd time.Time) (Resu
 		return res, fmt.Errorf("rating: empty/inverted window [%s,%s)", windowStart.Format(time.RFC3339), windowEnd.Format(time.RFC3339))
 	}
 
-	rr, err := r.store.RateWindow(ctx, windowStart, windowEnd)
+	rr, err := r.store.RateWindow(ctx, r.book, windowStart, windowEnd)
 	if err != nil {
 		return res, err
 	}
@@ -95,7 +101,7 @@ func (r *Rater) Run(ctx context.Context, windowStart, windowEnd time.Time) (Resu
 			windowStart.Format(time.RFC3339), windowEnd.Format(time.RFC3339), res.UnattributableEvents)
 	}
 	if res.HasUnpriced() {
-		r.log.Error.Printf("rating: window [%s,%s) has %d UNPRICED events (no resolvable price at event time — own rate, or base via derived_from through the global policy, all absent; or a derived_from chain > 1 hop) — these are NOT billed; set/backfill a price and re-rate this window",
+		r.log.Error.Printf("rating: window [%s,%s) has %d UNPRICED events (model_id absent from the price file — no base entry, and no in-file fine-tune base linkage for an ft: id) — these are NOT billed; the create-time price gate should prevent this, so a nonzero count means an unpriced model was served. Add the price to the file and re-rate this window",
 			windowStart.Format(time.RFC3339), windowEnd.Format(time.RFC3339), res.UnpricedEvents)
 	}
 

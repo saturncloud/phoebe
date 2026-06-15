@@ -4,15 +4,6 @@ import (
 	"testing"
 )
 
-// rate3 builds a Rate3 from decimal strings, for terse fixtures.
-func rate3(prompt, cached, completion string) Rate3 {
-	return Rate3{
-		Prompt:     MustDec(prompt),
-		Cached:     MustDec(cached),
-		Completion: MustDec(completion),
-	}
-}
-
 // TestRate is the money core. Each case names the billing rule it defends. The
 // per-token rates here are the RESOLVED rates (own, or base-through-policy);
 // resolution itself is exercised in pricebook_test.go. Rate is the multiply-and-sum

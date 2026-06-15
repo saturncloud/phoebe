@@ -2,253 +2,313 @@ package rating
 
 import (
 	"errors"
+	"strings"
 	"testing"
-	"time"
 )
 
-func mustTime(s string) time.Time {
-	t, err := time.Parse(time.RFC3339, s)
+// TestLoad_BasePriceApplied (yaml-base-price-applied): a base model keyed on its HF
+// id resolves to exactly the per-token rates the file declares, parsed as exact
+// decimal (no float drift).
+func TestLoad_BasePriceApplied(t *testing.T) {
+	const y = `
+version: 1
+base_models:
+  "meta-llama/Llama-3.1-8B-Instruct":
+    prompt:     "0.000000200"
+    cached:     "0.000000050"
+    completion: "0.000000600"
+`
+	pb, err := ParsePriceBook([]byte(y))
 	if err != nil {
-		panic(err)
+		t.Fatalf("parse: %v", err)
 	}
-	return t
-}
-
-// baseRow is a model with its OWN rate, open-ended from 2026-01-01.
-func baseRow(modelID, prompt, cached, completion string) PriceRow {
-	return PriceRow{
-		ModelID:       modelID,
-		HasRate:       true,
-		Prompt:        MustDec(prompt),
-		Cached:        MustDec(cached),
-		Completion:    MustDec(completion),
-		EffectiveFrom: mustTime("2026-01-01T00:00:00Z"),
+	r, err := pb.Resolve("meta-llama/Llama-3.1-8B-Instruct")
+	if err != nil {
+		t.Fatalf("resolve: %v", err)
+	}
+	if r.Prompt.String() != "0.000000200" || r.Cached.String() != "0.000000050" || r.Completion.String() != "0.000000600" {
+		t.Fatalf("rates = %s/%s/%s, want the file's exact values", r.Prompt, r.Cached, r.Completion)
 	}
 }
 
-// derivedRow is a fine-tune: NO own rate, derived_from a base, open-ended.
-func derivedRow(modelID, base string) PriceRow {
-	return PriceRow{
-		ModelID:       modelID,
-		DerivedFrom:   base,
-		HasRate:       false,
-		EffectiveFrom: mustTime("2026-01-01T00:00:00Z"),
+// TestLoad_FineTunePremiumMultiplier (yaml-fine-tune-premium-multiplier): an ft: id
+// with an in-file derived_from inherits base × factor.
+func TestLoad_FineTunePremiumMultiplier(t *testing.T) {
+	const y = `
+version: 1
+base_models:
+  "base":
+    prompt:     "0.000003"
+    cached:     "0.0000003"
+    completion: "0.00001"
+fine_tunes:
+  "ft:abc123":
+    derived_from: "base"
+fine_tune_premium:
+  policy: multiplier
+  factor: "1.5"
+`
+	pb, err := ParsePriceBook([]byte(y))
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	r, err := pb.Resolve("ft:abc123")
+	if err != nil {
+		t.Fatalf("resolve: %v", err)
+	}
+	// base × 1.5
+	if r.Prompt.String() != "0.000004500" || r.Cached.String() != "0.000000450" || r.Completion.String() != "0.000015000" {
+		t.Fatalf("ft rates = %s/%s/%s, want base×1.5", r.Prompt, r.Cached, r.Completion)
 	}
 }
 
-// TestResolve_EffectiveDatedSelection: an event before a price change uses the OLD
-// price; at/after uses the new one; before any price fails loud. The half-open
-// [from,to) boundary belongs to the new window.
-func TestResolve_EffectiveDatedSelection(t *testing.T) {
-	old := PriceRow{
-		ModelID: "m", HasRate: true,
-		Prompt: MustDec("0.000003"), Cached: MustDec("0"), Completion: MustDec("0"),
-		EffectiveFrom: mustTime("2026-01-01T00:00:00Z"),
-		EffectiveTo:   mustTime("2026-06-01T00:00:00Z"),
+// TestLoad_FineTunePremiumMarkup (yaml-fine-tune-premium-markup): an ft: id inherits
+// base + per-token markup.
+func TestLoad_FineTunePremiumMarkup(t *testing.T) {
+	const y = `
+version: 1
+base_models:
+  "base":
+    prompt:     "0.000003"
+    cached:     "0.0000003"
+    completion: "0.00001"
+fine_tunes:
+  "ft:abc123":
+    derived_from: "base"
+fine_tune_premium:
+  policy: markup
+  markup: "0.000001"
+`
+	pb, err := ParsePriceBook([]byte(y))
+	if err != nil {
+		t.Fatalf("parse: %v", err)
 	}
-	current := PriceRow{
-		ModelID: "m", HasRate: true,
-		Prompt: MustDec("0.000005"), Cached: MustDec("0"), Completion: MustDec("0"),
-		EffectiveFrom: mustTime("2026-06-01T00:00:00Z"),
+	r, err := pb.Resolve("ft:abc123")
+	if err != nil {
+		t.Fatalf("resolve: %v", err)
 	}
-	book := NewPriceBook([]PriceRow{current, old}, nil) // out of order on purpose
+	// base + 0.000001 per token
+	if r.Prompt.String() != "0.000004000" || r.Cached.String() != "0.000001300" || r.Completion.String() != "0.000011000" {
+		t.Fatalf("ft rates = %s/%s/%s, want base+0.000001", r.Prompt, r.Cached, r.Completion)
+	}
+}
 
+// TestLoad_FineTuneIdentityPremium: with no premium block (identity default), an ft:
+// inherits its base exactly — the pointer-not-copy rule.
+func TestLoad_FineTuneIdentityPremium(t *testing.T) {
+	const y = `
+version: 1
+base_models:
+  "base":
+    prompt:     "0.000003"
+    cached:     "0.0000003"
+    completion: "0.00001"
+fine_tunes:
+  "ft:abc123":
+    derived_from: "base"
+`
+	pb, err := ParsePriceBook([]byte(y))
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	r, err := pb.Resolve("ft:abc123")
+	if err != nil {
+		t.Fatalf("resolve: %v", err)
+	}
+	if r.Prompt.String() != "0.000003000" || r.Cached.String() != "0.000000300" || r.Completion.String() != "0.000010000" {
+		t.Fatalf("identity ft rates = %s/%s/%s, want = base", r.Prompt, r.Cached, r.Completion)
+	}
+}
+
+// TestLoad_FineTuneOwnRateBypassesPremium: a fine-tune with its OWN rate in the file
+// ignores the premium entirely (the escape hatch).
+func TestLoad_FineTuneOwnRateBypassesPremium(t *testing.T) {
+	const y = `
+version: 1
+base_models:
+  "base":
+    prompt:     "0.000009"
+    cached:     "0.000009"
+    completion: "0.000009"
+fine_tunes:
+  "ft:own":
+    derived_from: "base"
+    rate:
+      prompt:     "0.000003"
+      cached:     "0.0000003"
+      completion: "0.00001"
+fine_tune_premium:
+  policy: multiplier
+  factor: "1000"
+`
+	pb, err := ParsePriceBook([]byte(y))
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	r, err := pb.Resolve("ft:own")
+	if err != nil {
+		t.Fatalf("resolve: %v", err)
+	}
+	if r.Prompt.String() != "0.000003000" {
+		t.Fatalf("own-rate ft prompt = %s, want 0.000003000 (premium must NOT apply)", r.Prompt)
+	}
+}
+
+// TestResolve_MissingPriceFailsLoud (missing-price-fails-loud-not-zero): an unknown
+// model id (and an ft: id with no in-file linkage — the flagged gap) resolves to
+// ErrNoPrice, NEVER a $0 rate.
+func TestResolve_MissingPriceFailsLoud(t *testing.T) {
+	const y = `
+version: 1
+base_models:
+  "base":
+    prompt:     "0.000003"
+    cached:     "0"
+    completion: "0"
+`
+	pb, err := ParsePriceBook([]byte(y))
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	if _, err := pb.Resolve("does-not-exist"); !errors.Is(err, ErrNoPrice) {
+		t.Fatalf("unknown model: err = %v, want ErrNoPrice", err)
+	}
+	// An ft: id whose base linkage is NOT in the file is the flagged gap: it must
+	// fail loud, never silently $0.
+	if _, err := pb.Resolve("ft:not-plumbed-yet"); !errors.Is(err, ErrNoPrice) {
+		t.Fatalf("unlinked ft id: err = %v, want ErrNoPrice (flagged gap must fail loud)", err)
+	}
+}
+
+// TestLoad_MalformedYAMLFailsClosed (malformed-yaml-fails-closed): a bad price file —
+// not YAML, wrong version, unknown key, float-shaped rate, negative rate, missing
+// rate component, empty book, dangling derived_from — is an ERROR. The rater refuses
+// to run rather than rate at $0 or a wrong rate.
+func TestLoad_MalformedYAMLFailsClosed(t *testing.T) {
 	cases := []struct {
-		name, at, wantPrompt string
-		wantErr              error
+		name string
+		yaml string
 	}{
-		{name: "event-before-change-uses-old-price", at: "2026-03-15T12:00:00Z", wantPrompt: "0.000003000"},
-		{name: "event-at-new-effective_from-uses-new-price", at: "2026-06-01T00:00:00Z", wantPrompt: "0.000005000"},
-		{name: "event-after-change-uses-new-price", at: "2026-09-01T00:00:00Z", wantPrompt: "0.000005000"},
-		{name: "event-before-any-price-fails-loud", at: "2025-01-01T00:00:00Z", wantErr: ErrNoPrice},
+		{"not-yaml", "::: this is not yaml :::"},
+		{"wrong-version", "version: 2\nbase_models:\n  m: {prompt: \"1\", cached: \"1\", completion: \"1\"}"},
+		{"no-version", "base_models:\n  m: {prompt: \"1\", cached: \"1\", completion: \"1\"}"},
+		{"empty-base-models", "version: 1\nbase_models: {}"},
+		{"unknown-key", "version: 1\nbase_models:\n  m: {prompt: \"1\", cached: \"1\", completion: \"1\"}\nbogus: 3"},
+		{"typoed-rate-key", "version: 1\nbase_models:\n  m: {promt: \"1\", cached: \"1\", completion: \"1\"}"},
+		{"float-exponent-rate", "version: 1\nbase_models:\n  m: {prompt: \"1e-6\", cached: \"0\", completion: \"0\"}"},
+		{"negative-rate", "version: 1\nbase_models:\n  m: {prompt: \"-0.000001\", cached: \"0\", completion: \"0\"}"},
+		{"missing-component", "version: 1\nbase_models:\n  m: {prompt: \"0.000001\", completion: \"0\"}"},
+		{"base-with-ft-prefix", "version: 1\nbase_models:\n  \"ft:x\": {prompt: \"1\", cached: \"1\", completion: \"1\"}"},
+		{"dangling-derived-from", "version: 1\nbase_models:\n  base: {prompt: \"1\", cached: \"1\", completion: \"1\"}\nfine_tunes:\n  \"ft:x\": {derived_from: \"nope\"}"},
+		{"ft-no-linkage", "version: 1\nbase_models:\n  base: {prompt: \"1\", cached: \"1\", completion: \"1\"}\nfine_tunes:\n  \"ft:x\": {}"},
+		{"multiplier-no-factor", "version: 1\nbase_models:\n  m: {prompt: \"1\", cached: \"1\", completion: \"1\"}\nfine_tune_premium:\n  policy: multiplier"},
+		{"markup-with-factor", "version: 1\nbase_models:\n  m: {prompt: \"1\", cached: \"1\", completion: \"1\"}\nfine_tune_premium:\n  policy: markup\n  factor: \"1.5\"\n  markup: \"1\""},
+		{"unknown-policy", "version: 1\nbase_models:\n  m: {prompt: \"1\", cached: \"1\", completion: \"1\"}\nfine_tune_premium:\n  policy: bogus"},
+		{"negative-gpu-floor", "version: 1\nbase_models:\n  m: {prompt: \"1\", cached: \"1\", completion: \"1\"}\ngpu_floor_rates:\n  A100: \"-1\""},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			r, err := book.ResolvePrice("m", mustTime(tc.at))
-			if tc.wantErr != nil {
-				if !errors.Is(err, tc.wantErr) {
-					t.Fatalf("err = %v, want Is(%v)", err, tc.wantErr)
-				}
-				return
-			}
-			if err != nil {
-				t.Fatalf("unexpected err: %v", err)
-			}
-			if r.Prompt.String() != tc.wantPrompt {
-				t.Fatalf("prompt = %s, want %s (wrong effective price)", r.Prompt, tc.wantPrompt)
+			if _, err := ParsePriceBook([]byte(tc.yaml)); err == nil {
+				t.Fatalf("malformed price file %q parsed cleanly; want a fail-closed error (never rate at $0/wrong)", tc.name)
 			}
 		})
 	}
 }
 
-// TestResolve_MissingPriceFailsLoud: an unknown model and a model with no row at
-// `at` both fail loud (ErrNoPrice) — NEVER a $0 resolution.
-func TestResolve_MissingPriceFailsLoud(t *testing.T) {
-	book := NewPriceBook([]PriceRow{baseRow("m", "0.000003", "0", "0")}, nil)
-	if _, err := book.ResolvePrice("does-not-exist", mustTime("2026-06-01T00:00:00Z")); !errors.Is(err, ErrNoPrice) {
-		t.Fatalf("unknown model: err = %v, want ErrNoPrice", err)
-	}
-}
-
-// TestResolve_HalfOpenWindow: an event exactly at effective_to is excluded (belongs
-// to the next window or is unpriced).
-func TestResolve_HalfOpenWindow(t *testing.T) {
-	row := PriceRow{
-		ModelID: "m", HasRate: true, Prompt: MustDec("0.000003"), Cached: MustDec("0"), Completion: MustDec("0"),
-		EffectiveFrom: mustTime("2026-01-01T00:00:00Z"),
-		EffectiveTo:   mustTime("2026-06-01T00:00:00Z"),
-	}
-	book := NewPriceBook([]PriceRow{row}, nil)
-	if _, err := book.ResolvePrice("m", mustTime("2026-06-01T00:00:00Z")); !errors.Is(err, ErrNoPrice) {
-		t.Fatalf("at upper bound: err = %v, want ErrNoPrice (half-open)", err)
-	}
-	if _, err := book.ResolvePrice("m", mustTime("2026-05-31T23:59:59Z")); err != nil {
-		t.Fatalf("just before upper bound: unexpected err %v", err)
-	}
-}
-
-// TestResolve_DerivedFromInheritance_Identity: a fine-tune (rate=null, derived_from)
-// with the default identity policy inherits its base's rate exactly. This is the
-// pointer-not-copy rule — a base price change auto-propagates.
-func TestResolve_DerivedFromInheritance_Identity(t *testing.T) {
-	base := baseRow("base", "0.000003", "0.0000003", "0.00001")
-	ft := derivedRow("ft", "base")
-	book := NewPriceBook([]PriceRow{base, ft}, nil) // no policy row → identity default
-
-	r, err := book.ResolvePrice("ft", mustTime("2026-06-01T00:00:00Z"))
+// TestLoad_NumericExactnessNoFloat (numeric-exactness-no-float): a sub-$1/1M price
+// declared as a decimal string survives the load EXACTLY (the reason rates are
+// strings in YAML, not floats).
+func TestLoad_NumericExactnessNoFloat(t *testing.T) {
+	const y = `
+version: 1
+base_models:
+  m:
+    prompt:     "0.000000150"
+    cached:     "0"
+    completion: "0.000000600"
+`
+	pb, err := ParsePriceBook([]byte(y))
 	if err != nil {
-		t.Fatal(err)
+		t.Fatalf("parse: %v", err)
 	}
-	if r.Prompt.String() != "0.000003000" || r.Cached.String() != "0.000000300" || r.Completion.String() != "0.000010000" {
-		t.Fatalf("inherited rate = %s/%s/%s, want base rate (identity)", r.Prompt, r.Cached, r.Completion)
-	}
-}
-
-// TestResolve_DerivationMultiplier: fine-tune price = base × factor (1.5×).
-func TestResolve_DerivationMultiplier(t *testing.T) {
-	base := baseRow("base", "0.000003", "0.0000003", "0.00001")
-	ft := derivedRow("ft", "base")
-	pol := []PolicyRow{{
-		Func: PolicyMultiplier, Factor: MustDec("1.5"),
-		EffectiveFrom: mustTime("2026-01-01T00:00:00Z"),
-	}}
-	book := NewPriceBook([]PriceRow{base, ft}, pol)
-
-	r, err := book.ResolvePrice("ft", mustTime("2026-06-01T00:00:00Z"))
+	r, err := pb.Resolve("m")
 	if err != nil {
-		t.Fatal(err)
+		t.Fatalf("resolve: %v", err)
 	}
-	if r.Prompt.String() != "0.000004500" || r.Cached.String() != "0.000000450" || r.Completion.String() != "0.000015000" {
-		t.Fatalf("multiplier-derived = %s/%s/%s, want base×1.5", r.Prompt, r.Cached, r.Completion)
+	if r.Prompt.String() != "0.000000150" || r.Completion.String() != "0.000000600" {
+		t.Fatalf("exact sub-$1/1M rate drifted: %s/%s", r.Prompt, r.Completion)
 	}
 }
 
-// TestResolve_DerivationMarkup: fine-tune price = base + per-token markup.
-func TestResolve_DerivationMarkup(t *testing.T) {
-	base := baseRow("base", "0.000003", "0.0000003", "0.00001")
-	ft := derivedRow("ft", "base")
-	pol := []PolicyRow{{
-		Func: PolicyMarkup, Markup: MustDec("0.000001"),
-		EffectiveFrom: mustTime("2026-01-01T00:00:00Z"),
-	}}
-	book := NewPriceBook([]PriceRow{base, ft}, pol)
-
-	r, err := book.ResolvePrice("ft", mustTime("2026-06-01T00:00:00Z"))
+// TestLoad_GPUFloorRatesParsed: per-GPU floor rates are parsed and validated (so the
+// file is complete) even though the token rater does not yet consume them.
+func TestLoad_GPUFloorRatesParsed(t *testing.T) {
+	const y = `
+version: 1
+base_models:
+  m: {prompt: "0.000001", cached: "0", completion: "0"}
+gpu_floor_rates:
+  "A100-80GB": "0.000123000"
+  "H100-80GB": "0.000456000"
+`
+	pb, err := ParsePriceBook([]byte(y))
 	if err != nil {
-		t.Fatal(err)
+		t.Fatalf("parse: %v", err)
 	}
-	if r.Prompt.String() != "0.000004000" || r.Cached.String() != "0.000001300" || r.Completion.String() != "0.000011000" {
-		t.Fatalf("markup-derived = %s/%s/%s, want base+0.000001", r.Prompt, r.Cached, r.Completion)
+	if got := pb.gpuFloor["A100-80GB"].String(); got != "0.000123000" {
+		t.Fatalf("A100 floor = %s, want 0.000123000", got)
+	}
+	if got := pb.gpuFloor["H100-80GB"].String(); got != "0.000456000" {
+		t.Fatalf("H100 floor = %s, want 0.000456000", got)
 	}
 }
 
-// TestResolve_OwnRateBypassesPolicy: a model with its OWN explicit rate ignores the
-// derivation policy entirely (the escape hatch), even if a multiplier is in effect.
-func TestResolve_OwnRateBypassesPolicy(t *testing.T) {
-	// "m" has its own rate AND (hypothetically) a derived_from; the own rate wins
-	// and the 1000× multiplier must NOT touch it.
-	own := PriceRow{
-		ModelID: "m", HasRate: true, DerivedFrom: "base",
-		Prompt: MustDec("0.000003"), Cached: MustDec("0.0000003"), Completion: MustDec("0.00001"),
-		EffectiveFrom: mustTime("2026-01-01T00:00:00Z"),
+// TestLoadPriceBook_MissingFileFailsClosed: a missing price file is an error — the
+// rater can't run without prices (never default to $0).
+func TestLoadPriceBook_MissingFileFailsClosed(t *testing.T) {
+	if _, err := LoadPriceBook("/no/such/prices.yaml"); err == nil {
+		t.Fatal("missing price file loaded cleanly; want a fail-closed error")
 	}
-	base := baseRow("base", "0.000009", "0", "0")
-	pol := []PolicyRow{{
-		Func: PolicyMultiplier, Factor: MustDec("1000"),
-		EffectiveFrom: mustTime("2026-01-01T00:00:00Z"),
-	}}
-	book := NewPriceBook([]PriceRow{own, base}, pol)
+}
 
-	r, err := book.ResolvePrice("m", mustTime("2026-06-01T00:00:00Z"))
+// TestLoadPriceBook_ExampleFileIsValid: the shipped example price file must parse and
+// validate — it is the operator-facing contract and a broken example is a footgun.
+func TestLoadPriceBook_ExampleFileIsValid(t *testing.T) {
+	pb, err := LoadPriceBook("../../config/prices.example.yaml")
 	if err != nil {
-		t.Fatal(err)
+		t.Fatalf("example price file does not load: %v", err)
 	}
-	if r.Prompt.String() != "0.000003000" {
-		t.Fatalf("own-rate model prompt = %s, want 0.000003000 (policy must NOT apply)", r.Prompt)
-	}
-}
-
-// TestResolve_OneHopOnly: a model deriving from another DERIVED model (chain > 1
-// hop) is an ERROR (ErrDerivationChain), never recursed. v1 supports one hop only.
-func TestResolve_OneHopOnly(t *testing.T) {
-	base := baseRow("base", "0.000003", "0", "0")
-	mid := derivedRow("mid", "base")  // mid derives from base (1 hop, fine on its own)
-	leaf := derivedRow("leaf", "mid") // leaf derives from mid (a derived model) → 2 hops
-	book := NewPriceBook([]PriceRow{base, mid, leaf}, nil)
-
-	// mid resolves fine (one hop).
-	if _, err := book.ResolvePrice("mid", mustTime("2026-06-01T00:00:00Z")); err != nil {
-		t.Fatalf("mid (1 hop) should resolve, got %v", err)
-	}
-	// leaf is a 2-hop chain → error, not recursion.
-	_, err := book.ResolvePrice("leaf", mustTime("2026-06-01T00:00:00Z"))
-	if !errors.Is(err, ErrDerivationChain) {
-		t.Fatalf("leaf (2 hops): err = %v, want ErrDerivationChain", err)
+	// It should price at least one concrete base model end-to-end.
+	if _, err := pb.Resolve("meta-llama/Llama-3.1-8B-Instruct"); err != nil {
+		t.Fatalf("example file does not price the documented base model: %v", err)
 	}
 }
 
-// TestResolve_DerivedBaseMissing: a fine-tune whose base has no effective rate at
-// `at` is unpriced (fail loud), not $0.
-func TestResolve_DerivedBaseMissing(t *testing.T) {
-	// base's rate only opens in June; an April event for the fine-tune can't resolve.
-	base := PriceRow{
-		ModelID: "base", HasRate: true, Prompt: MustDec("0.000003"), Cached: MustDec("0"), Completion: MustDec("0"),
-		EffectiveFrom: mustTime("2026-06-01T00:00:00Z"),
+// TestResolvedRates_PremiumAppliedOnce: the flat projection the store joins carries
+// the FINAL rate (premium already applied) for both base and derived ids, and a
+// fine-tune with an own rate is emitted once at its own rate (premium not applied).
+func TestResolvedRates_PremiumAppliedOnce(t *testing.T) {
+	pb := newTestBook(
+		map[string]Rate3{"base": rate3("0.000004", "0", "0")},
+		map[string]string{"ft:x": "base"},
+		PolicyMultiplier, MustDec("1.5"), Dec{},
+	)
+	rows := pb.resolvedRates()
+	got := map[string]string{}
+	for _, r := range rows {
+		got[r.ModelID] = r.Prompt
 	}
-	ft := derivedRow("ft", "base") // ft effective from Jan, base only from June
-	book := NewPriceBook([]PriceRow{base, ft}, nil)
-	if _, err := book.ResolvePrice("ft", mustTime("2026-04-01T00:00:00Z")); !errors.Is(err, ErrNoPrice) {
-		t.Fatalf("derived with no base rate: err = %v, want ErrNoPrice", err)
+	if len(rows) != 2 {
+		t.Fatalf("projected %d rows, want 2 (base + derived)", len(rows))
 	}
-}
-
-// TestResolve_DerivationPolicyEffectiveDated: the policy in effect at the event's
-// time is the one applied — a later policy change does not retroactively reprice.
-func TestResolve_DerivationPolicyEffectiveDated(t *testing.T) {
-	base := baseRow("base", "0.000004", "0", "0")
-	ft := derivedRow("ft", "base")
-	pol := []PolicyRow{
-		{Func: PolicyMultiplier, Factor: MustDec("1.5"),
-			EffectiveFrom: mustTime("2026-01-01T00:00:00Z"), EffectiveTo: mustTime("2026-06-01T00:00:00Z")},
-		{Func: PolicyMultiplier, Factor: MustDec("2"),
-			EffectiveFrom: mustTime("2026-06-01T00:00:00Z")},
+	if got["base"] != "0.000004000" {
+		t.Fatalf("base projected prompt = %s, want 0.000004000", got["base"])
 	}
-	book := NewPriceBook([]PriceRow{base, ft}, pol)
-
-	// March → 1.5× policy: 0.000004*1.5 = 0.000006
-	r, err := book.ResolvePrice("ft", mustTime("2026-03-01T00:00:00Z"))
-	if err != nil {
-		t.Fatal(err)
+	if got["ft:x"] != "0.000006000" { // 0.000004 × 1.5
+		t.Fatalf("derived projected prompt = %s, want 0.000006000 (premium applied)", got["ft:x"])
 	}
-	if r.Prompt.String() != "0.000006000" {
-		t.Fatalf("March prompt = %s, want 0.000006000 (1.5× policy)", r.Prompt)
-	}
-	// July → 2× policy: 0.000004*2 = 0.000008
-	r, err = book.ResolvePrice("ft", mustTime("2026-07-01T00:00:00Z"))
-	if err != nil {
-		t.Fatal(err)
-	}
-	if r.Prompt.String() != "0.000008000" {
-		t.Fatalf("July prompt = %s, want 0.000008000 (2× policy)", r.Prompt)
+	// Deterministic ordering for a stable projection.
+	if !strings.HasPrefix(rows[0].ModelID, "base") {
+		t.Fatalf("rows not sorted by model_id: %+v", rows)
 	}
 }

@@ -9,14 +9,15 @@ import (
 )
 
 // oracleStore is an in-memory Store that models EXACTLY what the SQL rater does,
-// using the Go oracle (PriceBook.ResolvePrice + Rate). It exists so the Rater
-// orchestration AND the money rules can be exercised without Postgres, and so the
-// conformance test has a faithful reference of the SQL's resolve→cost→sum.
+// using the production PriceBook (PriceBook.Resolve) + the Rate() oracle. It exists
+// so the Rater orchestration AND the money rules can be exercised without Postgres,
+// and so the conformance test has a faithful reference of the SQL's resolve→cost→sum.
 //
 // It models rated_usage as a map keyed by the natural key, REPLACING on upsert
 // (mirroring ON CONFLICT DO UPDATE), so idempotency is observable. Like the
-// production statement, RateWindow returns the anomaly counts from the SAME
-// resolve pass as the rollups (one snapshot).
+// production statement, RateWindow returns the anomaly counts from the SAME resolve
+// pass as the rollups (one snapshot). The book passed to RateWindow is ignored in
+// favour of the store's own (they are the same book the Rater holds).
 type oracleStore struct {
 	book   *PriceBook
 	events []RatedEvent
@@ -34,6 +35,7 @@ type rollupKey struct {
 type oracleRollup struct {
 	prompt, cached, completion, billable int64
 	cost                                 Dec
+	appliedRate                          Rate3
 	eventCount                           int
 }
 
@@ -45,8 +47,9 @@ func (s *oracleStore) Ping(_ context.Context) error { return nil }
 func (s *oracleStore) Close() error                 { return nil }
 
 // resolveWindow walks the events in [start,end) exactly as the SQL CTE does:
-// unattributable (empty auth/model) and unpriced (no resolvable rate, or a >1-hop
-// chain) are counted and EXCLUDED; the rest are priced via Rate() and summed.
+// unattributable (empty auth/model) and unpriced (no resolvable rate) are counted
+// and EXCLUDED; the rest are priced via Rate() and summed, with the applied rate
+// frozen onto the rollup.
 func (s *oracleStore) resolveWindow(start, end time.Time) (map[rollupKey]oracleRollup, Anomalies) {
 	out := map[rollupKey]oracleRollup{}
 	var an Anomalies
@@ -58,15 +61,16 @@ func (s *oracleStore) resolveWindow(start, end time.Time) (map[rollupKey]oracleR
 			an.UnattributableEvents++
 			continue
 		}
-		rate, err := s.book.ResolvePrice(e.ModelID, e.At)
+		resolved, err := s.book.Resolve(e.ModelID)
 		if err != nil {
-			an.UnpricedEvents++ // ErrNoPrice or ErrDerivationChain: never $0-billed
+			an.UnpricedEvents++ // ErrNoPrice: never $0-billed
 			continue
 		}
-		// Accumulate the EXACT (unrounded) per-event cost. Rounding happens ONCE
-		// per rollup below, mirroring the SQL's SUM(...) → NUMERIC(20,9). Summing
-		// pre-rounded per-event values here would be round-then-sum and could
-		// diverge from production by up to ~1 nano/event on sub-nano residues.
+		// The rate that ACTUALLY bills is the 9dp-quantized rate — the one projected
+		// into the SQL price table (NUMERIC(20,9)) and frozen onto the row. Cost is
+		// computed from THAT rate, so the row's cost is reconstructable from its
+		// applied rate (self-auditing). Mirrors the production SQL exactly.
+		rate := resolved.Quantized()
 		cost := rateExact(e, rate)
 		hour := e.At.UTC().Truncate(time.Hour)
 		k := rollupKey{authID: e.AuthID, modelID: e.ModelID, windowStart: hour}
@@ -76,11 +80,10 @@ func (s *oracleStore) resolveWindow(start, end time.Time) (map[rollupKey]oracleR
 		ru.completion += e.CompletionTokens
 		ru.billable += BillablePromptTokens(e.PromptTokens, e.CachedTokens)
 		ru.cost = ru.cost.Add(cost)
+		ru.appliedRate = rate // single-model rollup → one applied rate
 		ru.eventCount++
 		out[k] = ru
 	}
-	// Round each rollup's exact summed cost ONCE — the quantize the DB applies
-	// when the SUM lands in the NUMERIC(20,9) column.
 	for k, ru := range out {
 		ru.cost = ru.cost.Round(moneyScale)
 		out[k] = ru
@@ -88,11 +91,8 @@ func (s *oracleStore) resolveWindow(start, end time.Time) (map[rollupKey]oracleR
 	return out, an
 }
 
-func (s *oracleStore) RateWindow(_ context.Context, start, end time.Time) (RateResult, error) {
+func (s *oracleStore) RateWindow(_ context.Context, _ *PriceBook, start, end time.Time) (RateResult, error) {
 	s.rateCalls++
-	// ONE resolve pass produces the rollups AND the anomaly counts, mirroring the
-	// production SQL's single-statement/single-snapshot shape: a row can never be
-	// excluded from the rollups yet missed by the counts.
 	rollups, an := s.resolveWindow(start.UTC(), end.UTC())
 	total := Dec{}
 	var rated int64
@@ -117,15 +117,8 @@ func (s *oracleStore) RateWindow(_ context.Context, start, end time.Time) (RateR
 
 func testLogger() *logging.Logger { return logging.New(logging.ERROR) }
 
-// bookM is a one-base-model price book ("m": prompt 0.000003 / cached 0.0000003 /
-// completion 0.00001), open-ended.
-func bookM() *PriceBook {
-	return NewPriceBook([]PriceRow{baseRow("m", "0.000003", "0.0000003", "0.00001")}, nil)
-}
-
 // TestRater_MultiEventAggregation: many events for one (auth,model,hour) sum into
-// ONE rollup with summed tokens and summed cost — the aggregation grain. Money is
-// summed in the store (modeling SQL SUM), surfaced to the Rater as NUMERIC text.
+// ONE rollup with summed tokens and summed cost — the aggregation grain.
 func TestRater_MultiEventAggregation(t *testing.T) {
 	at := mustTime("2026-06-08T10:15:00Z")
 	events := []RatedEvent{
@@ -133,7 +126,7 @@ func TestRater_MultiEventAggregation(t *testing.T) {
 		{AuthID: "a", ModelID: "m", PromptTokens: 10, CachedTokens: 0, CompletionTokens: 5, At: at.Add(20 * time.Minute)},
 	}
 	store := newOracleStore(bookM(), events)
-	r := New(store, testLogger())
+	r := New(store, bookM(), testLogger())
 
 	res, err := r.Run(context.Background(), mustTime("2026-06-08T10:00:00Z"), mustTime("2026-06-08T11:00:00Z"))
 	if err != nil {
@@ -142,8 +135,8 @@ func TestRater_MultiEventAggregation(t *testing.T) {
 	if res.EventsRated != 2 || res.RollupsWritten != 1 {
 		t.Fatalf("rated=%d rollups=%d, want 2 and 1", res.EventsRated, res.RollupsWritten)
 	}
-	// event1: 70*0.000003 + 30*0.0000003 + 50*0.00001 = 0.00021 + 0.000009 + 0.0005 = 0.000719
-	// event2: 10*0.000003 + 0 + 5*0.00001 = 0.00003 + 0.00005 = 0.00008
+	// event1: 70*0.000003 + 30*0.0000003 + 50*0.00001 = 0.000719
+	// event2: 10*0.000003 + 0 + 5*0.00001 = 0.00008
 	// total = 0.000799
 	if res.TotalCost != "0.000799000" {
 		t.Fatalf("total = %s, want 0.000799000", res.TotalCost)
@@ -158,15 +151,15 @@ func TestRater_MultiEventAggregation(t *testing.T) {
 	}
 }
 
-// TestRater_IdempotentRerunNoDoubling: rating the SAME window twice produces
-// identical totals — no doubling. The load-bearing re-runnability invariant.
+// TestRater_IdempotentRerunNoDoubling (idempotent-rerun): rating the SAME window
+// twice produces identical totals — no doubling.
 func TestRater_IdempotentRerunNoDoubling(t *testing.T) {
 	at := mustTime("2026-06-08T10:15:00Z")
 	events := []RatedEvent{
 		{AuthID: "a", ModelID: "m", PromptTokens: 100, CachedTokens: 30, CompletionTokens: 50, At: at},
 	}
 	store := newOracleStore(bookM(), events)
-	r := New(store, testLogger())
+	r := New(store, bookM(), testLogger())
 	ws, we := mustTime("2026-06-08T10:00:00Z"), mustTime("2026-06-08T11:00:00Z")
 
 	res1, err := r.Run(context.Background(), ws, we)
@@ -188,19 +181,15 @@ func TestRater_IdempotentRerunNoDoubling(t *testing.T) {
 	}
 }
 
-// TestRater_LateArrivalRatedByTrailingWindow: an event whose event_ts falls in
-// hour H but which is DRAINED only after H was already rated (Valkey outage → WAL
-// recovery) is picked up by a later run whose window still covers H — the
-// trailing-window contract cmd/rater's default implements. The re-rate REPLACES
-// H's bucket (never doubles), so late events are folded in idempotently.
+// TestRater_LateArrivalRatedByTrailingWindow: an event whose event_ts falls in hour
+// H but which is DRAINED only after H was rated is picked up by a later run whose
+// window still covers H — the trailing-window contract. The re-rate REPLACES H's
+// bucket (never doubles).
 func TestRater_LateArrivalRatedByTrailingWindow(t *testing.T) {
 	hourH := mustTime("2026-06-08T10:00:00Z")
-	store := newOracleStore(bookM(), nil) // nothing drained yet
-	r := New(store, testLogger())
+	store := newOracleStore(bookM(), nil)
+	r := New(store, bookM(), testLogger())
 
-	// Run 1: the H+1-cadence cron rates hour H — the late event has NOT been
-	// drained yet, so the run sees nothing. With a last-hour-only default this
-	// event would now be lost forever.
 	res1, err := r.Run(context.Background(), hourH, hourH.Add(time.Hour))
 	if err != nil {
 		t.Fatal(err)
@@ -209,12 +198,10 @@ func TestRater_LateArrivalRatedByTrailingWindow(t *testing.T) {
 		t.Fatalf("run1 rated=%d rollups=%d, want 0/0 (event not drained yet)", res1.EventsRated, res1.RollupsWritten)
 	}
 
-	// The event lands late: drained after H was rated, event_ts still inside H.
 	store.events = append(store.events, RatedEvent{
 		AuthID: "a", ModelID: "m", PromptTokens: 100, CompletionTokens: 50, At: hourH.Add(15 * time.Minute),
 	})
 
-	// Run 2: the next default run rates the TRAILING window, which still covers H.
 	res2, err := r.Run(context.Background(), hourH.Add(-23*time.Hour), hourH.Add(2*time.Hour))
 	if err != nil {
 		t.Fatal(err)
@@ -228,8 +215,9 @@ func TestRater_LateArrivalRatedByTrailingWindow(t *testing.T) {
 	}
 }
 
-// TestRater_MissingPriceFailsLoudNotZero: an event for a model with no price is
-// counted unpriced and EXCLUDED from the rollups — never a $0 row.
+// TestRater_MissingPriceFailsLoudNotZero (missing-price-fails-loud-not-zero): an
+// event for a model absent from the price file is counted unpriced and EXCLUDED from
+// the rollups — never a $0 row.
 func TestRater_MissingPriceFailsLoudNotZero(t *testing.T) {
 	at := mustTime("2026-06-08T10:15:00Z")
 	events := []RatedEvent{
@@ -237,7 +225,7 @@ func TestRater_MissingPriceFailsLoudNotZero(t *testing.T) {
 		{AuthID: "a", ModelID: "unpriced", PromptTokens: 100, CompletionTokens: 50, At: at}, // NO price
 	}
 	store := newOracleStore(bookM(), events)
-	r := New(store, testLogger())
+	r := New(store, bookM(), testLogger())
 	res, err := r.Run(context.Background(), mustTime("2026-06-08T10:00:00Z"), mustTime("2026-06-08T11:00:00Z"))
 	if err != nil {
 		t.Fatal(err)
@@ -259,8 +247,7 @@ func TestRater_MissingPriceFailsLoudNotZero(t *testing.T) {
 }
 
 // TestRater_UnattributableCountedNotSilent: rows with NULL auth_id and/or model_id
-// must NOT be rated, MUST be counted, and MUST trigger the loud anomaly / exit-2
-// path — never silently dropped.
+// must NOT be rated, MUST be counted, and MUST trigger the loud anomaly / exit-2 path.
 func TestRater_UnattributableCountedNotSilent(t *testing.T) {
 	at := mustTime("2026-06-08T10:15:00Z")
 	events := []RatedEvent{
@@ -269,7 +256,7 @@ func TestRater_UnattributableCountedNotSilent(t *testing.T) {
 		{AuthID: "a", ModelID: "", PromptTokens: 100, CompletionTokens: 50, At: at},  // NULL model_id
 	}
 	store := newOracleStore(bookM(), events)
-	r := New(store, testLogger())
+	r := New(store, bookM(), testLogger())
 	res, err := r.Run(context.Background(), mustTime("2026-06-08T10:00:00Z"), mustTime("2026-06-08T11:00:00Z"))
 	if err != nil {
 		t.Fatal(err)
@@ -285,89 +272,81 @@ func TestRater_UnattributableCountedNotSilent(t *testing.T) {
 	}
 }
 
-// TestRater_EffectiveDatedSelectionInRun: end-to-end, an old event is rated with
-// the old price even when a newer price exists — no retroactive repricing.
-func TestRater_EffectiveDatedSelectionInRun(t *testing.T) {
-	book := NewPriceBook([]PriceRow{
-		{ModelID: "m", HasRate: true, Prompt: MustDec("0.000003"), Cached: MustDec("0"), Completion: MustDec("0"),
-			EffectiveFrom: mustTime("2026-01-01T00:00:00Z"), EffectiveTo: mustTime("2026-06-01T00:00:00Z")},
-		{ModelID: "m", HasRate: true, Prompt: MustDec("0.000005"), Cached: MustDec("0"), Completion: MustDec("0"),
-			EffectiveFrom: mustTime("2026-06-01T00:00:00Z")},
-	}, nil)
-	events := []RatedEvent{
-		{AuthID: "a", ModelID: "m", PromptTokens: 100, At: mustTime("2026-03-10T10:15:00Z")},
-	}
-	store := newOracleStore(book, events)
-	r := New(store, testLogger())
-	res, err := r.Run(context.Background(), mustTime("2026-03-10T10:00:00Z"), mustTime("2026-03-10T11:00:00Z"))
-	if err != nil {
-		t.Fatal(err)
-	}
-	// 100 * 0.000003 (old price) = 0.0003, NOT 100*0.000005.
-	if res.TotalCost != "0.000300000" {
-		t.Fatalf("total = %s, want 0.000300000 (old effective price)", res.TotalCost)
-	}
-}
-
-// TestRater_DerivedFineTuneRatedViaPolicy: end-to-end, a fine-tune (rate=null,
-// derived_from base) is rated at base × policy — exercising derivation in the run.
+// TestRater_DerivedFineTuneRatedViaPolicy: end-to-end, a fine-tune (derived_from a
+// base) is rated at base × premium — exercising derivation in the run.
 func TestRater_DerivedFineTuneRatedViaPolicy(t *testing.T) {
-	book := NewPriceBook(
-		[]PriceRow{
-			baseRow("base", "0.000004", "0", "0"),
-			derivedRow("ft", "base"),
-		},
-		[]PolicyRow{{Func: PolicyMultiplier, Factor: MustDec("1.5"), EffectiveFrom: mustTime("2026-01-01T00:00:00Z")}},
+	book := newTestBook(
+		map[string]Rate3{"base": rate3("0.000004", "0", "0")},
+		map[string]string{"ft": "base"},
+		PolicyMultiplier, MustDec("1.5"), Dec{},
 	)
 	events := []RatedEvent{
 		{AuthID: "a", ModelID: "ft", PromptTokens: 1000, At: mustTime("2026-06-08T10:15:00Z")},
 	}
 	store := newOracleStore(book, events)
-	r := New(store, testLogger())
+	r := New(store, book, testLogger())
 	res, err := r.Run(context.Background(), mustTime("2026-06-08T10:00:00Z"), mustTime("2026-06-08T11:00:00Z"))
 	if err != nil {
 		t.Fatal(err)
 	}
-	// 1000 * (0.000004 * 1.5) = 1000 * 0.000006 = 0.006
+	// 1000 * (0.000004 * 1.5) = 0.006
 	if res.TotalCost != "0.006000000" {
 		t.Fatalf("total = %s, want 0.006000000 (base×1.5 fine-tune)", res.TotalCost)
+	}
+}
+
+// TestRater_AppliedRateStoredOnRow (applied-rate-stored-on-row): the rollup carries
+// the exact per-token rate it was billed at, for both base and derived models.
+func TestRater_AppliedRateStoredOnRow(t *testing.T) {
+	book := newTestBook(
+		map[string]Rate3{"base": rate3("0.000004", "0.0000004", "0.00001")},
+		map[string]string{"ft": "base"},
+		PolicyMultiplier, MustDec("1.5"), Dec{},
+	)
+	at := mustTime("2026-06-08T10:15:00Z")
+	events := []RatedEvent{
+		{AuthID: "a", ModelID: "base", PromptTokens: 10, At: at},
+		{AuthID: "a", ModelID: "ft", PromptTokens: 10, At: at},
+	}
+	store := newOracleStore(book, events)
+	r := New(store, book, testLogger())
+	if _, err := r.Run(context.Background(), mustTime("2026-06-08T10:00:00Z"), mustTime("2026-06-08T11:00:00Z")); err != nil {
+		t.Fatal(err)
+	}
+	hour := mustTime("2026-06-08T10:00:00Z")
+	baseRow := store.table[rollupKey{"a", "base", hour}]
+	if baseRow.appliedRate.Prompt.String() != "0.000004000" {
+		t.Fatalf("base applied prompt rate = %s, want 0.000004000", baseRow.appliedRate.Prompt)
+	}
+	ftRow := store.table[rollupKey{"a", "ft", hour}]
+	// premium applied: 0.000004 × 1.5 = 0.000006
+	if ftRow.appliedRate.Prompt.String() != "0.000006000" {
+		t.Fatalf("ft applied prompt rate = %s, want 0.000006000 (premium frozen on row)", ftRow.appliedRate.Prompt)
 	}
 }
 
 // TestRater_InvertedWindow rejects an empty/inverted window before any SQL.
 func TestRater_InvertedWindow(t *testing.T) {
 	store := newOracleStore(bookM(), nil)
-	r := New(store, testLogger())
+	r := New(store, bookM(), testLogger())
 	if _, err := r.Run(context.Background(), mustTime("2026-06-08T11:00:00Z"), mustTime("2026-06-08T10:00:00Z")); err == nil {
 		t.Fatal("expected error for inverted window")
 	}
 }
 
 // TestConformance_SQLModelMatchesRateOracle checks the in-Go model's INTERNAL
-// consistency: over a fixture mixing base, derived (multiplier), effective-dated,
-// cached-subset, and unpriced/unattributable rows, the rollup the oracleStore
-// builds (resolve→exact-cost→sum→round-once) equals an independent recomputation,
-// row-for-row. NOTE: this does NOT exercise the production SQL — both sides are
-// pure Go. The SQL is pinned to the oracle by the //go:build integration tests in
-// store_integration_test.go, which run the REAL rateWindowSQL against a live
-// Postgres (TestConformance_SQLModelMatchesRateOracle conformance + the sub-nano
-// rounding-order guard). Those run in CI's integration-test job (Postgres
-// service). This in-Go test is the fast inner check; the integration tests are the
-// real pin.
+// consistency: over a fixture mixing base, derived (multiplier), cached-subset, and
+// unpriced/unattributable rows, the rollup the oracleStore builds
+// (resolve→exact-cost→sum→round-once) equals an independent recomputation,
+// row-for-row. The production SQL is pinned to this oracle by the //go:build
+// integration tests in store_integration_test.go.
 func TestConformance_SQLModelMatchesRateOracle(t *testing.T) {
-	book := NewPriceBook(
-		[]PriceRow{
-			// base "b" effective-dated: 0.000003 until June, 0.000005 after.
-			{ModelID: "b", HasRate: true, Prompt: MustDec("0.000003"), Cached: MustDec("0.0000003"), Completion: MustDec("0.00001"),
-				EffectiveFrom: mustTime("2026-01-01T00:00:00Z"), EffectiveTo: mustTime("2026-06-01T00:00:00Z")},
-			{ModelID: "b", HasRate: true, Prompt: MustDec("0.000005"), Cached: MustDec("0.0000005"), Completion: MustDec("0.00002"),
-				EffectiveFrom: mustTime("2026-06-01T00:00:00Z")},
-			// fine-tune "f" derives from "b".
-			derivedRow("f", "b"),
-		},
-		[]PolicyRow{{Func: PolicyMultiplier, Factor: MustDec("1.5"), EffectiveFrom: mustTime("2026-01-01T00:00:00Z")}},
+	book := newTestBook(
+		map[string]Rate3{"b": rate3("0.000005", "0.0000005", "0.00002")},
+		map[string]string{"f": "b"},
+		PolicyMultiplier, MustDec("1.5"), Dec{},
 	)
-	hour := mustTime("2026-06-08T10:00:00Z") // after June → base uses 0.000005 rate
+	hour := mustTime("2026-06-08T10:00:00Z")
 	events := []RatedEvent{
 		{AuthID: "a", ModelID: "b", PromptTokens: 100, CachedTokens: 30, CompletionTokens: 50, At: hour.Add(5 * time.Minute)},
 		{AuthID: "a", ModelID: "b", PromptTokens: 200, CachedTokens: 0, CompletionTokens: 10, At: hour.Add(40 * time.Minute)},
@@ -377,37 +356,32 @@ func TestConformance_SQLModelMatchesRateOracle(t *testing.T) {
 		{AuthID: "", ModelID: "b", PromptTokens: 9, At: hour.Add(2 * time.Minute)},                                               // unattributable
 	}
 	store := newOracleStore(book, events)
-	r := New(store, testLogger())
+	r := New(store, book, testLogger())
 	res, err := r.Run(context.Background(), hour, hour.Add(time.Hour))
 	if err != nil {
 		t.Fatal(err)
 	}
 
-	// Independent oracle recomputation: group the PRICED, ATTRIBUTABLE events and
-	// sum Rate() per (auth,model,hour). This deliberately re-derives the expectation
-	// rather than trusting the store, so it is a true cross-check.
 	type key struct{ auth, model string }
 	want := map[key]Dec{}
 	for _, e := range events {
 		if e.AuthID == "" || e.ModelID == "" {
 			continue
 		}
-		rate, err := book.ResolvePrice(e.ModelID, e.At)
+		resolved, err := book.Resolve(e.ModelID)
 		if err != nil {
 			continue
 		}
 		k := key{e.AuthID, e.ModelID}
-		want[k] = want[k].Add(Rate(e, rate))
+		want[k] = want[k].Add(Rate(e, resolved.Quantized()))
 	}
 	if res.UnpricedEvents != 1 || res.UnattributableEvents != 1 {
 		t.Fatalf("anomalies = unpriced %d / unattr %d, want 1/1", res.UnpricedEvents, res.UnattributableEvents)
 	}
 	// SINGLE-SNAPSHOT ACCOUNTING INVARIANT: rated + unpriced + unattributable must
-	// PARTITION the in-window events — every event is in exactly one bucket. In
-	// production this holds because the counts come from the same statement (same
-	// snapshot) as the upsert; here the oracle mirrors that with one resolve pass.
+	// PARTITION the in-window events.
 	if got := res.EventsRated + res.UnpricedEvents + res.UnattributableEvents; got != int64(len(events)) {
-		t.Fatalf("rated(%d) + unpriced(%d) + unattributable(%d) = %d, want %d (every in-window event accounted exactly once)",
+		t.Fatalf("rated(%d) + unpriced(%d) + unattributable(%d) = %d, want %d",
 			res.EventsRated, res.UnpricedEvents, res.UnattributableEvents, got, len(events))
 	}
 	if res.RollupsWritten != int64(len(want)) {

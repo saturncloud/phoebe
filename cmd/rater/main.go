@@ -1,9 +1,12 @@
-// Command rater is phoebe's REVENUE path batch job. It reads a window of raw
-// metering rows from billing_event and, ENTIRELY IN SQL, joins the effective-dated
-// price book (model_price, keyed on model_id) plus the global fine-tune derivation
-// policy (derivation_policy), computes per-event cost as exact NUMERIC, sums it,
-// and upserts per-(auth_id, model_id, hour) cost rollups into rated_usage. No money
-// math happens in Go — the rater binary is orchestration only.
+// Command rater is phoebe's REVENUE path batch job. It loads a YAML PRICE FILE (E1)
+// — base per-token rates keyed on the HF model id, the single global fine-tune
+// premium policy, and per-GPU floor rates — reads a window of raw metering rows from
+// billing_event, projects the prices into a transient TEMP table, and ENTIRELY IN
+// SQL computes per-event cost as exact NUMERIC, sums it, and upserts
+// per-(auth_id, model_id, hour) cost rollups into rated_usage (with the applied
+// per-token rates frozen onto each row). No money math happens in Go — the rater
+// binary is orchestration only (the fine-tune premium is applied in exact decimal
+// when the prices are projected, then handed to SQL as NUMERIC).
 //
 // It is a ONE-SHOT BATCH job (run by cron / a k8s CronJob), NOT a daemon: it
 // rates one window and exits. Exit codes:
@@ -33,9 +36,11 @@
 // explicitly with --since/--until).
 //
 // Config, like the drainer: a YAML settings file (flag -f) for pool knobs and
-// rateTrailingHours, and the DATABASE_URL env var (Atlas convention) for Postgres.
-// The rater does NOT run migrations — it assumes billing_event/model_price/
-// derivation_policy/rated_usage exist (see migrations/README.md).
+// rateTrailingHours, the DATABASE_URL env var (Atlas convention) for Postgres, and a
+// price-file path (settings `priceFile` or flag -prices) for the YAML price book. The
+// rater does NOT run migrations — it assumes billing_event/rated_usage exist (see
+// migrations/README.md). It FAILS CLOSED if the price file is missing or malformed:
+// it refuses to rate rather than bill at $0.
 package main
 
 import (
@@ -62,6 +67,12 @@ type raterSettings struct {
 	// explicit 0 fails loud instead of silently meaning "default".
 	RateTrailingHours *int `yaml:"rateTrailingHours"`
 
+	// PriceFile is the path to the YAML price book (E1). Required (via settings or
+	// the -prices flag): the rater cannot price without it. A local path now; the
+	// S3-fetch is out of scope (fetch-to-local then point this at the local copy —
+	// the create-time price gate and the rater must read the same file/version).
+	PriceFile string `yaml:"priceFile"`
+
 	MaxOpenConns    int    `yaml:"maxOpenConns"`
 	MaxIdleConns    int    `yaml:"maxIdleConns"`
 	ConnMaxLifetime string `yaml:"connMaxLifetime"`
@@ -87,6 +98,7 @@ func main() {
 // (os.Exit skips defers).
 func run() int {
 	settingsFile := flag.String("f", "/etc/saturn/config/rater.yaml", "Settings YAML file path")
+	pricesFlag := flag.String("prices", "", "Price YAML file path (overrides settings priceFile)")
 	since := flag.String("since", "", "Window start, RFC3339 (default: floor(now) minus rateTrailingHours)")
 	until := flag.String("until", "", "Window end, RFC3339 (default: start of the current hour)")
 	flag.Parse()
@@ -100,6 +112,23 @@ func run() int {
 	}
 	if opts.debug {
 		log.SetLevel(logging.DEBUG)
+	}
+
+	// The -prices flag overrides the settings priceFile. The price file is REQUIRED:
+	// without it the rater cannot price (it must never default to $0). Load+validate
+	// up front so a bad file fails the job before any DB work — fail closed.
+	pricePath := opts.priceFile
+	if *pricesFlag != "" {
+		pricePath = *pricesFlag
+	}
+	if pricePath == "" {
+		log.Error.Printf("rater: no price file configured (set priceFile in the settings file or pass -prices); the rater cannot rate without prices")
+		return exitFatal
+	}
+	book, err := rating.LoadPriceBook(pricePath)
+	if err != nil {
+		log.Error.Printf("rater: load price file %q: %v (refusing to rate — never bill at $0)", pricePath, err)
+		return exitFatal
 	}
 
 	windowStart, windowEnd, err := resolveWindow(*since, *until, opts.trailingHours, time.Now())
@@ -120,7 +149,7 @@ func run() int {
 	}
 	defer func() { _ = store.Close() }()
 
-	r := rating.New(store, log)
+	r := rating.New(store, book, log)
 	res, err := r.Run(ctx, windowStart, windowEnd)
 	if err != nil {
 		log.Error.Printf("rater: run: %v", err)
@@ -194,7 +223,8 @@ func resolveWindow(since, until string, trailingHours int, now time.Time) (time.
 // raterOptions are the non-pool knobs loadConfig resolves from the settings file.
 type raterOptions struct {
 	debug         bool
-	trailingHours int // validated >= 1, defaulted to defaultRateTrailingHours
+	trailingHours int    // validated >= 1, defaulted to defaultRateTrailingHours
+	priceFile     string // path to the YAML price book (may be overridden by -prices)
 }
 
 // loadConfig reads the YAML settings file, applies rating.DefaultConfig, then
@@ -236,6 +266,7 @@ func loadConfig(path string) (rating.Config, raterOptions, error) {
 	// DATABASE_URL (Atlas convention) is the authoritative Postgres source.
 	cfg.DatabaseURL = os.Getenv("DATABASE_URL")
 
+	opts.priceFile = s.PriceFile
 	opts.debug = s.Debug
 	return cfg, opts, nil
 }
