@@ -626,6 +626,83 @@ func TestE2E_FineTuneBillsAtBaseTimesPremium(t *testing.T) {
 	h.assertNumericEqual(t, cost, wantCost, "rated_usage.cost")
 }
 
+// TestE2E_FineTuneWithoutBaseModelHeaderIsUnpriced is the fail-CLOSED end of the
+// fine-tune pipe (the mirror of TestE2E_FineTuneBillsAtBaseTimesPremium). A request to
+// a fine-tune deployment that arrives WITHOUT the X-Saturn-Base-Model header — the
+// propagation seam broken (Traefik not allowlisting it, Atlas not stamping it) — must
+// NOT be silently rated: the ft:<checkpoint> id is absent from the price file and has
+// no base_model to derive through, so the whole pipe must end with the event UNPRICED
+// (an anomaly that screams), never $0-billed and never rated. A silent $0 here would
+// lose ALL fine-tune revenue the moment the header stopped propagating.
+func TestE2E_FineTuneWithoutBaseModelHeaderIsUnpriced(t *testing.T) {
+	h := newHarness(t, "phoebe_e2e_ft_nobase")
+
+	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.WriteHeader(http.StatusOK)
+		fl, _ := w.(http.Flusher)
+		for _, chunk := range strings.SplitAfter(ftVllmStream, "\n\n") {
+			if chunk == "" {
+				continue
+			}
+			_, _ = io.WriteString(w, chunk)
+			if fl != nil {
+				fl.Flush()
+			}
+		}
+	}))
+	defer backend.Close()
+
+	srv := h.proxyServer(t, backend.URL)
+	rr := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions",
+		strings.NewReader(`{"model":"my-finetune","stream":true,"messages":[]}`))
+	req.Header.Set(identity.HeaderAuthID, testAuthID)
+	req.Header.Set(identity.HeaderResourceID, testResourceID)
+	req.Header.Set(identity.HeaderResourceType, "deployment")
+	req.Header.Set(identity.HeaderUserID, "user-e2e")
+	req.Header.Set(identity.HeaderGroupID, "group-e2e")
+	// DELIBERATELY no X-Saturn-Base-Model header — the propagation bug under test.
+	srv.Handler().ServeHTTP(rr, req)
+
+	if rr.Code != http.StatusOK {
+		t.Fatalf("proxy status = %d, want 200 (body: %s)", rr.Code, rr.Body.String())
+	}
+
+	h.waitForStreamLen(t, 1, 5*time.Second)
+	h.drainUntilRows(t, 1, 10*time.Second)
+
+	// base_model must be NULL on the row — the header never rode, so the rater has
+	// nothing to derive through.
+	var baseModel sql.NullString
+	if err := h.db.QueryRow("SELECT base_model FROM billing_event").Scan(&baseModel); err != nil {
+		t.Fatalf("read billing_event.base_model: %v", err)
+	}
+	if baseModel.Valid {
+		t.Fatalf("billing_event.base_model = %q, want NULL (no header was sent)", baseModel.String)
+	}
+
+	// The ft: event must FAIL LOUD: unpriced, not rated, not $0-billed.
+	res := h.rateEventHour(t, h.priceBook(t))
+	if res.UnpricedEvents != 1 {
+		t.Fatalf("UnpricedEvents = %d, want 1 (an ft: event with no base_model must scream)", res.UnpricedEvents)
+	}
+	if res.EventsRated != 0 || res.RollupsWritten != 0 {
+		t.Fatalf("result = %+v, want 0 rated / 0 rollups (a base_model-less fine-tune must NEVER be rated or $0-billed)", res)
+	}
+	if !res.HasUnpriced() || !res.HasAnomaly() {
+		t.Fatal("HasUnpriced/HasAnomaly = false, want true (the propagation bug must drive exit-nonzero)")
+	}
+	// And no rated_usage row was written for it.
+	var nRollups int
+	if err := h.db.QueryRow("SELECT COUNT(*) FROM rated_usage").Scan(&nRollups); err != nil {
+		t.Fatalf("count rated_usage: %v", err)
+	}
+	if nRollups != 0 {
+		t.Fatalf("rated_usage rows = %d, want 0 (no $0 row for the unpriced fine-tune)", nRollups)
+	}
+}
+
 // TestE2E_ModellessEventIsUnattributable pins the nullStr(model) contract end
 // to end: an event whose upstream never reported a model (e.g. an abort before
 // the first chunk) must reach Postgres with model = NULL and be counted by the

@@ -119,7 +119,14 @@ def upgrade():
 
 
 def downgrade():
-    op.execute("ALTER TABLE billing_event DROP COLUMN IF EXISTS base_model")
+    # NOTE: do NOT drop billing_event.base_model here. That column is OWNED by the
+    # billing_event create migration (b1f0c2d3e4a5), which declares it directly; this
+    # revision only re-adds it idempotently (ADD COLUMN IF NOT EXISTS) as belt-and-braces
+    # for a billing_event table created before the column existed. A migration must
+    # reverse only its OWN additions — dropping base_model on this downgrade would leave
+    # the schema DIVERGED from b1f0c2d3e4a5 (the column gone while its owning migration
+    # is still applied), and would silently destroy fine-tune base linkage. base_model
+    # is removed only by reversing b1f0c2d3e4a5 itself (drop_table billing_event).
     op.execute("DROP INDEX billing_event_rating_instant_ix")
     op.drop_index("rated_usage_auth_id_window_start_ix", table_name="rated_usage")
     op.drop_table("rated_usage")
