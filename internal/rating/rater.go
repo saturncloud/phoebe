@@ -31,12 +31,14 @@ func New(store Store, log *logging.Logger) *Rater {
 // number. UnpricedEvents / UnattributableEvents are the fail-loud signals: real
 // traffic the price book could not price, and rows that could not be attributed.
 type Result struct {
-	WindowStart          time.Time
-	WindowEnd            time.Time
-	EventsRated          int
-	UnpricedEvents       int    // events whose model had NO resolvable price (NOT $0-billed)
-	UnattributableEvents int    // in-window rows with NULL auth_id/model_id (upstream leak)
-	RollupsWritten       int    // distinct (auth_id, model_id, hour) rows upserted
+	WindowStart time.Time
+	WindowEnd   time.Time
+	// int64: COUNT/SUM over an arbitrary backfill window can exceed 2^31; the SQL
+	// casts these as ::bigint to avoid a silent 32-bit overflow (see store.go).
+	EventsRated          int64
+	UnpricedEvents       int64  // events whose model had NO resolvable price (NOT $0-billed)
+	UnattributableEvents int64  // in-window rows with NULL auth_id/model_id (upstream leak)
+	RollupsWritten       int64  // distinct (auth_id, model_id, hour) rows upserted
 	TotalCost            string // sum of all rollup costs, NUMERIC as text
 }
 

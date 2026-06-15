@@ -30,12 +30,8 @@ import (
 //     be excluded from the rollups yet missed by the anomaly counts (two separate
 //     READ COMMITTED statements could disagree exactly that way). Anomalous rows are
 //     NEVER summed into a rollup; they are counted and surfaced.
-//   - CountAnomalies re-counts the anomalies for an arbitrary window (ad-hoc / ops
-//     use). The rater's fail-loud contract does NOT depend on it — Run gets its
-//     counts from RateWindow's single snapshot.
 type Store interface {
 	RateWindow(ctx context.Context, start, end time.Time) (RateResult, error)
-	CountAnomalies(ctx context.Context, start, end time.Time) (Anomalies, error)
 	Ping(ctx context.Context) error
 	Close() error
 }
@@ -44,21 +40,27 @@ type Store interface {
 // (rollups/events/total) AND the anomaly counts from the SAME snapshot.
 // TotalCost is a NUMERIC carried as a string (money never becomes a Go number).
 type RateResult struct {
-	RollupsWritten int
-	EventsRated    int
+	// int64 (not int): these are COUNT/SUM over an arbitrary backfill window, so a
+	// wide window can exceed 2^31. Widened with the ::bigint SQL casts to avoid a
+	// silent 32-bit overflow.
+	RollupsWritten int64
+	EventsRated    int64
 	TotalCost      string // NUMERIC as text; "" when no rollups
 
 	// Fail-loud counts, from the same statement/snapshot as the upsert above, so
 	// they can never disagree with what the rollups excluded.
-	UnpricedEvents       int
-	UnattributableEvents int
+	UnpricedEvents       int64
+	UnattributableEvents int64
 }
 
 // Anomalies are the fail-loud counts for a window: events that could not be priced
-// and rows that could not be attributed. Both drive the exit-nonzero path.
+// and rows that could not be attributed. Both drive the exit-nonzero path. They
+// ride RateWindow's single snapshot (RateResult carries the same two counts); this
+// named pair is the resolve-pass result the test oracle mirrors. int64 to match
+// RateResult's widened counts (a wide backfill window can exceed 2^31).
 type Anomalies struct {
-	UnpricedEvents       int
-	UnattributableEvents int
+	UnpricedEvents       int64
+	UnattributableEvents int64
 }
 
 // PostgresStore reads billing_event + model_price + derivation_policy and writes
@@ -122,10 +124,10 @@ func (s *PostgresStore) Close() error                   { return s.db.Close() }
 
 // resolvedEventsCTE is the heart of the v2 rater: a CTE that, for every
 // billing_event row in [$1, $2), resolves the effective per-token rate and the
-// per-event cost ENTIRELY IN SQL. It is shared verbatim by rateWindowSQL (which
-// SUMs and upserts the priced rows AND counts the rows that did NOT resolve, in
-// one statement/snapshot) and countAnomaliesSQL (the ad-hoc/ops counting query),
-// so the two ALWAYS agree on what "priced" means.
+// per-event cost ENTIRELY IN SQL. It is consumed by rateWindowSQL, which SUMs and
+// upserts the priced rows AND counts the rows that did NOT resolve in one
+// statement/snapshot, so the rollups and the anomaly counts always agree on what
+// "priced" means.
 //
 // Resolution, AS-OF each event's rating instant ev_ts = COALESCE(event_ts,
 // created_at):
@@ -362,18 +364,22 @@ upserted AS (
     RETURNING event_count, cost
 )
 SELECT
-    (SELECT COUNT(*)::int                      FROM upserted) AS rollups_written,
-    (SELECT COALESCE(SUM(event_count), 0)::int FROM upserted) AS events_rated,
-    (SELECT COALESCE(SUM(cost), 0)::numeric    FROM upserted) AS total_cost,
+    -- ::bigint, not ::int: a very wide backfill window can sum more than 2^31
+    -- events (or write more than 2^31 rollup rows), which a 32-bit cast would
+    -- silently overflow into a negative/garbage count and defeat the rated-count
+    -- reconciliation. The cost is already NUMERIC. Scanned into int64 in Go.
+    (SELECT COUNT(*)::bigint                      FROM upserted) AS rollups_written,
+    (SELECT COALESCE(SUM(event_count), 0)::bigint FROM upserted) AS events_rated,
+    (SELECT COALESCE(SUM(cost), 0)::numeric       FROM upserted) AS total_cost,
     -- Anomaly counts from the SAME snapshot as the upsert. An unattributable row is
     -- counted ONLY as unattributable (the more specific signal), never also as
     -- unpriced, so the counts partition the in-window rows:
     --   events_rated + unpriced + unattributable == total in-window events.
-    (SELECT COUNT(*)::int FROM resolved
+    (SELECT COUNT(*)::bigint FROM resolved
       WHERE prompt_price IS NULL
         AND auth_id  IS NOT NULL
         AND model_id IS NOT NULL)                             AS unpriced_events,
-    (SELECT COUNT(*)::int FROM ev
+    (SELECT COUNT(*)::bigint FROM ev
       WHERE auth_id IS NULL OR model_id IS NULL)              AS unattributable_events`
 
 // RateWindow runs the single resolve→sum→upsert→count statement for [start, end)
@@ -391,43 +397,4 @@ func (s *PostgresStore) RateWindow(ctx context.Context, start, end time.Time) (R
 	}
 	res.TotalCost = total
 	return res, nil
-}
-
-// countAnomaliesSQL appends, to the resolution CTE, a single counting query over
-// the SAME window and SAME resolution: events that could NOT be priced (resolution
-// returned NULL rates) among ATTRIBUTABLE rows, and rows that are UNATTRIBUTABLE
-// (NULL auth_id/model_id). It shares resolvedEventsCTE with the rating insert so
-// "unpriced" means exactly the same thing in both.
-//
-// NOTE: the rater's fail-loud contract does NOT use this — Run gets its anomaly
-// counts from rateWindowSQL's single snapshot (a separate statement could miss a
-// row committed between the two). This query exists for ad-hoc / ops inspection of
-// a window without writing rollups.
-//
-// An unattributable row cannot be priced either, but it is counted ONLY as
-// unattributable (the distinct, more-specific signal) so the two counts don't
-// double-attribute the same row.
-const countAnomaliesSQL = resolvedEventsCTE + `
-SELECT
-    COUNT(*) FILTER (
-        WHERE prompt_price IS NULL
-          AND auth_id  IS NOT NULL
-          AND model_id IS NOT NULL
-    )::int AS unpriced,
-    COUNT(*) FILTER (
-        WHERE auth_id IS NULL OR model_id IS NULL
-    )::int AS unattributable
-FROM resolved`
-
-// CountAnomalies counts the fail-loud signals for [start, end): unpriced events and
-// unattributable rows. Nonzero either way drives the exit-nonzero / loud-log path.
-func (s *PostgresStore) CountAnomalies(ctx context.Context, start, end time.Time) (Anomalies, error) {
-	var a Anomalies
-	err := s.db.QueryRowContext(ctx, countAnomaliesSQL, start.UTC(), end.UTC()).
-		Scan(&a.UnpricedEvents, &a.UnattributableEvents)
-	if err != nil {
-		return Anomalies{}, fmt.Errorf("rating: count anomalies [%s,%s): %w",
-			start.UTC().Format(time.RFC3339), end.UTC().Format(time.RFC3339), err)
-	}
-	return a, nil
 }

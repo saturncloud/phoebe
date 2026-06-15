@@ -166,6 +166,20 @@ func (d *Drainer) process(ctx context.Context, msgs []redis.XMessage) (int, erro
 		ackIDs = append(ackIDs, m.ID)
 	}
 
+	// Drop poison entries FIRST, before the store work — they are malformed and
+	// unstorable BY DEFINITION, so dropping them is correct regardless of store
+	// health. Doing it here (rather than after the store) means a store-outage
+	// early-return below still drops them: otherwise the poison would redeliver
+	// every pass until an outage-free run, re-logging the same bad entries and
+	// wasting reclaim work, with no upside (they can never be stored). An ACK
+	// failure here is harmless — they redeliver and get dropped again, no data
+	// loss (the entries carry no storable billing data).
+	if len(poison) > 0 {
+		if err := d.ack(ctx, poison); err != nil {
+			d.log.Warn.Printf("drainer: ack poison entries: %v", err)
+		}
+	}
+
 	stored := len(events)
 	if len(events) > 0 {
 		// Store MUST commit before we ACK. The single batch statement is the
@@ -192,14 +206,6 @@ func (d *Drainer) process(ctx context.Context, msgs []redis.XMessage) (int, erro
 			// redeliver and the idempotent upsert no-ops them. Surface as error
 			// so the loop backs off, but the data is already durable.
 			return stored, fmt.Errorf("ack after store: %w", err)
-		}
-	}
-
-	// Drop poison entries after the real work; an ACK failure here just means
-	// they redeliver and get dropped again (still no data loss).
-	if len(poison) > 0 {
-		if err := d.ack(ctx, poison); err != nil {
-			d.log.Warn.Printf("drainer: ack poison entries: %v", err)
 		}
 	}
 

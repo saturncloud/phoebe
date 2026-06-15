@@ -244,10 +244,14 @@ func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request) {
 	// reads the body once and restores it so forceIncludeUsage re-reads the
 	// same bytes (no double-read). Only runs when shouldLog is true.
 	var reqBody string
+	var reqTruncated bool
 	var startTime time.Time
 	if shouldLog {
 		startTime = time.Now()
-		reqBody, err = captureRequestBody(r)
+		// Cap the LOGGED request-body copy at the same bound as the response copy
+		// (s.ioMaxBodyLen) — an uncapped body flows into to_tsvector and fails the
+		// INSERT past ~1 MiB. The forwarded request keeps the full body.
+		reqBody, reqTruncated, err = captureRequestBody(r, s.ioMaxBodyLen)
 		if err != nil {
 			s.log.Error.Printf("capture request body: %v", err)
 			http.Error(w, "bad request body", http.StatusBadRequest)
@@ -307,6 +311,7 @@ func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request) {
 					// Engine-reported model name, not the routing resource id.
 					Model:             res.Model,
 					RequestBody:       reqBody,
+					RequestTruncated:  reqTruncated,
 					ResponseBody:      respBody,
 					ResponseTruncated: truncated,
 					StatusCode:        statusCode,
@@ -334,21 +339,53 @@ func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request) {
 		return nil
 	}
 
-	rp.ErrorHandler = func(w http.ResponseWriter, _ *http.Request, err error) {
-		// context.Canceled means the client disconnected — an abort, not an
-		// upstream fault. Don't log it as an error or write a 502 over a
-		// connection that's already gone. errors.Is (not ==): the transport
-		// usually delivers the cancellation WRAPPED (e.g. *net.OpError around
-		// errCanceled), which satisfies Is but never equality.
-		if errors.Is(err, context.Canceled) {
+	rp.ErrorHandler = s.errorHandler(upstream.String(), id, requestID)
+
+	rp.ServeHTTP(w, r)
+}
+
+// errorHandler builds the ReverseProxy ErrorHandler for one request. The handler
+// fires for BOTH RoundTrip errors and ModifyResponse-returned errors, but only
+// CLIENT ABORTS (disconnect / deadline) are special-cased: an abort is logged at
+// debug and must not 502 a connection that is already gone, while a genuine
+// upstream/transport fault is logged at error and 502'd. The single isClientAbort
+// predicate decides which.
+//
+// THE ABORT-EMIT (Fix A) — money-path observability. ModifyResponse installs the
+// captureReader whose onDone emits the metering event; but a client that aborts
+// BEFORE the upstream writes its response headers fails RoundTrip, so
+// ModifyResponse never runs and onDone never fires — the request would pass the
+// billing-identity gate yet emit NOTHING, leaving served-or-attempted traffic
+// completely invisible to billing/reconciliation. So on an abort we emit exactly
+// ONE zero-token, attributable event (Aborted=true, no usage) with the already-
+// resolved identity, via the SAME s.emit path the completion path uses — so the
+// pre-header abort obeys the SAME BillPartialOnAbort policy (no second policy).
+//
+// Invariant: every request past the billing-identity gate emits exactly one
+// attributable event — real usage on completion, or a zero-token Aborted event on
+// disconnect (pre- OR post-header).
+//
+// NO double-emit: in phoebe ModifyResponse always returns nil, so ErrorHandler
+// fires ONLY on a RoundTrip error (pre-header) — mutually exclusive with the
+// onDone path (post-header), which needs ModifyResponse to have run. The emit is
+// gated on isClientAbort, so a genuine upstream/ModifyResponse fault never writes
+// a bogus zero-token billing row. The context is decoupled from the cancelled
+// client ctx (WithoutCancel) — the abort is precisely WHY we are here, so a
+// cancelled ctx must not be able to drop the emit (mirrors onDone).
+func (s *Server) errorHandler(upstream string, id identity.Identity, requestID string) func(http.ResponseWriter, *http.Request, error) {
+	return func(w http.ResponseWriter, r *http.Request, err error) {
+		if isClientAbort(err) {
 			s.log.Debug.Printf("client disconnected for %s", upstream)
+			// Pre-header abort: ModifyResponse never ran, so onDone will not emit.
+			// Emit a zero-token attributable event so the request is not invisible
+			// to billing. Best-effort, non-blocking — like onDone's emit.
+			ctx := context.WithoutCancel(r.Context())
+			s.emit(ctx, id, requestID, capture.Result{Aborted: true, UsageFound: false})
 			return
 		}
 		s.log.Error.Printf("upstream %s error: %v", upstream, err)
 		http.Error(w, "upstream error", http.StatusBadGateway)
 	}
-
-	rp.ServeHTTP(w, r)
 }
 
 // emit builds the metering event from the captured result and hands it to the
@@ -429,4 +466,29 @@ func missingBillingFields(id identity.Identity) []string {
 func isEventStream(resp *http.Response) bool {
 	ct := resp.Header.Get("Content-Type")
 	return strings.HasPrefix(ct, "text/event-stream")
+}
+
+// isClientAbort reports whether a ReverseProxy error is a client-side abort (the
+// client disconnected → context.Canceled) as opposed to an upstream/transport
+// fault. errors.Is (never ==) because the transport delivers the sentinel WRAPPED
+// on the common mid-flight paths (a *url.Error or *net.OpError around it), so an
+// identity compare would misclassify a real abort as an upstream error.
+//
+// DELIBERATELY context.Canceled ONLY — NOT context.DeadlineExceeded. In this
+// proxy's config a DeadlineExceeded is ALWAYS an upstream/transport fault, never
+// a client one: the request context carries no client deadline (the only
+// WithTimeout is the server's graceful-shutdown ctx), and DeadlineExceeded is
+// exactly what an upstream dial timeout (the transport's built-in 30s dial
+// Timeout) or a response-header timeout returns. Treating it as an abort would
+// SILENTLY downgrade an upstream outage to a debug "client disconnected" log,
+// drop the 502 the client should get, and emit a spurious zero-token Aborted
+// billing row attributing the outage to the tenant. (A prior change widened this
+// to include DeadlineExceeded; that was a regression — see TestIsClientAbort.)
+//
+// This is the SINGLE predicate that decides both ErrorHandler branches: an abort
+// is logged at debug + emits a zero-token attributable event (see handleProxy's
+// ErrorHandler), while a genuine upstream fault is logged at error + 502'd. The
+// two must agree on what "abort" means, hence one helper.
+func isClientAbort(err error) bool {
+	return errors.Is(err, context.Canceled)
 }

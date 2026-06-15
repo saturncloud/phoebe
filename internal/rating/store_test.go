@@ -103,30 +103,6 @@ func TestRateWindowSQL_Shape(t *testing.T) {
 	}
 }
 
-// TestCountAnomaliesSQL_Shape locks the anomaly-count query: it shares the SAME
-// resolution CTE (so "unpriced" means the same thing as in the insert) and counts
-// unpriced (priced=NULL, attributable) vs unattributable (NULL auth/model) without
-// double-attributing a row.
-func TestCountAnomaliesSQL_Shape(t *testing.T) {
-	wantFragments := []string{
-		"COUNT(*) FILTER (",
-		"WHERE prompt_price IS NULL",
-		"AND auth_id  IS NOT NULL",
-		"AND model_id IS NOT NULL",
-		"WHERE auth_id IS NULL OR model_id IS NULL",
-		"FROM resolved",
-	}
-	for _, f := range wantFragments {
-		if !strings.Contains(countAnomaliesSQL, f) {
-			t.Errorf("countAnomaliesSQL missing fragment: %q", f)
-		}
-	}
-	// Both statements must be built on the identical resolution CTE.
-	if !strings.Contains(rateWindowSQL, "WITH ev AS (") || !strings.Contains(countAnomaliesSQL, "WITH ev AS (") {
-		t.Fatal("rate/anomaly statements must both build on resolvedEventsCTE")
-	}
-}
-
 // TestEnsureUTCTimeZone: the belt-and-braces DSN pin appends timezone=UTC unless
 // the operator already chose a TZ (we never fight an explicit DSN). The bucketing
 // expression in rateWindowSQL is the load-bearing TZ fix; this is defense in depth.
@@ -143,33 +119,5 @@ func TestEnsureUTCTimeZone(t *testing.T) {
 		if got := ensureUTCTimeZone(c.in); got != c.want {
 			t.Errorf("ensureUTCTimeZone(%q) = %q, want %q", c.in, got, c.want)
 		}
-	}
-}
-
-// TestPostgresStore_CountAnomalies scans the two counts.
-func TestPostgresStore_CountAnomalies(t *testing.T) {
-	db, mock, err := sqlmock.New(sqlmock.QueryMatcherOption(sqlmock.QueryMatcherRegexp))
-	if err != nil {
-		t.Fatalf("sqlmock: %v", err)
-	}
-	defer db.Close()
-	store := NewPostgresStore(db)
-
-	start := mustTime("2026-06-08T10:00:00Z")
-	end := mustTime("2026-06-08T11:00:00Z")
-
-	mock.ExpectQuery(`COUNT\(\*\) FILTER`).
-		WithArgs(start.UTC(), end.UTC()).
-		WillReturnRows(sqlmock.NewRows([]string{"unpriced", "unattributable"}).AddRow(3, 1))
-
-	a, err := store.CountAnomalies(context.Background(), start, end)
-	if err != nil {
-		t.Fatalf("CountAnomalies: %v", err)
-	}
-	if a.UnpricedEvents != 3 || a.UnattributableEvents != 1 {
-		t.Fatalf("anomalies = %+v, want 3/1", a)
-	}
-	if err := mock.ExpectationsWereMet(); err != nil {
-		t.Fatalf("unmet: %v", err)
 	}
 }

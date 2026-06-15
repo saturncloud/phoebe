@@ -108,7 +108,8 @@ func (p StaticPolicy) ShouldLog(id identity.Identity, requestID string) bool {
 	if p.SampleRate <= 0 {
 		return false
 	}
-	// Per-tenant opt-in. An empty allowlist means all tenants are eligible.
+	// Per-tenant opt-in (fail-closed). An empty allowlist opts in NO ONE;
+	// fleet-wide capture requires the explicit AllowAllTenants flag. See optedIn.
 	if !p.optedIn(id) {
 		return false
 	}

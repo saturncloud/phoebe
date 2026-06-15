@@ -55,8 +55,17 @@ def upgrade():
         # Workload.
         sa.Column("model", sa.Unicode(length=255), nullable=True),
         # Captured bodies. TEXT at the column level; buffered size is capped in
-        # the sink (default 256 KiB response) so rows stay bounded.
+        # the sink (default 256 KiB) so rows stay bounded. The cap applies to BOTH
+        # bodies — request_body flows into the body_tsv to_tsvector, which Postgres
+        # rejects past ~1 MiB, so an uncapped long-context prompt would fail the
+        # whole INSERT. request_truncated / response_truncated flag a cut body.
         sa.Column("request_body", sa.UnicodeText(), nullable=True),
+        sa.Column(
+            "request_truncated",
+            sa.Boolean(),
+            nullable=False,
+            server_default=sa.false(),
+        ),
         sa.Column("response_body", sa.UnicodeText(), nullable=True),
         sa.Column(
             "response_truncated",

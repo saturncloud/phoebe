@@ -47,9 +47,13 @@ CREATE TABLE io_log (
     model              VARCHAR(255),
 
     -- The captured bodies. TEXT (unbounded at the column level); the BUFFERED
-    -- size is capped in the sink (default 256 KiB for the response) so rows stay
-    -- bounded. response_truncated flags a response cut at that cap.
+    -- size is capped in the sink (default 256 KiB) so rows stay bounded. The cap
+    -- applies to BOTH bodies — request_body flows into the body_tsv to_tsvector
+    -- below, which Postgres rejects past ~1 MiB, so an uncapped long-context
+    -- prompt would fail the whole INSERT. request_truncated / response_truncated
+    -- flag a body cut at that cap.
     request_body       TEXT,
+    request_truncated  BOOLEAN NOT NULL DEFAULT FALSE,
     response_body      TEXT,
     response_truncated BOOLEAN NOT NULL DEFAULT FALSE,
 
