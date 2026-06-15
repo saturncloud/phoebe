@@ -240,6 +240,78 @@ base_models:
 	}
 }
 
+// TestLoad_SubNanoRateRoundsToZeroFailsClosed (sub-nano-rate-rounds-to-zero-fails-closed):
+// a per-token rate finer than 9dp that quantizes to $0 is REJECTED at load. Money is
+// billed at 9dp (NUMERIC(20,9)); a nonzero rate that rounds to zero would serve the
+// model for FREE — silent lost revenue. The guard fires on the nonzero-rounds-to-zero
+// case ONLY: a literal "0" is an intentional free rate and must still load, and a rate
+// at or above 1 nano must load unchanged.
+func TestLoad_SubNanoRateRoundsToZeroFailsClosed(t *testing.T) {
+	// A nonzero prompt rate one decimal finer than nano: 0.0000000001 -> 0.000000000.
+	const tooFine = `
+version: 1
+base_models:
+  m:
+    prompt:     "0.0000000001"
+    cached:     "0"
+    completion: "0"
+`
+	_, err := ParsePriceBook([]byte(tooFine))
+	if err == nil {
+		t.Fatal("a nonzero rate that rounds to $0 at 9dp loaded cleanly; want a fail-closed error (it would bill the model FREE)")
+	}
+	if !strings.Contains(err.Error(), "rounds to $0") || !strings.Contains(err.Error(), "m") {
+		t.Fatalf("error = %q, want it to name the offending model and the round-to-zero cause", err)
+	}
+
+	// Half-up boundary: 0.0000000005 -> 0.000000001 (NONZERO at 9dp), so it must LOAD.
+	const onBoundary = `
+version: 1
+base_models:
+  m:
+    prompt:     "0.0000000005"
+    cached:     "0"
+    completion: "0"
+`
+	pb, err := ParsePriceBook([]byte(onBoundary))
+	if err != nil {
+		t.Fatalf("a rate that rounds half-up to 1 nano must load: %v", err)
+	}
+	if r, _ := pb.Resolve("m"); r.Prompt.Round(moneyScale).String() != "0.000000001" {
+		t.Fatalf("boundary rate quantized to %s, want 0.000000001", r.Prompt.Round(moneyScale))
+	}
+
+	// An intentional literal $0 free rate must STILL load (the guard targets nonzero
+	// mis-pricings, not deliberate zeros).
+	const freeRate = `
+version: 1
+base_models:
+  m:
+    prompt:     "0"
+    cached:     "0"
+    completion: "0"
+`
+	if _, err := ParsePriceBook([]byte(freeRate)); err != nil {
+		t.Fatalf("a literal $0 free rate must load (intentional zero): %v", err)
+	}
+
+	// The guard also covers a fine-tune's OWN rate (same parseRate3 path).
+	const ftOwnTooFine = `
+version: 1
+base_models:
+  base: {prompt: "0.000001", cached: "0", completion: "0"}
+fine_tunes:
+  "ft:x":
+    rate:
+      prompt:     "0.0000000002"
+      cached:     "0"
+      completion: "0"
+`
+	if _, err := ParsePriceBook([]byte(ftOwnTooFine)); err == nil {
+		t.Fatal("a fine-tune own-rate that rounds to $0 loaded cleanly; want fail-closed")
+	}
+}
+
 // TestLoad_GPUFloorRatesParsed: per-GPU floor rates are parsed and validated (so the
 // file is complete) even though the token rater does not yet consume them.
 func TestLoad_GPUFloorRatesParsed(t *testing.T) {

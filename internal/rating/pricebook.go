@@ -270,6 +270,17 @@ func parseNonNegRate(modelID, field, s string) (Dec, error) {
 	if d.Sign() < 0 {
 		return Dec{}, fmt.Errorf("rating: model %q %s rate is negative (%s) — a price must never credit the customer", modelID, field, s)
 	}
+	// FAIL CLOSED on a sub-9dp rate that quantizes to ZERO. Money is stored and
+	// billed at 9dp (moneyScale / NUMERIC(20,9)); a finer nonzero rate is silently
+	// rounded, and one that rounds to 0 (e.g. "0.0000000001") would serve the model
+	// for FREE — exactly the lost-revenue outcome this package exists to prevent. An
+	// operator who writes a nonzero number clearly intends a nonzero price, so a
+	// round-to-zero is a MIS-PRICED model, not a $0 model. A literal $0 (d.Sign()==0
+	// here) is a legitimate, intentional free rate and is allowed.
+	if d.Sign() > 0 && d.Round(moneyScale).IsZero() {
+		return Dec{}, fmt.Errorf("rating: model %q %s rate %s is nonzero but rounds to $0 at %d-decimal (nano-USD) precision — it would bill the model for FREE; write a rate >= 0.000000001 or 0 for an intentional free rate",
+			modelID, field, s, moneyScale)
+	}
 	return d, nil
 }
 
