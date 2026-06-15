@@ -61,11 +61,20 @@ type Record struct {
 	// model id — see proxy.emit).
 	Model string `json:"model,omitempty"`
 
-	// RequestBody is the ORIGINAL client request body (pre-rewrite). See the
-	// proxy wiring comment for why the original is captured rather than the
-	// usage-forced rewrite: tenant troubleshooting wants to see what the client
-	// actually sent, not phoebe's internal include_usage injection.
+	// RequestBody is the ORIGINAL client request body (pre-rewrite), capped at the
+	// configured MaxBodyBytes. See the proxy wiring comment for why the original
+	// is captured rather than the usage-forced rewrite: tenant troubleshooting
+	// wants to see what the client actually sent, not phoebe's internal
+	// include_usage injection.
 	RequestBody string `json:"request_body,omitempty"`
+
+	// RequestTruncated is true if RequestBody was cut at the size cap. Mirrors
+	// ResponseTruncated. The cap matters here for correctness, not just memory:
+	// the request body flows into to_tsvector at INSERT time, which Postgres
+	// rejects past ~1 MiB — an uncapped long-context prompt would fail the whole
+	// row. The full body still reached the upstream verbatim; the cap bounds only
+	// what we STORE.
+	RequestTruncated bool `json:"request_truncated,omitempty"`
 
 	// ResponseBody is the response bytes forwarded to the client, up to the
 	// configured cap. For SSE streams this is the concatenated raw stream.

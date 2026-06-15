@@ -244,10 +244,14 @@ func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request) {
 	// reads the body once and restores it so forceIncludeUsage re-reads the
 	// same bytes (no double-read). Only runs when shouldLog is true.
 	var reqBody string
+	var reqTruncated bool
 	var startTime time.Time
 	if shouldLog {
 		startTime = time.Now()
-		reqBody, err = captureRequestBody(r)
+		// Cap the LOGGED request-body copy at the same bound as the response copy
+		// (s.ioMaxBodyLen) — an uncapped body flows into to_tsvector and fails the
+		// INSERT past ~1 MiB. The forwarded request keeps the full body.
+		reqBody, reqTruncated, err = captureRequestBody(r, s.ioMaxBodyLen)
 		if err != nil {
 			s.log.Error.Printf("capture request body: %v", err)
 			http.Error(w, "bad request body", http.StatusBadRequest)
@@ -307,6 +311,7 @@ func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request) {
 					// Engine-reported model name, not the routing resource id.
 					Model:             res.Model,
 					RequestBody:       reqBody,
+					RequestTruncated:  reqTruncated,
 					ResponseBody:      respBody,
 					ResponseTruncated: truncated,
 					StatusCode:        statusCode,

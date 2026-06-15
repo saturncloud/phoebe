@@ -10,27 +10,38 @@ import (
 
 // captureRequestBody reads the request body and restores it so a subsequent
 // reader (forceIncludeUsage) sees the same bytes — no double-read of the
-// underlying stream. It returns the ORIGINAL body as a string for M5 I/O
-// logging. Called only when the iolog policy gate passed, so the read cost is
-// paid exclusively by opted-in, sampled requests.
+// underlying stream. It returns the ORIGINAL body (capped for the LOG copy) as a
+// string for M5 I/O logging, plus whether that copy was truncated. Called only
+// when the iolog policy gate passed, so the read cost is paid exclusively by
+// opted-in, sampled requests.
 //
-// A nil body yields "" with no error. The whole body is held in memory here,
-// which is acceptable: it is bounded by the inbound request size and only
-// happens for sampled requests.
-func captureRequestBody(r *http.Request) (string, error) {
+// THE LOGGED COPY IS CAPPED at maxBodyBytes — the SAME bound the response copy
+// uses (truncateAtRuneBoundary), for the SAME reason: the request body flows into
+// to_tsvector at INSERT time, and Postgres rejects a tsvector input past ~1 MiB,
+// which would fail the whole io_log INSERT and silently drop the record on any
+// long-context prompt. The cap bounds what we LOG; the FORWARDED request to the
+// upstream is always the full body (restored below), so this never changes what
+// the model sees — only the stored log copy. Truncation is at a rune boundary so
+// the stored TEXT is valid UTF-8. maxBodyBytes <= 0 means uncapped.
+//
+// A nil body yields ("", false) with no error.
+func captureRequestBody(r *http.Request, maxBodyBytes int) (body string, truncated bool, err error) {
 	if r.Body == nil {
-		return "", nil
+		return "", false, nil
 	}
-	body, err := io.ReadAll(r.Body)
+	raw, err := io.ReadAll(r.Body)
 	_ = r.Body.Close()
 	if err != nil {
-		return "", err
+		return "", false, err
 	}
-	// Restore the body so forceIncludeUsage (and the upstream) can read it.
-	r.Body = io.NopCloser(bytes.NewReader(body))
-	r.ContentLength = int64(len(body))
-	r.Header.Set("Content-Length", strconv.Itoa(len(body)))
-	return string(body), nil
+	// Restore the FULL body so forceIncludeUsage (and the upstream) read every
+	// byte — the cap only bounds the LOG copy, never the forwarded request.
+	r.Body = io.NopCloser(bytes.NewReader(raw))
+	r.ContentLength = int64(len(raw))
+	r.Header.Set("Content-Length", strconv.Itoa(len(raw)))
+
+	logCopy, truncated := truncateAtRuneBoundary(raw, maxBodyBytes)
+	return string(logCopy), truncated, nil
 }
 
 // forceIncludeUsage rewrites a request body so that streamed responses carry a

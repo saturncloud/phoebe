@@ -85,6 +85,7 @@ func TestPostgresSink_InsertSQLShape(t *testing.T) {
 			sqlmock.AnyArg(), // resource_type (empty -> NULL)
 			rec.Model,
 			rec.RequestBody,
+			rec.RequestTruncated,
 			rec.ResponseBody,
 			rec.ResponseTruncated,
 			rec.StatusCode,
@@ -109,7 +110,7 @@ func TestPostgresSink_InsertSQLShape(t *testing.T) {
 // the full-text vector population, the "grep inside bodies" mechanism.
 func TestPostgresSink_QueryMentionsTsvector(t *testing.T) {
 	q := insertQuery("io_log")
-	for _, want := range []string{"INSERT INTO io_log", "to_tsvector", "body_tsv", "$14"} {
+	for _, want := range []string{"INSERT INTO io_log", "to_tsvector", "body_tsv", "request_truncated", "$15"} {
 		if !regexp.MustCompile(regexp.QuoteMeta(want)).MatchString(q) {
 			t.Errorf("insert query missing %q:\n%s", want, q)
 		}
@@ -157,7 +158,8 @@ func TestPostgresSink_NulAndInvalidUTF8BodySanitized(t *testing.T) {
 			rec.ResourceID,
 			sqlmock.AnyArg(),
 			rec.Model,
-			"ab",  // NUL removed
+			"ab", // NUL removed
+			rec.RequestTruncated,
 			"x�y", // the run of invalid bytes replaced with one U+FFFD
 			rec.ResponseTruncated,
 			rec.StatusCode,

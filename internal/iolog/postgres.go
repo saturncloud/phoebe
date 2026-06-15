@@ -119,13 +119,13 @@ func withDefaults(cfg Config) Config {
 func insertQuery(table string) string {
 	return fmt.Sprintf(`INSERT INTO %s (
 		request_id, auth_id, user_id, group_id, resource_id, resource_type,
-		model, request_body, response_body, response_truncated,
+		model, request_body, request_truncated, response_body, response_truncated,
 		status_code, streamed, latency_ms, created_at, body_tsv
 	) VALUES (
 		$1, $2, $3, $4, $5, $6,
-		$7, $8, $9, $10,
-		$11, $12, $13, $14,
-		to_tsvector('simple', coalesce($8,'') || ' ' || coalesce($9,''))
+		$7, $8, $9, $10, $11,
+		$12, $13, $14, $15,
+		to_tsvector('simple', coalesce($8,'') || ' ' || coalesce($10,''))
 	)`, table)
 }
 
@@ -143,6 +143,7 @@ func insertArgs(rec Record) []any {
 		nullStr(rec.ResourceType),
 		nullStr(rec.Model),
 		sanitizeBody(rec.RequestBody),
+		rec.RequestTruncated,
 		sanitizeBody(rec.ResponseBody),
 		rec.ResponseTruncated,
 		rec.StatusCode,
