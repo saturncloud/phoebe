@@ -36,18 +36,36 @@ func (u Usage) CachedTokens() int {
 
 // Event is one immutable, idempotent metering record per request. It is keyed
 // by RequestID for downstream dedup (at-least-once delivery).
+//
+// Phoebe records the RAW identity it was given (every X-Saturn-* header) plus
+// raw token counts. It does NOT resolve org/tenant on the hot path: AuthID (the
+// token / API-key id) is the stable attribution key, and rating resolves
+// auth_id → IdentityAuth → user/group/org out of band. UserID, GroupID,
+// ResourceID, ResourceType are captured verbatim so no information the edge
+// gave us is lost.
 type Event struct {
-	RequestID        string `json:"request_id"`
-	GroupID          string `json:"group_id"` // tenant / org
-	UserID           string `json:"user_id"`
-	Model            string `json:"model"`
-	Adapter          string `json:"adapter,omitempty"`
-	PromptTokens     int    `json:"prompt_tokens"`
-	CachedTokens     int    `json:"cached_tokens"`
-	CompletionTokens int    `json:"completion_tokens"`
-	FinishReason     string `json:"finish_reason,omitempty"`
-	GPUType          string `json:"gpu_type,omitempty"` // for margin; echoed by router/engine
-	Aborted          bool   `json:"aborted,omitempty"`
+	RequestID string `json:"request_id"`
+
+	// Identity, captured verbatim from atlas-auth headers.
+	AuthID       string `json:"auth_id,omitempty"`       // token / API-key id (JWT sub) — primary key
+	UserID       string `json:"user_id,omitempty"`       // present on user tokens
+	GroupID      string `json:"group_id,omitempty"`      // present on group tokens
+	ResourceID   string `json:"resource_id,omitempty"`   // model / deployment id
+	ResourceType string `json:"resource_type,omitempty"` // e.g. workspace, deployment
+
+	// Workload.
+	Model   string `json:"model,omitempty"`
+	Adapter string `json:"adapter,omitempty"`
+
+	// Token counts (the engine's own usage block; never re-tokenized).
+	PromptTokens     int `json:"prompt_tokens"`
+	CachedTokens     int `json:"cached_tokens"`
+	CompletionTokens int `json:"completion_tokens"`
+
+	FinishReason string `json:"finish_reason,omitempty"`
+	GPUType      string `json:"gpu_type,omitempty"` // for margin; echoed by router/engine
+	Aborted      bool   `json:"aborted,omitempty"`
+
 	// TimestampUnixMs is stamped by the emitter, not in the hot path here.
 	TimestampUnixMs int64 `json:"timestamp_unix_ms"`
 }
@@ -66,7 +84,7 @@ type LogEmitter struct {
 }
 
 func (l *LogEmitter) Emit(_ context.Context, e Event) {
-	l.Log.Info.Printf("metering event: request_id=%s group=%s user=%s model=%s prompt=%d cached=%d completion=%d finish=%s aborted=%t",
-		e.RequestID, e.GroupID, e.UserID, e.Model,
+	l.Log.Info.Printf("metering event: request_id=%s auth_id=%s group=%s user=%s resource=%s/%s model=%s prompt=%d cached=%d completion=%d finish=%s aborted=%t",
+		e.RequestID, e.AuthID, e.GroupID, e.UserID, e.ResourceType, e.ResourceID, e.Model,
 		e.PromptTokens, e.CachedTokens, e.CompletionTokens, e.FinishReason, e.Aborted)
 }

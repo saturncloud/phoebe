@@ -1,0 +1,241 @@
+// Command rater is phoebe's REVENUE path batch job. It reads a window of raw
+// metering rows from billing_event and, ENTIRELY IN SQL, joins the effective-dated
+// price book (model_price, keyed on model_id) plus the global fine-tune derivation
+// policy (derivation_policy), computes per-event cost as exact NUMERIC, sums it,
+// and upserts per-(auth_id, model_id, hour) cost rollups into rated_usage. No money
+// math happens in Go — the rater binary is orchestration only.
+//
+// It is a ONE-SHOT BATCH job (run by cron / a k8s CronJob), NOT a daemon: it
+// rates one window and exits. Exit codes:
+//
+//	0  window rated, every event priced and attributed
+//	1  fatal error (config, DB, etc.) — nothing or partial; safe to re-run
+//	2  window rated BUT an anomaly leaked (fail-loud): some events were unpriced
+//	   (backfill the price book and re-rate) and/or some rows were unattributable
+//	   — NULL auth_id/model_id, which the interceptor's billing gate should reject
+//	   before metering, so a nonzero count means revenue is leaking upstream.
+//	   Distinct code so a CronJob can alert on "lost revenue / lost data"
+//	   separately from "job broke".
+//
+// Re-running any window is safe and idempotent (rollups upsert on the natural
+// key), so cron overlap or manual re-rating never double-counts.
+//
+// THE DEFAULT WINDOW IS THE TRAILING N COMPLETE HOURS, [floor(now)-N*1h,
+// floor(now)), N = rateTrailingHours (default 24). It is deliberately NOT just the
+// last hour: events can be DRAINED LATE (a Valkey outage recovered from the WAL)
+// with an event_ts in an hour that was already rated, and a last-hour-only cron
+// would never revisit that hour — silent revenue loss. Re-rating closed hours is
+// safe BY CONSTRUCTION: the upsert REPLACES each (auth_id, model_id, hour) bucket
+// with a freshly recomputed total, so the late event is folded in and nothing
+// doubles. RESIDUAL RISK, stated honestly: an event arriving MORE than N hours
+// late still slips past the default window (the DESIGN.md reconciliation backstop
+// is the eventual answer; until then, widen rateTrailingHours or re-rate the hour
+// explicitly with --since/--until).
+//
+// Config, like the drainer: a YAML settings file (flag -f) for pool knobs and
+// rateTrailingHours, and the DATABASE_URL env var (Atlas convention) for Postgres.
+// The rater does NOT run migrations — it assumes billing_event/model_price/
+// derivation_policy/rated_usage exist (see migrations/README.md).
+package main
+
+import (
+	"context"
+	"flag"
+	"os"
+	"time"
+
+	"gopkg.in/yaml.v2"
+
+	"github.com/saturncloud/phoebe/internal/logging"
+	"github.com/saturncloud/phoebe/internal/rating"
+)
+
+// raterSettings is the YAML shape for the rater. Mirrors rating.Config without
+// importing it into a shared config package (same rationale as drainSettings).
+// Durations are strings parsed with time.ParseDuration; "" means "use default".
+type raterSettings struct {
+	Debug bool `yaml:"debug"`
+
+	// RateTrailingHours is N in the default window [floor(now)-N*1h, floor(now)):
+	// how many complete trailing hours each run (re-)rates, to catch late-drained
+	// events (see the package doc). Default 24; must be >= 1. A pointer so an
+	// explicit 0 fails loud instead of silently meaning "default".
+	RateTrailingHours *int `yaml:"rateTrailingHours"`
+
+	MaxOpenConns    int    `yaml:"maxOpenConns"`
+	MaxIdleConns    int    `yaml:"maxIdleConns"`
+	ConnMaxLifetime string `yaml:"connMaxLifetime"`
+}
+
+// defaultRateTrailingHours is the default N for the trailing window. 24 trades a
+// cheap re-rate of already-correct hours (the upsert is a no-op REPLACE) for a full
+// day of late-drain tolerance.
+const defaultRateTrailingHours = 24
+
+// exit codes (see package doc).
+const (
+	exitOK      = 0
+	exitFatal   = 1
+	exitAnomaly = 2 // window rated but something leaked: unpriced and/or unattributable
+)
+
+func main() {
+	os.Exit(run())
+}
+
+// run is main's body returning an exit code, so deferred Close runs before exit
+// (os.Exit skips defers).
+func run() int {
+	settingsFile := flag.String("f", "/etc/saturn/config/rater.yaml", "Settings YAML file path")
+	since := flag.String("since", "", "Window start, RFC3339 (default: floor(now) minus rateTrailingHours)")
+	until := flag.String("until", "", "Window end, RFC3339 (default: start of the current hour)")
+	flag.Parse()
+
+	log := logging.New(logging.INFO)
+
+	cfg, opts, err := loadConfig(*settingsFile)
+	if err != nil {
+		log.Error.Printf("rater: load config: %v", err)
+		return exitFatal
+	}
+	if opts.debug {
+		log.SetLevel(logging.DEBUG)
+	}
+
+	windowStart, windowEnd, err := resolveWindow(*since, *until, opts.trailingHours, time.Now())
+	if err != nil {
+		log.Error.Printf("rater: %v", err)
+		return exitFatal
+	}
+
+	ctx, stop := signalContext()
+	defer stop()
+
+	pingCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
+	store, err := rating.OpenPostgres(pingCtx, cfg)
+	cancel()
+	if err != nil {
+		log.Error.Printf("rater: %v", err)
+		return exitFatal
+	}
+	defer func() { _ = store.Close() }()
+
+	r := rating.New(store, log)
+	res, err := r.Run(ctx, windowStart, windowEnd)
+	if err != nil {
+		log.Error.Printf("rater: run: %v", err)
+		return exitFatal
+	}
+
+	if res.HasAnomaly() {
+		// The window was rated and rollups were written, but something leaked:
+		// events that could not be priced and/or rows that could not be attributed
+		// (NULL auth_id/model). Non-zero exit so a CronJob surfaces the lost
+		// revenue / lost data.
+		return exitAnomaly
+	}
+	return exitOK
+}
+
+// resolveWindow computes [start, end). Defaults (both flags empty) rate the
+// TRAILING trailingHours COMPLETE hours: [floor(now)-N*1h, floor(now)). The
+// natural CronJob cadence is still hourly (run at :05 past the hour); each run
+// re-rates the last N closed hours so an event DRAINED LATE into an already-rated
+// hour (Valkey outage → WAL recovery) is picked up by a later run instead of being
+// lost forever. Re-rating a closed hour is safe by construction: the upsert
+// REPLACES each (auth_id, model_id, hour) bucket with a recomputed total, so
+// re-runs reconcile and never double-count. An event arriving more than N hours
+// late still slips (residual risk; see the package doc — reconciliation is the
+// backstop). Either flag may be given explicitly (RFC3339) and WINS over the
+// default; both must parse, be hour-aligned, and start must be before end.
+func resolveWindow(since, until string, trailingHours int, now time.Time) (time.Time, time.Time, error) {
+	if trailingHours < 1 {
+		return time.Time{}, time.Time{}, errInvalidTrailingHours(trailingHours)
+	}
+	now = now.UTC()
+	currentHour := now.Truncate(time.Hour)
+
+	start := currentHour.Add(-time.Duration(trailingHours) * time.Hour)
+	end := currentHour
+
+	if since != "" {
+		t, err := time.Parse(time.RFC3339, since)
+		if err != nil {
+			return time.Time{}, time.Time{}, errBadWindow("since", since, err)
+		}
+		start = t.UTC()
+	}
+	if until != "" {
+		t, err := time.Parse(time.RFC3339, until)
+		if err != nil {
+			return time.Time{}, time.Time{}, errBadWindow("until", until, err)
+		}
+		end = t.UTC()
+	}
+	if !start.Before(end) {
+		return time.Time{}, time.Time{}, errInvertedWindow(start, end)
+	}
+	// Both bounds MUST be hour-aligned. The rollup buckets by date_trunc('hour')
+	// and the upsert REPLACES a bucket's totals (not additive — that is what makes
+	// a re-run idempotent), so a sub-hour bound would rate only part of a
+	// date-trunc'd hour and overwrite that hour's complete rollup with a partial
+	// sum → silent under-bill. The default window is hour-aligned by construction;
+	// this fences the explicit --since/--until path. Fail loud rather than snap,
+	// so an operator never silently re-rates hours they did not name.
+	if !start.Truncate(time.Hour).Equal(start) {
+		return time.Time{}, time.Time{}, errUnalignedWindow("since", start)
+	}
+	if !end.Truncate(time.Hour).Equal(end) {
+		return time.Time{}, time.Time{}, errUnalignedWindow("until", end)
+	}
+	return start, end, nil
+}
+
+// raterOptions are the non-pool knobs loadConfig resolves from the settings file.
+type raterOptions struct {
+	debug         bool
+	trailingHours int // validated >= 1, defaulted to defaultRateTrailingHours
+}
+
+// loadConfig reads the YAML settings file, applies rating.DefaultConfig, then
+// overlays DATABASE_URL from the environment. A missing settings file is
+// tolerated (all defaults + env), so the rater can run env-only.
+func loadConfig(path string) (rating.Config, raterOptions, error) {
+	cfg := rating.DefaultConfig()
+	opts := raterOptions{trailingHours: defaultRateTrailingHours}
+
+	var s raterSettings
+	if data, err := os.ReadFile(path); err == nil {
+		if err := yaml.Unmarshal(data, &s); err != nil {
+			return cfg, opts, err
+		}
+	} else if !os.IsNotExist(err) {
+		return cfg, opts, err
+	}
+
+	if s.RateTrailingHours != nil {
+		if *s.RateTrailingHours < 1 {
+			return cfg, opts, errInvalidTrailingHours(*s.RateTrailingHours)
+		}
+		opts.trailingHours = *s.RateTrailingHours
+	}
+	if s.MaxOpenConns > 0 {
+		cfg.MaxOpenConns = s.MaxOpenConns
+	}
+	if s.MaxIdleConns > 0 {
+		cfg.MaxIdleConns = s.MaxIdleConns
+	}
+	if s.ConnMaxLifetime != "" {
+		v, err := time.ParseDuration(s.ConnMaxLifetime)
+		if err != nil {
+			return cfg, opts, errInvalidDuration("connMaxLifetime", err)
+		}
+		cfg.ConnMaxLifetime = v
+	}
+
+	// DATABASE_URL (Atlas convention) is the authoritative Postgres source.
+	cfg.DatabaseURL = os.Getenv("DATABASE_URL")
+
+	opts.debug = s.Debug
+	return cfg, opts, nil
+}

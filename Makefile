@@ -14,6 +14,14 @@ run: build
 test:
 	go test ./...
 
+# Runs the live-Postgres conformance tests (the `integration` build tag). These
+# prove the production SQL rater computes the same money as the Rate() oracle —
+# including the sum-then-round behavior a unit test can't exercise. Requires
+# PHOEBE_TEST_DATABASE_URL pointing at a Postgres with btree_gist available.
+.PHONY: integration-test
+integration-test:
+	go test -tags=integration ./...
+
 .PHONY: vet
 vet:
 	go vet ./...

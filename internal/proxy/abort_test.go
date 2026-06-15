@@ -7,8 +7,9 @@ package proxy
 // first chunk(s) and then blocks on a channel. The test cancels the client
 // context while the backend is blocked. ReverseProxy sees the cancelled context,
 // cancels the upstream request, and closes the captureReader body — triggering
-// the abort path. The abort-watcher goroutine in handleProxy calls markAborted()
-// concurrently; go test -race verifies no data races.
+// finish(), which reads the cancelled request context as the abort signal. The
+// metering event is emitted asynchronously, so tests assert via
+// em.waitForEvents(...); go test -race verifies no data races.
 
 import (
 	"context"
@@ -65,10 +66,10 @@ func slowBackend(t *testing.T, firstChunks string) (*httptest.Server, chan struc
 	return srv, unblock
 }
 
-// doAbortRequest sends a proxied SSE request via srv, cancels the context
-// after delayBeforeCancel, and waits for ServeHTTP to return.
-// It returns a function that blocks until the event pipeline has settled
-// (used to ensure async emit completes before asserting).
+// doAbortRequest sends a proxied SSE request via srv and cancels the context
+// after delayBeforeCancel, then returns once ServeHTTP returns. The metering
+// event is emitted asynchronously, so callers must assert via
+// em.waitForEvents(...), not em.all() immediately after this returns.
 func doAbortRequest(t *testing.T, srv *Server, delayBeforeCancel time.Duration) {
 	t.Helper()
 	ctx, cancel := context.WithCancel(context.Background())
@@ -83,6 +84,7 @@ func doAbortRequest(t *testing.T, srv *Server, delayBeforeCancel time.Duration) 
 	if err != nil {
 		t.Fatalf("new request: %v", err)
 	}
+	req.Header.Set(identity.HeaderAuthID, "auth-1")
 	req.Header.Set(identity.HeaderResourceID, "model-abc")
 	req.Header.Set(identity.HeaderGroupID, "org-1")
 	req.Header.Set(identity.HeaderUserID, "user-1")
@@ -90,10 +92,11 @@ func doAbortRequest(t *testing.T, srv *Server, delayBeforeCancel time.Duration) 
 
 	rr := httptest.NewRecorder()
 	srv.Handler().ServeHTTP(rr, req)
-	// ServeHTTP returned — onDone has been called (it's synchronous with
-	// ReverseProxy teardown). Give the abort-watcher goroutine a moment to
-	// finish if it hasn't yet (markAborted may run just after ServeHTTP returns).
-	time.Sleep(5 * time.Millisecond)
+	// ServeHTTP has returned, but the metering event is emitted ASYNCHRONOUSLY
+	// (the abort-watcher goroutine may call markAborted just after ServeHTTP
+	// returns, and onDone fires from there). The caller must therefore wait for
+	// the event with em.waitForEvents(...) rather than reading em.all()
+	// immediately — a fixed sleep here was flaky under CI load.
 }
 
 // TestAbortMidStreamEmitsAbortedEvent verifies that a client disconnect mid-
@@ -109,7 +112,7 @@ func TestAbortMidStreamEmitsAbortedEvent(t *testing.T) {
 
 	doAbortRequest(t, srv, 10*time.Millisecond)
 
-	events := em.all()
+	events := em.waitForEvents(1, 2*time.Second)
 	if len(events) != 1 {
 		t.Fatalf("expected 1 event, got %d", len(events))
 	}
@@ -132,7 +135,7 @@ func TestAbortBillPartialTrue_NoUsage(t *testing.T) {
 
 	doAbortRequest(t, srv, 10*time.Millisecond)
 
-	events := em.all()
+	events := em.waitForEvents(1, 2*time.Second)
 	if len(events) != 1 {
 		t.Fatalf("BillPartialOnAbort=true, abort, no usage: expected 1 event, got %d", len(events))
 	}
@@ -160,7 +163,9 @@ func TestAbortBillPartialFalse_NoUsage(t *testing.T) {
 
 	doAbortRequest(t, srv, 10*time.Millisecond)
 
-	events := em.all()
+	// Wait briefly: if an event were wrongly emitted it would land within
+	// this window. None should, per BillPartialOnAbort=false.
+	events := em.waitForEvents(1, 200*time.Millisecond)
 	if len(events) != 0 {
 		t.Fatalf("BillPartialOnAbort=false, abort, no usage: expected 0 events, got %d: %+v", len(events), events)
 	}
@@ -189,7 +194,7 @@ data: {"choices":[],"usage":{"prompt_tokens":50,"total_tokens":70,"completion_to
 
 			doAbortRequest(t, srv, 20*time.Millisecond)
 
-			events := em.all()
+			events := em.waitForEvents(1, 2*time.Second)
 			if len(events) != 1 {
 				t.Fatalf("abort+usage: expected 1 event, got %d", len(events))
 			}
@@ -218,7 +223,7 @@ func TestAbortOnDoneFiresExactlyOnceViaProxy(t *testing.T) {
 
 	doAbortRequest(t, srv, 10*time.Millisecond)
 
-	events := em.all()
+	events := em.waitForEvents(1, 2*time.Second)
 	if len(events) != 1 {
 		t.Fatalf("onDone fired %d times via proxy, want exactly 1", len(events))
 	}
@@ -250,6 +255,7 @@ func TestNormalCompletionNotAffectedByAbortWatcher(t *testing.T) {
 
 	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions",
 		strings.NewReader(`{"model":"m","stream":true,"messages":[]}`))
+	req.Header.Set(identity.HeaderAuthID, "auth-1")
 	req.Header.Set(identity.HeaderResourceID, "model-abc")
 	req.Header.Set(identity.HeaderGroupID, "org-1")
 	req.Header.Set(identity.HeaderUserID, "user-1")
@@ -261,7 +267,7 @@ func TestNormalCompletionNotAffectedByAbortWatcher(t *testing.T) {
 	// being cancelled at ServeHTTP return).
 	time.Sleep(10 * time.Millisecond)
 
-	events := em.all()
+	events := em.waitForEvents(1, 2*time.Second)
 	if len(events) != 1 {
 		t.Fatalf("expected 1 event, got %d", len(events))
 	}
@@ -307,6 +313,7 @@ func TestAbortRaceStress(t *testing.T) {
 			}()
 			req, _ := http.NewRequestWithContext(ctx, http.MethodPost, "/v1/chat/completions",
 				strings.NewReader(`{"model":"m","stream":true,"messages":[]}`))
+			req.Header.Set(identity.HeaderAuthID, "auth-1")
 			req.Header.Set(identity.HeaderResourceID, "model-abc")
 			req.Header.Set(identity.HeaderGroupID, "org-1")
 			req.Header.Set(identity.HeaderUserID, "user-1")
@@ -373,6 +380,7 @@ func TestLongStreamNoDeadlineSever(t *testing.T) {
 
 	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions",
 		strings.NewReader(`{"model":"m","stream":true,"messages":[]}`))
+	req.Header.Set(identity.HeaderAuthID, "auth-1")
 	req.Header.Set(identity.HeaderResourceID, "model-abc")
 	req.Header.Set(identity.HeaderGroupID, "org-1")
 	req.Header.Set(identity.HeaderUserID, "user-1")
@@ -380,7 +388,7 @@ func TestLongStreamNoDeadlineSever(t *testing.T) {
 	rr := httptest.NewRecorder()
 	srv.Handler().ServeHTTP(rr, req)
 
-	events := em.all()
+	events := em.waitForEvents(1, 2*time.Second)
 	if len(events) != 1 {
 		t.Fatalf("long stream: expected 1 event, got %d", len(events))
 	}

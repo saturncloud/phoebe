@@ -1,11 +1,13 @@
 package emit
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -22,6 +24,9 @@ import (
 
 func testLogger() *logging.Logger { return logging.New(logging.DEBUG) }
 
+// tmpWALPath returns a fresh WAL directory path. The base name deliberately
+// keeps the historical ".jsonl" file name — production configs do the same so
+// that a pre-upgrade legacy file at the path is auto-imported.
 func tmpWALPath(t *testing.T) string {
 	t.Helper()
 	return filepath.Join(t.TempDir(), "wal.jsonl")
@@ -45,6 +50,18 @@ func redisClient(addr string) *redis.Client {
 	return redis.NewClient(&redis.Options{Addr: addr})
 }
 
+// fastFailClient is a redis client that gives up quickly — used by outage
+// tests so failing XADDs don't stretch the test wall-clock.
+func fastFailClient(addr string) *redis.Client {
+	return redis.NewClient(&redis.Options{
+		Addr:         addr,
+		MaxRetries:   -1, // disable retries entirely
+		DialTimeout:  50 * time.Millisecond,
+		ReadTimeout:  50 * time.Millisecond,
+		WriteTimeout: 50 * time.Millisecond,
+	})
+}
+
 func makeEvent(id string) metering.Event {
 	return metering.Event{
 		RequestID:        id,
@@ -57,19 +74,50 @@ func makeEvent(id string) metering.Event {
 	}
 }
 
-// drainWALEvents reads all events from the WAL file at path.
-func drainWALEvents(t *testing.T, path string) []metering.Event {
+func openTestWAL(t *testing.T, dir string) *wal {
 	t.Helper()
-	w, err := openWAL(path)
+	w, err := openWAL(dir, testLogger())
 	if err != nil {
-		t.Fatalf("open wal: %v", err)
+		t.Fatalf("openWAL(%s): %v", dir, err)
 	}
-	defer w.close() //nolint:errcheck
-	events, err := w.readAll()
+	return w
+}
+
+// unshipped returns every event the wal still considers unshipped.
+func unshipped(t *testing.T, w *wal) []metering.Event {
+	t.Helper()
+	events, _, _, err := w.pending(0)
 	if err != nil {
-		t.Fatalf("wal readAll: %v", err)
+		t.Fatalf("wal pending: %v", err)
 	}
 	return events
+}
+
+// drainWALEvents opens the WAL at path and returns its unshipped events.
+//
+// NOTE on the retained tail: tidwall/wal cannot truncate to empty, so a fully
+// drained log retains its final (already-shipped) entry, and the
+// shipped-through watermark lives only in memory. A freshly opened wal
+// therefore reports that one entry as unshipped — at-least-once, deduped
+// downstream on request_id. Callers asserting "fully drained" should expect
+// AT MOST ONE residual event, not zero.
+func drainWALEvents(t *testing.T, path string) []metering.Event {
+	t.Helper()
+	w := openTestWAL(t, path)
+	defer w.close() //nolint:errcheck
+	return unshipped(t, w)
+}
+
+// appendRaw writes raw (possibly garbage) bytes as the next WAL entry via the
+// library — simulates an undecodable entry for corruption tests.
+func appendRaw(t *testing.T, w *wal, data []byte) {
+	t.Helper()
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	if err := w.log.Write(w.nextIndex, data); err != nil {
+		t.Fatalf("raw write: %v", err)
+	}
+	w.nextIndex++
 }
 
 // streamLen returns XLEN of the stream.
@@ -80,6 +128,24 @@ func streamLen(t *testing.T, rdb *redis.Client, stream string) int64 {
 		t.Fatalf("xlen: %v", err)
 	}
 	return n
+}
+
+// streamRequestIDs returns the SET of request_ids currently in the stream.
+func streamRequestIDs(t *testing.T, rdb *redis.Client, stream string) map[string]bool {
+	t.Helper()
+	msgs, err := rdb.XRange(context.Background(), stream, "-", "+").Result()
+	if err != nil {
+		t.Fatalf("xrange: %v", err)
+	}
+	ids := map[string]bool{}
+	for _, m := range msgs {
+		var ev metering.Event
+		if err := json.Unmarshal([]byte(m.Values["event"].(string)), &ev); err != nil {
+			t.Fatalf("unmarshal stream event: %v", err)
+		}
+		ids[ev.RequestID] = true
+	}
+	return ids
 }
 
 // fixedClock returns a function that always returns the same time.
@@ -103,10 +169,7 @@ func waitForCondition(t *testing.T, timeout time.Duration, fn func() bool) {
 // ---- WAL unit tests ---------------------------------------------------------
 
 func TestWAL_AppendAndRead(t *testing.T) {
-	w, err := openWAL(filepath.Join(t.TempDir(), "wal.jsonl"))
-	if err != nil {
-		t.Fatal(err)
-	}
+	w := openTestWAL(t, tmpWALPath(t))
 	defer w.close() //nolint:errcheck
 
 	events := []metering.Event{makeEvent("r1"), makeEvent("r2"), makeEvent("r3")}
@@ -116,10 +179,7 @@ func TestWAL_AppendAndRead(t *testing.T) {
 		}
 	}
 
-	got, err := w.readAll()
-	if err != nil {
-		t.Fatalf("readAll: %v", err)
-	}
+	got := unshipped(t, w)
 	if len(got) != len(events) {
 		t.Fatalf("got %d events, want %d", len(got), len(events))
 	}
@@ -130,11 +190,11 @@ func TestWAL_AppendAndRead(t *testing.T) {
 	}
 }
 
-func TestWAL_TruncateClearsFile(t *testing.T) {
-	w, err := openWAL(filepath.Join(t.TempDir(), "wal.jsonl"))
-	if err != nil {
-		t.Fatal(err)
-	}
+// TestWAL_MarkShippedReclaims verifies the truncate-after-ship watermark
+// protocol: after markShipped(through), nothing is reported unshipped, and a
+// later append is reported alone.
+func TestWAL_MarkShippedReclaims(t *testing.T) {
+	w := openTestWAL(t, tmpWALPath(t))
 	defer w.close() //nolint:errcheck
 
 	for i := range 5 {
@@ -142,23 +202,74 @@ func TestWAL_TruncateClearsFile(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	if err := w.truncate(); err != nil {
-		t.Fatal(err)
-	}
-	got, err := w.readAll()
+	events, through, skipped, err := w.pending(0)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(got) != 0 {
-		t.Fatalf("after truncate: got %d events, want 0", len(got))
+	if len(events) != 5 || skipped != 0 {
+		t.Fatalf("pending = %d events (%d skipped), want 5 (0)", len(events), skipped)
+	}
+	if err := w.markShipped(through); err != nil {
+		t.Fatalf("markShipped: %v", err)
+	}
+	if got := unshipped(t, w); len(got) != 0 {
+		t.Fatalf("after markShipped: %d unshipped, want 0", len(got))
+	}
+
+	// A new append after a full drain must be reported, and reported alone —
+	// not bundled with the retained already-shipped tail entry.
+	if err := w.append(makeEvent("after-drain")); err != nil {
+		t.Fatal(err)
+	}
+	got := unshipped(t, w)
+	if len(got) != 1 || got[0].RequestID != "after-drain" {
+		t.Fatalf("after new append: unshipped = %+v, want exactly [after-drain]", got)
+	}
+}
+
+// TestWAL_ConcurrentAppendDuringDrain is the regression guard for the
+// lost-event race the old design defended against with rotation: an append
+// landing DURING the ship window must survive the post-ship truncation. With
+// sequential indexes this holds structurally — the concurrent append gets a
+// higher index than the drain's `through`, which TruncateFront never touches.
+func TestWAL_ConcurrentAppendDuringDrain(t *testing.T) {
+	w := openTestWAL(t, tmpWALPath(t))
+	defer w.close() //nolint:errcheck
+
+	for i := range 3 {
+		if err := w.append(makeEvent(fmt.Sprintf("old%d", i))); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	// Start a drain: read the unshipped batch (ship window opens here).
+	events, through, _, err := w.pending(0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(events) != 3 {
+		t.Fatalf("pending %d events, want 3", len(events))
+	}
+
+	// Append DURING the ship window — after the read, before the truncate.
+	if err := w.append(makeEvent("during-ship")); err != nil {
+		t.Fatal(err)
+	}
+
+	// Complete the drain.
+	if err := w.markShipped(through); err != nil {
+		t.Fatal(err)
+	}
+
+	// The during-ship event must still be unshipped — NOT destroyed.
+	got := unshipped(t, w)
+	if len(got) != 1 || got[0].RequestID != "during-ship" {
+		t.Fatalf("lost the concurrent append: unshipped = %+v, want exactly [during-ship]", got)
 	}
 }
 
 func TestWAL_ConcurrentAppend(t *testing.T) {
-	w, err := openWAL(filepath.Join(t.TempDir(), "wal.jsonl"))
-	if err != nil {
-		t.Fatal(err)
-	}
+	w := openTestWAL(t, tmpWALPath(t))
 	defer w.close() //nolint:errcheck
 
 	const n = 200
@@ -172,12 +283,202 @@ func TestWAL_ConcurrentAppend(t *testing.T) {
 	}
 	wg.Wait()
 
-	got, err := w.readAll()
+	if got := unshipped(t, w); len(got) != n {
+		t.Fatalf("got %d events, want %d", len(got), n)
+	}
+}
+
+// TestWAL_CrashReopen: append N, close (standing in for a crash — tidwall
+// fsyncs every write, so a closed log and a killed process leave the same
+// bytes), reopen → all N still present and reported unshipped.
+func TestWAL_CrashReopen(t *testing.T) {
+	path := tmpWALPath(t)
+
+	const n = 10
+	w := openTestWAL(t, path)
+	for i := range n {
+		if err := w.append(makeEvent(fmt.Sprintf("persist-%d", i))); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := w.close(); err != nil {
+		t.Fatal(err)
+	}
+
+	w2 := openTestWAL(t, path)
+	defer w2.close() //nolint:errcheck
+	got := unshipped(t, w2)
+	if len(got) != n {
+		t.Fatalf("after reopen: got %d events, want %d", len(got), n)
+	}
+	for i, g := range got {
+		if want := fmt.Sprintf("persist-%d", i); g.RequestID != want {
+			t.Errorf("event[%d] = %q, want %q (order must survive reopen)", i, g.RequestID, want)
+		}
+	}
+}
+
+// TestWAL_CorruptEntrySkipped: an undecodable entry between valid ones is
+// skipped with a count — it must never abort the drain — and is truncated
+// past so it cannot wedge the log forever.
+func TestWAL_CorruptEntrySkipped(t *testing.T) {
+	w := openTestWAL(t, tmpWALPath(t))
+	defer w.close() //nolint:errcheck
+
+	if err := w.append(makeEvent("ok-1")); err != nil {
+		t.Fatal(err)
+	}
+	appendRaw(t, w, []byte("\x00{{ definitely not json"))
+	if err := w.append(makeEvent("ok-2")); err != nil {
+		t.Fatal(err)
+	}
+
+	events, through, skipped, err := w.pending(0)
+	if err != nil {
+		t.Fatalf("pending: %v", err)
+	}
+	if skipped != 1 {
+		t.Errorf("skipped = %d, want 1", skipped)
+	}
+	if len(events) != 2 || events[0].RequestID != "ok-1" || events[1].RequestID != "ok-2" {
+		t.Fatalf("events = %+v, want [ok-1 ok-2]", events)
+	}
+	// through covers the corrupt entry, so markShipped truncates past it.
+	if err := w.markShipped(through); err != nil {
+		t.Fatal(err)
+	}
+	if got := unshipped(t, w); len(got) != 0 {
+		t.Fatalf("after markShipped: %d unshipped, want 0 (corrupt entry truncated past)", len(got))
+	}
+}
+
+// TestWAL_OversizeEvent: a ~100KB field round-trips. The old bufio.Scanner
+// default 64KB token limit killed the whole scan on such an event.
+func TestWAL_OversizeEvent(t *testing.T) {
+	w := openTestWAL(t, tmpWALPath(t))
+	defer w.close() //nolint:errcheck
+
+	big := makeEvent("big-1")
+	big.Model = strings.Repeat("m", 100*1024)
+	if err := w.append(big); err != nil {
+		t.Fatalf("append oversize: %v", err)
+	}
+	if err := w.append(makeEvent("after-big")); err != nil {
+		t.Fatal(err)
+	}
+
+	got := unshipped(t, w)
+	if len(got) != 2 {
+		t.Fatalf("got %d events, want 2", len(got))
+	}
+	if got[0].RequestID != "big-1" || len(got[0].Model) != 100*1024 {
+		t.Fatalf("oversize event mangled: id=%q model len=%d", got[0].RequestID, len(got[0].Model))
+	}
+	if got[1].RequestID != "after-big" {
+		t.Fatalf("event after oversize one lost: %+v", got[1])
+	}
+}
+
+// TestWAL_CorruptDirQuarantinedOnOpen: a log directory tidwall refuses to open
+// is moved aside to <dir>.corrupt.<ts> and a fresh log is created — a corrupt
+// billing buffer must not block serving, and the bad bytes are kept for
+// forensics.
+func TestWAL_CorruptDirQuarantinedOnOpen(t *testing.T) {
+	path := tmpWALPath(t)
+
+	w := openTestWAL(t, path)
+	if err := w.append(makeEvent("pre-corruption")); err != nil {
+		t.Fatal(err)
+	}
+	if err := w.close(); err != nil {
+		t.Fatal(err)
+	}
+
+	// Scribble over every segment file so Open fails with corruption.
+	entries, err := os.ReadDir(path)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(got) != n {
-		t.Fatalf("got %d events, want %d", len(got), n)
+	if len(entries) == 0 {
+		t.Fatal("expected segment files in wal dir")
+	}
+	for _, ent := range entries {
+		if err := os.WriteFile(filepath.Join(path, ent.Name()), []byte("not a wal segment"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	w2, err := openWAL(path, testLogger())
+	if err != nil {
+		t.Fatalf("openWAL after corruption should recover, got: %v", err)
+	}
+	defer w2.close() //nolint:errcheck
+
+	if got := unshipped(t, w2); len(got) != 0 {
+		t.Fatalf("fresh wal after quarantine should be empty, got %d events", len(got))
+	}
+	if err := w2.append(makeEvent("post-recovery")); err != nil {
+		t.Fatalf("append to recovered wal: %v", err)
+	}
+
+	// The quarantined directory must exist for forensics.
+	matches, err := filepath.Glob(path + ".corrupt.*")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(matches) != 1 {
+		t.Fatalf("want exactly one quarantined dir, got %v", matches)
+	}
+}
+
+// TestWAL_LegacyImport: an old-style single-file JSONL WAL at the configured
+// path (including a >64KB line and a torn final line) is imported into the new
+// directory log and the file is renamed aside — lost-on-upgrade events would
+// be silent revenue loss.
+func TestWAL_LegacyImport(t *testing.T) {
+	path := tmpWALPath(t)
+
+	big := makeEvent("legacy-big")
+	big.Model = strings.Repeat("m", 100*1024) // >64KB line: the old Scanner bug
+	var legacyFile []byte
+	for _, ev := range []metering.Event{makeEvent("legacy-1"), big, makeEvent("legacy-2")} {
+		line, err := json.Marshal(ev)
+		if err != nil {
+			t.Fatal(err)
+		}
+		legacyFile = append(legacyFile, line...)
+		legacyFile = append(legacyFile, '\n')
+	}
+	// Torn final line: a crash mid-append leaves a partial record.
+	legacyFile = append(legacyFile, []byte(`{"request_id":"torn-`)...)
+	if err := os.WriteFile(path, legacyFile, 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	w := openTestWAL(t, path)
+	defer w.close() //nolint:errcheck
+
+	got := unshipped(t, w)
+	if len(got) != 3 {
+		t.Fatalf("imported %d events, want 3", len(got))
+	}
+	wantIDs := []string{"legacy-1", "legacy-big", "legacy-2"}
+	for i, want := range wantIDs {
+		if got[i].RequestID != want {
+			t.Errorf("imported[%d] = %q, want %q", i, got[i].RequestID, want)
+		}
+	}
+	if len(got[1].Model) != 100*1024 {
+		t.Errorf("oversize legacy line truncated: model len = %d", len(got[1].Model))
+	}
+
+	// The legacy file is renamed aside, and the path is now a directory.
+	if _, err := os.Stat(path + ".imported"); err != nil {
+		t.Errorf("legacy file not renamed aside: %v", err)
+	}
+	fi, err := os.Stat(path)
+	if err != nil || !fi.IsDir() {
+		t.Errorf("WAL path is not a directory after import (err=%v)", err)
 	}
 }
 
@@ -302,14 +603,7 @@ func TestEmitter_XADDFails_FallsToWAL(t *testing.T) {
 	cfg.WorkerCount = 1
 	cfg.XADDTimeout = 50 * time.Millisecond // short timeout so test is fast
 
-	// Build a real redis client with no retries and a short dial timeout.
-	rdb := redis.NewClient(&redis.Options{
-		Addr:         mr.Addr(),
-		MaxRetries:   0,
-		DialTimeout:  50 * time.Millisecond,
-		ReadTimeout:  50 * time.Millisecond,
-		WriteTimeout: 50 * time.Millisecond,
-	})
+	rdb := fastFailClient(mr.Addr())
 
 	em, err := New(cfg, testLogger(), rdb)
 	if err != nil {
@@ -356,9 +650,9 @@ func TestEmitter_WALShipperDrainsOnRecovery(t *testing.T) {
 	}
 	time.Sleep(80 * time.Millisecond)
 
-	// Verify events are in WAL.
-	walEvents := drainWALEvents(t, cfg.WALPath)
-	if len(walEvents) == 0 {
+	// Verify events are in WAL (read via the emitter's own handle — opening a
+	// second tidwall.Log on a live directory is not supported).
+	if got := unshipped(t, em.wal); len(got) == 0 {
 		t.Fatal("expected events in WAL before recovery")
 	}
 
@@ -387,10 +681,216 @@ func TestEmitter_WALShipperDrainsOnRecovery(t *testing.T) {
 		t.Error(err)
 	}
 
-	// WAL should be empty after successful drain.
+	// All events made it; the WAL retains AT MOST its already-shipped tail
+	// entry (tidwall cannot truncate to empty — see drainWALEvents). With
+	// multiple workers the append order is nondeterministic, so the tail can
+	// be any one of the shipped events.
 	remaining := drainWALEvents(t, cfg.WALPath)
-	if len(remaining) != 0 {
-		t.Fatalf("WAL should be empty after drain, got %d events", len(remaining))
+	if len(remaining) > 1 {
+		t.Fatalf("WAL should hold at most the retained tail after drain, got %d events", len(remaining))
+	}
+	if len(remaining) == 1 {
+		shipped := map[string]bool{"s1": true, "s2": true, "s3": true}
+		if !shipped[remaining[0].RequestID] {
+			t.Fatalf("retained tail = %q, want one of the shipped events", remaining[0].RequestID)
+		}
+	}
+}
+
+// TestEmitter_MultiTickOutage_NoLoss is the clobber regression: Valkey down
+// across several drain ticks with appends continuing each tick, every ship
+// attempt failing — then Valkey recovers and ALL events from ALL ticks must
+// arrive. (The old rotate design renamed each tick's WAL onto the same fixed
+// .draining path, destroying every previous tick's unshipped snapshot.)
+func TestEmitter_MultiTickOutage_NoLoss(t *testing.T) {
+	mr := miniredis.RunT(t)
+	cfg := testConfig(t, mr)
+	cfg.ShipInterval = 40 * time.Millisecond
+	cfg.XADDTimeout = 50 * time.Millisecond
+	cfg.ShipBatchSize = 4 // multiple batches per drain, for good measure
+
+	rdb := fastFailClient(mr.Addr())
+	em, err := New(cfg, testLogger(), rdb)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Take Valkey down for the whole multi-tick window.
+	mr.Close()
+
+	const ticks = 4
+	const perTick = 5
+	want := map[string]bool{}
+	for tick := range ticks {
+		for i := range perTick {
+			id := fmt.Sprintf("outage-t%d-e%d", tick, i)
+			want[id] = true
+			em.Emit(context.Background(), makeEvent(id))
+		}
+		// Sleep past at least one ship interval so a failing drain tick runs
+		// between each burst of appends.
+		time.Sleep(cfg.ShipInterval + 20*time.Millisecond)
+	}
+
+	// Every event from every tick must still be held by the WAL.
+	waitForCondition(t, 3*time.Second, func() bool {
+		return len(unshipped(t, em.wal)) == ticks*perTick
+	})
+
+	// Valkey recovers at the same address.
+	if err := mr.Restart(); err != nil {
+		t.Fatalf("miniredis restart: %v", err)
+	}
+
+	// ALL events from ALL ticks arrive (set-wise: re-ships may duplicate
+	// under the at-least-once contract, but nothing may be missing).
+	waitForCondition(t, 5*time.Second, func() bool {
+		got := streamRequestIDs(t, rdb, cfg.StreamName)
+		for id := range want {
+			if !got[id] {
+				return false
+			}
+		}
+		return true
+	})
+
+	if err := em.Close(context.Background()); err != nil {
+		t.Error(err)
+	}
+}
+
+// TestEmitter_PartialBatchProgress: ship succeeds for batch 1 and fails for
+// batch 2 → batch-1 entries are reclaimed immediately (truncate after EACH
+// shipped batch), batch-2 entries are retained and shipped on the next drain,
+// with no duplicates beyond the at-least-once contract (here: zero, since no
+// crash intervened).
+func TestEmitter_PartialBatchProgress(t *testing.T) {
+	mr := miniredis.RunT(t)
+	cfg := testConfig(t, mr)
+	cfg.ShipInterval = time.Hour // shipper ticker must not interfere
+	cfg.ShipBatchSize = 3
+
+	em, err := New(cfg, testLogger(), redisClient(mr.Addr()))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Seed the WAL directly (Valkey is up, so Emit would bypass it).
+	var want []string
+	for i := range 6 {
+		id := fmt.Sprintf("partial-%d", i)
+		want = append(want, id)
+		if err := em.wal.append(makeEvent(id)); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	var shipped []string
+	calls := 0
+	em.shipFn = func(events []metering.Event) bool {
+		calls++
+		if calls > 1 {
+			return false // batch 2 fails
+		}
+		for _, ev := range events {
+			shipped = append(shipped, ev.RequestID)
+		}
+		return true
+	}
+
+	em.drainWAL()
+
+	if calls != 2 {
+		t.Fatalf("ship calls = %d, want 2 (one success, one failure)", calls)
+	}
+	if len(shipped) != 3 {
+		t.Fatalf("batch 1 shipped %d events, want 3", len(shipped))
+	}
+	// Batch-1 entries reclaimed, batch-2 entries retained.
+	rest := unshipped(t, em.wal)
+	if len(rest) != 3 {
+		t.Fatalf("retained %d events, want 3 (batch 2 only)", len(rest))
+	}
+	for i, ev := range rest {
+		if want := fmt.Sprintf("partial-%d", i+3); ev.RequestID != want {
+			t.Errorf("retained[%d] = %q, want %q", i, ev.RequestID, want)
+		}
+	}
+
+	// Next tick: ship recovers; batch 2 goes out exactly once.
+	em.shipFn = func(events []metering.Event) bool {
+		for _, ev := range events {
+			shipped = append(shipped, ev.RequestID)
+		}
+		return true
+	}
+	em.drainWAL()
+
+	if len(shipped) != 6 {
+		t.Fatalf("total shipped = %d, want 6 (no re-ship of batch 1, no loss of batch 2)", len(shipped))
+	}
+	for i, id := range want {
+		if shipped[i] != id {
+			t.Errorf("shipped[%d] = %q, want %q", i, shipped[i], id)
+		}
+	}
+	if len(unshipped(t, em.wal)) != 0 {
+		t.Fatal("WAL still reports unshipped events after full drain")
+	}
+
+	em.shipFn = em.shipBatch // restore before Close's final drain
+	if err := em.Close(context.Background()); err != nil {
+		t.Error(err)
+	}
+}
+
+// TestEmitter_LegacyImportShipped: end-to-end upgrade path — an old-style
+// wal.jsonl file (with a torn last line) at WALPath is imported on startup,
+// shipped to Valkey, and the file is renamed aside.
+func TestEmitter_LegacyImportShipped(t *testing.T) {
+	mr := miniredis.RunT(t)
+	cfg := testConfig(t, mr)
+	cfg.ShipInterval = 30 * time.Millisecond
+
+	var legacyFile []byte
+	want := map[string]bool{}
+	for i := range 3 {
+		ev := makeEvent(fmt.Sprintf("upgrade-%d", i))
+		want[ev.RequestID] = true
+		line, err := json.Marshal(ev)
+		if err != nil {
+			t.Fatal(err)
+		}
+		legacyFile = append(legacyFile, line...)
+		legacyFile = append(legacyFile, '\n')
+	}
+	legacyFile = append(legacyFile, []byte(`{"request_id":"torn`)...)
+	if err := os.WriteFile(cfg.WALPath, legacyFile, 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	em, err := New(cfg, testLogger(), redisClient(mr.Addr()))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	rdb := redisClient(mr.Addr())
+	waitForCondition(t, 3*time.Second, func() bool {
+		got := streamRequestIDs(t, rdb, cfg.StreamName)
+		for id := range want {
+			if !got[id] {
+				return false
+			}
+		}
+		return true
+	})
+
+	if _, err := os.Stat(cfg.WALPath + ".imported"); err != nil {
+		t.Errorf("legacy file not renamed aside: %v", err)
+	}
+
+	if err := em.Close(context.Background()); err != nil {
+		t.Error(err)
 	}
 }
 
@@ -398,20 +898,15 @@ func TestEmitter_WALShipperDrainsOnRecovery(t *testing.T) {
 
 func TestEmitter_WALFails_LogFloor(t *testing.T) {
 	cfg := testConfig(t, nil)
-	// Point WAL at a path we can't write to.
-	cfg.WALPath = "/proc/not-a-real-path/wal.jsonl"
-
-	// New will fail to open the WAL — so we test walOrLog directly.
-	// Instead, open a fresh emitter with a valid WAL, then force a WAL error
-	// by replacing wal.f with a closed file.
-	cfg.WALPath = tmpWALPath(t)
 	em, err := New(cfg, testLogger(), nil)
 	if err != nil {
 		t.Fatal(err)
 	}
 
-	// Close the WAL file to induce write errors.
-	em.wal.f.Close()
+	// Close the WAL to induce append errors (tidwall returns ErrClosed).
+	if err := em.wal.close(); err != nil {
+		t.Fatal(err)
+	}
 
 	// walOrLog should fall through to the log floor without panicking.
 	ev := makeEvent("floor-req")
@@ -578,6 +1073,112 @@ func TestEmitter_CloseFlushesInFlight(t *testing.T) {
 	}
 }
 
+// ---- DurableEmitter: Emit racing Close never strands an event ----------------
+
+// TestEmitter_CloseVsEmit_NeverStrands: the old workers exited via
+// `default: return` the moment the channel was momentarily empty, and Emit
+// kept queueing into the buffered channel after Close — stranding events with
+// no WAL entry and no log floor. Now every emitted event must end up in
+// Valkey, the WAL, or the log floor (here rdb is nil, so: WAL or floor).
+func TestEmitter_CloseVsEmit_NeverStrands(t *testing.T) {
+	cfg := testConfig(t, nil)
+	cfg.ChanBuf = 8 // small buffer: maximize the strand window
+	cfg.WorkerCount = 2
+	cfg.ShipInterval = time.Hour
+
+	// Capture the ERROR stream to count log-floor emissions. The log.Logger's
+	// internal mutex serializes concurrent writes to the buffer.
+	var floorBuf bytes.Buffer
+	logger := logging.New(logging.ERROR)
+	logger.Error.SetOutput(&floorBuf)
+
+	em, err := New(cfg, logger, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	const goroutines = 8
+	const perG = 50
+	want := map[string]bool{}
+	for g := range goroutines {
+		for i := range perG {
+			want[fmt.Sprintf("race-g%d-e%d", g, i)] = true
+		}
+	}
+
+	start := make(chan struct{})
+	var wg sync.WaitGroup
+	for g := range goroutines {
+		wg.Add(1)
+		go func(g int) {
+			defer wg.Done()
+			<-start
+			for i := range perG {
+				em.Emit(context.Background(), makeEvent(fmt.Sprintf("race-g%d-e%d", g, i)))
+			}
+		}(g)
+	}
+
+	// Close races the emitters.
+	closeRes := make(chan error, 1)
+	go func() {
+		<-start
+		closeRes <- em.Close(context.Background())
+	}()
+
+	close(start)
+	wg.Wait()
+	if err := <-closeRes; err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+
+	// Account for every event: WAL ∪ floor must cover the full emitted set.
+	got := map[string]bool{}
+	for _, ev := range drainWALEvents(t, cfg.WALPath) {
+		got[ev.RequestID] = true
+	}
+	for _, line := range strings.Split(floorBuf.String(), "\n") {
+		if i := strings.Index(line, "METERING_FLOOR request_id="); i >= 0 {
+			rest := line[i+len("METERING_FLOOR request_id="):]
+			got[rest[:strings.Index(rest, " ")]] = true
+		}
+	}
+	var missing []string
+	for id := range want {
+		if !got[id] {
+			missing = append(missing, id)
+		}
+	}
+	if len(missing) > 0 {
+		t.Fatalf("%d events stranded (in neither WAL nor log floor), e.g. %v", len(missing), missing[:min(5, len(missing))])
+	}
+}
+
+// TestEmitter_EmitAfterClose_NotLost: an Emit arriving strictly after Close
+// must not panic (closed channel) and must land somewhere durable — the WAL
+// is closed by then, so the log floor.
+func TestEmitter_EmitAfterClose_NotLost(t *testing.T) {
+	cfg := testConfig(t, nil)
+
+	var floorBuf bytes.Buffer
+	logger := logging.New(logging.ERROR)
+	logger.Error.SetOutput(&floorBuf)
+
+	em, err := New(cfg, logger, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := em.Close(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+
+	em.Emit(context.Background(), makeEvent("late-arrival"))
+
+	if !strings.Contains(floorBuf.String(), "METERING_FLOOR request_id=late-arrival") {
+		t.Fatal("event emitted after Close did not reach the log floor")
+	}
+}
+
 // ---- DurableEmitter: satisfies metering.Emitter interface -------------------
 
 func TestEmitter_ImplementsInterface(t *testing.T) {
@@ -635,42 +1236,6 @@ func TestEmitter_RaceStress(t *testing.T) {
 	t.Logf("total emits: %d, stream len: %d", total.Load(), streamLen(t, rdb, cfg.StreamName))
 }
 
-// ---- WAL reopen: data persists across process restart -----------------------
-
-func TestWAL_DataPersistsAcrossReopen(t *testing.T) {
-	dir := t.TempDir()
-	path := filepath.Join(dir, "wal.jsonl")
-
-	// Write events in first open.
-	{
-		w, err := openWAL(path)
-		if err != nil {
-			t.Fatal(err)
-		}
-		for i := range 5 {
-			if err := w.append(makeEvent(fmt.Sprintf("persist-%d", i))); err != nil {
-				t.Fatal(err)
-			}
-		}
-		w.close() //nolint:errcheck
-	}
-
-	// Reopen and verify.
-	w2, err := openWAL(path)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer w2.close() //nolint:errcheck
-
-	events, err := w2.readAll()
-	if err != nil {
-		t.Fatal(err)
-	}
-	if len(events) != 5 {
-		t.Fatalf("after reopen: got %d events, want 5", len(events))
-	}
-}
-
 // ---- File-not-writable: New returns error, not panic -----------------------
 
 func TestNew_InvalidWALPath_ReturnsError(t *testing.T) {
@@ -681,30 +1246,5 @@ func TestNew_InvalidWALPath_ReturnsError(t *testing.T) {
 	_, err := New(cfg, testLogger(), nil)
 	if err == nil {
 		t.Fatal("expected error for unwritable WAL path, got nil")
-	}
-}
-
-// ---- os.File: verify fsync is called (basic smoke) -------------------------
-
-func TestWAL_FsyncSmoke(t *testing.T) {
-	dir := t.TempDir()
-	w, err := openWAL(filepath.Join(dir, "wal.jsonl"))
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer w.close() //nolint:errcheck
-
-	ev := makeEvent("fsync-test")
-	if err := w.append(ev); err != nil {
-		t.Fatalf("append: %v", err)
-	}
-
-	// Verify the file has non-zero size (fsync doesn't lose data).
-	info, err := os.Stat(w.path)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if info.Size() == 0 {
-		t.Fatal("WAL file is empty after append+fsync")
 	}
 }

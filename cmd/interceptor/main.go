@@ -4,12 +4,14 @@ import (
 	"context"
 	"flag"
 	"net/url"
+	"os"
 	"time"
 
 	"github.com/redis/go-redis/v9"
 
 	"github.com/saturncloud/phoebe/internal/config"
 	"github.com/saturncloud/phoebe/internal/emit"
+	"github.com/saturncloud/phoebe/internal/iolog"
 	"github.com/saturncloud/phoebe/internal/logging"
 	"github.com/saturncloud/phoebe/internal/metering"
 	"github.com/saturncloud/phoebe/internal/proxy"
@@ -36,11 +38,21 @@ func main() {
 	}
 
 	emitter, closeEmitter := buildEmitter(settings, log)
-	defer closeEmitter()
+	ioPolicy, ioSink, ioMaxBody, closeIOLog := buildIOLog(settings, log)
 
-	srv := proxy.New(settings, log, resolver, emitter)
-	if err := srv.Run(); err != nil {
-		log.Error.Fatalf("server error: %v", err)
+	srv := proxy.NewWithIOLog(settings, log, resolver, emitter, ioPolicy, ioSink, ioMaxBody)
+	srvErr := srv.Run()
+
+	// Cleanup must run UNCONDITIONALLY before exit. log.Fatalf here would
+	// os.Exit and skip deferred closes, stranding buffered metering events
+	// (no WAL flush, no log floor) and unflushed I/O-log batches — so collect
+	// the error, close everything, then exit nonzero.
+	closeIOLog()
+	closeEmitter()
+
+	if srvErr != nil {
+		log.Error.Printf("server error: %v", srvErr)
+		os.Exit(1)
 	}
 }
 
@@ -141,5 +153,46 @@ func buildEmitter(s *config.Settings, log *logging.Logger) (metering.Emitter, fu
 		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 		defer cancel()
 		em.Close(ctx)
+	}
+}
+
+// buildIOLog constructs the M5 I/O-logging policy + sink. It FAILS CLOSED: when
+// ioLog.enabled is false (the default), it returns a deny-all policy and a
+// NopSink, so the proxy buffers no bodies and the subsystem is fully inert.
+//
+// Only when enabled does it construct the StaticPolicy (the interim opt-in +
+// sampling gate — see iolog.StaticPolicy for the control-plane TODO) and the
+// PostgresSink. If the PostgresSink can't be built, logging degrades to off
+// rather than taking down serving — I/O logging is best-effort debug telemetry,
+// never a reason to fail a billable request.
+//
+// Returns the policy, sink, response-body cap, and a close function.
+func buildIOLog(s *config.Settings, log *logging.Logger) (iolog.Policy, iolog.Sink, int, func()) {
+	c := s.IOLog
+	if !c.Enabled {
+		log.Info.Printf("iolog: disabled (default) — no request/response bodies captured")
+		return nil, nil, 0, func() {}
+	}
+
+	policy := iolog.NewStaticPolicy(c.Enabled, c.SampleRate, c.AllowAuthIDs, c.AllowGroupIDs, c.AllowAllTenants)
+
+	cfg := iolog.DefaultConfig()
+	cfg.DatabaseURL = c.DatabaseURL
+	if c.MaxBodyBytes > 0 {
+		cfg.MaxBodyBytes = c.MaxBodyBytes
+	}
+
+	sink, err := iolog.NewPostgresSink(cfg, log)
+	if err != nil {
+		// Degrade to off: never let a logging-store failure stop serving.
+		log.Error.Printf("iolog: postgres sink init failed (%v); disabling I/O logging", err)
+		return nil, nil, 0, func() {}
+	}
+
+	log.Info.Printf("iolog: enabled (sampleRate=%.3f, table=%s, maxBodyBytes=%d)", c.SampleRate, cfg.Table, cfg.MaxBodyBytes)
+	return policy, sink, cfg.MaxBodyBytes, func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		_ = sink.Close(ctx)
 	}
 }

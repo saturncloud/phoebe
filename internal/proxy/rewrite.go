@@ -8,6 +8,31 @@ import (
 	"strconv"
 )
 
+// captureRequestBody reads the request body and restores it so a subsequent
+// reader (forceIncludeUsage) sees the same bytes — no double-read of the
+// underlying stream. It returns the ORIGINAL body as a string for M5 I/O
+// logging. Called only when the iolog policy gate passed, so the read cost is
+// paid exclusively by opted-in, sampled requests.
+//
+// A nil body yields "" with no error. The whole body is held in memory here,
+// which is acceptable: it is bounded by the inbound request size and only
+// happens for sampled requests.
+func captureRequestBody(r *http.Request) (string, error) {
+	if r.Body == nil {
+		return "", nil
+	}
+	body, err := io.ReadAll(r.Body)
+	_ = r.Body.Close()
+	if err != nil {
+		return "", err
+	}
+	// Restore the body so forceIncludeUsage (and the upstream) can read it.
+	r.Body = io.NopCloser(bytes.NewReader(body))
+	r.ContentLength = int64(len(body))
+	r.Header.Set("Content-Length", strconv.Itoa(len(body)))
+	return string(body), nil
+}
+
 // forceIncludeUsage rewrites a request body so that streamed responses carry a
 // usage block. vLLM only emits streaming usage when
 // request.stream_options.include_usage is true; without stream_options it

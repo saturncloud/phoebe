@@ -17,7 +17,7 @@ import (
 // ladder:
 //
 //  1. Valkey Streams (XADD) — hot buffer, async, non-blocking
-//  2. Local-disk WAL — fsync'd JSONL, survives Valkey outages
+//  2. Local-disk WAL — fsync'd sequential log (tidwall/wal), survives Valkey outages
 //  3. Structured log — last resort if disk also fails; log pipeline can recover
 //
 // Emit is always non-blocking: it hands the event to an internal channel and
@@ -35,6 +35,18 @@ type DurableEmitter struct {
 	now    func() time.Time
 	wg     sync.WaitGroup
 	stopCh chan struct{}
+
+	// closeMu + closed guard the Emit/Close race: Emit sends on ch under the
+	// read lock, Close closes ch under the write lock — so a send can never
+	// hit a closed channel, and an Emit that observes closed goes straight to
+	// the WAL instead of a channel no worker will ever drain again.
+	closeMu sync.RWMutex
+	closed  bool
+
+	// shipFn ships one batch to Valkey, returning true iff ALL events landed.
+	// Defaults to shipBatch; tests inject failures here to exercise the
+	// drain's partial-progress behaviour without timing games.
+	shipFn func([]metering.Event) bool
 }
 
 // New creates and starts a DurableEmitter.
@@ -47,7 +59,7 @@ func New(cfg Config, log *logging.Logger, rdb redis.Cmdable) (*DurableEmitter, e
 		return nil, fmt.Errorf("emit.New: logger must not be nil")
 	}
 
-	w, err := openWAL(cfg.WALPath)
+	w, err := openWAL(cfg.WALPath, log)
 	if err != nil {
 		return nil, fmt.Errorf("emit.New: %w", err)
 	}
@@ -61,6 +73,7 @@ func New(cfg Config, log *logging.Logger, rdb redis.Cmdable) (*DurableEmitter, e
 		now:    time.Now,
 		stopCh: make(chan struct{}),
 	}
+	e.shipFn = e.shipBatch
 
 	n := cfg.WorkerCount
 	if n <= 0 {
@@ -89,29 +102,55 @@ func NewWithClock(cfg Config, log *logging.Logger, rdb redis.Cmdable, now func()
 }
 
 // Emit satisfies metering.Emitter. It stamps TimestampUnixMs, then tries to
-// hand the event to the worker channel. If the channel is full it falls
-// directly to the WAL (and to the log floor if the WAL also fails). It never
-// blocks the caller.
+// hand the event to the worker channel. If the channel is full — or the
+// emitter is closed, so no worker will ever drain the channel again — it
+// falls directly to the WAL (and to the log floor if the WAL also fails).
+// It never blocks the caller, and an Emit racing Close never strands an
+// event: it always lands in Valkey, the WAL, or the log floor.
 func (e *DurableEmitter) Emit(_ context.Context, ev metering.Event) {
 	ev.TimestampUnixMs = e.now().UnixMilli()
 
-	// Fast path: hand off to channel.
-	select {
-	case e.ch <- ev:
-		return
-	default:
-		// Channel full — fall through to WAL directly.
+	// Fast path: hand off to channel. The read lock pairs with Close's write
+	// lock so the send cannot race the close(e.ch).
+	e.closeMu.RLock()
+	if !e.closed {
+		select {
+		case e.ch <- ev:
+			e.closeMu.RUnlock()
+			return
+		default:
+			// Channel full — fall through to WAL directly.
+		}
 	}
+	e.closeMu.RUnlock()
 
 	e.walOrLog(ev)
 }
 
-// Close drains in-flight events, stops background goroutines, and closes the
-// WAL file. The provided context bounds the drain wait.
+// Close flushes every in-flight event, stops background goroutines, makes a
+// final attempt to ship the WAL, and closes it. The provided context bounds
+// the wait. Order matters for the no-stranding guarantee:
+//
+//  1. mark closed + close(e.ch) under the write lock — subsequent Emits go
+//     straight to the WAL/floor, and no send can hit the closed channel;
+//  2. workers range the channel to completion, so every queued event is
+//     processed (xadd, falling to WAL/floor on error) — the old code's
+//     `default: return` exited the instant the channel was momentarily
+//     empty, stranding events a racing Emit had just queued;
+//  3. only after the workers are done, a final drainWAL ships what fell to
+//     disk during shutdown, then the WAL is closed.
 func (e *DurableEmitter) Close(ctx context.Context) error {
-	close(e.stopCh)
-	// Drain the channel by closing it after signalling workers.
-	// Workers exit when stopCh is closed; remaining items are processed.
+	e.closeMu.Lock()
+	if e.closed {
+		e.closeMu.Unlock()
+		return nil
+	}
+	e.closed = true
+	close(e.ch)
+	e.closeMu.Unlock()
+
+	close(e.stopCh) // stop the shipper ticker
+
 	done := make(chan struct{})
 	go func() {
 		e.wg.Wait()
@@ -122,31 +161,18 @@ func (e *DurableEmitter) Close(ctx context.Context) error {
 	case <-ctx.Done():
 		return ctx.Err()
 	}
+
+	e.drainWAL()
 	return e.wal.close()
 }
 
-// worker drains the event channel and ships each event to Valkey.
-// Falls to WAL on XADD error.
+// worker drains the event channel and ships each event to Valkey, falling to
+// the WAL on XADD error. It exits only when the channel is closed AND fully
+// drained — never on "momentarily empty", which would strand racing Emits.
 func (e *DurableEmitter) worker() {
 	defer e.wg.Done()
-	for {
-		select {
-		case ev, ok := <-e.ch:
-			if !ok {
-				return
-			}
-			e.xadd(ev)
-		case <-e.stopCh:
-			// Drain remaining events before exiting.
-			for {
-				select {
-				case ev := <-e.ch:
-					e.xadd(ev)
-				default:
-					return
-				}
-			}
-		}
+	for ev := range e.ch {
+		e.xadd(ev)
 	}
 }
 
@@ -219,27 +245,23 @@ func (e *DurableEmitter) shipper() {
 		case <-ticker.C:
 			e.drainWAL()
 		case <-e.stopCh:
-			// Final drain on shutdown.
-			e.drainWAL()
+			// No final drain here: Close runs it after the workers have
+			// flushed the channel, so shutdown-window events ship too.
 			return
 		}
 	}
 }
 
-// drainWAL reads the WAL, ships each event to Valkey, and truncates the file
-// on full success. Partial success is safe because XADD is idempotent via
-// request_id at the consumer — at-least-once delivery is the contract.
+// drainWAL ships the WAL's unshipped entries to Valkey in ShipBatchSize
+// batches, truncating after EACH successfully shipped batch — so progress made
+// before a mid-drain failure is retained, never re-done wholesale. On a ship
+// failure it stops: the remaining entries stay in the log and the next tick
+// resumes from the watermark. Entries are only ever reclaimed after their
+// batch is confirmed shipped, and concurrent appends land at higher indexes
+// that truncation never touches — loss during a drain is structurally
+// impossible. Delivery is at-least-once; the drainer dedups on request_id.
 func (e *DurableEmitter) drainWAL() {
 	if e.rdb == nil {
-		return
-	}
-
-	events, err := e.wal.readAll()
-	if err != nil {
-		e.log.Error.Printf("emit: wal readAll: %v", err)
-		return
-	}
-	if len(events) == 0 {
 		return
 	}
 
@@ -248,24 +270,27 @@ func (e *DurableEmitter) drainWAL() {
 		batchSize = 256
 	}
 
-	allShipped := true
-	for i := 0; i < len(events); i += batchSize {
-		end := i + batchSize
-		if end > len(events) {
-			end = len(events)
+	for {
+		events, through, skipped, err := e.wal.pending(batchSize)
+		if err != nil {
+			e.log.Error.Printf("emit: wal read for drain: %v", err)
+			return
 		}
-		batch := events[i:end]
-		if !e.shipBatch(batch) {
-			allShipped = false
-			break
+		if skipped > 0 {
+			e.log.Error.Printf("emit: wal drain: skipped %d corrupt entries (undecodable; truncating past them)", skipped)
 		}
-	}
-
-	if allShipped {
-		if err := e.wal.truncate(); err != nil {
-			e.log.Error.Printf("emit: wal truncate after drain: %v", err)
-		} else {
-			e.log.Info.Printf("emit: wal drained and truncated (%d events shipped)", len(events))
+		if through == 0 {
+			return // nothing unshipped
+		}
+		if len(events) > 0 && !e.shipFn(events) {
+			return // ship failed — entries remain; next tick resumes here
+		}
+		if err := e.wal.markShipped(through); err != nil {
+			e.log.Error.Printf("emit: wal truncate after ship: %v", err)
+			return
+		}
+		if len(events) > 0 {
+			e.log.Info.Printf("emit: wal drained batch (%d events shipped)", len(events))
 		}
 	}
 }

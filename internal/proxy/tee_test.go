@@ -2,26 +2,40 @@ package proxy
 
 import (
 	"bytes"
+	"context"
 	"io"
 	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
+	"unicode/utf8"
 
 	"github.com/saturncloud/phoebe/internal/capture"
 )
 
+// cancelledCtx returns a context that is already cancelled — the tee reads this
+// as "client disconnected" (abort) at finalisation, the same signal net/http
+// delivers on a real client disconnect.
+func cancelledCtx() context.Context {
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	return ctx
+}
+
 // realistic vLLM streaming response: content chunks, then a chunk carrying
 // finish_reason (empty delta), then the usage chunk (choices: []), then [DONE].
 // This ordering is the LiteLLM trap — we must NOT stop at finish_reason.
-const vllmStream = `data: {"id":"c1","object":"chat.completion.chunk","choices":[{"index":0,"delta":{"role":"assistant","content":"Hello"}}]}
+// Every chunk carries the engine-reported "model" at the top level — exactly as
+// vLLM/OpenAI emit it. That name (NOT the X-Saturn-Resource-Id routing id) is
+// rating's price key, so the fixture must include it.
+const vllmStream = `data: {"id":"c1","object":"chat.completion.chunk","model":"llama-3-8b","choices":[{"index":0,"delta":{"role":"assistant","content":"Hello"}}]}
 
-data: {"id":"c1","object":"chat.completion.chunk","choices":[{"index":0,"delta":{"content":" world"}}]}
+data: {"id":"c1","object":"chat.completion.chunk","model":"llama-3-8b","choices":[{"index":0,"delta":{"content":" world"}}]}
 
-data: {"id":"c1","object":"chat.completion.chunk","choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}
+data: {"id":"c1","object":"chat.completion.chunk","model":"llama-3-8b","choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}
 
-data: {"id":"c1","object":"chat.completion.chunk","choices":[],"usage":{"prompt_tokens":2006,"total_tokens":2306,"completion_tokens":300,"prompt_tokens_details":{"cached_tokens":1920}}}
+data: {"id":"c1","object":"chat.completion.chunk","model":"llama-3-8b","choices":[],"usage":{"prompt_tokens":2006,"total_tokens":2306,"completion_tokens":300,"prompt_tokens_details":{"cached_tokens":1920}}}
 
 data: [DONE]
 
@@ -32,7 +46,7 @@ data: [DONE]
 func drain(t *testing.T, body string, streamed bool) ([]byte, capture.Result) {
 	t.Helper()
 	var got capture.Result
-	cr := newCaptureReader(io.NopCloser(strings.NewReader(body)), streamed, func(r capture.Result) {
+	cr := newCaptureReader(context.Background(), io.NopCloser(strings.NewReader(body)), streamed, func(r capture.Result) {
 		got = r
 	})
 	forwarded, err := io.ReadAll(cr)
@@ -122,7 +136,7 @@ func TestTeeStreamingSplitAcrossReads(t *testing.T) {
 	// Feed the stream one byte at a time to prove line reassembly across Read
 	// boundaries — the realistic case where chunks arrive fragmented.
 	var got capture.Result
-	cr := newCaptureReader(io.NopCloser(iotest1ByteReader(vllmStream)), true, func(r capture.Result) {
+	cr := newCaptureReader(context.Background(), io.NopCloser(iotest1ByteReader(vllmStream)), true, func(r capture.Result) {
 		got = r
 	})
 	forwarded, err := io.ReadAll(cr)
@@ -139,46 +153,75 @@ func TestTeeStreamingSplitAcrossReads(t *testing.T) {
 	}
 }
 
-// TestTeeAbortFinalizes verifies that markAborted + Close produces Aborted=true
-// with no usage. The onDone callback is passed at construction so markAborted
-// can fire it directly — this matches the real proxy path.
+// TestTeeAbortFinalizes verifies that when the request context is cancelled
+// (client disconnect), Close → finish produces Aborted=true with no usage —
+// regardless of which path reaches finish() first.
 func TestTeeAbortFinalizes(t *testing.T) {
 	partial := `data: {"choices":[{"index":0,"delta":{"content":"Hel"}}]}
 
 `
 	var got capture.Result
-	cr := newCaptureReader(io.NopCloser(strings.NewReader(partial)), true, func(r capture.Result) {
+	cr := newCaptureReader(cancelledCtx(), io.NopCloser(strings.NewReader(partial)), true, func(r capture.Result) {
 		got = r
 	})
 	buf := make([]byte, 8)
 	_, _ = cr.Read(buf) // partial read
-	cr.markAborted()
-	// Close is a no-op for done (finish already fired from markAborted), but
-	// we call it to mirror the real path.
-	_ = cr.Close()
+	_ = cr.Close()      // teardown after a client disconnect
 
 	if !got.Aborted {
-		t.Fatal("Aborted not set after markAborted")
+		t.Fatal("Aborted not set when context was cancelled")
 	}
 	if got.UsageFound {
 		t.Fatal("partial stream should not have usage")
 	}
 }
 
+// TestTeeBodyLogTruncationKeepsRuneBoundary guards the M5 capture contract
+// with Postgres: when the body-log cap lands mid-rune, the buffered copy must
+// back up to a rune boundary so it stays valid UTF-8 — a split multibyte rune
+// would make the io_log TEXT insert fail and drop the whole record.
+func TestTeeBodyLogTruncationKeepsRuneBoundary(t *testing.T) {
+	body := "abc日本語テキスト" // 3 ASCII bytes then 3-byte runes
+	cr := newCaptureReader(context.Background(), io.NopCloser(strings.NewReader(body)), false, func(capture.Result) {})
+	// Cap of 5 lands two bytes INTO the 3-byte rune 日 (bytes 3..5).
+	cr.enableBodyLog(5)
+	if _, err := io.ReadAll(cr); err != nil {
+		t.Fatalf("read: %v", err)
+	}
+	_ = cr.Close()
+
+	got, truncated := cr.capturedBody()
+	if !truncated {
+		t.Fatal("body over cap must be flagged truncated")
+	}
+	if !utf8.ValidString(got) {
+		t.Fatalf("truncated body is invalid UTF-8: %q — would fail the Postgres TEXT insert", got)
+	}
+	if got != "abc" {
+		t.Fatalf("captured body = %q, want %q (cut backed up to the rune start)", got, "abc")
+	}
+
+	// Once truncated, nothing more may be appended (the boundary backup leaves
+	// headroom below the cap; it must not be refilled by later reads).
+	cr.appendLog([]byte("ZZZ"))
+	if after, _ := cr.capturedBody(); after != got {
+		t.Fatalf("appendLog after truncation grew the buffer: %q -> %q", got, after)
+	}
+}
+
 // TestTeeOnDoneFiresExactlyOnce ensures the callback is invoked exactly once
-// even when markAborted, Read-EOF, and Close all converge.
+// even when Read-EOF and Close converge concurrently.
 func TestTeeOnDoneFiresExactlyOnce(t *testing.T) {
 	var count int32
-	cr := newCaptureReader(io.NopCloser(strings.NewReader(vllmStream)), true, func(capture.Result) {
+	cr := newCaptureReader(context.Background(), io.NopCloser(strings.NewReader(vllmStream)), true, func(capture.Result) {
 		atomic.AddInt32(&count, 1)
 	})
 
 	var wg sync.WaitGroup
-	wg.Add(3)
+	wg.Add(2)
 
-	// Three concurrent paths that all try to fire finish().
+	// Two concurrent paths that both try to fire finish().
 	go func() { defer wg.Done(); _, _ = io.ReadAll(cr) }()                        // normal EOF path
-	go func() { defer wg.Done(); cr.markAborted() }()                             // abort path
 	go func() { defer wg.Done(); time.Sleep(time.Millisecond); _ = cr.Close() }() // close path
 
 	wg.Wait()
@@ -188,26 +231,22 @@ func TestTeeOnDoneFiresExactlyOnce(t *testing.T) {
 	}
 }
 
-// TestTeeMarkAbortedAfterEOFIsNoop verifies that if the stream completed
-// cleanly (EOF) before markAborted is called, the already-fired onDone is NOT
-// re-fired and the original Aborted=false result stands.
-func TestTeeMarkAbortedAfterEOFIsNoop(t *testing.T) {
+// TestTeeCleanCompletionNotAborted verifies that a stream that reaches EOF with
+// a live (non-cancelled) context finalises as Aborted=false — a clean
+// completion is never mis-flagged as an abort.
+func TestTeeCleanCompletionNotAborted(t *testing.T) {
 	var results []capture.Result
-	cr := newCaptureReader(io.NopCloser(strings.NewReader(vllmStream)), true, func(r capture.Result) {
+	cr := newCaptureReader(context.Background(), io.NopCloser(strings.NewReader(vllmStream)), true, func(r capture.Result) {
 		results = append(results, r)
 	})
-	// Drain to EOF — onDone fires here with Aborted=false.
-	_, _ = io.ReadAll(cr)
-	_ = cr.Close()
-
-	// Now simulate a late context-cancel: markAborted should be a no-op.
-	cr.markAborted()
+	_, _ = io.ReadAll(cr) // EOF → finish with ctx.Err()==nil
+	_ = cr.Close()        // no-op (already done)
 
 	if len(results) != 1 {
 		t.Fatalf("onDone fired %d times, want 1", len(results))
 	}
 	if results[0].Aborted {
-		t.Fatal("clean completion should not be marked aborted by a late cancel")
+		t.Fatal("clean completion should not be Aborted")
 	}
 }
 
@@ -215,10 +254,10 @@ func TestTeeMarkAbortedAfterEOFIsNoop(t *testing.T) {
 // usage block) arrived before the abort, the result carries both Aborted=true
 // and the captured usage.
 //
-// We call markAborted() directly before Close() to simulate the abort path
-// where finish() has not yet run. We use a blocking source so that io.ReadAll
-// (or the equivalent) never returns EOF on its own, ensuring finish() is only
-// triggered by markAborted().
+// The request context is cancelled (client disconnect) and Close() triggers
+// finish() while Read is still blocked. We use a blocking source so the stream
+// never reaches EOF on its own, ensuring finish() runs via the abort/Close path
+// and reads the cancelled context.
 func TestTeeAbortWithPartialUsage(t *testing.T) {
 	streamWithUsage := `data: {"choices":[{"index":0,"delta":{},"finish_reason":"length"}]}
 
@@ -230,7 +269,7 @@ data: {"choices":[],"usage":{"prompt_tokens":100,"total_tokens":130,"completion_
 	src := &blockAfterReader{data: []byte(streamWithUsage)}
 
 	var got capture.Result
-	cr := newCaptureReader(src, true, func(r capture.Result) {
+	cr := newCaptureReader(cancelledCtx(), src, true, func(r capture.Result) {
 		got = r
 	})
 
@@ -250,8 +289,9 @@ data: {"choices":[],"usage":{"prompt_tokens":100,"total_tokens":130,"completion_
 	// Give the goroutine time to consume the pre-loaded bytes.
 	time.Sleep(5 * time.Millisecond)
 
-	// Abort: sets Aborted=true and fires finish() while Read is still blocked.
-	cr.markAborted()
+	// Abort path: Close() fires finish() (while Read is still blocked), which
+	// reads the cancelled context → Aborted=true, with usage already captured.
+	_ = cr.Close()
 
 	// Unblock Read by closing the source.
 	src.unblock()
