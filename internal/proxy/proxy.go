@@ -346,15 +346,36 @@ func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request) {
 // upstream/transport fault is logged at error and 502'd. The single isClientAbort
 // predicate decides which.
 //
-// id and requestID are threaded in so a future emit can attribute an abort event
-// (see handleProxy: every request past the billing-identity gate is meant to emit
-// exactly one attributable event).
+// THE ABORT-EMIT (Fix A) — money-path observability. ModifyResponse installs the
+// captureReader whose onDone emits the metering event; but a client that aborts
+// BEFORE the upstream writes its response headers fails RoundTrip, so
+// ModifyResponse never runs and onDone never fires — the request would pass the
+// billing-identity gate yet emit NOTHING, leaving served-or-attempted traffic
+// completely invisible to billing/reconciliation. So on an abort we emit exactly
+// ONE zero-token, attributable event (Aborted=true, no usage) with the already-
+// resolved identity, via the SAME s.emit path the completion path uses — so the
+// pre-header abort obeys the SAME BillPartialOnAbort policy (no second policy).
+//
+// Invariant: every request past the billing-identity gate emits exactly one
+// attributable event — real usage on completion, or a zero-token Aborted event on
+// disconnect (pre- OR post-header).
+//
+// NO double-emit: in phoebe ModifyResponse always returns nil, so ErrorHandler
+// fires ONLY on a RoundTrip error (pre-header) — mutually exclusive with the
+// onDone path (post-header), which needs ModifyResponse to have run. The emit is
+// gated on isClientAbort, so a genuine upstream/ModifyResponse fault never writes
+// a bogus zero-token billing row. The context is decoupled from the cancelled
+// client ctx (WithoutCancel) — the abort is precisely WHY we are here, so a
+// cancelled ctx must not be able to drop the emit (mirrors onDone).
 func (s *Server) errorHandler(upstream string, id identity.Identity, requestID string) func(http.ResponseWriter, *http.Request, error) {
-	_ = id
-	_ = requestID
-	return func(w http.ResponseWriter, _ *http.Request, err error) {
+	return func(w http.ResponseWriter, r *http.Request, err error) {
 		if isClientAbort(err) {
 			s.log.Debug.Printf("client disconnected for %s", upstream)
+			// Pre-header abort: ModifyResponse never ran, so onDone will not emit.
+			// Emit a zero-token attributable event so the request is not invisible
+			// to billing. Best-effort, non-blocking — like onDone's emit.
+			ctx := context.WithoutCancel(r.Context())
+			s.emit(ctx, id, requestID, capture.Result{Aborted: true, UsageFound: false})
 			return
 		}
 		s.log.Error.Printf("upstream %s error: %v", upstream, err)

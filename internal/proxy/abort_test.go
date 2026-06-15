@@ -284,10 +284,14 @@ func TestNormalCompletionNotAffectedByAbortWatcher(t *testing.T) {
 //   - Every emitted event has Aborted=true (no partial-billed clean event).
 //   - onDone fires at most once per request (no double-emit).
 //
-// Some requests may be cancelled before ReverseProxy establishes the upstream
-// response (context cancelled before ModifyResponse runs), in which case no
-// captureReader is created and no event is emitted — that is correct. We only
-// assert on events that were emitted, not on total count.
+// CONTRACT (post Fix A): a request cancelled BEFORE ModifyResponse runs (no
+// captureReader, no onDone) now ALSO emits — a zero-token Aborted event from the
+// ErrorHandler — so an aborted request is never billing-invisible regardless of
+// whether the cancel landed pre- or post-header. (Previously such a request
+// emitted nothing, which this test documented as "correct"; Fix A changed that
+// contract.) Either way the event is Aborted=true, which is what we assert. We do
+// not assert an exact total because pre-/post-header split is scheduling-
+// dependent, but every emitted event must be Aborted.
 func TestAbortRaceStress(t *testing.T) {
 	const N = 50
 
