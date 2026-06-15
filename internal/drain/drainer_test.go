@@ -516,6 +516,84 @@ func TestDrain_StoreOutageDuringFallbackDoesNotAck(t *testing.T) {
 	}, 2*time.Second)
 }
 
+// TestDrain_PoisonAckedDuringStoreOutage proves the poison-ACK is independent of
+// store health: a malformed (decode-failed) entry is ACK'd and DROPPED even when
+// the store is DOWN, while the good entries batched with it stay pending and
+// redeliver after recovery. Previously the poison-ACK ran only AFTER the store
+// work, so a store-outage early-return skipped it and the poison redelivered
+// every pass until an outage-free run. A malformed entry can never be stored
+// regardless of store health, so dropping it is always correct.
+func TestDrain_PoisonAckedDuringStoreOutage(t *testing.T) {
+	_, rdb := startMiniredis(t)
+	cfg := testConfig(rdb.Options().Addr)
+	store := newFakeStore()
+	store.failAll = true // store is DOWN
+	store.pingErr = errors.New("store down")
+
+	// A malformed entry (cannot decode) plus a good entry — same batch.
+	if err := rdb.XAdd(context.Background(), &redis.XAddArgs{
+		Stream: cfg.StreamName,
+		Values: map[string]any{"event": "{not valid json"},
+	}).Err(); err != nil {
+		t.Fatalf("xadd poison: %v", err)
+	}
+	xaddEvent(t, rdb, cfg.StreamName, sampleEvent("good-during-outage"))
+
+	// Phase 1: run against the dead store until the store has been hit (the
+	// fallback ran, proving we got past decode), then stop.
+	d := New(cfg, testLogger(), rdb, store)
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() { done <- d.Run(ctx) }()
+	deadline := time.After(2 * time.Second)
+	for {
+		store.mu.Lock()
+		tried := store.calls >= 1
+		store.mu.Unlock()
+		if tried {
+			break
+		}
+		select {
+		case <-deadline:
+			cancel()
+			<-done
+			t.Fatal("store was never hit (decode/poison path may not have run)")
+		case <-time.After(2 * time.Millisecond):
+		}
+	}
+	cancel()
+	<-done
+
+	// The poison entry must be ACK'd (dropped) DESPITE the outage; the good
+	// entry must remain pending (un-ACK'd, will redeliver). So exactly ONE entry
+	// stays pending, not two.
+	if p := pendingCount(t, rdb, cfg.StreamName, cfg.Group); p != 1 {
+		t.Fatalf("pending = %d, want 1 (poison ACK'd during outage, good entry still pending)", p)
+	}
+	if got := store.rowCount(); got != 0 {
+		t.Fatalf("rows = %d, want 0 during outage", got)
+	}
+
+	// Phase 2: store recovers; the un-ACK'd GOOD entry redelivers and lands. The
+	// poison must NOT reappear (it was already dropped).
+	store.mu.Lock()
+	store.failAll = false
+	store.pingErr = nil
+	store.mu.Unlock()
+
+	d2 := New(cfg, testLogger(), rdb, store)
+	runUntil(t, d2, func() bool {
+		return store.rowCount() == 1 && pendingCount(t, rdb, cfg.StreamName, cfg.Group) == 0
+	}, 2*time.Second)
+
+	store.mu.Lock()
+	_, good := store.rows["good-during-outage"]
+	store.mu.Unlock()
+	if !good {
+		t.Fatal("good entry never stored after recovery")
+	}
+}
+
 // TestEnsureGroup_Idempotent proves ensureGroup tolerates BUSYGROUP (already
 // exists) so restarts are clean.
 func TestEnsureGroup_Idempotent(t *testing.T) {
