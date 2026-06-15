@@ -334,21 +334,32 @@ func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request) {
 		return nil
 	}
 
-	rp.ErrorHandler = func(w http.ResponseWriter, _ *http.Request, err error) {
-		// context.Canceled means the client disconnected — an abort, not an
-		// upstream fault. Don't log it as an error or write a 502 over a
-		// connection that's already gone. errors.Is (not ==): the transport
-		// usually delivers the cancellation WRAPPED (e.g. *net.OpError around
-		// errCanceled), which satisfies Is but never equality.
-		if errors.Is(err, context.Canceled) {
+	rp.ErrorHandler = s.errorHandler(upstream.String(), id, requestID)
+
+	rp.ServeHTTP(w, r)
+}
+
+// errorHandler builds the ReverseProxy ErrorHandler for one request. The handler
+// fires for BOTH RoundTrip errors and ModifyResponse-returned errors, but only
+// CLIENT ABORTS (disconnect / deadline) are special-cased: an abort is logged at
+// debug and must not 502 a connection that is already gone, while a genuine
+// upstream/transport fault is logged at error and 502'd. The single isClientAbort
+// predicate decides which.
+//
+// id and requestID are threaded in so a future emit can attribute an abort event
+// (see handleProxy: every request past the billing-identity gate is meant to emit
+// exactly one attributable event).
+func (s *Server) errorHandler(upstream string, id identity.Identity, requestID string) func(http.ResponseWriter, *http.Request, error) {
+	_ = id
+	_ = requestID
+	return func(w http.ResponseWriter, _ *http.Request, err error) {
+		if isClientAbort(err) {
 			s.log.Debug.Printf("client disconnected for %s", upstream)
 			return
 		}
 		s.log.Error.Printf("upstream %s error: %v", upstream, err)
 		http.Error(w, "upstream error", http.StatusBadGateway)
 	}
-
-	rp.ServeHTTP(w, r)
 }
 
 // emit builds the metering event from the captured result and hands it to the
@@ -429,4 +440,19 @@ func missingBillingFields(id identity.Identity) []string {
 func isEventStream(resp *http.Response) bool {
 	ct := resp.Header.Get("Content-Type")
 	return strings.HasPrefix(ct, "text/event-stream")
+}
+
+// isClientAbort reports whether a ReverseProxy error is a client-side abort — a
+// disconnect (context.Canceled) or a request deadline (context.DeadlineExceeded)
+// — as opposed to an upstream/transport fault. errors.Is (never ==) because the
+// transport delivers these WRAPPED on the common mid-flight paths (a *url.Error
+// or *net.OpError around the sentinel), so an identity compare would misclassify
+// a real abort as an upstream error.
+//
+// This is the SINGLE predicate that decides both ErrorHandler branches: an abort
+// is logged at debug + emits a zero-token attributable event (see handleProxy's
+// ErrorHandler), while a genuine upstream fault is logged at error + 502'd. The
+// two must agree on what "abort" means, hence one helper.
+func isClientAbort(err error) bool {
+	return errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded)
 }
