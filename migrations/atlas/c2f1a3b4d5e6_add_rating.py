@@ -179,7 +179,10 @@ def upgrade():
         sa.Column("billable_prompt_tokens", sa.BigInteger(), nullable=False),
         # The money, exact NUMERIC, computed and summed in SQL.
         sa.Column("cost", MONEY, nullable=False),
-        sa.Column("event_count", sa.Integer(), nullable=False),
+        # BigInteger, not Integer: a wide rollup window can count more than
+        # 2^31 events (matches the COUNT(*)::bigint cast in the rater). No data
+        # migration is needed — rated_usage is empty pre-prod.
+        sa.Column("event_count", sa.BigInteger(), nullable=False),
         sa.Column(
             "rated_at",
             sa.DateTime(timezone=True),

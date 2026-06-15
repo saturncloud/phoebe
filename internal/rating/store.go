@@ -325,7 +325,7 @@ priced AS (
           + cached_tokens     * cached_price
           + completion_tokens * completion_price
         )                                                AS cost,
-        COUNT(*)::int                                    AS event_count
+        COUNT(*)::bigint                                 AS event_count
     FROM resolved
     WHERE prompt_price IS NOT NULL          -- priced only
       AND auth_id  IS NOT NULL              -- attributable only

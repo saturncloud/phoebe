@@ -96,7 +96,7 @@ CREATE TABLE rated_usage (
     completion_tokens      BIGINT NOT NULL,
     billable_prompt_tokens BIGINT NOT NULL,
     cost                   NUMERIC(20,9) NOT NULL,
-    event_count            INTEGER NOT NULL,
+    event_count            BIGINT NOT NULL,
     rated_at               TIMESTAMPTZ NOT NULL DEFAULT now(),
     CONSTRAINT rated_usage_auth_model_window_uq UNIQUE (auth_id, model_id, window_start)
 );`
@@ -469,6 +469,59 @@ func TestIntegration_RatingInstantIndexServesScan(t *testing.T) {
 	}
 	if !strings.Contains(plan, "billing_event_rating_instant_ix") {
 		t.Fatalf("plan does not use billing_event_rating_instant_ix (the index cannot serve the rater's predicate):\n%s", plan)
+	}
+}
+
+// TestIntegration_EventCountIsBigint pins D2: rated_usage.event_count must be a
+// BIGINT, so a rollup counting more than 2^31 events INSERTs and round-trips
+// instead of overflowing INTEGER. Asserts both the declared column type and an
+// actual > 2^31 value surviving INSERT + SELECT.
+func TestIntegration_EventCountIsBigint(t *testing.T) {
+	dsn := os.Getenv("PHOEBE_TEST_DATABASE_URL")
+	if dsn == "" {
+		t.Skip("PHOEBE_TEST_DATABASE_URL not set; skipping live-Postgres conformance")
+	}
+	db, err := sql.Open("pgx", dsn)
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	defer db.Close()
+	db.SetMaxOpenConns(1) // SET/search_path must stick
+
+	const sch = "phoebe_rating_bigint_it"
+	exec(t, db, "DROP SCHEMA IF EXISTS "+sch+" CASCADE")
+	exec(t, db, "CREATE SCHEMA "+sch)
+	exec(t, db, "SET search_path TO "+sch)
+	defer func() { exec(t, db, "DROP SCHEMA IF EXISTS "+sch+" CASCADE") }()
+	exec(t, db, schemaDDL)
+
+	// The declared column type must be bigint, not integer.
+	var dataType string
+	if err := db.QueryRow(
+		`SELECT data_type FROM information_schema.columns
+		   WHERE table_schema = $1 AND table_name = 'rated_usage' AND column_name = 'event_count'`,
+		sch).Scan(&dataType); err != nil {
+		t.Fatalf("read event_count column type: %v", err)
+	}
+	if dataType != "bigint" {
+		t.Fatalf("rated_usage.event_count data_type = %q, want \"bigint\"", dataType)
+	}
+
+	// A value past INT32_MAX must INSERT and round-trip unharmed.
+	const bigCount int64 = 5_000_000_000 // > 2^31-1 (2_147_483_647)
+	exec(t, db, fmt.Sprintf(`INSERT INTO rated_usage
+		(id, auth_id, model_id, window_start, window_end,
+		 prompt_tokens, cached_tokens, completion_tokens, billable_prompt_tokens, cost, event_count)
+		VALUES ('bc1','a','b','2026-06-08T10:00:00Z','2026-06-08T11:00:00Z',
+		        0,0,0,0,0, %d)`, bigCount))
+
+	var got int64
+	if err := db.QueryRow(
+		`SELECT event_count FROM rated_usage WHERE id = 'bc1'`).Scan(&got); err != nil {
+		t.Fatalf("read back event_count: %v", err)
+	}
+	if got != bigCount {
+		t.Fatalf("event_count round-trip = %d, want %d", got, bigCount)
 	}
 }
 

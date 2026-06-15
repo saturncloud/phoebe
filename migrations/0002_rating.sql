@@ -217,7 +217,9 @@ CREATE TABLE rated_usage (
 
     -- The money, as exact NUMERIC. Computed and summed in SQL (never in Go).
     cost                    NUMERIC(20, 9) NOT NULL,
-    event_count             INTEGER NOT NULL,
+    -- BIGINT, not INTEGER: a wide rollup window can count more than 2^31 events,
+    -- which the COUNT(*)::bigint cast in the rater already produces.
+    event_count             BIGINT NOT NULL,
 
     rated_at                TIMESTAMPTZ NOT NULL DEFAULT now(),
 
