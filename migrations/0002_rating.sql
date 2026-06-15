@@ -92,3 +92,12 @@ CREATE INDEX rated_usage_auth_id_window_start_ix
 -- that only grows) on every run.
 CREATE INDEX IF NOT EXISTS billing_event_rating_instant_ix
     ON billing_event ((COALESCE(event_ts, created_at)));
+
+-- base_model on billing_event (E3 fine-tune linkage): the HF base id a fine-tune
+-- derives from, stamped by Atlas at deploy. The rater prices an ft:<checkpoint>
+-- model at base x premium via this column; an ft: model with a NULL base_model
+-- fails loud (never $0). Added idempotently: the billing_event create migration
+-- (0001) now declares it directly, so on a fresh DB this is a no-op; a
+-- billing_event created before the column existed still gets it here. Mirrors the
+-- Alembic rating migration (migrations/atlas/c2f1a3b4d5e6_add_rating.py).
+ALTER TABLE billing_event ADD COLUMN IF NOT EXISTS base_model VARCHAR(255);

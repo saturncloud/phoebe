@@ -91,6 +91,7 @@ var upsertColumns = []string{
 	"resource_id",
 	"resource_type",
 	"model",
+	"base_model",
 	"adapter",
 	"prompt_tokens",
 	"cached_tokens",
@@ -101,7 +102,7 @@ var upsertColumns = []string{
 	"event_ts",
 }
 
-const colsPerRow = 15 // len(upsertColumns); created_at is DB-defaulted.
+const colsPerRow = 16 // len(upsertColumns); created_at is DB-defaulted.
 
 // Upsert writes a batch of events in a single transaction with a multi-row
 // INSERT ... ON CONFLICT (request_id) DO NOTHING.
@@ -182,6 +183,12 @@ func eventArgs(e metering.Event) []any {
 		// would dodge it and be misreported as UNPRICED (wrong runbook —
 		// "backfill prices" instead of "fix the capture gap").
 		nullStr(e.Model),
+		// BaseModel is "" for a base model (the common case) and the HF base id for
+		// a fine-tune. nullStr so a base model stores NULL, not '' — the rater's
+		// derived-price join keys on a non-null base_model, and a stray '' could
+		// only ever miss the join (NULL = NULL is never true), so this is belt-and
+		// -braces for a clean column either way.
+		nullStr(e.BaseModel),
 		nullStr(e.Adapter),
 		e.PromptTokens,
 		e.CachedTokens,

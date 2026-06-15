@@ -154,9 +154,10 @@ fine_tune_premium:
 	}
 }
 
-// TestResolve_MissingPriceFailsLoud (missing-price-fails-loud-not-zero): an unknown
-// model id (and an ft: id with no in-file linkage — the flagged gap) resolves to
-// ErrNoPrice, NEVER a $0 rate.
+// TestResolve_MissingPriceFailsLoud (missing-price-fails-loud-not-zero): the
+// model_id-only Resolve fails loud for an unknown id and for an ft: id with no in-file
+// linkage (the event-carried base_model path is ResolveEvent's job, tested separately
+// in TestResolveEvent_FineTuneViaBaseModel). NEVER a $0 rate.
 func TestResolve_MissingPriceFailsLoud(t *testing.T) {
 	const y = `
 version: 1
@@ -173,10 +174,56 @@ base_models:
 	if _, err := pb.Resolve("does-not-exist"); !errors.Is(err, ErrNoPrice) {
 		t.Fatalf("unknown model: err = %v, want ErrNoPrice", err)
 	}
-	// An ft: id whose base linkage is NOT in the file is the flagged gap: it must
-	// fail loud, never silently $0.
+	// An ft: id with no in-file linkage fails loud under the model_id-only Resolve
+	// (pricing it requires the event's base_model — see ResolveEvent). Never $0.
 	if _, err := pb.Resolve("ft:not-plumbed-yet"); !errors.Is(err, ErrNoPrice) {
-		t.Fatalf("unlinked ft id: err = %v, want ErrNoPrice (flagged gap must fail loud)", err)
+		t.Fatalf("unlinked ft id: err = %v, want ErrNoPrice (must fail loud)", err)
+	}
+}
+
+// TestResolveEvent_FineTuneViaBaseModel (resolve-event-fine-tune-via-base-model):
+// ResolveEvent prices an ft:<checkpoint> model_id — not named in the file — through the
+// event-carried base_model (E3), at base × premium. Direct model_id pricing still wins
+// when the id IS in the file; an ft: id with an empty base_model fails loud.
+func TestResolveEvent_FineTuneViaBaseModel(t *testing.T) {
+	const y = `
+version: 1
+base_models:
+  "meta-llama/Llama-3.1-8B-Instruct":
+    prompt:     "0.000004"
+    cached:     "0.0000004"
+    completion: "0.00001"
+fine_tune_premium:
+  policy: multiplier
+  factor: "1.5"
+`
+	pb, err := ParsePriceBook([]byte(y))
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+
+	// ft: id NOT in the file, base_model IS → base × 1.5.
+	r, err := pb.ResolveEvent("ft:deadbeef", "meta-llama/Llama-3.1-8B-Instruct")
+	if err != nil {
+		t.Fatalf("resolve ft via base_model: %v", err)
+	}
+	if r.Prompt.String() != "0.000006000" || r.Cached.String() != "0.000000600" || r.Completion.String() != "0.000015000" {
+		t.Fatalf("derived rates = %s/%s/%s, want base×1.5", r.Prompt, r.Cached, r.Completion)
+	}
+
+	// A base model id resolves DIRECTLY regardless of base_model (here empty).
+	if r, err := pb.ResolveEvent("meta-llama/Llama-3.1-8B-Instruct", ""); err != nil || r.Prompt.String() != "0.000004000" {
+		t.Fatalf("base model direct resolve = %s, %v; want 0.000004000 / nil", r.Prompt, err)
+	}
+
+	// FAIL LOUD: an ft: id with an EMPTY base_model is a propagation bug, not $0.
+	if _, err := pb.ResolveEvent("ft:deadbeef", ""); !errors.Is(err, ErrNoPrice) {
+		t.Fatalf("ft: with empty base_model: err = %v, want ErrNoPrice (never silently mis-price)", err)
+	}
+
+	// FAIL LOUD: an ft: id whose base_model is NOT a priced base → ErrNoPrice.
+	if _, err := pb.ResolveEvent("ft:deadbeef", "some/unpriced-base"); !errors.Is(err, ErrNoPrice) {
+		t.Fatalf("ft: with unknown base_model: err = %v, want ErrNoPrice", err)
 	}
 }
 

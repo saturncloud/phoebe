@@ -435,6 +435,12 @@ func (s *Server) emit(ctx context.Context, id identity.Identity, requestID strin
 		// emitted no parseable model; rating then fails the event loud rather
 		// than billing it wrong.
 		Model: res.Model,
+		// BaseModel is the fine-tune's HF base id (E3 derived_from), injected by
+		// atlas-auth at deploy time and carried verbatim. Empty for a base model;
+		// for an ft:<checkpoint> Model the rater prices via base x premium. Stamped
+		// from the trusted identity header, never from the engine response (the
+		// engine doesn't know the deployment's base).
+		BaseModel: id.BaseModel,
 
 		PromptTokens:     res.Usage.PromptTokens,
 		CachedTokens:     res.Usage.CachedTokens(),

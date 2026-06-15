@@ -129,16 +129,36 @@ CREATE TEMP TABLE rating_price (
     completion_price NUMERIC(20,9) NOT NULL
 ) ON COMMIT DROP`
 
+// createDerivedTempSQL creates the per-transaction DERIVED price table, keyed on the
+// BASE model id. It carries the per-token rate a fine-tune deriving from that base
+// pays — the global premium applied to the base in exact Dec, quantized to 9dp at
+// projection (same NUMERIC(20,9) as rating_price). A fine-tune event arrives with an
+// ft:<checkpoint> model_id the file never names, but it carries its base_model (E3);
+// the rater joins that base_model here to price it at base x premium. ON COMMIT DROP
+// so it never persists. Empty when the file declares no base models (impossible: the
+// loader rejects an empty base_models).
+const createDerivedTempSQL = `
+CREATE TEMP TABLE rating_derived (
+    base_model       text PRIMARY KEY,
+    prompt_price     NUMERIC(20,9) NOT NULL,
+    cached_price     NUMERIC(20,9) NOT NULL,
+    completion_price NUMERIC(20,9) NOT NULL
+) ON COMMIT DROP`
+
 // rateWindowSQL resolves, sums, upserts, and counts in ONE statement over the
 // transient rating_price table (populated from the YAML PriceBook for this run).
 //
-// RESOLUTION: a billing_event's model NAME is aliased to model_id (the price key)
-// and joined to rating_price. rating_price already carries the FINAL per-token rate
-// — the global fine-tune premium was applied in exact Dec when the book was
-// projected — so the SQL does NO premium math; it just looks up the rate and
-// multiplies. An event whose model_id is absent from rating_price is UNPRICED (the
-// LEFT JOIN yields NULLs) and is COUNTED, never $0-billed (the fail-loud rule; the
-// E4 create-time price gate should prevent this, but the rater keeps the backstop).
+// RESOLUTION (two tables, direct wins): a billing_event's model NAME is aliased to
+// model_id (the price key) and LEFT JOINed to rating_price (the direct rate). If that
+// misses AND model_id is an ft:<checkpoint> id carrying a base_model (E3 fine-tune),
+// it is LEFT JOINed to rating_derived on base_model — the base-x-premium rate. Both
+// tables already carry the FINAL per-token rate (premium applied + quantized in exact
+// Dec at projection), so the SQL does NO premium math; it COALESCEs direct-over-derived
+// and multiplies. An event that resolves through NEITHER is UNPRICED (NULLs) and is
+// COUNTED, never $0-billed — including an ft: id with an EMPTY base_model, which is a
+// propagation bug (Atlas guarantees base_model at deploy), not a free model, so it
+// MUST scream rather than silently mis-price. (E4's create-time gate should prevent
+// any unpriced traffic; the rater keeps the fail-loud backstop.)
 //
 // THE BILLABLE-PROMPT FORMULA (highest-risk line; mirror of Rate() in the oracle):
 //
@@ -178,6 +198,9 @@ WITH ev AS (
         -- that name IS phoebe's stable price key, model_id. A NULL model is
         -- unattributable.
         model AS model_id,
+        -- base_model: the HF base id a fine-tune derives from (E3), stamped by Atlas.
+        -- NULL for a base model. Used only to price an ft:<checkpoint> model_id.
+        base_model,
         prompt_tokens,
         cached_tokens,
         completion_tokens,
@@ -195,12 +218,26 @@ resolved AS (
         ev.cached_tokens,
         ev.completion_tokens,
         GREATEST(ev.prompt_tokens - ev.cached_tokens, 0) AS billable_prompt,
-        rp.prompt_price,
-        rp.cached_price,
-        rp.completion_price
+        -- Direct price wins; else the derived (base x premium) price for an ft: id
+        -- carrying a base_model. A miss on BOTH → NULL → UNPRICED (never $0). An ft:
+        -- id with a NULL base_model can only miss the derived join (NULL = NULL is
+        -- never true), so it correctly falls through to UNPRICED and screams.
+        COALESCE(rp.prompt_price,     rd.prompt_price)     AS prompt_price,
+        COALESCE(rp.cached_price,     rd.cached_price)     AS cached_price,
+        COALESCE(rp.completion_price, rd.completion_price) AS completion_price
     FROM ev
-    -- The YAML-projected price table. A miss → NULL rates → UNPRICED (never $0).
+    -- The YAML-projected DIRECT price table (keyed on model_id).
     LEFT JOIN rating_price rp ON rp.model_id = ev.model_id
+    -- The DERIVED price table (keyed on base_model): consulted ONLY for an ft:
+    -- model_id that missed the direct join — base_model prices the fine-tune at
+    -- base x premium. The rp.model_id-IS-NULL guard keeps direct-over-derived
+    -- precedence (a fine-tune with its own in-file rate is never re-derived); the
+    -- ft: prefix guard keeps a base model from ever resolving through the derived
+    -- table by accident.
+    LEFT JOIN rating_derived rd
+        ON rd.base_model = ev.base_model
+       AND rp.model_id IS NULL
+       AND ev.model_id LIKE 'ft:%'
 ),
 priced AS (
     SELECT
@@ -308,7 +345,13 @@ func (s *PostgresStore) RateWindow(ctx context.Context, book *PriceBook, start, 
 	if _, err := tx.ExecContext(ctx, createPriceTempSQL); err != nil {
 		return RateResult{}, fmt.Errorf("rating: create temp price table: %w", err)
 	}
+	if _, err := tx.ExecContext(ctx, createDerivedTempSQL); err != nil {
+		return RateResult{}, fmt.Errorf("rating: create temp derived-price table: %w", err)
+	}
 	if err := insertPrices(ctx, tx, book.resolvedRates()); err != nil {
+		return RateResult{}, err
+	}
+	if err := insertDerived(ctx, tx, book.derivedRates()); err != nil {
 		return RateResult{}, err
 	}
 
@@ -353,6 +396,34 @@ func insertPrices(ctx context.Context, tx *sql.Tx, rates []resolvedRate) error {
 	}
 	if _, err := tx.ExecContext(ctx, sb.String(), args...); err != nil {
 		return fmt.Errorf("rating: load prices into temp table: %w", err)
+	}
+	return nil
+}
+
+// insertDerived bulk-loads the projected DERIVED rates (base_model x premium) into the
+// TEMP rating_derived table with a single multi-row INSERT. Same NUMERIC-as-string
+// discipline as insertPrices — money never becomes a Go float in transit. The slice is
+// non-empty in practice (the loader rejects an empty base_models, and every base
+// yields one derived row), but an empty slice is tolerated: a file with only own-rate
+// fine-tunes and no derivable base simply has no derived rows, and any ft: event then
+// falls through to UNPRICED (fail loud).
+func insertDerived(ctx context.Context, tx *sql.Tx, rates []derivedRate) error {
+	if len(rates) == 0 {
+		return nil
+	}
+	var sb strings.Builder
+	sb.WriteString("INSERT INTO rating_derived (base_model, prompt_price, cached_price, completion_price) VALUES ")
+	args := make([]any, 0, len(rates)*4)
+	for i, r := range rates {
+		if i > 0 {
+			sb.WriteString(", ")
+		}
+		n := i * 4
+		fmt.Fprintf(&sb, "($%d, $%d, $%d, $%d)", n+1, n+2, n+3, n+4)
+		args = append(args, r.BaseModel, r.Prompt, r.Cached, r.Completion)
+	}
+	if _, err := tx.ExecContext(ctx, sb.String(), args...); err != nil {
+		return fmt.Errorf("rating: load derived prices into temp table: %w", err)
 	}
 	return nil
 }

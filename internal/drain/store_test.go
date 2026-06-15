@@ -42,13 +42,13 @@ func TestPostgresStore_UpsertSQL(t *testing.T) {
 
 	mock.ExpectBegin()
 	mock.ExpectExec(regexp.QuoteMeta(
-		"INSERT INTO billing_event (request_id, auth_id, user_id, group_id, resource_id, resource_type, model, adapter, prompt_tokens, cached_tokens, completion_tokens, finish_reason, gpu_type, aborted, event_ts) VALUES",
+		"INSERT INTO billing_event (request_id, auth_id, user_id, group_id, resource_id, resource_type, model, base_model, adapter, prompt_tokens, cached_tokens, completion_tokens, finish_reason, gpu_type, aborted, event_ts) VALUES",
 	)).
 		WithArgs(
-			// row 1
-			"req-1", "auth-1", nil, nil, nil, nil, "m1", nil, 5, 0, 7, nil, nil, false, time.UnixMilli(ts).UTC(),
+			// row 1 (base_model NULL: a base-model event, no derived_from)
+			"req-1", "auth-1", nil, nil, nil, nil, "m1", nil, nil, 5, 0, 7, nil, nil, false, time.UnixMilli(ts).UTC(),
 			// row 2 (no identity, no timestamp → event_ts NULL)
-			"req-2", nil, nil, nil, nil, nil, "m2", nil, 0, 0, 0, nil, nil, false, nil,
+			"req-2", nil, nil, nil, nil, nil, "m2", nil, nil, 0, 0, 0, nil, nil, false, nil,
 		).
 		WillReturnResult(sqlmock.NewResult(0, 2))
 	mock.ExpectCommit()
@@ -122,6 +122,7 @@ func TestPostgresStore_EmptyModelStoredAsNull(t *testing.T) {
 		WithArgs(
 			"req-no-model", "auth-1", nil, nil, nil, nil,
 			nil, // model: "" must bind NULL
+			nil, // base_model: "" must bind NULL
 			nil, 1, 0, 2, nil, nil, false, nil,
 		).
 		WillReturnResult(sqlmock.NewResult(0, 1))
@@ -155,9 +156,13 @@ func TestEventArgs_NullsEmptyIdentities(t *testing.T) {
 	if args[1] != nil {
 		t.Fatalf("auth_id arg = %v, want nil for empty AuthID", args[1])
 	}
-	// prompt_tokens is index 8 — must be the int, not nil.
-	if args[8] != 3 {
-		t.Fatalf("prompt_tokens arg = %v, want 3", args[8])
+	// base_model is index 7 — must be nil for empty (a base-model event).
+	if args[7] != nil {
+		t.Fatalf("base_model arg = %v, want nil for empty BaseModel", args[7])
+	}
+	// prompt_tokens is index 9 (model=6, base_model=7, adapter=8) — the int, not nil.
+	if args[9] != 3 {
+		t.Fatalf("prompt_tokens arg = %v, want 3", args[9])
 	}
 	// event_ts is the last index — nil when TimestampUnixMs==0.
 	if args[colsPerRow-1] != nil {

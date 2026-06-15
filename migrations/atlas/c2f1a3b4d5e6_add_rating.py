@@ -103,8 +103,20 @@ def upgrade():
         "ON billing_event ((COALESCE(event_ts, created_at)))"
     )
 
+    # base_model on billing_event (E3 fine-tune linkage): the HF base id a fine-tune
+    # derives from, stamped by Atlas at deploy. The rater prices an ft:<checkpoint>
+    # model at base x premium via this column. The billing_event create migration
+    # (b1f0c2d3e4a5) now declares it directly, but this revision was authored after
+    # billing_event shipped, so add it idempotently here too — a billing_event table
+    # created before the column was added still gets it, and a fresh DB (where the
+    # create already has it) is a harmless no-op. NULL for a base-model deployment.
+    op.execute(
+        "ALTER TABLE billing_event ADD COLUMN IF NOT EXISTS base_model VARCHAR(255)"
+    )
+
 
 def downgrade():
+    op.execute("ALTER TABLE billing_event DROP COLUMN IF EXISTS base_model")
     op.execute("DROP INDEX billing_event_rating_instant_ix")
     op.drop_index("rated_usage_auth_id_window_start_ix", table_name="rated_usage")
     op.drop_table("rated_usage")

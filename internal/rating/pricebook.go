@@ -85,15 +85,14 @@ type fineTunePremiumYAML struct {
 // resolves to its derived_from base's rate transformed by the global premium; an
 // unknown id is ErrNoPrice (never $0).
 //
-// FINE-TUNE BASE LINKAGE — KNOWN GAP (flagged): billing_event today carries only the
-// engine-reported model NAME (migrations/0001_billing_event.sql: no derived_from /
-// base_model column). So an event whose model_id is an `ft:<checkpoint>` id has NO
-// base linkage available at rating time. This PriceBook supports a fine-tune's
-// linkage being carried IN THE FILE — a base_models or fine_tunes entry can name a
-// derived_from — but until the metering path plumbs the base (saturn.io/...base_model)
-// through to billing_event OR a fine-tune→base map ships in the file, an ft: id that
-// is not itself a key in the file resolves to ErrNoPrice (fail loud, never $0). A
-// base-direct event (model_id IS a key) prices fully today.
+// FINE-TUNE BASE LINKAGE: a fine-tune's base rides on the EVENT now (billing_event
+// carries base_model, stamped by Atlas at deploy — E3 option a). Resolve(modelID)
+// below is the model_id-only resolution (a base id, or a fine-tune whose linkage/rate
+// the FILE declares). The event-aware ResolveEvent(modelID, baseModel) extends it: an
+// ft:<checkpoint> id the file never names prices at base × premium via its event-
+// carried base_model (the common production path, since the checkpoint id is minted
+// per deployment). An ft: id with an EMPTY base_model is a propagation bug, not a free
+// model — ResolveEvent returns ErrNoPrice (fail loud, never $0).
 type PriceBook struct {
 	// base maps model_id → its own per-token rate (base models AND any fine-tune
 	// that carries its own explicit rate in the file).
@@ -340,7 +339,9 @@ func (pb *PriceBook) Resolve(modelID string) (Rate3, error) {
 		baseRate := pb.base[base] // guaranteed present by buildPriceBook's validation
 		return ApplyPolicy(baseRate, pb.policyFn, pb.policyFactor, pb.policyMarkup)
 	}
-	// 3. Unknown id (including an ft: id with no in-file linkage — the flagged gap).
+	// 3. Unknown to the FILE: a base id not present, or an ft: id with no in-file
+	//    linkage. ResolveEvent extends this with the event-carried base_model path;
+	//    this model_id-only form fails loud here (never $0).
 	return Rate3{}, ErrNoPrice
 }
 
@@ -387,4 +388,79 @@ func (pb *PriceBook) resolvedRates() []resolvedRate {
 	}
 	sort.Slice(out, func(i, j int) bool { return out[i].ModelID < out[j].ModelID })
 	return out
+}
+
+// derivedRate is one row of the SQL rater's transient DERIVED price table: a BASE
+// model id and the FINAL per-token rate a fine-tune deriving from it pays (the global
+// premium applied to the base, then quantized). Keyed on the base id because a
+// fine-tune event arrives carrying its base_model (E3), not a price-key the file
+// knows — its ft:<checkpoint> id is minted per deployment and is never in the file.
+type derivedRate struct {
+	BaseModel  string
+	Prompt     string
+	Cached     string
+	Completion string
+}
+
+// derivedRates projects, for every priced BASE model, the per-token rate a fine-tune
+// of it pays: base rate transformed by the global premium (identity|multiplier|markup),
+// quantized to 9dp via String(). The SQL joins an ft: event's base_model to this table
+// to price it at base x premium WITHOUT the file ever naming the fine-tune's checkpoint
+// id. Pointer-not-copy (E3): change a base price and every derived rate moves with it.
+//
+// Only true base models are projected (a base that is ITSELF a derived fine-tune is
+// not a valid derivation target — the loader already forbids multi-hop chains). A
+// fine-tune that carries its OWN rate in the file is NOT a derivation source here; it
+// is priced directly off resolvedRates by its own model_id.
+func (pb *PriceBook) derivedRates() []derivedRate {
+	out := make([]derivedRate, 0, len(pb.base))
+	for id := range pb.base {
+		// A fine-tune that declared its own rate lives in pb.base too; it is not a
+		// base another fine-tune derives from, so skip anything declared as a
+		// derivedFrom source-less own-rate fine-tune. In practice every pb.base entry
+		// that is NOT also a derivedFrom KEY is a legitimate derivation source.
+		if _, isDerived := pb.derivedFrom[id]; isDerived {
+			continue // an own-rate fine-tune: not a base others derive from
+		}
+		r, err := ApplyPolicy(pb.base[id], pb.policyFn, pb.policyFactor, pb.policyMarkup)
+		if err != nil {
+			continue // unreachable: parsePremium validated the policy at load
+		}
+		out = append(out, derivedRate{
+			BaseModel: id, Prompt: r.Prompt.String(), Cached: r.Cached.String(), Completion: r.Completion.String(),
+		})
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].BaseModel < out[j].BaseModel })
+	return out
+}
+
+// ResolveEvent resolves the effective per-token rate for an event, given its model_id
+// AND its base_model (E3). It is the Go mirror of the SQL's two-table resolution and
+// the spec the conformance oracle uses:
+//
+//  1. model_id is directly priced (a base model, or a fine-tune with its own/derived
+//     in-file rate) → that rate.
+//  2. model_id is an ft: id NOT in the file, but base_model is a priced base → base x
+//     premium (the derived path; the common production case once Atlas stamps
+//     base_model onto the event).
+//  3. model_id is an ft: id with an EMPTY base_model → ErrNoPrice. A fine-tune with no
+//     base is a propagation bug (Atlas guarantees base_model at deploy), NOT a free
+//     model — fail loud, never $0.
+//  4. anything else → ErrNoPrice.
+func (pb *PriceBook) ResolveEvent(modelID, baseModel string) (Rate3, error) {
+	// 1 & file-declared linkage: the existing model_id-keyed resolution.
+	if r, err := pb.Resolve(modelID); err == nil {
+		return r, nil
+	}
+	// 2: a fine-tune priced via its event-carried base_model.
+	if strings.HasPrefix(modelID, fineTunePrefix) && baseModel != "" {
+		if base, ok := pb.base[baseModel]; ok {
+			// Don't derive from a base that is itself a derived fine-tune (one hop only).
+			if _, isDerived := pb.derivedFrom[baseModel]; !isDerived {
+				return ApplyPolicy(base, pb.policyFn, pb.policyFactor, pb.policyMarkup)
+			}
+		}
+	}
+	// 3 & 4: fail loud (an ft: id with empty/unknown base lands here).
+	return Rate3{}, ErrNoPrice
 }

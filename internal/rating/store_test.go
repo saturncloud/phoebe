@@ -30,8 +30,14 @@ func TestPostgresStore_RateWindowSQL(t *testing.T) {
 
 	mock.ExpectBegin()
 	mock.ExpectExec(`CREATE TEMP TABLE rating_price`).WillReturnResult(sqlmock.NewResult(0, 0))
+	mock.ExpectExec(`CREATE TEMP TABLE rating_derived`).WillReturnResult(sqlmock.NewResult(0, 0))
 	// The projected price row is bound as NUMERIC strings (money never a Go float).
 	mock.ExpectExec(`INSERT INTO rating_price`).
+		WithArgs("m", "0.000003000", "0.000000300", "0.000010000").
+		WillReturnResult(sqlmock.NewResult(0, 1))
+	// The DERIVED price row (base x premium) — identity premium here, so same rate as
+	// the base, keyed on the base_model "m".
+	mock.ExpectExec(`INSERT INTO rating_derived`).
 		WithArgs("m", "0.000003000", "0.000000300", "0.000010000").
 		WillReturnResult(sqlmock.NewResult(0, 1))
 	rows := sqlmock.NewRows([]string{"rollups_written", "events_rated", "total_cost", "unpriced_events", "unattributable_events"}).
@@ -82,6 +88,14 @@ func TestRateWindowSQL_Shape(t *testing.T) {
 		"COALESCE(event_ts, created_at) <  $2",
 		// the YAML-projected price table is joined (no model_price/derivation_policy)
 		"LEFT JOIN rating_price rp ON rp.model_id = ev.model_id",
+		// the DERIVED price table prices an ft: model_id via its event-carried
+		// base_model (E3); direct-over-derived precedence + the ft: prefix guard
+		"LEFT JOIN rating_derived rd",
+		"rd.base_model = ev.base_model",
+		"rp.model_id IS NULL",
+		"ev.model_id LIKE 'ft:%'",
+		// the effective rate COALESCEs direct over derived
+		"COALESCE(rp.prompt_price,     rd.prompt_price)",
 		// billable-prompt clamp + the cost formula (cached charged once)
 		"GREATEST(ev.prompt_tokens - ev.cached_tokens, 0)",
 		"billable_prompt   * prompt_price",

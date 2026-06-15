@@ -101,7 +101,7 @@ func (r *Rater) Run(ctx context.Context, windowStart, windowEnd time.Time) (Resu
 			windowStart.Format(time.RFC3339), windowEnd.Format(time.RFC3339), res.UnattributableEvents)
 	}
 	if res.HasUnpriced() {
-		r.log.Error.Printf("rating: window [%s,%s) has %d UNPRICED events (model_id absent from the price file — no base entry, and no in-file fine-tune base linkage for an ft: id) — these are NOT billed; the create-time price gate should prevent this, so a nonzero count means an unpriced model was served. Add the price to the file and re-rate this window",
+		r.log.Error.Printf("rating: window [%s,%s) has %d UNPRICED events (model_id absent from the price file — no base entry; or an ft: id whose base_model is empty/unpriced, which for a fine-tune is a base_model PROPAGATION BUG, not a free model) — these are NOT billed; the create-time price gate should prevent this, so a nonzero count means an unpriced model was served (or base_model stopped propagating). Add the price/fix the header and re-rate this window",
 			windowStart.Format(time.RFC3339), windowEnd.Format(time.RFC3339), res.UnpricedEvents)
 	}
 

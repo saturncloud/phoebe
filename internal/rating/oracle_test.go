@@ -31,8 +31,12 @@ var ErrDerivationChain = errors.New("rating: derived_from chain exceeds one hop 
 // decoupled from metering.Event so the pure money math has no dependency on the
 // capture/emit side and can be tested in isolation.
 type RatedEvent struct {
-	AuthID           string
-	ModelID          string
+	AuthID  string
+	ModelID string
+	// BaseModel is the HF base id a fine-tune derives from (E3), carried on the event
+	// from billing_event.base_model. Empty for a base model. The oracle prices an ft:
+	// ModelID via base x premium keyed on BaseModel — mirroring the SQL.
+	BaseModel        string
 	PromptTokens     int64 // TOTAL prompt tokens (cached + non-cached), per vLLM
 	CachedTokens     int64 // SUBSET of PromptTokens that was a cache hit
 	CompletionTokens int64

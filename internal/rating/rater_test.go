@@ -61,7 +61,7 @@ func (s *oracleStore) resolveWindow(start, end time.Time) (map[rollupKey]oracleR
 			an.UnattributableEvents++
 			continue
 		}
-		resolved, err := s.book.Resolve(e.ModelID)
+		resolved, err := s.book.ResolveEvent(e.ModelID, e.BaseModel)
 		if err != nil {
 			an.UnpricedEvents++ // ErrNoPrice: never $0-billed
 			continue
@@ -292,6 +292,80 @@ func TestRater_DerivedFineTuneRatedViaPolicy(t *testing.T) {
 	// 1000 * (0.000004 * 1.5) = 0.006
 	if res.TotalCost != "0.006000000" {
 		t.Fatalf("total = %s, want 0.006000000 (base×1.5 fine-tune)", res.TotalCost)
+	}
+}
+
+// TestRater_FineTunePricesViaBaseModelOnEvent (fine-tune-prices-via-base-model-on-event):
+// a real fine-tune event — an ft:<checkpoint> model_id the file never names, carrying
+// its base_model (E3, stamped by Atlas at deploy) — prices at base × premium by
+// resolving through the event's base_model. This is the primary production fine-tune
+// path: the file declares only the BASE; the ft: checkpoint id is minted per deployment.
+func TestRater_FineTunePricesViaBaseModelOnEvent(t *testing.T) {
+	book := newTestBook(
+		map[string]Rate3{"meta-llama/Llama-3.1-8B-Instruct": rate3("0.000004", "0", "0")},
+		nil, // NO in-file fine-tune linkage — the ft: id is unknown at file-authoring
+		PolicyMultiplier, MustDec("1.5"), Dec{},
+	)
+	events := []RatedEvent{{
+		AuthID:       "a",
+		ModelID:      "ft:9f8e7d6c5b4a", // a checkpoint id the file does not list
+		BaseModel:    "meta-llama/Llama-3.1-8B-Instruct",
+		PromptTokens: 1000,
+		At:           mustTime("2026-06-08T10:15:00Z"),
+	}}
+	store := newOracleStore(book, events)
+	r := New(store, book, testLogger())
+	res, err := r.Run(context.Background(), mustTime("2026-06-08T10:00:00Z"), mustTime("2026-06-08T11:00:00Z"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res.UnpricedEvents != 0 {
+		t.Fatalf("unpriced = %d, want 0 (the ft: event prices via its base_model)", res.UnpricedEvents)
+	}
+	// 1000 * (0.000004 * 1.5) = 0.006 — the fine-tune billed at base × premium.
+	if res.EventsRated != 1 || res.RollupsWritten != 1 || res.TotalCost != "0.006000000" {
+		t.Fatalf("result = %+v, want 1 event / 1 rollup / 0.006000000 (base×1.5 via base_model)", res)
+	}
+	// The applied rate frozen on the row is the derived (base × premium) rate.
+	hour := mustTime("2026-06-08T10:00:00Z")
+	row := store.table[rollupKey{"a", "ft:9f8e7d6c5b4a", hour}]
+	if row.appliedRate.Prompt.String() != "0.000006000" {
+		t.Fatalf("ft applied prompt rate = %s, want 0.000006000 (0.000004 × 1.5)", row.appliedRate.Prompt)
+	}
+}
+
+// TestRater_FineTuneWithoutBaseModelFailsLoud (fine-tune-without-base-model-fails-loud):
+// the fail-closed invariant. An ft:<checkpoint> model_id with an EMPTY base_model is a
+// PROPAGATION BUG (Atlas guarantees base_model is present to deploy a fine-tune), NOT a
+// free model. It must be counted UNPRICED (ErrNoPrice) and EXCLUDED from the rollups —
+// never silently mis-priced or $0-billed. A silent $0 here would lose all fine-tune
+// revenue the moment the base_model header stopped propagating.
+func TestRater_FineTuneWithoutBaseModelFailsLoud(t *testing.T) {
+	book := newTestBook(
+		map[string]Rate3{"meta-llama/Llama-3.1-8B-Instruct": rate3("0.000004", "0", "0")},
+		nil, PolicyMultiplier, MustDec("1.5"), Dec{},
+	)
+	events := []RatedEvent{{
+		AuthID:       "a",
+		ModelID:      "ft:9f8e7d6c5b4a",
+		BaseModel:    "", // THE BUG: base_model never propagated to the event
+		PromptTokens: 1000,
+		At:           mustTime("2026-06-08T10:15:00Z"),
+	}}
+	store := newOracleStore(book, events)
+	r := New(store, book, testLogger())
+	res, err := r.Run(context.Background(), mustTime("2026-06-08T10:00:00Z"), mustTime("2026-06-08T11:00:00Z"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res.UnpricedEvents != 1 {
+		t.Fatalf("unpriced = %d, want 1 (ft: with empty base_model must scream)", res.UnpricedEvents)
+	}
+	if res.EventsRated != 0 || res.RollupsWritten != 0 || len(store.table) != 0 {
+		t.Fatalf("result = %+v, table=%d — an ft: with no base_model must NEVER be rated or $0-billed", res, len(store.table))
+	}
+	if !res.HasUnpriced() || !res.HasAnomaly() {
+		t.Fatal("HasUnpriced/HasAnomaly = false, want true (the propagation bug must drive exit-nonzero)")
 	}
 }
 

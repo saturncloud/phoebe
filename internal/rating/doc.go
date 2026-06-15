@@ -57,15 +57,18 @@
 //     timestamp), so rollup keys can never disagree across sessions and re-rates can
 //     never create overlapping buckets.
 //
-// FINE-TUNE BASE-LINKAGE GAP (flagged): billing_event today carries only the
-// engine-reported model NAME (migrations/0001_billing_event.sql has no derived_from /
-// base_model column). So a fine-tune's base is NOT plumbed through to the rater. A
-// base-direct model (model_id IS a base_models key in the file) prices fully. An
-// ft:<checkpoint> id prices ONLY if the file declares its derived_from (or its own
-// rate); otherwise it is UNPRICED — fail loud, never $0. Closing the gap means the
-// metering path stamping the base (from saturn.io/...base_model) onto the event, OR
-// shipping a fine-tune→base map in the file. The pricing/premium machinery is complete
-// and tested; only the linkage source is pending.
+// FINE-TUNE BASE LINKAGE (closed): a fine-tune's base rides on the event.
+// billing_event carries base_model — the HF base id stamped by Atlas at deploy (E3,
+// option a), arriving on the X-Saturn-Base-Model identity header. The rater prices an
+// ft:<checkpoint> model_id (which the price file never names — the checkpoint id is
+// minted per deployment) at base_price × premium by resolving through the event's
+// base_model (pointer-not-copy: a base price change auto-propagates). A base-direct
+// model (model_id IS a base_models key) still prices directly off its own rate, and a
+// fine-tune that carries its own/declared rate in the file still wins over derivation
+// (direct-over-derived). FAIL-CLOSED INVARIANT: an ft: model_id with an EMPTY
+// base_model is a propagation bug (Atlas guarantees base_model to deploy a fine-tune),
+// NOT a free model — it is counted UNPRICED and screams, never silently $0-billed.
+// See PriceBook.ResolveEvent and the rating_derived join in store.go.
 //
 // ROUNDING — QUANTIZE-THEN-MULTIPLY (the ratified money spec; read before touching
 // any cost math):

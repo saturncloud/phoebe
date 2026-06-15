@@ -503,6 +503,129 @@ func TestE2E_StreamedRequestBecomesMoney(t *testing.T) {
 	h.assertNumericEqual(t, cost, wantCost, "rated_usage.cost")
 }
 
+// ftVllmStream is the vLLM SSE fixture for a FINE-TUNE deployment: the engine reports
+// the ft:<checkpoint> id as its model name (the stable price key for a fine-tune, E3).
+const ftVllmStream = `data: {"id":"c2","object":"chat.completion.chunk","model":"ft:9f8e7d6c5b4a","choices":[{"index":0,"delta":{"role":"assistant","content":"Hi"}}]}
+
+data: {"id":"c2","object":"chat.completion.chunk","model":"ft:9f8e7d6c5b4a","choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}
+
+data: {"id":"c2","object":"chat.completion.chunk","model":"ft:9f8e7d6c5b4a","choices":[],"usage":{"prompt_tokens":1000,"total_tokens":1000,"completion_tokens":0,"prompt_tokens_details":{"cached_tokens":0}}}
+
+data: [DONE]
+
+`
+
+// ftPriceBookYAML prices ONLY the base model + a 1.5× premium. The fine-tune's
+// ft:<checkpoint> id is NOT listed — it prices through the event-carried base_model.
+const ftPriceBookYAML = `
+version: 1
+base_models:
+  "meta-llama/Llama-3.1-8B-Instruct":
+    prompt:     "0.000004"
+    cached:     "0"
+    completion: "0"
+fine_tune_premium:
+  policy: multiplier
+  factor: "1.5"
+`
+
+// TestE2E_FineTuneBillsAtBaseTimesPremium is the fine-tune pipeline test: a request to
+// a fine-tune deployment carries the X-Saturn-Base-Model header (as Atlas injects it
+// at deploy), the engine reports the ft:<checkpoint> id as its model, and the whole
+// pipe must end with the fine-tune billed at base × premium — proving base_model rides
+// end to end (proxy → emit → drain → billing_event.base_model → rater derived join).
+//
+//   - base_model contract: billing_event.base_model is the HF base id from the header,
+//     NOT empty — the propagation seam the rater needs to price an ft: id;
+//   - the money: the ft: id (absent from the price file) bills at base × 1.5 via its
+//     base_model, with zero unpriced events.
+func TestE2E_FineTuneBillsAtBaseTimesPremium(t *testing.T) {
+	h := newHarness(t, "phoebe_e2e_finetune")
+
+	const (
+		ftModelName = "ft:9f8e7d6c5b4a"
+		ftBaseModel = "meta-llama/Llama-3.1-8B-Instruct"
+	)
+
+	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.WriteHeader(http.StatusOK)
+		fl, _ := w.(http.Flusher)
+		for _, chunk := range strings.SplitAfter(ftVllmStream, "\n\n") {
+			if chunk == "" {
+				continue
+			}
+			_, _ = io.WriteString(w, chunk)
+			if fl != nil {
+				fl.Flush()
+			}
+		}
+	}))
+	defer backend.Close()
+
+	srv := h.proxyServer(t, backend.URL)
+	rr := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions",
+		strings.NewReader(`{"model":"my-finetune","stream":true,"messages":[]}`))
+	req.Header.Set(identity.HeaderAuthID, testAuthID)
+	req.Header.Set(identity.HeaderResourceID, testResourceID)
+	req.Header.Set(identity.HeaderResourceType, "deployment")
+	req.Header.Set(identity.HeaderUserID, "user-e2e")
+	req.Header.Set(identity.HeaderGroupID, "group-e2e")
+	// The base_model header Atlas injects at deploy for a fine-tune endpoint.
+	req.Header.Set(identity.HeaderBaseModel, ftBaseModel)
+	srv.Handler().ServeHTTP(rr, req)
+
+	if rr.Code != http.StatusOK {
+		t.Fatalf("proxy status = %d, want 200 (body: %s)", rr.Code, rr.Body.String())
+	}
+
+	h.waitForStreamLen(t, 1, 5*time.Second)
+	h.drainUntilRows(t, 1, 10*time.Second)
+
+	// base_model contract: stored verbatim, alongside the ft: model name.
+	var model, baseModel sql.NullString
+	if err := h.db.QueryRow("SELECT model, base_model FROM billing_event").Scan(&model, &baseModel); err != nil {
+		t.Fatalf("read billing_event: %v", err)
+	}
+	if !model.Valid || model.String != ftModelName {
+		t.Errorf("billing_event.model = %v, want %q (the ft: checkpoint id)", model, ftModelName)
+	}
+	if !baseModel.Valid || baseModel.String != ftBaseModel {
+		t.Fatalf("billing_event.base_model = %v, want %q — the header must ride to billing_event for the rater to price the fine-tune", baseModel, ftBaseModel)
+	}
+
+	// Rate from the YAML book that prices ONLY the base; the ft: id must resolve via
+	// base_model at base × premium.
+	book, err := rating.ParsePriceBook([]byte(ftPriceBookYAML))
+	if err != nil {
+		t.Fatalf("parse ft price book: %v", err)
+	}
+	res := h.rateEventHour(t, book)
+
+	if res.UnpricedEvents != 0 || res.UnattributableEvents != 0 {
+		t.Fatalf("anomalies = %d unpriced / %d unattributable, want 0/0 — base_model failed to plumb the fine-tune's price", res.UnpricedEvents, res.UnattributableEvents)
+	}
+	if res.EventsRated != 1 || res.RollupsWritten != 1 {
+		t.Fatalf("rater Result = %+v, want 1 event / 1 rollup", res)
+	}
+	// 1000 prompt tokens × (0.000004 base × 1.5 premium) = 0.006.
+	const wantCost = "0.006"
+	h.assertNumericEqual(t, res.TotalCost, wantCost, "Result.TotalCost (base × premium)")
+
+	var ruModelID, cost, appliedPrompt string
+	if err := h.db.QueryRow(
+		`SELECT model_id, cost::text, applied_prompt_rate::text FROM rated_usage`).
+		Scan(&ruModelID, &cost, &appliedPrompt); err != nil {
+		t.Fatalf("read rated_usage: %v", err)
+	}
+	if ruModelID != ftModelName {
+		t.Errorf("rated_usage.model_id = %q, want %q (the fine-tune's ft: id)", ruModelID, ftModelName)
+	}
+	h.assertNumericEqual(t, appliedPrompt, "0.000006", "rated_usage.applied_prompt_rate (base × premium frozen on row)")
+	h.assertNumericEqual(t, cost, wantCost, "rated_usage.cost")
+}
+
 // TestE2E_ModellessEventIsUnattributable pins the nullStr(model) contract end
 // to end: an event whose upstream never reported a model (e.g. an abort before
 // the first chunk) must reach Postgres with model = NULL and be counted by the

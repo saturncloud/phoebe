@@ -35,6 +35,7 @@ CREATE TABLE billing_event (
     request_id        VARCHAR(255) PRIMARY KEY,
     auth_id           VARCHAR(64),
     model             VARCHAR(255),
+    base_model        VARCHAR(255),
     prompt_tokens     INTEGER NOT NULL DEFAULT 0,
     cached_tokens     INTEGER NOT NULL DEFAULT 0,
     completion_tokens INTEGER NOT NULL DEFAULT 0,
@@ -402,6 +403,99 @@ func TestConformance_OracleQuantizesBeforeMultiply_OnResidue(t *testing.T) {
 	}
 	if unquantized == MustDec(gotCost).String() {
 		t.Fatal("un-quantized oracle MATCHES the SQL on a residue fixture — the conformance guard has no teeth (the spec divergence is undetectable)")
+	}
+}
+
+// TestIntegration_FineTunePricesViaBaseModel runs the REAL SQL over fine-tune events
+// that price through the event-carried base_model (E3): an ft:<checkpoint> model the
+// price file never names, but whose base_model IS a priced base, bills at base ×
+// premium. It also pins the fail-loud invariant in SQL — an ft: event with a NULL
+// base_model lands in UNPRICED (never $0). This is the production fine-tune path now
+// that base_model rides on billing_event.
+func TestIntegration_FineTunePricesViaBaseModel(t *testing.T) {
+	dsn := os.Getenv("PHOEBE_TEST_DATABASE_URL")
+	if dsn == "" {
+		t.Skip("PHOEBE_TEST_DATABASE_URL not set; skipping live-Postgres conformance")
+	}
+	ctx := context.Background()
+	db, err := sql.Open("pgx", dsn)
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	defer db.Close()
+
+	const sch = "phoebe_rating_basemodel_it"
+	exec(t, db, "DROP SCHEMA IF EXISTS "+sch+" CASCADE")
+	exec(t, db, "CREATE SCHEMA "+sch)
+	exec(t, db, "SET search_path TO "+sch)
+	defer func() { exec(t, db, "DROP SCHEMA IF EXISTS "+sch+" CASCADE") }()
+	exec(t, db, schemaDDL)
+
+	hour := mustTime("2026-06-08T10:00:00Z")
+	// File declares ONLY the base; the ft: checkpoint id is not listed. 1.5× premium.
+	book := newTestBook(
+		map[string]Rate3{"meta-llama/Llama-3.1-8B-Instruct": rate3("0.000004", "0", "0")},
+		nil, PolicyMultiplier, MustDec("1.5"), Dec{},
+	)
+
+	type seed struct {
+		req, model, baseModel string
+		prompt                int64
+	}
+	seeds := []seed{
+		// Priced via base_model: ft: id + a known base → base × 1.5.
+		{"ft-ok", "ft:9f8e7d6c5b4a", "meta-llama/Llama-3.1-8B-Instruct", 1000},
+		// FAIL LOUD: ft: id with NULL base_model → unpriced (propagation bug, never $0).
+		{"ft-nobase", "ft:cafebabe", "", 1000},
+		// FAIL LOUD: ft: id with an unknown base_model → unpriced.
+		{"ft-badbase", "ft:0badf00d", "some/unpriced-base", 1000},
+	}
+	for _, s := range seeds {
+		if _, err := db.ExecContext(ctx,
+			`INSERT INTO billing_event (request_id, auth_id, model, base_model, prompt_tokens, completion_tokens, event_ts)
+			 VALUES ($1,'a',$2,$3,$4,0,$5)`,
+			s.req, s.model, nullableStr(s.baseModel), s.prompt, hour.Add(5*time.Minute)); err != nil {
+			t.Fatalf("seed %s: %v", s.req, err)
+		}
+	}
+
+	store := NewPostgresStore(db)
+	res, err := store.RateWindow(ctx, book, hour, hour.Add(time.Hour))
+	if err != nil {
+		t.Fatalf("RateWindow: %v", err)
+	}
+
+	// Exactly one rollup (the priced fine-tune); two unpriced (no/unknown base_model).
+	if res.RollupsWritten != 1 || res.EventsRated != 1 {
+		t.Fatalf("rollups/events = %d/%d, want 1/1 (only ft-ok prices)", res.RollupsWritten, res.EventsRated)
+	}
+	if res.UnpricedEvents != 2 {
+		t.Fatalf("unpriced = %d, want 2 (ft-nobase + ft-badbase must scream, never $0)", res.UnpricedEvents)
+	}
+
+	// The priced fine-tune billed at base × premium, with the derived rate on the row.
+	var gotCost, gotApplied string
+	if err := db.QueryRowContext(ctx,
+		`SELECT cost::text, applied_prompt_rate::text FROM rated_usage WHERE model_id='ft:9f8e7d6c5b4a' AND window_start=$1`,
+		hour).Scan(&gotCost, &gotApplied); err != nil {
+		t.Fatalf("read rated_usage: %v", err)
+	}
+	if MustDec(gotApplied).String() != "0.000006000" {
+		t.Errorf("applied_prompt_rate = %s, want 0.000006000 (0.000004 × 1.5)", gotApplied)
+	}
+	// 1000 × 0.000006 = 0.006.
+	if MustDec(gotCost).String() != "0.006000000" {
+		t.Errorf("cost = %s, want 0.006000000 (base × premium via base_model)", gotCost)
+	}
+
+	// Cross-check against the oracle (ResolveEvent → quantize → Rate).
+	rate, err := book.ResolveEvent("ft:9f8e7d6c5b4a", "meta-llama/Llama-3.1-8B-Instruct")
+	if err != nil {
+		t.Fatalf("oracle ResolveEvent: %v", err)
+	}
+	wantCost := Rate(RatedEvent{PromptTokens: 1000}, rate.Quantized()).String()
+	if MustDec(gotCost).String() != wantCost {
+		t.Errorf("SQL cost %s != oracle %s (base_model derived path must conform)", gotCost, wantCost)
 	}
 }
 

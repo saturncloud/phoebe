@@ -28,6 +28,12 @@ CREATE TABLE billing_event (
 
     -- Workload.
     model             VARCHAR(255),
+    -- base_model: the HF base id a fine-tune derives from (E3 derived_from),
+    -- stamped at deploy time by Atlas (which enforces base_model is present to
+    -- deploy a fine-tune). NULL for a base-model deployment. The rater prices an
+    -- ft:<checkpoint> model at base_price x premium by joining this to the price
+    -- file's base rates; an ft: model with a NULL base_model fails loud (never $0).
+    base_model        VARCHAR(255),
     adapter           VARCHAR(255),
 
     -- Raw token counts (the engine's own usage block; never re-tokenized).
