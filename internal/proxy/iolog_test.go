@@ -269,19 +269,29 @@ func TestIOLog_ResponseCapTruncates(t *testing.T) {
 	}
 }
 
-// TestIOLog_NonBlockingSink verifies a slow sink does not block the client
-// response: Log is async, so even a sink that sleeps doesn't delay serving.
-func TestIOLog_NonBlockingSink(t *testing.T) {
+// TestIOLog_SinkReceivesRecordViaOnDone tests what the proxy actually guarantees
+// about the sink: for an opted-in request it hands EXACTLY ONE record to the sink,
+// from the onDone completion callback, with the response forwarded verbatim. It
+// does NOT claim the sink runs off the response path — the proxy calls Sink.Log
+// SYNCHRONOUSLY from onDone (and onDone can fire inside the final body Read, before
+// the last bytes are copied to the client), so a sink that blocks in Log WOULD
+// stall the response. The non-blocking guarantee is therefore the SINK's
+// responsibility, asserted on the real PostgresSink in
+// iolog.TestPostgresSink_LogIsNonBlocking (a buffered-channel send that drops
+// rather than blocks).
+//
+// The previous test was named "NonBlockingSink" but wired a sink that never
+// blocked — so it asserted nothing about non-blocking. This name matches what the
+// proxy-level test can honestly verify; the real non-blocking property is pinned
+// where it actually lives.
+func TestIOLog_SinkReceivesRecordViaOnDone(t *testing.T) {
+	const respBody = `{"ok":true,"model":"m"}`
 	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
-		_, _ = w.Write([]byte(`{"ok":true}`))
+		_, _ = io.WriteString(w, respBody)
 	}))
 	defer backend.Close()
 	upstream, _ := url.Parse(backend.URL)
 
-	// A real PostgresSink-style async sink is exercised elsewhere; here a
-	// recordingSink suffices since the proxy calls Log from the onDone callback,
-	// which runs after the body is fully forwarded. We just assert the response
-	// completed and a record exists.
 	policy := &spyPolicy{decision: true}
 	sink := &recordingSink{}
 	srv := newIOLogServer(t, upstream, policy, sink, 0)
@@ -291,7 +301,10 @@ func TestIOLog_NonBlockingSink(t *testing.T) {
 	if rr.Code != http.StatusOK {
 		t.Fatalf("status = %d, want 200", rr.Code)
 	}
-	if len(sink.all()) != 1 {
-		t.Fatalf("want 1 record")
+	if rr.Body.String() != respBody {
+		t.Fatalf("response not forwarded verbatim: %q", rr.Body.String())
+	}
+	if got := len(sink.all()); got != 1 {
+		t.Fatalf("opted-in request must hand exactly 1 record to the sink, got %d", got)
 	}
 }
