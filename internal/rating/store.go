@@ -367,7 +367,13 @@ upserted AS (
         cost, applied_prompt_rate, applied_cached_rate, applied_completion_rate,
         event_count
     FROM priced
-    -- Deterministic lock order across concurrent raters (no ABBA deadlock).
+    -- Deterministic upsert order so a SINGLE rater never self-deadlocks against its
+    -- own rows (it takes row locks in one consistent order). Cross-rater
+    -- deadlock-safety (this ordered upsert vs. the deleted CTE's DELETE — a
+    -- potential ABBA pair) holds ONLY UNDER SINGLE-FLIGHT: the deployment forbids two
+    -- raters over overlapping windows (Atlas CronJob concurrencyPolicy: Forbid), so
+    -- the cross-rater hazard is unreachable and no delete-lock-ordering machinery is
+    -- added here. See cmd/rater's package doc for the single-flight contract.
     ORDER BY auth_id, model_id, window_start
     ON CONFLICT (auth_id, model_id, window_start) DO UPDATE SET
         window_end              = EXCLUDED.window_end,
