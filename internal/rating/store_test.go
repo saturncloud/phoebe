@@ -40,10 +40,11 @@ func TestPostgresStore_RateWindowSQL(t *testing.T) {
 	mock.ExpectExec(`INSERT INTO rating_derived`).
 		WithArgs("m", "0.000003000", "0.000000300", "0.000010000").
 		WillReturnResult(sqlmock.NewResult(0, 1))
-	rows := sqlmock.NewRows([]string{"rollups_written", "events_rated", "total_cost", "unpriced_events", "unattributable_events"}).
-		AddRow(2, 5, "0.001234500", 3, 1)
+	rows := sqlmock.NewRows([]string{"rollups_written", "events_rated", "total_cost", "unpriced_events", "unattributable_events", "ambiguous_base_events"}).
+		AddRow(2, 5, "0.001234500", 3, 1, 4)
+	// The statement binds $3 = the ft: LIKE pattern (single-sourced from fineTunePrefix).
 	mock.ExpectQuery(`INSERT INTO rated_usage`).
-		WithArgs(start.UTC(), end.UTC()).
+		WithArgs(start.UTC(), end.UTC(), ftLikePattern).
 		WillReturnRows(rows)
 	mock.ExpectCommit()
 
@@ -54,8 +55,8 @@ func TestPostgresStore_RateWindowSQL(t *testing.T) {
 	if res.RollupsWritten != 2 || res.EventsRated != 5 || res.TotalCost != "0.001234500" {
 		t.Fatalf("result = %+v, want 2/5/0.001234500", res)
 	}
-	if res.UnpricedEvents != 3 || res.UnattributableEvents != 1 {
-		t.Fatalf("anomaly counts = %d/%d, want 3/1 (must ride the same statement)", res.UnpricedEvents, res.UnattributableEvents)
+	if res.UnpricedEvents != 3 || res.UnattributableEvents != 1 || res.AmbiguousBaseEvents != 4 {
+		t.Fatalf("anomaly counts = %d/%d/%d, want 3/1/4 (must ride the same statement)", res.UnpricedEvents, res.UnattributableEvents, res.AmbiguousBaseEvents)
 	}
 	if err := mock.ExpectationsWereMet(); err != nil {
 		t.Fatalf("unmet: %v", err)
@@ -93,7 +94,8 @@ func TestRateWindowSQL_Shape(t *testing.T) {
 		"LEFT JOIN rating_derived rd",
 		"rd.base_model = ev.base_model",
 		"rp.model_id IS NULL",
-		"ev.model_id LIKE 'ft:%'",
+		// ft: marker is single-sourced from the Go fineTunePrefix constant, bound as $3
+		"ev.model_id LIKE $3",
 		// the effective rate COALESCEs direct over derived
 		"COALESCE(rp.prompt_price,     rd.prompt_price)",
 		// billable-prompt clamp + the cost formula (cached charged once)
@@ -111,8 +113,10 @@ func TestRateWindowSQL_Shape(t *testing.T) {
 		"AND model_id IS NOT NULL",
 		// session-TZ-independent hour bucket
 		"date_trunc('hour', ev_ts AT TIME ZONE 'UTC') AT TIME ZONE 'UTC'",
-		// deterministic natural-key surrogate id (re-runs regenerate the same id)
-		"md5(auth_id || '|' || model_id || '|' || extract(epoch FROM window_start)::bigint::text)",
+		// deterministic natural-key surrogate id (re-runs regenerate the same id),
+		// LENGTH-PREFIXED so a '|' in a field can never collide two keys
+		"md5(length(auth_id)::text || ':' || auth_id",
+		"|| '|' || length(model_id)::text || ':' || model_id",
 		// deterministic lock order across concurrent raters (no ABBA deadlock)
 		"ORDER BY auth_id, model_id, window_start",
 		// idempotent upsert on the natural key
@@ -120,6 +124,10 @@ func TestRateWindowSQL_Shape(t *testing.T) {
 		// the anomaly counts ride the SAME statement (one snapshot) as the upsert
 		"AS unpriced_events",
 		"AS unattributable_events",
+		// the E3 ft-uniqueness gate: an ft: rollup spanning >1 base_model is split out
+		"COUNT(DISTINCT base_model) FILTER (WHERE via_derived) > 1 AS ambiguous_base",
+		"WHERE NOT ambiguous_base",
+		"AS ambiguous_base_events",
 	}
 	// The price tables are GONE (prices are YAML now): no reference to model_price,
 	// derivation_policy, effective-dating, or a derivation CASE may remain.

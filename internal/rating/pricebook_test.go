@@ -181,6 +181,167 @@ base_models:
 	}
 }
 
+// TestLoad_DerivedRateRoundsToZeroFailsClosed (derived-rate-rounds-to-zero-fails-closed):
+// the round-to-zero fail-closed guard EXTENDED to the DERIVED path (FIX 1). A fine-tune
+// premium that drives a NONZERO base rate to a derived rate that quantizes to $0 is
+// rejected at LOAD — otherwise every ft: event of that base would silently bill $0,
+// counted as rated. The guard fires ONLY on a nonzero base zeroed by the premium; an
+// intentional free rate or any premium that keeps the rate nonzero loads fine.
+func TestLoad_DerivedRateRoundsToZeroFailsClosed(t *testing.T) {
+	// factor "0": a nonzero base rate driven to a derived $0 — REJECT.
+	rejectFactorZero := `
+version: 1
+base_models:
+  "base":
+    prompt:     "0.000003"
+    cached:     "0.0000003"
+    completion: "0.00001"
+fine_tune_premium:
+  policy: multiplier
+  factor: "0"
+`
+	// tiny fractional factor on a SMALL (1-nano) base: 0.000000001 × 0.4 = 0.0000000004
+	// → rounds to $0 at 9dp — REJECT.
+	rejectTinyFactor := `
+version: 1
+base_models:
+  "base":
+    prompt:     "0.000000001"
+    cached:     "0.000000001"
+    completion: "0.000000001"
+fine_tune_premium:
+  policy: multiplier
+  factor: "0.4"
+`
+	for _, tc := range []struct{ name, yaml string }{
+		{"factor-zero-zeroes-nonzero-base", rejectFactorZero},
+		{"tiny-fractional-factor-on-small-base", rejectTinyFactor},
+	} {
+		if _, err := ParsePriceBook([]byte(tc.yaml)); err == nil {
+			t.Errorf("%s: load succeeded, want rejection (derived rate rounds to $0 → silent free fine-tune)", tc.name)
+		} else if !strings.Contains(err.Error(), "rounds to $0") {
+			t.Errorf("%s: err = %v, want a round-to-$0 rejection naming the derived rate", tc.name, err)
+		}
+	}
+
+	// LEGIT loads: each keeps an intended-nonzero (or intentionally free) derived rate.
+	for _, tc := range []struct{ name, yaml string }{
+		{
+			// A real multiplier on a real base — the common case. Loads.
+			"legit-multiplier", `
+version: 1
+base_models:
+  "base":
+    prompt:     "0.000003"
+    cached:     "0.0000003"
+    completion: "0.00001"
+fine_tune_premium:
+  policy: multiplier
+  factor: "1.5"
+`,
+		},
+		{
+			// A markup premium that keeps every component nonzero. Loads.
+			"legit-markup", `
+version: 1
+base_models:
+  "base":
+    prompt:     "0.000003"
+    cached:     "0.0000003"
+    completion: "0.00001"
+fine_tune_premium:
+  policy: markup
+  markup: "0.000000100"
+`,
+		},
+		{
+			// Identity premium (default). Loads.
+			"identity", `
+version: 1
+base_models:
+  "base":
+    prompt:     "0.000003"
+    cached:     "0.0000003"
+    completion: "0.00001"
+`,
+		},
+		{
+			// A base whose cached component is an INTENTIONAL $0: factor 0.4 on a $0
+			// cached yields a derived $0, but the BASE component was already 0, so this
+			// is a legitimate free component, not a silently-zeroed nonzero rate. Loads.
+			"intentional-free-component", `
+version: 1
+base_models:
+  "base":
+    prompt:     "0.000003"
+    cached:     "0"
+    completion: "0.00001"
+fine_tune_premium:
+  policy: multiplier
+  factor: "0.4"
+`,
+		},
+	} {
+		if _, err := ParsePriceBook([]byte(tc.yaml)); err != nil {
+			t.Errorf("%s: load failed, want success: %v", tc.name, err)
+		}
+	}
+}
+
+// TestResolveEvent_FineTuneCannotDeriveFromFineTune (one-hop-no-fine-tune-of-fine-tune):
+// E3's ONE-HOP rule (FIX 3). An own-rate fine-tune (an ft: id with its own rate in the
+// file) is NOT a valid derivation base: another ft: event whose base_model points at it
+// must NOT price at that fine-tune's rate × premium (a second hop) — it fails loud
+// (ErrNoPrice). Only a TRUE base model is a one-hop derivation source.
+func TestResolveEvent_FineTuneCannotDeriveFromFineTune(t *testing.T) {
+	const y = `
+version: 1
+base_models:
+  "meta-llama/Llama-3.1-8B-Instruct":
+    prompt:     "0.000004"
+    cached:     "0"
+    completion: "0"
+fine_tunes:
+  "ft:ownrate":
+    rate:
+      prompt:     "0.00001"
+      cached:     "0"
+      completion: "0"
+fine_tune_premium:
+  policy: multiplier
+  factor: "1.5"
+`
+	pb, err := ParsePriceBook([]byte(y))
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+
+	// The own-rate fine-tune itself still prices DIRECTLY by its own model_id (one hop
+	// is about being a derivation SOURCE, not about pricing itself).
+	if r, err := pb.ResolveEvent("ft:ownrate", ""); err != nil || r.Prompt.String() != "0.000010000" {
+		t.Fatalf("own-rate ft direct resolve = %s, %v; want 0.000010000 / nil", r.Prompt, err)
+	}
+
+	// THE INVARIANT: a different ft: event whose base_model is the OWN-RATE fine-tune
+	// must NOT derive from it (that would be ft-of-ft, a second hop). Fail loud.
+	if _, err := pb.ResolveEvent("ft:9f8e7d6c5b4a", "ft:ownrate"); !errors.Is(err, ErrNoPrice) {
+		t.Fatalf("ft deriving from an own-rate ft: err = %v, want ErrNoPrice (one hop only — no fine-tune-of-fine-tune)", err)
+	}
+
+	// Sanity: deriving from the TRUE base still works (the one legitimate hop).
+	if r, err := pb.ResolveEvent("ft:9f8e7d6c5b4a", "meta-llama/Llama-3.1-8B-Instruct"); err != nil || r.Prompt.String() != "0.000006000" {
+		t.Fatalf("ft deriving from the true base = %s, %v; want 0.000006000 / nil", r.Prompt, err)
+	}
+
+	// And the SQL projection excludes the own-rate ft: as a derivation base: it must
+	// NOT appear in rating_derived (keyed on base_model), so the SQL and oracle agree.
+	for _, d := range pb.derivedRates() {
+		if d.BaseModel == "ft:ownrate" {
+			t.Fatalf("derivedRates() projected the own-rate fine-tune %q as a derivation base — one-hop violation in the SQL path", d.BaseModel)
+		}
+	}
+}
+
 // TestResolveEvent_FineTuneViaBaseModel (resolve-event-fine-tune-via-base-model):
 // ResolveEvent prices an ft:<checkpoint> model_id — not named in the file — through the
 // event-carried base_model (E3), at base × premium. Direct model_id pricing still wins

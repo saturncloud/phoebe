@@ -51,6 +51,12 @@ type RateResult struct {
 	// never disagree with what the rollups excluded.
 	UnpricedEvents       int64
 	UnattributableEvents int64
+	// AmbiguousBaseEvents counts events under rollups where a single ft: model_id
+	// resolved through MORE THAN ONE distinct base_model in a window — the E3
+	// ft-uniqueness violation (a uuid4 checkpoint id can't carry two bases). Those
+	// rollups are excluded from the upsert and screamed about, never silently billed at
+	// the MIN (cheaper) rate.
+	AmbiguousBaseEvents int64
 }
 
 // Anomalies are the fail-loud counts for a window: events that could not be priced
@@ -59,6 +65,7 @@ type RateResult struct {
 type Anomalies struct {
 	UnpricedEvents       int64
 	UnattributableEvents int64
+	AmbiguousBaseEvents  int64
 }
 
 // PostgresStore reads billing_event and writes rated_usage in the shared Atlas
@@ -186,13 +193,15 @@ CREATE TEMP TABLE rating_derived (
 //
 // IDEMPOTENCY: ON CONFLICT (auth_id, model_id, window_start) DO UPDATE replaces the
 // stored sums/cost/applied-rates with the freshly recomputed ones. The surrogate id
-// is DETERMINISTIC (md5 of the natural key), so a re-run regenerates the SAME id.
+// is DETERMINISTIC (md5 of the LENGTH-PREFIXED natural key — injective, so no '|' in a
+// field can collide two keys), so a re-run regenerates the SAME id.
 //
 // ONE STATEMENT, ONE SNAPSHOT: the upsert and the anomaly counts are CTEs of a
 // single statement, so a billing_event the drainer commits mid-run is visible to
 // BOTH the rollups and the counts or to NEITHER — never excluded-but-uncounted.
 //
-// $1 = window start (inclusive), $2 = window end (exclusive).
+// $1 = window start (inclusive), $2 = window end (exclusive), $3 = the fine-tune
+// LIKE pattern (fineTunePrefix + '%'), single-sourcing the ft: marker from Go.
 const rateWindowSQL = `
 WITH ev AS (
     SELECT
@@ -216,6 +225,7 @@ resolved AS (
     SELECT
         ev.auth_id,
         ev.model_id,
+        ev.base_model,
         ev.ev_ts,
         ev.prompt_tokens,
         ev.cached_tokens,
@@ -227,7 +237,11 @@ resolved AS (
         -- never true), so it correctly falls through to UNPRICED and screams.
         COALESCE(rp.prompt_price,     rd.prompt_price)     AS prompt_price,
         COALESCE(rp.cached_price,     rd.cached_price)     AS cached_price,
-        COALESCE(rp.completion_price, rd.completion_price) AS completion_price
+        COALESCE(rp.completion_price, rd.completion_price) AS completion_price,
+        -- Whether this row priced through the DERIVED (base_model) path: an ft: id that
+        -- missed the direct table and hit rating_derived. Drives the ft-uniqueness
+        -- enforcement below — only a derived-priced row's base_model matters.
+        (rp.model_id IS NULL AND rd.base_model IS NOT NULL) AS via_derived
     FROM ev
     -- The YAML-projected DIRECT price table (keyed on model_id).
     LEFT JOIN rating_price rp ON rp.model_id = ev.model_id
@@ -240,9 +254,20 @@ resolved AS (
     LEFT JOIN rating_derived rd
         ON rd.base_model = ev.base_model
        AND rp.model_id IS NULL
-       AND ev.model_id LIKE 'ft:%'
+       -- The ft: prefix is SINGLE-SOURCED from the Go fineTunePrefix constant, bound as
+       -- $3 (ftLikePattern), so the money path has ONE source of truth for what marks a
+       -- fine-tune — never a literal 'ft:%' that could drift from the constant.
+       AND ev.model_id LIKE $3
 ),
-priced AS (
+-- grouped: the per-(auth_id, model_id, hour) rollup BEFORE the ft-uniqueness gate.
+-- It carries ambiguous_base = COUNT(DISTINCT base_model among DERIVED-priced rows) > 1.
+-- E3 mints ft:<checkpoint_artifact_id> as a globally-unique uuid4, so one ft: model_id
+-- can NEVER legitimately carry two different base_models. If it does, the derived rates
+-- differ and a blind MIN()-applied-rate would silently bill the rollup at the CHEAPER
+-- base — under-billing, counted as rated. That is a base_model PROPAGATION/UNIQUENESS
+-- violation: it must SCREAM, not silently pick a rate. So ambiguous rollups are split
+-- out below (counted as an anomaly, never upserted).
+grouped AS (
     SELECT
         auth_id,
         model_id,
@@ -259,17 +284,26 @@ priced AS (
           + cached_tokens     * cached_price
           + completion_tokens * completion_price
         )                                                AS cost,
-        -- The applied per-token rates frozen onto the row. A rollup is single-model,
-        -- so MIN == MAX == the one rate; MIN picks it deterministically.
+        -- The applied per-token rates frozen onto the row. A rollup is single-model and
+        -- (by the ft-uniqueness invariant enforced below) single derived-base, so all
+        -- rows share ONE rate; MIN picks it deterministically. The ambiguous_base guard
+        -- guarantees MIN is not silently masking a second, different rate.
         MIN(prompt_price)                                AS applied_prompt_rate,
         MIN(cached_price)                                AS applied_cached_rate,
         MIN(completion_price)                            AS applied_completion_rate,
-        COUNT(*)::bigint                                 AS event_count
+        COUNT(*)::bigint                                 AS event_count,
+        -- > 1 distinct base_model among the DERIVED-priced rows → ambiguous (the E3
+        -- ft-uniqueness violation). DERIVED rows only: a direct-priced row's base_model
+        -- never affects its rate, so it must not trip the gate.
+        COUNT(DISTINCT base_model) FILTER (WHERE via_derived) > 1 AS ambiguous_base
     FROM resolved
     WHERE prompt_price IS NOT NULL          -- priced only
       AND auth_id  IS NOT NULL              -- attributable only
       AND model_id IS NOT NULL
     GROUP BY auth_id, model_id, date_trunc('hour', ev_ts AT TIME ZONE 'UTC') AT TIME ZONE 'UTC'
+),
+priced AS (
+    SELECT * FROM grouped WHERE NOT ambiguous_base
 ),
 upserted AS (
     INSERT INTO rated_usage (
@@ -280,9 +314,14 @@ upserted AS (
     )
     SELECT
         -- DETERMINISTIC 32-char hex surrogate: md5 of the natural key, so re-rating
-        -- regenerates the SAME id. epoch() (not ::text) keeps the hash input
-        -- session-TZ-independent.
-        md5(auth_id || '|' || model_id || '|' || extract(epoch FROM window_start)::bigint::text),
+        -- regenerates the SAME id. The fields are LENGTH-PREFIXED (len || ':' || value)
+        -- so the encoding is INJECTIVE — a '|' inside auth_id or model_id can never
+        -- shift the boundary and collide two different keys onto one id (e.g. auth 'a|b'
+        -- + model 'c' vs auth 'a' + model 'b|c'). epoch (a bounded integer, no
+        -- separator hazard) keeps the hash input session-TZ-independent.
+        md5(length(auth_id)::text || ':' || auth_id
+          || '|' || length(model_id)::text || ':' || model_id
+          || '|' || extract(epoch FROM window_start)::bigint::text),
         auth_id, model_id, window_start, window_end,
         prompt_tokens, cached_tokens, completion_tokens, billable_prompt_tokens,
         cost, applied_prompt_rate, applied_cached_rate, applied_completion_rate,
@@ -311,13 +350,21 @@ SELECT
     -- Anomaly counts from the SAME snapshot as the upsert. An unattributable row is
     -- counted ONLY as unattributable (the more specific signal), never also as
     -- unpriced, so the counts partition the in-window rows:
-    --   events_rated + unpriced + unattributable == total in-window events.
+    --   events_rated + unpriced + unattributable + ambiguous_base == total in-window events.
     (SELECT COUNT(*)::bigint FROM resolved
       WHERE prompt_price IS NULL
         AND auth_id  IS NOT NULL
         AND model_id IS NOT NULL)                             AS unpriced_events,
     (SELECT COUNT(*)::bigint FROM ev
-      WHERE auth_id IS NULL OR model_id IS NULL)              AS unattributable_events`
+      WHERE auth_id IS NULL OR model_id IS NULL)              AS unattributable_events,
+    -- AMBIGUOUS-BASE events: the EVENT count under ambiguous rollups (a single ft:
+    -- model_id resolving through >1 distinct base_model in one window — the E3
+    -- ft-uniqueness violation). These rollups are NOT upserted (excluded from priced),
+    -- so their events are neither rated nor $0-billed; they are counted here, from the
+    -- SAME snapshot, and drive the fail-loud exit. SUM(event_count) (not COUNT(*) of
+    -- rollups) so the partition identity above stays in EVENT units.
+    (SELECT COALESCE(SUM(event_count), 0)::bigint FROM grouped
+      WHERE ambiguous_base)                                  AS ambiguous_base_events`
 
 // RateWindow runs the price-projection + the single resolve→sum→upsert→count
 // statement for [start, end) in ONE transaction, and reports the rollups written,
@@ -360,9 +407,9 @@ func (s *PostgresStore) RateWindow(ctx context.Context, book *PriceBook, start, 
 
 	var res RateResult
 	var total string
-	err = tx.QueryRowContext(ctx, rateWindowSQL, start.UTC(), end.UTC()).
+	err = tx.QueryRowContext(ctx, rateWindowSQL, start.UTC(), end.UTC(), ftLikePattern).
 		Scan(&res.RollupsWritten, &res.EventsRated, &total,
-			&res.UnpricedEvents, &res.UnattributableEvents)
+			&res.UnpricedEvents, &res.UnattributableEvents, &res.AmbiguousBaseEvents)
 	if err != nil {
 		return RateResult{}, fmt.Errorf("rating: rate window [%s,%s): %w",
 			start.UTC().Format(time.RFC3339), end.UTC().Format(time.RFC3339), err)

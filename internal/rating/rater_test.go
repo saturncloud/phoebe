@@ -37,6 +37,11 @@ type oracleRollup struct {
 	cost                                 Dec
 	appliedRate                          Rate3
 	eventCount                           int
+	// derivedBases is the set of distinct base_models the events in this rollup priced
+	// THROUGH the derived path (an ft: id not directly in the file). >1 → the E3
+	// ft-uniqueness violation: the rollup is ambiguous and must NOT be billed. Mirrors
+	// the SQL's COUNT(DISTINCT base_model) FILTER (WHERE via_derived).
+	derivedBases map[string]struct{}
 }
 
 func newOracleStore(book *PriceBook, events []RatedEvent) *oracleStore {
@@ -82,9 +87,27 @@ func (s *oracleStore) resolveWindow(start, end time.Time) (map[rollupKey]oracleR
 		ru.cost = ru.cost.Add(cost)
 		ru.appliedRate = rate // single-model rollup → one applied rate
 		ru.eventCount++
+		// Track the base_model of any DERIVED-priced event (an ft: id not directly in
+		// the file). >1 distinct → ambiguous (E3 ft-uniqueness violation). Mirrors the
+		// SQL via_derived FILTER.
+		if _, direct := s.book.Resolve(e.ModelID); direct != nil && e.BaseModel != "" {
+			if ru.derivedBases == nil {
+				ru.derivedBases = map[string]struct{}{}
+			}
+			ru.derivedBases[e.BaseModel] = struct{}{}
+		}
 		out[k] = ru
 	}
+	// Split out AMBIGUOUS-BASE rollups: a single ft: model_id that resolved through more
+	// than one base_model in the window is NOT billed (a blind MIN()-rate would silently
+	// under-charge) — its events are counted as the ambiguous-base anomaly and the rollup
+	// is dropped. Mirrors store.go's grouped→priced split.
 	for k, ru := range out {
+		if len(ru.derivedBases) > 1 {
+			an.AmbiguousBaseEvents += int64(ru.eventCount)
+			delete(out, k)
+			continue
+		}
 		ru.cost = ru.cost.Round(moneyScale)
 		out[k] = ru
 	}
@@ -106,6 +129,7 @@ func (s *oracleStore) RateWindow(_ context.Context, _ *PriceBook, start, end tim
 		EventsRated:          rated,
 		UnpricedEvents:       an.UnpricedEvents,
 		UnattributableEvents: an.UnattributableEvents,
+		AmbiguousBaseEvents:  an.AmbiguousBaseEvents,
 	}
 	if len(rollups) > 0 {
 		res.TotalCost = total.String()
@@ -366,6 +390,98 @@ func TestRater_FineTuneWithoutBaseModelFailsLoud(t *testing.T) {
 	}
 	if !res.HasUnpriced() || !res.HasAnomaly() {
 		t.Fatal("HasUnpriced/HasAnomaly = false, want true (the propagation bug must drive exit-nonzero)")
+	}
+}
+
+// TestRater_FineTuneAmbiguousBaseModelFailsLoud (fine-tune-ambiguous-base-model-fails-loud):
+// the E3 ft-uniqueness invariant (FIX 2). E3 mints ft:<checkpoint_artifact_id> as a
+// globally-unique uuid4, so a single ft: model_id can NEVER legitimately carry two
+// different base_models. If it does (a base_model propagation bug), the derived rates
+// differ and a blind MIN()-applied-rate would silently bill the rollup at the CHEAPER
+// base — under-billing, counted as rated. The invariant converts that into a SCREAM:
+// the ambiguous rollup is NOT billed, its events are counted ambiguous, and the run
+// fails loud. (The same ft: id with the SAME base across events is fine — one rollup.)
+func TestRater_FineTuneAmbiguousBaseModelFailsLoud(t *testing.T) {
+	book := newTestBook(
+		map[string]Rate3{
+			"cheap/base":     rate3("0.000001", "0", "0"),
+			"expensive/base": rate3("0.000009", "0", "0"),
+		},
+		nil, PolicyMultiplier, MustDec("1.5"), Dec{},
+	)
+	at := mustTime("2026-06-08T10:15:00Z")
+	events := []RatedEvent{
+		// SAME ft: model_id, TWO different base_models in the same window → ambiguous.
+		{AuthID: "a", ModelID: "ft:dupe", BaseModel: "cheap/base", PromptTokens: 1000, At: at},
+		{AuthID: "a", ModelID: "ft:dupe", BaseModel: "expensive/base", PromptTokens: 1000, At: at.Add(5 * time.Minute)},
+		// A clean, single-base ft: rollup that MUST still rate normally alongside it.
+		{AuthID: "a", ModelID: "ft:clean", BaseModel: "cheap/base", PromptTokens: 1000, At: at},
+	}
+	store := newOracleStore(book, events)
+	r := New(store, book, testLogger())
+	res, err := r.Run(context.Background(), mustTime("2026-06-08T10:00:00Z"), mustTime("2026-06-08T11:00:00Z"))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// The two ambiguous events are counted, NOT rated, NOT $0-billed.
+	if res.AmbiguousBaseEvents != 2 {
+		t.Fatalf("ambiguous-base events = %d, want 2 (the two-base ft: rollup must scream)", res.AmbiguousBaseEvents)
+	}
+	if !res.HasAmbiguousBase() || !res.HasAnomaly() {
+		t.Fatal("HasAmbiguousBase/HasAnomaly = false, want true (the uniqueness violation must drive exit-nonzero)")
+	}
+	// The clean ft: rollup still rated; the ambiguous one did not.
+	if res.EventsRated != 1 || res.RollupsWritten != 1 {
+		t.Fatalf("rated=%d rollups=%d, want 1/1 (only the single-base ft: rollup)", res.EventsRated, res.RollupsWritten)
+	}
+	for k := range store.table {
+		if k.modelID == "ft:dupe" {
+			t.Fatal("a rollup exists for the ambiguous ft: id — it must NOT be billed (silent MIN-rate under-charge)")
+		}
+	}
+	// SINGLE-SNAPSHOT PARTITION: rated + unpriced + unattributable + ambiguous == total.
+	if got := res.EventsRated + res.UnpricedEvents + res.UnattributableEvents + res.AmbiguousBaseEvents; got != int64(len(events)) {
+		t.Fatalf("rated(%d)+unpriced(%d)+unattr(%d)+ambiguous(%d) = %d, want %d",
+			res.EventsRated, res.UnpricedEvents, res.UnattributableEvents, res.AmbiguousBaseEvents, got, len(events))
+	}
+}
+
+// TestRater_RollupCostSelfAudits (rollup-cost-self-audits): the persona-pass invariant —
+// every written rollup's cost EXACTLY equals its applied per-token rate × its token
+// counts (cost == applied_prompt_rate × billable + applied_cached_rate × cached +
+// applied_completion_rate × completion). Because the applied rate is the 9dp value
+// frozen on the row, the cost is fully reconstructable from the row alone — no hidden
+// second rate, no MIN() masking a divergent rate. Covers base AND derived rollups.
+func TestRater_RollupCostSelfAudits(t *testing.T) {
+	book := newTestBook(
+		map[string]Rate3{"base": rate3("0.000004", "0.0000004", "0.00001")},
+		map[string]string{"ft": "base"},
+		PolicyMultiplier, MustDec("1.5"), Dec{},
+	)
+	at := mustTime("2026-06-08T10:15:00Z")
+	events := []RatedEvent{
+		{AuthID: "a", ModelID: "base", PromptTokens: 100, CachedTokens: 30, CompletionTokens: 50, At: at},
+		{AuthID: "a", ModelID: "base", PromptTokens: 200, CachedTokens: 0, CompletionTokens: 10, At: at.Add(10 * time.Minute)},
+		{AuthID: "a", ModelID: "ft", PromptTokens: 100, CachedTokens: 0, CompletionTokens: 0, At: at},
+	}
+	store := newOracleStore(book, events)
+	r := New(store, book, testLogger())
+	if _, err := r.Run(context.Background(), mustTime("2026-06-08T10:00:00Z"), mustTime("2026-06-08T11:00:00Z")); err != nil {
+		t.Fatal(err)
+	}
+	if len(store.table) == 0 {
+		t.Fatal("no rollups written")
+	}
+	for k, ru := range store.table {
+		want := ru.appliedRate.Prompt.MulInt(ru.billable).
+			Add(ru.appliedRate.Cached.MulInt(ru.cached)).
+			Add(ru.appliedRate.Completion.MulInt(ru.completion)).
+			Round(moneyScale)
+		if ru.cost.String() != want.String() {
+			t.Errorf("rollup (%s,%s) cost = %s, but applied_rate × tokens = %s (self-audit broken)",
+				k.authID, k.modelID, ru.cost, want)
+		}
 	}
 }
 

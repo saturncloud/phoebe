@@ -499,6 +499,165 @@ func TestIntegration_FineTunePricesViaBaseModel(t *testing.T) {
 	}
 }
 
+// TestIntegration_FineTuneAmbiguousBaseModelFailsLoud runs the REAL SQL over the E3
+// ft-uniqueness violation (FIX 2): a single ft: model_id resolving through TWO distinct
+// base_models in one window. E3 mints ft:<checkpoint_artifact_id> as a globally-unique
+// uuid4, so this can't happen legitimately; if it does, a blind MIN()-applied-rate would
+// silently bill the rollup at the cheaper base. The SQL must instead SPLIT the ambiguous
+// rollup out: not upsert it, and count its events as ambiguous_base_events. A clean
+// single-base ft: rollup in the same window must still rate normally.
+func TestIntegration_FineTuneAmbiguousBaseModelFailsLoud(t *testing.T) {
+	dsn := os.Getenv("PHOEBE_TEST_DATABASE_URL")
+	if dsn == "" {
+		t.Skip("PHOEBE_TEST_DATABASE_URL not set; skipping live-Postgres conformance")
+	}
+	ctx := context.Background()
+	db, err := sql.Open("pgx", dsn)
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	defer db.Close()
+
+	const sch = "phoebe_rating_ambig_it"
+	exec(t, db, "DROP SCHEMA IF EXISTS "+sch+" CASCADE")
+	exec(t, db, "CREATE SCHEMA "+sch)
+	exec(t, db, "SET search_path TO "+sch)
+	defer func() { exec(t, db, "DROP SCHEMA IF EXISTS "+sch+" CASCADE") }()
+	exec(t, db, schemaDDL)
+
+	hour := mustTime("2026-06-08T10:00:00Z")
+	book := newTestBook(
+		map[string]Rate3{
+			"cheap/base":     rate3("0.000001", "0", "0"),
+			"expensive/base": rate3("0.000009", "0", "0"),
+		},
+		nil, PolicyMultiplier, MustDec("1.5"), Dec{},
+	)
+
+	type seed struct {
+		req, model, baseModel string
+		prompt                int64
+	}
+	seeds := []seed{
+		// SAME ft: id, TWO different base_models → ambiguous (must NOT bill at MIN rate).
+		{"ambig-1", "ft:dupe", "cheap/base", 1000},
+		{"ambig-2", "ft:dupe", "expensive/base", 1000},
+		// A clean single-base ft: rollup that MUST still rate.
+		{"clean", "ft:clean", "cheap/base", 1000},
+	}
+	for _, s := range seeds {
+		if _, err := db.ExecContext(ctx,
+			`INSERT INTO billing_event (request_id, auth_id, model, base_model, prompt_tokens, completion_tokens, event_ts)
+			 VALUES ($1,'a',$2,$3,$4,0,$5)`,
+			s.req, s.model, nullableStr(s.baseModel), s.prompt, hour.Add(5*time.Minute)); err != nil {
+			t.Fatalf("seed %s: %v", s.req, err)
+		}
+	}
+
+	store := NewPostgresStore(db)
+	res, err := store.RateWindow(ctx, book, hour, hour.Add(time.Hour))
+	if err != nil {
+		t.Fatalf("RateWindow: %v", err)
+	}
+
+	// Only the clean rollup rated; the two ambiguous events are counted, not billed.
+	if res.RollupsWritten != 1 || res.EventsRated != 1 {
+		t.Fatalf("rollups/events = %d/%d, want 1/1 (only the single-base ft: rollup)", res.RollupsWritten, res.EventsRated)
+	}
+	if res.AmbiguousBaseEvents != 2 {
+		t.Fatalf("ambiguous = %d, want 2 (the two-base ft: rollup must scream, never MIN-billed)", res.AmbiguousBaseEvents)
+	}
+	// NO rated_usage row for the ambiguous ft: id (not even at the cheaper rate).
+	var nDupe int
+	if err := db.QueryRowContext(ctx,
+		`SELECT COUNT(*) FROM rated_usage WHERE model_id='ft:dupe'`).Scan(&nDupe); err != nil {
+		t.Fatalf("count ft:dupe rollups: %v", err)
+	}
+	if nDupe != 0 {
+		t.Fatalf("rated_usage has %d rows for the ambiguous ft:dupe — it must NOT be billed (silent MIN under-charge)", nDupe)
+	}
+	// The clean fine-tune billed normally at its base × premium.
+	var cost string
+	if err := db.QueryRowContext(ctx,
+		`SELECT cost::text FROM rated_usage WHERE model_id='ft:clean'`).Scan(&cost); err != nil {
+		t.Fatalf("read ft:clean rollup: %v", err)
+	}
+	if MustDec(cost).String() != "0.001500000" { // 1000 × (0.000001 × 1.5)
+		t.Errorf("ft:clean cost = %s, want 0.001500000 (base × premium)", cost)
+	}
+}
+
+// TestIntegration_OneHopFineTuneCannotDeriveFromFineTune runs the REAL SQL to pin E3's
+// one-hop rule (FIX 3): an own-rate fine-tune is NOT a derivation base. An ft: event
+// whose base_model points at another own-rate ft: must NOT price (a second hop) — it
+// lands UNPRICED, matching the oracle's ResolveEvent. Proves the SQL projection
+// (rating_derived) excludes ft:-prefixed own-rate entries, so SQL and oracle agree.
+func TestIntegration_OneHopFineTuneCannotDeriveFromFineTune(t *testing.T) {
+	dsn := os.Getenv("PHOEBE_TEST_DATABASE_URL")
+	if dsn == "" {
+		t.Skip("PHOEBE_TEST_DATABASE_URL not set; skipping live-Postgres conformance")
+	}
+	ctx := context.Background()
+	db, err := sql.Open("pgx", dsn)
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	defer db.Close()
+
+	const sch = "phoebe_rating_onehop_it"
+	exec(t, db, "DROP SCHEMA IF EXISTS "+sch+" CASCADE")
+	exec(t, db, "CREATE SCHEMA "+sch)
+	exec(t, db, "SET search_path TO "+sch)
+	defer func() { exec(t, db, "DROP SCHEMA IF EXISTS "+sch+" CASCADE") }()
+	exec(t, db, schemaDDL)
+
+	hour := mustTime("2026-06-08T10:00:00Z")
+	// A true base AND an own-rate fine-tune (ft:ownrate) priced directly in the file.
+	book := newTestBook(
+		map[string]Rate3{
+			"meta-llama/Llama-3.1-8B-Instruct": rate3("0.000004", "0", "0"),
+			"ft:ownrate":                       rate3("0.00001", "0", "0"),
+		},
+		nil, PolicyMultiplier, MustDec("1.5"), Dec{},
+	)
+
+	type seed struct {
+		req, model, baseModel string
+	}
+	seeds := []seed{
+		// One legitimate hop: ft: deriving from the TRUE base → priced.
+		{"hop-ok", "ft:abc", "meta-llama/Llama-3.1-8B-Instruct"},
+		// SECOND hop forbidden: ft: whose base_model is the own-rate fine-tune → UNPRICED.
+		{"hop-bad", "ft:def", "ft:ownrate"},
+	}
+	for _, s := range seeds {
+		if _, err := db.ExecContext(ctx,
+			`INSERT INTO billing_event (request_id, auth_id, model, base_model, prompt_tokens, completion_tokens, event_ts)
+			 VALUES ($1,'a',$2,$3,1000,0,$4)`,
+			s.req, s.model, s.baseModel, hour.Add(5*time.Minute)); err != nil {
+			t.Fatalf("seed %s: %v", s.req, err)
+		}
+	}
+
+	store := NewPostgresStore(db)
+	res, err := store.RateWindow(ctx, book, hour, hour.Add(time.Hour))
+	if err != nil {
+		t.Fatalf("RateWindow: %v", err)
+	}
+
+	// hop-ok prices (one rollup); hop-bad is UNPRICED (the second hop is forbidden).
+	if res.RollupsWritten != 1 || res.EventsRated != 1 {
+		t.Fatalf("rollups/events = %d/%d, want 1/1 (only the one-hop ft: prices)", res.RollupsWritten, res.EventsRated)
+	}
+	if res.UnpricedEvents != 1 {
+		t.Fatalf("unpriced = %d, want 1 (ft deriving from an own-rate ft: must fail loud — no second hop)", res.UnpricedEvents)
+	}
+	// Cross-check the oracle agrees: ResolveEvent fails for the second hop.
+	if _, err := book.ResolveEvent("ft:def", "ft:ownrate"); err == nil {
+		t.Fatal("oracle ResolveEvent priced a fine-tune-of-fine-tune — SQL and oracle must BOTH forbid the second hop")
+	}
+}
+
 // TestIntegration_UTCBucketing_SessionTZIndependent: the hour bucket must NOT depend
 // on the session TimeZone. A fractional-offset session (Asia/Kolkata, +05:30) must
 // produce window_start on EXACT UTC hour boundaries, and a re-run from a UTC session

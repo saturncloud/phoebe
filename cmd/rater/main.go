@@ -14,11 +14,13 @@
 //	0  window rated, every event priced and attributed
 //	1  fatal error (config, DB, etc.) — nothing or partial; safe to re-run
 //	2  window rated BUT an anomaly leaked (fail-loud): some events were unpriced
-//	   (backfill the price book and re-rate) and/or some rows were unattributable
-//	   — NULL auth_id/model_id, which the interceptor's billing gate should reject
-//	   before metering, so a nonzero count means revenue is leaking upstream.
-//	   Distinct code so a CronJob can alert on "lost revenue / lost data"
-//	   separately from "job broke".
+//	   (backfill the price book and re-rate), some rows were unattributable — NULL
+//	   auth_id/model_id, which the interceptor's billing gate should reject before
+//	   metering — and/or an ft: rollup spanned more than one base_model in a window
+//	   (the E3 ft-uniqueness violation: a uuid4 checkpoint id cannot carry two bases,
+//	   so this is broken base_model propagation, never a priceable rollup). Any of
+//	   these means revenue is leaking upstream. Distinct code so a CronJob can alert
+//	   on "lost revenue / lost data" separately from "job broke".
 //
 // Re-running any window is safe and idempotent (rollups upsert on the natural
 // key), so cron overlap or manual re-rating never double-counts.
@@ -158,8 +160,9 @@ func run() int {
 
 	if res.HasAnomaly() {
 		// The window was rated and rollups were written, but something leaked:
-		// events that could not be priced and/or rows that could not be attributed
-		// (NULL auth_id/model). Non-zero exit so a CronJob surfaces the lost
+		// events that could not be priced, rows that could not be attributed (NULL
+		// auth_id/model), and/or an ft: rollup spanning multiple base_models (the E3
+		// ft-uniqueness violation). Non-zero exit so a CronJob surfaces the lost
 		// revenue / lost data.
 		return exitAnomaly
 	}

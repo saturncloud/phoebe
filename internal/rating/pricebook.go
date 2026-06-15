@@ -15,6 +15,12 @@ import (
 // an HF id and a fine-tune keyed on an ft: id live in disjoint namespaces.
 const fineTunePrefix = "ft:"
 
+// ftLikePattern is the SQL LIKE pattern that matches a fine-tune model_id, derived
+// from fineTunePrefix so the rater's SQL (store.go) and the Go resolution share ONE
+// source of truth for the ft: marker on the money path — no hardcoded 'ft:%' literal
+// that could silently drift from the constant.
+const ftLikePattern = fineTunePrefix + "%"
+
 // --- THE PRICE FILE SCHEMA (the operator-facing contract) -------------------
 //
 // The price file is the SINGLE source of truth for what every model costs (E1).
@@ -223,6 +229,21 @@ func buildPriceBook(f PriceFile, fineTunes map[string]fineTuneEntry) (*PriceBook
 	}
 	pb.policyFn, pb.policyFactor, pb.policyMarkup = fn, factor, markup
 
+	// FAIL CLOSED on a DERIVED rate that quantizes to ZERO (the round-to-zero guard,
+	// extended from file-declared rates — parseNonNegRate — to the derived path). A
+	// fine-tune premium that drives base x premium to $0 (a "0" factor, a tiny
+	// fractional factor on a small base, a negative-rounding markup) would silently
+	// bill EVERY ft: event $0, counted as rated not unpriced — the exact lost-revenue
+	// outcome this package exists to prevent, on the path the file-declared guard did
+	// not cover. The base rate is a nonzero price the operator intends; a premium that
+	// rounds it to $0 is a MIS-CONFIGURED premium, caught here at LOAD (never at bill
+	// time). A premium that genuinely yields an intended-nonzero or intended-$0 rate
+	// loads fine — we only reject "nonzero base rate silently zeroed by the premium".
+	// Mirrors the projection derivedRates() materialises, so what loads is what bills.
+	if err := validateDerivedRatesNonZero(pb); err != nil {
+		return nil, err
+	}
+
 	// Per-GPU floor rates (validated now, used by the uptime meter later).
 	for gpu, s := range f.GPUFloorRates {
 		d, err := ParseDec(s)
@@ -281,6 +302,53 @@ func parseNonNegRate(modelID, field, s string) (Dec, error) {
 			modelID, field, s, moneyScale)
 	}
 	return d, nil
+}
+
+// validateDerivedRatesNonZero enforces the round-to-zero fail-closed guard on the
+// DERIVED rate path. For every TRUE derivation base (the same set derivedRates()
+// projects — isDerivationBase), it applies the global premium to the EXACT base rate
+// and rejects the load if any component is nonzero before quantization but rounds to
+// $0 at moneyScale. That premium would silently $0-bill every fine-tune of that base.
+//
+// The guard fires only on a NONZERO base component zeroed by the premium: a base whose
+// own component is exactly $0 (an intentional free component) yields a derived $0 that
+// is legitimate, and an identity/legit-multiplier/legit-markup premium that keeps the
+// rate nonzero passes. So the operator can configure a real free rate or any premium
+// that preserves an intended price; only "a nonzero base rate the premium silently
+// zeroes" is rejected — the lost-revenue misconfiguration.
+func validateDerivedRatesNonZero(pb *PriceBook) error {
+	for id := range pb.base {
+		if !isDerivationBase(id, pb.derivedFrom) {
+			continue // only true bases are derivation sources (one hop, E3)
+		}
+		base := pb.base[id]
+		derived, err := ApplyPolicy(base, pb.policyFn, pb.policyFactor, pb.policyMarkup)
+		if err != nil {
+			return err // unreachable: parsePremium validated the policy
+		}
+		for _, c := range []struct {
+			field    string
+			baseRate Dec
+			derived  Dec
+		}{
+			{"prompt", base.Prompt, derived.Prompt},
+			{"cached", base.Cached, derived.Cached},
+			{"completion", base.Completion, derived.Completion},
+		} {
+			// Only a NONZERO base component zeroed by the premium is a bug. The trigger
+			// is on the BASE being nonzero (the operator intended a nonzero rate), not on
+			// the pre-quantization derived value: a "0" factor drives derived to EXACTLY
+			// 0, which must still be rejected — it is the premium silently zeroing an
+			// intended-nonzero base, the same lost-revenue class as a sub-nano residue. A
+			// base component that is itself $0 (intentional free) yields a legitimate
+			// derived $0 and is NOT caught (baseRate.Sign() == 0).
+			if c.baseRate.Sign() > 0 && c.derived.Round(moneyScale).IsZero() {
+				return fmt.Errorf("rating: fine-tune premium (policy %s) drives base model %q %s rate %s to a derived rate that rounds to $0 at %d-decimal (nano-USD) precision — every fine-tune of this base would bill FREE; fix the premium (factor/markup) so the derived rate is >= 0.000000001",
+					pb.policyFn, id, c.field, c.baseRate.String(), moneyScale)
+			}
+		}
+	}
+	return nil
 }
 
 // parsePremium parses+validates the global premium policy. Exactly the parameter
@@ -408,19 +476,24 @@ type derivedRate struct {
 // to price it at base x premium WITHOUT the file ever naming the fine-tune's checkpoint
 // id. Pointer-not-copy (E3): change a base price and every derived rate moves with it.
 //
-// Only true base models are projected (a base that is ITSELF a derived fine-tune is
-// not a valid derivation target — the loader already forbids multi-hop chains). A
-// fine-tune that carries its OWN rate in the file is NOT a derivation source here; it
-// is priced directly off resolvedRates by its own model_id.
+// ONE HOP ONLY (E3): a derivation base must be a TRUE base model. An entry is NOT a
+// valid derivation source — and is excluded here — if it is itself a fine-tune, in
+// either of the two forms it can take in pb.base:
+//   - an ft:-prefixed model_id (an own-rate fine-tune the file declared with its own
+//     rate, which lives in pb.base): a fine-tune deriving from it would be a second
+//     hop, which E3 forbids;
+//   - a model_id that is also a derivedFrom KEY (a fine-tune that declared a
+//     derived_from): the loader rejects multi-hop linkage, but this is the
+//     belt-and-braces exclusion at projection time.
+//
+// A fine-tune that carries its OWN rate is priced directly off resolvedRates by its own
+// model_id; it never appears here, so an ft: event can never derive from another
+// fine-tune's own rate.
 func (pb *PriceBook) derivedRates() []derivedRate {
 	out := make([]derivedRate, 0, len(pb.base))
 	for id := range pb.base {
-		// A fine-tune that declared its own rate lives in pb.base too; it is not a
-		// base another fine-tune derives from, so skip anything declared as a
-		// derivedFrom source-less own-rate fine-tune. In practice every pb.base entry
-		// that is NOT also a derivedFrom KEY is a legitimate derivation source.
-		if _, isDerived := pb.derivedFrom[id]; isDerived {
-			continue // an own-rate fine-tune: not a base others derive from
+		if !isDerivationBase(id, pb.derivedFrom) {
+			continue // a fine-tune (ft: own-rate or a derivedFrom key) is not a one-hop base
 		}
 		r, err := ApplyPolicy(pb.base[id], pb.policyFn, pb.policyFactor, pb.policyMarkup)
 		if err != nil {
@@ -432,6 +505,21 @@ func (pb *PriceBook) derivedRates() []derivedRate {
 	}
 	sort.Slice(out, func(i, j int) bool { return out[i].BaseModel < out[j].BaseModel })
 	return out
+}
+
+// isDerivationBase reports whether a pb.base entry is a TRUE base model that an ft:
+// event may derive from in ONE hop (E3). It is NOT — so a fine-tune can never derive
+// from it — when it is itself a fine-tune: an ft:-prefixed own-rate entry, or a
+// derivedFrom key. One definition, shared by derivedRates() (the SQL projection) and
+// ResolveEvent() (the Go oracle), so the two can never disagree on the one-hop rule.
+func isDerivationBase(modelID string, derivedFrom map[string]string) bool {
+	if strings.HasPrefix(modelID, fineTunePrefix) {
+		return false // an own-rate fine-tune: deriving from it is a second hop
+	}
+	if _, isDerived := derivedFrom[modelID]; isDerived {
+		return false // a file-declared derived fine-tune: also not a base
+	}
+	return true
 }
 
 // ResolveEvent resolves the effective per-token rate for an event, given its model_id
@@ -452,13 +540,13 @@ func (pb *PriceBook) ResolveEvent(modelID, baseModel string) (Rate3, error) {
 	if r, err := pb.Resolve(modelID); err == nil {
 		return r, nil
 	}
-	// 2: a fine-tune priced via its event-carried base_model.
+	// 2: a fine-tune priced via its event-carried base_model. ONE HOP ONLY (E3): the
+	// base_model must be a TRUE base model — never another fine-tune (an ft: own-rate
+	// entry or a file-declared derived id). isDerivationBase enforces the same rule the
+	// SQL projection (derivedRates) does, so the oracle and production agree on one-hop.
 	if strings.HasPrefix(modelID, fineTunePrefix) && baseModel != "" {
-		if base, ok := pb.base[baseModel]; ok {
-			// Don't derive from a base that is itself a derived fine-tune (one hop only).
-			if _, isDerived := pb.derivedFrom[baseModel]; !isDerived {
-				return ApplyPolicy(base, pb.policyFn, pb.policyFactor, pb.policyMarkup)
-			}
+		if base, ok := pb.base[baseModel]; ok && isDerivationBase(baseModel, pb.derivedFrom) {
+			return ApplyPolicy(base, pb.policyFn, pb.policyFactor, pb.policyMarkup)
 		}
 	}
 	// 3 & 4: fail loud (an ft: id with empty/unknown base lands here).
