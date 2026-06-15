@@ -468,17 +468,27 @@ func isEventStream(resp *http.Response) bool {
 	return strings.HasPrefix(ct, "text/event-stream")
 }
 
-// isClientAbort reports whether a ReverseProxy error is a client-side abort — a
-// disconnect (context.Canceled) or a request deadline (context.DeadlineExceeded)
-// — as opposed to an upstream/transport fault. errors.Is (never ==) because the
-// transport delivers these WRAPPED on the common mid-flight paths (a *url.Error
-// or *net.OpError around the sentinel), so an identity compare would misclassify
-// a real abort as an upstream error.
+// isClientAbort reports whether a ReverseProxy error is a client-side abort (the
+// client disconnected → context.Canceled) as opposed to an upstream/transport
+// fault. errors.Is (never ==) because the transport delivers the sentinel WRAPPED
+// on the common mid-flight paths (a *url.Error or *net.OpError around it), so an
+// identity compare would misclassify a real abort as an upstream error.
+//
+// DELIBERATELY context.Canceled ONLY — NOT context.DeadlineExceeded. In this
+// proxy's config a DeadlineExceeded is ALWAYS an upstream/transport fault, never
+// a client one: the request context carries no client deadline (the only
+// WithTimeout is the server's graceful-shutdown ctx), and DeadlineExceeded is
+// exactly what an upstream dial timeout (the transport's built-in 30s dial
+// Timeout) or a response-header timeout returns. Treating it as an abort would
+// SILENTLY downgrade an upstream outage to a debug "client disconnected" log,
+// drop the 502 the client should get, and emit a spurious zero-token Aborted
+// billing row attributing the outage to the tenant. (A prior change widened this
+// to include DeadlineExceeded; that was a regression — see TestIsClientAbort.)
 //
 // This is the SINGLE predicate that decides both ErrorHandler branches: an abort
 // is logged at debug + emits a zero-token attributable event (see handleProxy's
 // ErrorHandler), while a genuine upstream fault is logged at error + 502'd. The
 // two must agree on what "abort" means, hence one helper.
 func isClientAbort(err error) bool {
-	return errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded)
+	return errors.Is(err, context.Canceled)
 }
