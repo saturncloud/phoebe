@@ -127,6 +127,10 @@ def downgrade():
     # the schema DIVERGED from b1f0c2d3e4a5 (the column gone while its owning migration
     # is still applied), and would silently destroy fine-tune base linkage. base_model
     # is removed only by reversing b1f0c2d3e4a5 itself (drop_table billing_event).
-    op.execute("DROP INDEX billing_event_rating_instant_ix")
+    # IF EXISTS for symmetry with the idempotent upgrade (CREATE INDEX is raw SQL with
+    # no IF NOT EXISTS, but ADD COLUMN IF NOT EXISTS is — and a partially-applied or
+    # re-run downgrade must not error on an already-dropped index). Keeps up/down/up
+    # idempotent.
+    op.execute("DROP INDEX IF EXISTS billing_event_rating_instant_ix")
     op.drop_index("rated_usage_auth_id_window_start_ix", table_name="rated_usage")
     op.drop_table("rated_usage")

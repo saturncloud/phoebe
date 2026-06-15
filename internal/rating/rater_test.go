@@ -619,8 +619,12 @@ func TestRater_FineTuneAmbiguousBaseModelFailsLoud(t *testing.T) {
 		// SAME ft: model_id, TWO different base_models in the same window → ambiguous.
 		{AuthID: "a", ModelID: "ft:dupe", BaseModel: "cheap/base", PromptTokens: 1000, At: at},
 		{AuthID: "a", ModelID: "ft:dupe", BaseModel: "expensive/base", PromptTokens: 1000, At: at.Add(5 * time.Minute)},
-		// A clean, single-base ft: rollup that MUST still rate normally alongside it.
+		// THE LEGITIMATE CASE the gate must NOT trip: the same ft: id with the SAME base
+		// across MULTIPLE events is one clean rollup (COUNT(DISTINCT base_model)=1), and
+		// MUST still rate normally alongside the ambiguous one. Two events prove the gate
+		// keys on DISTINCT bases, not on event count.
 		{AuthID: "a", ModelID: "ft:clean", BaseModel: "cheap/base", PromptTokens: 1000, At: at},
+		{AuthID: "a", ModelID: "ft:clean", BaseModel: "cheap/base", PromptTokens: 1000, At: at.Add(7 * time.Minute)},
 	}
 	store := newOracleStore(book, events)
 	r := New(store, book, testLogger())
@@ -636,9 +640,10 @@ func TestRater_FineTuneAmbiguousBaseModelFailsLoud(t *testing.T) {
 	if !res.HasAmbiguousBase() || !res.HasAnomaly() {
 		t.Fatal("HasAmbiguousBase/HasAnomaly = false, want true (the uniqueness violation must drive exit-nonzero)")
 	}
-	// The clean ft: rollup still rated; the ambiguous one did not.
-	if res.EventsRated != 1 || res.RollupsWritten != 1 {
-		t.Fatalf("rated=%d rollups=%d, want 1/1 (only the single-base ft: rollup)", res.EventsRated, res.RollupsWritten)
+	// The clean ft: rollup (both same-base events) still rated as ONE rollup; the
+	// ambiguous one did not. 2 events rated into 1 rollup.
+	if res.EventsRated != 2 || res.RollupsWritten != 1 {
+		t.Fatalf("rated=%d rollups=%d, want 2/1 (the same-ft-same-base multi-event rollup must rate as one)", res.EventsRated, res.RollupsWritten)
 	}
 	for k := range store.table {
 		if k.modelID == "ft:dupe" {
@@ -656,8 +661,17 @@ func TestRater_FineTuneAmbiguousBaseModelFailsLoud(t *testing.T) {
 // every written rollup's cost EXACTLY equals its applied per-token rate × its token
 // counts (cost == applied_prompt_rate × billable + applied_cached_rate × cached +
 // applied_completion_rate × completion). Because the applied rate is the 9dp value
-// frozen on the row, the cost is fully reconstructable from the row alone — no hidden
-// second rate, no MIN() masking a divergent rate. Covers base AND derived rollups.
+// frozen on the row, the cost is fully reconstructable from the row ALONE — no hidden
+// second rate.
+//
+// SCOPE: the fixture has a base rollup and a DERIVED rollup, which carry DIFFERENT
+// applied rates, and asserts EACH reconstructs from its OWN frozen rate — so the
+// self-audit is exercised across heterogeneous rate kinds, not just one rate. It does
+// NOT exercise MIN() masking a divergent rate WITHIN a rollup: that can only arise when
+// one ft: id resolves through >1 base in a window, which the ambiguity gate excludes
+// from billing entirely — proven by TestRater_FineTuneAmbiguousBaseModelFailsLoud (and
+// its live-PG twin), where the ambiguous rollup is NOT written at all. So within any
+// WRITTEN rollup the rate is uniform by construction and MIN() has nothing to mask.
 func TestRater_RollupCostSelfAudits(t *testing.T) {
 	book := newTestBook(
 		map[string]Rate3{"base": rate3("0.000004", "0.0000004", "0.00001")},
