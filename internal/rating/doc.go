@@ -1,5 +1,5 @@
 // Package rating is phoebe's REVENUE path. It turns the raw token counts in
-// billing_event into money: per (auth_id, model_id, hour) cost rollups in
+// billing_event into money: per (auth_id, resource_id, model_id, hour) cost rollups in
 // rated_usage, priced from a YAML PRICE FILE (E1) — not a DB price table.
 //
 // THE PRICE FILE IS THE CONTRACT (E1). An operator authors a versioned YAML file

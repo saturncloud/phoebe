@@ -43,9 +43,9 @@ type Result struct {
 	// casts these as ::bigint to avoid a silent 32-bit overflow (see store.go).
 	EventsRated          int64
 	UnpricedEvents       int64  // events whose model had NO resolvable price (NOT $0-billed)
-	UnattributableEvents int64  // in-window rows with NULL auth_id/model_id (upstream leak)
+	UnattributableEvents int64  // in-window rows with NULL auth_id/resource_id/model_id (upstream leak)
 	AmbiguousBaseEvents  int64  // events under an ft: rollup spanning >1 base_model (E3 violation)
-	RollupsWritten       int64  // distinct (auth_id, model_id, hour) rows upserted
+	RollupsWritten       int64  // distinct (auth_id, resource_id, model_id, hour) rows upserted
 	ReconciledDeletions  int64  // stale in-window rollups DELETED because this re-run no longer produces them
 	TotalCost            string // sum of all rollup costs, NUMERIC as text
 }
@@ -55,7 +55,9 @@ type Result struct {
 func (r Result) HasUnpriced() bool { return r.UnpricedEvents > 0 }
 
 // HasUnattributable reports whether any in-window row was skipped for a NULL
-// auth_id/model_id — like HasUnpriced, a loud, exit-nonzero outcome.
+// auth_id/resource_id/model_id — like HasUnpriced, a loud, exit-nonzero outcome. A
+// NULL resource_id means the row can't name its deployment/org (E2), so it can't be
+// billed and is counted here rather than attributed to a NULL org.
 func (r Result) HasUnattributable() bool { return r.UnattributableEvents > 0 }
 
 // HasAmbiguousBase reports whether any ft: rollup spanned more than one base_model in a
@@ -79,7 +81,7 @@ func (r Result) HasAnomaly() bool {
 //
 // FAIL-LOUD ON MISSING PRICE / UNATTRIBUTABLE (the fail-closed rule): an event
 // whose model has no resolvable price at its time, and a row with a NULL
-// auth_id/model_id, are NOT summed into any rollup — the SQL excludes them. They
+// auth_id/resource_id/model_id, are NOT summed into any rollup — the SQL excludes them. They
 // are COUNTED by the SAME statement that writes the rollups (one snapshot, so a
 // row the drainer commits mid-run can never be excluded-but-uncounted), logged
 // loudly (ERROR), and drive cmd/rater's exit-nonzero path. They never become $0
@@ -131,7 +133,7 @@ func (r *Rater) Run(ctx context.Context, windowStart, windowEnd time.Time, windo
 			windowStart.Format(time.RFC3339), windowEnd.Format(time.RFC3339), res.AmbiguousBaseEvents)
 	}
 	if res.HasUnattributable() {
-		r.log.Error.Printf("rating: window [%s,%s) has %d UNATTRIBUTABLE billing_event rows (NULL auth_id/model_id) — these cannot be rated; the interceptor's billing gate should reject them before metering, so a nonzero count means revenue is leaking upstream",
+		r.log.Error.Printf("rating: window [%s,%s) has %d UNATTRIBUTABLE billing_event rows (NULL auth_id/resource_id/model_id — a NULL resource_id can't name the deployment/org for E2 billing) — these cannot be rated; the interceptor's billing gate should reject them before metering, so a nonzero count means revenue is leaking upstream",
 			windowStart.Format(time.RFC3339), windowEnd.Format(time.RFC3339), res.UnattributableEvents)
 	}
 	if res.HasUnpriced() {
@@ -162,7 +164,7 @@ func (r *Rater) Run(ctx context.Context, windowStart, windowEnd time.Time, windo
 	}
 
 	if res.HasAnomaly() {
-		r.log.Error.Printf("rating: window [%s,%s) rated %d events into %d rollups, total=%s USD; %d UNPRICED events dropped (backfill prices and re-rate), %d UNATTRIBUTABLE rows skipped (NULL auth_id/model_id — upstream billing-gate leak), %d AMBIGUOUS-BASE events dropped (ft: id spanning multiple base_models — fix base_model propagation and re-rate)",
+		r.log.Error.Printf("rating: window [%s,%s) rated %d events into %d rollups, total=%s USD; %d UNPRICED events dropped (backfill prices and re-rate), %d UNATTRIBUTABLE rows skipped (NULL auth_id/resource_id/model_id — upstream billing-gate leak), %d AMBIGUOUS-BASE events dropped (ft: id spanning multiple base_models — fix base_model propagation and re-rate)",
 			windowStart.Format(time.RFC3339), windowEnd.Format(time.RFC3339),
 			res.EventsRated, res.RollupsWritten, res.TotalCost, res.UnpricedEvents, res.UnattributableEvents, res.AmbiguousBaseEvents)
 	} else {

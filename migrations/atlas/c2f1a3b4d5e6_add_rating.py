@@ -21,10 +21,14 @@ Rating (E1) is the REVENUE path. Money correctness is the entire product:
     micro/nano scalar. The rater projects the YAML prices into a transient TEMP
     table and computes AND sums per-event cost in one SQL statement; Go never holds
     a money total. The fine-tune premium is applied in exact decimal at projection.
-  * rated_usage is the per-(auth_id, model_id, hour) rollup, idempotently upserted on
-    the natural key. It carries the APPLIED per-token rates (applied_prompt_rate /
-    applied_cached_rate / applied_completion_rate) so the row is self-auditing and
-    immutable: "we never reprice traffic you've already served" holds by construction.
+  * rated_usage is the per-(auth_id, resource_id, model_id, hour) rollup, idempotently
+    upserted on the natural key. It carries the APPLIED per-token rates
+    (applied_prompt_rate / applied_cached_rate / applied_completion_rate) so the row is
+    self-auditing and immutable: "we never reprice traffic you've already served" holds
+    by construction. resource_id (the deployment id) is part of the grain for E2
+    customer attribution — billing resolves the org via resource_id→org_id. It is
+    NON-NULL here though NULLABLE on billing_event: the rater fails closed, excluding a
+    NULL-resource_id event from the rollup and counting it as unattributable.
 
 CLEAN REWRITE (no prod data): an earlier draft of this revision created model_price
 + derivation_policy. E1 moved prices to a YAML file, so those tables are gone and
@@ -49,11 +53,16 @@ MONEY = sa.Numeric(precision=20, scale=9)
 
 
 def upgrade():
-    # --- rated_usage: the per-(auth_id, model_id, hour) cost rollup ---
+    # --- rated_usage: the per-(auth_id, resource_id, model_id, hour) cost rollup ---
+    # resource_id (the deployment id) is part of the grain for E2 customer attribution
+    # (billing resolves the org via resource_id→org_id). NON-NULL here though NULLABLE
+    # on billing_event: the rater fails closed — a NULL-resource_id event is excluded
+    # from the rollup and counted as unattributable, never billed to a NULL org.
     op.create_table(
         "rated_usage",
         sa.Column("id", sa.Unicode(length=32), nullable=False),
         sa.Column("auth_id", sa.Unicode(length=64), nullable=False),
+        sa.Column("resource_id", sa.Unicode(length=64), nullable=False),
         sa.Column("model_id", sa.Unicode(length=255), nullable=False),
         sa.Column("window_start", sa.DateTime(timezone=True), nullable=False),
         sa.Column("window_end", sa.DateTime(timezone=True), nullable=False),
@@ -81,18 +90,31 @@ def upgrade():
             server_default=sa.func.now(),
         ),
         sa.PrimaryKeyConstraint("id", name=op.f("pk_rated_usage")),
-        # Idempotency key: one rollup row per (auth_id, model_id, hour).
+        # Idempotency key: one rollup row per (auth_id, resource_id, model_id, hour).
         sa.UniqueConstraint(
             "auth_id",
+            "resource_id",
             "model_id",
             "window_start",
-            name=op.f("rated_usage_auth_model_window_uq"),
+            name=op.f("rated_usage_auth_resource_model_window_uq"),
         ),
     )
     op.create_index(
         "rated_usage_auth_id_window_start_ix",
         "rated_usage",
         ["auth_id", "window_start"],
+        unique=False,
+    )
+
+    # E2 customer attribution reads rated_usage by DEPLOYMENT over a time window
+    # (resolve the org via resource_id→org_id, then sum that deployment's cost). A
+    # resource_id-leading index makes a per-deployment time-range query a tight slice
+    # rather than a scan over the auth-leading index where resource_id only trails.
+    # Mirrors migrations/0002_rating.sql.
+    op.create_index(
+        "rated_usage_resource_id_window_start_ix",
+        "rated_usage",
+        ["resource_id", "window_start"],
         unique=False,
     )
 
@@ -155,6 +177,11 @@ def downgrade():
     # implicit drop already took it, must not error.
     op.drop_index(
         "rated_usage_window_start_ix", table_name="rated_usage", if_exists=True
+    )
+    op.drop_index(
+        "rated_usage_resource_id_window_start_ix",
+        table_name="rated_usage",
+        if_exists=True,
     )
     op.drop_index(
         "rated_usage_auth_id_window_start_ix", table_name="rated_usage", if_exists=True

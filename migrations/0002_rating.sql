@@ -10,9 +10,12 @@
 -- each rated_usage row. See config/prices.example.yaml and internal/rating.
 --
 -- ONE table here:
---   rated_usage — the rollup. Per-(auth_id, model_id, hour) cost, idempotently
---                 upserted, carrying the applied per-token rates so the row is
---                 self-auditing and immutable ("we never reprice served traffic").
+--   rated_usage — the rollup. Per-(auth_id, resource_id, model_id, hour) cost,
+--                 idempotently upserted, carrying the applied per-token rates so the
+--                 row is self-auditing and immutable ("we never reprice served
+--                 traffic"). resource_id (the deployment id) is part of the grain for
+--                 E2 customer attribution: billing resolves the org via
+--                 resource_id→org_id.
 --
 -- MONEY UNIT (read before touching any number here):
 --   All money is stored as NUMERIC(20,9) — exact base-10 decimal, 9 fractional
@@ -31,16 +34,29 @@
 -- migrations/atlas/c2f1a3b4d5e6_add_rating.py and migrations/README.md. Keep the
 -- two in sync.
 
--- rated_usage: the per-(auth_id, model_id, hour) cost rollup.
+-- rated_usage: the per-(auth_id, resource_id, model_id, hour) cost rollup.
 --
 -- Grain is HOURLY (window_start truncated to the hour), matching Atlas's
--- hourly_usage_record. The natural key (auth_id, model_id, window_start) is UNIQUE
--- so re-rating a window UPSERTS the same rows instead of duplicating them — re-runs
--- are idempotent and never double-count.
+-- hourly_usage_record. The natural key (auth_id, resource_id, model_id, window_start)
+-- is UNIQUE so re-rating a window UPSERTS the same rows instead of duplicating them —
+-- re-runs are idempotent and never double-count.
+--
+-- resource_id IS PART OF THE GRAIN, NOT REDUNDANT WITH model_id (E2 customer
+-- attribution): billing identifies the customer org via resource_id→org_id. model_id
+-- stays because price resolution is per-MODEL — one deployment can serve multiple
+-- models/adapters at different rates, and collapsing them would sum traffic priced
+-- differently. Two deployments of the SAME model by the SAME auth in one hour are
+-- TWO rows (correct — they may bill to different orgs). resource_id is NON-NULL here
+-- though NULLABLE on billing_event: a row that can't name its deployment/org cannot
+-- be billed, so the rater EXCLUDES a NULL-resource_id event from this rollup and
+-- COUNTS it as unattributable (fail closed) — see internal/rating/store.go.
 CREATE TABLE rated_usage (
     id                      VARCHAR(32) NOT NULL,   -- surrogate; natural key is the unique constraint below
 
     auth_id                 VARCHAR(64) NOT NULL,
+    -- resource_id: the deployment id (E2 customer attribution). NON-NULL — the rater
+    -- never writes a row it can't attribute to a deployment/org.
+    resource_id             VARCHAR(64) NOT NULL,
     model_id                VARCHAR(255) NOT NULL,
 
     -- [window_start, window_end) is the hour this rollup covers.
@@ -79,14 +95,21 @@ CREATE TABLE rated_usage (
     rated_at                TIMESTAMPTZ NOT NULL DEFAULT now(),
 
     CONSTRAINT pk_rated_usage PRIMARY KEY (id),
-    -- Idempotency key: one rollup row per (auth_id, model_id, hour).
-    CONSTRAINT rated_usage_auth_model_window_uq
-        UNIQUE (auth_id, model_id, window_start)
+    -- Idempotency key: one rollup row per (auth_id, resource_id, model_id, hour).
+    CONSTRAINT rated_usage_auth_resource_model_window_uq
+        UNIQUE (auth_id, resource_id, model_id, window_start)
 );
 
 -- Per-API-key billing queries scan by auth_id over a time window.
 CREATE INDEX rated_usage_auth_id_window_start_ix
     ON rated_usage (auth_id, window_start);
+
+-- E2 customer attribution reads rated_usage by DEPLOYMENT over a time window (resolve
+-- the org via resource_id→org_id, then sum that deployment's cost). resource_id leads
+-- so a per-deployment time-range query is a tight index slice rather than a scan over
+-- an auth-leading index where resource_id is only a trailing column.
+CREATE INDEX rated_usage_resource_id_window_start_ix
+    ON rated_usage (resource_id, window_start);
 
 -- The reconcile DELETE (re-rate convergence, the `deleted` CTE in
 -- internal/rating/store.go) filters rated_usage on window_start ALONE

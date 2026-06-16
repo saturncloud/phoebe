@@ -34,6 +34,9 @@ const schemaDDL = `
 CREATE TABLE billing_event (
     request_id        VARCHAR(255) PRIMARY KEY,
     auth_id           VARCHAR(64),
+    -- resource_id (the deployment id) is NULLABLE here, mirroring migration 0001: the
+    -- rater fails closed on a NULL (counts it unattributable), it does not reject it.
+    resource_id       VARCHAR(64),
     model             VARCHAR(255),
     base_model        VARCHAR(255),
     prompt_tokens     INTEGER NOT NULL DEFAULT 0,
@@ -49,6 +52,7 @@ CREATE INDEX billing_event_rating_instant_ix
 CREATE TABLE rated_usage (
     id                      VARCHAR(32) PRIMARY KEY,
     auth_id                 VARCHAR(64) NOT NULL,
+    resource_id             VARCHAR(64) NOT NULL,
     model_id                VARCHAR(255) NOT NULL,
     window_start            TIMESTAMPTZ NOT NULL,
     window_end              TIMESTAMPTZ NOT NULL,
@@ -62,13 +66,15 @@ CREATE TABLE rated_usage (
     applied_completion_rate NUMERIC(20,9) NOT NULL DEFAULT 0,
     event_count             BIGINT NOT NULL,
     rated_at                TIMESTAMPTZ NOT NULL DEFAULT now(),
-    CONSTRAINT rated_usage_auth_model_window_uq UNIQUE (auth_id, model_id, window_start)
+    CONSTRAINT rated_usage_auth_resource_model_window_uq UNIQUE (auth_id, resource_id, model_id, window_start)
 );
 
 -- Mirror the production indexes (migrations/0002_rating.sql): the auth-leading index
--- for billing queries, and the window_start-leading index the reconcile DELETE needs
--- (it filters window_start alone; every auth-leading index leaves it trailing).
+-- for billing queries, the resource_id-leading index for E2 per-deployment reads, and
+-- the window_start-leading index the reconcile DELETE needs (it filters window_start
+-- alone; every auth/resource-leading index leaves it trailing).
 CREATE INDEX rated_usage_auth_id_window_start_ix ON rated_usage (auth_id, window_start);
+CREATE INDEX rated_usage_resource_id_window_start_ix ON rated_usage (resource_id, window_start);
 CREATE INDEX rated_usage_window_start_ix ON rated_usage (window_start);`
 
 // conformanceBook is the fixture price book shared by the conformance tests: base
@@ -103,18 +109,19 @@ func TestIntegration_RateWindow_ConformsToOracle(t *testing.T) {
 	hour := mustTime("2026-06-08T10:00:00Z")
 	book := conformanceBook()
 
-	// Events: priced base, priced derived, unpriced, unattributable.
+	// Events: priced base, priced derived, unpriced, unattributable. Each priced/unpriced
+	// event carries a resource_id (E2 grain); the unattributable one has none.
 	events := []RatedEvent{
-		{AuthID: "a", ModelID: "b", PromptTokens: 100, CachedTokens: 30, CompletionTokens: 50, At: hour.Add(5 * time.Minute)},
-		{AuthID: "a", ModelID: "f", PromptTokens: 100, CachedTokens: 0, CompletionTokens: 0, At: hour.Add(15 * time.Minute)},
-		{AuthID: "a", ModelID: "unpriced", PromptTokens: 9, At: hour.Add(1 * time.Minute)},
-		{AuthID: "", ModelID: "b", PromptTokens: 9, At: hour.Add(2 * time.Minute)},
+		{AuthID: "a", ResourceID: "r", ModelID: "b", PromptTokens: 100, CachedTokens: 30, CompletionTokens: 50, At: hour.Add(5 * time.Minute)},
+		{AuthID: "a", ResourceID: "r", ModelID: "f", PromptTokens: 100, CachedTokens: 0, CompletionTokens: 0, At: hour.Add(15 * time.Minute)},
+		{AuthID: "a", ResourceID: "r", ModelID: "unpriced", PromptTokens: 9, At: hour.Add(1 * time.Minute)},
+		{AuthID: "", ResourceID: "r", ModelID: "b", PromptTokens: 9, At: hour.Add(2 * time.Minute)},
 	}
 	for i, e := range events {
 		_, err := db.ExecContext(ctx,
-			`INSERT INTO billing_event (request_id, auth_id, model, prompt_tokens, cached_tokens, completion_tokens, event_ts)
-			 VALUES ($1,$2,$3,$4,$5,$6,$7)`,
-			fmt.Sprintf("req-%d", i), nullableStr(e.AuthID), nullableStr(e.ModelID),
+			`INSERT INTO billing_event (request_id, auth_id, resource_id, model, prompt_tokens, cached_tokens, completion_tokens, event_ts)
+			 VALUES ($1,$2,$3,$4,$5,$6,$7,$8)`,
+			fmt.Sprintf("req-%d", i), nullableStr(e.AuthID), nullableStr(e.ResourceID), nullableStr(e.ModelID),
 			e.PromptTokens, e.CachedTokens, e.CompletionTokens, e.At)
 		if err != nil {
 			t.Fatalf("seed event %d: %v", i, err)
@@ -177,6 +184,18 @@ func TestIntegration_RateWindow_ConformsToOracle(t *testing.T) {
 		}
 	}
 
+	// E2 ATTRIBUTION: every written rollup carries the event's resource_id (the
+	// deployment id billing resolves the org from). The two priced rollups were seeded
+	// with resource_id 'r'.
+	var nWithResource, nTotal int
+	if err := db.QueryRowContext(ctx, `SELECT COUNT(*) FILTER (WHERE resource_id = 'r'), COUNT(*) FROM rated_usage`).
+		Scan(&nWithResource, &nTotal); err != nil {
+		t.Fatalf("read resource_id: %v", err)
+	}
+	if nWithResource != nTotal || nTotal != 2 {
+		t.Fatalf("rated_usage resource_id: %d of %d rows carry 'r', want all 2 (E2 attribution must be on every row)", nWithResource, nTotal)
+	}
+
 	// Deterministic surrogate ids: capture before the re-run.
 	idsBefore := readRatedUsageIDs(t, db)
 
@@ -200,10 +219,97 @@ func TestIntegration_RateWindow_ConformsToOracle(t *testing.T) {
 	}
 }
 
+// TestIntegration_ResourceIDGrainAndFailClosed runs the REAL SQL to pin the E2
+// resource_id grain in Postgres:
+//   - TWO deployments (distinct resource_id) of the SAME model by the SAME auth in the
+//     SAME hour produce TWO distinct rated_usage rows (NOT one summed row) — they may
+//     bill to different orgs, so collapsing them would mis-attribute revenue;
+//   - a NULL-resource_id event is UNATTRIBUTABLE: counted, never written (a row that
+//     can't name its deployment/org must never be billed). This is the live-Postgres
+//     proof of the fail-closed attribution partition.
+func TestIntegration_ResourceIDGrainAndFailClosed(t *testing.T) {
+	dsn := os.Getenv("PHOEBE_TEST_DATABASE_URL")
+	if dsn == "" {
+		t.Skip("PHOEBE_TEST_DATABASE_URL not set; skipping live-Postgres conformance")
+	}
+	ctx := context.Background()
+	db, err := sql.Open("pgx", dsn)
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	defer db.Close()
+
+	const sch = "phoebe_rating_resource_it"
+	exec(t, db, "DROP SCHEMA IF EXISTS "+sch+" CASCADE")
+	exec(t, db, "CREATE SCHEMA "+sch)
+	exec(t, db, "SET search_path TO "+sch)
+	defer func() { exec(t, db, "DROP SCHEMA IF EXISTS "+sch+" CASCADE") }()
+	exec(t, db, schemaDDL)
+
+	hour := mustTime("2026-06-08T10:00:00Z")
+	book := newTestBook(
+		map[string]Rate3{"b": rate3("0.000005", "0", "0")},
+		nil, PolicyIdentity, Dec{}, Dec{},
+	)
+
+	// Two deployments of model "b" by auth "a" in the same hour, plus a NULL-resource_id
+	// event that must fail closed.
+	if _, err := db.ExecContext(ctx,
+		`INSERT INTO billing_event (request_id, auth_id, resource_id, model, prompt_tokens, completion_tokens, event_ts)
+		 VALUES ('d1','a','deploy-1','b',100,0,$1),
+		        ('d2','a','deploy-2','b',100,0,$1),
+		        ('dnull','a',NULL,'b',100,0,$1)`, hour.Add(5*time.Minute)); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+
+	store := NewPostgresStore(db)
+	res, err := store.RateWindow(ctx, book, hour, hour.Add(time.Hour))
+	if err != nil {
+		t.Fatalf("RateWindow: %v", err)
+	}
+
+	// Two deployments → two rollups; the NULL-resource_id event is unattributable.
+	if res.RollupsWritten != 2 || res.EventsRated != 2 {
+		t.Fatalf("rollups/events = %d/%d, want 2/2 (distinct deployments bill separately)", res.RollupsWritten, res.EventsRated)
+	}
+	if res.UnattributableEvents != 1 {
+		t.Fatalf("unattributable = %d, want 1 (the NULL-resource_id event must be counted, never billed)", res.UnattributableEvents)
+	}
+	// PARTITION holds with resource_id in the mix.
+	if got := res.EventsRated + res.UnpricedEvents + res.UnattributableEvents + res.AmbiguousBaseEvents; got != 3 {
+		t.Fatalf("rated+unpriced+unattr+ambiguous = %d, want 3 (all seeded events)", got)
+	}
+
+	// Exactly two rows, one per deployment; NONE with a NULL/empty resource_id.
+	var nRows, nNull int
+	if err := db.QueryRowContext(ctx,
+		`SELECT COUNT(*), COUNT(*) FILTER (WHERE resource_id IS NULL OR resource_id = '') FROM rated_usage`).
+		Scan(&nRows, &nNull); err != nil {
+		t.Fatalf("count rows: %v", err)
+	}
+	if nRows != 2 {
+		t.Fatalf("rated_usage rows = %d, want 2 (one per deployment)", nRows)
+	}
+	if nNull != 0 {
+		t.Fatalf("rated_usage has %d NULL/empty-resource_id rows — a row that can't name its deployment/org must NEVER be written", nNull)
+	}
+	for _, rid := range []string{"deploy-1", "deploy-2"} {
+		var n int
+		if err := db.QueryRowContext(ctx,
+			`SELECT COUNT(*) FROM rated_usage WHERE auth_id='a' AND resource_id=$1 AND model_id='b' AND window_start=$2`,
+			rid, hour).Scan(&n); err != nil {
+			t.Fatalf("count %s: %v", rid, err)
+		}
+		if n != 1 {
+			t.Fatalf("deployment %s rollups = %d, want exactly 1", rid, n)
+		}
+	}
+}
+
 // readRatedUsageIDs returns natural-key → id for every rated_usage row.
 func readRatedUsageIDs(t *testing.T, db *sql.DB) map[string]string {
 	t.Helper()
-	rows, err := db.Query(`SELECT auth_id || '|' || model_id || '|' || extract(epoch FROM window_start)::bigint::text, id FROM rated_usage`)
+	rows, err := db.Query(`SELECT auth_id || '|' || resource_id || '|' || model_id || '|' || extract(epoch FROM window_start)::bigint::text, id FROM rated_usage`)
 	if err != nil {
 		t.Fatalf("read rated_usage ids: %v", err)
 	}
@@ -271,8 +377,8 @@ func TestConformance_PremiumQuantizedBeforeBilling(t *testing.T) {
 	}
 	for i, e := range events {
 		if _, err := db.ExecContext(ctx,
-			`INSERT INTO billing_event (request_id, auth_id, model, prompt_tokens, cached_tokens, completion_tokens, event_ts)
-			 VALUES ($1,$2,$3,$4,$5,$6,$7)`,
+			`INSERT INTO billing_event (request_id, auth_id, resource_id, model, prompt_tokens, cached_tokens, completion_tokens, event_ts)
+			 VALUES ($1,$2,'r',$3,$4,$5,$6,$7)`,
 			fmt.Sprintf("q-req-%d", i), e.AuthID, e.ModelID,
 			e.PromptTokens, e.CachedTokens, e.CompletionTokens, e.At); err != nil {
 			t.Fatalf("seed event %d: %v", i, err)
@@ -361,8 +467,8 @@ func TestConformance_OracleQuantizesBeforeMultiply_OnResidue(t *testing.T) {
 	}
 	for i, e := range events {
 		if _, err := db.ExecContext(ctx,
-			`INSERT INTO billing_event (request_id, auth_id, model, prompt_tokens, cached_tokens, completion_tokens, event_ts)
-			 VALUES ($1,$2,$3,$4,$5,$6,$7)`,
+			`INSERT INTO billing_event (request_id, auth_id, resource_id, model, prompt_tokens, cached_tokens, completion_tokens, event_ts)
+			 VALUES ($1,$2,'r',$3,$4,$5,$6,$7)`,
 			fmt.Sprintf("res-req-%d", i), e.AuthID, e.ModelID,
 			e.PromptTokens, e.CachedTokens, e.CompletionTokens, e.At); err != nil {
 			t.Fatalf("seed event %d: %v", i, err)
@@ -458,8 +564,8 @@ func TestIntegration_FineTunePricesViaBaseModel(t *testing.T) {
 	}
 	for _, s := range seeds {
 		if _, err := db.ExecContext(ctx,
-			`INSERT INTO billing_event (request_id, auth_id, model, base_model, prompt_tokens, completion_tokens, event_ts)
-			 VALUES ($1,'a',$2,$3,$4,0,$5)`,
+			`INSERT INTO billing_event (request_id, auth_id, resource_id, model, base_model, prompt_tokens, completion_tokens, event_ts)
+			 VALUES ($1,'a','r',$2,$3,$4,0,$5)`,
 			s.req, s.model, nullableStr(s.baseModel), s.prompt, hour.Add(5*time.Minute)); err != nil {
 			t.Fatalf("seed %s: %v", s.req, err)
 		}
@@ -553,8 +659,8 @@ func TestIntegration_FineTuneAmbiguousBaseModelFailsLoud(t *testing.T) {
 	}
 	for _, s := range seeds {
 		if _, err := db.ExecContext(ctx,
-			`INSERT INTO billing_event (request_id, auth_id, model, base_model, prompt_tokens, completion_tokens, event_ts)
-			 VALUES ($1,'a',$2,$3,$4,0,$5)`,
+			`INSERT INTO billing_event (request_id, auth_id, resource_id, model, base_model, prompt_tokens, completion_tokens, event_ts)
+			 VALUES ($1,'a','r',$2,$3,$4,0,$5)`,
 			s.req, s.model, nullableStr(s.baseModel), s.prompt, hour.Add(5*time.Minute)); err != nil {
 			t.Fatalf("seed %s: %v", s.req, err)
 		}
@@ -632,9 +738,9 @@ func TestIntegration_ReRateReconciles(t *testing.T) {
 	// Run A: a single-base ft: rollup (ft:dupe) PLUS a co-window survivor (ft:keep).
 	// Both clean → billed. ft:keep must survive run B's reconcile untouched.
 	if _, err := db.ExecContext(ctx,
-		`INSERT INTO billing_event (request_id, auth_id, model, base_model, prompt_tokens, completion_tokens, event_ts)
-		 VALUES ('rc-1','a','ft:dupe','cheap/base',1000,0,$1),
-		        ('rc-keep','a','ft:keep','cheap/base',1000,0,$1)`, hour.Add(5*time.Minute)); err != nil {
+		`INSERT INTO billing_event (request_id, auth_id, resource_id, model, base_model, prompt_tokens, completion_tokens, event_ts)
+		 VALUES ('rc-1','a','r','ft:dupe','cheap/base',1000,0,$1),
+		        ('rc-keep','a','r','ft:keep','cheap/base',1000,0,$1)`, hour.Add(5*time.Minute)); err != nil {
 		t.Fatalf("seed rc-1/rc-keep: %v", err)
 	}
 	resA, err := store.RateWindow(ctx, book, hour, hour.Add(time.Hour))
@@ -654,8 +760,8 @@ func TestIntegration_ReRateReconciles(t *testing.T) {
 
 	// Mutate: a SECOND base_model for the SAME ft: id → ambiguous.
 	if _, err := db.ExecContext(ctx,
-		`INSERT INTO billing_event (request_id, auth_id, model, base_model, prompt_tokens, completion_tokens, event_ts)
-		 VALUES ('rc-2','a','ft:dupe','expensive/base',1000,0,$1)`, hour.Add(10*time.Minute)); err != nil {
+		`INSERT INTO billing_event (request_id, auth_id, resource_id, model, base_model, prompt_tokens, completion_tokens, event_ts)
+		 VALUES ('rc-2','a','r','ft:dupe','expensive/base',1000,0,$1)`, hour.Add(10*time.Minute)); err != nil {
 		t.Fatalf("seed rc-2: %v", err)
 	}
 	resB, err := store.RateWindow(ctx, book, hour, hour.Add(time.Hour))
@@ -729,8 +835,8 @@ func TestIntegration_ReRateReconcileLeavesOtherWindowsUntouched(t *testing.T) {
 
 	// Seed a clean rollup in BOTH the 10:00 and 12:00 hours; rate each window.
 	if _, err := db.ExecContext(ctx,
-		`INSERT INTO billing_event (request_id, auth_id, model, prompt_tokens, completion_tokens, event_ts)
-		 VALUES ('w10','a','b',100,0,$1), ('w12','a','b',100,0,$2)`,
+		`INSERT INTO billing_event (request_id, auth_id, resource_id, model, prompt_tokens, completion_tokens, event_ts)
+		 VALUES ('w10','a','r','b',100,0,$1), ('w12','a','r','b',100,0,$2)`,
 		hour10.Add(5*time.Minute), hour12.Add(5*time.Minute)); err != nil {
 		t.Fatalf("seed windows: %v", err)
 	}
@@ -814,8 +920,8 @@ func TestIntegration_OneHopFineTuneCannotDeriveFromFineTune(t *testing.T) {
 	}
 	for _, s := range seeds {
 		if _, err := db.ExecContext(ctx,
-			`INSERT INTO billing_event (request_id, auth_id, model, base_model, prompt_tokens, completion_tokens, event_ts)
-			 VALUES ($1,'a',$2,$3,1000,0,$4)`,
+			`INSERT INTO billing_event (request_id, auth_id, resource_id, model, base_model, prompt_tokens, completion_tokens, event_ts)
+			 VALUES ($1,'a','r',$2,$3,1000,0,$4)`,
 			s.req, s.model, s.baseModel, hour.Add(5*time.Minute)); err != nil {
 			t.Fatalf("seed %s: %v", s.req, err)
 		}
@@ -870,8 +976,8 @@ func TestIntegration_UTCBucketing_SessionTZIndependent(t *testing.T) {
 		nil, PolicyIdentity, Dec{}, Dec{},
 	)
 	if _, err := db.ExecContext(ctx,
-		`INSERT INTO billing_event (request_id, auth_id, model, prompt_tokens, cached_tokens, completion_tokens, event_ts)
-		 VALUES ('tz-req-0','a','b',100,0,50,$1)`, hour.Add(30*time.Minute)); err != nil {
+		`INSERT INTO billing_event (request_id, auth_id, resource_id, model, prompt_tokens, cached_tokens, completion_tokens, event_ts)
+		 VALUES ('tz-req-0','a','r','b',100,0,50,$1)`, hour.Add(30*time.Minute)); err != nil {
 		t.Fatalf("seed event: %v", err)
 	}
 
@@ -991,12 +1097,13 @@ func TestIntegration_ReconcileDeleteCanUseWindowStartIndex(t *testing.T) {
 	// only prove the index CAN serve the predicate under seqscan-off, not that the
 	// planner prefers it at default cost, so a large population would back nothing.
 	exec(t, db, `INSERT INTO rated_usage
-		(id, auth_id, model_id, window_start, window_end,
+		(id, auth_id, resource_id, model_id, window_start, window_end,
 		 prompt_tokens, cached_tokens, completion_tokens, billable_prompt_tokens,
 		 cost, applied_prompt_rate, applied_cached_rate, applied_completion_rate, event_count)
 		SELECT
 		    md5(a::text || ':' || h::text),
 		    'auth' || a::text,
+		    'deploy' || a::text,
 		    'm',
 		    '2026-01-01T00:00:00Z'::timestamptz + (h || ' hours')::interval,
 		    '2026-01-01T01:00:00Z'::timestamptz + (h || ' hours')::interval,
@@ -1013,7 +1120,7 @@ func TestIntegration_ReconcileDeleteCanUseWindowStartIndex(t *testing.T) {
 	// must still go through the index rather than seqscanning the whole table.
 	const reconcileDelete = `EXPLAIN
 		WITH priced AS (
-		    SELECT auth_id, model_id, window_start FROM rated_usage WHERE false
+		    SELECT auth_id, resource_id, model_id, window_start FROM rated_usage WHERE false
 		)
 		DELETE FROM rated_usage ru
 		WHERE ru.window_start >= '2026-01-01T04:00:00Z'
@@ -1021,6 +1128,7 @@ func TestIntegration_ReconcileDeleteCanUseWindowStartIndex(t *testing.T) {
 		  AND NOT EXISTS (
 		      SELECT 1 FROM priced p
 		      WHERE p.auth_id      = ru.auth_id
+		        AND p.resource_id  = ru.resource_id
 		        AND p.model_id     = ru.model_id
 		        AND p.window_start = ru.window_start
 		  )`

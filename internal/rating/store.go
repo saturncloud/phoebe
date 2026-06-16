@@ -21,7 +21,7 @@ import (
 // store PROJECTS the book's already-premium-applied per-token rates into a
 // transient (TEMP) price table for the window, then rates the whole window in SQL —
 // resolves the effective rate, computes per-event cost, sums it per (auth_id,
-// model_id, hour) into rated_usage idempotently, AND counts the fail-loud anomalies,
+// resource_id, model_id, hour) into rated_usage idempotently, AND counts the fail-loud anomalies,
 // all in one snapshot so the rollups and the anomaly counts always agree on what
 // "priced" means.
 type Store interface {
@@ -197,9 +197,9 @@ CREATE TEMP TABLE rating_derived (
 // so rollup keys can never disagree across sessions and re-rates can't overlap.
 //
 // IDEMPOTENCY IS RECONCILE, NOT UPSERT-ONLY: a re-run of a window makes rated_usage
-// EXACTLY what the latest run says. ON CONFLICT (auth_id, model_id, window_start) DO
-// UPDATE replaces a surviving rollup's sums/cost/applied-rates with the freshly
-// recomputed ones (the surrogate id is DETERMINISTIC — md5 of the LENGTH-PREFIXED
+// EXACTLY what the latest run says. ON CONFLICT (auth_id, resource_id, model_id,
+// window_start) DO UPDATE replaces a surviving rollup's sums/cost/applied-rates with
+// the freshly recomputed ones (the surrogate id is DETERMINISTIC — md5 of the LENGTH-PREFIXED
 // natural key, injective, so no '|' in a field can collide two keys — so a re-run
 // regenerates the SAME id). AND the `deleted` CTE removes any in-window rated_usage
 // row this run did NOT reproduce in priced (it became ambiguous/unpriced, or its
@@ -218,6 +218,11 @@ const rateWindowSQL = `
 WITH ev AS (
     SELECT
         auth_id,
+        -- resource_id: the deployment id (E2 customer attribution — billing resolves
+        -- the org via resource_id→org_id). It is part of the rated_usage grain: a NULL
+        -- resource_id row CANNOT name its deployment/org, so it is unattributable
+        -- (counted, never billed to a NULL org) — see the unattributable filter below.
+        resource_id,
         -- billing_event stores the engine-reported model NAME in its model column;
         -- that name IS phoebe's stable price key, model_id. A NULL model is
         -- unattributable.
@@ -236,6 +241,7 @@ WITH ev AS (
 resolved AS (
     SELECT
         ev.auth_id,
+        ev.resource_id,
         ev.model_id,
         ev.base_model,
         ev.ev_ts,
@@ -271,7 +277,8 @@ resolved AS (
        -- fine-tune — never a literal 'ft:%' that could drift from the constant.
        AND ev.model_id LIKE $3
 ),
--- grouped: the per-(auth_id, model_id, hour) rollup BEFORE the ft-uniqueness gate.
+-- grouped: the per-(auth_id, resource_id, model_id, hour) rollup BEFORE the
+-- ft-uniqueness gate.
 -- It carries ambiguous_base = COUNT(DISTINCT base_model among DERIVED-priced rows) > 1.
 -- E3 mints ft:<checkpoint_artifact_id> as a globally-unique uuid4, so one ft: model_id
 -- can NEVER legitimately carry two different base_models. If it does, the derived rates
@@ -282,6 +289,7 @@ resolved AS (
 grouped AS (
     SELECT
         auth_id,
+        resource_id,
         model_id,
         -- Session-TZ-independent hour bucket; see the statement comment.
         date_trunc('hour', ev_ts AT TIME ZONE 'UTC') AT TIME ZONE 'UTC'                     AS window_start,
@@ -310,16 +318,20 @@ grouped AS (
         COUNT(DISTINCT base_model) FILTER (WHERE via_derived) > 1 AS ambiguous_base
     FROM resolved
     WHERE prompt_price IS NOT NULL          -- priced only
-      AND auth_id  IS NOT NULL              -- attributable only
-      AND model_id IS NOT NULL
-    GROUP BY auth_id, model_id, date_trunc('hour', ev_ts AT TIME ZONE 'UTC') AT TIME ZONE 'UTC'
+      AND auth_id     IS NOT NULL           -- attributable only
+      AND model_id    IS NOT NULL
+      -- resource_id is a NON-NULL key column AND the E2 customer-attribution key. A
+      -- NULL resource_id row can't name its deployment/org, so it is NEVER billed; it
+      -- is excluded here and COUNTED as unattributable below (fail closed).
+      AND resource_id IS NOT NULL
+    GROUP BY auth_id, resource_id, model_id, date_trunc('hour', ev_ts AT TIME ZONE 'UTC') AT TIME ZONE 'UTC'
 ),
 priced AS (
     SELECT * FROM grouped WHERE NOT ambiguous_base
 ),
 -- RECONCILE (re-rate deletes superseded rollups): a rated_usage row whose
--- (auth_id, model_id, window_start) falls IN this run's window but is NOT in the
--- current priced set is STALE — it billed CLEAN in a prior run, but the latest run
+-- (auth_id, resource_id, model_id, window_start) falls IN this run's window but is
+-- NOT in the current priced set is STALE — it billed CLEAN in a prior run, but the latest run
 -- now excludes it (it became ambiguous-base, or unpriced, or its events vanished).
 -- "What the latest run says is what bills," so it is DELETED, atomically with the
 -- upsert below, in the SAME snapshot. Without this, an upsert-only re-run leaves the
@@ -340,6 +352,7 @@ deleted AS (
       AND NOT EXISTS (
           SELECT 1 FROM priced p
           WHERE p.auth_id      = ru.auth_id
+            AND p.resource_id  = ru.resource_id
             AND p.model_id     = ru.model_id
             AND p.window_start = ru.window_start
       )
@@ -347,7 +360,7 @@ deleted AS (
 ),
 upserted AS (
     INSERT INTO rated_usage (
-        id, auth_id, model_id, window_start, window_end,
+        id, auth_id, resource_id, model_id, window_start, window_end,
         prompt_tokens, cached_tokens, completion_tokens, billable_prompt_tokens,
         cost, applied_prompt_rate, applied_cached_rate, applied_completion_rate,
         event_count
@@ -355,14 +368,17 @@ upserted AS (
     SELECT
         -- DETERMINISTIC 32-char hex surrogate: md5 of the natural key, so re-rating
         -- regenerates the SAME id. The fields are LENGTH-PREFIXED (len || ':' || value)
-        -- so the encoding is INJECTIVE — a '|' inside auth_id or model_id can never
-        -- shift the boundary and collide two different keys onto one id (e.g. auth 'a|b'
-        -- + model 'c' vs auth 'a' + model 'b|c'). epoch (a bounded integer, no
-        -- separator hazard) keeps the hash input session-TZ-independent.
+        -- so the encoding is INJECTIVE — a '|' inside auth_id, resource_id or model_id
+        -- can never shift the boundary and collide two different keys onto one id (e.g.
+        -- auth 'a|b' + resource 'c' vs auth 'a' + resource 'b|c'). The field ORDER is
+        -- FIXED and MUST equal the unique key (auth_id, resource_id, model_id,
+        -- window_start); epoch (a bounded integer, no separator hazard) keeps the hash
+        -- input session-TZ-independent.
         md5(length(auth_id)::text || ':' || auth_id
+          || '|' || length(resource_id)::text || ':' || resource_id
           || '|' || length(model_id)::text || ':' || model_id
           || '|' || extract(epoch FROM window_start)::bigint::text),
-        auth_id, model_id, window_start, window_end,
+        auth_id, resource_id, model_id, window_start, window_end,
         prompt_tokens, cached_tokens, completion_tokens, billable_prompt_tokens,
         cost, applied_prompt_rate, applied_cached_rate, applied_completion_rate,
         event_count
@@ -374,8 +390,8 @@ upserted AS (
     -- raters over overlapping windows (Atlas CronJob concurrencyPolicy: Forbid), so
     -- the cross-rater hazard is unreachable and no delete-lock-ordering machinery is
     -- added here. See cmd/rater's package doc for the single-flight contract.
-    ORDER BY auth_id, model_id, window_start
-    ON CONFLICT (auth_id, model_id, window_start) DO UPDATE SET
+    ORDER BY auth_id, resource_id, model_id, window_start
+    ON CONFLICT (auth_id, resource_id, model_id, window_start) DO UPDATE SET
         window_end              = EXCLUDED.window_end,
         prompt_tokens           = EXCLUDED.prompt_tokens,
         cached_tokens           = EXCLUDED.cached_tokens,
@@ -401,12 +417,16 @@ SELECT
     -- counted ONLY as unattributable (the more specific signal), never also as
     -- unpriced, so the counts partition the in-window rows:
     --   events_rated + unpriced + unattributable + ambiguous_base == total in-window events.
+    -- The unpriced count requires FULL attribution (auth_id, resource_id, model_id all
+    -- NON-NULL) for exactly this exclusivity: a NULL-resource_id row that is also
+    -- unpriced must be counted ONLY as unattributable, never double-counted here.
     (SELECT COUNT(*)::bigint FROM resolved
-      WHERE prompt_price IS NULL
-        AND auth_id  IS NOT NULL
-        AND model_id IS NOT NULL)                             AS unpriced_events,
+      WHERE prompt_price  IS NULL
+        AND auth_id     IS NOT NULL
+        AND resource_id IS NOT NULL
+        AND model_id    IS NOT NULL)                          AS unpriced_events,
     (SELECT COUNT(*)::bigint FROM ev
-      WHERE auth_id IS NULL OR model_id IS NULL)              AS unattributable_events,
+      WHERE auth_id IS NULL OR resource_id IS NULL OR model_id IS NULL) AS unattributable_events,
     -- AMBIGUOUS-BASE events: the EVENT count under ambiguous rollups (a single ft:
     -- model_id resolving through >1 distinct base_model in one window — the E3
     -- ft-uniqueness violation). These rollups are NOT upserted (excluded from priced),

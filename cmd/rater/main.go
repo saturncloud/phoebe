@@ -3,7 +3,7 @@
 // premium policy, and per-GPU floor rates — reads a window of raw metering rows from
 // billing_event, projects the prices into a transient TEMP table, and ENTIRELY IN
 // SQL computes per-event cost as exact NUMERIC, sums it, and upserts
-// per-(auth_id, model_id, hour) cost rollups into rated_usage (with the applied
+// per-(auth_id, resource_id, model_id, hour) cost rollups into rated_usage (with the applied
 // per-token rates frozen onto each row). No money math happens in Go — the rater
 // binary is orchestration only (the fine-tune premium is applied in exact decimal
 // when the prices are projected, then handed to SQL as NUMERIC).
@@ -66,8 +66,8 @@
 // last hour: events can be DRAINED LATE (a Valkey outage recovered from the WAL)
 // with an event_ts in an hour that was already rated, and a last-hour-only cron
 // would never revisit that hour — silent revenue loss. Re-rating closed hours is
-// safe BY CONSTRUCTION: the upsert REPLACES each (auth_id, model_id, hour) bucket
-// with a freshly recomputed total, so the late event is folded in and nothing
+// safe BY CONSTRUCTION: the upsert REPLACES each (auth_id, resource_id, model_id, hour)
+// bucket with a freshly recomputed total, so the late event is folded in and nothing
 // doubles. RESIDUAL RISK, stated honestly: an event arriving MORE than N hours
 // late still slips past the default window (the DESIGN.md reconciliation backstop
 // is the eventual answer; until then, widen rateTrailingHours or re-rate the hour
@@ -228,7 +228,7 @@ func run() int {
 // re-rates the last N closed hours so an event DRAINED LATE into an already-rated
 // hour (Valkey outage → WAL recovery) is picked up by a later run instead of being
 // lost forever. Re-rating a closed hour is safe by construction: the upsert
-// REPLACES each (auth_id, model_id, hour) bucket with a recomputed total, so
+// REPLACES each (auth_id, resource_id, model_id, hour) bucket with a recomputed total, so
 // re-runs reconcile and never double-count. An event arriving more than N hours
 // late still slips (residual risk; see the package doc — reconciliation is the
 // backstop). Either flag may be given explicitly (RFC3339) and WINS over the
