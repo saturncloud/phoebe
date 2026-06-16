@@ -292,7 +292,7 @@ func (h *harness) rateEventHour(t *testing.T, book *rating.PriceBook) rating.Res
 	hour := evTS.UTC().Truncate(time.Hour)
 
 	rater := rating.New(rating.NewPostgresStore(h.db), book, h.log)
-	res, err := rater.Run(context.Background(), hour, hour.Add(time.Hour))
+	res, err := rater.Run(context.Background(), hour, hour.Add(time.Hour), false)
 	if err != nil {
 		t.Fatalf("rater.Run: %v", err)
 	}

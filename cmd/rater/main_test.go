@@ -108,14 +108,17 @@ func TestResolveWindow_BadFormat(t *testing.T) {
 	}
 }
 
-// TestRater_RoutineRunReconcileDeleteExitsNonzero pins the loud half of the
-// reconcile-exit contract: a ROUTINE run (the default trailing-hours window —
+// TestRater_RoutineRunReconcileDeleteExitsNonzero pins the EXIT-CODE half of the
+// reconcile observability contract: a ROUTINE run (the default trailing-hours window —
 // windowExplicit == false) that DELETED a previously-billed rated_usage row
 // (ReconciledDeletions > 0) is a revenue change with no operator behind it, which
 // means data was lost / an upstream regression dropped events. It MUST exit nonzero
-// (exitAnomaly) so a CronJob pages — even with NO other anomaly. RED before FIX 1:
-// the old exit path keyed solely on HasAnomaly(), so a reconcile-delete with no
-// other anomaly returned exitOK and the page never fired.
+// (exitAnomaly) so a CronJob pages — even with NO other anomaly. This pins ONLY the
+// exit code (exitCode()'s gate); the matching LOG-severity half (routine → ERROR) is
+// pinned separately by TestRater_RoutineReconcileDeleteLogsError in internal/rating,
+// where the reconcile-delete log line is emitted. RED before FIX 1's exit-code change:
+// the old exit path keyed solely on HasAnomaly(), so a reconcile-delete with no other
+// anomaly returned exitOK and the page never fired.
 func TestRater_RoutineRunReconcileDeleteExitsNonzero(t *testing.T) {
 	const (
 		windowExplicit = false // routine default trailing-hours window

@@ -208,7 +208,7 @@ func run() int {
 	defer func() { _ = store.Close() }()
 
 	r := rating.New(store, book, log)
-	res, err := r.Run(ctx, windowStart, windowEnd)
+	res, err := r.Run(ctx, windowStart, windowEnd, windowExplicit)
 	if err != nil {
 		log.Error.Printf("rater: run: %v", err)
 		return exitFatal
