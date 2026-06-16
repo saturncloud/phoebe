@@ -93,7 +93,19 @@ func (r Result) HasAnomaly() bool {
 // re-run converges rated_usage to exactly the latest run's output — never
 // double-counts, and never leaves a superseded rollup billing at its stale cost. A
 // clean identical re-run is a no-op (same rows upserted, nothing deleted). See store.go.
-func (r *Rater) Run(ctx context.Context, windowStart, windowEnd time.Time) (Result, error) {
+//
+// windowExplicit threads the routine-vs-backfill distinction into the rating-side
+// observability so the LOG severity of a reconcile-delete matches the EXIT-code
+// contract (option (c), see cmd/rater). On a ROUTINE run (default trailing-hours
+// window, windowExplicit == false) a reconcile-delete rewrote a prior bill with no
+// operator behind it — data vanished from billing_event or an upstream regression
+// dropped events — so it is logged at ERROR (page). On an EXPLICIT backfill
+// (--since/--until, windowExplicit == true) the same delete is intended convergence,
+// logged at INFO. The reconcile SEMANTICS are identical either way; only the log
+// severity (and, in cmd/rater, the exit code) turns on windowExplicit. The flag is
+// passed in rather than recomputed here because only cmd/rater knows how the window
+// was chosen, mirroring the exit-code gate.
+func (r *Rater) Run(ctx context.Context, windowStart, windowEnd time.Time, windowExplicit bool) (Result, error) {
 	windowStart = windowStart.UTC()
 	windowEnd = windowEnd.UTC()
 	res := Result{WindowStart: windowStart, WindowEnd: windowEnd}
@@ -128,11 +140,25 @@ func (r *Rater) Run(ctx context.Context, windowStart, windowEnd time.Time) (Resu
 	}
 
 	// A re-rate that SUPERSEDES prior billing (deleted stale rollups) is significant —
-	// not an anomaly, but it changes a customer's bill, so surface it. 0 on a first run
-	// or a clean identical re-run.
+	// not a leaked-anomaly (it does not flip HasAnomaly), but it changes a customer's
+	// bill, so surface it. 0 on a first run or a clean identical re-run. The SEVERITY
+	// turns on windowExplicit (the routine-vs-backfill contract, option (c)):
+	//   - ROUTINE (default trailing-hours window, !windowExplicit): no operator chose
+	//     this window, so rewriting a prior bill is alarming — events vanished from
+	//     billing_event (data loss) or an upstream regression dropped them (e.g.
+	//     base_model stopped propagating → rollups went unpriced/ambiguous). ERROR:
+	//     page/investigate. This is the loud half that matches cmd/rater's exit 2.
+	//   - EXPLICIT backfill (--since/--until, windowExplicit): convergence is exactly
+	//     what the operator asked for (e.g. a late price fix) — INFO, not a page.
+	// The deletion count + window appear in both; only the level and the wording differ.
 	if res.ReconciledDeletions > 0 {
-		r.log.Info.Printf("rating: window [%s,%s) reconcile DELETED %d stale rollup(s) that prior runs billed but this run no longer produces (became ambiguous/unpriced, or their events vanished) — 'what the latest run says is what bills'",
-			windowStart.Format(time.RFC3339), windowEnd.Format(time.RFC3339), res.ReconciledDeletions)
+		if windowExplicit {
+			r.log.Info.Printf("rating: EXPLICIT backfill window [%s,%s) reconcile DELETED %d stale rollup(s) that prior runs billed but this run no longer produces (became ambiguous/unpriced, or their events vanished) — intended convergence, 'what the latest run says is what bills'",
+				windowStart.Format(time.RFC3339), windowEnd.Format(time.RFC3339), res.ReconciledDeletions)
+		} else {
+			r.log.Error.Printf("rating: ROUTINE window [%s,%s) reconcile DELETED %d previously-billed rollup(s) — a routine run REWROTE A PRIOR BILL with no operator behind it, meaning those events VANISHED from billing_event (data loss) or an upstream regression now drops them (e.g. base_model stopped propagating → rollups went unpriced/ambiguous). This is NOT a backfill; page/investigate (run with --since/--until only after confirming the deletion is intended)",
+				windowStart.Format(time.RFC3339), windowEnd.Format(time.RFC3339), res.ReconciledDeletions)
+		}
 	}
 
 	if res.HasAnomaly() {

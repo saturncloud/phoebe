@@ -1,7 +1,9 @@
 package rating
 
 import (
+	"bytes"
 	"context"
+	"strings"
 	"testing"
 	"time"
 
@@ -170,7 +172,7 @@ func TestRater_MultiEventAggregation(t *testing.T) {
 	store := newOracleStore(bookM(), events)
 	r := New(store, bookM(), testLogger())
 
-	res, err := r.Run(context.Background(), mustTime("2026-06-08T10:00:00Z"), mustTime("2026-06-08T11:00:00Z"))
+	res, err := r.Run(context.Background(), mustTime("2026-06-08T10:00:00Z"), mustTime("2026-06-08T11:00:00Z"), false)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -204,11 +206,11 @@ func TestRater_IdempotentRerunNoDoubling(t *testing.T) {
 	r := New(store, bookM(), testLogger())
 	ws, we := mustTime("2026-06-08T10:00:00Z"), mustTime("2026-06-08T11:00:00Z")
 
-	res1, err := r.Run(context.Background(), ws, we)
+	res1, err := r.Run(context.Background(), ws, we, false)
 	if err != nil {
 		t.Fatal(err)
 	}
-	res2, err := r.Run(context.Background(), ws, we)
+	res2, err := r.Run(context.Background(), ws, we, false)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -245,7 +247,7 @@ func TestRater_ReRateDeletesSupersededRollup(t *testing.T) {
 		{AuthID: "a", ModelID: "ft:dupe", BaseModel: "cheap/base", PromptTokens: 1000, At: at},
 	})
 	r := New(store, book, testLogger())
-	resA, err := r.Run(context.Background(), ws, we)
+	resA, err := r.Run(context.Background(), ws, we, false)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -261,7 +263,7 @@ func TestRater_ReRateDeletesSupersededRollup(t *testing.T) {
 	// window → ambiguous. Run B excludes it from priced.
 	store.events = append(store.events,
 		RatedEvent{AuthID: "a", ModelID: "ft:dupe", BaseModel: "expensive/base", PromptTokens: 1000, At: at.Add(5 * time.Minute)})
-	resB, err := r.Run(context.Background(), ws, we)
+	resB, err := r.Run(context.Background(), ws, we, false)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -301,7 +303,7 @@ func TestRater_ReRateSupersedesOneKeepsAnotherSameWindow(t *testing.T) {
 		{AuthID: "a", ModelID: "ft:gone", BaseModel: "cheap/base", PromptTokens: 1000, At: at},
 	})
 	r := New(store, book, testLogger())
-	if _, err := r.Run(context.Background(), ws, we); err != nil {
+	if _, err := r.Run(context.Background(), ws, we, false); err != nil {
 		t.Fatal(err)
 	}
 	if len(store.table) != 2 {
@@ -310,7 +312,7 @@ func TestRater_ReRateSupersedesOneKeepsAnotherSameWindow(t *testing.T) {
 	// Run B: ft:gone gains a second base (ambiguous → superseded); ft:keep unchanged.
 	store.events = append(store.events,
 		RatedEvent{AuthID: "a", ModelID: "ft:gone", BaseModel: "expensive/base", PromptTokens: 1000, At: at.Add(5 * time.Minute)})
-	resB, err := r.Run(context.Background(), ws, we)
+	resB, err := r.Run(context.Background(), ws, we, false)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -339,7 +341,7 @@ func TestRater_ReRateDeletesVanishedRollup(t *testing.T) {
 		{AuthID: "a", ModelID: "m", PromptTokens: 100, CompletionTokens: 50, At: at},
 	})
 	r := New(store, bookM(), testLogger())
-	if _, err := r.Run(context.Background(), ws, we); err != nil {
+	if _, err := r.Run(context.Background(), ws, we, false); err != nil {
 		t.Fatal(err)
 	}
 	if len(store.table) != 1 {
@@ -347,7 +349,7 @@ func TestRater_ReRateDeletesVanishedRollup(t *testing.T) {
 	}
 	// All events for the window vanish.
 	store.events = nil
-	resB, err := r.Run(context.Background(), ws, we)
+	resB, err := r.Run(context.Background(), ws, we, false)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -370,11 +372,11 @@ func TestRater_ReRateIdenticalDataIsNoOp(t *testing.T) {
 	})
 	r := New(store, bookM(), testLogger())
 
-	res1, err := r.Run(context.Background(), ws, we)
+	res1, err := r.Run(context.Background(), ws, we, false)
 	if err != nil {
 		t.Fatal(err)
 	}
-	res2, err := r.Run(context.Background(), ws, we)
+	res2, err := r.Run(context.Background(), ws, we, false)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -393,11 +395,11 @@ func TestRater_ReRateIdenticalDataIsNoOp(t *testing.T) {
 	otherHour := mustTime("2026-06-08T12:00:00Z")
 	store.events = append(store.events,
 		RatedEvent{AuthID: "a", ModelID: "m", PromptTokens: 5, At: otherHour.Add(5 * time.Minute)})
-	if _, err := r.Run(context.Background(), otherHour, otherHour.Add(time.Hour)); err != nil {
+	if _, err := r.Run(context.Background(), otherHour, otherHour.Add(time.Hour), false); err != nil {
 		t.Fatal(err)
 	}
 	// Now re-rate ONLY the first window again: the 12:00 rollup must survive untouched.
-	resFirst, err := r.Run(context.Background(), ws, we)
+	resFirst, err := r.Run(context.Background(), ws, we, false)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -410,6 +412,111 @@ func TestRater_ReRateIdenticalDataIsNoOp(t *testing.T) {
 	}
 }
 
+// captureLogger builds a Logger whose INFO and ERROR streams are redirected to the
+// returned buffers, so a test can assert WHICH severity a reconcile-delete fired at.
+// It starts at DEBUG so neither stream is discarded by the level filter — the test
+// is asserting the call site's chosen level, not the logger's threshold.
+func captureLogger() (*logging.Logger, *bytes.Buffer, *bytes.Buffer) {
+	log := logging.New(logging.DEBUG)
+	var infoBuf, errBuf bytes.Buffer
+	log.Info.SetOutput(&infoBuf)
+	log.Error.SetOutput(&errBuf)
+	return log, &infoBuf, &errBuf
+}
+
+// supersededReconcileStore returns an oracleStore whose first Run produces ONE clean
+// rollup and whose second Run (after the events vanish) reconcile-DELETES it with NO
+// other anomaly — the minimal reconcile-delete (HasAnomaly stays false), so a test can
+// attribute the resulting log line purely to the reconcile path, not the anomaly path.
+func supersededReconcileStore() (*oracleStore, time.Time, time.Time) {
+	at := mustTime("2026-06-08T10:15:00Z")
+	ws, we := mustTime("2026-06-08T10:00:00Z"), mustTime("2026-06-08T11:00:00Z")
+	store := newOracleStore(bookM(), []RatedEvent{
+		{AuthID: "a", ModelID: "m", PromptTokens: 100, CompletionTokens: 50, At: at},
+	})
+	return store, ws, we
+}
+
+// TestRater_RoutineReconcileDeleteLogsError pins the LOUD half of the reconcile
+// observability contract (option (c)): a ROUTINE run (windowExplicit == false) that
+// reconcile-DELETES a previously-billed rollup must emit an ERROR line (page someone),
+// even with NO other anomaly. RED before FIX 1: the old code logged the reconcile-delete
+// UNCONDITIONALLY at INFO (testLogger discards INFO), so the ERROR stream was empty and
+// this assertion failed — the page never fired on a routine bill rewrite.
+func TestRater_RoutineReconcileDeleteLogsError(t *testing.T) {
+	store, ws, we := supersededReconcileStore()
+	log, infoBuf, errBuf := captureLogger()
+	r := New(store, bookM(), log)
+
+	// Run A: one clean rollup, no reconcile-delete.
+	if _, err := r.Run(context.Background(), ws, we, false); err != nil {
+		t.Fatal(err)
+	}
+	infoBuf.Reset()
+	errBuf.Reset()
+
+	// Run B (routine): the events vanish → the rollup is reconcile-deleted with no anomaly.
+	store.events = nil
+	resB, err := r.Run(context.Background(), ws, we, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if resB.ReconciledDeletions != 1 {
+		t.Fatalf("setup: deletions=%d, want 1", resB.ReconciledDeletions)
+	}
+	if resB.HasAnomaly() {
+		t.Fatalf("setup: a clean reconcile-delete must NOT flip HasAnomaly (got %+v) — else the ERROR could come from the anomaly path, not the reconcile path", resB)
+	}
+	// THE INVARIANT: a routine reconcile-delete fires an ERROR (the page).
+	if errBuf.Len() == 0 {
+		t.Fatal("routine reconcile-delete emitted NO ERROR line — a prior bill was rewritten with no operator behind it (data loss / upstream regression); it MUST log at ERROR so a CronJob pages")
+	}
+	if !strings.Contains(errBuf.String(), "ROUTINE") || !strings.Contains(errBuf.String(), "reconcile") {
+		t.Fatalf("routine reconcile-delete ERROR line lacks the routine-rewrite wording: %q", errBuf.String())
+	}
+	// The deletion count and window must be present in the loud line.
+	if !strings.Contains(errBuf.String(), "[2026-06-08T10:00:00Z,2026-06-08T11:00:00Z)") {
+		t.Fatalf("ERROR line is missing the window: %q", errBuf.String())
+	}
+}
+
+// TestRater_BackfillReconcileDeleteLogsInfoNoError pins the QUIET half: an EXPLICIT
+// operator backfill (windowExplicit == true) that reconcile-deletes the SAME rollup is
+// intended convergence — it logs at INFO and emits NO ERROR (no page). The flag flips
+// ONLY the reconcile-delete severity; identical data, identical reconcile, opposite level.
+func TestRater_BackfillReconcileDeleteLogsInfoNoError(t *testing.T) {
+	store, ws, we := supersededReconcileStore()
+	log, infoBuf, errBuf := captureLogger()
+	r := New(store, bookM(), log)
+
+	// Run A (explicit backfill): one clean rollup.
+	if _, err := r.Run(context.Background(), ws, we, true); err != nil {
+		t.Fatal(err)
+	}
+	infoBuf.Reset()
+	errBuf.Reset()
+
+	// Run B (explicit backfill): the events vanish → reconcile-delete, but operator-chosen.
+	store.events = nil
+	resB, err := r.Run(context.Background(), ws, we, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if resB.ReconciledDeletions != 1 {
+		t.Fatalf("setup: deletions=%d, want 1", resB.ReconciledDeletions)
+	}
+	// THE INVARIANT: a backfill reconcile-delete is INFO, never ERROR.
+	if errBuf.Len() != 0 {
+		t.Fatalf("explicit backfill reconcile-delete emitted an ERROR line (it must be INFO — the operator asked for this convergence): %q", errBuf.String())
+	}
+	if !strings.Contains(infoBuf.String(), "reconcile DELETED") {
+		t.Fatalf("explicit backfill reconcile-delete did not log the convergence INFO line: %q", infoBuf.String())
+	}
+	if !strings.Contains(infoBuf.String(), "[2026-06-08T10:00:00Z,2026-06-08T11:00:00Z)") {
+		t.Fatalf("INFO line is missing the window: %q", infoBuf.String())
+	}
+}
+
 // TestRater_LateArrivalRatedByTrailingWindow: an event whose event_ts falls in hour
 // H but which is DRAINED only after H was rated is picked up by a later run whose
 // window still covers H — the trailing-window contract. The re-rate REPLACES H's
@@ -419,7 +526,7 @@ func TestRater_LateArrivalRatedByTrailingWindow(t *testing.T) {
 	store := newOracleStore(bookM(), nil)
 	r := New(store, bookM(), testLogger())
 
-	res1, err := r.Run(context.Background(), hourH, hourH.Add(time.Hour))
+	res1, err := r.Run(context.Background(), hourH, hourH.Add(time.Hour), false)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -431,7 +538,7 @@ func TestRater_LateArrivalRatedByTrailingWindow(t *testing.T) {
 		AuthID: "a", ModelID: "m", PromptTokens: 100, CompletionTokens: 50, At: hourH.Add(15 * time.Minute),
 	})
 
-	res2, err := r.Run(context.Background(), hourH.Add(-23*time.Hour), hourH.Add(2*time.Hour))
+	res2, err := r.Run(context.Background(), hourH.Add(-23*time.Hour), hourH.Add(2*time.Hour), false)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -455,7 +562,7 @@ func TestRater_MissingPriceFailsLoudNotZero(t *testing.T) {
 	}
 	store := newOracleStore(bookM(), events)
 	r := New(store, bookM(), testLogger())
-	res, err := r.Run(context.Background(), mustTime("2026-06-08T10:00:00Z"), mustTime("2026-06-08T11:00:00Z"))
+	res, err := r.Run(context.Background(), mustTime("2026-06-08T10:00:00Z"), mustTime("2026-06-08T11:00:00Z"), false)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -486,7 +593,7 @@ func TestRater_UnattributableCountedNotSilent(t *testing.T) {
 	}
 	store := newOracleStore(bookM(), events)
 	r := New(store, bookM(), testLogger())
-	res, err := r.Run(context.Background(), mustTime("2026-06-08T10:00:00Z"), mustTime("2026-06-08T11:00:00Z"))
+	res, err := r.Run(context.Background(), mustTime("2026-06-08T10:00:00Z"), mustTime("2026-06-08T11:00:00Z"), false)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -514,7 +621,7 @@ func TestRater_DerivedFineTuneRatedViaPolicy(t *testing.T) {
 	}
 	store := newOracleStore(book, events)
 	r := New(store, book, testLogger())
-	res, err := r.Run(context.Background(), mustTime("2026-06-08T10:00:00Z"), mustTime("2026-06-08T11:00:00Z"))
+	res, err := r.Run(context.Background(), mustTime("2026-06-08T10:00:00Z"), mustTime("2026-06-08T11:00:00Z"), false)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -544,7 +651,7 @@ func TestRater_FineTunePricesViaBaseModelOnEvent(t *testing.T) {
 	}}
 	store := newOracleStore(book, events)
 	r := New(store, book, testLogger())
-	res, err := r.Run(context.Background(), mustTime("2026-06-08T10:00:00Z"), mustTime("2026-06-08T11:00:00Z"))
+	res, err := r.Run(context.Background(), mustTime("2026-06-08T10:00:00Z"), mustTime("2026-06-08T11:00:00Z"), false)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -583,7 +690,7 @@ func TestRater_FineTuneWithoutBaseModelFailsLoud(t *testing.T) {
 	}}
 	store := newOracleStore(book, events)
 	r := New(store, book, testLogger())
-	res, err := r.Run(context.Background(), mustTime("2026-06-08T10:00:00Z"), mustTime("2026-06-08T11:00:00Z"))
+	res, err := r.Run(context.Background(), mustTime("2026-06-08T10:00:00Z"), mustTime("2026-06-08T11:00:00Z"), false)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -628,7 +735,7 @@ func TestRater_FineTuneAmbiguousBaseModelFailsLoud(t *testing.T) {
 	}
 	store := newOracleStore(book, events)
 	r := New(store, book, testLogger())
-	res, err := r.Run(context.Background(), mustTime("2026-06-08T10:00:00Z"), mustTime("2026-06-08T11:00:00Z"))
+	res, err := r.Run(context.Background(), mustTime("2026-06-08T10:00:00Z"), mustTime("2026-06-08T11:00:00Z"), false)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -686,7 +793,7 @@ func TestRater_RollupCostSelfAudits(t *testing.T) {
 	}
 	store := newOracleStore(book, events)
 	r := New(store, book, testLogger())
-	if _, err := r.Run(context.Background(), mustTime("2026-06-08T10:00:00Z"), mustTime("2026-06-08T11:00:00Z")); err != nil {
+	if _, err := r.Run(context.Background(), mustTime("2026-06-08T10:00:00Z"), mustTime("2026-06-08T11:00:00Z"), false); err != nil {
 		t.Fatal(err)
 	}
 	if len(store.table) == 0 {
@@ -719,7 +826,7 @@ func TestRater_AppliedRateStoredOnRow(t *testing.T) {
 	}
 	store := newOracleStore(book, events)
 	r := New(store, book, testLogger())
-	if _, err := r.Run(context.Background(), mustTime("2026-06-08T10:00:00Z"), mustTime("2026-06-08T11:00:00Z")); err != nil {
+	if _, err := r.Run(context.Background(), mustTime("2026-06-08T10:00:00Z"), mustTime("2026-06-08T11:00:00Z"), false); err != nil {
 		t.Fatal(err)
 	}
 	hour := mustTime("2026-06-08T10:00:00Z")
@@ -738,7 +845,7 @@ func TestRater_AppliedRateStoredOnRow(t *testing.T) {
 func TestRater_InvertedWindow(t *testing.T) {
 	store := newOracleStore(bookM(), nil)
 	r := New(store, bookM(), testLogger())
-	if _, err := r.Run(context.Background(), mustTime("2026-06-08T11:00:00Z"), mustTime("2026-06-08T10:00:00Z")); err == nil {
+	if _, err := r.Run(context.Background(), mustTime("2026-06-08T11:00:00Z"), mustTime("2026-06-08T10:00:00Z"), false); err == nil {
 		t.Fatal("expected error for inverted window")
 	}
 }
@@ -768,7 +875,7 @@ func TestOracleModel_SelfConsistent(t *testing.T) {
 	}
 	store := newOracleStore(book, events)
 	r := New(store, book, testLogger())
-	res, err := r.Run(context.Background(), hour, hour.Add(time.Hour))
+	res, err := r.Run(context.Background(), hour, hour.Add(time.Hour), false)
 	if err != nil {
 		t.Fatal(err)
 	}
