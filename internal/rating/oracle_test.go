@@ -32,9 +32,12 @@ import (
 type RatedEvent struct {
 	AuthID string
 	// ResourceID is the deployment id (E2 customer attribution — billing resolves the
-	// org via resource_id→org_id). Part of the rollup grain. Empty → unattributable
-	// (the row can't name its deployment/org), mirroring the SQL's resource_id-IS-NULL
-	// handling: counted, never billed.
+	// org via resource_id→org_id). Part of the rollup grain. Empty ("") MODELS A NULL
+	// resource_id column: the oracle has no separate NULL, so "" stands in for it and is
+	// counted unattributable (the row can't name its deployment/org), never billed. This
+	// mirrors the SQL's `resource_id IS NULL` handling exactly because production never
+	// lets a literal '' into the column — the drainer's nullStr writes ''→NULL and the
+	// proxy billing gate fails closed on empty ResourceID before metering.
 	ResourceID string
 	ModelID    string
 	// BaseModel is the HF base id a fine-tune derives from (E3), carried on the event

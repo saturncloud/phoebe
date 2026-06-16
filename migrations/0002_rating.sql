@@ -104,12 +104,14 @@ CREATE TABLE rated_usage (
 CREATE INDEX rated_usage_auth_id_window_start_ix
     ON rated_usage (auth_id, window_start);
 
--- E2 customer attribution reads rated_usage by DEPLOYMENT over a time window (resolve
--- the org via resource_id→org_id, then sum that deployment's cost). resource_id leads
--- so a per-deployment time-range query is a tight index slice rather than a scan over
--- an auth-leading index where resource_id is only a trailing column.
-CREATE INDEX rated_usage_resource_id_window_start_ix
-    ON rated_usage (resource_id, window_start);
+-- NOTE: rated_usage carries a resource_id column (part of the unique grain), but
+-- this migration deliberately ships NO standalone (resource_id, window_start) index.
+-- The only reader that would want it is the E2 per-deployment billing consumer
+-- (resolve the org via resource_id→org_id, sum that deployment's cost), which does
+-- not exist in this repo yet — it's the future Atlas/Stripe consumer. Adding the
+-- index now would pay write-amplification on EVERY rated_usage upsert for an absent
+-- reader; per "forward intent without speculative build" it lands in the PR that
+-- adds the E2 reader, alongside an EXPLAIN that proves it's used.
 
 -- The reconcile DELETE (re-rate convergence, the `deleted` CTE in
 -- internal/rating/store.go) filters rated_usage on window_start ALONE

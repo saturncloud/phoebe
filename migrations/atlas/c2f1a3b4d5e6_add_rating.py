@@ -106,17 +106,15 @@ def upgrade():
         unique=False,
     )
 
-    # E2 customer attribution reads rated_usage by DEPLOYMENT over a time window
-    # (resolve the org via resource_id→org_id, then sum that deployment's cost). A
-    # resource_id-leading index makes a per-deployment time-range query a tight slice
-    # rather than a scan over the auth-leading index where resource_id only trails.
-    # Mirrors migrations/0002_rating.sql.
-    op.create_index(
-        "rated_usage_resource_id_window_start_ix",
-        "rated_usage",
-        ["resource_id", "window_start"],
-        unique=False,
-    )
+    # NOTE: rated_usage carries a resource_id column (part of the unique grain), but
+    # this migration deliberately ships NO standalone (resource_id, window_start) index.
+    # The only reader that would want it is the E2 per-deployment billing consumer
+    # (resolve the org via resource_id→org_id, sum that deployment's cost), which does
+    # not exist in this repo yet — it's the future Atlas/Stripe consumer. Adding the
+    # index now would pay write-amplification on EVERY rated_usage upsert for an absent
+    # reader; per "forward intent without speculative build" it lands in the PR that
+    # adds the E2 reader, alongside an EXPLAIN that proves it's used. Mirrors
+    # migrations/0002_rating.sql.
 
     # The reconcile DELETE (re-rate convergence, the `deleted` CTE in
     # internal/rating/store.go) filters rated_usage on window_start ALONE
@@ -177,11 +175,6 @@ def downgrade():
     # implicit drop already took it, must not error.
     op.drop_index(
         "rated_usage_window_start_ix", table_name="rated_usage", if_exists=True
-    )
-    op.drop_index(
-        "rated_usage_resource_id_window_start_ix",
-        table_name="rated_usage",
-        if_exists=True,
     )
     op.drop_index(
         "rated_usage_auth_id_window_start_ix", table_name="rated_usage", if_exists=True

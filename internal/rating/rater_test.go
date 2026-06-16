@@ -65,6 +65,15 @@ func (s *oracleStore) resolveWindow(start, end time.Time) (map[rollupKey]oracleR
 		if e.At.Before(start) || !e.At.Before(end) {
 			continue
 		}
+		// EMPTY-STRING MODELS A NULL IDENTITY COLUMN. The Go oracle has no separate
+		// NULL, so "" stands in for a NULL auth_id/resource_id/model_id; production SQL
+		// instead filters `... IS NULL`. The two agree ONLY because of two production
+		// guarantees that ensure a literal '' never reaches billing_event: the drainer's
+		// nullStr maps ''→NULL on write (internal/drain/store.go) and the proxy billing
+		// gate fails closed on an empty ResourceID before metering. With '' impossible in
+		// the column, `== ""` here faithfully mirrors SQL's `IS NULL`, so the oracle's
+		// unattributable partition matches the rater's `resource_id IS NULL` count. Do not
+		// "fix" this to also test '' — '' is out of the modeled domain by construction.
 		if e.AuthID == "" || e.ResourceID == "" || e.ModelID == "" {
 			an.UnattributableEvents++
 			continue

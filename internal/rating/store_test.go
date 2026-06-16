@@ -115,7 +115,10 @@ func TestRateWindowSQL_Shape(t *testing.T) {
 		"WHERE prompt_price IS NOT NULL",
 		"AND auth_id     IS NOT NULL",
 		"AND model_id    IS NOT NULL",
-		"AND resource_id IS NOT NULL",
+		// Anchor the grouped filter's resource_id guard to its GROUP BY (which uniquely
+		// follows it), so this pins the priced/grouped clause specifically — not the bare
+		// substring, which would also match the unpriced-count guard below.
+		"AND resource_id IS NOT NULL\n    GROUP BY auth_id, resource_id, model_id",
 		// session-TZ-independent hour bucket
 		"date_trunc('hour', ev_ts AT TIME ZONE 'UTC') AT TIME ZONE 'UTC'",
 		// deterministic natural-key surrogate id (re-runs regenerate the same id),
@@ -141,10 +144,16 @@ func TestRateWindowSQL_Shape(t *testing.T) {
 		"p.resource_id  = ru.resource_id",
 		"AS reconciled_deletions",
 		// the anomaly counts ride the SAME statement (one snapshot) as the upsert; a NULL
-		// resource_id is counted UNATTRIBUTABLE (fail closed), never billed
+		// resource_id is counted UNATTRIBUTABLE (fail closed), never billed.
+		// PARTITION EXCLUSIVITY: the unpriced count must require FULL attribution
+		// (auth_id, resource_id, model_id all NON-NULL) so a NULL-resource_id unpriced row
+		// is counted ONLY as unattributable, never double-counted. Pin the whole
+		// contiguous WHERE so the resource_id guard is anchored to THIS count clause — a
+		// bare "AND resource_id IS NOT NULL" would also match the grouped/priced filter and
+		// wouldn't catch the guard being dropped from the unpriced count.
+		"WHERE prompt_price  IS NULL\n        AND auth_id     IS NOT NULL\n        AND resource_id IS NOT NULL\n        AND model_id    IS NOT NULL)",
 		"AS unpriced_events",
 		"OR resource_id IS NULL OR model_id IS NULL) AS unattributable_events",
-		"AND resource_id IS NOT NULL",
 		// the E3 ft-uniqueness gate: an ft: rollup spanning >1 base_model is split out
 		"COUNT(DISTINCT base_model) FILTER (WHERE via_derived) > 1 AS ambiguous_base",
 		"WHERE NOT ambiguous_base",

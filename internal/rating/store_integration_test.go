@@ -70,11 +70,11 @@ CREATE TABLE rated_usage (
 );
 
 -- Mirror the production indexes (migrations/0002_rating.sql): the auth-leading index
--- for billing queries, the resource_id-leading index for E2 per-deployment reads, and
--- the window_start-leading index the reconcile DELETE needs (it filters window_start
--- alone; every auth/resource-leading index leaves it trailing).
+-- for billing queries and the window_start-leading index the reconcile DELETE needs (it
+-- filters window_start alone; every auth-leading index leaves it trailing). No standalone
+-- (resource_id, window_start) index — production ships none until the E2 per-deployment
+-- reader exists (see the migration's NOTE), so the fixture omits it too.
 CREATE INDEX rated_usage_auth_id_window_start_ix ON rated_usage (auth_id, window_start);
-CREATE INDEX rated_usage_resource_id_window_start_ix ON rated_usage (resource_id, window_start);
 CREATE INDEX rated_usage_window_start_ix ON rated_usage (window_start);`
 
 // conformanceBook is the fixture price book shared by the conformance tests: base
