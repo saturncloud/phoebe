@@ -110,20 +110,27 @@ func TestRateWindowSQL_Shape(t *testing.T) {
 		"applied_prompt_rate",
 		"applied_cached_rate",
 		"applied_completion_rate",
-		// priced + attributable filter (never $0-bill unpriced/unattributable)
+		// priced + attributable filter (never $0-bill unpriced/unattributable). A NULL
+		// resource_id can't name the deployment/org (E2) → excluded + counted, never billed.
 		"WHERE prompt_price IS NOT NULL",
-		"AND auth_id  IS NOT NULL",
-		"AND model_id IS NOT NULL",
+		"AND auth_id     IS NOT NULL",
+		"AND model_id    IS NOT NULL",
+		// Anchor the grouped filter's resource_id guard to its GROUP BY (which uniquely
+		// follows it), so this pins the priced/grouped clause specifically — not the bare
+		// substring, which would also match the unpriced-count guard below.
+		"AND resource_id IS NOT NULL\n    GROUP BY auth_id, resource_id, model_id",
 		// session-TZ-independent hour bucket
 		"date_trunc('hour', ev_ts AT TIME ZONE 'UTC') AT TIME ZONE 'UTC'",
 		// deterministic natural-key surrogate id (re-runs regenerate the same id),
-		// LENGTH-PREFIXED so a '|' in a field can never collide two keys
+		// LENGTH-PREFIXED so a '|' in a field can never collide two keys; resource_id is
+		// part of the key, in fixed order (auth_id, resource_id, model_id, window_start)
 		"md5(length(auth_id)::text || ':' || auth_id",
+		"|| '|' || length(resource_id)::text || ':' || resource_id",
 		"|| '|' || length(model_id)::text || ':' || model_id",
 		// deterministic lock order across concurrent raters (no ABBA deadlock)
-		"ORDER BY auth_id, model_id, window_start",
+		"ORDER BY auth_id, resource_id, model_id, window_start",
 		// idempotent upsert on the natural key
-		"ON CONFLICT (auth_id, model_id, window_start) DO UPDATE SET",
+		"ON CONFLICT (auth_id, resource_id, model_id, window_start) DO UPDATE SET",
 		// RE-RATE RECONCILES (FIX 2): the `deleted` CTE removes any in-window rollup this
 		// run did NOT reproduce in priced, atomically with the upsert — so a superseded
 		// rollup cannot keep billing at its stale cost. Window-scoped + NOT EXISTS priced.
@@ -132,10 +139,21 @@ func TestRateWindowSQL_Shape(t *testing.T) {
 		"ru.window_start <  $2",
 		"NOT EXISTS (",
 		"FROM priced p",
+		// the reconcile anti-join keys on the FULL grain incl. resource_id, so it matches
+		// the new unique constraint exactly (a deployment that fell out is reconciled)
+		"p.resource_id  = ru.resource_id",
 		"AS reconciled_deletions",
-		// the anomaly counts ride the SAME statement (one snapshot) as the upsert
+		// the anomaly counts ride the SAME statement (one snapshot) as the upsert; a NULL
+		// resource_id is counted UNATTRIBUTABLE (fail closed), never billed.
+		// PARTITION EXCLUSIVITY: the unpriced count must require FULL attribution
+		// (auth_id, resource_id, model_id all NON-NULL) so a NULL-resource_id unpriced row
+		// is counted ONLY as unattributable, never double-counted. Pin the whole
+		// contiguous WHERE so the resource_id guard is anchored to THIS count clause — a
+		// bare "AND resource_id IS NOT NULL" would also match the grouped/priced filter and
+		// wouldn't catch the guard being dropped from the unpriced count.
+		"WHERE prompt_price  IS NULL\n        AND auth_id     IS NOT NULL\n        AND resource_id IS NOT NULL\n        AND model_id    IS NOT NULL)",
 		"AS unpriced_events",
-		"AS unattributable_events",
+		"OR resource_id IS NULL OR model_id IS NULL) AS unattributable_events",
 		// the E3 ft-uniqueness gate: an ft: rollup spanning >1 base_model is split out
 		"COUNT(DISTINCT base_model) FILTER (WHERE via_derived) > 1 AS ambiguous_base",
 		"WHERE NOT ambiguous_base",

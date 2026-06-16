@@ -469,7 +469,7 @@ func TestE2E_StreamedRequestBecomesMoney(t *testing.T) {
 
 	var (
 		nRollups                                     int
-		ruAuthID, ruModelID, cost                    string
+		ruAuthID, ruResourceID, ruModelID, cost      string
 		ruPrompt, ruCached, ruCompletion, ruBillable int64
 		eventCount                                   int64 // BIGINT column
 	)
@@ -480,13 +480,19 @@ func TestE2E_StreamedRequestBecomesMoney(t *testing.T) {
 		t.Fatalf("rated_usage rows = %d, want exactly 1", nRollups)
 	}
 	if err := h.db.QueryRow(
-		`SELECT auth_id, model_id, prompt_tokens, cached_tokens, completion_tokens, billable_prompt_tokens, cost::text, event_count
+		`SELECT auth_id, resource_id, model_id, prompt_tokens, cached_tokens, completion_tokens, billable_prompt_tokens, cost::text, event_count
 		 FROM rated_usage`).
-		Scan(&ruAuthID, &ruModelID, &ruPrompt, &ruCached, &ruCompletion, &ruBillable, &cost, &eventCount); err != nil {
+		Scan(&ruAuthID, &ruResourceID, &ruModelID, &ruPrompt, &ruCached, &ruCompletion, &ruBillable, &cost, &eventCount); err != nil {
 		t.Fatalf("read rated_usage: %v", err)
 	}
 	if ruAuthID != testAuthID {
 		t.Errorf("rated_usage.auth_id = %q, want %q (the X-Saturn-Auth-Id header value)", ruAuthID, testAuthID)
+	}
+	// E2 customer attribution: the rollup carries the deployment id the request routed
+	// to (X-Saturn-Resource-Id), end-to-end from the proxy through billing_event into
+	// the rated_usage grain — this is the key billing resolves the org from.
+	if ruResourceID != testResourceID {
+		t.Errorf("rated_usage.resource_id = %q, want %q (the X-Saturn-Resource-Id header value, for E2 org attribution)", ruResourceID, testResourceID)
 	}
 	// THE deployment-id-bug guard, at the far end of the pipe: the money is
 	// keyed on the engine name the upstream reported, not the id we routed on.

@@ -30,8 +30,16 @@ import (
 // decoupled from metering.Event so the pure money math has no dependency on the
 // capture/emit side and can be tested in isolation.
 type RatedEvent struct {
-	AuthID  string
-	ModelID string
+	AuthID string
+	// ResourceID is the deployment id (E2 customer attribution — billing resolves the
+	// org via resource_id→org_id). Part of the rollup grain. Empty ("") MODELS A NULL
+	// resource_id column: the oracle has no separate NULL, so "" stands in for it and is
+	// counted unattributable (the row can't name its deployment/org), never billed. This
+	// mirrors the SQL's `resource_id IS NULL` handling exactly because production never
+	// lets a literal '' into the column — the drainer's nullStr writes ''→NULL and the
+	// proxy billing gate fails closed on empty ResourceID before metering.
+	ResourceID string
+	ModelID    string
 	// BaseModel is the HF base id a fine-tune derives from (E3), carried on the event
 	// from billing_event.base_model. Empty for a base model. The oracle prices an ft:
 	// ModelID via base x premium keyed on BaseModel — mirroring the SQL.

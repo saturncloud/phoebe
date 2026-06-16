@@ -5,8 +5,12 @@ This directory holds the schema for phoebe's billing tables, which live in the
 
 - `billing_event` — the system-of-record table that phoebe's Postgres drainer
   (`cmd/drainer`) writes raw, pre-rating metering records into.
-- `rated_usage` — the **rating (E1)** (revenue) rollup: per-(auth_id, model_id,
-  hour) cost, carrying the applied per-token rates frozen onto each row. **Money is
+- `rated_usage` — the **rating (E1)** (revenue) rollup: per-(auth_id, resource_id,
+  model_id, hour) cost, carrying the applied per-token rates frozen onto each row.
+  `resource_id` (the deployment id) is part of the grain for **E2 customer
+  attribution** (billing resolves the org via `resource_id`→`org_id`); a
+  NULL-`resource_id` event fails closed (counted unattributable, never billed).
+  **Money is
   stored as `NUMERIC(20,9)` — exact decimal, never float and never an integer
   micro/nano scalar — and ALL money math happens in SQL, not Go.**
 

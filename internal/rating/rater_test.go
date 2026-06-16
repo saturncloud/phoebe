@@ -30,6 +30,7 @@ type oracleStore struct {
 
 type rollupKey struct {
 	authID      string
+	resourceID  string
 	modelID     string
 	windowStart time.Time
 }
@@ -64,7 +65,16 @@ func (s *oracleStore) resolveWindow(start, end time.Time) (map[rollupKey]oracleR
 		if e.At.Before(start) || !e.At.Before(end) {
 			continue
 		}
-		if e.AuthID == "" || e.ModelID == "" {
+		// EMPTY-STRING MODELS A NULL IDENTITY COLUMN. The Go oracle has no separate
+		// NULL, so "" stands in for a NULL auth_id/resource_id/model_id; production SQL
+		// instead filters `... IS NULL`. The two agree ONLY because of two production
+		// guarantees that ensure a literal '' never reaches billing_event: the drainer's
+		// nullStr maps ''→NULL on write (internal/drain/store.go) and the proxy billing
+		// gate fails closed on an empty ResourceID before metering. With '' impossible in
+		// the column, `== ""` here faithfully mirrors SQL's `IS NULL`, so the oracle's
+		// unattributable partition matches the rater's `resource_id IS NULL` count. Do not
+		// "fix" this to also test '' — '' is out of the modeled domain by construction.
+		if e.AuthID == "" || e.ResourceID == "" || e.ModelID == "" {
 			an.UnattributableEvents++
 			continue
 		}
@@ -80,7 +90,7 @@ func (s *oracleStore) resolveWindow(start, end time.Time) (map[rollupKey]oracleR
 		rate := resolved.Quantized()
 		cost := rateExact(e, rate)
 		hour := e.At.UTC().Truncate(time.Hour)
-		k := rollupKey{authID: e.AuthID, modelID: e.ModelID, windowStart: hour}
+		k := rollupKey{authID: e.AuthID, resourceID: e.ResourceID, modelID: e.ModelID, windowStart: hour}
 		ru := out[k]
 		ru.prompt += e.PromptTokens
 		ru.cached += e.CachedTokens
@@ -166,8 +176,8 @@ func testLogger() *logging.Logger { return logging.New(logging.ERROR) }
 func TestRater_MultiEventAggregation(t *testing.T) {
 	at := mustTime("2026-06-08T10:15:00Z")
 	events := []RatedEvent{
-		{AuthID: "a", ModelID: "m", PromptTokens: 100, CachedTokens: 30, CompletionTokens: 50, At: at},
-		{AuthID: "a", ModelID: "m", PromptTokens: 10, CachedTokens: 0, CompletionTokens: 5, At: at.Add(20 * time.Minute)},
+		{AuthID: "a", ResourceID: "r", ModelID: "m", PromptTokens: 100, CachedTokens: 30, CompletionTokens: 50, At: at},
+		{AuthID: "a", ResourceID: "r", ModelID: "m", PromptTokens: 10, CachedTokens: 0, CompletionTokens: 5, At: at.Add(20 * time.Minute)},
 	}
 	store := newOracleStore(bookM(), events)
 	r := New(store, bookM(), testLogger())
@@ -185,7 +195,7 @@ func TestRater_MultiEventAggregation(t *testing.T) {
 	if res.TotalCost != "0.000799000" {
 		t.Fatalf("total = %s, want 0.000799000", res.TotalCost)
 	}
-	k := rollupKey{authID: "a", modelID: "m", windowStart: mustTime("2026-06-08T10:00:00Z")}
+	k := rollupKey{authID: "a", resourceID: "r", modelID: "m", windowStart: mustTime("2026-06-08T10:00:00Z")}
 	ru := store.table[k]
 	if ru.prompt != 110 || ru.cached != 30 || ru.completion != 55 || ru.billable != 80 {
 		t.Fatalf("token sums = p%d c%d comp%d bill%d, want 110/30/55/80", ru.prompt, ru.cached, ru.completion, ru.billable)
@@ -200,7 +210,7 @@ func TestRater_MultiEventAggregation(t *testing.T) {
 func TestRater_IdempotentRerunNoDoubling(t *testing.T) {
 	at := mustTime("2026-06-08T10:15:00Z")
 	events := []RatedEvent{
-		{AuthID: "a", ModelID: "m", PromptTokens: 100, CachedTokens: 30, CompletionTokens: 50, At: at},
+		{AuthID: "a", ResourceID: "r", ModelID: "m", PromptTokens: 100, CachedTokens: 30, CompletionTokens: 50, At: at},
 	}
 	store := newOracleStore(bookM(), events)
 	r := New(store, bookM(), testLogger())
@@ -244,7 +254,7 @@ func TestRater_ReRateDeletesSupersededRollup(t *testing.T) {
 
 	// Run A: a single-base ft: rollup — CLEAN, bills.
 	store := newOracleStore(book, []RatedEvent{
-		{AuthID: "a", ModelID: "ft:dupe", BaseModel: "cheap/base", PromptTokens: 1000, At: at},
+		{AuthID: "a", ResourceID: "r", ModelID: "ft:dupe", BaseModel: "cheap/base", PromptTokens: 1000, At: at},
 	})
 	r := New(store, book, testLogger())
 	resA, err := r.Run(context.Background(), ws, we, false)
@@ -254,7 +264,7 @@ func TestRater_ReRateDeletesSupersededRollup(t *testing.T) {
 	if resA.RollupsWritten != 1 || resA.ReconciledDeletions != 0 {
 		t.Fatalf("run A: rollups=%d deletions=%d, want 1/0", resA.RollupsWritten, resA.ReconciledDeletions)
 	}
-	dupeKey := rollupKey{authID: "a", modelID: "ft:dupe", windowStart: ws}
+	dupeKey := rollupKey{authID: "a", resourceID: "r", modelID: "ft:dupe", windowStart: ws}
 	if _, ok := store.table[dupeKey]; !ok {
 		t.Fatal("run A: clean ft:dupe rollup must exist before re-rate")
 	}
@@ -262,7 +272,7 @@ func TestRater_ReRateDeletesSupersededRollup(t *testing.T) {
 	// Mutate data: a SECOND, distinct base_model arrives for the SAME ft: id in the same
 	// window → ambiguous. Run B excludes it from priced.
 	store.events = append(store.events,
-		RatedEvent{AuthID: "a", ModelID: "ft:dupe", BaseModel: "expensive/base", PromptTokens: 1000, At: at.Add(5 * time.Minute)})
+		RatedEvent{AuthID: "a", ResourceID: "r", ModelID: "ft:dupe", BaseModel: "expensive/base", PromptTokens: 1000, At: at.Add(5 * time.Minute)})
 	resB, err := r.Run(context.Background(), ws, we, false)
 	if err != nil {
 		t.Fatal(err)
@@ -299,8 +309,8 @@ func TestRater_ReRateSupersedesOneKeepsAnotherSameWindow(t *testing.T) {
 	ws, we := mustTime("2026-06-08T10:00:00Z"), mustTime("2026-06-08T11:00:00Z")
 	// Run A: TWO clean single-base ft: rollups (ft:keep and ft:gone).
 	store := newOracleStore(book, []RatedEvent{
-		{AuthID: "a", ModelID: "ft:keep", BaseModel: "cheap/base", PromptTokens: 1000, At: at},
-		{AuthID: "a", ModelID: "ft:gone", BaseModel: "cheap/base", PromptTokens: 1000, At: at},
+		{AuthID: "a", ResourceID: "r", ModelID: "ft:keep", BaseModel: "cheap/base", PromptTokens: 1000, At: at},
+		{AuthID: "a", ResourceID: "r", ModelID: "ft:gone", BaseModel: "cheap/base", PromptTokens: 1000, At: at},
 	})
 	r := New(store, book, testLogger())
 	if _, err := r.Run(context.Background(), ws, we, false); err != nil {
@@ -311,7 +321,7 @@ func TestRater_ReRateSupersedesOneKeepsAnotherSameWindow(t *testing.T) {
 	}
 	// Run B: ft:gone gains a second base (ambiguous → superseded); ft:keep unchanged.
 	store.events = append(store.events,
-		RatedEvent{AuthID: "a", ModelID: "ft:gone", BaseModel: "expensive/base", PromptTokens: 1000, At: at.Add(5 * time.Minute)})
+		RatedEvent{AuthID: "a", ResourceID: "r", ModelID: "ft:gone", BaseModel: "expensive/base", PromptTokens: 1000, At: at.Add(5 * time.Minute)})
 	resB, err := r.Run(context.Background(), ws, we, false)
 	if err != nil {
 		t.Fatal(err)
@@ -319,10 +329,10 @@ func TestRater_ReRateSupersedesOneKeepsAnotherSameWindow(t *testing.T) {
 	if resB.ReconciledDeletions != 1 {
 		t.Fatalf("run B: deletions = %d, want 1 (only ft:gone superseded)", resB.ReconciledDeletions)
 	}
-	if _, gone := store.table[rollupKey{authID: "a", modelID: "ft:gone", windowStart: ws}]; gone {
+	if _, gone := store.table[rollupKey{authID: "a", resourceID: "r", modelID: "ft:gone", windowStart: ws}]; gone {
 		t.Fatal("ft:gone rollup survived — it became ambiguous and must be deleted")
 	}
-	if _, keep := store.table[rollupKey{authID: "a", modelID: "ft:keep", windowStart: ws}]; !keep {
+	if _, keep := store.table[rollupKey{authID: "a", resourceID: "r", modelID: "ft:keep", windowStart: ws}]; !keep {
 		t.Fatal("ft:keep rollup was deleted — a surviving co-window rollup must be UPDATED, not clobbered")
 	}
 	if len(store.table) != 1 {
@@ -338,7 +348,7 @@ func TestRater_ReRateDeletesVanishedRollup(t *testing.T) {
 	at := mustTime("2026-06-08T10:15:00Z")
 	ws, we := mustTime("2026-06-08T10:00:00Z"), mustTime("2026-06-08T11:00:00Z")
 	store := newOracleStore(bookM(), []RatedEvent{
-		{AuthID: "a", ModelID: "m", PromptTokens: 100, CompletionTokens: 50, At: at},
+		{AuthID: "a", ResourceID: "r", ModelID: "m", PromptTokens: 100, CompletionTokens: 50, At: at},
 	})
 	r := New(store, bookM(), testLogger())
 	if _, err := r.Run(context.Background(), ws, we, false); err != nil {
@@ -367,8 +377,8 @@ func TestRater_ReRateIdenticalDataIsNoOp(t *testing.T) {
 	at := mustTime("2026-06-08T10:15:00Z")
 	ws, we := mustTime("2026-06-08T10:00:00Z"), mustTime("2026-06-08T11:00:00Z")
 	store := newOracleStore(bookM(), []RatedEvent{
-		{AuthID: "a", ModelID: "m", PromptTokens: 100, CachedTokens: 30, CompletionTokens: 50, At: at},
-		{AuthID: "b", ModelID: "m", PromptTokens: 200, At: at.Add(10 * time.Minute)},
+		{AuthID: "a", ResourceID: "r", ModelID: "m", PromptTokens: 100, CachedTokens: 30, CompletionTokens: 50, At: at},
+		{AuthID: "b", ResourceID: "r", ModelID: "m", PromptTokens: 200, At: at.Add(10 * time.Minute)},
 	})
 	r := New(store, bookM(), testLogger())
 
@@ -394,7 +404,7 @@ func TestRater_ReRateIdenticalDataIsNoOp(t *testing.T) {
 	// [ws,we): the reconcile's window predicate is half-open and hour-scoped.
 	otherHour := mustTime("2026-06-08T12:00:00Z")
 	store.events = append(store.events,
-		RatedEvent{AuthID: "a", ModelID: "m", PromptTokens: 5, At: otherHour.Add(5 * time.Minute)})
+		RatedEvent{AuthID: "a", ResourceID: "r", ModelID: "m", PromptTokens: 5, At: otherHour.Add(5 * time.Minute)})
 	if _, err := r.Run(context.Background(), otherHour, otherHour.Add(time.Hour), false); err != nil {
 		t.Fatal(err)
 	}
@@ -406,7 +416,7 @@ func TestRater_ReRateIdenticalDataIsNoOp(t *testing.T) {
 	if resFirst.ReconciledDeletions != 0 {
 		t.Fatalf("re-rate of [10:00,11:00) deleted %d rows, want 0 (must not touch the 12:00 rollup)", resFirst.ReconciledDeletions)
 	}
-	otherKey := rollupKey{authID: "a", modelID: "m", windowStart: otherHour}
+	otherKey := rollupKey{authID: "a", resourceID: "r", modelID: "m", windowStart: otherHour}
 	if _, ok := store.table[otherKey]; !ok {
 		t.Fatal("a re-rate of the first window deleted an out-of-window (12:00) rollup — the window predicate leaked")
 	}
@@ -432,7 +442,7 @@ func supersededReconcileStore() (*oracleStore, time.Time, time.Time) {
 	at := mustTime("2026-06-08T10:15:00Z")
 	ws, we := mustTime("2026-06-08T10:00:00Z"), mustTime("2026-06-08T11:00:00Z")
 	store := newOracleStore(bookM(), []RatedEvent{
-		{AuthID: "a", ModelID: "m", PromptTokens: 100, CompletionTokens: 50, At: at},
+		{AuthID: "a", ResourceID: "r", ModelID: "m", PromptTokens: 100, CompletionTokens: 50, At: at},
 	})
 	return store, ws, we
 }
@@ -538,7 +548,7 @@ func TestRater_LateArrivalRatedByTrailingWindow(t *testing.T) {
 	}
 
 	store.events = append(store.events, RatedEvent{
-		AuthID: "a", ModelID: "m", PromptTokens: 100, CompletionTokens: 50, At: hourH.Add(15 * time.Minute),
+		AuthID: "a", ResourceID: "r", ModelID: "m", PromptTokens: 100, CompletionTokens: 50, At: hourH.Add(15 * time.Minute),
 	})
 
 	res2, err := r.Run(context.Background(), hourH.Add(-23*time.Hour), hourH.Add(2*time.Hour), false)
@@ -548,7 +558,7 @@ func TestRater_LateArrivalRatedByTrailingWindow(t *testing.T) {
 	if res2.EventsRated != 1 || res2.RollupsWritten != 1 {
 		t.Fatalf("run2 rated=%d rollups=%d, want 1/1 (late event caught by trailing window)", res2.EventsRated, res2.RollupsWritten)
 	}
-	k := rollupKey{authID: "a", modelID: "m", windowStart: hourH}
+	k := rollupKey{authID: "a", resourceID: "r", modelID: "m", windowStart: hourH}
 	if _, ok := store.table[k]; !ok {
 		t.Fatal("no rollup for hour H — the late-drained event was lost")
 	}
@@ -560,8 +570,8 @@ func TestRater_LateArrivalRatedByTrailingWindow(t *testing.T) {
 func TestRater_MissingPriceFailsLoudNotZero(t *testing.T) {
 	at := mustTime("2026-06-08T10:15:00Z")
 	events := []RatedEvent{
-		{AuthID: "a", ModelID: "m", PromptTokens: 100, CompletionTokens: 50, At: at},        // priced
-		{AuthID: "a", ModelID: "unpriced", PromptTokens: 100, CompletionTokens: 50, At: at}, // NO price
+		{AuthID: "a", ResourceID: "r", ModelID: "m", PromptTokens: 100, CompletionTokens: 50, At: at},        // priced
+		{AuthID: "a", ResourceID: "r", ModelID: "unpriced", PromptTokens: 100, CompletionTokens: 50, At: at}, // NO price
 	}
 	store := newOracleStore(bookM(), events)
 	r := New(store, bookM(), testLogger())
@@ -585,14 +595,17 @@ func TestRater_MissingPriceFailsLoudNotZero(t *testing.T) {
 	}
 }
 
-// TestRater_UnattributableCountedNotSilent: rows with NULL auth_id and/or model_id
-// must NOT be rated, MUST be counted, and MUST trigger the loud anomaly / exit-2 path.
+// TestRater_UnattributableCountedNotSilent: rows with NULL auth_id, NULL resource_id,
+// and/or NULL model_id must NOT be rated, MUST be counted, and MUST trigger the loud
+// anomaly / exit-2 path. resource_id joins the key columns (E2): a row that can't name
+// its deployment/org is unattributable exactly like a NULL auth_id/model_id.
 func TestRater_UnattributableCountedNotSilent(t *testing.T) {
 	at := mustTime("2026-06-08T10:15:00Z")
 	events := []RatedEvent{
-		{AuthID: "a", ModelID: "m", PromptTokens: 100, CompletionTokens: 50, At: at}, // ok
-		{AuthID: "", ModelID: "m", PromptTokens: 100, CompletionTokens: 50, At: at},  // NULL auth_id
-		{AuthID: "a", ModelID: "", PromptTokens: 100, CompletionTokens: 50, At: at},  // NULL model_id
+		{AuthID: "a", ResourceID: "r", ModelID: "m", PromptTokens: 100, CompletionTokens: 50, At: at}, // ok
+		{AuthID: "", ResourceID: "r", ModelID: "m", PromptTokens: 100, CompletionTokens: 50, At: at},  // NULL auth_id
+		{AuthID: "a", ResourceID: "", ModelID: "m", PromptTokens: 100, CompletionTokens: 50, At: at},  // NULL resource_id
+		{AuthID: "a", ResourceID: "r", ModelID: "", PromptTokens: 100, CompletionTokens: 50, At: at},  // NULL model_id
 	}
 	store := newOracleStore(bookM(), events)
 	r := New(store, bookM(), testLogger())
@@ -600,14 +613,90 @@ func TestRater_UnattributableCountedNotSilent(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if res.UnattributableEvents != 2 {
-		t.Fatalf("unattributable = %d, want 2", res.UnattributableEvents)
+	if res.UnattributableEvents != 3 {
+		t.Fatalf("unattributable = %d, want 3 (NULL auth_id, NULL resource_id, NULL model_id)", res.UnattributableEvents)
 	}
 	if res.EventsRated != 1 || res.RollupsWritten != 1 || len(store.table) != 1 {
 		t.Fatalf("rated=%d rollups=%d table=%d, want 1/1/1", res.EventsRated, res.RollupsWritten, len(store.table))
 	}
 	if !res.HasUnattributable() || !res.HasAnomaly() {
 		t.Fatal("HasUnattributable/HasAnomaly = false, want true (drives exit 2)")
+	}
+}
+
+// TestRater_DistinctDeploymentsBillSeparately (E2 grain — the negative invariant):
+// TWO deployments (distinct resource_id) of the SAME model by the SAME auth in the
+// SAME hour produce TWO distinct rated_usage rows, NOT one summed row. resource_id is
+// part of the grain precisely because the two deployments may bill to different orgs
+// (resource_id→org_id), so collapsing them would mis-attribute revenue. The two rows
+// share (auth_id, model_id, window_start) and differ ONLY in resource_id.
+func TestRater_DistinctDeploymentsBillSeparately(t *testing.T) {
+	at := mustTime("2026-06-08T10:15:00Z")
+	ws := mustTime("2026-06-08T10:00:00Z")
+	events := []RatedEvent{
+		{AuthID: "a", ResourceID: "deploy-1", ModelID: "m", PromptTokens: 100, CompletionTokens: 50, At: at},
+		{AuthID: "a", ResourceID: "deploy-2", ModelID: "m", PromptTokens: 100, CompletionTokens: 50, At: at.Add(5 * time.Minute)},
+	}
+	store := newOracleStore(bookM(), events)
+	r := New(store, bookM(), testLogger())
+	res, err := r.Run(context.Background(), ws, mustTime("2026-06-08T11:00:00Z"), false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// TWO rollups, one per deployment — NOT one summed row.
+	if res.EventsRated != 2 || res.RollupsWritten != 2 || len(store.table) != 2 {
+		t.Fatalf("rated=%d rollups=%d table=%d, want 2/2/2 (distinct resource_id must NOT collapse into one row)",
+			res.EventsRated, res.RollupsWritten, len(store.table))
+	}
+	// Each deployment has its OWN row under the same (auth, model, hour).
+	for _, rid := range []string{"deploy-1", "deploy-2"} {
+		k := rollupKey{authID: "a", resourceID: rid, modelID: "m", windowStart: ws}
+		ru, ok := store.table[k]
+		if !ok {
+			t.Fatalf("no rollup for deployment %q — distinct deployments must each bill", rid)
+		}
+		if ru.eventCount != 1 {
+			t.Fatalf("deployment %q event_count = %d, want 1 (one event per deployment)", rid, ru.eventCount)
+		}
+	}
+}
+
+// TestRater_NullResourceIdIsUnattributable (fail-closed attribution): an event with a
+// NULL resource_id CANNOT name its deployment/org (E2 resolves the org via
+// resource_id→org_id), so it must be counted UNATTRIBUTABLE and EXCLUDED from billing —
+// never $0-billed, never billed to a NULL org. It pins the partition invariant with
+// resource_id in the mix: rated + unpriced + unattributable + ambiguous == total.
+func TestRater_NullResourceIdIsUnattributable(t *testing.T) {
+	at := mustTime("2026-06-08T10:15:00Z")
+	events := []RatedEvent{
+		{AuthID: "a", ResourceID: "r", ModelID: "m", PromptTokens: 100, CompletionTokens: 50, At: at}, // attributable
+		{AuthID: "a", ResourceID: "", ModelID: "m", PromptTokens: 100, CompletionTokens: 50, At: at},  // NULL resource_id → unattributable
+	}
+	store := newOracleStore(bookM(), events)
+	r := New(store, bookM(), testLogger())
+	res, err := r.Run(context.Background(), mustTime("2026-06-08T10:00:00Z"), mustTime("2026-06-08T11:00:00Z"), false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res.UnattributableEvents != 1 {
+		t.Fatalf("unattributable = %d, want 1 (the NULL-resource_id event must be counted, never billed)", res.UnattributableEvents)
+	}
+	if res.EventsRated != 1 || res.RollupsWritten != 1 || len(store.table) != 1 {
+		t.Fatalf("rated=%d rollups=%d table=%d, want 1/1/1 (no row for the unattributable event)", res.EventsRated, res.RollupsWritten, len(store.table))
+	}
+	// No rollup carries an empty resource_id — the fail-closed row is never written.
+	for k := range store.table {
+		if k.resourceID == "" {
+			t.Fatal("a rollup exists with an empty resource_id — a row that can't name its deployment/org must NEVER be billed")
+		}
+	}
+	if !res.HasUnattributable() || !res.HasAnomaly() {
+		t.Fatal("HasUnattributable/HasAnomaly = false, want true (NULL resource_id must drive exit-nonzero)")
+	}
+	// PARTITION with resource_id in the mix.
+	if got := res.EventsRated + res.UnpricedEvents + res.UnattributableEvents + res.AmbiguousBaseEvents; got != int64(len(events)) {
+		t.Fatalf("rated(%d)+unpriced(%d)+unattr(%d)+ambiguous(%d) = %d, want %d",
+			res.EventsRated, res.UnpricedEvents, res.UnattributableEvents, res.AmbiguousBaseEvents, got, len(events))
 	}
 }
 
@@ -620,7 +709,7 @@ func TestRater_DerivedFineTuneRatedViaPolicy(t *testing.T) {
 		PolicyMultiplier, MustDec("1.5"), Dec{},
 	)
 	events := []RatedEvent{
-		{AuthID: "a", ModelID: "ft", PromptTokens: 1000, At: mustTime("2026-06-08T10:15:00Z")},
+		{AuthID: "a", ResourceID: "r", ModelID: "ft", PromptTokens: 1000, At: mustTime("2026-06-08T10:15:00Z")},
 	}
 	store := newOracleStore(book, events)
 	r := New(store, book, testLogger())
@@ -646,7 +735,7 @@ func TestRater_FineTunePricesViaBaseModelOnEvent(t *testing.T) {
 		PolicyMultiplier, MustDec("1.5"), Dec{},
 	)
 	events := []RatedEvent{{
-		AuthID:       "a",
+		AuthID: "a", ResourceID: "r",
 		ModelID:      "ft:9f8e7d6c5b4a", // a checkpoint id the file does not list
 		BaseModel:    "meta-llama/Llama-3.1-8B-Instruct",
 		PromptTokens: 1000,
@@ -667,7 +756,7 @@ func TestRater_FineTunePricesViaBaseModelOnEvent(t *testing.T) {
 	}
 	// The applied rate frozen on the row is the derived (base × premium) rate.
 	hour := mustTime("2026-06-08T10:00:00Z")
-	row := store.table[rollupKey{"a", "ft:9f8e7d6c5b4a", hour}]
+	row := store.table[rollupKey{"a", "r", "ft:9f8e7d6c5b4a", hour}]
 	if row.appliedRate.Prompt.String() != "0.000006000" {
 		t.Fatalf("ft applied prompt rate = %s, want 0.000006000 (0.000004 × 1.5)", row.appliedRate.Prompt)
 	}
@@ -685,7 +774,7 @@ func TestRater_FineTuneWithoutBaseModelFailsLoud(t *testing.T) {
 		nil, PolicyMultiplier, MustDec("1.5"), Dec{},
 	)
 	events := []RatedEvent{{
-		AuthID:       "a",
+		AuthID: "a", ResourceID: "r",
 		ModelID:      "ft:9f8e7d6c5b4a",
 		BaseModel:    "", // THE BUG: base_model never propagated to the event
 		PromptTokens: 1000,
@@ -727,14 +816,14 @@ func TestRater_FineTuneAmbiguousBaseModelFailsLoud(t *testing.T) {
 	at := mustTime("2026-06-08T10:15:00Z")
 	events := []RatedEvent{
 		// SAME ft: model_id, TWO different base_models in the same window → ambiguous.
-		{AuthID: "a", ModelID: "ft:dupe", BaseModel: "cheap/base", PromptTokens: 1000, At: at},
-		{AuthID: "a", ModelID: "ft:dupe", BaseModel: "expensive/base", PromptTokens: 1000, At: at.Add(5 * time.Minute)},
+		{AuthID: "a", ResourceID: "r", ModelID: "ft:dupe", BaseModel: "cheap/base", PromptTokens: 1000, At: at},
+		{AuthID: "a", ResourceID: "r", ModelID: "ft:dupe", BaseModel: "expensive/base", PromptTokens: 1000, At: at.Add(5 * time.Minute)},
 		// THE LEGITIMATE CASE the gate must NOT trip: the same ft: id with the SAME base
 		// across MULTIPLE events is one clean rollup (COUNT(DISTINCT base_model)=1), and
 		// MUST still rate normally alongside the ambiguous one. Two events prove the gate
 		// keys on DISTINCT bases, not on event count.
-		{AuthID: "a", ModelID: "ft:clean", BaseModel: "cheap/base", PromptTokens: 1000, At: at},
-		{AuthID: "a", ModelID: "ft:clean", BaseModel: "cheap/base", PromptTokens: 1000, At: at.Add(7 * time.Minute)},
+		{AuthID: "a", ResourceID: "r", ModelID: "ft:clean", BaseModel: "cheap/base", PromptTokens: 1000, At: at},
+		{AuthID: "a", ResourceID: "r", ModelID: "ft:clean", BaseModel: "cheap/base", PromptTokens: 1000, At: at.Add(7 * time.Minute)},
 	}
 	store := newOracleStore(book, events)
 	r := New(store, book, testLogger())
@@ -790,9 +879,9 @@ func TestRater_RollupCostSelfAudits(t *testing.T) {
 	)
 	at := mustTime("2026-06-08T10:15:00Z")
 	events := []RatedEvent{
-		{AuthID: "a", ModelID: "base", PromptTokens: 100, CachedTokens: 30, CompletionTokens: 50, At: at},
-		{AuthID: "a", ModelID: "base", PromptTokens: 200, CachedTokens: 0, CompletionTokens: 10, At: at.Add(10 * time.Minute)},
-		{AuthID: "a", ModelID: "ft", PromptTokens: 100, CachedTokens: 0, CompletionTokens: 0, At: at},
+		{AuthID: "a", ResourceID: "r", ModelID: "base", PromptTokens: 100, CachedTokens: 30, CompletionTokens: 50, At: at},
+		{AuthID: "a", ResourceID: "r", ModelID: "base", PromptTokens: 200, CachedTokens: 0, CompletionTokens: 10, At: at.Add(10 * time.Minute)},
+		{AuthID: "a", ResourceID: "r", ModelID: "ft", PromptTokens: 100, CachedTokens: 0, CompletionTokens: 0, At: at},
 	}
 	store := newOracleStore(book, events)
 	r := New(store, book, testLogger())
@@ -824,8 +913,8 @@ func TestRater_AppliedRateStoredOnRow(t *testing.T) {
 	)
 	at := mustTime("2026-06-08T10:15:00Z")
 	events := []RatedEvent{
-		{AuthID: "a", ModelID: "base", PromptTokens: 10, At: at},
-		{AuthID: "a", ModelID: "ft", PromptTokens: 10, At: at},
+		{AuthID: "a", ResourceID: "r", ModelID: "base", PromptTokens: 10, At: at},
+		{AuthID: "a", ResourceID: "r", ModelID: "ft", PromptTokens: 10, At: at},
 	}
 	store := newOracleStore(book, events)
 	r := New(store, book, testLogger())
@@ -833,11 +922,11 @@ func TestRater_AppliedRateStoredOnRow(t *testing.T) {
 		t.Fatal(err)
 	}
 	hour := mustTime("2026-06-08T10:00:00Z")
-	baseRow := store.table[rollupKey{"a", "base", hour}]
+	baseRow := store.table[rollupKey{"a", "r", "base", hour}]
 	if baseRow.appliedRate.Prompt.String() != "0.000004000" {
 		t.Fatalf("base applied prompt rate = %s, want 0.000004000", baseRow.appliedRate.Prompt)
 	}
-	ftRow := store.table[rollupKey{"a", "ft", hour}]
+	ftRow := store.table[rollupKey{"a", "r", "ft", hour}]
 	// premium applied: 0.000004 × 1.5 = 0.000006
 	if ftRow.appliedRate.Prompt.String() != "0.000006000" {
 		t.Fatalf("ft applied prompt rate = %s, want 0.000006000 (premium frozen on row)", ftRow.appliedRate.Prompt)
@@ -869,12 +958,12 @@ func TestOracleModel_SelfConsistent(t *testing.T) {
 	)
 	hour := mustTime("2026-06-08T10:00:00Z")
 	events := []RatedEvent{
-		{AuthID: "a", ModelID: "b", PromptTokens: 100, CachedTokens: 30, CompletionTokens: 50, At: hour.Add(5 * time.Minute)},
-		{AuthID: "a", ModelID: "b", PromptTokens: 200, CachedTokens: 0, CompletionTokens: 10, At: hour.Add(40 * time.Minute)},
-		{AuthID: "a", ModelID: "f", PromptTokens: 100, CachedTokens: 0, CompletionTokens: 0, At: hour.Add(15 * time.Minute)},
-		{AuthID: "b", ModelID: "b", PromptTokens: 1000, CachedTokens: 1000, CompletionTokens: 0, At: hour.Add(20 * time.Minute)}, // all-cached
-		{AuthID: "a", ModelID: "unpriced", PromptTokens: 9, At: hour.Add(1 * time.Minute)},                                       // unpriced
-		{AuthID: "", ModelID: "b", PromptTokens: 9, At: hour.Add(2 * time.Minute)},                                               // unattributable
+		{AuthID: "a", ResourceID: "r", ModelID: "b", PromptTokens: 100, CachedTokens: 30, CompletionTokens: 50, At: hour.Add(5 * time.Minute)},
+		{AuthID: "a", ResourceID: "r", ModelID: "b", PromptTokens: 200, CachedTokens: 0, CompletionTokens: 10, At: hour.Add(40 * time.Minute)},
+		{AuthID: "a", ResourceID: "r", ModelID: "f", PromptTokens: 100, CachedTokens: 0, CompletionTokens: 0, At: hour.Add(15 * time.Minute)},
+		{AuthID: "b", ResourceID: "r", ModelID: "b", PromptTokens: 1000, CachedTokens: 1000, CompletionTokens: 0, At: hour.Add(20 * time.Minute)}, // all-cached
+		{AuthID: "a", ResourceID: "r", ModelID: "unpriced", PromptTokens: 9, At: hour.Add(1 * time.Minute)},                                       // unpriced
+		{AuthID: "", ModelID: "b", PromptTokens: 9, At: hour.Add(2 * time.Minute)},                                                                // unattributable
 	}
 	store := newOracleStore(book, events)
 	r := New(store, book, testLogger())
@@ -909,7 +998,7 @@ func TestOracleModel_SelfConsistent(t *testing.T) {
 		t.Fatalf("rollups = %d, want %d", res.RollupsWritten, len(want))
 	}
 	for k, w := range want {
-		rk := rollupKey{authID: k.auth, modelID: k.model, windowStart: hour}
+		rk := rollupKey{authID: k.auth, resourceID: "r", modelID: k.model, windowStart: hour}
 		got := store.table[rk].cost
 		if got.String() != w.String() {
 			t.Errorf("rollup (%s,%s) cost = %s, oracle wants %s", k.auth, k.model, got, w)
