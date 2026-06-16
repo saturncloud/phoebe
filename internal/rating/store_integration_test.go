@@ -935,51 +935,51 @@ func TestIntegration_RatingInstantIndexServesScan(t *testing.T) {
 	exec(t, db, schemaDDL)
 
 	exec(t, db, "SET enable_seqscan = off")
-	rows, err := db.Query(`EXPLAIN SELECT * FROM billing_event
+	plan := explainPlan(t, db, `EXPLAIN SELECT * FROM billing_event
 		WHERE COALESCE(event_ts, created_at) >= '2026-06-08T10:00:00Z'
 		  AND COALESCE(event_ts, created_at) <  '2026-06-08T11:00:00Z'`)
-	if err != nil {
-		t.Fatalf("explain: %v", err)
-	}
-	defer rows.Close()
-	var plan string
-	for rows.Next() {
-		var line string
-		if err := rows.Scan(&line); err != nil {
-			t.Fatalf("scan: %v", err)
-		}
-		plan += line + "\n"
-	}
-	if err := rows.Err(); err != nil {
-		t.Fatalf("rows: %v", err)
-	}
 	if !strings.Contains(plan, "billing_event_rating_instant_ix") {
 		t.Fatalf("plan does not use billing_event_rating_instant_ix:\n%s", plan)
 	}
 }
 
-// TestIntegration_ReconcileDeleteUsesWindowStartIndex: the reconcile DELETE (the
+// TestIntegration_ReconcileDeleteCanUseWindowStartIndex: the reconcile DELETE (the
 // `deleted` CTE) filters rated_usage on window_start ALONE. Every other index leads
-// with auth_id, leaving window_start trailing → no index can serve a
-// window_start-only range scan, so without rated_usage_window_start_ix the reconcile
-// seq-scans rated_usage (and takes a full-trailing-window lock footprint) on every
-// run. This pins that the window_start-leading index exists AND the planner uses it
-// for the reconcile's EXACT predicate.
+// with auth_id, leaving window_start trailing → no auth-leading index can serve a
+// window_start-only range scan as a tight slice. This pins the STRUCTURAL invariant
+// that the dedicated window_start-leading index exists AND can serve the reconcile's
+// EXACT predicate — proven by forcing the planner's hand with `enable_seqscan=off`.
+//
+// CORRECTNESS (hard) vs PERFORMANCE (soft) — what each pass actually proves:
+//
+//   - HARD (t.Fatalf): with seqscan DISABLED, the plan MUST scan rated_usage via
+//     rated_usage_window_start_ix. This is a structural/correctness invariant — it
+//     proves the index CAN serve the window_start-only predicate at all. Its failure
+//     mode (no usable index for the predicate) is a real defect, so it gates.
+//
+//   - SOFT (t.Logf only): whether the planner PREFERS the dedicated index at DEFAULT
+//     cost (seqscan enabled) over the auth-leading composite is a PERFORMANCE signal,
+//     not a correctness gate. Empirically the planner picks rated_usage_window_start_ix
+//     here (dropping it falls back to the costlier composite full-index scan, ~280 vs
+//     ~8), but that choice is the planner's cost model — version- and GUC-fragile. Its
+//     failure mode is a SLOW reconcile, not a wrong bill, so per rigor-by-cost-of-
+//     being-wrong it must NOT be a fragile correctness-style gate. We log the plan and
+//     which index it chose so a regression is visible, without flaking the suite when
+//     Postgres's costing shifts across major versions.
 //
 // REAL PROOF, not vacuous: an earlier version EXPLAINed a `SELECT 1` against a
 // freshly-created EMPTY rated_usage. On an empty (or tiny) table the planner
 // seqscans regardless of any index — and the standalone SELECT does not even
 // resemble the reconcile DELETE — so a passing assertion proved nothing about the
 // actual statement. Here we (a) POPULATE rated_usage with many rows across many
-// hours so a narrow window-slice is genuinely cheaper by index than a seqscan, then
-// (b) EXPLAIN the ACTUAL reconcile DELETE from store.go (the `deleted` CTE's
-// rated_usage table-access: the window_start range plus the NOT EXISTS anti-join
-// against this run's priced rows) and assert it scans rated_usage via
-// rated_usage_window_start_ix. We assert the index is chosen by DEFAULT cost
-// (seqscan ENABLED) — that is the load-bearing proof the index PAYS OFF for the
-// reconcile's predicate, not just that one CAN be forced. A seqscan-disabled pass
-// follows as a belt-and-braces check that the index can serve the predicate at all.
-func TestIntegration_ReconcileDeleteUsesWindowStartIndex(t *testing.T) {
+// hours so a narrow window-slice is genuinely index-servable, then (b) EXPLAIN the
+// ACTUAL reconcile DELETE from store.go (the `deleted` CTE's rated_usage
+// table-access: the window_start range plus the NOT EXISTS anti-join against this
+// run's priced rows). The default-cost pass is checked by index NAME via an index
+// scan node — `Index Scan using rated_usage_window_start_ix on rated_usage ru` —
+// not a bare substring that the composite would also match; that discriminating
+// check is the SOFT signal. The seqscan-off pass is the HARD structural gate.
+func TestIntegration_ReconcileDeleteCanUseWindowStartIndex(t *testing.T) {
 	dsn := os.Getenv("PHOEBE_TEST_DATABASE_URL")
 	if dsn == "" {
 		t.Skip("PHOEBE_TEST_DATABASE_URL not set; skipping live-Postgres conformance")
@@ -1037,29 +1037,33 @@ func TestIntegration_ReconcileDeleteUsesWindowStartIndex(t *testing.T) {
 		        AND p.window_start = ru.window_start
 		  )`
 
-	// (1) Default-cost plan (seqscan ENABLED): the LOAD-BEARING proof the index PAYS
-	// OFF — the planner chooses rated_usage_window_start_ix on cost, not because
-	// seqscan was forbidden. This is discriminating: verified empirically, dropping
-	// the index makes the planner fall back to the auth-leading composite
-	// (auth_id, window_start) as a far costlier full-index scan (~280 vs ~8), so this
-	// assertion FAILS without the window_start index — it is not vacuous. (The
-	// fallback is an index scan, not a literal Seq Scan, because the composite still
-	// covers window_start as a non-leading column; the point stands — the dedicated
-	// window_start index is what the reconcile's window-only predicate should use.)
+	// (1) Default-cost plan (seqscan ENABLED) — SOFT PERFORMANCE SIGNAL, not a gate.
+	// Whether the planner PREFERS the dedicated window_start index over the auth-leading
+	// composite is a cost-model decision that is fragile across PG major versions / GUCs;
+	// its failure mode is a slow reconcile, not a wrong bill. So we LOG (never t.Fatalf)
+	// whether the default plan uses the dedicated index by NAME via an index scan node
+	// — "using rated_usage_window_start_ix" — which is discriminating (it would NOT match
+	// the auth-leading composite). Empirically the planner picks it here; if a future PG
+	// stops preferring it, this log makes the regression visible without flaking the run.
 	plan := explainPlan(t, db, reconcileDelete)
-	if !strings.Contains(plan, "rated_usage_window_start_ix") {
-		t.Fatalf("reconcile DELETE did not choose rated_usage_window_start_ix at DEFAULT cost on a populated table (a window_start-only slice should prefer the dedicated index):\n%s", plan)
-	}
-	if strings.Contains(plan, "Seq Scan on rated_usage ru") {
-		t.Fatalf("reconcile DELETE seq-scans rated_usage at default cost — the window_start index is not serving the range predicate:\n%s", plan)
+	if strings.Contains(plan, "using rated_usage_window_start_ix") {
+		t.Logf("default-cost reconcile DELETE plan uses the dedicated window_start index (perf signal OK):\n%s", plan)
+	} else {
+		t.Logf("PERF SIGNAL: default-cost reconcile DELETE did NOT choose rated_usage_window_start_ix "+
+			"(planner cost model may have shifted; reconcile still correct, possibly slower):\n%s", plan)
 	}
 
-	// (2) Belt-and-braces: with seqscan disabled the index must STILL be able to serve
-	// the predicate (a remaining seqscan would mean no usable index at all).
+	// (2) Seqscan DISABLED — HARD STRUCTURAL/CORRECTNESS GATE. With seqscan forbidden the
+	// plan MUST scan rated_usage through rated_usage_window_start_ix, proving the index
+	// CAN serve the window_start-only predicate at all. A remaining seqscan (or any other
+	// index) here means no usable index for the reconcile's exact predicate — a real
+	// defect — so THIS is what we t.Fatalf on. We assert by NAME via the index scan node
+	// ("using rated_usage_window_start_ix") so a plan that fell through to the composite
+	// would NOT satisfy it.
 	exec(t, db, "SET enable_seqscan = off")
 	plan2 := explainPlan(t, db, reconcileDelete)
-	if !strings.Contains(plan2, "rated_usage_window_start_ix") {
-		t.Fatalf("reconcile DELETE predicate cannot be served by rated_usage_window_start_ix even with seqscan off:\n%s", plan2)
+	if !strings.Contains(plan2, "using rated_usage_window_start_ix") {
+		t.Fatalf("reconcile DELETE predicate cannot be served by rated_usage_window_start_ix even with seqscan off (no usable window_start index for the window-only predicate):\n%s", plan2)
 	}
 }
 

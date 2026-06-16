@@ -440,9 +440,12 @@ func supersededReconcileStore() (*oracleStore, time.Time, time.Time) {
 // TestRater_RoutineReconcileDeleteLogsError pins the LOUD half of the reconcile
 // observability contract (option (c)): a ROUTINE run (windowExplicit == false) that
 // reconcile-DELETES a previously-billed rollup must emit an ERROR line (page someone),
-// even with NO other anomaly. RED before FIX 1: the old code logged the reconcile-delete
-// UNCONDITIONALLY at INFO (testLogger discards INFO), so the ERROR stream was empty and
-// this assertion failed — the page never fired on a routine bill rewrite.
+// even with NO other anomaly. It uses captureLogger() (which buffers BOTH the INFO and
+// ERROR streams, so the assertion is on WHICH severity the line was emitted at — not on
+// a level filter discarding it). RED before FIX 1: the old code logged the
+// reconcile-delete UNCONDITIONALLY at INFO, so the captured ERROR stream stayed empty
+// and the errBuf.Len()==0 assertion failed — the page never fired on a routine bill
+// rewrite.
 func TestRater_RoutineReconcileDeleteLogsError(t *testing.T) {
 	store, ws, we := supersededReconcileStore()
 	log, infoBuf, errBuf := captureLogger()
