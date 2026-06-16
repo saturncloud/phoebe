@@ -1,64 +1,41 @@
 // THE Rate() ORACLE — test-support code (this is a _test.go file; it never ships).
 //
-// This file holds a PURE Go reference implementation of the cost formula (Rate)
-// plus an exact decimal helper (Dec). The SQL rater in store.go is the PRODUCTION
-// path; Rate() is the SPEC, and the conformance test asserts the SQL output
-// matches Rate() row-for-row over a fixture. Rate() uses big.Rat — exact rational
-// arithmetic — so it has NO float error and is the authority on what the SQL must
-// compute. See doc.go for the production-vs-oracle split.
+// This file holds a PURE Go reference implementation of the cost formula (Rate).
+// The SQL rater in store.go is the PRODUCTION path; Rate() is the SPEC, and the
+// conformance test asserts the SQL output matches Rate() row-for-row over a
+// fixture. Rate() builds on the production exact-decimal type Dec (decimal.go) —
+// big.Rat, no float error — so it is the authority on what the SQL must compute.
+// See doc.go for the production-vs-oracle split.
+//
+// The exact-decimal type (Dec), the per-token rate triple (Rate3), the fine-tune
+// premium policy (PolicyFunc / ApplyPolicy), and the ErrNoPrice sentinel are
+// PRODUCTION types now (the YAML price loader parses into them) and live in
+// decimal.go / policy.go. This file holds only the oracle-specific surface:
+// RatedEvent, the billable-prompt formula, and the Rate cost function.
+//
+// ONE-HOP DERIVATION is enforced at LOAD, not at rate time: buildPriceBook
+// (pricebook.go) rejects a derived_from that points at a base which is itself derived
+// (a multi-hop chain) and a dangling derived_from, and ResolveEvent never derives from
+// a base that is itself a derived fine-tune. So a chain longer than one hop can never
+// reach the oracle — there is no runtime "derivation chain" sentinel to return (an
+// earlier ErrDerivationChain was documented as returned but never was; it was dead
+// surface and is removed).
 package rating
 
 import (
-	"errors"
-	"fmt"
-	"math/big"
 	"time"
 )
-
-// moneyScale is the number of fractional decimal digits money is stored and
-// compared at, matching the NUMERIC(20,9) columns in migrations/0002_rating.sql.
-// 9 digits == nano-USD resolution. Rate() rounds its exact rational result to
-// this scale (half-up) so the oracle and the DB's NUMERIC arithmetic agree.
-const moneyScale = 9
-
-// ErrNoPrice is the fail-closed sentinel: the price book has no resolvable entry
-// for a model at the event's time (no own rate, and no one-hop derived base rate).
-// The caller MUST surface this (count it, log it loudly) and MUST NOT bill the
-// event at $0. Returned by ResolvePrice and propagated by Rate.
-var ErrNoPrice = errors.New("rating: no price for model at event time")
-
-// ErrDerivationChain is returned when a model's derived_from points at another
-// DERIVED model (a chain longer than one hop). v1 supports ONE hop only; a deeper
-// chain is treated as an error (and counted as unpriced), never recursed — see the
-// one-hop-only rule. Distinct from ErrNoPrice so the anomaly can be reported
-// specifically, but it drives the same fail-loud, exit-nonzero path.
-var ErrDerivationChain = errors.New("rating: derived_from chain exceeds one hop (unsupported in v1)")
-
-// PolicyFunc is the derivation-policy function type. It mirrors the
-// derivation_policy.function CHECK constraint in the schema.
-type PolicyFunc string
-
-const (
-	PolicyIdentity   PolicyFunc = "identity"   // derived = base
-	PolicyMultiplier PolicyFunc = "multiplier" // derived = base * factor
-	PolicyMarkup     PolicyFunc = "markup"     // derived = base + markup (per-token)
-)
-
-// Rate is the per-token rate triple a model resolves to at a given instant, AFTER
-// any derivation policy has been applied. These are the prices Rate() multiplies
-// the token counts by. Carried as exact Dec (never float).
-type Rate3 struct {
-	Prompt     Dec
-	Cached     Dec
-	Completion Dec
-}
 
 // RatedEvent is the minimal slice of a billing_event that rating needs. It is
 // decoupled from metering.Event so the pure money math has no dependency on the
 // capture/emit side and can be tested in isolation.
 type RatedEvent struct {
-	AuthID           string
-	ModelID          string
+	AuthID  string
+	ModelID string
+	// BaseModel is the HF base id a fine-tune derives from (E3), carried on the event
+	// from billing_event.base_model. Empty for a base model. The oracle prices an ft:
+	// ModelID via base x premium keyed on BaseModel — mirroring the SQL.
+	BaseModel        string
 	PromptTokens     int64 // TOTAL prompt tokens (cached + non-cached), per vLLM
 	CachedTokens     int64 // SUBSET of PromptTokens that was a cache hit
 	CompletionTokens int64
@@ -69,9 +46,9 @@ type RatedEvent struct {
 }
 
 // Rate computes the cost of a single event given the already-resolved per-token
-// rate (own rate, or base-rate-through-policy). Resolution — including
-// effective-dating and the derivation policy — happens BEFORE Rate, in ResolvePrice
-// (oracle) / the SQL join (production); Rate is purely the multiply-and-sum.
+// rate (base rate, or base-rate-through-premium). Resolution — including the
+// fine-tune premium — happens BEFORE Rate, in the price loader / the SQL join; Rate
+// is purely the multiply-and-sum.
 //
 // THE BILLABLE-PROMPT FORMULA (the highest-risk line in the codebase — read this
 // before changing anything):
@@ -86,9 +63,8 @@ type RatedEvent struct {
 //	         + completion_tokens  * completion_price
 //
 //	We charge each prompt token EXACTLY ONCE: non-cached at the prompt rate, cached
-//	at the (usually discounted) cached rate. Charging cached_tokens at BOTH rates —
-//	prompt_tokens*prompt_price + cached_tokens*cached_price — would OVERBILL for
-//	every cache hit. Do not do that. The same formula is implemented in SQL in
+//	at the (usually discounted) cached rate. Charging cached_tokens at BOTH rates
+//	would OVERBILL every cache hit. The same formula is implemented in SQL in
 //	store.go; the conformance test pins them together.
 //
 // Defensive clamp: if cached_tokens > prompt_tokens (malformed engine usage),
@@ -98,15 +74,22 @@ type RatedEvent struct {
 //
 // Aborted events are rated NORMALLY: an aborted stream still served real tokens.
 //
-// ROUNDING — match production exactly (sum-then-round, NOT round-then-sum):
-// the SQL rater SUMs the exact per-event products across the whole rollup and
-// rounds the SUM once when it lands in NUMERIC(20,9). So the oracle must NOT
-// round per event and then sum — that (round-then-sum) can differ from the SQL
-// by up to ~1 nano per event when a per-token rate has a sub-nano residue (e.g.
-// a derived price like base 0.000000001 × 1.5). rateExact returns the UNROUNDED
-// exact cost; the rollup sums those and rounds once (see the oracle store and
-// quantize). Rate() is the single-event convenience form (sum of one = round
-// once), kept for per-event unit tests where there is no cross-event sum.
+// ROUNDING — quantize-then-multiply (the ratified spec; see doc.go's ROUNDING
+// section for why). Production stores the applied per-token rate on the
+// rated_usage row (E1), so the rate must be the 9dp NUMERIC(20,9) value the row
+// can hold — the premium is applied to the EXACT base rate, then the FINAL
+// per-token rate is QUANTIZED to 9dp, and cost = quantized-rate × tokens. So the
+// oracle's caller passes an ALREADY-QUANTIZED rate (r.Quantized()): Rate then
+// multiplies that 9dp rate by integer token counts (an exact product at 9dp) and
+// sums. There is no sub-nano residue to round away — the trailing Round here is a
+// no-op on a quantized rate, kept only so a caller that (incorrectly) passes an
+// un-quantized rate still lands on a representable money value rather than a
+// big.Rat with an enormous denominator.
+//
+// IMPORTANT: Rate is faithful to production ONLY when fed a quantized rate. The
+// conformance tests pass r.Quantized(); see TestConformance_PremiumQuantizedBeforeBilling
+// for the residue case (1-nano base × 1.5 → 0.000000002 bills) that distinguishes
+// quantize-then-multiply from the old sum-then-round.
 func Rate(e RatedEvent, r Rate3) Dec {
 	return rateExact(e, r).Round(moneyScale)
 }
@@ -128,142 +111,4 @@ func BillablePromptTokens(promptTokens, cachedTokens int64) int64 {
 		return 0
 	}
 	return b
-}
-
-// ApplyPolicy transforms a base per-token rate triple by the derivation policy,
-// producing the derived (fine-tune) rate. This is the Go oracle for the policy
-// math that the SQL applies in-join (a CASE on function). identity is the default;
-// multiplier scales every component by factor; markup adds a per-token amount to
-// every component. Exact decimal throughout.
-func ApplyPolicy(base Rate3, fn PolicyFunc, factor, markup Dec) (Rate3, error) {
-	switch fn {
-	case PolicyIdentity:
-		return base, nil
-	case PolicyMultiplier:
-		return Rate3{
-			Prompt:     base.Prompt.Mul(factor),
-			Cached:     base.Cached.Mul(factor),
-			Completion: base.Completion.Mul(factor),
-		}, nil
-	case PolicyMarkup:
-		return Rate3{
-			Prompt:     base.Prompt.Add(markup),
-			Cached:     base.Cached.Add(markup),
-			Completion: base.Completion.Add(markup),
-		}, nil
-	default:
-		return Rate3{}, fmt.Errorf("rating: unknown derivation policy function %q", fn)
-	}
-}
-
-// Dec is an EXACT decimal money value backed by a big.Rat. It powers the Rate()
-// oracle's exact arithmetic — phoebe does NOT do money math in Go on the
-// production path (the SQL rater does), and Dec is test-only by virtue of living
-// in a _test.go file. Dec uses big.Rat (exact rationals), so multiplies and adds
-// have zero rounding error; rounding happens once, explicitly, at Round(moneyScale).
-//
-// The zero Dec is exact 0.
-type Dec struct {
-	// r is nil for the zero value (treated as 0). Always accessed via rat().
-	r *big.Rat
-}
-
-// rat returns the underlying rational, treating the nil zero-value as 0.
-func (d Dec) rat() *big.Rat {
-	if d.r == nil {
-		return new(big.Rat) // 0/1
-	}
-	return d.r
-}
-
-// MustDec parses a decimal string (e.g. "0.000000150") into an exact Dec, panicking
-// on a malformed input. For test fixtures and constants where the literal is known
-// good.
-func MustDec(s string) Dec {
-	d, err := ParseDec(s)
-	if err != nil {
-		panic(err)
-	}
-	return d
-}
-
-// ParseDec parses a decimal string into an exact Dec. It accepts the forms Postgres
-// emits for a NUMERIC ("3", "0.300000000", "-0.5"); it rejects float-style
-// exponents to keep the money path free of any float round-trip.
-func ParseDec(s string) (Dec, error) {
-	if s == "" {
-		return Dec{}, fmt.Errorf("rating: empty decimal string")
-	}
-	r, ok := new(big.Rat).SetString(s)
-	if !ok {
-		return Dec{}, fmt.Errorf("rating: invalid decimal %q", s)
-	}
-	return Dec{r: r}, nil
-}
-
-// Add returns d + o (exact).
-func (d Dec) Add(o Dec) Dec {
-	return Dec{r: new(big.Rat).Add(d.rat(), o.rat())}
-}
-
-// Mul returns d * o (exact).
-func (d Dec) Mul(o Dec) Dec {
-	return Dec{r: new(big.Rat).Mul(d.rat(), o.rat())}
-}
-
-// MulInt returns d * n (exact), the per-token-price × token-count operation.
-func (d Dec) MulInt(n int64) Dec {
-	return Dec{r: new(big.Rat).Mul(d.rat(), new(big.Rat).SetInt64(n))}
-}
-
-// Round returns d rounded to `scale` fractional decimal digits, half-up (round
-// half away from zero), matching the rounding the DB applies when storing into a
-// NUMERIC(_, scale). This is the ONLY place the oracle rounds.
-func (d Dec) Round(scale int) Dec {
-	// scaled = d * 10^scale, then round to nearest integer half-up, then / 10^scale.
-	pow := new(big.Int).Exp(big.NewInt(10), big.NewInt(int64(scale)), nil)
-	powRat := new(big.Rat).SetInt(pow)
-	scaled := new(big.Rat).Mul(d.rat(), powRat)
-
-	num := scaled.Num()
-	den := scaled.Denom()
-	// Integer division with half-up rounding on |num/den|.
-	q := new(big.Int)
-	rem := new(big.Int)
-	q.QuoRem(num, den, rem)
-	// 2*|rem| >= |den| → round away from zero.
-	twiceRem := new(big.Int).Abs(rem)
-	twiceRem.Lsh(twiceRem, 1)
-	if twiceRem.Cmp(new(big.Int).Abs(den)) >= 0 {
-		if num.Sign() < 0 {
-			q.Sub(q, big.NewInt(1))
-		} else {
-			q.Add(q, big.NewInt(1))
-		}
-	}
-	rounded := new(big.Rat).SetFrac(q, pow)
-	return Dec{r: rounded}
-}
-
-// String renders the Dec at moneyScale fixed decimal places — the canonical form
-// used to bind a money value into a parameterised SQL statement and to compare
-// against a value Postgres returned. Fixed-scale so "3" and "3.000000000" compare
-// equal as strings after both pass through here.
-func (d Dec) String() string {
-	return d.StringScale(moneyScale)
-}
-
-// StringScale renders the Dec at exactly `scale` fixed decimal places (half-up).
-func (d Dec) StringScale(scale int) string {
-	return d.Round(scale).rat().FloatString(scale)
-}
-
-// Equal reports exact equality of the rational values (scale-independent: 3 == 3.0).
-func (d Dec) Equal(o Dec) bool {
-	return d.rat().Cmp(o.rat()) == 0
-}
-
-// IsZero reports whether d is exactly zero.
-func (d Dec) IsZero() bool {
-	return d.rat().Sign() == 0
 }

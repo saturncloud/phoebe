@@ -2,253 +2,695 @@ package rating
 
 import (
 	"errors"
+	"strings"
 	"testing"
-	"time"
 )
 
-func mustTime(s string) time.Time {
-	t, err := time.Parse(time.RFC3339, s)
+// TestLoad_BasePriceApplied (yaml-base-price-applied): a base model keyed on its HF
+// id resolves to exactly the per-token rates the file declares, parsed as exact
+// decimal (no float drift).
+func TestLoad_BasePriceApplied(t *testing.T) {
+	const y = `
+version: 1
+base_models:
+  "meta-llama/Llama-3.1-8B-Instruct":
+    prompt:     "0.000000200"
+    cached:     "0.000000050"
+    completion: "0.000000600"
+`
+	pb, err := ParsePriceBook([]byte(y))
 	if err != nil {
-		panic(err)
+		t.Fatalf("parse: %v", err)
 	}
-	return t
-}
-
-// baseRow is a model with its OWN rate, open-ended from 2026-01-01.
-func baseRow(modelID, prompt, cached, completion string) PriceRow {
-	return PriceRow{
-		ModelID:       modelID,
-		HasRate:       true,
-		Prompt:        MustDec(prompt),
-		Cached:        MustDec(cached),
-		Completion:    MustDec(completion),
-		EffectiveFrom: mustTime("2026-01-01T00:00:00Z"),
+	r, err := pb.Resolve("meta-llama/Llama-3.1-8B-Instruct")
+	if err != nil {
+		t.Fatalf("resolve: %v", err)
+	}
+	if r.Prompt.String() != "0.000000200" || r.Cached.String() != "0.000000050" || r.Completion.String() != "0.000000600" {
+		t.Fatalf("rates = %s/%s/%s, want the file's exact values", r.Prompt, r.Cached, r.Completion)
 	}
 }
 
-// derivedRow is a fine-tune: NO own rate, derived_from a base, open-ended.
-func derivedRow(modelID, base string) PriceRow {
-	return PriceRow{
-		ModelID:       modelID,
-		DerivedFrom:   base,
-		HasRate:       false,
-		EffectiveFrom: mustTime("2026-01-01T00:00:00Z"),
+// TestLoad_FineTunePremiumMultiplier (yaml-fine-tune-premium-multiplier): an ft: id
+// with an in-file derived_from inherits base × factor.
+func TestLoad_FineTunePremiumMultiplier(t *testing.T) {
+	const y = `
+version: 1
+base_models:
+  "base":
+    prompt:     "0.000003"
+    cached:     "0.0000003"
+    completion: "0.00001"
+fine_tunes:
+  "ft:abc123":
+    derived_from: "base"
+fine_tune_premium:
+  policy: multiplier
+  factor: "1.5"
+`
+	pb, err := ParsePriceBook([]byte(y))
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	r, err := pb.Resolve("ft:abc123")
+	if err != nil {
+		t.Fatalf("resolve: %v", err)
+	}
+	// base × 1.5
+	if r.Prompt.String() != "0.000004500" || r.Cached.String() != "0.000000450" || r.Completion.String() != "0.000015000" {
+		t.Fatalf("ft rates = %s/%s/%s, want base×1.5", r.Prompt, r.Cached, r.Completion)
 	}
 }
 
-// TestResolve_EffectiveDatedSelection: an event before a price change uses the OLD
-// price; at/after uses the new one; before any price fails loud. The half-open
-// [from,to) boundary belongs to the new window.
-func TestResolve_EffectiveDatedSelection(t *testing.T) {
-	old := PriceRow{
-		ModelID: "m", HasRate: true,
-		Prompt: MustDec("0.000003"), Cached: MustDec("0"), Completion: MustDec("0"),
-		EffectiveFrom: mustTime("2026-01-01T00:00:00Z"),
-		EffectiveTo:   mustTime("2026-06-01T00:00:00Z"),
+// TestLoad_FineTunePremiumMarkup (yaml-fine-tune-premium-markup): an ft: id inherits
+// base + per-token markup.
+func TestLoad_FineTunePremiumMarkup(t *testing.T) {
+	const y = `
+version: 1
+base_models:
+  "base":
+    prompt:     "0.000003"
+    cached:     "0.0000003"
+    completion: "0.00001"
+fine_tunes:
+  "ft:abc123":
+    derived_from: "base"
+fine_tune_premium:
+  policy: markup
+  markup: "0.000001"
+`
+	pb, err := ParsePriceBook([]byte(y))
+	if err != nil {
+		t.Fatalf("parse: %v", err)
 	}
-	current := PriceRow{
-		ModelID: "m", HasRate: true,
-		Prompt: MustDec("0.000005"), Cached: MustDec("0"), Completion: MustDec("0"),
-		EffectiveFrom: mustTime("2026-06-01T00:00:00Z"),
+	r, err := pb.Resolve("ft:abc123")
+	if err != nil {
+		t.Fatalf("resolve: %v", err)
 	}
-	book := NewPriceBook([]PriceRow{current, old}, nil) // out of order on purpose
+	// base + 0.000001 per token
+	if r.Prompt.String() != "0.000004000" || r.Cached.String() != "0.000001300" || r.Completion.String() != "0.000011000" {
+		t.Fatalf("ft rates = %s/%s/%s, want base+0.000001", r.Prompt, r.Cached, r.Completion)
+	}
+}
 
+// TestLoad_FineTuneIdentityPremium: with no premium block (identity default), an ft:
+// resolves to its base's rate exactly (no markup, no multiplier).
+func TestLoad_FineTuneIdentityPremium(t *testing.T) {
+	const y = `
+version: 1
+base_models:
+  "base":
+    prompt:     "0.000003"
+    cached:     "0.0000003"
+    completion: "0.00001"
+fine_tunes:
+  "ft:abc123":
+    derived_from: "base"
+`
+	pb, err := ParsePriceBook([]byte(y))
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	r, err := pb.Resolve("ft:abc123")
+	if err != nil {
+		t.Fatalf("resolve: %v", err)
+	}
+	if r.Prompt.String() != "0.000003000" || r.Cached.String() != "0.000000300" || r.Completion.String() != "0.000010000" {
+		t.Fatalf("identity ft rates = %s/%s/%s, want = base", r.Prompt, r.Cached, r.Completion)
+	}
+}
+
+// TestLoad_FineTuneOwnRateBypassesPremium: a fine-tune with its OWN rate in the file
+// ignores the premium entirely (the escape hatch).
+func TestLoad_FineTuneOwnRateBypassesPremium(t *testing.T) {
+	const y = `
+version: 1
+base_models:
+  "base":
+    prompt:     "0.000009"
+    cached:     "0.000009"
+    completion: "0.000009"
+fine_tunes:
+  "ft:own":
+    derived_from: "base"
+    rate:
+      prompt:     "0.000003"
+      cached:     "0.0000003"
+      completion: "0.00001"
+fine_tune_premium:
+  policy: multiplier
+  factor: "1000"
+`
+	pb, err := ParsePriceBook([]byte(y))
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	r, err := pb.Resolve("ft:own")
+	if err != nil {
+		t.Fatalf("resolve: %v", err)
+	}
+	if r.Prompt.String() != "0.000003000" {
+		t.Fatalf("own-rate ft prompt = %s, want 0.000003000 (premium must NOT apply)", r.Prompt)
+	}
+}
+
+// TestResolve_MissingPriceFailsLoud (missing-price-fails-loud-not-zero): the
+// model_id-only Resolve fails loud for an unknown id and for an ft: id with no in-file
+// linkage (the event-carried base_model path is ResolveEvent's job, tested separately
+// in TestResolveEvent_FineTuneViaBaseModel). NEVER a $0 rate.
+func TestResolve_MissingPriceFailsLoud(t *testing.T) {
+	const y = `
+version: 1
+base_models:
+  "base":
+    prompt:     "0.000003"
+    cached:     "0"
+    completion: "0"
+`
+	pb, err := ParsePriceBook([]byte(y))
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	if _, err := pb.Resolve("does-not-exist"); !errors.Is(err, ErrNoPrice) {
+		t.Fatalf("unknown model: err = %v, want ErrNoPrice", err)
+	}
+	// An ft: id with no in-file linkage fails loud under the model_id-only Resolve
+	// (pricing it requires the event's base_model — see ResolveEvent). Never $0.
+	if _, err := pb.Resolve("ft:not-plumbed-yet"); !errors.Is(err, ErrNoPrice) {
+		t.Fatalf("unlinked ft id: err = %v, want ErrNoPrice (must fail loud)", err)
+	}
+}
+
+// TestLoad_DerivedRateRoundsToZeroFailsClosed (derived-rate-rounds-to-zero-fails-closed):
+// the round-to-zero fail-closed guard EXTENDED to the DERIVED path (FIX 1). A fine-tune
+// premium that drives a NONZERO base rate to a derived rate that quantizes to $0 is
+// rejected at LOAD — otherwise every ft: event of that base would silently bill $0,
+// counted as rated. The guard fires ONLY on a nonzero base zeroed by the premium; an
+// intentional free rate or any premium that keeps the rate nonzero loads fine.
+func TestLoad_DerivedRateRoundsToZeroFailsClosed(t *testing.T) {
+	// factor "0": a nonzero base rate driven to a derived $0 — REJECT.
+	rejectFactorZero := `
+version: 1
+base_models:
+  "base":
+    prompt:     "0.000003"
+    cached:     "0.0000003"
+    completion: "0.00001"
+fine_tune_premium:
+  policy: multiplier
+  factor: "0"
+`
+	// tiny fractional factor on a SMALL (1-nano) base: 0.000000001 × 0.4 = 0.0000000004
+	// → rounds to $0 at 9dp — REJECT.
+	rejectTinyFactor := `
+version: 1
+base_models:
+  "base":
+    prompt:     "0.000000001"
+    cached:     "0.000000001"
+    completion: "0.000000001"
+fine_tune_premium:
+  policy: multiplier
+  factor: "0.4"
+`
+	for _, tc := range []struct{ name, yaml string }{
+		{"factor-zero-zeroes-nonzero-base", rejectFactorZero},
+		{"tiny-fractional-factor-on-small-base", rejectTinyFactor},
+	} {
+		if _, err := ParsePriceBook([]byte(tc.yaml)); err == nil {
+			t.Errorf("%s: load succeeded, want rejection (derived rate rounds to $0 → silent free fine-tune)", tc.name)
+		} else if !strings.Contains(err.Error(), "rounds to $0") {
+			t.Errorf("%s: err = %v, want a round-to-$0 rejection naming the derived rate", tc.name, err)
+		}
+	}
+
+	// FILE-DECLARED derived_from path (FIX 1): a fine-tune declaring derived_from a TRUE
+	// base, with a premium that zeroes the base, must ALSO be rejected. Before FIX 1 the
+	// round-to-zero guard only iterated true bases via validateDerivedRatesNonZero, which
+	// it still does — but the point here is that once the one-hop loader gap is closed a
+	// file-declared derived_from can ONLY point at a true base, so this derived projection
+	// IS covered. factor "0" drives the base to a derived $0 → REJECT.
+	rejectDerivedFromZeroed := `
+version: 1
+base_models:
+  "base":
+    prompt:     "0.000003"
+    cached:     "0.0000003"
+    completion: "0.00001"
+fine_tunes:
+  "ft:child":
+    derived_from: "base"
+fine_tune_premium:
+  policy: multiplier
+  factor: "0"
+`
+	if _, err := ParsePriceBook([]byte(rejectDerivedFromZeroed)); err == nil {
+		t.Errorf("derived_from-a-true-base with a factor-0 premium loaded; want rejection (every ft: of that base would bill $0)")
+	} else if !strings.Contains(err.Error(), "rounds to $0") {
+		t.Errorf("derived_from-zeroed: err = %v, want a round-to-$0 rejection", err)
+	}
+
+	// LEGIT loads: each keeps an intended-nonzero (or intentionally free) derived rate.
+	for _, tc := range []struct{ name, yaml string }{
+		{
+			// A real multiplier on a real base — the common case. Loads.
+			"legit-multiplier", `
+version: 1
+base_models:
+  "base":
+    prompt:     "0.000003"
+    cached:     "0.0000003"
+    completion: "0.00001"
+fine_tune_premium:
+  policy: multiplier
+  factor: "1.5"
+`,
+		},
+		{
+			// A markup premium that keeps every component nonzero. Loads.
+			"legit-markup", `
+version: 1
+base_models:
+  "base":
+    prompt:     "0.000003"
+    cached:     "0.0000003"
+    completion: "0.00001"
+fine_tune_premium:
+  policy: markup
+  markup: "0.000000100"
+`,
+		},
+		{
+			// Identity premium (default). Loads.
+			"identity", `
+version: 1
+base_models:
+  "base":
+    prompt:     "0.000003"
+    cached:     "0.0000003"
+    completion: "0.00001"
+`,
+		},
+		{
+			// A base whose cached component is an INTENTIONAL $0: factor 0.4 on a $0
+			// cached yields a derived $0, but the BASE component was already 0, so this
+			// is a legitimate free component, not a silently-zeroed nonzero rate. Loads.
+			"intentional-free-component", `
+version: 1
+base_models:
+  "base":
+    prompt:     "0.000003"
+    cached:     "0"
+    completion: "0.00001"
+fine_tune_premium:
+  policy: multiplier
+  factor: "0.4"
+`,
+		},
+	} {
+		if _, err := ParsePriceBook([]byte(tc.yaml)); err != nil {
+			t.Errorf("%s: load failed, want success: %v", tc.name, err)
+		}
+	}
+}
+
+// TestLoad_FineTuneDerivingFromFineTuneRejected (one-hop-loader-rejects-ft-of-ft):
+// FIX 1 — the one-hop rule on the FILE-DECLARED derived_from path. Before this fix the
+// loader only checked that a derived_from target was PRESENT in pb.base, but an own-rate
+// fine-tune IS in pb.base — so `ft:child derived_from: ft:ownrate` (a fine-tune deriving
+// from a fine-tune) was ACCEPTED, and with a small premium it bills $0, never caught by
+// the round-to-zero guard (which iterates only true bases). The loader must reject a
+// derived_from whose target is itself a fine-tune (an own-rate ft:, or a derivedFrom key):
+// E3 allows ONE hop only — derive from a TRUE base model. This closes the $0-derived-
+// fine-tune hole at LOAD, never at bill time.
+func TestLoad_FineTuneDerivingFromFineTuneRejected(t *testing.T) {
+	// ft:child derives from ft:ownrate (an own-rate fine-tune) → a SECOND hop. Reject.
+	const ftOfOwnRateFt = `
+version: 1
+base_models:
+  "meta-llama/Llama-3.1-8B-Instruct":
+    prompt:     "0.000004"
+    cached:     "0"
+    completion: "0"
+fine_tunes:
+  "ft:ownrate":
+    rate:
+      prompt:     "0.00001"
+      cached:     "0"
+      completion: "0"
+  "ft:child":
+    derived_from: "ft:ownrate"
+fine_tune_premium:
+  policy: multiplier
+  factor: "1.5"
+`
+	if _, err := ParsePriceBook([]byte(ftOfOwnRateFt)); err == nil {
+		t.Fatal("ft:child derived_from an own-rate ft: loaded; want rejection (one hop only — no fine-tune-of-fine-tune)")
+	} else if !strings.Contains(err.Error(), "one hop") && !strings.Contains(err.Error(), "fine-tune") {
+		t.Fatalf("err = %v, want a one-hop rejection naming the fine-tune derivation target", err)
+	}
+
+	// ft:child derives from ft:mid, which itself declares a derived_from (a chain) → a
+	// SECOND hop on the derivedFrom-key arm of isDerivationBase. Reject.
+	const ftOfDerivedFt = `
+version: 1
+base_models:
+  "base":
+    prompt:     "0.000004"
+    cached:     "0"
+    completion: "0"
+fine_tunes:
+  "ft:mid":
+    derived_from: "base"
+  "ft:child":
+    derived_from: "ft:mid"
+`
+	if _, err := ParsePriceBook([]byte(ftOfDerivedFt)); err == nil {
+		t.Fatal("ft:child derived_from a derived ft: loaded; want rejection (multi-hop chain forbidden)")
+	}
+
+	// CONTROL: ft:child deriving from a TRUE base still loads (the one legitimate hop).
+	const oneHopOK = `
+version: 1
+base_models:
+  "base":
+    prompt:     "0.000004"
+    cached:     "0"
+    completion: "0"
+fine_tunes:
+  "ft:child":
+    derived_from: "base"
+`
+	if _, err := ParsePriceBook([]byte(oneHopOK)); err != nil {
+		t.Fatalf("ft:child deriving from a true base must load (the one legitimate hop): %v", err)
+	}
+}
+
+// TestResolveEvent_FineTuneCannotDeriveFromFineTune (one-hop-no-fine-tune-of-fine-tune):
+// E3's ONE-HOP rule (FIX 3). An own-rate fine-tune (an ft: id with its own rate in the
+// file) is NOT a valid derivation base: another ft: event whose base_model points at it
+// must NOT price at that fine-tune's rate × premium (a second hop) — it fails loud
+// (ErrNoPrice). Only a TRUE base model is a one-hop derivation source.
+func TestResolveEvent_FineTuneCannotDeriveFromFineTune(t *testing.T) {
+	const y = `
+version: 1
+base_models:
+  "meta-llama/Llama-3.1-8B-Instruct":
+    prompt:     "0.000004"
+    cached:     "0"
+    completion: "0"
+fine_tunes:
+  "ft:ownrate":
+    rate:
+      prompt:     "0.00001"
+      cached:     "0"
+      completion: "0"
+fine_tune_premium:
+  policy: multiplier
+  factor: "1.5"
+`
+	pb, err := ParsePriceBook([]byte(y))
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+
+	// The own-rate fine-tune itself still prices DIRECTLY by its own model_id (one hop
+	// is about being a derivation SOURCE, not about pricing itself).
+	if r, err := pb.ResolveEvent("ft:ownrate", ""); err != nil || r.Prompt.String() != "0.000010000" {
+		t.Fatalf("own-rate ft direct resolve = %s, %v; want 0.000010000 / nil", r.Prompt, err)
+	}
+
+	// THE INVARIANT: a different ft: event whose base_model is the OWN-RATE fine-tune
+	// must NOT derive from it (that would be ft-of-ft, a second hop). Fail loud.
+	if _, err := pb.ResolveEvent("ft:9f8e7d6c5b4a", "ft:ownrate"); !errors.Is(err, ErrNoPrice) {
+		t.Fatalf("ft deriving from an own-rate ft: err = %v, want ErrNoPrice (one hop only — no fine-tune-of-fine-tune)", err)
+	}
+
+	// Sanity: deriving from the TRUE base still works (the one legitimate hop).
+	if r, err := pb.ResolveEvent("ft:9f8e7d6c5b4a", "meta-llama/Llama-3.1-8B-Instruct"); err != nil || r.Prompt.String() != "0.000006000" {
+		t.Fatalf("ft deriving from the true base = %s, %v; want 0.000006000 / nil", r.Prompt, err)
+	}
+
+	// And the SQL projection excludes the own-rate ft: as a derivation base: it must
+	// NOT appear in rating_derived (keyed on base_model), so the SQL and oracle agree.
+	for _, d := range pb.derivedRates() {
+		if d.BaseModel == "ft:ownrate" {
+			t.Fatalf("derivedRates() projected the own-rate fine-tune %q as a derivation base — one-hop violation in the SQL path", d.BaseModel)
+		}
+	}
+}
+
+// TestResolveEvent_FineTuneViaBaseModel (resolve-event-fine-tune-via-base-model):
+// ResolveEvent prices an ft:<checkpoint> model_id — not named in the file — through the
+// event-carried base_model (E3), at base × premium. Direct model_id pricing still wins
+// when the id IS in the file; an ft: id with an empty base_model fails loud.
+func TestResolveEvent_FineTuneViaBaseModel(t *testing.T) {
+	const y = `
+version: 1
+base_models:
+  "meta-llama/Llama-3.1-8B-Instruct":
+    prompt:     "0.000004"
+    cached:     "0.0000004"
+    completion: "0.00001"
+fine_tune_premium:
+  policy: multiplier
+  factor: "1.5"
+`
+	pb, err := ParsePriceBook([]byte(y))
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+
+	// ft: id NOT in the file, base_model IS → base × 1.5.
+	r, err := pb.ResolveEvent("ft:deadbeef", "meta-llama/Llama-3.1-8B-Instruct")
+	if err != nil {
+		t.Fatalf("resolve ft via base_model: %v", err)
+	}
+	if r.Prompt.String() != "0.000006000" || r.Cached.String() != "0.000000600" || r.Completion.String() != "0.000015000" {
+		t.Fatalf("derived rates = %s/%s/%s, want base×1.5", r.Prompt, r.Cached, r.Completion)
+	}
+
+	// A base model id resolves DIRECTLY regardless of base_model (here empty).
+	if r, err := pb.ResolveEvent("meta-llama/Llama-3.1-8B-Instruct", ""); err != nil || r.Prompt.String() != "0.000004000" {
+		t.Fatalf("base model direct resolve = %s, %v; want 0.000004000 / nil", r.Prompt, err)
+	}
+
+	// FAIL LOUD: an ft: id with an EMPTY base_model is a propagation bug, not $0.
+	if _, err := pb.ResolveEvent("ft:deadbeef", ""); !errors.Is(err, ErrNoPrice) {
+		t.Fatalf("ft: with empty base_model: err = %v, want ErrNoPrice (never silently mis-price)", err)
+	}
+
+	// FAIL LOUD: an ft: id whose base_model is NOT a priced base → ErrNoPrice.
+	if _, err := pb.ResolveEvent("ft:deadbeef", "some/unpriced-base"); !errors.Is(err, ErrNoPrice) {
+		t.Fatalf("ft: with unknown base_model: err = %v, want ErrNoPrice", err)
+	}
+}
+
+// TestLoad_MalformedYAMLFailsClosed (malformed-yaml-fails-closed): a bad price file is
+// an ERROR — the rater refuses to run rather than rate at $0 or a wrong rate. The
+// table enumerates every malformed shape it pins, including an INCONSISTENT PREMIUM
+// POLICY: not YAML, wrong/absent version, unknown key, typo'd rate key, float-shaped
+// (exponent) rate, negative rate, missing rate component, empty base_models, a base id
+// using the ft: prefix, a dangling derived_from, a fine-tune with no linkage, a
+// multiplier policy with no factor, a markup policy that also sets factor, an unknown
+// policy name, and a negative GPU floor.
+func TestLoad_MalformedYAMLFailsClosed(t *testing.T) {
 	cases := []struct {
-		name, at, wantPrompt string
-		wantErr              error
+		name string
+		yaml string
 	}{
-		{name: "event-before-change-uses-old-price", at: "2026-03-15T12:00:00Z", wantPrompt: "0.000003000"},
-		{name: "event-at-new-effective_from-uses-new-price", at: "2026-06-01T00:00:00Z", wantPrompt: "0.000005000"},
-		{name: "event-after-change-uses-new-price", at: "2026-09-01T00:00:00Z", wantPrompt: "0.000005000"},
-		{name: "event-before-any-price-fails-loud", at: "2025-01-01T00:00:00Z", wantErr: ErrNoPrice},
+		{"not-yaml", "::: this is not yaml :::"},
+		{"wrong-version", "version: 2\nbase_models:\n  m: {prompt: \"1\", cached: \"1\", completion: \"1\"}"},
+		{"no-version", "base_models:\n  m: {prompt: \"1\", cached: \"1\", completion: \"1\"}"},
+		{"empty-base-models", "version: 1\nbase_models: {}"},
+		{"unknown-key", "version: 1\nbase_models:\n  m: {prompt: \"1\", cached: \"1\", completion: \"1\"}\nbogus: 3"},
+		{"typoed-rate-key", "version: 1\nbase_models:\n  m: {promt: \"1\", cached: \"1\", completion: \"1\"}"},
+		{"float-exponent-rate", "version: 1\nbase_models:\n  m: {prompt: \"1e-6\", cached: \"0\", completion: \"0\"}"},
+		{"negative-rate", "version: 1\nbase_models:\n  m: {prompt: \"-0.000001\", cached: \"0\", completion: \"0\"}"},
+		{"missing-component", "version: 1\nbase_models:\n  m: {prompt: \"0.000001\", completion: \"0\"}"},
+		{"base-with-ft-prefix", "version: 1\nbase_models:\n  \"ft:x\": {prompt: \"1\", cached: \"1\", completion: \"1\"}"},
+		{"dangling-derived-from", "version: 1\nbase_models:\n  base: {prompt: \"1\", cached: \"1\", completion: \"1\"}\nfine_tunes:\n  \"ft:x\": {derived_from: \"nope\"}"},
+		{"ft-no-linkage", "version: 1\nbase_models:\n  base: {prompt: \"1\", cached: \"1\", completion: \"1\"}\nfine_tunes:\n  \"ft:x\": {}"},
+		{"multiplier-no-factor", "version: 1\nbase_models:\n  m: {prompt: \"1\", cached: \"1\", completion: \"1\"}\nfine_tune_premium:\n  policy: multiplier"},
+		{"markup-with-factor", "version: 1\nbase_models:\n  m: {prompt: \"1\", cached: \"1\", completion: \"1\"}\nfine_tune_premium:\n  policy: markup\n  factor: \"1.5\"\n  markup: \"1\""},
+		{"unknown-policy", "version: 1\nbase_models:\n  m: {prompt: \"1\", cached: \"1\", completion: \"1\"}\nfine_tune_premium:\n  policy: bogus"},
+		{"negative-gpu-floor", "version: 1\nbase_models:\n  m: {prompt: \"1\", cached: \"1\", completion: \"1\"}\ngpu_floor_rates:\n  A100: \"-1\""},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			r, err := book.ResolvePrice("m", mustTime(tc.at))
-			if tc.wantErr != nil {
-				if !errors.Is(err, tc.wantErr) {
-					t.Fatalf("err = %v, want Is(%v)", err, tc.wantErr)
-				}
-				return
-			}
-			if err != nil {
-				t.Fatalf("unexpected err: %v", err)
-			}
-			if r.Prompt.String() != tc.wantPrompt {
-				t.Fatalf("prompt = %s, want %s (wrong effective price)", r.Prompt, tc.wantPrompt)
+			if _, err := ParsePriceBook([]byte(tc.yaml)); err == nil {
+				t.Fatalf("malformed price file %q parsed cleanly; want a fail-closed error (never rate at $0/wrong)", tc.name)
 			}
 		})
 	}
 }
 
-// TestResolve_MissingPriceFailsLoud: an unknown model and a model with no row at
-// `at` both fail loud (ErrNoPrice) — NEVER a $0 resolution.
-func TestResolve_MissingPriceFailsLoud(t *testing.T) {
-	book := NewPriceBook([]PriceRow{baseRow("m", "0.000003", "0", "0")}, nil)
-	if _, err := book.ResolvePrice("does-not-exist", mustTime("2026-06-01T00:00:00Z")); !errors.Is(err, ErrNoPrice) {
-		t.Fatalf("unknown model: err = %v, want ErrNoPrice", err)
-	}
-}
-
-// TestResolve_HalfOpenWindow: an event exactly at effective_to is excluded (belongs
-// to the next window or is unpriced).
-func TestResolve_HalfOpenWindow(t *testing.T) {
-	row := PriceRow{
-		ModelID: "m", HasRate: true, Prompt: MustDec("0.000003"), Cached: MustDec("0"), Completion: MustDec("0"),
-		EffectiveFrom: mustTime("2026-01-01T00:00:00Z"),
-		EffectiveTo:   mustTime("2026-06-01T00:00:00Z"),
-	}
-	book := NewPriceBook([]PriceRow{row}, nil)
-	if _, err := book.ResolvePrice("m", mustTime("2026-06-01T00:00:00Z")); !errors.Is(err, ErrNoPrice) {
-		t.Fatalf("at upper bound: err = %v, want ErrNoPrice (half-open)", err)
-	}
-	if _, err := book.ResolvePrice("m", mustTime("2026-05-31T23:59:59Z")); err != nil {
-		t.Fatalf("just before upper bound: unexpected err %v", err)
-	}
-}
-
-// TestResolve_DerivedFromInheritance_Identity: a fine-tune (rate=null, derived_from)
-// with the default identity policy inherits its base's rate exactly. This is the
-// pointer-not-copy rule — a base price change auto-propagates.
-func TestResolve_DerivedFromInheritance_Identity(t *testing.T) {
-	base := baseRow("base", "0.000003", "0.0000003", "0.00001")
-	ft := derivedRow("ft", "base")
-	book := NewPriceBook([]PriceRow{base, ft}, nil) // no policy row → identity default
-
-	r, err := book.ResolvePrice("ft", mustTime("2026-06-01T00:00:00Z"))
+// TestLoad_NumericExactnessNoFloat (numeric-exactness-no-float): a sub-$1/1M price
+// declared as a decimal string survives the load EXACTLY (the reason rates are
+// strings in YAML, not floats).
+func TestLoad_NumericExactnessNoFloat(t *testing.T) {
+	const y = `
+version: 1
+base_models:
+  m:
+    prompt:     "0.000000150"
+    cached:     "0"
+    completion: "0.000000600"
+`
+	pb, err := ParsePriceBook([]byte(y))
 	if err != nil {
-		t.Fatal(err)
+		t.Fatalf("parse: %v", err)
 	}
-	if r.Prompt.String() != "0.000003000" || r.Cached.String() != "0.000000300" || r.Completion.String() != "0.000010000" {
-		t.Fatalf("inherited rate = %s/%s/%s, want base rate (identity)", r.Prompt, r.Cached, r.Completion)
-	}
-}
-
-// TestResolve_DerivationMultiplier: fine-tune price = base × factor (1.5×).
-func TestResolve_DerivationMultiplier(t *testing.T) {
-	base := baseRow("base", "0.000003", "0.0000003", "0.00001")
-	ft := derivedRow("ft", "base")
-	pol := []PolicyRow{{
-		Func: PolicyMultiplier, Factor: MustDec("1.5"),
-		EffectiveFrom: mustTime("2026-01-01T00:00:00Z"),
-	}}
-	book := NewPriceBook([]PriceRow{base, ft}, pol)
-
-	r, err := book.ResolvePrice("ft", mustTime("2026-06-01T00:00:00Z"))
+	r, err := pb.Resolve("m")
 	if err != nil {
-		t.Fatal(err)
+		t.Fatalf("resolve: %v", err)
 	}
-	if r.Prompt.String() != "0.000004500" || r.Cached.String() != "0.000000450" || r.Completion.String() != "0.000015000" {
-		t.Fatalf("multiplier-derived = %s/%s/%s, want base×1.5", r.Prompt, r.Cached, r.Completion)
+	if r.Prompt.String() != "0.000000150" || r.Completion.String() != "0.000000600" {
+		t.Fatalf("exact sub-$1/1M rate drifted: %s/%s", r.Prompt, r.Completion)
 	}
 }
 
-// TestResolve_DerivationMarkup: fine-tune price = base + per-token markup.
-func TestResolve_DerivationMarkup(t *testing.T) {
-	base := baseRow("base", "0.000003", "0.0000003", "0.00001")
-	ft := derivedRow("ft", "base")
-	pol := []PolicyRow{{
-		Func: PolicyMarkup, Markup: MustDec("0.000001"),
-		EffectiveFrom: mustTime("2026-01-01T00:00:00Z"),
-	}}
-	book := NewPriceBook([]PriceRow{base, ft}, pol)
+// TestLoad_SubNanoRateRoundsToZeroFailsClosed (sub-nano-rate-rounds-to-zero-fails-closed):
+// a per-token rate finer than 9dp that quantizes to $0 is REJECTED at load. Money is
+// billed at 9dp (NUMERIC(20,9)); a nonzero rate that rounds to zero would serve the
+// model for FREE — silent lost revenue. The guard fires on the nonzero-rounds-to-zero
+// case ONLY: a literal "0" is an intentional free rate and must still load, and a rate
+// at or above 1 nano must load unchanged.
+func TestLoad_SubNanoRateRoundsToZeroFailsClosed(t *testing.T) {
+	// A nonzero prompt rate one decimal finer than nano: 0.0000000001 -> 0.000000000.
+	const tooFine = `
+version: 1
+base_models:
+  m:
+    prompt:     "0.0000000001"
+    cached:     "0"
+    completion: "0"
+`
+	_, err := ParsePriceBook([]byte(tooFine))
+	if err == nil {
+		t.Fatal("a nonzero rate that rounds to $0 at 9dp loaded cleanly; want a fail-closed error (it would bill the model FREE)")
+	}
+	if !strings.Contains(err.Error(), "rounds to $0") || !strings.Contains(err.Error(), "m") {
+		t.Fatalf("error = %q, want it to name the offending model and the round-to-zero cause", err)
+	}
 
-	r, err := book.ResolvePrice("ft", mustTime("2026-06-01T00:00:00Z"))
+	// Half-up boundary: 0.0000000005 -> 0.000000001 (NONZERO at 9dp), so it must LOAD.
+	const onBoundary = `
+version: 1
+base_models:
+  m:
+    prompt:     "0.0000000005"
+    cached:     "0"
+    completion: "0"
+`
+	pb, err := ParsePriceBook([]byte(onBoundary))
 	if err != nil {
-		t.Fatal(err)
+		t.Fatalf("a rate that rounds half-up to 1 nano must load: %v", err)
 	}
-	if r.Prompt.String() != "0.000004000" || r.Cached.String() != "0.000001300" || r.Completion.String() != "0.000011000" {
-		t.Fatalf("markup-derived = %s/%s/%s, want base+0.000001", r.Prompt, r.Cached, r.Completion)
+	if r, _ := pb.Resolve("m"); r.Prompt.Round(moneyScale).String() != "0.000000001" {
+		t.Fatalf("boundary rate quantized to %s, want 0.000000001", r.Prompt.Round(moneyScale))
+	}
+
+	// An intentional literal $0 free rate must STILL load (the guard targets nonzero
+	// mis-pricings, not deliberate zeros).
+	const freeRate = `
+version: 1
+base_models:
+  m:
+    prompt:     "0"
+    cached:     "0"
+    completion: "0"
+`
+	if _, err := ParsePriceBook([]byte(freeRate)); err != nil {
+		t.Fatalf("a literal $0 free rate must load (intentional zero): %v", err)
+	}
+
+	// The guard also covers a fine-tune's OWN rate (same parseRate3 path).
+	const ftOwnTooFine = `
+version: 1
+base_models:
+  base: {prompt: "0.000001", cached: "0", completion: "0"}
+fine_tunes:
+  "ft:x":
+    rate:
+      prompt:     "0.0000000002"
+      cached:     "0"
+      completion: "0"
+`
+	if _, err := ParsePriceBook([]byte(ftOwnTooFine)); err == nil {
+		t.Fatal("a fine-tune own-rate that rounds to $0 loaded cleanly; want fail-closed")
 	}
 }
 
-// TestResolve_OwnRateBypassesPolicy: a model with its OWN explicit rate ignores the
-// derivation policy entirely (the escape hatch), even if a multiplier is in effect.
-func TestResolve_OwnRateBypassesPolicy(t *testing.T) {
-	// "m" has its own rate AND (hypothetically) a derived_from; the own rate wins
-	// and the 1000× multiplier must NOT touch it.
-	own := PriceRow{
-		ModelID: "m", HasRate: true, DerivedFrom: "base",
-		Prompt: MustDec("0.000003"), Cached: MustDec("0.0000003"), Completion: MustDec("0.00001"),
-		EffectiveFrom: mustTime("2026-01-01T00:00:00Z"),
-	}
-	base := baseRow("base", "0.000009", "0", "0")
-	pol := []PolicyRow{{
-		Func: PolicyMultiplier, Factor: MustDec("1000"),
-		EffectiveFrom: mustTime("2026-01-01T00:00:00Z"),
-	}}
-	book := NewPriceBook([]PriceRow{own, base}, pol)
-
-	r, err := book.ResolvePrice("m", mustTime("2026-06-01T00:00:00Z"))
+// TestLoad_GPUFloorRatesParsed: per-GPU floor rates are parsed and validated (so the
+// file is complete) even though the token rater does not yet consume them.
+func TestLoad_GPUFloorRatesParsed(t *testing.T) {
+	const y = `
+version: 1
+base_models:
+  m: {prompt: "0.000001", cached: "0", completion: "0"}
+gpu_floor_rates:
+  "A100-80GB": "0.000123000"
+  "H100-80GB": "0.000456000"
+`
+	pb, err := ParsePriceBook([]byte(y))
 	if err != nil {
-		t.Fatal(err)
+		t.Fatalf("parse: %v", err)
 	}
-	if r.Prompt.String() != "0.000003000" {
-		t.Fatalf("own-rate model prompt = %s, want 0.000003000 (policy must NOT apply)", r.Prompt)
+	if got := pb.gpuFloor["A100-80GB"].String(); got != "0.000123000" {
+		t.Fatalf("A100 floor = %s, want 0.000123000", got)
 	}
-}
-
-// TestResolve_OneHopOnly: a model deriving from another DERIVED model (chain > 1
-// hop) is an ERROR (ErrDerivationChain), never recursed. v1 supports one hop only.
-func TestResolve_OneHopOnly(t *testing.T) {
-	base := baseRow("base", "0.000003", "0", "0")
-	mid := derivedRow("mid", "base")  // mid derives from base (1 hop, fine on its own)
-	leaf := derivedRow("leaf", "mid") // leaf derives from mid (a derived model) → 2 hops
-	book := NewPriceBook([]PriceRow{base, mid, leaf}, nil)
-
-	// mid resolves fine (one hop).
-	if _, err := book.ResolvePrice("mid", mustTime("2026-06-01T00:00:00Z")); err != nil {
-		t.Fatalf("mid (1 hop) should resolve, got %v", err)
-	}
-	// leaf is a 2-hop chain → error, not recursion.
-	_, err := book.ResolvePrice("leaf", mustTime("2026-06-01T00:00:00Z"))
-	if !errors.Is(err, ErrDerivationChain) {
-		t.Fatalf("leaf (2 hops): err = %v, want ErrDerivationChain", err)
+	if got := pb.gpuFloor["H100-80GB"].String(); got != "0.000456000" {
+		t.Fatalf("H100 floor = %s, want 0.000456000", got)
 	}
 }
 
-// TestResolve_DerivedBaseMissing: a fine-tune whose base has no effective rate at
-// `at` is unpriced (fail loud), not $0.
-func TestResolve_DerivedBaseMissing(t *testing.T) {
-	// base's rate only opens in June; an April event for the fine-tune can't resolve.
-	base := PriceRow{
-		ModelID: "base", HasRate: true, Prompt: MustDec("0.000003"), Cached: MustDec("0"), Completion: MustDec("0"),
-		EffectiveFrom: mustTime("2026-06-01T00:00:00Z"),
-	}
-	ft := derivedRow("ft", "base") // ft effective from Jan, base only from June
-	book := NewPriceBook([]PriceRow{base, ft}, nil)
-	if _, err := book.ResolvePrice("ft", mustTime("2026-04-01T00:00:00Z")); !errors.Is(err, ErrNoPrice) {
-		t.Fatalf("derived with no base rate: err = %v, want ErrNoPrice", err)
+// TestLoadPriceBook_MissingFileFailsClosed: a missing price file is an error — the
+// rater can't run without prices (never default to $0).
+func TestLoadPriceBook_MissingFileFailsClosed(t *testing.T) {
+	if _, err := LoadPriceBook("/no/such/prices.yaml"); err == nil {
+		t.Fatal("missing price file loaded cleanly; want a fail-closed error")
 	}
 }
 
-// TestResolve_DerivationPolicyEffectiveDated: the policy in effect at the event's
-// time is the one applied — a later policy change does not retroactively reprice.
-func TestResolve_DerivationPolicyEffectiveDated(t *testing.T) {
-	base := baseRow("base", "0.000004", "0", "0")
-	ft := derivedRow("ft", "base")
-	pol := []PolicyRow{
-		{Func: PolicyMultiplier, Factor: MustDec("1.5"),
-			EffectiveFrom: mustTime("2026-01-01T00:00:00Z"), EffectiveTo: mustTime("2026-06-01T00:00:00Z")},
-		{Func: PolicyMultiplier, Factor: MustDec("2"),
-			EffectiveFrom: mustTime("2026-06-01T00:00:00Z")},
-	}
-	book := NewPriceBook([]PriceRow{base, ft}, pol)
-
-	// March → 1.5× policy: 0.000004*1.5 = 0.000006
-	r, err := book.ResolvePrice("ft", mustTime("2026-03-01T00:00:00Z"))
+// TestLoadPriceBook_ExampleFileIsValid: the shipped example price file must parse and
+// validate — it is the operator-facing contract and a broken example is a footgun.
+func TestLoadPriceBook_ExampleFileIsValid(t *testing.T) {
+	pb, err := LoadPriceBook("../../config/prices.example.yaml")
 	if err != nil {
-		t.Fatal(err)
+		t.Fatalf("example price file does not load: %v", err)
 	}
-	if r.Prompt.String() != "0.000006000" {
-		t.Fatalf("March prompt = %s, want 0.000006000 (1.5× policy)", r.Prompt)
+	// It should price at least one concrete base model end-to-end.
+	if _, err := pb.Resolve("meta-llama/Llama-3.1-8B-Instruct"); err != nil {
+		t.Fatalf("example file does not price the documented base model: %v", err)
 	}
-	// July → 2× policy: 0.000004*2 = 0.000008
-	r, err = book.ResolvePrice("ft", mustTime("2026-07-01T00:00:00Z"))
-	if err != nil {
-		t.Fatal(err)
+}
+
+// TestResolvedRates_PremiumAppliedOnce: the flat projection the store joins carries
+// the FINAL rate (premium already applied) for both base and derived ids, and a
+// fine-tune with an own rate is emitted once at its own rate (premium not applied).
+func TestResolvedRates_PremiumAppliedOnce(t *testing.T) {
+	pb := newTestBook(
+		map[string]Rate3{"base": rate3("0.000004", "0", "0")},
+		map[string]string{"ft:x": "base"},
+		PolicyMultiplier, MustDec("1.5"), Dec{},
+	)
+	rows := pb.resolvedRates()
+	got := map[string]string{}
+	for _, r := range rows {
+		got[r.ModelID] = r.Prompt
 	}
-	if r.Prompt.String() != "0.000008000" {
-		t.Fatalf("July prompt = %s, want 0.000008000 (2× policy)", r.Prompt)
+	if len(rows) != 2 {
+		t.Fatalf("projected %d rows, want 2 (base + derived)", len(rows))
+	}
+	if got["base"] != "0.000004000" {
+		t.Fatalf("base projected prompt = %s, want 0.000004000", got["base"])
+	}
+	if got["ft:x"] != "0.000006000" { // 0.000004 × 1.5
+		t.Fatalf("derived projected prompt = %s, want 0.000006000 (premium applied)", got["ft:x"])
+	}
+	// Deterministic ordering for a stable projection.
+	if !strings.HasPrefix(rows[0].ModelID, "base") {
+		t.Fatalf("rows not sorted by model_id: %+v", rows)
 	}
 }

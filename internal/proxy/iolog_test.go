@@ -1,6 +1,7 @@
 package proxy
 
 import (
+	"bytes"
 	"context"
 	"io"
 	"net/http"
@@ -307,4 +308,87 @@ func TestIOLog_SinkReceivesRecordViaOnDone(t *testing.T) {
 	if got := len(sink.all()); got != 1 {
 		t.Fatalf("opted-in request must hand exactly 1 record to the sink, got %d", got)
 	}
+}
+
+// newIOLogServerWithLog is newIOLogServer but with a caller-supplied logger, so a
+// test can capture WARN output (the request-body-truncation observability line).
+func newIOLogServerWithLog(t *testing.T, upstream *url.URL, policy iolog.Policy, sink iolog.Sink, maxBody int, log *logging.Logger) *Server {
+	t.Helper()
+	s := &config.Settings{ListenAddr: ":0"}
+	resolver := registry.NewStatic(upstream)
+	return NewWithIOLog(s, log, resolver, &recordingEmitter{}, policy, sink, maxBody)
+}
+
+// TestIOLog_RequestTruncationLogged verifies Hugo's D1 decision: hard truncation
+// of the captured request body is fine, but it must be OBSERVABLE — a single WARN
+// line fires (with request_id and original→cap sizes) ONLY when the body exceeds
+// the cap, and stays silent for an under-cap body.
+func TestIOLog_RequestTruncationLogged(t *testing.T) {
+	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// Drain so the upstream still sees the full forwarded body.
+		_, _ = io.Copy(io.Discard, r.Body)
+		_, _ = io.WriteString(w, `{"ok":true,"model":"m"}`)
+	}))
+	defer backend.Close()
+	upstream, _ := url.Parse(backend.URL)
+
+	const bodyCap = 100
+
+	t.Run("over cap logs", func(t *testing.T) {
+		var buf bytes.Buffer
+		log := logging.New(logging.WARN)
+		log.Warn.SetOutput(&buf)
+
+		policy := &spyPolicy{decision: true}
+		sink := &recordingSink{}
+		srv := newIOLogServerWithLog(t, upstream, policy, sink, bodyCap, log)
+
+		big := strings.Repeat("A", 500)
+		rr := httptest.NewRecorder()
+		srv.Handler().ServeHTTP(rr, iologRequest(http.MethodPost, big))
+
+		if rr.Code != http.StatusOK {
+			t.Fatalf("status = %d, want 200", rr.Code)
+		}
+		// The record must mark the request body truncated...
+		recs := sink.all()
+		if len(recs) != 1 || !recs[0].RequestTruncated {
+			t.Fatalf("expected 1 record with RequestTruncated=true, got %+v", recs)
+		}
+		// ...and the WARN line must fire with request_id and original→cap sizes.
+		out := buf.String()
+		if !strings.Contains(out, "request body truncated") {
+			t.Fatalf("no truncation WARN logged; got %q", out)
+		}
+		if !strings.Contains(out, "request_id=req-iolog-1") {
+			t.Errorf("WARN missing request_id; got %q", out)
+		}
+		if !strings.Contains(out, "500 → 100 bytes") {
+			t.Errorf("WARN missing original→cap sizes (want \"500 → 100 bytes\"); got %q", out)
+		}
+	})
+
+	t.Run("under cap silent", func(t *testing.T) {
+		var buf bytes.Buffer
+		log := logging.New(logging.WARN)
+		log.Warn.SetOutput(&buf)
+
+		policy := &spyPolicy{decision: true}
+		sink := &recordingSink{}
+		srv := newIOLogServerWithLog(t, upstream, policy, sink, bodyCap, log)
+
+		rr := httptest.NewRecorder()
+		srv.Handler().ServeHTTP(rr, iologRequest(http.MethodPost, `{"model":"m"}`))
+
+		if rr.Code != http.StatusOK {
+			t.Fatalf("status = %d, want 200", rr.Code)
+		}
+		recs := sink.all()
+		if len(recs) != 1 || recs[0].RequestTruncated {
+			t.Fatalf("under-cap body must not be truncated; got %+v", recs)
+		}
+		if out := buf.String(); strings.Contains(out, "request body truncated") {
+			t.Errorf("under-cap body must NOT log truncation; got %q", out)
+		}
+	})
 }

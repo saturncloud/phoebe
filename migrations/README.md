@@ -1,39 +1,54 @@
-# phoebe migrations — `billing_event` + rating (`model_price`, `rated_usage`)
+# phoebe migrations — `billing_event` + rating (`rated_usage`)
 
 This directory holds the schema for phoebe's billing tables, which live in the
 **shared Atlas Postgres** alongside the rest of the Saturn schema:
 
 - `billing_event` — the system-of-record table that phoebe's Postgres drainer
   (`cmd/drainer`) writes raw, pre-rating metering records into.
-- `model_price` + `derivation_policy` + `rated_usage` — the **rating v2** (revenue)
-  schema: the effective-dated price book (keyed on a stable `model_id`), the single
-  global fine-tune derivation policy, and the per-(auth_id, model_id, hour) cost
-  rollup that the rater batch job (`cmd/rater`) joins and writes. **Money is stored
-  as `NUMERIC(20,9)` — exact decimal, never float and never an integer micro/nano
-  scalar — and ALL money math happens in SQL, not Go.**
+- `rated_usage` — the **rating (E1)** (revenue) rollup: per-(auth_id, model_id,
+  hour) cost, carrying the applied per-token rates frozen onto each row. **Money is
+  stored as `NUMERIC(20,9)` — exact decimal, never float and never an integer
+  micro/nano scalar — and ALL money math happens in SQL, not Go.**
 
-### Rating v2 money model (read before touching a number)
+**PRICES ARE A YAML CONFIG FILE, NOT A DB TABLE (E1).** There is no `model_price`
+and no `derivation_policy` table. The operator authors a versioned price YAML
+(`config/prices.example.yaml`): base per-token rates keyed on the HF model id, the
+single global fine-tune premium policy, and per-GPU floor rates. The file's version
+history IS the price audit trail. The hourly rater loads the **current** file,
+projects the rates into a transient TEMP table, rates the last complete hour, and
+**freezes the applied rate onto each `rated_usage` row** (self-auditing, immutable).
+
+### Rating money model (read before touching a number)
 
 - Every money column is `NUMERIC(20,9)`: 9 fractional digits (nano-USD), 11
   integer digits. A sub-$1/1M price like `$0.15/1M = 0.000000150` USD/token is
   exact; an integer micro/nano unit would round it or coarsen it.
-- The rater **computes per-event cost AND sums it in a single `INSERT … SELECT`**.
-  Go never holds a running money total; it only carries `NUMERIC` values as text.
-- `model_price` is keyed on `model_id` (a stable model identity, **not** a
-  deployment id or display name). A fine-tune with a NULL rate sets `derived_from`
-  to its base's `model_id` and inherits the base's effective rate transformed by
-  `derivation_policy` — a pointer, not a copy (a base price change auto-propagates).
-  One hop only (a chain > 1 hop is treated as unpriced).
-- `derivation_policy` is the **single global** rule (`identity | multiplier |
-  markup`), effective-dated. Per-base override is a deliberate v1 non-goal.
-- Effective-dating is **forward-only, non-overlapping**, enforced by GiST `EXCLUDE`
-  constraints (`btree_gist`): at most one price/policy row matches per instant, so
-  the rating join can never fan out and silently over-bill.
-- **Audit:** `model_price`/`derivation_policy` are append-only-effective-dated
-  (never UPDATE a price — insert a new effective row and close the old); that
-  history IS the audit trail, and `created_by` records who set it. The write-path
-  authz ("operator-only") is an Atlas/control-plane concern — **out of scope for
-  phoebe**; the DB merely records `created_by`.
+- The rater **computes per-event cost AND sums it in a single `INSERT … SELECT`**
+  over the YAML-projected price table. Go never holds a running money total; it only
+  carries `NUMERIC` values as text. (The fine-tune premium is the one exception —
+  applied in exact decimal when the prices are projected, then handed to SQL.)
+- Prices are keyed on `model_id` (a stable model identity, **not** a deployment id
+  or display name): an HF base id, or `ft:<checkpoint>` for a fine-tune. A fine-tune
+  inherits its base's rate transformed by the global premium — a pointer, not a copy
+  (a base price change auto-propagates). One hop only.
+- **`rated_usage` carries the applied rates** (`applied_prompt_rate` /
+  `applied_cached_rate` / `applied_completion_rate`): the exact per-token rates the
+  rollup was billed at. The row is then immutable and self-auditing — "we never
+  reprice traffic you've already served" holds by construction.
+- **Audit:** the price file's git/version history IS the audit trail; re-rating is a
+  deliberate, audited re-run, never a silent side effect of editing the file. The
+  write-path authz ("operator-only") is an out-of-band concern (who can edit the
+  file), not a phoebe DB concern.
+
+> **Fine-tune base linkage (closed):** `billing_event` now carries a `base_model`
+> column — the HF base id a fine-tune derives from (E3), stamped by Atlas at deploy and
+> injected on the `X-Saturn-Base-Model` header. The rater prices an `ft:<checkpoint>`
+> id (which the price file never names) at base × premium by resolving through this
+> column. A base-direct model still prices off its own rate. An `ft:` id with a NULL
+> `base_model` is a propagation bug, not a free model: it is **unpriced** (fail loud,
+> never $0). The column is declared in the `billing_event` create migration and added
+> idempotently in the rating migration (`ADD COLUMN IF NOT EXISTS`) for any
+> already-applied `billing_event`.
 
 ## Why the schema lives here but is *applied* by Atlas (migration ownership)
 
@@ -56,11 +71,11 @@ a **ready-to-copy Alembic file**, not a migrator phoebe executes:
 | --- | --- |
 | `0001_billing_event.sql` | Plain DDL. Reference + local-dev convenience (`psql -f`). Not the production apply path. |
 | `atlas/b1f0c2d3e4a5_add_billing_event.py` | A real Alembic `upgrade()`/`downgrade()` following Atlas conventions. The production artifact. |
-| `0002_rating.sql` | Plain DDL for `model_price` + `derivation_policy` + `rated_usage` (the rating v2 tables, NUMERIC money, GiST exclusion constraints). Reference + local-dev. Notes `CREATE EXTENSION btree_gist`. |
-| `atlas/c2f1a3b4d5e6_add_rating.py` | The Alembic artifact for the rating tables. Chains after `billing_event`. |
+| `0002_rating.sql` | Plain DDL for `rated_usage` (the rating rollup; NUMERIC money + applied-rate columns). Reference + local-dev. Prices are a YAML file, not a table. |
+| `atlas/c2f1a3b4d5e6_add_rating.py` | The Alembic artifact for `rated_usage`. Chains after `billing_event`. |
 | `0002_io_log.sql` | Plain DDL for `io_log` (M5 per-tenant I/O-logging store: request/response bodies + `body_tsv` GIN full-text). Reference + local-dev. |
 | `atlas/c2e1d3f4a5b6_add_io_log.py` | The Alembic artifact for `io_log`. Chains after `billing_event` (re-point when landing alongside rating — see below). |
-| `seed_example_prices.sql` | **PLACEHOLDER, non-binding** example price book for local dev (a base model, a derived fine-tune, and a global derivation policy). NOT a schema migration and NOT for prod — an operator sets real prices as data. |
+| `../config/prices.example.yaml` | The **operator-facing price file** (E1): base per-token rates keyed on the HF model id, the global fine-tune premium policy, per-GPU floor rates. The contract the rater prices from. Not a migration. |
 
 ### Migration chain (IMPORTANT when landing these together)
 
@@ -111,12 +126,13 @@ without a matching entry there simply won't be written:
 - `billing_event`: `0001_billing_event.sql` ↔ `atlas/b1f0c2d3e4a5_…` ↔
   `internal/drain/store.go` (`upsertColumns`).
 - `rated_usage`: `0002_rating.sql` ↔ `atlas/c2f1a3b4d5e6_…` ↔ the `INSERT INTO
-  rated_usage (…)` column list in `internal/rating/store.go` (`rateWindowSQL`).
+  rated_usage (…)` column list in `internal/rating/store.go` (`rateWindowSQL`),
+  including the `applied_*_rate` columns.
 - `io_log`: `0002_io_log.sql` ↔ `atlas/c2e1d3f4a5b6_…` ↔ the insert column list in
   `internal/iolog/postgres.go`.
-- `model_price` and `derivation_policy` are read-only to phoebe (rating SELECTs
-  them; an operator writes prices/policy as data), so they have no Go upsert column
-  list — only the `.sql`/Alembic pair.
+- Prices are NOT in the DB: they live in the YAML price file
+  (`config/prices.example.yaml`), parsed by `internal/rating/pricebook.go`. There is
+  no `model_price`/`derivation_policy` table to keep in sync.
 
 > Backfill note (empty-model fix): drainer rows written before the
 > `nullStr(e.Model)` fix stored `model = ''` instead of NULL when the upstream

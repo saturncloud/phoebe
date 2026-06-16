@@ -255,23 +255,34 @@ func (h *harness) drainUntilRows(t *testing.T, n int, timeout time.Duration) {
 	}
 }
 
-// seedPrice inserts the model_price row for the engine model name. effective_from
-// is in the past relative to the test events (which are stamped time.Now by the
-// emitter), so resolution always finds it.
-func (h *harness) seedPrice(t *testing.T) {
+// priceBookYAML is the YAML price file for the e2e rater (E1): prices are a config
+// file now, not DB rows. It prices the ENGINE model name with the same rates the
+// old model_price seed used, so the expected cost is unchanged.
+const priceBookYAML = `
+version: 1
+base_models:
+  "llama-3-8b":
+    prompt:     "0.000005"
+    cached:     "0.0000005"
+    completion: "0.00002"
+`
+
+// priceBook parses the e2e YAML price file into a PriceBook (fail-closed if the
+// fixture is malformed).
+func (h *harness) priceBook(t *testing.T) *rating.PriceBook {
 	t.Helper()
-	if _, err := h.db.Exec(
-		`INSERT INTO model_price (id, model_id, prompt_price, cached_price, completion_price, effective_from)
-		 VALUES ('e2e-price-0001', $1, 0.000005, 0.0000005, 0.00002, $2)`,
-		testModelName, time.Now().UTC().Add(-24*time.Hour)); err != nil {
-		t.Fatalf("seed model_price: %v", err)
+	pb, err := rating.ParsePriceBook([]byte(priceBookYAML))
+	if err != nil {
+		t.Fatalf("parse e2e price book: %v", err)
 	}
+	return pb
 }
 
 // rateEventHour reads the stored event's rating instant back from billing_event,
-// truncates it to its UTC hour, and runs a real rating.Rater over exactly that
-// hour window — so the test never races a wall-clock hour boundary.
-func (h *harness) rateEventHour(t *testing.T) rating.Result {
+// truncates it to its UTC hour, and runs a real rating.Rater (priced from the YAML
+// PriceBook) over exactly that hour window — so the test never races a wall-clock
+// hour boundary.
+func (h *harness) rateEventHour(t *testing.T, book *rating.PriceBook) rating.Result {
 	t.Helper()
 	var evTS time.Time
 	if err := h.db.QueryRow(
@@ -280,8 +291,8 @@ func (h *harness) rateEventHour(t *testing.T) rating.Result {
 	}
 	hour := evTS.UTC().Truncate(time.Hour)
 
-	rater := rating.New(rating.NewPostgresStore(h.db), h.log)
-	res, err := rater.Run(context.Background(), hour, hour.Add(time.Hour))
+	rater := rating.New(rating.NewPostgresStore(h.db), book, h.log)
+	res, err := rater.Run(context.Background(), hour, hour.Add(time.Hour), false)
 	if err != nil {
 		t.Fatalf("rater.Run: %v", err)
 	}
@@ -433,9 +444,8 @@ func TestE2E_StreamedRequestBecomesMoney(t *testing.T) {
 		t.Error("billing_event.aborted = true for a completed stream")
 	}
 
-	// 4. Rater: seed the price for the ENGINE name, rate the event's hour.
-	h.seedPrice(t)
-	res := h.rateEventHour(t)
+	// 4. Rater: price the ENGINE name from the YAML price file, rate the event's hour.
+	res := h.rateEventHour(t, h.priceBook(t))
 
 	// 5. The money. Expected cost, hand-derived from the fixture and the seeded
 	//    prices (mirrors the Rate() oracle's billable-prompt formula, computed
@@ -461,7 +471,7 @@ func TestE2E_StreamedRequestBecomesMoney(t *testing.T) {
 		nRollups                                     int
 		ruAuthID, ruModelID, cost                    string
 		ruPrompt, ruCached, ruCompletion, ruBillable int64
-		eventCount                                   int
+		eventCount                                   int64 // BIGINT column
 	)
 	if err := h.db.QueryRow("SELECT COUNT(*) FROM rated_usage").Scan(&nRollups); err != nil {
 		t.Fatalf("count rated_usage: %v", err)
@@ -491,6 +501,206 @@ func TestE2E_StreamedRequestBecomesMoney(t *testing.T) {
 		t.Errorf("rated_usage.event_count = %d, want 1", eventCount)
 	}
 	h.assertNumericEqual(t, cost, wantCost, "rated_usage.cost")
+}
+
+// ftVllmStream is the vLLM SSE fixture for a FINE-TUNE deployment: the engine reports
+// the ft:<checkpoint> id as its model name (the stable price key for a fine-tune, E3).
+const ftVllmStream = `data: {"id":"c2","object":"chat.completion.chunk","model":"ft:9f8e7d6c5b4a","choices":[{"index":0,"delta":{"role":"assistant","content":"Hi"}}]}
+
+data: {"id":"c2","object":"chat.completion.chunk","model":"ft:9f8e7d6c5b4a","choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}
+
+data: {"id":"c2","object":"chat.completion.chunk","model":"ft:9f8e7d6c5b4a","choices":[],"usage":{"prompt_tokens":1000,"total_tokens":1000,"completion_tokens":0,"prompt_tokens_details":{"cached_tokens":0}}}
+
+data: [DONE]
+
+`
+
+// ftPriceBookYAML prices ONLY the base model + a 1.5× premium. The fine-tune's
+// ft:<checkpoint> id is NOT listed — it prices through the event-carried base_model.
+const ftPriceBookYAML = `
+version: 1
+base_models:
+  "meta-llama/Llama-3.1-8B-Instruct":
+    prompt:     "0.000004"
+    cached:     "0"
+    completion: "0"
+fine_tune_premium:
+  policy: multiplier
+  factor: "1.5"
+`
+
+// TestE2E_FineTuneBillsAtBaseTimesPremium is the fine-tune pipeline test: a request to
+// a fine-tune deployment carries the X-Saturn-Base-Model header (as Atlas injects it
+// at deploy), the engine reports the ft:<checkpoint> id as its model, and the whole
+// pipe must end with the fine-tune billed at base × premium — proving base_model rides
+// end to end (proxy → emit → drain → billing_event.base_model → rater derived join).
+//
+//   - base_model contract: billing_event.base_model is the HF base id from the header,
+//     NOT empty — the propagation seam the rater needs to price an ft: id;
+//   - the money: the ft: id (absent from the price file) bills at base × 1.5 via its
+//     base_model, with zero unpriced events.
+func TestE2E_FineTuneBillsAtBaseTimesPremium(t *testing.T) {
+	h := newHarness(t, "phoebe_e2e_finetune")
+
+	const (
+		ftModelName = "ft:9f8e7d6c5b4a"
+		ftBaseModel = "meta-llama/Llama-3.1-8B-Instruct"
+	)
+
+	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.WriteHeader(http.StatusOK)
+		fl, _ := w.(http.Flusher)
+		for _, chunk := range strings.SplitAfter(ftVllmStream, "\n\n") {
+			if chunk == "" {
+				continue
+			}
+			_, _ = io.WriteString(w, chunk)
+			if fl != nil {
+				fl.Flush()
+			}
+		}
+	}))
+	defer backend.Close()
+
+	srv := h.proxyServer(t, backend.URL)
+	rr := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions",
+		strings.NewReader(`{"model":"my-finetune","stream":true,"messages":[]}`))
+	req.Header.Set(identity.HeaderAuthID, testAuthID)
+	req.Header.Set(identity.HeaderResourceID, testResourceID)
+	req.Header.Set(identity.HeaderResourceType, "deployment")
+	req.Header.Set(identity.HeaderUserID, "user-e2e")
+	req.Header.Set(identity.HeaderGroupID, "group-e2e")
+	// The base_model header Atlas injects at deploy for a fine-tune endpoint.
+	req.Header.Set(identity.HeaderBaseModel, ftBaseModel)
+	srv.Handler().ServeHTTP(rr, req)
+
+	if rr.Code != http.StatusOK {
+		t.Fatalf("proxy status = %d, want 200 (body: %s)", rr.Code, rr.Body.String())
+	}
+
+	h.waitForStreamLen(t, 1, 5*time.Second)
+	h.drainUntilRows(t, 1, 10*time.Second)
+
+	// base_model contract: stored verbatim, alongside the ft: model name.
+	var model, baseModel sql.NullString
+	if err := h.db.QueryRow("SELECT model, base_model FROM billing_event").Scan(&model, &baseModel); err != nil {
+		t.Fatalf("read billing_event: %v", err)
+	}
+	if !model.Valid || model.String != ftModelName {
+		t.Errorf("billing_event.model = %v, want %q (the ft: checkpoint id)", model, ftModelName)
+	}
+	if !baseModel.Valid || baseModel.String != ftBaseModel {
+		t.Fatalf("billing_event.base_model = %v, want %q — the header must ride to billing_event for the rater to price the fine-tune", baseModel, ftBaseModel)
+	}
+
+	// Rate from the YAML book that prices ONLY the base; the ft: id must resolve via
+	// base_model at base × premium.
+	book, err := rating.ParsePriceBook([]byte(ftPriceBookYAML))
+	if err != nil {
+		t.Fatalf("parse ft price book: %v", err)
+	}
+	res := h.rateEventHour(t, book)
+
+	if res.UnpricedEvents != 0 || res.UnattributableEvents != 0 {
+		t.Fatalf("anomalies = %d unpriced / %d unattributable, want 0/0 — base_model failed to plumb the fine-tune's price", res.UnpricedEvents, res.UnattributableEvents)
+	}
+	if res.EventsRated != 1 || res.RollupsWritten != 1 {
+		t.Fatalf("rater Result = %+v, want 1 event / 1 rollup", res)
+	}
+	// 1000 prompt tokens × (0.000004 base × 1.5 premium) = 0.006.
+	const wantCost = "0.006"
+	h.assertNumericEqual(t, res.TotalCost, wantCost, "Result.TotalCost (base × premium)")
+
+	var ruModelID, cost, appliedPrompt string
+	if err := h.db.QueryRow(
+		`SELECT model_id, cost::text, applied_prompt_rate::text FROM rated_usage`).
+		Scan(&ruModelID, &cost, &appliedPrompt); err != nil {
+		t.Fatalf("read rated_usage: %v", err)
+	}
+	if ruModelID != ftModelName {
+		t.Errorf("rated_usage.model_id = %q, want %q (the fine-tune's ft: id)", ruModelID, ftModelName)
+	}
+	h.assertNumericEqual(t, appliedPrompt, "0.000006", "rated_usage.applied_prompt_rate (base × premium frozen on row)")
+	h.assertNumericEqual(t, cost, wantCost, "rated_usage.cost")
+}
+
+// TestE2E_FineTuneWithoutBaseModelHeaderIsUnpriced is the fail-CLOSED end of the
+// fine-tune pipe (the mirror of TestE2E_FineTuneBillsAtBaseTimesPremium). A request to
+// a fine-tune deployment that arrives WITHOUT the X-Saturn-Base-Model header — the
+// propagation seam broken (Traefik not allowlisting it, Atlas not stamping it) — must
+// NOT be silently rated: the ft:<checkpoint> id is absent from the price file and has
+// no base_model to derive through, so the whole pipe must end with the event UNPRICED
+// (an anomaly that screams), never $0-billed and never rated. A silent $0 here would
+// lose ALL fine-tune revenue the moment the header stopped propagating.
+func TestE2E_FineTuneWithoutBaseModelHeaderIsUnpriced(t *testing.T) {
+	h := newHarness(t, "phoebe_e2e_ft_nobase")
+
+	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.WriteHeader(http.StatusOK)
+		fl, _ := w.(http.Flusher)
+		for _, chunk := range strings.SplitAfter(ftVllmStream, "\n\n") {
+			if chunk == "" {
+				continue
+			}
+			_, _ = io.WriteString(w, chunk)
+			if fl != nil {
+				fl.Flush()
+			}
+		}
+	}))
+	defer backend.Close()
+
+	srv := h.proxyServer(t, backend.URL)
+	rr := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions",
+		strings.NewReader(`{"model":"my-finetune","stream":true,"messages":[]}`))
+	req.Header.Set(identity.HeaderAuthID, testAuthID)
+	req.Header.Set(identity.HeaderResourceID, testResourceID)
+	req.Header.Set(identity.HeaderResourceType, "deployment")
+	req.Header.Set(identity.HeaderUserID, "user-e2e")
+	req.Header.Set(identity.HeaderGroupID, "group-e2e")
+	// DELIBERATELY no X-Saturn-Base-Model header — the propagation bug under test.
+	srv.Handler().ServeHTTP(rr, req)
+
+	if rr.Code != http.StatusOK {
+		t.Fatalf("proxy status = %d, want 200 (body: %s)", rr.Code, rr.Body.String())
+	}
+
+	h.waitForStreamLen(t, 1, 5*time.Second)
+	h.drainUntilRows(t, 1, 10*time.Second)
+
+	// base_model must be NULL on the row — the header never rode, so the rater has
+	// nothing to derive through.
+	var baseModel sql.NullString
+	if err := h.db.QueryRow("SELECT base_model FROM billing_event").Scan(&baseModel); err != nil {
+		t.Fatalf("read billing_event.base_model: %v", err)
+	}
+	if baseModel.Valid {
+		t.Fatalf("billing_event.base_model = %q, want NULL (no header was sent)", baseModel.String)
+	}
+
+	// The ft: event must FAIL LOUD: unpriced, not rated, not $0-billed.
+	res := h.rateEventHour(t, h.priceBook(t))
+	if res.UnpricedEvents != 1 {
+		t.Fatalf("UnpricedEvents = %d, want 1 (an ft: event with no base_model must scream)", res.UnpricedEvents)
+	}
+	if res.EventsRated != 0 || res.RollupsWritten != 0 {
+		t.Fatalf("result = %+v, want 0 rated / 0 rollups (a base_model-less fine-tune must NEVER be rated or $0-billed)", res)
+	}
+	if !res.HasUnpriced() || !res.HasAnomaly() {
+		t.Fatal("HasUnpriced/HasAnomaly = false, want true (the propagation bug must drive exit-nonzero)")
+	}
+	// And no rated_usage row was written for it.
+	var nRollups int
+	if err := h.db.QueryRow("SELECT COUNT(*) FROM rated_usage").Scan(&nRollups); err != nil {
+		t.Fatalf("count rated_usage: %v", err)
+	}
+	if nRollups != 0 {
+		t.Fatalf("rated_usage rows = %d, want 0 (no $0 row for the unpriced fine-tune)", nRollups)
+	}
 }
 
 // TestE2E_ModellessEventIsUnattributable pins the nullStr(model) contract end
@@ -530,10 +740,9 @@ func TestE2E_ModellessEventIsUnattributable(t *testing.T) {
 		t.Fatal("billing_event.model is not NULL for a model-less event — '' dodges the rater's unattributable predicate")
 	}
 
-	// Price book seeded so an event misfiled as "unpriced" could only mean the
+	// Price book loaded so an event misfiled as "unpriced" could only mean the
 	// bucket logic itself is wrong, not a missing price.
-	h.seedPrice(t)
-	res := h.rateEventHour(t)
+	res := h.rateEventHour(t, h.priceBook(t))
 
 	if res.UnattributableEvents != 1 {
 		t.Errorf("UnattributableEvents = %d, want 1 (the model-less event)", res.UnattributableEvents)

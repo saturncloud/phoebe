@@ -57,6 +57,17 @@ type Event struct {
 	Model   string `json:"model,omitempty"`
 	Adapter string `json:"adapter,omitempty"`
 
+	// BaseModel is the Hugging Face base id a fine-tune derives from (E3
+	// derived_from), stamped at deploy time by Atlas (which enforces base_model is
+	// present to deploy a fine-tune — a fine-tune cannot exist without a base). It is
+	// EMPTY for a base model (whose Model already IS the price key). The rater needs
+	// it because Model for a fine-tune is an `ft:<checkpoint>` id whose base is not
+	// otherwise recoverable: with BaseModel set, the rater prices the fine-tune at
+	// base_price x premium (E3 pointer-not-copy). An `ft:` Model with an EMPTY
+	// BaseModel is a propagation bug, not a free model — the rater fails it loud
+	// (ErrNoPrice), never $0. Captured verbatim on the hot path; empty is valid.
+	BaseModel string `json:"base_model,omitempty"`
+
 	// Token counts (the engine's own usage block; never re-tokenized).
 	PromptTokens     int `json:"prompt_tokens"`
 	CachedTokens     int `json:"cached_tokens"`

@@ -38,6 +38,11 @@ def upgrade():
         sa.Column("resource_type", sa.Unicode(length=64), nullable=True),
         # Workload.
         sa.Column("model", sa.Unicode(length=255), nullable=True),
+        # base_model: the HF base id a fine-tune derives from (E3 derived_from),
+        # stamped at deploy time by Atlas. NULL for a base-model deployment. The
+        # rater prices an ft:<checkpoint> model at base x premium via this column;
+        # an ft: model with a NULL base_model fails loud (never $0).
+        sa.Column("base_model", sa.Unicode(length=255), nullable=True),
         sa.Column("adapter", sa.Unicode(length=255), nullable=True),
         # Raw token counts (NOT NULL, default 0).
         sa.Column("prompt_tokens", sa.Integer(), nullable=False, server_default="0"),

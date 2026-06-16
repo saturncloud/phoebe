@@ -24,15 +24,17 @@ import (
 // the model sees — only the stored log copy. Truncation is at a rune boundary so
 // the stored TEXT is valid UTF-8. maxBodyBytes <= 0 means uncapped.
 //
-// A nil body yields ("", false) with no error.
-func captureRequestBody(r *http.Request, maxBodyBytes int) (body string, truncated bool, err error) {
+// A nil body yields ("", false, 0) with no error. origLen is the size of the
+// FULL body read off the wire (before capping), so a caller can log the
+// original-vs-cap sizes when truncated is true.
+func captureRequestBody(r *http.Request, maxBodyBytes int) (body string, truncated bool, origLen int, err error) {
 	if r.Body == nil {
-		return "", false, nil
+		return "", false, 0, nil
 	}
 	raw, err := io.ReadAll(r.Body)
 	_ = r.Body.Close()
 	if err != nil {
-		return "", false, err
+		return "", false, 0, err
 	}
 	// Restore the FULL body so forceIncludeUsage (and the upstream) read every
 	// byte — the cap only bounds the LOG copy, never the forwarded request.
@@ -41,7 +43,7 @@ func captureRequestBody(r *http.Request, maxBodyBytes int) (body string, truncat
 	r.Header.Set("Content-Length", strconv.Itoa(len(raw)))
 
 	logCopy, truncated := truncateAtRuneBoundary(raw, maxBodyBytes)
-	return string(logCopy), truncated, nil
+	return string(logCopy), truncated, len(raw), nil
 }
 
 // forceIncludeUsage rewrites a request body so that streamed responses carry a
