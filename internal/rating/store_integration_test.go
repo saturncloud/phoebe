@@ -25,10 +25,40 @@ import (
 	_ "github.com/jackc/pgx/v5/stdlib"
 )
 
-// schemaDDL is the rating schema (just billing_event + rated_usage now — prices are
-// a YAML file, not DB tables), created in an isolated schema per test run so the
-// test is self-contained and leaves no residue.
-const schemaDDL = `
+// ratingSchemaDDL returns the rating schema applied before each integration test
+// (billing_event + rated_usage — prices are a YAML file, not DB tables). It is
+// loaded from the REAL migration .sql files rather than a hand-copied constant, so
+// the conformance test runs against EXACTLY the production schema and can never
+// silently drift from it: a column-type or index-expression change in the
+// migration that the test didn't track would otherwise pass green here and break
+// in prod. Loading 0001 then 0002_rating reproduces the production apply order;
+// base_model is declared in 0001 and re-added IF NOT EXISTS in 0002_rating, so the
+// overlap is a harmless no-op. The DDL runs inside the per-test isolated schema
+// (search_path is set by the caller), leaving no residue. io_log (0002_io_log) is
+// intentionally not loaded — the rater never touches it.
+func ratingSchemaDDL(t *testing.T) string {
+	t.Helper()
+	var b strings.Builder
+	for _, f := range []string{
+		"../../migrations/0001_billing_event.sql",
+		"../../migrations/0002_rating.sql",
+	} {
+		ddl, err := os.ReadFile(f)
+		if err != nil {
+			t.Fatalf("read migration %s: %v (the integration test applies the REAL "+
+				"migration DDL so it can't drift from production)", f, err)
+		}
+		b.Write(ddl)
+		b.WriteString("\n")
+	}
+	return b.String()
+}
+
+// schemaDDLReference is the previously hand-maintained schema, kept ONLY as a
+// readable in-file description of what the loaded migrations produce. It is NOT
+// applied (ratingSchemaDDL loads the real files); if you edit it, you are editing
+// a comment. Drift between this and the migrations is now harmless.
+const schemaDDLReference = `
 -- billing_event mirrors the v1 metering schema (migration 0001): the model NAME
 -- lives in the model column, which the rater aliases to model_id (the price key).
 CREATE TABLE billing_event (
@@ -104,7 +134,7 @@ func TestIntegration_RateWindow_ConformsToOracle(t *testing.T) {
 	exec(t, db, "CREATE SCHEMA "+sch)
 	exec(t, db, "SET search_path TO "+sch)
 	defer func() { exec(t, db, "DROP SCHEMA IF EXISTS "+sch+" CASCADE") }()
-	exec(t, db, schemaDDL)
+	exec(t, db, ratingSchemaDDL(t))
 
 	hour := mustTime("2026-06-08T10:00:00Z")
 	book := conformanceBook()
@@ -244,7 +274,7 @@ func TestIntegration_ResourceIDGrainAndFailClosed(t *testing.T) {
 	exec(t, db, "CREATE SCHEMA "+sch)
 	exec(t, db, "SET search_path TO "+sch)
 	defer func() { exec(t, db, "DROP SCHEMA IF EXISTS "+sch+" CASCADE") }()
-	exec(t, db, schemaDDL)
+	exec(t, db, ratingSchemaDDL(t))
 
 	hour := mustTime("2026-06-08T10:00:00Z")
 	book := newTestBook(
@@ -356,7 +386,7 @@ func TestConformance_PremiumQuantizedBeforeBilling(t *testing.T) {
 	exec(t, db, "CREATE SCHEMA "+sch)
 	exec(t, db, "SET search_path TO "+sch)
 	defer func() { exec(t, db, "DROP SCHEMA IF EXISTS "+sch+" CASCADE") }()
-	exec(t, db, schemaDDL)
+	exec(t, db, ratingSchemaDDL(t))
 
 	hour := mustTime("2026-06-08T10:00:00Z")
 
@@ -449,7 +479,7 @@ func TestConformance_OracleQuantizesBeforeMultiply_OnResidue(t *testing.T) {
 	exec(t, db, "CREATE SCHEMA "+sch)
 	exec(t, db, "SET search_path TO "+sch)
 	defer func() { exec(t, db, "DROP SCHEMA IF EXISTS "+sch+" CASCADE") }()
-	exec(t, db, schemaDDL)
+	exec(t, db, ratingSchemaDDL(t))
 
 	hour := mustTime("2026-06-08T10:00:00Z")
 	book := newTestBook(
@@ -541,7 +571,7 @@ func TestIntegration_FineTunePricesViaBaseModel(t *testing.T) {
 	exec(t, db, "CREATE SCHEMA "+sch)
 	exec(t, db, "SET search_path TO "+sch)
 	defer func() { exec(t, db, "DROP SCHEMA IF EXISTS "+sch+" CASCADE") }()
-	exec(t, db, schemaDDL)
+	exec(t, db, ratingSchemaDDL(t))
 
 	hour := mustTime("2026-06-08T10:00:00Z")
 	// File declares ONLY the base; the ft: checkpoint id is not listed. 1.5× premium.
@@ -635,7 +665,7 @@ func TestIntegration_FineTuneAmbiguousBaseModelFailsLoud(t *testing.T) {
 	exec(t, db, "CREATE SCHEMA "+sch)
 	exec(t, db, "SET search_path TO "+sch)
 	defer func() { exec(t, db, "DROP SCHEMA IF EXISTS "+sch+" CASCADE") }()
-	exec(t, db, schemaDDL)
+	exec(t, db, ratingSchemaDDL(t))
 
 	hour := mustTime("2026-06-08T10:00:00Z")
 	book := newTestBook(
@@ -723,7 +753,7 @@ func TestIntegration_ReRateReconciles(t *testing.T) {
 	exec(t, db, "CREATE SCHEMA "+sch)
 	exec(t, db, "SET search_path TO "+sch)
 	defer func() { exec(t, db, "DROP SCHEMA IF EXISTS "+sch+" CASCADE") }()
-	exec(t, db, schemaDDL)
+	exec(t, db, ratingSchemaDDL(t))
 
 	hour := mustTime("2026-06-08T10:00:00Z")
 	book := newTestBook(
@@ -823,7 +853,7 @@ func TestIntegration_ReRateReconcileLeavesOtherWindowsUntouched(t *testing.T) {
 	exec(t, db, "CREATE SCHEMA "+sch)
 	exec(t, db, "SET search_path TO "+sch)
 	defer func() { exec(t, db, "DROP SCHEMA IF EXISTS "+sch+" CASCADE") }()
-	exec(t, db, schemaDDL)
+	exec(t, db, ratingSchemaDDL(t))
 
 	hour10 := mustTime("2026-06-08T10:00:00Z")
 	hour12 := mustTime("2026-06-08T12:00:00Z")
@@ -897,7 +927,7 @@ func TestIntegration_OneHopFineTuneCannotDeriveFromFineTune(t *testing.T) {
 	exec(t, db, "CREATE SCHEMA "+sch)
 	exec(t, db, "SET search_path TO "+sch)
 	defer func() { exec(t, db, "DROP SCHEMA IF EXISTS "+sch+" CASCADE") }()
-	exec(t, db, schemaDDL)
+	exec(t, db, ratingSchemaDDL(t))
 
 	hour := mustTime("2026-06-08T10:00:00Z")
 	// A true base AND an own-rate fine-tune (ft:ownrate) priced directly in the file.
@@ -968,7 +998,7 @@ func TestIntegration_UTCBucketing_SessionTZIndependent(t *testing.T) {
 	exec(t, db, "CREATE SCHEMA "+sch)
 	exec(t, db, "SET search_path TO "+sch)
 	defer func() { exec(t, db, "DROP SCHEMA IF EXISTS "+sch+" CASCADE") }()
-	exec(t, db, schemaDDL)
+	exec(t, db, ratingSchemaDDL(t))
 
 	hour := mustTime("2026-06-08T10:00:00Z")
 	book := newTestBook(
@@ -1038,7 +1068,7 @@ func TestIntegration_RatingInstantIndexServesScan(t *testing.T) {
 	exec(t, db, "CREATE SCHEMA "+sch)
 	exec(t, db, "SET search_path TO "+sch)
 	defer func() { exec(t, db, "DROP SCHEMA IF EXISTS "+sch+" CASCADE") }()
-	exec(t, db, schemaDDL)
+	exec(t, db, ratingSchemaDDL(t))
 
 	exec(t, db, "SET enable_seqscan = off")
 	plan := explainPlan(t, db, `EXPLAIN SELECT * FROM billing_event
@@ -1087,7 +1117,7 @@ func TestIntegration_ReconcileDeleteCanUseWindowStartIndex(t *testing.T) {
 	exec(t, db, "CREATE SCHEMA "+sch)
 	exec(t, db, "SET search_path TO "+sch)
 	defer func() { exec(t, db, "DROP SCHEMA IF EXISTS "+sch+" CASCADE") }()
-	exec(t, db, schemaDDL)
+	exec(t, db, ratingSchemaDDL(t))
 
 	// POPULATE a small, ANALYZE'd population: 10 distinct auth_ids × 24 hours = 240
 	// rated_usage rows across a couple dozen windows. That is enough for the
