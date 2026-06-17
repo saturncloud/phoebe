@@ -1,0 +1,66 @@
+name: CI
+on: push
+
+jobs:
+  lint:
+    name: Lint
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: "1.23"
+      - name: golangci-lint
+        uses: golangci/golangci-lint-action@v6
+        with:
+          version: v1.64.8
+
+  test:
+    name: Test
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: "1.23"
+      - run: go mod download
+      - name: Vet
+        run: go vet ./...
+      - name: Test
+        run: make test
+
+  integration-test:
+    name: Integration (live Postgres conformance)
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        # Money correctness IS the product: the rating SQL must be exercised
+        # against a real Postgres (the in-Go oracle pins the formula, but only
+        # the live DB proves the SQL — and the NUMERIC sum-then-round — match).
+        image: postgres:16
+        env:
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: phoebe_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: "1.23"
+      - run: go mod download
+      - name: Integration test
+        env:
+          PHOEBE_TEST_DATABASE_URL: postgres://postgres:postgres@localhost:5432/phoebe_test?sslmode=disable
+        run: make integration-test

@@ -1,0 +1,104 @@
+# =====================================================================
+#  phoebe price file — the OPERATOR-FACING CONTRACT (E1).
+# =====================================================================
+#
+# This file is the SINGLE source of truth for what every model costs. An operator
+# authors it and version-controls it; the file's history IS the price audit trail —
+# there is no DB price table, no effective-dating, no price-management UI, no
+# operator-writes-to-DB authz surface. This is the enterprise / air-gapped win: an
+# operator ships their own file.
+#
+# HOW IT IS USED:
+#   - The hourly rater (cmd/rater) loads the CURRENT file at run start, rates the
+#     last complete hour, and FREEZES the applied per-token rate onto each
+#     rated_usage row. The row is then immutable and self-auditing: "we never
+#     reprice traffic you've already served" holds by construction.
+#   - A mid-hour price edit affects at most that one hour, on a price whose timing
+#     the operator controls. Re-rating is a deliberate, audited re-run — never a
+#     silent side effect of editing this file.
+#   - The create-time PRICE GATE (Atlas, E4) reads THIS SAME file: a deployment whose
+#     model is not priced here cannot be created/served. So the rater should never
+#     meet an unpriced model — but it keeps a fail-loud backstop (an unpriced model
+#     is COUNTED and logged, NEVER billed $0).
+#
+# MONEY UNIT (read before touching a number):
+#   Rates are per-token USD, written as EXACT DECIMAL STRINGS (quoted). They are
+#   parsed to exact decimal (NUMERIC(20,9), nano-USD resolution) — NEVER a float.
+#   Quote every rate: an unquoted 0.000000150 risks a YAML float round-trip that
+#   silently corrupts the value. A float-style exponent ("1.5e-7"), a negative rate,
+#   or a missing component is REJECTED at load (the rater refuses to run).
+#     "$X per 1,000,000 tokens"  ==  X / 1e6  USD/token.
+#     e.g. $0.20/1M = "0.000000200" ; $0.15/1M = "0.000000150" (exact at 9dp).
+
+# Schema version. Only 1 is understood; bump it when the format changes
+# incompatibly so an old binary fails closed rather than mis-parsing.
+version: 1
+
+# --- BASE models -----------------------------------------------------------
+# Keyed on the HUGGING FACE MODEL ID (E3) — a stable identity, not a deployment id
+# and not a display name (names are mutable/user-controlled and disqualified as a
+# billing key). cached is a DISTINCT, usually-discounted rate: vLLM's cached_tokens
+# are the SUBSET of prompt_tokens served from cache, and the rater charges the
+# non-cached prompt subset (prompt - cached) at `prompt` and the cached subset at
+# `cached` — each prompt token billed exactly once. All three are REQUIRED.
+base_models:
+  "meta-llama/Llama-3.1-8B-Instruct":
+    prompt:     "0.000000200"   # $0.20 / 1M prompt tokens (non-cached)
+    cached:     "0.000000050"   # $0.05 / 1M cached prompt tokens (discounted)
+    completion: "0.000000600"   # $0.60 / 1M completion tokens
+
+  "meta-llama/Llama-3.1-70B-Instruct":
+    prompt:     "0.000000900"
+    cached:     "0.000000225"
+    completion: "0.000002700"
+
+  "mistralai/Mistral-7B-Instruct-v0.3":
+    prompt:     "0.000000150"
+    cached:     "0.000000040"
+    completion: "0.000000450"
+
+# --- FINE-TUNE premium policy ----------------------------------------------
+# The SINGLE GLOBAL rule that turns a base model's per-token price into a
+# fine-tune's price. Operators NEVER set per-fine-tune prices (there may be
+# thousands); they set ONE policy here. A fine-tune inherits the base's rate
+# transformed by this policy — a POINTER, not a copy: change a base price and every
+# fine-tune of it re-prices automatically on the next run.
+#   policy: identity    → fine-tune price = base price                 (default)
+#   policy: multiplier  → fine-tune price = base price * factor        (set `factor`)
+#   policy: markup      → fine-tune price = base price + markup/token  (set `markup`)
+# Set EXACTLY the parameter for the chosen policy; the other must be absent.
+fine_tune_premium:
+  policy: multiplier
+  factor: "1.5"                 # fine-tunes cost base × 1.5 (a +50% premium)
+  # markup: "0.000000100"       # (only for policy: markup) +$0.10/1M per component
+
+# --- FINE-TUNE entries (OPTIONAL) ------------------------------------------
+# Fine-tunes are keyed on `ft:<checkpoint_artifact_id>` (E3). A fine-tune entry
+# names the base it `derived_from` (the base must be a priced base_models id, one
+# hop only). The premium above is then applied to that base's rate.
+#
+# NOTE — base-linkage gap (see the rater package doc and the PR): billing_event
+# today carries only the engine-reported model NAME, NOT a fine-tune→base link, so
+# an `ft:` id is priced ONLY if it is declared here (or carries its own `rate`).
+# Until the metering path plumbs `derived_from` through to billing_event, an `ft:`
+# id with no entry here is UNPRICED (fail loud, never $0). A base-direct model
+# (model_id IS a base_models key) prices fully without any entry here.
+fine_tunes:
+  "ft:1f0c2d3e4a5b6c7d8e9f0a1b2c3d4e5f":
+    derived_from: "meta-llama/Llama-3.1-8B-Instruct"
+  # A fine-tune MAY carry its OWN rate (the escape hatch) — bypasses the premium:
+  # "ft:deadbeefdeadbeefdeadbeefdeadbeef":
+  #   rate:
+  #     prompt:     "0.000000300"
+  #     cached:     "0.000000075"
+  #     completion: "0.000000900"
+
+# --- PER-GPU floor rates ---------------------------------------------------
+# Per-token (per-GPU-second, in the uptime meter's eventual unit) floor rates,
+# keyed on GPU type. INCLUDED HERE so the file is complete, but the TOKEN rater
+# does NOT consume these yet — they are parsed + validated (well-formed, non-negative)
+# and reserved for the uptime meter. Set "0.000000000" for no floor.
+gpu_floor_rates:
+  "A100-80GB": "0.000000000"
+  "H100-80GB": "0.000000000"
+  "L40S":      "0.000000000"
