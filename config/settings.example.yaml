@@ -19,14 +19,24 @@ billPartialOnAbort: true
 
 # Model → upstream dispatch (M4).
 registry:
-  # static     — always use defaultUpstream (above). Single-model / dev.
-  # convention — derive the upstream from a Service-naming template; new models
-  #              are reachable with no redeploy.
-  # cached     — control-plane lookup with an LRU + TTL cache (lookup currently
-  #              degrades to the convention template until the Atlas resource
-  #              path is wired).
-  # chain      — cached, falling back to convention if the lookup errors.
+  # static     — always use defaultUpstream (above). Single-model / dev / first
+  #              deploy: point defaultUpstream at the one served model's Service.
+  # cached     — resolve each model's upstream from its in-cluster Service via the
+  #              saturncloud.io/resource-id label (== X-Saturn-Resource-Id), LRU +
+  #              TTL cached. THIS is the real multi-model strategy. Needs
+  #              k8sNamespace (below) + an RBAC Role granting get/list on services.
+  # chain      — cached k8s lookup, falling back to the convention template only if
+  #              the k8s API is unreachable.
+  # convention — derive the upstream from a Service-naming TEMPLATE. NOTE: the
+  #              template below is a PLACEHOLDER and does NOT match Saturn's real
+  #              Service name (pd-{identity5}-{name}-{id} in main-namespace), which
+  #              embeds pieces phoebe never receives. Do not rely on convention for
+  #              Saturn inference unless your template matches your cluster — prefer
+  #              "cached".
   strategy: "static"
+  # Namespace inference Services live in (Saturn: "main-namespace"). Required for
+  # cached/chain; ignored by static/convention.
+  k8sNamespace: ""
   conventionTemplate: "http://model-{id}.inference.svc.cluster.local:8000"
   cacheSize: 4096
   cachePositiveTTL: "5m"

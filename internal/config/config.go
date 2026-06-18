@@ -78,6 +78,11 @@ type RegistrySettings struct {
 	CachePositiveTTL string `yaml:"cachePositiveTTL"`
 	CacheNegativeTTL string `yaml:"cacheNegativeTTL"`
 
+	// K8sNamespace is the namespace the cached/chain resolver lists inference
+	// Services in (Saturn: "main-namespace"). Required for cached/chain; ignored
+	// by static/convention.
+	K8sNamespace string `yaml:"k8sNamespace"`
+
 	// Parsed durations.
 	PositiveTTL time.Duration `yaml:"-"`
 	NegativeTTL time.Duration `yaml:"-"`
