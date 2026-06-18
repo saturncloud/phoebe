@@ -4,7 +4,8 @@
 // M1 implemented the forward-then-inspect streaming tee. M3 (this milestone)
 // wires client-abort detection and applies the bill-partial-on-abort policy:
 //   - read trusted identity headers (does NOT authenticate)
-//   - resolve the target model's upstream from X-Saturn-Resource-Id
+//   - forward to the Atlas-injected X-Saturn-Upstream backend (the routing
+//     authority; fail closed when absent/malformed — phoebe never guesses)
 //   - force stream_options.include_usage=true on every streaming request
 //   - stream each SSE chunk to the client immediately (per-chunk flush, never
 //     buffer-then-forward), capturing the trailing usage block and finish_reason
@@ -37,7 +38,6 @@ import (
 	"github.com/saturncloud/phoebe/internal/iolog"
 	"github.com/saturncloud/phoebe/internal/logging"
 	"github.com/saturncloud/phoebe/internal/metering"
-	"github.com/saturncloud/phoebe/internal/registry"
 )
 
 // requestIDHeader is the per-request idempotency key. vLLM/the router echo a
@@ -96,7 +96,6 @@ func generateRequestID() (string, error) {
 type Server struct {
 	settings *config.Settings
 	log      *logging.Logger
-	resolver registry.Resolver
 	emitter  metering.Emitter
 
 	// ioPolicy gates M5 body capture (opt-in + sampling). ioSink receives the
@@ -111,11 +110,10 @@ type Server struct {
 // New constructs a Server from its dependencies. I/O logging is OFF: the policy
 // denies every request and the sink is a NopSink, so no bodies are buffered.
 // Use NewWithIOLog to enable M5 body capture.
-func New(s *config.Settings, log *logging.Logger, resolver registry.Resolver, emitter metering.Emitter) *Server {
+func New(s *config.Settings, log *logging.Logger, emitter metering.Emitter) *Server {
 	return &Server{
 		settings: s,
 		log:      log,
-		resolver: resolver,
 		emitter:  emitter,
 		// denyAllPolicy + NopSink = logging fully inert; ShouldLog is never true
 		// so no request ever buffers a body. This is the fail-closed default.
@@ -129,9 +127,9 @@ func New(s *config.Settings, log *logging.Logger, resolver registry.Resolver, em
 // per request whether to capture bodies; sink receives the Records. maxBodyLen
 // caps the buffered response-body copy (<=0 uses the default). When logging is
 // disabled, callers pass denyAllPolicy/NopSink via New instead.
-func NewWithIOLog(s *config.Settings, log *logging.Logger, resolver registry.Resolver, emitter metering.Emitter,
+func NewWithIOLog(s *config.Settings, log *logging.Logger, emitter metering.Emitter,
 	policy iolog.Policy, sink iolog.Sink, maxBodyLen int) *Server {
-	srv := New(s, log, resolver, emitter)
+	srv := New(s, log, emitter)
 	if policy != nil {
 		srv.ioPolicy = policy
 	}
@@ -165,7 +163,7 @@ func (s *Server) handleHealth(w http.ResponseWriter, _ *http.Request) {
 	_, _ = w.Write([]byte("ok\n"))
 }
 
-// handleProxy is the single capture point: identity → registry → upstream,
+// handleProxy is the single capture point: identity → X-Saturn-Upstream target,
 // with the streaming tee capturing usage as the response flows to the client.
 //
 // Abort detection (M3): the captureReader reads r.Context().Err() at
@@ -220,37 +218,20 @@ func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Routing authority. For a Token Factory inference deployment, Atlas injects the
-	// deployment's real backend as X-Saturn-Upstream (a trusted, Traefik-allowlisted
-	// header) — because Atlas authoritatively knows the deployment's own k8s Service
-	// (a `pd-...` name) when it builds the route, which phoebe CANNOT derive by
-	// convention. When present, forward THERE; the resolver (convention/static) is only
-	// the fallback for the non-inference path. This is the whole point of the
-	// producer-side X-Saturn-Upstream Middleware: phoebe never guesses a Service name.
-	var upstream *url.URL
-	var err error
-	if id.Upstream != "" {
-		upstream, err = parseUpstreamHeader(id.Upstream)
-		if err != nil {
-			// A malformed trusted header means the edge contract is broken (Atlas
-			// injected a bad value), not a normal request — fail closed rather than
-			// forward to a guessed/empty target.
-			s.log.Error.Printf("invalid %s %q: %v", identity.HeaderUpstream, id.Upstream, err)
-			http.Error(w, "invalid upstream routing header", http.StatusBadGateway)
-			return
-		}
-	} else {
-		upstream, err = s.resolver.Resolve(id.ResourceID)
-		if err == registry.ErrNotFound {
-			// Torn-down or unknown model: fail cleanly, never hang or misroute.
-			http.Error(w, "model upstream not found", http.StatusNotFound)
-			return
-		}
-		if err != nil {
-			s.log.Error.Printf("resolve %q: %v", id.ResourceID, err)
-			http.Error(w, "upstream resolution error", http.StatusBadGateway)
-			return
-		}
+	// The forward target comes ONLY from the X-Saturn-Upstream header that Atlas
+	// injected on this deployment's per-subdomain route (see identity.HeaderUpstream).
+	// phoebe makes no routing decision of its own — it forwards to the address on
+	// the envelope. FAIL CLOSED: an absent or unparseable upstream is refused, never
+	// forwarded to a default or a guess. There is no other source of a target, so
+	// misrouting authenticated traffic is structurally impossible, not just avoided.
+	upstream, err := parseUpstreamHeader(id.Upstream)
+	if err != nil {
+		// No usable upstream on a request that passed auth. Either the route wasn't
+		// built for phoebe (misconfiguration) or the header was stripped — refuse,
+		// don't invent a target. Log loudly with the resource for diagnosis.
+		s.log.Error.Printf("refusing %q: %v (resource_id=%q)", identity.HeaderUpstream, err, id.ResourceID)
+		http.Error(w, "no upstream for this request", http.StatusBadGateway)
+		return
 	}
 
 	// M5 I/O-logging gate — computed ONCE. Everything that adds hot-path cost
@@ -529,7 +510,7 @@ func missingBillingFields(id identity.Identity) []string {
 // Service — so a non-http scheme means the edge contract is broken, fail closed).
 //
 // GRAMMAR IS STRICTLY host:port (fail closed on anything more). The producer side
-// (Atlas's Middleware, the resolver's ConventionResolver) emits host-only upstreams, so
+// (Atlas's `_phoebe_inference_upstream` Middleware) emits host-only upstreams, so
 // the contract is host:port. A value carrying a PATH is rejected: NewSingleHostReverseProxy
 // PREPENDS the target's path to every forwarded request, so honoring `host:8000/v1` would
 // silently rewrite `/v1/chat/completions` → `/v1/v1/chat/completions` — a per-request 404
@@ -537,7 +518,8 @@ func missingBillingFields(id identity.Identity) []string {
 // userinfo is likewise not part of the contract. On a trusted routing seam, a value that
 // deviates from the grammar means the edge contract is broken (Atlas emitted something
 // wrong), not a normal request — reject it so the caller fails closed (502) rather than
-// misroute. This matches the host-only shape of the resolver fallback exactly.
+// misroute. Empty/absent is refused for the same reason: phoebe must never forward to
+// a default when the routing authority is missing.
 func parseUpstreamHeader(v string) (*url.URL, error) {
 	raw := strings.TrimSpace(v)
 	if raw == "" {
@@ -548,7 +530,7 @@ func parseUpstreamHeader(v string) (*url.URL, error) {
 	}
 	u, err := url.Parse(raw)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("unparseable upstream %q: %w", raw, err)
 	}
 	if u.Host == "" {
 		return nil, fmt.Errorf("upstream header %q has no host", v)

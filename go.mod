@@ -7,7 +7,6 @@ require gopkg.in/yaml.v2 v2.4.0
 require (
 	github.com/DATA-DOG/go-sqlmock v1.5.2
 	github.com/alicebob/miniredis/v2 v2.38.0
-	github.com/hashicorp/golang-lru/v2 v2.0.7
 	github.com/jackc/pgx/v5 v5.7.5
 	github.com/redis/go-redis/v9 v9.11.0
 	github.com/tidwall/wal v1.2.1

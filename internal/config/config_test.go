@@ -27,44 +27,8 @@ func TestLoadDefaults(t *testing.T) {
 	if s.ListenAddr != ":8080" {
 		t.Fatalf("ListenAddr = %q, want :8080", s.ListenAddr)
 	}
-	if s.Registry.Strategy != "static" {
-		t.Fatalf("default strategy = %q, want static", s.Registry.Strategy)
-	}
 	if !s.BillPartialOnAbort {
 		t.Fatal("BillPartialOnAbort should default true")
-	}
-}
-
-func TestLoadRegistryConventionRequiresTemplate(t *testing.T) {
-	_, err := Load(writeTemp(t, "registry:\n  strategy: convention\n"))
-	if err == nil {
-		t.Fatal("expected error: convention strategy without template")
-	}
-}
-
-func TestLoadRegistryParsesTTLs(t *testing.T) {
-	s, err := Load(writeTemp(t, `
-registry:
-  strategy: cached
-  conventionTemplate: "http://model-{id}.svc:8000"
-  cachePositiveTTL: "2m"
-  cacheNegativeTTL: "15s"
-`))
-	if err != nil {
-		t.Fatal(err)
-	}
-	if s.Registry.PositiveTTL.Minutes() != 2 {
-		t.Fatalf("PositiveTTL = %v, want 2m", s.Registry.PositiveTTL)
-	}
-	if s.Registry.NegativeTTL.Seconds() != 15 {
-		t.Fatalf("NegativeTTL = %v, want 15s", s.Registry.NegativeTTL)
-	}
-}
-
-func TestLoadInvalidStrategy(t *testing.T) {
-	_, err := Load(writeTemp(t, "registry:\n  strategy: bogus\n"))
-	if err == nil {
-		t.Fatal("expected error for invalid strategy")
 	}
 }
 

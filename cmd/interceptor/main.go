@@ -3,7 +3,6 @@ package main
 import (
 	"context"
 	"flag"
-	"net/url"
 	"os"
 	"time"
 
@@ -15,7 +14,6 @@ import (
 	"github.com/saturncloud/phoebe/internal/logging"
 	"github.com/saturncloud/phoebe/internal/metering"
 	"github.com/saturncloud/phoebe/internal/proxy"
-	"github.com/saturncloud/phoebe/internal/registry"
 )
 
 func main() {
@@ -32,15 +30,10 @@ func main() {
 		log.SetLevel(logging.DEBUG)
 	}
 
-	resolver, err := buildResolver(settings, log)
-	if err != nil {
-		log.Error.Fatalf("failed to build resolver: %v", err)
-	}
-
 	emitter, closeEmitter := buildEmitter(settings, log)
 	ioPolicy, ioSink, ioMaxBody, closeIOLog := buildIOLog(settings, log)
 
-	srv := proxy.NewWithIOLog(settings, log, resolver, emitter, ioPolicy, ioSink, ioMaxBody)
+	srv := proxy.NewWithIOLog(settings, log, emitter, ioPolicy, ioSink, ioMaxBody)
 	srvErr := srv.Run()
 
 	// Cleanup must run UNCONDITIONALLY before exit. log.Fatalf here would
@@ -53,72 +46,6 @@ func main() {
 	if srvErr != nil {
 		log.Error.Printf("server error: %v", srvErr)
 		os.Exit(1)
-	}
-}
-
-// buildResolver constructs the model→upstream resolver per the configured
-// strategy. "static" uses the single DefaultUpstream (M0/M1 behaviour);
-// "convention", "cached", and "chain" enable dynamic dispatch (M4).
-//
-// NOTE: the "cached" and "chain" strategies are meant to resolve via a control
-// plane (Atlas) lookup. That control-plane API is the still-unverified seam
-// (does auth-server already resolve model resources via X-Saturn-Resource-Id?),
-// so until it's wired the LookupFunc degrades to the naming convention — a
-// reasonable guess that needs no redeploy. Replace conventionLookup with the
-// real Atlas call once the resource-resolution path is confirmed.
-func buildResolver(s *config.Settings, log *logging.Logger) (registry.Resolver, error) {
-	rs := s.Registry
-	switch rs.Strategy {
-	case "", "static":
-		log.Info.Printf("resolver: static (default upstream %s)", s.DefaultUpstream)
-		return registry.NewStatic(s.Default), nil
-
-	case "convention":
-		log.Info.Printf("resolver: convention (%s)", rs.ConventionTemplate)
-		return registry.NewConventionResolver(registry.ConventionConfig{
-			Template: rs.ConventionTemplate,
-		})
-
-	case "cached":
-		conv, err := registry.NewConventionResolver(registry.ConventionConfig{Template: rs.ConventionTemplate})
-		if err != nil {
-			return nil, err
-		}
-		log.Info.Printf("resolver: cached (lookup degrades to convention until control-plane wired)")
-		return registry.NewCachedResolver(conventionLookup(conv), registry.CacheConfig{
-			Size:        rs.CacheSize,
-			PositiveTTL: rs.PositiveTTL,
-			NegativeTTL: rs.NegativeTTL,
-		})
-
-	case "chain":
-		conv, err := registry.NewConventionResolver(registry.ConventionConfig{Template: rs.ConventionTemplate})
-		if err != nil {
-			return nil, err
-		}
-		cached, err := registry.NewCachedResolver(conventionLookup(conv), registry.CacheConfig{
-			Size:        rs.CacheSize,
-			PositiveTTL: rs.PositiveTTL,
-			NegativeTTL: rs.NegativeTTL,
-		})
-		if err != nil {
-			return nil, err
-		}
-		// Cached control-plane lookup first, naming-convention fallback if it
-		// errors — graceful degradation when the control plane is unreachable.
-		log.Info.Printf("resolver: chain (cached → convention)")
-		return registry.ChainResolver{cached, conv}, nil
-
-	default:
-		return registry.NewStatic(s.Default), nil
-	}
-}
-
-// conventionLookup adapts a ConventionResolver to a registry.LookupFunc so it
-// can stand in for the (not-yet-wired) control-plane lookup.
-func conventionLookup(conv *registry.ConventionResolver) registry.LookupFunc {
-	return func(_ context.Context, resourceID string) (*url.URL, error) {
-		return conv.Resolve(resourceID)
 	}
 }
 

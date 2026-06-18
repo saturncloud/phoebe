@@ -72,6 +72,7 @@ func TestPreHeaderAbortEmitsAttributableEvent(t *testing.T) {
 	if err != nil {
 		t.Fatalf("new request: %v", err)
 	}
+	req.Header.Set(identity.HeaderUpstream, upstream.Host)
 	req.Header.Set(identity.HeaderAuthID, "auth-1")
 	req.Header.Set(identity.HeaderResourceID, "model-abc")
 	req.Header.Set(identity.HeaderGroupID, "org-1")
@@ -120,6 +121,7 @@ func TestPreHeaderAbortBillPartialFalseNoEvent(t *testing.T) {
 	}()
 	req, _ := http.NewRequestWithContext(ctx, http.MethodPost, "/v1/chat/completions",
 		strings.NewReader(`{"model":"m","stream":true,"messages":[]}`))
+	req.Header.Set(identity.HeaderUpstream, upstream.Host)
 	req.Header.Set(identity.HeaderAuthID, "auth-1")
 	req.Header.Set(identity.HeaderResourceID, "model-abc")
 	req.Header.Set("X-Request-Id", "req-preheader-nobill")
@@ -159,6 +161,7 @@ func TestNormalCompletionEmitsExactlyOnce(t *testing.T) {
 
 	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions",
 		strings.NewReader(`{"model":"m","stream":true,"messages":[]}`))
+	req.Header.Set(identity.HeaderUpstream, upstream.Host)
 	req.Header.Set(identity.HeaderAuthID, "auth-1")
 	req.Header.Set(identity.HeaderResourceID, "model-abc")
 	req.Header.Set("X-Request-Id", "req-once")

@@ -80,21 +80,22 @@ const (
 	// take down the inference path. See internal/proxy missingBillingFields.
 	HeaderOrgID = "X-Saturn-Org-Id"
 
-	// HeaderUpstream carries the ROUTING AUTHORITY: the deployment's real backend
-	// (host:port) that phoebe must forward to. Atlas injects it per Token Factory
-	// inference deployment (the `_phoebe_inference_upstream` Middleware, after
-	// atlas-auth), because Atlas authoritatively knows the deployment's own k8s
-	// Service (`{k8s_name}.{ns}.svc.cluster.local:{VLLM_SERVE_PORT}`) when it builds
-	// the route — a `pd-...` Service name that phoebe canNOT derive by convention
-	// (the ConventionResolver's `model-{resource_id}...` template computes a different,
-	// non-existent name). So when this header is present, phoebe forwards THERE and
-	// does not resolve; the resolver is only the fallback for the non-inference path.
+	// HeaderUpstream carries the EXACT backend the request must be forwarded to —
+	// `host:port` (e.g. pd-abcde-mymodel-r123.main-namespace.svc.cluster.local:8000).
 	//
-	// TRUST: allowlisted in Traefik's authResponseHeaders, so a client-supplied value
-	// is stripped before it reaches phoebe (a client must not be able to point its
-	// authorized-for-X request at engine Y — a confused-deputy). Phoebe therefore
-	// trusts this header exactly like the identity headers. Absent = empty string
-	// (the normal, non-inference path; fall back to the resolver).
+	// This is the ROUTING-AUTHORITY header and the reason phoebe does no upstream
+	// resolution of its own. Atlas builds one IngressRoute per inference deployment
+	// (matched by the deployment's unique subdomain) and, knowing the real Service
+	// for that exact deployment, injects this header before the request reaches
+	// phoebe. The backend identity rides on the envelope Atlas already addressed
+	// correctly — phoebe forwards to "the address on the envelope," never guesses.
+	//
+	// SECURITY: this header MUST be in Traefik's strip-then-inject set (the
+	// ForwardAuth authResponseHeaders allowlist), exactly like the identity headers,
+	// so a client cannot spoof its own upstream. If a client could set it, an
+	// authorized-for-X request could be pointed at engine Y — the confused-deputy
+	// this design exists to make impossible. phoebe FAILS CLOSED: an absent/invalid
+	// upstream → the request is refused, never forwarded to a default or a guess.
 	HeaderUpstream = "X-Saturn-Upstream"
 )
 
@@ -124,9 +125,9 @@ type Identity struct {
 	// (C4); its value is forensic. Empty for a base-model endpoint.
 	Adapter string
 	// Upstream is the deployment's real backend (host:port) for phoebe to forward to,
-	// injected by Atlas per inference deployment (routing authority, trusted). Present
-	// only on the Token Factory inference path; empty for everything else (fall back to
-	// the resolver). See HeaderUpstream.
+	// injected by Atlas per inference deployment (routing authority, trusted). Phoebe
+	// fails closed when it is absent or malformed — the request is refused, never
+	// forwarded to a default or a guess. See HeaderUpstream.
 	Upstream string
 }
 
