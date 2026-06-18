@@ -24,8 +24,10 @@ import (
 	"crypto/rand"
 	"encoding/hex"
 	"errors"
+	"fmt"
 	"net/http"
 	"net/http/httputil"
+	"net/url"
 	"strings"
 	"time"
 
@@ -35,7 +37,6 @@ import (
 	"github.com/saturncloud/phoebe/internal/iolog"
 	"github.com/saturncloud/phoebe/internal/logging"
 	"github.com/saturncloud/phoebe/internal/metering"
-	"github.com/saturncloud/phoebe/internal/registry"
 )
 
 // requestIDHeader is the per-request idempotency key. vLLM/the router echo a
@@ -94,7 +95,6 @@ func generateRequestID() (string, error) {
 type Server struct {
 	settings *config.Settings
 	log      *logging.Logger
-	resolver registry.Resolver
 	emitter  metering.Emitter
 
 	// ioPolicy gates M5 body capture (opt-in + sampling). ioSink receives the
@@ -109,11 +109,10 @@ type Server struct {
 // New constructs a Server from its dependencies. I/O logging is OFF: the policy
 // denies every request and the sink is a NopSink, so no bodies are buffered.
 // Use NewWithIOLog to enable M5 body capture.
-func New(s *config.Settings, log *logging.Logger, resolver registry.Resolver, emitter metering.Emitter) *Server {
+func New(s *config.Settings, log *logging.Logger, emitter metering.Emitter) *Server {
 	return &Server{
 		settings: s,
 		log:      log,
-		resolver: resolver,
 		emitter:  emitter,
 		// denyAllPolicy + NopSink = logging fully inert; ShouldLog is never true
 		// so no request ever buffers a body. This is the fail-closed default.
@@ -127,9 +126,9 @@ func New(s *config.Settings, log *logging.Logger, resolver registry.Resolver, em
 // per request whether to capture bodies; sink receives the Records. maxBodyLen
 // caps the buffered response-body copy (<=0 uses the default). When logging is
 // disabled, callers pass denyAllPolicy/NopSink via New instead.
-func NewWithIOLog(s *config.Settings, log *logging.Logger, resolver registry.Resolver, emitter metering.Emitter,
+func NewWithIOLog(s *config.Settings, log *logging.Logger, emitter metering.Emitter,
 	policy iolog.Policy, sink iolog.Sink, maxBodyLen int) *Server {
-	srv := New(s, log, resolver, emitter)
+	srv := New(s, log, emitter)
 	if policy != nil {
 		srv.ioPolicy = policy
 	}
@@ -218,15 +217,19 @@ func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	upstream, err := s.resolver.Resolve(id.ResourceID)
-	if err == registry.ErrNotFound {
-		// Torn-down or unknown model: fail cleanly, never hang or misroute.
-		http.Error(w, "model upstream not found", http.StatusNotFound)
-		return
-	}
+	// The forward target comes ONLY from the X-Saturn-Upstream header that Atlas
+	// injected on this deployment's per-subdomain route (see identity.HeaderUpstream).
+	// phoebe makes no routing decision of its own — it forwards to the address on
+	// the envelope. FAIL CLOSED: an absent or unparseable upstream is refused, never
+	// forwarded to a default or a guess. There is no other source of a target, so
+	// misrouting authenticated traffic is structurally impossible, not just avoided.
+	upstream, err := parseUpstream(r.Header.Get(identity.HeaderUpstream))
 	if err != nil {
-		s.log.Error.Printf("resolve %q: %v", id.ResourceID, err)
-		http.Error(w, "upstream resolution error", http.StatusBadGateway)
+		// No usable upstream on a request that passed auth. Either the route wasn't
+		// built for phoebe (misconfiguration) or the header was stripped — refuse,
+		// don't invent a target. Log loudly with the resource for diagnosis.
+		s.log.Error.Printf("refusing %q: %v (resource_id=%q)", identity.HeaderUpstream, err, id.ResourceID)
+		http.Error(w, "no upstream for this request", http.StatusBadGateway)
 		return
 	}
 
@@ -474,6 +477,30 @@ func missingBillingFields(id identity.Identity) []string {
 		missing = append(missing, identity.HeaderResourceID)
 	}
 	return missing
+}
+
+// parseUpstream turns the X-Saturn-Upstream header value into a forwardable URL.
+// The value is the backend Atlas addressed for this deployment's route — either a
+// bare `host:port` (the common form Atlas injects) or a full `scheme://host:port`.
+// A bare host:port defaults to http (engines are plain HTTP inside the cluster).
+// Returns an error (→ fail closed) on empty, unparseable, or hostless input — phoebe
+// must never forward to a default when the routing authority is missing.
+func parseUpstream(raw string) (*url.URL, error) {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return nil, fmt.Errorf("empty upstream header")
+	}
+	if !strings.Contains(raw, "://") {
+		raw = "http://" + raw
+	}
+	u, err := url.Parse(raw)
+	if err != nil {
+		return nil, fmt.Errorf("unparseable upstream %q: %w", raw, err)
+	}
+	if u.Host == "" {
+		return nil, fmt.Errorf("upstream %q has no host", raw)
+	}
+	return u, nil
 }
 
 // isEventStream reports whether the response is an SSE stream.

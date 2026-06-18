@@ -15,7 +15,6 @@ import (
 	"github.com/saturncloud/phoebe/internal/identity"
 	"github.com/saturncloud/phoebe/internal/iolog"
 	"github.com/saturncloud/phoebe/internal/logging"
-	"github.com/saturncloud/phoebe/internal/registry"
 )
 
 // recordingSink captures iolog Records for assertions. Safe for concurrent use.
@@ -60,12 +59,14 @@ func newIOLogServer(t *testing.T, upstream *url.URL, policy iolog.Policy, sink i
 	t.Helper()
 	s := &config.Settings{ListenAddr: ":0"}
 	log := logging.New(logging.ERROR)
-	resolver := registry.NewStatic(upstream)
-	return NewWithIOLog(s, log, resolver, &recordingEmitter{}, policy, sink, maxBody)
+	return NewWithIOLog(s, log, &recordingEmitter{}, policy, sink, maxBody)
 }
 
-func iologRequest(method, body string) *http.Request {
+// iologRequest builds a test request carrying the full identity headers AND the
+// X-Saturn-Upstream routing header (routing now comes solely from that header).
+func iologRequest(upstream *url.URL, method, body string) *http.Request {
 	req := httptest.NewRequest(method, "/v1/chat/completions", strings.NewReader(body))
+	req.Header.Set(identity.HeaderUpstream, upstream.Host)
 	req.Header.Set(identity.HeaderAuthID, "auth-key-7")
 	req.Header.Set(identity.HeaderResourceID, "model-abc")
 	req.Header.Set(identity.HeaderResourceType, "deployment")
@@ -88,11 +89,11 @@ func TestIOLog_DisabledByDefault(t *testing.T) {
 	s := &config.Settings{ListenAddr: ":0"}
 	// Plain New(): denyAllPolicy + NopSink. We pass our recording sink only to
 	// prove it's NOT used — wire it via NewWithIOLog with a deny-all policy.
-	srv := New(s, logging.New(logging.ERROR), registry.NewStatic(upstream), &recordingEmitter{})
+	srv := New(s, logging.New(logging.ERROR), &recordingEmitter{})
 	srv.ioSink = sink // even if a sink is present, deny-all policy means no Log
 
 	rr := httptest.NewRecorder()
-	srv.Handler().ServeHTTP(rr, iologRequest(http.MethodPost, `{"model":"m"}`))
+	srv.Handler().ServeHTTP(rr, iologRequest(upstream, http.MethodPost, `{"model":"m"}`))
 
 	if rr.Code != http.StatusOK {
 		t.Fatalf("status = %d, want 200", rr.Code)
@@ -117,7 +118,7 @@ func TestIOLog_ShouldLogFalse_NoBuffering(t *testing.T) {
 	srv := newIOLogServer(t, upstream, policy, sink, 0)
 
 	rr := httptest.NewRecorder()
-	srv.Handler().ServeHTTP(rr, iologRequest(http.MethodPost, `{"model":"m"}`))
+	srv.Handler().ServeHTTP(rr, iologRequest(upstream, http.MethodPost, `{"model":"m"}`))
 
 	if rr.Code != http.StatusOK {
 		t.Fatalf("status = %d, want 200", rr.Code)
@@ -154,7 +155,7 @@ func TestIOLog_ShouldLogTrue_ProducesRecord(t *testing.T) {
 	srv := newIOLogServer(t, upstream, policy, sink, 0)
 
 	rr := httptest.NewRecorder()
-	srv.Handler().ServeHTTP(rr, iologRequest(http.MethodPost, reqBody))
+	srv.Handler().ServeHTTP(rr, iologRequest(upstream, http.MethodPost, reqBody))
 
 	if rr.Code != http.StatusOK {
 		t.Fatalf("status = %d, want 200", rr.Code)
@@ -218,7 +219,7 @@ func TestIOLog_StreamingForwardedVerbatim(t *testing.T) {
 	srv := newIOLogServer(t, upstream, policy, sink, 0)
 
 	rr := httptest.NewRecorder()
-	req := iologRequest(http.MethodPost, `{"model":"m","stream":true,"messages":[]}`)
+	req := iologRequest(upstream, http.MethodPost, `{"model":"m","stream":true,"messages":[]}`)
 	srv.Handler().ServeHTTP(rr, req)
 
 	if rr.Body.String() != vllmStream {
@@ -252,7 +253,7 @@ func TestIOLog_ResponseCapTruncates(t *testing.T) {
 	srv := newIOLogServer(t, upstream, policy, sink, bodyCap)
 
 	rr := httptest.NewRecorder()
-	srv.Handler().ServeHTTP(rr, iologRequest(http.MethodPost, `{"model":"m"}`))
+	srv.Handler().ServeHTTP(rr, iologRequest(upstream, http.MethodPost, `{"model":"m"}`))
 
 	// Client receives the FULL body — the cap only bounds the logged COPY.
 	if rr.Body.Len() != len(big) {
@@ -298,7 +299,7 @@ func TestIOLog_SinkReceivesRecordViaOnDone(t *testing.T) {
 	srv := newIOLogServer(t, upstream, policy, sink, 0)
 
 	rr := httptest.NewRecorder()
-	srv.Handler().ServeHTTP(rr, iologRequest(http.MethodPost, `{"model":"m"}`))
+	srv.Handler().ServeHTTP(rr, iologRequest(upstream, http.MethodPost, `{"model":"m"}`))
 	if rr.Code != http.StatusOK {
 		t.Fatalf("status = %d, want 200", rr.Code)
 	}
@@ -315,8 +316,7 @@ func TestIOLog_SinkReceivesRecordViaOnDone(t *testing.T) {
 func newIOLogServerWithLog(t *testing.T, upstream *url.URL, policy iolog.Policy, sink iolog.Sink, maxBody int, log *logging.Logger) *Server {
 	t.Helper()
 	s := &config.Settings{ListenAddr: ":0"}
-	resolver := registry.NewStatic(upstream)
-	return NewWithIOLog(s, log, resolver, &recordingEmitter{}, policy, sink, maxBody)
+	return NewWithIOLog(s, log, &recordingEmitter{}, policy, sink, maxBody)
 }
 
 // TestIOLog_RequestTruncationLogged verifies Hugo's D1 decision: hard truncation
@@ -345,7 +345,7 @@ func TestIOLog_RequestTruncationLogged(t *testing.T) {
 
 		big := strings.Repeat("A", 500)
 		rr := httptest.NewRecorder()
-		srv.Handler().ServeHTTP(rr, iologRequest(http.MethodPost, big))
+		srv.Handler().ServeHTTP(rr, iologRequest(upstream, http.MethodPost, big))
 
 		if rr.Code != http.StatusOK {
 			t.Fatalf("status = %d, want 200", rr.Code)
@@ -378,7 +378,7 @@ func TestIOLog_RequestTruncationLogged(t *testing.T) {
 		srv := newIOLogServerWithLog(t, upstream, policy, sink, bodyCap, log)
 
 		rr := httptest.NewRecorder()
-		srv.Handler().ServeHTTP(rr, iologRequest(http.MethodPost, `{"model":"m"}`))
+		srv.Handler().ServeHTTP(rr, iologRequest(upstream, http.MethodPost, `{"model":"m"}`))
 
 		if rr.Code != http.StatusOK {
 			t.Fatalf("status = %d, want 200", rr.Code)

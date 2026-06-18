@@ -27,7 +27,6 @@ import (
 	"github.com/saturncloud/phoebe/internal/identity"
 	"github.com/saturncloud/phoebe/internal/logging"
 	"github.com/saturncloud/phoebe/internal/metering"
-	"github.com/saturncloud/phoebe/internal/registry"
 )
 
 // newTestServerWithSettings constructs a Server with explicit settings so
@@ -36,8 +35,7 @@ func newTestServerWithSettings(t *testing.T, upstream *url.URL, em metering.Emit
 	t.Helper()
 	s := &config.Settings{ListenAddr: ":0", BillPartialOnAbort: billPartial}
 	log := logging.New(logging.ERROR)
-	resolver := registry.NewStatic(upstream)
-	return New(s, log, resolver, em)
+	return New(s, log, em)
 }
 
 // slowBackend starts an httptest.Server that writes firstChunks immediately,
@@ -70,7 +68,7 @@ func slowBackend(t *testing.T, firstChunks string) (*httptest.Server, chan struc
 // after delayBeforeCancel, then returns once ServeHTTP returns. The metering
 // event is emitted asynchronously, so callers must assert via
 // em.waitForEvents(...), not em.all() immediately after this returns.
-func doAbortRequest(t *testing.T, srv *Server, delayBeforeCancel time.Duration) {
+func doAbortRequest(t *testing.T, srv *Server, upstream *url.URL, delayBeforeCancel time.Duration) {
 	t.Helper()
 	ctx, cancel := context.WithCancel(context.Background())
 
@@ -84,6 +82,7 @@ func doAbortRequest(t *testing.T, srv *Server, delayBeforeCancel time.Duration) 
 	if err != nil {
 		t.Fatalf("new request: %v", err)
 	}
+	req.Header.Set(identity.HeaderUpstream, upstream.Host)
 	req.Header.Set(identity.HeaderAuthID, "auth-1")
 	req.Header.Set(identity.HeaderResourceID, "model-abc")
 	req.Header.Set(identity.HeaderGroupID, "org-1")
@@ -110,7 +109,7 @@ func TestAbortMidStreamEmitsAbortedEvent(t *testing.T) {
 	em := &recordingEmitter{}
 	srv := newTestServerWithSettings(t, upstream, em, true /* billPartial */)
 
-	doAbortRequest(t, srv, 10*time.Millisecond)
+	doAbortRequest(t, srv, upstream, 10*time.Millisecond)
 
 	events := em.waitForEvents(1, 2*time.Second)
 	if len(events) != 1 {
@@ -133,7 +132,7 @@ func TestAbortBillPartialTrue_NoUsage(t *testing.T) {
 	em := &recordingEmitter{}
 	srv := newTestServerWithSettings(t, upstream, em, true /* billPartial */)
 
-	doAbortRequest(t, srv, 10*time.Millisecond)
+	doAbortRequest(t, srv, upstream, 10*time.Millisecond)
 
 	events := em.waitForEvents(1, 2*time.Second)
 	if len(events) != 1 {
@@ -161,7 +160,7 @@ func TestAbortBillPartialFalse_NoUsage(t *testing.T) {
 	em := &recordingEmitter{}
 	srv := newTestServerWithSettings(t, upstream, em, false /* billPartial */)
 
-	doAbortRequest(t, srv, 10*time.Millisecond)
+	doAbortRequest(t, srv, upstream, 10*time.Millisecond)
 
 	// Wait briefly: if an event were wrongly emitted it would land within
 	// this window. None should, per BillPartialOnAbort=false.
@@ -192,7 +191,7 @@ data: {"choices":[],"usage":{"prompt_tokens":50,"total_tokens":70,"completion_to
 			em := &recordingEmitter{}
 			srv := newTestServerWithSettings(t, upstream, em, billPartial)
 
-			doAbortRequest(t, srv, 20*time.Millisecond)
+			doAbortRequest(t, srv, upstream, 20*time.Millisecond)
 
 			events := em.waitForEvents(1, 2*time.Second)
 			if len(events) != 1 {
@@ -221,7 +220,7 @@ func TestAbortOnDoneFiresExactlyOnceViaProxy(t *testing.T) {
 	em := &recordingEmitter{}
 	srv := newTestServerWithSettings(t, upstream, em, true)
 
-	doAbortRequest(t, srv, 10*time.Millisecond)
+	doAbortRequest(t, srv, upstream, 10*time.Millisecond)
 
 	events := em.waitForEvents(1, 2*time.Second)
 	if len(events) != 1 {
@@ -255,6 +254,7 @@ func TestNormalCompletionNotAffectedByAbortWatcher(t *testing.T) {
 
 	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions",
 		strings.NewReader(`{"model":"m","stream":true,"messages":[]}`))
+	req.Header.Set(identity.HeaderUpstream, upstream.Host)
 	req.Header.Set(identity.HeaderAuthID, "auth-1")
 	req.Header.Set(identity.HeaderResourceID, "model-abc")
 	req.Header.Set(identity.HeaderGroupID, "org-1")
@@ -317,6 +317,7 @@ func TestAbortRaceStress(t *testing.T) {
 			}()
 			req, _ := http.NewRequestWithContext(ctx, http.MethodPost, "/v1/chat/completions",
 				strings.NewReader(`{"model":"m","stream":true,"messages":[]}`))
+			req.Header.Set(identity.HeaderUpstream, upstream.Host)
 			req.Header.Set(identity.HeaderAuthID, "auth-1")
 			req.Header.Set(identity.HeaderResourceID, "model-abc")
 			req.Header.Set(identity.HeaderGroupID, "org-1")
@@ -384,6 +385,7 @@ func TestLongStreamNoDeadlineSever(t *testing.T) {
 
 	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions",
 		strings.NewReader(`{"model":"m","stream":true,"messages":[]}`))
+	req.Header.Set(identity.HeaderUpstream, upstream.Host)
 	req.Header.Set(identity.HeaderAuthID, "auth-1")
 	req.Header.Set(identity.HeaderResourceID, "model-abc")
 	req.Header.Set(identity.HeaderGroupID, "org-1")

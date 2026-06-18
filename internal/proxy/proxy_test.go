@@ -16,7 +16,6 @@ import (
 	"github.com/saturncloud/phoebe/internal/identity"
 	"github.com/saturncloud/phoebe/internal/logging"
 	"github.com/saturncloud/phoebe/internal/metering"
-	"github.com/saturncloud/phoebe/internal/registry"
 )
 
 // recordingEmitter captures emitted events for assertions. Safe for concurrent
@@ -69,8 +68,15 @@ func newTestServerE(t *testing.T, upstream *url.URL, em metering.Emitter) *Serve
 	t.Helper()
 	s := &config.Settings{ListenAddr: ":0"}
 	log := logging.New(logging.ERROR)
-	resolver := registry.NewStatic(upstream)
-	return New(s, log, resolver, em)
+	return New(s, log, em)
+}
+
+// setUpstream stamps the X-Saturn-Upstream routing header onto a test request,
+// exactly as Atlas's per-route injection does in production. Routing now comes
+// solely from this header (phoebe resolves no upstream of its own), so every
+// request a test expects to be FORWARDED must carry it.
+func setUpstream(req *http.Request, upstream *url.URL) {
+	req.Header.Set(identity.HeaderUpstream, upstream.Host)
 }
 
 func TestHealthz(t *testing.T) {
@@ -112,6 +118,7 @@ func TestProxyBillingGate(t *testing.T) {
 
 			rr := httptest.NewRecorder()
 			req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", nil)
+			setUpstream(req, upstream)
 			if tt.authID != "" {
 				req.Header.Set(identity.HeaderAuthID, tt.authID)
 			}
@@ -155,6 +162,7 @@ func TestProxyRequestID_GeneratedWhenAbsent(t *testing.T) {
 	rr := httptest.NewRecorder()
 	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions",
 		strings.NewReader(`{"model":"m","messages":[]}`))
+	setUpstream(req, upstream)
 	req.Header.Set(identity.HeaderAuthID, "auth-1")
 	req.Header.Set(identity.HeaderResourceID, "model-abc")
 	// Deliberately NO X-Request-Id.
@@ -218,6 +226,7 @@ func TestProxyRequestID_RejectsInvalid(t *testing.T) {
 
 			rr := httptest.NewRecorder()
 			req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", nil)
+			setUpstream(req, upstream)
 			req.Header.Set(identity.HeaderAuthID, "auth-1")
 			req.Header.Set(identity.HeaderResourceID, "model-abc")
 			req.Header.Set("X-Request-Id", tt.requestID)
@@ -249,6 +258,7 @@ func TestProxyForwardsToUpstream(t *testing.T) {
 
 	rr := httptest.NewRecorder()
 	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", nil)
+	setUpstream(req, upstream)
 	req.Header.Set(identity.HeaderAuthID, "auth-key-7")
 	req.Header.Set(identity.HeaderResourceID, "model-abc")
 	srv.Handler().ServeHTTP(rr, req)
@@ -262,20 +272,28 @@ func TestProxyForwardsToUpstream(t *testing.T) {
 	}
 }
 
-func TestProxyNotFound(t *testing.T) {
-	// Resolver with no fallback → ErrNotFound → clean 404.
+// TestProxyNoUpstreamFailsClosed verifies the fail-closed routing contract: a
+// request that passes the billing-identity gate but carries NO X-Saturn-Upstream
+// header has no forward target, so phoebe must refuse it (502) rather than invent
+// a default — there is no resolver and no fallback upstream anymore.
+func TestProxyNoUpstreamFailsClosed(t *testing.T) {
 	s := &config.Settings{ListenAddr: ":0"}
 	log := logging.New(logging.ERROR)
-	srv := New(s, log, registry.NewStatic(nil), &recordingEmitter{})
+	em := &recordingEmitter{}
+	srv := New(s, log, em)
 
 	rr := httptest.NewRecorder()
 	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", nil)
 	req.Header.Set(identity.HeaderAuthID, "auth-1")
 	req.Header.Set(identity.HeaderResourceID, "gone")
+	// Deliberately NO X-Saturn-Upstream header.
 	srv.Handler().ServeHTTP(rr, req)
 
-	if rr.Code != http.StatusNotFound {
-		t.Fatalf("torn-down model: got %d, want 404", rr.Code)
+	if rr.Code != http.StatusBadGateway {
+		t.Fatalf("missing upstream: got %d, want 502 (fail closed, never forward to a default)", rr.Code)
+	}
+	if got := em.count(); got != 0 {
+		t.Fatalf("refused (no-upstream) request emitted %d billing events, want 0", got)
 	}
 }
 
@@ -312,6 +330,7 @@ func TestProxyStreamingEndToEnd(t *testing.T) {
 	rr := httptest.NewRecorder()
 	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions",
 		strings.NewReader(`{"model":"m","stream":true,"messages":[]}`))
+	setUpstream(req, upstream)
 	req.Header.Set(identity.HeaderResourceID, "model-abc")
 	req.Header.Set(identity.HeaderResourceType, "deployment")
 	req.Header.Set(identity.HeaderGroupID, "org-1")

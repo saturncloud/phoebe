@@ -31,7 +31,6 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
-	"net/url"
 	"os"
 	"path/filepath"
 	"strings"
@@ -50,7 +49,6 @@ import (
 	"github.com/saturncloud/phoebe/internal/metering"
 	"github.com/saturncloud/phoebe/internal/proxy"
 	"github.com/saturncloud/phoebe/internal/rating"
-	"github.com/saturncloud/phoebe/internal/registry"
 )
 
 // vllmStream mirrors the realistic vLLM SSE fixture in internal/proxy/tee_test.go
@@ -181,16 +179,14 @@ func newHarness(t *testing.T, schema string) *harness {
 	return &harness{db: db, rdb: rdb, emitter: emitter, drainCfg: drainCfg, log: log}
 }
 
-// proxyServer builds a real proxy.Server routing every resource id to the
-// given upstream, emitting through the harness's real DurableEmitter.
-func (h *harness) proxyServer(t *testing.T, upstream string) *proxy.Server {
+// proxyServer builds a real proxy.Server emitting through the harness's real
+// DurableEmitter. The proxy no longer resolves upstreams — each test request
+// carries the forward target in the X-Saturn-Upstream header (as Atlas injects
+// it per route), so this helper takes no upstream.
+func (h *harness) proxyServer(t *testing.T) *proxy.Server {
 	t.Helper()
-	u, err := url.Parse(upstream)
-	if err != nil {
-		t.Fatalf("parse upstream url: %v", err)
-	}
 	settings := &config.Settings{ListenAddr: ":0", BillPartialOnAbort: true}
-	return proxy.New(settings, h.log, registry.NewStatic(u), h.emitter)
+	return proxy.New(settings, h.log, h.emitter)
 }
 
 // waitForStreamLen polls the miniredis stream until it holds at least n
@@ -368,10 +364,11 @@ func TestE2E_StreamedRequestBecomesMoney(t *testing.T) {
 	// 2. Proxy: real Server + real DurableEmitter. Full identity headers,
 	//    resource id != model name, and deliberately NO X-Request-Id — this
 	//    exercises the generated-id path end to end.
-	srv := h.proxyServer(t, backend.URL)
+	srv := h.proxyServer(t)
 	rr := httptest.NewRecorder()
 	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions",
 		strings.NewReader(`{"model":"whatever-the-client-said","stream":true,"messages":[]}`))
+	req.Header.Set(identity.HeaderUpstream, backend.URL)
 	req.Header.Set(identity.HeaderAuthID, testAuthID)
 	req.Header.Set(identity.HeaderResourceID, testResourceID)
 	req.Header.Set(identity.HeaderResourceType, "deployment")
@@ -569,10 +566,11 @@ func TestE2E_FineTuneBillsAtBaseTimesPremium(t *testing.T) {
 	}))
 	defer backend.Close()
 
-	srv := h.proxyServer(t, backend.URL)
+	srv := h.proxyServer(t)
 	rr := httptest.NewRecorder()
 	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions",
 		strings.NewReader(`{"model":"my-finetune","stream":true,"messages":[]}`))
+	req.Header.Set(identity.HeaderUpstream, backend.URL)
 	req.Header.Set(identity.HeaderAuthID, testAuthID)
 	req.Header.Set(identity.HeaderResourceID, testResourceID)
 	req.Header.Set(identity.HeaderResourceType, "deployment")
@@ -659,10 +657,11 @@ func TestE2E_FineTuneWithoutBaseModelHeaderIsUnpriced(t *testing.T) {
 	}))
 	defer backend.Close()
 
-	srv := h.proxyServer(t, backend.URL)
+	srv := h.proxyServer(t)
 	rr := httptest.NewRecorder()
 	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions",
 		strings.NewReader(`{"model":"my-finetune","stream":true,"messages":[]}`))
+	req.Header.Set(identity.HeaderUpstream, backend.URL)
 	req.Header.Set(identity.HeaderAuthID, testAuthID)
 	req.Header.Set(identity.HeaderResourceID, testResourceID)
 	req.Header.Set(identity.HeaderResourceType, "deployment")
