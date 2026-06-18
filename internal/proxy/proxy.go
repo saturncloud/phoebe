@@ -480,11 +480,22 @@ func missingBillingFields(id identity.Identity) []string {
 }
 
 // parseUpstream turns the X-Saturn-Upstream header value into a forwardable URL.
-// The value is the backend Atlas addressed for this deployment's route — either a
-// bare `host:port` (the common form Atlas injects) or a full `scheme://host:port`.
-// A bare host:port defaults to http (engines are plain HTTP inside the cluster).
-// Returns an error (→ fail closed) on empty, unparseable, or hostless input — phoebe
-// must never forward to a default when the routing authority is missing.
+// The value is the backend Atlas addressed for this deployment's route — a bare
+// `host:port` (the form Atlas injects) or, tolerated, a full `http://host:port`.
+//
+// It is deliberately STRICT (fail closed → 502, no forward): the header is the
+// routing authority, so anything that isn't an in-cluster engine host:port is
+// refused rather than forwarded. In particular it rejects:
+//   - empty / unparseable / hostless input,
+//   - a non-http scheme (engines are plain HTTP inside the cluster; an https/
+//     ftp/gopher value would forward with that transport — SSRF surface),
+//   - a path / query / fragment (NewSingleHostReverseProxy PREPENDS the upstream
+//     path onto the request path, so `host:port/foo` would silently rewrite where
+//     every request lands — path smuggling).
+//
+// These are defense-in-depth at the documented chokepoint: in the deployed config
+// Atlas injects a clean bare host:port and the header is anti-spoofed, but the
+// parse boundary must enforce its own contract loudly.
 func parseUpstream(raw string) (*url.URL, error) {
 	raw = strings.TrimSpace(raw)
 	if raw == "" {
@@ -499,6 +510,12 @@ func parseUpstream(raw string) (*url.URL, error) {
 	}
 	if u.Host == "" {
 		return nil, fmt.Errorf("upstream %q has no host", raw)
+	}
+	if u.Scheme != "http" {
+		return nil, fmt.Errorf("upstream %q has unsupported scheme %q (only http)", raw, u.Scheme)
+	}
+	if (u.Path != "" && u.Path != "/") || u.RawQuery != "" || u.Fragment != "" {
+		return nil, fmt.Errorf("upstream %q must be host:port with no path/query/fragment", raw)
 	}
 	return u, nil
 }

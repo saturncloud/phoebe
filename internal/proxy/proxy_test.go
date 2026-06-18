@@ -297,6 +297,47 @@ func TestProxyNoUpstreamFailsClosed(t *testing.T) {
 	}
 }
 
+// parseUpstream is the routing-authority parse boundary; it must accept exactly
+// an in-cluster engine host:port and reject everything else (fail closed). Tested
+// by attack: non-http scheme (SSRF transport), path/query (request-path smuggling
+// via ReverseProxy path-join), and malformed/empty input.
+func TestParseUpstream(t *testing.T) {
+	accept := []struct{ in, wantURL string }{
+		{"engine.svc:8000", "http://engine.svc:8000"},
+		{"pd-a.main-namespace.svc.cluster.local:8000", "http://pd-a.main-namespace.svc.cluster.local:8000"},
+		{"http://engine.svc:8000", "http://engine.svc:8000"},
+		{"  engine.svc:8000  ", "http://engine.svc:8000"}, // trimmed
+	}
+	for _, c := range accept {
+		u, err := parseUpstream(c.in)
+		if err != nil {
+			t.Errorf("parseUpstream(%q): unexpected error %v", c.in, err)
+			continue
+		}
+		if u.String() != c.wantURL {
+			t.Errorf("parseUpstream(%q) = %q, want %q", c.in, u.String(), c.wantURL)
+		}
+	}
+
+	reject := []string{
+		"",                            // empty
+		"   ",                         // whitespace only
+		"https://engine.svc:8000",     // non-http scheme (would TLS to a plain-HTTP engine)
+		"gopher://host:70",            // exotic scheme
+		"ftp://host:21",               // exotic scheme
+		"engine.svc:8000/foo",         // path smuggling (ReverseProxy prepends it)
+		"http://engine.svc:8000/foo",  // path smuggling, explicit scheme
+		"engine.svc:8000?k=v",         // query smuggling
+		"http://engine.svc:8000#frag", // fragment
+		"http://",                     // hostless
+	}
+	for _, in := range reject {
+		if u, err := parseUpstream(in); err == nil {
+			t.Errorf("parseUpstream(%q) = %q, want error (fail closed)", in, u.String())
+		}
+	}
+}
+
 // TestProxyStreamingEndToEnd drives the full path through a real fake-vLLM
 // backend: rewrite → forward → tee → emit. It asserts (1) the client receives
 // the SSE bytes verbatim, (2) the backend actually saw include_usage forced,
