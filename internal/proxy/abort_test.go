@@ -31,7 +31,7 @@ import (
 
 // newTestServerWithSettings constructs a Server with explicit settings so
 // BillPartialOnAbort can be controlled per-test.
-func newTestServerWithSettings(t *testing.T, upstream *url.URL, em metering.Emitter, billPartial bool) *Server {
+func newTestServerWithSettings(t *testing.T, _ *url.URL, em metering.Emitter, billPartial bool) *Server {
 	t.Helper()
 	s := &config.Settings{ListenAddr: ":0", BillPartialOnAbort: billPartial}
 	log := logging.New(logging.ERROR)

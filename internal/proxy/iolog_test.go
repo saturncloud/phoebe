@@ -55,7 +55,7 @@ func (p *spyPolicy) callCount() int {
 	return p.calls
 }
 
-func newIOLogServer(t *testing.T, upstream *url.URL, policy iolog.Policy, sink iolog.Sink, maxBody int) *Server {
+func newIOLogServer(t *testing.T, _ *url.URL, policy iolog.Policy, sink iolog.Sink, maxBody int) *Server {
 	t.Helper()
 	s := &config.Settings{ListenAddr: ":0"}
 	log := logging.New(logging.ERROR)
@@ -313,7 +313,7 @@ func TestIOLog_SinkReceivesRecordViaOnDone(t *testing.T) {
 
 // newIOLogServerWithLog is newIOLogServer but with a caller-supplied logger, so a
 // test can capture WARN output (the request-body-truncation observability line).
-func newIOLogServerWithLog(t *testing.T, upstream *url.URL, policy iolog.Policy, sink iolog.Sink, maxBody int, log *logging.Logger) *Server {
+func newIOLogServerWithLog(t *testing.T, _ *url.URL, policy iolog.Policy, sink iolog.Sink, maxBody int, log *logging.Logger) *Server {
 	t.Helper()
 	s := &config.Settings{ListenAddr: ":0"}
 	return NewWithIOLog(s, log, &recordingEmitter{}, policy, sink, maxBody)

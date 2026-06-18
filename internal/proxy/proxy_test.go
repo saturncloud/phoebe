@@ -64,7 +64,7 @@ func newTestServer(t *testing.T, upstream *url.URL) *Server {
 	return newTestServerE(t, upstream, &recordingEmitter{})
 }
 
-func newTestServerE(t *testing.T, upstream *url.URL, em metering.Emitter) *Server {
+func newTestServerE(t *testing.T, _ *url.URL, em metering.Emitter) *Server {
 	t.Helper()
 	s := &config.Settings{ListenAddr: ":0"}
 	log := logging.New(logging.ERROR)
