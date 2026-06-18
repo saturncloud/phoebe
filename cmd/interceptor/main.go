@@ -3,7 +3,7 @@ package main
 import (
 	"context"
 	"flag"
-	"net/url"
+	"fmt"
 	"os"
 	"time"
 
@@ -80,23 +80,23 @@ func buildResolver(s *config.Settings, log *logging.Logger) (registry.Resolver, 
 		})
 
 	case "cached":
-		conv, err := registry.NewConventionResolver(registry.ConventionConfig{Template: rs.ConventionTemplate})
+		lookup, err := k8sLookup(rs)
 		if err != nil {
 			return nil, err
 		}
-		log.Info.Printf("resolver: cached (lookup degrades to convention until control-plane wired)")
-		return registry.NewCachedResolver(conventionLookup(conv), registry.CacheConfig{
+		log.Info.Printf("resolver: cached (k8s label lookup in namespace %q)", rs.K8sNamespace)
+		return registry.NewCachedResolver(lookup, registry.CacheConfig{
 			Size:        rs.CacheSize,
 			PositiveTTL: rs.PositiveTTL,
 			NegativeTTL: rs.NegativeTTL,
 		})
 
 	case "chain":
-		conv, err := registry.NewConventionResolver(registry.ConventionConfig{Template: rs.ConventionTemplate})
+		lookup, err := k8sLookup(rs)
 		if err != nil {
 			return nil, err
 		}
-		cached, err := registry.NewCachedResolver(conventionLookup(conv), registry.CacheConfig{
+		cached, err := registry.NewCachedResolver(lookup, registry.CacheConfig{
 			Size:        rs.CacheSize,
 			PositiveTTL: rs.PositiveTTL,
 			NegativeTTL: rs.NegativeTTL,
@@ -104,9 +104,16 @@ func buildResolver(s *config.Settings, log *logging.Logger) (registry.Resolver, 
 		if err != nil {
 			return nil, err
 		}
-		// Cached control-plane lookup first, naming-convention fallback if it
-		// errors — graceful degradation when the control plane is unreachable.
-		log.Info.Printf("resolver: chain (cached → convention)")
+		conv, err := registry.NewConventionResolver(registry.ConventionConfig{Template: rs.ConventionTemplate})
+		if err != nil {
+			return nil, err
+		}
+		// Cached k8s label lookup first; convention fallback only if the k8s API
+		// is unreachable (transient). The convention template is a best-effort
+		// guess at the Service name and is NOT guaranteed correct for Saturn's
+		// pd-{identity5}-{name}-{id} scheme — prefer plain "cached" unless your
+		// convention template matches your cluster.
+		log.Info.Printf("resolver: chain (cached k8s → convention fallback)")
 		return registry.ChainResolver{cached, conv}, nil
 
 	default:
@@ -114,12 +121,23 @@ func buildResolver(s *config.Settings, log *logging.Logger) (registry.Resolver, 
 	}
 }
 
-// conventionLookup adapts a ConventionResolver to a registry.LookupFunc so it
-// can stand in for the (not-yet-wired) control-plane lookup.
-func conventionLookup(conv *registry.ConventionResolver) registry.LookupFunc {
-	return func(_ context.Context, resourceID string) (*url.URL, error) {
-		return conv.Resolve(resourceID)
+// k8sLookup builds the real control-plane LookupFunc: resolve a deployment id to
+// its model Service via the saturncloud.io/resource-id label, using the
+// in-cluster Kubernetes API. Requires an RBAC Role granting get/list on services
+// in rs.K8sNamespace.
+func k8sLookup(rs config.RegistrySettings) (registry.LookupFunc, error) {
+	if rs.K8sNamespace == "" {
+		return nil, fmt.Errorf("registry.k8sNamespace is required for the %q strategy "+
+			"(the namespace inference Services live in, e.g. \"main-namespace\")", rs.Strategy)
 	}
+	client, err := registry.InClusterClient()
+	if err != nil {
+		return nil, fmt.Errorf("registry: %w", err)
+	}
+	return registry.NewK8sLookup(registry.K8sLookupConfig{
+		Namespace: rs.K8sNamespace,
+		Client:    client,
+	})
 }
 
 // buildEmitter constructs the durable metering emitter. When ValkeyAddr is set
