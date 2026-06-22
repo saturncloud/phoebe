@@ -3,7 +3,6 @@ package main
 import (
 	"context"
 	"flag"
-	"fmt"
 	"os"
 	"time"
 
@@ -15,7 +14,6 @@ import (
 	"github.com/saturncloud/phoebe/internal/logging"
 	"github.com/saturncloud/phoebe/internal/metering"
 	"github.com/saturncloud/phoebe/internal/proxy"
-	"github.com/saturncloud/phoebe/internal/registry"
 )
 
 func main() {
@@ -32,15 +30,10 @@ func main() {
 		log.SetLevel(logging.DEBUG)
 	}
 
-	resolver, err := buildResolver(settings, log)
-	if err != nil {
-		log.Error.Fatalf("failed to build resolver: %v", err)
-	}
-
 	emitter, closeEmitter := buildEmitter(settings, log)
 	ioPolicy, ioSink, ioMaxBody, closeIOLog := buildIOLog(settings, log)
 
-	srv := proxy.NewWithIOLog(settings, log, resolver, emitter, ioPolicy, ioSink, ioMaxBody)
+	srv := proxy.NewWithIOLog(settings, log, emitter, ioPolicy, ioSink, ioMaxBody)
 	srvErr := srv.Run()
 
 	// Cleanup must run UNCONDITIONALLY before exit. log.Fatalf here would
@@ -54,90 +47,6 @@ func main() {
 		log.Error.Printf("server error: %v", srvErr)
 		os.Exit(1)
 	}
-}
-
-// buildResolver constructs the model→upstream resolver per the configured
-// strategy. "static" uses the single DefaultUpstream (M0/M1 behaviour);
-// "convention", "cached", and "chain" enable dynamic dispatch (M4).
-//
-// NOTE: the "cached" and "chain" strategies are meant to resolve via a control
-// plane (Atlas) lookup. That control-plane API is the still-unverified seam
-// (does auth-server already resolve model resources via X-Saturn-Resource-Id?),
-// so until it's wired the LookupFunc degrades to the naming convention — a
-// reasonable guess that needs no redeploy. Replace conventionLookup with the
-// real Atlas call once the resource-resolution path is confirmed.
-func buildResolver(s *config.Settings, log *logging.Logger) (registry.Resolver, error) {
-	rs := s.Registry
-	switch rs.Strategy {
-	case "", "static":
-		log.Info.Printf("resolver: static (default upstream %s)", s.DefaultUpstream)
-		return registry.NewStatic(s.Default), nil
-
-	case "convention":
-		log.Info.Printf("resolver: convention (%s)", rs.ConventionTemplate)
-		return registry.NewConventionResolver(registry.ConventionConfig{
-			Template: rs.ConventionTemplate,
-		})
-
-	case "cached":
-		lookup, err := k8sLookup(rs)
-		if err != nil {
-			return nil, err
-		}
-		log.Info.Printf("resolver: cached (k8s label lookup in namespace %q)", rs.K8sNamespace)
-		return registry.NewCachedResolver(lookup, registry.CacheConfig{
-			Size:        rs.CacheSize,
-			PositiveTTL: rs.PositiveTTL,
-			NegativeTTL: rs.NegativeTTL,
-		})
-
-	case "chain":
-		lookup, err := k8sLookup(rs)
-		if err != nil {
-			return nil, err
-		}
-		cached, err := registry.NewCachedResolver(lookup, registry.CacheConfig{
-			Size:        rs.CacheSize,
-			PositiveTTL: rs.PositiveTTL,
-			NegativeTTL: rs.NegativeTTL,
-		})
-		if err != nil {
-			return nil, err
-		}
-		conv, err := registry.NewConventionResolver(registry.ConventionConfig{Template: rs.ConventionTemplate})
-		if err != nil {
-			return nil, err
-		}
-		// Cached k8s label lookup first; convention fallback only if the k8s API
-		// is unreachable (transient). The convention template is a best-effort
-		// guess at the Service name and is NOT guaranteed correct for Saturn's
-		// pd-{identity5}-{name}-{id} scheme — prefer plain "cached" unless your
-		// convention template matches your cluster.
-		log.Info.Printf("resolver: chain (cached k8s → convention fallback)")
-		return registry.ChainResolver{cached, conv}, nil
-
-	default:
-		return registry.NewStatic(s.Default), nil
-	}
-}
-
-// k8sLookup builds the real control-plane LookupFunc: resolve a deployment id to
-// its model Service via the saturncloud.io/resource-id label, using the
-// in-cluster Kubernetes API. Requires an RBAC Role granting get/list on services
-// in rs.K8sNamespace.
-func k8sLookup(rs config.RegistrySettings) (registry.LookupFunc, error) {
-	if rs.K8sNamespace == "" {
-		return nil, fmt.Errorf("registry.k8sNamespace is required for the %q strategy "+
-			"(the namespace inference Services live in, e.g. \"main-namespace\")", rs.Strategy)
-	}
-	client, err := registry.InClusterClient()
-	if err != nil {
-		return nil, fmt.Errorf("registry: %w", err)
-	}
-	return registry.NewK8sLookup(registry.K8sLookupConfig{
-		Namespace: rs.K8sNamespace,
-		Client:    client,
-	})
 }
 
 // buildEmitter constructs the durable metering emitter. When ValkeyAddr is set

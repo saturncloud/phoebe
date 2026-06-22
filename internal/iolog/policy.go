@@ -11,8 +11,7 @@ import (
 // per request before deciding to buffer anything.
 //
 // The Policy interface is the seam. It exists so the interim StaticPolicy below
-// can be swapped for a control-plane-backed policy WITHOUT touching the proxy —
-// exactly like registry.LookupFunc is the seam for the control-plane resolver.
+// can be swapped for a control-plane-backed policy WITHOUT touching the proxy.
 type Policy interface {
 	// ShouldLog reports whether this request's bodies should be captured.
 	// It MUST be cheap (it runs on the hot path) and deterministic given the
@@ -27,8 +26,7 @@ type Policy interface {
 // ─────────────────────────────────────────────────────────────────────────────
 // The REAL per-tenant opt-in config — which tenants enabled I/O logging and at
 // what sample rate — belongs in the control plane (Atlas), looked up per
-// auth_id/group_id the same way registry.CachedResolver looks up upstreams via
-// its LookupFunc seam. That control-plane API is unspecified, so M5 ships this
+// auth_id/group_id. That control-plane API is unspecified, so M5 ships this
 // static stand-in:
 //
 //   - Enabled         global on/off. DEFAULT FALSE — logging is OFF by default
