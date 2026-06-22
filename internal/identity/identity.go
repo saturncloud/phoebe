@@ -43,6 +43,24 @@ const (
 	// adding it to Traefik's authResponseHeaders allowlist, is a separate
 	// (small) change. Phoebe reads it defensively: absent = empty string.
 	HeaderAuthID = "X-Saturn-Auth-Id"
+
+	// HeaderUpstream carries the EXACT backend the request must be forwarded to —
+	// `host:port` (e.g. pd-abcde-mymodel-r123.main-namespace.svc.cluster.local:8000).
+	//
+	// This is the ROUTING-AUTHORITY header and the reason phoebe does no upstream
+	// resolution of its own. Atlas builds one IngressRoute per inference deployment
+	// (matched by the deployment's unique subdomain) and, knowing the real Service
+	// for that exact deployment, injects this header before the request reaches
+	// phoebe. The backend identity rides on the envelope Atlas already addressed
+	// correctly — phoebe forwards to "the address on the envelope," never guesses.
+	//
+	// SECURITY: this header MUST be in Traefik's strip-then-inject set (the
+	// ForwardAuth authResponseHeaders allowlist), exactly like the identity headers,
+	// so a client cannot spoof its own upstream. If a client could set it, an
+	// authorized-for-X request could be pointed at engine Y — the confused-deputy
+	// this design exists to make impossible. phoebe FAILS CLOSED: an absent/invalid
+	// upstream → the request is refused, never forwarded to a default or a guess.
+	HeaderUpstream = "X-Saturn-Upstream"
 )
 
 // Identity is the trusted, pre-resolved caller identity for a request. Phoebe
