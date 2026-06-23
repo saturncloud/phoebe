@@ -428,3 +428,50 @@ func TestIdempotent_TrimsSidecarWhitespace(t *testing.T) {
 		t.Fatalf("a whitespace-only sidecar difference forced a rewrite (inode %d -> %d)", inoBefore, inoAfter)
 	}
 }
+
+// TestFetchAndInstall_VersionlessRemovesStaleSidecar (price-fetch-missing-version)
+// pins the MECHANICAL half of the missing-version contract (the fail-open-vs-closed
+// design half is task #30): when the manager serves a CHANGED valid body with NO
+// X-Saturn-Price-Version header over a destination that already has a sidecar, the
+// new body is installed AND the stale sidecar is REMOVED — so the sidecar can never
+// name a content-hash that differs from the body on disk (a reconcile/audit lie).
+func TestFetchAndInstall_VersionlessRemovesStaleSidecar(t *testing.T) {
+	dir := t.TempDir()
+	dest := filepath.Join(dir, "prices.yaml")
+
+	// Seed a prior good install: an OLD body + a sidecar naming its version.
+	const oldBody = validPriceYAML
+	if err := os.WriteFile(dest, []byte(oldBody), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(dest+versionSuffix, []byte("hash-OLD"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	// A genuinely DIFFERENT valid body (distinct completion rate), served with NO
+	// version header (priceServer omits the header when version == "").
+	const newBody = `
+version: 1
+base_models:
+  "meta-llama/Llama-3.1-8B-Instruct":
+    prompt:     "0.000000200"
+    cached:     "0.000000050"
+    completion: "0.000000999"
+fine_tune_premium:
+  policy: "identity"
+`
+	srv := priceServer(t, http.StatusOK, "", newBody, nil)
+	if err := fetchAndInstall(context.Background(), quietLog(), optsFor(srv, dest), "test-token"); err != nil {
+		t.Fatalf("fetchAndInstall: %v", err)
+	}
+
+	// Body must be the new one.
+	got, _ := os.ReadFile(dest)
+	if string(got) != newBody {
+		t.Fatalf("body was not updated to the new version-less body")
+	}
+	// The stale sidecar MUST be gone — never left naming hash-OLD for newBody bytes.
+	if ver, ok := readInstalledVersion(dest); ok {
+		t.Fatalf("stale sidecar survived a version-less install: %q (must be absent so it can't mis-attribute the body)", ver)
+	}
+}
