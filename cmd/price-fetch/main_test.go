@@ -6,6 +6,8 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strings"
+	"syscall"
 	"testing"
 	"time"
 
@@ -94,31 +96,52 @@ func TestFetchAndInstall_Success(t *testing.T) {
 	}
 }
 
+// inodeOf returns the filesystem inode number of the file at path. A rewrite via the
+// temp-file+rename install path lands a NEW inode, so an unchanged inode proves the
+// file was not rewritten — robust where mtime is too coarse.
+func inodeOf(t *testing.T, path string) uint64 {
+	t.Helper()
+	fi, err := os.Stat(path)
+	if err != nil {
+		t.Fatalf("stat %s: %v", path, err)
+	}
+	st, ok := fi.Sys().(*syscall.Stat_t)
+	if !ok {
+		t.Fatalf("stat %s: Sys() is not *syscall.Stat_t", path)
+	}
+	return st.Ino
+}
+
 // TestFetchAndInstall_Idempotent (price-fetch-idempotent): when the served version
-// matches the installed sidecar, the file is NOT rewritten (no churn, no rename a
-// rater could race). We detect "not rewritten" by pre-seeding the destination with
-// DIFFERENT bytes under the same version and asserting they survive.
+// matches the installed sidecar AND the on-disk body already equals the served body,
+// the file is NOT rewritten (no churn, no rename a rater could race). With the
+// body-content check (Fix 2) a true no-op REQUIRES the on-disk body to already match,
+// so we seed the destination with the EXACT served bytes and assert the file's inode
+// is unchanged (the install path would rename a fresh inode into place).
 func TestFetchAndInstall_Idempotent(t *testing.T) {
 	dir := t.TempDir()
 	dest := filepath.Join(dir, "prices.yaml")
 
-	// Seed: a marker body + a sidecar recording the version the server will serve.
-	const marker = "PRE-EXISTING-BYTES\n"
-	if err := os.WriteFile(dest, []byte(marker), 0o644); err != nil {
+	// Seed: the exact served body + a sidecar recording the served version.
+	if err := os.WriteFile(dest, []byte(validPriceYAML), 0o644); err != nil {
 		t.Fatal(err)
 	}
 	if err := os.WriteFile(dest+versionSuffix, []byte("hash-v1"), 0o644); err != nil {
 		t.Fatal(err)
 	}
+	inoBefore := inodeOf(t, dest)
 
 	srv := priceServer(t, http.StatusOK, "hash-v1", validPriceYAML, nil)
 	if err := fetchAndInstall(context.Background(), quietLog(), optsFor(srv, dest), "test-token"); err != nil {
 		t.Fatalf("fetchAndInstall: %v", err)
 	}
 
+	if inoAfter := inodeOf(t, dest); inoAfter != inoBefore {
+		t.Fatalf("file was rewritten on a true match (inode %d -> %d)", inoBefore, inoAfter)
+	}
 	got, _ := os.ReadFile(dest)
-	if string(got) != marker {
-		t.Fatalf("file was rewritten on a matching version; got %q want the seeded marker", string(got))
+	if string(got) != validPriceYAML {
+		t.Fatalf("file content changed on a no-op; got %q", string(got))
 	}
 }
 
@@ -270,5 +293,138 @@ func TestRun_Success(t *testing.T) {
 	}
 	if _, err := os.Stat(dest); err != nil {
 		t.Fatalf("price file not installed: %v", err)
+	}
+}
+
+// TestInstall_BodyFirst_RecoversFromSidecarAheadCrash
+// (price-fetch-recover-from-stranded-state): reproduces the post-crash stranded state
+// where the sidecar already records the NEW version but the body on disk is still OLD
+// (the dangerous {sidecar:V_new, body:B_old}). A version-only idempotency no-op would
+// strand the old bytes forever. With the body-content check (Fix 2) the no-op does NOT
+// fire — fetchAndInstall re-installs the NEW body. This is the invariant that makes
+// recovery REAL; body-first ordering (Fix 1) only stops CREATING this state going
+// forward.
+func TestInstall_BodyFirst_RecoversFromSidecarAheadCrash(t *testing.T) {
+	dir := t.TempDir()
+	dest := filepath.Join(dir, "prices.yaml")
+
+	// Stranded state: OLD body, sidecar already AHEAD at hash-NEW.
+	if err := os.WriteFile(dest, []byte("OLD-STALE-BYTES\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(dest+versionSuffix, []byte("hash-NEW"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	// Server serves version hash-NEW with the valid NEW body.
+	srv := priceServer(t, http.StatusOK, "hash-NEW", validPriceYAML, nil)
+	if err := fetchAndInstall(context.Background(), quietLog(), optsFor(srv, dest), "test-token"); err != nil {
+		t.Fatalf("fetchAndInstall: %v", err)
+	}
+
+	got, _ := os.ReadFile(dest)
+	if string(got) != validPriceYAML {
+		t.Fatalf("stranded OLD bytes were not recovered; on-disk body = %q, want the NEW body", string(got))
+	}
+}
+
+// TestFetchAndInstall_OversizedBodyRejected (price-fetch-reject-oversized): a 200 body
+// larger than maxPriceBodyBytes is REJECTED, not silently truncated to a parseable
+// prefix. Nothing is installed; the error mentions the cap.
+func TestFetchAndInstall_OversizedBodyRejected(t *testing.T) {
+	dir := t.TempDir()
+	dest := filepath.Join(dir, "prices.yaml")
+
+	// A valid-looking prefix padded with a long YAML comment line to overrun the cap by
+	// one byte. (A truncated prefix of this WOULD parse — that's exactly the danger.)
+	prefix := "version: 1\nbase_models:\n"
+	pad := maxPriceBodyBytes + 1 - len(prefix)
+	body := prefix + "#" + strings.Repeat("x", pad-1)
+	if len(body) != maxPriceBodyBytes+1 {
+		t.Fatalf("test body len = %d, want %d", len(body), maxPriceBodyBytes+1)
+	}
+
+	srv := priceServer(t, http.StatusOK, "hash-big", body, nil)
+	err := fetchAndInstall(context.Background(), quietLog(), optsFor(srv, dest), "test-token")
+	if err == nil {
+		t.Fatalf("expected an error on an oversized body, got nil")
+	}
+	if !strings.Contains(err.Error(), "exceeds") {
+		t.Fatalf("error = %v, want it to mention the size cap (\"exceeds\")", err)
+	}
+	if _, statErr := os.Stat(dest); statErr == nil {
+		t.Fatalf("a file was installed despite an oversized body")
+	}
+}
+
+// TestFetchAndInstall_BoundaryBodyAccepted (price-fetch-accept-at-cap): a body exactly
+// maxPriceBodyBytes long is at the cap, not over it, so it is read in full. (We use a
+// padding YAML comment so the body still parses; it must install.)
+func TestFetchAndInstall_BoundaryBodyAccepted(t *testing.T) {
+	dir := t.TempDir()
+	dest := filepath.Join(dir, "prices.yaml")
+
+	pad := maxPriceBodyBytes - len(validPriceYAML) - len("\n#")
+	body := validPriceYAML + "\n#" + strings.Repeat("x", pad)
+	if len(body) != maxPriceBodyBytes {
+		t.Fatalf("test body len = %d, want %d", len(body), maxPriceBodyBytes)
+	}
+
+	srv := priceServer(t, http.StatusOK, "hash-cap", body, nil)
+	if err := fetchAndInstall(context.Background(), quietLog(), optsFor(srv, dest), "test-token"); err != nil {
+		t.Fatalf("a body exactly at the cap should install, got: %v", err)
+	}
+	got, _ := os.ReadFile(dest)
+	if string(got) != body {
+		t.Fatalf("installed bytes != served bytes at the boundary")
+	}
+}
+
+// TestInstall_FileMode0644 (price-fetch-world-readable): the installed price file and
+// its sidecar are 0644 (world-readable), not CreateTemp's 0600, so the rater running
+// under a DIFFERENT uid can read them. Drives the real install path.
+func TestInstall_FileMode0644(t *testing.T) {
+	dir := t.TempDir()
+	dest := filepath.Join(dir, "prices.yaml")
+	srv := priceServer(t, http.StatusOK, "hash-v1", validPriceYAML, nil)
+
+	if err := fetchAndInstall(context.Background(), quietLog(), optsFor(srv, dest), "test-token"); err != nil {
+		t.Fatalf("fetchAndInstall: %v", err)
+	}
+
+	for _, p := range []string{dest, dest + versionSuffix} {
+		fi, err := os.Stat(p)
+		if err != nil {
+			t.Fatalf("stat %s: %v", p, err)
+		}
+		if perm := fi.Mode().Perm(); perm != 0o644 {
+			t.Fatalf("%s mode = %o, want 0644", p, perm)
+		}
+	}
+}
+
+// TestIdempotent_TrimsSidecarWhitespace (price-fetch-trim-sidecar): an
+// externally-seeded sidecar with a trailing newline (e.g. `echo V > file`) still
+// compares equal to the served version, so a true match (same body too) is a no-op.
+func TestIdempotent_TrimsSidecarWhitespace(t *testing.T) {
+	dir := t.TempDir()
+	dest := filepath.Join(dir, "prices.yaml")
+
+	if err := os.WriteFile(dest, []byte(validPriceYAML), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	// Sidecar seeded WITH a trailing newline (the externally-seeded shape).
+	if err := os.WriteFile(dest+versionSuffix, []byte("hash-v1\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	inoBefore := inodeOf(t, dest)
+
+	srv := priceServer(t, http.StatusOK, "hash-v1", validPriceYAML, nil)
+	if err := fetchAndInstall(context.Background(), quietLog(), optsFor(srv, dest), "test-token"); err != nil {
+		t.Fatalf("fetchAndInstall: %v", err)
+	}
+
+	if inoAfter := inodeOf(t, dest); inoAfter != inoBefore {
+		t.Fatalf("a whitespace-only sidecar difference forced a rewrite (inode %d -> %d)", inoBefore, inoAfter)
 	}
 }

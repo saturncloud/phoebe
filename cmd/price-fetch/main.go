@@ -35,11 +35,16 @@
 //   - The fetched bytes are validated by the rater's OWN loader (rating.ParsePriceBook)
 //     before they are installed. A file the rater would reject is NEVER written into
 //     place — the rater can never be handed a file it chokes on or that would $0-rate.
-//   - The install is ATOMIC: write a temp file in the destination dir, fsync, then
-//     rename(2) over the destination. The rater loads the file in one read; it can
-//     never observe a half-written file. The version sidecar is written BEFORE the
-//     rename so the recorded version can never describe bytes that are not yet (or
-//     never) in place.
+//   - The install is ATOMIC: write a temp file in the destination dir, fsync the file
+//     AND the parent directory, then rename(2) over the destination. The rater loads
+//     the file in one read; it can never observe a half-written file. The BODY is
+//     written and renamed FIRST, then the version sidecar. If the process dies between
+//     the two renames, the worst case is {body:B_new, sidecar:V_old-or-absent}: the
+//     next run sees served-version != installed-version (or no sidecar), so the
+//     idempotency guard does NOT short-circuit and the install correctly re-runs. The
+//     guard ALSO verifies the on-disk body equals the freshly-fetched bytes, so a
+//     sidecar that is somehow AHEAD of a stale body still re-installs rather than
+//     billing stale prices — recovery is real, not just claimed.
 //   - When the fetch fails and a good local file exists, the file is left UNTOUCHED
 //     (stale-but-priced) and the job exits 2. When the fetch fails and NO local file
 //     exists, there is nothing to rate against and the job exits 2 as well — the
@@ -48,7 +53,9 @@
 package main
 
 import (
+	"bytes"
 	"context"
+	"errors"
 	"flag"
 	"fmt"
 	"io"
@@ -56,6 +63,7 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"strings"
 	"syscall"
 	"time"
 
@@ -96,6 +104,13 @@ const defaultRequestTimeout = 30 * time.Second
 // tokenPricesPath is the endpoint path on the manager. The customer is identified by
 // the auth token, so there is no per-customer path component.
 const tokenPricesPath = "/customer/token-prices"
+
+// maxPriceBodyBytes caps the served price file. The file is small (KBs); 8 MiB is a
+// generous ceiling. We read one byte PAST the cap and REJECT an over-cap body rather
+// than silently truncating: a truncated-but-parseable prefix could install a PARTIAL
+// price book (a truncated valid YAML still parses under UnmarshalStrict), so we fail
+// closed instead and leave the prior file in place.
+const maxPriceBodyBytes = 8 << 20
 
 func main() {
 	os.Exit(run())
@@ -159,12 +174,15 @@ func runWith(argv []string) int {
 
 	if err := fetchAndInstall(ctx, log, opts, token); err != nil {
 		// A fetch/validation failure is NOT fatal-to-the-system: a prior good file may
-		// still be in place for the rater. Report it as "prices stale" (code 2), and
-		// say whether a local file exists so the operator knows if rating can proceed.
-		if _, statErr := os.Stat(opts.priceFile); statErr == nil {
-			log.Error.Printf("price-fetch: %v — leaving the existing price file %q in place (rater will rate against STALE prices)", err, opts.priceFile)
+		// still be in place for the rater. Report it as "prices stale" (code 2). Probe
+		// the local file with the RATER'S OWN loader (not a bare os.Stat) so the operator
+		// learns whether rating can actually proceed, not just whether a file exists.
+		if _, loadErr := rating.LoadPriceBook(opts.priceFile); loadErr == nil {
+			log.Error.Printf("price-fetch: %v — leaving the existing price file %q in place and the rater CAN load it (stale-but-priced)", err, opts.priceFile)
+		} else if errors.Is(loadErr, os.ErrNotExist) {
+			log.Error.Printf("price-fetch: %v — NO local price file exists at %q (the rater will fail closed)", err, opts.priceFile)
 		} else {
-			log.Error.Printf("price-fetch: %v — and NO local price file exists at %q (the rater will fail closed)", err, opts.priceFile)
+			log.Error.Printf("price-fetch: %v — existing price file %q is UNLOADABLE: %v (the rater will fail closed)", err, opts.priceFile, loadErr)
 		}
 		return exitFetchBad
 	}
@@ -187,13 +205,19 @@ func fetchAndInstall(ctx context.Context, log *logging.Logger, opts fetchOptions
 		return fmt.Errorf("served price file failed validation (rater would reject it): %w", err)
 	}
 
-	// Idempotency: if the served version matches what is already installed, do not
-	// rewrite the file. Avoids churn (and a needless rename the rater could race) when
-	// prices have not changed. A missing/empty sidecar means "unknown" -> install.
+	// Idempotency: if the served version matches what is already installed AND the
+	// on-disk body already equals the freshly-fetched bytes, do not rewrite the file.
+	// Avoids churn (and a needless rename the rater could race) when prices have not
+	// changed. A missing/empty sidecar means "unknown" -> install. The body check is
+	// what makes recovery real: a sidecar that is AHEAD of a stale body (e.g. a crash
+	// between the two renames, before body-first ordering existed) no longer
+	// short-circuits — we re-install instead of billing stale prices forever.
 	if version != "" {
 		if installed, ok := readInstalledVersion(opts.priceFile); ok && installed == version {
-			log.Info.Printf("price-fetch: served version %q already installed at %q; no-op", version, opts.priceFile)
-			return nil
+			if onDisk, err := os.ReadFile(opts.priceFile); err == nil && bytes.Equal(onDisk, body) {
+				log.Info.Printf("price-fetch: served version %q already installed at %q; no-op", version, opts.priceFile)
+				return nil
+			}
 		}
 	}
 
@@ -223,46 +247,58 @@ func fetchPrices(ctx context.Context, opts fetchOptions, token string) ([]byte, 
 	}
 	defer func() { _ = resp.Body.Close() }()
 
-	// Cap the read so a misbehaving/huge response cannot exhaust memory. The price
-	// file is small (KBs); 8 MiB is a generous ceiling that still fails closed on a
-	// runaway body.
-	body, err := io.ReadAll(io.LimitReader(resp.Body, 8<<20))
+	// Cap the read so a misbehaving/huge response cannot exhaust memory, reading ONE
+	// byte past the cap so we can DISTINGUISH a body that is exactly at the cap from one
+	// that overran it. An over-cap body is rejected (not silently truncated): a
+	// truncated valid-YAML prefix would install a partial book, so we fail closed.
+	body, err := io.ReadAll(io.LimitReader(resp.Body, maxPriceBodyBytes+1))
 	if err != nil {
 		return nil, "", fmt.Errorf("read response from %s: %w", url, err)
+	}
+	if len(body) > maxPriceBodyBytes {
+		return nil, "", fmt.Errorf("price file from %s exceeds %d bytes (refusing a possibly-truncated body)", url, maxPriceBodyBytes)
 	}
 	if resp.StatusCode != http.StatusOK {
 		return nil, "", fmt.Errorf("GET %s: status %d (not serving prices)", url, resp.StatusCode)
 	}
-	return body, resp.Header.Get(priceVersionHeader), nil
+	return body, strings.TrimSpace(resp.Header.Get(priceVersionHeader)), nil
 }
 
 // installAtomically writes body to the destination via a temp file + rename(2), so a
-// concurrent rater read can never observe a partial file. The version sidecar is
-// written and fsynced BEFORE the destination rename: if the process dies between the
-// two, the worst case is a sidecar describing a version whose bytes are not yet in
-// place — caught next run by the version mismatch (re-install), never a file whose
-// recorded version is AHEAD of its content during rating.
+// concurrent rater read can never observe a partial file. The BODY is written and
+// renamed FIRST, then (if there is a version) the sidecar: if the process dies between
+// the two renames, the worst case is {body:B_new, sidecar:V_old-or-absent}. The next
+// run then sees served-version != installed-version (or readInstalledVersion ok=false
+// when the sidecar is absent), so the idempotency guard does NOT short-circuit and the
+// install correctly re-runs — making recovery real. The opposite (sidecar-first)
+// ordering was dangerous: it could leave a sidecar AHEAD of stale body bytes, and the
+// version-only idempotency no-op would then bill stale prices forever.
 func installAtomically(dest string, body []byte, version string) error {
 	dir := filepath.Dir(dest)
 
-	// Sidecar first (best-effort ordering described above). Only when we have a
-	// version to record; a served file with no version header installs without a
-	// sidecar (idempotency then always re-installs, which is safe).
+	// Body first: the recorded version must never advance ahead of the bytes on disk.
+	if err := writeFileSync(dir, dest, body); err != nil {
+		return fmt.Errorf("install price file: %w", err)
+	}
+
+	// Then the sidecar, only when we have a version to record; a served file with no
+	// version header installs without a sidecar (idempotency then always re-installs,
+	// which is safe).
 	if version != "" {
 		if err := writeFileSync(dir, dest+versionSuffix, []byte(version)); err != nil {
 			return fmt.Errorf("write version sidecar: %w", err)
 		}
 	}
-
-	if err := writeFileSync(dir, dest, body); err != nil {
-		return fmt.Errorf("install price file: %w", err)
-	}
 	return nil
 }
 
-// writeFileSync writes data to a uniquely-named temp file in dir, fsyncs it, and
-// renames it over dest. Both file are on the same filesystem (dir), so the rename is
-// atomic. The temp file is cleaned up on any error before the rename.
+// writeFileSync writes data to a uniquely-named temp file in dir, fsyncs it, renames
+// it over dest, and then fsyncs the parent DIRECTORY so the rename itself is durable
+// (POSIX: a rename is not crash-safe until the containing directory is fsynced). Both
+// files are on the same filesystem (dir), so the rename is atomic. The temp file is
+// cleaned up on any error before the rename. The file is installed world-readable
+// (0644) — price data is NON-secret (the SATURN_TOKEN is never written here) and the
+// rater may run under a DIFFERENT uid, so CreateTemp's default 0600 would lock it out.
 func writeFileSync(dir, dest string, data []byte) error {
 	tmp, err := os.CreateTemp(dir, ".price-fetch-*")
 	if err != nil {
@@ -285,11 +321,31 @@ func writeFileSync(dir, dest string, data []byte) error {
 		_ = tmp.Close()
 		return fmt.Errorf("fsync temp file: %w", err)
 	}
+	// CreateTemp makes the file 0600; relax to 0644 BEFORE close so the rater (a
+	// possibly-different uid) can read the installed file. *os.File.Chmod has no
+	// TOCTOU window — it operates on the open descriptor.
+	if err := tmp.Chmod(0o644); err != nil {
+		_ = tmp.Close()
+		return fmt.Errorf("chmod temp file: %w", err)
+	}
 	if err := tmp.Close(); err != nil {
 		return fmt.Errorf("close temp file: %w", err)
 	}
 	if err := os.Rename(tmpName, dest); err != nil {
 		return fmt.Errorf("rename %s -> %s: %w", tmpName, dest, err)
+	}
+	// Fsync the parent directory so the rename survives a crash. Until this returns,
+	// POSIX permits the directory entry to be lost even though the file data is synced.
+	dirFile, err := os.Open(dir)
+	if err != nil {
+		return fmt.Errorf("open dir %s for fsync: %w", dir, err)
+	}
+	if err := dirFile.Sync(); err != nil {
+		_ = dirFile.Close()
+		return fmt.Errorf("fsync dir %s: %w", dir, err)
+	}
+	if err := dirFile.Close(); err != nil {
+		return fmt.Errorf("close dir %s: %w", dir, err)
 	}
 	committed = true
 	return nil
@@ -302,7 +358,10 @@ func readInstalledVersion(dest string) (string, bool) {
 	if err != nil {
 		return "", false
 	}
-	return string(data), true
+	// Trim whitespace so an externally-seeded sidecar (e.g. `echo V > file`, which adds
+	// a trailing newline) still compares equal to the trimmed header. We always WRITE
+	// the sidecar without a trailing newline; this only hardens the read side.
+	return strings.TrimSpace(string(data)), true
 }
 
 // fetchOptions are the resolved knobs from the settings file (+ flag/env overrides).
