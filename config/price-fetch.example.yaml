@@ -1,0 +1,25 @@
+# Example price-fetch settings. Copy to a real location and pass with -f.
+#
+# price-fetch pulls the customer's effective token prices from the central pricing
+# service (saturn-aws-manager's GET /customer/token-prices) and installs them as the
+# local YAML price file the rater reads. Run it as a CronJob ahead of the rater (or
+# on its own cadence); the rater always reads whatever file is currently installed.
+#
+# The customer auth token is NOT configured here — it is read from the SATURN_TOKEN
+# environment variable (a mounted secret), so it never lands in a configmap or logs.
+debug: false
+
+# Base URL of the central pricing service. The endpoint path
+# (/customer/token-prices) is appended automatically. Override with -manager-url.
+managerURL: "https://manager.internal.svc.cluster.local"
+
+# LOCAL destination path — MUST be the same file the rater's `priceFile` points at.
+# price-fetch writes it atomically (temp + rename); the rater reads it. A sidecar
+# "<priceFile>.version" records the X-Saturn-Price-Version of the installed file for
+# audit/reconcile. Override with -out.
+priceFile: "/etc/saturn/prices/prices.yaml"
+
+# Whole-fetch timeout (connect + read). The price file is small; a long stall means
+# the manager is unhealthy and the job should fall back to the last-good file rather
+# than hang the pod. Default 30s.
+requestTimeout: "30s"
