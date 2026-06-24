@@ -165,7 +165,7 @@ func TestPostSnapshot_SendsAuthAndBody(t *testing.T) {
 // TestPostSnapshot_Non2xxFails (token-push-non2xx-fails): a rejected push is an error,
 // never treated as a successful push.
 func TestPostSnapshot_Non2xxFails(t *testing.T) {
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		w.WriteHeader(http.StatusBadRequest)
 		_, _ = w.Write([]byte("malformed snapshot"))
 	}))
@@ -183,7 +183,7 @@ func TestPostSnapshot_Non2xxFails(t *testing.T) {
 // not exitOK.
 func TestPushWindows_ExitUnattribOnOrphan(t *testing.T) {
 	hits := 0
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		hits++
 		w.WriteHeader(http.StatusOK)
 	}))
@@ -209,7 +209,7 @@ func TestPushWindows_ExitUnattribOnOrphan(t *testing.T) {
 // TestPushWindows_FatalOnPostError (token-push-fatal-on-post-error): a failed push
 // returns exitFatal.
 func TestPushWindows_FatalOnPostError(t *testing.T) {
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		w.WriteHeader(http.StatusInternalServerError)
 	}))
 	defer srv.Close()
