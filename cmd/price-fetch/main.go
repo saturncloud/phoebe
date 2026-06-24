@@ -25,7 +25,9 @@
 //	0  a fresh price file was fetched, validated, and installed (or the served
 //	   version already matched what is installed — a no-op, nothing rewritten)
 //	1  fatal: bad config / no auth token / unusable destination path
-//	2  fetch FAILED (manager unreachable, non-200, malformed/invalid price file)
+//	2  fetch FAILED (manager unreachable, non-200, malformed/invalid price file, or a
+//	   200 missing the X-Saturn-Price-Version header — the manager always sets it, so
+//	   its absence is treated as a contract violation, not a best-effort omission)
 //	   BUT a previously-good local file is still in place. The rater can keep
 //	   rating against it; this code says "prices are STALE, investigate" without
 //	   conflating it with "the job is broken" (code 1) — distinct so a CronJob can
@@ -263,7 +265,18 @@ func fetchPrices(ctx context.Context, opts fetchOptions, token string) ([]byte, 
 	if resp.StatusCode != http.StatusOK {
 		return nil, "", fmt.Errorf("GET %s: status %d (not serving prices)", url, resp.StatusCode)
 	}
-	return body, strings.TrimSpace(resp.Header.Get(priceVersionHeader)), nil
+	// The manager ALWAYS sets X-Saturn-Price-Version on a 200: it is a deterministic
+	// content hash of the served prices, set unconditionally (the endpoint raises an
+	// error rather than serve a body without it). So an empty header on a 200 is not a
+	// "best-effort omission" — it means something is wrong (a bug, a proxy stripping the
+	// header, or the wrong endpoint answering). Fail closed: refuse the body and leave
+	// the prior good file in place, rather than install prices we could never attribute
+	// in a billing reconcile ("phoebe billed window W against price-version V" needs V).
+	version := strings.TrimSpace(resp.Header.Get(priceVersionHeader))
+	if version == "" {
+		return nil, "", fmt.Errorf("GET %s: 200 response is missing the %s header (the manager always sets it; refusing an unversioned price file)", url, priceVersionHeader)
+	}
+	return body, version, nil
 }
 
 // installAtomically writes body to the destination via a temp file + rename(2), so a

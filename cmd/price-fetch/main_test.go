@@ -429,27 +429,26 @@ func TestIdempotent_TrimsSidecarWhitespace(t *testing.T) {
 	}
 }
 
-// TestFetchAndInstall_VersionlessRemovesStaleSidecar (price-fetch-missing-version)
-// pins the MECHANICAL half of the missing-version contract (the fail-open-vs-closed
-// design half is task #30): when the manager serves a CHANGED valid body with NO
-// X-Saturn-Price-Version header over a destination that already has a sidecar, the
-// new body is installed AND the stale sidecar is REMOVED — so the sidecar can never
-// name a content-hash that differs from the body on disk (a reconcile/audit lie).
-func TestFetchAndInstall_VersionlessRemovesStaleSidecar(t *testing.T) {
+// TestFetchAndInstall_MissingVersionFailsClosed (price-fetch-missing-version) pins
+// the missing-version contract: the manager ALWAYS sets X-Saturn-Price-Version on a
+// 200 (it is a deterministic content hash, set unconditionally), so a 200 with no
+// version header is a contract violation, not a best-effort omission. The fetcher
+// refuses it and leaves any prior good file + sidecar untouched (stale-but-priced) —
+// never installs a price file it could not attribute in a billing reconcile.
+func TestFetchAndInstall_MissingVersionFailsClosed(t *testing.T) {
 	dir := t.TempDir()
 	dest := filepath.Join(dir, "prices.yaml")
 
-	// Seed a prior good install: an OLD body + a sidecar naming its version.
-	const oldBody = validPriceYAML
-	if err := os.WriteFile(dest, []byte(oldBody), 0o644); err != nil {
+	// Seed a prior good install: a body + a sidecar naming its version.
+	if err := os.WriteFile(dest, []byte(validPriceYAML), 0o644); err != nil {
 		t.Fatal(err)
 	}
 	if err := os.WriteFile(dest+versionSuffix, []byte("hash-OLD"), 0o644); err != nil {
 		t.Fatal(err)
 	}
 
-	// A genuinely DIFFERENT valid body (distinct completion rate), served with NO
-	// version header (priceServer omits the header when version == "").
+	// A genuinely DIFFERENT valid body served with NO version header (priceServer
+	// omits the header when version == "").
 	const newBody = `
 version: 1
 base_models:
@@ -461,17 +460,39 @@ fine_tune_premium:
   policy: "identity"
 `
 	srv := priceServer(t, http.StatusOK, "", newBody, nil)
-	if err := fetchAndInstall(context.Background(), quietLog(), optsFor(srv, dest), "test-token"); err != nil {
-		t.Fatalf("fetchAndInstall: %v", err)
+	err := fetchAndInstall(context.Background(), quietLog(), optsFor(srv, dest), "test-token")
+	if err == nil {
+		t.Fatalf("expected an error on a 200 with no version header, got nil")
 	}
 
-	// Body must be the new one.
+	// The prior good body and sidecar must be UNTOUCHED — never replaced by an
+	// unversioned body.
 	got, _ := os.ReadFile(dest)
-	if string(got) != newBody {
-		t.Fatalf("body was not updated to the new version-less body")
+	if string(got) != validPriceYAML {
+		t.Fatalf("prior good body was replaced by an unversioned fetch")
 	}
-	// The stale sidecar MUST be gone — never left naming hash-OLD for newBody bytes.
-	if ver, ok := readInstalledVersion(dest); ok {
-		t.Fatalf("stale sidecar survived a version-less install: %q (must be absent so it can't mis-attribute the body)", ver)
+	if ver, ok := readInstalledVersion(dest); !ok || ver != "hash-OLD" {
+		t.Fatalf("prior sidecar disturbed: ver=%q ok=%v, want hash-OLD", ver, ok)
+	}
+}
+
+// TestRun_MissingVersionExits2 (price-fetch-missing-version-exit-2): through the full
+// run() path, a 200 with no version header exits exitFetchBad(2) — the
+// prices-not-refreshing signal — not fatal(1) and not success(0).
+func TestRun_MissingVersionExits2(t *testing.T) {
+	t.Setenv(tokenEnv, "test-token")
+	dir := t.TempDir()
+	dest := filepath.Join(dir, "prices.yaml")
+	if err := os.WriteFile(dest, []byte(validPriceYAML), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	srv := priceServer(t, http.StatusOK, "", validPriceYAML, nil)
+	code := runWith([]string{
+		"-manager-url", srv.URL,
+		"-out", dest,
+		"-f", filepath.Join(dir, "does-not-exist.yaml"),
+	})
+	if code != exitFetchBad {
+		t.Fatalf("exit code = %d, want exitFetchBad(%d)", code, exitFetchBad)
 	}
 }
