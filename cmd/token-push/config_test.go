@@ -38,6 +38,15 @@ func TestResolveWindows_RejectsUnaligned(t *testing.T) {
 	}
 }
 
+// TestResolveWindows_RejectsUnalignedUntil (token-push-windows-until-unaligned): the
+// symmetric guard to -since — a non-hour-aligned -until is rejected too.
+func TestResolveWindows_RejectsUnalignedUntil(t *testing.T) {
+	now := time.Date(2026, 6, 16, 18, 0, 0, 0, time.UTC)
+	if _, err := resolveWindows("2026-06-16T11:00:00Z", "2026-06-16T14:30:00Z", 24, now); err == nil {
+		t.Fatalf("expected an error for a non-hour-aligned -until")
+	}
+}
+
 // TestResolveWindows_RejectsInverted (token-push-windows-inverted): start >= end fails.
 func TestResolveWindows_RejectsInverted(t *testing.T) {
 	now := time.Date(2026, 6, 16, 14, 0, 0, 0, time.UTC)

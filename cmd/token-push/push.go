@@ -168,29 +168,62 @@ func (p *pusher) buildSnapshot(ctx context.Context, windowStart time.Time) (snap
 	}, unattributable, nil
 }
 
-// pushWindows builds and POSTs a snapshot for each window, in order. It returns the
-// process exit code: exitFatal if any window fails to push (so a CronJob retries the
-// whole run — pushes are idempotent), exitUnattrib if every push succeeded but some
-// rows were unattributable (omitted), else exitOK.
+// pushWindows builds and POSTs a snapshot for each window. It returns the process exit
+// code: exitFatal if any window fails to push, exitUnattrib if every pushed window was
+// accepted but some window was WITHHELD because it contained an unattributable row,
+// else exitOK.
+//
+// CRITICAL — a window with ANY unattributable row is NOT pushed (Ben's ruling). The
+// snapshot is delete-by-absence on the manager: a rated_usage_id the manager has on
+// file for this window but ABSENT from the snapshot is treated as a reconcile-DELETE
+// (un-bill). So pushing a window with a row OMITTED (because its resource_id no longer
+// resolves to an org) would silently DELETE the prior, possibly-already-billed charge
+// for that row — a money-loss, not a "hold". We instead WITHHOLD the whole window
+// (leave the manager's prior good state for it standing) and scream + exit 2. This is
+// the price-fetch fail-closed posture: stale-but-billed beats silently-un-billed.
+// Convergence resumes automatically on the next run once the resource_name row is
+// restored (the trailing re-push window re-covers the hour). The interim cost is
+// possibly over-holding a window that had a genuinely NEW unresolvable row — over-
+// holding is the safe direction. (A future wire `held` marker scopes delete-by-absence
+// so a held row need not block its whole window; that lands install+manager together.)
+//
+// Windows are independent: a withheld or failed window does not abort the others, so a
+// single bad window can't block reconvergence of every other hour.
 func (p *pusher) pushWindows(ctx context.Context, windows []time.Time) int {
-	totalUnattributable := 0
+	withheld := 0
+	failed := 0
 	for _, w := range windows {
 		snap, unattributable, err := p.buildSnapshot(ctx, w)
 		if err != nil {
 			p.log.Error.Printf("token-push: build snapshot for %s: %v", w.Format(time.RFC3339), err)
-			return exitFatal
+			failed++
+			continue
 		}
-		totalUnattributable += unattributable
+
+		if unattributable > 0 {
+			// Do NOT push: this snapshot omits a row, and absence == delete on the
+			// manager. Withhold the whole window rather than risk un-billing a prior
+			// charge. Already screamed per-row in buildSnapshot.
+			p.log.Error.Printf(
+				"token-push: WITHHOLDING window %s — it has %d unattributable row(s); pushing the omitted snapshot would delete-by-absence a possibly-billed rollup. Leaving the manager's prior state for this window untouched (restore the resource_name mapping; the next run re-pushes).",
+				snap.WindowStart, unattributable,
+			)
+			withheld++
+			continue
+		}
 
 		if err := p.postSnapshot(ctx, snap); err != nil {
 			p.log.Error.Printf("token-push: push snapshot for %s: %v", w.Format(time.RFC3339), err)
-			return exitFatal
+			failed++
+			continue
 		}
-		p.log.Info.Printf("token-push: pushed window %s (%d rollups, %d unattributable omitted)",
-			snap.WindowStart, len(snap.Rollups), unattributable)
+		p.log.Info.Printf("token-push: pushed window %s (%d rollups)", snap.WindowStart, len(snap.Rollups))
 	}
 
-	if totalUnattributable > 0 {
+	if failed > 0 {
+		return exitFatal
+	}
+	if withheld > 0 {
 		return exitUnattrib
 	}
 	return exitOK

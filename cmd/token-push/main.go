@@ -17,10 +17,14 @@
 //     delete would silently keep billing a vanished rollup forever.
 //   - ORG RESOLVED INSTALL-SIDE (Decision 2 / C1). resource_id → org_id is joined HERE,
 //     where the resource_name FK lives; the manager never reads the install DB. The
-//     org_id rides the payload. A rollup whose resource_id resolves to NO org is held
-//     back and screamed about, NEVER pushed with a guessed/empty org (C2/C7 fail-closed)
-//     — but, because rated_usage.resource_id is NOT NULL and the rater only writes
-//     attributable rows, an unresolved org means a deployment row vanished from
+//     org_id rides the payload. A rollup whose resource_id resolves to NO org makes its
+//     WHOLE WINDOW be WITHHELD (not pushed) and screamed about — because the snapshot is
+//     delete-by-absence, pushing a window with a row omitted would silently DELETE that
+//     row's prior (possibly already-billed) charge. Withholding leaves the manager's
+//     prior good state for the window standing (stale-but-billed); the next run re-pushes
+//     once the resource_name mapping is restored. NEVER pushed with a guessed/empty org
+//     (C2/C7 fail-closed). Because rated_usage.resource_id is NOT NULL and the rater only
+//     writes attributable rows, an unresolved org means a deployment row vanished from
 //     resource_name: a real anomaly worth a non-zero exit.
 //   - MONEY IS AN EXACT DECIMAL STRING end to end (C8). cost and the applied rates cross
 //     the wire as NUMERIC text, never a float — read as ::text from Postgres, emitted as
@@ -36,10 +40,11 @@
 //	   nothing to push — an empty window snapshots to an empty rollup set, which the
 //	   manager still needs to apply delete-by-absence)
 //	1  fatal: bad config / no auth token / DB unreachable / a window failed to push
-//	2  a window was pushed BUT some rated_usage rows could NOT be resolved to an org
-//	   (a deployment missing from resource_name) — those rows were OMITTED from the
-//	   snapshot and screamed about. Distinct code so a CronJob alerts on "usage we
-//	   metered and priced but cannot attribute to an org" (lost revenue / lost
+//	2  some window was WITHHELD (not pushed) because it contained a rated_usage row
+//	   that could NOT be resolved to an org (a deployment missing from resource_name);
+//	   every window that WAS pushed succeeded. The withheld window's prior state on the
+//	   manager is left untouched (stale-but-billed). Distinct code so a CronJob alerts on
+//	   "usage we metered and priced but cannot attribute to an org" (held revenue / lost
 //	   attribution) separately from "the job broke".
 //
 // WINDOW SELECTION mirrors the rater: default is the trailing N complete hours, so a

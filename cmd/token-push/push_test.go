@@ -178,10 +178,12 @@ func TestPostSnapshot_Non2xxFails(t *testing.T) {
 	}
 }
 
-// TestPushWindows_ExitUnattribOnOrphan (token-push-exit-2): when a window pushes
-// successfully but contained an unattributable row, the run returns exitUnattrib(2),
-// not exitOK.
-func TestPushWindows_ExitUnattribOnOrphan(t *testing.T) {
+// TestPushWindows_WithholdsWindowWithUnattributable (token-push-withhold-on-orphan):
+// a window containing ANY unattributable row is NOT pushed — pushing the omitted
+// snapshot would delete-by-absence a possibly-billed rollup. The manager is NEVER hit
+// for that window, and the run exits 2 (held, not pushed). This is the money-loss fix:
+// the OLD behavior pushed the window (hits==1), un-billing the orphan's prior charge.
+func TestPushWindows_WithholdsWindowWithUnattributable(t *testing.T) {
 	hits := 0
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		hits++
@@ -201,8 +203,48 @@ func TestPushWindows_ExitUnattribOnOrphan(t *testing.T) {
 	if code != exitUnattrib {
 		t.Fatalf("exit code = %d, want exitUnattrib(%d)", code, exitUnattrib)
 	}
-	if hits != 1 {
-		t.Fatalf("manager hit %d times, want 1 (the attributable rows still push)", hits)
+	if hits != 0 {
+		t.Fatalf("manager was hit %d times for a window with an unattributable row; it must be WITHHELD (a push would delete-by-absence the orphan's prior charge)", hits)
+	}
+}
+
+// TestPushWindows_WithheldWindowDoesNotBlockCleanWindow (token-push-windows-independent):
+// a withheld (or failed) window does not abort the run — a clean window still pushes.
+// This is the non-atomic-reconciliation fix: one bad hour can't block reconvergence of
+// every other hour.
+func TestPushWindows_WithheldWindowDoesNotBlockCleanWindow(t *testing.T) {
+	pushed := map[string]bool{}
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		b, _ := io.ReadAll(r.Body)
+		var s snapshot
+		_ = json.Unmarshal(b, &s)
+		pushed[s.WindowStart] = true
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer srv.Close()
+
+	p, mock := newMockPusher(t)
+	p.managerURL = srv.URL
+	p.token = "t"
+
+	win2 := win.Add(time.Hour)
+	// win: has an orphan -> withheld. win2: clean -> pushed.
+	mock.ExpectQuery(`FROM rated_usage ru`).WithArgs(win).WillReturnRows(
+		sqlmock.NewRows(snapshotCols).
+			AddRow("orphan", "res-x", "m", nil, "0.002", "0.1", "0.05", "0.6", int64(1), int64(0), int64(1), int64(1)))
+	mock.ExpectQuery(`FROM rated_usage ru`).WithArgs(win2).WillReturnRows(
+		sqlmock.NewRows(snapshotCols).
+			AddRow("ok", "res-1", "m", "org-acme", "0.001", "0.1", "0.05", "0.6", int64(1), int64(0), int64(1), int64(1)))
+
+	code := p.pushWindows(context.Background(), []time.Time{win, win2})
+	if code != exitUnattrib {
+		t.Fatalf("exit code = %d, want exitUnattrib(%d)", code, exitUnattrib)
+	}
+	if pushed[win.UTC().Format(time.RFC3339)] {
+		t.Fatalf("the orphan window was pushed; it must be withheld")
+	}
+	if !pushed[win2.UTC().Format(time.RFC3339)] {
+		t.Fatalf("the clean window was NOT pushed; a withheld earlier window must not block it")
 	}
 }
 
