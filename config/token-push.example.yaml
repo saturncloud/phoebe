@@ -1,0 +1,27 @@
+# Example token-push settings. Copy to a real location and pass with -f.
+#
+# token-push is the install-side hourly billing PUSH job: it reads the rater's
+# rated_usage rollups, resolves each deployment to the org that owns it
+# (resource_id -> resource_name.org_id, a local join in the shared Atlas Postgres),
+# and POSTs an hourly snapshot to the central manager's POST /customer/token-usage.
+# Run it as a CronJob AFTER the rater (so it ships the latest rollups), e.g. at :10
+# past the hour if the rater runs at :05.
+#
+# The customer auth token is NOT configured here — it is read from the SATURN_TOKEN
+# environment variable (a mounted secret), so it never lands in a configmap or logs.
+# The database connection comes from DATABASE_URL (Atlas convention), the same shared
+# Postgres the rater reads.
+debug: false
+
+# Base URL of the central manager. The endpoint path (/customer/token-usage) is
+# appended automatically. Override with -manager-url.
+managerURL: "https://manager.internal.svc.cluster.local"
+
+# How many complete trailing hours each run snapshots. Matches the rater's re-rate
+# window so a late re-rate or reconcile-delete is carried across the boundary (the
+# snapshot is idempotent on the manager, so re-pushing a window never double-bills).
+# Default 24.
+pushTrailingHours: 24
+
+# Whole-request timeout for a single window POST. Default 60s.
+requestTimeout: "60s"
