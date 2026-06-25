@@ -2,10 +2,12 @@ package main
 
 import (
 	"context"
+	"database/sql"
 	"encoding/json"
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 	"time"
 
@@ -30,7 +32,7 @@ func newMockPusher(t *testing.T) (*pusher, sqlmock.Sqlmock) {
 		t.Fatalf("sqlmock: %v", err)
 	}
 	t.Cleanup(func() { _ = db.Close() })
-	return &pusher{db: db, log: quietLog(), timeout: 5 * time.Second}, mock
+	return &pusher{db: db, log: quietLog(), client: &http.Client{Timeout: 5 * time.Second}}, mock
 }
 
 var win = time.Date(2026, 6, 16, 14, 0, 0, 0, time.UTC)
@@ -55,7 +57,8 @@ func TestBuildSnapshot_ResolvesOrgAndShape(t *testing.T) {
 	if unattributable != 0 {
 		t.Fatalf("unattributable = %d, want 0", unattributable)
 	}
-	if snap.WindowStart != "2026-06-16T14:00:00Z" {
+	// Explicit +00:00 offset, not "Z" — Python 3.10 fromisoformat rejects "Z".
+	if snap.WindowStart != "2026-06-16T14:00:00+00:00" {
 		t.Fatalf("window_start = %q", snap.WindowStart)
 	}
 	if len(snap.Rollups) != 1 {
@@ -120,17 +123,19 @@ func TestBuildSnapshot_EmptyWindowMarshalsToEmptyArray(t *testing.T) {
 }
 
 func containsJSONEmptyRollups(s string) bool {
-	// crude but exact: the empty-array form, not the null form.
-	return contains(s, `"rollups":[]`) && !contains(s, `"rollups":null`)
+	// the empty-array form, not the null form.
+	return strings.Contains(s, `"rollups":[]`) && !strings.Contains(s, `"rollups":null`)
 }
 
-func contains(haystack, needle string) bool {
-	for i := 0; i+len(needle) <= len(haystack); i++ {
-		if haystack[i:i+len(needle)] == needle {
-			return true
-		}
+// expectLiveness queues the rated_usage liveness pre-check (pushWindows runs it before
+// any window). hasRows=true → the table is non-empty (push proceeds).
+func expectLiveness(mock sqlmock.Sqlmock, hasRows bool) {
+	q := mock.ExpectQuery(`SELECT 1 FROM rated_usage LIMIT 1`)
+	if hasRows {
+		q.WillReturnRows(sqlmock.NewRows([]string{"?column?"}).AddRow(1))
+	} else {
+		q.WillReturnError(sql.ErrNoRows)
 	}
-	return false
 }
 
 // TestPostSnapshot_SendsAuthAndBody (token-push-post-auth-body): the POST carries the
@@ -146,7 +151,7 @@ func TestPostSnapshot_SendsAuthAndBody(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	p := &pusher{log: quietLog(), managerURL: srv.URL, token: "tok-123", timeout: 5 * time.Second}
+	p := &pusher{log: quietLog(), managerURL: srv.URL, token: "tok-123", client: &http.Client{Timeout: 5 * time.Second}}
 	snap := snapshot{WindowStart: "2026-06-16T14:00:00Z", Rollups: []rollup{{RatedUsageID: "x", OrgID: "o", Cost: "0.5"}}}
 	if err := p.postSnapshot(context.Background(), snap); err != nil {
 		t.Fatalf("postSnapshot: %v", err)
@@ -157,7 +162,7 @@ func TestPostSnapshot_SendsAuthAndBody(t *testing.T) {
 	if gotPath != tokenUsagePath {
 		t.Fatalf("path = %q, want %q", gotPath, tokenUsagePath)
 	}
-	if !contains(gotBody, `"rated_usage_id":"x"`) || !contains(gotBody, `"cost":"0.5"`) {
+	if !strings.Contains(gotBody, `"rated_usage_id":"x"`) || !strings.Contains(gotBody, `"cost":"0.5"`) {
 		t.Fatalf("body missing expected fields: %s", gotBody)
 	}
 }
@@ -171,7 +176,7 @@ func TestPostSnapshot_Non2xxFails(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	p := &pusher{log: quietLog(), managerURL: srv.URL, token: "t", timeout: 5 * time.Second}
+	p := &pusher{log: quietLog(), managerURL: srv.URL, token: "t", client: &http.Client{Timeout: 5 * time.Second}}
 	err := p.postSnapshot(context.Background(), snapshot{WindowStart: "2026-06-16T14:00:00Z", Rollups: []rollup{}})
 	if err == nil {
 		t.Fatalf("expected an error on a 400, got nil")
@@ -197,6 +202,7 @@ func TestPushWindows_WithholdsWindowWithUnattributable(t *testing.T) {
 	rows := sqlmock.NewRows(snapshotCols).
 		AddRow("ok", "res-1", "m", "org-acme", "0.001", "0.1", "0.05", "0.6", int64(1), int64(0), int64(1), int64(1)).
 		AddRow("orphan", "res-x", "m", nil, "0.002", "0.1", "0.05", "0.6", int64(1), int64(0), int64(1), int64(1))
+	expectLiveness(mock, true)
 	mock.ExpectQuery(`FROM rated_usage ru`).WithArgs(win).WillReturnRows(rows)
 
 	code := p.pushWindows(context.Background(), []time.Time{win})
@@ -229,6 +235,7 @@ func TestPushWindows_WithheldWindowDoesNotBlockCleanWindow(t *testing.T) {
 
 	win2 := win.Add(time.Hour)
 	// win: has an orphan -> withheld. win2: clean -> pushed.
+	expectLiveness(mock, true)
 	mock.ExpectQuery(`FROM rated_usage ru`).WithArgs(win).WillReturnRows(
 		sqlmock.NewRows(snapshotCols).
 			AddRow("orphan", "res-x", "m", nil, "0.002", "0.1", "0.05", "0.6", int64(1), int64(0), int64(1), int64(1)))
@@ -240,10 +247,12 @@ func TestPushWindows_WithheldWindowDoesNotBlockCleanWindow(t *testing.T) {
 	if code != exitUnattrib {
 		t.Fatalf("exit code = %d, want exitUnattrib(%d)", code, exitUnattrib)
 	}
-	if pushed[win.UTC().Format(time.RFC3339)] {
+	// Keys are the snapshot's WindowStart, formatted with the +00:00 offset (not "Z").
+	const fmtOffset = "2006-01-02T15:04:05+00:00"
+	if pushed[win.UTC().Format(fmtOffset)] {
 		t.Fatalf("the orphan window was pushed; it must be withheld")
 	}
-	if !pushed[win2.UTC().Format(time.RFC3339)] {
+	if !pushed[win2.UTC().Format(fmtOffset)] {
 		t.Fatalf("the clean window was NOT pushed; a withheld earlier window must not block it")
 	}
 }
@@ -259,6 +268,7 @@ func TestPushWindows_FatalOnPostError(t *testing.T) {
 	p, mock := newMockPusher(t)
 	p.managerURL = srv.URL
 	p.token = "t"
+	expectLiveness(mock, true)
 	mock.ExpectQuery(`FROM rated_usage ru`).WithArgs(win).
 		WillReturnRows(sqlmock.NewRows(snapshotCols).
 			AddRow("ok", "res-1", "m", "org-acme", "0.001", "0.1", "0.05", "0.6", int64(1), int64(0), int64(1), int64(1)))
@@ -266,5 +276,58 @@ func TestPushWindows_FatalOnPostError(t *testing.T) {
 	code := p.pushWindows(context.Background(), []time.Time{win})
 	if code != exitFatal {
 		t.Fatalf("exit code = %d, want exitFatal(%d)", code, exitFatal)
+	}
+}
+
+// TestPushWindows_EmptyTableRefuses (token-push-empty-table-refuses): an entirely empty
+// rated_usage table (fresh install / DB wipe) makes the liveness guard refuse to push —
+// otherwise every window would signal delete-all and wipe the manager's prior billing.
+func TestPushWindows_EmptyTableRefuses(t *testing.T) {
+	hits := 0
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		hits++
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer srv.Close()
+
+	p, mock := newMockPusher(t)
+	p.managerURL = srv.URL
+	p.token = "t"
+	expectLiveness(mock, false) // empty table
+
+	code := p.pushWindows(context.Background(), []time.Time{win, win.Add(time.Hour)})
+	if code != exitFatal {
+		t.Fatalf("exit code = %d, want exitFatal(%d) on an empty table", code, exitFatal)
+	}
+	if hits != 0 {
+		t.Fatalf("manager was hit %d times on an empty table; must refuse to push (delete-all hazard)", hits)
+	}
+}
+
+// TestPushWindows_FatalDominatesWithheld (token-push-fatal-dominates): when one window
+// is withheld (unattributable) AND another fails to push, the run exits FATAL (1), not 2
+// — a broken job is the more urgent signal.
+func TestPushWindows_FatalDominatesWithheld(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusInternalServerError) // every push fails
+	}))
+	defer srv.Close()
+
+	p, mock := newMockPusher(t)
+	p.managerURL = srv.URL
+	p.token = "t"
+	win2 := win.Add(time.Hour)
+	expectLiveness(mock, true)
+	// win: orphan -> withheld (no POST). win2: clean -> POST fails (fatal).
+	mock.ExpectQuery(`FROM rated_usage ru`).WithArgs(win).WillReturnRows(
+		sqlmock.NewRows(snapshotCols).
+			AddRow("orphan", "res-x", "m", nil, "0.002", "0.1", "0.05", "0.6", int64(1), int64(0), int64(1), int64(1)))
+	mock.ExpectQuery(`FROM rated_usage ru`).WithArgs(win2).WillReturnRows(
+		sqlmock.NewRows(snapshotCols).
+			AddRow("ok", "res-1", "m", "org-acme", "0.001", "0.1", "0.05", "0.6", int64(1), int64(0), int64(1), int64(1)))
+
+	code := p.pushWindows(context.Background(), []time.Time{win, win2})
+	if code != exitFatal {
+		t.Fatalf("exit code = %d, want exitFatal(%d) — fatal must dominate withheld", code, exitFatal)
 	}
 }

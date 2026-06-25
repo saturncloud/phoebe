@@ -57,6 +57,7 @@ package main
 import (
 	"context"
 	"flag"
+	"net/http"
 	"os"
 	"os/signal"
 	"syscall"
@@ -76,7 +77,7 @@ const tokenUsagePath = "/customer/token-usage"
 const (
 	exitOK       = 0
 	exitFatal    = 1
-	exitUnattrib = 2 // pushed, but some rows had no resolvable org (omitted + screamed).
+	exitUnattrib = 2 // a window was WITHHELD (not pushed) — some row had no resolvable org.
 )
 
 // defaultPushTrailingHours is how many complete trailing hours each run snapshots,
@@ -157,7 +158,7 @@ func runWith(argv []string) int {
 		log:        log,
 		managerURL: opts.managerURL,
 		token:      token,
-		timeout:    opts.requestTimeout,
+		client:     &http.Client{Timeout: opts.requestTimeout},
 	}
 
 	return p.pushWindows(ctx, windows)

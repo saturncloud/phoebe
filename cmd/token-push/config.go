@@ -149,14 +149,25 @@ func resolveWindows(since, until string, trailingHours int, now time.Time) ([]ti
 		}
 		end = t.UTC()
 	}
-	if !start.Before(end) {
-		return nil, fmt.Errorf("window start %s is not before end %s", start.Format(time.RFC3339), end.Format(time.RFC3339))
-	}
+	// Alignment BEFORE ordering: a misaligned -since that also happens to land after
+	// the default end would otherwise report a misleading "not before end" instead of
+	// the real "not hour-aligned" cause.
 	if !start.Truncate(time.Hour).Equal(start) {
 		return nil, fmt.Errorf("-since %s is not hour-aligned", start.Format(time.RFC3339))
 	}
 	if !end.Truncate(time.Hour).Equal(end) {
 		return nil, fmt.Errorf("-until %s is not hour-aligned", end.Format(time.RFC3339))
+	}
+	if !start.Before(end) {
+		return nil, fmt.Errorf("window start %s is not before end %s", start.Format(time.RFC3339), end.Format(time.RFC3339))
+	}
+	// Never snapshot a FUTURE window: future hours have no rated_usage rows, so an
+	// empty snapshot for them would signal delete-all to the manager for hours that
+	// should not exist, and a far-future -until would also generate an unbounded number
+	// of windows. The end is clamped to the current hour (the rater only rates closed
+	// hours, so there is never anything to push past it).
+	if end.After(currentHour) {
+		return nil, fmt.Errorf("-until %s is in the future (past the current hour %s); the rater only rates closed hours and a future snapshot would signal delete-all", end.Format(time.RFC3339), currentHour.Format(time.RFC3339))
 	}
 
 	var windows []time.Time

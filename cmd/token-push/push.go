@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"strings"
 	"time"
 
 	_ "github.com/jackc/pgx/v5/stdlib"
@@ -22,7 +23,10 @@ type pusher struct {
 	log        *logging.Logger
 	managerURL string
 	token      string
-	timeout    time.Duration
+	// client is shared across all window POSTs so TCP/TLS connections to the manager
+	// are reused across the (default 24) windows of a run, instead of a fresh handshake
+	// per window.
+	client *http.Client
 }
 
 // rollup is one rated_usage row resolved to its billing org, as it crosses the wire.
@@ -163,15 +167,36 @@ func (p *pusher) buildSnapshot(ctx context.Context, windowStart time.Time) (snap
 	}
 
 	return snapshot{
-		WindowStart: windowStart.UTC().Format(time.RFC3339),
+		// Format with an explicit +00:00 offset, NOT the "Z" military form: the manager
+		// is Python, and Python 3.10's datetime.fromisoformat() rejects a trailing "Z"
+		// (only fixed in 3.11). "+00:00" is parseable by fromisoformat AND by Go's
+		// RFC3339 — the safe cross-language form. (time.RFC3339 emits "Z" for UTC, so we
+		// pin the numeric offset zone explicitly.)
+		WindowStart: windowStart.UTC().Format("2006-01-02T15:04:05+00:00"),
 		Rollups:     resolved,
 	}, unattributable, nil
 }
 
+// ratedUsageHasAnyRow reports whether rated_usage contains at least one row. Used as a
+// liveness guard before pushing: an entirely empty table means an all-empty (delete-all)
+// run, which token-push refuses. Bounded with LIMIT 1 — it does not count.
+func (p *pusher) ratedUsageHasAnyRow(ctx context.Context) (bool, error) {
+	var one int
+	err := p.db.QueryRowContext(ctx, `SELECT 1 FROM rated_usage LIMIT 1`).Scan(&one)
+	if err == sql.ErrNoRows {
+		return false, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	return true, nil
+}
+
 // pushWindows builds and POSTs a snapshot for each window. It returns the process exit
-// code: exitFatal if any window fails to push, exitUnattrib if every pushed window was
-// accepted but some window was WITHHELD because it contained an unattributable row,
-// else exitOK.
+// code with FATAL DOMINATING: exitFatal if ANY window failed to push (the job is broken
+// — most urgent, takes precedence even if another window was also withheld); else
+// exitUnattrib if any window was WITHHELD because it contained an unattributable row
+// (held revenue / lost attribution, but the job otherwise ran); else exitOK.
 //
 // CRITICAL — a window with ANY unattributable row is NOT pushed (Ben's ruling). The
 // snapshot is delete-by-absence on the manager: a rated_usage_id the manager has on
@@ -190,6 +215,25 @@ func (p *pusher) buildSnapshot(ctx context.Context, windowStart time.Time) (snap
 // Windows are independent: a withheld or failed window does not abort the others, so a
 // single bad window can't block reconvergence of every other hour.
 func (p *pusher) pushWindows(ctx context.Context, windows []time.Time) int {
+	// LIVENESS GUARD against an empty rated_usage table (fresh install, DB wipe,
+	// disaster recovery). An empty window snapshots to "rollups": [] which signals
+	// delete-all for that hour; if the WHOLE table is empty, every window would push a
+	// delete-all and wipe up to trailingHours of previously-billed data on the manager.
+	// A fresh install with genuinely no usage also has nothing to push. So if the table
+	// has zero rows AT ALL, refuse to push anything and exit fatal (the operator must
+	// confirm this is intended — token-push will not delete the manager's history on an
+	// empty local table). This is the safe install-side half; the full fix (a manager
+	// "no-data != delete" contract) is escalated.
+	hasAny, err := p.ratedUsageHasAnyRow(ctx)
+	if err != nil {
+		p.log.Error.Printf("token-push: liveness check on rated_usage: %v", err)
+		return exitFatal
+	}
+	if !hasAny {
+		p.log.Error.Printf("token-push: rated_usage is EMPTY — refusing to push (an all-empty run would signal delete-all for every window and wipe the manager's prior billing data). If this install genuinely has no usage, there is nothing to push; if the table was wiped, restore it before running.")
+		return exitFatal
+	}
+
 	withheld := 0
 	failed := 0
 	for _, w := range windows {
@@ -239,7 +283,10 @@ func (p *pusher) postSnapshot(ctx context.Context, snap snapshot) error {
 		return fmt.Errorf("marshal snapshot: %w", err)
 	}
 
-	url := p.managerURL + tokenUsagePath
+	// Trim a trailing slash on the base URL so a configured "https://m/" doesn't
+	// produce "//customer/token-usage" (which can 404 or redirect, silently failing
+	// the push).
+	url := strings.TrimRight(p.managerURL, "/") + tokenUsagePath
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(body))
 	if err != nil {
 		return fmt.Errorf("build request: %w", err)
@@ -247,8 +294,7 @@ func (p *pusher) postSnapshot(ctx context.Context, snap snapshot) error {
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Authorization", "token "+p.token)
 
-	client := &http.Client{Timeout: p.timeout}
-	resp, err := client.Do(req)
+	resp, err := p.client.Do(req)
 	if err != nil {
 		return fmt.Errorf("POST %s: %w", url, err)
 	}
