@@ -199,9 +199,9 @@ CREATE TEMP TABLE rating_derived (
 // IDEMPOTENCY IS RECONCILE, NOT UPSERT-ONLY: a re-run of a window makes rated_usage
 // EXACTLY what the latest run says. ON CONFLICT (auth_id, resource_id, model_id,
 // window_start) DO UPDATE replaces a surviving rollup's sums/cost/applied-rates with
-// the freshly recomputed ones (the surrogate id is DETERMINISTIC — md5 of the LENGTH-PREFIXED
-// natural key, injective, so no '|' in a field can collide two keys — so a re-run
-// regenerates the SAME id). AND the `deleted` CTE removes any in-window rated_usage
+// the freshly recomputed ones, and PRESERVES the existing row's id (DO UPDATE never
+// touches id) — so a rollup keeps its random-UUID id across re-runs even though the id
+// is not derived from the natural key. AND the `deleted` CTE removes any in-window rated_usage
 // row this run did NOT reproduce in priced (it became ambiguous/unpriced, or its
 // events vanished), so a rollup that billed clean in a prior run cannot keep billing
 // at its stale cost. A clean re-run with identical data reproduces every prior row, so
@@ -366,18 +366,18 @@ upserted AS (
         event_count
     )
     SELECT
-        -- DETERMINISTIC 32-char hex surrogate: md5 of the natural key, so re-rating
-        -- regenerates the SAME id. The fields are LENGTH-PREFIXED (len || ':' || value)
-        -- so the encoding is INJECTIVE — a '|' inside auth_id, resource_id or model_id
-        -- can never shift the boundary and collide two different keys onto one id (e.g.
-        -- auth 'a|b' + resource 'c' vs auth 'a' + resource 'b|c'). The field ORDER is
-        -- FIXED and MUST equal the unique key (auth_id, resource_id, model_id,
-        -- window_start); epoch (a bounded integer, no separator hazard) keeps the hash
-        -- input session-TZ-independent.
-        md5(length(auth_id)::text || ':' || auth_id
-          || '|' || length(resource_id)::text || ':' || resource_id
-          || '|' || length(model_id)::text || ':' || model_id
-          || '|' || extract(epoch FROM window_start)::bigint::text),
+        -- id is a fresh random UUID (32-char dashless hex, fitting VARCHAR(32)) — a
+        -- meaningless surrogate, NOT derived from the natural key. Row IDENTITY for the
+        -- idempotent upsert is the COMPOUND UNIQUE constraint (auth_id, resource_id,
+        -- model_id, window_start) below, which is the ON CONFLICT target; the id plays no
+        -- part in conflict resolution. So on a re-rate the EXISTING row's id is preserved
+        -- (DO UPDATE never touches id) — gen_random_uuid() here is evaluated then
+        -- DISCARDED for a conflicting row. A globally-unique random id (vs the old
+        -- install-local md5-of-natural-key) is the correct shape for a value that crosses
+        -- the install->manager boundary as a billing key: two installs can never collide,
+        -- so downstream need not assume install-local uniqueness. (All Saturn ids are
+        -- UUIDs.) gen_random_uuid() is built into Postgres 13+ — no extension needed.
+        replace(gen_random_uuid()::text, '-', ''),
         auth_id, resource_id, model_id, window_start, window_end,
         prompt_tokens, cached_tokens, completion_tokens, billable_prompt_tokens,
         cost, applied_prompt_rate, applied_cached_rate, applied_completion_rate,
