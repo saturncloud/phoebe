@@ -196,7 +196,10 @@ func TestIntegration_RateWindow_ConformsToOracle(t *testing.T) {
 		t.Fatalf("rated_usage resource_id: %d of %d rows carry 'r', want all 2 (E2 attribution must be on every row)", nWithResource, nTotal)
 	}
 
-	// Deterministic surrogate ids: capture before the re-run.
+	// Stable surrogate ids across re-run: capture before. The id is a random UUID, but
+	// a re-rate UPSERTs via ON CONFLICT on the compound unique key (DO UPDATE never
+	// touches id), so an existing rollup KEEPS its id across re-runs — the property the
+	// manager's idempotency relies on.
 	idsBefore := readRatedUsageIDs(t, db)
 
 	// Idempotency (idempotent-rerun): re-run, totals unchanged, still 2 rows.
@@ -214,7 +217,7 @@ func TestIntegration_RateWindow_ConformsToOracle(t *testing.T) {
 	}
 	for k, id := range idsBefore {
 		if idsAfter[k] != id {
-			t.Errorf("rollup %s id changed across re-run: %s → %s (id must be deterministic)", k, id, idsAfter[k])
+			t.Errorf("rollup %s id changed across re-run: %s → %s (ON CONFLICT must preserve the existing row's id)", k, id, idsAfter[k])
 		}
 	}
 }

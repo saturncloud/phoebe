@@ -121,12 +121,9 @@ func TestRateWindowSQL_Shape(t *testing.T) {
 		"AND resource_id IS NOT NULL\n    GROUP BY auth_id, resource_id, model_id",
 		// session-TZ-independent hour bucket
 		"date_trunc('hour', ev_ts AT TIME ZONE 'UTC') AT TIME ZONE 'UTC'",
-		// deterministic natural-key surrogate id (re-runs regenerate the same id),
-		// LENGTH-PREFIXED so a '|' in a field can never collide two keys; resource_id is
-		// part of the key, in fixed order (auth_id, resource_id, model_id, window_start)
-		"md5(length(auth_id)::text || ':' || auth_id",
-		"|| '|' || length(resource_id)::text || ':' || resource_id",
-		"|| '|' || length(model_id)::text || ':' || model_id",
+		// id is a fresh random UUID (dashless, 32 chars) — a meaningless surrogate; row
+		// identity for the idempotent upsert is the compound unique constraint, not the id.
+		"replace(gen_random_uuid()::text, '-', '')",
 		// deterministic lock order across concurrent raters (no ABBA deadlock)
 		"ORDER BY auth_id, resource_id, model_id, window_start",
 		// idempotent upsert on the natural key
