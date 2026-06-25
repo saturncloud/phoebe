@@ -25,7 +25,9 @@
 //	0  a fresh price file was fetched, validated, and installed (or the served
 //	   version already matched what is installed — a no-op, nothing rewritten)
 //	1  fatal: bad config / no auth token / unusable destination path
-//	2  fetch FAILED (manager unreachable, non-200, malformed/invalid price file)
+//	2  fetch FAILED (manager unreachable, non-200, malformed/invalid price file, or a
+//	   200 missing the X-Saturn-Price-Version header — the manager always sets it, so
+//	   its absence is treated as a contract violation, not a best-effort omission)
 //	   BUT a previously-good local file is still in place. The rater can keep
 //	   rating against it; this code says "prices are STALE, investigate" without
 //	   conflating it with "the job is broken" (code 1) — distinct so a CronJob can
@@ -44,9 +46,10 @@
 //     idempotency guard does NOT short-circuit and the install correctly re-runs. The
 //     guard ALSO verifies the on-disk body equals the freshly-fetched bytes, so a
 //     sidecar that is somehow AHEAD of a stale body still re-installs rather than
-//     billing stale prices — recovery is real, not just claimed. A version-LESS install
-//     REMOVES any pre-existing sidecar, so the sidecar can never name a version that
-//     differs from the body on disk (it names the body's version or is absent).
+//     billing stale prices — recovery is real, not just claimed. A 200 with no
+//     X-Saturn-Price-Version header is refused at fetch (see below), so an installed
+//     price file ALWAYS records a version — the sidecar names the installed body's
+//     version, never a different one.
 //   - When the fetch fails and a good local file exists, the file is left UNTOUCHED
 //     (stale-but-priced) and the job exits 2. When the fetch fails and NO local file
 //     exists, there is nothing to rate against and the job exits 2 as well — the
@@ -263,47 +266,51 @@ func fetchPrices(ctx context.Context, opts fetchOptions, token string) ([]byte, 
 	if resp.StatusCode != http.StatusOK {
 		return nil, "", fmt.Errorf("GET %s: status %d (not serving prices)", url, resp.StatusCode)
 	}
-	return body, strings.TrimSpace(resp.Header.Get(priceVersionHeader)), nil
+	// The manager ALWAYS sets X-Saturn-Price-Version on a 200: it is a deterministic
+	// content hash of the served prices, set unconditionally (the endpoint raises an
+	// error rather than serve a body without it). So an empty header on a 200 is not a
+	// "best-effort omission" — it means something is wrong (a bug, a proxy stripping the
+	// header, or the wrong endpoint answering). Fail closed: refuse the body and leave
+	// the prior good file in place, rather than install prices we could never attribute
+	// in a billing reconcile ("phoebe billed window W against price-version V" needs V).
+	version := strings.TrimSpace(resp.Header.Get(priceVersionHeader))
+	if version == "" {
+		return nil, "", fmt.Errorf("GET %s: 200 response is missing the %s header (the manager always sets it; refusing an unversioned price file)", url, priceVersionHeader)
+	}
+	return body, version, nil
 }
 
 // installAtomically writes body to the destination via a temp file + rename(2), so a
 // concurrent rater read can never observe a partial file. The BODY is written and
-// renamed FIRST, then the sidecar is reconciled to the version: if the process dies
-// between the two renames, the worst case is {body:B_new, sidecar:V_old-or-absent}. The
-// next run then sees served-version != installed-version (or readInstalledVersion
-// ok=false when the sidecar is absent), so the idempotency guard does NOT short-circuit
-// and the install correctly re-runs — making recovery real. The opposite (sidecar-first)
-// ordering was dangerous: it could leave a sidecar AHEAD of stale body bytes, and the
-// version-only idempotency no-op would then bill stale prices forever.
+// renamed FIRST, then the sidecar: if the process dies between the two renames, the
+// worst case is {body:B_new, sidecar:V_old}. The next run then sees served-version !=
+// installed-version, so the idempotency guard does NOT short-circuit and the install
+// correctly re-runs — making recovery real. The opposite (sidecar-first) ordering was
+// dangerous: it could leave a sidecar AHEAD of stale body bytes, and the version-only
+// idempotency no-op would then bill stale prices forever.
 //
-// When the served body carries NO version, any pre-existing sidecar is REMOVED (not left
-// in place): a sidecar that named the prior content-hash would mis-attribute the new body
-// to the wrong version. After this function returns, the sidecar therefore either names
-// the installed body's version or is absent — it can never name a DIFFERENT version than
-// the body on disk.
+// PRECONDITION: version is non-empty. The caller (fetchPrices) fails closed on a 200
+// with no X-Saturn-Price-Version header (a missing header is treated as a manager
+// contract violation, not a best-effort omission), so an unversioned body never reaches
+// here. We assert that precondition rather than silently branch on it: an empty version
+// reaching this point is a programming error, and a price file installed with no recorded
+// version would be unattributable in a billing reconcile.
 func installAtomically(dest string, body []byte, version string) error {
+	if version == "" {
+		// Unreachable from production (fetchPrices guarantees a non-empty version); a
+		// fail-loud assertion so a future caller can't silently install an unversioned,
+		// unattributable price file.
+		return fmt.Errorf("installAtomically: empty version (a price file must always record its X-Saturn-Price-Version)")
+	}
+
 	dir := filepath.Dir(dest)
 
 	// Body first: the recorded version must never advance ahead of the bytes on disk.
 	if err := writeFileSync(dir, dest, body); err != nil {
 		return fmt.Errorf("install price file: %w", err)
 	}
-
-	// Then the sidecar. When we have a version, record it. When we do NOT (a served
-	// body with no X-Saturn-Price-Version header), any PRE-EXISTING sidecar from a
-	// prior run would now LIE — it would attribute these freshly-written bytes to the
-	// prior content-hash, corrupting the billing-reconcile audit key ("phoebe billed
-	// window W against price-version V" would name the wrong V). So REMOVE it: a
-	// missing sidecar honestly means "unknown version" (readInstalledVersion -> ok=false
-	// -> re-install next run), which is safe; a stale sidecar is a silent falsehood.
-	if version != "" {
-		if err := writeFileSync(dir, dest+versionSuffix, []byte(version)); err != nil {
-			return fmt.Errorf("write version sidecar: %w", err)
-		}
-		return nil
-	}
-	if err := os.Remove(dest + versionSuffix); err != nil && !os.IsNotExist(err) {
-		return fmt.Errorf("remove stale version sidecar: %w", err)
+	if err := writeFileSync(dir, dest+versionSuffix, []byte(version)); err != nil {
+		return fmt.Errorf("write version sidecar: %w", err)
 	}
 	return nil
 }
