@@ -496,3 +496,19 @@ func TestRun_MissingVersionExits2(t *testing.T) {
 		t.Fatalf("exit code = %d, want exitFetchBad(%d)", code, exitFetchBad)
 	}
 }
+
+// TestInstallAtomically_EmptyVersionAsserts (price-fetch-install-empty-version-asserts):
+// installAtomically fails loud on an empty version. This precondition is unreachable from
+// production (fetchPrices refuses a 200 with no version header), but the assertion keeps a
+// future caller from silently installing an unversioned, unattributable price file.
+func TestInstallAtomically_EmptyVersionAsserts(t *testing.T) {
+	dir := t.TempDir()
+	dest := filepath.Join(dir, "prices.yaml")
+	if err := installAtomically(dest, []byte("x"), ""); err == nil {
+		t.Fatalf("expected installAtomically to error on an empty version")
+	}
+	// Nothing should have been written.
+	if _, err := os.Stat(dest); err == nil {
+		t.Fatalf("a price file was installed despite the empty-version assertion")
+	}
+}
