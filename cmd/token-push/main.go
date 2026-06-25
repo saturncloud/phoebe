@@ -36,10 +36,14 @@
 // It is a ONE-SHOT batch job (cron / k8s CronJob), NOT a daemon: it pushes the windows it
 // covers and exits. Exit codes:
 //
-//	0  every covered window's snapshot was accepted by the manager (or there was
-//	   nothing to push — an empty window snapshots to an empty rollup set, which the
-//	   manager still needs to apply delete-by-absence)
-//	1  fatal: bad config / no auth token / DB unreachable / a window failed to push
+//	0  every covered window's snapshot was accepted by the manager. (An individual
+//	   empty WINDOW on a live table is fine — it snapshots to an empty rollup set, which
+//	   the manager applies as delete-by-absence for that hour. But an entirely empty
+//	   rated_usage TABLE is exit 1, not 0 — see the liveness guard below.)
+//	1  fatal: bad config / no auth token / DB unreachable / a window failed to push /
+//	   an ENTIRELY EMPTY rated_usage table (the liveness guard refuses to push, since an
+//	   all-empty run would signal delete-all for every window and wipe the manager's
+//	   prior billing) / a window range wider than the backfill cap
 //	2  some window was WITHHELD (not pushed) because it contained a rated_usage row
 //	   that could NOT be resolved to an org (a deployment missing from resource_name);
 //	   every window that WAS pushed succeeded. The withheld window's prior state on the
@@ -79,6 +83,12 @@ const (
 	exitFatal    = 1
 	exitUnattrib = 2 // a window was WITHHELD (not pushed) — some row had no resolvable org.
 )
+
+// maxPushWindows caps how many hour-windows a single run may enumerate (a backfill
+// span guard). 90 days — far above any legitimate backfill, far below the tens of
+// thousands a mistyped multi-year -since would produce. Bounds the deep-past edge of
+// resolveWindows, symmetric to the future-hour clamp.
+const maxPushWindows = 24 * 90
 
 // defaultPushTrailingHours is how many complete trailing hours each run snapshots,
 // matching the rater's re-rate window so a late re-rate/delete is carried across the

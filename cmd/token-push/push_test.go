@@ -331,3 +331,22 @@ func TestPushWindows_FatalDominatesWithheld(t *testing.T) {
 		t.Fatalf("exit code = %d, want exitFatal(%d) — fatal must dominate withheld", code, exitFatal)
 	}
 }
+
+// TestPostSnapshot_TrimsTrailingSlash (token-push-url-trailing-slash): a managerURL with
+// a trailing slash does not produce a double-slash path that could 404/redirect.
+func TestPostSnapshot_TrimsTrailingSlash(t *testing.T) {
+	var gotPath string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotPath = r.URL.Path
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer srv.Close()
+
+	p := &pusher{log: quietLog(), managerURL: srv.URL + "/", token: "t", client: &http.Client{Timeout: 5 * time.Second}}
+	if err := p.postSnapshot(context.Background(), snapshot{WindowStart: "2026-06-16T14:00:00+00:00", Rollups: []rollup{}}); err != nil {
+		t.Fatalf("postSnapshot: %v", err)
+	}
+	if gotPath != tokenUsagePath {
+		t.Fatalf("path = %q, want %q (trailing slash not trimmed → double-slash)", gotPath, tokenUsagePath)
+	}
+}

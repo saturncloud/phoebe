@@ -169,6 +169,18 @@ func resolveWindows(since, until string, trailingHours int, now time.Time) ([]ti
 	if end.After(currentHour) {
 		return nil, fmt.Errorf("-until %s is in the future (past the current hour %s); the rater only rates closed hours and a future snapshot would signal delete-all", end.Format(time.RFC3339), currentHour.Format(time.RFC3339))
 	}
+	// Bound the span on the DEEP-PAST side too (symmetric to the future clamp above): a
+	// mistyped or over-broad -since (e.g. a stray year) would enumerate tens of
+	// thousands of historical hours, each an EMPTY snapshot = delete-all for that hour,
+	// silently un-billing historical revenue the manager still holds — plus a query +
+	// POST per hour. Fail loud rather than enumerate: an over-wide range is almost
+	// certainly an operator typo, and a legitimate wide backfill should be deliberate
+	// (narrow the range, or raise the cap on purpose). The cap is far above any real
+	// backfill (90 days) and far below the 56k+ a stray year produces.
+	if n := int(end.Sub(start) / time.Hour); n > maxPushWindows {
+		return nil, fmt.Errorf("window range %s .. %s spans %d hours, exceeding the %d-hour (%d-day) cap; a range this wide is almost certainly a mistyped -since and would push %d empty historical snapshots, each a delete-by-absence (un-bill) for that hour — narrow -since/-until or raise the cap deliberately",
+			start.Format(time.RFC3339), end.Format(time.RFC3339), n, maxPushWindows, maxPushWindows/24, n)
+	}
 
 	var windows []time.Time
 	for w := start; w.Before(end); w = w.Add(time.Hour) {
