@@ -2,16 +2,18 @@
 """add io_log (phoebe M5 I/O-logging store)
 
 Revision ID: c2e1d3f4a5b6
-Revises: b1f0c2d3e4a5
+Revises: c2f1a3b4d5e6
 Create Date: 2026-06-07 00:00:00.000000
 
 This is a READY-TO-COPY artifact maintained in the phoebe repo. To apply it,
-copy this file into saturn/alembic/versions/ and set down_revision to the THEN
--current Atlas head. It is pinned to b1f0c2d3e4a5 (the phoebe billing_event
-migration) as the natural predecessor; if that migration is not yet applied, or
-the Atlas head has since moved, RE-POINT down_revision to the current head so the
-revision graph stays linear. See migrations/README.md for the rationale and the
-head-discovery command.
+copy this file into saturn/alembic/versions/. Its down_revision is c2f1a3b4d5e6
+(the phoebe RATING migration), so the three phoebe migrations form a single
+LINEAR chain — billing_event -> rating -> io_log — with exactly one head, never a
+fork. (rating and io_log were both originally authored off billing_event; io_log
+is re-pointed AFTER rating so the graph stays linear, as we always require.) If
+the Atlas head moved under billing_event, re-point BILLING_EVENT's down_revision
+(not this one) to the new head; this file always chains after rating. See
+migrations/README.md.
 
 io_log is the M5 store for request/response BODIES — a SEPARATE table from
 billing_event with its own (short) retention and access posture. Capture is
@@ -26,7 +28,7 @@ from sqlalchemy.dialects import postgresql
 
 # revision identifiers, used by Alembic.
 revision = "c2e1d3f4a5b6"
-down_revision = "b1f0c2d3e4a5"
+down_revision = "c2f1a3b4d5e6"
 branch_labels = None
 depends_on = None
 
