@@ -78,25 +78,26 @@ a **ready-to-copy Alembic file**, not a migrator phoebe executes:
 | `0002_rating.sql` | Plain DDL for `rated_usage` (the rating rollup; NUMERIC money + applied-rate columns). Reference + local-dev. Prices are a YAML file, not a table. |
 | `atlas/c2f1a3b4d5e6_add_rating.py` | The Alembic artifact for `rated_usage`. Chains after `billing_event`. |
 | `0002_io_log.sql` | Plain DDL for `io_log` (M5 per-tenant I/O-logging store: request/response bodies + `body_tsv` GIN full-text). Reference + local-dev. |
-| `atlas/c2e1d3f4a5b6_add_io_log.py` | The Alembic artifact for `io_log`. Chains after `billing_event` (re-point when landing alongside rating — see below). |
+| `atlas/c2e1d3f4a5b6_add_io_log.py` | The Alembic artifact for `io_log`. Chains after `rating` (`down_revision = c2f1a3b4d5e6`), keeping the chain linear. |
 | `../config/prices.example.yaml` | The **operator-facing price file** (E1): base per-token rates keyed on the HF model id, the global fine-tune premium policy, per-GPU floor rates. The contract the rater prices from. Not a migration. |
 
-### Migration chain (IMPORTANT when landing these together)
+### Migration chain (single head, linear — we always require this)
 
-Both `rating` and `io_log` were authored on their own branches and pin
-`down_revision = "b1f0c2d3e4a5"` (billing_event). That's a **fork**, which Alembic
-rejects as two heads. When applying more than one, **linearize them** so there's
-exactly one head:
+The three phoebe migrations form ONE linear chain with a single head:
 
 ```
 <current Atlas head> → b1f0c2d3e4a5 (billing_event)
                      → c2f1a3b4d5e6 (rating)
-                     → c2e1d3f4a5b6 (io_log)   ← re-point its down_revision to rating
+                     → c2e1d3f4a5b6 (io_log)
 ```
 
-Order among rating/io_log doesn't matter functionally (different tables); only
-that the graph stays linear. `billing_event`'s own `down_revision` re-points to
-the then-current Atlas head at copy time.
+`rating` and `io_log` were originally authored independently and BOTH pinned
+`down_revision = "b1f0c2d3e4a5"` — a fork (two heads), which we do not allow.
+`io_log` is now re-pointed to chain after `rating` (`down_revision =
+"c2f1a3b4d5e6"`), so the files are linear as-shipped — no manual re-pointing at
+apply time. The only `down_revision` that may need adjusting is `billing_event`'s:
+if the Atlas head has moved past `c1d2e3f4a5b6` since authoring, re-point
+`billing_event` to the new head (the rest of the chain follows).
 
 ## How to apply it to the shared Atlas Postgres
 
