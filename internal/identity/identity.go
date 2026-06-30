@@ -43,6 +43,28 @@ const (
 	// adding it to Traefik's authResponseHeaders allowlist, is a separate
 	// (small) change. Phoebe reads it defensively: absent = empty string.
 	HeaderAuthID = "X-Saturn-Auth-Id"
+
+	// HeaderOrgID carries the org that OWNS the served deployment — the customer to
+	// attribute (and ultimately bill) this inference to (E2). This is DELIBERATELY
+	// NOT the caller's active-org context (which, per HeaderAuthID above, isn't
+	// resolvable from the token for a multi-org user): it is a property of the
+	// *resource*, not the *caller*. Atlas knows the deployment's org_id at deploy
+	// time (the saturncloud.io/org-id label on the deployment) and injects it here
+	// as a per-deployment Traefik Middleware header on the inference route — so it
+	// is present whenever the deployment can serve inference. Capturing it HERE,
+	// at meter time, removes the push-time resource_id→org_id reconstruction (the
+	// torn-down-deployment race): the org rides the metering event like resource_id,
+	// instead of being re-joined against the deletable resource_name table at push.
+	//
+	// PLUMBING SEAM (Atlas-side, separate change): Atlas injects this header per
+	// deployment and adds it to Traefik's authResponseHeaders allowlist, exactly as
+	// for HeaderBaseModel. Phoebe reads it defensively: absent = empty string. An
+	// absent org_id is intentionally NOT a hot-path gate (it must never black-hole
+	// inference while the producer header rolls out per-install); the fail-closed
+	// for a missing org lives downstream at push (a NULL-org rollup is held +
+	// counted + screamed, never billed to a guessed org), exactly where it can't
+	// take down the inference path. See internal/proxy missingBillingFields.
+	HeaderOrgID = "X-Saturn-Org-Id"
 )
 
 // Identity is the trusted, pre-resolved caller identity for a request. Phoebe
@@ -55,6 +77,13 @@ type Identity struct {
 	GroupID      string
 	ResourceID   string
 	ResourceType string
+	// OrgID is the org that owns the served deployment (E2 customer attribution),
+	// injected by Atlas as a per-deployment Traefik header. Carried verbatim onto the
+	// metering event so push reads org straight off the rollup instead of re-joining
+	// the resource_name table at push time. Empty is tolerated on the hot path (a
+	// missing org never gates inference; it is held + screamed at push, never billed
+	// to a guessed org).
+	OrgID string
 	// BaseModel is the HF base id a fine-tune derives from (E3), present only for a
 	// fine-tune deployment. Empty for a base model. Carried to the metering event so
 	// the rater can price an ft:<checkpoint> at base x premium.
@@ -70,6 +99,7 @@ func FromRequest(r *http.Request) Identity {
 		GroupID:      r.Header.Get(HeaderGroupID),
 		ResourceID:   r.Header.Get(HeaderResourceID),
 		ResourceType: r.Header.Get(HeaderResourceType),
+		OrgID:        r.Header.Get(HeaderOrgID),
 		BaseModel:    r.Header.Get(HeaderBaseModel),
 	}
 }

@@ -13,6 +13,8 @@ func TestFromRequestCapturesAllHeaders(t *testing.T) {
 	r.Header.Set(HeaderGroupID, "group-2")
 	r.Header.Set(HeaderResourceID, "model-x")
 	r.Header.Set(HeaderResourceType, "deployment")
+	r.Header.Set(HeaderOrgID, "org-7")
+	r.Header.Set(HeaderBaseModel, "meta-llama/Llama-3.1-8B-Instruct")
 
 	id := FromRequest(r)
 
@@ -31,12 +33,19 @@ func TestFromRequestCapturesAllHeaders(t *testing.T) {
 	if id.ResourceType != "deployment" {
 		t.Errorf("ResourceType = %q, want deployment", id.ResourceType)
 	}
+	if id.OrgID != "org-7" {
+		t.Errorf("OrgID = %q, want org-7", id.OrgID)
+	}
+	if id.BaseModel != "meta-llama/Llama-3.1-8B-Instruct" {
+		t.Errorf("BaseModel = %q, want meta-llama/Llama-3.1-8B-Instruct", id.BaseModel)
+	}
 }
 
 func TestFromRequestMissingHeadersAreEmpty(t *testing.T) {
 	r := httptest.NewRequest(http.MethodPost, "/", nil)
 	id := FromRequest(r)
-	if id.AuthID != "" || id.UserID != "" || id.GroupID != "" || id.ResourceID != "" || id.ResourceType != "" {
+	if id.AuthID != "" || id.UserID != "" || id.GroupID != "" || id.ResourceID != "" ||
+		id.ResourceType != "" || id.OrgID != "" || id.BaseModel != "" {
 		t.Fatalf("expected all-empty identity, got %+v", id)
 	}
 }
