@@ -729,8 +729,8 @@ func TestRater_NullResourceIdIsUnattributable(t *testing.T) {
 	}
 	// PARTITION with resource_id in the mix.
 	if got := res.EventsRated + res.UnpricedEvents + res.UnattributableEvents + res.AmbiguousBaseEvents + res.AmbiguousOrgEvents; got != int64(len(events)) {
-		t.Fatalf("rated(%d)+unpriced(%d)+unattr(%d)+ambiguous(%d) = %d, want %d",
-			res.EventsRated, res.UnpricedEvents, res.UnattributableEvents, res.AmbiguousBaseEvents, got, len(events))
+		t.Fatalf("rated(%d)+unpriced(%d)+unattr(%d)+ambiguous_base(%d)+ambiguous_org(%d) = %d, want %d",
+			res.EventsRated, res.UnpricedEvents, res.UnattributableEvents, res.AmbiguousBaseEvents, res.AmbiguousOrgEvents, got, len(events))
 	}
 }
 
@@ -886,8 +886,8 @@ func TestRater_FineTuneAmbiguousBaseModelFailsLoud(t *testing.T) {
 	// SINGLE-SNAPSHOT PARTITION: rated + unpriced + unattributable + ambiguous_base +
 	// ambiguous_org == total (org bucket is 0 in the oracle; still a true partition cell).
 	if got := res.EventsRated + res.UnpricedEvents + res.UnattributableEvents + res.AmbiguousBaseEvents + res.AmbiguousOrgEvents; got != int64(len(events)) {
-		t.Fatalf("rated(%d)+unpriced(%d)+unattr(%d)+ambiguous(%d) = %d, want %d",
-			res.EventsRated, res.UnpricedEvents, res.UnattributableEvents, res.AmbiguousBaseEvents, got, len(events))
+		t.Fatalf("rated(%d)+unpriced(%d)+unattr(%d)+ambiguous_base(%d)+ambiguous_org(%d) = %d, want %d",
+			res.EventsRated, res.UnpricedEvents, res.UnattributableEvents, res.AmbiguousBaseEvents, res.AmbiguousOrgEvents, got, len(events))
 	}
 }
 
@@ -1023,11 +1023,15 @@ func TestOracleModel_SelfConsistent(t *testing.T) {
 	if res.UnpricedEvents != 1 || res.UnattributableEvents != 1 {
 		t.Fatalf("anomalies = unpriced %d / unattr %d, want 1/1", res.UnpricedEvents, res.UnattributableEvents)
 	}
-	// SINGLE-SNAPSHOT ACCOUNTING INVARIANT: rated + unpriced + unattributable must
-	// PARTITION the in-window events.
-	if got := res.EventsRated + res.UnpricedEvents + res.UnattributableEvents; got != int64(len(events)) {
-		t.Fatalf("rated(%d) + unpriced(%d) + unattributable(%d) = %d, want %d",
-			res.EventsRated, res.UnpricedEvents, res.UnattributableEvents, got, len(events))
+	// SINGLE-SNAPSHOT ACCOUNTING INVARIANT: the FULL 5-bucket partition must account for
+	// every in-window event (the ambiguous buckets are 0 in this fixture, but naming all
+	// five keeps the invariant honest — a regression that leaks into an ambiguous bucket
+	// would break the sum instead of passing coincidentally).
+	if got := res.EventsRated + res.UnpricedEvents + res.UnattributableEvents +
+		res.AmbiguousBaseEvents + res.AmbiguousOrgEvents; got != int64(len(events)) {
+		t.Fatalf("rated(%d)+unpriced(%d)+unattr(%d)+ambiguous_base(%d)+ambiguous_org(%d) = %d, want %d",
+			res.EventsRated, res.UnpricedEvents, res.UnattributableEvents,
+			res.AmbiguousBaseEvents, res.AmbiguousOrgEvents, got, len(events))
 	}
 	if res.RollupsWritten != int64(len(want)) {
 		t.Fatalf("rollups = %d, want %d", res.RollupsWritten, len(want))

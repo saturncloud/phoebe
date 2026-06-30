@@ -400,6 +400,7 @@ func TestE2E_StreamedRequestBecomesMoney(t *testing.T) {
 	var (
 		nRows                         int
 		requestID, authID, resourceID string
+		beOrgID                       sql.NullString // billing_event.org_id (nullable) — asserted at the drain layer
 		model                         sql.NullString
 		prompt, cached, completion    int
 		aborted                       bool
@@ -411,9 +412,9 @@ func TestE2E_StreamedRequestBecomesMoney(t *testing.T) {
 		t.Fatalf("billing_event rows = %d, want exactly 1", nRows)
 	}
 	if err := h.db.QueryRow(
-		`SELECT request_id, auth_id, resource_id, model, prompt_tokens, cached_tokens, completion_tokens, aborted
+		`SELECT request_id, auth_id, resource_id, org_id, model, prompt_tokens, cached_tokens, completion_tokens, aborted
 		 FROM billing_event`).
-		Scan(&requestID, &authID, &resourceID, &model, &prompt, &cached, &completion, &aborted); err != nil {
+		Scan(&requestID, &authID, &resourceID, &beOrgID, &model, &prompt, &cached, &completion, &aborted); err != nil {
 		t.Fatalf("read billing_event: %v", err)
 	}
 
@@ -435,6 +436,11 @@ func TestE2E_StreamedRequestBecomesMoney(t *testing.T) {
 	}
 	if resourceID != testResourceID {
 		t.Errorf("billing_event.resource_id = %q, want %q", resourceID, testResourceID)
+	}
+	// ORG captured at the DRAIN layer (not only transitively via rated_usage): a drainer
+	// regression that drops org to NULL is caught HERE, at the layer that produced it.
+	if !beOrgID.Valid || beOrgID.String != testOrgID {
+		t.Errorf("billing_event.org_id = %v, want %q (captured from X-Saturn-Org-Id at meter time)", beOrgID, testOrgID)
 	}
 	if authID != testAuthID {
 		t.Errorf("billing_event.auth_id = %q, want %q", authID, testAuthID)

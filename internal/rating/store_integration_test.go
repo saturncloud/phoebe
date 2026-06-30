@@ -149,8 +149,11 @@ func TestIntegration_RateWindow_ConformsToOracle(t *testing.T) {
 	if res.UnpricedEvents != 1 || res.UnattributableEvents != 1 {
 		t.Fatalf("RateWindow anomaly counts = %d/%d, want 1/1 (single-snapshot accounting)", res.UnpricedEvents, res.UnattributableEvents)
 	}
-	if got := res.EventsRated + res.UnpricedEvents + res.UnattributableEvents; got != int64(len(events)) {
-		t.Fatalf("rated+unpriced+unattributable = %d, want %d", got, len(events))
+	// Full 5-bucket partition (ambiguous buckets are 0 in this fixture, but named so the
+	// invariant holds by construction, not by coincidence).
+	if got := res.EventsRated + res.UnpricedEvents + res.UnattributableEvents +
+		res.AmbiguousBaseEvents + res.AmbiguousOrgEvents; got != int64(len(events)) {
+		t.Fatalf("rated+unpriced+unattr+ambiguous_base+ambiguous_org = %d, want %d", got, len(events))
 	}
 
 	// Oracle: independent Rate() over the priced+attributable events; also assert the
@@ -488,6 +491,81 @@ func TestIntegration_BothAmbiguousCountedOnceAsBase(t *testing.T) {
 	// And nothing was billed (the rollup is withheld).
 	if res.RollupsWritten != 0 {
 		t.Fatalf("RollupsWritten = %d, want 0 (a both-ambiguous rollup is never billed)", res.RollupsWritten)
+	}
+}
+
+// TestIntegration_CleanThenAmbiguousOrgReconciles pins the re-rate path where a rollup
+// billed CLEAN in run A becomes org-ambiguous in run B (a second deployment-org appeared
+// for the same resource in-window). Run B must: (a) reconcile-DELETE the prior clean row
+// (it can no longer be billed to a single org) AND (b) count it as ambiguous_org +
+// exit-nonzero. Both signals fire — the prior bill is removed and the conflict screams.
+// This documents the current "both fire" alert contract (see the open question on whether
+// a reconcile-delete should suppress the anomaly exit).
+func TestIntegration_CleanThenAmbiguousOrgReconciles(t *testing.T) {
+	dsn := os.Getenv("PHOEBE_TEST_DATABASE_URL")
+	if dsn == "" {
+		t.Skip("PHOEBE_TEST_DATABASE_URL not set; skipping live-Postgres conformance")
+	}
+	ctx := context.Background()
+	db, err := sql.Open("pgx", dsn)
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	defer db.Close()
+
+	const sch = "phoebe_rating_clean2ambig_it"
+	exec(t, db, "DROP SCHEMA IF EXISTS "+sch+" CASCADE")
+	exec(t, db, "CREATE SCHEMA "+sch)
+	exec(t, db, "SET search_path TO "+sch)
+	defer func() { exec(t, db, "DROP SCHEMA IF EXISTS "+sch+" CASCADE") }()
+	exec(t, db, schemaDDL)
+
+	hour := mustTime("2026-06-08T10:00:00Z")
+	book := newTestBook(
+		map[string]Rate3{"b": rate3("0.000005", "0", "0")},
+		nil, PolicyIdentity, Dec{}, Dec{},
+	)
+	store := NewPostgresStore(db)
+
+	// Run A: one clean single-org rollup → billed.
+	if _, err := db.ExecContext(ctx,
+		`INSERT INTO billing_event (request_id, auth_id, resource_id, org_id, model, prompt_tokens, completion_tokens, event_ts)
+		 VALUES ('c1','a','d1','org-1','b',100,0,$1)`, hour.Add(5*time.Minute)); err != nil {
+		t.Fatalf("seed A: %v", err)
+	}
+	resA, err := store.RateWindow(ctx, book, hour, hour.Add(time.Hour))
+	if err != nil {
+		t.Fatalf("RateWindow A: %v", err)
+	}
+	if resA.RollupsWritten != 1 || resA.AmbiguousOrgEvents != 0 {
+		t.Fatalf("run A: rollups=%d ambiguous_org=%d, want 1/0 (clean)", resA.RollupsWritten, resA.AmbiguousOrgEvents)
+	}
+
+	// Run B: a SECOND org appears for the same resource in the same hour → ambiguous.
+	if _, err := db.ExecContext(ctx,
+		`INSERT INTO billing_event (request_id, auth_id, resource_id, org_id, model, prompt_tokens, completion_tokens, event_ts)
+		 VALUES ('c2','a','d1','org-2','b',100,0,$1)`, hour.Add(6*time.Minute)); err != nil {
+		t.Fatalf("seed B: %v", err)
+	}
+	resB, err := store.RateWindow(ctx, book, hour, hour.Add(time.Hour))
+	if err != nil {
+		t.Fatalf("RateWindow B: %v", err)
+	}
+	// The prior clean row is reconcile-DELETED (no longer billable to one org)...
+	if resB.ReconciledDeletions != 1 {
+		t.Fatalf("run B: reconciled deletions = %d, want 1 (the prior clean rollup must be removed)", resB.ReconciledDeletions)
+	}
+	// ...AND the conflict is counted + screams (both signals fire — current contract).
+	if resB.AmbiguousOrgEvents != 2 {
+		t.Fatalf("run B: ambiguous_org = %d, want 2 (the two conflicting-org events)", resB.AmbiguousOrgEvents)
+	}
+	// Nothing remains billed for the now-ambiguous rollup.
+	var n int
+	if err := db.QueryRowContext(ctx, `SELECT COUNT(*) FROM rated_usage WHERE resource_id='d1'`).Scan(&n); err != nil {
+		t.Fatalf("count: %v", err)
+	}
+	if n != 0 {
+		t.Fatalf("rated_usage still has %d rows for the now-ambiguous rollup — it must be un-billed", n)
 	}
 }
 

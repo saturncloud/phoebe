@@ -122,7 +122,8 @@ func (s *PostgresStore) Upsert(ctx context.Context, events []metering.Event) err
 		return nil
 	}
 
-	// Build a parameterised multi-row VALUES clause: ($1,...,$15),($16,...),...
+	// Build a parameterised multi-row VALUES clause: ($1,...,$17),($18,...),...
+	// (colsPerRow params per row).
 	// Parameterised (never string-interpolated) to avoid any injection via the
 	// engine-supplied request_id / model strings.
 	placeholders := make([]string, 0, len(events))
