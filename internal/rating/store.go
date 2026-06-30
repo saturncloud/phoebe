@@ -225,10 +225,11 @@ const rateWindowSQL = `
 WITH ev AS (
     SELECT
         auth_id,
-        -- resource_id: the deployment id (E2 customer attribution — billing resolves
-        -- the org via resource_id→org_id). It is part of the rated_usage grain: a NULL
-        -- resource_id row CANNOT name its deployment/org, so it is unattributable
-        -- (counted, never billed to a NULL org) — see the unattributable filter below.
+        -- resource_id: the deployment id (E2 customer attribution — the owning org is
+        -- captured at meter time into org_id; see that column below, no push-time join).
+        -- It is part of the rated_usage grain: a NULL resource_id row CANNOT name its
+        -- deployment/org, so it is unattributable (counted, never billed to a NULL org) —
+        -- see the unattributable filter below.
         resource_id,
         -- org_id: the deployment-owning org (E2 attribution), captured at meter time
         -- from X-Saturn-Org-Id. Carried onto the rollup so push reads org off the row
@@ -427,10 +428,17 @@ upserted AS (
     -- added here. See cmd/rater's package doc for the single-flight contract.
     ORDER BY auth_id, resource_id, model_id, window_start
     ON CONFLICT (auth_id, resource_id, model_id, window_start) DO UPDATE SET
-        -- Refresh org_id on re-rate: a rollup first written with a NULL org (header not
-        -- yet wired) picks up the real org once the producer is injecting and the window
-        -- is re-rated within the trailing re-rate horizon.
-        org_id                  = EXCLUDED.org_id,
+        -- Refresh org_id on re-rate, but NEVER erase a known org: COALESCE prefers the
+        -- new snapshot's org and FALLS BACK to the existing row's org when the new one is
+        -- NULL. So a rollup first written with a NULL org (header not yet wired) picks up
+        -- the real org on a later re-rate (NULL -> real, convergence), but a re-rate over
+        -- a window whose snapshot has since LOST its org headers (e.g. a forced replay
+        -- from a stale billing_event range) can NOT overwrite a prior good org with NULL
+        -- (real -> NULL would silently un-attribute already-billed usage). The only
+        -- legitimate "org changed" case (real A -> real B for one resource) is NOT a
+        -- silent re-rate flip: it is a distinct-org collision the ambiguous_org guard
+        -- above already withholds + screams, so it never reaches this UPDATE.
+        org_id                  = COALESCE(EXCLUDED.org_id, rated_usage.org_id),
         window_end              = EXCLUDED.window_end,
         prompt_tokens           = EXCLUDED.prompt_tokens,
         cached_tokens           = EXCLUDED.cached_tokens,

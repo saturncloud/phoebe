@@ -2,7 +2,7 @@
 """add org_id to billing_event + rated_usage (E2 customer attribution at meter time)
 
 Revision ID: d3a2b4c5e6f7
-Revises: c2f1a3b4d5e6
+Revises: c2e1d3f4a5b6
 Create Date: 2026-06-30 00:00:00.000000
 
 This is a READY-TO-COPY artifact maintained in the phoebe repo. To apply it,

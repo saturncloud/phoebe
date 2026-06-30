@@ -164,7 +164,9 @@ func TestRateWindowSQL_Shape(t *testing.T) {
 		"MAX(org_id)                                      AS org_id",
 		"id, auth_id, resource_id, org_id, model_id, window_start, window_end",
 		"auth_id, resource_id, org_id, model_id, window_start, window_end,",
-		"org_id                  = EXCLUDED.org_id",
+		// COALESCE, not bare EXCLUDED: a re-rate may set NULL->real (convergence) but must
+		// NEVER overwrite a known org with NULL (real->NULL un-attribution).
+		"org_id                  = COALESCE(EXCLUDED.org_id, rated_usage.org_id)",
 		// the E2 attribution gate: a rollup spanning >1 distinct non-NULL org is split out
 		// (never billed to a guessed org) and counted, exactly like ambiguous_base
 		"COUNT(DISTINCT org_id) > 1 AS ambiguous_org",

@@ -38,6 +38,20 @@ func newMockPusher(t *testing.T) (*pusher, sqlmock.Sqlmock) {
 
 var win = time.Date(2026, 6, 16, 14, 0, 0, 0, time.UTC)
 
+// TestSnapshotQuery_NoResourceNameJoin pins the load-bearing invariant of this change as
+// an ASSERTION, not just a comment: org_id is read off the rollup, so snapshotQuery must
+// NOT join the Atlas-owned resource_name table (the deleted push-time reconstruction that
+// raced deployment teardown). A future refactor re-adding `LEFT JOIN resource_name` would
+// pass the `FROM rated_usage ru` mock regex; this catches it directly.
+func TestSnapshotQuery_NoResourceNameJoin(t *testing.T) {
+	if strings.Contains(snapshotQuery, "resource_name") {
+		t.Fatalf("snapshotQuery references resource_name — the push-time org join must stay deleted (org rides the rollup): %s", snapshotQuery)
+	}
+	if !strings.Contains(snapshotQuery, "ru.org_id") {
+		t.Fatalf("snapshotQuery must read org_id off rated_usage (ru.org_id): %s", snapshotQuery)
+	}
+}
+
 // TestBuildSnapshot_CarriesOrgAndShape (token-push-snapshot-shape): a row carrying its
 // org_id (captured at meter time, read straight off rated_usage — no resolve step) becomes
 // a wire rollup with org_id attached, money carried as exact-decimal strings, and rev=0.
@@ -101,7 +115,31 @@ func TestBuildSnapshot_UnattributableOmitted(t *testing.T) {
 		t.Fatalf("unattributable = %d, want 1", unattributable)
 	}
 	if len(snap.Rollups) != 1 || snap.Rollups[0].RatedUsageID != "rated-ok" {
-		t.Fatalf("orphan row was not omitted: %+v", snap.Rollups)
+		t.Fatalf("unattributable row was not omitted: %+v", snap.Rollups)
+	}
+}
+
+// TestBuildSnapshot_EmptyStringOrgIsOmitted pins the `orgID.String == ""` arm of the
+// omit guard (defense in depth). The drainer's nullStr() writes ""→NULL, so a literal
+// empty-string org should never reach the column — but if a direct backfill or a future
+// producer ever wrote ”, billing it to a blank org would violate C2/C7. A non-NULL
+// empty-string org_id must be treated exactly like NULL: omitted + counted, never pushed.
+func TestBuildSnapshot_EmptyStringOrgIsOmitted(t *testing.T) {
+	p, mock := newMockPusher(t)
+	rows := sqlmock.NewRows(snapshotCols).
+		AddRow("rated-blank", "res-1", "", "m", // non-NULL EMPTY-STRING org_id
+			"0.001", "0.1", "0.05", "0.6", int64(1), int64(0), int64(1), int64(1))
+	mock.ExpectQuery(`FROM rated_usage ru`).WithArgs(win).WillReturnRows(rows)
+
+	snap, unattributable, err := p.buildSnapshot(context.Background(), win)
+	if err != nil {
+		t.Fatalf("buildSnapshot: %v", err)
+	}
+	if unattributable != 1 {
+		t.Fatalf("unattributable = %d, want 1 (empty-string org must be omitted like NULL)", unattributable)
+	}
+	if len(snap.Rollups) != 0 {
+		t.Fatalf("empty-string-org row was pushed: %+v (must never bill a blank org)", snap.Rollups)
 	}
 }
 

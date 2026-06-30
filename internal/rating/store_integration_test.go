@@ -419,6 +419,92 @@ func TestIntegration_AmbiguousOrgFailsLoud(t *testing.T) {
 	}
 }
 
+// TestIntegration_OrgReRateConvergesNeverErases pins the ON CONFLICT org_id =
+// COALESCE(EXCLUDED.org_id, rated_usage.org_id) behavior against real Postgres — the
+// re-rate one-way-door the battery flagged:
+//
+//   - NULL -> real (CONVERGENCE): a rollup first rated before its org header was wired
+//     (org NULL) picks up the real org on a later re-rate. This is the intended rollout
+//     recovery.
+//   - real -> NULL (NEVER ERASE): a re-rate over a window whose snapshot has since LOST
+//     its org (e.g. a stale/forced replay) must NOT overwrite the prior good org with
+//     NULL — that would silently un-attribute already-billed usage. COALESCE keeps the
+//     existing org.
+func TestIntegration_OrgReRateConvergesNeverErases(t *testing.T) {
+	dsn := os.Getenv("PHOEBE_TEST_DATABASE_URL")
+	if dsn == "" {
+		t.Skip("PHOEBE_TEST_DATABASE_URL not set; skipping live-Postgres conformance")
+	}
+	ctx := context.Background()
+	db, err := sql.Open("pgx", dsn)
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	defer db.Close()
+
+	const sch = "phoebe_rating_orgrerate_it"
+	exec(t, db, "DROP SCHEMA IF EXISTS "+sch+" CASCADE")
+	exec(t, db, "CREATE SCHEMA "+sch)
+	exec(t, db, "SET search_path TO "+sch)
+	defer func() { exec(t, db, "DROP SCHEMA IF EXISTS "+sch+" CASCADE") }()
+	exec(t, db, schemaDDL)
+
+	hour := mustTime("2026-06-08T10:00:00Z")
+	book := newTestBook(
+		map[string]Rate3{"b": rate3("0.000005", "0", "0")},
+		nil, PolicyIdentity, Dec{}, Dec{},
+	)
+	store := NewPostgresStore(db)
+	orgOf := func() sql.NullString {
+		var o sql.NullString
+		if err := db.QueryRowContext(ctx,
+			`SELECT org_id FROM rated_usage WHERE resource_id='d1'`).Scan(&o); err != nil {
+			t.Fatalf("read org: %v", err)
+		}
+		return o
+	}
+
+	// Run 1: the org header isn't wired yet → org_id NULL on the event.
+	if _, err := db.ExecContext(ctx,
+		`INSERT INTO billing_event (request_id, auth_id, resource_id, org_id, model, prompt_tokens, completion_tokens, event_ts)
+		 VALUES ('r1','a','d1',NULL,'b',100,0,$1)`, hour.Add(5*time.Minute)); err != nil {
+		t.Fatalf("seed run1: %v", err)
+	}
+	if _, err := store.RateWindow(ctx, book, hour, hour.Add(time.Hour)); err != nil {
+		t.Fatalf("RateWindow run1: %v", err)
+	}
+	if o := orgOf(); o.Valid {
+		t.Fatalf("after run1 org_id = %v, want NULL (header not yet wired)", o)
+	}
+
+	// Run 2: the producer is now injecting → the SAME hour re-rates with a real org.
+	// NULL -> real: COALESCE prefers the new non-NULL org.
+	if _, err := db.ExecContext(ctx,
+		`INSERT INTO billing_event (request_id, auth_id, resource_id, org_id, model, prompt_tokens, completion_tokens, event_ts)
+		 VALUES ('r2','a','d1','org-real','b',100,0,$1)`, hour.Add(6*time.Minute)); err != nil {
+		t.Fatalf("seed run2: %v", err)
+	}
+	if _, err := store.RateWindow(ctx, book, hour, hour.Add(time.Hour)); err != nil {
+		t.Fatalf("RateWindow run2: %v", err)
+	}
+	if o := orgOf(); !o.Valid || o.String != "org-real" {
+		t.Fatalf("after run2 org_id = %v, want 'org-real' (NULL->real convergence)", o)
+	}
+
+	// Run 3: a stale replay drops the org headers again (only the NULL-org event is in
+	// range). real -> NULL must NOT erase the prior good org. We re-rate with ONLY the
+	// original NULL-org event present for this hour by deleting the real-org event first.
+	if _, err := db.ExecContext(ctx, `DELETE FROM billing_event WHERE request_id='r2'`); err != nil {
+		t.Fatalf("delete r2: %v", err)
+	}
+	if _, err := store.RateWindow(ctx, book, hour, hour.Add(time.Hour)); err != nil {
+		t.Fatalf("RateWindow run3: %v", err)
+	}
+	if o := orgOf(); !o.Valid || o.String != "org-real" {
+		t.Fatalf("after run3 org_id = %v, want 'org-real' preserved (a stale NULL replay must NEVER erase a known org)", o)
+	}
+}
+
 // readRatedUsageIDs returns natural-key → id for every rated_usage row.
 func readRatedUsageIDs(t *testing.T, db *sql.DB) map[string]string {
 	t.Helper()

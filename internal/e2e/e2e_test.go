@@ -472,7 +472,7 @@ func TestE2E_StreamedRequestBecomesMoney(t *testing.T) {
 	var (
 		nRollups                                     int
 		ruAuthID, ruResourceID, ruModelID, cost      string
-		ruOrgID                                      string
+		ruOrgID                                      sql.NullString // nullable column; a NULL must surface as a clear assertion, not a scan error
 		ruPrompt, ruCached, ruCompletion, ruBillable int64
 		eventCount                                   int64 // BIGINT column
 	)
@@ -501,8 +501,8 @@ func TestE2E_StreamedRequestBecomesMoney(t *testing.T) {
 	// CAPTURED at the proxy and carried through billing_event into the rated_usage rollup
 	// — the whole point of this change (org rides the request, not a push-time
 	// resource_name join). This is the composed-path assertion for the header→rollup carry.
-	if ruOrgID != testOrgID {
-		t.Errorf("rated_usage.org_id = %q, want %q (the X-Saturn-Org-Id header value, carried meter→rate)", ruOrgID, testOrgID)
+	if !ruOrgID.Valid || ruOrgID.String != testOrgID {
+		t.Errorf("rated_usage.org_id = %v, want %q (the X-Saturn-Org-Id header value, carried meter→rate)", ruOrgID, testOrgID)
 	}
 	// THE deployment-id-bug guard, at the far end of the pipe: the money is
 	// keyed on the engine name the upstream reported, not the id we routed on.
