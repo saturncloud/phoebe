@@ -37,6 +37,10 @@ CREATE TABLE billing_event (
     -- resource_id (the deployment id) is NULLABLE here, mirroring migration 0001: the
     -- rater fails closed on a NULL (counts it unattributable), it does not reject it.
     resource_id       VARCHAR(64),
+    -- org_id (the deployment-owning org) is NULLABLE here, mirroring migration
+    -- d3a2b4c5e6f7: captured at meter time, carried onto rated_usage; a NULL is held
+    -- + screamed at push, never billed to a guessed org.
+    org_id            VARCHAR(64),
     model             VARCHAR(255),
     base_model        VARCHAR(255),
     prompt_tokens     INTEGER NOT NULL DEFAULT 0,
@@ -53,6 +57,9 @@ CREATE TABLE rated_usage (
     id                      VARCHAR(32) PRIMARY KEY,
     auth_id                 VARCHAR(64) NOT NULL,
     resource_id             VARCHAR(64) NOT NULL,
+    -- org_id NULLABLE (unlike resource_id): carried from billing_event by the rater;
+    -- a NULL is the held-not-billed signal at push (migration d3a2b4c5e6f7).
+    org_id                  VARCHAR(64),
     model_id                VARCHAR(255) NOT NULL,
     window_start            TIMESTAMPTZ NOT NULL,
     window_end              TIMESTAMPTZ NOT NULL,
