@@ -52,6 +52,12 @@ type Event struct {
 	GroupID      string `json:"group_id,omitempty"`      // present on group tokens
 	ResourceID   string `json:"resource_id,omitempty"`   // model / deployment id
 	ResourceType string `json:"resource_type,omitempty"` // e.g. workspace, deployment
+	// OrgID is the org that OWNS the served deployment (E2 customer attribution),
+	// injected by Atlas as a per-deployment Traefik header (X-Saturn-Org-Id). Captured
+	// verbatim at meter time so push reads org off the rollup instead of re-joining
+	// resource_name at push. Empty when the producer header is absent (rollout gap) —
+	// such a row is held + counted + screamed at push, never billed to a guessed org.
+	OrgID string `json:"org_id,omitempty"`
 
 	// Workload.
 	Model   string `json:"model,omitempty"`
@@ -95,7 +101,7 @@ type LogEmitter struct {
 }
 
 func (l *LogEmitter) Emit(_ context.Context, e Event) {
-	l.Log.Info.Printf("metering event: request_id=%s auth_id=%s group=%s user=%s resource=%s/%s model=%s prompt=%d cached=%d completion=%d finish=%s aborted=%t",
-		e.RequestID, e.AuthID, e.GroupID, e.UserID, e.ResourceType, e.ResourceID, e.Model,
+	l.Log.Info.Printf("metering event: request_id=%s auth_id=%s org=%s group=%s user=%s resource=%s/%s model=%s prompt=%d cached=%d completion=%d finish=%s aborted=%t",
+		e.RequestID, e.AuthID, e.OrgID, e.GroupID, e.UserID, e.ResourceType, e.ResourceID, e.Model,
 		e.PromptTokens, e.CachedTokens, e.CompletionTokens, e.FinishReason, e.Aborted)
 }
