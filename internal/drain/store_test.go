@@ -42,13 +42,13 @@ func TestPostgresStore_UpsertSQL(t *testing.T) {
 
 	mock.ExpectBegin()
 	mock.ExpectExec(regexp.QuoteMeta(
-		"INSERT INTO billing_event (request_id, auth_id, user_id, group_id, resource_id, resource_type, model, base_model, adapter, prompt_tokens, cached_tokens, completion_tokens, finish_reason, gpu_type, aborted, event_ts) VALUES",
+		"INSERT INTO billing_event (request_id, auth_id, user_id, group_id, resource_id, resource_type, org_id, model, base_model, adapter, prompt_tokens, cached_tokens, completion_tokens, finish_reason, gpu_type, aborted, event_ts) VALUES",
 	)).
 		WithArgs(
-			// row 1 (base_model NULL: a base-model event, no derived_from)
-			"req-1", "auth-1", nil, nil, nil, nil, "m1", nil, nil, 5, 0, 7, nil, nil, false, time.UnixMilli(ts).UTC(),
+			// row 1 (org_id + base_model NULL: a base-model event, no org header, no derived_from)
+			"req-1", "auth-1", nil, nil, nil, nil, nil, "m1", nil, nil, 5, 0, 7, nil, nil, false, time.UnixMilli(ts).UTC(),
 			// row 2 (no identity, no timestamp → event_ts NULL)
-			"req-2", nil, nil, nil, nil, nil, "m2", nil, nil, 0, 0, 0, nil, nil, false, nil,
+			"req-2", nil, nil, nil, nil, nil, nil, "m2", nil, nil, 0, 0, 0, nil, nil, false, nil,
 		).
 		WillReturnResult(sqlmock.NewResult(0, 2))
 	mock.ExpectCommit()
@@ -121,6 +121,7 @@ func TestPostgresStore_EmptyModelStoredAsNull(t *testing.T) {
 	mock.ExpectExec("INSERT INTO billing_event").
 		WithArgs(
 			"req-no-model", "auth-1", nil, nil, nil, nil,
+			nil, // org_id: "" must bind NULL
 			nil, // model: "" must bind NULL
 			nil, // base_model: "" must bind NULL
 			nil, 1, 0, 2, nil, nil, false, nil,
@@ -156,13 +157,19 @@ func TestEventArgs_NullsEmptyIdentities(t *testing.T) {
 	if args[1] != nil {
 		t.Fatalf("auth_id arg = %v, want nil for empty AuthID", args[1])
 	}
-	// base_model is index 7 — must be nil for empty (a base-model event).
-	if args[7] != nil {
-		t.Fatalf("base_model arg = %v, want nil for empty BaseModel", args[7])
+	// org_id is index 6 (after resource_type) — must be nil for empty (no producer
+	// header / rollout gap); a stored '' would dodge the rater/push `org_id IS NULL`
+	// held-not-billed predicate.
+	if args[6] != nil {
+		t.Fatalf("org_id arg = %v, want nil for empty OrgID", args[6])
 	}
-	// prompt_tokens is index 9 (model=6, base_model=7, adapter=8) — the int, not nil.
-	if args[9] != 3 {
-		t.Fatalf("prompt_tokens arg = %v, want 3", args[9])
+	// base_model is index 8 (org_id pushed model/base_model down by one) — nil for empty.
+	if args[8] != nil {
+		t.Fatalf("base_model arg = %v, want nil for empty BaseModel", args[8])
+	}
+	// prompt_tokens is index 10 (org_id=6, model=7, base_model=8, adapter=9) — int, not nil.
+	if args[10] != 3 {
+		t.Fatalf("prompt_tokens arg = %v, want 3", args[10])
 	}
 	// event_ts is the last index — nil when TimestampUnixMs==0.
 	if args[colsPerRow-1] != nil {

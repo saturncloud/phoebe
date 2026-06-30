@@ -90,6 +90,7 @@ var upsertColumns = []string{
 	"group_id",
 	"resource_id",
 	"resource_type",
+	"org_id",
 	"model",
 	"base_model",
 	"adapter",
@@ -102,7 +103,7 @@ var upsertColumns = []string{
 	"event_ts",
 }
 
-const colsPerRow = 16 // len(upsertColumns); created_at is DB-defaulted.
+const colsPerRow = 17 // len(upsertColumns); created_at is DB-defaulted.
 
 // Upsert writes a batch of events in a single transaction with a multi-row
 // INSERT ... ON CONFLICT (request_id) DO NOTHING.
@@ -177,6 +178,11 @@ func eventArgs(e metering.Event) []any {
 		nullStr(e.GroupID),
 		nullStr(e.ResourceID),
 		nullStr(e.ResourceType),
+		// OrgID is "" when Atlas isn't injecting X-Saturn-Org-Id yet (producer-rollout
+		// gap). nullStr so it stores NULL, not '' — the rater/push fail-closed predicate
+		// is `org_id IS NULL` (held + screamed at push), and a stored '' would dodge it
+		// and be pushed as an empty-org rollup (billed to a guessed/blank org).
+		nullStr(e.OrgID),
 		// Model is "" when the upstream never reported one (capture gap), so it
 		// goes through nullStr like every other identity column: the rater's
 		// unattributable predicate is `model_id IS NULL`, and a stored ''
