@@ -372,13 +372,12 @@ func TestIntegration_AmbiguousOrgFailsLoud(t *testing.T) {
 		t.Fatalf("RateWindow: %v", err)
 	}
 
-	// The two conflicting-org events are counted ambiguous and drive exit-nonzero.
+	// The two conflicting-org events are counted ambiguous (a nonzero count is what
+	// drives the rater's exit-nonzero / HasAnomaly path — that predicate wiring is pinned
+	// separately by TestResult_HasAmbiguousOrgDrivesAnomaly; here we assert the count the
+	// SQL produces, since RateWindow returns the store-level RateResult, not Result).
 	if res.AmbiguousOrgEvents != 2 {
 		t.Fatalf("AmbiguousOrgEvents = %d, want 2 (the two distinct-org events)", res.AmbiguousOrgEvents)
-	}
-	if !res.HasAmbiguousOrg() || !res.HasAnomaly() {
-		t.Fatalf("HasAmbiguousOrg/HasAnomaly = %v/%v, want true/true (a multi-org rollup must drive exit-nonzero)",
-			res.HasAmbiguousOrg(), res.HasAnomaly())
 	}
 	// clean (1 event) + mixed (2 events) rate; amb (2 events) is withheld.
 	if res.RollupsWritten != 2 || res.EventsRated != 3 {
