@@ -10,6 +10,32 @@ import (
 	"github.com/saturncloud/phoebe/internal/logging"
 )
 
+// TestResult_HasAmbiguousOrgDrivesAnomaly locks the exit-2 contract for the new E2
+// attribution anomaly by name (mirroring the HasAmbiguousBase/HasUnpriced predicate
+// assertions): a Result carrying ambiguous-org events must report HasAmbiguousOrg AND
+// HasAnomaly (so cmd/rater exits non-zero and the CronJob alerts), and a clean Result
+// must report neither. This pins the HasAmbiguousOrg disjunct in HasAnomaly() — a
+// refactor that drops it would let an ambiguous-org-only window exit 0 (mis-attributable
+// metered usage passing silently), which this test turns RED. The org anomaly is
+// otherwise reachable only via live Postgres (the oracle store can't model org), so this
+// pure-Go predicate test is the cheapest guard on the loud-path wiring.
+func TestResult_HasAmbiguousOrgDrivesAnomaly(t *testing.T) {
+	ambiguous := Result{AmbiguousOrgEvents: 1}
+	if !ambiguous.HasAmbiguousOrg() {
+		t.Fatal("HasAmbiguousOrg() = false with AmbiguousOrgEvents=1, want true")
+	}
+	if !ambiguous.HasAnomaly() {
+		t.Fatal("HasAnomaly() = false for an ambiguous-org Result, want true (must drive exit-nonzero)")
+	}
+	clean := Result{}
+	if clean.HasAmbiguousOrg() {
+		t.Fatal("HasAmbiguousOrg() = true for a zero Result, want false")
+	}
+	if clean.HasAnomaly() {
+		t.Fatal("HasAnomaly() = true for a zero Result, want false (no anomaly, no exit-nonzero)")
+	}
+}
+
 // oracleStore is an in-memory Store that models EXACTLY what the SQL rater does,
 // using the production PriceBook (PriceBook.Resolve) + the Rate() oracle. It exists
 // so the Rater orchestration AND the money rules can be exercised without Postgres,

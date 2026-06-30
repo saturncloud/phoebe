@@ -169,6 +169,9 @@ func TestRateWindowSQL_Shape(t *testing.T) {
 		// (never billed to a guessed org) and counted, exactly like ambiguous_base
 		"COUNT(DISTINCT org_id) > 1 AS ambiguous_org",
 		"WHERE NOT ambiguous_base AND NOT ambiguous_org",
+		// the ambiguous_org count is EXCLUSIVE of ambiguous_base (strict partition:
+		// a both-ambiguous rollup counts only as base)
+		"WHERE ambiguous_org AND NOT ambiguous_base",
 		"AS ambiguous_org_events",
 	}
 	// The price tables are GONE (prices are YAML now): no reference to model_price,

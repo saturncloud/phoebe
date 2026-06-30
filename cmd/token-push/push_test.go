@@ -38,10 +38,10 @@ func newMockPusher(t *testing.T) (*pusher, sqlmock.Sqlmock) {
 
 var win = time.Date(2026, 6, 16, 14, 0, 0, 0, time.UTC)
 
-// TestBuildSnapshot_ResolvesOrgAndShape (token-push-snapshot-shape): a row carrying its
-// org_id (captured at meter time, read straight off rated_usage) becomes a wire rollup
-// with org_id attached, money carried as exact-decimal strings, and rev=0.
-func TestBuildSnapshot_ResolvesOrgAndShape(t *testing.T) {
+// TestBuildSnapshot_CarriesOrgAndShape (token-push-snapshot-shape): a row carrying its
+// org_id (captured at meter time, read straight off rated_usage — no resolve step) becomes
+// a wire rollup with org_id attached, money carried as exact-decimal strings, and rev=0.
+func TestBuildSnapshot_CarriesOrgAndShape(t *testing.T) {
 	p, mock := newMockPusher(t)
 	rows := sqlmock.NewRows(snapshotCols).AddRow(
 		"rated-id-1", "res-deploy-1", "org-acme", "meta-llama/Llama-3.1-8B-Instruct",

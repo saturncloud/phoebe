@@ -78,6 +78,7 @@ const (
 	testResourceID = "deploy-abc123"
 	testModelName  = "llama-3-8b"
 	testAuthID     = "auth-key-e2e"
+	testOrgID      = "org-e2e"
 
 	streamName = "phoebe:metering:e2e"
 )
@@ -377,6 +378,7 @@ func TestE2E_StreamedRequestBecomesMoney(t *testing.T) {
 	req.Header.Set(identity.HeaderResourceType, "deployment")
 	req.Header.Set(identity.HeaderUserID, "user-e2e")
 	req.Header.Set(identity.HeaderGroupID, "group-e2e")
+	req.Header.Set(identity.HeaderOrgID, testOrgID)
 	srv.Handler().ServeHTTP(rr, req)
 
 	if rr.Code != http.StatusOK {
@@ -470,6 +472,7 @@ func TestE2E_StreamedRequestBecomesMoney(t *testing.T) {
 	var (
 		nRollups                                     int
 		ruAuthID, ruResourceID, ruModelID, cost      string
+		ruOrgID                                      string
 		ruPrompt, ruCached, ruCompletion, ruBillable int64
 		eventCount                                   int64 // BIGINT column
 	)
@@ -480,9 +483,9 @@ func TestE2E_StreamedRequestBecomesMoney(t *testing.T) {
 		t.Fatalf("rated_usage rows = %d, want exactly 1", nRollups)
 	}
 	if err := h.db.QueryRow(
-		`SELECT auth_id, resource_id, model_id, prompt_tokens, cached_tokens, completion_tokens, billable_prompt_tokens, cost::text, event_count
+		`SELECT auth_id, resource_id, org_id, model_id, prompt_tokens, cached_tokens, completion_tokens, billable_prompt_tokens, cost::text, event_count
 		 FROM rated_usage`).
-		Scan(&ruAuthID, &ruResourceID, &ruModelID, &ruPrompt, &ruCached, &ruCompletion, &ruBillable, &cost, &eventCount); err != nil {
+		Scan(&ruAuthID, &ruResourceID, &ruOrgID, &ruModelID, &ruPrompt, &ruCached, &ruCompletion, &ruBillable, &cost, &eventCount); err != nil {
 		t.Fatalf("read rated_usage: %v", err)
 	}
 	if ruAuthID != testAuthID {
@@ -493,6 +496,13 @@ func TestE2E_StreamedRequestBecomesMoney(t *testing.T) {
 	// the rated_usage grain — this is the key billing resolves the org from.
 	if ruResourceID != testResourceID {
 		t.Errorf("rated_usage.resource_id = %q, want %q (the X-Saturn-Resource-Id header value, for E2 org attribution)", ruResourceID, testResourceID)
+	}
+	// E2 org attribution, end-to-end: the deployment-owning org (X-Saturn-Org-Id) is
+	// CAPTURED at the proxy and carried through billing_event into the rated_usage rollup
+	// — the whole point of this change (org rides the request, not a push-time
+	// resource_name join). This is the composed-path assertion for the header→rollup carry.
+	if ruOrgID != testOrgID {
+		t.Errorf("rated_usage.org_id = %q, want %q (the X-Saturn-Org-Id header value, carried meter→rate)", ruOrgID, testOrgID)
 	}
 	// THE deployment-id-bug guard, at the far end of the pipe: the money is
 	// keyed on the engine name the upstream reported, not the id we routed on.

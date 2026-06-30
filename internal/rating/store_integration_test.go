@@ -282,9 +282,10 @@ func TestIntegration_ResourceIDGrainAndFailClosed(t *testing.T) {
 	if res.UnattributableEvents != 1 {
 		t.Fatalf("unattributable = %d, want 1 (the NULL-resource_id event must be counted, never billed)", res.UnattributableEvents)
 	}
-	// PARTITION holds with resource_id in the mix.
-	if got := res.EventsRated + res.UnpricedEvents + res.UnattributableEvents + res.AmbiguousBaseEvents; got != 3 {
-		t.Fatalf("rated+unpriced+unattr+ambiguous = %d, want 3 (all seeded events)", got)
+	// PARTITION holds with resource_id in the mix (all five buckets; org is 0 here).
+	if got := res.EventsRated + res.UnpricedEvents + res.UnattributableEvents +
+		res.AmbiguousBaseEvents + res.AmbiguousOrgEvents; got != 3 {
+		t.Fatalf("rated+unpriced+unattr+ambiguous_base+ambiguous_org = %d, want 3 (all seeded events)", got)
 	}
 
 	// Exactly two rows, one per deployment; NONE with a NULL/empty resource_id.
@@ -310,6 +311,112 @@ func TestIntegration_ResourceIDGrainAndFailClosed(t *testing.T) {
 		if n != 1 {
 			t.Fatalf("deployment %s rollups = %d, want exactly 1", rid, n)
 		}
+	}
+}
+
+// TestIntegration_AmbiguousOrgFailsLoud is the org twin of the ambiguous_base
+// fail-loud test: it exercises the three net-new org-rollup boundaries against real
+// Postgres (the oracle store can't model org, so this is their only executing coverage):
+//
+//   - TWO DISTINCT non-NULL orgs under one (auth,resource,model,hour) rollup → an E2
+//     attribution propagation bug: the rollup is WITHHELD (never billed to a guessed
+//     MAX org), counted in AmbiguousOrgEvents, and drives HasAnomaly/exit-nonzero.
+//   - PARTIAL-NULL (real org on some events, NULL on others — the header-rollout window)
+//     → MAX(org_id)/COUNT(DISTINCT) ignore the NULL, so the rollup is NOT ambiguous: it
+//     bills, carrying the single real org. This is the precise behavior the PR exists to
+//     make safe.
+//   - A CLEAN single-org rollup rates normally alongside.
+func TestIntegration_AmbiguousOrgFailsLoud(t *testing.T) {
+	dsn := os.Getenv("PHOEBE_TEST_DATABASE_URL")
+	if dsn == "" {
+		t.Skip("PHOEBE_TEST_DATABASE_URL not set; skipping live-Postgres conformance")
+	}
+	ctx := context.Background()
+	db, err := sql.Open("pgx", dsn)
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	defer db.Close()
+
+	const sch = "phoebe_rating_ambigorg_it"
+	exec(t, db, "DROP SCHEMA IF EXISTS "+sch+" CASCADE")
+	exec(t, db, "CREATE SCHEMA "+sch)
+	exec(t, db, "SET search_path TO "+sch)
+	defer func() { exec(t, db, "DROP SCHEMA IF EXISTS "+sch+" CASCADE") }()
+	exec(t, db, schemaDDL)
+
+	hour := mustTime("2026-06-08T10:00:00Z")
+	book := newTestBook(
+		map[string]Rate3{"b": rate3("0.000005", "0", "0")},
+		nil, PolicyIdentity, Dec{}, Dec{},
+	)
+
+	// Seed three rollups in one hour, INCLUDING the org_id column (the other tests omit
+	// it, so org is NULL there; here it is load-bearing):
+	//   resource 'amb'   : two events, DISTINCT non-NULL orgs 'org-1'/'org-2' → ambiguous.
+	//   resource 'clean' : one event, org 'org-3' → bills normally.
+	//   resource 'mixed' : two events, org 'org-4' and NULL → partial-NULL, bills as org-4.
+	if _, err := db.ExecContext(ctx,
+		`INSERT INTO billing_event (request_id, auth_id, resource_id, org_id, model, prompt_tokens, completion_tokens, event_ts)
+		 VALUES ('a1','a','amb','org-1','b',100,0,$1),
+		        ('a2','a','amb','org-2','b',100,0,$1),
+		        ('c1','a','clean','org-3','b',100,0,$1),
+		        ('m1','a','mixed','org-4','b',100,0,$1),
+		        ('m2','a','mixed',NULL,'b',100,0,$1)`, hour.Add(5*time.Minute)); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+
+	store := NewPostgresStore(db)
+	res, err := store.RateWindow(ctx, book, hour, hour.Add(time.Hour))
+	if err != nil {
+		t.Fatalf("RateWindow: %v", err)
+	}
+
+	// The two conflicting-org events are counted ambiguous and drive exit-nonzero.
+	if res.AmbiguousOrgEvents != 2 {
+		t.Fatalf("AmbiguousOrgEvents = %d, want 2 (the two distinct-org events)", res.AmbiguousOrgEvents)
+	}
+	if !res.HasAmbiguousOrg() || !res.HasAnomaly() {
+		t.Fatalf("HasAmbiguousOrg/HasAnomaly = %v/%v, want true/true (a multi-org rollup must drive exit-nonzero)",
+			res.HasAmbiguousOrg(), res.HasAnomaly())
+	}
+	// clean (1 event) + mixed (2 events) rate; amb (2 events) is withheld.
+	if res.RollupsWritten != 2 || res.EventsRated != 3 {
+		t.Fatalf("rollups/events = %d/%d, want 2/3 (clean + mixed bill; amb withheld)", res.RollupsWritten, res.EventsRated)
+	}
+	// PARTITION over all five buckets (org now nonzero).
+	if got := res.EventsRated + res.UnpricedEvents + res.UnattributableEvents +
+		res.AmbiguousBaseEvents + res.AmbiguousOrgEvents; got != 5 {
+		t.Fatalf("partition sum = %d, want 5 (all seeded events accounted exactly once)", got)
+	}
+
+	// The ambiguous rollup must NOT be billed to a guessed org.
+	var nAmb int
+	if err := db.QueryRowContext(ctx,
+		`SELECT COUNT(*) FROM rated_usage WHERE resource_id='amb'`).Scan(&nAmb); err != nil {
+		t.Fatalf("count amb: %v", err)
+	}
+	if nAmb != 0 {
+		t.Fatalf("rated_usage has %d rows for the two-org rollup — it must NEVER be billed to a guessed org", nAmb)
+	}
+
+	// The partial-NULL rollup bills, carrying the single REAL org (MAX ignored the NULL).
+	var mixedOrg sql.NullString
+	if err := db.QueryRowContext(ctx,
+		`SELECT org_id FROM rated_usage WHERE resource_id='mixed'`).Scan(&mixedOrg); err != nil {
+		t.Fatalf("read mixed org: %v", err)
+	}
+	if !mixedOrg.Valid || mixedOrg.String != "org-4" {
+		t.Fatalf("mixed rollup org_id = %v, want 'org-4' (partial-NULL must collapse to the real org, not split or null)", mixedOrg)
+	}
+	// And the clean rollup carries its org.
+	var cleanOrg sql.NullString
+	if err := db.QueryRowContext(ctx,
+		`SELECT org_id FROM rated_usage WHERE resource_id='clean'`).Scan(&cleanOrg); err != nil {
+		t.Fatalf("read clean org: %v", err)
+	}
+	if !cleanOrg.Valid || cleanOrg.String != "org-3" {
+		t.Fatalf("clean rollup org_id = %v, want 'org-3'", cleanOrg)
 	}
 }
 

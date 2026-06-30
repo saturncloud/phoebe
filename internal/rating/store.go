@@ -454,8 +454,10 @@ SELECT
     (SELECT COUNT(*)::bigint FROM deleted)                       AS reconciled_deletions,
     -- Anomaly counts from the SAME snapshot as the upsert. An unattributable row is
     -- counted ONLY as unattributable (the more specific signal), never also as
-    -- unpriced, so the counts partition the in-window rows:
-    --   events_rated + unpriced + unattributable + ambiguous_base == total in-window events.
+    -- unpriced; likewise an ambiguous_org rollup that is ALSO ambiguous_base is counted
+    -- ONLY as ambiguous_base. So the counts strictly PARTITION the in-window rows:
+    --   events_rated + unpriced + unattributable + ambiguous_base + ambiguous_org
+    --     == total in-window events.
     -- The unpriced count requires FULL attribution (auth_id, resource_id, model_id all
     -- NON-NULL) for exactly this exclusivity: a NULL-resource_id row that is also
     -- unpriced must be counted ONLY as unattributable, never double-counted here.
@@ -478,10 +480,16 @@ SELECT
     -- org_id (an E2 attribution propagation bug — one resource resolving to two orgs in
     -- a window). Excluded from priced (NOT billed to a guessed org), counted here from
     -- the same snapshot to drive the fail-loud exit. Same EVENT-unit convention as
-    -- ambiguous_base. A rollup can be excluded for EITHER ambiguity; the two counts can
-    -- overlap, so they are diagnostics for the exit signal, not strict partition cells.
+    -- ambiguous_base. EXCLUSIVE of ambiguous_base (AND NOT ambiguous_base) so the
+    -- anomaly counts stay a strict PARTITION: a rollup that is BOTH base- and
+    -- org-ambiguous is counted ONLY as ambiguous_base (the more specific E3 signal),
+    -- exactly as unattributable takes precedence over unpriced above. So
+    --   events_rated + unpriced + unattributable + ambiguous_base + ambiguous_org
+    --     == total in-window events
+    -- holds with no double-count. Both still drive exit-nonzero, so precedence changes
+    -- only which bucket reports the overlap, never whether it screams.
     (SELECT COALESCE(SUM(event_count), 0)::bigint FROM grouped
-      WHERE ambiguous_org)                                   AS ambiguous_org_events`
+      WHERE ambiguous_org AND NOT ambiguous_base)           AS ambiguous_org_events`
 
 // RateWindow runs the price-projection + the single resolve→sum→upsert→count
 // statement for [start, end) in ONE transaction, and reports the rollups written,

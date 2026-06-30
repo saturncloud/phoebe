@@ -7,10 +7,11 @@ Create Date: 2026-06-30 00:00:00.000000
 
 This is a READY-TO-COPY artifact maintained in the phoebe repo. To apply it,
 copy this file into saturn/alembic/versions/. down_revision is pinned to
-c2f1a3b4d5e6 (phoebe's rating migration) so the phoebe chain stays contiguous:
-billing_event -> rating -> io_log -> org_id. At copy time, re-point down_revision
-to whatever the LAST phoebe revision already applied to the shared DB is (so the
-graph stays linear). See migrations/README.md.
+c2e1d3f4a5b6 (phoebe's io_log migration) — the LAST phoebe revision in the
+linearized chain billing_event -> rating -> io_log -> org_id (the README diagram).
+At copy time, re-point down_revision to whatever the last phoebe revision already
+applied to the shared DB actually is (so the graph stays single-head/linear).
+See migrations/README.md.
 
 WHY THIS IS A FOLLOW-UP MIGRATION, NOT AN EDIT TO THE CREATE MIGRATIONS:
 billing_event (b1f0c2d3e4a5) and rated_usage (c2f1a3b4d5e6) have ALREADY shipped on
@@ -42,7 +43,7 @@ from alembic import op
 
 # revision identifiers, used by Alembic.
 revision = "d3a2b4c5e6f7"
-down_revision = "c2f1a3b4d5e6"
+down_revision = "c2e1d3f4a5b6"
 branch_labels = None
 depends_on = None
 
