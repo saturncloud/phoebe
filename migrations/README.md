@@ -84,7 +84,7 @@ a **ready-to-copy Alembic file**, not a migrator phoebe executes:
 | `atlas/c2f1a3b4d5e6_add_rating.py` | The Alembic artifact for `rated_usage`. Chains after `billing_event`. |
 | `0002_io_log.sql` | Plain DDL for `io_log` (M5 per-tenant I/O-logging store: request/response bodies + `body_tsv` GIN full-text). Reference + local-dev. |
 | `atlas/c2e1d3f4a5b6_add_io_log.py` | The Alembic artifact for `io_log`. Chains after `billing_event` (re-point when landing alongside rating — see below). |
-| `atlas/d3a2b4c5e6f7_add_org_id.py` | Follow-up Alembic that adds `org_id` (E2 attribution) idempotently to `billing_event` AND `rated_usage` (`ADD COLUMN IF NOT EXISTS`, nullable). A follow-up — not an edit to the create migrations — because those already shipped on `release-2026.02.01`/`release-2026.06.01`. Chains after `rating`. |
+| `atlas/d3a2b4c5e6f7_add_org_id.py` | Follow-up Alembic that adds `org_id` (E2 attribution) idempotently to `billing_event` AND `rated_usage` (`ADD COLUMN IF NOT EXISTS`, nullable). A follow-up — not an edit to the create migrations — because those already shipped on `release-2026.02.01`/`release-2026.06.01`. Chains after `io_log` (the last phoebe rev in the linearized chain). |
 | `../config/prices.example.yaml` | The **operator-facing price file** (E1): base per-token rates keyed on the HF model id, the global fine-tune premium policy, per-GPU floor rates. The contract the rater prices from. Not a migration. |
 
 ### Migration chain (IMPORTANT when landing these together)

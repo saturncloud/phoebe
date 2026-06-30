@@ -326,6 +326,9 @@ func TestIntegration_ResourceIDGrainAndFailClosed(t *testing.T) {
 //     bills, carrying the single real org. This is the precise behavior the PR exists to
 //     make safe.
 //   - A CLEAN single-org rollup rates normally alongside.
+//
+// The base+org BOTH-ambiguous interaction (the strict-partition exclusivity clause) is
+// covered separately by TestIntegration_BothAmbiguousCountedOnceAsBase.
 func TestIntegration_AmbiguousOrgFailsLoud(t *testing.T) {
 	dsn := os.Getenv("PHOEBE_TEST_DATABASE_URL")
 	if dsn == "" {
@@ -416,6 +419,75 @@ func TestIntegration_AmbiguousOrgFailsLoud(t *testing.T) {
 	}
 	if !cleanOrg.Valid || cleanOrg.String != "org-3" {
 		t.Fatalf("clean rollup org_id = %v, want 'org-3'", cleanOrg)
+	}
+}
+
+// TestIntegration_BothAmbiguousCountedOnceAsBase pins the strict-partition exclusivity
+// clause `WHERE ambiguous_org AND NOT ambiguous_base` (store.go) against real Postgres: a
+// single rollup that is SIMULTANEOUSLY base-ambiguous (one ft: id over two base_models)
+// AND org-ambiguous (two distinct non-NULL orgs) must be counted EXACTLY ONCE — as
+// ambiguous_base (the more specific E3 signal), NOT also as ambiguous_org. Without the
+// exclusivity clause this rollup would be double-counted and the partition identity
+// (rated + unpriced + unattr + ambiguous_base + ambiguous_org == total) would break. The
+// existing single-axis tests can't catch a dropped/inverted exclusivity guard because
+// neither trips both flags at once.
+func TestIntegration_BothAmbiguousCountedOnceAsBase(t *testing.T) {
+	dsn := os.Getenv("PHOEBE_TEST_DATABASE_URL")
+	if dsn == "" {
+		t.Skip("PHOEBE_TEST_DATABASE_URL not set; skipping live-Postgres conformance")
+	}
+	ctx := context.Background()
+	db, err := sql.Open("pgx", dsn)
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	defer db.Close()
+
+	const sch = "phoebe_rating_bothambig_it"
+	exec(t, db, "DROP SCHEMA IF EXISTS "+sch+" CASCADE")
+	exec(t, db, "CREATE SCHEMA "+sch)
+	exec(t, db, "SET search_path TO "+sch)
+	defer func() { exec(t, db, "DROP SCHEMA IF EXISTS "+sch+" CASCADE") }()
+	exec(t, db, schemaDDL)
+
+	hour := mustTime("2026-06-08T10:00:00Z")
+	book := newTestBook(
+		map[string]Rate3{
+			"cheap/base":     rate3("0.000001", "0", "0"),
+			"expensive/base": rate3("0.000009", "0", "0"),
+		},
+		nil, PolicyMultiplier, MustDec("1.5"), Dec{},
+	)
+
+	// One ft:dupe rollup whose two events disagree on BOTH base_model AND org_id.
+	if _, err := db.ExecContext(ctx,
+		`INSERT INTO billing_event (request_id, auth_id, resource_id, org_id, model, base_model, prompt_tokens, completion_tokens, event_ts)
+		 VALUES ('b1','a','d1','org-1','ft:dupe','cheap/base',1000,0,$1),
+		        ('b2','a','d1','org-2','ft:dupe','expensive/base',1000,0,$1)`, hour.Add(5*time.Minute)); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+
+	store := NewPostgresStore(db)
+	res, err := store.RateWindow(ctx, book, hour, hour.Add(time.Hour))
+	if err != nil {
+		t.Fatalf("RateWindow: %v", err)
+	}
+
+	// Counted ONCE as base (the more specific signal), NOT also as org.
+	if res.AmbiguousBaseEvents != 2 {
+		t.Fatalf("AmbiguousBaseEvents = %d, want 2 (both events of the dupe rollup)", res.AmbiguousBaseEvents)
+	}
+	if res.AmbiguousOrgEvents != 0 {
+		t.Fatalf("AmbiguousOrgEvents = %d, want 0 (a both-ambiguous rollup counts ONLY as base — the exclusivity clause)", res.AmbiguousOrgEvents)
+	}
+	// Strict partition holds: no double-count.
+	if got := res.EventsRated + res.UnpricedEvents + res.UnattributableEvents +
+		res.AmbiguousBaseEvents + res.AmbiguousOrgEvents; got != 2 {
+		t.Fatalf("partition sum = %d, want 2 (the rollup must be counted exactly once, not double)", got)
+	}
+	// And nothing was billed (the rollup is withheld).
+	if res.RollupsWritten != 0 {
+		t.Fatalf("RollupsWritten = %d, want 0 (a both-ambiguous rollup is never billed)", res.RollupsWritten)
 	}
 }
 

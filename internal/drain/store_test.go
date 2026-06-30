@@ -175,4 +175,12 @@ func TestEventArgs_NullsEmptyIdentities(t *testing.T) {
 	if args[colsPerRow-1] != nil {
 		t.Fatalf("event_ts arg = %v, want nil for zero timestamp", args[colsPerRow-1])
 	}
+
+	// POSITIVE bind: a non-empty OrgID must reach the org_id column verbatim (index 6),
+	// not just be NULLed when empty — the meter-time org capture is the point of the
+	// change, so the happy path is pinned here (not only transitively via e2e).
+	withOrg := eventArgs(metering.Event{RequestID: "r", Model: "m", OrgID: "org-xyz"})
+	if withOrg[6] != "org-xyz" {
+		t.Fatalf("org_id arg = %v, want \"org-xyz\" (a non-empty OrgID must bind through)", withOrg[6])
+	}
 }
