@@ -437,6 +437,11 @@ func (s *Server) emit(ctx context.Context, id identity.Identity, requestID strin
 		GroupID:      id.GroupID,
 		ResourceID:   id.ResourceID,
 		ResourceType: id.ResourceType,
+		// OrgID is the deployment-owning org (E2), stamped from the trusted
+		// X-Saturn-Org-Id header. Captured here so the org rides the event to push;
+		// empty is tolerated (a missing org is held + screamed at push, never gated
+		// on the hot path — see missingBillingFields).
+		OrgID: id.OrgID,
 		// Model is the ENGINE-REPORTED name (rating's stable price key),
 		// captured from the response body — NOT id.ResourceID, which is the
 		// ephemeral deployment id and prices nothing. Empty when the upstream
@@ -465,6 +470,15 @@ func (s *Server) emit(ctx context.Context, id identity.Identity, requestID strin
 // AuthID (token / API-key id) is the attribution key; ResourceID identifies
 // the model being billed. Both are mandatory. UserID/GroupID are resolved
 // downstream from AuthID and are NOT required here.
+//
+// OrgID is intentionally NOT gated here yet. It is captured best-effort onto the
+// event and fail-closed DOWNSTREAM (a NULL-org rollup is held + counted + screamed
+// at push, never billed to a guessed org). Gating it on the hot path would
+// black-hole inference on any install whose Atlas isn't yet injecting
+// X-Saturn-Org-Id — the same per-install producer-rollout fragility that applies to
+// X-Saturn-Auth-Id and X-Saturn-Base-Model. Once the producer header is universal,
+// promoting org_id to a hard gate here is a one-line follow-up; until then the
+// fail-closed lives at the layer that can afford it.
 func missingBillingFields(id identity.Identity) []string {
 	var missing []string
 	if id.AuthID == "" {
