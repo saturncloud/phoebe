@@ -38,8 +38,8 @@ func TestRun_NoManagerURLFatal(t *testing.T) {
 }
 
 // TestRun_NoDatabaseURLFatal (token-push-no-db): an empty DATABASE_URL is fatal — the
-// pusher reads rated_usage + resource_name from it and cannot run without it. This
-// reaches openDB, which rejects an empty DSN before any push.
+// pusher reads rated_usage from it and cannot run without it. This reaches openDB,
+// which rejects an empty DSN before any push.
 func TestRun_NoDatabaseURLFatal(t *testing.T) {
 	t.Setenv(tokenEnv, "tok")
 	t.Setenv("DATABASE_URL", "")
