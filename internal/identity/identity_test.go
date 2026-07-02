@@ -15,6 +15,7 @@ func TestFromRequestCapturesAllHeaders(t *testing.T) {
 	r.Header.Set(HeaderResourceType, "deployment")
 	r.Header.Set(HeaderOrgID, "org-7")
 	r.Header.Set(HeaderBaseModel, "meta-llama/Llama-3.1-8B-Instruct")
+	r.Header.Set(HeaderUpstream, "pd-x.main-namespace.svc.cluster.local:8000")
 
 	id := FromRequest(r)
 
@@ -39,13 +40,16 @@ func TestFromRequestCapturesAllHeaders(t *testing.T) {
 	if id.BaseModel != "meta-llama/Llama-3.1-8B-Instruct" {
 		t.Errorf("BaseModel = %q, want meta-llama/Llama-3.1-8B-Instruct", id.BaseModel)
 	}
+	if id.Upstream != "pd-x.main-namespace.svc.cluster.local:8000" {
+		t.Errorf("Upstream = %q, want pd-x.main-namespace.svc.cluster.local:8000", id.Upstream)
+	}
 }
 
 func TestFromRequestMissingHeadersAreEmpty(t *testing.T) {
 	r := httptest.NewRequest(http.MethodPost, "/", nil)
 	id := FromRequest(r)
 	if id.AuthID != "" || id.UserID != "" || id.GroupID != "" || id.ResourceID != "" ||
-		id.ResourceType != "" || id.OrgID != "" || id.BaseModel != "" {
+		id.ResourceType != "" || id.OrgID != "" || id.BaseModel != "" || id.Upstream != "" {
 		t.Fatalf("expected all-empty identity, got %+v", id)
 	}
 }

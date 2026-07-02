@@ -262,6 +262,88 @@ func TestProxyForwardsToUpstream(t *testing.T) {
 	}
 }
 
+// TestProxyUpstreamHeaderRoutes is THE routing-seam test: when Atlas injects
+// X-Saturn-Upstream (a Token Factory inference deployment), phoebe MUST forward to that
+// backend and NOT resolve — because the real k8s Service (a `pd-...` name) is not
+// derivable by the resolver's convention. Proven by pointing the RESOLVER at a
+// "wrong" backend that fails the test if hit, and the HEADER at the "right" one.
+func TestProxyUpstreamHeaderRoutes(t *testing.T) {
+	// The resolver's target — MUST NOT be reached when the header is present.
+	wrong := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		t.Error("resolver backend was hit — phoebe ignored X-Saturn-Upstream and resolved by convention")
+		w.WriteHeader(http.StatusTeapot)
+	}))
+	defer wrong.Close()
+	// The header's target — the real deployment Service; MUST be reached.
+	right := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = w.Write([]byte(`{"routed":"via-upstream-header"}`))
+	}))
+	defer right.Close()
+
+	wrongURL, _ := url.Parse(wrong.URL)
+	srv := newTestServer(t, wrongURL) // resolver → wrong backend
+
+	rr := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", nil)
+	req.Header.Set(identity.HeaderAuthID, "auth-1")
+	req.Header.Set(identity.HeaderResourceID, "828402f0deadbeef") // a `pd-...` deploy; convention can't reach it
+	// Atlas injects the real backend as host:port (no scheme), as it does in production.
+	req.Header.Set(identity.HeaderUpstream, strings.TrimPrefix(right.URL, "http://"))
+	srv.Handler().ServeHTTP(rr, req)
+
+	if rr.Code != http.StatusOK {
+		t.Fatalf("got %d, want 200 (should forward via the upstream header)", rr.Code)
+	}
+	body, _ := io.ReadAll(rr.Body)
+	if string(body) != `{"routed":"via-upstream-header"}` {
+		t.Fatalf("body = %q, want the header-target's response (phoebe forwarded to the wrong backend)", string(body))
+	}
+}
+
+// TestProxyUpstreamHeaderAbsentFallsBackToResolver: with NO X-Saturn-Upstream (the
+// normal, non-inference path), phoebe resolves as before — the header is a preference,
+// not a requirement.
+func TestProxyUpstreamHeaderAbsentFallsBackToResolver(t *testing.T) {
+	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = w.Write([]byte(`{"routed":"via-resolver"}`))
+	}))
+	defer backend.Close()
+	u, _ := url.Parse(backend.URL)
+	srv := newTestServer(t, u)
+
+	rr := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", nil)
+	req.Header.Set(identity.HeaderAuthID, "auth-1")
+	req.Header.Set(identity.HeaderResourceID, "model-abc")
+	// No X-Saturn-Upstream.
+	srv.Handler().ServeHTTP(rr, req)
+
+	if rr.Code != http.StatusOK {
+		t.Fatalf("got %d, want 200 (resolver fallback)", rr.Code)
+	}
+	body, _ := io.ReadAll(rr.Body)
+	if string(body) != `{"routed":"via-resolver"}` {
+		t.Fatalf("body = %q, want the resolver target's response", string(body))
+	}
+}
+
+// TestProxyUpstreamHeaderMalformedFailsClosed: a broken trusted header (Atlas injected a
+// bad value) is a broken edge contract, not a normal request — fail closed (502), never
+// forward to a guessed/empty target.
+func TestProxyUpstreamHeaderMalformedFailsClosed(t *testing.T) {
+	unused, _ := url.Parse("http://unused")
+	srv := newTestServer(t, unused)
+	rr := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", nil)
+	req.Header.Set(identity.HeaderAuthID, "auth-1")
+	req.Header.Set(identity.HeaderResourceID, "r")
+	req.Header.Set(identity.HeaderUpstream, "://:") // no host, unparseable target
+	srv.Handler().ServeHTTP(rr, req)
+	if rr.Code != http.StatusBadGateway {
+		t.Fatalf("got %d, want 502 (a malformed upstream header must fail closed)", rr.Code)
+	}
+}
+
 // TestProxyBillingGate_OrgIDNotGated asserts the Q2 ruling by name: org_id is
 // captured best-effort, NOT a hot-path gate. A request carrying X-Saturn-Org-Id has
 // it stamped onto the metering event; a request MISSING it is still served (200) and

@@ -65,6 +65,23 @@ const (
 	// counted + screamed, never billed to a guessed org), exactly where it can't
 	// take down the inference path. See internal/proxy missingBillingFields.
 	HeaderOrgID = "X-Saturn-Org-Id"
+
+	// HeaderUpstream carries the ROUTING AUTHORITY: the deployment's real backend
+	// (host:port) that phoebe must forward to. Atlas injects it per Token Factory
+	// inference deployment (the `_phoebe_inference_upstream` Middleware, after
+	// atlas-auth), because Atlas authoritatively knows the deployment's own k8s
+	// Service (`{k8s_name}.{ns}.svc.cluster.local:{VLLM_SERVE_PORT}`) when it builds
+	// the route — a `pd-...` Service name that phoebe canNOT derive by convention
+	// (the ConventionResolver's `model-{resource_id}...` template computes a different,
+	// non-existent name). So when this header is present, phoebe forwards THERE and
+	// does not resolve; the resolver is only the fallback for the non-inference path.
+	//
+	// TRUST: allowlisted in Traefik's authResponseHeaders, so a client-supplied value
+	// is stripped before it reaches phoebe (a client must not be able to point its
+	// authorized-for-X request at engine Y — a confused-deputy). Phoebe therefore
+	// trusts this header exactly like the identity headers. Absent = empty string
+	// (the normal, non-inference path; fall back to the resolver).
+	HeaderUpstream = "X-Saturn-Upstream"
 )
 
 // Identity is the trusted, pre-resolved caller identity for a request. Phoebe
@@ -88,6 +105,11 @@ type Identity struct {
 	// fine-tune deployment. Empty for a base model. Carried to the metering event so
 	// the rater can price an ft:<checkpoint> at base x premium.
 	BaseModel string
+	// Upstream is the deployment's real backend (host:port) for phoebe to forward to,
+	// injected by Atlas per inference deployment (routing authority, trusted). Present
+	// only on the Token Factory inference path; empty for everything else (fall back to
+	// the resolver). See HeaderUpstream.
+	Upstream string
 }
 
 // FromRequest extracts the trusted identity headers. It performs no
@@ -101,5 +123,6 @@ func FromRequest(r *http.Request) Identity {
 		ResourceType: r.Header.Get(HeaderResourceType),
 		OrgID:        r.Header.Get(HeaderOrgID),
 		BaseModel:    r.Header.Get(HeaderBaseModel),
+		Upstream:     r.Header.Get(HeaderUpstream),
 	}
 }
