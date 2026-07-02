@@ -24,8 +24,10 @@ import (
 	"crypto/rand"
 	"encoding/hex"
 	"errors"
+	"fmt"
 	"net/http"
 	"net/http/httputil"
+	"net/url"
 	"strings"
 	"time"
 
@@ -218,16 +220,37 @@ func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	upstream, err := s.resolver.Resolve(id.ResourceID)
-	if err == registry.ErrNotFound {
-		// Torn-down or unknown model: fail cleanly, never hang or misroute.
-		http.Error(w, "model upstream not found", http.StatusNotFound)
-		return
-	}
-	if err != nil {
-		s.log.Error.Printf("resolve %q: %v", id.ResourceID, err)
-		http.Error(w, "upstream resolution error", http.StatusBadGateway)
-		return
+	// Routing authority. For a Token Factory inference deployment, Atlas injects the
+	// deployment's real backend as X-Saturn-Upstream (a trusted, Traefik-allowlisted
+	// header) — because Atlas authoritatively knows the deployment's own k8s Service
+	// (a `pd-...` name) when it builds the route, which phoebe CANNOT derive by
+	// convention. When present, forward THERE; the resolver (convention/static) is only
+	// the fallback for the non-inference path. This is the whole point of the
+	// producer-side X-Saturn-Upstream Middleware: phoebe never guesses a Service name.
+	var upstream *url.URL
+	var err error
+	if id.Upstream != "" {
+		upstream, err = parseUpstreamHeader(id.Upstream)
+		if err != nil {
+			// A malformed trusted header means the edge contract is broken (Atlas
+			// injected a bad value), not a normal request — fail closed rather than
+			// forward to a guessed/empty target.
+			s.log.Error.Printf("invalid %s %q: %v", identity.HeaderUpstream, id.Upstream, err)
+			http.Error(w, "invalid upstream routing header", http.StatusBadGateway)
+			return
+		}
+	} else {
+		upstream, err = s.resolver.Resolve(id.ResourceID)
+		if err == registry.ErrNotFound {
+			// Torn-down or unknown model: fail cleanly, never hang or misroute.
+			http.Error(w, "model upstream not found", http.StatusNotFound)
+			return
+		}
+		if err != nil {
+			s.log.Error.Printf("resolve %q: %v", id.ResourceID, err)
+			http.Error(w, "upstream resolution error", http.StatusBadGateway)
+			return
+		}
 	}
 
 	// M5 I/O-logging gate — computed ONCE. Everything that adds hot-path cost
@@ -437,6 +460,11 @@ func (s *Server) emit(ctx context.Context, id identity.Identity, requestID strin
 		GroupID:      id.GroupID,
 		ResourceID:   id.ResourceID,
 		ResourceType: id.ResourceType,
+		// OrgID is the deployment-owning org (E2), stamped from the trusted
+		// X-Saturn-Org-Id header. Captured here so the org rides the event to push;
+		// empty is tolerated (a missing org is held + screamed at push, never gated
+		// on the hot path — see missingBillingFields).
+		OrgID: id.OrgID,
 		// Model is the ENGINE-REPORTED name (rating's stable price key),
 		// captured from the response body — NOT id.ResourceID, which is the
 		// ephemeral deployment id and prices nothing. Empty when the upstream
@@ -465,6 +493,15 @@ func (s *Server) emit(ctx context.Context, id identity.Identity, requestID strin
 // AuthID (token / API-key id) is the attribution key; ResourceID identifies
 // the model being billed. Both are mandatory. UserID/GroupID are resolved
 // downstream from AuthID and are NOT required here.
+//
+// OrgID is intentionally NOT gated here yet. It is captured best-effort onto the
+// event and fail-closed DOWNSTREAM (a NULL-org rollup is held + counted + screamed
+// at push, never billed to a guessed org). Gating it on the hot path would
+// black-hole inference on any install whose Atlas isn't yet injecting
+// X-Saturn-Org-Id — the same per-install producer-rollout fragility that applies to
+// X-Saturn-Auth-Id and X-Saturn-Base-Model. Once the producer header is universal,
+// promoting org_id to a hard gate here is a one-line follow-up; until then the
+// fail-closed lives at the layer that can afford it.
 func missingBillingFields(id identity.Identity) []string {
 	var missing []string
 	if id.AuthID == "" {
@@ -474,6 +511,40 @@ func missingBillingFields(id identity.Identity) []string {
 		missing = append(missing, identity.HeaderResourceID)
 	}
 	return missing
+}
+
+// parseUpstreamHeader turns Atlas's X-Saturn-Upstream value into a forwarding URL.
+// Atlas sends a bare `host:port` (the deployment's k8s Service DNS, e.g.
+// `pd-x.main-namespace.svc.cluster.local:8000`) with NO scheme — in-cluster east-west
+// traffic to a vLLM engine is plain HTTP, so we prepend http://. A value that already
+// carries a scheme (defensive) is honored.
+//
+// GRAMMAR IS STRICTLY host:port (fail closed on anything more). The producer side
+// (Atlas's Middleware, the resolver's ConventionResolver) emits host-only upstreams, so
+// the contract is host:port. A value carrying a PATH is rejected: NewSingleHostReverseProxy
+// PREPENDS the target's path to every forwarded request, so honoring `host:8000/v1` would
+// silently rewrite `/v1/chat/completions` → `/v1/v1/chat/completions` — a per-request 404
+// for the whole deployment, surfaced as a healthy 200-route by phoebe. A query/fragment/
+// userinfo is likewise not part of the contract. On a trusted routing seam, a value that
+// deviates from the grammar means the edge contract is broken (Atlas emitted something
+// wrong), not a normal request — reject it so the caller fails closed (502) rather than
+// misroute. This matches the host-only shape of the resolver fallback exactly.
+func parseUpstreamHeader(v string) (*url.URL, error) {
+	raw := v
+	if !strings.Contains(raw, "://") {
+		raw = "http://" + raw
+	}
+	u, err := url.Parse(raw)
+	if err != nil {
+		return nil, err
+	}
+	if u.Host == "" {
+		return nil, fmt.Errorf("upstream header %q has no host", v)
+	}
+	if (u.Path != "" && u.Path != "/") || u.RawQuery != "" || u.Fragment != "" || u.User != nil {
+		return nil, fmt.Errorf("upstream header %q must be a bare host:port (no path/query/fragment/userinfo)", v)
+	}
+	return u, nil
 }
 
 // isEventStream reports whether the response is an SSE stream.

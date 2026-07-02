@@ -62,6 +62,12 @@ type RateResult struct {
 	// rollups are excluded from the upsert and screamed about, never silently billed at
 	// the MIN (cheaper) rate.
 	AmbiguousBaseEvents int64
+	// AmbiguousOrgEvents counts events under rollups carrying >1 distinct non-NULL
+	// org_id — an E2 attribution propagation bug (one resource resolving to two orgs in
+	// a window). Those rollups are excluded from the upsert and screamed about, never
+	// billed to a guessed org. A partial-NULL org (real org + missing-header rows) is
+	// NOT ambiguous and does not count here.
+	AmbiguousOrgEvents int64
 }
 
 // Anomalies are the fail-loud counts for a window: events that could not be priced
@@ -71,6 +77,7 @@ type Anomalies struct {
 	UnpricedEvents       int64
 	UnattributableEvents int64
 	AmbiguousBaseEvents  int64
+	AmbiguousOrgEvents   int64
 }
 
 // PostgresStore reads billing_event and writes rated_usage in the shared Atlas
@@ -218,11 +225,19 @@ const rateWindowSQL = `
 WITH ev AS (
     SELECT
         auth_id,
-        -- resource_id: the deployment id (E2 customer attribution — billing resolves
-        -- the org via resource_id→org_id). It is part of the rated_usage grain: a NULL
-        -- resource_id row CANNOT name its deployment/org, so it is unattributable
-        -- (counted, never billed to a NULL org) — see the unattributable filter below.
+        -- resource_id: the deployment id (E2 customer attribution — the owning org is
+        -- captured at meter time into org_id; see that column below, no push-time join).
+        -- It is part of the rated_usage grain: a NULL resource_id row CANNOT name its
+        -- deployment/org, so it is unattributable (counted, never billed to a NULL org) —
+        -- see the unattributable filter below.
         resource_id,
+        -- org_id: the deployment-owning org (E2 attribution), captured at meter time
+        -- from X-Saturn-Org-Id. Carried onto the rollup so push reads org off the row
+        -- (no resource_name join). NULL when the producer header was absent — carried
+        -- through and surfaced (a NULL-org rollup is held at push, never billed to a
+        -- guessed org); it does NOT enter the rollup grain (org is a function of
+        -- resource_id, so it must not split a rollup).
+        org_id,
         -- billing_event stores the engine-reported model NAME in its model column;
         -- that name IS phoebe's stable price key, model_id. A NULL model is
         -- unattributable.
@@ -242,6 +257,7 @@ resolved AS (
     SELECT
         ev.auth_id,
         ev.resource_id,
+        ev.org_id,
         ev.model_id,
         ev.base_model,
         ev.ev_ts,
@@ -312,10 +328,27 @@ grouped AS (
         MIN(cached_price)                                AS applied_cached_rate,
         MIN(completion_price)                            AS applied_completion_rate,
         COUNT(*)::bigint                                 AS event_count,
+        -- org_id carried onto the rollup via MAX (NOT a GROUP BY key — org is a function
+        -- of resource_id, so it must never split a rollup). MAX ignores NULLs, so a
+        -- deployment that metered some events before its org header was wired and some
+        -- after collapses to the one non-NULL org (a partial-NULL is NOT ambiguity). The
+        -- result is NULL only if EVERY event in the rollup lacked org — then push holds
+        -- + screams the rollup, never bills a guessed org. The ambiguous_org guard below
+        -- guarantees MAX is not silently masking a SECOND, distinct non-NULL org.
+        MAX(org_id)                                      AS org_id,
         -- > 1 distinct base_model among the DERIVED-priced rows → ambiguous (the E3
         -- ft-uniqueness violation). DERIVED rows only: a direct-priced row's base_model
         -- never affects its rate, so it must not trip the gate.
-        COUNT(DISTINCT base_model) FILTER (WHERE via_derived) > 1 AS ambiguous_base
+        COUNT(DISTINCT base_model) FILTER (WHERE via_derived) > 1 AS ambiguous_base,
+        -- > 1 distinct NON-NULL org_id for one (auth, resource, model, hour) rollup →
+        -- ambiguous org. Org is a deployment property, so a resource resolving to two
+        -- distinct orgs in one window is an attribution PROPAGATION bug (Atlas injected
+        -- conflicting org labels). A blind MAX(org_id) would silently bill the whole
+        -- rollup to ONE of them — mis-attribution counted as rated. So ambiguous-org
+        -- rollups are split out (counted as an anomaly, never upserted), exactly like
+        -- ambiguous_base. A partial-NULL (one real org + missing-header rows) is NOT
+        -- ambiguous (DISTINCT over non-NULLs is 1).
+        COUNT(DISTINCT org_id) > 1 AS ambiguous_org
     FROM resolved
     WHERE prompt_price IS NOT NULL          -- priced only
       AND auth_id     IS NOT NULL           -- attributable only
@@ -327,7 +360,7 @@ grouped AS (
     GROUP BY auth_id, resource_id, model_id, date_trunc('hour', ev_ts AT TIME ZONE 'UTC') AT TIME ZONE 'UTC'
 ),
 priced AS (
-    SELECT * FROM grouped WHERE NOT ambiguous_base
+    SELECT * FROM grouped WHERE NOT ambiguous_base AND NOT ambiguous_org
 ),
 -- RECONCILE (re-rate deletes superseded rollups): a rated_usage row whose
 -- (auth_id, resource_id, model_id, window_start) falls IN this run's window but is
@@ -360,7 +393,7 @@ deleted AS (
 ),
 upserted AS (
     INSERT INTO rated_usage (
-        id, auth_id, resource_id, model_id, window_start, window_end,
+        id, auth_id, resource_id, org_id, model_id, window_start, window_end,
         prompt_tokens, cached_tokens, completion_tokens, billable_prompt_tokens,
         cost, applied_prompt_rate, applied_cached_rate, applied_completion_rate,
         event_count
@@ -378,7 +411,10 @@ upserted AS (
           || '|' || length(resource_id)::text || ':' || resource_id
           || '|' || length(model_id)::text || ':' || model_id
           || '|' || extract(epoch FROM window_start)::bigint::text),
-        auth_id, resource_id, model_id, window_start, window_end,
+        -- org_id is NOT part of the md5 natural key (the key is auth/resource/model/
+        -- window): org is DERIVED from resource_id, so a NULL→value org transition must
+        -- NOT mint a new id and double-write. It is carried as a data column only.
+        auth_id, resource_id, org_id, model_id, window_start, window_end,
         prompt_tokens, cached_tokens, completion_tokens, billable_prompt_tokens,
         cost, applied_prompt_rate, applied_cached_rate, applied_completion_rate,
         event_count
@@ -392,6 +428,17 @@ upserted AS (
     -- added here. See cmd/rater's package doc for the single-flight contract.
     ORDER BY auth_id, resource_id, model_id, window_start
     ON CONFLICT (auth_id, resource_id, model_id, window_start) DO UPDATE SET
+        -- Refresh org_id on re-rate, but NEVER erase a known org: COALESCE prefers the
+        -- new snapshot's org and FALLS BACK to the existing row's org when the new one is
+        -- NULL. So a rollup first written with a NULL org (header not yet wired) picks up
+        -- the real org on a later re-rate (NULL -> real, convergence), but a re-rate over
+        -- a window whose snapshot has since LOST its org headers (e.g. a forced replay
+        -- from a stale billing_event range) can NOT overwrite a prior good org with NULL
+        -- (real -> NULL would silently un-attribute already-billed usage). The only
+        -- legitimate "org changed" case (real A -> real B for one resource) is NOT a
+        -- silent re-rate flip: it is a distinct-org collision the ambiguous_org guard
+        -- above already withholds + screams, so it never reaches this UPDATE.
+        org_id                  = COALESCE(EXCLUDED.org_id, rated_usage.org_id),
         window_end              = EXCLUDED.window_end,
         prompt_tokens           = EXCLUDED.prompt_tokens,
         cached_tokens           = EXCLUDED.cached_tokens,
@@ -415,8 +462,10 @@ SELECT
     (SELECT COUNT(*)::bigint FROM deleted)                       AS reconciled_deletions,
     -- Anomaly counts from the SAME snapshot as the upsert. An unattributable row is
     -- counted ONLY as unattributable (the more specific signal), never also as
-    -- unpriced, so the counts partition the in-window rows:
-    --   events_rated + unpriced + unattributable + ambiguous_base == total in-window events.
+    -- unpriced; likewise an ambiguous_org rollup that is ALSO ambiguous_base is counted
+    -- ONLY as ambiguous_base. So the counts strictly PARTITION the in-window rows:
+    --   events_rated + unpriced + unattributable + ambiguous_base + ambiguous_org
+    --     == total in-window events.
     -- The unpriced count requires FULL attribution (auth_id, resource_id, model_id all
     -- NON-NULL) for exactly this exclusivity: a NULL-resource_id row that is also
     -- unpriced must be counted ONLY as unattributable, never double-counted here.
@@ -434,7 +483,21 @@ SELECT
     -- SAME snapshot, and drive the fail-loud exit. SUM(event_count) (not COUNT(*) of
     -- rollups) so the partition identity above stays in EVENT units.
     (SELECT COALESCE(SUM(event_count), 0)::bigint FROM grouped
-      WHERE ambiguous_base)                                  AS ambiguous_base_events`
+      WHERE ambiguous_base)                                  AS ambiguous_base_events,
+    -- AMBIGUOUS-ORG events: the EVENT count under rollups carrying >1 distinct non-NULL
+    -- org_id (an E2 attribution propagation bug — one resource resolving to two orgs in
+    -- a window). Excluded from priced (NOT billed to a guessed org), counted here from
+    -- the same snapshot to drive the fail-loud exit. Same EVENT-unit convention as
+    -- ambiguous_base. EXCLUSIVE of ambiguous_base (AND NOT ambiguous_base) so the
+    -- anomaly counts stay a strict PARTITION: a rollup that is BOTH base- and
+    -- org-ambiguous is counted ONLY as ambiguous_base (the more specific E3 signal),
+    -- exactly as unattributable takes precedence over unpriced above. So
+    --   events_rated + unpriced + unattributable + ambiguous_base + ambiguous_org
+    --     == total in-window events
+    -- holds with no double-count. Both still drive exit-nonzero, so precedence changes
+    -- only which bucket reports the overlap, never whether it screams.
+    (SELECT COALESCE(SUM(event_count), 0)::bigint FROM grouped
+      WHERE ambiguous_org AND NOT ambiguous_base)           AS ambiguous_org_events`
 
 // RateWindow runs the price-projection + the single resolve→sum→upsert→count
 // statement for [start, end) in ONE transaction, and reports the rollups written,
@@ -479,7 +542,8 @@ func (s *PostgresStore) RateWindow(ctx context.Context, book *PriceBook, start, 
 	var total string
 	err = tx.QueryRowContext(ctx, rateWindowSQL, start.UTC(), end.UTC(), ftLikePattern).
 		Scan(&res.RollupsWritten, &res.EventsRated, &total, &res.ReconciledDeletions,
-			&res.UnpricedEvents, &res.UnattributableEvents, &res.AmbiguousBaseEvents)
+			&res.UnpricedEvents, &res.UnattributableEvents, &res.AmbiguousBaseEvents,
+			&res.AmbiguousOrgEvents)
 	if err != nil {
 		return RateResult{}, fmt.Errorf("rating: rate window [%s,%s): %w",
 			start.UTC().Format(time.RFC3339), end.UTC().Format(time.RFC3339), err)

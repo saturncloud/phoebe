@@ -18,9 +18,10 @@ import (
 
 func quietLog() *logging.Logger { return logging.New(logging.ERROR) }
 
-// snapshotCols is the column set snapshotQuery returns, in order.
+// snapshotCols is the column set snapshotQuery returns, in order. org_id is read
+// directly off rated_usage (captured at meter time), right after resource_id.
 var snapshotCols = []string{
-	"id", "resource_id", "model_id", "org_id",
+	"id", "resource_id", "org_id", "model_id",
 	"cost", "applied_prompt_rate", "applied_cached_rate", "applied_completion_rate",
 	"prompt_tokens", "cached_tokens", "completion_tokens", "billable_prompt_tokens",
 }
@@ -37,17 +38,32 @@ func newMockPusher(t *testing.T) (*pusher, sqlmock.Sqlmock) {
 
 var win = time.Date(2026, 6, 16, 14, 0, 0, 0, time.UTC)
 
-// TestBuildSnapshot_ResolvesOrgAndShape (token-push-snapshot-shape): a resolved row
-// becomes a wire rollup with org_id attached, money carried as exact-decimal strings,
-// and rev=0.
-func TestBuildSnapshot_ResolvesOrgAndShape(t *testing.T) {
+// TestSnapshotQuery_NoResourceNameJoin pins the load-bearing invariant of this change as
+// an ASSERTION, not just a comment: org_id is read off the rollup, so snapshotQuery must
+// NOT join the Atlas-owned resource_name table (the deleted push-time reconstruction that
+// raced deployment teardown). A future refactor re-adding `LEFT JOIN resource_name` would
+// pass the `FROM rated_usage ru` mock regex; this catches it directly.
+func TestSnapshotQuery_NoResourceNameJoin(t *testing.T) {
+	if strings.Contains(snapshotQuery, "resource_name") {
+		t.Fatalf("snapshotQuery references resource_name — the push-time org join must stay deleted (org rides the rollup): %s", snapshotQuery)
+	}
+	if !strings.Contains(snapshotQuery, "ru.org_id") {
+		t.Fatalf("snapshotQuery must read org_id off rated_usage (ru.org_id): %s", snapshotQuery)
+	}
+}
+
+// TestBuildSnapshot_CarriesOrgAndShape (token-push-snapshot-shape): a row carrying its
+// org_id (captured at meter time, read straight off rated_usage — no resolve step) becomes
+// a wire rollup with org_id attached, money carried as exact-decimal strings, and rev=0.
+func TestBuildSnapshot_CarriesOrgAndShape(t *testing.T) {
 	p, mock := newMockPusher(t)
 	rows := sqlmock.NewRows(snapshotCols).AddRow(
-		"rated-id-1", "res-deploy-1", "meta-llama/Llama-3.1-8B-Instruct", "org-acme",
+		"rated-id-1", "res-deploy-1", "org-acme", "meta-llama/Llama-3.1-8B-Instruct",
 		"0.001234500", "0.000000150", "0.000000075", "0.000000600",
 		int64(8000), int64(2000), int64(500), int64(6000),
 	)
-	mock.ExpectQuery(`SELECT.*FROM rated_usage ru.*LEFT JOIN resource_name`).
+	// No resource_name join — org rides the rollup.
+	mock.ExpectQuery(`SELECT.*FROM rated_usage ru`).
 		WithArgs(win).WillReturnRows(rows)
 
 	snap, unattributable, err := p.buildSnapshot(context.Background(), win)
@@ -79,16 +95,16 @@ func TestBuildSnapshot_ResolvesOrgAndShape(t *testing.T) {
 }
 
 // TestBuildSnapshot_UnattributableOmitted (token-push-unattributable-omitted): a row
-// whose resource_id resolves to NO org (NULL org_id from the LEFT JOIN) is OMITTED from
-// the snapshot and counted — never pushed with a guessed/empty org (C2/C7).
+// carrying a NULL org_id (Atlas didn't inject X-Saturn-Org-Id, or propagation broke) is
+// OMITTED from the snapshot and counted — never pushed with a guessed/empty org (C2/C7).
 func TestBuildSnapshot_UnattributableOmitted(t *testing.T) {
 	p, mock := newMockPusher(t)
 	rows := sqlmock.NewRows(snapshotCols).
-		AddRow("rated-ok", "res-1", "m", "org-acme",
+		AddRow("rated-ok", "res-1", "org-acme", "m",
 									"0.001", "0.1", "0.05", "0.6", int64(1), int64(0), int64(1), int64(1)).
-		AddRow("rated-orphan", "res-vanished", "m", nil, // NULL org_id
+		AddRow("rated-orphan", "res-vanished", nil, "m", // NULL org_id
 			"0.002", "0.1", "0.05", "0.6", int64(1), int64(0), int64(1), int64(1))
-	mock.ExpectQuery(`FROM rated_usage ru.*LEFT JOIN resource_name`).
+	mock.ExpectQuery(`FROM rated_usage ru`).
 		WithArgs(win).WillReturnRows(rows)
 
 	snap, unattributable, err := p.buildSnapshot(context.Background(), win)
@@ -99,7 +115,31 @@ func TestBuildSnapshot_UnattributableOmitted(t *testing.T) {
 		t.Fatalf("unattributable = %d, want 1", unattributable)
 	}
 	if len(snap.Rollups) != 1 || snap.Rollups[0].RatedUsageID != "rated-ok" {
-		t.Fatalf("orphan row was not omitted: %+v", snap.Rollups)
+		t.Fatalf("unattributable row was not omitted: %+v", snap.Rollups)
+	}
+}
+
+// TestBuildSnapshot_EmptyStringOrgIsOmitted pins the `orgID.String == ""` arm of the
+// omit guard (defense in depth). The drainer's nullStr() writes ""→NULL, so a literal
+// empty-string org should never reach the column — but if a direct backfill or a future
+// producer ever wrote ”, billing it to a blank org would violate C2/C7. A non-NULL
+// empty-string org_id must be treated exactly like NULL: omitted + counted, never pushed.
+func TestBuildSnapshot_EmptyStringOrgIsOmitted(t *testing.T) {
+	p, mock := newMockPusher(t)
+	rows := sqlmock.NewRows(snapshotCols).
+		AddRow("rated-blank", "res-1", "", "m", // non-NULL EMPTY-STRING org_id
+			"0.001", "0.1", "0.05", "0.6", int64(1), int64(0), int64(1), int64(1))
+	mock.ExpectQuery(`FROM rated_usage ru`).WithArgs(win).WillReturnRows(rows)
+
+	snap, unattributable, err := p.buildSnapshot(context.Background(), win)
+	if err != nil {
+		t.Fatalf("buildSnapshot: %v", err)
+	}
+	if unattributable != 1 {
+		t.Fatalf("unattributable = %d, want 1 (empty-string org must be omitted like NULL)", unattributable)
+	}
+	if len(snap.Rollups) != 0 {
+		t.Fatalf("empty-string-org row was pushed: %+v (must never bill a blank org)", snap.Rollups)
 	}
 }
 
@@ -200,8 +240,8 @@ func TestPushWindows_WithholdsWindowWithUnattributable(t *testing.T) {
 	p.managerURL = srv.URL
 	p.token = "t"
 	rows := sqlmock.NewRows(snapshotCols).
-		AddRow("ok", "res-1", "m", "org-acme", "0.001", "0.1", "0.05", "0.6", int64(1), int64(0), int64(1), int64(1)).
-		AddRow("orphan", "res-x", "m", nil, "0.002", "0.1", "0.05", "0.6", int64(1), int64(0), int64(1), int64(1))
+		AddRow("ok", "res-1", "org-acme", "m", "0.001", "0.1", "0.05", "0.6", int64(1), int64(0), int64(1), int64(1)).
+		AddRow("orphan", "res-x", nil, "m", "0.002", "0.1", "0.05", "0.6", int64(1), int64(0), int64(1), int64(1))
 	expectLiveness(mock, true)
 	mock.ExpectQuery(`FROM rated_usage ru`).WithArgs(win).WillReturnRows(rows)
 
@@ -238,10 +278,10 @@ func TestPushWindows_WithheldWindowDoesNotBlockCleanWindow(t *testing.T) {
 	expectLiveness(mock, true)
 	mock.ExpectQuery(`FROM rated_usage ru`).WithArgs(win).WillReturnRows(
 		sqlmock.NewRows(snapshotCols).
-			AddRow("orphan", "res-x", "m", nil, "0.002", "0.1", "0.05", "0.6", int64(1), int64(0), int64(1), int64(1)))
+			AddRow("orphan", "res-x", nil, "m", "0.002", "0.1", "0.05", "0.6", int64(1), int64(0), int64(1), int64(1)))
 	mock.ExpectQuery(`FROM rated_usage ru`).WithArgs(win2).WillReturnRows(
 		sqlmock.NewRows(snapshotCols).
-			AddRow("ok", "res-1", "m", "org-acme", "0.001", "0.1", "0.05", "0.6", int64(1), int64(0), int64(1), int64(1)))
+			AddRow("ok", "res-1", "org-acme", "m", "0.001", "0.1", "0.05", "0.6", int64(1), int64(0), int64(1), int64(1)))
 
 	code := p.pushWindows(context.Background(), []time.Time{win, win2})
 	if code != exitUnattrib {
@@ -271,7 +311,7 @@ func TestPushWindows_FatalOnPostError(t *testing.T) {
 	expectLiveness(mock, true)
 	mock.ExpectQuery(`FROM rated_usage ru`).WithArgs(win).
 		WillReturnRows(sqlmock.NewRows(snapshotCols).
-			AddRow("ok", "res-1", "m", "org-acme", "0.001", "0.1", "0.05", "0.6", int64(1), int64(0), int64(1), int64(1)))
+			AddRow("ok", "res-1", "org-acme", "m", "0.001", "0.1", "0.05", "0.6", int64(1), int64(0), int64(1), int64(1)))
 
 	code := p.pushWindows(context.Background(), []time.Time{win})
 	if code != exitFatal {
@@ -321,10 +361,10 @@ func TestPushWindows_FatalDominatesWithheld(t *testing.T) {
 	// win: orphan -> withheld (no POST). win2: clean -> POST fails (fatal).
 	mock.ExpectQuery(`FROM rated_usage ru`).WithArgs(win).WillReturnRows(
 		sqlmock.NewRows(snapshotCols).
-			AddRow("orphan", "res-x", "m", nil, "0.002", "0.1", "0.05", "0.6", int64(1), int64(0), int64(1), int64(1)))
+			AddRow("orphan", "res-x", nil, "m", "0.002", "0.1", "0.05", "0.6", int64(1), int64(0), int64(1), int64(1)))
 	mock.ExpectQuery(`FROM rated_usage ru`).WithArgs(win2).WillReturnRows(
 		sqlmock.NewRows(snapshotCols).
-			AddRow("ok", "res-1", "m", "org-acme", "0.001", "0.1", "0.05", "0.6", int64(1), int64(0), int64(1), int64(1)))
+			AddRow("ok", "res-1", "org-acme", "m", "0.001", "0.1", "0.05", "0.6", int64(1), int64(0), int64(1), int64(1)))
 
 	code := p.pushWindows(context.Background(), []time.Time{win, win2})
 	if code != exitFatal {

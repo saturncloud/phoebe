@@ -78,6 +78,7 @@ const (
 	testResourceID = "deploy-abc123"
 	testModelName  = "llama-3-8b"
 	testAuthID     = "auth-key-e2e"
+	testOrgID      = "org-e2e"
 
 	streamName = "phoebe:metering:e2e"
 )
@@ -377,6 +378,7 @@ func TestE2E_StreamedRequestBecomesMoney(t *testing.T) {
 	req.Header.Set(identity.HeaderResourceType, "deployment")
 	req.Header.Set(identity.HeaderUserID, "user-e2e")
 	req.Header.Set(identity.HeaderGroupID, "group-e2e")
+	req.Header.Set(identity.HeaderOrgID, testOrgID)
 	srv.Handler().ServeHTTP(rr, req)
 
 	if rr.Code != http.StatusOK {
@@ -398,6 +400,7 @@ func TestE2E_StreamedRequestBecomesMoney(t *testing.T) {
 	var (
 		nRows                         int
 		requestID, authID, resourceID string
+		beOrgID                       sql.NullString // billing_event.org_id (nullable) — asserted at the drain layer
 		model                         sql.NullString
 		prompt, cached, completion    int
 		aborted                       bool
@@ -409,9 +412,9 @@ func TestE2E_StreamedRequestBecomesMoney(t *testing.T) {
 		t.Fatalf("billing_event rows = %d, want exactly 1", nRows)
 	}
 	if err := h.db.QueryRow(
-		`SELECT request_id, auth_id, resource_id, model, prompt_tokens, cached_tokens, completion_tokens, aborted
+		`SELECT request_id, auth_id, resource_id, org_id, model, prompt_tokens, cached_tokens, completion_tokens, aborted
 		 FROM billing_event`).
-		Scan(&requestID, &authID, &resourceID, &model, &prompt, &cached, &completion, &aborted); err != nil {
+		Scan(&requestID, &authID, &resourceID, &beOrgID, &model, &prompt, &cached, &completion, &aborted); err != nil {
 		t.Fatalf("read billing_event: %v", err)
 	}
 
@@ -433,6 +436,11 @@ func TestE2E_StreamedRequestBecomesMoney(t *testing.T) {
 	}
 	if resourceID != testResourceID {
 		t.Errorf("billing_event.resource_id = %q, want %q", resourceID, testResourceID)
+	}
+	// ORG captured at the DRAIN layer (not only transitively via rated_usage): a drainer
+	// regression that drops org to NULL is caught HERE, at the layer that produced it.
+	if !beOrgID.Valid || beOrgID.String != testOrgID {
+		t.Errorf("billing_event.org_id = %v, want %q (captured from X-Saturn-Org-Id at meter time)", beOrgID, testOrgID)
 	}
 	if authID != testAuthID {
 		t.Errorf("billing_event.auth_id = %q, want %q", authID, testAuthID)
@@ -470,6 +478,7 @@ func TestE2E_StreamedRequestBecomesMoney(t *testing.T) {
 	var (
 		nRollups                                     int
 		ruAuthID, ruResourceID, ruModelID, cost      string
+		ruOrgID                                      sql.NullString // nullable column; a NULL must surface as a clear assertion, not a scan error
 		ruPrompt, ruCached, ruCompletion, ruBillable int64
 		eventCount                                   int64 // BIGINT column
 	)
@@ -480,9 +489,9 @@ func TestE2E_StreamedRequestBecomesMoney(t *testing.T) {
 		t.Fatalf("rated_usage rows = %d, want exactly 1", nRollups)
 	}
 	if err := h.db.QueryRow(
-		`SELECT auth_id, resource_id, model_id, prompt_tokens, cached_tokens, completion_tokens, billable_prompt_tokens, cost::text, event_count
+		`SELECT auth_id, resource_id, org_id, model_id, prompt_tokens, cached_tokens, completion_tokens, billable_prompt_tokens, cost::text, event_count
 		 FROM rated_usage`).
-		Scan(&ruAuthID, &ruResourceID, &ruModelID, &ruPrompt, &ruCached, &ruCompletion, &ruBillable, &cost, &eventCount); err != nil {
+		Scan(&ruAuthID, &ruResourceID, &ruOrgID, &ruModelID, &ruPrompt, &ruCached, &ruCompletion, &ruBillable, &cost, &eventCount); err != nil {
 		t.Fatalf("read rated_usage: %v", err)
 	}
 	if ruAuthID != testAuthID {
@@ -493,6 +502,13 @@ func TestE2E_StreamedRequestBecomesMoney(t *testing.T) {
 	// the rated_usage grain — this is the key billing resolves the org from.
 	if ruResourceID != testResourceID {
 		t.Errorf("rated_usage.resource_id = %q, want %q (the X-Saturn-Resource-Id header value, for E2 org attribution)", ruResourceID, testResourceID)
+	}
+	// E2 org attribution, end-to-end: the deployment-owning org (X-Saturn-Org-Id) is
+	// CAPTURED at the proxy and carried through billing_event into the rated_usage rollup
+	// — the whole point of this change (org rides the request, not a push-time
+	// resource_name join). This is the composed-path assertion for the header→rollup carry.
+	if !ruOrgID.Valid || ruOrgID.String != testOrgID {
+		t.Errorf("rated_usage.org_id = %v, want %q (the X-Saturn-Org-Id header value, carried meter→rate)", ruOrgID, testOrgID)
 	}
 	// THE deployment-id-bug guard, at the far end of the pipe: the money is
 	// keyed on the engine name the upstream reported, not the id we routed on.

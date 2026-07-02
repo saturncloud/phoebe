@@ -10,6 +10,32 @@ import (
 	"github.com/saturncloud/phoebe/internal/logging"
 )
 
+// TestResult_HasAmbiguousOrgDrivesAnomaly locks the exit-2 contract for the new E2
+// attribution anomaly by name (mirroring the HasAmbiguousBase/HasUnpriced predicate
+// assertions): a Result carrying ambiguous-org events must report HasAmbiguousOrg AND
+// HasAnomaly (so cmd/rater exits non-zero and the CronJob alerts), and a clean Result
+// must report neither. This pins the HasAmbiguousOrg disjunct in HasAnomaly() — a
+// refactor that drops it would let an ambiguous-org-only window exit 0 (mis-attributable
+// metered usage passing silently), which this test turns RED. The org anomaly is
+// otherwise reachable only via live Postgres (the oracle store can't model org), so this
+// pure-Go predicate test is the cheapest guard on the loud-path wiring.
+func TestResult_HasAmbiguousOrgDrivesAnomaly(t *testing.T) {
+	ambiguous := Result{AmbiguousOrgEvents: 1}
+	if !ambiguous.HasAmbiguousOrg() {
+		t.Fatal("HasAmbiguousOrg() = false with AmbiguousOrgEvents=1, want true")
+	}
+	if !ambiguous.HasAnomaly() {
+		t.Fatal("HasAnomaly() = false for an ambiguous-org Result, want true (must drive exit-nonzero)")
+	}
+	clean := Result{}
+	if clean.HasAmbiguousOrg() {
+		t.Fatal("HasAmbiguousOrg() = true for a zero Result, want false")
+	}
+	if clean.HasAnomaly() {
+		t.Fatal("HasAnomaly() = true for a zero Result, want false (no anomaly, no exit-nonzero)")
+	}
+}
+
 // oracleStore is an in-memory Store that models EXACTLY what the SQL rater does,
 // using the production PriceBook (PriceBook.Resolve) + the Rate() oracle. It exists
 // so the Rater orchestration AND the money rules can be exercised without Postgres,
@@ -160,6 +186,13 @@ func (s *oracleStore) RateWindow(_ context.Context, _ *PriceBook, start, end tim
 		UnpricedEvents:       an.UnpricedEvents,
 		UnattributableEvents: an.UnattributableEvents,
 		AmbiguousBaseEvents:  an.AmbiguousBaseEvents,
+		// The oracle does NOT model org attribution: RatedEvent has no OrgID (org doesn't
+		// affect the money rules the oracle exists to mirror — it's carried, not priced).
+		// So AmbiguousOrgEvents is always 0 here, set EXPLICITLY (not left as a zero-value
+		// gap) so this struct is field-complete vs the production RateResult and the
+		// partition sum is honest. The ambiguous_org / partial-NULL SQL behaviors are
+		// covered by the live-Postgres TestIntegration_AmbiguousOrgFailsLoud instead.
+		AmbiguousOrgEvents: 0,
 	}
 	if len(rollups) > 0 {
 		res.TotalCost = total.String()
@@ -665,7 +698,8 @@ func TestRater_DistinctDeploymentsBillSeparately(t *testing.T) {
 // NULL resource_id CANNOT name its deployment/org (E2 resolves the org via
 // resource_id→org_id), so it must be counted UNATTRIBUTABLE and EXCLUDED from billing —
 // never $0-billed, never billed to a NULL org. It pins the partition invariant with
-// resource_id in the mix: rated + unpriced + unattributable + ambiguous == total.
+// resource_id in the mix: rated + unpriced + unattributable + ambiguous_base +
+// ambiguous_org == total (the oracle sets ambiguous_org to 0; it's a true partition cell).
 func TestRater_NullResourceIdIsUnattributable(t *testing.T) {
 	at := mustTime("2026-06-08T10:15:00Z")
 	events := []RatedEvent{
@@ -694,9 +728,9 @@ func TestRater_NullResourceIdIsUnattributable(t *testing.T) {
 		t.Fatal("HasUnattributable/HasAnomaly = false, want true (NULL resource_id must drive exit-nonzero)")
 	}
 	// PARTITION with resource_id in the mix.
-	if got := res.EventsRated + res.UnpricedEvents + res.UnattributableEvents + res.AmbiguousBaseEvents; got != int64(len(events)) {
-		t.Fatalf("rated(%d)+unpriced(%d)+unattr(%d)+ambiguous(%d) = %d, want %d",
-			res.EventsRated, res.UnpricedEvents, res.UnattributableEvents, res.AmbiguousBaseEvents, got, len(events))
+	if got := res.EventsRated + res.UnpricedEvents + res.UnattributableEvents + res.AmbiguousBaseEvents + res.AmbiguousOrgEvents; got != int64(len(events)) {
+		t.Fatalf("rated(%d)+unpriced(%d)+unattr(%d)+ambiguous_base(%d)+ambiguous_org(%d) = %d, want %d",
+			res.EventsRated, res.UnpricedEvents, res.UnattributableEvents, res.AmbiguousBaseEvents, res.AmbiguousOrgEvents, got, len(events))
 	}
 }
 
@@ -849,10 +883,11 @@ func TestRater_FineTuneAmbiguousBaseModelFailsLoud(t *testing.T) {
 			t.Fatal("a rollup exists for the ambiguous ft: id — it must NOT be billed (silent MIN-rate under-charge)")
 		}
 	}
-	// SINGLE-SNAPSHOT PARTITION: rated + unpriced + unattributable + ambiguous == total.
-	if got := res.EventsRated + res.UnpricedEvents + res.UnattributableEvents + res.AmbiguousBaseEvents; got != int64(len(events)) {
-		t.Fatalf("rated(%d)+unpriced(%d)+unattr(%d)+ambiguous(%d) = %d, want %d",
-			res.EventsRated, res.UnpricedEvents, res.UnattributableEvents, res.AmbiguousBaseEvents, got, len(events))
+	// SINGLE-SNAPSHOT PARTITION: rated + unpriced + unattributable + ambiguous_base +
+	// ambiguous_org == total (org bucket is 0 in the oracle; still a true partition cell).
+	if got := res.EventsRated + res.UnpricedEvents + res.UnattributableEvents + res.AmbiguousBaseEvents + res.AmbiguousOrgEvents; got != int64(len(events)) {
+		t.Fatalf("rated(%d)+unpriced(%d)+unattr(%d)+ambiguous_base(%d)+ambiguous_org(%d) = %d, want %d",
+			res.EventsRated, res.UnpricedEvents, res.UnattributableEvents, res.AmbiguousBaseEvents, res.AmbiguousOrgEvents, got, len(events))
 	}
 }
 
@@ -988,11 +1023,15 @@ func TestOracleModel_SelfConsistent(t *testing.T) {
 	if res.UnpricedEvents != 1 || res.UnattributableEvents != 1 {
 		t.Fatalf("anomalies = unpriced %d / unattr %d, want 1/1", res.UnpricedEvents, res.UnattributableEvents)
 	}
-	// SINGLE-SNAPSHOT ACCOUNTING INVARIANT: rated + unpriced + unattributable must
-	// PARTITION the in-window events.
-	if got := res.EventsRated + res.UnpricedEvents + res.UnattributableEvents; got != int64(len(events)) {
-		t.Fatalf("rated(%d) + unpriced(%d) + unattributable(%d) = %d, want %d",
-			res.EventsRated, res.UnpricedEvents, res.UnattributableEvents, got, len(events))
+	// SINGLE-SNAPSHOT ACCOUNTING INVARIANT: the FULL 5-bucket partition must account for
+	// every in-window event (the ambiguous buckets are 0 in this fixture, but naming all
+	// five keeps the invariant honest — a regression that leaks into an ambiguous bucket
+	// would break the sum instead of passing coincidentally).
+	if got := res.EventsRated + res.UnpricedEvents + res.UnattributableEvents +
+		res.AmbiguousBaseEvents + res.AmbiguousOrgEvents; got != int64(len(events)) {
+		t.Fatalf("rated(%d)+unpriced(%d)+unattr(%d)+ambiguous_base(%d)+ambiguous_org(%d) = %d, want %d",
+			res.EventsRated, res.UnpricedEvents, res.UnattributableEvents,
+			res.AmbiguousBaseEvents, res.AmbiguousOrgEvents, got, len(events))
 	}
 	if res.RollupsWritten != int64(len(want)) {
 		t.Fatalf("rollups = %d, want %d", res.RollupsWritten, len(want))

@@ -45,6 +45,7 @@ type Result struct {
 	UnpricedEvents       int64  // events whose model had NO resolvable price (NOT $0-billed)
 	UnattributableEvents int64  // in-window rows with NULL auth_id/resource_id/model_id (upstream leak)
 	AmbiguousBaseEvents  int64  // events under an ft: rollup spanning >1 base_model (E3 violation)
+	AmbiguousOrgEvents   int64  // events under a rollup spanning >1 non-NULL org_id (E2 attribution bug)
 	RollupsWritten       int64  // distinct (auth_id, resource_id, model_id, hour) rows upserted
 	ReconciledDeletions  int64  // stale in-window rollups DELETED because this re-run no longer produces them
 	TotalCost            string // sum of all rollup costs, NUMERIC as text
@@ -67,12 +68,19 @@ func (r Result) HasUnattributable() bool { return r.UnattributableEvents > 0 }
 // exit-nonzero, like the other anomalies.
 func (r Result) HasAmbiguousBase() bool { return r.AmbiguousBaseEvents > 0 }
 
+// HasAmbiguousOrg reports whether any rollup spanned more than one distinct non-NULL
+// org_id in a window — an E2 attribution propagation bug (one resource resolving to two
+// orgs). The rollup is NOT billed (it would silently mis-attribute to one org), it
+// screams. Loud, exit-nonzero, like the other anomalies. A partial-NULL org (real org +
+// missing-header rows) is NOT ambiguous and never trips this.
+func (r Result) HasAmbiguousOrg() bool { return r.AmbiguousOrgEvents > 0 }
+
 // HasAnomaly reports whether the run rated cleanly but something leaked: events that
-// could not be priced, rows that could not be attributed, OR an ft: rollup spanning
-// multiple base_models. All are the same class of fail-loud signal, so cmd/rater exits
-// non-zero on any of them.
+// could not be priced, rows that could not be attributed, an ft: rollup spanning
+// multiple base_models, OR a rollup spanning multiple orgs. All are the same class of
+// fail-loud signal, so cmd/rater exits non-zero on any of them.
 func (r Result) HasAnomaly() bool {
-	return r.HasUnpriced() || r.HasUnattributable() || r.HasAmbiguousBase()
+	return r.HasUnpriced() || r.HasUnattributable() || r.HasAmbiguousBase() || r.HasAmbiguousOrg()
 }
 
 // Run rates [windowStart, windowEnd): it runs the SINGLE SQL statement that
@@ -127,10 +135,15 @@ func (r *Rater) Run(ctx context.Context, windowStart, windowEnd time.Time, windo
 	res.UnpricedEvents = rr.UnpricedEvents
 	res.UnattributableEvents = rr.UnattributableEvents
 	res.AmbiguousBaseEvents = rr.AmbiguousBaseEvents
+	res.AmbiguousOrgEvents = rr.AmbiguousOrgEvents
 
 	if res.HasAmbiguousBase() {
 		r.log.Error.Printf("rating: window [%s,%s) has %d events under AMBIGUOUS-BASE rollups (a single ft: model_id resolved through MORE THAN ONE base_model in a window) — E3 mints ft:<checkpoint_artifact_id> as a globally-unique uuid4, so this is a base_model PROPAGATION/UNIQUENESS violation, NOT a priceable rollup; these rollups are NOT billed (billing the MIN rate would silently under-charge). Fix base_model propagation and re-rate this window",
 			windowStart.Format(time.RFC3339), windowEnd.Format(time.RFC3339), res.AmbiguousBaseEvents)
+	}
+	if res.HasAmbiguousOrg() {
+		r.log.Error.Printf("rating: window [%s,%s) has %d events under AMBIGUOUS-ORG rollups (a single (auth, resource, model, hour) rollup carried MORE THAN ONE distinct non-NULL org_id) — a deployment owns exactly one org, so this is an E2 attribution PROPAGATION bug (Atlas injected conflicting X-Saturn-Org-Id values for one resource); these rollups are NOT billed (a guessed org would mis-attribute revenue). Fix org_id propagation and re-rate this window",
+			windowStart.Format(time.RFC3339), windowEnd.Format(time.RFC3339), res.AmbiguousOrgEvents)
 	}
 	if res.HasUnattributable() {
 		r.log.Error.Printf("rating: window [%s,%s) has %d UNATTRIBUTABLE billing_event rows (NULL auth_id/resource_id/model_id — a NULL resource_id can't name the deployment/org for E2 billing) — these cannot be rated; the interceptor's billing gate should reject them before metering, so a nonzero count means revenue is leaking upstream",
@@ -164,9 +177,9 @@ func (r *Rater) Run(ctx context.Context, windowStart, windowEnd time.Time, windo
 	}
 
 	if res.HasAnomaly() {
-		r.log.Error.Printf("rating: window [%s,%s) rated %d events into %d rollups, total=%s USD; %d UNPRICED events dropped (backfill prices and re-rate), %d UNATTRIBUTABLE rows skipped (NULL auth_id/resource_id/model_id — upstream billing-gate leak), %d AMBIGUOUS-BASE events dropped (ft: id spanning multiple base_models — fix base_model propagation and re-rate)",
+		r.log.Error.Printf("rating: window [%s,%s) rated %d events into %d rollups, total=%s USD; %d UNPRICED events dropped (backfill prices and re-rate), %d UNATTRIBUTABLE rows skipped (NULL auth_id/resource_id/model_id — upstream billing-gate leak), %d AMBIGUOUS-BASE events dropped (ft: id spanning multiple base_models — fix base_model propagation and re-rate), %d AMBIGUOUS-ORG events dropped (one resource spanning multiple orgs — fix org_id propagation and re-rate)",
 			windowStart.Format(time.RFC3339), windowEnd.Format(time.RFC3339),
-			res.EventsRated, res.RollupsWritten, res.TotalCost, res.UnpricedEvents, res.UnattributableEvents, res.AmbiguousBaseEvents)
+			res.EventsRated, res.RollupsWritten, res.TotalCost, res.UnpricedEvents, res.UnattributableEvents, res.AmbiguousBaseEvents, res.AmbiguousOrgEvents)
 	} else {
 		r.log.Info.Printf("rating: window [%s,%s) rated %d events into %d rollups, total=%s USD",
 			windowStart.Format(time.RFC3339), windowEnd.Format(time.RFC3339),

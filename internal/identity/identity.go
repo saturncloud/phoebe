@@ -43,6 +43,45 @@ const (
 	// adding it to Traefik's authResponseHeaders allowlist, is a separate
 	// (small) change. Phoebe reads it defensively: absent = empty string.
 	HeaderAuthID = "X-Saturn-Auth-Id"
+
+	// HeaderOrgID carries the org that OWNS the served deployment — the customer to
+	// attribute (and ultimately bill) this inference to (E2). This is DELIBERATELY
+	// NOT the caller's active-org context (which, per HeaderAuthID above, isn't
+	// resolvable from the token for a multi-org user): it is a property of the
+	// *resource*, not the *caller*. Atlas knows the deployment's org_id at deploy
+	// time (the saturncloud.io/org-id label on the deployment) and injects it here
+	// as a per-deployment Traefik Middleware header on the inference route — so it
+	// is present whenever the deployment can serve inference. Capturing it HERE,
+	// at meter time, removes the push-time resource_id→org_id reconstruction (the
+	// torn-down-deployment race): the org rides the metering event like resource_id,
+	// instead of being re-joined against the deletable resource_name table at push.
+	//
+	// PLUMBING SEAM (Atlas-side, separate change): Atlas injects this header per
+	// deployment and adds it to Traefik's authResponseHeaders allowlist, exactly as
+	// for HeaderBaseModel. Phoebe reads it defensively: absent = empty string. An
+	// absent org_id is intentionally NOT a hot-path gate (it must never black-hole
+	// inference while the producer header rolls out per-install); the fail-closed
+	// for a missing org lives downstream at push (a NULL-org rollup is held +
+	// counted + screamed, never billed to a guessed org), exactly where it can't
+	// take down the inference path. See internal/proxy missingBillingFields.
+	HeaderOrgID = "X-Saturn-Org-Id"
+
+	// HeaderUpstream carries the ROUTING AUTHORITY: the deployment's real backend
+	// (host:port) that phoebe must forward to. Atlas injects it per Token Factory
+	// inference deployment (the `_phoebe_inference_upstream` Middleware, after
+	// atlas-auth), because Atlas authoritatively knows the deployment's own k8s
+	// Service (`{k8s_name}.{ns}.svc.cluster.local:{VLLM_SERVE_PORT}`) when it builds
+	// the route — a `pd-...` Service name that phoebe canNOT derive by convention
+	// (the ConventionResolver's `model-{resource_id}...` template computes a different,
+	// non-existent name). So when this header is present, phoebe forwards THERE and
+	// does not resolve; the resolver is only the fallback for the non-inference path.
+	//
+	// TRUST: allowlisted in Traefik's authResponseHeaders, so a client-supplied value
+	// is stripped before it reaches phoebe (a client must not be able to point its
+	// authorized-for-X request at engine Y — a confused-deputy). Phoebe therefore
+	// trusts this header exactly like the identity headers. Absent = empty string
+	// (the normal, non-inference path; fall back to the resolver).
+	HeaderUpstream = "X-Saturn-Upstream"
 )
 
 // Identity is the trusted, pre-resolved caller identity for a request. Phoebe
@@ -55,10 +94,22 @@ type Identity struct {
 	GroupID      string
 	ResourceID   string
 	ResourceType string
+	// OrgID is the org that owns the served deployment (E2 customer attribution),
+	// injected by Atlas as a per-deployment Traefik header. Carried verbatim onto the
+	// metering event so push reads org straight off the rollup instead of re-joining
+	// the resource_name table at push time. Empty is tolerated on the hot path (a
+	// missing org never gates inference; it is held + screamed at push, never billed
+	// to a guessed org).
+	OrgID string
 	// BaseModel is the HF base id a fine-tune derives from (E3), present only for a
 	// fine-tune deployment. Empty for a base model. Carried to the metering event so
 	// the rater can price an ft:<checkpoint> at base x premium.
 	BaseModel string
+	// Upstream is the deployment's real backend (host:port) for phoebe to forward to,
+	// injected by Atlas per inference deployment (routing authority, trusted). Present
+	// only on the Token Factory inference path; empty for everything else (fall back to
+	// the resolver). See HeaderUpstream.
+	Upstream string
 }
 
 // FromRequest extracts the trusted identity headers. It performs no
@@ -70,6 +121,8 @@ func FromRequest(r *http.Request) Identity {
 		GroupID:      r.Header.Get(HeaderGroupID),
 		ResourceID:   r.Header.Get(HeaderResourceID),
 		ResourceType: r.Header.Get(HeaderResourceType),
+		OrgID:        r.Header.Get(HeaderOrgID),
 		BaseModel:    r.Header.Get(HeaderBaseModel),
+		Upstream:     r.Header.Get(HeaderUpstream),
 	}
 }
