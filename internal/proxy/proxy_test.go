@@ -332,15 +332,27 @@ func TestProxyUpstreamHeaderAbsentFallsBackToResolver(t *testing.T) {
 // forward to a guessed/empty target.
 func TestProxyUpstreamHeaderMalformedFailsClosed(t *testing.T) {
 	unused, _ := url.Parse("http://unused")
-	srv := newTestServer(t, unused)
-	rr := httptest.NewRecorder()
-	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", nil)
-	req.Header.Set(identity.HeaderAuthID, "auth-1")
-	req.Header.Set(identity.HeaderResourceID, "r")
-	req.Header.Set(identity.HeaderUpstream, "://:") // no host, unparseable target
-	srv.Handler().ServeHTTP(rr, req)
-	if rr.Code != http.StatusBadGateway {
-		t.Fatalf("got %d, want 502 (a malformed upstream header must fail closed)", rr.Code)
+	// The grammar is strictly host:port. A value with no host, OR one carrying a
+	// path/query/fragment (which NewSingleHostReverseProxy would silently prepend to
+	// every request → a whole-deployment 404), is a broken edge contract → fail closed.
+	for _, bad := range []string{
+		"://:", // no host, unparseable
+		"pd-x.main-namespace.svc.cluster.local:8000/v1",  // path → would double-prefix routes
+		"pd-x.main-namespace.svc.cluster.local:8000?a=b", // query
+		"pd-x:8000#frag", // fragment
+	} {
+		t.Run(bad, func(t *testing.T) {
+			srv := newTestServer(t, unused)
+			rr := httptest.NewRecorder()
+			req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", nil)
+			req.Header.Set(identity.HeaderAuthID, "auth-1")
+			req.Header.Set(identity.HeaderResourceID, "r")
+			req.Header.Set(identity.HeaderUpstream, bad)
+			srv.Handler().ServeHTTP(rr, req)
+			if rr.Code != http.StatusBadGateway {
+				t.Fatalf("upstream %q: got %d, want 502 (non-bare-host:port must fail closed)", bad, rr.Code)
+			}
+		})
 	}
 }
 

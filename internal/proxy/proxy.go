@@ -517,9 +517,18 @@ func missingBillingFields(id identity.Identity) []string {
 // Atlas sends a bare `host:port` (the deployment's k8s Service DNS, e.g.
 // `pd-x.main-namespace.svc.cluster.local:8000`) with NO scheme — in-cluster east-west
 // traffic to a vLLM engine is plain HTTP, so we prepend http://. A value that already
-// carries a scheme (defensive) is honored. The result must have a host; anything that
-// parses to an empty host (or fails outright) is rejected so a broken header can never
-// forward to a guessed/empty target.
+// carries a scheme (defensive) is honored.
+//
+// GRAMMAR IS STRICTLY host:port (fail closed on anything more). The producer side
+// (Atlas's Middleware, the resolver's ConventionResolver) emits host-only upstreams, so
+// the contract is host:port. A value carrying a PATH is rejected: NewSingleHostReverseProxy
+// PREPENDS the target's path to every forwarded request, so honoring `host:8000/v1` would
+// silently rewrite `/v1/chat/completions` → `/v1/v1/chat/completions` — a per-request 404
+// for the whole deployment, surfaced as a healthy 200-route by phoebe. A query/fragment/
+// userinfo is likewise not part of the contract. On a trusted routing seam, a value that
+// deviates from the grammar means the edge contract is broken (Atlas emitted something
+// wrong), not a normal request — reject it so the caller fails closed (502) rather than
+// misroute. This matches the host-only shape of the resolver fallback exactly.
 func parseUpstreamHeader(v string) (*url.URL, error) {
 	raw := v
 	if !strings.Contains(raw, "://") {
@@ -531,6 +540,9 @@ func parseUpstreamHeader(v string) (*url.URL, error) {
 	}
 	if u.Host == "" {
 		return nil, fmt.Errorf("upstream header %q has no host", v)
+	}
+	if (u.Path != "" && u.Path != "/") || u.RawQuery != "" || u.Fragment != "" || u.User != nil {
+		return nil, fmt.Errorf("upstream header %q must be a bare host:port (no path/query/fragment/userinfo)", v)
 	}
 	return u, nil
 }
