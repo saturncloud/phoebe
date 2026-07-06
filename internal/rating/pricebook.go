@@ -535,33 +535,58 @@ func isDerivationBase(modelID string, derivedFrom map[string]string) bool {
 	return true
 }
 
-// ResolveEvent resolves the effective per-token rate for an event, given its model_id
-// AND its base_model (E3). It is the Go mirror of the SQL's two-table resolution and
-// the spec the conformance oracle uses:
+// ResolveEvent resolves the effective per-token rate for an event, given its
+// model_id, its base_model, AND its adapter (the C4 pricing contract). It is the Go
+// mirror of the SQL's resolution (store.go rateWindowSQL) and the spec the
+// conformance oracle uses. vLLM serves Token Factory endpoints under the ENDPOINT
+// NAME, so model_id is usually NOT a price-file key; base_model (X-Saturn-Base-Model,
+// on ALL TF deployments) is the catalog price key, and a non-empty adapter
+// (X-Saturn-Adapter, ONLY on fine-tune checkpoint deployments) marks the event as
+// fine-tune traffic. THE LADDER — precedence exactly a > b > c > d:
 //
-//  1. model_id is directly priced (a base model, or a fine-tune with its own/derived
-//     in-file rate) → that rate.
-//  2. model_id is an ft: id NOT in the file, but base_model is a priced base → base x
-//     premium (the derived path; the common production case once Atlas stamps
-//     base_model onto the event).
-//  3. model_id is an ft: id with an EMPTY base_model → ErrNoPrice. A fine-tune with no
-//     base is a propagation bug (Atlas guarantees base_model at deploy), NOT a free
-//     model — fail loud, never $0.
-//  4. anything else → ErrNoPrice.
-func (pb *PriceBook) ResolveEvent(modelID, baseModel string) (Rate3, error) {
-	// 1 & file-declared linkage: the existing model_id-keyed resolution.
+//	a. model_id is directly priced (a price-file key: a base model served under its
+//	   HF id, a fine-tune with its own/derived in-file rate, or a per-endpoint
+//	   override entry) → that rate. The per-endpoint override seam.
+//	b. else, base_model non-empty AND the event is FINE-TUNE traffic (adapter
+//	   non-empty OR model_id has the ft: prefix) → base x premium (the derived
+//	   path). ONE HOP (E3): the base_model must be a TRUE base. A fine-tune whose
+//	   base_model is empty or unpriced does NOT fall through to (c) — it is
+//	   UNPRICED (a propagation bug that screams, never a plain-base under-bill).
+//	c. else, base_model non-empty (a BASE-MODEL endpoint serving under its endpoint
+//	   name) → the PLAIN base rate, keyed on base_model, WITHOUT premium.
+//	d. else → ErrNoPrice (fail loud, never $0) — including fine-tune traffic with
+//	   an empty base_model (Atlas guarantees base_model at deploy).
+func (pb *PriceBook) ResolveEvent(modelID, baseModel, adapter string) (Rate3, error) {
+	// (a) Direct model_id hit: the existing model_id-keyed resolution.
 	if r, err := pb.Resolve(modelID); err == nil {
 		return r, nil
 	}
-	// 2: a fine-tune priced via its event-carried base_model. ONE HOP ONLY (E3): the
-	// base_model must be a TRUE base model — never another fine-tune (an ft: own-rate
-	// entry or a file-declared derived id). isDerivationBase enforces the same rule the
-	// SQL projection (derivedRates) does, so the oracle and production agree on one-hop.
-	if strings.HasPrefix(modelID, fineTunePrefix) && baseModel != "" {
-		if base, ok := pb.base[baseModel]; ok && isDerivationBase(baseModel, pb.derivedFrom) {
-			return ApplyPolicy(base, pb.policyFn, pb.policyFactor, pb.policyMarkup)
+	// FINE-TUNE marker (C4): an injected adapter id, or the legacy ft: model prefix.
+	fineTune := adapter != "" || strings.HasPrefix(modelID, fineTunePrefix)
+	if fineTune {
+		// (b) fine-tune priced via its event-carried base_model. ONE HOP ONLY (E3):
+		// the base_model must be a TRUE base model — never another fine-tune (an ft:
+		// own-rate entry or a file-declared derived id). isDerivationBase enforces the
+		// same rule the SQL projection (derivedRates) does, so the oracle and
+		// production agree on one-hop. An empty/unknown base falls to ErrNoPrice —
+		// NEVER to the plain-base path (c).
+		if baseModel != "" {
+			if base, ok := pb.base[baseModel]; ok && isDerivationBase(baseModel, pb.derivedFrom) {
+				return ApplyPolicy(base, pb.policyFn, pb.policyFactor, pb.policyMarkup)
+			}
+		}
+		return Rate3{}, ErrNoPrice
+	}
+	// (c) a base-model endpoint: no adapter, no ft: prefix, base_model carries the
+	// catalog price key → the plain base rate, NO premium. Resolve (not a bare
+	// pb.base lookup) mirrors the SQL exactly: the direct price table the SQL joins
+	// on ev.base_model is the resolvedRates() projection, which is Resolve() for
+	// every key it carries.
+	if baseModel != "" {
+		if r, err := pb.Resolve(baseModel); err == nil {
+			return r, nil
 		}
 	}
-	// 3 & 4: fail loud (an ft: id with empty/unknown base lands here).
+	// (d) fail loud.
 	return Rate3{}, ErrNoPrice
 }

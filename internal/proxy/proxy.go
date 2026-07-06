@@ -443,12 +443,18 @@ func (s *Server) emit(ctx context.Context, id identity.Identity, requestID strin
 		// emitted no parseable model; rating then fails the event loud rather
 		// than billing it wrong.
 		Model: res.Model,
-		// BaseModel is the fine-tune's HF base id (E3 derived_from), injected by
-		// atlas-auth at deploy time and carried verbatim. Empty for a base model;
-		// for an ft:<checkpoint> Model the rater prices via base x premium. Stamped
-		// from the trusted identity header, never from the engine response (the
-		// engine doesn't know the deployment's base).
+		// BaseModel is the HF base id — the CATALOG PRICE KEY (C4), injected per
+		// deployment by the Atlas-rendered Traefik middleware and carried verbatim.
+		// Present on all Token Factory inference deployments; the rater needs it
+		// because Model is the ENDPOINT NAME, which the price file never names.
+		// Stamped from the trusted identity header, never from the engine response
+		// (the engine doesn't know the deployment's base).
 		BaseModel: id.BaseModel,
+		// Adapter is the fine-tune checkpoint artifact id, present ONLY on
+		// fine-tune checkpoint deployments (same trusted middleware injection).
+		// Its presence triggers the fine-tune premium at rating; its value is
+		// forensic. Empty for a base-model endpoint.
+		Adapter: id.Adapter,
 
 		PromptTokens:     res.Usage.PromptTokens,
 		CachedTokens:     res.Usage.CachedTokens(),
