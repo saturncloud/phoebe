@@ -69,18 +69,42 @@
 //     timestamp), so rollup keys can never disagree across sessions and re-rates can
 //     never create overlapping buckets.
 //
-// FINE-TUNE BASE LINKAGE (closed): a fine-tune's base rides on the event.
-// billing_event carries base_model — the HF base id stamped by Atlas at deploy (E3,
-// option a), arriving on the X-Saturn-Base-Model identity header. The rater prices an
-// ft:<checkpoint> model_id (which the price file never names — the checkpoint id is
-// minted per deployment) at base_price × premium by resolving through the event's
-// base_model (pointer-not-copy: a base price change auto-propagates). A base-direct
-// model (model_id IS a base_models key) still prices directly off its own rate, and a
-// fine-tune that carries its own/declared rate in the file still wins over derivation
-// (direct-over-derived). FAIL-CLOSED INVARIANT: an ft: model_id with an EMPTY
-// base_model is a propagation bug (Atlas guarantees base_model to deploy a fine-tune),
-// NOT a free model — it is counted UNPRICED and screams, never silently $0-billed.
-// See PriceBook.ResolveEvent and the rating_derived join in store.go.
+// THE C4 RESOLUTION LADDER (the ratified pricing-key served-name seam): vLLM serves
+// every Token Factory endpoint under its ENDPOINT NAME (a ratified naming contract),
+// so billing_event.model is usually NOT a price-file key. Two per-deployment,
+// anti-spoof headers injected by the Atlas-rendered Traefik middleware carry the
+// pricing facts onto the event instead:
+//
+//   - X-Saturn-Base-Model → billing_event.base_model: the HF base id — the CATALOG
+//     PRICE KEY — on ALL Token Factory inference deployments (base-model endpoints
+//     AND fine-tune checkpoint endpoints);
+//   - X-Saturn-Adapter → billing_event.adapter: the checkpoint artifact id, ONLY on
+//     fine-tune checkpoint deployments. Its PRESENCE is the fine-tune premium
+//     trigger; its value is forensic (which checkpoint served).
+//
+// Resolution precedence, EXACTLY a > b > c > d (Go: PriceBook.ResolveEvent; SQL:
+// rateWindowSQL in store.go — kept in exact agreement by the conformance tests):
+//
+//	a. model_id directly priced in the file (a base served under its HF id, an
+//	   own-rate fine-tune, or a per-endpoint override entry) → that rate. The
+//	   per-endpoint override seam; no premium math.
+//	b. else, base_model non-empty AND the event is FINE-TUNE traffic (adapter
+//	   non-empty OR model_id has the ft: prefix) → base_price × premium, resolving
+//	   through the event's base_model (pointer-not-copy: a base price change
+//	   auto-propagates). ONE HOP (E3): the base must be a TRUE base model.
+//	c. else, base_model non-empty (a BASE-MODEL endpoint serving under its endpoint
+//	   name) → the PLAIN base rate keyed on base_model, WITHOUT premium.
+//	d. else UNPRICED — counted and screamed, never $0-billed.
+//
+// FAIL-CLOSED INVARIANTS: fine-tune traffic (adapter present or ft: model_id) with
+// an EMPTY or unpriced base_model is a propagation bug (Atlas guarantees base_model
+// to deploy), NOT a free model — it is counted UNPRICED and screams; the fine-tune
+// marker BARS it from the plain-base path, so it can never silently under-bill at
+// the un-premiumed rate. And a rollup whose base_model-priced events carried more
+// than ONE rate in a window (>1 distinct base_model, or mixed premium/plain-base
+// pricing from an adapter flap) is AMBIGUOUS: excluded from billing and counted,
+// never MIN-billed at the cheaper rate. See PriceBook.ResolveEvent and the
+// rating_derived / plain-base joins in store.go.
 //
 // ROUNDING — QUANTIZE-THEN-MULTIPLY (the ratified money spec; read before touching
 // any cost math):

@@ -39,11 +39,15 @@ type oracleRollup struct {
 	cost                                 Dec
 	appliedRate                          Rate3
 	eventCount                           int
-	// derivedBases is the set of distinct base_models the events in this rollup priced
-	// THROUGH the derived path (an ft: id not directly in the file). >1 → the E3
-	// ft-uniqueness violation: the rollup is ambiguous and must NOT be billed. Mirrors
-	// the SQL's COUNT(DISTINCT base_model) FILTER (WHERE via_derived).
-	derivedBases map[string]struct{}
+	// pricedBases is the set of distinct base_models the events in this rollup priced
+	// THROUGH — via the derived (base x premium) path or the plain-base path. >1 →
+	// more than one rate in the rollup: ambiguous, must NOT be billed. Mirrors the
+	// SQL's COUNT(DISTINCT base_model) FILTER (WHERE via_derived OR via_base).
+	pricedBases map[string]struct{}
+	// viaDerived / viaBase record which base_model paths this rollup's events priced
+	// through. BOTH → mixed premium/plain-base pricing on one model_id (the adapter
+	// flapping): also ambiguous. Mirrors bool_or(via_derived) AND bool_or(via_base).
+	viaDerived, viaBase bool
 }
 
 func newOracleStore(book *PriceBook, events []RatedEvent) *oracleStore {
@@ -68,7 +72,7 @@ func (s *oracleStore) resolveWindow(start, end time.Time) (map[rollupKey]oracleR
 			an.UnattributableEvents++
 			continue
 		}
-		resolved, err := s.book.ResolveEvent(e.ModelID, e.BaseModel)
+		resolved, err := s.book.ResolveEvent(e.ModelID, e.BaseModel, e.Adapter)
 		if err != nil {
 			an.UnpricedEvents++ // ErrNoPrice: never $0-billed
 			continue
@@ -89,23 +93,30 @@ func (s *oracleStore) resolveWindow(start, end time.Time) (map[rollupKey]oracleR
 		ru.cost = ru.cost.Add(cost)
 		ru.appliedRate = rate // single-model rollup → one applied rate
 		ru.eventCount++
-		// Track the base_model of any DERIVED-priced event (an ft: id not directly in
-		// the file). >1 distinct → ambiguous (E3 ft-uniqueness violation). Mirrors the
-		// SQL via_derived FILTER.
-		if _, direct := s.book.Resolve(e.ModelID); direct != nil && e.BaseModel != "" {
-			if ru.derivedBases == nil {
-				ru.derivedBases = map[string]struct{}{}
+		// Track any event that priced THROUGH its base_model (it resolved, but not
+		// directly on model_id): record the base and which path it took. Mirrors the
+		// SQL's via_derived / via_base flags.
+		if _, direct := s.book.Resolve(e.ModelID); direct != nil {
+			if e.Adapter != "" || strings.HasPrefix(e.ModelID, fineTunePrefix) {
+				ru.viaDerived = true // fine-tune traffic: base x premium
+			} else {
+				ru.viaBase = true // base-model endpoint: plain base rate
 			}
-			ru.derivedBases[e.BaseModel] = struct{}{}
+			if ru.pricedBases == nil {
+				ru.pricedBases = map[string]struct{}{}
+			}
+			ru.pricedBases[e.BaseModel] = struct{}{}
 		}
 		out[k] = ru
 	}
-	// Split out AMBIGUOUS-BASE rollups: a single ft: model_id that resolved through more
-	// than one base_model in the window is NOT billed (a blind MIN()-rate would silently
-	// under-charge) — its events are counted as the ambiguous-base anomaly and the rollup
-	// is dropped. Mirrors store.go's grouped→priced split.
+	// Split out AMBIGUOUS rollups (the single-rate gate): a model_id whose
+	// base_model-priced events carried more than one rate in the window — >1 distinct
+	// base_model, or a MIX of derived and plain-base pricing — is NOT billed (a blind
+	// MIN()-rate would silently under-charge). Its events are counted as the
+	// ambiguous-base anomaly and the rollup is dropped. Mirrors store.go's
+	// grouped→priced split.
 	for k, ru := range out {
-		if len(ru.derivedBases) > 1 {
+		if len(ru.pricedBases) > 1 || (ru.viaDerived && ru.viaBase) {
 			an.AmbiguousBaseEvents += int64(ru.eventCount)
 			delete(out, k)
 			continue
@@ -913,6 +924,189 @@ func TestOracleModel_SelfConsistent(t *testing.T) {
 		got := store.table[rk].cost
 		if got.String() != w.String() {
 			t.Errorf("rollup (%s,%s) cost = %s, oracle wants %s", k.auth, k.model, got, w)
+		}
+	}
+}
+
+// TestRater_BaseEndpointPricesAtPlainBaseRate (base-endpoint-no-premium): the C4
+// base-model endpoint path through a full rating run. The event's model_id is the
+// ENDPOINT NAME (not a file key, no ft: prefix), there is NO adapter, and base_model
+// carries the catalog price key: it bills at the PLAIN base rate — no premium — with
+// that plain rate frozen onto the row.
+func TestRater_BaseEndpointPricesAtPlainBaseRate(t *testing.T) {
+	book := newTestBook(
+		map[string]Rate3{"meta-llama/Llama-3.1-8B-Instruct": rate3("0.000004", "0", "0")},
+		nil, PolicyMultiplier, MustDec("1.5"), Dec{},
+	)
+	events := []RatedEvent{{
+		AuthID:       "a",
+		ModelID:      "tf-ep-my-llama", // the endpoint name vLLM serves under (C4)
+		BaseModel:    "meta-llama/Llama-3.1-8B-Instruct",
+		Adapter:      "", // a base-model endpoint: no adapter header
+		PromptTokens: 1000,
+		At:           mustTime("2026-06-08T10:15:00Z"),
+	}}
+	store := newOracleStore(book, events)
+	r := New(store, book, testLogger())
+	res, err := r.Run(context.Background(), mustTime("2026-06-08T10:00:00Z"), mustTime("2026-06-08T11:00:00Z"), false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res.UnpricedEvents != 0 {
+		t.Fatalf("unpriced = %d, want 0 (a base endpoint prices via its base_model)", res.UnpricedEvents)
+	}
+	// 1000 x 0.000004 = 0.004 — the PLAIN base rate; 0.006 here would mean the
+	// premium leaked onto a base-model endpoint (over-billing).
+	if res.EventsRated != 1 || res.RollupsWritten != 1 || res.TotalCost != "0.004000000" {
+		t.Fatalf("result = %+v, want 1 event / 1 rollup / 0.004000000 (plain base rate, NO premium)", res)
+	}
+	row := store.table[rollupKey{"a", "tf-ep-my-llama", mustTime("2026-06-08T10:00:00Z")}]
+	if row.appliedRate.Prompt.String() != "0.000004000" {
+		t.Fatalf("applied prompt rate = %s, want 0.000004000 (the un-premiumed base rate frozen on the row)", row.appliedRate.Prompt)
+	}
+}
+
+// TestRater_AdapterTriggersPremium (adapter-triggers-premium): the C4 fine-tune
+// checkpoint endpoint path through a full rating run. The event's model_id is the
+// ENDPOINT NAME (not ft:-prefixed), the injected adapter is present, and base_model
+// carries the base: it bills at base x premium, with the derived rate on the row.
+func TestRater_AdapterTriggersPremium(t *testing.T) {
+	book := newTestBook(
+		map[string]Rate3{"meta-llama/Llama-3.1-8B-Instruct": rate3("0.000004", "0", "0")},
+		nil, PolicyMultiplier, MustDec("1.5"), Dec{},
+	)
+	events := []RatedEvent{{
+		AuthID:       "a",
+		ModelID:      "tf-ep-my-finetune", // endpoint name — nothing marks it ft: but the adapter
+		BaseModel:    "meta-llama/Llama-3.1-8B-Instruct",
+		Adapter:      "ckpt-artifact-42",
+		PromptTokens: 1000,
+		At:           mustTime("2026-06-08T10:15:00Z"),
+	}}
+	store := newOracleStore(book, events)
+	r := New(store, book, testLogger())
+	res, err := r.Run(context.Background(), mustTime("2026-06-08T10:00:00Z"), mustTime("2026-06-08T11:00:00Z"), false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res.UnpricedEvents != 0 {
+		t.Fatalf("unpriced = %d, want 0 (the adapter marks the event fine-tune; it prices via base_model)", res.UnpricedEvents)
+	}
+	// 1000 x (0.000004 x 1.5) = 0.006 — 0.004 here would mean the adapter failed to
+	// trigger the premium (under-billing every fine-tune served under an endpoint name).
+	if res.EventsRated != 1 || res.RollupsWritten != 1 || res.TotalCost != "0.006000000" {
+		t.Fatalf("result = %+v, want 1 event / 1 rollup / 0.006000000 (base x premium via adapter)", res)
+	}
+	row := store.table[rollupKey{"a", "tf-ep-my-finetune", mustTime("2026-06-08T10:00:00Z")}]
+	if row.appliedRate.Prompt.String() != "0.000006000" {
+		t.Fatalf("applied prompt rate = %s, want 0.000006000 (base x premium frozen on the row)", row.appliedRate.Prompt)
+	}
+}
+
+// TestRater_AdapterWithEmptyBaseModelFailsLoud (adapter-with-empty-base-model-unpriced):
+// the C4 fail-closed case. Fine-tune traffic (adapter present) whose base_model never
+// propagated is a PROPAGATION BUG, not a free model: counted UNPRICED, excluded from
+// the rollups, never $0-billed — and never silently priced at a plain-base rate.
+func TestRater_AdapterWithEmptyBaseModelFailsLoud(t *testing.T) {
+	book := newTestBook(
+		map[string]Rate3{"meta-llama/Llama-3.1-8B-Instruct": rate3("0.000004", "0", "0")},
+		nil, PolicyMultiplier, MustDec("1.5"), Dec{},
+	)
+	events := []RatedEvent{{
+		AuthID:       "a",
+		ModelID:      "tf-ep-my-finetune",
+		BaseModel:    "", // THE BUG: base_model never propagated
+		Adapter:      "ckpt-artifact-42",
+		PromptTokens: 1000,
+		At:           mustTime("2026-06-08T10:15:00Z"),
+	}}
+	store := newOracleStore(book, events)
+	r := New(store, book, testLogger())
+	res, err := r.Run(context.Background(), mustTime("2026-06-08T10:00:00Z"), mustTime("2026-06-08T11:00:00Z"), false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res.UnpricedEvents != 1 {
+		t.Fatalf("unpriced = %d, want 1 (adapter with empty base_model must scream)", res.UnpricedEvents)
+	}
+	if res.EventsRated != 0 || res.RollupsWritten != 0 || len(store.table) != 0 {
+		t.Fatalf("result = %+v, table=%d — adapter traffic with no base_model must NEVER be rated or $0-billed", res, len(store.table))
+	}
+	if !res.HasUnpriced() || !res.HasAnomaly() {
+		t.Fatal("HasUnpriced/HasAnomaly = false, want true (the propagation bug must drive exit-nonzero)")
+	}
+}
+
+// TestRater_MixedAdapterPresenceFailsLoud: the C4 extension of the single-rate gate.
+// ONE endpoint-name model_id whose adapter header FLAPS within a window — some events
+// derived-priced (premium), some plain-base-priced — carries TWO different rates in
+// one rollup; a blind MIN() would silently bill the whole rollup at the cheaper
+// (plain) rate. The rollup must be excluded and counted ambiguous, never MIN-billed.
+func TestRater_MixedAdapterPresenceFailsLoud(t *testing.T) {
+	book := newTestBook(
+		map[string]Rate3{"meta-llama/Llama-3.1-8B-Instruct": rate3("0.000004", "0", "0")},
+		nil, PolicyMultiplier, MustDec("1.5"), Dec{},
+	)
+	at := mustTime("2026-06-08T10:15:00Z")
+	events := []RatedEvent{
+		// SAME model_id and base_model; adapter present on one, absent on the other.
+		{AuthID: "a", ModelID: "tf-ep-flap", BaseModel: "meta-llama/Llama-3.1-8B-Instruct", Adapter: "ckpt-artifact-42", PromptTokens: 1000, At: at},
+		{AuthID: "a", ModelID: "tf-ep-flap", BaseModel: "meta-llama/Llama-3.1-8B-Instruct", Adapter: "", PromptTokens: 1000, At: at.Add(5 * time.Minute)},
+	}
+	store := newOracleStore(book, events)
+	r := New(store, book, testLogger())
+	res, err := r.Run(context.Background(), mustTime("2026-06-08T10:00:00Z"), mustTime("2026-06-08T11:00:00Z"), false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res.AmbiguousBaseEvents != 2 {
+		t.Fatalf("ambiguous = %d, want 2 (premium/plain flap on one endpoint must scream, never MIN-bill)", res.AmbiguousBaseEvents)
+	}
+	if res.EventsRated != 0 || res.RollupsWritten != 0 || len(store.table) != 0 {
+		t.Fatalf("result = %+v, table=%d — a mixed-rate rollup must NOT be billed", res, len(store.table))
+	}
+	if !res.HasAmbiguousBase() || !res.HasAnomaly() {
+		t.Fatal("HasAmbiguousBase/HasAnomaly = false, want true")
+	}
+}
+
+// TestRater_BaseEndpointAmbiguousBaseModelFailsLoud: the single-rate gate on the
+// PLAIN-BASE path. One endpoint-name model_id resolving through TWO distinct
+// base_models in a window (e.g. an endpoint name deleted and recreated over a
+// different base inside one hour) carries two plain rates; MIN() would silently
+// under-bill at the cheaper base. Excluded and counted ambiguous — same invariant the
+// ft: path has always enforced, extended to C4's plain-base resolution.
+func TestRater_BaseEndpointAmbiguousBaseModelFailsLoud(t *testing.T) {
+	book := newTestBook(
+		map[string]Rate3{
+			"cheap/base":     rate3("0.000001", "0", "0"),
+			"expensive/base": rate3("0.000009", "0", "0"),
+		},
+		nil, PolicyMultiplier, MustDec("1.5"), Dec{},
+	)
+	at := mustTime("2026-06-08T10:15:00Z")
+	events := []RatedEvent{
+		{AuthID: "a", ModelID: "tf-ep-reused", BaseModel: "cheap/base", PromptTokens: 1000, At: at},
+		{AuthID: "a", ModelID: "tf-ep-reused", BaseModel: "expensive/base", PromptTokens: 1000, At: at.Add(5 * time.Minute)},
+		// A clean single-base endpoint in the same window must still rate.
+		{AuthID: "a", ModelID: "tf-ep-clean", BaseModel: "cheap/base", PromptTokens: 1000, At: at},
+	}
+	store := newOracleStore(book, events)
+	r := New(store, book, testLogger())
+	res, err := r.Run(context.Background(), mustTime("2026-06-08T10:00:00Z"), mustTime("2026-06-08T11:00:00Z"), false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res.AmbiguousBaseEvents != 2 {
+		t.Fatalf("ambiguous = %d, want 2 (two-base endpoint name must scream)", res.AmbiguousBaseEvents)
+	}
+	// The clean endpoint billed at its plain base rate: 1000 x 0.000001 = 0.001.
+	if res.EventsRated != 1 || res.RollupsWritten != 1 || res.TotalCost != "0.001000000" {
+		t.Fatalf("result = %+v, want 1 event / 1 rollup / 0.001000000 (the clean plain-base rollup)", res)
+	}
+	for k := range store.table {
+		if k.modelID == "tf-ep-reused" {
+			t.Fatal("a rollup exists for the two-base endpoint name — it must NOT be billed (silent MIN under-charge)")
 		}
 	}
 }

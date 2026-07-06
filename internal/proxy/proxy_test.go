@@ -317,6 +317,10 @@ func TestProxyStreamingEndToEnd(t *testing.T) {
 	req.Header.Set(identity.HeaderGroupID, "org-1")
 	req.Header.Set(identity.HeaderUserID, "user-1")
 	req.Header.Set(identity.HeaderAuthID, "auth-key-7")
+	// The two per-deployment C4 headers the Atlas-rendered Traefik middleware
+	// injects: the catalog price key and the fine-tune checkpoint artifact id.
+	req.Header.Set(identity.HeaderBaseModel, "meta-llama/Llama-3.1-8B-Instruct")
+	req.Header.Set(identity.HeaderAdapter, "ckpt-artifact-42")
 	req.Header.Set("X-Request-Id", "req-123")
 
 	srv.Handler().ServeHTTP(rr, req)
@@ -357,6 +361,16 @@ func TestProxyStreamingEndToEnd(t *testing.T) {
 	}
 	if e.PromptTokens != 2006 || e.CompletionTokens != 300 || e.CachedTokens != 1920 {
 		t.Fatalf("event token counts wrong: %+v", e)
+	}
+	// BaseModel and Adapter are the C4 pricing seam: the trusted per-deployment
+	// headers must ride onto the metering event VERBATIM — base_model is the
+	// catalog price key and adapter presence is the fine-tune premium trigger.
+	// Dropping either silently mis-prices every endpoint-name event downstream.
+	if e.BaseModel != "meta-llama/Llama-3.1-8B-Instruct" {
+		t.Fatalf("event BaseModel = %q, want the X-Saturn-Base-Model header value", e.BaseModel)
+	}
+	if e.Adapter != "ckpt-artifact-42" {
+		t.Fatalf("event Adapter = %q, want the X-Saturn-Adapter header value", e.Adapter)
 	}
 	if e.FinishReason != "stop" {
 		t.Fatalf("event finish_reason = %q, want stop", e.FinishReason)

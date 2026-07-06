@@ -14,20 +14,34 @@ const (
 	HeaderResourceID   = "X-Saturn-Resource-Id"
 	HeaderResourceType = "X-Saturn-Resource-Type"
 
-	// HeaderBaseModel carries the Hugging Face base model id a fine-tune deployment
-	// derives from (E3 derived_from). Atlas resolves and validates it at endpoint
-	// creation — a fine-tune cannot deploy without a base — and injects it here
-	// alongside the other identity headers, so phoebe carries it onto the metering
-	// event for the rater to price a fine-tune at base x premium. It is EMPTY for a
-	// base-model deployment (whose engine model name is already the price key).
+	// HeaderBaseModel carries the Hugging Face base model id — the CATALOG PRICE KEY
+	// (C4). vLLM serves every Token Factory endpoint under its ENDPOINT NAME (a
+	// ratified naming contract), so the engine-reported model is NOT a price key the
+	// file can name; this header is how the rater finds the catalog rate. Atlas
+	// resolves it at endpoint creation and injects it on ALL Token Factory inference
+	// deployments: for a base-model endpoint it is the model being served; for a
+	// fine-tune checkpoint endpoint it is the base the checkpoint derives from (E3
+	// derived_from — a fine-tune cannot deploy without a base).
 	//
-	// PLUMBING SEAM (Atlas-side, separate change): atlas-auth must inject this header
-	// (the deploy-time base_model) and add it to Traefik's authResponseHeaders
-	// allowlist, exactly as for HeaderAuthID. Phoebe reads it defensively: absent =
-	// empty string. An `ft:`-prefixed model with an empty base_model then fails loud
-	// at rating (ErrNoPrice), never silently bills $0 — so a missing header surfaces
-	// as a screaming anomaly, not lost revenue.
+	// PLUMBING SEAM (Atlas-side, built in parallel): the Atlas-rendered Traefik
+	// middleware injects this header AND HeaderAdapter per deployment, as deploy-time
+	// resource properties — server-side, anti-spoof overwritten, never trusted from
+	// clients. Phoebe reads them defensively: absent = empty string. A fine-tune
+	// event (adapter present or ft:-prefixed model) with an empty base_model then
+	// fails loud at rating (ErrNoPrice), never silently bills $0 — so a missing
+	// header surfaces as a screaming anomaly, not lost revenue.
 	HeaderBaseModel = "X-Saturn-Base-Model"
+
+	// HeaderAdapter carries the fine-tune checkpoint artifact id, and is present ONLY
+	// on fine-tune checkpoint deployments (absent on base-model endpoints). Like
+	// HeaderBaseModel it is a deploy-time resource property, injected server-side by
+	// the Atlas-rendered Traefik middleware, anti-spoof overwritten, never trusted
+	// from clients. Its PRESENCE is the fine-tune-premium trigger for rating (C4):
+	// the endpoint serves under its endpoint name, so the model id alone cannot mark
+	// it as a fine-tune. Its VALUE is forensic (which checkpoint artifact served the
+	// request), carried onto billing_event.adapter verbatim. Phoebe reads it
+	// defensively: absent = empty string (a base-model endpoint).
+	HeaderAdapter = "X-Saturn-Adapter"
 
 	// HeaderAuthID carries the token / API-key identity — the JWT `sub` claim,
 	// which in Atlas is the IdentityAuth.id (the same value for both browser-
@@ -55,10 +69,14 @@ type Identity struct {
 	GroupID      string
 	ResourceID   string
 	ResourceType string
-	// BaseModel is the HF base id a fine-tune derives from (E3), present only for a
-	// fine-tune deployment. Empty for a base model. Carried to the metering event so
-	// the rater can price an ft:<checkpoint> at base x premium.
+	// BaseModel is the HF base id — the catalog price key (C4), present on all Token
+	// Factory inference deployments (base-model AND fine-tune checkpoint endpoints).
+	// Carried to the metering event so the rater can price the endpoint-name model.
 	BaseModel string
+	// Adapter is the fine-tune checkpoint artifact id, present ONLY on fine-tune
+	// checkpoint deployments. Its presence triggers the fine-tune premium at rating
+	// (C4); its value is forensic. Empty for a base-model endpoint.
+	Adapter string
 }
 
 // FromRequest extracts the trusted identity headers. It performs no
@@ -71,5 +89,6 @@ func FromRequest(r *http.Request) Identity {
 		ResourceID:   r.Header.Get(HeaderResourceID),
 		ResourceType: r.Header.Get(HeaderResourceType),
 		BaseModel:    r.Header.Get(HeaderBaseModel),
+		Adapter:      r.Header.Get(HeaderAdapter),
 	}
 }
