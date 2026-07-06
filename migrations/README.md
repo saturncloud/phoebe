@@ -8,8 +8,13 @@ This directory holds the schema for phoebe's billing tables, which live in the
 - `rated_usage` — the **rating (E1)** (revenue) rollup: per-(auth_id, resource_id,
   model_id, hour) cost, carrying the applied per-token rates frozen onto each row.
   `resource_id` (the deployment id) is part of the grain for **E2 customer
-  attribution** (billing resolves the org via `resource_id`→`org_id`); a
-  NULL-`resource_id` event fails closed (counted unattributable, never billed).
+  attribution**, and `org_id` (the deployment-owning org) is carried onto the rollup
+  for the same purpose — captured at **meter time** from the `X-Saturn-Org-Id` header
+  and threaded `billing_event`→`rated_usage`, so push reads org straight off the
+  rollup rather than re-joining the Atlas-owned `resource_name` table (which raced
+  deployment teardown). A NULL-`resource_id` event fails closed (counted
+  unattributable, never billed); a NULL-`org_id` rollup is likewise held + screamed at
+  push, never billed to a guessed org.
   **Money is
   stored as `NUMERIC(20,9)` — exact decimal, never float and never an integer
   micro/nano scalar — and ALL money math happens in SQL, not Go.**
@@ -79,6 +84,7 @@ a **ready-to-copy Alembic file**, not a migrator phoebe executes:
 | `atlas/c2f1a3b4d5e6_add_rating.py` | The Alembic artifact for `rated_usage`. Chains after `billing_event`. |
 | `0002_io_log.sql` | Plain DDL for `io_log` (M5 per-tenant I/O-logging store: request/response bodies + `body_tsv` GIN full-text). Reference + local-dev. |
 | `atlas/c2e1d3f4a5b6_add_io_log.py` | The Alembic artifact for `io_log`. Chains after `billing_event` (re-point when landing alongside rating — see below). |
+| `atlas/d3a2b4c5e6f7_add_org_id.py` | Follow-up Alembic that adds `org_id` (E2 attribution) idempotently to `billing_event` AND `rated_usage` (`ADD COLUMN IF NOT EXISTS`, nullable). A follow-up — not an edit to the create migrations — because those already shipped on `release-2026.02.01`/`release-2026.06.01`. Chains after `io_log` (the last phoebe rev in the linearized chain). |
 | `../config/prices.example.yaml` | The **operator-facing price file** (E1): base per-token rates keyed on the HF model id, the global fine-tune premium policy, per-GPU floor rates. The contract the rater prices from. Not a migration. |
 
 ### Migration chain (IMPORTANT when landing these together)
@@ -91,8 +97,14 @@ exactly one head:
 ```
 <current Atlas head> → b1f0c2d3e4a5 (billing_event)
                      → c2f1a3b4d5e6 (rating)
-                     → c2e1d3f4a5b6 (io_log)   ← re-point its down_revision to rating
+                     → c2e1d3f4a5b6 (io_log)     ← re-point its down_revision to rating
+                     → d3a2b4c5e6f7 (org_id)     ← chains after the last phoebe rev
 ```
+
+`org_id` is a LATER follow-up: `billing_event`/`rating` have already shipped to the
+release branches, so `d3a2b4c5e6f7` adds the column idempotently rather than editing
+the (already-applied) create migrations. At copy time, point its `down_revision` at
+whatever the last phoebe revision applied to the shared DB is.
 
 Order among rating/io_log doesn't matter functionally (different tables); only
 that the graph stays linear. `billing_event`'s own `down_revision` re-points to
@@ -127,11 +139,12 @@ Each `.sql` and its Alembic file describe the *same* table(s). If you change one
 change the other. The Go column lists must also match — a column added to a table
 without a matching entry there simply won't be written:
 
-- `billing_event`: `0001_billing_event.sql` ↔ `atlas/b1f0c2d3e4a5_…` ↔
-  `internal/drain/store.go` (`upsertColumns`).
-- `rated_usage`: `0002_rating.sql` ↔ `atlas/c2f1a3b4d5e6_…` ↔ the `INSERT INTO
-  rated_usage (…)` column list in `internal/rating/store.go` (`rateWindowSQL`),
-  including the `applied_*_rate` columns.
+- `billing_event`: `0001_billing_event.sql` ↔ `atlas/b1f0c2d3e4a5_…` (+ `org_id`
+  added by `atlas/d3a2b4c5e6f7_…`) ↔ `internal/drain/store.go` (`upsertColumns`).
+- `rated_usage`: `0002_rating.sql` ↔ `atlas/c2f1a3b4d5e6_…` (+ `org_id` added by
+  `atlas/d3a2b4c5e6f7_…`) ↔ the `INSERT INTO rated_usage (…)` column list in
+  `internal/rating/store.go` (`rateWindowSQL`), including the `applied_*_rate` and
+  `org_id` columns.
 - `io_log`: `0002_io_log.sql` ↔ `atlas/c2e1d3f4a5b6_…` ↔ the insert column list in
   `internal/iolog/postgres.go`.
 - Prices are NOT in the DB: they live in the YAML price file

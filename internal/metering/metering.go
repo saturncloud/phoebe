@@ -52,20 +52,33 @@ type Event struct {
 	GroupID      string `json:"group_id,omitempty"`      // present on group tokens
 	ResourceID   string `json:"resource_id,omitempty"`   // model / deployment id
 	ResourceType string `json:"resource_type,omitempty"` // e.g. workspace, deployment
+	// OrgID is the org that OWNS the served deployment (E2 customer attribution),
+	// injected by Atlas as a per-deployment Traefik header (X-Saturn-Org-Id). Captured
+	// verbatim at meter time so push reads org off the rollup instead of re-joining
+	// resource_name at push. Empty when the producer header is absent (rollout gap) —
+	// such a row is held + counted + screamed at push, never billed to a guessed org.
+	OrgID string `json:"org_id,omitempty"`
 
 	// Workload.
-	Model   string `json:"model,omitempty"`
+	Model string `json:"model,omitempty"`
+	// Adapter is the fine-tune checkpoint artifact id (X-Saturn-Adapter), injected
+	// per deployment by the Atlas-rendered Traefik middleware and present ONLY on
+	// fine-tune checkpoint deployments. Its PRESENCE marks the event as fine-tune
+	// traffic for the rater (C4 — the endpoint serves under its endpoint name, so
+	// Model alone cannot mark it); its VALUE is forensic (which checkpoint served).
+	// Empty for a base-model endpoint. Captured verbatim; empty is valid.
 	Adapter string `json:"adapter,omitempty"`
 
-	// BaseModel is the Hugging Face base id a fine-tune derives from (E3
-	// derived_from), stamped at deploy time by Atlas (which enforces base_model is
-	// present to deploy a fine-tune — a fine-tune cannot exist without a base). It is
-	// EMPTY for a base model (whose Model already IS the price key). The rater needs
-	// it because Model for a fine-tune is an `ft:<checkpoint>` id whose base is not
-	// otherwise recoverable: with BaseModel set, the rater prices the fine-tune at
-	// base_price x premium (E3 pointer-not-copy). An `ft:` Model with an EMPTY
-	// BaseModel is a propagation bug, not a free model — the rater fails it loud
-	// (ErrNoPrice), never $0. Captured verbatim on the hot path; empty is valid.
+	// BaseModel is the Hugging Face base id — the CATALOG PRICE KEY (C4), stamped at
+	// deploy time by Atlas on ALL Token Factory inference deployments: the model
+	// being served (base-model endpoint) or the base the checkpoint derives from
+	// (fine-tune endpoint, E3 derived_from — a fine-tune cannot exist without a
+	// base). The rater needs it because Model is the ENDPOINT NAME the engine serves
+	// under, which the price file never names: with BaseModel set, a base-model
+	// endpoint prices at the plain base rate and a fine-tune (Adapter present, or an
+	// ft: Model) at base_price x premium (E3 pointer-not-copy). A fine-tune event
+	// with an EMPTY BaseModel is a propagation bug, not a free model — the rater
+	// fails it loud (ErrNoPrice), never $0. Captured verbatim; empty is valid.
 	BaseModel string `json:"base_model,omitempty"`
 
 	// Token counts (the engine's own usage block; never re-tokenized).
@@ -95,7 +108,7 @@ type LogEmitter struct {
 }
 
 func (l *LogEmitter) Emit(_ context.Context, e Event) {
-	l.Log.Info.Printf("metering event: request_id=%s auth_id=%s group=%s user=%s resource=%s/%s model=%s prompt=%d cached=%d completion=%d finish=%s aborted=%t",
-		e.RequestID, e.AuthID, e.GroupID, e.UserID, e.ResourceType, e.ResourceID, e.Model,
+	l.Log.Info.Printf("metering event: request_id=%s auth_id=%s org=%s group=%s user=%s resource=%s/%s model=%s prompt=%d cached=%d completion=%d finish=%s aborted=%t",
+		e.RequestID, e.AuthID, e.OrgID, e.GroupID, e.UserID, e.ResourceType, e.ResourceID, e.Model,
 		e.PromptTokens, e.CachedTokens, e.CompletionTokens, e.FinishReason, e.Aborted)
 }

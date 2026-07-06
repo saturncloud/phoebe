@@ -1,9 +1,10 @@
 // Command token-push is phoebe's install-side hourly billing PUSH job. It reads the
-// rater's rated_usage rollups for a window, resolves each rollup's deployment to the
-// org that owns it (resource_id → resource_name.org_id, a LOCAL join in the shared
-// Atlas Postgres), and POSTs an hourly SNAPSHOT to the central manager's
-// POST /customer/token-usage. The manager turns those rollups into Stripe charges; this
-// binary is the trust-boundary crossing that gets the priced usage OUT of the install.
+// rater's rated_usage rollups for a window — each already carrying its billing org
+// (org_id is captured at METER time from X-Saturn-Org-Id and carried onto rated_usage by
+// the rater, so push reads it straight off the rollup, no resource_name join) — and
+// POSTs an hourly SNAPSHOT to the central manager's POST /customer/token-usage. The
+// manager turns those rollups into Stripe charges; this binary is the trust-boundary
+// crossing that gets the priced usage OUT of the install.
 //
 // See token-factory-stripe-consumer-design.md (Ben). This binary is that design's
 // "install-side hourly push job" upstream prerequisite. The contract points it must
@@ -15,17 +16,20 @@
 //     that is ABSENT from the snapshot as a reconcile-DELETE. So a re-rate or a
 //     reconcile-delete in phoebe self-corrects across the boundary — a bare incremental
 //     delete would silently keep billing a vanished rollup forever.
-//   - ORG RESOLVED INSTALL-SIDE (Decision 2 / C1). resource_id → org_id is joined HERE,
-//     where the resource_name FK lives; the manager never reads the install DB. The
-//     org_id rides the payload. A rollup whose resource_id resolves to NO org makes its
-//     WHOLE WINDOW be WITHHELD (not pushed) and screamed about — because the snapshot is
-//     delete-by-absence, pushing a window with a row omitted would silently DELETE that
-//     row's prior (possibly already-billed) charge. Withholding leaves the manager's
-//     prior good state for the window standing (stale-but-billed); the next run re-pushes
-//     once the resource_name mapping is restored. NEVER pushed with a guessed/empty org
-//     (C2/C7 fail-closed). Because rated_usage.resource_id is NOT NULL and the rater only
-//     writes attributable rows, an unresolved org means a deployment row vanished from
-//     resource_name: a real anomaly worth a non-zero exit.
+//   - ORG CAPTURED INSTALL-SIDE AT METER TIME (Decision 2 / C1). org_id is captured by
+//     the interceptor from the X-Saturn-Org-Id header (the deployment's saturncloud.io/
+//     org-id label, injected by Atlas) and carried billing_event→rated_usage by the
+//     rater; the manager never reads the install DB. The org_id rides the payload off
+//     the rollup — no push-time resource_name join (which raced deployment teardown). A
+//     rollup with a NULL org_id makes its WHOLE WINDOW be WITHHELD (not pushed) and
+//     screamed about — because the snapshot is delete-by-absence, pushing a window with a
+//     row omitted would silently DELETE that row's prior (possibly already-billed)
+//     charge. Withholding leaves the manager's prior good state for the window standing
+//     (stale-but-billed); the next run re-pushes once org_id propagates (a re-rate also
+//     refreshes a NULL-org rollup to its real org). NEVER pushed with a guessed/empty org
+//     (C2/C7 fail-closed). A NULL org_id means Atlas did not inject X-Saturn-Org-Id for
+//     that deployment (a producer-rollout gap) or propagation broke: a real anomaly
+//     worth a non-zero exit.
 //   - MONEY IS AN EXACT DECIMAL STRING end to end (C8). cost and the applied rates cross
 //     the wire as NUMERIC text, never a float — read as ::text from Postgres, emitted as
 //     JSON strings.
@@ -45,7 +49,7 @@
 //	   all-empty run would signal delete-all for every window and wipe the manager's
 //	   prior billing) / a window range wider than the backfill cap
 //	2  some window was WITHHELD (not pushed) because it contained a rated_usage row
-//	   that could NOT be resolved to an org (a deployment missing from resource_name);
+//	   with a NULL org_id (Atlas didn't inject X-Saturn-Org-Id, or propagation broke);
 //	   every window that WAS pushed succeeded. The withheld window's prior state on the
 //	   manager is left untouched (stale-but-billed). Distinct code so a CronJob alerts on
 //	   "usage we metered and priced but cannot attribute to an org" (held revenue / lost

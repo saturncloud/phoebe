@@ -40,8 +40,8 @@ func TestPostgresStore_RateWindowSQL(t *testing.T) {
 	mock.ExpectExec(`INSERT INTO rating_derived`).
 		WithArgs("m", "0.000003000", "0.000000300", "0.000010000").
 		WillReturnResult(sqlmock.NewResult(0, 1))
-	rows := sqlmock.NewRows([]string{"rollups_written", "events_rated", "total_cost", "reconciled_deletions", "unpriced_events", "unattributable_events", "ambiguous_base_events"}).
-		AddRow(2, 5, "0.001234500", 0, 3, 1, 4)
+	rows := sqlmock.NewRows([]string{"rollups_written", "events_rated", "total_cost", "reconciled_deletions", "unpriced_events", "unattributable_events", "ambiguous_base_events", "ambiguous_org_events"}).
+		AddRow(2, 5, "0.001234500", 0, 3, 1, 4, 2)
 	// The statement binds $3 = the ft: LIKE pattern (single-sourced from fineTunePrefix).
 	mock.ExpectQuery(`INSERT INTO rated_usage`).
 		WithArgs(start.UTC(), end.UTC(), ftLikePattern).
@@ -55,8 +55,8 @@ func TestPostgresStore_RateWindowSQL(t *testing.T) {
 	if res.RollupsWritten != 2 || res.EventsRated != 5 || res.TotalCost != "0.001234500" {
 		t.Fatalf("result = %+v, want 2/5/0.001234500", res)
 	}
-	if res.UnpricedEvents != 3 || res.UnattributableEvents != 1 || res.AmbiguousBaseEvents != 4 {
-		t.Fatalf("anomaly counts = %d/%d/%d, want 3/1/4 (must ride the same statement)", res.UnpricedEvents, res.UnattributableEvents, res.AmbiguousBaseEvents)
+	if res.UnpricedEvents != 3 || res.UnattributableEvents != 1 || res.AmbiguousBaseEvents != 4 || res.AmbiguousOrgEvents != 2 {
+		t.Fatalf("anomaly counts = %d/%d/%d/%d, want 3/1/4/2 (must ride the same statement)", res.UnpricedEvents, res.UnattributableEvents, res.AmbiguousBaseEvents, res.AmbiguousOrgEvents)
 	}
 	if res.ReconciledDeletions != 0 {
 		t.Fatalf("reconciled deletions = %d, want 0 (the projected count must scan into the result)", res.ReconciledDeletions)
@@ -97,10 +97,19 @@ func TestRateWindowSQL_Shape(t *testing.T) {
 		"LEFT JOIN rating_derived rd",
 		"rd.base_model = ev.base_model",
 		"rp.model_id IS NULL",
-		// ft: marker is single-sourced from the Go fineTunePrefix constant, bound as $3
-		"ev.model_id LIKE $3",
-		// the effective rate COALESCEs direct over derived
-		"COALESCE(rp.prompt_price,     rd.prompt_price)",
+		// the FINE-TUNE marker (C4): the ft: prefix single-sourced from the Go
+		// fineTunePrefix constant (bound as $3) OR a non-null injected adapter —
+		// the derived join fires on either
+		"(ev.model_id LIKE $3 OR ev.adapter IS NOT NULL)",
+		// the PLAIN-BASE join (C4 ladder step c): the direct price table keyed on
+		// ev.base_model, guarded to NON-fine-tune traffic (the exact negation of
+		// the derived join's marker), so a fine-tune whose base misses the derived
+		// table can never fall through to an un-premiumed base rate
+		"LEFT JOIN rating_price rpb",
+		"rpb.model_id = ev.base_model",
+		"NOT (ev.model_id LIKE $3 OR ev.adapter IS NOT NULL)",
+		// the effective rate COALESCEs direct over derived over plain-base
+		"COALESCE(rp.prompt_price,     rd.prompt_price,     rpb.prompt_price)",
 		// billable-prompt clamp + the cost formula (cached charged once)
 		"GREATEST(ev.prompt_tokens - ev.cached_tokens, 0)",
 		"billable_prompt   * prompt_price",
@@ -154,10 +163,30 @@ func TestRateWindowSQL_Shape(t *testing.T) {
 		"WHERE prompt_price  IS NULL\n        AND auth_id     IS NOT NULL\n        AND resource_id IS NOT NULL\n        AND model_id    IS NOT NULL)",
 		"AS unpriced_events",
 		"OR resource_id IS NULL OR model_id IS NULL) AS unattributable_events",
-		// the E3 ft-uniqueness gate: an ft: rollup spanning >1 base_model is split out
-		"COUNT(DISTINCT base_model) FILTER (WHERE via_derived) > 1 AS ambiguous_base",
+		// the SINGLE-RATE gate: a rollup whose base_model-priced rows span >1 base
+		// (E3 ft-uniqueness / C4 endpoint-name reuse) or MIX derived and plain-base
+		// pricing (adapter flap) is split out — never MIN-billed
+		"COUNT(DISTINCT base_model) FILTER (WHERE via_derived OR via_base) > 1",
+		"OR (bool_or(via_derived) AND bool_or(via_base))",
 		"WHERE NOT ambiguous_base",
 		"AS ambiguous_base_events",
+		// org_id is carried at meter time (E2): selected from billing_event, carried onto
+		// the rollup via MAX (NOT a GROUP BY key — org is a function of resource_id), and
+		// written into rated_usage. NOT part of the md5 natural key.
+		"MAX(org_id)                                      AS org_id",
+		"id, auth_id, resource_id, org_id, model_id, window_start, window_end",
+		"auth_id, resource_id, org_id, model_id, window_start, window_end,",
+		// COALESCE, not bare EXCLUDED: a re-rate may set NULL->real (convergence) but must
+		// NEVER overwrite a known org with NULL (real->NULL un-attribution).
+		"org_id                  = COALESCE(EXCLUDED.org_id, rated_usage.org_id)",
+		// the E2 attribution gate: a rollup spanning >1 distinct non-NULL org is split out
+		// (never billed to a guessed org) and counted, exactly like ambiguous_base
+		"COUNT(DISTINCT org_id) > 1 AS ambiguous_org",
+		"WHERE NOT ambiguous_base AND NOT ambiguous_org",
+		// the ambiguous_org count is EXCLUSIVE of ambiguous_base (strict partition:
+		// a both-ambiguous rollup counts only as base)
+		"WHERE ambiguous_org AND NOT ambiguous_base",
+		"AS ambiguous_org_events",
 	}
 	// The price tables are GONE (prices are YAML now): no reference to model_price,
 	// derivation_policy, effective-dating, or a derivation CASE may remain.

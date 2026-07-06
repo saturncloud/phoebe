@@ -58,6 +58,13 @@ CREATE TABLE rated_usage (
     -- never writes a row it can't attribute to a deployment/org.
     resource_id             VARCHAR(64) NOT NULL,
     model_id                VARCHAR(255) NOT NULL,
+    -- org_id: the deployment-owning org, carried from billing_event by the rater so
+    -- token-push reads org straight off the rollup (no resource_name join). NULLABLE,
+    -- deliberately UNLIKE resource_id above: a NULL org is the rater's fail-closed
+    -- signal that push must withhold + scream (not delete-by-absence, not bill a
+    -- guessed org). (Production applies via the d3a2b4c5e6f7 follow-up migration;
+    -- declared here for fresh local DBs.)
+    org_id                  VARCHAR(64),
 
     -- [window_start, window_end) is the hour this rollup covers.
     window_start            TIMESTAMPTZ NOT NULL,

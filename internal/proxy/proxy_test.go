@@ -16,7 +16,6 @@ import (
 	"github.com/saturncloud/phoebe/internal/identity"
 	"github.com/saturncloud/phoebe/internal/logging"
 	"github.com/saturncloud/phoebe/internal/metering"
-	"github.com/saturncloud/phoebe/internal/registry"
 )
 
 // recordingEmitter captures emitted events for assertions. Safe for concurrent
@@ -65,12 +64,19 @@ func newTestServer(t *testing.T, upstream *url.URL) *Server {
 	return newTestServerE(t, upstream, &recordingEmitter{})
 }
 
-func newTestServerE(t *testing.T, upstream *url.URL, em metering.Emitter) *Server {
+func newTestServerE(t *testing.T, _ *url.URL, em metering.Emitter) *Server {
 	t.Helper()
 	s := &config.Settings{ListenAddr: ":0"}
 	log := logging.New(logging.ERROR)
-	resolver := registry.NewStatic(upstream)
-	return New(s, log, resolver, em)
+	return New(s, log, em)
+}
+
+// setUpstream stamps the X-Saturn-Upstream routing header onto a test request,
+// exactly as Atlas's per-route injection does in production. Routing now comes
+// solely from this header (phoebe resolves no upstream of its own), so every
+// request a test expects to be FORWARDED must carry it.
+func setUpstream(req *http.Request, upstream *url.URL) {
+	req.Header.Set(identity.HeaderUpstream, upstream.Host)
 }
 
 func TestHealthz(t *testing.T) {
@@ -112,6 +118,7 @@ func TestProxyBillingGate(t *testing.T) {
 
 			rr := httptest.NewRecorder()
 			req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", nil)
+			setUpstream(req, upstream)
 			if tt.authID != "" {
 				req.Header.Set(identity.HeaderAuthID, tt.authID)
 			}
@@ -155,6 +162,7 @@ func TestProxyRequestID_GeneratedWhenAbsent(t *testing.T) {
 	rr := httptest.NewRecorder()
 	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions",
 		strings.NewReader(`{"model":"m","messages":[]}`))
+	setUpstream(req, upstream)
 	req.Header.Set(identity.HeaderAuthID, "auth-1")
 	req.Header.Set(identity.HeaderResourceID, "model-abc")
 	// Deliberately NO X-Request-Id.
@@ -218,6 +226,7 @@ func TestProxyRequestID_RejectsInvalid(t *testing.T) {
 
 			rr := httptest.NewRecorder()
 			req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", nil)
+			setUpstream(req, upstream)
 			req.Header.Set(identity.HeaderAuthID, "auth-1")
 			req.Header.Set(identity.HeaderResourceID, "model-abc")
 			req.Header.Set("X-Request-Id", tt.requestID)
@@ -249,6 +258,7 @@ func TestProxyForwardsToUpstream(t *testing.T) {
 
 	rr := httptest.NewRecorder()
 	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", nil)
+	setUpstream(req, upstream)
 	req.Header.Set(identity.HeaderAuthID, "auth-key-7")
 	req.Header.Set(identity.HeaderResourceID, "model-abc")
 	srv.Handler().ServeHTTP(rr, req)
@@ -262,20 +272,118 @@ func TestProxyForwardsToUpstream(t *testing.T) {
 	}
 }
 
-func TestProxyNotFound(t *testing.T) {
-	// Resolver with no fallback → ErrNotFound → clean 404.
+// TestProxyUpstreamHeaderMalformedFailsClosed: a broken trusted header (Atlas injected a
+// bad value) is a broken edge contract, not a normal request — fail closed (502), never
+// forward to a guessed/empty target.
+func TestProxyUpstreamHeaderMalformedFailsClosed(t *testing.T) {
+	unused, _ := url.Parse("http://unused")
+	// The grammar is strictly host:port with an implicit (or explicit) http scheme.
+	// A value with no host, one carrying a path/query/fragment (which
+	// NewSingleHostReverseProxy would silently prepend to every request → a
+	// whole-deployment 404), or a NON-HTTP scheme (SSRF surface: phoebe would speak
+	// that transport to the target) is a broken edge contract → fail closed.
+	for _, bad := range []string{
+		"://:", // no host, unparseable
+		"pd-x.main-namespace.svc.cluster.local:8000/v1",  // path → would double-prefix routes
+		"pd-x.main-namespace.svc.cluster.local:8000?a=b", // query
+		"pd-x:8000#frag", // fragment
+		"https://pd-x.main-namespace.svc.cluster.local:8000", // non-http scheme (TLS to a plaintext engine)
+		"ftp://pd-x:8000", // non-http scheme
+	} {
+		t.Run(bad, func(t *testing.T) {
+			srv := newTestServer(t, unused)
+			rr := httptest.NewRecorder()
+			req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", nil)
+			req.Header.Set(identity.HeaderAuthID, "auth-1")
+			req.Header.Set(identity.HeaderResourceID, "r")
+			req.Header.Set(identity.HeaderUpstream, bad)
+			srv.Handler().ServeHTTP(rr, req)
+			if rr.Code != http.StatusBadGateway {
+				t.Fatalf("upstream %q: got %d, want 502 (non-bare-host:port must fail closed)", bad, rr.Code)
+			}
+		})
+	}
+}
+
+// TestProxyBillingGate_OrgIDNotGated asserts the Q2 ruling by name: org_id is
+// captured best-effort, NOT a hot-path gate. A request carrying X-Saturn-Org-Id has
+// it stamped onto the metering event; a request MISSING it is still served (200) and
+// still emits an event (org held + screamed at push, never here) — so a per-install
+// producer-rollout gap can never black-hole inference.
+func TestProxyBillingGate_OrgIDNotGated(t *testing.T) {
+	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = w.Write([]byte(`{"model":"m","usage":{"prompt_tokens":1,"completion_tokens":1}}`))
+	}))
+	defer backend.Close()
+	upstream, _ := url.Parse(backend.URL)
+
+	t.Run("org present is carried onto the event", func(t *testing.T) {
+		em := &recordingEmitter{}
+		srv := newTestServerE(t, upstream, em)
+		rr := httptest.NewRecorder()
+		req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", nil)
+		setUpstream(req, upstream)
+		req.Header.Set(identity.HeaderAuthID, "auth-1")
+		req.Header.Set(identity.HeaderResourceID, "model-abc")
+		req.Header.Set(identity.HeaderOrgID, "org-42")
+		srv.Handler().ServeHTTP(rr, req)
+		if rr.Code != http.StatusOK {
+			t.Fatalf("got %d, want 200", rr.Code)
+		}
+		evs := em.waitForEvents(1, time.Second)
+		if len(evs) != 1 {
+			t.Fatalf("emitted %d events, want 1", len(evs))
+		}
+		if evs[0].OrgID != "org-42" {
+			t.Errorf("event OrgID = %q, want org-42", evs[0].OrgID)
+		}
+	})
+
+	t.Run("org absent is served and still emits (not gated)", func(t *testing.T) {
+		em := &recordingEmitter{}
+		srv := newTestServerE(t, upstream, em)
+		rr := httptest.NewRecorder()
+		req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", nil)
+		setUpstream(req, upstream)
+		req.Header.Set(identity.HeaderAuthID, "auth-1")
+		req.Header.Set(identity.HeaderResourceID, "model-abc")
+		// No X-Saturn-Org-Id.
+		srv.Handler().ServeHTTP(rr, req)
+		if rr.Code != http.StatusOK {
+			t.Fatalf("missing org_id must NOT gate: got %d, want 200", rr.Code)
+		}
+		evs := em.waitForEvents(1, time.Second)
+		if len(evs) != 1 {
+			t.Fatalf("missing org_id must still emit: emitted %d events, want 1", len(evs))
+		}
+		if evs[0].OrgID != "" {
+			t.Errorf("event OrgID = %q, want empty", evs[0].OrgID)
+		}
+	})
+}
+
+// TestProxyNoUpstreamFailsClosed verifies the fail-closed routing contract: a
+// request that passes the billing-identity gate but carries NO X-Saturn-Upstream
+// header has no forward target, so phoebe must refuse it (502) rather than invent
+// a default — there is no resolver and no fallback upstream anymore.
+func TestProxyNoUpstreamFailsClosed(t *testing.T) {
 	s := &config.Settings{ListenAddr: ":0"}
 	log := logging.New(logging.ERROR)
-	srv := New(s, log, registry.NewStatic(nil), &recordingEmitter{})
+	em := &recordingEmitter{}
+	srv := New(s, log, em)
 
 	rr := httptest.NewRecorder()
 	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", nil)
 	req.Header.Set(identity.HeaderAuthID, "auth-1")
 	req.Header.Set(identity.HeaderResourceID, "gone")
+	// Deliberately NO X-Saturn-Upstream header.
 	srv.Handler().ServeHTTP(rr, req)
 
-	if rr.Code != http.StatusNotFound {
-		t.Fatalf("torn-down model: got %d, want 404", rr.Code)
+	if rr.Code != http.StatusBadGateway {
+		t.Fatalf("missing upstream: got %d, want 502 (fail closed, never forward to a default)", rr.Code)
+	}
+	if got := em.count(); got != 0 {
+		t.Fatalf("refused (no-upstream) request emitted %d billing events, want 0", got)
 	}
 }
 
@@ -312,11 +420,16 @@ func TestProxyStreamingEndToEnd(t *testing.T) {
 	rr := httptest.NewRecorder()
 	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions",
 		strings.NewReader(`{"model":"m","stream":true,"messages":[]}`))
+	setUpstream(req, upstream)
 	req.Header.Set(identity.HeaderResourceID, "model-abc")
 	req.Header.Set(identity.HeaderResourceType, "deployment")
 	req.Header.Set(identity.HeaderGroupID, "org-1")
 	req.Header.Set(identity.HeaderUserID, "user-1")
 	req.Header.Set(identity.HeaderAuthID, "auth-key-7")
+	// The two per-deployment C4 headers the Atlas-rendered Traefik middleware
+	// injects: the catalog price key and the fine-tune checkpoint artifact id.
+	req.Header.Set(identity.HeaderBaseModel, "meta-llama/Llama-3.1-8B-Instruct")
+	req.Header.Set(identity.HeaderAdapter, "ckpt-artifact-42")
 	req.Header.Set("X-Request-Id", "req-123")
 
 	srv.Handler().ServeHTTP(rr, req)
@@ -357,6 +470,16 @@ func TestProxyStreamingEndToEnd(t *testing.T) {
 	}
 	if e.PromptTokens != 2006 || e.CompletionTokens != 300 || e.CachedTokens != 1920 {
 		t.Fatalf("event token counts wrong: %+v", e)
+	}
+	// BaseModel and Adapter are the C4 pricing seam: the trusted per-deployment
+	// headers must ride onto the metering event VERBATIM — base_model is the
+	// catalog price key and adapter presence is the fine-tune premium trigger.
+	// Dropping either silently mis-prices every endpoint-name event downstream.
+	if e.BaseModel != "meta-llama/Llama-3.1-8B-Instruct" {
+		t.Fatalf("event BaseModel = %q, want the X-Saturn-Base-Model header value", e.BaseModel)
+	}
+	if e.Adapter != "ckpt-artifact-42" {
+		t.Fatalf("event Adapter = %q, want the X-Saturn-Adapter header value", e.Adapter)
 	}
 	if e.FinishReason != "stop" {
 		t.Fatalf("event finish_reason = %q, want stop", e.FinishReason)

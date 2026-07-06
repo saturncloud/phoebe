@@ -31,7 +31,6 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
-	"net/url"
 	"os"
 	"path/filepath"
 	"strings"
@@ -50,7 +49,6 @@ import (
 	"github.com/saturncloud/phoebe/internal/metering"
 	"github.com/saturncloud/phoebe/internal/proxy"
 	"github.com/saturncloud/phoebe/internal/rating"
-	"github.com/saturncloud/phoebe/internal/registry"
 )
 
 // vllmStream mirrors the realistic vLLM SSE fixture in internal/proxy/tee_test.go
@@ -78,6 +76,7 @@ const (
 	testResourceID = "deploy-abc123"
 	testModelName  = "llama-3-8b"
 	testAuthID     = "auth-key-e2e"
+	testOrgID      = "org-e2e"
 
 	streamName = "phoebe:metering:e2e"
 )
@@ -181,16 +180,14 @@ func newHarness(t *testing.T, schema string) *harness {
 	return &harness{db: db, rdb: rdb, emitter: emitter, drainCfg: drainCfg, log: log}
 }
 
-// proxyServer builds a real proxy.Server routing every resource id to the
-// given upstream, emitting through the harness's real DurableEmitter.
-func (h *harness) proxyServer(t *testing.T, upstream string) *proxy.Server {
+// proxyServer builds a real proxy.Server emitting through the harness's real
+// DurableEmitter. The proxy no longer resolves upstreams — each test request
+// carries the forward target in the X-Saturn-Upstream header (as Atlas injects
+// it per route), so this helper takes no upstream.
+func (h *harness) proxyServer(t *testing.T) *proxy.Server {
 	t.Helper()
-	u, err := url.Parse(upstream)
-	if err != nil {
-		t.Fatalf("parse upstream url: %v", err)
-	}
 	settings := &config.Settings{ListenAddr: ":0", BillPartialOnAbort: true}
-	return proxy.New(settings, h.log, registry.NewStatic(u), h.emitter)
+	return proxy.New(settings, h.log, h.emitter)
 }
 
 // waitForStreamLen polls the miniredis stream until it holds at least n
@@ -368,15 +365,17 @@ func TestE2E_StreamedRequestBecomesMoney(t *testing.T) {
 	// 2. Proxy: real Server + real DurableEmitter. Full identity headers,
 	//    resource id != model name, and deliberately NO X-Request-Id — this
 	//    exercises the generated-id path end to end.
-	srv := h.proxyServer(t, backend.URL)
+	srv := h.proxyServer(t)
 	rr := httptest.NewRecorder()
 	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions",
 		strings.NewReader(`{"model":"whatever-the-client-said","stream":true,"messages":[]}`))
+	req.Header.Set(identity.HeaderUpstream, backend.URL)
 	req.Header.Set(identity.HeaderAuthID, testAuthID)
 	req.Header.Set(identity.HeaderResourceID, testResourceID)
 	req.Header.Set(identity.HeaderResourceType, "deployment")
 	req.Header.Set(identity.HeaderUserID, "user-e2e")
 	req.Header.Set(identity.HeaderGroupID, "group-e2e")
+	req.Header.Set(identity.HeaderOrgID, testOrgID)
 	srv.Handler().ServeHTTP(rr, req)
 
 	if rr.Code != http.StatusOK {
@@ -398,6 +397,7 @@ func TestE2E_StreamedRequestBecomesMoney(t *testing.T) {
 	var (
 		nRows                         int
 		requestID, authID, resourceID string
+		beOrgID                       sql.NullString // billing_event.org_id (nullable) — asserted at the drain layer
 		model                         sql.NullString
 		prompt, cached, completion    int
 		aborted                       bool
@@ -409,9 +409,9 @@ func TestE2E_StreamedRequestBecomesMoney(t *testing.T) {
 		t.Fatalf("billing_event rows = %d, want exactly 1", nRows)
 	}
 	if err := h.db.QueryRow(
-		`SELECT request_id, auth_id, resource_id, model, prompt_tokens, cached_tokens, completion_tokens, aborted
+		`SELECT request_id, auth_id, resource_id, org_id, model, prompt_tokens, cached_tokens, completion_tokens, aborted
 		 FROM billing_event`).
-		Scan(&requestID, &authID, &resourceID, &model, &prompt, &cached, &completion, &aborted); err != nil {
+		Scan(&requestID, &authID, &resourceID, &beOrgID, &model, &prompt, &cached, &completion, &aborted); err != nil {
 		t.Fatalf("read billing_event: %v", err)
 	}
 
@@ -433,6 +433,11 @@ func TestE2E_StreamedRequestBecomesMoney(t *testing.T) {
 	}
 	if resourceID != testResourceID {
 		t.Errorf("billing_event.resource_id = %q, want %q", resourceID, testResourceID)
+	}
+	// ORG captured at the DRAIN layer (not only transitively via rated_usage): a drainer
+	// regression that drops org to NULL is caught HERE, at the layer that produced it.
+	if !beOrgID.Valid || beOrgID.String != testOrgID {
+		t.Errorf("billing_event.org_id = %v, want %q (captured from X-Saturn-Org-Id at meter time)", beOrgID, testOrgID)
 	}
 	if authID != testAuthID {
 		t.Errorf("billing_event.auth_id = %q, want %q", authID, testAuthID)
@@ -470,6 +475,7 @@ func TestE2E_StreamedRequestBecomesMoney(t *testing.T) {
 	var (
 		nRollups                                     int
 		ruAuthID, ruResourceID, ruModelID, cost      string
+		ruOrgID                                      sql.NullString // nullable column; a NULL must surface as a clear assertion, not a scan error
 		ruPrompt, ruCached, ruCompletion, ruBillable int64
 		eventCount                                   int64 // BIGINT column
 	)
@@ -480,9 +486,9 @@ func TestE2E_StreamedRequestBecomesMoney(t *testing.T) {
 		t.Fatalf("rated_usage rows = %d, want exactly 1", nRollups)
 	}
 	if err := h.db.QueryRow(
-		`SELECT auth_id, resource_id, model_id, prompt_tokens, cached_tokens, completion_tokens, billable_prompt_tokens, cost::text, event_count
+		`SELECT auth_id, resource_id, org_id, model_id, prompt_tokens, cached_tokens, completion_tokens, billable_prompt_tokens, cost::text, event_count
 		 FROM rated_usage`).
-		Scan(&ruAuthID, &ruResourceID, &ruModelID, &ruPrompt, &ruCached, &ruCompletion, &ruBillable, &cost, &eventCount); err != nil {
+		Scan(&ruAuthID, &ruResourceID, &ruOrgID, &ruModelID, &ruPrompt, &ruCached, &ruCompletion, &ruBillable, &cost, &eventCount); err != nil {
 		t.Fatalf("read rated_usage: %v", err)
 	}
 	if ruAuthID != testAuthID {
@@ -493,6 +499,13 @@ func TestE2E_StreamedRequestBecomesMoney(t *testing.T) {
 	// the rated_usage grain — this is the key billing resolves the org from.
 	if ruResourceID != testResourceID {
 		t.Errorf("rated_usage.resource_id = %q, want %q (the X-Saturn-Resource-Id header value, for E2 org attribution)", ruResourceID, testResourceID)
+	}
+	// E2 org attribution, end-to-end: the deployment-owning org (X-Saturn-Org-Id) is
+	// CAPTURED at the proxy and carried through billing_event into the rated_usage rollup
+	// — the whole point of this change (org rides the request, not a push-time
+	// resource_name join). This is the composed-path assertion for the header→rollup carry.
+	if !ruOrgID.Valid || ruOrgID.String != testOrgID {
+		t.Errorf("rated_usage.org_id = %v, want %q (the X-Saturn-Org-Id header value, carried meter→rate)", ruOrgID, testOrgID)
 	}
 	// THE deployment-id-bug guard, at the far end of the pipe: the money is
 	// keyed on the engine name the upstream reported, not the id we routed on.
@@ -569,10 +582,11 @@ func TestE2E_FineTuneBillsAtBaseTimesPremium(t *testing.T) {
 	}))
 	defer backend.Close()
 
-	srv := h.proxyServer(t, backend.URL)
+	srv := h.proxyServer(t)
 	rr := httptest.NewRecorder()
 	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions",
 		strings.NewReader(`{"model":"my-finetune","stream":true,"messages":[]}`))
+	req.Header.Set(identity.HeaderUpstream, backend.URL)
 	req.Header.Set(identity.HeaderAuthID, testAuthID)
 	req.Header.Set(identity.HeaderResourceID, testResourceID)
 	req.Header.Set(identity.HeaderResourceType, "deployment")
@@ -659,10 +673,11 @@ func TestE2E_FineTuneWithoutBaseModelHeaderIsUnpriced(t *testing.T) {
 	}))
 	defer backend.Close()
 
-	srv := h.proxyServer(t, backend.URL)
+	srv := h.proxyServer(t)
 	rr := httptest.NewRecorder()
 	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions",
 		strings.NewReader(`{"model":"my-finetune","stream":true,"messages":[]}`))
+	req.Header.Set(identity.HeaderUpstream, backend.URL)
 	req.Header.Set(identity.HeaderAuthID, testAuthID)
 	req.Header.Set(identity.HeaderResourceID, testResourceID)
 	req.Header.Set(identity.HeaderResourceType, "deployment")
@@ -763,4 +778,127 @@ func TestE2E_ModellessEventIsUnattributable(t *testing.T) {
 		t.Error("Result.HasAnomaly() = false — the leak must drive the exit-nonzero path")
 	}
 	h.assertNumericEqual(t, res.TotalCost, "0", "Result.TotalCost")
+}
+
+// epVllmStream is the vLLM SSE fixture for a C4 Token Factory deployment: the engine
+// reports the ENDPOINT NAME as its model (the ratified serving contract — vLLM serves
+// under the endpoint name, so the model is NOT a price-file key and NOT ft:-prefixed).
+const epVllmStream = `data: {"id":"c3","object":"chat.completion.chunk","model":"tf-ep-my-finetune","choices":[{"index":0,"delta":{"role":"assistant","content":"Hi"}}]}
+
+data: {"id":"c3","object":"chat.completion.chunk","model":"tf-ep-my-finetune","choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}
+
+data: {"id":"c3","object":"chat.completion.chunk","model":"tf-ep-my-finetune","choices":[],"usage":{"prompt_tokens":1000,"total_tokens":1000,"completion_tokens":0,"prompt_tokens_details":{"cached_tokens":0}}}
+
+data: [DONE]
+
+`
+
+// TestE2E_AdapterHeaderLandsInBillingEventAndTriggersPremium is the C4 fine-tune
+// pipeline test: a request to a fine-tune checkpoint endpoint carries BOTH
+// per-deployment headers the Atlas-rendered Traefik middleware injects —
+// X-Saturn-Base-Model (the catalog price key) and X-Saturn-Adapter (the checkpoint
+// artifact id, whose PRESENCE is the premium trigger) — while the engine reports the
+// ENDPOINT NAME (not an ft: id) as its model. The whole pipe must end with:
+//
+//   - adapter contract: billing_event.adapter is the checkpoint artifact id from the
+//     header, stored VERBATIM (forensic: which checkpoint served the request);
+//   - the money: the endpoint-name model (absent from the price file, no ft: prefix)
+//     bills at base x premium — the adapter presence alone triggered the premium.
+func TestE2E_AdapterHeaderLandsInBillingEventAndTriggersPremium(t *testing.T) {
+	h := newHarness(t, "phoebe_e2e_adapter")
+
+	const (
+		epModelName = "tf-ep-my-finetune"
+		epBaseModel = "meta-llama/Llama-3.1-8B-Instruct"
+		epAdapter   = "ckpt-9f8e7d6c5b4a"
+	)
+
+	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.WriteHeader(http.StatusOK)
+		fl, _ := w.(http.Flusher)
+		for _, chunk := range strings.SplitAfter(epVllmStream, "\n\n") {
+			if chunk == "" {
+				continue
+			}
+			_, _ = io.WriteString(w, chunk)
+			if fl != nil {
+				fl.Flush()
+			}
+		}
+	}))
+	defer backend.Close()
+
+	srv := h.proxyServer(t)
+	rr := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions",
+		strings.NewReader(`{"model":"my-finetune","stream":true,"messages":[]}`))
+	// The forward target rides on the request (X-Saturn-Upstream, as Atlas
+	// injects per deployment); phoebe has no resolver.
+	req.Header.Set(identity.HeaderUpstream, backend.URL)
+	req.Header.Set(identity.HeaderAuthID, testAuthID)
+	req.Header.Set(identity.HeaderResourceID, testResourceID)
+	req.Header.Set(identity.HeaderResourceType, "deployment")
+	req.Header.Set(identity.HeaderUserID, "user-e2e")
+	req.Header.Set(identity.HeaderGroupID, "group-e2e")
+	// The two per-deployment headers the Atlas middleware injects on a fine-tune
+	// checkpoint endpoint (C4).
+	req.Header.Set(identity.HeaderBaseModel, epBaseModel)
+	req.Header.Set(identity.HeaderAdapter, epAdapter)
+	srv.Handler().ServeHTTP(rr, req)
+
+	if rr.Code != http.StatusOK {
+		t.Fatalf("proxy status = %d, want 200 (body: %s)", rr.Code, rr.Body.String())
+	}
+
+	h.waitForStreamLen(t, 1, 5*time.Second)
+	h.drainUntilRows(t, 1, 10*time.Second)
+
+	// The adapter + base_model contracts: both header values ride to billing_event
+	// verbatim, alongside the endpoint-name model.
+	var model, baseModel, adapter sql.NullString
+	if err := h.db.QueryRow("SELECT model, base_model, adapter FROM billing_event").Scan(&model, &baseModel, &adapter); err != nil {
+		t.Fatalf("read billing_event: %v", err)
+	}
+	if !model.Valid || model.String != epModelName {
+		t.Errorf("billing_event.model = %v, want %q (the endpoint name the engine serves under)", model, epModelName)
+	}
+	if !baseModel.Valid || baseModel.String != epBaseModel {
+		t.Fatalf("billing_event.base_model = %v, want %q (the catalog price key must ride to billing_event)", baseModel, epBaseModel)
+	}
+	if !adapter.Valid || adapter.String != epAdapter {
+		t.Fatalf("billing_event.adapter = %v, want %q — X-Saturn-Adapter must land in billing_event.adapter (the premium trigger + checkpoint forensics)", adapter, epAdapter)
+	}
+
+	// Rate from a book that prices ONLY the base with a 1.5x premium: the
+	// endpoint-name model must bill at base x premium via adapter + base_model.
+	book, err := rating.ParsePriceBook([]byte(ftPriceBookYAML))
+	if err != nil {
+		t.Fatalf("parse ft price book: %v", err)
+	}
+	res := h.rateEventHour(t, book)
+
+	if res.UnpricedEvents != 0 || res.UnattributableEvents != 0 {
+		t.Fatalf("anomalies = %d unpriced / %d unattributable, want 0/0 — the adapter/base_model seam failed to price the fine-tune",
+			res.UnpricedEvents, res.UnattributableEvents)
+	}
+	if res.EventsRated != 1 || res.RollupsWritten != 1 {
+		t.Fatalf("rater Result = %+v, want 1 event / 1 rollup", res)
+	}
+	// 1000 prompt tokens x (0.000004 base x 1.5 premium) = 0.006. If the adapter
+	// failed to trigger the premium this would be 0.004 (plain base rate).
+	const wantCost = "0.006"
+	h.assertNumericEqual(t, res.TotalCost, wantCost, "Result.TotalCost (adapter-triggered premium)")
+
+	var ruModelID, cost, appliedPrompt string
+	if err := h.db.QueryRow(
+		`SELECT model_id, cost::text, applied_prompt_rate::text FROM rated_usage`).
+		Scan(&ruModelID, &cost, &appliedPrompt); err != nil {
+		t.Fatalf("read rated_usage: %v", err)
+	}
+	if ruModelID != epModelName {
+		t.Errorf("rated_usage.model_id = %q, want %q (billed under the endpoint name)", ruModelID, epModelName)
+	}
+	h.assertNumericEqual(t, appliedPrompt, "0.000006", "rated_usage.applied_prompt_rate (base x premium frozen on row)")
+	h.assertNumericEqual(t, cost, wantCost, "rated_usage.cost")
 }

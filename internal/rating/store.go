@@ -56,12 +56,20 @@ type RateResult struct {
 	// never disagree with what the rollups excluded.
 	UnpricedEvents       int64
 	UnattributableEvents int64
-	// AmbiguousBaseEvents counts events under rollups where a single ft: model_id
-	// resolved through MORE THAN ONE distinct base_model in a window — the E3
-	// ft-uniqueness violation (a uuid4 checkpoint id can't carry two bases). Those
-	// rollups are excluded from the upsert and screamed about, never silently billed at
-	// the MIN (cheaper) rate.
+	// AmbiguousBaseEvents counts events under rollups whose base_model-priced rows
+	// (derived OR plain-base) did not share ONE rate in the window: a single model_id
+	// resolving through more than one distinct base_model (the E3 ft-uniqueness
+	// violation for an ft: id; the same hazard for a reused endpoint name under C4),
+	// or a mix of premium and plain-base pricing on one endpoint name (the adapter
+	// header flapping). Those rollups are excluded from the upsert and screamed
+	// about, never silently billed at the MIN (cheaper) rate.
 	AmbiguousBaseEvents int64
+	// AmbiguousOrgEvents counts events under rollups carrying >1 distinct non-NULL
+	// org_id — an E2 attribution propagation bug (one resource resolving to two orgs in
+	// a window). Those rollups are excluded from the upsert and screamed about, never
+	// billed to a guessed org. A partial-NULL org (real org + missing-header rows) is
+	// NOT ambiguous and does not count here.
+	AmbiguousOrgEvents int64
 }
 
 // Anomalies are the fail-loud counts for a window: events that could not be priced
@@ -71,6 +79,7 @@ type Anomalies struct {
 	UnpricedEvents       int64
 	UnattributableEvents int64
 	AmbiguousBaseEvents  int64
+	AmbiguousOrgEvents   int64
 }
 
 // PostgresStore reads billing_event and writes rated_usage in the shared Atlas
@@ -163,17 +172,31 @@ CREATE TEMP TABLE rating_derived (
 // rateWindowSQL resolves, sums, upserts, and counts in ONE statement over the
 // transient rating_price table (populated from the YAML PriceBook for this run).
 //
-// RESOLUTION (two tables, direct wins): a billing_event's model NAME is aliased to
-// model_id (the price key) and LEFT JOINed to rating_price (the direct rate). If that
-// misses AND model_id is an ft:<checkpoint> id carrying a base_model (E3 fine-tune),
-// it is LEFT JOINed to rating_derived on base_model — the base-x-premium rate. Both
-// tables already carry the FINAL per-token rate (premium applied + quantized in exact
-// Dec at projection), so the SQL does NO premium math; it COALESCEs direct-over-derived
-// and multiplies. An event that resolves through NEITHER is UNPRICED (NULLs) and is
-// COUNTED, never $0-billed — including an ft: id with an EMPTY base_model, which is a
-// propagation bug (Atlas guarantees base_model at deploy), not a free model, so it
-// MUST scream rather than silently mis-price. (E4's create-time gate should prevent
-// any unpriced traffic; the rater keeps the fail-loud backstop.)
+// RESOLUTION (the C4 ladder, precedence a > b > c > d; the Go mirror is
+// PriceBook.ResolveEvent): vLLM serves Token Factory endpoints under the ENDPOINT
+// NAME, so billing_event.model (aliased to model_id) is usually NOT a price-file
+// key; the event's base_model (X-Saturn-Base-Model, on ALL TF deployments) is the
+// catalog price key and a non-null adapter (X-Saturn-Adapter, ONLY on fine-tune
+// checkpoint deployments) marks fine-tune traffic.
+//
+//	a. rating_price on model_id (the direct rate — a price-file key, incl. any
+//	   per-endpoint override) wins;
+//	b. else, for FINE-TUNE traffic (adapter non-null OR an ft: model_id) carrying a
+//	   base_model: rating_derived on base_model — the base-x-premium rate;
+//	c. else, for a BASE-MODEL endpoint (no adapter, no ft: prefix) carrying a
+//	   base_model: rating_price keyed on base_model — the PLAIN base rate, no
+//	   premium;
+//	d. an event that resolves through NONE is UNPRICED (NULLs) and is COUNTED,
+//	   never $0-billed — including fine-tune traffic with a NULL base_model, which
+//	   is a propagation bug (Atlas guarantees base_model at deploy), not a free
+//	   model, so it MUST scream rather than silently mis-price. The (b) and (c)
+//	   join guards are mutually exclusive on the fine-tune marker, so fine-tune
+//	   traffic with an unpriced base can never slip into the plain-base rate.
+//
+// All tables already carry the FINAL per-token rate (premium applied + quantized in
+// exact Dec at projection), so the SQL does NO premium math; it COALESCEs
+// direct-over-derived-over-plain-base and multiplies. (E4's create-time gate should
+// prevent any unpriced traffic; the rater keeps the fail-loud backstop.)
 //
 // THE BILLABLE-PROMPT FORMULA (highest-risk line; mirror of Rate() in the oracle):
 //
@@ -218,18 +241,30 @@ const rateWindowSQL = `
 WITH ev AS (
     SELECT
         auth_id,
-        -- resource_id: the deployment id (E2 customer attribution — billing resolves
-        -- the org via resource_id→org_id). It is part of the rated_usage grain: a NULL
-        -- resource_id row CANNOT name its deployment/org, so it is unattributable
-        -- (counted, never billed to a NULL org) — see the unattributable filter below.
+        -- resource_id: the deployment id (E2 customer attribution — the owning org is
+        -- captured at meter time into org_id; see that column below, no push-time join).
+        -- It is part of the rated_usage grain: a NULL resource_id row CANNOT name its
+        -- deployment/org, so it is unattributable (counted, never billed to a NULL org) —
+        -- see the unattributable filter below.
         resource_id,
+        -- org_id: the deployment-owning org (E2 attribution), captured at meter time
+        -- from X-Saturn-Org-Id. Carried onto the rollup so push reads org off the row
+        -- (no resource_name join). NULL when the producer header was absent — carried
+        -- through and surfaced (a NULL-org rollup is held at push, never billed to a
+        -- guessed org); it does NOT enter the rollup grain (org is a function of
+        -- resource_id, so it must not split a rollup).
+        org_id,
         -- billing_event stores the engine-reported model NAME in its model column;
         -- that name IS phoebe's stable price key, model_id. A NULL model is
         -- unattributable.
         model AS model_id,
-        -- base_model: the HF base id a fine-tune derives from (E3), stamped by Atlas.
-        -- NULL for a base model. Used only to price an ft:<checkpoint> model_id.
+        -- base_model: the HF base id — the catalog price key (C4), stamped by Atlas
+        -- on every Token Factory deployment. Prices both a base-model endpoint
+        -- (plain base rate) and a fine-tune (base x premium).
         base_model,
+        -- adapter: the fine-tune checkpoint artifact id, non-NULL ONLY on fine-tune
+        -- checkpoint deployments. Its PRESENCE is the premium trigger (C4).
+        adapter,
         prompt_tokens,
         cached_tokens,
         completion_tokens,
@@ -242,6 +277,7 @@ resolved AS (
     SELECT
         ev.auth_id,
         ev.resource_id,
+        ev.org_id,
         ev.model_id,
         ev.base_model,
         ev.ev_ts,
@@ -249,43 +285,68 @@ resolved AS (
         ev.cached_tokens,
         ev.completion_tokens,
         GREATEST(ev.prompt_tokens - ev.cached_tokens, 0) AS billable_prompt,
-        -- Direct price wins; else the derived (base x premium) price for an ft: id
-        -- carrying a base_model. A miss on BOTH → NULL → UNPRICED (never $0). An ft:
-        -- id with a NULL base_model can only miss the derived join (NULL = NULL is
-        -- never true), so it correctly falls through to UNPRICED and screams.
-        COALESCE(rp.prompt_price,     rd.prompt_price)     AS prompt_price,
-        COALESCE(rp.cached_price,     rd.cached_price)     AS cached_price,
-        COALESCE(rp.completion_price, rd.completion_price) AS completion_price,
-        -- Whether this row priced through the DERIVED (base_model) path: an ft: id that
-        -- missed the direct table and hit rating_derived. Drives the ft-uniqueness
-        -- enforcement below — only a derived-priced row's base_model matters.
-        (rp.model_id IS NULL AND rd.base_model IS NOT NULL) AS via_derived
+        -- The C4 ladder: direct (a) wins; else derived base x premium (b) for
+        -- fine-tune traffic; else the plain base rate (c) for a base-model endpoint.
+        -- The rd and rpb join guards are mutually exclusive on the fine-tune marker,
+        -- so at most one of them is non-NULL and the COALESCE order between them is
+        -- documentation, not a tiebreak. A miss on ALL → NULL → UNPRICED (never $0).
+        -- Fine-tune traffic with a NULL base_model can only miss its join (NULL =
+        -- NULL is never true) and is BARRED from the plain-base join by the marker
+        -- guard, so it correctly falls through to UNPRICED and screams.
+        COALESCE(rp.prompt_price,     rd.prompt_price,     rpb.prompt_price)     AS prompt_price,
+        COALESCE(rp.cached_price,     rd.cached_price,     rpb.cached_price)     AS cached_price,
+        COALESCE(rp.completion_price, rd.completion_price, rpb.completion_price) AS completion_price,
+        -- Whether this row priced through the DERIVED (base x premium) path (b), or
+        -- the PLAIN-BASE path (c). Both key the rate on base_model, so both feed the
+        -- single-rate ambiguity gate below.
+        (rp.model_id IS NULL AND rd.base_model IS NOT NULL) AS via_derived,
+        (rp.model_id IS NULL AND rpb.model_id  IS NOT NULL) AS via_base
     FROM ev
-    -- The YAML-projected DIRECT price table (keyed on model_id).
+    -- (a) The YAML-projected DIRECT price table (keyed on model_id).
     LEFT JOIN rating_price rp ON rp.model_id = ev.model_id
-    -- The DERIVED price table (keyed on base_model): consulted ONLY for an ft:
-    -- model_id that missed the direct join — base_model prices the fine-tune at
-    -- base x premium. The rp.model_id-IS-NULL guard keeps direct-over-derived
-    -- precedence (a fine-tune with its own in-file rate is never re-derived); the
-    -- ft: prefix guard keeps a base model from ever resolving through the derived
-    -- table by accident.
+    -- (b) The DERIVED price table (keyed on base_model): consulted ONLY for
+    -- FINE-TUNE traffic — an injected adapter, or the ft: model prefix — that missed
+    -- the direct join; base_model prices the fine-tune at base x premium. The
+    -- rp.model_id-IS-NULL guard keeps direct-over-derived precedence (a fine-tune
+    -- with its own in-file rate is never re-derived); the fine-tune-marker guard
+    -- keeps a base-model endpoint from ever resolving through the derived table.
     LEFT JOIN rating_derived rd
         ON rd.base_model = ev.base_model
        AND rp.model_id IS NULL
        -- The ft: prefix is SINGLE-SOURCED from the Go fineTunePrefix constant, bound as
        -- $3 (ftLikePattern), so the money path has ONE source of truth for what marks a
-       -- fine-tune — never a literal 'ft:%' that could drift from the constant.
-       AND ev.model_id LIKE $3
+       -- fine-tune — never a literal 'ft:%' that could drift from the constant. The
+       -- adapter presence is the OTHER fine-tune marker (C4): the endpoint serves under
+       -- its endpoint name, so the model id alone cannot mark it.
+       AND (ev.model_id LIKE $3 OR ev.adapter IS NOT NULL)
+    -- (c) The PLAIN-BASE rate for a BASE-MODEL endpoint serving under its endpoint
+    -- name (C4): the same direct price table, keyed on ev.base_model — NO premium.
+    -- Guarded to NON-fine-tune traffic only (the exact negation of rd's marker
+    -- guard), so a fine-tune whose base misses rating_derived can never fall through
+    -- to an un-premiumed plain-base rate — it must scream as UNPRICED instead.
+    LEFT JOIN rating_price rpb
+        ON rpb.model_id = ev.base_model
+       AND rp.model_id IS NULL
+       AND NOT (ev.model_id LIKE $3 OR ev.adapter IS NOT NULL)
 ),
 -- grouped: the per-(auth_id, resource_id, model_id, hour) rollup BEFORE the
--- ft-uniqueness gate.
--- It carries ambiguous_base = COUNT(DISTINCT base_model among DERIVED-priced rows) > 1.
--- E3 mints ft:<checkpoint_artifact_id> as a globally-unique uuid4, so one ft: model_id
--- can NEVER legitimately carry two different base_models. If it does, the derived rates
--- differ and a blind MIN()-applied-rate would silently bill the rollup at the CHEAPER
--- base — under-billing, counted as rated. That is a base_model PROPAGATION/UNIQUENESS
--- violation: it must SCREAM, not silently pick a rate. So ambiguous rollups are split
--- out below (counted as an anomaly, never upserted).
+-- single-rate gate.
+-- A rollup stores ONE applied-rate triple, so every priced row in it must have
+-- resolved to the SAME rate. Rows that priced through base_model (via_derived or
+-- via_base) can violate that two ways, both stamped ambiguous_base:
+--   - >1 DISTINCT base_model among them: for an ft: id that is the E3 ft-uniqueness
+--     violation (a globally-unique uuid4 checkpoint id can't carry two bases); for
+--     an endpoint-name model_id it is the same hazard via C4 (e.g. an endpoint name
+--     reused across deployments with different bases inside one window). Either
+--     way the rates differ and a blind MIN()-applied-rate would silently bill the
+--     rollup at the CHEAPER base — under-billing, counted as rated.
+--   - BOTH paths present (some rows derived, some plain-base — the adapter header
+--     flapping on one endpoint name): premium and no-premium rates differ even on a
+--     SINGLE base_model, and MIN() would again silently pick the cheaper.
+-- Both are base_model/adapter PROPAGATION violations: they must SCREAM, not
+-- silently pick a rate. Ambiguous rollups are split out below (counted as an
+-- anomaly, never upserted). Direct-priced (via model_id) rows never trip the gate —
+-- their base_model/adapter never affected their rate.
 grouped AS (
     SELECT
         auth_id,
@@ -305,17 +366,37 @@ grouped AS (
           + completion_tokens * completion_price
         )                                                AS cost,
         -- The applied per-token rates frozen onto the row. A rollup is single-model and
-        -- (by the ft-uniqueness invariant enforced below) single derived-base, so all
+        -- (by the single-rate gate enforced below) single base-and-path, so all
         -- rows share ONE rate; MIN picks it deterministically. The ambiguous_base guard
         -- guarantees MIN is not silently masking a second, different rate.
         MIN(prompt_price)                                AS applied_prompt_rate,
         MIN(cached_price)                                AS applied_cached_rate,
         MIN(completion_price)                            AS applied_completion_rate,
         COUNT(*)::bigint                                 AS event_count,
-        -- > 1 distinct base_model among the DERIVED-priced rows → ambiguous (the E3
-        -- ft-uniqueness violation). DERIVED rows only: a direct-priced row's base_model
-        -- never affects its rate, so it must not trip the gate.
-        COUNT(DISTINCT base_model) FILTER (WHERE via_derived) > 1 AS ambiguous_base
+        -- org_id carried onto the rollup via MAX (NOT a GROUP BY key — org is a function
+        -- of resource_id, so it must never split a rollup). MAX ignores NULLs, so a
+        -- deployment that metered some events before its org header was wired and some
+        -- after collapses to the one non-NULL org (a partial-NULL is NOT ambiguity). The
+        -- result is NULL only if EVERY event in the rollup lacked org — then push holds
+        -- + screams the rollup, never bills a guessed org. The ambiguous_org guard below
+        -- guarantees MAX is not silently masking a SECOND, distinct non-NULL org.
+        MAX(org_id)                                      AS org_id,
+        -- THE SINGLE-RATE GATE (see the grouped comment): among rows whose rate came
+        -- from base_model (derived OR plain-base), >1 distinct base_model — or a MIX
+        -- of the two paths (premium vs no-premium on one endpoint name) — means more
+        -- than one rate in the rollup → ambiguous. Rows priced directly on model_id
+        -- never affect it.
+        (COUNT(DISTINCT base_model) FILTER (WHERE via_derived OR via_base) > 1
+         OR (bool_or(via_derived) AND bool_or(via_base)))          AS ambiguous_base,
+        -- > 1 distinct NON-NULL org_id for one (auth, resource, model, hour) rollup →
+        -- ambiguous org. Org is a deployment property, so a resource resolving to two
+        -- distinct orgs in one window is an attribution PROPAGATION bug (Atlas injected
+        -- conflicting org labels). A blind MAX(org_id) would silently bill the whole
+        -- rollup to ONE of them — mis-attribution counted as rated. So ambiguous-org
+        -- rollups are split out (counted as an anomaly, never upserted), exactly like
+        -- ambiguous_base. A partial-NULL (one real org + missing-header rows) is NOT
+        -- ambiguous (DISTINCT over non-NULLs is 1).
+        COUNT(DISTINCT org_id) > 1 AS ambiguous_org
     FROM resolved
     WHERE prompt_price IS NOT NULL          -- priced only
       AND auth_id     IS NOT NULL           -- attributable only
@@ -327,7 +408,7 @@ grouped AS (
     GROUP BY auth_id, resource_id, model_id, date_trunc('hour', ev_ts AT TIME ZONE 'UTC') AT TIME ZONE 'UTC'
 ),
 priced AS (
-    SELECT * FROM grouped WHERE NOT ambiguous_base
+    SELECT * FROM grouped WHERE NOT ambiguous_base AND NOT ambiguous_org
 ),
 -- RECONCILE (re-rate deletes superseded rollups): a rated_usage row whose
 -- (auth_id, resource_id, model_id, window_start) falls IN this run's window but is
@@ -360,7 +441,7 @@ deleted AS (
 ),
 upserted AS (
     INSERT INTO rated_usage (
-        id, auth_id, resource_id, model_id, window_start, window_end,
+        id, auth_id, resource_id, org_id, model_id, window_start, window_end,
         prompt_tokens, cached_tokens, completion_tokens, billable_prompt_tokens,
         cost, applied_prompt_rate, applied_cached_rate, applied_completion_rate,
         event_count
@@ -378,7 +459,10 @@ upserted AS (
           || '|' || length(resource_id)::text || ':' || resource_id
           || '|' || length(model_id)::text || ':' || model_id
           || '|' || extract(epoch FROM window_start)::bigint::text),
-        auth_id, resource_id, model_id, window_start, window_end,
+        -- org_id is NOT part of the md5 natural key (the key is auth/resource/model/
+        -- window): org is DERIVED from resource_id, so a NULL→value org transition must
+        -- NOT mint a new id and double-write. It is carried as a data column only.
+        auth_id, resource_id, org_id, model_id, window_start, window_end,
         prompt_tokens, cached_tokens, completion_tokens, billable_prompt_tokens,
         cost, applied_prompt_rate, applied_cached_rate, applied_completion_rate,
         event_count
@@ -392,6 +476,17 @@ upserted AS (
     -- added here. See cmd/rater's package doc for the single-flight contract.
     ORDER BY auth_id, resource_id, model_id, window_start
     ON CONFLICT (auth_id, resource_id, model_id, window_start) DO UPDATE SET
+        -- Refresh org_id on re-rate, but NEVER erase a known org: COALESCE prefers the
+        -- new snapshot's org and FALLS BACK to the existing row's org when the new one is
+        -- NULL. So a rollup first written with a NULL org (header not yet wired) picks up
+        -- the real org on a later re-rate (NULL -> real, convergence), but a re-rate over
+        -- a window whose snapshot has since LOST its org headers (e.g. a forced replay
+        -- from a stale billing_event range) can NOT overwrite a prior good org with NULL
+        -- (real -> NULL would silently un-attribute already-billed usage). The only
+        -- legitimate "org changed" case (real A -> real B for one resource) is NOT a
+        -- silent re-rate flip: it is a distinct-org collision the ambiguous_org guard
+        -- above already withholds + screams, so it never reaches this UPDATE.
+        org_id                  = COALESCE(EXCLUDED.org_id, rated_usage.org_id),
         window_end              = EXCLUDED.window_end,
         prompt_tokens           = EXCLUDED.prompt_tokens,
         cached_tokens           = EXCLUDED.cached_tokens,
@@ -415,8 +510,10 @@ SELECT
     (SELECT COUNT(*)::bigint FROM deleted)                       AS reconciled_deletions,
     -- Anomaly counts from the SAME snapshot as the upsert. An unattributable row is
     -- counted ONLY as unattributable (the more specific signal), never also as
-    -- unpriced, so the counts partition the in-window rows:
-    --   events_rated + unpriced + unattributable + ambiguous_base == total in-window events.
+    -- unpriced; likewise an ambiguous_org rollup that is ALSO ambiguous_base is counted
+    -- ONLY as ambiguous_base. So the counts strictly PARTITION the in-window rows:
+    --   events_rated + unpriced + unattributable + ambiguous_base + ambiguous_org
+    --     == total in-window events.
     -- The unpriced count requires FULL attribution (auth_id, resource_id, model_id all
     -- NON-NULL) for exactly this exclusivity: a NULL-resource_id row that is also
     -- unpriced must be counted ONLY as unattributable, never double-counted here.
@@ -427,14 +524,29 @@ SELECT
         AND model_id    IS NOT NULL)                          AS unpriced_events,
     (SELECT COUNT(*)::bigint FROM ev
       WHERE auth_id IS NULL OR resource_id IS NULL OR model_id IS NULL) AS unattributable_events,
-    -- AMBIGUOUS-BASE events: the EVENT count under ambiguous rollups (a single ft:
-    -- model_id resolving through >1 distinct base_model in one window — the E3
-    -- ft-uniqueness violation). These rollups are NOT upserted (excluded from priced),
+    -- AMBIGUOUS-BASE events: the EVENT count under ambiguous rollups (a single
+    -- model_id whose base_model-priced rows carried >1 rate in one window — >1
+    -- distinct base_model, or mixed premium/plain-base pricing; see the grouped
+    -- comment). These rollups are NOT upserted (excluded from priced),
     -- so their events are neither rated nor $0-billed; they are counted here, from the
     -- SAME snapshot, and drive the fail-loud exit. SUM(event_count) (not COUNT(*) of
     -- rollups) so the partition identity above stays in EVENT units.
     (SELECT COALESCE(SUM(event_count), 0)::bigint FROM grouped
-      WHERE ambiguous_base)                                  AS ambiguous_base_events`
+      WHERE ambiguous_base)                                  AS ambiguous_base_events,
+    -- AMBIGUOUS-ORG events: the EVENT count under rollups carrying >1 distinct non-NULL
+    -- org_id (an E2 attribution propagation bug — one resource resolving to two orgs in
+    -- a window). Excluded from priced (NOT billed to a guessed org), counted here from
+    -- the same snapshot to drive the fail-loud exit. Same EVENT-unit convention as
+    -- ambiguous_base. EXCLUSIVE of ambiguous_base (AND NOT ambiguous_base) so the
+    -- anomaly counts stay a strict PARTITION: a rollup that is BOTH base- and
+    -- org-ambiguous is counted ONLY as ambiguous_base (the more specific E3 signal),
+    -- exactly as unattributable takes precedence over unpriced above. So
+    --   events_rated + unpriced + unattributable + ambiguous_base + ambiguous_org
+    --     == total in-window events
+    -- holds with no double-count. Both still drive exit-nonzero, so precedence changes
+    -- only which bucket reports the overlap, never whether it screams.
+    (SELECT COALESCE(SUM(event_count), 0)::bigint FROM grouped
+      WHERE ambiguous_org AND NOT ambiguous_base)           AS ambiguous_org_events`
 
 // RateWindow runs the price-projection + the single resolve→sum→upsert→count
 // statement for [start, end) in ONE transaction, and reports the rollups written,
@@ -479,7 +591,8 @@ func (s *PostgresStore) RateWindow(ctx context.Context, book *PriceBook, start, 
 	var total string
 	err = tx.QueryRowContext(ctx, rateWindowSQL, start.UTC(), end.UTC(), ftLikePattern).
 		Scan(&res.RollupsWritten, &res.EventsRated, &total, &res.ReconciledDeletions,
-			&res.UnpricedEvents, &res.UnattributableEvents, &res.AmbiguousBaseEvents)
+			&res.UnpricedEvents, &res.UnattributableEvents, &res.AmbiguousBaseEvents,
+			&res.AmbiguousOrgEvents)
 	if err != nil {
 		return RateResult{}, fmt.Errorf("rating: rate window [%s,%s): %w",
 			start.UTC().Format(time.RFC3339), end.UTC().Format(time.RFC3339), err)

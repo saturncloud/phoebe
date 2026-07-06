@@ -31,8 +31,9 @@ import (
 // capture/emit side and can be tested in isolation.
 type RatedEvent struct {
 	AuthID string
-	// ResourceID is the deployment id (E2 customer attribution — billing resolves the
-	// org via resource_id→org_id). Part of the rollup grain. Empty ("") MODELS A NULL
+	// ResourceID is the deployment id (E2 customer attribution — the owning org is
+	// captured at meter time into the rollup's org_id, NOT resolved from resource_id at
+	// push). Part of the rollup grain. Empty ("") MODELS A NULL
 	// resource_id column: the oracle has no separate NULL, so "" stands in for it and is
 	// counted unattributable (the row can't name its deployment/org), never billed. This
 	// mirrors the SQL's `resource_id IS NULL` handling exactly because production never
@@ -40,10 +41,15 @@ type RatedEvent struct {
 	// proxy billing gate fails closed on empty ResourceID before metering.
 	ResourceID string
 	ModelID    string
-	// BaseModel is the HF base id a fine-tune derives from (E3), carried on the event
-	// from billing_event.base_model. Empty for a base model. The oracle prices an ft:
-	// ModelID via base x premium keyed on BaseModel — mirroring the SQL.
-	BaseModel        string
+	// BaseModel is the HF base id — the catalog price key (C4), carried on the event
+	// from billing_event.base_model. The oracle prices an endpoint-name ModelID
+	// through it (plain base rate, or base x premium for fine-tune traffic) —
+	// mirroring the SQL.
+	BaseModel string
+	// Adapter is the fine-tune checkpoint artifact id from billing_event.adapter,
+	// non-empty ONLY for fine-tune checkpoint deployments. Its presence is the
+	// premium trigger (C4) — mirroring the SQL.
+	Adapter          string
 	PromptTokens     int64 // TOTAL prompt tokens (cached + non-cached), per vLLM
 	CachedTokens     int64 // SUBSET of PromptTokens that was a cache hit
 	CompletionTokens int64
