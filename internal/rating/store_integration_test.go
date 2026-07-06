@@ -39,6 +39,7 @@ CREATE TABLE billing_event (
     resource_id       VARCHAR(64),
     model             VARCHAR(255),
     base_model        VARCHAR(255),
+    adapter           VARCHAR(255),
     prompt_tokens     INTEGER NOT NULL DEFAULT 0,
     cached_tokens     INTEGER NOT NULL DEFAULT 0,
     completion_tokens INTEGER NOT NULL DEFAULT 0,
@@ -601,7 +602,7 @@ func TestIntegration_FineTunePricesViaBaseModel(t *testing.T) {
 	}
 
 	// Cross-check against the oracle (ResolveEvent → quantize → Rate).
-	rate, err := book.ResolveEvent("ft:9f8e7d6c5b4a", "meta-llama/Llama-3.1-8B-Instruct")
+	rate, err := book.ResolveEvent("ft:9f8e7d6c5b4a", "meta-llama/Llama-3.1-8B-Instruct", "")
 	if err != nil {
 		t.Fatalf("oracle ResolveEvent: %v", err)
 	}
@@ -941,7 +942,7 @@ func TestIntegration_OneHopFineTuneCannotDeriveFromFineTune(t *testing.T) {
 		t.Fatalf("unpriced = %d, want 1 (ft deriving from an own-rate ft: must fail loud — no second hop)", res.UnpricedEvents)
 	}
 	// Cross-check the oracle agrees: ResolveEvent fails for the second hop.
-	if _, err := book.ResolveEvent("ft:def", "ft:ownrate"); err == nil {
+	if _, err := book.ResolveEvent("ft:def", "ft:ownrate", ""); err == nil {
 		t.Fatal("oracle ResolveEvent priced a fine-tune-of-fine-tune — SQL and oracle must BOTH forbid the second hop")
 	}
 }
@@ -1182,4 +1183,215 @@ func nullableStr(s string) any {
 		return nil
 	}
 	return s
+}
+
+// TestIntegration_C4ResolutionLadderConformsToOracle runs the REAL rating SQL over
+// one fixture per rung of the C4 resolution ladder and pins it to the Go oracle
+// (ResolveEvent → Quantized → Rate) case by case. The contract under test: vLLM
+// serves under the ENDPOINT NAME, X-Saturn-Base-Model (billing_event.base_model) is
+// the catalog price key, and X-Saturn-Adapter (billing_event.adapter) presence is
+// the fine-tune premium trigger. Precedence a > b > c > d:
+//
+//	base-endpoint-no-premium            (c) base_model set, no adapter, non-ft name → plain base rate
+//	adapter-triggers-premium            (b) endpoint name + adapter + base_model → base x premium
+//	ft-prefix-still-premium             (b) ft: model_id + base_model → base x premium (unchanged)
+//	direct-entry-wins-over-derivation   (a) model_id in the file + base_model + adapter → the direct rate
+//	adapter-with-empty-base-model-unpriced (d) adapter, NULL base_model → UNPRICED (fail closed)
+//	plain-unknown-model-unpriced        (d) nothing resolves → UNPRICED (unchanged)
+func TestIntegration_C4ResolutionLadderConformsToOracle(t *testing.T) {
+	dsn := os.Getenv("PHOEBE_TEST_DATABASE_URL")
+	if dsn == "" {
+		t.Skip("PHOEBE_TEST_DATABASE_URL not set; skipping live-Postgres conformance")
+	}
+	ctx := context.Background()
+	db, err := sql.Open("pgx", dsn)
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	defer db.Close()
+
+	const sch = "phoebe_rating_c4_it"
+	exec(t, db, "DROP SCHEMA IF EXISTS "+sch+" CASCADE")
+	exec(t, db, "CREATE SCHEMA "+sch)
+	exec(t, db, "SET search_path TO "+sch)
+	defer func() { exec(t, db, "DROP SCHEMA IF EXISTS "+sch+" CASCADE") }()
+	exec(t, db, schemaDDL)
+
+	hour := mustTime("2026-06-08T10:00:00Z")
+	// One priced base (the catalog key), one direct per-endpoint override entry,
+	// 1.5x premium. Endpoint names are deliberately NOT file keys.
+	book := newTestBook(
+		map[string]Rate3{
+			"meta-llama/Llama-3.1-8B-Instruct": rate3("0.000004", "0.0000004", "0.00001"),
+			"tf-ep-override":                   rate3("0.000099", "0", "0"),
+		},
+		nil, PolicyMultiplier, MustDec("1.5"), Dec{},
+	)
+
+	const base = "meta-llama/Llama-3.1-8B-Instruct"
+	cases := []struct {
+		name              string
+		model, baseModel  string
+		adapter           string
+		prompt            int64
+		priced            bool
+		wantAppliedPrompt string // the 9dp rate that must be frozen on the row
+	}{
+		{"base-endpoint-no-premium", "tf-ep-base", base, "", 100, true, "0.000004000"},
+		{"adapter-triggers-premium", "tf-ep-ft", base, "ckpt-artifact-1", 200, true, "0.000006000"},
+		{"ft-prefix-still-premium", "ft:9f8e7d6c5b4a", base, "", 300, true, "0.000006000"},
+		{"direct-entry-wins-over-derivation", "tf-ep-override", base, "ckpt-artifact-2", 400, true, "0.000099000"},
+		{"adapter-with-empty-base-model-unpriced", "tf-ep-orphan", "", "ckpt-artifact-3", 500, false, ""},
+		{"plain-unknown-model-unpriced", "tf-ep-unknown", "", "", 600, false, ""},
+	}
+	for i, c := range cases {
+		if _, err := db.ExecContext(ctx,
+			`INSERT INTO billing_event (request_id, auth_id, resource_id, model, base_model, adapter, prompt_tokens, completion_tokens, event_ts)
+			 VALUES ($1,'a','r',$2,$3,$4,$5,0,$6)`,
+			fmt.Sprintf("c4-req-%d", i), c.model, nullableStr(c.baseModel), nullableStr(c.adapter),
+			c.prompt, hour.Add(5*time.Minute)); err != nil {
+			t.Fatalf("seed %s: %v", c.name, err)
+		}
+	}
+
+	store := NewPostgresStore(db)
+	res, err := store.RateWindow(ctx, book, hour, hour.Add(time.Hour))
+	if err != nil {
+		t.Fatalf("RateWindow: %v", err)
+	}
+	if res.RollupsWritten != 4 || res.EventsRated != 4 {
+		t.Fatalf("rollups/events = %d/%d, want 4/4 (the four priced rungs)", res.RollupsWritten, res.EventsRated)
+	}
+	if res.UnpricedEvents != 2 {
+		t.Fatalf("unpriced = %d, want 2 (the two fail-closed rungs must scream, never $0)", res.UnpricedEvents)
+	}
+
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			rate, oerr := book.ResolveEvent(c.model, c.baseModel, c.adapter)
+			if !c.priced {
+				// Oracle agrees it is unpriced, and the SQL wrote NO rollup for it.
+				if oerr == nil {
+					t.Fatalf("oracle priced %s — SQL and oracle must BOTH refuse", c.name)
+				}
+				var n int
+				if err := db.QueryRowContext(ctx,
+					`SELECT COUNT(*) FROM rated_usage WHERE model_id=$1`, c.model).Scan(&n); err != nil {
+					t.Fatalf("count: %v", err)
+				}
+				if n != 0 {
+					t.Fatalf("rated_usage has %d rows for %s — an unpriced event must never be billed", n, c.model)
+				}
+				return
+			}
+			if oerr != nil {
+				t.Fatalf("oracle ResolveEvent(%s): %v", c.name, oerr)
+			}
+			billed := rate.Quantized()
+			wantCost := Rate(RatedEvent{PromptTokens: c.prompt}, billed).String()
+			var gotCost, gotApplied string
+			if err := db.QueryRowContext(ctx,
+				`SELECT cost::text, applied_prompt_rate::text FROM rated_usage WHERE model_id=$1 AND window_start=$2`,
+				c.model, hour).Scan(&gotCost, &gotApplied); err != nil {
+				t.Fatalf("read rated_usage (%s): %v", c.model, err)
+			}
+			if MustDec(gotCost).String() != wantCost {
+				t.Errorf("SQL cost = %s, oracle = %s (SQL and Go must agree on the C4 ladder)", gotCost, wantCost)
+			}
+			if MustDec(gotApplied).String() != c.wantAppliedPrompt {
+				t.Errorf("applied_prompt_rate = %s, want %s (the ladder rung's rate frozen on the row)", gotApplied, c.wantAppliedPrompt)
+			}
+			if MustDec(gotApplied).String() != billed.Prompt.String() {
+				t.Errorf("applied_prompt_rate = %s != oracle quantized rate %s", gotApplied, billed.Prompt)
+			}
+		})
+	}
+}
+
+// TestIntegration_C4AmbiguityFailsLoud runs the REAL SQL over the two NEW single-rate
+// violations C4's plain-base path makes possible, proving the extended gate splits
+// them out (counted ambiguous, never MIN-billed) while a clean endpoint still rates:
+//
+//   - an endpoint-name model_id resolving through TWO distinct base_models on the
+//     PLAIN-BASE path (an endpoint name reused over a different base in one window);
+//   - ONE endpoint name whose adapter FLAPS (some events premium-derived, some
+//     plain-base) — two rates even on a single base_model.
+func TestIntegration_C4AmbiguityFailsLoud(t *testing.T) {
+	dsn := os.Getenv("PHOEBE_TEST_DATABASE_URL")
+	if dsn == "" {
+		t.Skip("PHOEBE_TEST_DATABASE_URL not set; skipping live-Postgres conformance")
+	}
+	ctx := context.Background()
+	db, err := sql.Open("pgx", dsn)
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	defer db.Close()
+
+	const sch = "phoebe_rating_c4ambig_it"
+	exec(t, db, "DROP SCHEMA IF EXISTS "+sch+" CASCADE")
+	exec(t, db, "CREATE SCHEMA "+sch)
+	exec(t, db, "SET search_path TO "+sch)
+	defer func() { exec(t, db, "DROP SCHEMA IF EXISTS "+sch+" CASCADE") }()
+	exec(t, db, schemaDDL)
+
+	hour := mustTime("2026-06-08T10:00:00Z")
+	book := newTestBook(
+		map[string]Rate3{
+			"cheap/base":     rate3("0.000001", "0", "0"),
+			"expensive/base": rate3("0.000009", "0", "0"),
+		},
+		nil, PolicyMultiplier, MustDec("1.5"), Dec{},
+	)
+
+	type seed struct {
+		req, model, baseModel, adapter string
+	}
+	seeds := []seed{
+		// Two distinct bases on the PLAIN-BASE path for one endpoint name → ambiguous.
+		{"pb-1", "tf-ep-reused", "cheap/base", ""},
+		{"pb-2", "tf-ep-reused", "expensive/base", ""},
+		// Adapter FLAP on one endpoint name (same base): premium vs plain → ambiguous.
+		{"flap-1", "tf-ep-flap", "cheap/base", "ckpt-artifact-9"},
+		{"flap-2", "tf-ep-flap", "cheap/base", ""},
+		// A clean single-base, no-adapter endpoint that MUST still rate (plain rate).
+		{"clean", "tf-ep-clean", "cheap/base", ""},
+	}
+	for _, s := range seeds {
+		if _, err := db.ExecContext(ctx,
+			`INSERT INTO billing_event (request_id, auth_id, resource_id, model, base_model, adapter, prompt_tokens, completion_tokens, event_ts)
+			 VALUES ($1,'a','r',$2,$3,$4,1000,0,$5)`,
+			s.req, s.model, s.baseModel, nullableStr(s.adapter), hour.Add(5*time.Minute)); err != nil {
+			t.Fatalf("seed %s: %v", s.req, err)
+		}
+	}
+
+	store := NewPostgresStore(db)
+	res, err := store.RateWindow(ctx, book, hour, hour.Add(time.Hour))
+	if err != nil {
+		t.Fatalf("RateWindow: %v", err)
+	}
+	if res.RollupsWritten != 1 || res.EventsRated != 1 {
+		t.Fatalf("rollups/events = %d/%d, want 1/1 (only tf-ep-clean bills)", res.RollupsWritten, res.EventsRated)
+	}
+	if res.AmbiguousBaseEvents != 4 {
+		t.Fatalf("ambiguous = %d, want 4 (two-base reuse + adapter flap must scream, never MIN-bill)", res.AmbiguousBaseEvents)
+	}
+	var nAmbig int
+	if err := db.QueryRowContext(ctx,
+		`SELECT COUNT(*) FROM rated_usage WHERE model_id IN ('tf-ep-reused','tf-ep-flap')`).Scan(&nAmbig); err != nil {
+		t.Fatalf("count ambiguous rollups: %v", err)
+	}
+	if nAmbig != 0 {
+		t.Fatalf("rated_usage has %d rows for ambiguous endpoints — they must NOT be billed", nAmbig)
+	}
+	// The clean endpoint billed at its PLAIN base rate: 1000 x 0.000001 = 0.001.
+	var cost string
+	if err := db.QueryRowContext(ctx,
+		`SELECT cost::text FROM rated_usage WHERE model_id='tf-ep-clean'`).Scan(&cost); err != nil {
+		t.Fatalf("read tf-ep-clean rollup: %v", err)
+	}
+	if MustDec(cost).String() != "0.001000000" {
+		t.Errorf("tf-ep-clean cost = %s, want 0.001000000 (plain base rate, no premium)", cost)
+	}
 }

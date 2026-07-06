@@ -97,10 +97,19 @@ func TestRateWindowSQL_Shape(t *testing.T) {
 		"LEFT JOIN rating_derived rd",
 		"rd.base_model = ev.base_model",
 		"rp.model_id IS NULL",
-		// ft: marker is single-sourced from the Go fineTunePrefix constant, bound as $3
-		"ev.model_id LIKE $3",
-		// the effective rate COALESCEs direct over derived
-		"COALESCE(rp.prompt_price,     rd.prompt_price)",
+		// the FINE-TUNE marker (C4): the ft: prefix single-sourced from the Go
+		// fineTunePrefix constant (bound as $3) OR a non-null injected adapter —
+		// the derived join fires on either
+		"(ev.model_id LIKE $3 OR ev.adapter IS NOT NULL)",
+		// the PLAIN-BASE join (C4 ladder step c): the direct price table keyed on
+		// ev.base_model, guarded to NON-fine-tune traffic (the exact negation of
+		// the derived join's marker), so a fine-tune whose base misses the derived
+		// table can never fall through to an un-premiumed base rate
+		"LEFT JOIN rating_price rpb",
+		"rpb.model_id = ev.base_model",
+		"NOT (ev.model_id LIKE $3 OR ev.adapter IS NOT NULL)",
+		// the effective rate COALESCEs direct over derived over plain-base
+		"COALESCE(rp.prompt_price,     rd.prompt_price,     rpb.prompt_price)",
 		// billable-prompt clamp + the cost formula (cached charged once)
 		"GREATEST(ev.prompt_tokens - ev.cached_tokens, 0)",
 		"billable_prompt   * prompt_price",
@@ -154,8 +163,11 @@ func TestRateWindowSQL_Shape(t *testing.T) {
 		"WHERE prompt_price  IS NULL\n        AND auth_id     IS NOT NULL\n        AND resource_id IS NOT NULL\n        AND model_id    IS NOT NULL)",
 		"AS unpriced_events",
 		"OR resource_id IS NULL OR model_id IS NULL) AS unattributable_events",
-		// the E3 ft-uniqueness gate: an ft: rollup spanning >1 base_model is split out
-		"COUNT(DISTINCT base_model) FILTER (WHERE via_derived) > 1 AS ambiguous_base",
+		// the SINGLE-RATE gate: a rollup whose base_model-priced rows span >1 base
+		// (E3 ft-uniqueness / C4 endpoint-name reuse) or MIX derived and plain-base
+		// pricing (adapter flap) is split out — never MIN-billed
+		"COUNT(DISTINCT base_model) FILTER (WHERE via_derived OR via_base) > 1",
+		"OR (bool_or(via_derived) AND bool_or(via_base))",
 		"WHERE NOT ambiguous_base",
 		"AS ambiguous_base_events",
 	}

@@ -416,18 +416,18 @@ fine_tune_premium:
 
 	// The own-rate fine-tune itself still prices DIRECTLY by its own model_id (one hop
 	// is about being a derivation SOURCE, not about pricing itself).
-	if r, err := pb.ResolveEvent("ft:ownrate", ""); err != nil || r.Prompt.String() != "0.000010000" {
+	if r, err := pb.ResolveEvent("ft:ownrate", "", ""); err != nil || r.Prompt.String() != "0.000010000" {
 		t.Fatalf("own-rate ft direct resolve = %s, %v; want 0.000010000 / nil", r.Prompt, err)
 	}
 
 	// THE INVARIANT: a different ft: event whose base_model is the OWN-RATE fine-tune
 	// must NOT derive from it (that would be ft-of-ft, a second hop). Fail loud.
-	if _, err := pb.ResolveEvent("ft:9f8e7d6c5b4a", "ft:ownrate"); !errors.Is(err, ErrNoPrice) {
+	if _, err := pb.ResolveEvent("ft:9f8e7d6c5b4a", "ft:ownrate", ""); !errors.Is(err, ErrNoPrice) {
 		t.Fatalf("ft deriving from an own-rate ft: err = %v, want ErrNoPrice (one hop only — no fine-tune-of-fine-tune)", err)
 	}
 
 	// Sanity: deriving from the TRUE base still works (the one legitimate hop).
-	if r, err := pb.ResolveEvent("ft:9f8e7d6c5b4a", "meta-llama/Llama-3.1-8B-Instruct"); err != nil || r.Prompt.String() != "0.000006000" {
+	if r, err := pb.ResolveEvent("ft:9f8e7d6c5b4a", "meta-llama/Llama-3.1-8B-Instruct", ""); err != nil || r.Prompt.String() != "0.000006000" {
 		t.Fatalf("ft deriving from the true base = %s, %v; want 0.000006000 / nil", r.Prompt, err)
 	}
 
@@ -462,7 +462,7 @@ fine_tune_premium:
 	}
 
 	// ft: id NOT in the file, base_model IS → base × 1.5.
-	r, err := pb.ResolveEvent("ft:deadbeef", "meta-llama/Llama-3.1-8B-Instruct")
+	r, err := pb.ResolveEvent("ft:deadbeef", "meta-llama/Llama-3.1-8B-Instruct", "")
 	if err != nil {
 		t.Fatalf("resolve ft via base_model: %v", err)
 	}
@@ -471,17 +471,17 @@ fine_tune_premium:
 	}
 
 	// A base model id resolves DIRECTLY regardless of base_model (here empty).
-	if r, err := pb.ResolveEvent("meta-llama/Llama-3.1-8B-Instruct", ""); err != nil || r.Prompt.String() != "0.000004000" {
+	if r, err := pb.ResolveEvent("meta-llama/Llama-3.1-8B-Instruct", "", ""); err != nil || r.Prompt.String() != "0.000004000" {
 		t.Fatalf("base model direct resolve = %s, %v; want 0.000004000 / nil", r.Prompt, err)
 	}
 
 	// FAIL LOUD: an ft: id with an EMPTY base_model is a propagation bug, not $0.
-	if _, err := pb.ResolveEvent("ft:deadbeef", ""); !errors.Is(err, ErrNoPrice) {
+	if _, err := pb.ResolveEvent("ft:deadbeef", "", ""); !errors.Is(err, ErrNoPrice) {
 		t.Fatalf("ft: with empty base_model: err = %v, want ErrNoPrice (never silently mis-price)", err)
 	}
 
 	// FAIL LOUD: an ft: id whose base_model is NOT a priced base → ErrNoPrice.
-	if _, err := pb.ResolveEvent("ft:deadbeef", "some/unpriced-base"); !errors.Is(err, ErrNoPrice) {
+	if _, err := pb.ResolveEvent("ft:deadbeef", "some/unpriced-base", ""); !errors.Is(err, ErrNoPrice) {
 		t.Fatalf("ft: with unknown base_model: err = %v, want ErrNoPrice", err)
 	}
 }
@@ -692,5 +692,130 @@ func TestResolvedRates_PremiumAppliedOnce(t *testing.T) {
 	// Deterministic ordering for a stable projection.
 	if !strings.HasPrefix(rows[0].ModelID, "base") {
 		t.Fatalf("rows not sorted by model_id: %+v", rows)
+	}
+}
+
+// c4Book is the fixture for the C4 resolution-ladder tests: one priced base (the
+// catalog price key arriving on X-Saturn-Base-Model), one direct per-endpoint
+// override entry, and a 1.5x fine-tune premium. Endpoint names ("tf-ep-...") are
+// deliberately NOT price-file keys — under C4 vLLM serves under the endpoint name.
+func c4Book(t *testing.T) *PriceBook {
+	t.Helper()
+	const y = `
+version: 1
+base_models:
+  "meta-llama/Llama-3.1-8B-Instruct":
+    prompt:     "0.000004"
+    cached:     "0.0000004"
+    completion: "0.00001"
+  "tf-ep-override":
+    prompt:     "0.000099"
+    cached:     "0.0000099"
+    completion: "0.00099"
+fine_tune_premium:
+  policy: multiplier
+  factor: "1.5"
+`
+	pb, err := ParsePriceBook([]byte(y))
+	if err != nil {
+		t.Fatalf("parse c4 book: %v", err)
+	}
+	return pb
+}
+
+// TestResolveEvent_BaseEndpointPricesAtPlainBaseRate (base-endpoint-no-premium): a
+// BASE-MODEL endpoint under C4 — model_id is the endpoint name (not a file key, no
+// ft: prefix), NO adapter, base_model carries the catalog price key — prices at the
+// PLAIN base rate, with NO premium applied. Ladder step (c).
+func TestResolveEvent_BaseEndpointPricesAtPlainBaseRate(t *testing.T) {
+	pb := c4Book(t)
+	r, err := pb.ResolveEvent("tf-ep-my-llama", "meta-llama/Llama-3.1-8B-Instruct", "")
+	if err != nil {
+		t.Fatalf("resolve base endpoint via base_model: %v", err)
+	}
+	if r.Prompt.String() != "0.000004000" || r.Cached.String() != "0.000000400" || r.Completion.String() != "0.000010000" {
+		t.Fatalf("plain base rates = %s/%s/%s, want the base rate UNMULTIPLIED (no premium on a base endpoint)",
+			r.Prompt, r.Cached, r.Completion)
+	}
+}
+
+// TestResolveEvent_AdapterTriggersPremium (adapter-triggers-premium): a fine-tune
+// checkpoint endpoint under C4 — model_id is the endpoint name (NOT ft:-prefixed),
+// but the injected adapter is non-empty — prices at base x premium. The adapter's
+// PRESENCE is the trigger; its value (the checkpoint artifact id) does not matter
+// for the rate. Ladder step (b).
+func TestResolveEvent_AdapterTriggersPremium(t *testing.T) {
+	pb := c4Book(t)
+	r, err := pb.ResolveEvent("tf-ep-my-finetune", "meta-llama/Llama-3.1-8B-Instruct", "ckpt-artifact-42")
+	if err != nil {
+		t.Fatalf("resolve adapter endpoint: %v", err)
+	}
+	if r.Prompt.String() != "0.000006000" || r.Cached.String() != "0.000000600" || r.Completion.String() != "0.000015000" {
+		t.Fatalf("adapter-derived rates = %s/%s/%s, want base x 1.5 (adapter presence must trigger the premium)",
+			r.Prompt, r.Cached, r.Completion)
+	}
+}
+
+// TestResolveEvent_FtPrefixStillPremium (ft-prefix-still-premium): the legacy ft:
+// marker is UNCHANGED by C4 — an ft:<checkpoint> model_id with a priced base_model
+// still prices at base x premium, with or without an adapter. Ladder step (b).
+func TestResolveEvent_FtPrefixStillPremium(t *testing.T) {
+	pb := c4Book(t)
+	for _, adapter := range []string{"", "ckpt-artifact-42"} {
+		r, err := pb.ResolveEvent("ft:9f8e7d6c5b4a", "meta-llama/Llama-3.1-8B-Instruct", adapter)
+		if err != nil {
+			t.Fatalf("resolve ft: id (adapter=%q): %v", adapter, err)
+		}
+		if r.Prompt.String() != "0.000006000" {
+			t.Fatalf("ft: prompt rate (adapter=%q) = %s, want 0.000006000 (base x 1.5)", adapter, r.Prompt)
+		}
+	}
+}
+
+// TestResolveEvent_DirectEntryWinsOverDerivation (direct-entry-wins-over-derivation):
+// a model_id present in the price file wins over EVERY base_model path — no premium
+// math, even when base_model and adapter are also set. This is the per-endpoint
+// override seam. Ladder step (a).
+func TestResolveEvent_DirectEntryWinsOverDerivation(t *testing.T) {
+	pb := c4Book(t)
+	for _, adapter := range []string{"", "ckpt-artifact-42"} {
+		r, err := pb.ResolveEvent("tf-ep-override", "meta-llama/Llama-3.1-8B-Instruct", adapter)
+		if err != nil {
+			t.Fatalf("resolve override entry (adapter=%q): %v", adapter, err)
+		}
+		if r.Prompt.String() != "0.000099000" {
+			t.Fatalf("override prompt rate (adapter=%q) = %s, want 0.000099000 (the DIRECT file rate — no derivation, no premium)",
+				adapter, r.Prompt)
+		}
+	}
+}
+
+// TestResolveEvent_AdapterWithEmptyBaseModelUnpriced
+// (adapter-with-empty-base-model-unpriced): fine-tune traffic (adapter present) with
+// an EMPTY base_model is a propagation bug, not a free model — ErrNoPrice, and it
+// must NOT fall through to any other rate. Same for an unpriced base_model: the
+// fine-tune marker BARS the plain-base path, so it can never under-bill at a plain
+// rate either. Ladder step (d), fail closed.
+func TestResolveEvent_AdapterWithEmptyBaseModelUnpriced(t *testing.T) {
+	pb := c4Book(t)
+	if _, err := pb.ResolveEvent("tf-ep-my-finetune", "", "ckpt-artifact-42"); !errors.Is(err, ErrNoPrice) {
+		t.Fatalf("adapter + empty base_model: err = %v, want ErrNoPrice (propagation bug must scream, never $0)", err)
+	}
+	if _, err := pb.ResolveEvent("tf-ep-my-finetune", "some/unpriced-base", "ckpt-artifact-42"); !errors.Is(err, ErrNoPrice) {
+		t.Fatalf("adapter + unpriced base_model: err = %v, want ErrNoPrice", err)
+	}
+}
+
+// TestResolveEvent_PlainUnknownModelUnpriced (plain-unknown-model-unpriced): an
+// event with no file entry, no base_model, and no adapter resolves to NOTHING —
+// ErrNoPrice, never $0. Unchanged by C4. Ladder step (d).
+func TestResolveEvent_PlainUnknownModelUnpriced(t *testing.T) {
+	pb := c4Book(t)
+	if _, err := pb.ResolveEvent("tf-ep-unknown", "", ""); !errors.Is(err, ErrNoPrice) {
+		t.Fatalf("unknown endpoint name with no base_model: err = %v, want ErrNoPrice", err)
+	}
+	// An unknown base_model on a base endpoint also fails loud (nothing resolves).
+	if _, err := pb.ResolveEvent("tf-ep-unknown", "some/unpriced-base", ""); !errors.Is(err, ErrNoPrice) {
+		t.Fatalf("unknown endpoint name with unpriced base_model: err = %v, want ErrNoPrice", err)
 	}
 }
