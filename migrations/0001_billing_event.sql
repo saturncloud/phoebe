@@ -25,6 +25,14 @@ CREATE TABLE billing_event (
     group_id          VARCHAR(32),
     resource_id       VARCHAR(64),
     resource_type     VARCHAR(64),
+    -- org_id: the org that OWNS the served deployment (E2 customer attribution),
+    -- injected by Atlas as a per-deployment Traefik header (X-Saturn-Org-Id) and
+    -- captured at meter time so push reads org off the rollup instead of re-joining
+    -- resource_name. NULLABLE: the producer header rolls out per-install; an absent
+    -- org must not fail the drainer's batch INSERT — a NULL org_id is held (counted
+    -- unattributable at push), never billed to a guessed org. (Production applies this
+    -- via the d3a2b4c5e6f7 follow-up migration; declared here for fresh local DBs.)
+    org_id            VARCHAR(64),
 
     -- Workload.
     model             VARCHAR(255),

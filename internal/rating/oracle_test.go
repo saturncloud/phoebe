@@ -31,8 +31,9 @@ import (
 // capture/emit side and can be tested in isolation.
 type RatedEvent struct {
 	AuthID string
-	// ResourceID is the deployment id (E2 customer attribution — billing resolves the
-	// org via resource_id→org_id). Part of the rollup grain. Empty ("") MODELS A NULL
+	// ResourceID is the deployment id (E2 customer attribution — the owning org is
+	// captured at meter time into the rollup's org_id, NOT resolved from resource_id at
+	// push). Part of the rollup grain. Empty ("") MODELS A NULL
 	// resource_id column: the oracle has no separate NULL, so "" stands in for it and is
 	// counted unattributable (the row can't name its deployment/org), never billed. This
 	// mirrors the SQL's `resource_id IS NULL` handling exactly because production never

@@ -58,11 +58,11 @@ type snapshot struct {
 }
 
 // openDB opens the shared Atlas Postgres the same way the rater does (pgx stdlib,
-// UTC-pinned DSN, small batch-job pool). token-push reads rated_usage + resource_name
-// from this DB; it never writes.
+// UTC-pinned DSN, small batch-job pool). token-push reads rated_usage from this DB
+// (org_id is carried on the rollup — no resource_name join); it never writes.
 func openDB(ctx context.Context, cfg rating.Config) (*sql.DB, error) {
 	if cfg.DatabaseURL == "" {
-		return nil, fmt.Errorf("token-push: DATABASE_URL is empty (Postgres holds rated_usage and resource_name; the pusher cannot run without it)")
+		return nil, fmt.Errorf("token-push: DATABASE_URL is empty (Postgres holds rated_usage; the pusher cannot run without it)")
 	}
 	db, err := sql.Open("pgx", ensureUTCTimeZone(cfg.DatabaseURL))
 	if err != nil {
@@ -78,21 +78,25 @@ func openDB(ctx context.Context, cfg rating.Config) (*sql.DB, error) {
 	return db, nil
 }
 
-// snapshotQuery reads every rated_usage row whose window_start == $1 and LEFT JOINs
-// resource_name to resolve the billing org. The LEFT JOIN (not INNER) is deliberate:
-// a row whose resource_id has NO resource_name match must still be SEEN here so it can
-// be counted and screamed about (C7), not silently filtered out by the join. Money and
-// rates are read as ::text so they never become a float in Go (C8).
+// snapshotQuery reads every rated_usage row whose window_start == $1. The billing org
+// (org_id) is read DIRECTLY off the rollup: phoebe captures the deployment-owning org at
+// METER time (the X-Saturn-Org-Id header) and the rater carries it onto rated_usage, so
+// push no longer reconstructs it by joining resource_name. That former join raced
+// deployment teardown — a deployment deleted between meter and push lost its
+// resource_name row, making already-metered usage unattributable. With org frozen onto
+// the rollup at meter time, a later teardown cannot un-attribute it.
 //
-// resource_id → resource_name.resource_id → resource_name.org_id (a direct FK to
-// org.id). resource_name is the canonical resource→org map for every resource type, in
-// the same shared Atlas Postgres; phoebe does not own it (assumed-to-exist).
+// org_id is NULLABLE on rated_usage: NULL when the producer header was absent (a
+// rollout gap or an upstream propagation bug). A NULL-org row is still SEEN here (read
+// as a NULL string) so it can be counted and screamed about (C7), exactly as the old
+// LEFT JOIN miss was — the whole window is then withheld, never pushed with a blank org.
+// Money and rates are read as ::text so they never become a float in Go (C8).
 const snapshotQuery = `
 SELECT
     ru.id,
     ru.resource_id,
+    ru.org_id,                       -- NULL when the producer header was absent at meter time
     ru.model_id,
-    rn.org_id,                       -- NULL when the deployment is absent from resource_name
     ru.cost::text,
     ru.applied_prompt_rate::text,
     ru.applied_cached_rate::text,
@@ -102,16 +106,16 @@ SELECT
     ru.completion_tokens,
     ru.billable_prompt_tokens
 FROM rated_usage ru
-LEFT JOIN resource_name rn ON rn.resource_id = ru.resource_id
 WHERE ru.window_start = $1
 ORDER BY ru.id`
 
-// buildSnapshot reads the rollups for windowStart and resolves each to its org. It
-// returns the snapshot (only org-resolved rows) and the count of rows it had to OMIT
-// because their resource_id resolved to no org. An omitted row is an anomaly: the rater
-// only writes attributable (non-NULL resource_id) rows, so a miss here means the
-// deployment vanished from resource_name. Omitted rows are NEVER pushed with a guessed
-// or empty org (C2/C7) — they are held back and the caller exits non-zero.
+// buildSnapshot reads the rollups for windowStart, each already carrying its billing
+// org (captured at meter time, carried onto rated_usage by the rater). It returns the
+// snapshot (only org-resolved rows) and the count of rows it had to OMIT because their
+// org_id was NULL. An omitted row is an anomaly: it means Atlas did not inject
+// X-Saturn-Org-Id for that deployment (a producer-rollout gap) or org_id propagation
+// broke upstream. Omitted rows are NEVER pushed with a guessed or empty org (C2/C7) —
+// they are held back and the caller exits non-zero.
 func (p *pusher) buildSnapshot(ctx context.Context, windowStart time.Time) (snapshot, int, error) {
 	rows, err := p.db.QueryContext(ctx, snapshotQuery, windowStart)
 	if err != nil {
@@ -130,8 +134,8 @@ func (p *pusher) buildSnapshot(ctx context.Context, windowStart time.Time) (snap
 		if err := rows.Scan(
 			&r.RatedUsageID,
 			&r.ResourceID,
-			&r.ModelID,
 			&orgID,
+			&r.ModelID,
 			&r.Cost,
 			&r.AppliedPromptRate,
 			&r.AppliedCachedRate,
@@ -147,9 +151,9 @@ func (p *pusher) buildSnapshot(ctx context.Context, windowStart time.Time) (snap
 		if !orgID.Valid || orgID.String == "" {
 			// Held back, never billed to a guessed org. Scream with the identifying
 			// fields (NOT the cost amount in the clear beyond what's needed) so an
-			// operator can find the orphaned deployment.
+			// operator can find the deployment whose org didn't propagate.
 			p.log.Error.Printf(
-				"token-push: rated_usage %s (resource_id=%s, model_id=%s) has no org in resource_name — OMITTED from the snapshot (held, not billed); deployment missing from resource_name",
+				"token-push: rated_usage %s (resource_id=%s, model_id=%s) has a NULL org_id — OMITTED from the snapshot (held, not billed); Atlas did not inject X-Saturn-Org-Id for this deployment (producer-rollout gap) or org_id propagation broke upstream",
 				r.RatedUsageID, r.ResourceID, r.ModelID,
 			)
 			unattributable++
@@ -201,16 +205,16 @@ func (p *pusher) ratedUsageHasAnyRow(ctx context.Context) (bool, error) {
 // CRITICAL — a window with ANY unattributable row is NOT pushed (Ben's ruling). The
 // snapshot is delete-by-absence on the manager: a rated_usage_id the manager has on
 // file for this window but ABSENT from the snapshot is treated as a reconcile-DELETE
-// (un-bill). So pushing a window with a row OMITTED (because its resource_id no longer
-// resolves to an org) would silently DELETE the prior, possibly-already-billed charge
-// for that row — a money-loss, not a "hold". We instead WITHHOLD the whole window
-// (leave the manager's prior good state for it standing) and scream + exit 2. This is
-// the price-fetch fail-closed posture: stale-but-billed beats silently-un-billed.
-// Convergence resumes automatically on the next run once the resource_name row is
-// restored (the trailing re-push window re-covers the hour). The interim cost is
-// possibly over-holding a window that had a genuinely NEW unresolvable row — over-
-// holding is the safe direction. (A future wire `held` marker scopes delete-by-absence
-// so a held row need not block its whole window; that lands install+manager together.)
+// (un-bill). So pushing a window with a row OMITTED (because its org_id is NULL — Atlas
+// didn't inject X-Saturn-Org-Id, or org_id propagation broke) would silently DELETE the
+// prior, possibly-already-billed charge for that row — a money-loss, not a "hold". We
+// instead WITHHOLD the whole window (leave the manager's prior good state for it
+// standing) and scream + exit 2. This is the price-fetch fail-closed posture:
+// stale-but-billed beats silently-un-billed. Convergence resumes automatically on the
+// next run once the org propagates (the trailing re-push window re-covers the hour, and
+// a re-rate refreshes a NULL-org rollup to its real org). The interim cost is possibly
+// over-holding a window that had a genuinely NEW unattributable row — over-holding is
+// the safe direction.
 //
 // Windows are independent: a withheld or failed window does not abort the others, so a
 // single bad window can't block reconvergence of every other hour.
@@ -249,7 +253,7 @@ func (p *pusher) pushWindows(ctx context.Context, windows []time.Time) int {
 			// manager. Withhold the whole window rather than risk un-billing a prior
 			// charge. Already screamed per-row in buildSnapshot.
 			p.log.Error.Printf(
-				"token-push: WITHHOLDING window %s — it has %d unattributable row(s); pushing the omitted snapshot would delete-by-absence a possibly-billed rollup. Leaving the manager's prior state for this window untouched (restore the resource_name mapping; the next run re-pushes).",
+				"token-push: WITHHOLDING window %s — it has %d unattributable row(s) (NULL org_id); pushing the omitted snapshot would delete-by-absence a possibly-billed rollup. Leaving the manager's prior state for this window untouched (fix X-Saturn-Org-Id propagation; the next run re-pushes once the rollup's org resolves).",
 				snap.WindowStart, unattributable,
 			)
 			withheld++
