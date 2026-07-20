@@ -23,10 +23,8 @@
 -- a request may legitimately produce zero or one sampled rows. We index it for
 -- joins back to billing_event rather than constraining uniqueness.
 --
--- NOTE: this .sql is for reference and local dev only. In the shared Atlas
--- Postgres the table is created by the Alembic chain — see
--- migrations/atlas/<rev>_add_io_log.py and migrations/README.md. Keep the two
--- (and internal/iolog/postgres.go's insert column list) in sync.
+-- phoebe OWNS this schema (phoebe's own Postgres, applied by cmd/migrate). Keep
+-- internal/iolog/postgres.go's insert column list in sync with this table.
 
 CREATE TABLE io_log (
     -- Surrogate key: io_log is append-only, so a generated id is cleaner than

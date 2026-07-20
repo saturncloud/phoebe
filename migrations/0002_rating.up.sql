@@ -29,10 +29,8 @@
 --   The fine-tune premium is applied in exact decimal when the prices are projected.
 --   See internal/rating.
 --
--- NOTE: this .sql is for reference and local dev only. In the shared Atlas Postgres
--- the table is created by the Alembic chain — see
--- migrations/atlas/c2f1a3b4d5e6_add_rating.py and migrations/README.md. Keep the
--- two in sync.
+-- phoebe OWNS this schema (phoebe's own Postgres, applied by cmd/migrate). See
+-- 0001_billing_event.up.sql.
 
 -- rated_usage: the per-(auth_id, resource_id, model_id, hour) cost rollup.
 --
@@ -62,8 +60,7 @@ CREATE TABLE rated_usage (
     -- token-push reads org straight off the rollup (no resource_name join). NULLABLE,
     -- deliberately UNLIKE resource_id above: a NULL org is the rater's fail-closed
     -- signal that push must withhold + scream (not delete-by-absence, not bill a
-    -- guessed org). (Production applies via the d3a2b4c5e6f7 follow-up migration;
-    -- declared here for fresh local DBs.)
+    -- guessed org).
     org_id                  VARCHAR(64),
 
     -- [window_start, window_end) is the hour this rollup covers.
@@ -87,8 +84,7 @@ CREATE TABLE rated_usage (
     -- A rollup mixes only one model_id, so a single applied-rate triple is
     -- well-defined. With these on the row, cost is fully reconstructable and the row
     -- never needs to be repriced — "we never reprice traffic you've already served"
-    -- holds by construction. Defaulted to 0 so an ALTER on an existing table is
-    -- backfill-free; every rater-written row sets them explicitly.
+    -- holds by construction.
     applied_prompt_rate     NUMERIC(20, 9) NOT NULL DEFAULT 0,
     applied_cached_rate     NUMERIC(20, 9) NOT NULL DEFAULT 0,
     applied_completion_rate NUMERIC(20, 9) NOT NULL DEFAULT 0,
@@ -128,7 +124,7 @@ CREATE INDEX rated_usage_auth_id_window_start_ix
 -- rated_usage and take a full-trailing-window lock footprint on EVERY run (the
 -- default window re-rates 24 closed hours). This window_start-leading index makes
 -- the reconcile DELETE an index range scan over exactly the [window_start) hours in
--- scope. Mirrors the Alembic rating migration.
+-- scope.
 CREATE INDEX rated_usage_window_start_ix
     ON rated_usage (window_start);
 
@@ -138,14 +134,5 @@ CREATE INDEX rated_usage_window_start_ix
 -- bare (event_ts) — partial or not — can never serve a COALESCE(event_ts,
 -- created_at) predicate, and the rater would seq-scan billing_event (a table
 -- that only grows) on every run.
-CREATE INDEX IF NOT EXISTS billing_event_rating_instant_ix
+CREATE INDEX billing_event_rating_instant_ix
     ON billing_event ((COALESCE(event_ts, created_at)));
-
--- base_model on billing_event (E3 fine-tune linkage): the HF base id a fine-tune
--- derives from, stamped by Atlas at deploy. The rater prices an ft:<checkpoint>
--- model at base x premium via this column; an ft: model with a NULL base_model
--- fails loud (never $0). Added idempotently: the billing_event create migration
--- (0001) now declares it directly, so on a fresh DB this is a no-op; a
--- billing_event created before the column existed still gets it here. Mirrors the
--- Alembic rating migration (migrations/atlas/c2f1a3b4d5e6_add_rating.py).
-ALTER TABLE billing_event ADD COLUMN IF NOT EXISTS base_model VARCHAR(255);
