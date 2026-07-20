@@ -49,6 +49,7 @@ import (
 	"github.com/saturncloud/phoebe/internal/metering"
 	"github.com/saturncloud/phoebe/internal/proxy"
 	"github.com/saturncloud/phoebe/internal/rating"
+	"github.com/saturncloud/phoebe/migrations"
 )
 
 // vllmStream mirrors the realistic vLLM SSE fixture in internal/proxy/tee_test.go
@@ -135,12 +136,13 @@ func newHarness(t *testing.T, schema string) *harness {
 	}
 	t.Cleanup(func() { _ = db.Close() })
 
-	// The production migrations, from disk. 0002 is multi-statement (and its
-	// CREATE EXTENSION is a no-op after the admin install above); pgx's stdlib
-	// driver execs an argument-less query over the simple protocol, which
-	// accepts multiple statements — same approach as the files' psql usage.
-	mustExec(t, db, readMigration(t, "0001_billing_event.sql"))
-	mustExec(t, db, readMigration(t, "0002_rating.sql"))
+	// The production migrations, from the embedded migrations.FS (same source
+	// cmd/migrate applies). 0002 is multi-statement (and its CREATE EXTENSION is a
+	// no-op after the admin install above); pgx's stdlib driver execs an
+	// argument-less query over the simple protocol, which accepts multiple
+	// statements — same approach as the files' psql usage.
+	mustExec(t, db, readMigration(t, "0001_billing_event.up.sql"))
+	mustExec(t, db, readMigration(t, "0002_rating.up.sql"))
 
 	mr, err := miniredis.Run()
 	if err != nil {
@@ -316,11 +318,13 @@ func mustExec(t *testing.T, db *sql.DB, q string) {
 	}
 }
 
-// readMigration loads a production migration file from migrations/ relative to
-// this package (go test runs with the package dir as cwd).
+// readMigration loads a production migration file from the SAME embedded FS that
+// cmd/migrate applies (migrations.FS), so this test can never drift from the real
+// apply path or a filename rename. It applies the up migrations directly (rather
+// than via golang-migrate) so it can target an isolated per-test schema.
 func readMigration(t *testing.T, name string) string {
 	t.Helper()
-	b, err := os.ReadFile(filepath.Join("..", "..", "migrations", name))
+	b, err := migrations.FS.ReadFile(name)
 	if err != nil {
 		t.Fatalf("read migration %s: %v", name, err)
 	}

@@ -24,3 +24,6 @@ config/settings.yaml
 
 # go workspace
 vendor/
+
+# built binaries (go build ./cmd/...)
+/migrate
