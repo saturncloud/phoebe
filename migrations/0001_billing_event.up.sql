@@ -9,10 +9,10 @@
 -- row (effectively-once). It is an engine/OpenAI request id (not an Atlas 32-char
 -- hex), hence varchar(255).
 --
--- NOTE: this .sql is for reference and local dev only. In the shared Atlas
--- Postgres the table is created by the Alembic chain — see
--- migrations/atlas/<rev>_add_billing_event.py and migrations/README.md. Keep the
--- two in sync.
+-- phoebe OWNS this schema. It lives in phoebe's OWN Postgres (deployed by the
+-- phoebe chart), applied by cmd/migrate (golang-migrate). phoebe is self-contained:
+-- no query joins any Atlas-owned table, so the billing tables do not need to be
+-- co-located with the Atlas schema.
 
 CREATE TABLE billing_event (
     request_id        VARCHAR(255) NOT NULL,
@@ -30,8 +30,7 @@ CREATE TABLE billing_event (
     -- captured at meter time so push reads org off the rollup instead of re-joining
     -- resource_name. NULLABLE: the producer header rolls out per-install; an absent
     -- org must not fail the drainer's batch INSERT — a NULL org_id is held (counted
-    -- unattributable at push), never billed to a guessed org. (Production applies this
-    -- via the d3a2b4c5e6f7 follow-up migration; declared here for fresh local DBs.)
+    -- unattributable at push), never billed to a guessed org.
     org_id            VARCHAR(64),
 
     -- Workload.
