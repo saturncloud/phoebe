@@ -34,14 +34,14 @@ import (
 // in prod. Loading 0001 then 0002_rating reproduces the production apply order;
 // base_model is declared in 0001 and re-added IF NOT EXISTS in 0002_rating, so the
 // overlap is a harmless no-op. The DDL runs inside the per-test isolated schema
-// (search_path is set by the caller), leaving no residue. io_log (0002_io_log) is
+// (search_path is set by the caller), leaving no residue. io_log (0003_io_log) is
 // intentionally not loaded — the rater never touches it.
 func ratingSchemaDDL(t *testing.T) string {
 	t.Helper()
 	var b strings.Builder
 	for _, f := range []string{
-		"../../migrations/0001_billing_event.sql",
-		"../../migrations/0002_rating.sql",
+		"../../migrations/0001_billing_event.up.sql",
+		"../../migrations/0002_rating.up.sql",
 	} {
 		ddl, err := os.ReadFile(f)
 		if err != nil {
@@ -380,7 +380,7 @@ func TestIntegration_AmbiguousOrgFailsLoud(t *testing.T) {
 	exec(t, db, "CREATE SCHEMA "+sch)
 	exec(t, db, "SET search_path TO "+sch)
 	defer func() { exec(t, db, "DROP SCHEMA IF EXISTS "+sch+" CASCADE") }()
-	exec(t, db, schemaDDL)
+	exec(t, db, ratingSchemaDDL(t))
 
 	hour := mustTime("2026-06-08T10:00:00Z")
 	book := newTestBook(
@@ -482,7 +482,7 @@ func TestIntegration_BothAmbiguousCountedOnceAsBase(t *testing.T) {
 	exec(t, db, "CREATE SCHEMA "+sch)
 	exec(t, db, "SET search_path TO "+sch)
 	defer func() { exec(t, db, "DROP SCHEMA IF EXISTS "+sch+" CASCADE") }()
-	exec(t, db, schemaDDL)
+	exec(t, db, ratingSchemaDDL(t))
 
 	hour := mustTime("2026-06-08T10:00:00Z")
 	book := newTestBook(
@@ -549,7 +549,7 @@ func TestIntegration_CleanThenAmbiguousOrgReconciles(t *testing.T) {
 	exec(t, db, "CREATE SCHEMA "+sch)
 	exec(t, db, "SET search_path TO "+sch)
 	defer func() { exec(t, db, "DROP SCHEMA IF EXISTS "+sch+" CASCADE") }()
-	exec(t, db, schemaDDL)
+	exec(t, db, ratingSchemaDDL(t))
 
 	hour := mustTime("2026-06-08T10:00:00Z")
 	book := newTestBook(
@@ -628,7 +628,7 @@ func TestIntegration_OrgReRateConvergesNeverErases(t *testing.T) {
 	exec(t, db, "CREATE SCHEMA "+sch)
 	exec(t, db, "SET search_path TO "+sch)
 	defer func() { exec(t, db, "DROP SCHEMA IF EXISTS "+sch+" CASCADE") }()
-	exec(t, db, schemaDDL)
+	exec(t, db, ratingSchemaDDL(t))
 
 	hour := mustTime("2026-06-08T10:00:00Z")
 	book := newTestBook(
@@ -1594,7 +1594,7 @@ func TestIntegration_C4ResolutionLadderConformsToOracle(t *testing.T) {
 	exec(t, db, "CREATE SCHEMA "+sch)
 	exec(t, db, "SET search_path TO "+sch)
 	defer func() { exec(t, db, "DROP SCHEMA IF EXISTS "+sch+" CASCADE") }()
-	exec(t, db, schemaDDL)
+	exec(t, db, ratingSchemaDDL(t))
 
 	hour := mustTime("2026-06-08T10:00:00Z")
 	// One priced base (the catalog key), one direct per-endpoint override entry,
@@ -1712,7 +1712,7 @@ func TestIntegration_C4AmbiguityFailsLoud(t *testing.T) {
 	exec(t, db, "CREATE SCHEMA "+sch)
 	exec(t, db, "SET search_path TO "+sch)
 	defer func() { exec(t, db, "DROP SCHEMA IF EXISTS "+sch+" CASCADE") }()
-	exec(t, db, schemaDDL)
+	exec(t, db, ratingSchemaDDL(t))
 
 	hour := mustTime("2026-06-08T10:00:00Z")
 	book := newTestBook(
