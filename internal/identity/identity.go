@@ -43,6 +43,21 @@ const (
 	// defensively: absent = empty string (a base-model endpoint).
 	HeaderAdapter = "X-Saturn-Adapter"
 
+	// HeaderServedModel carries the served-model name(s) the subdomain-authorized
+	// resource is allowed to serve — a comma-separated allow-list injected by the
+	// Atlas per-deployment Traefik middleware (a deploy-time resource property,
+	// server-side, anti-spoof overwritten, never client-trusted). It is the
+	// SECURITY CRUX of the shared tier: atlas-auth authorizes the caller for a
+	// SUBDOMAIN/resource, but Dynamo routes on the request-body `model=`, and on a
+	// shared graph many tenants' models share one upstream. Without binding the two,
+	// a caller authorized for model-A's subdomain could put `model=B` in the body
+	// and reach B. Phoebe ASSERTS the request `model=` is in this allow-list and
+	// fails closed (403) on mismatch — atlas DECIDES access, phoebe only guarantees
+	// the body can't escape the atlas-authorized resource. Absent = the binding is
+	// not enforced for this route (dedicated single-model endpoints, where one
+	// subdomain == one model, need no binding); present = enforce.
+	HeaderServedModel = "X-Saturn-Served-Model"
+
 	// HeaderTier carries the SERVING TIER of the deployment — "shared" or
 	// "dedicated" — the SKU axis that prices the two fundamentally-different
 	// products independently (design D1). Like HeaderBaseModel/HeaderAdapter it
@@ -141,6 +156,11 @@ type Identity struct {
 	// event so the rater prices shared traffic from the distinct shared:<base>
 	// row. See HeaderTier.
 	Tier string
+	// ServedModel is the comma-separated allow-list of served-model names the
+	// subdomain-authorized resource may serve. Empty = binding not enforced for
+	// this route. Phoebe asserts the request-body `model=` is in this set and
+	// fails closed on mismatch. See HeaderServedModel.
+	ServedModel string
 	// Upstream is the deployment's real backend (host:port) for phoebe to forward to,
 	// injected by Atlas per inference deployment (routing authority, trusted). Phoebe
 	// fails closed when it is absent or malformed — the request is refused, never
@@ -161,6 +181,7 @@ func FromRequest(r *http.Request) Identity {
 		BaseModel:    r.Header.Get(HeaderBaseModel),
 		Adapter:      r.Header.Get(HeaderAdapter),
 		Tier:         r.Header.Get(HeaderTier),
+		ServedModel:  r.Header.Get(HeaderServedModel),
 		Upstream:     r.Header.Get(HeaderUpstream),
 	}
 }

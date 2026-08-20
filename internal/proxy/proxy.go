@@ -271,6 +271,36 @@ func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
+	// SHARED-TIER MODEL BINDING (security crux): assert the request-body `model=`
+	// is one the subdomain-authorized resource may serve, fail closed on mismatch.
+	// atlas-auth authorized the caller for this subdomain/resource; Dynamo routes
+	// on the body `model=` and a shared graph fronts many tenants behind one
+	// upstream — so bind the two or a caller could send `model=<someone-else's>`
+	// and be served it. Only enforced when Atlas injected an allow-list
+	// (X-Saturn-Served-Model); dedicated single-model routes carry none and skip
+	// this at zero cost. Runs BEFORE forwarding so a bad model never reaches the
+	// engine. Reads the body once and restores it for forceIncludeUsage.
+	if id.ServedModel != "" {
+		body, rerr := readAndRestoreBody(r)
+		if rerr != nil {
+			s.log.Error.Printf("model-binding: read request body: %v", rerr)
+			http.Error(w, "bad request body", http.StatusBadRequest)
+			return
+		}
+		switch checkModelBinding(body, id.ServedModel) {
+		case bindingMismatch, bindingUnparseable:
+			// Fail closed: the request names a model this resource is not
+			// authorized to serve (or one we cannot verify). Log with the
+			// resource for forensics; do NOT echo the attempted model to the
+			// caller (no oracle for probing which models exist on the graph).
+			s.log.Warn.Printf("model-binding: refused request_id=%s resource_id=%s (model not authorized for resource)",
+				requestID, id.ResourceID)
+			http.Error(w, "requested model is not authorized for this endpoint", http.StatusForbidden)
+			return
+		case bindingOK:
+		}
+	}
+
 	// Force streaming usage so we never under-bill a streamed response.
 	if err := forceIncludeUsage(r); err != nil {
 		s.log.Error.Printf("rewrite request body: %v", err)
