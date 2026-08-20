@@ -94,6 +94,7 @@ var upsertColumns = []string{
 	"model",
 	"base_model",
 	"adapter",
+	"tier",
 	"prompt_tokens",
 	"cached_tokens",
 	"completion_tokens",
@@ -103,7 +104,7 @@ var upsertColumns = []string{
 	"event_ts",
 }
 
-const colsPerRow = 17 // len(upsertColumns); created_at is DB-defaulted.
+const colsPerRow = 18 // len(upsertColumns); created_at is DB-defaulted.
 
 // Upsert writes a batch of events in a single transaction with a multi-row
 // INSERT ... ON CONFLICT (request_id) DO NOTHING.
@@ -197,6 +198,11 @@ func eventArgs(e metering.Event) []any {
 		// -braces for a clean column either way.
 		nullStr(e.BaseModel),
 		nullStr(e.Adapter),
+		// Tier is "" for dedicated (the common case, incl. every pre-shared event)
+		// and "shared" for shared traffic. nullStr so dedicated stores NULL, not
+		// '' — the rater treats NULL/'' identically as dedicated (the bare price
+		// key), and a clean NULL keeps the column faithful to "absence = dedicated".
+		nullStr(e.Tier),
 		e.PromptTokens,
 		e.CachedTokens,
 		e.CompletionTokens,

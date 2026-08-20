@@ -42,13 +42,14 @@ func TestPostgresStore_UpsertSQL(t *testing.T) {
 
 	mock.ExpectBegin()
 	mock.ExpectExec(regexp.QuoteMeta(
-		"INSERT INTO billing_event (request_id, auth_id, user_id, group_id, resource_id, resource_type, org_id, model, base_model, adapter, prompt_tokens, cached_tokens, completion_tokens, finish_reason, gpu_type, aborted, event_ts) VALUES",
+		"INSERT INTO billing_event (request_id, auth_id, user_id, group_id, resource_id, resource_type, org_id, model, base_model, adapter, tier, prompt_tokens, cached_tokens, completion_tokens, finish_reason, gpu_type, aborted, event_ts) VALUES",
 	)).
 		WithArgs(
-			// row 1 (org_id + base_model NULL: a base-model event, no org header, no derived_from)
-			"req-1", "auth-1", nil, nil, nil, nil, nil, "m1", nil, nil, 5, 0, 7, nil, nil, false, time.UnixMilli(ts).UTC(),
+			// row 1 (org_id + base_model + tier NULL: a dedicated base-model event, no
+			// org header, no derived_from)
+			"req-1", "auth-1", nil, nil, nil, nil, nil, "m1", nil, nil, nil, 5, 0, 7, nil, nil, false, time.UnixMilli(ts).UTC(),
 			// row 2 (no identity, no timestamp → event_ts NULL)
-			"req-2", nil, nil, nil, nil, nil, nil, "m2", nil, nil, 0, 0, 0, nil, nil, false, nil,
+			"req-2", nil, nil, nil, nil, nil, nil, "m2", nil, nil, nil, 0, 0, 0, nil, nil, false, nil,
 		).
 		WillReturnResult(sqlmock.NewResult(0, 2))
 	mock.ExpectCommit()
@@ -124,7 +125,9 @@ func TestPostgresStore_EmptyModelStoredAsNull(t *testing.T) {
 			nil, // org_id: "" must bind NULL
 			nil, // model: "" must bind NULL
 			nil, // base_model: "" must bind NULL
-			nil, 1, 0, 2, nil, nil, false, nil,
+			nil, // adapter: "" must bind NULL
+			nil, // tier: "" must bind NULL (dedicated)
+			1, 0, 2, nil, nil, false, nil,
 		).
 		WillReturnResult(sqlmock.NewResult(0, 1))
 	mock.ExpectCommit()
@@ -167,9 +170,13 @@ func TestEventArgs_NullsEmptyIdentities(t *testing.T) {
 	if args[8] != nil {
 		t.Fatalf("base_model arg = %v, want nil for empty BaseModel", args[8])
 	}
-	// prompt_tokens is index 10 (org_id=6, model=7, base_model=8, adapter=9) — int, not nil.
-	if args[10] != 3 {
-		t.Fatalf("prompt_tokens arg = %v, want 3", args[10])
+	// tier is index 10 (model=7, base_model=8, adapter=9, tier=10) — nil for empty (dedicated).
+	if args[10] != nil {
+		t.Fatalf("tier arg = %v, want nil for empty Tier", args[10])
+	}
+	// prompt_tokens is index 11 (…base_model=8, adapter=9, tier=10) — int, not nil.
+	if args[11] != 3 {
+		t.Fatalf("prompt_tokens arg = %v, want 3", args[11])
 	}
 	// event_ts is the last index — nil when TimestampUnixMs==0.
 	if args[colsPerRow-1] != nil {

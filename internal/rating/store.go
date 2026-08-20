@@ -262,6 +262,17 @@ WITH ev AS (
         -- on every Token Factory deployment. Prices both a base-model endpoint
         -- (plain base rate) and a fine-tune (base x premium).
         base_model,
+        -- tier: the serving-tier SKU axis (X-Saturn-Tier). NULL/'' = dedicated;
+        -- 'shared' = shared traffic, priced from the tiered base key below.
+        tier,
+        -- tiered_base: the TIER-PREFIXED base price key (design D1, mirrors the Go
+        -- tierKey). Shared traffic (tier = 'shared') prices from a DISTINCT
+        -- 'shared:'||base_model row; dedicated (NULL/''/anything else = the
+        -- absence-of-prefix contract) keys on the bare base_model. The (b) derived
+        -- and (c) plain-base joins below key on THIS, so shared and dedicated of the
+        -- same base resolve to independent rate rows.
+        CASE WHEN tier = 'shared' THEN 'shared:' || base_model ELSE base_model END
+            AS tiered_base,
         -- adapter: the fine-tune checkpoint artifact id, non-NULL ONLY on fine-tune
         -- checkpoint deployments. Its PRESENCE is the premium trigger (C4).
         adapter,
@@ -311,7 +322,7 @@ resolved AS (
     -- with its own in-file rate is never re-derived); the fine-tune-marker guard
     -- keeps a base-model endpoint from ever resolving through the derived table.
     LEFT JOIN rating_derived rd
-        ON rd.base_model = ev.base_model
+        ON rd.base_model = ev.tiered_base
        AND rp.model_id IS NULL
        -- The ft: prefix is SINGLE-SOURCED from the Go fineTunePrefix constant, bound as
        -- $3 (ftLikePattern), so the money path has ONE source of truth for what marks a
@@ -325,7 +336,7 @@ resolved AS (
     -- guard), so a fine-tune whose base misses rating_derived can never fall through
     -- to an un-premiumed plain-base rate — it must scream as UNPRICED instead.
     LEFT JOIN rating_price rpb
-        ON rpb.model_id = ev.base_model
+        ON rpb.model_id = ev.tiered_base
        AND rp.model_id IS NULL
        AND NOT (ev.model_id LIKE $3 OR ev.adapter IS NOT NULL)
 ),
