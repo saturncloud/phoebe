@@ -26,3 +26,17 @@ emit:
   valkeyAddr: "localhost:6379"
   streamName: "phoebe:metering"
   walPath: "/var/lib/phoebe/metering-wal.jsonl"
+
+# TF single-host gateway resolution (OFF by default). On the gateway route the
+# request-body model= selects the model: phoebe resolves (X-Saturn-Org-Id,
+# model) against Atlas's tf_model table and forwards to
+# <graph>-frontend.<namespace>.svc.cluster.local:<port>. Requests marked
+# X-Saturn-Gateway on an interceptor with this disabled are refused (503,
+# fail closed). namespace is REQUIRED when enabled: it is the platform
+# shared-graph namespace every gateway-served graph lives in — phoebe never
+# guesses a forward target. databaseUrl falls back to the DATABASE_URL env var.
+# gateway:
+#   enabled: true
+#   namespace: "saturn-tf-shared"
+#   port: 8000
+#   databaseUrl: ""

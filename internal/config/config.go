@@ -41,6 +41,13 @@ type Settings struct {
 	// dependency (same pattern as Emit).
 	IOLog IOLogSettings `yaml:"ioLog"`
 
+	// Gateway configures the TF single-host gateway resolution path (requests
+	// marked X-Saturn-Gateway resolve their body model= against Atlas's
+	// tf_model). OFF by default — a phoebe without it refuses gateway-marked
+	// requests fail-closed (503). main.go translates these into the
+	// internal/gateway resolver wiring (same pattern as Emit/IOLog).
+	Gateway GatewaySettings `yaml:"gateway"`
+
 	// --- Parsed settings (populated by parse) ---
 
 	ListenAddr  string        `yaml:"-"`
@@ -100,6 +107,36 @@ type IOLogSettings struct {
 	MaxBodyBytes int `yaml:"maxBodyBytes"`
 }
 
+// GatewaySettings is the YAML shape for the TF gateway resolution path.
+//
+// FAIL CLOSED: Enabled defaults to false, and enabling without a Namespace is
+// a startup error — the namespace is half of every composed upstream
+// (<graph>-frontend.<namespace>.svc.cluster.local:<port>), and phoebe never
+// guesses a forward target. OPERATING ASSUMPTION (documented, load-bearing):
+// every serving graph reachable through this phoebe's gateway host lives in
+// this ONE namespace (the platform shared-graph namespace); a tf_model row
+// whose graph lives elsewhere fails at dial, never misroutes.
+type GatewaySettings struct {
+	// Enabled turns gateway resolution on. Default false: gateway-marked
+	// requests are refused (503) rather than resolved.
+	Enabled bool `yaml:"enabled"`
+
+	// Namespace is the k8s namespace the shared serving graphs' frontend
+	// Services live in. REQUIRED when Enabled (fail closed, see above).
+	Namespace string `yaml:"namespace"`
+
+	// Port is the graphs' OpenAI-compatible serve port. Default 8000 (vLLM's
+	// serve port, the same value Atlas's header-injected upstreams carry).
+	Port int `yaml:"port"`
+
+	// DatabaseURL is the Atlas Postgres DSN for tf_model lookups — the same
+	// database phoebe's drainer/rater already use for billing_event /
+	// rated_usage. Empty falls back to the DATABASE_URL env var (Atlas
+	// convention, resolved in main); enabled with NEITHER set is a startup
+	// error.
+	DatabaseURL string `yaml:"databaseUrl"`
+}
+
 // Load reads, defaults, and parses a settings YAML file.
 func Load(settingsFile string) (*Settings, error) {
 	s := &Settings{
@@ -143,6 +180,30 @@ func (s *Settings) parse() error {
 
 	if err := s.IOLog.parse(); err != nil {
 		return err
+	}
+	if err := s.Gateway.parse(); err != nil {
+		return err
+	}
+	return nil
+}
+
+// parse validates the gateway settings and applies the port default. It fails
+// closed: an enabled gateway with no namespace is a misconfiguration rejected
+// at startup — serving gateway requests would require guessing where the
+// graphs live, which phoebe never does. (DatabaseURL is validated in main,
+// after the DATABASE_URL env fallback.)
+func (g *GatewaySettings) parse() error {
+	if !g.Enabled {
+		return nil // off: nothing to validate
+	}
+	if g.Namespace == "" {
+		return fmt.Errorf("gateway.enabled=true requires gateway.namespace (the shared-graph namespace; phoebe never guesses a forward target)")
+	}
+	if g.Port == 0 {
+		g.Port = 8000
+	}
+	if g.Port < 1 || g.Port > 65535 {
+		return fmt.Errorf("gateway.port %d out of range [1,65535]", g.Port)
 	}
 	return nil
 }

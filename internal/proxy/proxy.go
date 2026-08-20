@@ -113,6 +113,11 @@ type Server struct {
 	waker        Waker
 	wakeTimeout  time.Duration
 	wakeMaxTries int
+
+	// gateway wires the TF gateway resolution path ((org, body model=) →
+	// tf_model → identity + upstream). nil (the default) = gateway disabled:
+	// gateway-marked requests fail closed with 503. Set via WithGateway.
+	gateway *gatewayRoute
 }
 
 // New constructs a Server from its dependencies. I/O logging is OFF: the policy
@@ -205,6 +210,22 @@ func (s *Server) handleHealth(w http.ResponseWriter, _ *http.Request) {
 // onDone fires exactly once regardless of whether EOF or Close reaches it first.
 func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request) {
 	id := identity.FromRequest(r)
+
+	// GATEWAY RESOLUTION (TF single-host gateway): a request the trusted
+	// middleware marked X-Saturn-Gateway carries NO per-resource routing
+	// headers — phoebe itself resolves the (org, body model=) pair to the
+	// tf_model row and fills in ResourceID / BaseModel / Adapter / ServingMode
+	// / ServedModel / Upstream on the identity, after which this handler runs
+	// UNCHANGED: the billing gate, upstream parse, wake, and metering treat the
+	// request exactly like a header-routed one. resolveGateway fails closed
+	// (403/400/404/503, generic bodies) and has then already written the
+	// response. Non-gateway requests skip this entirely — today's header-routed
+	// behavior, byte for byte.
+	if id.Gateway {
+		if !s.resolveGateway(w, r, &id) {
+			return
+		}
+	}
 
 	// Billing-identity gate: fail closed if we lack what we need to attribute
 	// consumption. A billing product must not serve traffic it can't bill — a
@@ -311,7 +332,15 @@ func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request) {
 	// (X-Saturn-Served-Model); dedicated single-model routes carry none and skip
 	// this at zero cost. Runs BEFORE forwarding so a bad model never reaches the
 	// engine. Reads the body once and restores it for forceIncludeUsage.
-	if id.ServedModel != "" {
+	//
+	// GATEWAY requests skip this check — THE PATHS DIVERGE HERE: on the
+	// subdomain path Atlas authorizes a resource and injects its allow-list,
+	// and this check binds the body to it; on the gateway path there is no
+	// injected allow-list — resolveGateway looked the body's model= up UNDER
+	// THE ORG, so resolution IS the binding (id.ServedModel was set FROM the
+	// resolved request model; re-checking it against itself would be a
+	// tautology).
+	if id.ServedModel != "" && !id.Gateway {
 		body, rerr := readAndRestoreBody(r)
 		if rerr != nil {
 			s.log.Error.Printf("model-binding: read request body: %v", rerr)

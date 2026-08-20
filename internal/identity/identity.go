@@ -70,6 +70,21 @@ const (
 	// reads it defensively: absent = "" = dedicated.
 	HeaderServingMode = "X-Saturn-Serving-Mode"
 
+	// HeaderGateway marks a request that arrived on the TF shared-inference
+	// GATEWAY route: the single gateway host that replaces per-model subdomains
+	// for the shared mode. The gateway route's Atlas middleware injects exactly
+	// `true` (and X-Saturn-Org-Id) and injects NONE of the per-resource routing
+	// headers (X-Saturn-Upstream / X-Saturn-Resource-Id / X-Saturn-Served-Model)
+	// — on this route the request-body `model=` selects the model, and phoebe
+	// resolves (org, model) against Atlas's tf_model table itself (see
+	// internal/gateway). ANTI-SPOOF: like every X-Saturn-* header, only the
+	// gateway route sets it and per-resource routes strip it, so a client can
+	// neither fake gateway routing nor smuggle it onto a subdomain route. Read
+	// strictly: only the exact value "true" marks a gateway request; anything
+	// else keeps today's header-routed behavior (which fails closed on the
+	// missing upstream).
+	HeaderGateway = "X-Saturn-Gateway"
+
 	// HeaderAuthID carries the token / API-key identity — the JWT `sub` claim,
 	// which in Atlas is the IdentityAuth.id (the same value for both browser-
 	// session and API-key tokens; they share one token mechanism). This is the
@@ -166,6 +181,12 @@ type Identity struct {
 	// fails closed when it is absent or malformed — the request is refused, never
 	// forwarded to a default or a guess. See HeaderUpstream.
 	Upstream string
+	// Gateway reports the request arrived on the TF gateway route
+	// (HeaderGateway == "true", trusted middleware injection): no per-resource
+	// routing headers; phoebe resolves ResourceID / BaseModel / Adapter /
+	// ServingMode / Upstream itself from (OrgID, body model=). See
+	// internal/gateway and the proxy's gateway resolution step.
+	Gateway bool
 }
 
 // FromRequest extracts the trusted identity headers. It performs no
@@ -183,5 +204,6 @@ func FromRequest(r *http.Request) Identity {
 		ServingMode:  r.Header.Get(HeaderServingMode),
 		ServedModel:  r.Header.Get(HeaderServedModel),
 		Upstream:     r.Header.Get(HeaderUpstream),
+		Gateway:      r.Header.Get(HeaderGateway) == "true",
 	}
 }

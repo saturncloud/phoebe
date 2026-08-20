@@ -97,6 +97,70 @@ ioLog:
 	}
 }
 
+// TestLoadGatewayOffByDefault: no gateway block means disabled — and parse
+// imposes no requirements (a legacy config file keeps loading unchanged).
+func TestLoadGatewayOffByDefault(t *testing.T) {
+	s, err := Load(writeTemp(t, "debug: false\n"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if s.Gateway.Enabled {
+		t.Fatal("gateway must be disabled by default")
+	}
+}
+
+// TestLoadGatewayEnabledRequiresNamespace: the fail-closed validation —
+// enabling the gateway without the shared-graph namespace is a startup error
+// (phoebe never guesses a forward target), not a silent misroute.
+func TestLoadGatewayEnabledRequiresNamespace(t *testing.T) {
+	_, err := Load(writeTemp(t, "gateway:\n  enabled: true\n"))
+	if err == nil {
+		t.Fatal("expected error: gateway.enabled without namespace")
+	}
+}
+
+// TestLoadGatewayPortDefaults8000: an enabled gateway without a port takes
+// 8000 (vLLM's serve port); an explicit port is honored; out-of-range is
+// rejected.
+func TestLoadGatewayPortDefaults8000(t *testing.T) {
+	s, err := Load(writeTemp(t, "gateway:\n  enabled: true\n  namespace: \"tf-shared\"\n"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if s.Gateway.Port != 8000 {
+		t.Fatalf("port = %d, want default 8000", s.Gateway.Port)
+	}
+
+	s, err = Load(writeTemp(t, "gateway:\n  enabled: true\n  namespace: \"tf-shared\"\n  port: 9000\n"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if s.Gateway.Port != 9000 {
+		t.Fatalf("port = %d, want 9000", s.Gateway.Port)
+	}
+
+	if _, err := Load(writeTemp(t, "gateway:\n  enabled: true\n  namespace: \"tf-shared\"\n  port: 70000\n")); err == nil {
+		t.Fatal("expected error: gateway.port out of range")
+	}
+}
+
+// TestLoadGatewayParsesEnabled: a full gateway block round-trips.
+func TestLoadGatewayParsesEnabled(t *testing.T) {
+	s, err := Load(writeTemp(t, `
+gateway:
+  enabled: true
+  namespace: "tf-shared"
+  port: 8000
+  databaseUrl: "postgres://u:p@h:5432/atlas"
+`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !s.Gateway.Enabled || s.Gateway.Namespace != "tf-shared" || s.Gateway.DatabaseURL != "postgres://u:p@h:5432/atlas" {
+		t.Fatalf("gateway settings wrong: %+v", s.Gateway)
+	}
+}
+
 func TestLoadEmitSettings(t *testing.T) {
 	s, err := Load(writeTemp(t, `
 emit:
