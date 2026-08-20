@@ -15,13 +15,14 @@ import (
 // an HF id and a fine-tune keyed on an ft: id live in disjoint namespaces.
 const fineTunePrefix = "ft:"
 
-// Tier-SKU pricing axis (design D1, "Option A" — an OUTER prefix on the price
-// key). A shared base is priced from a `shared:<base>` row; dedicated is the
-// bare `<base>`. tierShared is the event's tier value; tierSharedPrefix is the
-// key prefix. Absence of a tier = dedicated = the bare key.
+// Serving-mode SKU pricing axis (design D1, "Option A" — an OUTER prefix on the
+// price key). A shared base is priced from a `shared:<base>` row; dedicated is
+// the bare `<base>`. servingModeShared is the event's serving_mode value;
+// sharedPrefix is the key prefix. Absence of a serving mode = dedicated = the
+// bare key.
 const (
-	tierShared       = "shared"
-	tierSharedPrefix = "shared:"
+	servingModeShared = "shared"
+	sharedPrefix      = "shared:"
 )
 
 // ftLikePattern is the SQL LIKE pattern that matches a fine-tune model_id, derived
@@ -565,16 +566,16 @@ func isDerivationBase(modelID string, derivedFrom map[string]string) bool {
 //	   name) → the PLAIN base rate, keyed on base_model, WITHOUT premium.
 //	d. else → ErrNoPrice (fail loud, never $0) — including fine-tune traffic with
 //	   an empty base_model (Atlas guarantees base_model at deploy).
-func (pb *PriceBook) ResolveEvent(modelID, baseModel, adapter, tier string) (Rate3, error) {
-	// TIER AXIS (design D1): shared and dedicated are distinct SKUs priced from
-	// distinct rows. The tier is an OUTER prefix on the price key — a shared base
-	// is stored as `shared:<base>`, dedicated as the bare `<base>`. Absence of a
-	// tier (or "dedicated") = the bare key, so every pre-shared event is
-	// unaffected. We resolve the base against its TIERED key: for shared traffic
-	// the ladder below keys on `shared:<base>` instead of `<base>`. (model_id
-	// direct hits at (a) are unaffected — an explicit priced model_id wins
-	// regardless of tier, the per-endpoint override seam.)
-	tieredBase := tierKey(tier, baseModel)
+func (pb *PriceBook) ResolveEvent(modelID, baseModel, adapter, servingMode string) (Rate3, error) {
+	// SERVING-MODE AXIS (design D1): shared and dedicated are distinct SKUs priced
+	// from distinct rows. The serving mode is an OUTER prefix on the price key — a
+	// shared base is stored as `shared:<base>`, dedicated as the bare `<base>`.
+	// Absence of a serving mode (or "dedicated") = the bare key, so every
+	// pre-shared event is unaffected. We resolve the base against its SKU key: for
+	// shared traffic the ladder below keys on `shared:<base>` instead of `<base>`.
+	// (model_id direct hits at (a) are unaffected — an explicit priced model_id
+	// wins regardless of serving mode, the per-endpoint override seam.)
+	skuBase := servingModeKey(servingMode, baseModel)
 
 	// (a) Direct model_id hit: the existing model_id-keyed resolution.
 	if r, err := pb.Resolve(modelID); err == nil {
@@ -589,10 +590,10 @@ func (pb *PriceBook) ResolveEvent(modelID, baseModel, adapter, tier string) (Rat
 		// same rule the SQL projection (derivedRates) does, so the oracle and
 		// production agree on one-hop. An empty/unknown base falls to ErrNoPrice —
 		// NEVER to the plain-base path (c). For shared traffic the base is looked up
-		// under its tiered key (`shared:<base>`), so a shared fine-tune resolves as
+		// under its SKU key (`shared:<base>`), so a shared fine-tune resolves as
 		// (shared base row) x (plan premium).
 		if baseModel != "" {
-			if base, ok := pb.base[tieredBase]; ok && isDerivationBase(tieredBase, pb.derivedFrom) {
+			if base, ok := pb.base[skuBase]; ok && isDerivationBase(skuBase, pb.derivedFrom) {
 				return ApplyPolicy(base, pb.policyFn, pb.policyFactor, pb.policyMarkup)
 			}
 		}
@@ -602,9 +603,9 @@ func (pb *PriceBook) ResolveEvent(modelID, baseModel, adapter, tier string) (Rat
 	// catalog price key → the plain base rate, NO premium. Resolve (not a bare
 	// pb.base lookup) mirrors the SQL exactly: the direct price table the SQL joins
 	// on ev.base_model is the resolvedRates() projection, which is Resolve() for
-	// every key it carries. Shared traffic keys on the tiered `shared:<base>` row.
+	// every key it carries. Shared traffic keys on the SKU `shared:<base>` row.
 	if baseModel != "" {
-		if r, err := pb.Resolve(tieredBase); err == nil {
+		if r, err := pb.Resolve(skuBase); err == nil {
 			return r, nil
 		}
 	}
@@ -612,16 +613,16 @@ func (pb *PriceBook) ResolveEvent(modelID, baseModel, adapter, tier string) (Rat
 	return Rate3{}, ErrNoPrice
 }
 
-// tierKey composes the OUTER tier-prefixed price key for a base model id
+// servingModeKey composes the OUTER mode-prefixed price key for a base model id
 // (design D1, "Option A"): shared traffic keys on `shared:<base>`; dedicated
-// (empty tier, or the literal "dedicated") keys on the bare `<base>`, so every
-// price key and event shipped before the shared tier stays valid and prices
-// exactly as before. An unknown tier value is treated as dedicated (the bare
-// key) — a mis-stamped tier can never silently reprice to a shared row that
-// doesn't exist; it falls through to the normal dedicated resolution.
-func tierKey(tier, base string) string {
-	if tier == tierShared {
-		return tierSharedPrefix + base
+// (empty serving mode, or the literal "dedicated") keys on the bare `<base>`, so
+// every price key and event shipped before shared serving stays valid and prices
+// exactly as before. An unknown serving-mode value is treated as dedicated (the
+// bare key) — a mis-stamped serving mode can never silently reprice to a shared
+// row that doesn't exist; it falls through to the normal dedicated resolution.
+func servingModeKey(servingMode, base string) string {
+	if servingMode == servingModeShared {
+		return sharedPrefix + base
 	}
 	return base
 }

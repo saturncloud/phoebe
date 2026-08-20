@@ -107,9 +107,9 @@ type Server struct {
 	ioMaxBodyLen int
 
 	// waker triggers a shared base graph's 0->1 scale-up on a cold response,
-	// for the shared serverless tier. nil (the default) = wake disabled: a cold
+	// for the shared serverless mode. nil (the default) = wake disabled: a cold
 	// response passes straight through to the client, exactly as before. Set via
-	// WithWaker when the shared tier is enabled.
+	// WithWaker when shared serving is enabled.
 	waker        Waker
 	wakeTimeout  time.Duration
 	wakeMaxTries int
@@ -156,7 +156,7 @@ const (
 	defaultWakeMaxTries = 3                 // probe -> wake -> re-probe attempts
 )
 
-// WithWaker enables shared-tier wake-from-zero: on a cold response for a
+// WithWaker enables shared-mode wake-from-zero: on a cold response for a
 // wakeable route, the proxy triggers a 0->1 scale via the waker and holds the
 // request until warm. nil waker leaves wake disabled (cold responses pass
 // through). timeout/maxTries <= 0 use the defaults.
@@ -302,7 +302,7 @@ func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	// SHARED-TIER MODEL BINDING (security crux): assert the request-body `model=`
+	// SHARED-MODE MODEL BINDING (security crux): assert the request-body `model=`
 	// is one the subdomain-authorized resource may serve, fail closed on mismatch.
 	// atlas-auth authorized the caller for this subdomain/resource; Dynamo routes
 	// on the body `model=` and a shared graph fronts many tenants behind one
@@ -339,7 +339,7 @@ func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// WAKE-FROM-ZERO (shared serverless tier, the 0->1 leg). On a wakeable route
+	// WAKE-FROM-ZERO (shared serverless mode, the 0->1 leg). On a wakeable route
 	// (shared + authorized resource id) with a waker configured, probe the
 	// upstream; if it returns a COLD response (scaled-to-zero base), trigger a
 	// 0->1 wake and retry rather than serving the client a 404/503. The probe
@@ -543,10 +543,10 @@ func (s *Server) emit(ctx context.Context, id identity.Identity, requestID strin
 		// Its presence triggers the fine-tune premium at rating; its value is
 		// forensic. Empty for a base-model endpoint.
 		Adapter: id.Adapter,
-		// Tier is the serving-tier SKU axis ("shared" | "dedicated"), from the
-		// trusted middleware header. Empty = dedicated. Shared traffic prices
+		// ServingMode is the serving-mode SKU axis ("shared" | "dedicated"), from
+		// the trusted middleware header. Empty = dedicated. Shared traffic prices
 		// from the distinct shared:<base> rate row.
-		Tier: id.Tier,
+		ServingMode: id.ServingMode,
 
 		PromptTokens:     res.Usage.PromptTokens,
 		CachedTokens:     res.Usage.CachedTokens(),

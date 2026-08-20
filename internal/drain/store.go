@@ -94,7 +94,7 @@ var upsertColumns = []string{
 	"model",
 	"base_model",
 	"adapter",
-	"tier",
+	"serving_mode",
 	"prompt_tokens",
 	"cached_tokens",
 	"completion_tokens",
@@ -198,11 +198,11 @@ func eventArgs(e metering.Event) []any {
 		// -braces for a clean column either way.
 		nullStr(e.BaseModel),
 		nullStr(e.Adapter),
-		// Tier is "" for dedicated (the common case, incl. every pre-shared event)
-		// and "shared" for shared traffic. nullStr so dedicated stores NULL, not
-		// '' — the rater treats NULL/'' identically as dedicated (the bare price
+		// ServingMode is "" for dedicated (the common case, incl. every pre-shared
+		// event) and "shared" for shared traffic. nullStr so dedicated stores NULL,
+		// not '' — the rater treats NULL/'' identically as dedicated (the bare price
 		// key), and a clean NULL keeps the column faithful to "absence = dedicated".
-		nullStr(e.Tier),
+		nullStr(e.ServingMode),
 		e.PromptTokens,
 		e.CachedTokens,
 		e.CompletionTokens,

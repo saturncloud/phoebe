@@ -95,7 +95,7 @@ func TestRateWindowSQL_Shape(t *testing.T) {
 		// the DERIVED price table prices an ft: model_id via its event-carried
 		// base_model (E3); direct-over-derived precedence + the ft: prefix guard
 		"LEFT JOIN rating_derived rd",
-		"rd.base_model = ev.tiered_base",
+		"rd.base_model = ev.sku_base",
 		"rp.model_id IS NULL",
 		// the FINE-TUNE marker (C4): the ft: prefix single-sourced from the Go
 		// fineTunePrefix constant (bound as $3) OR a non-null injected adapter —
@@ -106,7 +106,7 @@ func TestRateWindowSQL_Shape(t *testing.T) {
 		// the derived join's marker), so a fine-tune whose base misses the derived
 		// table can never fall through to an un-premiumed base rate
 		"LEFT JOIN rating_price rpb",
-		"rpb.model_id = ev.tiered_base",
+		"rpb.model_id = ev.sku_base",
 		"NOT (ev.model_id LIKE $3 OR ev.adapter IS NOT NULL)",
 		// the effective rate COALESCEs direct over derived over plain-base
 		"COALESCE(rp.prompt_price,     rd.prompt_price,     rpb.prompt_price)",

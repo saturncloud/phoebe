@@ -108,7 +108,7 @@ func (s *oracleStore) resolveWindow(start, end time.Time) (map[rollupKey]oracleR
 			an.UnattributableEvents++
 			continue
 		}
-		resolved, err := s.book.ResolveEvent(e.ModelID, e.BaseModel, e.Adapter, e.Tier)
+		resolved, err := s.book.ResolveEvent(e.ModelID, e.BaseModel, e.Adapter, e.ServingMode)
 		if err != nil {
 			an.UnpricedEvents++ // ErrNoPrice: never $0-billed
 			continue

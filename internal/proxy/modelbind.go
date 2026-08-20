@@ -18,7 +18,7 @@ const (
 	bindingOK modelBindingResult = iota
 	// bindingMismatch: the request names a model NOT in the authorized allow-list.
 	// Fail closed (403) — the caller is trying to escape the subdomain-authorized
-	// resource (the shared-tier cross-model attack).
+	// resource (the shared-mode cross-model attack).
 	bindingMismatch
 	// bindingUnparseable: the request body is present but its model= could not be
 	// read (not JSON, or no model field). Fail closed when the binding is enforced:
@@ -27,7 +27,7 @@ const (
 	bindingUnparseable
 )
 
-// checkModelBinding enforces the shared-tier security crux: the request-body
+// checkModelBinding enforces the shared-mode security crux: the request-body
 // `model=` must be one the subdomain-authorized resource is allowed to serve.
 //
 // atlas-auth authorized the caller for a SUBDOMAIN → resource, and injected the

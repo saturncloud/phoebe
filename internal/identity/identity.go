@@ -47,7 +47,7 @@ const (
 	// resource is allowed to serve — a comma-separated allow-list injected by the
 	// Atlas per-deployment Traefik middleware (a deploy-time resource property,
 	// server-side, anti-spoof overwritten, never client-trusted). It is the
-	// SECURITY CRUX of the shared tier: atlas-auth authorizes the caller for a
+	// SECURITY CRUX of shared serving: atlas-auth authorizes the caller for a
 	// SUBDOMAIN/resource, but Dynamo routes on the request-body `model=`, and on a
 	// shared graph many tenants' models share one upstream. Without binding the two,
 	// a caller authorized for model-A's subdomain could put `model=B` in the body
@@ -58,17 +58,17 @@ const (
 	// subdomain == one model, need no binding); present = enforce.
 	HeaderServedModel = "X-Saturn-Served-Model"
 
-	// HeaderTier carries the SERVING TIER of the deployment — "shared" or
+	// HeaderServingMode carries the serving mode of the deployment — "shared" or
 	// "dedicated" — the SKU axis that prices the two fundamentally-different
 	// products independently (design D1). Like HeaderBaseModel/HeaderAdapter it
 	// is a deploy-time resource property injected server-side by the
 	// Atlas-rendered Traefik middleware, anti-spoof overwritten, never trusted
 	// from clients. ABSENT = dedicated (the OUTER-prefix pricing contract: a bare
-	// base id is dedicated, so every event shipped before the shared tier prices
+	// base id is dedicated, so every event shipped before shared serving prices
 	// as dedicated with no rewrite). PRESENT with "shared" marks shared traffic,
 	// which the rater prices from the distinct shared:<base> price row. Phoebe
 	// reads it defensively: absent = "" = dedicated.
-	HeaderTier = "X-Saturn-Tier"
+	HeaderServingMode = "X-Saturn-Serving-Mode"
 
 	// HeaderAuthID carries the token / API-key identity — the JWT `sub` claim,
 	// which in Atlas is the IdentityAuth.id (the same value for both browser-
@@ -151,11 +151,11 @@ type Identity struct {
 	// checkpoint deployments. Its presence triggers the fine-tune premium at rating
 	// (C4); its value is forensic. Empty for a base-model endpoint.
 	Adapter string
-	// Tier is the serving tier ("shared" | "dedicated"), the SKU pricing axis.
-	// Empty = dedicated (the absence-of-prefix contract). Carried to the metering
-	// event so the rater prices shared traffic from the distinct shared:<base>
-	// row. See HeaderTier.
-	Tier string
+	// ServingMode is the serving mode ("shared" | "dedicated"), the SKU pricing
+	// axis. Empty = dedicated (the absence-of-prefix contract). Carried to the
+	// metering event so the rater prices shared traffic from the distinct
+	// shared:<base> row. See HeaderServingMode.
+	ServingMode string
 	// ServedModel is the comma-separated allow-list of served-model names the
 	// subdomain-authorized resource may serve. Empty = binding not enforced for
 	// this route. Phoebe asserts the request-body `model=` is in this set and
@@ -180,7 +180,7 @@ func FromRequest(r *http.Request) Identity {
 		OrgID:        r.Header.Get(HeaderOrgID),
 		BaseModel:    r.Header.Get(HeaderBaseModel),
 		Adapter:      r.Header.Get(HeaderAdapter),
-		Tier:         r.Header.Get(HeaderTier),
+		ServingMode:  r.Header.Get(HeaderServingMode),
 		ServedModel:  r.Header.Get(HeaderServedModel),
 		Upstream:     r.Header.Get(HeaderUpstream),
 	}

@@ -29,7 +29,7 @@ type Waker interface {
 	Wake(ctx context.Context, upstream string, resourceID string) error
 }
 
-// Shared-tier wake-from-zero (the 0->1 leg). Dynamo has NO wake-from-zero: when
+// Shared-mode wake-from-zero (the 0->1 leg). Dynamo has NO wake-from-zero: when
 // a shared base graph's worker is scaled to 0 (by the Atlas reaper), the
 // frontend drops the model and a request for it returns a COLD response. Phoebe
 // — the only actor in the request path — supplies the external wake signal:
@@ -43,7 +43,7 @@ type Waker interface {
 // A 404 alone is AMBIGUOUS (a genuinely-nonexistent model 404s identically), so
 // phoebe never wakes on the response ALONE — it wakes only when the request also
 // carries a valid, atlas-authorized X-Saturn-Resource-Id (proof this is a real
-// deployed endpoint) AND the route is a shared-tier route (a served-model
+// deployed endpoint) AND the route is a shared-mode route (a served-model
 // allow-list is present). A cold response without those is returned to the
 // client unchanged.
 
@@ -60,7 +60,7 @@ func isColdStatus(status int) bool {
 }
 
 // isWakeable reports whether a request is eligible for wake-from-zero: it must be
-// a shared-tier route (a served-model allow-list was injected by Atlas) AND carry
+// a shared-mode route (a served-model allow-list was injected by Atlas) AND carry
 // a valid atlas-authorized resource id. This is what disambiguates "cold parked
 // base, wake it" from "model genuinely doesn't exist" — the latter has no such
 // authorized resource. Dedicated routes (no allow-list) are never woken here
@@ -143,7 +143,7 @@ func (b *bufferingResponseWriter) flushTo(w http.ResponseWriter) {
 }
 
 // wakeEnabled reports whether this request should go through the wake path: a
-// waker is configured AND the route is wakeable (shared-tier + authorized
+// waker is configured AND the route is wakeable (shared-mode + authorized
 // resource id). Everything else streams directly with zero wake overhead.
 func (s *Server) wakeEnabled(id identity.Identity) bool {
 	return s.waker != nil && isWakeable(id)

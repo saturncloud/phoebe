@@ -820,11 +820,11 @@ func TestResolveEvent_PlainUnknownModelUnpriced(t *testing.T) {
 	}
 }
 
-// tierBook has BOTH a dedicated base row and a distinct shared:<base> row for
-// the same model, plus the plan premium — the D1 "independent price for the
+// servingModeBook has BOTH a dedicated base row and a distinct shared:<base> row
+// for the same model, plus the plan premium — the D1 "independent price for the
 // same model" shape. Dedicated prices $4/1M prompt; shared prices $1/1M
-// (cheaper, the shared-tier thesis).
-func tierBook(t *testing.T) *PriceBook {
+// (cheaper, the shared-mode thesis).
+func servingModeBook(t *testing.T) *PriceBook {
 	t.Helper()
 	const y = `
 version: 1
@@ -843,19 +843,19 @@ fine_tune_premium:
 `
 	pb, err := ParsePriceBook([]byte(y))
 	if err != nil {
-		t.Fatalf("parse tier book: %v", err)
+		t.Fatalf("parse serving-mode book: %v", err)
 	}
 	return pb
 }
 
-// The tier-SKU axis (D1): shared and dedicated of the SAME base price from
-// distinct rows; the tier is an OUTER prefix on the price key. Absence of a
-// tier = dedicated = the bare key (back-compat).
-func TestResolveEvent_TierAxis(t *testing.T) {
-	pb := tierBook(t)
+// The serving-mode SKU axis (D1): shared and dedicated of the SAME base price
+// from distinct rows; the serving mode is an OUTER prefix on the price key.
+// Absence of a serving mode = dedicated = the bare key (back-compat).
+func TestResolveEvent_ServingModeAxis(t *testing.T) {
+	pb := servingModeBook(t)
 	const base = "meta-llama/Llama-3.1-8B-Instruct"
 
-	// Dedicated (empty tier) base-model endpoint -> the bare row ($4/1M).
+	// Dedicated (empty serving mode) base-model endpoint -> the bare row ($4/1M).
 	if r, err := pb.ResolveEvent("tf-ep-ded", base, "", ""); err != nil ||
 		r.Prompt.String() != "0.000004000" {
 		t.Fatalf("dedicated base: r=%v err=%v, want 0.000004000", r, err)
@@ -881,10 +881,10 @@ func TestResolveEvent_TierAxis(t *testing.T) {
 		r.Prompt.String() != "0.000006000" {
 		t.Fatalf("dedicated fine-tune: r=%v err=%v, want 0.000006000", r, err)
 	}
-	// A mis-stamped/unknown tier falls back to dedicated (never silently reprices
-	// to a nonexistent shared row): "bogus" -> the bare row.
+	// A mis-stamped/unknown serving mode falls back to dedicated (never silently
+	// reprices to a nonexistent shared row): "bogus" -> the bare row.
 	if r, err := pb.ResolveEvent("tf-ep-x", base, "", "bogus"); err != nil ||
 		r.Prompt.String() != "0.000004000" {
-		t.Fatalf("unknown tier -> dedicated: r=%v err=%v, want 0.000004000", r, err)
+		t.Fatalf("unknown serving mode -> dedicated: r=%v err=%v, want 0.000004000", r, err)
 	}
 }

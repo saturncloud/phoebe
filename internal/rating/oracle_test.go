@@ -50,10 +50,10 @@ type RatedEvent struct {
 	// non-empty ONLY for fine-tune checkpoint deployments. Its presence is the
 	// premium trigger (C4) — mirroring the SQL.
 	Adapter string
-	// Tier is the serving-tier SKU axis from billing_event.tier ("shared" |
-	// "dedicated"; empty = dedicated). Shared traffic prices from the tiered
-	// shared:<base> row — mirroring the SQL.
-	Tier             string
+	// ServingMode is the serving-mode SKU axis from billing_event.serving_mode
+	// ("shared" | "dedicated"; empty = dedicated). Shared traffic prices from the
+	// distinct shared:<base> row — mirroring the SQL.
+	ServingMode      string
 	PromptTokens     int64 // TOTAL prompt tokens (cached + non-cached), per vLLM
 	CachedTokens     int64 // SUBSET of PromptTokens that was a cache hit
 	CompletionTokens int64
