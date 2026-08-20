@@ -1,9 +1,13 @@
 package proxy
 
 import (
+	"bytes"
 	"encoding/json"
+	"errors"
 	"strings"
 )
+
+var errNotObject = errors.New("request body is not a JSON object")
 
 // modelBindingResult is the outcome of the request-body model= binding check.
 type modelBindingResult int
@@ -38,10 +42,21 @@ const (
 // the one thing) → bindingOK, no parse, no cost. atlas DECIDES access; this only
 // guarantees the body can't escape the atlas-authorized resource.
 func checkModelBinding(body []byte, servedModelAllowList string) modelBindingResult {
+	// An ABSENT header (empty string) = binding not enforced (dedicated
+	// single-model route). But a PRESENT header that parses to an EMPTY set
+	// (e.g. a whitespace-only served name, or all-empty CSV parts) must fail
+	// CLOSED, not open: an empty allow-list on a shared route would let ANY
+	// model= through, defeating the binding. The caller only reaches here when
+	// the header is non-empty, so "present but empty set" is the attack/bug case.
+	if servedModelAllowList == "" {
+		return bindingOK // truly absent (empty header) -> not a shared-binding route
+	}
 	allow := parseServedModelAllowList(servedModelAllowList)
 	if len(allow) == 0 {
-		// Binding not enforced for this route (no allow-list injected).
-		return bindingOK
+		// Present (non-empty header) but parsed to nothing — whitespace-only or
+		// all-empty CSV parts. Fail CLOSED: an empty allow-list on a route that
+		// DID inject the header would let any model= through.
+		return bindingMismatch
 	}
 	model, ok := extractRequestModel(body)
 	if !ok {
@@ -72,12 +87,21 @@ func parseServedModelAllowList(h string) map[string]struct{} {
 
 // extractRequestModel pulls the top-level "model" string from an OpenAI-shaped
 // request body. Returns ("", false) if the body is not a JSON object, has no
-// model field, or model is not a non-empty string. Pure + allocation-light (it
-// unmarshals only the model field).
+// model field, model is not a non-empty string, OR the object has DUPLICATE
+// top-level "model" keys.
+//
+// The duplicate-key check is a security guard: a plain struct Unmarshal silently
+// takes the LAST duplicate, but the Dynamo router downstream may resolve
+// duplicates differently (e.g. first-wins). If phoebe validated the last and the
+// router routed the first, `{"model":"victim","model":"mine"}` would bypass the
+// binding. We can't see the router's resolution, so we refuse the ambiguity: a
+// body with two top-level "model" keys fails the check (-> bindingUnparseable ->
+// 403). A well-formed request has exactly one.
 func extractRequestModel(body []byte) (string, bool) {
 	if len(body) == 0 {
 		return "", false
 	}
+	// Fast path for the value; then verify uniqueness of the top-level key.
 	var m struct {
 		Model string `json:"model"`
 	}
@@ -87,5 +111,89 @@ func extractRequestModel(body []byte) (string, bool) {
 	if m.Model == "" {
 		return "", false
 	}
+	if count, err := countTopLevelModelKeys(body); err != nil || count != 1 {
+		return "", false
+	}
 	return m.Model, true
+}
+
+// countTopLevelModelKeys counts how many times "model" appears as a key of the
+// top-level JSON object, using a streaming token decoder (so nested "model"
+// keys, e.g. inside an array element, are not counted). Returns an error if the
+// body is not a JSON object.
+func countTopLevelModelKeys(body []byte) (int, error) {
+	dec := json.NewDecoder(bytes.NewReader(body))
+	tok, err := dec.Token()
+	if err != nil {
+		return 0, err
+	}
+	if d, ok := tok.(json.Delim); !ok || d != '{' {
+		return 0, errNotObject
+	}
+	count := 0
+	depth := 0 // depth WITHIN the top-level object's values
+	for dec.More() || depth > 0 {
+		tok, err := dec.Token()
+		if err != nil {
+			return 0, err
+		}
+		switch t := tok.(type) {
+		case json.Delim:
+			switch t {
+			case '{', '[':
+				depth++
+			case '}', ']':
+				if depth == 0 {
+					// closing the top-level object
+					return count, nil
+				}
+				depth--
+			}
+		case string:
+			// A string token at depth 0 in the key position is a top-level key.
+			if depth == 0 {
+				if t == "model" {
+					count++
+				}
+				// consume this key's value (a token or a nested structure).
+				if err := skipValue(dec); err != nil {
+					return 0, err
+				}
+			}
+		}
+	}
+	return count, nil
+}
+
+// skipValue consumes exactly one JSON value from the decoder (scalar, object, or
+// array), leaving the decoder positioned after it.
+func skipValue(dec *json.Decoder) error {
+	tok, err := dec.Token()
+	if err != nil {
+		return err
+	}
+	d, ok := tok.(json.Delim)
+	if !ok {
+		return nil // a scalar value — done
+	}
+	if d != '{' && d != '[' {
+		return nil
+	}
+	// Recurse through the nested container to its matching close.
+	depth := 1
+	for depth > 0 {
+		t, err := dec.Token()
+		if err != nil {
+			return err
+		}
+		if dd, ok := t.(json.Delim); ok {
+			switch dd {
+			case '{', '[':
+				depth++
+			case '}', ']':
+				depth--
+			}
+		}
+	}
+	return nil
 }
