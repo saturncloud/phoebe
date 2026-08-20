@@ -48,6 +48,13 @@ type Settings struct {
 	// internal/gateway resolver wiring (same pattern as Emit/IOLog).
 	Gateway GatewaySettings `yaml:"gateway"`
 
+	// Wake configures wake-from-zero actuation (the client-go DGDSA waker,
+	// internal/waker). OFF by default — without it a cold response passes
+	// through to the client exactly as before. main.go builds the waker; an
+	// unavailable kubernetes config degrades to wake-off (logged), never a
+	// crash.
+	Wake WakeSettings `yaml:"wake"`
+
 	// --- Parsed settings (populated by parse) ---
 
 	ListenAddr  string        `yaml:"-"`
@@ -137,6 +144,22 @@ type GatewaySettings struct {
 	DatabaseURL string `yaml:"databaseUrl"`
 }
 
+// WakeSettings is the YAML shape for the wake-from-zero actuator.
+//
+// The DGDSAs/ScaledObjects the waker patches live in the SAME namespace as
+// the gateway's serving graphs, so enabling wake requires gateway.namespace
+// (validated in Settings.parse — fail closed rather than actuate in a guessed
+// namespace).
+type WakeSettings struct {
+	// Enabled turns the DGDSA waker on. Default false: cold responses pass
+	// through unchanged.
+	Enabled bool `yaml:"enabled"`
+
+	// Kubeconfig is a kubeconfig file path for dev/tests. Empty (production)
+	// uses in-cluster config.
+	Kubeconfig string `yaml:"kubeconfig"`
+}
+
 // Load reads, defaults, and parses a settings YAML file.
 func Load(settingsFile string) (*Settings, error) {
 	s := &Settings{
@@ -183,6 +206,13 @@ func (s *Settings) parse() error {
 	}
 	if err := s.Gateway.parse(); err != nil {
 		return err
+	}
+	// The waker patches DGDSAs in the gateway namespace; without it there is
+	// no safe namespace to actuate in (fail closed at startup, not a guessed
+	// patch at wake time). gateway.enabled itself is NOT required — wake also
+	// serves header-routed shared subdomains.
+	if s.Wake.Enabled && s.Gateway.Namespace == "" {
+		return fmt.Errorf("wake.enabled=true requires gateway.namespace (the namespace the serving graphs' DGDSAs live in)")
 	}
 	return nil
 }

@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"io"
+	"net"
 	"net/http"
 	"net/http/httputil"
 	"net/url"
@@ -12,21 +13,36 @@ import (
 	"github.com/saturncloud/phoebe/internal/identity"
 )
 
+// WakeTarget identifies WHAT a wake actuates, resolved by the proxy ONCE (see
+// serveWithWake) so the actuator never re-parses strings the proxy composed.
+type WakeTarget struct {
+	// UpstreamHost is the trusted upstream host:port the cold response came
+	// from (the readiness-probe address).
+	UpstreamHost string
+	// GraphK8sName is the Dynamo graph (DGD) k8s name whose worker DGDSA the
+	// waker scales. On the gateway path it is the tf_model row's
+	// graph_k8s_name, threaded through resolution verbatim; on header-routed
+	// requests it is derived once from the upstream host (see
+	// graphFromUpstreamHost). Never empty for a target the proxy hands to a
+	// waker.
+	GraphK8sName string
+	// ResourceID is the atlas-authorized resource id (authorization proof at
+	// wake time + audit).
+	ResourceID string
+}
+
 // Waker triggers a shared base graph's 0->1 scale-up and blocks until the
 // graph's worker is ready to serve (or the context/deadline is exceeded).
-// Abstracted so the ACTUATION is pluggable: either phoebe patches the DGDSA
-// directly (client-go), or phoebe POSTs to an Atlas wake endpoint that reuses
-// the reaper's pause+scale logic. The proxy's cold-detect + hold-and-retry logic
-// is identical either way.
+// Abstracted so the ACTUATION is pluggable (the concrete client-go DGDSA
+// waker lives in internal/waker; a future actuator could POST to an Atlas
+// wake endpoint instead). The proxy's cold-detect + hold-and-retry logic is
+// identical either way.
 //
-// Wake receives the trusted upstream (from X-Saturn-Upstream, e.g.
-// "<graph>-frontend.<ns>.svc:8000") — from which the implementation derives the
-// graph and its DGDSA — and the resource id (for authorization/audit at the
-// actuator). It returns nil once the worker is ready, or an error if wake could
-// not complete within the deadline (the caller then returns the original cold
+// Wake returns nil once the worker is ready, or an error if wake could not
+// complete within the deadline (the caller then returns the original cold
 // response to the client rather than hanging forever).
 type Waker interface {
-	Wake(ctx context.Context, upstream string, resourceID string) error
+	Wake(ctx context.Context, target WakeTarget) error
 }
 
 // Shared-mode wake-from-zero (the 0->1 leg). Dynamo has NO wake-from-zero: when
@@ -67,6 +83,21 @@ func isColdStatus(status int) bool {
 // (they don't scale to zero via this path).
 func isWakeable(id identity.Identity) bool {
 	return id.ResourceID != "" && id.ServedModel != ""
+}
+
+// graphFromUpstreamHost derives the Dynamo graph (DGD) k8s name from a
+// trusted upstream host for HEADER-ROUTED wakes (the gateway path threads the
+// graph name from resolution instead — see serveWithWake). The upstream's
+// first DNS label names the graph's Service: for a Dynamo frontend Service
+// that is `<graph>-frontend` (exactly what the gateway's upstreamFor
+// composes, and what Atlas injects for Dynamo-served deployments), so the
+// `-frontend` suffix is stripped; a label without the suffix IS the k8s name.
+func graphFromUpstreamHost(host string) string {
+	if h, _, err := net.SplitHostPort(host); err == nil {
+		host = h
+	}
+	first, _, _ := strings.Cut(host, ".")
+	return strings.TrimSuffix(first, "-frontend")
 }
 
 // bodyLooksNotReady reports whether a 503 body carries Dynamo's fixed
@@ -182,6 +213,19 @@ func (s *Server) serveWithWake(
 		}
 	}
 
+	// Resolve the wake target ONCE. The gateway path already knows the graph
+	// (tf_model.graph_k8s_name, carried on the identity by resolveGateway);
+	// header-routed requests derive it from the upstream host here — the
+	// single parse site, never re-parsed by the actuator.
+	target := WakeTarget{
+		UpstreamHost: upstream.Host,
+		GraphK8sName: id.GraphK8sName,
+		ResourceID:   id.ResourceID,
+	}
+	if target.GraphK8sName == "" {
+		target.GraphK8sName = graphFromUpstreamHost(upstream.Host)
+	}
+
 	maxTries := s.wakeMaxTries
 	if maxTries < 1 {
 		maxTries = 1
@@ -212,7 +256,7 @@ func (s *Server) serveWithWake(
 			ctx, cancel = context.WithTimeout(ctx, s.wakeTimeout)
 			defer cancel()
 		}
-		if werr := s.waker.Wake(ctx, upstream.Host, id.ResourceID); werr != nil {
+		if werr := s.waker.Wake(ctx, target); werr != nil {
 			// Wake couldn't complete (deadline/scale error): return the cold
 			// response to the client rather than hang. It's a real, honest 503/404
 			// for a base we couldn't bring up in time.

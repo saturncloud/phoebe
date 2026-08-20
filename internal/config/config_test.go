@@ -161,6 +161,34 @@ gateway:
 	}
 }
 
+// TestLoadWakeOffByDefault: no wake block means disabled, no requirements.
+func TestLoadWakeOffByDefault(t *testing.T) {
+	s, err := Load(writeTemp(t, "debug: false\n"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if s.Wake.Enabled {
+		t.Fatal("wake must be disabled by default")
+	}
+}
+
+// TestLoadWakeEnabledRequiresGatewayNamespace: the waker patches DGDSAs in the
+// gateway namespace; enabling wake without one is a startup error (fail closed
+// — never actuate in a guessed namespace). gateway.enabled itself is NOT
+// required (wake also serves header-routed shared subdomains).
+func TestLoadWakeEnabledRequiresGatewayNamespace(t *testing.T) {
+	if _, err := Load(writeTemp(t, "wake:\n  enabled: true\n")); err == nil {
+		t.Fatal("expected error: wake.enabled without gateway.namespace")
+	}
+	s, err := Load(writeTemp(t, "wake:\n  enabled: true\ngateway:\n  namespace: \"tf-shared\"\n"))
+	if err != nil {
+		t.Fatalf("wake with gateway.namespace (gateway disabled) must load: %v", err)
+	}
+	if !s.Wake.Enabled || s.Gateway.Enabled {
+		t.Fatalf("settings wrong: wake=%+v gateway=%+v", s.Wake, s.Gateway)
+	}
+}
+
 func TestLoadEmitSettings(t *testing.T) {
 	s, err := Load(writeTemp(t, `
 emit:

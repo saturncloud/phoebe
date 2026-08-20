@@ -19,6 +19,7 @@ import (
 	"github.com/saturncloud/phoebe/internal/logging"
 	"github.com/saturncloud/phoebe/internal/metering"
 	"github.com/saturncloud/phoebe/internal/proxy"
+	"github.com/saturncloud/phoebe/internal/waker"
 )
 
 func main() {
@@ -45,6 +46,10 @@ func main() {
 	srv := proxy.NewWithIOLog(settings, log, emitter, ioPolicy, ioSink, ioMaxBody)
 	if gwResolver != nil {
 		srv = srv.WithGateway(gwResolver, settings.Gateway.Namespace, settings.Gateway.Port)
+	}
+	if w := buildWaker(settings, log); w != nil {
+		// 0/0 = the proxy's own defaults (120s wake ceiling, 3 tries).
+		srv = srv.WithWaker(w, 0, 0)
 	}
 	srvErr := srv.Run()
 
@@ -101,6 +106,29 @@ func buildGateway(s *config.Settings, log *logging.Logger) (gateway.Resolver, fu
 	log.Info.Printf("gateway: enabled (namespace=%s port=%d, cache %s/%s pos/neg)",
 		s.Gateway.Namespace, s.Gateway.Port, gateway.DefaultPositiveTTL, gateway.DefaultNegativeTTL)
 	return resolver, func() { _ = db.Close() }
+}
+
+// buildWaker constructs the client-go DGDSA waker (wake-from-zero actuation
+// in the MAIN phoebe container — no separate waker pod; see
+// deploy/rbac-waker.yaml for the RBAC it needs). Returns nil when wake is
+// disabled (the default) OR when the kubernetes config is unavailable: the
+// proxy then runs with wake off — cold responses pass through exactly as
+// before — because a broken wake path must degrade the cold-start UX, never
+// crash or block the proxy (which also serves warm traffic).
+func buildWaker(s *config.Settings, log *logging.Logger) proxy.Waker {
+	if !s.Wake.Enabled {
+		return nil
+	}
+	w, err := waker.New(waker.Config{
+		Namespace:  s.Gateway.Namespace,
+		Kubeconfig: s.Wake.Kubeconfig,
+	}, log)
+	if err != nil {
+		log.Error.Printf("wake: kubernetes client unavailable (%v); wake-from-zero DISABLED — cold responses pass through", err)
+		return nil
+	}
+	log.Info.Printf("wake: enabled (DGDSA namespace=%s)", s.Gateway.Namespace)
+	return w
 }
 
 // buildEmitter constructs the durable metering emitter. When ValkeyAddr is set

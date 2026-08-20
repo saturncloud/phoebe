@@ -386,4 +386,9 @@ func TestGateway_WakeEligible(t *testing.T) {
 	if got := atomic.LoadInt32(&waker.calls); got != 1 {
 		t.Fatalf("waker called %d times, want 1 (gateway route must be wakeable)", got)
 	}
+	// The RESOLVED graph name is threaded onto the wake target verbatim —
+	// never re-derived from the upstream host the gateway composed from it.
+	if tgt := waker.last(); tgt.GraphK8sName != "graph-llama31" || tgt.ResourceID != "tfm-cold-1" {
+		t.Fatalf("wake target = %+v, want the resolved graph/resource", tgt)
+	}
 }

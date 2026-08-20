@@ -40,3 +40,16 @@ emit:
 #   namespace: "saturn-tf-shared"
 #   port: 8000
 #   databaseUrl: ""
+
+# Wake-from-zero actuation (OFF by default). When enabled, a cold response on
+# a wakeable route patches the graph's DGDSA <graph>-vllmworker to 1 replica
+# and unpauses its KEDA ScaledObject <graph>-scaler (in that order — the KEDA
+# pause handoff), holding the request until the worker serves. Requires
+# gateway.namespace (where the DGDSAs live) and the RBAC in
+# deploy/rbac-waker.yaml on phoebe's ServiceAccount. Uses in-cluster config;
+# kubeconfig is a dev/test override. If the kubernetes config is unavailable,
+# wake degrades to off (cold responses pass through) — it never crashes the
+# proxy.
+# wake:
+#   enabled: true
+#   kubeconfig: ""

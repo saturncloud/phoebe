@@ -187,6 +187,13 @@ type Identity struct {
 	// ServingMode / Upstream itself from (OrgID, body model=). See
 	// internal/gateway and the proxy's gateway resolution step.
 	Gateway bool
+	// GraphK8sName is the Dynamo graph (DGD) k8s name serving this request —
+	// known only via gateway resolution (tf_model.graph_k8s_name), NOT header-
+	// sourced. Threaded to the wake target so the waker never re-parses the
+	// upstream host the gateway just composed from this same name. Empty on
+	// header-routed requests (the proxy derives the graph from the upstream
+	// host instead).
+	GraphK8sName string
 }
 
 // FromRequest extracts the trusted identity headers. It performs no

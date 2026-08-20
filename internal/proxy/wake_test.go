@@ -6,6 +6,7 @@ import (
 	"net/http/httptest"
 	"net/url"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -40,6 +41,23 @@ func TestIsColdWakeable(t *testing.T) {
 	}
 }
 
+// TestGraphFromUpstreamHost pins the header-routed graph derivation: first DNS
+// label, `-frontend` Service suffix stripped, port ignored; a label without
+// the suffix is the k8s name itself.
+func TestGraphFromUpstreamHost(t *testing.T) {
+	cases := map[string]string{
+		"graph-llama31-frontend.tf-shared.svc.cluster.local:8000":     "graph-llama31",
+		"pd-abcde-mymodel-r123.main-namespace.svc.cluster.local:8000": "pd-abcde-mymodel-r123",
+		"solo-frontend:8000": "solo",
+		"bare-name":          "bare-name",
+	}
+	for host, want := range cases {
+		if got := graphFromUpstreamHost(host); got != want {
+			t.Errorf("graphFromUpstreamHost(%q) = %q, want %q", host, got, want)
+		}
+	}
+}
+
 func TestIsWakeable(t *testing.T) {
 	if !isWakeable(identity.Identity{ResourceID: "r1", ServedModel: "m"}) {
 		t.Fatal("shared route with resource id should be wakeable")
@@ -57,10 +75,16 @@ type fakeWaker struct {
 	err     error
 	warmsAt int32 // after this many wake calls, the upstream goes warm
 	backend *coldToWarmBackend
+
+	mu         sync.Mutex
+	lastTarget WakeTarget
 }
 
-func (f *fakeWaker) Wake(ctx context.Context, upstream, resourceID string) error {
+func (f *fakeWaker) Wake(ctx context.Context, target WakeTarget) error {
 	n := atomic.AddInt32(&f.calls, 1)
+	f.mu.Lock()
+	f.lastTarget = target
+	f.mu.Unlock()
 	if f.err != nil {
 		return f.err
 	}
@@ -68,6 +92,12 @@ func (f *fakeWaker) Wake(ctx context.Context, upstream, resourceID string) error
 		f.backend.warm.Store(true)
 	}
 	return nil
+}
+
+func (f *fakeWaker) last() WakeTarget {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.lastTarget
 }
 
 // coldToWarmBackend serves cold (404) until warm is set, then 200.

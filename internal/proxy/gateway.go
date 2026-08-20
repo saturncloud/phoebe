@@ -143,6 +143,10 @@ func (s *Server) resolveGateway(w http.ResponseWriter, r *http.Request, id *iden
 	// because wake eligibility (isWakeable) keys on ResourceID+ServedModel:
 	// "resolution succeeded" is exactly what makes a gateway route wakeable.
 	id.ServedModel = model
+	// The graph name rides the identity to the wake target verbatim, so a wake
+	// on this route actuates exactly the resolved graph — never a re-parse of
+	// the upstream host composed from it one line below.
+	id.GraphK8sName = res.GraphK8sName
 	id.Upstream = s.gateway.upstreamFor(res.GraphK8sName)
 	return true
 }
