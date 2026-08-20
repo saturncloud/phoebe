@@ -105,6 +105,14 @@ type Server struct {
 	ioPolicy     iolog.Policy
 	ioSink       iolog.Sink
 	ioMaxBodyLen int
+
+	// waker triggers a shared base graph's 0->1 scale-up on a cold response,
+	// for the shared serverless tier. nil (the default) = wake disabled: a cold
+	// response passes straight through to the client, exactly as before. Set via
+	// WithWaker when the shared tier is enabled.
+	waker        Waker
+	wakeTimeout  time.Duration
+	wakeMaxTries int
 }
 
 // New constructs a Server from its dependencies. I/O logging is OFF: the policy
@@ -138,6 +146,29 @@ func NewWithIOLog(s *config.Settings, log *logging.Logger, emitter metering.Emit
 	}
 	if maxBodyLen > 0 {
 		srv.ioMaxBodyLen = maxBodyLen
+	}
+	return srv
+}
+
+// Default wake bounds when a waker is wired without explicit values.
+const (
+	defaultWakeTimeout  = 120 * time.Second // per-wake ceiling (base cold-start + headroom)
+	defaultWakeMaxTries = 3                 // probe -> wake -> re-probe attempts
+)
+
+// WithWaker enables shared-tier wake-from-zero: on a cold response for a
+// wakeable route, the proxy triggers a 0->1 scale via the waker and holds the
+// request until warm. nil waker leaves wake disabled (cold responses pass
+// through). timeout/maxTries <= 0 use the defaults.
+func (srv *Server) WithWaker(waker Waker, timeout time.Duration, maxTries int) *Server {
+	srv.waker = waker
+	srv.wakeTimeout = timeout
+	if srv.wakeTimeout <= 0 {
+		srv.wakeTimeout = defaultWakeTimeout
+	}
+	srv.wakeMaxTries = maxTries
+	if srv.wakeMaxTries <= 0 {
+		srv.wakeMaxTries = defaultWakeMaxTries
 	}
 	return srv
 }
@@ -306,6 +337,24 @@ func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request) {
 		s.log.Error.Printf("rewrite request body: %v", err)
 		http.Error(w, "bad request body", http.StatusBadRequest)
 		return
+	}
+
+	// WAKE-FROM-ZERO (shared serverless tier, the 0->1 leg). On a wakeable route
+	// (shared + authorized resource id) with a waker configured, probe the
+	// upstream; if it returns a COLD response (scaled-to-zero base), trigger a
+	// 0->1 wake and retry rather than serving the client a 404/503. The probe
+	// buffers the response (a cold response is a tiny JSON error), so nothing
+	// cold reaches the client; the request is replayed (body restored) after the
+	// wake. Once a NON-cold response arrives (or tries are exhausted), we fall
+	// through to the normal streaming forward below, which serves + meters it.
+	// Non-wakeable routes skip this entirely — zero overhead.
+	if s.wakeEnabled(id) {
+		if served := s.serveWithWake(w, r, upstream, id, requestID); served {
+			return
+		}
+		// Not served here means: the base is now warm (or wake was a no-op) —
+		// fall through to the normal metered streaming forward. The request body
+		// was restored by serveWithWake for the final attempt.
 	}
 
 	rp := httputil.NewSingleHostReverseProxy(upstream)
