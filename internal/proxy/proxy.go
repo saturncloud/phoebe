@@ -464,6 +464,10 @@ func (s *Server) emit(ctx context.Context, id identity.Identity, requestID strin
 		// Its presence triggers the fine-tune premium at rating; its value is
 		// forensic. Empty for a base-model endpoint.
 		Adapter: id.Adapter,
+		// Tier is the serving-tier SKU axis ("shared" | "dedicated"), from the
+		// trusted middleware header. Empty = dedicated. Shared traffic prices
+		// from the distinct shared:<base> rate row.
+		Tier: id.Tier,
 
 		PromptTokens:     res.Usage.PromptTokens,
 		CachedTokens:     res.Usage.CachedTokens(),

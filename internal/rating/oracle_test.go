@@ -49,7 +49,11 @@ type RatedEvent struct {
 	// Adapter is the fine-tune checkpoint artifact id from billing_event.adapter,
 	// non-empty ONLY for fine-tune checkpoint deployments. Its presence is the
 	// premium trigger (C4) — mirroring the SQL.
-	Adapter          string
+	Adapter string
+	// Tier is the serving-tier SKU axis from billing_event.tier ("shared" |
+	// "dedicated"; empty = dedicated). Shared traffic prices from the tiered
+	// shared:<base> row — mirroring the SQL.
+	Tier             string
 	PromptTokens     int64 // TOTAL prompt tokens (cached + non-cached), per vLLM
 	CachedTokens     int64 // SUBSET of PromptTokens that was a cache hit
 	CompletionTokens int64

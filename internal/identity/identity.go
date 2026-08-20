@@ -43,6 +43,18 @@ const (
 	// defensively: absent = empty string (a base-model endpoint).
 	HeaderAdapter = "X-Saturn-Adapter"
 
+	// HeaderTier carries the SERVING TIER of the deployment — "shared" or
+	// "dedicated" — the SKU axis that prices the two fundamentally-different
+	// products independently (design D1). Like HeaderBaseModel/HeaderAdapter it
+	// is a deploy-time resource property injected server-side by the
+	// Atlas-rendered Traefik middleware, anti-spoof overwritten, never trusted
+	// from clients. ABSENT = dedicated (the OUTER-prefix pricing contract: a bare
+	// base id is dedicated, so every event shipped before the shared tier prices
+	// as dedicated with no rewrite). PRESENT with "shared" marks shared traffic,
+	// which the rater prices from the distinct shared:<base> price row. Phoebe
+	// reads it defensively: absent = "" = dedicated.
+	HeaderTier = "X-Saturn-Tier"
+
 	// HeaderAuthID carries the token / API-key identity — the JWT `sub` claim,
 	// which in Atlas is the IdentityAuth.id (the same value for both browser-
 	// session and API-key tokens; they share one token mechanism). This is the
@@ -124,6 +136,11 @@ type Identity struct {
 	// checkpoint deployments. Its presence triggers the fine-tune premium at rating
 	// (C4); its value is forensic. Empty for a base-model endpoint.
 	Adapter string
+	// Tier is the serving tier ("shared" | "dedicated"), the SKU pricing axis.
+	// Empty = dedicated (the absence-of-prefix contract). Carried to the metering
+	// event so the rater prices shared traffic from the distinct shared:<base>
+	// row. See HeaderTier.
+	Tier string
 	// Upstream is the deployment's real backend (host:port) for phoebe to forward to,
 	// injected by Atlas per inference deployment (routing authority, trusted). Phoebe
 	// fails closed when it is absent or malformed — the request is refused, never
@@ -143,6 +160,7 @@ func FromRequest(r *http.Request) Identity {
 		OrgID:        r.Header.Get(HeaderOrgID),
 		BaseModel:    r.Header.Get(HeaderBaseModel),
 		Adapter:      r.Header.Get(HeaderAdapter),
+		Tier:         r.Header.Get(HeaderTier),
 		Upstream:     r.Header.Get(HeaderUpstream),
 	}
 }
