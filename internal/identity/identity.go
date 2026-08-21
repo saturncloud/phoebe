@@ -43,6 +43,48 @@ const (
 	// defensively: absent = empty string (a base-model endpoint).
 	HeaderAdapter = "X-Saturn-Adapter"
 
+	// HeaderServedModel carries the served-model name(s) the subdomain-authorized
+	// resource is allowed to serve — a comma-separated allow-list injected by the
+	// Atlas per-deployment Traefik middleware (a deploy-time resource property,
+	// server-side, anti-spoof overwritten, never client-trusted). It is the
+	// SECURITY CRUX of shared serving: atlas-auth authorizes the caller for a
+	// SUBDOMAIN/resource, but Dynamo routes on the request-body `model=`, and on a
+	// shared graph many tenants' models share one upstream. Without binding the two,
+	// a caller authorized for model-A's subdomain could put `model=B` in the body
+	// and reach B. Phoebe ASSERTS the request `model=` is in this allow-list and
+	// fails closed (403) on mismatch — atlas DECIDES access, phoebe only guarantees
+	// the body can't escape the atlas-authorized resource. Absent = the binding is
+	// not enforced for this route (dedicated single-model endpoints, where one
+	// subdomain == one model, need no binding); present = enforce.
+	HeaderServedModel = "X-Saturn-Served-Model"
+
+	// HeaderServingMode carries the serving mode of the deployment — "shared" or
+	// "dedicated" — the SKU axis that prices the two fundamentally-different
+	// products independently (design D1). Like HeaderBaseModel/HeaderAdapter it
+	// is a deploy-time resource property injected server-side by the
+	// Atlas-rendered Traefik middleware, anti-spoof overwritten, never trusted
+	// from clients. ABSENT = dedicated (the OUTER-prefix pricing contract: a bare
+	// base id is dedicated, so every event shipped before shared serving prices
+	// as dedicated with no rewrite). PRESENT with "shared" marks shared traffic,
+	// which the rater prices from the distinct shared:<base> price row. Phoebe
+	// reads it defensively: absent = "" = dedicated.
+	HeaderServingMode = "X-Saturn-Serving-Mode"
+
+	// HeaderGateway marks a request that arrived on the TF shared-inference
+	// GATEWAY route: the single gateway host that replaces per-model subdomains
+	// for the shared mode. The gateway route's Atlas middleware injects exactly
+	// `true` (and X-Saturn-Org-Id) and injects NONE of the per-resource routing
+	// headers (X-Saturn-Upstream / X-Saturn-Resource-Id / X-Saturn-Served-Model)
+	// — on this route the request-body `model=` selects the model, and phoebe
+	// resolves (org, model) against Atlas's tf_model table itself (see
+	// internal/gateway). ANTI-SPOOF: like every X-Saturn-* header, only the
+	// gateway route sets it and per-resource routes strip it, so a client can
+	// neither fake gateway routing nor smuggle it onto a subdomain route. Read
+	// strictly: only the exact value "true" marks a gateway request; anything
+	// else keeps today's header-routed behavior (which fails closed on the
+	// missing upstream).
+	HeaderGateway = "X-Saturn-Gateway"
+
 	// HeaderAuthID carries the token / API-key identity — the JWT `sub` claim,
 	// which in Atlas is the IdentityAuth.id (the same value for both browser-
 	// session and API-key tokens; they share one token mechanism). This is the
@@ -124,11 +166,34 @@ type Identity struct {
 	// checkpoint deployments. Its presence triggers the fine-tune premium at rating
 	// (C4); its value is forensic. Empty for a base-model endpoint.
 	Adapter string
+	// ServingMode is the serving mode ("shared" | "dedicated"), the SKU pricing
+	// axis. Empty = dedicated (the absence-of-prefix contract). Carried to the
+	// metering event so the rater prices shared traffic from the distinct
+	// shared:<base> row. See HeaderServingMode.
+	ServingMode string
+	// ServedModel is the comma-separated allow-list of served-model names the
+	// subdomain-authorized resource may serve. Empty = binding not enforced for
+	// this route. Phoebe asserts the request-body `model=` is in this set and
+	// fails closed on mismatch. See HeaderServedModel.
+	ServedModel string
 	// Upstream is the deployment's real backend (host:port) for phoebe to forward to,
 	// injected by Atlas per inference deployment (routing authority, trusted). Phoebe
 	// fails closed when it is absent or malformed — the request is refused, never
 	// forwarded to a default or a guess. See HeaderUpstream.
 	Upstream string
+	// Gateway reports the request arrived on the TF gateway route
+	// (HeaderGateway == "true", trusted middleware injection): no per-resource
+	// routing headers; phoebe resolves ResourceID / BaseModel / Adapter /
+	// ServingMode / Upstream itself from (OrgID, body model=). See
+	// internal/gateway and the proxy's gateway resolution step.
+	Gateway bool
+	// GraphK8sName is the Dynamo graph (DGD) k8s name serving this request —
+	// known only via gateway resolution (tf_model.graph_k8s_name), NOT header-
+	// sourced. Threaded to the wake target so the waker never re-parses the
+	// upstream host the gateway just composed from this same name. Empty on
+	// header-routed requests (the proxy derives the graph from the upstream
+	// host instead).
+	GraphK8sName string
 }
 
 // FromRequest extracts the trusted identity headers. It performs no
@@ -143,6 +208,9 @@ func FromRequest(r *http.Request) Identity {
 		OrgID:        r.Header.Get(HeaderOrgID),
 		BaseModel:    r.Header.Get(HeaderBaseModel),
 		Adapter:      r.Header.Get(HeaderAdapter),
+		ServingMode:  r.Header.Get(HeaderServingMode),
+		ServedModel:  r.Header.Get(HeaderServedModel),
 		Upstream:     r.Header.Get(HeaderUpstream),
+		Gateway:      r.Header.Get(HeaderGateway) == "true",
 	}
 }

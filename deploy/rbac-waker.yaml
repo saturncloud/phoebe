@@ -1,0 +1,58 @@
+# RBAC for phoebe's wake-from-zero actuator (internal/waker).
+#
+# DELIVERABLE, NOT AUTO-APPLIED: the durable home for these objects is the
+# saturn-k8s chart (rendered alongside phoebe's Deployment/ServiceAccount);
+# this file is the reviewed source of truth for what that chart must grant
+# until the integration lands. Apply manually only for dev clusters:
+#   kubectl -n <workload-namespace> apply -f deploy/rbac-waker.yaml
+#
+# DESIGN (ratified): phoebe scales the cold graph's
+# DynamoGraphDeploymentScalingAdapter DIRECTLY from the MAIN phoebe container
+# — no separate waker pod — so phoebe's own ServiceAccount gets exactly the
+# verbs the wake needs and nothing else:
+#
+#   dynamographdeploymentscalingadapters (nvidia.com): get/list/patch
+#       read spec.replicas (wake only writes when it reads 0 — it can never
+#       scale down) and merge-patch spec.replicas: 1. No create/delete/update:
+#       the DGDSA's lifecycle belongs to the Dynamo operator.
+#   scaledobjects (keda.sh): get/patch
+#       the KEDA pause handoff — annotate autoscaling.keda.sh/paused: "false"
+#       AFTER the scale-up to hand the 1->N range back to KEDA. Best-effort;
+#       no list (the waker addresses each ScaledObject by its rendered name
+#       <graph>-scaler).
+#
+# NAMESPACE-SCOPED on purpose: a Role (not ClusterRole) in the workload
+# namespace the serving graphs live in (gateway.namespace in phoebe's
+# settings). Replace the two placeholders when applying:
+#   <workload-namespace>    the shared-graph namespace
+#   <phoebe-serviceaccount> phoebe's ServiceAccount name in that namespace
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: phoebe-waker
+  namespace: <workload-namespace>
+  labels:
+    saturncloud.io/managed-by: "Atlas"
+rules:
+  - apiGroups: ["nvidia.com"]
+    resources: ["dynamographdeploymentscalingadapters"]
+    verbs: ["get", "list", "patch"]
+  - apiGroups: ["keda.sh"]
+    resources: ["scaledobjects"]
+    verbs: ["get", "patch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: phoebe-waker
+  namespace: <workload-namespace>
+  labels:
+    saturncloud.io/managed-by: "Atlas"
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: phoebe-waker
+subjects:
+  - kind: ServiceAccount
+    name: <phoebe-serviceaccount>
+    namespace: <workload-namespace>

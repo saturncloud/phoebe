@@ -42,6 +42,9 @@ func ratingSchemaDDL(t *testing.T) string {
 	for _, f := range []string{
 		"../../migrations/0001_billing_event.up.sql",
 		"../../migrations/0002_rating.up.sql",
+		// 0004 adds billing_event.serving_mode, which rateWindowSQL reads (the
+		// serving-mode SKU axis). Skipping it reproduces the staging 42703.
+		"../../migrations/0004_billing_event_serving_mode.up.sql",
 	} {
 		ddl, err := os.ReadFile(f)
 		if err != nil {
@@ -981,7 +984,7 @@ func TestIntegration_FineTunePricesViaBaseModel(t *testing.T) {
 	}
 
 	// Cross-check against the oracle (ResolveEvent → quantize → Rate).
-	rate, err := book.ResolveEvent("ft:9f8e7d6c5b4a", "meta-llama/Llama-3.1-8B-Instruct", "")
+	rate, err := book.ResolveEvent("ft:9f8e7d6c5b4a", "meta-llama/Llama-3.1-8B-Instruct", "", "")
 	if err != nil {
 		t.Fatalf("oracle ResolveEvent: %v", err)
 	}
@@ -1321,7 +1324,7 @@ func TestIntegration_OneHopFineTuneCannotDeriveFromFineTune(t *testing.T) {
 		t.Fatalf("unpriced = %d, want 1 (ft deriving from an own-rate ft: must fail loud — no second hop)", res.UnpricedEvents)
 	}
 	// Cross-check the oracle agrees: ResolveEvent fails for the second hop.
-	if _, err := book.ResolveEvent("ft:def", "ft:ownrate", ""); err == nil {
+	if _, err := book.ResolveEvent("ft:def", "ft:ownrate", "", ""); err == nil {
 		t.Fatal("oracle ResolveEvent priced a fine-tune-of-fine-tune — SQL and oracle must BOTH forbid the second hop")
 	}
 }
@@ -1647,7 +1650,7 @@ func TestIntegration_C4ResolutionLadderConformsToOracle(t *testing.T) {
 
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
-			rate, oerr := book.ResolveEvent(c.model, c.baseModel, c.adapter)
+			rate, oerr := book.ResolveEvent(c.model, c.baseModel, c.adapter, "")
 			if !c.priced {
 				// Oracle agrees it is unpriced, and the SQL wrote NO rollup for it.
 				if oerr == nil {
