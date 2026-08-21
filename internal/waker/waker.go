@@ -70,11 +70,23 @@ var (
 // the Atlas reaper writes the same annotation from the other side.
 const kedaPausedAnnotation = "autoscaling.keda.sh/paused"
 
-// DGDSAName returns the DGDSA that scales a graph's vLLM worker:
-// `<graph>-vllmworker` — Dynamo v1.4.0 generateAdapterName
-// ("<dgd>-<lowercase(component)>" for the VllmWorker component), the same
-// name Atlas's shared_base_dgdsa_name computes for KEDA and the reaper.
-func DGDSAName(graphK8sName string) string { return graphK8sName + "-vllmworker" }
+// DGDSAName returns the DGDSA that scales a graph's worker:
+// `<graph>-worker` — Dynamo's generateAdapterName
+// ("<dgd>-<lowercase(component)>") over the UNIFORM `Worker` component name
+// the multi-backend shared graphs use for every backend (vllm/sglang/trtllm;
+// the Atlas template renames the component so the scale target is
+// backend-agnostic). The same name Atlas's shared_base_dgdsa_name computes
+// for KEDA and the reaper.
+func DGDSAName(graphK8sName string) string { return graphK8sName + "-worker" }
+
+// legacyDGDSAName is the pre-multi-backend DGDSA name, from the era when the
+// shared graph's only component was `VllmWorker`: `<graph>-vllmworker`.
+// Wake FALLS BACK to it when the uniform name is NotFound, so graphs deployed
+// before the component rename keep waking until they are recreated.
+// REMOVABLE once no pre-multibackend graphs exist (every shared graph
+// recreated/upgraded past the rename); the fallback logs a deprecation line
+// each time it actually fires, so its retirement is observable in the logs.
+func legacyDGDSAName(graphK8sName string) string { return graphK8sName + "-vllmworker" }
 
 // ScaledObjectName returns the graph's KEDA ScaledObject: `<graph>-scaler`,
 // exactly as Atlas renders it (token_factory._render_keda_scaledobject).
@@ -199,10 +211,9 @@ func (w *KubeWaker) scaleUp(ctx context.Context, graph, resourceID string) error
 	lock.Lock()
 	defer lock.Unlock()
 
-	name := DGDSAName(graph)
-	dgdsa, err := w.client.Resource(dgdsaGVR).Namespace(w.namespace).Get(ctx, name, metav1.GetOptions{})
+	dgdsa, name, err := w.getDGDSA(ctx, graph)
 	if err != nil {
-		return fmt.Errorf("waker: read DGDSA %s/%s: %w", w.namespace, name, err)
+		return err
 	}
 	replicas, found, err := unstructured.NestedInt64(dgdsa.Object, "spec", "replicas")
 	if err != nil {
@@ -222,6 +233,42 @@ func (w *KubeWaker) scaleUp(ctx context.Context, graph, resourceID string) error
 
 	w.unpauseKEDA(ctx, graph)
 	return nil
+}
+
+// getDGDSA reads the graph's DGDSA, trying the uniform `<graph>-worker` name
+// FIRST and falling back to the legacy `<graph>-vllmworker` on NotFound (see
+// legacyDGDSAName — the fallback is self-retiring and removable once no
+// pre-multibackend graphs exist). Returns the object together with the name it
+// was found under, so the caller patches exactly what it read.
+//
+// Only NotFound triggers the fallback: any other read failure (RBAC, API
+// server) is returned as-is — retrying a broken read under a second name
+// would mask the real fault. Both names NotFound is a single combined error
+// (the graph has no scalable adapter under either name → the proxy serves the
+// honest cold response).
+func (w *KubeWaker) getDGDSA(ctx context.Context, graph string) (*unstructured.Unstructured, string, error) {
+	name := DGDSAName(graph)
+	dgdsa, err := w.client.Resource(dgdsaGVR).Namespace(w.namespace).Get(ctx, name, metav1.GetOptions{})
+	if err == nil {
+		return dgdsa, name, nil
+	}
+	if !apierrors.IsNotFound(err) {
+		return nil, "", fmt.Errorf("waker: read DGDSA %s/%s: %w", w.namespace, name, err)
+	}
+
+	legacy := legacyDGDSAName(graph)
+	dgdsa, lerr := w.client.Resource(dgdsaGVR).Namespace(w.namespace).Get(ctx, legacy, metav1.GetOptions{})
+	if lerr == nil {
+		// DEPRECATION: this graph predates the uniform Worker component. The
+		// wake still works via the legacy adapter; recreate/upgrade the graph
+		// to retire this path (and eventually the fallback itself).
+		w.log.Warn.Printf("waker: DEPRECATED DGDSA name %s/%s in use (pre-multibackend graph); uniform name %s not found — recreate the graph to retire the vllmworker fallback", w.namespace, legacy, name)
+		return dgdsa, legacy, nil
+	}
+	if !apierrors.IsNotFound(lerr) {
+		return nil, "", fmt.Errorf("waker: read legacy DGDSA %s/%s: %w", w.namespace, legacy, lerr)
+	}
+	return nil, "", fmt.Errorf("waker: no DGDSA for graph %q in %s under %q or legacy %q: %w", graph, w.namespace, name, legacy, err)
 }
 
 // unpauseKEDA hands the 1->N range back to KEDA by annotating the graph's

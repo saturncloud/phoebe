@@ -147,15 +147,78 @@ func TestWake_AlreadyAwakeIsNoOpSuccess(t *testing.T) {
 	}
 }
 
-// TestWake_DGDSAMissingErrors: no DGDSA means there is nothing safe to actuate
-// — the wake errors (and the proxy serves the honest cold response; see the
+// TestDGDSANames pins the literal name contract: the uniform multi-backend
+// name `<graph>-worker` (what Atlas's renamed Worker component yields) and the
+// pre-multibackend legacy `<graph>-vllmworker` the fallback still serves.
+func TestDGDSANames(t *testing.T) {
+	if got := DGDSAName("g1"); got != "g1-worker" {
+		t.Fatalf("DGDSAName = %q, want g1-worker", got)
+	}
+	if got := legacyDGDSAName("g1"); got != "g1-vllmworker" {
+		t.Fatalf("legacyDGDSAName = %q, want g1-vllmworker", got)
+	}
+}
+
+// TestWake_UniformWorkerNameHappyPath: a post-rename graph (only
+// `<graph>-worker` exists) wakes via the uniform name — one read, the scale
+// patch lands on `<graph>-worker`, and the legacy name is never consulted.
+func TestWake_UniformWorkerNameHappyPath(t *testing.T) {
+	w, client := newFakeWaker(t, dgdsaObj("g1", 0), scaledObjectObj("g1", "true"))
+
+	if err := w.Wake(context.Background(), target("g1")); err != nil {
+		t.Fatalf("Wake: %v", err)
+	}
+	patches := patchActions(client)
+	if len(patches) != 2 || patches[0].GetName() != "g1-worker" {
+		t.Fatalf("patches = %v, want the scale patch on g1-worker first", patches)
+	}
+	for _, a := range client.Actions() {
+		if a.GetVerb() == "get" && a.(k8stesting.GetAction).GetName() == "g1-vllmworker" {
+			t.Fatal("uniform-name graph must never consult the legacy name")
+		}
+	}
+}
+
+// TestWake_LegacyVllmWorkerFallback: a pre-multibackend graph (only
+// `<graph>-vllmworker` exists) still wakes — the uniform name 404s, the
+// fallback reads the legacy adapter, and the scale patch lands on the SAME
+// name that was read. The ScaledObject unpause (graph-named `<graph>-scaler`,
+// not component-coupled) fires as usual.
+func TestWake_LegacyVllmWorkerFallback(t *testing.T) {
+	legacy := dgdsaObj("g1", 0)
+	legacy.Object["metadata"].(map[string]any)["name"] = legacyDGDSAName("g1")
+	w, client := newFakeWaker(t, legacy, scaledObjectObj("g1", "true"))
+
+	if err := w.Wake(context.Background(), target("g1")); err != nil {
+		t.Fatalf("Wake via legacy name: %v", err)
+	}
+	patches := patchActions(client)
+	if len(patches) != 2 {
+		t.Fatalf("issued %d patches, want 2 (legacy scale + SO unpause)", len(patches))
+	}
+	if patches[0].GetName() != "g1-vllmworker" {
+		t.Fatalf("scale patch on %q, want the legacy g1-vllmworker (patch what was read)", patches[0].GetName())
+	}
+	if patches[1].GetName() != ScaledObjectName("g1") {
+		t.Fatalf("unpause on %q, want %s (graph-named, unaffected by the component rename)", patches[1].GetName(), ScaledObjectName("g1"))
+	}
+}
+
+// TestWake_BothDGDSANamesMissingErrors: neither the uniform nor the legacy
+// adapter exists — the wake errors (naming BOTH candidates for diagnosis) and
+// writes nothing; the proxy then serves the honest cold response (see the
 // serveWithWake integration test below).
-func TestWake_DGDSAMissingErrors(t *testing.T) {
+func TestWake_BothDGDSANamesMissingErrors(t *testing.T) {
 	w, client := newFakeWaker(t) // empty cluster
 
 	err := w.Wake(context.Background(), target("g1"))
 	if err == nil {
-		t.Fatal("Wake with no DGDSA must error")
+		t.Fatal("Wake with no DGDSA under either name must error")
+	}
+	for _, name := range []string{"g1-worker", "g1-vllmworker"} {
+		if !strings.Contains(err.Error(), name) {
+			t.Fatalf("error %q does not name candidate %q", err, name)
+		}
 	}
 	if patches := patchActions(client); len(patches) != 0 {
 		t.Fatalf("issued %d patches, want 0 (nothing to actuate)", len(patches))
