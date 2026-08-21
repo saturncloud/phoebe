@@ -81,6 +81,13 @@ type Event struct {
 	// fails it loud (ErrNoPrice), never $0. Captured verbatim; empty is valid.
 	BaseModel string `json:"base_model,omitempty"`
 
+	// ServingMode is the serving mode ("shared" | "dedicated"), the SKU pricing
+	// axis (X-Saturn-Serving-Mode). Empty = dedicated (the absence-of-prefix
+	// contract, so every pre-shared event is unaffected). "shared" prices from the
+	// distinct shared:<base> rate row. Captured verbatim; empty is valid (=
+	// dedicated).
+	ServingMode string `json:"serving_mode,omitempty"`
+
 	// Token counts (the engine's own usage block; never re-tokenized).
 	PromptTokens     int `json:"prompt_tokens"`
 	CachedTokens     int `json:"cached_tokens"`

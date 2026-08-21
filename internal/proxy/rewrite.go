@@ -60,6 +60,24 @@ func captureRequestBody(r *http.Request, maxBodyBytes int) (body string, truncat
 // Non-streaming requests are left untouched: their responses always carry
 // usage. A body that isn't JSON, or has no token-bearing shape, is passed
 // through verbatim so we never break a request we don't understand.
+// readAndRestoreBody reads the full request body and restores it so a later
+// reader (forceIncludeUsage) sees the same bytes — no double-consume. Returns
+// the body bytes for inspection (e.g. the model-binding check). A nil body reads
+// as empty.
+func readAndRestoreBody(r *http.Request) ([]byte, error) {
+	if r.Body == nil {
+		return nil, nil
+	}
+	body, err := io.ReadAll(r.Body)
+	_ = r.Body.Close()
+	if err != nil {
+		return nil, err
+	}
+	r.Body = io.NopCloser(bytes.NewReader(body))
+	r.ContentLength = int64(len(body))
+	return body, nil
+}
+
 func forceIncludeUsage(r *http.Request) error {
 	if r.Body == nil {
 		return nil

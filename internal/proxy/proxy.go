@@ -105,6 +105,19 @@ type Server struct {
 	ioPolicy     iolog.Policy
 	ioSink       iolog.Sink
 	ioMaxBodyLen int
+
+	// waker triggers a shared base graph's 0->1 scale-up on a cold response,
+	// for the shared serverless mode. nil (the default) = wake disabled: a cold
+	// response passes straight through to the client, exactly as before. Set via
+	// WithWaker when shared serving is enabled.
+	waker        Waker
+	wakeTimeout  time.Duration
+	wakeMaxTries int
+
+	// gateway wires the TF gateway resolution path ((org, body model=) →
+	// tf_model → identity + upstream). nil (the default) = gateway disabled:
+	// gateway-marked requests fail closed with 503. Set via WithGateway.
+	gateway *gatewayRoute
 }
 
 // New constructs a Server from its dependencies. I/O logging is OFF: the policy
@@ -142,6 +155,40 @@ func NewWithIOLog(s *config.Settings, log *logging.Logger, emitter metering.Emit
 	return srv
 }
 
+// Default wake bounds when a waker is wired without explicit values.
+const (
+	// defaultWakeTimeout is the per-wake ceiling the woken request is held for.
+	// 300s, sized to the MEASURED cold path: a vLLM worker's cold reload is
+	// ~2.5min on the live staging cluster, so the previous 120s default meant a
+	// real wake NEVER completed inside the budget — every genuinely cold
+	// request held two minutes and then got the cold response anyway. The
+	// tradeoff of a longer hold: a wake that will ultimately fail keeps the
+	// client (and one upstream slot) waiting up to 5 minutes before the honest
+	// cold response — acceptable because OpenAI-style clients tolerate
+	// multi-minute holds, and the alternative (a budget shorter than the
+	// cold start) makes the wake feature a no-op. Still bounded; operators can
+	// tune per install via wake.timeout in the settings.
+	defaultWakeTimeout  = 300 * time.Second
+	defaultWakeMaxTries = 3 // probe -> wake -> re-probe attempts
+)
+
+// WithWaker enables shared-mode wake-from-zero: on a cold response for a
+// wakeable route, the proxy triggers a 0->1 scale via the waker and holds the
+// request until warm. nil waker leaves wake disabled (cold responses pass
+// through). timeout/maxTries <= 0 use the defaults.
+func (s *Server) WithWaker(waker Waker, timeout time.Duration, maxTries int) *Server {
+	s.waker = waker
+	s.wakeTimeout = timeout
+	if s.wakeTimeout <= 0 {
+		s.wakeTimeout = defaultWakeTimeout
+	}
+	s.wakeMaxTries = maxTries
+	if s.wakeMaxTries <= 0 {
+		s.wakeMaxTries = defaultWakeMaxTries
+	}
+	return s
+}
+
 // denyAllPolicy is the default Policy when I/O logging is off: ShouldLog is
 // always false, so the proxy never buffers a request or response body. Keeping
 // this as a real Policy (rather than a nil check on the hot path) means the
@@ -174,6 +221,22 @@ func (s *Server) handleHealth(w http.ResponseWriter, _ *http.Request) {
 // onDone fires exactly once regardless of whether EOF or Close reaches it first.
 func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request) {
 	id := identity.FromRequest(r)
+
+	// GATEWAY RESOLUTION (TF single-host gateway): a request the trusted
+	// middleware marked X-Saturn-Gateway carries NO per-resource routing
+	// headers — phoebe itself resolves the (org, body model=) pair to the
+	// tf_model row and fills in ResourceID / BaseModel / Adapter / ServingMode
+	// / ServedModel / Upstream on the identity, after which this handler runs
+	// UNCHANGED: the billing gate, upstream parse, wake, and metering treat the
+	// request exactly like a header-routed one. resolveGateway fails closed
+	// (403/400/404/503, generic bodies) and has then already written the
+	// response. Non-gateway requests skip this entirely — today's header-routed
+	// behavior, byte for byte.
+	if id.Gateway {
+		if !s.resolveGateway(w, r, &id) {
+			return
+		}
+	}
 
 	// Billing-identity gate: fail closed if we lack what we need to attribute
 	// consumption. A billing product must not serve traffic it can't bill — a
@@ -271,11 +334,67 @@ func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
+	// SHARED-MODE MODEL BINDING (security crux): assert the request-body `model=`
+	// is one the subdomain-authorized resource may serve, fail closed on mismatch.
+	// atlas-auth authorized the caller for this subdomain/resource; Dynamo routes
+	// on the body `model=` and a shared graph fronts many tenants behind one
+	// upstream — so bind the two or a caller could send `model=<someone-else's>`
+	// and be served it. Only enforced when Atlas injected an allow-list
+	// (X-Saturn-Served-Model); dedicated single-model routes carry none and skip
+	// this at zero cost. Runs BEFORE forwarding so a bad model never reaches the
+	// engine. Reads the body once and restores it for forceIncludeUsage.
+	//
+	// GATEWAY requests skip this check — THE PATHS DIVERGE HERE: on the
+	// subdomain path Atlas authorizes a resource and injects its allow-list,
+	// and this check binds the body to it; on the gateway path there is no
+	// injected allow-list — resolveGateway looked the body's model= up UNDER
+	// THE ORG, so resolution IS the binding (id.ServedModel was set FROM the
+	// resolved request model; re-checking it against itself would be a
+	// tautology).
+	if id.ServedModel != "" && !id.Gateway {
+		body, rerr := readAndRestoreBody(r)
+		if rerr != nil {
+			s.log.Error.Printf("model-binding: read request body: %v", rerr)
+			http.Error(w, "bad request body", http.StatusBadRequest)
+			return
+		}
+		switch checkModelBinding(body, id.ServedModel) {
+		case bindingMismatch, bindingUnparseable:
+			// Fail closed: the request names a model this resource is not
+			// authorized to serve (or one we cannot verify). Log with the
+			// resource for forensics; do NOT echo the attempted model to the
+			// caller (no oracle for probing which models exist on the graph).
+			s.log.Warn.Printf("model-binding: refused request_id=%s resource_id=%s (model not authorized for resource)",
+				requestID, id.ResourceID)
+			http.Error(w, "requested model is not authorized for this endpoint", http.StatusForbidden)
+			return
+		case bindingOK:
+		}
+	}
+
 	// Force streaming usage so we never under-bill a streamed response.
 	if err := forceIncludeUsage(r); err != nil {
 		s.log.Error.Printf("rewrite request body: %v", err)
 		http.Error(w, "bad request body", http.StatusBadRequest)
 		return
+	}
+
+	// WAKE-FROM-ZERO (shared serverless mode, the 0->1 leg). On a wakeable route
+	// (shared + authorized resource id) with a waker configured, probe the
+	// upstream; if it returns a COLD response (scaled-to-zero base), trigger a
+	// 0->1 wake and retry rather than serving the client a 404/503. The probe
+	// buffers the response (a cold response is a tiny JSON error), so nothing
+	// cold reaches the client; the request is replayed (body restored) after the
+	// wake. Once a NON-cold response arrives (or tries are exhausted), we fall
+	// through to the normal streaming forward below, which serves + meters it.
+	// Non-wakeable routes skip this entirely — zero overhead.
+	if s.wakeEnabled(id) {
+		if served := s.serveWithWake(w, r, upstream, id, requestID); served {
+			return
+		}
+		// Not served here means: the base is now warm (or wake was a no-op) —
+		// fall through to the normal metered streaming forward. The request body
+		// was restored by serveWithWake for the final attempt.
 	}
 
 	rp := httputil.NewSingleHostReverseProxy(upstream)
@@ -464,6 +583,10 @@ func (s *Server) emit(ctx context.Context, id identity.Identity, requestID strin
 		// Its presence triggers the fine-tune premium at rating; its value is
 		// forensic. Empty for a base-model endpoint.
 		Adapter: id.Adapter,
+		// ServingMode is the serving-mode SKU axis ("shared" | "dedicated"), from
+		// the trusted middleware header. Empty = dedicated. Shared traffic prices
+		// from the distinct shared:<base> rate row.
+		ServingMode: id.ServingMode,
 
 		PromptTokens:     res.Usage.PromptTokens,
 		CachedTokens:     res.Usage.CachedTokens(),
