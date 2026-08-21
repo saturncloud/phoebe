@@ -32,20 +32,20 @@ type gatewayRoute struct {
 // gateway unconfigured (gateway requests 503) rather than composing upstreams
 // into a guessed namespace. config.GatewaySettings validation makes that
 // unreachable from main; this is the last line.
-func (srv *Server) WithGateway(resolver gateway.Resolver, namespace string, port int) *Server {
+func (s *Server) WithGateway(resolver gateway.Resolver, namespace string, port int) *Server {
 	if resolver == nil || namespace == "" {
-		return srv
+		return s
 	}
 	if port <= 0 {
 		port = 8000
 	}
-	srv.gateway = &gatewayRoute{
+	s.gateway = &gatewayRoute{
 		resolver: resolver,
 		upstreamFor: func(graphK8sName string) string {
 			return fmt.Sprintf("%s-frontend.%s.svc.cluster.local:%d", graphK8sName, namespace, port)
 		},
 	}
-	return srv
+	return s
 }
 
 // resolveGateway performs gateway model resolution for a request the trusted

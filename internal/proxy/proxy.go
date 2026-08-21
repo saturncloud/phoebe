@@ -176,17 +176,17 @@ const (
 // wakeable route, the proxy triggers a 0->1 scale via the waker and holds the
 // request until warm. nil waker leaves wake disabled (cold responses pass
 // through). timeout/maxTries <= 0 use the defaults.
-func (srv *Server) WithWaker(waker Waker, timeout time.Duration, maxTries int) *Server {
-	srv.waker = waker
-	srv.wakeTimeout = timeout
-	if srv.wakeTimeout <= 0 {
-		srv.wakeTimeout = defaultWakeTimeout
+func (s *Server) WithWaker(waker Waker, timeout time.Duration, maxTries int) *Server {
+	s.waker = waker
+	s.wakeTimeout = timeout
+	if s.wakeTimeout <= 0 {
+		s.wakeTimeout = defaultWakeTimeout
 	}
-	srv.wakeMaxTries = maxTries
-	if srv.wakeMaxTries <= 0 {
-		srv.wakeMaxTries = defaultWakeMaxTries
+	s.wakeMaxTries = maxTries
+	if s.wakeMaxTries <= 0 {
+		s.wakeMaxTries = defaultWakeMaxTries
 	}
-	return srv
+	return s
 }
 
 // denyAllPolicy is the default Policy when I/O logging is off: ShouldLog is

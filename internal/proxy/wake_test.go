@@ -80,7 +80,7 @@ type fakeWaker struct {
 	lastTarget WakeTarget
 }
 
-func (f *fakeWaker) Wake(ctx context.Context, target WakeTarget) error {
+func (f *fakeWaker) Wake(_ context.Context, target WakeTarget) error {
 	n := atomic.AddInt32(&f.calls, 1)
 	f.mu.Lock()
 	f.lastTarget = target
@@ -103,7 +103,7 @@ func (f *fakeWaker) last() WakeTarget {
 // coldToWarmBackend serves cold (404) until warm is set, then 200.
 type coldToWarmBackend struct{ warm atomic.Bool }
 
-func (c *coldToWarmBackend) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+func (c *coldToWarmBackend) ServeHTTP(w http.ResponseWriter, _ *http.Request) {
 	if c.warm.Load() {
 		w.WriteHeader(200)
 		_, _ = w.Write([]byte(`{"served":true}`))

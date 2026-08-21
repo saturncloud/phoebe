@@ -68,13 +68,6 @@ type Waker interface {
 // generic overload 503 (which comes via a separate queue-rejection path).
 const dynamoNotReadyBodyMarker = "is not ready to serve requests yet"
 
-// isColdStatus reports whether an upstream status code is a candidate cold
-// (scaled-to-zero) signal. 404 and 503 are the only candidates; the 503 is
-// further narrowed by body inspection (see isColdResponse).
-func isColdStatus(status int) bool {
-	return status == http.StatusNotFound || status == http.StatusServiceUnavailable
-}
-
 // isWakeable reports whether a request is eligible for wake-from-zero: it must be
 // a shared-mode route (a served-model allow-list was injected by Atlas) AND carry
 // a valid atlas-authorized resource id. This is what disambiguates "cold parked
