@@ -48,8 +48,9 @@ func main() {
 		srv = srv.WithGateway(gwResolver, settings.Gateway.Namespace, settings.Gateway.Port)
 	}
 	if w := buildWaker(settings, log); w != nil {
-		// 0/0 = the proxy's own defaults (120s wake ceiling, 3 tries).
-		srv = srv.WithWaker(w, 0, 0)
+		// Timeout 0 = the proxy default (300s — sized above vLLM's measured
+		// ~2.5min cold reload); tries 0 = the proxy default (3).
+		srv = srv.WithWaker(w, settings.Wake.Timeout, 0)
 	}
 	srvErr := srv.Run()
 

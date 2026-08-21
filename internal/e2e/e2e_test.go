@@ -143,6 +143,11 @@ func newHarness(t *testing.T, schema string) *harness {
 	// statements — same approach as the files' psql usage.
 	mustExec(t, db, readMigration(t, "0001_billing_event.up.sql"))
 	mustExec(t, db, readMigration(t, "0002_rating.up.sql"))
+	// 0003 (io_log) is not needed by this pipeline. 0004 adds
+	// billing_event.serving_mode, which the drainer's INSERT references — the
+	// exact drift this harness exists to catch (a fresh staging DB without it
+	// poison-dropped every event with SQLSTATE 42703).
+	mustExec(t, db, readMigration(t, "0004_billing_event_serving_mode.up.sql"))
 
 	mr, err := miniredis.Run()
 	if err != nil {

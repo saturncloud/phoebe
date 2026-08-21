@@ -34,6 +34,7 @@ golang-migrate up/down pairs, applied in version order:
 | 0001 | `0001_billing_event.{up,down}.sql` | `billing_event` (+ `org_id`, `base_model`, indexes) |
 | 0002 | `0002_rating.{up,down}.sql` | `rated_usage` (+ `org_id`, indexes) + the billing_event rating-instant index |
 | 0003 | `0003_io_log.{up,down}.sql` | `io_log` (+ GIN body index, retention indexes) |
+| 0004 | `0004_billing_event_serving_mode.{up,down}.sql` | `billing_event.serving_mode` (the serving-mode SKU axis; NULL = dedicated) |
 
 `embed.go` embeds these into the `migrations` package; `cmd/migrate` applies them.
 

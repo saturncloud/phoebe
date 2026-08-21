@@ -4,6 +4,7 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
+	"time"
 )
 
 func writeTemp(t *testing.T, yaml string) string {
@@ -186,6 +187,35 @@ func TestLoadWakeEnabledRequiresGatewayNamespace(t *testing.T) {
 	}
 	if !s.Wake.Enabled || s.Gateway.Enabled {
 		t.Fatalf("settings wrong: wake=%+v gateway=%+v", s.Wake, s.Gateway)
+	}
+}
+
+// TestLoadWakeTimeout: wake.timeout parses to a duration; empty means "proxy
+// default" (0); garbage and non-positive values are startup errors.
+func TestLoadWakeTimeout(t *testing.T) {
+	base := "gateway:\n  namespace: \"tf-shared\"\nwake:\n  enabled: true\n"
+
+	s, err := Load(writeTemp(t, base))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if s.Wake.Timeout != 0 {
+		t.Fatalf("unset wake.timeout = %v, want 0 (proxy default)", s.Wake.Timeout)
+	}
+
+	s, err = Load(writeTemp(t, base+"  timeout: \"7m\"\n"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if s.Wake.Timeout != 7*time.Minute {
+		t.Fatalf("wake.timeout = %v, want 7m", s.Wake.Timeout)
+	}
+
+	if _, err := Load(writeTemp(t, base+"  timeout: \"soon\"\n")); err == nil {
+		t.Fatal("expected error: unparseable wake.timeout")
+	}
+	if _, err := Load(writeTemp(t, base+"  timeout: \"-30s\"\n")); err == nil {
+		t.Fatal("expected error: non-positive wake.timeout")
 	}
 }
 

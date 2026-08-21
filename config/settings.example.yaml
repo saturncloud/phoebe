@@ -50,6 +50,12 @@ emit:
 # kubeconfig is a dev/test override. If the kubernetes config is unavailable,
 # wake degrades to off (cold responses pass through) — it never crashes the
 # proxy.
+# timeout bounds one wake's request hold (default 300s). It MUST exceed the
+# real cold start — vLLM's cold reload measured ~2.5min on staging; a smaller
+# budget holds the client and then serves the cold response anyway — but it is
+# also how long a doomed wake keeps a client waiting. Measured cold start +
+# headroom, not impatience.
 # wake:
 #   enabled: true
 #   kubeconfig: ""
+#   timeout: "300s"

@@ -158,6 +158,19 @@ type WakeSettings struct {
 	// Kubeconfig is a kubeconfig file path for dev/tests. Empty (production)
 	// uses in-cluster config.
 	Kubeconfig string `yaml:"kubeconfig"`
+
+	// TimeoutStr bounds how long a single wake may hold the woken request
+	// (empty = the proxy default, 300s). THE TRADEOFF: this must exceed the
+	// serving stack's real cold start (vLLM's cold reload measured ~2.5min on
+	// staging — a budget below it makes wake a no-op that holds clients and
+	// then serves the cold response anyway), but every second of it is also
+	// how long a doomed wake keeps a client waiting before the honest cold
+	// response. Size it to the measured cold start plus headroom, not to
+	// impatience.
+	TimeoutStr string `yaml:"timeout"`
+
+	// Timeout is the parsed TimeoutStr (0 = proxy default).
+	Timeout time.Duration `yaml:"-"`
 }
 
 // Load reads, defaults, and parses a settings YAML file.
@@ -213,6 +226,14 @@ func (s *Settings) parse() error {
 	// serves header-routed shared subdomains.
 	if s.Wake.Enabled && s.Gateway.Namespace == "" {
 		return fmt.Errorf("wake.enabled=true requires gateway.namespace (the namespace the serving graphs' DGDSAs live in)")
+	}
+	if s.Wake.TimeoutStr != "" {
+		if s.Wake.Timeout, err = time.ParseDuration(s.Wake.TimeoutStr); err != nil {
+			return fmt.Errorf("invalid wake.timeout: %w", err)
+		}
+		if s.Wake.Timeout <= 0 {
+			return fmt.Errorf("wake.timeout %q must be positive", s.Wake.TimeoutStr)
+		}
 	}
 	return nil
 }

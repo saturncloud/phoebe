@@ -113,6 +113,19 @@ func (c *coldToWarmBackend) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	_, _ = w.Write([]byte(`{"message":"Model not found"}`))
 }
 
+// TestWithWakerDefaults pins the default wake budget: 300s — deliberately
+// ABOVE vLLM's measured ~2.5min cold reload (a smaller default made every real
+// wake time out and serve the cold response after holding the client anyway).
+func TestWithWakerDefaults(t *testing.T) {
+	s := New(&config.Settings{}, logging.New(logging.ERROR), nil).WithWaker(&fakeWaker{}, 0, 0)
+	if s.wakeTimeout != 300*time.Second {
+		t.Fatalf("default wakeTimeout = %v, want 300s (must exceed the real cold start)", s.wakeTimeout)
+	}
+	if s.wakeMaxTries != 3 {
+		t.Fatalf("default wakeMaxTries = %d, want 3", s.wakeMaxTries)
+	}
+}
+
 func testServerWithWaker(waker Waker) *Server {
 	s := New(&config.Settings{}, logging.New(logging.ERROR), nil)
 	return s.WithWaker(waker, 5*time.Second, 3)
