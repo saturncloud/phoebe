@@ -19,9 +19,13 @@
 // KEDA's laggy unpause reconcile), THEN annotate paused: "false" to hand the
 // 1->N range back to KEDA (whose recreated HPA immediately holds >=1, so the
 // unpause can never undo the wake). Names mirror what Atlas renders:
-// DGDSA `<graph>-vllmworker` (Dynamo v1.4.0 generateAdapterName), ScaledObject
-// `<graph>-scaler` (token_factory._render_keda_scaledobject); the annotation
-// value "false" (not removal) matches the Atlas reaper's own unpause.
+// DGDSA `<graph>-worker` (Dynamo generateAdapterName over the uniform
+// `Worker` component the multi-backend shared graphs use for every backend),
+// with a self-retiring NotFound fallback to the pre-multibackend
+// `<graph>-vllmworker` (see getDGDSA/legacyDGDSAName); ScaledObject
+// `<graph>-scaler` (token_factory._render_keda_scaledobject, graph-named so
+// the component rename does not touch it); the annotation value "false" (not
+// removal) matches the Atlas reaper's own unpause.
 //
 // FAIL CLOSED / NEVER DOWN: a missing DGDSA or any read/patch failure on it
 // errors the wake — the proxy then serves the honest cold response. The waker
