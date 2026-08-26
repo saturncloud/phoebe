@@ -57,3 +57,21 @@ func TestFromRequestMissingHeadersAreEmpty(t *testing.T) {
 		t.Fatalf("expected all-empty identity, got %+v", id)
 	}
 }
+
+// TestFromRequestGatewayMarkerIsStrict: only the EXACT value "true" marks a
+// gateway request — any other value (or absence) keeps the header-routed path,
+// which fails closed on its missing upstream. The middleware injects exactly
+// "true"; anything else means the value didn't come from it.
+func TestFromRequestGatewayMarkerIsStrict(t *testing.T) {
+	for v, want := range map[string]bool{
+		"true": true, "": false, "1": false, "TRUE": false, "True": false, " true": false,
+	} {
+		r := httptest.NewRequest(http.MethodPost, "/", nil)
+		if v != "" {
+			r.Header.Set(HeaderGateway, v)
+		}
+		if got := FromRequest(r).Gateway; got != want {
+			t.Errorf("Gateway for header %q = %v, want %v", v, got, want)
+		}
+	}
+}

@@ -2,18 +2,24 @@ package main
 
 import (
 	"context"
+	"database/sql"
 	"flag"
 	"os"
 	"time"
 
+	// pgx stdlib driver: registers "pgx" with database/sql for the gateway
+	// tf_model resolver (same driver/DSN style as the drainer and iolog).
+	_ "github.com/jackc/pgx/v5/stdlib"
 	"github.com/redis/go-redis/v9"
 
 	"github.com/saturncloud/phoebe/internal/config"
 	"github.com/saturncloud/phoebe/internal/emit"
+	"github.com/saturncloud/phoebe/internal/gateway"
 	"github.com/saturncloud/phoebe/internal/iolog"
 	"github.com/saturncloud/phoebe/internal/logging"
 	"github.com/saturncloud/phoebe/internal/metering"
 	"github.com/saturncloud/phoebe/internal/proxy"
+	"github.com/saturncloud/phoebe/internal/waker"
 )
 
 func main() {
@@ -30,10 +36,22 @@ func main() {
 		log.SetLevel(logging.DEBUG)
 	}
 
+	// Gateway wiring FIRST: buildGateway may Fatalf on a fail-closed
+	// misconfiguration, and at this point nothing needs cleanup yet.
+	gwResolver, closeGateway := buildGateway(settings, log)
+
 	emitter, closeEmitter := buildEmitter(settings, log)
 	ioPolicy, ioSink, ioMaxBody, closeIOLog := buildIOLog(settings, log)
 
 	srv := proxy.NewWithIOLog(settings, log, emitter, ioPolicy, ioSink, ioMaxBody)
+	if gwResolver != nil {
+		srv = srv.WithGateway(gwResolver, settings.Gateway.Namespace, settings.Gateway.Port)
+	}
+	if w := buildWaker(settings, log); w != nil {
+		// Timeout 0 = the proxy default (300s — sized above vLLM's measured
+		// ~2.5min cold reload); tries 0 = the proxy default (3).
+		srv = srv.WithWaker(w, settings.Wake.Timeout, 0)
+	}
 	srvErr := srv.Run()
 
 	// Cleanup must run UNCONDITIONALLY before exit. log.Fatalf here would
@@ -42,11 +60,76 @@ func main() {
 	// the error, close everything, then exit nonzero.
 	closeIOLog()
 	closeEmitter()
+	closeGateway()
 
 	if srvErr != nil {
 		log.Error.Printf("server error: %v", srvErr)
 		os.Exit(1)
 	}
+}
+
+// buildGateway constructs the TF gateway (org, model) → tf_model resolver:
+// Atlas Postgres lookup behind a TTL cache. Returns (nil, no-op) when the
+// gateway is disabled (the default) — the proxy then refuses gateway-marked
+// requests fail-closed.
+//
+// FAIL CLOSED at startup: enabled with no usable DSN (neither
+// gateway.databaseUrl nor the DATABASE_URL env, Atlas convention) or an
+// unparseable DSN is a Fatalf — an interceptor that silently served gateway
+// 503s while claiming the feature is on would be a misconfiguration trap.
+// A REACHABILITY failure is deliberately NOT checked here (sql.Open does not
+// dial): a DB outage must degrade to per-request 503s on the gateway path
+// only, not crashloop an interceptor that also serves header-routed traffic.
+func buildGateway(s *config.Settings, log *logging.Logger) (gateway.Resolver, func()) {
+	if !s.Gateway.Enabled {
+		return nil, func() {}
+	}
+
+	dsn := s.Gateway.DatabaseURL
+	if dsn == "" {
+		dsn = os.Getenv("DATABASE_URL")
+	}
+	if dsn == "" {
+		log.Error.Fatalf("gateway.enabled=true requires gateway.databaseUrl (or the DATABASE_URL env var)")
+	}
+
+	db, err := sql.Open("pgx", dsn)
+	if err != nil {
+		log.Error.Fatalf("gateway: invalid database DSN: %v", err)
+	}
+	// Modest pool: the hot path is served from the TTL cache; the DB sees at
+	// most one lookup per (org, model) per TTL plus cold-start bursts.
+	db.SetMaxOpenConns(10)
+	db.SetMaxIdleConns(5)
+	db.SetConnMaxLifetime(30 * time.Minute)
+
+	resolver := gateway.NewCache(gateway.NewPGResolver(db), gateway.DefaultPositiveTTL, gateway.DefaultNegativeTTL)
+	log.Info.Printf("gateway: enabled (namespace=%s port=%d, cache %s/%s pos/neg)",
+		s.Gateway.Namespace, s.Gateway.Port, gateway.DefaultPositiveTTL, gateway.DefaultNegativeTTL)
+	return resolver, func() { _ = db.Close() }
+}
+
+// buildWaker constructs the client-go DGDSA waker (wake-from-zero actuation
+// in the MAIN phoebe container — no separate waker pod; see
+// deploy/rbac-waker.yaml for the RBAC it needs). Returns nil when wake is
+// disabled (the default) OR when the kubernetes config is unavailable: the
+// proxy then runs with wake off — cold responses pass through exactly as
+// before — because a broken wake path must degrade the cold-start UX, never
+// crash or block the proxy (which also serves warm traffic).
+func buildWaker(s *config.Settings, log *logging.Logger) proxy.Waker {
+	if !s.Wake.Enabled {
+		return nil
+	}
+	w, err := waker.New(waker.Config{
+		Namespace:  s.Gateway.Namespace,
+		Kubeconfig: s.Wake.Kubeconfig,
+	}, log)
+	if err != nil {
+		log.Error.Printf("wake: kubernetes client unavailable (%v); wake-from-zero DISABLED — cold responses pass through", err)
+		return nil
+	}
+	log.Info.Printf("wake: enabled (DGDSA namespace=%s)", s.Gateway.Namespace)
+	return w
 }
 
 // buildEmitter constructs the durable metering emitter. When ValkeyAddr is set

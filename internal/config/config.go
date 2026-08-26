@@ -41,6 +41,20 @@ type Settings struct {
 	// dependency (same pattern as Emit).
 	IOLog IOLogSettings `yaml:"ioLog"`
 
+	// Gateway configures the TF single-host gateway resolution path (requests
+	// marked X-Saturn-Gateway resolve their body model= against Atlas's
+	// tf_model). OFF by default — a phoebe without it refuses gateway-marked
+	// requests fail-closed (503). main.go translates these into the
+	// internal/gateway resolver wiring (same pattern as Emit/IOLog).
+	Gateway GatewaySettings `yaml:"gateway"`
+
+	// Wake configures wake-from-zero actuation (the client-go DGDSA waker,
+	// internal/waker). OFF by default — without it a cold response passes
+	// through to the client exactly as before. main.go builds the waker; an
+	// unavailable kubernetes config degrades to wake-off (logged), never a
+	// crash.
+	Wake WakeSettings `yaml:"wake"`
+
 	// --- Parsed settings (populated by parse) ---
 
 	ListenAddr  string        `yaml:"-"`
@@ -100,6 +114,65 @@ type IOLogSettings struct {
 	MaxBodyBytes int `yaml:"maxBodyBytes"`
 }
 
+// GatewaySettings is the YAML shape for the TF gateway resolution path.
+//
+// FAIL CLOSED: Enabled defaults to false, and enabling without a Namespace is
+// a startup error — the namespace is half of every composed upstream
+// (<graph>-frontend.<namespace>.svc.cluster.local:<port>), and phoebe never
+// guesses a forward target. OPERATING ASSUMPTION (documented, load-bearing):
+// every serving graph reachable through this phoebe's gateway host lives in
+// this ONE namespace (the platform shared-graph namespace); a tf_model row
+// whose graph lives elsewhere fails at dial, never misroutes.
+type GatewaySettings struct {
+	// Enabled turns gateway resolution on. Default false: gateway-marked
+	// requests are refused (503) rather than resolved.
+	Enabled bool `yaml:"enabled"`
+
+	// Namespace is the k8s namespace the shared serving graphs' frontend
+	// Services live in. REQUIRED when Enabled (fail closed, see above).
+	Namespace string `yaml:"namespace"`
+
+	// Port is the graphs' OpenAI-compatible serve port. Default 8000 (vLLM's
+	// serve port, the same value Atlas's header-injected upstreams carry).
+	Port int `yaml:"port"`
+
+	// DatabaseURL is the Atlas Postgres DSN for tf_model lookups — the same
+	// database phoebe's drainer/rater already use for billing_event /
+	// rated_usage. Empty falls back to the DATABASE_URL env var (Atlas
+	// convention, resolved in main); enabled with NEITHER set is a startup
+	// error.
+	DatabaseURL string `yaml:"databaseUrl"`
+}
+
+// WakeSettings is the YAML shape for the wake-from-zero actuator.
+//
+// The DGDSAs/ScaledObjects the waker patches live in the SAME namespace as
+// the gateway's serving graphs, so enabling wake requires gateway.namespace
+// (validated in Settings.parse — fail closed rather than actuate in a guessed
+// namespace).
+type WakeSettings struct {
+	// Enabled turns the DGDSA waker on. Default false: cold responses pass
+	// through unchanged.
+	Enabled bool `yaml:"enabled"`
+
+	// Kubeconfig is a kubeconfig file path for dev/tests. Empty (production)
+	// uses in-cluster config.
+	Kubeconfig string `yaml:"kubeconfig"`
+
+	// TimeoutStr bounds how long a single wake may hold the woken request
+	// (empty = the proxy default, 300s). THE TRADEOFF: this must exceed the
+	// serving stack's real cold start (vLLM's cold reload measured ~2.5min on
+	// staging — a budget below it makes wake a no-op that holds clients and
+	// then serves the cold response anyway), but every second of it is also
+	// how long a doomed wake keeps a client waiting before the honest cold
+	// response. Size it to the measured cold start plus headroom, not to
+	// impatience.
+	TimeoutStr string `yaml:"timeout"`
+
+	// Timeout is the parsed TimeoutStr (0 = proxy default).
+	Timeout time.Duration `yaml:"-"`
+}
+
 // Load reads, defaults, and parses a settings YAML file.
 func Load(settingsFile string) (*Settings, error) {
 	s := &Settings{
@@ -143,6 +216,45 @@ func (s *Settings) parse() error {
 
 	if err := s.IOLog.parse(); err != nil {
 		return err
+	}
+	if err := s.Gateway.parse(); err != nil {
+		return err
+	}
+	// The waker patches DGDSAs in the gateway namespace; without it there is
+	// no safe namespace to actuate in (fail closed at startup, not a guessed
+	// patch at wake time). gateway.enabled itself is NOT required — wake also
+	// serves header-routed shared subdomains.
+	if s.Wake.Enabled && s.Gateway.Namespace == "" {
+		return fmt.Errorf("wake.enabled=true requires gateway.namespace (the namespace the serving graphs' DGDSAs live in)")
+	}
+	if s.Wake.TimeoutStr != "" {
+		if s.Wake.Timeout, err = time.ParseDuration(s.Wake.TimeoutStr); err != nil {
+			return fmt.Errorf("invalid wake.timeout: %w", err)
+		}
+		if s.Wake.Timeout <= 0 {
+			return fmt.Errorf("wake.timeout %q must be positive", s.Wake.TimeoutStr)
+		}
+	}
+	return nil
+}
+
+// parse validates the gateway settings and applies the port default. It fails
+// closed: an enabled gateway with no namespace is a misconfiguration rejected
+// at startup — serving gateway requests would require guessing where the
+// graphs live, which phoebe never does. (DatabaseURL is validated in main,
+// after the DATABASE_URL env fallback.)
+func (g *GatewaySettings) parse() error {
+	if !g.Enabled {
+		return nil // off: nothing to validate
+	}
+	if g.Namespace == "" {
+		return fmt.Errorf("gateway.enabled=true requires gateway.namespace (the shared-graph namespace; phoebe never guesses a forward target)")
+	}
+	if g.Port == 0 {
+		g.Port = 8000
+	}
+	if g.Port < 1 || g.Port > 65535 {
+		return fmt.Errorf("gateway.port %d out of range [1,65535]", g.Port)
 	}
 	return nil
 }
