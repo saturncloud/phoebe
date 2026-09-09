@@ -136,11 +136,24 @@ type GatewaySettings struct {
 	// serve port, the same value Atlas's header-injected upstreams carry).
 	Port int `yaml:"port"`
 
-	// DatabaseURL is the Atlas Postgres DSN for tf_model lookups — the same
-	// database phoebe's drainer/rater already use for billing_event /
-	// rated_usage. Empty falls back to the DATABASE_URL env var (Atlas
-	// convention, resolved in main); enabled with NEITHER set is a startup
-	// error.
+	// LegacyPostgresResolver selects the DEPRECATED direct Atlas-DB (tf_model)
+	// resolution path instead of the default k8s-watch registry resolver.
+	// Kept for ONE release so installs can roll forward/back across the
+	// registry transition; requires databaseUrl (or the DATABASE_URL env) and
+	// Atlas-DB reachability from the data plane. Remove after the transition
+	// release together with gateway.PGResolver.
+	LegacyPostgresResolver bool `yaml:"legacyPostgresResolver"`
+
+	// Kubeconfig is a kubeconfig file path for dev/tests of the registry
+	// resolver's watch. Empty (production) uses in-cluster config.
+	Kubeconfig string `yaml:"kubeconfig"`
+
+	// DatabaseURL is the Atlas Postgres DSN for tf_model lookups — used ONLY
+	// by the deprecated legacyPostgresResolver path (the default registry
+	// resolver watches ConfigMaps and needs no database). In legacy mode,
+	// empty falls back to the DATABASE_URL env var (Atlas convention,
+	// resolved in main); legacy-enabled with NEITHER set is a startup error.
+	// Ignored in registry mode.
 	DatabaseURL string `yaml:"databaseUrl"`
 }
 
@@ -241,8 +254,10 @@ func (s *Settings) parse() error {
 // parse validates the gateway settings and applies the port default. It fails
 // closed: an enabled gateway with no namespace is a misconfiguration rejected
 // at startup — serving gateway requests would require guessing where the
-// graphs live, which phoebe never does. (DatabaseURL is validated in main,
-// after the DATABASE_URL env fallback.)
+// graphs live, which phoebe never does. DatabaseURL is deliberately NOT
+// required here: the default registry resolver needs no database; only the
+// deprecated legacyPostgresResolver path uses it, and that requirement is
+// enforced in main after the DATABASE_URL env fallback.
 func (g *GatewaySettings) parse() error {
 	if !g.Enabled {
 		return nil // off: nothing to validate

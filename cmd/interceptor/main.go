@@ -68,29 +68,54 @@ func main() {
 	}
 }
 
-// buildGateway constructs the TF gateway (org, model) → tf_model resolver:
-// Atlas Postgres lookup behind a TTL cache. Returns (nil, no-op) when the
-// gateway is disabled (the default) — the proxy then refuses gateway-marked
-// requests fail-closed.
+// buildGateway constructs the TF gateway (org, model) resolver. DEFAULT: the
+// k8s-watch registry resolver (label-selected ConfigMaps in the workload
+// namespace — see internal/gateway/registry.go; no database, no per-request
+// I/O, no TTL cache: the informer IS the cache). The DEPRECATED direct
+// Atlas-DB path stays behind gateway.legacyPostgresResolver for one release
+// so installs can roll forward/back. Returns (nil, no-op) when the gateway is
+// disabled — the proxy then refuses gateway-marked requests fail-closed.
 //
-// FAIL CLOSED at startup: enabled with no usable DSN (neither
-// gateway.databaseUrl nor the DATABASE_URL env, Atlas convention) or an
-// unparseable DSN is a Fatalf — an interceptor that silently served gateway
-// 503s while claiming the feature is on would be a misconfiguration trap.
-// A REACHABILITY failure is deliberately NOT checked here (sql.Open does not
-// dial): a DB outage must degrade to per-request 503s on the gateway path
-// only, not crashloop an interceptor that also serves header-routed traffic.
+// FAIL CLOSED at startup, both modes: an enabled gateway whose resolver
+// cannot be BUILT (no kubernetes config / no usable DSN) is a Fatalf — an
+// interceptor silently serving gateway 503s while claiming the feature is on
+// would be a misconfiguration trap. RUNTIME reachability is deliberately not
+// gated at startup: registry mode serves 503 until its first sync and then
+// last-known state across API-server flaps; legacy mode degrades to
+// per-request 503s on DB outage. Neither may crashloop an interceptor that
+// also serves header-routed traffic.
 func buildGateway(s *config.Settings, log *logging.Logger) (gateway.Resolver, func()) {
 	if !s.Gateway.Enabled {
 		return nil, func() {}
 	}
 
+	if s.Gateway.LegacyPostgresResolver {
+		log.Warn.Printf("gateway: using the DEPRECATED legacyPostgresResolver (direct Atlas-DB lookups); migrate to the registry resolver — this path is removed next release")
+		return buildLegacyPGGateway(s, log)
+	}
+
+	client, err := gateway.NewKubeClient(s.Gateway.Kubeconfig)
+	if err != nil {
+		log.Error.Fatalf("gateway: kubernetes config unavailable for the registry resolver (%v); set gateway.kubeconfig for dev, or gateway.legacyPostgresResolver to roll back", err)
+	}
+	resolver := gateway.NewRegistryResolver(client, s.Gateway.Namespace, log)
+	ctx, cancel := context.WithCancel(context.Background())
+	go resolver.Run(ctx)
+	log.Info.Printf("gateway: enabled (registry resolver, namespace=%s port=%d) — serving 503 until the registry syncs",
+		s.Gateway.Namespace, s.Gateway.Port)
+	return resolver, cancel
+}
+
+// buildLegacyPGGateway is the deprecated Atlas-DB resolution path (TTL cache
+// over tf_model lookups). Remove with gateway.PGResolver after the registry
+// transition release.
+func buildLegacyPGGateway(s *config.Settings, log *logging.Logger) (gateway.Resolver, func()) {
 	dsn := s.Gateway.DatabaseURL
 	if dsn == "" {
 		dsn = os.Getenv("DATABASE_URL")
 	}
 	if dsn == "" {
-		log.Error.Fatalf("gateway.enabled=true requires gateway.databaseUrl (or the DATABASE_URL env var)")
+		log.Error.Fatalf("gateway.legacyPostgresResolver=true requires gateway.databaseUrl (or the DATABASE_URL env var)")
 	}
 
 	db, err := sql.Open("pgx", dsn)
@@ -104,7 +129,7 @@ func buildGateway(s *config.Settings, log *logging.Logger) (gateway.Resolver, fu
 	db.SetConnMaxLifetime(30 * time.Minute)
 
 	resolver := gateway.NewCache(gateway.NewPGResolver(db), gateway.DefaultPositiveTTL, gateway.DefaultNegativeTTL)
-	log.Info.Printf("gateway: enabled (namespace=%s port=%d, cache %s/%s pos/neg)",
+	log.Info.Printf("gateway: enabled (LEGACY postgres resolver, namespace=%s port=%d, cache %s/%s pos/neg)",
 		s.Gateway.Namespace, s.Gateway.Port, gateway.DefaultPositiveTTL, gateway.DefaultNegativeTTL)
 	return resolver, func() { _ = db.Close() }
 }
