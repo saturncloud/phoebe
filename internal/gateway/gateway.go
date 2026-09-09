@@ -62,6 +62,11 @@ type Resolution struct {
 	// <graph>-frontend.<namespace>.svc.cluster.local:<port>. Never empty on a
 	// successful resolution (a row with no graph resolves as ErrNotFound).
 	GraphK8sName string
+	// Port is the graph's OpenAI-compatible serve port when the resolution
+	// source carries one (the registry ConfigMaps do — multi-backend graphs
+	// may serve on different ports). 0 = unknown: the proxy falls back to the
+	// configured gateway.port. The legacy PG resolver never sets it.
+	Port int
 }
 
 // Resolver maps a (org id, request-body model=) pair to its Resolution.
@@ -109,6 +114,14 @@ LIMIT 1`
 
 // PGResolver resolves against Atlas's tf_model table over database/sql (pgx
 // stdlib), the same connection style as the drainer/rater stores.
+//
+// DEPRECATED (kept for ONE release behind gateway.legacyPostgresResolver):
+// the RegistryResolver (registry.go) replaces direct Atlas-DB resolution — it
+// needs no Atlas DB reachability from the data plane (no dbtunnel), no
+// per-request I/O, and no TTL cache. This type exists so installs can roll
+// forward/back across the transition; remove it (and the legacy flag, the
+// databaseUrl plumbing, and the Cache when nothing else uses it) once the
+// registry path has shipped a release.
 type PGResolver struct {
 	db *sql.DB
 }

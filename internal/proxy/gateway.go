@@ -18,9 +18,12 @@ type gatewayRoute struct {
 	resolver gateway.Resolver
 	// upstreamFor composes the forward target for a resolved graph. In
 	// production this is always <graph>-frontend.<namespace>.svc.cluster.local
-	// :<port> over the configured gateway namespace/port; it is a func field so
-	// tests can point resolved requests at a live httptest backend.
-	upstreamFor func(graphK8sName string) string
+	// :<port> over the configured gateway namespace — the port is the
+	// RESOLUTION's port when it carries one (the registry ConfigMaps do;
+	// multi-backend graphs may serve on different ports) and the configured
+	// gateway.port otherwise. A func field so tests can point resolved
+	// requests at a live httptest backend.
+	upstreamFor func(graphK8sName string, port int) string
 }
 
 // WithGateway enables gateway resolution: requests carrying the trusted
@@ -41,8 +44,12 @@ func (s *Server) WithGateway(resolver gateway.Resolver, namespace string, port i
 	}
 	s.gateway = &gatewayRoute{
 		resolver: resolver,
-		upstreamFor: func(graphK8sName string) string {
-			return fmt.Sprintf("%s-frontend.%s.svc.cluster.local:%d", graphK8sName, namespace, port)
+		upstreamFor: func(graphK8sName string, resolvedPort int) string {
+			p := resolvedPort
+			if p <= 0 {
+				p = port // resolution carried no port: the configured default
+			}
+			return fmt.Sprintf("%s-frontend.%s.svc.cluster.local:%d", graphK8sName, namespace, p)
 		},
 	}
 	return s
@@ -147,6 +154,6 @@ func (s *Server) resolveGateway(w http.ResponseWriter, r *http.Request, id *iden
 	// on this route actuates exactly the resolved graph — never a re-parse of
 	// the upstream host composed from it one line below.
 	id.GraphK8sName = res.GraphK8sName
-	id.Upstream = s.gateway.upstreamFor(res.GraphK8sName)
+	id.Upstream = s.gateway.upstreamFor(res.GraphK8sName, res.Port)
 	return true
 }

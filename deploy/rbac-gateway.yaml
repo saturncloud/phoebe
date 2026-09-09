@@ -1,0 +1,51 @@
+# RBAC for phoebe's gateway registry resolver (internal/gateway/registry.go).
+#
+# DELIVERABLE, NOT AUTO-APPLIED: the durable home for these objects is the
+# saturn-k8s chart (rendered alongside phoebe's Deployment/ServiceAccount);
+# this file is the reviewed source of truth for what that chart must grant.
+# Apply manually only for dev clusters:
+#   kubectl -n <workload-namespace> apply -f deploy/rbac-gateway.yaml
+#
+# The resolver watches the served-model registry ConfigMaps Atlas renders
+# (label saturncloud.io/tf-served-model: "true", names tf-model-<model_id>)
+# in the workload namespace, so phoebe's ServiceAccount needs get/list/watch
+# on configmaps THERE and nothing else — no writes, no other namespaces.
+#
+# NOTE on scope: k8s RBAC cannot filter by LABEL, so this grant is read access
+# to ALL ConfigMaps in the workload namespace, not only the registry ones (the
+# label selection happens client-side in the informer's list/watch options).
+# That is why it is a namespace-scoped Role in the dedicated workload
+# namespace — never a ClusterRole: nothing secret should live in ConfigMaps
+# there (k8s ConfigMaps are not a secret store anyway; Secrets are separate
+# objects this Role cannot read).
+#
+# Replace the two placeholders when applying:
+#   <workload-namespace>    the shared-graph namespace (gateway.namespace)
+#   <phoebe-serviceaccount> phoebe's ServiceAccount name in that namespace
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: phoebe-gateway-registry
+  namespace: <workload-namespace>
+  labels:
+    saturncloud.io/managed-by: "Atlas"
+rules:
+  - apiGroups: [""]
+    resources: ["configmaps"]
+    verbs: ["get", "list", "watch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: phoebe-gateway-registry
+  namespace: <workload-namespace>
+  labels:
+    saturncloud.io/managed-by: "Atlas"
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: phoebe-gateway-registry
+subjects:
+  - kind: ServiceAccount
+    name: <phoebe-serviceaccount>
+    namespace: <workload-namespace>
