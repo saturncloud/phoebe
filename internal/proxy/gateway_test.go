@@ -11,6 +11,8 @@ import (
 	"testing"
 	"time"
 
+	k8sfake "k8s.io/client-go/kubernetes/fake"
+
 	"github.com/saturncloud/phoebe/internal/config"
 	"github.com/saturncloud/phoebe/internal/gateway"
 	"github.com/saturncloud/phoebe/internal/identity"
@@ -46,7 +48,7 @@ func newGatewayTestServer(t *testing.T, em *recordingEmitter, resolver gateway.R
 	s := New(&config.Settings{ListenAddr: ":0"}, logging.New(logging.ERROR), em).
 		WithGateway(resolver, "tf-shared", 8000)
 	if backend != nil {
-		s.gateway.upstreamFor = func(string) string { return backend.Host }
+		s.gateway.upstreamFor = func(string, int) string { return backend.Host }
 	}
 	return s
 }
@@ -310,6 +312,27 @@ func TestGateway_MissingModel400(t *testing.T) {
 	}
 }
 
+// TestGateway_RegistryUnsyncedAtStartup503: end to end through the handler —
+// a REAL RegistryResolver whose informer has not completed its first sync
+// fails closed with 503 (never a 404 lie, never a guessed route), and bills
+// nothing. This is the startup window before the registry watch lists.
+func TestGateway_RegistryUnsyncedAtStartup503(t *testing.T) {
+	resolver := gateway.NewRegistryResolver(k8sfake.NewSimpleClientset(), "tf-shared", logging.New(logging.ERROR)) // never Run: unsynced
+	em := &recordingEmitter{}
+	srv := New(&config.Settings{ListenAddr: ":0"}, logging.New(logging.ERROR), em).
+		WithGateway(resolver, "tf-shared", 8000)
+
+	rr := httptest.NewRecorder()
+	srv.Handler().ServeHTTP(rr, gatewayRequest("org-1", `{"model":"m"}`))
+
+	if rr.Code != http.StatusServiceUnavailable {
+		t.Fatalf("status = %d, want 503 while the registry is unsynced", rr.Code)
+	}
+	if em.count() != 0 {
+		t.Fatalf("unsynced-gateway request must not bill, emitted %d", em.count())
+	}
+}
+
 // TestGateway_Unconfigured503FailClosed: a gateway-marked request on an
 // interceptor with NO gateway configured is refused 503 — it never falls
 // through to header routing (which it cannot satisfy) or a guessed route.
@@ -340,18 +363,24 @@ func TestWithGateway_PartialWiringFailsClosed(t *testing.T) {
 }
 
 // TestGateway_UpstreamHostShape pins the production upstream composition:
-// <graph>-frontend.<namespace>.svc.cluster.local:<port>, with port defaulting
-// to 8000 when unset.
+// <graph>-frontend.<namespace>.svc.cluster.local:<port> — the RESOLUTION's
+// port when it carries one (registry rows do), the configured default (8000
+// when unset) otherwise.
 func TestGateway_UpstreamHostShape(t *testing.T) {
 	s := New(&config.Settings{ListenAddr: ":0"}, logging.New(logging.ERROR), &recordingEmitter{}).
 		WithGateway(&mapResolver{}, "tf-shared", 0)
-	got := s.gateway.upstreamFor("graph-llama31")
+	// No resolution port -> the configured default (8000).
+	got := s.gateway.upstreamFor("graph-llama31", 0)
 	want := "graph-llama31-frontend.tf-shared.svc.cluster.local:8000"
 	if got != want {
 		t.Fatalf("upstreamFor = %q, want %q", got, want)
 	}
 	if _, err := parseUpstreamHeader(got); err != nil {
 		t.Fatalf("composed upstream must satisfy the upstream grammar: %v", err)
+	}
+	// A resolution-carried port (multi-backend graph) wins over the default.
+	if got := s.gateway.upstreamFor("graph-llama31", 9099); got != "graph-llama31-frontend.tf-shared.svc.cluster.local:9099" {
+		t.Fatalf("upstreamFor with resolved port = %q, want :9099", got)
 	}
 }
 

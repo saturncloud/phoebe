@@ -162,6 +162,42 @@ gateway:
 	}
 }
 
+// TestLoadGatewayRegistryIsDefault: an enabled gateway with no resolver
+// selection uses the registry resolver (legacy flag false) and needs NO
+// databaseUrl — the registry watches ConfigMaps, not Postgres.
+func TestLoadGatewayRegistryIsDefault(t *testing.T) {
+	s, err := Load(writeTemp(t, "gateway:\n  enabled: true\n  namespace: \"tf-shared\"\n"))
+	if err != nil {
+		t.Fatalf("registry-mode gateway without databaseUrl must load: %v", err)
+	}
+	if s.Gateway.LegacyPostgresResolver {
+		t.Fatal("legacyPostgresResolver must default false (registry is the default)")
+	}
+	if s.Gateway.DatabaseURL != "" {
+		t.Fatalf("databaseUrl = %q, want empty (not required in registry mode)", s.Gateway.DatabaseURL)
+	}
+}
+
+// TestLoadGatewayLegacyResolverFlag: the deprecated PG path stays selectable
+// for one release behind the explicit flag (rollback seam); databaseUrl is
+// still not a PARSE requirement (main enforces it after the DATABASE_URL env
+// fallback, as before).
+func TestLoadGatewayLegacyResolverFlag(t *testing.T) {
+	s, err := Load(writeTemp(t, `
+gateway:
+  enabled: true
+  namespace: "tf-shared"
+  legacyPostgresResolver: true
+  databaseUrl: "postgres://u:p@h:5432/atlas"
+`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !s.Gateway.LegacyPostgresResolver || s.Gateway.DatabaseURL == "" {
+		t.Fatalf("legacy settings wrong: %+v", s.Gateway)
+	}
+}
+
 // TestLoadWakeOffByDefault: no wake block means disabled, no requirements.
 func TestLoadWakeOffByDefault(t *testing.T) {
 	s, err := Load(writeTemp(t, "debug: false\n"))

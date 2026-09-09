@@ -29,16 +29,27 @@ emit:
 
 # TF single-host gateway resolution (OFF by default). On the gateway route the
 # request-body model= selects the model: phoebe resolves (X-Saturn-Org-Id,
-# model) against Atlas's tf_model table and forwards to
-# <graph>-frontend.<namespace>.svc.cluster.local:<port>. Requests marked
-# X-Saturn-Gateway on an interceptor with this disabled are refused (503,
-# fail closed). namespace is REQUIRED when enabled: it is the platform
-# shared-graph namespace every gateway-served graph lives in — phoebe never
-# guesses a forward target. databaseUrl falls back to the DATABASE_URL env var.
+# model) from the served-model REGISTRY — Atlas-rendered ConfigMaps in the
+# workload namespace (label saturncloud.io/tf-served-model: "true"), watched
+# by an informer (no database, no per-request I/O; RBAC in
+# deploy/rbac-gateway.yaml) — and forwards to
+# <graph>-frontend.<namespace>.svc.cluster.local:<port> (the registration's
+# port, or `port` below when it carries none). Requests marked
+# X-Saturn-Gateway on an interceptor with this disabled are refused (503, fail
+# closed); with it enabled they 503 until the registry's first sync, then keep
+# resolving from last-known state across API-server flaps. namespace is
+# REQUIRED when enabled: it is the platform shared-graph namespace every
+# gateway-served graph (and its registry ConfigMap) lives in — phoebe never
+# guesses a forward target.
+# legacyPostgresResolver: true selects the DEPRECATED direct Atlas-DB
+# resolution instead (kept one release for rollback; requires databaseUrl or
+# the DATABASE_URL env var; databaseUrl is ignored in registry mode).
 # gateway:
 #   enabled: true
 #   namespace: "saturn-tf-shared"
 #   port: 8000
+#   kubeconfig: ""
+#   legacyPostgresResolver: false
 #   databaseUrl: ""
 
 # Wake-from-zero actuation (OFF by default). When enabled, a cold response on
