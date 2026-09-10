@@ -100,13 +100,6 @@ const (
 	// (small) change. Phoebe reads it defensively: absent = empty string.
 	HeaderAuthID = "X-Saturn-Auth-Id"
 
-	// HeaderRequestID is a unique billing-attempt id minted by Atlas's auth
-	// server and copied through Traefik's explicit authResponseHeaders list.
-	// That allowlist strips any client-supplied value first, making this safe as
-	// billing_event's idempotency key. It is intentionally distinct from the
-	// public, client-controlled X-Request-Id correlation header.
-	HeaderRequestID = "X-Saturn-Request-Id"
-
 	// HeaderOrgID carries the org that OWNS the served deployment — the customer to
 	// attribute (and ultimately bill) this inference to (E2). This is DELIBERATELY
 	// NOT the caller's active-org context (which, per HeaderAuthID above, isn't

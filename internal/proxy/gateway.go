@@ -84,7 +84,7 @@ func (s *Server) WithGateway(resolver gateway.Resolver, namespace string, port i
 //	503 resolver failure — the DB couldn't answer; phoebe never serves
 //	    traffic it can't attribute.
 func (s *Server) resolveGateway(w http.ResponseWriter, r *http.Request, id *identity.Identity) bool {
-	requestID := r.Header.Get(identity.HeaderRequestID)
+	requestID := r.Header.Get(requestIDHeader)
 
 	if s.gateway == nil {
 		s.log.Error.Printf("gateway: refusing gateway-marked request: gateway resolution is not configured on this interceptor (set gateway.enabled/namespace/databaseUrl) org_id=%q request_id=%q",

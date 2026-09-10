@@ -77,7 +77,7 @@ func TestPreHeaderAbortEmitsAttributableEvent(t *testing.T) {
 	req.Header.Set(identity.HeaderResourceID, "model-abc")
 	req.Header.Set(identity.HeaderGroupID, "org-1")
 	req.Header.Set(identity.HeaderUserID, "user-1")
-	req.Header.Set(identity.HeaderRequestID, "req-preheader-abort")
+	req.Header.Set("X-Request-Id", "req-preheader-abort")
 
 	rr := httptest.NewRecorder()
 	srv.Handler().ServeHTTP(rr, req)
@@ -96,8 +96,8 @@ func TestPreHeaderAbortEmitsAttributableEvent(t *testing.T) {
 	if e.AuthID != "auth-1" || e.ResourceID != "model-abc" {
 		t.Fatalf("pre-header abort event must be attributable (AuthID+ResourceID): %+v", e)
 	}
-	if e.RequestID != "req-preheader-abort" {
-		t.Fatalf("pre-header abort RequestID = %q, want req-preheader-abort", e.RequestID)
+	if !strings.HasPrefix(e.RequestID, "phoebe-") || e.RequestID == "req-preheader-abort" {
+		t.Fatalf("pre-header abort RequestID = %q, want fresh Phoebe attempt id", e.RequestID)
 	}
 }
 
@@ -124,7 +124,7 @@ func TestPreHeaderAbortBillPartialFalseNoEvent(t *testing.T) {
 	req.Header.Set(identity.HeaderUpstream, upstream.Host)
 	req.Header.Set(identity.HeaderAuthID, "auth-1")
 	req.Header.Set(identity.HeaderResourceID, "model-abc")
-	req.Header.Set(identity.HeaderRequestID, "req-preheader-nobill")
+	req.Header.Set("X-Request-Id", "req-preheader-nobill")
 	rr := httptest.NewRecorder()
 	srv.Handler().ServeHTTP(rr, req)
 
@@ -164,7 +164,7 @@ func TestNormalCompletionEmitsExactlyOnce(t *testing.T) {
 	req.Header.Set(identity.HeaderUpstream, upstream.Host)
 	req.Header.Set(identity.HeaderAuthID, "auth-1")
 	req.Header.Set(identity.HeaderResourceID, "model-abc")
-	req.Header.Set(identity.HeaderRequestID, "req-once")
+	req.Header.Set("X-Request-Id", "req-once")
 	rr := httptest.NewRecorder()
 	srv.Handler().ServeHTTP(rr, req)
 

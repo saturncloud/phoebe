@@ -44,29 +44,9 @@ import (
 // as billing_event's idempotency key: clients can choose and replay it.
 const requestIDHeader = "X-Request-Id"
 
-// maxRequestIDLen bounds an inbound X-Request-Id. The billing_event PK column
-// is VARCHAR(255); 200 leaves headroom so a valid id can never fail the
-// drainer's INSERT on length.
-const maxRequestIDLen = 200
-
-// validRequestID reports whether a trusted or locally generated request id is
-// safe as the billing idempotency key: at most maxRequestIDLen bytes, every byte in
-// [\x21-\x7e] (printable ASCII, no spaces/control bytes). Anything else is
-// rejected fail-closed — see the requestIDHeader comment for why.
-func validRequestID(id string) bool {
-	if len(id) > maxRequestIDLen {
-		return false
-	}
-	for i := 0; i < len(id); i++ {
-		if id[i] < 0x21 || id[i] > 0x7e {
-			return false
-		}
-	}
-	return true
-}
-
-// generateRequestID is the rolling-upgrade fallback when an older auth-server
-// has not supplied X-Saturn-Request-Id. It ignores the client correlation id.
+// generateRequestID mints the internal billing-attempt id at Phoebe ingress.
+// It is called exactly once per inbound inference request; retries and durable
+// emitter redeliveries retain the resulting value on the same metering event.
 func generateRequestID() (string, error) {
 	var b [16]byte
 	if _, err := rand.Read(b[:]); err != nil {
@@ -234,28 +214,16 @@ func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Use only the trusted edge-stamped billing-attempt id. The public
-	// X-Request-Id is deliberately ignored, so replaying it creates a fresh
-	// billing row. Locally mint during rolling upgrades if the trusted header is
-	// absent; an invalid trusted value means the edge contract is broken and
-	// fails closed.
-	requestID := r.Header.Get(identity.HeaderRequestID)
-	switch {
-	case requestID == "":
-		generated, err := generateRequestID()
-		if err != nil {
-			// crypto/rand failing means we cannot mint the billing key; fail
-			// closed rather than serve an unbillable request.
-			s.log.Error.Printf("generate request id: %v", err)
-			http.Error(w, "internal error", http.StatusInternalServerError)
-			return
-		}
-		requestID = generated
-	case !validRequestID(requestID):
-		s.log.Warn.Printf("rejecting invalid %s (len=%d) resource=%s auth=%s",
-			identity.HeaderRequestID, len(requestID), id.ResourceID, id.AuthID)
-		http.Error(w, "invalid trusted request id",
-			http.StatusBadRequest)
+	// Never use the public X-Request-Id as billing_event's primary key: clients
+	// can replay it. Mint a fresh attempt id after the billing identity gate and
+	// before any forwarding. The one value is then captured by all retries and
+	// by the metering event's at-least-once delivery path.
+	requestID, err := generateRequestID()
+	if err != nil {
+		// crypto/rand failing means we cannot mint the billing key; fail closed
+		// rather than serve an unbillable request.
+		s.log.Error.Printf("generate request id: %v", err)
+		http.Error(w, "internal error", http.StatusInternalServerError)
 		return
 	}
 	// Replace, never preserve, the client correlation id on the engine-facing

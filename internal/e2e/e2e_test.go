@@ -345,7 +345,7 @@ func readMigration(t *testing.T, name string) string {
 //     ("llama-3-8b"), never the routing resource id ("deploy-abc123") the
 //     request was addressed to — the deployment-id-as-Model bug made every
 //     event unpriceable;
-//   - request_id contract: the trusted edge id survives to billing_event verbatim —
+//   - request_id contract: Phoebe's internal attempt id survives to billing_event verbatim —
 //     the empty-request_id bug had the drainer poison-dropping such events
 //     (served-but-never-billed);
 //   - the money: cost equals the independently hand-computed NUMERIC, with
@@ -371,7 +371,7 @@ func TestE2E_StreamedRequestBecomesMoney(t *testing.T) {
 	defer backend.Close()
 
 	// 2. Proxy: real Server + real DurableEmitter. Full identity headers,
-	//    resource id != model name, with a trusted edge-stamped billing id.
+	//    resource id != model name, with a replayable client correlation id.
 	srv := h.proxyServer(t)
 	rr := httptest.NewRecorder()
 	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions",
@@ -383,7 +383,7 @@ func TestE2E_StreamedRequestBecomesMoney(t *testing.T) {
 	req.Header.Set(identity.HeaderUserID, "user-e2e")
 	req.Header.Set(identity.HeaderGroupID, "group-e2e")
 	req.Header.Set(identity.HeaderOrgID, testOrgID)
-	req.Header.Set(identity.HeaderRequestID, "saturn-e2e-streamed-request")
+	req.Header.Set("X-Request-Id", "saturn-e2e-streamed-request")
 	srv.Handler().ServeHTTP(rr, req)
 
 	if rr.Code != http.StatusOK {
@@ -393,8 +393,8 @@ func TestE2E_StreamedRequestBecomesMoney(t *testing.T) {
 		t.Fatalf("client did not receive the SSE stream verbatim:\n%q", rr.Body.String())
 	}
 	clientRequestID := rr.Header().Get("X-Request-Id")
-	if clientRequestID != "saturn-e2e-streamed-request" {
-		t.Fatalf("response X-Request-Id = %q, want trusted billing id", clientRequestID)
+	if !strings.HasPrefix(clientRequestID, "phoebe-") || clientRequestID == "saturn-e2e-streamed-request" {
+		t.Fatalf("response X-Request-Id = %q, want fresh Phoebe billing id", clientRequestID)
 	}
 
 	// 3. Drainer: the emit is async — wait for the stream entry, then run the

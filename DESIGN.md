@@ -39,16 +39,13 @@ auth-server calls Atlas `/check?resource_url=…` and only emits headers + a 204
 (which tells Traefik to forward) after access passes.
 
 **Billing request identity:** public `X-Request-Id` is client-controlled and is
-therefore never the billing idempotency key. Atlas stamps a unique
-`X-Saturn-Request-Id` on every authorized attempt and Traefik copies it through
-an explicit allowlist, which also strips client spoofs. Phoebe uses that trusted
-value for `billing_event.request_id`, overwrites the engine-facing and response
-`X-Request-Id` with it for correlation, and locally generates a `phoebe-<32 hex>`
-value when the trusted header is absent during a rolling upgrade. Invalid
-trusted values fail closed. At-least-once stream redelivery retains the same
-trusted id and remains safely deduplicated by `ON CONFLICT (request_id) DO
-NOTHING`; replaying a public correlation id receives a fresh trusted id and a
-separate billable row.
+therefore never the billing idempotency key. Phoebe generates a fresh internal
+`phoebe-<32 hex>` attempt id exactly once for every inbound inference request,
+uses it for `billing_event.request_id`, and overwrites the engine-facing and
+response `X-Request-Id` with it for correlation. At-least-once stream redelivery
+retains the id already stored on the metering event and remains safely
+deduplicated by `ON CONFLICT (request_id) DO NOTHING`; replaying a public
+correlation id creates a fresh attempt id and a separate billable row.
 
 ---
 
