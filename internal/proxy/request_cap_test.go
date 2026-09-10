@@ -77,7 +77,7 @@ func TestRequestBodyCappedBeforeTsvector(t *testing.T) {
 	req.Header.Set(identity.HeaderUpstream, upstream.Host)
 	req.Header.Set(identity.HeaderAuthID, "auth-1")
 	req.Header.Set(identity.HeaderResourceID, "model-abc")
-	req.Header.Set("X-Request-Id", "req-bigbody")
+	req.Header.Set(identity.HeaderRequestID, "req-bigbody")
 	srv.Handler().ServeHTTP(rr, req)
 
 	// The upstream must have received the FULL body — the cap bounds only the log.
@@ -116,7 +116,7 @@ func TestRequestBodyUnderCapNotFlagged(t *testing.T) {
 	req.Header.Set(identity.HeaderUpstream, upstream.Host)
 	req.Header.Set(identity.HeaderAuthID, "auth-1")
 	req.Header.Set(identity.HeaderResourceID, "model-abc")
-	req.Header.Set("X-Request-Id", "req-small")
+	req.Header.Set(identity.HeaderRequestID, "req-small")
 	srv.Handler().ServeHTTP(rr, req)
 
 	recs := sink.all()

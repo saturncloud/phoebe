@@ -77,7 +77,7 @@ func TestPreHeaderAbortEmitsAttributableEvent(t *testing.T) {
 	req.Header.Set(identity.HeaderResourceID, "model-abc")
 	req.Header.Set(identity.HeaderGroupID, "org-1")
 	req.Header.Set(identity.HeaderUserID, "user-1")
-	req.Header.Set("X-Request-Id", "req-preheader-abort")
+	req.Header.Set(identity.HeaderRequestID, "req-preheader-abort")
 
 	rr := httptest.NewRecorder()
 	srv.Handler().ServeHTTP(rr, req)
@@ -124,7 +124,7 @@ func TestPreHeaderAbortBillPartialFalseNoEvent(t *testing.T) {
 	req.Header.Set(identity.HeaderUpstream, upstream.Host)
 	req.Header.Set(identity.HeaderAuthID, "auth-1")
 	req.Header.Set(identity.HeaderResourceID, "model-abc")
-	req.Header.Set("X-Request-Id", "req-preheader-nobill")
+	req.Header.Set(identity.HeaderRequestID, "req-preheader-nobill")
 	rr := httptest.NewRecorder()
 	srv.Handler().ServeHTTP(rr, req)
 
@@ -164,7 +164,7 @@ func TestNormalCompletionEmitsExactlyOnce(t *testing.T) {
 	req.Header.Set(identity.HeaderUpstream, upstream.Host)
 	req.Header.Set(identity.HeaderAuthID, "auth-1")
 	req.Header.Set(identity.HeaderResourceID, "model-abc")
-	req.Header.Set("X-Request-Id", "req-once")
+	req.Header.Set(identity.HeaderRequestID, "req-once")
 	rr := httptest.NewRecorder()
 	srv.Handler().ServeHTTP(rr, req)
 

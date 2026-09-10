@@ -72,7 +72,7 @@ func iologRequest(upstream *url.URL, method, body string) *http.Request {
 	req.Header.Set(identity.HeaderResourceType, "deployment")
 	req.Header.Set(identity.HeaderGroupID, "org-1")
 	req.Header.Set(identity.HeaderUserID, "user-1")
-	req.Header.Set("X-Request-Id", "req-iolog-1")
+	req.Header.Set(identity.HeaderRequestID, "req-iolog-1")
 	return req
 }
 

@@ -38,18 +38,17 @@ constants), `saturn-k8s` forwardauth middleware. Authorization is URL-based:
 auth-server calls Atlas `/check?resource_url=…` and only emits headers + a 204
 (which tells Traefik to forward) after access passes.
 
-**Known limitation — client-supplied `X-Request-Id` reuse:** `X-Request-Id` is
-NOT on the allowlist, so it is client-controlled — yet it is the billing
-idempotency key (`billing_event`'s primary key). The proxy gates it fail-closed
-(absent → server-generated `phoebe-<32 hex>`; >200 chars or non-printable-ASCII
-→ 400), so a client cannot dodge billing by omitting the header or wedge the
-drainer with an oversize value. What the gate canNOT stop is a client
-deliberately **resending a previously billed valid id**: the `ON CONFLICT
-(request_id) DO NOTHING` dedup treats it like a stream redelivery, so the
-replayed request is served but billed zero. At-least-once delivery makes
-request_id-dedup load-bearing, so the drainer cannot distinguish replay from
-redelivery; the true fix is an edge-stamped, allowlisted request id (same
-pattern as §3). Accepted gap until that lands.
+**Billing request identity:** public `X-Request-Id` is client-controlled and is
+therefore never the billing idempotency key. Atlas stamps a unique
+`X-Saturn-Request-Id` on every authorized attempt and Traefik copies it through
+an explicit allowlist, which also strips client spoofs. Phoebe uses that trusted
+value for `billing_event.request_id`, overwrites the engine-facing and response
+`X-Request-Id` with it for correlation, and locally generates a `phoebe-<32 hex>`
+value when the trusted header is absent during a rolling upgrade. Invalid
+trusted values fail closed. At-least-once stream redelivery retains the same
+trusted id and remains safely deduplicated by `ON CONFLICT (request_id) DO
+NOTHING`; replaying a public correlation id receives a fresh trusted id and a
+separate billable row.
 
 ---
 

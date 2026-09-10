@@ -77,6 +77,7 @@ func newTestServerE(t *testing.T, _ *url.URL, em metering.Emitter) *Server {
 // request a test expects to be FORWARDED must carry it.
 func setUpstream(req *http.Request, upstream *url.URL) {
 	req.Header.Set(identity.HeaderUpstream, upstream.Host)
+	req.Header.Set(identity.HeaderRequestID, "saturn-test-request-id")
 }
 
 func TestHealthz(t *testing.T) {
@@ -140,11 +141,8 @@ func TestProxyBillingGate(t *testing.T) {
 	}
 }
 
-// TestProxyRequestID_GeneratedWhenAbsent guards the served-but-never-billed
-// hole: X-Request-Id is client-controlled and the drainer poison-drops events
-// with an empty request_id, so a client that simply omits the header must NOT
-// escape billing. The proxy generates an id, uses it on the metering event,
-// forwards it upstream, and echoes it to the client for correlation.
+// TestProxyRequestID_GeneratedWhenTrustedHeaderAbsent protects rolling upgrades:
+// Phoebe mints a billing id when an older edge supplies no trusted header.
 func TestProxyRequestID_GeneratedWhenAbsent(t *testing.T) {
 	var mu sync.Mutex
 	var upstreamSaw string
@@ -163,6 +161,7 @@ func TestProxyRequestID_GeneratedWhenAbsent(t *testing.T) {
 	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions",
 		strings.NewReader(`{"model":"m","messages":[]}`))
 	setUpstream(req, upstream)
+	req.Header.Del(identity.HeaderRequestID)
 	req.Header.Set(identity.HeaderAuthID, "auth-1")
 	req.Header.Set(identity.HeaderResourceID, "model-abc")
 	// Deliberately NO X-Request-Id.
@@ -190,6 +189,39 @@ func TestProxyRequestID_GeneratedWhenAbsent(t *testing.T) {
 	}
 	if got := rr.Header().Get("X-Request-Id"); got != id {
 		t.Fatalf("response X-Request-Id = %q, want %q (client must learn the generated id)", got, id)
+	}
+}
+
+// Reusing a client-controlled correlation id must still produce two distinct
+// billing attempts. This is the regression test for served-but-unbilled replay.
+func TestProxyRequestID_ClientReplayCannotReuseBillingID(t *testing.T) {
+	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = w.Write([]byte(`{"model":"m1","usage":{"prompt_tokens":1,"completion_tokens":1}}`))
+	}))
+	defer backend.Close()
+	upstream, _ := url.Parse(backend.URL)
+	em := &recordingEmitter{}
+	srv := newTestServerE(t, upstream, em)
+
+	for i, trusted := range []string{"saturn-attempt-one", "saturn-attempt-two"} {
+		rr := httptest.NewRecorder()
+		req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", nil)
+		setUpstream(req, upstream)
+		req.Header.Set(identity.HeaderAuthID, "auth-1")
+		req.Header.Set(identity.HeaderResourceID, "model-abc")
+		req.Header.Set(requestIDHeader, "client-replayed-id")
+		req.Header.Set(identity.HeaderRequestID, trusted)
+		srv.Handler().ServeHTTP(rr, req)
+		if rr.Code != http.StatusOK {
+			t.Fatalf("attempt %d status = %d, want 200", i, rr.Code)
+		}
+		if got := rr.Header().Get(requestIDHeader); got != trusted {
+			t.Fatalf("attempt %d response id = %q, want trusted %q", i, got, trusted)
+		}
+	}
+	events := em.waitForEvents(2, 2*time.Second)
+	if len(events) != 2 || events[0].RequestID == events[1].RequestID {
+		t.Fatalf("billing ids = %#v, want two distinct trusted attempts", events)
 	}
 }
 
@@ -229,7 +261,7 @@ func TestProxyRequestID_RejectsInvalid(t *testing.T) {
 			setUpstream(req, upstream)
 			req.Header.Set(identity.HeaderAuthID, "auth-1")
 			req.Header.Set(identity.HeaderResourceID, "model-abc")
-			req.Header.Set("X-Request-Id", tt.requestID)
+			req.Header.Set(identity.HeaderRequestID, tt.requestID)
 			srv.Handler().ServeHTTP(rr, req)
 
 			if rr.Code != tt.wantStatus {
@@ -472,7 +504,7 @@ func TestProxyStreamingEndToEnd(t *testing.T) {
 	// injects: the catalog price key and the fine-tune checkpoint artifact id.
 	req.Header.Set(identity.HeaderBaseModel, "meta-llama/Llama-3.1-8B-Instruct")
 	req.Header.Set(identity.HeaderAdapter, "ckpt-artifact-42")
-	req.Header.Set("X-Request-Id", "req-123")
+	req.Header.Set(identity.HeaderRequestID, "req-123")
 
 	srv.Handler().ServeHTTP(rr, req)
 

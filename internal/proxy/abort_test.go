@@ -87,7 +87,7 @@ func doAbortRequest(t *testing.T, srv *Server, upstream *url.URL, delayBeforeCan
 	req.Header.Set(identity.HeaderResourceID, "model-abc")
 	req.Header.Set(identity.HeaderGroupID, "org-1")
 	req.Header.Set(identity.HeaderUserID, "user-1")
-	req.Header.Set("X-Request-Id", "req-abort")
+	req.Header.Set(identity.HeaderRequestID, "req-abort")
 
 	rr := httptest.NewRecorder()
 	srv.Handler().ServeHTTP(rr, req)
@@ -259,7 +259,7 @@ func TestNormalCompletionNotAffectedByAbortWatcher(t *testing.T) {
 	req.Header.Set(identity.HeaderResourceID, "model-abc")
 	req.Header.Set(identity.HeaderGroupID, "org-1")
 	req.Header.Set(identity.HeaderUserID, "user-1")
-	req.Header.Set("X-Request-Id", "req-normal")
+	req.Header.Set(identity.HeaderRequestID, "req-normal")
 	rr := httptest.NewRecorder()
 	srv.Handler().ServeHTTP(rr, req)
 
@@ -322,7 +322,7 @@ func TestAbortRaceStress(t *testing.T) {
 			req.Header.Set(identity.HeaderResourceID, "model-abc")
 			req.Header.Set(identity.HeaderGroupID, "org-1")
 			req.Header.Set(identity.HeaderUserID, "user-1")
-			req.Header.Set("X-Request-Id", fmt.Sprintf("req-%d", i))
+			req.Header.Set(identity.HeaderRequestID, fmt.Sprintf("req-%d", i))
 			rr := httptest.NewRecorder()
 			srv.Handler().ServeHTTP(rr, req)
 		}(i)
@@ -390,7 +390,7 @@ func TestLongStreamNoDeadlineSever(t *testing.T) {
 	req.Header.Set(identity.HeaderResourceID, "model-abc")
 	req.Header.Set(identity.HeaderGroupID, "org-1")
 	req.Header.Set(identity.HeaderUserID, "user-1")
-	req.Header.Set("X-Request-Id", "req-long")
+	req.Header.Set(identity.HeaderRequestID, "req-long")
 	rr := httptest.NewRecorder()
 	srv.Handler().ServeHTTP(rr, req)
 
