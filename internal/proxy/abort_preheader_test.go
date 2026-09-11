@@ -96,8 +96,8 @@ func TestPreHeaderAbortEmitsAttributableEvent(t *testing.T) {
 	if e.AuthID != "auth-1" || e.ResourceID != "model-abc" {
 		t.Fatalf("pre-header abort event must be attributable (AuthID+ResourceID): %+v", e)
 	}
-	if e.RequestID != "req-preheader-abort" {
-		t.Fatalf("pre-header abort RequestID = %q, want req-preheader-abort", e.RequestID)
+	if !strings.HasPrefix(e.RequestID, "phoebe-") || e.RequestID == "req-preheader-abort" {
+		t.Fatalf("pre-header abort RequestID = %q, want fresh Phoebe attempt id", e.RequestID)
 	}
 }
 

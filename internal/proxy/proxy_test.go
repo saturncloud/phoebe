@@ -8,7 +8,6 @@ import (
 	"net/url"
 	"strings"
 	"sync"
-	"sync/atomic"
 	"testing"
 	"time"
 
@@ -77,6 +76,7 @@ func newTestServerE(t *testing.T, _ *url.URL, em metering.Emitter) *Server {
 // request a test expects to be FORWARDED must carry it.
 func setUpstream(req *http.Request, upstream *url.URL) {
 	req.Header.Set(identity.HeaderUpstream, upstream.Host)
+	req.Header.Set("X-Request-Id", "saturn-test-request-id")
 }
 
 func TestHealthz(t *testing.T) {
@@ -140,11 +140,8 @@ func TestProxyBillingGate(t *testing.T) {
 	}
 }
 
-// TestProxyRequestID_GeneratedWhenAbsent guards the served-but-never-billed
-// hole: X-Request-Id is client-controlled and the drainer poison-drops events
-// with an empty request_id, so a client that simply omits the header must NOT
-// escape billing. The proxy generates an id, uses it on the metering event,
-// forwards it upstream, and echoes it to the client for correlation.
+// TestProxyRequestID_GeneratedWhenAbsent verifies Phoebe mints the billing id
+// itself and uses that one value for upstream, response, and metering.
 func TestProxyRequestID_GeneratedWhenAbsent(t *testing.T) {
 	var mu sync.Mutex
 	var upstreamSaw string
@@ -163,6 +160,7 @@ func TestProxyRequestID_GeneratedWhenAbsent(t *testing.T) {
 	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions",
 		strings.NewReader(`{"model":"m","messages":[]}`))
 	setUpstream(req, upstream)
+	req.Header.Del("X-Request-Id")
 	req.Header.Set(identity.HeaderAuthID, "auth-1")
 	req.Header.Set(identity.HeaderResourceID, "model-abc")
 	// Deliberately NO X-Request-Id.
@@ -179,9 +177,6 @@ func TestProxyRequestID_GeneratedWhenAbsent(t *testing.T) {
 	if !strings.HasPrefix(id, "phoebe-") || len(id) != len("phoebe-")+32 {
 		t.Fatalf("generated request id = %q, want phoebe-<32 hex>", id)
 	}
-	if !validRequestID(id) {
-		t.Fatalf("generated id %q fails our own validity gate", id)
-	}
 	mu.Lock()
 	saw := upstreamSaw
 	mu.Unlock()
@@ -193,57 +188,41 @@ func TestProxyRequestID_GeneratedWhenAbsent(t *testing.T) {
 	}
 }
 
-// TestProxyRequestID_RejectsInvalid is the fail-closed gate on the billing
-// idempotency PK: an oversize id would poison the drainer's batch INSERT
-// (VARCHAR(255)), and non-printable bytes are a billing-integrity attack, not
-// a normal request. Invalid ids get a 400 before any upstream work and emit
-// no billing event.
-func TestProxyRequestID_RejectsInvalid(t *testing.T) {
-	tests := []struct {
-		name       string
-		requestID  string
-		wantStatus int
-	}{
-		{"valid passes", "req-abc.123_OK", http.StatusOK},
-		{"max length passes", strings.Repeat("a", 200), http.StatusOK},
-		{"over max length rejected", strings.Repeat("a", 201), http.StatusBadRequest},
-		{"space rejected", "req 123", http.StatusBadRequest},
-		{"control byte rejected", "req\x01id", http.StatusBadRequest},
-		{"DEL byte rejected", "req\x7fid", http.StatusBadRequest},
-		{"non-ASCII rejected", "rëq-1", http.StatusBadRequest},
+// Reusing a client-controlled correlation id must still produce two distinct
+// billing attempts. This is the regression test for served-but-unbilled replay.
+func TestProxyRequestID_ClientReplayCannotReuseBillingID(t *testing.T) {
+	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = w.Write([]byte(`{"model":"m1","usage":{"prompt_tokens":1,"completion_tokens":1}}`))
+	}))
+	defer backend.Close()
+	upstream, _ := url.Parse(backend.URL)
+	em := &recordingEmitter{}
+	srv := newTestServerE(t, upstream, em)
+
+	responseIDs := make([]string, 0, 2)
+	for i := 0; i < 2; i++ {
+		rr := httptest.NewRecorder()
+		req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", nil)
+		setUpstream(req, upstream)
+		req.Header.Set(identity.HeaderAuthID, "auth-1")
+		req.Header.Set(identity.HeaderResourceID, "model-abc")
+		req.Header.Set(requestIDHeader, "client-replayed-id")
+		srv.Handler().ServeHTTP(rr, req)
+		if rr.Code != http.StatusOK {
+			t.Fatalf("attempt %d status = %d, want 200", i, rr.Code)
+		}
+		got := rr.Header().Get(requestIDHeader)
+		if !strings.HasPrefix(got, "phoebe-") || got == "client-replayed-id" {
+			t.Fatalf("attempt %d response id = %q, want Phoebe-generated id", i, got)
+		}
+		responseIDs = append(responseIDs, got)
 	}
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			var upstreamHits int32
-			backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
-				atomic.AddInt32(&upstreamHits, 1)
-				_, _ = w.Write([]byte(`{"ok":true}`))
-			}))
-			defer backend.Close()
-			upstream, _ := url.Parse(backend.URL)
-			em := &recordingEmitter{}
-			srv := newTestServerE(t, upstream, em)
-
-			rr := httptest.NewRecorder()
-			req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", nil)
-			setUpstream(req, upstream)
-			req.Header.Set(identity.HeaderAuthID, "auth-1")
-			req.Header.Set(identity.HeaderResourceID, "model-abc")
-			req.Header.Set("X-Request-Id", tt.requestID)
-			srv.Handler().ServeHTTP(rr, req)
-
-			if rr.Code != tt.wantStatus {
-				t.Fatalf("status = %d, want %d", rr.Code, tt.wantStatus)
-			}
-			if tt.wantStatus == http.StatusBadRequest {
-				if n := atomic.LoadInt32(&upstreamHits); n != 0 {
-					t.Fatalf("invalid id reached upstream %d times, want 0 (reject before forwarding)", n)
-				}
-				if got := em.count(); got != 0 {
-					t.Fatalf("rejected request emitted %d billing events, want 0", got)
-				}
-			}
-		})
+	events := em.waitForEvents(2, 2*time.Second)
+	if len(events) != 2 || events[0].RequestID == events[1].RequestID {
+		t.Fatalf("billing ids = %#v, want two distinct Phoebe attempts", events)
+	}
+	if events[0].RequestID != responseIDs[0] || events[1].RequestID != responseIDs[1] {
+		t.Fatalf("event ids do not match response ids: events=%#v responses=%#v", events, responseIDs)
 	}
 }
 
@@ -491,7 +470,7 @@ func TestProxyStreamingEndToEnd(t *testing.T) {
 		t.Fatalf("expected 1 metering event, got %d", len(events))
 	}
 	e := events[0]
-	if e.RequestID != "req-123" || e.GroupID != "org-1" || e.UserID != "user-1" {
+	if !strings.HasPrefix(e.RequestID, "phoebe-") || e.RequestID == "req-123" || e.GroupID != "org-1" || e.UserID != "user-1" {
 		t.Fatalf("event identity wrong: %+v", e)
 	}
 	if e.AuthID != "auth-key-7" {

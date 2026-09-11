@@ -40,50 +40,13 @@ import (
 	"github.com/saturncloud/phoebe/internal/metering"
 )
 
-// requestIDHeader is the per-request idempotency key. vLLM/the router echo a
-// request id; we also accept an inbound one. Captured for the metering event.
-//
-// SECURITY: unlike the X-Saturn-* identity headers, X-Request-Id is NOT on the
-// Traefik auth-server allowlist — it is client-controlled. The value becomes
-// billing_event's PRIMARY KEY (the billing idempotency key), so garbage here is
-// a billing-integrity attack surface, the same class as the identity gate in
-// handleProxy: an omitted id would make the event undecodable downstream
-// (served-but-never-billed), and an oversize/binary one would poison the
-// drainer's batch INSERT. handleProxy therefore generates an id when absent and
-// fails closed (400) on an invalid one.
-//
-// KNOWN LIMITATION: server-side generation does not stop a client deliberately
-// RESENDING a previously billed valid id — the billing_event PK dedups it, so
-// the replayed request is served but stores no new row (free inference). The
-// drainer cannot distinguish client replay from at-least-once stream
-// redelivery, so the true fix lives at the auth/edge layer (an allowlisted,
-// edge-stamped id). Documented in DESIGN.md §1 (trust model).
+// requestIDHeader is the public request-correlation header. It is never trusted
+// as billing_event's idempotency key: clients can choose and replay it.
 const requestIDHeader = "X-Request-Id"
 
-// maxRequestIDLen bounds an inbound X-Request-Id. The billing_event PK column
-// is VARCHAR(255); 200 leaves headroom so a valid id can never fail the
-// drainer's INSERT on length.
-const maxRequestIDLen = 200
-
-// validRequestID reports whether a client-supplied X-Request-Id is safe to use
-// as the billing idempotency key: at most maxRequestIDLen bytes, every byte in
-// [\x21-\x7e] (printable ASCII, no spaces/control bytes). Anything else is
-// rejected fail-closed — see the requestIDHeader comment for why.
-func validRequestID(id string) bool {
-	if len(id) > maxRequestIDLen {
-		return false
-	}
-	for i := 0; i < len(id); i++ {
-		if id[i] < 0x21 || id[i] > 0x7e {
-			return false
-		}
-	}
-	return true
-}
-
-// generateRequestID mints a server-side request id (16 bytes crypto/rand, hex)
-// for requests that arrive without one, so omitting the header can never dodge
-// billing. The "phoebe-" prefix makes generated ids recognisable downstream.
+// generateRequestID mints the internal billing-attempt id at Phoebe ingress.
+// It is called exactly once per inbound inference request; retries and durable
+// emitter redeliveries retain the resulting value on the same metering event.
 func generateRequestID() (string, error) {
 	var b [16]byte
 	if _, err := rand.Read(b[:]); err != nil {
@@ -251,35 +214,22 @@ func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Request-id gate: the id is the billing idempotency PK and X-Request-Id is
-	// client-controlled (not on the Traefik allowlist), so it gets the same
-	// fail-closed treatment as the identity gate above. Absent → generate (a
-	// client must never be served-but-unbilled by simply omitting the header);
-	// invalid → 400 (an oversize or non-printable id is a billing-integrity
-	// attack, not a normal request). See the requestIDHeader comment for the
-	// full threat model, including the deliberate-reuse limitation.
-	requestID := r.Header.Get(requestIDHeader)
-	switch {
-	case requestID == "":
-		generated, err := generateRequestID()
-		if err != nil {
-			// crypto/rand failing means we cannot mint the billing key; fail
-			// closed rather than serve an unbillable request.
-			s.log.Error.Printf("generate request id: %v", err)
-			http.Error(w, "internal error", http.StatusInternalServerError)
-			return
-		}
-		requestID = generated
-		// Propagate the generated id onto the forwarded request so upstream
-		// logs correlate; the response header is set in ModifyResponse below.
-		r.Header.Set(requestIDHeader, requestID)
-	case !validRequestID(requestID):
-		s.log.Warn.Printf("rejecting invalid %s (len=%d) resource=%s auth=%s",
-			requestIDHeader, len(requestID), id.ResourceID, id.AuthID)
-		http.Error(w, "invalid "+requestIDHeader+": must be at most 200 printable ASCII (no spaces) characters",
-			http.StatusBadRequest)
+	// Never use the public X-Request-Id as billing_event's primary key: clients
+	// can replay it. Mint a fresh attempt id after the billing identity gate and
+	// before any forwarding. The one value is then captured by all retries and
+	// by the metering event's at-least-once delivery path.
+	requestID, err := generateRequestID()
+	if err != nil {
+		// crypto/rand failing means we cannot mint the billing key; fail closed
+		// rather than serve an unbillable request.
+		s.log.Error.Printf("generate request id: %v", err)
+		http.Error(w, "internal error", http.StatusInternalServerError)
 		return
 	}
+	// Replace, never preserve, the client correlation id on the engine-facing
+	// request. The response echoes this authoritative id for support/billing
+	// correlation, retaining the existing API shape.
+	r.Header.Set(requestIDHeader, requestID)
 
 	// The forward target comes ONLY from the X-Saturn-Upstream header that Atlas
 	// injected on this deployment's per-subdomain route (see identity.HeaderUpstream).

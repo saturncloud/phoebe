@@ -165,8 +165,8 @@ func TestIOLog_ShouldLogTrue_ProducesRecord(t *testing.T) {
 		t.Fatalf("ShouldLog=true must produce exactly 1 record, got %d", len(recs))
 	}
 	rec := recs[0]
-	if rec.RequestID != "req-iolog-1" {
-		t.Errorf("RequestID = %q", rec.RequestID)
+	if !strings.HasPrefix(rec.RequestID, "phoebe-") || rec.RequestID == "req-iolog-1" {
+		t.Errorf("RequestID = %q, want fresh Phoebe attempt id", rec.RequestID)
 	}
 	if rec.AuthID != "auth-key-7" || rec.GroupID != "org-1" || rec.UserID != "user-1" {
 		t.Errorf("identity wrong: %+v", rec)
@@ -360,7 +360,7 @@ func TestIOLog_RequestTruncationLogged(t *testing.T) {
 		if !strings.Contains(out, "request body truncated") {
 			t.Fatalf("no truncation WARN logged; got %q", out)
 		}
-		if !strings.Contains(out, "request_id=req-iolog-1") {
+		if !strings.Contains(out, "request_id="+recs[0].RequestID) {
 			t.Errorf("WARN missing request_id; got %q", out)
 		}
 		if !strings.Contains(out, "500 → 100 bytes") {
