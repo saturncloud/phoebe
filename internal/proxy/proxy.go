@@ -367,6 +367,15 @@ func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request) {
 		r.Header.Set("X-Tenant-ID", tenant)
 		r.Header.Set("X-Dynamo-Request-Priority", strconv.FormatInt(tier.DynamoPriority, 10))
 		r.Header.Set("X-Dynamo-Request-Strict-Priority", strconv.FormatInt(tier.DynamoStrictPriority, 10))
+		for _, header := range []string{
+			"X-Dynamo-Worker-Instance-ID", "X-Dynamo-Prefill-Instance-ID",
+			"X-Dynamo-DP-Rank", "X-Dynamo-Prefill-DP-Rank",
+			// Dynamo 1.4 retains these aliases for compatibility.
+			"X-Worker-Instance-ID", "X-Prefill-Instance-ID",
+			"X-DP-Rank", "X-Data-Parallel-Rank", "X-Prefill-DP-Rank",
+		} {
+			r.Header.Del(header)
+		}
 		if s.admitter != nil {
 			graph := id.GraphK8sName
 			if graph == "" {

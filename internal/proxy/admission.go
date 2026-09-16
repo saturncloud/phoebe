@@ -74,6 +74,17 @@ func prepareSharedDynamoRequest(body []byte, org string, maxOutput int64, tier c
 			hints = map[string]json.RawMessage{}
 		}
 	}
+	// Direct worker/rank selection bypasses load- and cache-aware routing.
+	// Pre-tokenized input bypasses Dynamo's authoritative rendering/tokenization.
+	// Speculative prefill creates unreserved background engine work. None are
+	// safe client controls on a shared multi-tenant graph.
+	for _, key := range []string{
+		"backend_instance_id", "prefill_worker_id", "decode_worker_id",
+		"dp_rank", "prefill_dp_rank", "token_data",
+	} {
+		delete(nvext, key)
+	}
+	delete(hints, "speculative_prefill")
 
 	tenantHash := sha256.Sum256([]byte("phoebe-dynamo-tenant\x00" + org))
 	tenant := fmt.Sprintf("saturn-%x", tenantHash[:])
@@ -86,6 +97,9 @@ func prepareSharedDynamoRequest(body []byte, org string, maxOutput int64, tier c
 		return nil
 	}
 	if err := setJSON(nvext, "cache_salt", tenant); err != nil {
+		return nil, "", err
+	}
+	if err := setJSON(root, "cache_salt", tenant); err != nil {
 		return nil, "", err
 	}
 	if err := setJSON(hints, "priority", tier.DynamoPriority); err != nil {

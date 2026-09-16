@@ -289,20 +289,23 @@ func TestAdmissionWorkRejectsAmbiguousOrImpossibleRequests(t *testing.T) {
 }
 
 func TestPrepareSharedDynamoRequestOverwritesUntrustedHints(t *testing.T) {
-	body := []byte(`{"model":"m","max_tokens":41,"stream":true,"stream_options":{"include_usage":false},"nvext":{"cache_salt":"attacker","keep":"yes","agent_hints":{"priority":2147483647,"strict_priority":4294967295,"osl":1,"speculative_prefill":true}}}`)
+	body := []byte(`{"model":"m","max_tokens":41,"stream":true,"stream_options":{"include_usage":false},"cache_salt":"attacker","nvext":{"cache_salt":"attacker","keep":"yes","backend_instance_id":99,"token_data":[1,2],"agent_hints":{"priority":2147483647,"strict_priority":4294967295,"osl":1,"speculative_prefill":true}}}`)
 	tier := config.AdmissionTier{DynamoPriority: 9, DynamoStrictPriority: 2}
 	out, tenant, err := prepareSharedDynamoRequest(body, "org-a", 41, tier)
 	if err != nil {
 		t.Fatal(err)
 	}
 	var got struct {
+		CacheSalt     string `json:"cache_salt"`
 		StreamOptions struct {
 			IncludeUsage bool `json:"include_usage"`
 		} `json:"stream_options"`
 		Nvext struct {
-			CacheSalt string `json:"cache_salt"`
-			Keep      string `json:"keep"`
-			Hints     struct {
+			CacheSalt         string           `json:"cache_salt"`
+			Keep              string           `json:"keep"`
+			BackendInstanceID *json.RawMessage `json:"backend_instance_id"`
+			TokenData         *json.RawMessage `json:"token_data"`
+			Hints             struct {
 				Priority           int64 `json:"priority"`
 				StrictPriority     int64 `json:"strict_priority"`
 				OSL                int64 `json:"osl"`
@@ -313,13 +316,13 @@ func TestPrepareSharedDynamoRequestOverwritesUntrustedHints(t *testing.T) {
 	if err := json.Unmarshal(out, &got); err != nil {
 		t.Fatal(err)
 	}
-	if tenant == "" || got.Nvext.CacheSalt != tenant {
-		t.Fatalf("cache salt=%q tenant=%q", got.Nvext.CacheSalt, tenant)
+	if tenant == "" || got.Nvext.CacheSalt != tenant || got.CacheSalt != tenant {
+		t.Fatalf("cache salts=(%q,%q) tenant=%q", got.CacheSalt, got.Nvext.CacheSalt, tenant)
 	}
 	if got.Nvext.Hints.Priority != 9 || got.Nvext.Hints.StrictPriority != 2 || got.Nvext.Hints.OSL != 41 {
 		t.Fatalf("trusted hints not applied: %+v", got.Nvext.Hints)
 	}
-	if got.Nvext.Keep != "yes" || !got.Nvext.Hints.SpeculativePrefill || !got.StreamOptions.IncludeUsage {
+	if got.Nvext.Keep != "yes" || got.Nvext.BackendInstanceID != nil || got.Nvext.TokenData != nil || got.Nvext.Hints.SpeculativePrefill || !got.StreamOptions.IncludeUsage {
 		t.Fatalf("unrelated extensions or usage flag lost: %+v", got)
 	}
 	_, otherTenant, err := prepareSharedDynamoRequest(body, "org-b", 41, tier)
@@ -355,6 +358,7 @@ func TestProxyForwardsOnlyTrustedDynamoHints(t *testing.T) {
 	req.Header.Set("X-Tenant-ID", "attacker")
 	req.Header.Set("X-Dynamo-Request-Priority", "2147483647")
 	req.Header.Set("X-Dynamo-Request-Strict-Priority", "4294967295")
+	req.Header.Set("X-Dynamo-Worker-Instance-ID", "99")
 	req.Body = http.NoBody
 	req.Body = io.NopCloser(strings.NewReader(`{"model":"model-a","max_tokens":20,"nvext":{"cache_salt":"attacker","agent_hints":{"priority":999}}}`))
 	rr := httptest.NewRecorder()
@@ -371,6 +375,9 @@ func TestProxyForwardsOnlyTrustedDynamoHints(t *testing.T) {
 	}
 	if got := forwarded.Header.Get("X-Dynamo-Request-Strict-Priority"); got != "4" {
 		t.Fatalf("forwarded strict-priority header=%q", got)
+	}
+	if got := forwarded.Header.Get("X-Dynamo-Worker-Instance-ID"); got != "" {
+		t.Fatalf("forwarded direct-worker header=%q", got)
 	}
 	var payload struct {
 		Nvext struct {

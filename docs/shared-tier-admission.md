@@ -51,7 +51,10 @@ Phoebe derives `X-Tenant-ID` and `nvext.cache_salt` from a one-way hash of the
 trusted organization identity. Dynamo gives the header precedence and uses it
 for router and backend cache namespacing, preventing identical prompts from
 sharing KV entries across organizations without disclosing the Saturn org id.
-Unrelated `nvext` fields are preserved.
+Phoebe removes direct worker/rank selection, pre-tokenized input, and
+speculative-prefill hints: those controls would bypass routing/tokenization or
+create background work outside the request's reservation. Unrelated `nvext`
+fields are preserved.
 
 Dynamo tokenizes the rendered prompt and its WSPT queue charges uncached prompt
 tokens. Phoebe intentionally keeps a conservative full-request-byte
