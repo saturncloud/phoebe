@@ -16,7 +16,8 @@ import (
 
 func limits(active int64) config.AdmissionLimits {
 	return config.AdmissionLimits{MaxActiveRequests: active, MaxConcurrentPrefills: active,
-		MaxPromptBytes: 1024, MaxReservedOutputTokens: 1024, MaxActiveAdapters: active,
+		MaxActiveDecodes: active,
+		MaxPromptBytes:   1024, MaxReservedOutputTokens: 1024, MaxActiveAdapters: active,
 		RequestsPerWindow: 100, GeneratedTokensPerWindow: 1000, MaxColdHolds: active,
 		WakesPerWindow: 100, Window: time.Minute}
 }
@@ -146,6 +147,30 @@ func TestPrefillReservationReleasesAtResponseHeaders(t *testing.T) {
 		t.Fatalf("prefill release did not open capacity: %v", err)
 	}
 	_ = first.Complete(context.Background(), 0)
+	_ = second.Complete(context.Background(), 0)
+}
+
+func TestDecodeReservationHeldUntilCompletion(t *testing.T) {
+	l := limits(2)
+	l.MaxActiveDecodes = 1
+	a, _ := testAdmitter(t, config.AdmissionSettings{Platform: l})
+	first, err := a.Admit(context.Background(), request("a", "m"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err = first.PrefillDone(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if _, err = a.Admit(context.Background(), request("b", "m")); err == nil {
+		t.Fatal("decode slot released at the prefill boundary")
+	}
+	if err = first.Complete(context.Background(), 1); err != nil {
+		t.Fatal(err)
+	}
+	second, err := a.Admit(context.Background(), request("b", "m"))
+	if err != nil {
+		t.Fatalf("completed decode leaked its slot: %v", err)
+	}
 	_ = second.Complete(context.Background(), 0)
 }
 

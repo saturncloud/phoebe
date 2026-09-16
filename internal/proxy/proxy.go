@@ -360,10 +360,15 @@ func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request) {
 			s.writeAdmissionError(w, err)
 			return
 		}
-		keepaliveCtx, stopKeepalive := context.WithCancel(context.Background())
-		defer stopKeepalive()
-		go admitted.KeepAlive(keepaliveCtx, func(e error) {
+		// Renewal failure means the distributed authority can no longer prove
+		// this request owns capacity. Cancel the upstream request rather than
+		// merely logging and allowing an unaccounted stream to continue.
+		proxyCtx, stopProxy := context.WithCancelCause(r.Context())
+		r = r.WithContext(proxyCtx)
+		defer stopProxy(nil)
+		go admitted.KeepAlive(proxyCtx, func(e error) {
 			s.log.Error.Printf("admission: lease renewal failed for request_id=%s: %v", requestID, e)
+			stopProxy(e)
 		})
 		// Safety net for every early return. Normal response completion wins the
 		// lease's idempotent Complete race and charges actual generated tokens.
@@ -526,6 +531,10 @@ func (s *Server) errorHandler(upstream string, id identity.Identity, requestID s
 			if e := admitted.Complete(context.WithoutCancel(r.Context()), 0); e != nil {
 				s.log.Error.Printf("admission: upstream-failure release failed: %v", e)
 			}
+		}
+		if cause := context.Cause(r.Context()); errors.Is(cause, admission.ErrUnavailable) {
+			s.writeAdmissionError(w, cause)
+			return
 		}
 		if isClientAbort(err) {
 			s.log.Debug.Printf("client disconnected for %s", upstream)

@@ -174,6 +174,51 @@ func TestAdmissionReleasesAbortedStream(t *testing.T) {
 	_ = lease.Complete(context.Background(), 0)
 }
 
+func TestAdmissionRenewalFailureCancelsUpstreamAndReturns503(t *testing.T) {
+	started := make(chan struct{})
+	releaseBackend := make(chan struct{})
+	backend := httptest.NewServer(http.HandlerFunc(func(_ http.ResponseWriter, r *http.Request) {
+		close(started)
+		select {
+		case <-r.Context().Done():
+		case <-releaseBackend:
+		}
+	}))
+	defer backend.Close()
+	defer close(releaseBackend)
+	up, _ := url.Parse(backend.URL)
+	mr := miniredis.RunT(t)
+	cfg := proxyAdmissionConfig(1)
+	cfg.LeaseTTL = 30 * time.Millisecond
+	client := redis.NewClient(&redis.Options{
+		Addr: mr.Addr(), DialTimeout: 20 * time.Millisecond, ReadTimeout: 20 * time.Millisecond,
+		WriteTimeout: 20 * time.Millisecond, MaxRetries: 0,
+	})
+	defer client.Close()
+	s := New(&config.Settings{Admission: cfg}, logging.New(logging.ERROR), &recordingEmitter{}).
+		WithAdmitter(admission.New(client, cfg))
+	rr := httptest.NewRecorder()
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		s.Handler().ServeHTTP(rr, sharedRequest(up))
+	}()
+	select {
+	case <-started:
+	case <-time.After(time.Second):
+		t.Fatal("request never reached upstream")
+	}
+	mr.Close()
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("proxy did not cancel upstream after lease renewal failed")
+	}
+	if rr.Code != http.StatusServiceUnavailable {
+		t.Fatalf("status=%d, want 503 after admission authority loss", rr.Code)
+	}
+}
+
 func TestDedicatedTrafficBypassesSharedAdmission(t *testing.T) {
 	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		_, _ = w.Write([]byte(`{"model":"model-a","usage":{"prompt_tokens":1,"completion_tokens":1}}`))
@@ -198,5 +243,14 @@ func TestAdmissionWorkRejectsAmbiguousOrImpossibleRequests(t *testing.T) {
 	}
 	if model, n, ok := admissionWork([]byte(`{"model":"m"}`), 10); !ok || model != "m" || n != 10 {
 		t.Fatalf("defaults=(%q,%d,%t)", model, n, ok)
+	}
+	for _, body := range []string{
+		`{"model":"m","model":"other","max_tokens":2}`,
+		`{"model":"m","max_tokens":200,"max_tokens":2}`,
+		`{"model":"m","max_completion_tokens":200,"max_completion_tokens":2}`,
+	} {
+		if _, _, ok := admissionWork([]byte(body), 10); ok {
+			t.Fatalf("ambiguous admission work accepted: %s", body)
+		}
 	}
 }

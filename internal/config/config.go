@@ -77,6 +77,7 @@ type Settings struct {
 type AdmissionLimits struct {
 	MaxActiveRequests        int64         `yaml:"maxActiveRequests"`
 	MaxConcurrentPrefills    int64         `yaml:"maxConcurrentPrefills"`
+	MaxActiveDecodes         int64         `yaml:"maxActiveDecodes"`
 	MaxPromptBytes           int64         `yaml:"maxPromptBytes"`
 	MaxReservedOutputTokens  int64         `yaml:"maxReservedOutputTokens"`
 	MaxActiveAdapters        int64         `yaml:"maxActiveAdapters"`
@@ -361,13 +362,13 @@ func (a *AdmissionSettings) parse() error {
 }
 
 func limitValues(l AdmissionLimits) []int64 {
-	return []int64{l.MaxActiveRequests, l.MaxConcurrentPrefills, l.MaxPromptBytes,
+	return []int64{l.MaxActiveRequests, l.MaxConcurrentPrefills, l.MaxActiveDecodes, l.MaxPromptBytes,
 		l.MaxReservedOutputTokens, l.MaxActiveAdapters, l.RequestsPerWindow,
 		l.GeneratedTokensPerWindow, l.MaxColdHolds, l.WakesPerWindow}
 }
 
 func (a *AdmissionSettings) validateTierShares() error {
-	names := []string{"maxActiveRequests", "maxConcurrentPrefills", "maxPromptBytes",
+	names := []string{"maxActiveRequests", "maxConcurrentPrefills", "maxActiveDecodes", "maxPromptBytes",
 		"maxReservedOutputTokens", "maxActiveAdapters", "requestsPerWindow",
 		"generatedTokensPerWindow", "maxColdHolds", "wakesPerWindow"}
 	platform := limitValues(a.Platform)
@@ -396,7 +397,7 @@ func (a *AdmissionSettings) validateTierShares() error {
 }
 
 func (l *AdmissionLimits) parse(name string) error {
-	values := []int64{l.MaxActiveRequests, l.MaxConcurrentPrefills, l.MaxPromptBytes, l.MaxReservedOutputTokens, l.MaxActiveAdapters,
+	values := []int64{l.MaxActiveRequests, l.MaxConcurrentPrefills, l.MaxActiveDecodes, l.MaxPromptBytes, l.MaxReservedOutputTokens, l.MaxActiveAdapters,
 		l.RequestsPerWindow, l.GeneratedTokensPerWindow, l.MaxColdHolds, l.WakesPerWindow}
 	for _, value := range values {
 		if value < 0 {

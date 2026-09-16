@@ -74,14 +74,18 @@ emit:
 # Distributed admission for the SHARED serving tier (OFF by default). This is
 # physical protection, not a billing or contractual quota. All Phoebe replicas
 # must use the same Valkey. Runtime Valkey failure returns 503 before Dynamo;
-# there is deliberately no process-local fallback that could over-admit.
+# renewal failure cancels the affected upstream request so an expired lease
+# cannot become unaccounted work. There is deliberately no process-local
+# fallback that could over-admit.
 #
 # Each request is checked atomically at platform, serving-graph, organization,
 # and organization×model scopes. Prompt work is the complete OpenAI JSON body
 # size (Phoebe cannot safely duplicate model-specific template/tokenizer state);
 # output is max_completion_tokens/max_tokens, or defaultMaxOutputTokens.
-# Leases release prefill/input work at the first upstream body byte and active/output work
-# at response completion/abort/failure. Live streams renew their lease;
+# Decode slots are reserved before forwarding because a proxy cannot safely
+# queue once the engine starts responding. Leases release prefill/input work at
+# the first upstream body byte and active/decode/output work at completion,
+# abort, or failure. Live streams renew their lease;
 # leaseTtl is the crash-recovery bound when a replica stops renewing.
 #
 # Tier lanes are hard protected partitions. organizationTiers is operator-owned
@@ -97,6 +101,7 @@ emit:
 #   platform:
 #     maxActiveRequests: 256
 #     maxConcurrentPrefills: 32
+#     maxActiveDecodes: 224
 #     maxPromptBytes: 67108864
 #     maxReservedOutputTokens: 262144
 #     maxActiveAdapters: 128
@@ -108,6 +113,7 @@ emit:
 #   graph:
 #     maxActiveRequests: 64
 #     maxConcurrentPrefills: 8
+#     maxActiveDecodes: 56
 #     maxPromptBytes: 16777216
 #     maxReservedOutputTokens: 65536
 #     maxActiveAdapters: 32
@@ -119,6 +125,7 @@ emit:
 #   organization:
 #     maxActiveRequests: 32
 #     maxConcurrentPrefills: 4
+#     maxActiveDecodes: 28
 #     maxPromptBytes: 8388608
 #     maxReservedOutputTokens: 32768
 #     maxActiveAdapters: 16
@@ -130,6 +137,7 @@ emit:
 #   organizationModel:
 #     maxActiveRequests: 16
 #     maxConcurrentPrefills: 2
+#     maxActiveDecodes: 14
 #     maxPromptBytes: 4194304
 #     maxReservedOutputTokens: 16384
 #     maxActiveAdapters: 8
@@ -144,6 +152,7 @@ emit:
 #       limits: &tierLimits
 #         maxActiveRequests: 64
 #         maxConcurrentPrefills: 8
+#         maxActiveDecodes: 48
 #         maxPromptBytes: 16777216
 #         maxReservedOutputTokens: 65536
 #         maxActiveAdapters: 32
@@ -157,6 +166,7 @@ emit:
 #       limits:
 #         maxActiveRequests: 64
 #         maxConcurrentPrefills: 8
+#         maxActiveDecodes: 48
 #         maxPromptBytes: 16777216
 #         maxReservedOutputTokens: 65536
 #         maxActiveAdapters: 32

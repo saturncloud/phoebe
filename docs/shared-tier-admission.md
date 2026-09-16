@@ -9,7 +9,9 @@ Shared inference follows this path:
 Phoebe admits after atlas-auth has supplied trusted identity and after Phoebe
 has resolved and bound `(organization, model)`. It admits before the first
 engine request. The Valkey Lua transaction is the shared source of truth for
-every Phoebe replica; an unavailable store returns HTTP 503. A local fallback
+every Phoebe replica; an unavailable store returns HTTP 503. If that authority
+is lost during renewal, Phoebe cancels the affected upstream request rather
+than allowing its capacity lease to expire under live work. A local fallback
 would violate the global bound and is intentionally absent.
 
 ## Capability audit
@@ -19,7 +21,7 @@ would violate the global bound and is intentionally absent.
 | Authentication, route authorization, org/model registry | Already implemented | atlas-auth and Atlas decide access; Phoebe only consumes the trusted result. |
 | Platform, graph, org, org×model admission | Saturn-owned, implemented here | Atomic Valkey reservations in Phoebe. |
 | Concurrent prefills and input work | Saturn-owned, implemented conservatively | Phoebe reserves concurrent prefills and complete request-body bytes, then releases on the first upstream body byte. Model-specific rendered templates/token counts stay in the engine. |
-| Active decodes/streams and reserved output | Saturn-owned, implemented here | `max_tokens`/`max_completion_tokens` is reserved until completion, abort, timeout, rejection, or upstream failure. |
+| Active decodes/streams and reserved output | Saturn-owned, implemented here | A decode slot and `max_tokens`/`max_completion_tokens` are reserved before forwarding and held until completion, abort, timeout, rejection, or upstream failure. Reserving the slot early is conservative and avoids attempting to queue after response streaming begins. |
 | Request and generated-token windows | Saturn-owned, implemented here | Fixed operator-configured windows. Generated usage is charged from the engine's authoritative completion count; outstanding max-output reservations prevent overbooking. |
 | Cold holds and wake churn | Partially implemented before; completed here | Phoebe already detected/actuated wake-from-zero. Distributed hold and wake-window admission now surrounds actuation. |
 | Adapter and KV pressure | Partial | Phoebe bounds active adapter-bearing requests, prompt bytes, and reserved output as observable pressure proxies. Dynamo/vLLM owns real adapter residency, prefix cache, KV allocation, eviction, and batching. |
@@ -38,13 +40,17 @@ spend balance is used as a GPU-pressure signal.
 ## Lifecycle and crash recovery
 
 An admitted request owns a lease. Input/prefill counters release at response
-body byte; active stream, output, adapter, and generated-window reservation state
+body byte; active request/decode, output, adapter, and generated-window reservation state
 release at final body completion. The owning proxy renews the expiry throughout
 long streams. Pre-header aborts, upstream errors, ordinary
 rejections, wake failures, and handler early returns run the same idempotent
 release. A replica crash cannot execute cleanup, so every operation first reaps
 expired leases. `leaseTtl` is the maximum crash-leak interval, not a stream
 duration limit.
+
+Output-limit fields are accepted at most once in the top-level JSON object.
+Ambiguous duplicate keys are rejected before forwarding so Phoebe and the
+downstream JSON stack cannot select different values and under-reserve work.
 
 ## Rollout and rollback
 

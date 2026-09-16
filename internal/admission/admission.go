@@ -46,6 +46,7 @@ type scope struct {
 	Name      string `json:"name"`
 	Active    int64  `json:"active"`
 	Prefills  int64  `json:"prefills"`
+	Decodes   int64  `json:"decodes"`
 	Prompt    int64  `json:"prompt"`
 	Output    int64  `json:"output"`
 	Adapters  int64  `json:"adapters"`
@@ -161,6 +162,7 @@ func scaled(l config.AdmissionLimits, weight int64) config.AdmissionLimits {
 	}
 	l.MaxActiveRequests = mul(l.MaxActiveRequests)
 	l.MaxConcurrentPrefills = mul(l.MaxConcurrentPrefills)
+	l.MaxActiveDecodes = mul(l.MaxActiveDecodes)
 	l.MaxPromptBytes = mul(l.MaxPromptBytes)
 	l.MaxReservedOutputTokens = mul(l.MaxReservedOutputTokens)
 	l.MaxActiveAdapters = mul(l.MaxActiveAdapters)
@@ -178,7 +180,8 @@ func makeScope(name, id string, l config.AdmissionLimits) scope {
 	}
 	digest := sha256.Sum256([]byte(id))
 	return scope{ID: name + ":" + hex.EncodeToString(digest[:]), Name: name, Active: l.MaxActiveRequests, Prefills: l.MaxConcurrentPrefills,
-		Prompt: l.MaxPromptBytes, Output: l.MaxReservedOutputTokens, Adapters: l.MaxActiveAdapters,
+		Decodes: l.MaxActiveDecodes,
+		Prompt:  l.MaxPromptBytes, Output: l.MaxReservedOutputTokens, Adapters: l.MaxActiveAdapters,
 		Requests: l.RequestsPerWindow, Generated: l.GeneratedTokensPerWindow, Cold: l.MaxColdHolds,
 		Wakes: l.WakesPerWindow, WindowMs: windowMs}
 }

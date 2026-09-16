@@ -22,6 +22,14 @@ test:
 integration-test:
 	go test -tags=integration ./...
 
+# Exercises admission Lua atomics against a real Valkey/Redis-compatible server.
+# Example: PHOEBE_TEST_ADMISSION_VALKEY_ADDR=127.0.0.1:16379 make admission-integration-test
+.PHONY: admission-integration-test
+admission-integration-test:
+	@test -n "$$PHOEBE_TEST_ADMISSION_VALKEY_ADDR" || \
+		( echo "PHOEBE_TEST_ADMISSION_VALKEY_ADDR is required"; exit 1 )
+	go test -tags=admissionintegration ./internal/admission -run TestRealValkeyAtomicAdmission -count=1
+
 .PHONY: vet
 vet:
 	go vet ./...

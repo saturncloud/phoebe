@@ -15,6 +15,12 @@ import (
 // without duplicating engine state, so input work is intentionally the complete
 // JSON byte count; Dynamo remains authoritative for tokenization/KV placement.
 func admissionWork(body []byte, defaultOutput int64) (string, int64, bool) {
+	counts, err := countTopLevelKeys(body, map[string]struct{}{
+		"model": {}, "max_tokens": {}, "max_completion_tokens": {},
+	})
+	if err != nil || counts["model"] != 1 || counts["max_tokens"] > 1 || counts["max_completion_tokens"] > 1 {
+		return "", 0, false
+	}
 	var v struct {
 		Model               string `json:"model"`
 		MaxTokens           *int64 `json:"max_tokens"`

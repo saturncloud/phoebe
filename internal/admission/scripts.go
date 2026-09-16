@@ -32,6 +32,7 @@ end
 local function release_record(rec)
   for _,s in ipairs(rec.scopes) do
     add(field(s,'active'), -1)
+    add(field(s,'decodes'), -1)
     add(field(s,'output'), -rec.output)
     add(field(s,'genreserved'), -rec.output)
     if rec.adapter == 1 then add(field(s,'adapters'), -1) end
@@ -52,14 +53,14 @@ end
 var admitScript = redis.NewScript(luaHelpers + `
 local q=cjson.decode(ARGV[1]); q.now=current_time_ms(); reap(q.now)
 for _,s in ipairs(q.scopes) do
-  local checks={{'active',s.active,1},{'prefills',s.prefills,1},{'prompt',s.prompt,q.prompt},{'output',s.output,q.output},{'adapters',s.adapters,q.adapter}}
+  local checks={{'active',s.active,1},{'prefills',s.prefills,1},{'decodes',s.decodes,1},{'prompt',s.prompt,q.prompt},{'output',s.output,q.output},{'adapters',s.adapters,q.adapter}}
   for _,c in ipairs(checks) do if c[2] > 0 and get(field(s,c[1])) + c[3] > c[2] then return {0,s.name,c[1]} end end
   if s.requests > 0 and window_get(s,'requests',q.now)+1 > s.requests then return {0,s.name,'requests'} end
   if s.generated > 0 and window_get(s,'generated',q.now)+get(field(s,'genreserved'))+q.output > s.generated then return {0,s.name,'generated_tokens'} end
 end
 local rec={scopes=q.scopes,prompt=q.prompt,output=q.output,adapter=q.adapter,prefill=true,cold=false}
 for _,s in ipairs(q.scopes) do
-  add(field(s,'active'),1); add(field(s,'prefills'),1); add(field(s,'prompt'),q.prompt); add(field(s,'output'),q.output); add(field(s,'genreserved'),q.output)
+  add(field(s,'active'),1); add(field(s,'prefills'),1); add(field(s,'decodes'),1); add(field(s,'prompt'),q.prompt); add(field(s,'output'),q.output); add(field(s,'genreserved'),q.output)
   if q.adapter == 1 then add(field(s,'adapters'),1) end
   if s.requests > 0 then window_add(s,'requests',q.now,1) end
 end
