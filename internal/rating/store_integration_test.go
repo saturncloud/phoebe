@@ -45,6 +45,7 @@ func ratingSchemaDDL(t *testing.T) string {
 		// 0004 adds billing_event.serving_mode, which rateWindowSQL reads (the
 		// serving-mode SKU axis). Skipping it reproduces the staging 42703.
 		"../../migrations/0004_billing_event_serving_mode.up.sql",
+		"../../migrations/0005_invoice_grade_attempts.up.sql",
 	} {
 		ddl, err := os.ReadFile(f)
 		if err != nil {
@@ -54,6 +55,10 @@ func ratingSchemaDDL(t *testing.T) string {
 		b.Write(ddl)
 		b.WriteString("\n")
 	}
+	// Existing fixtures predate usage_found and all represent authoritative usage
+	// unless a test explicitly writes false. Keep their INSERTs readable while the
+	// production migration's false default remains covered by migration/E2E tests.
+	b.WriteString("ALTER TABLE billing_event ALTER COLUMN usage_found SET DEFAULT TRUE;\n")
 	return b.String()
 }
 
@@ -746,6 +751,58 @@ func TestIntegration_ReRatePreservesHistoricalPrice(t *testing.T) {
 	}
 	if tokens != 200 || MustDec(rate).String() != "0.000001000" || MustDec(cost).String() != "0.000200000" {
 		t.Fatalf("frozen rollup tokens/rate/cost = %d/%s/%s, want 200/0.000001000/0.000200000", tokens, rate, cost)
+	}
+
+	// Even a reconcile deletion must not erase the historical price decision.
+	if _, err := db.ExecContext(ctx, `DELETE FROM billing_event WHERE request_id IN ('p1','p2')`); err != nil {
+		t.Fatalf("remove raw events: %v", err)
+	}
+	if res, err := store.RateWindow(ctx, newBook, hour, hour.Add(time.Hour)); err != nil {
+		t.Fatalf("reconcile delete: %v", err)
+	} else if res.ReconciledDeletions != 1 {
+		t.Fatalf("reconcile deletions = %d, want 1", res.ReconciledDeletions)
+	}
+	if _, err := db.ExecContext(ctx,
+		`INSERT INTO billing_event (request_id, auth_id, resource_id, org_id, model, prompt_tokens, event_ts)
+		 VALUES ('p3','a','d1','org-1','b',100,$1)`, hour.Add(7*time.Minute)); err != nil {
+		t.Fatalf("seed recovered event: %v", err)
+	}
+	if _, err := store.RateWindow(ctx, newBook, hour, hour.Add(time.Hour)); err != nil {
+		t.Fatalf("recreate with changed book: %v", err)
+	}
+	if err := db.QueryRowContext(ctx,
+		`SELECT prompt_tokens, applied_prompt_rate::text, cost::text
+		 FROM rated_usage WHERE auth_id='a' AND resource_id='d1' AND model_id='b' AND window_start=$1`,
+		hour).Scan(&tokens, &rate, &cost); err != nil {
+		t.Fatalf("read recreated frozen rollup: %v", err)
+	}
+	if tokens != 100 || MustDec(rate).String() != "0.000001000" || MustDec(cost).String() != "0.000100000" {
+		t.Fatalf("recreated rollup tokens/rate/cost = %d/%s/%s, want 100/0.000001000/0.000100000", tokens, rate, cost)
+	}
+
+	// A failed attempt with no engine usage is retained for audit, but is neither
+	// billed as a zero-token rollup nor mislabeled as unattributable when model is
+	// unavailable because no upstream response arrived.
+	if _, err := db.ExecContext(ctx,
+		`INSERT INTO billing_event
+		 (request_id, auth_id, resource_id, org_id, model, usage_found, status_code, event_ts)
+		 VALUES ('failed-no-usage','a','d2','org-1',NULL,FALSE,502,$1)`, hour.Add(8*time.Minute)); err != nil {
+		t.Fatalf("seed missing-usage attempt: %v", err)
+	}
+	missingRes, err := store.RateWindow(ctx, newBook, hour, hour.Add(time.Hour))
+	if err != nil {
+		t.Fatalf("rate missing-usage attempt: %v", err)
+	}
+	if missingRes.MissingUsageEvents != 1 || missingRes.UnattributableEvents != 0 || missingRes.EventsRated != 1 {
+		t.Fatalf("missing-usage partition = missing %d / unattributable %d / rated %d, want 1/0/1",
+			missingRes.MissingUsageEvents, missingRes.UnattributableEvents, missingRes.EventsRated)
+	}
+	var failedRollups int
+	if err := db.QueryRowContext(ctx, `SELECT COUNT(*) FROM rated_usage WHERE resource_id='d2'`).Scan(&failedRollups); err != nil {
+		t.Fatalf("count failed-attempt rollups: %v", err)
+	}
+	if failedRollups != 0 {
+		t.Fatalf("failed-attempt rollups = %d, want 0 (missing usage must not become money)", failedRollups)
 	}
 }
 

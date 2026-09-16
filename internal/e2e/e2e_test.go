@@ -733,13 +733,13 @@ func TestE2E_FineTuneWithoutBaseModelHeaderIsUnpriced(t *testing.T) {
 	}
 }
 
-// TestE2E_ModellessEventIsUnattributable pins the nullStr(model) contract end
-// to end: an event whose upstream never reported a model (e.g. an abort before
-// the first chunk) must reach Postgres with model = NULL and be counted by the
-// rater as UNATTRIBUTABLE — never UNPRICED. A stored ” would dodge the
-// `model_id IS NULL` predicate and misreport as unpriced, pointing operators
-// at the wrong runbook ("backfill prices" instead of "fix the capture gap").
-func TestE2E_ModellessEventIsUnattributable(t *testing.T) {
+// TestE2E_ModellessEventWithoutUsageIsMissingUsage pins the no-response contract
+// end to end: an attempt whose upstream never reported either a model or a usage
+// block (for example, an abort before the first chunk) reaches Postgres with model
+// = NULL and is counted once as MISSING-USAGE. It must be neither UNATTRIBUTABLE
+// nor UNPRICED, because those categories describe usage-bearing events whose
+// attribution or pricing failed.
+func TestE2E_ModellessEventWithoutUsageIsMissingUsage(t *testing.T) {
 	h := newHarness(t, "phoebe_e2e_modelless")
 
 	// Emit directly through the REAL emitter, exactly as the proxy does for a
@@ -774,8 +774,11 @@ func TestE2E_ModellessEventIsUnattributable(t *testing.T) {
 	// bucket logic itself is wrong, not a missing price.
 	res := h.rateEventHour(t, h.priceBook(t))
 
-	if res.UnattributableEvents != 1 {
-		t.Errorf("UnattributableEvents = %d, want 1 (the model-less event)", res.UnattributableEvents)
+	if res.MissingUsageEvents != 1 {
+		t.Errorf("MissingUsageEvents = %d, want 1 (the no-usage attempt)", res.MissingUsageEvents)
+	}
+	if res.UnattributableEvents != 0 {
+		t.Errorf("UnattributableEvents = %d, want 0 — missing usage is the exclusive, more specific bucket", res.UnattributableEvents)
 	}
 	if res.UnpricedEvents != 0 {
 		t.Errorf("UnpricedEvents = %d, want 0 — a model-less event must land in UNATTRIBUTABLE, not UNPRICED (wrong runbook)", res.UnpricedEvents)

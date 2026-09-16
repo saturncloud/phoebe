@@ -24,9 +24,11 @@ central billing service.
    the Postgres transaction commits and deduplicates redelivery on the server-minted
    attempt id.
 5. The rater resolves prices and writes hourly `rated_usage` rows. Cached input is
-   charged once: `fresh = prompt - cached`. Once a natural-key/hour has been rated,
-   its stored applied rates override later price-book changes; late events use those
-   frozen historical rates.
+   charged once: `fresh = prompt - cached`. The first applied rate for each
+   natural-key/hour is retained in append-only `rating_price_lock`; it survives
+   rated-row reconciliation deletion, so late or recovered events use the original
+   rate even after the current price book changes. Attempts without authoritative
+   engine usage are excluded from money and make the rater exit non-zero.
 6. `token-push` sends authoritative hourly snapshots keyed by `rated_usage.id` to
    the central manager. Replays are deterministic; an unattributable window is
    withheld in full instead of partially deleting or mis-attributing prior billing.
@@ -79,9 +81,10 @@ balance while two customers are mis-attributed.
    safe; changing the id is not.
 3. Run the drainer until the consumer group has no pending/lagging entries. Confirm
    the recovered attempt ids exist once in `billing_event`.
-4. Restore the price-book version or attribution headers if the window was never
-   rated. For an already-rated natural key, the database row's applied rates are the
-   authority and a normal re-rate cannot overwrite them.
+4. Restore the price-book version or attribution headers if the natural-key/hour
+   was never locked. For a previously rated key, `rating_price_lock` is the authority
+   and a normal re-rate cannot overwrite it, even if reconciliation deleted the
+   corresponding `rated_usage` row.
 5. Run the rater explicitly for the complete affected half-open window. Investigate
    every unpriced, unattributable, ambiguous, missing-usage, or reconcile-deletion
    signal before proceeding.

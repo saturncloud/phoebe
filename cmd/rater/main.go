@@ -125,12 +125,12 @@ const defaultRateTrailingHours = 24
 const (
 	exitOK      = 0
 	exitFatal   = 1
-	exitAnomaly = 2 // window rated but something leaked: unpriced and/or unattributable
+	exitAnomaly = 2 // window rated but something leaked: pricing, attribution, or usage evidence
 )
 
 // exitCode maps a completed rating run to its process exit code, encoding the
 // reconcile-delete contract (see the package doc). A run that rated cleanly but
-// leaked an anomaly (unpriced / unattributable / ambiguous-base) ALWAYS exits
+// leaked an anomaly (unpriced / unattributable / missing-usage / ambiguous) ALWAYS exits
 // exitAnomaly. A reconcile-delete (reconciledDeletions > 0) exits exitAnomaly TOO —
 // but ONLY when the window was the default trailing-hours window (windowExplicit ==
 // false): on a routine run a prior bill vanishing is alarming (data loss / upstream
@@ -215,7 +215,7 @@ func run() int {
 	}
 
 	// Exit code encodes BOTH the leaked-anomaly signal (unpriced / unattributable /
-	// ambiguous-base — always nonzero) AND the reconcile-delete contract: a routine
+	// missing-usage / ambiguous — always nonzero) AND the reconcile-delete contract: a routine
 	// run (default window) that rewrote a prior bill is alarming and exits nonzero,
 	// while an explicit backfill (--since/--until) that did so is intended and exits
 	// 0. See exitCode and the package doc.

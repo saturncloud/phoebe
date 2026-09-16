@@ -1,4 +1,5 @@
 DROP VIEW IF EXISTS billing_reconciliation_hourly;
+DROP TABLE IF EXISTS rating_price_lock;
 DROP INDEX IF EXISTS billing_event_client_request_id_ix;
 
 ALTER TABLE billing_event

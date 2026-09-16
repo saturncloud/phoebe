@@ -34,8 +34,9 @@ func New(store Store, book *PriceBook, log *logging.Logger) *Rater {
 // operator / CronJob can assert on it.
 //
 // TotalCost is the window's total as NUMERIC TEXT — money never becomes a Go
-// number. UnpricedEvents / UnattributableEvents are the fail-loud signals: real
-// traffic the price book could not price, and rows that could not be attributed.
+// number. UnpricedEvents, UnattributableEvents, and MissingUsageEvents are
+// fail-loud signals: traffic the book could not price, rows that could not be
+// attributed, and attempts without authoritative engine counts.
 type Result struct {
 	WindowStart time.Time
 	WindowEnd   time.Time
@@ -44,6 +45,7 @@ type Result struct {
 	EventsRated          int64
 	UnpricedEvents       int64  // events whose model had NO resolvable price (NOT $0-billed)
 	UnattributableEvents int64  // in-window rows with NULL auth_id/resource_id/model_id (upstream leak)
+	MissingUsageEvents   int64  // attempts with no authoritative engine usage block (zero-charge, fail loud)
 	AmbiguousBaseEvents  int64  // events under an ft: rollup spanning >1 base_model (E3 violation)
 	AmbiguousOrgEvents   int64  // events under a rollup spanning >1 non-NULL org_id (E2 attribution bug)
 	RollupsWritten       int64  // distinct (auth_id, resource_id, model_id, hour) rows upserted
@@ -61,6 +63,10 @@ func (r Result) HasUnpriced() bool { return r.UnpricedEvents > 0 }
 // billed and is counted here rather than attributed to a NULL org.
 func (r Result) HasUnattributable() bool { return r.UnattributableEvents > 0 }
 
+// HasMissingUsage reports attempts retained for audit but excluded from money
+// because the serving engine did not supply authoritative token counts.
+func (r Result) HasMissingUsage() bool { return r.MissingUsageEvents > 0 }
+
 // HasAmbiguousBase reports whether any ft: rollup spanned more than one base_model in a
 // window — the E3 ft-uniqueness violation. A uuid4 checkpoint id cannot carry two
 // bases, so a nonzero count means base_model propagation is broken upstream; the rollup
@@ -75,12 +81,12 @@ func (r Result) HasAmbiguousBase() bool { return r.AmbiguousBaseEvents > 0 }
 // missing-header rows) is NOT ambiguous and never trips this.
 func (r Result) HasAmbiguousOrg() bool { return r.AmbiguousOrgEvents > 0 }
 
-// HasAnomaly reports whether the run rated cleanly but something leaked: events that
-// could not be priced, rows that could not be attributed, an ft: rollup spanning
-// multiple base_models, OR a rollup spanning multiple orgs. All are the same class of
-// fail-loud signal, so cmd/rater exits non-zero on any of them.
+// HasAnomaly reports whether something leaked: events that could not be priced,
+// rows that could not be attributed, attempts missing engine usage, an ft: rollup
+// spanning multiple base_models, or a rollup spanning multiple orgs. All are
+// fail-loud signals, so cmd/rater exits non-zero on any of them.
 func (r Result) HasAnomaly() bool {
-	return r.HasUnpriced() || r.HasUnattributable() || r.HasAmbiguousBase() || r.HasAmbiguousOrg()
+	return r.HasUnpriced() || r.HasUnattributable() || r.HasMissingUsage() || r.HasAmbiguousBase() || r.HasAmbiguousOrg()
 }
 
 // Run rates [windowStart, windowEnd): it runs the SINGLE SQL statement that
@@ -134,6 +140,7 @@ func (r *Rater) Run(ctx context.Context, windowStart, windowEnd time.Time, windo
 	res.TotalCost = rr.TotalCost
 	res.UnpricedEvents = rr.UnpricedEvents
 	res.UnattributableEvents = rr.UnattributableEvents
+	res.MissingUsageEvents = rr.MissingUsageEvents
 	res.AmbiguousBaseEvents = rr.AmbiguousBaseEvents
 	res.AmbiguousOrgEvents = rr.AmbiguousOrgEvents
 
@@ -152,6 +159,10 @@ func (r *Rater) Run(ctx context.Context, windowStart, windowEnd time.Time, windo
 	if res.HasUnpriced() {
 		r.log.Error.Printf("rating: window [%s,%s) has %d UNPRICED events (nothing resolved: model_id absent from the price file AND base_model empty/unpriced — which for fine-tune traffic (X-Saturn-Adapter present or an ft: id) is a base_model PROPAGATION BUG, not a free model) — these are NOT billed; the create-time price gate should prevent this, so a nonzero count means an unpriced model was served (or a header stopped propagating). Add the price/fix the header and re-rate this window",
 			windowStart.Format(time.RFC3339), windowEnd.Format(time.RFC3339), res.UnpricedEvents)
+	}
+	if res.HasMissingUsage() {
+		r.log.Error.Printf("rating: window [%s,%s) has %d MISSING-USAGE execution attempts — Phoebe retained zero-charge audit rows but excluded them from rated_usage because the engine supplied no authoritative usage block. Reconcile against engine logs before settling the invoice",
+			windowStart.Format(time.RFC3339), windowEnd.Format(time.RFC3339), res.MissingUsageEvents)
 	}
 
 	// A re-rate that SUPERSEDES prior billing (deleted stale rollups) is significant —
@@ -177,9 +188,9 @@ func (r *Rater) Run(ctx context.Context, windowStart, windowEnd time.Time, windo
 	}
 
 	if res.HasAnomaly() {
-		r.log.Error.Printf("rating: window [%s,%s) rated %d events into %d rollups, total=%s USD; %d UNPRICED events dropped (backfill prices and re-rate), %d UNATTRIBUTABLE rows skipped (NULL auth_id/resource_id/model_id — upstream billing-gate leak), %d AMBIGUOUS-BASE events dropped (one model_id, more than one base_model-derived rate — fix base_model/adapter propagation and re-rate), %d AMBIGUOUS-ORG events dropped (one resource spanning multiple orgs — fix org_id propagation and re-rate)",
+		r.log.Error.Printf("rating: window [%s,%s) rated %d events into %d rollups, total=%s USD; %d UNPRICED events dropped (backfill prices and re-rate), %d UNATTRIBUTABLE rows skipped (NULL auth_id/resource_id/model_id — upstream billing-gate leak), %d MISSING-USAGE attempts held at zero charge (reconcile engine logs), %d AMBIGUOUS-BASE events dropped (one model_id, more than one base_model-derived rate — fix base_model/adapter propagation and re-rate), %d AMBIGUOUS-ORG events dropped (one resource spanning multiple orgs — fix org_id propagation and re-rate)",
 			windowStart.Format(time.RFC3339), windowEnd.Format(time.RFC3339),
-			res.EventsRated, res.RollupsWritten, res.TotalCost, res.UnpricedEvents, res.UnattributableEvents, res.AmbiguousBaseEvents, res.AmbiguousOrgEvents)
+			res.EventsRated, res.RollupsWritten, res.TotalCost, res.UnpricedEvents, res.UnattributableEvents, res.MissingUsageEvents, res.AmbiguousBaseEvents, res.AmbiguousOrgEvents)
 	} else {
 		r.log.Info.Printf("rating: window [%s,%s) rated %d events into %d rollups, total=%s USD",
 			windowStart.Format(time.RFC3339), windowEnd.Format(time.RFC3339),

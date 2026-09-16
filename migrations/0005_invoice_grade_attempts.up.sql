@@ -41,6 +41,33 @@ CREATE INDEX billing_event_client_request_id_ix
     ON billing_event (client_request_id)
     WHERE client_request_id IS NOT NULL;
 
+-- A rated_usage row can be deleted during reconciliation when its raw events
+-- temporarily become anomalous or disappear.  Keep the first applied rate in a
+-- separate append-only ledger so recreating that rollup can never price already
+-- served traffic from a newer YAML book.
+CREATE TABLE rating_price_lock (
+    auth_id                 VARCHAR(64) NOT NULL,
+    resource_id             VARCHAR(64) NOT NULL,
+    model_id                VARCHAR(255) NOT NULL,
+    window_start            TIMESTAMPTZ NOT NULL,
+    applied_prompt_rate     NUMERIC(20,9) NOT NULL,
+    applied_cached_rate     NUMERIC(20,9) NOT NULL,
+    applied_completion_rate NUMERIC(20,9) NOT NULL,
+    locked_at               TIMESTAMPTZ NOT NULL DEFAULT now(),
+    PRIMARY KEY (auth_id, resource_id, model_id, window_start)
+);
+
+-- Preserve the applied rates of every rollup that predates this migration.
+INSERT INTO rating_price_lock (
+    auth_id, resource_id, model_id, window_start,
+    applied_prompt_rate, applied_cached_rate, applied_completion_rate
+)
+SELECT
+    auth_id, resource_id, model_id, window_start,
+    applied_prompt_rate, applied_cached_rate, applied_completion_rate
+FROM rated_usage
+ON CONFLICT DO NOTHING;
+
 -- Operator-facing raw -> rated reconciliation.  This deliberately stops at
 -- rated_usage: the central billing system is outside Phoebe's trust boundary,
 -- and must reconcile the pushed rated_usage.id values to its invoice lines.
