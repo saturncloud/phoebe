@@ -296,21 +296,44 @@ func TestExpiredLeaseIsReapedAfterReplicaDeath(t *testing.T) {
 }
 
 func TestKeepAlivePreventsLongStreamExpiry(t *testing.T) {
-	a, _ := testAdmitter(t, config.AdmissionSettings{Platform: limits(1), LeaseTTL: 30 * time.Millisecond})
+	a, mr := testAdmitter(t, config.AdmissionSettings{Platform: limits(1), LeaseTTL: 30 * time.Millisecond})
 	l, err := a.Admit(context.Background(), request("a", "m"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	initialExpiry, err := a.client.ZScore(context.Background(), a.expiries, l.id).Result()
 	if err != nil {
 		t.Fatal(err)
 	}
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan struct{})
 	go func() { defer close(done); l.KeepAlive(ctx, func(e error) { t.Errorf("keepalive: %v", e) }) }()
-	time.Sleep(75 * time.Millisecond)
+	// Wait for an observed renewal instead of assuming a busy CI runner will
+	// schedule the keepalive goroutine inside a sub-100ms sleep window.
+	deadline := time.Now().Add(time.Second)
+	var latestExpiry float64
+	for {
+		renewedExpiry, zerr := a.client.ZScore(context.Background(), a.expiries, l.id).Result()
+		if zerr != nil {
+			t.Fatal(zerr)
+		}
+		if renewedExpiry > initialExpiry {
+			latestExpiry = renewedExpiry
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("lease was not renewed")
+		}
+		time.Sleep(time.Millisecond)
+	}
 	if _, err = a.Admit(context.Background(), request("b", "m")); err == nil {
 		t.Fatal("live renewed stream was reaped")
 	}
 	cancel()
 	<-done
-	time.Sleep(40 * time.Millisecond)
+	// Lua uses Redis TIME, so advance Miniredis' server clock beyond the exact
+	// renewed ZSET score rather than sleeping or changing unrelated key TTLs.
+	mr.SetTime(time.UnixMilli(int64(latestExpiry) + 1))
 	next, err := a.Admit(context.Background(), request("b", "m"))
 	if err != nil {
 		t.Fatalf("stopped keepalive was not reaped: %v", err)
