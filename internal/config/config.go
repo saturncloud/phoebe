@@ -95,8 +95,13 @@ type AdmissionLimits struct {
 // explicit capacity multiplier for the lane, not a claim of request-ordering
 // fairness inside Dynamo.
 type AdmissionTier struct {
-	Weight int64           `yaml:"weight"`
-	Limits AdmissionLimits `yaml:"limits"`
+	Weight int64 `yaml:"weight"`
+	// DynamoPriority is the trusted soft priority propagated through Dynamo to
+	// engines that support per-request scheduling. Higher values are more
+	// important. DynamoStrictPriority is the unsigned router queue tier.
+	DynamoPriority       int64           `yaml:"dynamoPriority"`
+	DynamoStrictPriority int64           `yaml:"dynamoStrictPriority"`
+	Limits               AdmissionLimits `yaml:"limits"`
 }
 
 // AdmissionSettings is the YAML shape for Saturn-owned HTTP admission.
@@ -334,6 +339,12 @@ func (a *AdmissionSettings) parse() error {
 	for name, tier := range a.Tiers {
 		if tier.Weight <= 0 {
 			return fmt.Errorf("admission.tiers.%s.weight must be positive", name)
+		}
+		if tier.DynamoPriority < -(1<<31) || tier.DynamoPriority > 1<<31-1 {
+			return fmt.Errorf("admission.tiers.%s.dynamoPriority must fit in a signed 32-bit integer", name)
+		}
+		if tier.DynamoStrictPriority < 0 || tier.DynamoStrictPriority > 1<<32-1 {
+			return fmt.Errorf("admission.tiers.%s.dynamoStrictPriority must fit in an unsigned 32-bit integer", name)
 		}
 		if err := tier.Limits.parse("admission.tiers." + name); err != nil {
 			return err

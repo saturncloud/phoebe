@@ -2,6 +2,8 @@ package proxy
 
 import (
 	"context"
+	"encoding/json"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -237,6 +239,36 @@ func TestDedicatedTrafficBypassesSharedAdmission(t *testing.T) {
 	}
 }
 
+func TestSharedPolicyOverwritesClientPriorityWhenAdmissionDisabled(t *testing.T) {
+	seen := make(chan *http.Request, 1)
+	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		seen <- r.Clone(r.Context())
+		_, _ = w.Write([]byte(`{"model":"model-a","usage":{"prompt_tokens":1,"completion_tokens":1}}`))
+	}))
+	defer backend.Close()
+	up, _ := url.Parse(backend.URL)
+	s := New(&config.Settings{}, logging.New(logging.ERROR), &recordingEmitter{})
+	req := sharedRequest(up)
+	req.Header.Set("X-Tenant-ID", "attacker")
+	req.Header.Set("X-Dynamo-Request-Priority", "2147483647")
+	req.Header.Set("X-Dynamo-Request-Strict-Priority", "4294967295")
+	rr := httptest.NewRecorder()
+	s.Handler().ServeHTTP(rr, req)
+	if rr.Code != http.StatusOK {
+		t.Fatalf("status=%d", rr.Code)
+	}
+	forwarded := <-seen
+	if got := forwarded.Header.Get("X-Tenant-ID"); got == "" || got == "attacker" {
+		t.Fatalf("forwarded tenant header=%q", got)
+	}
+	if got := forwarded.Header.Get("X-Dynamo-Request-Priority"); got != "0" {
+		t.Fatalf("forwarded priority header=%q", got)
+	}
+	if got := forwarded.Header.Get("X-Dynamo-Request-Strict-Priority"); got != "0" {
+		t.Fatalf("forwarded strict-priority header=%q", got)
+	}
+}
+
 func TestAdmissionWorkRejectsAmbiguousOrImpossibleRequests(t *testing.T) {
 	if _, _, ok := admissionWork([]byte(`{"model":"m","max_tokens":2,"max_completion_tokens":3}`), 10); ok {
 		t.Fatal("conflicting output limits accepted")
@@ -248,9 +280,112 @@ func TestAdmissionWorkRejectsAmbiguousOrImpossibleRequests(t *testing.T) {
 		`{"model":"m","model":"other","max_tokens":2}`,
 		`{"model":"m","max_tokens":200,"max_tokens":2}`,
 		`{"model":"m","max_completion_tokens":200,"max_completion_tokens":2}`,
+		`{"model":"m","max_tokens":4294967296}`,
 	} {
 		if _, _, ok := admissionWork([]byte(body), 10); ok {
 			t.Fatalf("ambiguous admission work accepted: %s", body)
 		}
+	}
+}
+
+func TestPrepareSharedDynamoRequestOverwritesUntrustedHints(t *testing.T) {
+	body := []byte(`{"model":"m","max_tokens":41,"stream":true,"stream_options":{"include_usage":false},"nvext":{"cache_salt":"attacker","keep":"yes","agent_hints":{"priority":2147483647,"strict_priority":4294967295,"osl":1,"speculative_prefill":true}}}`)
+	tier := config.AdmissionTier{DynamoPriority: 9, DynamoStrictPriority: 2}
+	out, tenant, err := prepareSharedDynamoRequest(body, "org-a", 41, tier)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var got struct {
+		StreamOptions struct {
+			IncludeUsage bool `json:"include_usage"`
+		} `json:"stream_options"`
+		Nvext struct {
+			CacheSalt string `json:"cache_salt"`
+			Keep      string `json:"keep"`
+			Hints     struct {
+				Priority           int64 `json:"priority"`
+				StrictPriority     int64 `json:"strict_priority"`
+				OSL                int64 `json:"osl"`
+				SpeculativePrefill bool  `json:"speculative_prefill"`
+			} `json:"agent_hints"`
+		} `json:"nvext"`
+	}
+	if err := json.Unmarshal(out, &got); err != nil {
+		t.Fatal(err)
+	}
+	if tenant == "" || got.Nvext.CacheSalt != tenant {
+		t.Fatalf("cache salt=%q tenant=%q", got.Nvext.CacheSalt, tenant)
+	}
+	if got.Nvext.Hints.Priority != 9 || got.Nvext.Hints.StrictPriority != 2 || got.Nvext.Hints.OSL != 41 {
+		t.Fatalf("trusted hints not applied: %+v", got.Nvext.Hints)
+	}
+	if got.Nvext.Keep != "yes" || !got.Nvext.Hints.SpeculativePrefill || !got.StreamOptions.IncludeUsage {
+		t.Fatalf("unrelated extensions or usage flag lost: %+v", got)
+	}
+	_, otherTenant, err := prepareSharedDynamoRequest(body, "org-b", 41, tier)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if tenant == otherTenant {
+		t.Fatal("distinct organizations received the same Dynamo tenant namespace")
+	}
+}
+
+func TestProxyForwardsOnlyTrustedDynamoHints(t *testing.T) {
+	seen := make(chan *http.Request, 1)
+	seenBody := make(chan []byte, 1)
+	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, _ := readAndRestoreBody(r)
+		seen <- r.Clone(r.Context())
+		seenBody <- body
+		_, _ = w.Write([]byte(`{"model":"model-a","usage":{"prompt_tokens":2,"completion_tokens":3}}`))
+	}))
+	defer backend.Close()
+	up, _ := url.Parse(backend.URL)
+	mr := miniredis.RunT(t)
+	cfg := proxyAdmissionConfig(1)
+	cfg.Tiers = map[string]config.AdmissionTier{
+		"default": {Weight: 1},
+		"gold":    {Weight: 1, DynamoPriority: 11, DynamoStrictPriority: 4},
+	}
+	cfg.OrganizationTiers = map[string]string{"org-a": "gold"}
+	c := redis.NewClient(&redis.Options{Addr: mr.Addr()})
+	s := New(&config.Settings{Admission: cfg}, logging.New(logging.ERROR), &recordingEmitter{}).WithAdmitter(admission.New(c, cfg))
+	req := sharedRequest(up)
+	req.Header.Set("X-Tenant-ID", "attacker")
+	req.Header.Set("X-Dynamo-Request-Priority", "2147483647")
+	req.Header.Set("X-Dynamo-Request-Strict-Priority", "4294967295")
+	req.Body = http.NoBody
+	req.Body = io.NopCloser(strings.NewReader(`{"model":"model-a","max_tokens":20,"nvext":{"cache_salt":"attacker","agent_hints":{"priority":999}}}`))
+	rr := httptest.NewRecorder()
+	s.Handler().ServeHTTP(rr, req)
+	if rr.Code != http.StatusOK {
+		t.Fatalf("status=%d", rr.Code)
+	}
+	forwarded := <-seen
+	if got := forwarded.Header.Get("X-Tenant-ID"); got == "" || got == "attacker" {
+		t.Fatalf("forwarded tenant header=%q", got)
+	}
+	if got := forwarded.Header.Get("X-Dynamo-Request-Priority"); got != "11" {
+		t.Fatalf("forwarded priority header=%q", got)
+	}
+	if got := forwarded.Header.Get("X-Dynamo-Request-Strict-Priority"); got != "4" {
+		t.Fatalf("forwarded strict-priority header=%q", got)
+	}
+	var payload struct {
+		Nvext struct {
+			CacheSalt string `json:"cache_salt"`
+			Hints     struct {
+				Priority       int64 `json:"priority"`
+				StrictPriority int64 `json:"strict_priority"`
+				OSL            int64 `json:"osl"`
+			} `json:"agent_hints"`
+		} `json:"nvext"`
+	}
+	if err := json.Unmarshal(<-seenBody, &payload); err != nil {
+		t.Fatal(err)
+	}
+	if payload.Nvext.CacheSalt != forwarded.Header.Get("X-Tenant-ID") || payload.Nvext.Hints.Priority != 11 || payload.Nvext.Hints.StrictPriority != 4 || payload.Nvext.Hints.OSL != 20 {
+		t.Fatalf("forwarded trusted policy mismatch: %+v headers=%v", payload, forwarded.Header)
 	}
 }

@@ -29,6 +29,7 @@ import (
 	"net/http"
 	"net/http/httputil"
 	"net/url"
+	"strconv"
 	"strings"
 	"time"
 
@@ -330,53 +331,74 @@ func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	// SHARED-TIER DISTRIBUTED ADMISSION. Dedicated endpoints own their engine
-	// capacity and deliberately bypass this shared-pool gate. For shared traffic,
-	// authorization/model binding above has completed, but no request has reached
-	// Dynamo yet. Reserve conservative input/output work across all Phoebe
-	// replicas now. The original body is restored for the rewrite/forward path.
+	// SHARED REQUEST POLICY + DISTRIBUTED ADMISSION. Trusted Dynamo hints and
+	// cache isolation are enforced for every shared request, even during an
+	// admission rollout with the distributed gate disabled; otherwise a client
+	// could self-promote precisely while the rollout switch is off. Dedicated
+	// endpoints own their engine and bypass both shared-pool mechanisms.
 	var admitted *admission.Lease
-	if id.ServingMode == "shared" && s.admitter != nil {
+	if id.ServingMode == "shared" {
 		body, rerr := readAndRestoreBody(r)
 		if rerr != nil {
 			http.Error(w, "bad request body", http.StatusBadRequest)
 			return
 		}
-		model, maxOutput, ok := admissionWork(body, s.settings.Admission.DefaultMaxOutputTokens)
+		defaultOutput := s.settings.Admission.DefaultMaxOutputTokens
+		if defaultOutput <= 0 {
+			defaultOutput = 512
+		}
+		model, maxOutput, ok := admissionWork(body, defaultOutput)
 		if !ok {
 			http.Error(w, "invalid shared inference request", http.StatusBadRequest)
 			return
 		}
-		graph := id.GraphK8sName
-		if graph == "" {
-			graph = graphFromUpstreamHost(upstream.Host)
+		tier := s.settings.Admission.Tiers["default"]
+		if tierName, mapped := s.settings.Admission.OrganizationTiers[id.OrgID]; mapped {
+			tier = s.settings.Admission.Tiers[tierName]
 		}
-		admitted, err = s.admitter.Admit(r.Context(), admission.Request{
-			Graph: graph, Organization: id.OrgID, Model: model,
-			PromptBytes: int64(len(body)), ReservedOutputTokens: maxOutput,
-			Adapter: id.Adapter != "",
-		})
-		if err != nil {
-			s.writeAdmissionError(w, err)
+		body, tenant, rerr := prepareSharedDynamoRequest(body, id.OrgID, maxOutput, tier)
+		if rerr != nil {
+			http.Error(w, "invalid shared inference request", http.StatusBadRequest)
 			return
 		}
-		// Renewal failure means the distributed authority can no longer prove
-		// this request owns capacity. Cancel the upstream request rather than
-		// merely logging and allowing an unaccounted stream to continue.
-		proxyCtx, stopProxy := context.WithCancelCause(r.Context())
-		r = r.WithContext(proxyCtx)
-		defer stopProxy(nil)
-		go admitted.KeepAlive(proxyCtx, func(e error) {
-			s.log.Error.Printf("admission: lease renewal failed for request_id=%s: %v", requestID, e)
-			stopProxy(e)
-		})
-		// Safety net for every early return. Normal response completion wins the
-		// lease's idempotent Complete race and charges actual generated tokens.
-		defer func() {
-			if e := admitted.Complete(context.WithoutCancel(r.Context()), 0); e != nil {
-				s.log.Error.Printf("admission: release fallback failed: %v", e)
+		replaceRequestBody(r, body)
+		// Replace a client-supplied tenant header. Dynamo gives this header
+		// precedence over every body salt, so it must come from trusted identity.
+		r.Header.Set("X-Tenant-ID", tenant)
+		r.Header.Set("X-Dynamo-Request-Priority", strconv.FormatInt(tier.DynamoPriority, 10))
+		r.Header.Set("X-Dynamo-Request-Strict-Priority", strconv.FormatInt(tier.DynamoStrictPriority, 10))
+		if s.admitter != nil {
+			graph := id.GraphK8sName
+			if graph == "" {
+				graph = graphFromUpstreamHost(upstream.Host)
 			}
-		}()
+			admitted, err = s.admitter.Admit(r.Context(), admission.Request{
+				Graph: graph, Organization: id.OrgID, Model: model,
+				PromptBytes: int64(len(body)), ReservedOutputTokens: maxOutput,
+				Adapter: id.Adapter != "",
+			})
+			if err != nil {
+				s.writeAdmissionError(w, err)
+				return
+			}
+			// Renewal failure means the distributed authority can no longer prove
+			// this request owns capacity. Cancel the upstream request rather than
+			// merely logging and allowing an unaccounted stream to continue.
+			proxyCtx, stopProxy := context.WithCancelCause(r.Context())
+			r = r.WithContext(proxyCtx)
+			defer stopProxy(nil)
+			go admitted.KeepAlive(proxyCtx, func(e error) {
+				s.log.Error.Printf("admission: lease renewal failed for request_id=%s: %v", requestID, e)
+				stopProxy(e)
+			})
+			// Safety net for every early return. Normal response completion wins the
+			// lease's idempotent Complete race and charges actual generated tokens.
+			defer func() {
+				if e := admitted.Complete(context.WithoutCancel(r.Context()), 0); e != nil {
+					s.log.Error.Printf("admission: release fallback failed: %v", e)
+				}
+			}()
+		}
 	}
 
 	// Force streaming usage so we never under-bill a streamed response.

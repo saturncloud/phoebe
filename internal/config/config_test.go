@@ -286,6 +286,8 @@ admission:
         maxActiveRequests: 4
     protected:
       weight: 2
+      dynamoPriority: 17
+      dynamoStrictPriority: 3
       limits:
         maxActiveRequests: 2
         requestsPerWindow: 5
@@ -302,12 +304,17 @@ admission:
 	if got := s.Admission.Tiers["protected"].Limits.Window; got != 30*time.Second {
 		t.Fatalf("tier window=%s, want 30s", got)
 	}
+	if got := s.Admission.Tiers["protected"]; got.DynamoPriority != 17 || got.DynamoStrictPriority != 3 {
+		t.Fatalf("protected Dynamo hints wrong: %+v", got)
+	}
 }
 
 func TestLoadAdmissionRejectsInvalidPolicy(t *testing.T) {
 	tests := []string{
 		"admission:\n  enabled: true\n  valkeyAddr: v\n  platform:\n    maxActiveRequests: -1\n",
 		"admission:\n  enabled: true\n  valkeyAddr: v\n  tiers:\n    bad:\n      weight: 0\n",
+		"admission:\n  enabled: true\n  valkeyAddr: v\n  tiers:\n    default:\n      weight: 1\n      dynamoPriority: 2147483648\n",
+		"admission:\n  enabled: true\n  valkeyAddr: v\n  tiers:\n    default:\n      weight: 1\n      dynamoStrictPriority: -1\n",
 		"admission:\n  enabled: true\n  valkeyAddr: v\n  organizationTiers:\n    org-a: missing\n",
 	}
 	for _, body := range tests {

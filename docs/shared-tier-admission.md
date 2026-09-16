@@ -24,18 +24,40 @@ would violate the global bound and is intentionally absent.
 | Active decodes/streams and reserved output | Saturn-owned, implemented here | A decode slot and `max_tokens`/`max_completion_tokens` are reserved before forwarding and held until completion, abort, timeout, rejection, or upstream failure. Reserving the slot early is conservative and avoids attempting to queue after response streaming begins. |
 | Request and generated-token windows | Saturn-owned, implemented here | Fixed operator-configured windows. Generated usage is charged from the engine's authoritative completion count; outstanding max-output reservations prevent overbooking. |
 | Cold holds and wake churn | Partially implemented before; completed here | Phoebe already detected/actuated wake-from-zero. Distributed hold and wake-window admission now surrounds actuation. |
-| Adapter and KV pressure | Partial | Phoebe bounds active adapter-bearing requests, prompt bytes, and reserved output as observable pressure proxies. Dynamo/vLLM owns real adapter residency, prefix cache, KV allocation, eviction, and batching. |
-| Service-tier protected shares | Saturn-owned, implemented as coarse admission lanes | Operator-owned org→tier mapping prevents client selection. Hard lanes and weights protect capacity; this is not exact per-request scheduling fairness. |
-| Cache-aware/worker routing and prefill/decode scheduling | Externally provided | Dynamo frontend/router and engine scheduler. |
-| Gang lifecycle and replica topology | Externally provided | Grove/Dynamo operator. |
-| GPU queue quota, DRF, placement, and preemption | Externally provided | KAI Scheduler. It schedules pods, not HTTP requests or tokens. |
+| Adapter and KV pressure | Layered implementation | Phoebe bounds active adapter-bearing requests and reserved work. Saturn enables backend prefix caches and KV event publication; Dynamo routes on actual cache residency and load, while each engine owns allocation/eviction. |
+| Service-tier protected shares | Layered implementation | Operator-owned org→tier mapping prevents client selection. Hard Phoebe lanes protect capacity; Phoebe also replaces client hints with the tier's trusted Dynamo soft and strict priorities. |
+| Cache-aware/worker routing and prefill/decode scheduling | Saturn-configured Dynamo capability | Shared graphs enable KV routing, output-block tracking, a capacity-triggered WSPT queue, and backend priority scheduling where supported. |
+| Gang lifecycle and replica topology | Saturn-configured Grove/Dynamo capability | The graph remains the lifecycle and gang unit; request fairness is enforced above and inside it. |
+| GPU queue quota, DRF, placement, and preemption | Saturn-configured KAI capability | KAI protects graph/pod scheduling. Many organizations share one graph, so organization request fairness cannot be delegated to a pod scheduler. |
 
 ## Currencies stay separate
 
-Admission counters protect physical service health. Product/contract limits
-remain control-plane policy. Billing continues to use immutable engine-reported
-usage events. No admission estimate is written as invoice usage, and no price or
-spend balance is used as a GPU-pressure signal.
+Admission counters protect physical service health. Billing continues to use
+immutable engine-reported usage events: no admission estimate is written as
+invoice usage, and no price or spend balance is used as a GPU-pressure signal.
+Contract limits are a separate policy input even when they are enforced at this
+same gate, because a physical-capacity rejection and an exhausted entitlement
+have different ownership, status, and reset semantics.
+
+## Trusted Dynamo request policy
+
+For admitted shared requests, Phoebe normalizes `nvext.agent_hints.priority`,
+`strict_priority`, and `osl` from the operator-owned tier and output-token
+reservation. It also replaces `X-Dynamo-Request-Priority` and
+`X-Dynamo-Request-Strict-Priority`, because Dynamo gives those headers
+precedence over body hints. A client therefore cannot self-promote.
+
+Phoebe derives `X-Tenant-ID` and `nvext.cache_salt` from a one-way hash of the
+trusted organization identity. Dynamo gives the header precedence and uses it
+for router and backend cache namespacing, preventing identical prompts from
+sharing KV entries across organizations without disclosing the Saturn org id.
+Unrelated `nvext` fields are preserved.
+
+Dynamo tokenizes the rendered prompt and its WSPT queue charges uncached prompt
+tokens. Phoebe intentionally keeps a conservative full-request-byte
+reservation as the pre-tokenization distributed safety bound; this avoids
+duplicating model chat templates while still letting exact engine-side prompt
+work affect scheduling.
 
 ## Lifecycle and crash recovery
 
@@ -60,14 +82,13 @@ one shared Valkey and conservative measured limits, then enable admission. Watch
 feature; existing leases expire without affecting billing or Dynamo. Do not
 point replicas at different Valkey instances during a rolling update.
 
-## Explicit non-goals
+## Enforcement boundaries
 
-- Exact weighted fair queuing or token-by-token tenant scheduling. That requires
-  a tenant-aware serving scheduler below Phoebe; static lanes only bound
-  contention.
-- Exact rendered prompt tokens/bytes. Phoebe does not own chat templates or
-  tokenizers and uses full JSON bytes as a conservative input-work proxy.
-- Direct control of vLLM KV blocks, prefix-cache eviction, or resident LoRA
-  adapters.
-- Replacing KAI/Grove/Dynamo pod, graph, router, or engine scheduling.
-- Contract entitlement or spend enforcement, and invoice computation.
+Fairness is deliberately layered instead of pretending one counter is an exact
+GPU cost model. Phoebe provides global hard admission and trusted tenant/tier
+metadata. Dynamo uses actual tokenization, uncached-prefix work, KV residency,
+and active output blocks for routing. vLLM and SGLang apply supported engine
+priority and cache policy. KAI and Grove govern the graph pods. These layers do
+not promise mathematical token-by-token weighted fair queuing, but each
+available control surface is configured and no layer accepts tenant-selected
+priority.
