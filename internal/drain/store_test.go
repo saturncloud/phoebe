@@ -27,6 +27,7 @@ func TestPostgresStore_UpsertSQL(t *testing.T) {
 	events := []metering.Event{
 		{
 			RequestID:        "req-1",
+			ClientRequestID:  "logical-1",
 			AuthID:           "auth-1",
 			Model:            "m1",
 			PromptTokens:     5,
@@ -42,14 +43,14 @@ func TestPostgresStore_UpsertSQL(t *testing.T) {
 
 	mock.ExpectBegin()
 	mock.ExpectExec(regexp.QuoteMeta(
-		"INSERT INTO billing_event (request_id, auth_id, user_id, group_id, resource_id, resource_type, org_id, model, base_model, adapter, serving_mode, prompt_tokens, cached_tokens, completion_tokens, finish_reason, gpu_type, aborted, event_ts) VALUES",
+		"INSERT INTO billing_event (request_id, client_request_id, auth_id, user_id, group_id, resource_id, resource_type, org_id, model, base_model, adapter, serving_mode, prompt_tokens, cached_tokens, completion_tokens, finish_reason, gpu_type, aborted, usage_found, status_code, streamed, event_ts) VALUES",
 	)).
 		WithArgs(
 			// row 1 (org_id + base_model + serving_mode NULL: a dedicated base-model event, no
 			// org header, no derived_from)
-			"req-1", "auth-1", nil, nil, nil, nil, nil, "m1", nil, nil, nil, 5, 0, 7, nil, nil, false, time.UnixMilli(ts).UTC(),
+			"req-1", "logical-1", "auth-1", nil, nil, nil, nil, nil, "m1", nil, nil, nil, 5, 0, 7, nil, nil, false, false, nil, false, time.UnixMilli(ts).UTC(),
 			// row 2 (no identity, no timestamp → event_ts NULL)
-			"req-2", nil, nil, nil, nil, nil, nil, "m2", nil, nil, nil, 0, 0, 0, nil, nil, false, nil,
+			"req-2", nil, nil, nil, nil, nil, nil, nil, "m2", nil, nil, nil, 0, 0, 0, nil, nil, false, false, nil, false, nil,
 		).
 		WillReturnResult(sqlmock.NewResult(0, 2))
 	mock.ExpectCommit()
@@ -121,13 +122,13 @@ func TestPostgresStore_EmptyModelStoredAsNull(t *testing.T) {
 	mock.ExpectBegin()
 	mock.ExpectExec("INSERT INTO billing_event").
 		WithArgs(
-			"req-no-model", "auth-1", nil, nil, nil, nil,
+			"req-no-model", nil, "auth-1", nil, nil, nil, nil,
 			nil, // org_id: "" must bind NULL
 			nil, // model: "" must bind NULL
 			nil, // base_model: "" must bind NULL
 			nil, // adapter: "" must bind NULL
 			nil, // serving_mode: "" must bind NULL (dedicated)
-			1, 0, 2, nil, nil, false, nil,
+			1, 0, 2, nil, nil, false, false, nil, false, nil,
 		).
 		WillReturnResult(sqlmock.NewResult(0, 1))
 	mock.ExpectCommit()
@@ -156,28 +157,28 @@ func TestEventArgs_NullsEmptyIdentities(t *testing.T) {
 	if len(args) != colsPerRow {
 		t.Fatalf("len(args) = %d, want %d", len(args), colsPerRow)
 	}
-	// auth_id is index 1 — must be nil for empty.
-	if args[1] != nil {
-		t.Fatalf("auth_id arg = %v, want nil for empty AuthID", args[1])
+	// auth_id is index 2 (after client_request_id) — must be nil for empty.
+	if args[2] != nil {
+		t.Fatalf("auth_id arg = %v, want nil for empty AuthID", args[2])
 	}
 	// org_id is index 6 (after resource_type) — must be nil for empty (no producer
 	// header / rollout gap); a stored '' would dodge the rater/push `org_id IS NULL`
 	// held-not-billed predicate.
-	if args[6] != nil {
-		t.Fatalf("org_id arg = %v, want nil for empty OrgID", args[6])
+	if args[7] != nil {
+		t.Fatalf("org_id arg = %v, want nil for empty OrgID", args[7])
 	}
 	// base_model is index 8 (org_id pushed model/base_model down by one) — nil for empty.
-	if args[8] != nil {
-		t.Fatalf("base_model arg = %v, want nil for empty BaseModel", args[8])
+	if args[9] != nil {
+		t.Fatalf("base_model arg = %v, want nil for empty BaseModel", args[9])
 	}
 	// serving_mode is index 10 (model=7, base_model=8, adapter=9, serving_mode=10) —
 	// nil for empty (dedicated).
-	if args[10] != nil {
-		t.Fatalf("serving_mode arg = %v, want nil for empty ServingMode", args[10])
+	if args[11] != nil {
+		t.Fatalf("serving_mode arg = %v, want nil for empty ServingMode", args[11])
 	}
 	// prompt_tokens is index 11 (…base_model=8, adapter=9, serving_mode=10) — int, not nil.
-	if args[11] != 3 {
-		t.Fatalf("prompt_tokens arg = %v, want 3", args[11])
+	if args[12] != 3 {
+		t.Fatalf("prompt_tokens arg = %v, want 3", args[12])
 	}
 	// event_ts is the last index — nil when TimestampUnixMs==0.
 	if args[colsPerRow-1] != nil {
@@ -188,7 +189,7 @@ func TestEventArgs_NullsEmptyIdentities(t *testing.T) {
 	// not just be NULLed when empty — the meter-time org capture is the point of the
 	// change, so the happy path is pinned here (not only transitively via e2e).
 	withOrg := eventArgs(metering.Event{RequestID: "r", Model: "m", OrgID: "org-xyz"})
-	if withOrg[6] != "org-xyz" {
-		t.Fatalf("org_id arg = %v, want \"org-xyz\" (a non-empty OrgID must bind through)", withOrg[6])
+	if withOrg[7] != "org-xyz" {
+		t.Fatalf("org_id arg = %v, want \"org-xyz\" (a non-empty OrgID must bind through)", withOrg[7])
 	}
 }

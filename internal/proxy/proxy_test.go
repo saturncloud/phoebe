@@ -224,6 +224,9 @@ func TestProxyRequestID_ClientReplayCannotReuseBillingID(t *testing.T) {
 	if events[0].RequestID != responseIDs[0] || events[1].RequestID != responseIDs[1] {
 		t.Fatalf("event ids do not match response ids: events=%#v responses=%#v", events, responseIDs)
 	}
+	if events[0].ClientRequestID != "client-replayed-id" || events[1].ClientRequestID != "client-replayed-id" {
+		t.Fatalf("logical correlation was not preserved separately: events=%#v", events)
+	}
 }
 
 func TestProxyForwardsToUpstream(t *testing.T) {

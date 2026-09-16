@@ -108,8 +108,10 @@ func TestRateWindowSQL_Shape(t *testing.T) {
 		"LEFT JOIN rating_price rpb",
 		"rpb.model_id = ev.sku_base",
 		"NOT (ev.model_id LIKE $3 OR ev.adapter IS NOT NULL)",
-		// the effective rate COALESCEs direct over derived over plain-base
-		"COALESCE(rp.prompt_price,     rd.prompt_price,     rpb.prompt_price)",
+		// An existing rollup's frozen rate outranks the current book; only a new
+		// natural-key/hour resolves through direct/derived/plain-base pricing.
+		"LEFT JOIN rated_usage old",
+		"COALESCE(old.applied_prompt_rate,     rp.prompt_price,     rd.prompt_price,     rpb.prompt_price)",
 		// billable-prompt clamp + the cost formula (cached charged once)
 		"GREATEST(ev.prompt_tokens - ev.cached_tokens, 0)",
 		"billable_prompt   * prompt_price",

@@ -101,11 +101,9 @@ func TestPreHeaderAbortEmitsAttributableEvent(t *testing.T) {
 	}
 }
 
-// TestPreHeaderAbortBillPartialFalseNoEvent: with BillPartialOnAbort=false a
-// pre-header abort with no usage must NOT emit a billable event — the abort-emit
-// obeys the SAME bill-partial policy as the completion path (it does not invent a
-// second, policy-bypassing emit). It is logged for reconciliation instead.
-func TestPreHeaderAbortBillPartialFalseNoEvent(t *testing.T) {
+// A pre-header abort with no usage is a zero-charge but durable raw attempt even
+// when partial billing is disabled; reconciliation must not depend on logs.
+func TestPreHeaderAbortBillPartialFalseRecordsAttempt(t *testing.T) {
 	backend, unblock := blockBeforeHeadersBackend(t)
 	defer backend.Close()
 	defer close(unblock)
@@ -129,8 +127,8 @@ func TestPreHeaderAbortBillPartialFalseNoEvent(t *testing.T) {
 	srv.Handler().ServeHTTP(rr, req)
 
 	events := em.waitForEvents(1, 200*time.Millisecond)
-	if len(events) != 0 {
-		t.Fatalf("BillPartialOnAbort=false, pre-header abort, no usage: expected 0 events, got %d: %+v", len(events), events)
+	if len(events) != 1 || !events[0].Aborted || events[0].UsageFound || events[0].StatusCode != 499 {
+		t.Fatalf("BillPartialOnAbort=false pre-header abort = %+v, want one zero-charge observable 499 attempt", events)
 	}
 }
 

@@ -689,6 +689,66 @@ func TestIntegration_OrgReRateConvergesNeverErases(t *testing.T) {
 	}
 }
 
+// TestIntegration_ReRatePreservesHistoricalPrice proves the invoice-grade price
+// one-way door: changing the current YAML book after an hour was first rated may
+// incorporate late events, but every token in that existing rollup continues to
+// use the originally applied rates.
+func TestIntegration_ReRatePreservesHistoricalPrice(t *testing.T) {
+	dsn := os.Getenv("PHOEBE_TEST_DATABASE_URL")
+	if dsn == "" {
+		t.Skip("PHOEBE_TEST_DATABASE_URL not set; skipping live-Postgres conformance")
+	}
+	ctx := context.Background()
+	db, err := sql.Open("pgx", dsn)
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	defer db.Close()
+
+	const sch = "phoebe_rating_pricefreeze_it"
+	exec(t, db, "DROP SCHEMA IF EXISTS "+sch+" CASCADE")
+	exec(t, db, "CREATE SCHEMA "+sch)
+	exec(t, db, "SET search_path TO "+sch)
+	defer func() { exec(t, db, "DROP SCHEMA IF EXISTS "+sch+" CASCADE") }()
+	exec(t, db, ratingSchemaDDL(t))
+
+	hour := mustTime("2026-06-08T10:00:00Z")
+	store := NewPostgresStore(db)
+	oldBook := newTestBook(map[string]Rate3{"b": rate3("0.000001", "0", "0")}, nil, PolicyIdentity, Dec{}, Dec{})
+	newBook := newTestBook(map[string]Rate3{"b": rate3("0.000009", "0", "0")}, nil, PolicyIdentity, Dec{}, Dec{})
+
+	if _, err := db.ExecContext(ctx,
+		`INSERT INTO billing_event (request_id, auth_id, resource_id, org_id, model, prompt_tokens, event_ts)
+		 VALUES ('p1','a','d1','org-1','b',100,$1)`, hour.Add(5*time.Minute)); err != nil {
+		t.Fatalf("seed first event: %v", err)
+	}
+	if _, err := store.RateWindow(ctx, oldBook, hour, hour.Add(time.Hour)); err != nil {
+		t.Fatalf("initial rate: %v", err)
+	}
+
+	// Price changes, then a delayed event from the already-rated hour arrives.
+	if _, err := db.ExecContext(ctx,
+		`INSERT INTO billing_event (request_id, auth_id, resource_id, org_id, model, prompt_tokens, event_ts)
+		 VALUES ('p2','a','d1','org-1','b',100,$1)`, hour.Add(6*time.Minute)); err != nil {
+		t.Fatalf("seed late event: %v", err)
+	}
+	if _, err := store.RateWindow(ctx, newBook, hour, hour.Add(time.Hour)); err != nil {
+		t.Fatalf("re-rate with changed book: %v", err)
+	}
+
+	var tokens int64
+	var rate, cost string
+	if err := db.QueryRowContext(ctx,
+		`SELECT prompt_tokens, applied_prompt_rate::text, cost::text
+		 FROM rated_usage WHERE auth_id='a' AND resource_id='d1' AND model_id='b' AND window_start=$1`,
+		hour).Scan(&tokens, &rate, &cost); err != nil {
+		t.Fatalf("read frozen rollup: %v", err)
+	}
+	if tokens != 200 || MustDec(rate).String() != "0.000001000" || MustDec(cost).String() != "0.000200000" {
+		t.Fatalf("frozen rollup tokens/rate/cost = %d/%s/%s, want 200/0.000001000/0.000200000", tokens, rate, cost)
+	}
+}
+
 // readRatedUsageIDs returns natural-key → id for every rated_usage row.
 func readRatedUsageIDs(t *testing.T, db *sql.DB) map[string]string {
 	t.Helper()

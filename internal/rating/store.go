@@ -304,15 +304,26 @@ resolved AS (
         -- Fine-tune traffic with a NULL base_model can only miss its join (NULL =
         -- NULL is never true) and is BARRED from the plain-base join by the marker
         -- guard, so it correctly falls through to UNPRICED and screams.
-        COALESCE(rp.prompt_price,     rd.prompt_price,     rpb.prompt_price)     AS prompt_price,
-        COALESCE(rp.cached_price,     rd.cached_price,     rpb.cached_price)     AS cached_price,
-        COALESCE(rp.completion_price, rd.completion_price, rpb.completion_price) AS completion_price,
+        -- Historical-price one-way door: once this natural-key/hour has a
+        -- rated_usage row, its applied rates outrank the CURRENT YAML book.
+        -- Re-rating can incorporate late raw events and repair attribution, but
+        -- it can never silently reprice tokens that were already served.
+        COALESCE(old.applied_prompt_rate,     rp.prompt_price,     rd.prompt_price,     rpb.prompt_price)     AS prompt_price,
+        COALESCE(old.applied_cached_rate,     rp.cached_price,     rd.cached_price,     rpb.cached_price)     AS cached_price,
+        COALESCE(old.applied_completion_rate, rp.completion_price, rd.completion_price, rpb.completion_price) AS completion_price,
         -- Whether this row priced through the DERIVED (base x premium) path (b), or
         -- the PLAIN-BASE path (c). Both key the rate on base_model, so both feed the
         -- single-rate ambiguity gate below.
-        (rp.model_id IS NULL AND rd.base_model IS NOT NULL) AS via_derived,
-        (rp.model_id IS NULL AND rpb.model_id  IS NOT NULL) AS via_base
+        ((old.id IS NOT NULL AND (ev.model_id LIKE $3 OR ev.adapter IS NOT NULL) AND ev.base_model IS NOT NULL)
+          OR (old.id IS NULL AND rp.model_id IS NULL AND rd.base_model IS NOT NULL)) AS via_derived,
+        ((old.id IS NOT NULL AND NOT (ev.model_id LIKE $3 OR ev.adapter IS NOT NULL) AND ev.base_model IS NOT NULL)
+          OR (old.id IS NULL AND rp.model_id IS NULL AND rpb.model_id IS NOT NULL)) AS via_base
     FROM ev
+    LEFT JOIN rated_usage old
+        ON old.auth_id = ev.auth_id
+       AND old.resource_id = ev.resource_id
+       AND old.model_id = ev.model_id
+       AND old.window_start = date_trunc('hour', ev.ev_ts AT TIME ZONE 'UTC') AT TIME ZONE 'UTC'
     -- (a) The YAML-projected DIRECT price table (keyed on model_id).
     LEFT JOIN rating_price rp ON rp.model_id = ev.model_id
     -- (b) The DERIVED price table (keyed on base_model): consulted ONLY for

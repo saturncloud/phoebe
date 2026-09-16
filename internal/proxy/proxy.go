@@ -184,6 +184,7 @@ func (s *Server) handleHealth(w http.ResponseWriter, _ *http.Request) {
 // onDone fires exactly once regardless of whether EOF or Close reaches it first.
 func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request) {
 	id := identity.FromRequest(r)
+	clientRequestID := r.Header.Get(requestIDHeader)
 
 	// GATEWAY RESOLUTION (TF single-host gateway): a request the trusted
 	// middleware marked X-Saturn-Gateway carries NO per-resource routing
@@ -378,7 +379,7 @@ func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request) {
 			// honours ctx would otherwise lose every aborted request).
 			ctx := context.WithoutCancel(r.Context())
 			// Metering (durable) always fires.
-			s.emit(ctx, id, requestID, res)
+			s.emit(ctx, id, requestID, clientRequestID, statusCode, res)
 			// M5 I/O logging (best-effort) only when this request opted in.
 			if shouldLog {
 				respBody, truncated := cr.capturedBody()
@@ -420,7 +421,7 @@ func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request) {
 		return nil
 	}
 
-	rp.ErrorHandler = s.errorHandler(upstream.String(), id, requestID)
+	rp.ErrorHandler = s.errorHandler(upstream.String(), id, requestID, clientRequestID)
 
 	rp.ServeHTTP(w, r)
 }
@@ -453,7 +454,7 @@ func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request) {
 // a bogus zero-token billing row. The context is decoupled from the cancelled
 // client ctx (WithoutCancel) — the abort is precisely WHY we are here, so a
 // cancelled ctx must not be able to drop the emit (mirrors onDone).
-func (s *Server) errorHandler(upstream string, id identity.Identity, requestID string) func(http.ResponseWriter, *http.Request, error) {
+func (s *Server) errorHandler(upstream string, id identity.Identity, requestID, clientRequestID string) func(http.ResponseWriter, *http.Request, error) {
 	return func(w http.ResponseWriter, r *http.Request, err error) {
 		if isClientAbort(err) {
 			s.log.Debug.Printf("client disconnected for %s", upstream)
@@ -461,10 +462,15 @@ func (s *Server) errorHandler(upstream string, id identity.Identity, requestID s
 			// Emit a zero-token attributable event so the request is not invisible
 			// to billing. Best-effort, non-blocking — like onDone's emit.
 			ctx := context.WithoutCancel(r.Context())
-			s.emit(ctx, id, requestID, capture.Result{Aborted: true, UsageFound: false})
+			s.emit(ctx, id, requestID, clientRequestID, 499, capture.Result{Aborted: true, UsageFound: false})
 			return
 		}
 		s.log.Error.Printf("upstream %s error: %v", upstream, err)
+		// A transport failure is still a real execution attempt. Persist a zero-
+		// token raw row with UsageFound=false so reconciliation can distinguish it
+		// from a legitimate zero-token completion. Rating naturally charges $0.
+		s.emit(context.WithoutCancel(r.Context()), id, requestID, clientRequestID,
+			http.StatusBadGateway, capture.Result{UsageFound: false})
 		http.Error(w, "upstream error", http.StatusBadGateway)
 	}
 }
@@ -473,37 +479,29 @@ func (s *Server) errorHandler(upstream string, id identity.Identity, requestID s
 // emitter. It must not block the client response — the emitter is responsible
 // for async/durable delivery.
 //
-// Policy (M3):
-//   - Aborted + usage captured:    always emit (we have real counts).
-//   - Aborted + no usage:          emit only if BillPartialOnAbort; otherwise
-//     log for reconciliation.
-//   - Not aborted + no usage:      log for reconciliation; never bill.
-//   - Not aborted + usage:         always emit (normal completion).
-func (s *Server) emit(ctx context.Context, id identity.Identity, requestID string, res capture.Result) {
+// Every forwarded execution attempt is emitted exactly once. Usage-bearing
+// attempts carry the engine counts; failed/aborted attempts without usage carry
+// explicit UsageFound=false and zero counts, so they are visible to reconciliation
+// without fabricating a charge.
+func (s *Server) emit(ctx context.Context, id identity.Identity, requestID, clientRequestID string, statusCode int, res capture.Result) {
 	if res.Aborted && !res.UsageFound {
-		if !s.settings.BillPartialOnAbort {
-			// Policy: don't bill partial aborts with no token data. Log for
-			// reconciliation so the event is not silently lost.
-			s.log.Warn.Printf("aborted, no usage, not billing (BillPartialOnAbort=false) resource=%s request_id=%s streamed=%t",
-				id.ResourceID, requestID, res.Streamed)
-			return
-		}
-		// BillPartialOnAbort=true: emit a partial event with zero counts so
-		// downstream knows we attempted to bill and can reconcile if needed.
-		s.log.Debug.Printf("aborted, no usage, emitting partial event resource=%s request_id=%s streamed=%t",
-			id.ResourceID, requestID, res.Streamed)
+		// A missing usage block is never guessed or tokenized locally. The raw
+		// zero-token attempt is nevertheless durable for reconciliation; the
+		// BillPartialOnAbort switch controls policy, not ledger visibility.
+		s.log.Warn.Printf("aborted, no usage, recording unmetered attempt resource=%s request_id=%s streamed=%t bill_partial=%t",
+			id.ResourceID, requestID, res.Streamed, s.settings.BillPartialOnAbort)
 	}
 
 	if !res.UsageFound && !res.Aborted {
-		// No usage and not an abort: a non-OpenAI response or an upstream we
-		// can't meter. Log for reconciliation; emit nothing billable.
-		s.log.Warn.Printf("no usage captured for resource=%s request_id=%s streamed=%t",
+		// Persist the attempt rather than making failed/non-conforming responses
+		// invisible. With zero authoritative counts it contributes no charge.
+		s.log.Warn.Printf("no usage captured; recording unmetered attempt resource=%s request_id=%s streamed=%t",
 			id.ResourceID, requestID, res.Streamed)
-		return
 	}
 
 	e := metering.Event{
-		RequestID: requestID,
+		RequestID:       requestID,
+		ClientRequestID: clientRequestID,
 		// Identity captured verbatim — attribution resolved downstream.
 		AuthID:       id.AuthID,
 		UserID:       id.UserID,
@@ -543,6 +541,9 @@ func (s *Server) emit(ctx context.Context, id identity.Identity, requestID strin
 		CompletionTokens: res.Usage.CompletionTokens,
 		FinishReason:     res.FinishReason,
 		Aborted:          res.Aborted,
+		UsageFound:       res.UsageFound,
+		StatusCode:       statusCode,
+		Streamed:         res.Streamed,
 	}
 	s.emitter.Emit(ctx, e)
 }

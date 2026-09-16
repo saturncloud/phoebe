@@ -67,7 +67,7 @@ func TestErrorHandlerClassifiesWrappedCancel(t *testing.T) {
 	// cancel must NOT 502 over the already-dead connection. (The abort's
 	// zero-token emit and its BillPartialOnAbort gating are covered by the
 	// dedicated TestPreHeaderAbort* tests, not re-asserted here.)
-	h := srv.errorHandler(upstream.String(), id, "req-1")
+	h := srv.errorHandler(upstream.String(), id, "req-1", "logical-1")
 	rr := httptest.NewRecorder()
 	h(rr, httptest.NewRequest(http.MethodPost, "/v1/chat/completions", nil),
 		&url.Error{Op: "Post", URL: upstream.String(), Err: context.Canceled})
@@ -79,15 +79,15 @@ func TestErrorHandlerClassifiesWrappedCancel(t *testing.T) {
 }
 
 // TestErrorHandlerUpstreamFaultStill502 guards the negative: a GENUINE upstream
-// fault (not a client abort) must still be 502'd, so the abort special-case did
-// not swallow real errors.
+// fault (not a client abort) must still be 502'd and must leave an observable,
+// zero-charge execution-attempt row.
 func TestErrorHandlerUpstreamFaultStill502(t *testing.T) {
 	upstream, _ := url.Parse("http://upstream.invalid")
 	id := identity.Identity{AuthID: "auth-1", ResourceID: "model-abc"}
 
 	// Both a plain upstream error AND a wrapped DeadlineExceeded (a dial/header
 	// timeout — an upstream fault in this proxy, NOT a client abort) must 502 and
-	// must NOT emit a spurious zero-token Aborted billing row.
+	// emit one non-aborted, usage-missing attempt for reconciliation.
 	for _, tc := range []struct {
 		name string
 		err  error
@@ -98,15 +98,19 @@ func TestErrorHandlerUpstreamFaultStill502(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			emTC := &recordingEmitter{}
 			srvTC := newTestServerE(t, upstream, emTC)
-			h := srvTC.errorHandler(upstream.String(), id, "req-1")
+			h := srvTC.errorHandler(upstream.String(), id, "req-1", "logical-1")
 			rr := httptest.NewRecorder()
 			h(rr, httptest.NewRequest(http.MethodPost, "/v1/chat/completions", nil), tc.err)
 
 			if rr.Code != http.StatusBadGateway {
 				t.Fatalf("upstream fault Code=%d, want 502", rr.Code)
 			}
-			if n := len(emTC.all()); n != 0 {
-				t.Fatalf("upstream fault emitted %d events, want 0 (no spurious billing row)", n)
+			events := emTC.all()
+			if len(events) != 1 {
+				t.Fatalf("upstream fault emitted %d events, want 1 observable attempt", len(events))
+			}
+			if events[0].UsageFound || events[0].Aborted || events[0].StatusCode != http.StatusBadGateway {
+				t.Fatalf("upstream fault event = %+v, want usage-missing non-aborted 502 attempt", events[0])
 			}
 		})
 	}

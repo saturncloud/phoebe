@@ -45,7 +45,9 @@ uses it for `billing_event.request_id`, and overwrites the engine-facing and
 response `X-Request-Id` with it for correlation. At-least-once stream redelivery
 retains the id already stored on the metering event and remains safely
 deduplicated by `ON CONFLICT (request_id) DO NOTHING`; replaying a public
-correlation id creates a fresh attempt id and a separate billable row.
+correlation id creates a fresh attempt id and a separate billable row. The
+untrusted original is retained separately as `client_request_id` for support
+and logical-request correlation; it is never a uniqueness or billing key.
 
 ---
 
@@ -145,14 +147,13 @@ Phoebe.Emit (non-blocking, off hot path)
   product shipped/embeddable for neoclouds, the permissive license avoids
   Redis's SSPL/AGPL. Same Streams API. (Mirrors the org's OpenSearch-over-
   Elasticsearch posture.)
-- **WAL loss on pod death is ACCEPTABLE — but in-process loss during a drain is NOT.**
-  Two distinct losses, only one is tolerated:
-  - *Pod death* with un-shipped WAL events during a Valkey outage is a tolerable,
-    bounded, double-failure loss — Postgres is the system of record and
-    reconciliation is the backstop. **This is what lets Phoebe be a stateless
-    `Deployment`** — no StatefulSet, no per-replica PVC, `emptyDir` WAL is fine.
-    Do not "fix" *this* by demanding durable per-replica storage; that re-couples
-    Phoebe to stateful infra for no benefit.
+- **WAL loss on pod death is a declared external gap — in-process loss during a drain is NOT.**
+  - *Pod death* with un-shipped WAL events during a Valkey outage currently loses
+    `emptyDir` data. That does **not** satisfy invoice-grade durability. The chart
+    must mount persistent storage (or the emitter must synchronously append to a
+    remote durable service) before this path can be claimed as guaranteed. Until
+    then engine-log reconciliation is the explicit backstop; see
+    `docs/billing-reconciliation.md`.
   - *A live, healthy pod silently dropping an event during a drain is a bug, not a
     tolerated loss.* The WAL is **`github.com/tidwall/wal`** (chosen over the
     earlier hand-rolled file: small, MIT-licensed, widely tested, go1.13 — and
@@ -175,8 +176,9 @@ Phoebe.Emit (non-blocking, off hot path)
     single-file JSONL WAL found at the configured path is auto-imported on
     upgrade. See `internal/emit/wal.go` `append`/`pending`/`markShipped`.
 
-**Status:** Valkey emit + WAL + log floor are BUILT (`internal/emit`). The
-Postgres drainer and reconciliation are NOT yet built (see §8).
+**Status:** Valkey emit + WAL + log floor, Postgres drainer, raw-to-rated hourly
+reconciliation view, rater, and push are built. Cross-pod WAL durability and the
+external invoice-line comparison remain deployment/billing-system dependencies.
 
 ---
 

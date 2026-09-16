@@ -148,6 +148,7 @@ func newHarness(t *testing.T, schema string) *harness {
 	// exact drift this harness exists to catch (a fresh staging DB without it
 	// poison-dropped every event with SQLSTATE 42703).
 	mustExec(t, db, readMigration(t, "0004_billing_event_serving_mode.up.sql"))
+	mustExec(t, db, readMigration(t, "0005_invoice_grade_attempts.up.sql"))
 
 	mr, err := miniredis.Run()
 	if err != nil {
