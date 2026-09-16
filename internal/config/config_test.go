@@ -316,6 +316,7 @@ func TestLoadAdmissionRejectsInvalidPolicy(t *testing.T) {
 		"admission:\n  enabled: true\n  valkeyAddr: v\n  tiers:\n    default:\n      weight: 1\n      dynamoPriority: 2147483648\n",
 		"admission:\n  enabled: true\n  valkeyAddr: v\n  tiers:\n    default:\n      weight: 1\n      dynamoStrictPriority: -1\n",
 		"admission:\n  enabled: true\n  valkeyAddr: v\n  organizationTiers:\n    org-a: missing\n",
+		"admission:\n  enabled: true\n  valkeyAddr: v\n  platform:\n    totalPromptTokensPerWindow: 10\n    uncachedPromptTokensPerWindow: 11\n",
 	}
 	for _, body := range tests {
 		if _, err := Load(writeTemp(t, body)); err == nil {

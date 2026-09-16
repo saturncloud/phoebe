@@ -338,6 +338,12 @@ func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request) {
 	// endpoints own their engine and bypass both shared-pool mechanisms.
 	var admitted *admission.Lease
 	if id.ServingMode == "shared" {
+		rateLimits, rerr := parseTrustedRateLimits(id)
+		if rerr != nil {
+			s.log.Error.Printf("admission: invalid trusted rate-limit policy: %v", rerr)
+			http.Error(w, "shared inference policy unavailable", http.StatusServiceUnavailable)
+			return
+		}
 		body, rerr := readAndRestoreBody(r)
 		if rerr != nil {
 			http.Error(w, "bad request body", http.StatusBadRequest)
@@ -352,7 +358,14 @@ func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request) {
 			http.Error(w, "invalid shared inference request", http.StatusBadRequest)
 			return
 		}
-		tier := s.settings.Admission.Tiers["default"]
+		tierName := id.ServiceTier
+		if tierName == "" {
+			tierName = "default"
+		}
+		tier, ok := s.settings.Admission.Tiers[tierName]
+		if !ok {
+			tier = s.settings.Admission.Tiers["default"]
+		}
 		if tierName, mapped := s.settings.Admission.OrganizationTiers[id.OrgID]; mapped {
 			tier = s.settings.Admission.Tiers[tierName]
 		}
@@ -384,7 +397,7 @@ func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request) {
 			admitted, err = s.admitter.Admit(r.Context(), admission.Request{
 				Graph: graph, Organization: id.OrgID, Model: model,
 				PromptBytes: int64(len(body)), ReservedOutputTokens: maxOutput,
-				Adapter: id.Adapter != "",
+				Adapter: id.Adapter != "", ServiceTier: id.ServiceTier, RateLimits: rateLimits,
 			})
 			if err != nil {
 				s.writeAdmissionError(w, err)
@@ -466,7 +479,11 @@ func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request) {
 			// honours ctx would otherwise lose every aborted request).
 			ctx := context.WithoutCancel(r.Context())
 			if admitted != nil {
-				if e := admitted.Complete(ctx, int64(res.Usage.CompletionTokens)); e != nil {
+				if e := admitted.CompleteUsage(ctx, admission.Usage{
+					TotalPromptTokens:  int64(res.Usage.PromptTokens),
+					CachedPromptTokens: int64(res.Usage.CachedTokens()),
+					GeneratedTokens:    int64(res.Usage.CompletionTokens),
+				}); e != nil {
 					s.log.Error.Printf("admission: completion release failed: %v", e)
 				}
 			}

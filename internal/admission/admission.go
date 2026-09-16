@@ -23,9 +23,10 @@ var ErrUnavailable = errors.New("distributed admission state unavailable")
 
 // Rejected is a capacity/policy rejection, as distinct from state failure.
 type Rejected struct {
-	Scope      string
-	Dimension  string
-	RetryAfter time.Duration
+	Scope       string
+	Dimension   string
+	RetryAfter  time.Duration
+	Contractual bool
 }
 
 func (r *Rejected) Error() string {
@@ -39,22 +40,36 @@ type Request struct {
 	PromptBytes          int64
 	ReservedOutputTokens int64
 	Adapter              bool
+	ServiceTier          string
+	RateLimits           RateLimits
+}
+
+// RateLimits is the authenticated customer contract. Zero means unlimited.
+// Every value is per minute; total prompt contains the uncached subset.
+type RateLimits struct {
+	Requests             int64
+	TotalPromptTokens    int64
+	UncachedPromptTokens int64
+	GeneratedTokens      int64
 }
 
 type scope struct {
-	ID        string `json:"id"`
-	Name      string `json:"name"`
-	Active    int64  `json:"active"`
-	Prefills  int64  `json:"prefills"`
-	Decodes   int64  `json:"decodes"`
-	Prompt    int64  `json:"prompt"`
-	Output    int64  `json:"output"`
-	Adapters  int64  `json:"adapters"`
-	Requests  int64  `json:"requests"`
-	Generated int64  `json:"generated"`
-	Cold      int64  `json:"cold"`
-	Wakes     int64  `json:"wakes"`
-	WindowMs  int64  `json:"window_ms"`
+	ID             string `json:"id"`
+	Name           string `json:"name"`
+	Active         int64  `json:"active"`
+	Prefills       int64  `json:"prefills"`
+	Decodes        int64  `json:"decodes"`
+	Prompt         int64  `json:"prompt"`
+	Output         int64  `json:"output"`
+	Adapters       int64  `json:"adapters"`
+	Requests       int64  `json:"requests"`
+	TotalPrompt    int64  `json:"total_prompt"`
+	UncachedPrompt int64  `json:"uncached_prompt"`
+	Generated      int64  `json:"generated"`
+	Cold           int64  `json:"cold"`
+	Wakes          int64  `json:"wakes"`
+	WindowMs       int64  `json:"window_ms"`
+	Contractual    bool   `json:"contractual"`
 }
 
 type wireRequest struct {
@@ -123,7 +138,8 @@ func (a *RedisAdmitter) Admit(ctx context.Context, req Request) (*Lease, error) 
 			scopeName = fmt.Sprint(parts[1])
 			dimension = fmt.Sprint(parts[2])
 		}
-		return nil, &Rejected{Scope: scopeName, Dimension: dimension, RetryAfter: a.retryAfter(w.Scopes)}
+		contractual := len(parts) > 3 && number(parts[3]) == 1
+		return nil, &Rejected{Scope: scopeName, Dimension: dimension, RetryAfter: a.retryAfter(w.Scopes), Contractual: contractual}
 	}
 	return &Lease{owner: a, id: id}, nil
 }
@@ -167,6 +183,8 @@ func scaled(l config.AdmissionLimits, weight int64) config.AdmissionLimits {
 	l.MaxReservedOutputTokens = mul(l.MaxReservedOutputTokens)
 	l.MaxActiveAdapters = mul(l.MaxActiveAdapters)
 	l.RequestsPerWindow = mul(l.RequestsPerWindow)
+	l.TotalPromptTokensPerWindow = mul(l.TotalPromptTokensPerWindow)
+	l.UncachedPromptTokensPerWindow = mul(l.UncachedPromptTokensPerWindow)
 	l.GeneratedTokensPerWindow = mul(l.GeneratedTokensPerWindow)
 	l.MaxColdHolds = mul(l.MaxColdHolds)
 	l.WakesPerWindow = mul(l.WakesPerWindow)
@@ -182,15 +200,42 @@ func makeScope(name, id string, l config.AdmissionLimits) scope {
 	return scope{ID: name + ":" + hex.EncodeToString(digest[:]), Name: name, Active: l.MaxActiveRequests, Prefills: l.MaxConcurrentPrefills,
 		Decodes: l.MaxActiveDecodes,
 		Prompt:  l.MaxPromptBytes, Output: l.MaxReservedOutputTokens, Adapters: l.MaxActiveAdapters,
-		Requests: l.RequestsPerWindow, Generated: l.GeneratedTokensPerWindow, Cold: l.MaxColdHolds,
+		Requests: l.RequestsPerWindow, TotalPrompt: l.TotalPromptTokensPerWindow,
+		UncachedPrompt: l.UncachedPromptTokensPerWindow, Generated: l.GeneratedTokensPerWindow, Cold: l.MaxColdHolds,
 		Wakes: l.WakesPerWindow, WindowMs: windowMs}
+}
+
+func makeContractScope(name, id string, limits RateLimits) scope {
+	digest := sha256.Sum256([]byte(id))
+	return scope{
+		ID: name + ":" + hex.EncodeToString(digest[:]), Name: name,
+		Requests: limits.Requests, TotalPrompt: limits.TotalPromptTokens,
+		UncachedPrompt: limits.UncachedPromptTokens, Generated: limits.GeneratedTokens,
+		WindowMs: time.Minute.Milliseconds(), Contractual: true,
+	}
+}
+
+func (l RateLimits) any() bool {
+	return l.Requests > 0 || l.TotalPromptTokens > 0 || l.UncachedPromptTokens > 0 || l.GeneratedTokens > 0
 }
 
 func (a *RedisAdmitter) scopes(r Request) []scope {
 	out := []scope{makeScope("platform", "all", a.cfg.Platform), makeScope("graph", r.Graph, a.cfg.Graph),
 		makeScope("organization", r.Organization, a.cfg.Organization), makeScope("organization_model", r.Organization+"\x1f"+r.Model, a.cfg.OrganizationModel)}
-	tierName := a.cfg.OrganizationTiers[r.Organization]
+	if r.RateLimits.any() {
+		out = append(out,
+			makeContractScope("contract_organization", r.Organization, r.RateLimits),
+			makeContractScope("contract_organization_model", r.Organization+"\x1f"+r.Model, r.RateLimits),
+		)
+	}
+	tierName := r.ServiceTier
+	if mapped := a.cfg.OrganizationTiers[r.Organization]; mapped != "" {
+		tierName = mapped
+	}
 	if tierName == "" {
+		tierName = "default"
+	}
+	if _, ok := a.cfg.Tiers[tierName]; !ok {
 		tierName = "default"
 	}
 	if t, ok := a.cfg.Tiers[tierName]; ok {
@@ -213,10 +258,35 @@ func (l *Lease) BeginColdHold(ctx context.Context) error { return l.run(ctx, col
 func (l *Lease) EndColdHold(ctx context.Context) error   { return l.run(ctx, coldScript, "end", 0) }
 
 func (l *Lease) Complete(ctx context.Context, generatedTokens int64) error {
+	return l.CompleteUsage(ctx, Usage{GeneratedTokens: generatedTokens})
+}
+
+// Usage is the engine-authoritative token result used to settle contractual
+// throughput windows. CachedPromptTokens is a subset of TotalPromptTokens.
+// Prompt-byte reservations remain a separate physical guard and are never
+// converted into contractual token usage.
+type Usage struct {
+	TotalPromptTokens  int64
+	CachedPromptTokens int64
+	GeneratedTokens    int64
+}
+
+// CompleteUsage releases physical reservations and atomically records the
+// exact token currencies reported by the engine. Prompt windows are checked
+// on subsequent admission because exact rendered/cache-aware counts become
+// available only after Dynamo tokenization and execution; generated capacity
+// remains strictly reserved from max_tokens before dispatch.
+func (l *Lease) CompleteUsage(ctx context.Context, usage Usage) error {
 	// The Lua transition is idempotent (a missing lease is success), so retrying
 	// after a transient Valkey failure is both safe and preferable to waiting for
 	// TTL reaping.
-	return l.run(ctx, finishScript, "finish", generatedTokens)
+	totalPrompt := max(usage.TotalPromptTokens, 0)
+	cachedPrompt := max(usage.CachedPromptTokens, 0)
+	if cachedPrompt > totalPrompt {
+		cachedPrompt = totalPrompt
+	}
+	uncachedPrompt := totalPrompt - cachedPrompt
+	return l.run(ctx, finishScript, "finish", max(usage.GeneratedTokens, 0), totalPrompt, uncachedPrompt)
 }
 
 // KeepAlive renews a live request's expiry until ctx is cancelled. A healthy
@@ -249,8 +319,12 @@ func (l *Lease) KeepAlive(ctx context.Context, onError func(error)) {
 	}
 }
 
-func (l *Lease) run(ctx context.Context, script *redis.Script, action string, tokens int64) error {
-	res, err := script.Run(ctx, l.owner.client, []string{l.owner.counters, l.owner.leases, l.owner.expiries}, l.id, action, tokens).Result()
+func (l *Lease) run(ctx context.Context, script *redis.Script, action string, values ...int64) error {
+	args := []interface{}{l.id, action}
+	for _, value := range values {
+		args = append(args, value)
+	}
+	res, err := script.Run(ctx, l.owner.client, []string{l.owner.counters, l.owner.leases, l.owner.expiries}, args...).Result()
 	if err != nil {
 		return fmt.Errorf("%w: %v", ErrUnavailable, err)
 	}
@@ -261,7 +335,8 @@ func (l *Lease) run(ctx context.Context, script *redis.Script, action string, to
 			sn = fmt.Sprint(parts[1])
 			dim = fmt.Sprint(parts[2])
 		}
-		return &Rejected{Scope: sn, Dimension: dim, RetryAfter: time.Minute}
+		contractual := len(parts) > 3 && number(parts[3]) == 1
+		return &Rejected{Scope: sn, Dimension: dim, RetryAfter: time.Minute, Contractual: contractual}
 	}
 	return nil
 }

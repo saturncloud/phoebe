@@ -18,7 +18,8 @@ func limits(active int64) config.AdmissionLimits {
 	return config.AdmissionLimits{MaxActiveRequests: active, MaxConcurrentPrefills: active,
 		MaxActiveDecodes: active,
 		MaxPromptBytes:   1024, MaxReservedOutputTokens: 1024, MaxActiveAdapters: active,
-		RequestsPerWindow: 100, GeneratedTokensPerWindow: 1000, MaxColdHolds: active,
+		RequestsPerWindow: 100, TotalPromptTokensPerWindow: 1000,
+		UncachedPromptTokensPerWindow: 1000, GeneratedTokensPerWindow: 1000, MaxColdHolds: active,
 		WakesPerWindow: 100, Window: time.Minute}
 }
 
@@ -191,6 +192,70 @@ func TestGeneratedWindowReservesThenChargesActual(t *testing.T) {
 	// 10 actual + 20 requested still exceeds the 25-token window.
 	if _, err = a.Admit(context.Background(), request("b", "m")); err == nil {
 		t.Fatal("actual generated-token window was not charged")
+	}
+}
+
+func TestPromptWindowsSettleAuthoritativeCachedUsage(t *testing.T) {
+	t.Run("total prompt includes cached tokens", func(t *testing.T) {
+		l := limits(5)
+		l.TotalPromptTokensPerWindow = 100
+		a, _ := testAdmitter(t, config.AdmissionSettings{Platform: l})
+		first, err := a.Admit(context.Background(), request("a", "m"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := first.CompleteUsage(context.Background(), Usage{
+			TotalPromptTokens: 100, CachedPromptTokens: 90, GeneratedTokens: 1,
+		}); err != nil {
+			t.Fatal(err)
+		}
+		_, err = a.Admit(context.Background(), request("b", "m"))
+		var rejected *Rejected
+		if !errors.As(err, &rejected) || rejected.Dimension != "total_prompt_tokens" {
+			t.Fatalf("err=%v, want total_prompt_tokens rejection", err)
+		}
+	})
+
+	t.Run("uncached prompt excludes cache hits", func(t *testing.T) {
+		l := limits(5)
+		l.TotalPromptTokensPerWindow = 1000
+		l.UncachedPromptTokensPerWindow = 20
+		a, _ := testAdmitter(t, config.AdmissionSettings{Platform: l})
+		first, err := a.Admit(context.Background(), request("a", "m"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := first.CompleteUsage(context.Background(), Usage{
+			TotalPromptTokens: 100, CachedPromptTokens: 80,
+		}); err != nil {
+			t.Fatal(err)
+		}
+		_, err = a.Admit(context.Background(), request("b", "m"))
+		var rejected *Rejected
+		if !errors.As(err, &rejected) || rejected.Dimension != "uncached_prompt_tokens" {
+			t.Fatalf("err=%v, want uncached_prompt_tokens rejection", err)
+		}
+	})
+}
+
+func TestPromptUsageClampsMalformedCachedSubset(t *testing.T) {
+	l := limits(5)
+	l.TotalPromptTokensPerWindow = 10
+	l.UncachedPromptTokensPerWindow = 1
+	a, _ := testAdmitter(t, config.AdmissionSettings{Platform: l})
+	first, err := a.Admit(context.Background(), request("a", "m"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := first.CompleteUsage(context.Background(), Usage{
+		TotalPromptTokens: 10, CachedPromptTokens: 20,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	_, err = a.Admit(context.Background(), request("b", "m"))
+	var rejected *Rejected
+	if !errors.As(err, &rejected) || rejected.Dimension != "total_prompt_tokens" {
+		t.Fatalf("err=%v, want total_prompt_tokens rejection", err)
 	}
 }
 

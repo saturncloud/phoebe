@@ -53,10 +53,13 @@ end
 var admitScript = redis.NewScript(luaHelpers + `
 local q=cjson.decode(ARGV[1]); q.now=current_time_ms(); reap(q.now)
 for _,s in ipairs(q.scopes) do
+  local contract=s.contractual and 1 or 0
   local checks={{'active',s.active,1},{'prefills',s.prefills,1},{'decodes',s.decodes,1},{'prompt',s.prompt,q.prompt},{'output',s.output,q.output},{'adapters',s.adapters,q.adapter}}
-  for _,c in ipairs(checks) do if c[2] > 0 and get(field(s,c[1])) + c[3] > c[2] then return {0,s.name,c[1]} end end
-  if s.requests > 0 and window_get(s,'requests',q.now)+1 > s.requests then return {0,s.name,'requests'} end
-  if s.generated > 0 and window_get(s,'generated',q.now)+get(field(s,'genreserved'))+q.output > s.generated then return {0,s.name,'generated_tokens'} end
+  for _,c in ipairs(checks) do if c[2] > 0 and get(field(s,c[1])) + c[3] > c[2] then return {0,s.name,c[1],contract} end end
+  if s.requests > 0 and window_get(s,'requests',q.now)+1 > s.requests then return {0,s.name,'requests',contract} end
+  if s.total_prompt > 0 and window_get(s,'total_prompt',q.now) >= s.total_prompt then return {0,s.name,'total_prompt_tokens',contract} end
+  if s.uncached_prompt > 0 and window_get(s,'uncached_prompt',q.now) >= s.uncached_prompt then return {0,s.name,'uncached_prompt_tokens',contract} end
+  if s.generated > 0 and window_get(s,'generated',q.now)+get(field(s,'genreserved'))+q.output > s.generated then return {0,s.name,'generated_tokens',contract} end
 end
 local rec={scopes=q.scopes,prompt=q.prompt,output=q.output,adapter=q.adapter,prefill=true,cold=false}
 for _,s in ipairs(q.scopes) do
@@ -83,8 +86,9 @@ local now=current_time_ms(); reap(now); local raw=redis.call('HGET',KEYS[2],ARGV
 local rec=cjson.decode(raw)
 if ARGV[2] == 'begin' and not rec.cold then
   for _,s in ipairs(rec.scopes) do
-    if s.cold > 0 and get(field(s,'cold'))+1 > s.cold then return {0,s.name,'cold_holds'} end
-    if s.wakes > 0 and window_get(s,'wakes',now)+1 > s.wakes then return {0,s.name,'wakes'} end
+    local contract=s.contractual and 1 or 0
+    if s.cold > 0 and get(field(s,'cold'))+1 > s.cold then return {0,s.name,'cold_holds',contract} end
+    if s.wakes > 0 and window_get(s,'wakes',now)+1 > s.wakes then return {0,s.name,'wakes',contract} end
   end
   for _,s in ipairs(rec.scopes) do add(field(s,'cold'),1); if s.wakes > 0 then window_add(s,'wakes',now,1) end end
   rec.cold=true; redis.call('HSET',KEYS[2],ARGV[1],cjson.encode(rec))
@@ -98,8 +102,13 @@ return {1}
 var finishScript = redis.NewScript(luaHelpers + `
 local now=current_time_ms(); reap(now); local raw=redis.call('HGET',KEYS[2],ARGV[1]); if not raw then return {1} end
 local rec=cjson.decode(raw); local generated=tonumber(ARGV[3]) or 0
+local total_prompt=tonumber(ARGV[4]) or 0; local uncached_prompt=tonumber(ARGV[5]) or 0
 release_record(rec)
-for _,s in ipairs(rec.scopes) do if generated > 0 and s.generated > 0 then window_add(s,'generated',now,generated) end end
+for _,s in ipairs(rec.scopes) do
+  if total_prompt > 0 and s.total_prompt > 0 then window_add(s,'total_prompt',now,total_prompt) end
+  if uncached_prompt > 0 and s.uncached_prompt > 0 then window_add(s,'uncached_prompt',now,uncached_prompt) end
+  if generated > 0 and s.generated > 0 then window_add(s,'generated',now,generated) end
+end
 redis.call('HDEL',KEYS[2],ARGV[1]); redis.call('ZREM',KEYS[3],ARGV[1]); return {1}
 `)
 

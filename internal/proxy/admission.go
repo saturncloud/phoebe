@@ -12,6 +12,7 @@ import (
 
 	"github.com/saturncloud/phoebe/internal/admission"
 	"github.com/saturncloud/phoebe/internal/config"
+	"github.com/saturncloud/phoebe/internal/identity"
 )
 
 // admissionWork returns the exact routed model and a conservative output-token
@@ -139,10 +140,52 @@ func (s *Server) writeAdmissionError(w http.ResponseWriter, err error) {
 			retry = 1
 		}
 		w.Header().Set("Retry-After", strconv.FormatInt(retry, 10))
-		http.Error(w, "shared inference capacity is temporarily unavailable", http.StatusTooManyRequests)
+		status := http.StatusServiceUnavailable
+		message := "shared inference capacity is temporarily unavailable"
+		if rejected.Contractual {
+			status = http.StatusTooManyRequests
+			message = "shared inference rate limit exceeded"
+		}
+		http.Error(w, message, status)
 		s.log.Warn.Printf("admission: rejected scope=%s dimension=%s", rejected.Scope, rejected.Dimension)
 		return
 	}
 	http.Error(w, "shared inference admission state unavailable", http.StatusServiceUnavailable)
 	s.log.Error.Printf("admission: fail closed: %v", err)
+}
+
+func parseTrustedRateLimits(id identity.Identity) (admission.RateLimits, error) {
+	if id.Gateway && (id.ServiceTier == "" || id.RateLimitRequests == "" ||
+		id.RateLimitTotalPromptTokens == "" || id.RateLimitUncachedPromptTokens == "" ||
+		id.RateLimitGeneratedTokens == "") {
+		return admission.RateLimits{}, fmt.Errorf("incomplete trusted gateway rate-limit policy")
+	}
+	parse := func(name, value string) (int64, error) {
+		if value == "" {
+			return 0, nil
+		}
+		limit, err := strconv.ParseInt(value, 10, 64)
+		if err != nil || limit < 0 {
+			return 0, fmt.Errorf("invalid trusted %s header", name)
+		}
+		return limit, nil
+	}
+	var out admission.RateLimits
+	var err error
+	if out.Requests, err = parse(identity.HeaderRateLimitRequests, id.RateLimitRequests); err != nil {
+		return out, err
+	}
+	if out.TotalPromptTokens, err = parse(identity.HeaderRateLimitTotalPromptTokens, id.RateLimitTotalPromptTokens); err != nil {
+		return out, err
+	}
+	if out.UncachedPromptTokens, err = parse(identity.HeaderRateLimitUncachedPromptTokens, id.RateLimitUncachedPromptTokens); err != nil {
+		return out, err
+	}
+	if out.GeneratedTokens, err = parse(identity.HeaderRateLimitGeneratedTokens, id.RateLimitGeneratedTokens); err != nil {
+		return out, err
+	}
+	if out.TotalPromptTokens > 0 && out.UncachedPromptTokens > out.TotalPromptTokens {
+		return out, fmt.Errorf("trusted uncached prompt limit exceeds total prompt limit")
+	}
+	return out, nil
 }

@@ -22,10 +22,10 @@ would violate the global bound and is intentionally absent.
 | Platform, graph, org, org×model admission | Saturn-owned, implemented here | Atomic Valkey reservations in Phoebe. |
 | Concurrent prefills and input work | Saturn-owned, implemented conservatively | Phoebe reserves concurrent prefills and complete request-body bytes, then releases on the first upstream body byte. Model-specific rendered templates/token counts stay in the engine. |
 | Active decodes/streams and reserved output | Saturn-owned, implemented here | A decode slot and `max_tokens`/`max_completion_tokens` are reserved before forwarding and held until completion, abort, timeout, rejection, or upstream failure. Reserving the slot early is conservative and avoids attempting to queue after response streaming begins. |
-| Request and generated-token windows | Saturn-owned, implemented here | Fixed operator-configured windows. Generated usage is charged from the engine's authoritative completion count; outstanding max-output reservations prevent overbooking. |
+| Request and token-throughput windows | Saturn-owned, implemented here | Separate request, total-prompt, uncached-prompt, and generated-token windows. Engine usage settles all token currencies; outstanding max-output reservations prevent decode overbooking. Exact prompt/cache counts become available after Dynamo tokenization, so prompt windows reject subsequent work after settlement and can overshoot only by already-admitted requests. |
 | Cold holds and wake churn | Partially implemented before; completed here | Phoebe already detected/actuated wake-from-zero. Distributed hold and wake-window admission now surrounds actuation. |
 | Adapter and KV pressure | Layered implementation | Phoebe bounds active adapter-bearing requests and reserved work. Saturn enables backend prefix caches and KV event publication; Dynamo routes on actual cache residency and load, while each engine owns allocation/eviction. |
-| Service-tier protected shares | Layered implementation | Operator-owned org→tier mapping prevents client selection. Hard Phoebe lanes protect capacity; Phoebe also replaces client hints with the tier's trusted Dynamo soft and strict priorities. |
+| Service-tier protected shares | Layered implementation | Atlas derives the tier from effective UsageLimits; an operator-owned org→tier map can override it. Hard Phoebe lanes protect capacity, and Phoebe replaces client hints with the tier's trusted Dynamo soft and strict priorities. |
 | Cache-aware/worker routing and prefill/decode scheduling | Saturn-configured Dynamo capability | Shared graphs enable KV routing, output-block tracking, a capacity-triggered WSPT queue, and backend priority scheduling where supported. |
 | Gang lifecycle and replica topology | Saturn-configured Grove/Dynamo capability | The graph remains the lifecycle and gang unit; request fairness is enforced above and inside it. |
 | GPU queue quota, DRF, placement, and preemption | Saturn-configured KAI capability | KAI protects graph/pod scheduling. Many organizations share one graph, so organization request fairness cannot be delegated to a pod scheduler. |
@@ -39,9 +39,38 @@ Contract limits are a separate policy input even when they are enforced at this
 same gate, because a physical-capacity rejection and an exhausted entitlement
 have different ownership, status, and reset semantics.
 
+The public token contract never uses an unqualified "tokens" value. Its four
+rate dimensions are requests, total prompt tokens (cached plus uncached),
+uncached prompt tokens (the subset requiring prefill compute), and generated
+tokens. Cached prompt tokens therefore participate in total-prompt throughput
+without being double-counted as uncached work. This mirrors the resource-aware
+shared-inference convention while keeping invoice prices independent.
+
+Atlas resolves each authenticated owner's UsageLimits over its organization
+fallback and stamps the effective service tier plus all four rate dimensions
+through gateway ForwardAuth. Traefik allowlists that complete envelope, so a
+client-supplied tier or ceiling is overwritten before Phoebe. Phoebe enforces
+the same contract at aggregate organization and organization×model scopes;
+zero means no contractual ceiling, while independent operator capacity limits
+still apply. Atlas must stamp every field; a missing field is a broken trusted
+contract and fails closed, while the explicit string `0` represents unlimited.
+An exhausted contract returns 429 with Retry-After. Physical pool
+saturation or unavailable admission state returns 503 instead.
+
+Phoebe can reserve generated capacity strictly before dispatch because the
+request declares a maximum output. It cannot derive exact rendered prompt or
+cache-hit counts from raw OpenAI JSON without duplicating Dynamo's model chat
+templates, tokenizer, and live KV lookup. It settles those exact currencies
+from the engine's authoritative usage and blocks later admissions once a
+window is exhausted. Strict pre-dispatch prompt-token rejection requires a
+Dynamo admission hook after tokenization/cache lookup; request-body bytes stay
+an instantaneous physical guard, never a contractual token approximation.
+
 ## Trusted Dynamo request policy
 
-For admitted shared requests, Phoebe normalizes `nvext.agent_hints.priority`,
+For admitted shared requests, Phoebe selects the configured tier named by the
+trusted Atlas service-tier header (with operator `organizationTiers` as an
+explicit override), then normalizes `nvext.agent_hints.priority`,
 `strict_priority`, and `osl` from the operator-owned tier and output-token
 reservation. It also replaces `X-Dynamo-Request-Priority` and
 `X-Dynamo-Request-Strict-Priority`, because Dynamo gives those headers
@@ -66,7 +95,8 @@ work affect scheduling.
 
 An admitted request owns a lease. Input/prefill counters release at response
 body byte; active request/decode, output, adapter, and generated-window reservation state
-release at final body completion. The owning proxy renews the expiry throughout
+release at final body completion, when authoritative total-prompt,
+uncached-prompt, and generated counts are atomically settled. The owning proxy renews the expiry throughout
 long streams. Pre-header aborts, upstream errors, ordinary
 rejections, wake failures, and handler early returns run the same idempotent
 release. A replica crash cannot execute cleanup, so every operation first reaps
@@ -79,10 +109,11 @@ downstream JSON stack cannot select different values and under-reserve work.
 
 ## Rollout and rollback
 
-Roll out with `admission.enabled: false`, deploy all Phoebe replicas, configure
-one shared Valkey and conservative measured limits, then enable admission. Watch
-429s by scope/dimension and Valkey latency/errors. Roll back by disabling the
-feature; existing leases expire without affecting billing or Dynamo. Do not
+Roll out the Atlas migration/headers and Traefik seven-header ForwardAuth
+allowlist before the new Phoebe image. Then keep `admission.enabled: false`,
+deploy all Phoebe replicas, configure one shared Valkey and conservative measured limits, and enable admission. Watch
+429 contract rejections and 503 capacity rejections by scope/dimension, plus
+Valkey latency/errors. Roll back by disabling the feature; existing leases expire without affecting billing or Dynamo. Do not
 point replicas at different Valkey instances during a rolling update.
 
 ## Enforcement boundaries

@@ -17,6 +17,11 @@ func TestFromRequestCapturesAllHeaders(t *testing.T) {
 	r.Header.Set(HeaderBaseModel, "meta-llama/Llama-3.1-8B-Instruct")
 	r.Header.Set(HeaderAdapter, "ckpt-artifact-42")
 	r.Header.Set(HeaderUpstream, "pd-x.main-namespace.svc.cluster.local:8000")
+	r.Header.Set(HeaderServiceTier, "pro")
+	r.Header.Set(HeaderRateLimitRequests, "700")
+	r.Header.Set(HeaderRateLimitTotalPromptTokens, "1600000")
+	r.Header.Set(HeaderRateLimitUncachedPromptTokens, "400000")
+	r.Header.Set(HeaderRateLimitGeneratedTokens, "200000")
 
 	id := FromRequest(r)
 
@@ -43,6 +48,12 @@ func TestFromRequestCapturesAllHeaders(t *testing.T) {
 	}
 	if id.Adapter != "ckpt-artifact-42" {
 		t.Errorf("Adapter = %q, want ckpt-artifact-42", id.Adapter)
+	}
+	if id.ServiceTier != "pro" || id.RateLimitRequests != "700" ||
+		id.RateLimitTotalPromptTokens != "1600000" ||
+		id.RateLimitUncachedPromptTokens != "400000" ||
+		id.RateLimitGeneratedTokens != "200000" {
+		t.Errorf("rate-limit identity fields = %+v", id)
 	}
 	if id.Upstream != "pd-x.main-namespace.svc.cluster.local:8000" {
 		t.Errorf("Upstream = %q, want pd-x.main-namespace.svc.cluster.local:8000", id.Upstream)

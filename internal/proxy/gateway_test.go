@@ -53,10 +53,10 @@ func newGatewayTestServer(t *testing.T, em *recordingEmitter, resolver gateway.R
 	return s
 }
 
-// gatewayRequest builds a gateway-marked request: the trusted middleware
-// markers (X-Saturn-Gateway, X-Saturn-Org-Id) plus the auth id every billed
-// request carries — and NONE of the per-resource routing headers, exactly as
-// the gateway route contract specifies.
+// gatewayRequest builds a gateway-marked request with the complete trusted
+// identity and admission-policy contract. Zero rate limits mean unlimited.
+// It carries none of the per-resource routing headers, exactly as the gateway
+// route contract specifies.
 func gatewayRequest(org, body string) *http.Request {
 	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(body))
 	req.Header.Set(identity.HeaderGateway, "true")
@@ -64,6 +64,11 @@ func gatewayRequest(org, body string) *http.Request {
 		req.Header.Set(identity.HeaderOrgID, org)
 	}
 	req.Header.Set(identity.HeaderAuthID, "auth-1")
+	req.Header.Set(identity.HeaderServiceTier, "default")
+	req.Header.Set(identity.HeaderRateLimitRequests, "0")
+	req.Header.Set(identity.HeaderRateLimitTotalPromptTokens, "0")
+	req.Header.Set(identity.HeaderRateLimitUncachedPromptTokens, "0")
+	req.Header.Set(identity.HeaderRateLimitGeneratedTokens, "0")
 	return req
 }
 

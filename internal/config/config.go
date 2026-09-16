@@ -72,21 +72,25 @@ type Settings struct {
 }
 
 // AdmissionLimits is one independently-enforced scope budget. Zero means that
-// dimension is unlimited. Window applies to RequestsPerWindow,
-// GeneratedTokensPerWindow, and WakesPerWindow.
+// dimension is unlimited. Window applies to RequestsPerWindow, the three
+// token-throughput windows, and WakesPerWindow. Total prompt includes cached
+// and uncached prompt tokens; uncached prompt is the subset that required
+// prefill compute.
 type AdmissionLimits struct {
-	MaxActiveRequests        int64         `yaml:"maxActiveRequests"`
-	MaxConcurrentPrefills    int64         `yaml:"maxConcurrentPrefills"`
-	MaxActiveDecodes         int64         `yaml:"maxActiveDecodes"`
-	MaxPromptBytes           int64         `yaml:"maxPromptBytes"`
-	MaxReservedOutputTokens  int64         `yaml:"maxReservedOutputTokens"`
-	MaxActiveAdapters        int64         `yaml:"maxActiveAdapters"`
-	RequestsPerWindow        int64         `yaml:"requestsPerWindow"`
-	GeneratedTokensPerWindow int64         `yaml:"generatedTokensPerWindow"`
-	MaxColdHolds             int64         `yaml:"maxColdHolds"`
-	WakesPerWindow           int64         `yaml:"wakesPerWindow"`
-	WindowStr                string        `yaml:"window"`
-	Window                   time.Duration `yaml:"-"`
+	MaxActiveRequests             int64         `yaml:"maxActiveRequests"`
+	MaxConcurrentPrefills         int64         `yaml:"maxConcurrentPrefills"`
+	MaxActiveDecodes              int64         `yaml:"maxActiveDecodes"`
+	MaxPromptBytes                int64         `yaml:"maxPromptBytes"`
+	MaxReservedOutputTokens       int64         `yaml:"maxReservedOutputTokens"`
+	MaxActiveAdapters             int64         `yaml:"maxActiveAdapters"`
+	RequestsPerWindow             int64         `yaml:"requestsPerWindow"`
+	TotalPromptTokensPerWindow    int64         `yaml:"totalPromptTokensPerWindow"`
+	UncachedPromptTokensPerWindow int64         `yaml:"uncachedPromptTokensPerWindow"`
+	GeneratedTokensPerWindow      int64         `yaml:"generatedTokensPerWindow"`
+	MaxColdHolds                  int64         `yaml:"maxColdHolds"`
+	WakesPerWindow                int64         `yaml:"wakesPerWindow"`
+	WindowStr                     string        `yaml:"window"`
+	Window                        time.Duration `yaml:"-"`
 }
 
 // AdmissionTier gives an operator-defined service tier an isolated protected
@@ -375,12 +379,14 @@ func (a *AdmissionSettings) parse() error {
 func limitValues(l AdmissionLimits) []int64 {
 	return []int64{l.MaxActiveRequests, l.MaxConcurrentPrefills, l.MaxActiveDecodes, l.MaxPromptBytes,
 		l.MaxReservedOutputTokens, l.MaxActiveAdapters, l.RequestsPerWindow,
+		l.TotalPromptTokensPerWindow, l.UncachedPromptTokensPerWindow,
 		l.GeneratedTokensPerWindow, l.MaxColdHolds, l.WakesPerWindow}
 }
 
 func (a *AdmissionSettings) validateTierShares() error {
 	names := []string{"maxActiveRequests", "maxConcurrentPrefills", "maxActiveDecodes", "maxPromptBytes",
 		"maxReservedOutputTokens", "maxActiveAdapters", "requestsPerWindow",
+		"totalPromptTokensPerWindow", "uncachedPromptTokensPerWindow",
 		"generatedTokensPerWindow", "maxColdHolds", "wakesPerWindow"}
 	platform := limitValues(a.Platform)
 	sums := make([]int64, len(platform))
@@ -409,11 +415,15 @@ func (a *AdmissionSettings) validateTierShares() error {
 
 func (l *AdmissionLimits) parse(name string) error {
 	values := []int64{l.MaxActiveRequests, l.MaxConcurrentPrefills, l.MaxActiveDecodes, l.MaxPromptBytes, l.MaxReservedOutputTokens, l.MaxActiveAdapters,
-		l.RequestsPerWindow, l.GeneratedTokensPerWindow, l.MaxColdHolds, l.WakesPerWindow}
+		l.RequestsPerWindow, l.TotalPromptTokensPerWindow, l.UncachedPromptTokensPerWindow,
+		l.GeneratedTokensPerWindow, l.MaxColdHolds, l.WakesPerWindow}
 	for _, value := range values {
 		if value < 0 {
 			return fmt.Errorf("%s limits cannot be negative", name)
 		}
+	}
+	if l.TotalPromptTokensPerWindow > 0 && l.UncachedPromptTokensPerWindow > l.TotalPromptTokensPerWindow {
+		return fmt.Errorf("%s.uncachedPromptTokensPerWindow cannot exceed totalPromptTokensPerWindow", name)
 	}
 	if l.WindowStr == "" {
 		l.WindowStr = "1m"

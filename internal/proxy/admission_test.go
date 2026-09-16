@@ -66,8 +66,8 @@ func TestAdmissionAcrossProxyReplicasAndLifecycleRelease(t *testing.T) {
 	}
 	rr2 := httptest.NewRecorder()
 	two.Handler().ServeHTTP(rr2, sharedRequest(up))
-	if rr2.Code != http.StatusTooManyRequests {
-		t.Fatalf("contending replica status=%d, want 429", rr2.Code)
+	if rr2.Code != http.StatusServiceUnavailable {
+		t.Fatalf("contending replica status=%d, want 503", rr2.Code)
 	}
 	close(release)
 	if rr := <-done; rr.Code != http.StatusOK {
@@ -112,11 +112,62 @@ func TestAdmissionImpossibleOutputRejectedBeforeUpstream(t *testing.T) {
 	s := New(&config.Settings{Admission: cfg}, logging.New(logging.ERROR), &recordingEmitter{}).WithAdmitter(admission.New(c, cfg))
 	rr := httptest.NewRecorder()
 	s.Handler().ServeHTTP(rr, sharedRequest(up))
+	if rr.Code != http.StatusServiceUnavailable {
+		t.Fatalf("status=%d, want 503", rr.Code)
+	}
+	if hits != 0 {
+		t.Fatal("impossible request reached upstream")
+	}
+}
+
+func TestContractRateLimitReturns429BeforeUpstream(t *testing.T) {
+	var hits int
+	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) { hits++; w.WriteHeader(200) }))
+	defer backend.Close()
+	up, _ := url.Parse(backend.URL)
+	mr := miniredis.RunT(t)
+	cfg := proxyAdmissionConfig(2)
+	c := redis.NewClient(&redis.Options{Addr: mr.Addr()})
+	s := New(&config.Settings{Admission: cfg}, logging.New(logging.ERROR), &recordingEmitter{}).WithAdmitter(admission.New(c, cfg))
+	req := sharedRequest(up)
+	req.Header.Set(identity.HeaderRateLimitGeneratedTokens, "10")
+	rr := httptest.NewRecorder()
+	s.Handler().ServeHTTP(rr, req)
 	if rr.Code != http.StatusTooManyRequests {
 		t.Fatalf("status=%d, want 429", rr.Code)
 	}
 	if hits != 0 {
-		t.Fatal("impossible request reached upstream")
+		t.Fatal("contractually over-limit request reached upstream")
+	}
+}
+
+func TestMalformedTrustedRateLimitFailsClosed(t *testing.T) {
+	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) { w.WriteHeader(200) }))
+	defer backend.Close()
+	up, _ := url.Parse(backend.URL)
+	cfg := proxyAdmissionConfig(2)
+	s := New(&config.Settings{Admission: cfg}, logging.New(logging.ERROR), &recordingEmitter{})
+	req := sharedRequest(up)
+	req.Header.Set(identity.HeaderRateLimitRequests, "not-a-number")
+	rr := httptest.NewRecorder()
+	s.Handler().ServeHTTP(rr, req)
+	if rr.Code != http.StatusServiceUnavailable {
+		t.Fatalf("status=%d, want 503", rr.Code)
+	}
+}
+
+func TestGatewayMissingTrustedRateLimitPolicyFailsClosed(t *testing.T) {
+	_, err := parseTrustedRateLimits(identity.Identity{Gateway: true})
+	if err == nil {
+		t.Fatal("gateway request without Atlas policy was accepted as unlimited")
+	}
+	limits, err := parseTrustedRateLimits(identity.Identity{
+		Gateway: true, ServiceTier: "default", RateLimitRequests: "0",
+		RateLimitTotalPromptTokens: "0", RateLimitUncachedPromptTokens: "0",
+		RateLimitGeneratedTokens: "0",
+	})
+	if err != nil || limits != (admission.RateLimits{}) {
+		t.Fatalf("explicit unlimited gateway policy = %+v, %v", limits, err)
 	}
 }
 
@@ -334,7 +385,7 @@ func TestPrepareSharedDynamoRequestOverwritesUntrustedHints(t *testing.T) {
 	}
 }
 
-func TestProxyForwardsOnlyTrustedDynamoHints(t *testing.T) {
+func TestProxyForwardsAtlasServiceTierDynamoHints(t *testing.T) {
 	seen := make(chan *http.Request, 1)
 	seenBody := make(chan []byte, 1)
 	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -351,10 +402,10 @@ func TestProxyForwardsOnlyTrustedDynamoHints(t *testing.T) {
 		"default": {Weight: 1},
 		"gold":    {Weight: 1, DynamoPriority: 11, DynamoStrictPriority: 4},
 	}
-	cfg.OrganizationTiers = map[string]string{"org-a": "gold"}
 	c := redis.NewClient(&redis.Options{Addr: mr.Addr()})
 	s := New(&config.Settings{Admission: cfg}, logging.New(logging.ERROR), &recordingEmitter{}).WithAdmitter(admission.New(c, cfg))
 	req := sharedRequest(up)
+	req.Header.Set(identity.HeaderServiceTier, "gold")
 	req.Header.Set("X-Tenant-ID", "attacker")
 	req.Header.Set("X-Dynamo-Request-Priority", "2147483647")
 	req.Header.Set("X-Dynamo-Request-Strict-Priority", "4294967295")

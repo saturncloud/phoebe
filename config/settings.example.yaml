@@ -106,6 +106,8 @@ emit:
 #     maxReservedOutputTokens: 262144
 #     maxActiveAdapters: 128
 #     requestsPerWindow: 6000
+#     totalPromptTokensPerWindow: 16000000
+#     uncachedPromptTokensPerWindow: 4000000
 #     generatedTokensPerWindow: 4000000
 #     maxColdHolds: 16
 #     wakesPerWindow: 30
@@ -118,6 +120,8 @@ emit:
 #     maxReservedOutputTokens: 65536
 #     maxActiveAdapters: 32
 #     requestsPerWindow: 1500
+#     totalPromptTokensPerWindow: 4000000
+#     uncachedPromptTokensPerWindow: 1000000
 #     generatedTokensPerWindow: 1000000
 #     maxColdHolds: 4
 #     wakesPerWindow: 6
@@ -130,6 +134,8 @@ emit:
 #     maxReservedOutputTokens: 32768
 #     maxActiveAdapters: 16
 #     requestsPerWindow: 600
+#     totalPromptTokensPerWindow: 1600000
+#     uncachedPromptTokensPerWindow: 400000
 #     generatedTokensPerWindow: 400000
 #     maxColdHolds: 2
 #     wakesPerWindow: 4
@@ -142,6 +148,8 @@ emit:
 #     maxReservedOutputTokens: 16384
 #     maxActiveAdapters: 8
 #     requestsPerWindow: 300
+#     totalPromptTokensPerWindow: 800000
+#     uncachedPromptTokensPerWindow: 200000
 #     generatedTokensPerWindow: 200000
 #     maxColdHolds: 1
 #     wakesPerWindow: 2
@@ -157,6 +165,8 @@ emit:
 #         maxReservedOutputTokens: 65536
 #         maxActiveAdapters: 32
 #         requestsPerWindow: 1500
+#         totalPromptTokensPerWindow: 4000000
+#         uncachedPromptTokensPerWindow: 1000000
 #         generatedTokensPerWindow: 1000000
 #         maxColdHolds: 4
 #         wakesPerWindow: 6
@@ -171,6 +181,8 @@ emit:
 #         maxReservedOutputTokens: 65536
 #         maxActiveAdapters: 32
 #         requestsPerWindow: 1200
+#         totalPromptTokensPerWindow: 4000000
+#         uncachedPromptTokensPerWindow: 1000000
 #         generatedTokensPerWindow: 1000000
 #         maxColdHolds: 4
 #         wakesPerWindow: 6
