@@ -45,6 +45,7 @@ func ratingSchemaDDL(t *testing.T) string {
 		// 0004 adds billing_event.serving_mode, which rateWindowSQL reads (the
 		// serving-mode SKU axis). Skipping it reproduces the staging 42703.
 		"../../migrations/0004_billing_event_serving_mode.up.sql",
+		"../../migrations/0005_invoice_grade_attempts.up.sql",
 	} {
 		ddl, err := os.ReadFile(f)
 		if err != nil {
@@ -54,6 +55,10 @@ func ratingSchemaDDL(t *testing.T) string {
 		b.Write(ddl)
 		b.WriteString("\n")
 	}
+	// Existing fixtures predate usage_found and all represent authoritative usage
+	// unless a test explicitly writes false. Keep their INSERTs readable while the
+	// production migration's false default remains covered by migration/E2E tests.
+	b.WriteString("ALTER TABLE billing_event ALTER COLUMN usage_found SET DEFAULT TRUE;\n")
 	return b.String()
 }
 
@@ -686,6 +691,118 @@ func TestIntegration_OrgReRateConvergesNeverErases(t *testing.T) {
 	}
 	if o := orgOf(); !o.Valid || o.String != "org-real" {
 		t.Fatalf("after run3 org_id = %v, want 'org-real' preserved (a stale NULL replay must NEVER erase a known org)", o)
+	}
+}
+
+// TestIntegration_ReRatePreservesHistoricalPrice proves the invoice-grade price
+// one-way door: changing the current YAML book after an hour was first rated may
+// incorporate late events, but every token in that existing rollup continues to
+// use the originally applied rates.
+func TestIntegration_ReRatePreservesHistoricalPrice(t *testing.T) {
+	dsn := os.Getenv("PHOEBE_TEST_DATABASE_URL")
+	if dsn == "" {
+		t.Skip("PHOEBE_TEST_DATABASE_URL not set; skipping live-Postgres conformance")
+	}
+	ctx := context.Background()
+	db, err := sql.Open("pgx", dsn)
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	defer db.Close()
+
+	const sch = "phoebe_rating_pricefreeze_it"
+	exec(t, db, "DROP SCHEMA IF EXISTS "+sch+" CASCADE")
+	exec(t, db, "CREATE SCHEMA "+sch)
+	exec(t, db, "SET search_path TO "+sch)
+	defer func() { exec(t, db, "DROP SCHEMA IF EXISTS "+sch+" CASCADE") }()
+	exec(t, db, ratingSchemaDDL(t))
+
+	hour := mustTime("2026-06-08T10:00:00Z")
+	store := NewPostgresStore(db)
+	oldBook := newTestBook(map[string]Rate3{"b": rate3("0.000001", "0", "0")}, nil, PolicyIdentity, Dec{}, Dec{})
+	newBook := newTestBook(map[string]Rate3{"b": rate3("0.000009", "0", "0")}, nil, PolicyIdentity, Dec{}, Dec{})
+
+	if _, err := db.ExecContext(ctx,
+		`INSERT INTO billing_event (request_id, auth_id, resource_id, org_id, model, prompt_tokens, event_ts)
+		 VALUES ('p1','a','d1','org-1','b',100,$1)`, hour.Add(5*time.Minute)); err != nil {
+		t.Fatalf("seed first event: %v", err)
+	}
+	if _, err := store.RateWindow(ctx, oldBook, hour, hour.Add(time.Hour)); err != nil {
+		t.Fatalf("initial rate: %v", err)
+	}
+
+	// Price changes, then a delayed event from the already-rated hour arrives.
+	if _, err := db.ExecContext(ctx,
+		`INSERT INTO billing_event (request_id, auth_id, resource_id, org_id, model, prompt_tokens, event_ts)
+		 VALUES ('p2','a','d1','org-1','b',100,$1)`, hour.Add(6*time.Minute)); err != nil {
+		t.Fatalf("seed late event: %v", err)
+	}
+	if _, err := store.RateWindow(ctx, newBook, hour, hour.Add(time.Hour)); err != nil {
+		t.Fatalf("re-rate with changed book: %v", err)
+	}
+
+	var tokens int64
+	var rate, cost string
+	if err := db.QueryRowContext(ctx,
+		`SELECT prompt_tokens, applied_prompt_rate::text, cost::text
+		 FROM rated_usage WHERE auth_id='a' AND resource_id='d1' AND model_id='b' AND window_start=$1`,
+		hour).Scan(&tokens, &rate, &cost); err != nil {
+		t.Fatalf("read frozen rollup: %v", err)
+	}
+	if tokens != 200 || MustDec(rate).String() != "0.000001000" || MustDec(cost).String() != "0.000200000" {
+		t.Fatalf("frozen rollup tokens/rate/cost = %d/%s/%s, want 200/0.000001000/0.000200000", tokens, rate, cost)
+	}
+
+	// Even a reconcile deletion must not erase the historical price decision.
+	if _, err := db.ExecContext(ctx, `DELETE FROM billing_event WHERE request_id IN ('p1','p2')`); err != nil {
+		t.Fatalf("remove raw events: %v", err)
+	}
+	if res, err := store.RateWindow(ctx, newBook, hour, hour.Add(time.Hour)); err != nil {
+		t.Fatalf("reconcile delete: %v", err)
+	} else if res.ReconciledDeletions != 1 {
+		t.Fatalf("reconcile deletions = %d, want 1", res.ReconciledDeletions)
+	}
+	if _, err := db.ExecContext(ctx,
+		`INSERT INTO billing_event (request_id, auth_id, resource_id, org_id, model, prompt_tokens, event_ts)
+		 VALUES ('p3','a','d1','org-1','b',100,$1)`, hour.Add(7*time.Minute)); err != nil {
+		t.Fatalf("seed recovered event: %v", err)
+	}
+	if _, err := store.RateWindow(ctx, newBook, hour, hour.Add(time.Hour)); err != nil {
+		t.Fatalf("recreate with changed book: %v", err)
+	}
+	if err := db.QueryRowContext(ctx,
+		`SELECT prompt_tokens, applied_prompt_rate::text, cost::text
+		 FROM rated_usage WHERE auth_id='a' AND resource_id='d1' AND model_id='b' AND window_start=$1`,
+		hour).Scan(&tokens, &rate, &cost); err != nil {
+		t.Fatalf("read recreated frozen rollup: %v", err)
+	}
+	if tokens != 100 || MustDec(rate).String() != "0.000001000" || MustDec(cost).String() != "0.000100000" {
+		t.Fatalf("recreated rollup tokens/rate/cost = %d/%s/%s, want 100/0.000001000/0.000100000", tokens, rate, cost)
+	}
+
+	// A failed attempt with no engine usage is retained for audit, but is neither
+	// billed as a zero-token rollup nor mislabeled as unattributable when model is
+	// unavailable because no upstream response arrived.
+	if _, err := db.ExecContext(ctx,
+		`INSERT INTO billing_event
+		 (request_id, auth_id, resource_id, org_id, model, usage_found, status_code, event_ts)
+		 VALUES ('failed-no-usage','a','d2','org-1',NULL,FALSE,502,$1)`, hour.Add(8*time.Minute)); err != nil {
+		t.Fatalf("seed missing-usage attempt: %v", err)
+	}
+	missingRes, err := store.RateWindow(ctx, newBook, hour, hour.Add(time.Hour))
+	if err != nil {
+		t.Fatalf("rate missing-usage attempt: %v", err)
+	}
+	if missingRes.MissingUsageEvents != 1 || missingRes.UnattributableEvents != 0 || missingRes.EventsRated != 1 {
+		t.Fatalf("missing-usage partition = missing %d / unattributable %d / rated %d, want 1/0/1",
+			missingRes.MissingUsageEvents, missingRes.UnattributableEvents, missingRes.EventsRated)
+	}
+	var failedRollups int
+	if err := db.QueryRowContext(ctx, `SELECT COUNT(*) FROM rated_usage WHERE resource_id='d2'`).Scan(&failedRollups); err != nil {
+		t.Fatalf("count failed-attempt rollups: %v", err)
+	}
+	if failedRollups != 0 {
+		t.Fatalf("failed-attempt rollups = %d, want 0 (missing usage must not become money)", failedRollups)
 	}
 }
 

@@ -1,4 +1,4 @@
-# phoebe migrations — `billing_event` + `rated_usage` + `io_log`
+# phoebe migrations — raw events, rated usage, price locks, and I/O logs
 
 phoebe **owns its billing schema in its OWN Postgres** (deployed by the phoebe
 Helm chart), applied by **`cmd/migrate`** (golang-migrate). phoebe is
@@ -17,13 +17,17 @@ with the Atlas schema; they live in phoebe's own database.
   `org_id` is carried from `billing_event` so `cmd/token-push` reads org straight
   off the rollup. **Money is `NUMERIC(20,9)` — exact decimal, never float; all
   money math happens in SQL, not Go.**
+- **`rating_price_lock`** — append-only first-applied rates keyed by the same
+  natural key/hour. It survives a `rated_usage` reconciliation delete so a later
+  recovery cannot reprice already-served traffic from the current YAML book.
 - **`io_log`** — optional, sampled, short-retention request/response body capture
   (M5 I/O logging). Written by the interceptor's iolog sink; OFF by default.
 
-**Prices are a YAML config file, NOT a DB table (E1).** There is no `model_price`
-table. The hourly rater loads the current price YAML, projects it into a transient
-TEMP table, rates the last complete hour, and freezes the applied rate onto each
-`rated_usage` row.
+**The price catalog is a YAML config file, NOT a DB table (E1).** There is no
+`model_price` table. The hourly rater loads the current price YAML, projects it
+into a transient TEMP table, rates the last complete hour, and persists only the
+first applied rate for each natural-key/hour in `rating_price_lock` and the
+self-auditing `rated_usage` row.
 
 ## The migration files
 
@@ -35,6 +39,7 @@ golang-migrate up/down pairs, applied in version order:
 | 0002 | `0002_rating.{up,down}.sql` | `rated_usage` (+ `org_id`, indexes) + the billing_event rating-instant index |
 | 0003 | `0003_io_log.{up,down}.sql` | `io_log` (+ GIN body index, retention indexes) |
 | 0004 | `0004_billing_event_serving_mode.{up,down}.sql` | `billing_event.serving_mode` (the serving-mode SKU axis; NULL = dedicated) |
+| 0005 | `0005_invoice_grade_attempts.{up,down}.sql` | trusted/client request identity, attempt outcome and usage evidence, token constraints, `rating_price_lock`, and the hourly reconciliation view |
 
 `embed.go` embeds these into the `migrations` package; `cmd/migrate` applies them.
 

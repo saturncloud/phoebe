@@ -149,9 +149,9 @@ func TestAbortBillPartialTrue_NoUsage(t *testing.T) {
 	}
 }
 
-// TestAbortBillPartialFalse_NoUsage verifies that with BillPartialOnAbort=false
-// an abort with no usage does NOT emit any billable event.
-func TestAbortBillPartialFalse_NoUsage(t *testing.T) {
+// TestAbortBillPartialFalse_NoUsageRecordsAttempt verifies that disabling
+// partial billing affects the charge, not raw-ledger visibility.
+func TestAbortBillPartialFalse_NoUsageRecordsAttempt(t *testing.T) {
 	backend, unblock := slowBackend(t, `data: {"choices":[{"index":0,"delta":{"content":"Hi"}}]}`+"\n\n")
 	defer backend.Close()
 	defer close(unblock)
@@ -162,11 +162,9 @@ func TestAbortBillPartialFalse_NoUsage(t *testing.T) {
 
 	doAbortRequest(t, srv, upstream, 10*time.Millisecond)
 
-	// Wait briefly: if an event were wrongly emitted it would land within
-	// this window. None should, per BillPartialOnAbort=false.
 	events := em.waitForEvents(1, 200*time.Millisecond)
-	if len(events) != 0 {
-		t.Fatalf("BillPartialOnAbort=false, abort, no usage: expected 0 events, got %d: %+v", len(events), events)
+	if len(events) != 1 || !events[0].Aborted || events[0].UsageFound || events[0].PromptTokens != 0 || events[0].CompletionTokens != 0 {
+		t.Fatalf("BillPartialOnAbort=false abort = %+v, want one zero-charge observable attempt", events)
 	}
 }
 

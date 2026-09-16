@@ -56,6 +56,10 @@ type RateResult struct {
 	// never disagree with what the rollups excluded.
 	UnpricedEvents       int64
 	UnattributableEvents int64
+	// MissingUsageEvents are execution-attempt records for which the serving engine
+	// supplied no authoritative usage block. They are retained as zero-charge audit
+	// evidence, excluded from rated_usage, and surfaced as a fail-loud anomaly.
+	MissingUsageEvents int64
 	// AmbiguousBaseEvents counts events under rollups whose base_model-priced rows
 	// (derived OR plain-base) did not share ONE rate in the window: a single model_id
 	// resolving through more than one distinct base_model (the E3 ft-uniqueness
@@ -78,6 +82,7 @@ type RateResult struct {
 type Anomalies struct {
 	UnpricedEvents       int64
 	UnattributableEvents int64
+	MissingUsageEvents   int64
 	AmbiguousBaseEvents  int64
 	AmbiguousOrgEvents   int64
 }
@@ -211,10 +216,11 @@ CREATE TEMP TABLE rating_derived (
 //
 // APPLIED RATE STORED ON THE ROW (E1 self-auditing rollup): the rated_usage row
 // carries applied_prompt_rate / applied_cached_rate / applied_completion_rate — the
-// exact per-token rates this rollup was billed at. The row is then immutable and
-// self-auditing: "we never reprice traffic you've already served" holds by
-// construction, because the row froze its own rate. A rollup mixes only one
-// model_id, so a single applied-rate triple per row is well-defined.
+// exact per-token rates this rollup was billed at. The first rate is also retained
+// in rating_price_lock, whose lifecycle is independent of rated_usage reconciliation
+// deletes. That append-only lock is the one-way door: even if an anomalous rollup is
+// deleted and later recreated, already-served traffic cannot pick up a newer YAML
+// rate. A rollup mixes only one model_id, so one rate triple is well-defined.
 //
 // HOUR BUCKET IS SESSION-TZ-INDEPENDENT (date_trunc on a UTC wall-clock timestamp),
 // so rollup keys can never disagree across sessions and re-rates can't overlap.
@@ -276,6 +282,7 @@ WITH ev AS (
         -- adapter: the fine-tune checkpoint artifact id, non-NULL ONLY on fine-tune
         -- checkpoint deployments. Its PRESENCE is the premium trigger (C4).
         adapter,
+        usage_found,
         prompt_tokens,
         cached_tokens,
         completion_tokens,
@@ -292,6 +299,7 @@ resolved AS (
         ev.model_id,
         ev.base_model,
         ev.ev_ts,
+        ev.usage_found,
         ev.prompt_tokens,
         ev.cached_tokens,
         ev.completion_tokens,
@@ -304,15 +312,26 @@ resolved AS (
         -- Fine-tune traffic with a NULL base_model can only miss its join (NULL =
         -- NULL is never true) and is BARRED from the plain-base join by the marker
         -- guard, so it correctly falls through to UNPRICED and screams.
-        COALESCE(rp.prompt_price,     rd.prompt_price,     rpb.prompt_price)     AS prompt_price,
-        COALESCE(rp.cached_price,     rd.cached_price,     rpb.cached_price)     AS cached_price,
-        COALESCE(rp.completion_price, rd.completion_price, rpb.completion_price) AS completion_price,
+        -- Historical-price one-way door: once this natural-key/hour has a
+        -- rating_price_lock row, its applied rates outrank the CURRENT YAML book.
+        -- The lock survives rated_usage reconcile deletion, so re-rating can
+        -- incorporate late raw events and repair anomalies without repricing.
+        COALESCE(old.applied_prompt_rate,     rp.prompt_price,     rd.prompt_price,     rpb.prompt_price)     AS prompt_price,
+        COALESCE(old.applied_cached_rate,     rp.cached_price,     rd.cached_price,     rpb.cached_price)     AS cached_price,
+        COALESCE(old.applied_completion_rate, rp.completion_price, rd.completion_price, rpb.completion_price) AS completion_price,
         -- Whether this row priced through the DERIVED (base x premium) path (b), or
         -- the PLAIN-BASE path (c). Both key the rate on base_model, so both feed the
         -- single-rate ambiguity gate below.
-        (rp.model_id IS NULL AND rd.base_model IS NOT NULL) AS via_derived,
-        (rp.model_id IS NULL AND rpb.model_id  IS NOT NULL) AS via_base
+        ((old.auth_id IS NOT NULL AND (ev.model_id LIKE $3 OR ev.adapter IS NOT NULL) AND ev.base_model IS NOT NULL)
+          OR (old.auth_id IS NULL AND rp.model_id IS NULL AND rd.base_model IS NOT NULL)) AS via_derived,
+        ((old.auth_id IS NOT NULL AND NOT (ev.model_id LIKE $3 OR ev.adapter IS NOT NULL) AND ev.base_model IS NOT NULL)
+          OR (old.auth_id IS NULL AND rp.model_id IS NULL AND rpb.model_id IS NOT NULL)) AS via_base
     FROM ev
+    LEFT JOIN rating_price_lock old
+        ON old.auth_id = ev.auth_id
+       AND old.resource_id = ev.resource_id
+       AND old.model_id = ev.model_id
+       AND old.window_start = date_trunc('hour', ev.ev_ts AT TIME ZONE 'UTC') AT TIME ZONE 'UTC'
     -- (a) The YAML-projected DIRECT price table (keyed on model_id).
     LEFT JOIN rating_price rp ON rp.model_id = ev.model_id
     -- (b) The DERIVED price table (keyed on base_model): consulted ONLY for
@@ -409,7 +428,8 @@ grouped AS (
         -- ambiguous (DISTINCT over non-NULLs is 1).
         COUNT(DISTINCT org_id) > 1 AS ambiguous_org
     FROM resolved
-    WHERE prompt_price IS NOT NULL          -- priced only
+    WHERE usage_found                       -- authoritative engine counts only
+      AND prompt_price IS NOT NULL          -- priced only
       AND auth_id     IS NOT NULL           -- attributable only
       AND model_id    IS NOT NULL
       -- resource_id is a NON-NULL key column AND the E2 customer-attribution key. A
@@ -420,6 +440,21 @@ grouped AS (
 ),
 priced AS (
     SELECT * FROM grouped WHERE NOT ambiguous_base AND NOT ambiguous_org
+),
+-- Persist the first applied rate independently of rated_usage. A later reconcile
+-- may delete the rollup, but it never deletes this append-only price decision.
+price_locked AS (
+    INSERT INTO rating_price_lock (
+        auth_id, resource_id, model_id, window_start,
+        applied_prompt_rate, applied_cached_rate, applied_completion_rate
+    )
+    SELECT
+        auth_id, resource_id, model_id, window_start,
+        applied_prompt_rate, applied_cached_rate, applied_completion_rate
+    FROM priced
+    ORDER BY auth_id, resource_id, model_id, window_start
+    ON CONFLICT (auth_id, resource_id, model_id, window_start) DO NOTHING
+    RETURNING auth_id
 ),
 -- RECONCILE (re-rate deletes superseded rollups): a rated_usage row whose
 -- (auth_id, resource_id, model_id, window_start) falls IN this run's window but is
@@ -523,18 +558,23 @@ SELECT
     -- counted ONLY as unattributable (the more specific signal), never also as
     -- unpriced; likewise an ambiguous_org rollup that is ALSO ambiguous_base is counted
     -- ONLY as ambiguous_base. So the counts strictly PARTITION the in-window rows:
-    --   events_rated + unpriced + unattributable + ambiguous_base + ambiguous_org
+    --   events_rated + missing_usage + unpriced + unattributable + ambiguous_base + ambiguous_org
     --     == total in-window events.
     -- The unpriced count requires FULL attribution (auth_id, resource_id, model_id all
     -- NON-NULL) for exactly this exclusivity: a NULL-resource_id row that is also
     -- unpriced must be counted ONLY as unattributable, never double-counted here.
     (SELECT COUNT(*)::bigint FROM resolved
-      WHERE prompt_price  IS NULL
+      WHERE usage_found
+        AND prompt_price  IS NULL
         AND auth_id     IS NOT NULL
         AND resource_id IS NOT NULL
         AND model_id    IS NOT NULL)                          AS unpriced_events,
     (SELECT COUNT(*)::bigint FROM ev
-      WHERE auth_id IS NULL OR resource_id IS NULL OR model_id IS NULL) AS unattributable_events,
+      WHERE usage_found
+        AND (auth_id IS NULL OR resource_id IS NULL OR model_id IS NULL)) AS unattributable_events,
+    -- Missing engine usage is its own exclusive audit bucket. It must not become a
+    -- zero-token rated rollup or be misreported as an attribution/price failure.
+    (SELECT COUNT(*)::bigint FROM ev WHERE NOT usage_found)            AS missing_usage_events,
     -- AMBIGUOUS-BASE events: the EVENT count under ambiguous rollups (a single
     -- model_id whose base_model-priced rows carried >1 rate in one window — >1
     -- distinct base_model, or mixed premium/plain-base pricing; see the grouped
@@ -552,7 +592,7 @@ SELECT
     -- anomaly counts stay a strict PARTITION: a rollup that is BOTH base- and
     -- org-ambiguous is counted ONLY as ambiguous_base (the more specific E3 signal),
     -- exactly as unattributable takes precedence over unpriced above. So
-    --   events_rated + unpriced + unattributable + ambiguous_base + ambiguous_org
+    --   events_rated + missing_usage + unpriced + unattributable + ambiguous_base + ambiguous_org
     --     == total in-window events
     -- holds with no double-count. Both still drive exit-nonzero, so precedence changes
     -- only which bucket reports the overlap, never whether it screams.
@@ -602,7 +642,7 @@ func (s *PostgresStore) RateWindow(ctx context.Context, book *PriceBook, start, 
 	var total string
 	err = tx.QueryRowContext(ctx, rateWindowSQL, start.UTC(), end.UTC(), ftLikePattern).
 		Scan(&res.RollupsWritten, &res.EventsRated, &total, &res.ReconciledDeletions,
-			&res.UnpricedEvents, &res.UnattributableEvents, &res.AmbiguousBaseEvents,
+			&res.UnpricedEvents, &res.UnattributableEvents, &res.MissingUsageEvents, &res.AmbiguousBaseEvents,
 			&res.AmbiguousOrgEvents)
 	if err != nil {
 		return RateResult{}, fmt.Errorf("rating: rate window [%s,%s): %w",

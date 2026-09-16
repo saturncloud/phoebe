@@ -85,6 +85,7 @@ func (s *PostgresStore) Close() error {
 // per-row value binding. Keeping it in one place keeps the two in lockstep.
 var upsertColumns = []string{
 	"request_id",
+	"client_request_id",
 	"auth_id",
 	"user_id",
 	"group_id",
@@ -101,10 +102,13 @@ var upsertColumns = []string{
 	"finish_reason",
 	"gpu_type",
 	"aborted",
+	"usage_found",
+	"status_code",
+	"streamed",
 	"event_ts",
 }
 
-const colsPerRow = 18 // len(upsertColumns); created_at is DB-defaulted.
+const colsPerRow = 22 // len(upsertColumns); created_at is DB-defaulted.
 
 // Upsert writes a batch of events in a single transaction with a multi-row
 // INSERT ... ON CONFLICT (request_id) DO NOTHING.
@@ -175,6 +179,7 @@ func eventArgs(e metering.Event) []any {
 	}
 	return []any{
 		e.RequestID,
+		nullStr(e.ClientRequestID),
 		nullStr(e.AuthID),
 		nullStr(e.UserID),
 		nullStr(e.GroupID),
@@ -209,6 +214,9 @@ func eventArgs(e metering.Event) []any {
 		nullStr(e.FinishReason),
 		nullStr(e.GPUType),
 		e.Aborted,
+		e.UsageFound,
+		nullInt(e.StatusCode),
+		e.Streamed,
 		eventTS,
 	}
 }
@@ -219,4 +227,11 @@ func nullStr(s string) any {
 		return nil
 	}
 	return s
+}
+
+func nullInt(v int) any {
+	if v == 0 {
+		return nil
+	}
+	return v
 }
