@@ -40,8 +40,8 @@ func TestPostgresStore_RateWindowSQL(t *testing.T) {
 	mock.ExpectExec(`INSERT INTO rating_derived`).
 		WithArgs("m", "0.000003000", "0.000000300", "0.000010000").
 		WillReturnResult(sqlmock.NewResult(0, 1))
-	rows := sqlmock.NewRows([]string{"rollups_written", "events_rated", "total_cost", "reconciled_deletions", "unpriced_events", "unattributable_events", "missing_usage_events", "ambiguous_base_events", "ambiguous_org_events"}).
-		AddRow(2, 5, "0.001234500", 0, 3, 1, 6, 4, 2)
+	rows := sqlmock.NewRows([]string{"rollups_written", "events_rated", "total_cost", "reconciled_deletions", "unpriced_events", "unattributable_events", "missing_usage_events", "invalid_usage_events", "ambiguous_base_events", "ambiguous_org_events"}).
+		AddRow(2, 5, "0.001234500", 0, 3, 1, 6, 7, 4, 2)
 	// The statement binds $3 = the ft: LIKE pattern (single-sourced from fineTunePrefix).
 	mock.ExpectQuery(`INSERT INTO rated_usage`).
 		WithArgs(start.UTC(), end.UTC(), ftLikePattern).
@@ -60,6 +60,9 @@ func TestPostgresStore_RateWindowSQL(t *testing.T) {
 	}
 	if res.MissingUsageEvents != 6 {
 		t.Fatalf("missing usage = %d, want 6 (must ride the same statement)", res.MissingUsageEvents)
+	}
+	if res.InvalidUsageEvents != 7 {
+		t.Fatalf("invalid usage = %d, want 7 (must ride the same statement)", res.InvalidUsageEvents)
 	}
 	if res.ReconciledDeletions != 0 {
 		t.Fatalf("reconciled deletions = %d, want 0 (the projected count must scan into the result)", res.ReconciledDeletions)
@@ -119,6 +122,7 @@ func TestRateWindowSQL_Shape(t *testing.T) {
 		// its own strict-partition bucket.
 		"WHERE usage_found",
 		"WHERE NOT usage_found)            AS missing_usage_events",
+		"WHERE usage_found AND NOT valid_usage)                           AS invalid_usage_events",
 		// The first rate is durable even if rated_usage is reconciled away.
 		"INSERT INTO rating_price_lock",
 		"ON CONFLICT (auth_id, resource_id, model_id, window_start) DO NOTHING",
@@ -172,7 +176,7 @@ func TestRateWindowSQL_Shape(t *testing.T) {
 		// contiguous WHERE so the resource_id guard is anchored to THIS count clause — a
 		// bare "AND resource_id IS NOT NULL" would also match the grouped/priced filter and
 		// wouldn't catch the guard being dropped from the unpriced count.
-		"WHERE usage_found\n        AND prompt_price  IS NULL\n        AND auth_id     IS NOT NULL\n        AND resource_id IS NOT NULL\n        AND model_id    IS NOT NULL)",
+		"WHERE usage_found\n        AND valid_usage\n        AND prompt_price  IS NULL\n        AND auth_id     IS NOT NULL\n        AND resource_id IS NOT NULL\n        AND model_id    IS NOT NULL)",
 		"AS unpriced_events",
 		"AND (auth_id IS NULL OR resource_id IS NULL OR model_id IS NULL)) AS unattributable_events",
 		// the SINGLE-RATE gate: a rollup whose base_model-priced rows span >1 base

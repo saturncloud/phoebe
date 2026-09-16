@@ -43,6 +43,13 @@ func TestResult_MissingUsageDrivesAnomaly(t *testing.T) {
 	}
 }
 
+func TestResult_InvalidUsageDrivesAnomaly(t *testing.T) {
+	res := Result{InvalidUsageEvents: 1}
+	if !res.HasInvalidUsage() || !res.HasAnomaly() {
+		t.Fatal("invalid usage must be a fail-loud billing anomaly")
+	}
+}
+
 // oracleStore is an in-memory Store that models EXACTLY what the SQL rater does,
 // using the production PriceBook (PriceBook.Resolve) + the Rate() oracle. It exists
 // so the Rater orchestration AND the money rules can be exercised without Postgres,

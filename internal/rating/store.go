@@ -60,6 +60,9 @@ type RateResult struct {
 	// supplied no authoritative usage block. They are retained as zero-charge audit
 	// evidence, excluded from rated_usage, and surfaced as a fail-loud anomaly.
 	MissingUsageEvents int64
+	// InvalidUsageEvents are legacy authoritative rows that violate token
+	// invariants. They remain raw evidence but are excluded from money.
+	InvalidUsageEvents int64
 	// AmbiguousBaseEvents counts events under rollups whose base_model-priced rows
 	// (derived OR plain-base) did not share ONE rate in the window: a single model_id
 	// resolving through more than one distinct base_model (the E3 ft-uniqueness
@@ -83,6 +86,7 @@ type Anomalies struct {
 	UnpricedEvents       int64
 	UnattributableEvents int64
 	MissingUsageEvents   int64
+	InvalidUsageEvents   int64
 	AmbiguousBaseEvents  int64
 	AmbiguousOrgEvents   int64
 }
@@ -283,6 +287,8 @@ WITH ev AS (
         -- checkpoint deployments. Its PRESENCE is the premium trigger (C4).
         adapter,
         usage_found,
+        (prompt_tokens >= 0 AND cached_tokens >= 0 AND completion_tokens >= 0
+         AND cached_tokens <= prompt_tokens) AS valid_usage,
         prompt_tokens,
         cached_tokens,
         completion_tokens,
@@ -300,6 +306,7 @@ resolved AS (
         ev.base_model,
         ev.ev_ts,
         ev.usage_found,
+        ev.valid_usage,
         ev.prompt_tokens,
         ev.cached_tokens,
         ev.completion_tokens,
@@ -429,6 +436,7 @@ grouped AS (
         COUNT(DISTINCT org_id) > 1 AS ambiguous_org
     FROM resolved
     WHERE usage_found                       -- authoritative engine counts only
+      AND valid_usage                       -- malformed legacy evidence never enters money
       AND prompt_price IS NOT NULL          -- priced only
       AND auth_id     IS NOT NULL           -- attributable only
       AND model_id    IS NOT NULL
@@ -558,23 +566,30 @@ SELECT
     -- counted ONLY as unattributable (the more specific signal), never also as
     -- unpriced; likewise an ambiguous_org rollup that is ALSO ambiguous_base is counted
     -- ONLY as ambiguous_base. So the counts strictly PARTITION the in-window rows:
-    --   events_rated + missing_usage + unpriced + unattributable + ambiguous_base + ambiguous_org
+    --   events_rated + missing_usage + invalid_usage + unpriced + unattributable + ambiguous_base + ambiguous_org
     --     == total in-window events.
     -- The unpriced count requires FULL attribution (auth_id, resource_id, model_id all
     -- NON-NULL) for exactly this exclusivity: a NULL-resource_id row that is also
     -- unpriced must be counted ONLY as unattributable, never double-counted here.
     (SELECT COUNT(*)::bigint FROM resolved
       WHERE usage_found
+        AND valid_usage
         AND prompt_price  IS NULL
         AND auth_id     IS NOT NULL
         AND resource_id IS NOT NULL
         AND model_id    IS NOT NULL)                          AS unpriced_events,
     (SELECT COUNT(*)::bigint FROM ev
       WHERE usage_found
+        AND valid_usage
         AND (auth_id IS NULL OR resource_id IS NULL OR model_id IS NULL)) AS unattributable_events,
     -- Missing engine usage is its own exclusive audit bucket. It must not become a
     -- zero-token rated rollup or be misreported as an attribution/price failure.
     (SELECT COUNT(*)::bigint FROM ev WHERE NOT usage_found)            AS missing_usage_events,
+    -- Invalid authoritative legacy evidence predates the NOT VALID constraints.
+    -- Retain it in billing_event for repair, but never let malformed counts enter
+    -- money or overlap another anomaly bucket.
+    (SELECT COUNT(*)::bigint FROM ev
+      WHERE usage_found AND NOT valid_usage)                           AS invalid_usage_events,
     -- AMBIGUOUS-BASE events: the EVENT count under ambiguous rollups (a single
     -- model_id whose base_model-priced rows carried >1 rate in one window — >1
     -- distinct base_model, or mixed premium/plain-base pricing; see the grouped
@@ -592,7 +607,7 @@ SELECT
     -- anomaly counts stay a strict PARTITION: a rollup that is BOTH base- and
     -- org-ambiguous is counted ONLY as ambiguous_base (the more specific E3 signal),
     -- exactly as unattributable takes precedence over unpriced above. So
-    --   events_rated + missing_usage + unpriced + unattributable + ambiguous_base + ambiguous_org
+    --   events_rated + missing_usage + invalid_usage + unpriced + unattributable + ambiguous_base + ambiguous_org
     --     == total in-window events
     -- holds with no double-count. Both still drive exit-nonzero, so precedence changes
     -- only which bucket reports the overlap, never whether it screams.
@@ -642,7 +657,7 @@ func (s *PostgresStore) RateWindow(ctx context.Context, book *PriceBook, start, 
 	var total string
 	err = tx.QueryRowContext(ctx, rateWindowSQL, start.UTC(), end.UTC(), ftLikePattern).
 		Scan(&res.RollupsWritten, &res.EventsRated, &total, &res.ReconciledDeletions,
-			&res.UnpricedEvents, &res.UnattributableEvents, &res.MissingUsageEvents, &res.AmbiguousBaseEvents,
+			&res.UnpricedEvents, &res.UnattributableEvents, &res.MissingUsageEvents, &res.InvalidUsageEvents, &res.AmbiguousBaseEvents,
 			&res.AmbiguousOrgEvents)
 	if err != nil {
 		return RateResult{}, fmt.Errorf("rating: rate window [%s,%s): %w",

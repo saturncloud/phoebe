@@ -37,13 +37,20 @@ WITH raw AS (
         completion_tokens AS rated_completion_tokens,
         cost
     FROM rated_usage
+), reconciliation_keys AS (
+    -- UNION uses PostgreSQL set semantics (NULLs compare equal) to produce one
+    -- row per null-safe natural key without relying on FULL JOIN conditions that
+    -- PostgreSQL 16 cannot always plan for filtered queries.
+    SELECT window_start, auth_id, resource_id, model_id FROM raw
+    UNION
+    SELECT window_start, auth_id, resource_id, model_id FROM rated
 )
 SELECT
-    COALESCE(raw.window_start, rated.window_start) AS window_start,
-    COALESCE(raw.auth_id, rated.auth_id) AS auth_id,
-    COALESCE(raw.resource_id, rated.resource_id) AS resource_id,
+    reconciliation_keys.window_start AS window_start,
+    reconciliation_keys.auth_id AS auth_id,
+    reconciliation_keys.resource_id AS resource_id,
     COALESCE(raw.org_id, rated.org_id) AS org_id,
-    COALESCE(raw.model_id, rated.model_id) AS model_id,
+    reconciliation_keys.model_id AS model_id,
     COALESCE(raw.raw_attempts, 0) AS raw_attempts,
     COALESCE(raw.metered_attempts, 0) AS metered_attempts,
     COALESCE(raw.missing_usage_attempts, 0) AS missing_usage_attempts,
@@ -67,9 +74,14 @@ SELECT
     COALESCE(raw.raw_fresh_input_tokens, 0) - COALESCE(rated.rated_fresh_input_tokens, 0) AS fresh_input_token_delta,
     COALESCE(raw.raw_cached_tokens, 0) - COALESCE(rated.rated_cached_tokens, 0) AS cached_token_delta,
     COALESCE(raw.raw_completion_tokens, 0) - COALESCE(rated.rated_completion_tokens, 0) AS completion_token_delta
-FROM raw
-FULL OUTER JOIN rated
-  ON raw.window_start = rated.window_start
- AND raw.auth_id IS NOT DISTINCT FROM rated.auth_id
- AND raw.resource_id IS NOT DISTINCT FROM rated.resource_id
- AND raw.model_id IS NOT DISTINCT FROM rated.model_id;
+FROM reconciliation_keys
+LEFT JOIN raw
+  ON raw.window_start = reconciliation_keys.window_start
+ AND raw.auth_id IS NOT DISTINCT FROM reconciliation_keys.auth_id
+ AND raw.resource_id IS NOT DISTINCT FROM reconciliation_keys.resource_id
+ AND raw.model_id IS NOT DISTINCT FROM reconciliation_keys.model_id
+LEFT JOIN rated
+  ON rated.window_start = reconciliation_keys.window_start
+ AND rated.auth_id IS NOT DISTINCT FROM reconciliation_keys.auth_id
+ AND rated.resource_id IS NOT DISTINCT FROM reconciliation_keys.resource_id
+ AND rated.model_id IS NOT DISTINCT FROM reconciliation_keys.model_id;

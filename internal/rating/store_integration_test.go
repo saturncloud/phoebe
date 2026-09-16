@@ -833,6 +833,79 @@ func TestIntegration_ReRatePreservesHistoricalPrice(t *testing.T) {
 	}
 }
 
+// TestIntegration_LegacyInvalidUsageNeverEntersMoney proves the NOT VALID
+// rollout contract: malformed pre-0005 evidence remains queryable after the
+// migration, but the rater partitions it into InvalidUsageEvents and writes no
+// rated money.
+func TestIntegration_LegacyInvalidUsageNeverEntersMoney(t *testing.T) {
+	dsn := os.Getenv("PHOEBE_TEST_DATABASE_URL")
+	if dsn == "" {
+		t.Skip("PHOEBE_TEST_DATABASE_URL not set; skipping live-Postgres conformance")
+	}
+	ctx := context.Background()
+	db, err := sql.Open("pgx", dsn)
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	defer db.Close()
+
+	const sch = "phoebe_rating_legacy_invalid_it"
+	exec(t, db, "DROP SCHEMA IF EXISTS "+sch+" CASCADE")
+	exec(t, db, "CREATE SCHEMA "+sch)
+	exec(t, db, "SET search_path TO "+sch)
+	defer func() { exec(t, db, "DROP SCHEMA IF EXISTS "+sch+" CASCADE") }()
+
+	apply := func(name string) {
+		t.Helper()
+		ddl, readErr := os.ReadFile("../../migrations/" + name)
+		if readErr != nil {
+			t.Fatalf("read migration %s: %v", name, readErr)
+		}
+		exec(t, db, string(ddl))
+	}
+	for _, name := range []string{
+		"0001_billing_event.up.sql",
+		"0002_rating.up.sql",
+		"0004_billing_event_serving_mode.up.sql",
+	} {
+		apply(name)
+	}
+
+	hour := mustTime("2026-06-08T10:00:00Z")
+	// This row is legal before 0005 and deliberately violates cached <= prompt.
+	if _, err := db.ExecContext(ctx,
+		`INSERT INTO billing_event
+		 (request_id, auth_id, resource_id, org_id, model, prompt_tokens, cached_tokens, completion_tokens, event_ts)
+		 VALUES ('legacy-invalid','a','d1','org-1','b',10,40,0,$1)`, hour.Add(5*time.Minute)); err != nil {
+		t.Fatalf("seed legacy invalid event: %v", err)
+	}
+	apply("0005_invoice_grade_attempts.up.sql")
+	apply("0006_reconciliation_org_grain.up.sql")
+
+	book := newTestBook(map[string]Rate3{"b": rate3("0.000005", "0.000001", "0")}, nil, PolicyIdentity, Dec{}, Dec{})
+	res, err := NewPostgresStore(db).RateWindow(ctx, book, hour, hour.Add(time.Hour))
+	if err != nil {
+		t.Fatalf("RateWindow: %v", err)
+	}
+	if res.InvalidUsageEvents != 1 || res.EventsRated != 0 || res.RollupsWritten != 0 {
+		t.Fatalf("legacy invalid result = invalid/rated/rollups %d/%d/%d, want 1/0/0",
+			res.InvalidUsageEvents, res.EventsRated, res.RollupsWritten)
+	}
+	var rawRows, invalidAttempts, ratedRows int64
+	if err := db.QueryRowContext(ctx, `SELECT COUNT(*) FROM billing_event`).Scan(&rawRows); err != nil {
+		t.Fatalf("count raw evidence: %v", err)
+	}
+	if err := db.QueryRowContext(ctx, `SELECT COALESCE(SUM(invalid_usage_attempts),0) FROM billing_reconciliation_hourly`).Scan(&invalidAttempts); err != nil {
+		t.Fatalf("read invalid reconciliation evidence: %v", err)
+	}
+	if err := db.QueryRowContext(ctx, `SELECT COUNT(*) FROM rated_usage`).Scan(&ratedRows); err != nil {
+		t.Fatalf("count rated rows: %v", err)
+	}
+	if rawRows != 1 || invalidAttempts != 1 || ratedRows != 0 {
+		t.Fatalf("legacy invalid persistence = raw/invalid/rated %d/%d/%d, want 1/1/0", rawRows, invalidAttempts, ratedRows)
+	}
+}
+
 // readRatedUsageIDs returns natural-key → id for every rated_usage row.
 func readRatedUsageIDs(t *testing.T, db *sql.DB) map[string]string {
 	t.Helper()
