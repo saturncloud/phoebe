@@ -70,3 +70,100 @@ emit:
 #   enabled: true
 #   kubeconfig: ""
 #   timeout: "300s"
+
+# Distributed admission for the SHARED serving tier (OFF by default). This is
+# physical protection, not a billing or contractual quota. All Phoebe replicas
+# must use the same Valkey. Runtime Valkey failure returns 503 before Dynamo;
+# there is deliberately no process-local fallback that could over-admit.
+#
+# Each request is checked atomically at platform, serving-graph, organization,
+# and organization×model scopes. Prompt work is the complete OpenAI JSON body
+# size (Phoebe cannot safely duplicate model-specific template/tokenizer state);
+# output is max_completion_tokens/max_tokens, or defaultMaxOutputTokens.
+# Leases release prefill/input work at the first upstream body byte and active/output work
+# at response completion/abort/failure. Live streams renew their lease;
+# leaseTtl is the crash-recovery bound when a replica stops renewing.
+#
+# Tier lanes are hard protected partitions. organizationTiers is operator-owned
+# policy keyed by trusted org id; no client header chooses a tier. weight scales
+# that lane's configured capacities. This is weighted admission, not a claim of
+# exact request-order scheduling inside Dynamo.
+# admission:
+#   enabled: true
+#   valkeyAddr: "valkey.saturn.svc.cluster.local:6379"
+#   keyPrefix: "phoebe:admission"
+#   leaseTtl: "15m"
+#   defaultMaxOutputTokens: 512
+#   platform:
+#     maxActiveRequests: 256
+#     maxConcurrentPrefills: 32
+#     maxPromptBytes: 67108864
+#     maxReservedOutputTokens: 262144
+#     maxActiveAdapters: 128
+#     requestsPerWindow: 6000
+#     generatedTokensPerWindow: 4000000
+#     maxColdHolds: 16
+#     wakesPerWindow: 30
+#     window: "1m"
+#   graph:
+#     maxActiveRequests: 64
+#     maxConcurrentPrefills: 8
+#     maxPromptBytes: 16777216
+#     maxReservedOutputTokens: 65536
+#     maxActiveAdapters: 32
+#     requestsPerWindow: 1500
+#     generatedTokensPerWindow: 1000000
+#     maxColdHolds: 4
+#     wakesPerWindow: 6
+#     window: "1m"
+#   organization:
+#     maxActiveRequests: 32
+#     maxConcurrentPrefills: 4
+#     maxPromptBytes: 8388608
+#     maxReservedOutputTokens: 32768
+#     maxActiveAdapters: 16
+#     requestsPerWindow: 600
+#     generatedTokensPerWindow: 400000
+#     maxColdHolds: 2
+#     wakesPerWindow: 4
+#     window: "1m"
+#   organizationModel:
+#     maxActiveRequests: 16
+#     maxConcurrentPrefills: 2
+#     maxPromptBytes: 4194304
+#     maxReservedOutputTokens: 16384
+#     maxActiveAdapters: 8
+#     requestsPerWindow: 300
+#     generatedTokensPerWindow: 200000
+#     maxColdHolds: 1
+#     wakesPerWindow: 2
+#     window: "1m"
+#   tiers:
+#     default:
+#       weight: 1
+#       limits: &tierLimits
+#         maxActiveRequests: 64
+#         maxConcurrentPrefills: 8
+#         maxPromptBytes: 16777216
+#         maxReservedOutputTokens: 65536
+#         maxActiveAdapters: 32
+#         requestsPerWindow: 1500
+#         generatedTokensPerWindow: 1000000
+#         maxColdHolds: 4
+#         wakesPerWindow: 6
+#         window: "1m"
+#     protected:
+#       weight: 2
+#       limits:
+#         maxActiveRequests: 64
+#         maxConcurrentPrefills: 8
+#         maxPromptBytes: 16777216
+#         maxReservedOutputTokens: 65536
+#         maxActiveAdapters: 32
+#         requestsPerWindow: 1200
+#         generatedTokensPerWindow: 1000000
+#         maxColdHolds: 4
+#         wakesPerWindow: 6
+#         window: "1m"
+#   organizationTiers:
+#     "org-id-with-protected-share": "protected"

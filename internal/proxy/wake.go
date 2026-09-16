@@ -10,6 +10,7 @@ import (
 	"net/url"
 	"strings"
 
+	"github.com/saturncloud/phoebe/internal/admission"
 	"github.com/saturncloud/phoebe/internal/identity"
 )
 
@@ -190,6 +191,7 @@ func (s *Server) serveWithWake(
 	upstream *url.URL,
 	id identity.Identity,
 	requestID string,
+	lease *admission.Lease,
 ) (served bool) {
 	// Snapshot the (already include-usage-rewritten) request body so it can be
 	// replayed on each probe + the final forward. nil body is fine.
@@ -243,13 +245,25 @@ func (s *Server) serveWithWake(
 		}
 
 		// Cold. Trigger the wake and block until ready (bounded), then retry.
+		if lease != nil {
+			if aerr := lease.BeginColdHold(r.Context()); aerr != nil {
+				s.writeAdmissionError(w, aerr)
+				return true
+			}
+		}
 		ctx := r.Context()
 		if s.wakeTimeout > 0 {
 			var cancel context.CancelFunc
 			ctx, cancel = context.WithTimeout(ctx, s.wakeTimeout)
 			defer cancel()
 		}
-		if werr := s.waker.Wake(ctx, target); werr != nil {
+		werr := s.waker.Wake(ctx, target)
+		if lease != nil {
+			if aerr := lease.EndColdHold(context.WithoutCancel(r.Context())); aerr != nil {
+				s.log.Error.Printf("admission: cold-hold release failed: %v", aerr)
+			}
+		}
+		if werr != nil {
 			// Wake couldn't complete (deadline/scale error): return the cold
 			// response to the client rather than hang. It's a real, honest 503/404
 			// for a base we couldn't bring up in time.
