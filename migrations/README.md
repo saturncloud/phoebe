@@ -40,6 +40,7 @@ golang-migrate up/down pairs, applied in version order:
 | 0003 | `0003_io_log.{up,down}.sql` | `io_log` (+ GIN body index, retention indexes) |
 | 0004 | `0004_billing_event_serving_mode.{up,down}.sql` | `billing_event.serving_mode` (the serving-mode SKU axis; NULL = dedicated) |
 | 0005 | `0005_invoice_grade_attempts.{up,down}.sql` | trusted/client request identity, attempt outcome and usage evidence, token constraints, `rating_price_lock`, and the hourly reconciliation view |
+| 0006 | `0006_reconciliation_org_grain.{up,down}.sql` | aligns raw reconciliation with the rated natural key while exposing missing/conflicting org evidence |
 
 `embed.go` embeds these into the `migrations` package; `cmd/migrate` applies them.
 

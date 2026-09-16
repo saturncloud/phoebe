@@ -130,7 +130,7 @@ SELECT
     COALESCE(raw.raw_completion_tokens, 0) - COALESCE(rated.rated_completion_tokens, 0) AS completion_token_delta
 FROM raw
 FULL OUTER JOIN rated
-  ON raw.window_start = rated.window_start
+ ON raw.window_start = rated.window_start
  AND raw.auth_id IS NOT DISTINCT FROM rated.auth_id
  AND raw.resource_id IS NOT DISTINCT FROM rated.resource_id
  AND raw.org_id IS NOT DISTINCT FROM rated.org_id

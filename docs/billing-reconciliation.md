@@ -47,6 +47,7 @@ WHERE window_start >= :start AND window_start < :end
   AND (
       missing_usage_attempts <> 0
       OR invalid_usage_attempts <> 0
+      OR distinct_org_ids > 1
       OR attempt_delta <> missing_usage_attempts
       OR prompt_token_delta <> 0
       OR fresh_input_token_delta <> 0
@@ -65,6 +66,11 @@ deletion during a routine run, drainer poison row, `METERING_FLOOR`, WAL corrupt
 token-push withheld window, or push failure. Alert separately when the oldest Valkey
 pending entry, oldest WAL entry, or oldest unpushed rated hour exceeds two job
 periods. The deployment/chart owns those queue-age metrics.
+
+The view groups raw evidence at the exact rated natural key and exposes
+`missing_org_attempts` plus `distinct_org_ids` separately. A rollout-era mix of one
+NULL and one real org therefore reconciles to one rated row without false token
+deltas, while conflicting non-NULL orgs remain explicit.
 
 For the invoice boundary, export `rated_usage.id`, `window_start`, `org_id`, and
 `cost` for the same interval and compare it to the central manager's received-rollup

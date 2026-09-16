@@ -46,6 +46,7 @@ func ratingSchemaDDL(t *testing.T) string {
 		// serving-mode SKU axis). Skipping it reproduces the staging 42703.
 		"../../migrations/0004_billing_event_serving_mode.up.sql",
 		"../../migrations/0005_invoice_grade_attempts.up.sql",
+		"../../migrations/0006_reconciliation_org_grain.up.sql",
 	} {
 		ddl, err := os.ReadFile(f)
 		if err != nil {
@@ -678,6 +679,32 @@ func TestIntegration_OrgReRateConvergesNeverErases(t *testing.T) {
 	}
 	if o := orgOf(); !o.Valid || o.String != "org-real" {
 		t.Fatalf("after run2 org_id = %v, want 'org-real' (NULL->real convergence)", o)
+	}
+
+	// Reconciliation must use the same org-independent grain as the rater. The
+	// rollout-era NULL and real org are one accurately rated rollup, while the
+	// missing header remains visible as evidence rather than a false raw-only row.
+	var viewRows, rawAttempts, ratedAttempts, missingOrg, distinctOrgs int64
+	var attemptDelta, promptDelta, freshDelta, cachedDelta, completionDelta int64
+	if err := db.QueryRowContext(ctx, `
+		SELECT COUNT(*), MAX(raw_attempts), MAX(rated_attempts),
+		       MAX(missing_org_attempts), MAX(distinct_org_ids),
+		       MAX(attempt_delta), MAX(prompt_token_delta),
+		       MAX(fresh_input_token_delta), MAX(cached_token_delta),
+		       MAX(completion_token_delta)
+		FROM billing_reconciliation_hourly
+		WHERE window_start=$1 AND auth_id='a' AND resource_id='d1' AND model_id='b'`, hour).
+		Scan(&viewRows, &rawAttempts, &ratedAttempts, &missingOrg, &distinctOrgs,
+			&attemptDelta, &promptDelta, &freshDelta, &cachedDelta, &completionDelta); err != nil {
+		t.Fatalf("read reconciliation view: %v", err)
+	}
+	if viewRows != 1 || rawAttempts != 2 || ratedAttempts != 2 || missingOrg != 1 || distinctOrgs != 1 {
+		t.Fatalf("reconciliation grain = rows/raw/rated/missing-org/distinct-orgs %d/%d/%d/%d/%d, want 1/2/2/1/1",
+			viewRows, rawAttempts, ratedAttempts, missingOrg, distinctOrgs)
+	}
+	if attemptDelta != 0 || promptDelta != 0 || freshDelta != 0 || cachedDelta != 0 || completionDelta != 0 {
+		t.Fatalf("reconciliation deltas = attempts/prompt/fresh/cached/completion %d/%d/%d/%d/%d, want all zero",
+			attemptDelta, promptDelta, freshDelta, cachedDelta, completionDelta)
 	}
 
 	// Run 3: a stale replay drops the org headers again (only the NULL-org event is in
