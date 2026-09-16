@@ -105,12 +105,19 @@ func TestErrorHandlerUpstreamFaultStill502(t *testing.T) {
 			if rr.Code != http.StatusBadGateway {
 				t.Fatalf("upstream fault Code=%d, want 502", rr.Code)
 			}
+			if got := rr.Header().Get("X-Request-Id"); got != "req-1" {
+				t.Fatalf("upstream fault X-Request-Id=%q, want trusted attempt id req-1", got)
+			}
 			events := emTC.all()
 			if len(events) != 1 {
 				t.Fatalf("upstream fault emitted %d events, want 1 observable attempt", len(events))
 			}
 			if events[0].UsageFound || events[0].Aborted || events[0].StatusCode != http.StatusBadGateway {
 				t.Fatalf("upstream fault event = %+v, want usage-missing non-aborted 502 attempt", events[0])
+			}
+			if events[0].RequestID != rr.Header().Get("X-Request-Id") || events[0].ClientRequestID != "logical-1" {
+				t.Fatalf("upstream fault ids = trusted %q / client %q, want response-correlated req-1 / logical-1",
+					events[0].RequestID, events[0].ClientRequestID)
 			}
 		})
 	}

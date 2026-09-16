@@ -469,6 +469,9 @@ func (s *Server) errorHandler(upstream string, id identity.Identity, requestID, 
 		// A transport failure is still a real execution attempt. Persist a zero-
 		// token raw row with UsageFound=false so reconciliation can distinguish it
 		// from a legitimate zero-token completion. Rating naturally charges $0.
+		// Return the same trusted attempt id carried by the raw row so the client
+		// can correlate this terminal failure without relying on its untrusted id.
+		w.Header().Set("X-Request-Id", requestID)
 		s.emit(context.WithoutCancel(r.Context()), id, requestID, clientRequestID,
 			http.StatusBadGateway, capture.Result{UsageFound: false})
 		http.Error(w, "upstream error", http.StatusBadGateway)

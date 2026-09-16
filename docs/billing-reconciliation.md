@@ -47,6 +47,7 @@ WHERE window_start >= :start AND window_start < :end
   AND (
       missing_usage_attempts <> 0
       OR invalid_usage_attempts <> 0
+      OR missing_org_attempts <> 0
       OR distinct_org_ids > 1
       OR attempt_delta <> missing_usage_attempts
       OR prompt_token_delta <> 0
