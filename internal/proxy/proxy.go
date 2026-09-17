@@ -377,6 +377,14 @@ func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request) {
 		case bindingOK:
 		}
 	}
+	if id.ServedModel != "" && !id.Gateway && r.Method == http.MethodGet {
+		if discovery, authorized := authorizedModelDiscoveryPath(r.URL.Path, id.ServedModel); discovery && !authorized {
+			s.log.Warn.Printf("model-binding: refused request_id=%s resource_id=%s (model discovery not authorized for resource)",
+				requestID, id.ResourceID)
+			http.Error(w, "requested model is not authorized for this endpoint", http.StatusForbidden)
+			return
+		}
+	}
 
 	// SHARED REQUEST POLICY + DISTRIBUTED ADMISSION. Trusted Dynamo hints and
 	// cache isolation are enforced for every shared request, even during an
@@ -648,7 +656,7 @@ func (s *Server) errorHandler(upstream string, id identity.Identity, requestID, 
 			s.emit(ctx, id, requestID, clientRequestID, 499, capture.Result{Aborted: true, UsageFound: false})
 			return
 		}
-		s.log.Error.Printf("upstream %s error: %v", upstream, err)
+		s.log.Error.Printf("upstream %s error: %v (request_id=%s)", upstream, err, requestID)
 		// A transport failure is still a real execution attempt. Persist a zero-
 		// token raw row with UsageFound=false so reconciliation can distinguish it
 		// from a legitimate zero-token completion. Rating naturally charges $0.

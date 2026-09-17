@@ -73,10 +73,11 @@ const dynamoNotReadyBodyMarker = "is not ready to serve requests yet"
 // a shared-mode route (a served-model allow-list was injected by Atlas) AND carry
 // a valid atlas-authorized resource id. This is what disambiguates "cold parked
 // base, wake it" from "model genuinely doesn't exist" — the latter has no such
-// authorized resource. Dedicated routes (no allow-list) are never woken here
-// (they don't scale to zero via this path).
+// authorized resource. Dedicated routes also carry a served-model binding now,
+// so ServingMode is the authoritative discriminator; dedicated capacity never
+// scales to zero through this path.
 func isWakeable(id identity.Identity) bool {
-	return id.ResourceID != "" && id.ServedModel != ""
+	return id.ServingMode == "shared" && id.ResourceID != "" && id.ServedModel != ""
 }
 
 // graphFromUpstreamHost derives the Dynamo graph (DGD) k8s name from a
