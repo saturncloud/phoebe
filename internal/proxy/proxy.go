@@ -457,6 +457,15 @@ func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request) {
 	rp.FlushInterval = -1
 
 	rp.ModifyResponse = func(resp *http.Response) error {
+		// Dynamo's model-list endpoint is graph-wide. A dedicated subdomain is
+		// deployment-scoped, so expose only the served name Atlas authorized for
+		// this route; otherwise endpoint A could enumerate attached endpoint B.
+		if id.ServedModel != "" && !id.Gateway && r.Method == http.MethodGet && r.URL.Path == "/v1/models" {
+			if err := filterModelListResponse(resp, id.ServedModel); err != nil {
+				return fmt.Errorf("filter model list: %w", err)
+			}
+		}
+
 		// Echo the request id to the client (Set, not Add, so an upstream echo
 		// can't duplicate it) — with a generated id this is the client's only
 		// handle for correlating a support question to its billing record.

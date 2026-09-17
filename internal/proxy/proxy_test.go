@@ -93,7 +93,7 @@ func TestProxyBindsDedicatedEndpointToServedModel(t *testing.T) {
 	var upstreamCalls int
 	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		upstreamCalls++
-		_, _ = w.Write([]byte(`{"object":"list","data":[]}`))
+		_, _ = w.Write([]byte(`{"object":"list","data":[{"id":"adapter-a","object":"model"},{"id":"adapter-b","object":"model"},{"id":"base-internal","object":"model"}]}`))
 	}))
 	defer backend.Close()
 	upstream, _ := url.Parse(backend.URL)
@@ -121,6 +121,14 @@ func TestProxyBindsDedicatedEndpointToServedModel(t *testing.T) {
 	}
 	if rr := request(http.MethodGet, "/v1/models", ""); rr.Code != http.StatusOK {
 		t.Fatalf("model-list status = %d, want 200", rr.Code)
+	} else {
+		body := rr.Body.String()
+		if !strings.Contains(body, `"id":"adapter-a"`) {
+			t.Fatalf("model list omitted authorized model: %s", body)
+		}
+		if strings.Contains(body, "adapter-b") || strings.Contains(body, "base-internal") {
+			t.Fatalf("model list disclosed graph-wide names: %s", body)
+		}
 	}
 	if upstreamCalls != 2 {
 		t.Fatalf("authorized requests made %d upstream calls, want 2", upstreamCalls)
