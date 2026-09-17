@@ -13,6 +13,35 @@ func TestRequestMethodCarriesModel(t *testing.T) {
 	}
 }
 
+func TestAuthorizedModelDiscoveryPath(t *testing.T) {
+	tests := []struct {
+		path       string
+		discovery  bool
+		authorized bool
+	}{
+		{"/v1/models", false, false},
+		{"/health", false, false},
+		{"/v1/models/org/adapter", true, true},
+		{"/v1/models/org/adapter/ready", true, true},
+		{"/v1/models/org/other", true, false},
+		{"/v1/models/org/other/ready", true, false},
+	}
+	for _, tc := range tests {
+		discovery, authorized := authorizedModelDiscoveryPath(tc.path, "org/adapter")
+		if discovery != tc.discovery || authorized != tc.authorized {
+			t.Fatalf("path %q = (%v,%v), want (%v,%v)", tc.path, discovery, authorized, tc.discovery, tc.authorized)
+		}
+	}
+
+	// Exact match wins for a model whose id itself ends in /ready.
+	discovery, authorized := authorizedModelDiscoveryPath(
+		"/v1/models/org/adapter/ready", "org/adapter/ready",
+	)
+	if !discovery || !authorized {
+		t.Fatal("exact model id ending in /ready must be authorized")
+	}
+}
+
 func TestCheckModelBinding(t *testing.T) {
 	cases := []struct {
 		name  string

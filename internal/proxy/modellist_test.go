@@ -1,20 +1,24 @@
 package proxy
 
 import (
+	"bytes"
+	"compress/gzip"
 	"io"
 	"net/http"
 	"strings"
 	"testing"
 )
 
-func TestFilterModelListResponse(t *testing.T) {
-	resp := &http.Response{
+func modelListResponse(body string) *http.Response {
+	return &http.Response{
 		StatusCode: http.StatusOK,
 		Header:     make(http.Header),
-		Body: io.NopCloser(strings.NewReader(
-			`{"object":"list","data":[{"id":"a","owned_by":"one"},{"id":"b","owned_by":"two"}]}`,
-		)),
+		Body:       io.NopCloser(strings.NewReader(body)),
 	}
+}
+
+func TestFilterModelListResponse(t *testing.T) {
+	resp := modelListResponse(`{"object":"list","internal_graph":"secret","data":[{"id":"a","object":"model","owned_by":"one","internal":"secret"},{"id":"b","owned_by":"two"}]}`)
 	if err := filterModelListResponse(resp, "a"); err != nil {
 		t.Fatal(err)
 	}
@@ -22,22 +26,48 @@ func TestFilterModelListResponse(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got := string(body); !strings.Contains(got, `"id":"a"`) || strings.Contains(got, `"id":"b"`) {
+	got := string(body)
+	if !strings.Contains(got, `"id":"a"`) || strings.Contains(got, `"id":"b"`) {
 		t.Fatalf("filtered model list = %s", got)
+	}
+	if strings.Contains(got, "internal_graph") || strings.Contains(got, `"internal"`) {
+		t.Fatalf("filtered model list preserved extension fields: %s", got)
 	}
 	if resp.ContentLength != int64(len(body)) || resp.Header.Get("Content-Length") == "" {
 		t.Fatalf("response length metadata not updated: length=%d header=%q", resp.ContentLength, resp.Header.Get("Content-Length"))
 	}
 }
 
+func TestFilterModelListResponseDecodesGzip(t *testing.T) {
+	var compressed bytes.Buffer
+	gz := gzip.NewWriter(&compressed)
+	_, _ = gz.Write([]byte(`{"object":"list","data":[{"id":"a"},{"id":"b"}]}`))
+	if err := gz.Close(); err != nil {
+		t.Fatal(err)
+	}
+	resp := &http.Response{
+		StatusCode: http.StatusOK,
+		Header:     http.Header{"Content-Encoding": []string{"gzip"}},
+		Body:       io.NopCloser(bytes.NewReader(compressed.Bytes())),
+	}
+	if err := filterModelListResponse(resp, "a"); err != nil {
+		t.Fatal(err)
+	}
+	body, _ := io.ReadAll(resp.Body)
+	if strings.Contains(string(body), `"id":"b"`) || resp.Header.Get("Content-Encoding") != "" {
+		t.Fatalf("gzip response was not filtered and normalized: headers=%v body=%s", resp.Header, body)
+	}
+}
+
 func TestFilterModelListResponseFailsClosed(t *testing.T) {
-	for _, body := range []string{`not json`, `{"object":"list"}`, `{"data":{}}`} {
-		resp := &http.Response{
-			StatusCode: http.StatusOK,
-			Header:     make(http.Header),
-			Body:       io.NopCloser(strings.NewReader(body)),
-		}
-		if err := filterModelListResponse(resp, "a"); err == nil {
+	for _, body := range []string{
+		`not json`,
+		`{"object":"list"}`,
+		`{"data":{}}`,
+		`{"data":[{"id":"sibling","id":"allowed"}]}`,
+	} {
+		resp := modelListResponse(body)
+		if err := filterModelListResponse(resp, "allowed"); err == nil {
 			t.Fatalf("body %q unexpectedly passed", body)
 		}
 	}
