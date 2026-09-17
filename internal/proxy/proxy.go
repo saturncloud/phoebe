@@ -293,15 +293,15 @@ func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	// SHARED-MODE MODEL BINDING (security crux): assert the request-body `model=`
+	// SUBDOMAIN MODEL BINDING: assert the request-body `model=`
 	// is one the subdomain-authorized resource may serve, fail closed on mismatch.
 	// atlas-auth authorized the caller for this subdomain/resource; Dynamo routes
-	// on the body `model=` and a shared graph fronts many tenants behind one
-	// upstream — so bind the two or a caller could send `model=<someone-else's>`
-	// and be served it. Only enforced when Atlas injected an allow-list
-	// (X-Saturn-Served-Model); dedicated single-model routes carry none and skip
-	// this at zero cost. Runs BEFORE forwarding so a bad model never reaches the
-	// engine. Reads the body once and restores it for forceIncludeUsage.
+	// on the body `model=` and both shared and dedicated graphs can front several
+	// served names behind one upstream. Only enforced when Atlas injected an
+	// allow-list (X-Saturn-Served-Model). GET/HEAD/OPTIONS requests such as health
+	// and model discovery carry no routed model and pass through. Runs BEFORE
+	// forwarding so a bad model never reaches the engine. Reads the body once and
+	// restores it for forceIncludeUsage.
 	//
 	// GATEWAY requests skip this check — THE PATHS DIVERGE HERE: on the
 	// subdomain path Atlas authorizes a resource and injects its allow-list,
@@ -310,7 +310,7 @@ func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request) {
 	// THE ORG, so resolution IS the binding (id.ServedModel was set FROM the
 	// resolved request model; re-checking it against itself would be a
 	// tautology).
-	if id.ServedModel != "" && !id.Gateway {
+	if id.ServedModel != "" && !id.Gateway && requestMethodCarriesModel(r.Method) {
 		body, rerr := readAndRestoreBody(r)
 		if rerr != nil {
 			s.log.Error.Printf("model-binding: read request body: %v", rerr)

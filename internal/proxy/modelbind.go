@@ -7,6 +7,18 @@ import (
 	"strings"
 )
 
+// requestMethodCarriesModel identifies requests that can ask Dynamo to route
+// to a served model. Read-only discovery and health requests have no model body
+// and must continue to work on a bound endpoint.
+func requestMethodCarriesModel(method string) bool {
+	switch method {
+	case "GET", "HEAD", "OPTIONS":
+		return false
+	default:
+		return true
+	}
+}
+
 var errNotObject = errors.New("request body is not a JSON object")
 
 // modelBindingResult is the outcome of the request-body model= binding check.
@@ -37,13 +49,13 @@ const (
 // without this check a caller authorized for model-A could send `model=B` and be
 // served B. This binds the two: request model ∈ allow-list, else fail closed.
 //
-// The allow-list is empty for routes that don't enforce binding (a dedicated
-// single-model endpoint: one subdomain == one model, the engine can only serve
-// the one thing) → bindingOK, no parse, no cost. atlas DECIDES access; this only
-// guarantees the body can't escape the atlas-authorized resource.
+// The allow-list is empty for routes that don't enforce binding. Atlas decides
+// access; this only guarantees the body can't escape the Atlas-authorized
+// resource. Dedicated Dynamo routes carry a single served name because one
+// graph may host a base model plus several attached adapters.
 func checkModelBinding(body []byte, servedModelAllowList string) modelBindingResult {
-	// An ABSENT header (empty string) = binding not enforced (dedicated
-	// single-model route). But a PRESENT header that parses to an EMPTY set
+	// An ABSENT header (empty string) = binding not enforced. But a PRESENT
+	// header that parses to an EMPTY set
 	// (e.g. a whitespace-only served name, or all-empty CSV parts) must fail
 	// CLOSED, not open: an empty allow-list on a shared route would let ANY
 	// model= through, defeating the binding. The caller only reaches here when

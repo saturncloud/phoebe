@@ -2,6 +2,17 @@ package proxy
 
 import "testing"
 
+func TestRequestMethodCarriesModel(t *testing.T) {
+	for _, method := range []string{"GET", "HEAD", "OPTIONS"} {
+		if requestMethodCarriesModel(method) {
+			t.Fatalf("%s must bypass body model binding", method)
+		}
+	}
+	if !requestMethodCarriesModel("POST") {
+		t.Fatal("POST must enforce body model binding")
+	}
+}
+
 func TestCheckModelBinding(t *testing.T) {
 	cases := []struct {
 		name  string
