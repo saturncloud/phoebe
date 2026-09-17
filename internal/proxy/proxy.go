@@ -330,7 +330,7 @@ func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request) {
 		case bindingOK:
 		}
 	}
-	if id.ServedModel != "" && !id.Gateway && r.Method == http.MethodGet {
+	if id.ServedModel != "" && !id.Gateway && (r.Method == http.MethodGet || r.Method == http.MethodHead) {
 		if discovery, authorized := authorizedModelDiscoveryPath(r.URL.Path, id.ServedModel); discovery && !authorized {
 			s.log.Warn.Printf("model-binding: refused request_id=%s resource_id=%s (model discovery not authorized for resource)",
 				requestID, id.ResourceID)
@@ -468,9 +468,14 @@ func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request) {
 		// Dynamo's model-list endpoint is graph-wide. A dedicated subdomain is
 		// deployment-scoped, so expose only the served name Atlas authorized for
 		// this route; otherwise endpoint A could enumerate attached endpoint B.
-		if id.ServedModel != "" && !id.Gateway && r.Method == http.MethodGet && r.URL.Path == "/v1/models" {
-			if err := filterModelListResponse(resp, id.ServedModel); err != nil {
-				return fmt.Errorf("filter model list: %w", err)
+		if id.ServedModel != "" && !id.Gateway && r.URL.Path == "/v1/models" {
+			switch r.Method {
+			case http.MethodGet:
+				if err := filterModelListResponse(resp, id.ServedModel); err != nil {
+					return fmt.Errorf("filter model list: %w", err)
+				}
+			case http.MethodHead:
+				sanitizeModelListHeadResponse(resp)
 			}
 		}
 

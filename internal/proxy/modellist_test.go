@@ -18,7 +18,7 @@ func modelListResponse(body string) *http.Response {
 }
 
 func TestFilterModelListResponse(t *testing.T) {
-	resp := modelListResponse(`{"object":"list","internal_graph":"secret","data":[{"id":"a","object":"model","owned_by":"one","internal":"secret"},{"id":"b","owned_by":"two"}]}`)
+	resp := modelListResponse(`{"object":"list","internal_graph":"secret","data":[{"id":"a","object":"model","owned_by":"one","context_window":131072,"max_output_tokens":8192,"internal":"secret"},{"id":"b","owned_by":"two"}]}`)
 	if err := filterModelListResponse(resp, "a"); err != nil {
 		t.Fatal(err)
 	}
@@ -33,8 +33,30 @@ func TestFilterModelListResponse(t *testing.T) {
 	if strings.Contains(got, "internal_graph") || strings.Contains(got, `"internal"`) {
 		t.Fatalf("filtered model list preserved extension fields: %s", got)
 	}
+	if !strings.Contains(got, `"context_window":131072`) || !strings.Contains(got, `"max_output_tokens":8192`) {
+		t.Fatalf("filtered model list dropped documented limits: %s", got)
+	}
 	if resp.ContentLength != int64(len(body)) || resp.Header.Get("Content-Length") == "" {
 		t.Fatalf("response length metadata not updated: length=%d header=%q", resp.ContentLength, resp.Header.Get("Content-Length"))
+	}
+}
+
+func TestFilterModelListResponseSanitizesUpstreamErrors(t *testing.T) {
+	resp := modelListResponse(`{"error":"adapter-b on base-internal failed"}`)
+	resp.StatusCode = http.StatusServiceUnavailable
+	resp.Header.Set("X-Graph-Debug", "adapter-b")
+	if err := filterModelListResponse(resp, "adapter-a"); err != nil {
+		t.Fatal(err)
+	}
+	body, _ := io.ReadAll(resp.Body)
+	if resp.StatusCode != http.StatusServiceUnavailable {
+		t.Fatalf("status = %d, want 503", resp.StatusCode)
+	}
+	if strings.Contains(string(body), "adapter-b") || strings.Contains(string(body), "base-internal") {
+		t.Fatalf("sanitized error leaked upstream names: %s", body)
+	}
+	if resp.Header.Get("X-Graph-Debug") != "" {
+		t.Fatalf("sanitized error leaked upstream headers: %v", resp.Header)
 	}
 }
 

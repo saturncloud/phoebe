@@ -12,10 +12,12 @@ import (
 const maxModelListBytes = 4 << 20
 
 type safeModelListing struct {
-	ID      string `json:"id"`
-	Object  string `json:"object,omitempty"`
-	Created int64  `json:"created,omitempty"`
-	OwnedBy string `json:"owned_by,omitempty"`
+	ID              string  `json:"id"`
+	Object          string  `json:"object,omitempty"`
+	Created         int64   `json:"created,omitempty"`
+	OwnedBy         string  `json:"owned_by,omitempty"`
+	ContextWindow   *uint64 `json:"context_window,omitempty"`
+	MaxOutputTokens *uint64 `json:"max_output_tokens,omitempty"`
 }
 
 type safeModelList struct {
@@ -31,6 +33,15 @@ type safeModelList struct {
 // schema so duplicate keys and extension fields cannot smuggle sibling names.
 func filterModelListResponse(resp *http.Response, servedModelAllowList string) error {
 	if resp.StatusCode < http.StatusOK || resp.StatusCode >= http.StatusMultipleChoices {
+		if err := resp.Body.Close(); err != nil {
+			return fmt.Errorf("close model-list error response: %w", err)
+		}
+		body := []byte(`{"error":"model discovery unavailable"}`)
+		resp.Body = io.NopCloser(bytes.NewReader(body))
+		resp.ContentLength = int64(len(body))
+		resp.Header = make(http.Header)
+		resp.Header.Set("Content-Type", "application/json")
+		resp.Header.Set("Content-Length", fmt.Sprintf("%d", len(body)))
 		return nil
 	}
 	allow := parseServedModelAllowList(servedModelAllowList)
@@ -101,6 +112,14 @@ func filterModelListResponse(resp *http.Response, servedModelAllowList string) e
 	resp.Header.Set("Content-Length", fmt.Sprintf("%d", len(encoded)))
 	resp.Header.Del("Content-Encoding")
 	return nil
+}
+
+// sanitizeModelListHeadResponse preserves the upstream status while removing
+// graph-wide representation metadata (length, ETag, and extensions). HEAD has
+// no body to filter, and the request-id header is added after this step.
+func sanitizeModelListHeadResponse(resp *http.Response) {
+	resp.Header = make(http.Header)
+	resp.ContentLength = -1
 }
 
 func countTopLevelJSONKey(body []byte, key string) (int, error) {
