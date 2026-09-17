@@ -89,6 +89,44 @@ func TestHealthz(t *testing.T) {
 	}
 }
 
+func TestProxyBindsDedicatedEndpointToServedModel(t *testing.T) {
+	var upstreamCalls int
+	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		upstreamCalls++
+		_, _ = w.Write([]byte(`{"object":"list","data":[]}`))
+	}))
+	defer backend.Close()
+	upstream, _ := url.Parse(backend.URL)
+	srv := newTestServer(t, upstream)
+
+	request := func(method, path, body string) *httptest.ResponseRecorder {
+		req := httptest.NewRequest(method, path, strings.NewReader(body))
+		setUpstream(req, upstream)
+		req.Header.Set(identity.HeaderAuthID, "auth-1")
+		req.Header.Set(identity.HeaderResourceID, "deployment-a")
+		req.Header.Set(identity.HeaderServedModel, "adapter-a")
+		rr := httptest.NewRecorder()
+		srv.Handler().ServeHTTP(rr, req)
+		return rr
+	}
+
+	if rr := request(http.MethodPost, "/v1/chat/completions", `{"model":"adapter-b"}`); rr.Code != http.StatusForbidden {
+		t.Fatalf("cross-model status = %d, want 403", rr.Code)
+	}
+	if upstreamCalls != 0 {
+		t.Fatalf("cross-model request reached Dynamo (%d calls)", upstreamCalls)
+	}
+	if rr := request(http.MethodPost, "/v1/chat/completions", `{"model":"adapter-a"}`); rr.Code != http.StatusOK {
+		t.Fatalf("bound model status = %d, want 200", rr.Code)
+	}
+	if rr := request(http.MethodGet, "/v1/models", ""); rr.Code != http.StatusOK {
+		t.Fatalf("model-list status = %d, want 200", rr.Code)
+	}
+	if upstreamCalls != 2 {
+		t.Fatalf("authorized requests made %d upstream calls, want 2", upstreamCalls)
+	}
+}
+
 // TestProxyBillingGate verifies the fail-closed billing-identity gate: a
 // request missing the auth-id and/or resource-id headers is rejected with 400
 // (we never serve traffic we can't attribute), and the error names what's

@@ -2,44 +2,48 @@ package proxy
 
 import "testing"
 
+func TestRequestMethodCarriesModel(t *testing.T) {
+	for _, method := range []string{"GET", "HEAD", "OPTIONS"} {
+		if requestMethodCarriesModel(method) {
+			t.Fatalf("%s must bypass body model binding", method)
+		}
+	}
+	if !requestMethodCarriesModel("POST") {
+		t.Fatal("POST must enforce body model binding")
+	}
+}
+
 func TestCheckModelBinding(t *testing.T) {
 	cases := []struct {
-		name      string
-		body      string
-		allow     string
-		want      modelBindingResult
-		wantModel string
+		name  string
+		body  string
+		allow string
+		want  modelBindingResult
 	}{
-		// No allow-list -> binding not enforced (dedicated single-model route).
-		{"no allow-list passes through", `{"model":"anything"}`, "", bindingOK, ""},
+		// No allow-list -> binding not enforced (route without injected header).
+		{"no allow-list passes through", `{"model":"anything"}`, "", bindingOK},
 		// Authorized model in a single-entry allow-list.
-		{"authorized single", `{"model":"acme-bot"}`, "acme-bot", bindingOK, "acme-bot"},
+		{"authorized single", `{"model":"acme-bot"}`, "acme-bot", bindingOK},
 		// The cross-model attack: authorized for acme-bot's subdomain, body names victim.
-		{"cross-model attack refused", `{"model":"victim-bot"}`, "acme-bot", bindingMismatch, ""},
+		{"cross-model attack refused", `{"model":"victim-bot"}`, "acme-bot", bindingMismatch},
 		// Multi-entry allow-list (an endpoint serving base + adapter under two names).
-		// The SINGULAR selected model must come back, never the CSV allow-list:
-		// wake readiness matches /v1/models exactly.
-		{"authorized in multi", `{"model":"acme-bot-base"}`, "acme-bot,acme-bot-base", bindingOK, "acme-bot-base"},
-		{"authorized first of multi", `{"model":"acme-bot"}`, "acme-bot,acme-bot-base", bindingOK, "acme-bot"},
-		{"unauthorized in multi", `{"model":"other"}`, "acme-bot,acme-bot-base", bindingMismatch, ""},
+		{"authorized in multi", `{"model":"acme-bot-base"}`, "acme-bot,acme-bot-base", bindingOK},
+		{"authorized first of multi", `{"model":"acme-bot"}`, "acme-bot,acme-bot-base", bindingOK},
+		{"unauthorized in multi", `{"model":"other"}`, "acme-bot,acme-bot-base", bindingMismatch},
 		// Enforced but unverifiable -> fail closed.
-		{"no model field, enforced", `{"messages":[]}`, "acme-bot", bindingUnparseable, ""},
-		{"empty model, enforced", `{"model":""}`, "acme-bot", bindingUnparseable, ""},
-		{"non-json body, enforced", `not json`, "acme-bot", bindingUnparseable, ""},
-		{"empty body, enforced", ``, "acme-bot", bindingUnparseable, ""},
+		{"no model field, enforced", `{"messages":[]}`, "acme-bot", bindingUnparseable},
+		{"empty model, enforced", `{"model":""}`, "acme-bot", bindingUnparseable},
+		{"non-json body, enforced", `not json`, "acme-bot", bindingUnparseable},
+		{"empty body, enforced", ``, "acme-bot", bindingUnparseable},
 		// Whitespace in the header is trimmed.
-		{"spaced allow-list", `{"model":"acme-bot"}`, " acme-bot , other ", bindingOK, "acme-bot"},
+		{"spaced allow-list", `{"model":"acme-bot"}`, " acme-bot , other ", bindingOK},
 		// Case-sensitive (exact model ids).
-		{"case sensitive mismatch", `{"model":"Acme-Bot"}`, "acme-bot", bindingMismatch, ""},
+		{"case sensitive mismatch", `{"model":"Acme-Bot"}`, "acme-bot", bindingMismatch},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			got, gotModel := checkModelBinding([]byte(tc.body), tc.allow)
-			if got != tc.want {
+			if got := checkModelBinding([]byte(tc.body), tc.allow); got != tc.want {
 				t.Fatalf("checkModelBinding(%q, %q) = %d, want %d", tc.body, tc.allow, got, tc.want)
-			}
-			if gotModel != tc.wantModel {
-				t.Fatalf("checkModelBinding(%q, %q) model = %q, want %q", tc.body, tc.allow, gotModel, tc.wantModel)
 			}
 		})
 	}
@@ -75,12 +79,8 @@ func TestCheckModelBinding_DuplicateAndWhitespace(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			got, gotModel := checkModelBinding([]byte(tc.body), tc.allow)
-			if got != tc.want {
+			if got := checkModelBinding([]byte(tc.body), tc.allow); got != tc.want {
 				t.Fatalf("checkModelBinding(%q,%q)=%d want %d", tc.body, tc.allow, got, tc.want)
-			}
-			if got != bindingOK && gotModel != "" {
-				t.Fatalf("checkModelBinding(%q,%q) returned model %q on a non-OK result", tc.body, tc.allow, gotModel)
 			}
 		})
 	}

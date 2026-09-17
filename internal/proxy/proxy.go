@@ -337,15 +337,15 @@ func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	// SHARED-MODE MODEL BINDING (security crux): assert the request-body `model=`
+	// SUBDOMAIN MODEL BINDING: assert the request-body `model=`
 	// is one the subdomain-authorized resource may serve, fail closed on mismatch.
 	// atlas-auth authorized the caller for this subdomain/resource; Dynamo routes
-	// on the body `model=` and a shared graph fronts many tenants behind one
-	// upstream — so bind the two or a caller could send `model=<someone-else's>`
-	// and be served it. Only enforced when Atlas injected an allow-list
-	// (X-Saturn-Served-Model); dedicated single-model routes carry none and skip
-	// this at zero cost. Runs BEFORE forwarding so a bad model never reaches the
-	// engine. Reads the body once and restores it for forceIncludeUsage.
+	// on the body `model=` and both shared and dedicated graphs can front several
+	// served names behind one upstream. Only enforced when Atlas injected an
+	// allow-list (X-Saturn-Served-Model). GET/HEAD/OPTIONS requests such as health
+	// and model discovery carry no routed model and pass through. Runs BEFORE
+	// forwarding so a bad model never reaches the engine. Reads the body once and
+	// restores it for forceIncludeUsage.
 	//
 	// GATEWAY requests skip this check — THE PATHS DIVERGE HERE: on the
 	// subdomain path Atlas authorizes a resource and injects its allow-list,
@@ -354,22 +354,17 @@ func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request) {
 	// THE ORG, so resolution IS the binding (id.ServedModel was set FROM the
 	// resolved request model; re-checking it against itself would be a
 	// tautology).
-	// NOTE: the binding check's singular matched model is deliberately discarded.
-	// It existed so wake readiness could match /v1/models EXACTLY (id.ServedModel
-	// may be a comma-separated allow-list, which no /v1/models entry can equal).
-	// serveWithWake no longer polls /v1/models -- it probes for a cold response
-	// and retries -- so there is nothing left that needs the singular value.
-	if id.ServedModel != "" && !id.Gateway {
+	// The binding check once also returned the singular matched model, for wake
+	// readiness's exact /v1/models match; the wake reconciliation (72f7ec1)
+	// removed that consumer, so nothing consumes it any more.
+	if id.ServedModel != "" && !id.Gateway && requestMethodCarriesModel(r.Method) {
 		body, rerr := readAndRestoreBody(r)
 		if rerr != nil {
 			s.log.Error.Printf("model-binding: read request body: %v", rerr)
 			http.Error(w, "bad request body", http.StatusBadRequest)
 			return
 		}
-		// The second return is the singular matched model; see the note above
-		// for why nothing consumes it any more.
-		result, _ := checkModelBinding(body, id.ServedModel)
-		switch result {
+		switch checkModelBinding(body, id.ServedModel) {
 		case bindingMismatch, bindingUnparseable:
 			// Fail closed: the request names a model this resource is not
 			// authorized to serve (or one we cannot verify). Log with the

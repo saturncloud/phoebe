@@ -7,6 +7,18 @@ import (
 	"strings"
 )
 
+// requestMethodCarriesModel identifies requests that can ask Dynamo to route
+// to a served model. Read-only discovery and health requests have no model body
+// and must continue to work on a bound endpoint.
+func requestMethodCarriesModel(method string) bool {
+	switch method {
+	case "GET", "HEAD", "OPTIONS":
+		return false
+	default:
+		return true
+	}
+}
+
 var errNotObject = errors.New("request body is not a JSON object")
 
 // modelBindingResult is the outcome of the request-body model= binding check.
@@ -37,42 +49,42 @@ const (
 // without this check a caller authorized for model-A could send `model=B` and be
 // served B. This binds the two: request model ∈ allow-list, else fail closed.
 //
-// The allow-list is empty for routes that don't enforce binding (a dedicated
-// single-model endpoint: one subdomain == one model, the engine can only serve
-// the one thing) → bindingOK, no parse, no cost. atlas DECIDES access; this only
-// guarantees the body can't escape the atlas-authorized resource.
-// The second return value is the SINGULAR model the request selected, set only
-// on bindingOK for an enforced route. Wake readiness polls /v1/models for an
-// exact match, so it must receive this value and never the comma-separated
-// allow-list, which can never equal any single served-model name. It is empty
-// when the binding is not enforced (no allow-list header), where the caller
-// falls back to the route's own single served model.
-func checkModelBinding(body []byte, servedModelAllowList string) (modelBindingResult, string) {
-	// An ABSENT header (empty string) = binding not enforced (dedicated
-	// single-model route). But a PRESENT header that parses to an EMPTY set
+// The allow-list is empty for routes that don't enforce binding. Atlas decides
+// access; this only guarantees the body can't escape the Atlas-authorized
+// resource. Dedicated Dynamo routes carry a single served name because one
+// graph may host a base model plus several attached adapters.
+//
+// The binding check once also returned the SINGULAR model the request selected
+// (a comma-separated allow-list can never equal one /v1/models entry, so wake
+// readiness needed the resolved value). The wake reconciliation (72f7ec1)
+// removed that consumer — serveWithWake probes for a cold response and retries
+// instead of polling /v1/models — so the value is gone with it.
+func checkModelBinding(body []byte, servedModelAllowList string) modelBindingResult {
+	// An ABSENT header (empty string) = binding not enforced. But a PRESENT
+	// header that parses to an EMPTY set
 	// (e.g. a whitespace-only served name, or all-empty CSV parts) must fail
 	// CLOSED, not open: an empty allow-list on a shared route would let ANY
 	// model= through, defeating the binding. The caller only reaches here when
 	// the header is non-empty, so "present but empty set" is the attack/bug case.
 	if servedModelAllowList == "" {
-		return bindingOK, "" // truly absent (empty header) -> not a shared-binding route
+		return bindingOK // truly absent (empty header) -> not a shared-binding route
 	}
 	allow := parseServedModelAllowList(servedModelAllowList)
 	if len(allow) == 0 {
 		// Present (non-empty header) but parsed to nothing — whitespace-only or
 		// all-empty CSV parts. Fail CLOSED: an empty allow-list on a route that
 		// DID inject the header would let any model= through.
-		return bindingMismatch, ""
+		return bindingMismatch
 	}
 	model, ok := extractRequestModel(body)
 	if !ok {
 		// Enforced but the model is unreadable — fail closed.
-		return bindingUnparseable, ""
+		return bindingUnparseable
 	}
 	if _, authorized := allow[model]; authorized {
-		return bindingOK, model
+		return bindingOK
 	}
-	return bindingMismatch, ""
+	return bindingMismatch
 }
 
 // parseServedModelAllowList splits the comma-separated header into a set,
