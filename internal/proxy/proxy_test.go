@@ -146,8 +146,8 @@ func TestProxyBindsDedicatedEndpointToServedModel(t *testing.T) {
 	if rr := request(http.MethodGet, "/v1/models/adapter-a", ""); rr.Code != http.StatusOK {
 		t.Fatalf("bound model metadata status = %d, want 200", rr.Code)
 	}
-	if rr := request(http.MethodGet, "/v1/models/adapter-a/ready", ""); rr.Code != http.StatusOK {
-		t.Fatalf("bound model readiness status = %d, want 200", rr.Code)
+	if rr := request(http.MethodGet, "/v1/models/adapter-a/ready", ""); rr.Code != http.StatusForbidden {
+		t.Fatalf("ambiguous model readiness status = %d, want 403", rr.Code)
 	}
 	if rr := request(http.MethodHead, "/v1/models/adapter-a", ""); rr.Code != http.StatusOK {
 		t.Fatalf("bound HEAD metadata status = %d, want 200", rr.Code)
@@ -157,8 +157,8 @@ func TestProxyBindsDedicatedEndpointToServedModel(t *testing.T) {
 	} else if rr.Header().Get("Content-Length") != "" || rr.Header().Get("X-Graph-Debug") != "" {
 		t.Fatalf("HEAD list leaked graph-wide representation headers: %v", rr.Header())
 	}
-	if upstreamCalls != 6 {
-		t.Fatalf("authorized requests made %d upstream calls, want 6", upstreamCalls)
+	if upstreamCalls != 5 {
+		t.Fatalf("authorized requests made %d upstream calls, want 5", upstreamCalls)
 	}
 }
 

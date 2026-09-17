@@ -19,6 +19,9 @@ func modelListResponse(body string) *http.Response {
 
 func TestFilterModelListResponse(t *testing.T) {
 	resp := modelListResponse(`{"object":"list","internal_graph":"secret","data":[{"id":"a","object":"model","owned_by":"one","context_window":131072,"max_output_tokens":8192,"internal":"secret"},{"id":"b","owned_by":"two"}]}`)
+	resp.Header.Set("X-Graph-Debug", "b")
+	resp.Header.Set("ETag", "graph-wide")
+	resp.Trailer = http.Header{"X-Graph-Trailer": []string{"b"}}
 	if err := filterModelListResponse(resp, "a"); err != nil {
 		t.Fatal(err)
 	}
@@ -38,6 +41,9 @@ func TestFilterModelListResponse(t *testing.T) {
 	}
 	if resp.ContentLength != int64(len(body)) || resp.Header.Get("Content-Length") == "" {
 		t.Fatalf("response length metadata not updated: length=%d header=%q", resp.ContentLength, resp.Header.Get("Content-Length"))
+	}
+	if resp.Header.Get("X-Graph-Debug") != "" || resp.Header.Get("ETag") != "" || resp.Trailer != nil {
+		t.Fatalf("filtered model list leaked upstream metadata: headers=%v trailer=%v", resp.Header, resp.Trailer)
 	}
 }
 

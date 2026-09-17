@@ -21,8 +21,9 @@ func requestMethodCarriesModel(method string) bool {
 
 // authorizedModelDiscoveryPath validates Dynamo's graph-wide per-model GET
 // subtree against the endpoint's served-model allow-list. The wildcard model id
-// may contain slashes. Dynamo gives an exact model id precedence over the
-// optional trailing /ready subresource, so mirror that order here.
+// may contain slashes. Bound routes authorize exact model ids only: Dynamo gives
+// an exact sibling named <allowed>/ready precedence over the readiness
+// subresource, so suffix-based authorization would be ambiguous and fail open.
 func authorizedModelDiscoveryPath(path, servedModelAllowList string) (discovery, authorized bool) {
 	const prefix = "/v1/models/"
 	if !strings.HasPrefix(path, prefix) {
@@ -32,11 +33,6 @@ func authorizedModelDiscoveryPath(path, servedModelAllowList string) (discovery,
 	allow := parseServedModelAllowList(servedModelAllowList)
 	if _, ok := allow[requested]; ok {
 		return true, true
-	}
-	for model := range allow {
-		if requested == model+"/ready" {
-			return true, true
-		}
 	}
 	return true, false
 }
