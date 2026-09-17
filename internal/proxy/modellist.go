@@ -109,8 +109,10 @@ func filterModelListResponse(resp *http.Response, servedModelAllowList string) e
 
 	resp.Body = io.NopCloser(bytes.NewReader(encoded))
 	resp.ContentLength = int64(len(encoded))
+	resp.Header = make(http.Header)
+	resp.Header.Set("Content-Type", "application/json")
 	resp.Header.Set("Content-Length", fmt.Sprintf("%d", len(encoded)))
-	resp.Header.Del("Content-Encoding")
+	resp.Trailer = nil
 	return nil
 }
 

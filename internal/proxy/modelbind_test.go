@@ -22,7 +22,7 @@ func TestAuthorizedModelDiscoveryPath(t *testing.T) {
 		{"/v1/models", false, false},
 		{"/health", false, false},
 		{"/v1/models/org/adapter", true, true},
-		{"/v1/models/org/adapter/ready", true, true},
+		{"/v1/models/org/adapter/ready", true, false},
 		{"/v1/models/org/other", true, false},
 		{"/v1/models/org/other/ready", true, false},
 	}
@@ -33,7 +33,7 @@ func TestAuthorizedModelDiscoveryPath(t *testing.T) {
 		}
 	}
 
-	// Exact match wins for a model whose id itself ends in /ready.
+	// An endpoint whose own exact id ends in /ready remains addressable.
 	discovery, authorized := authorizedModelDiscoveryPath(
 		"/v1/models/org/adapter/ready", "org/adapter/ready",
 	)
