@@ -205,6 +205,20 @@ func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request) {
 	// response. Non-gateway requests skip this entirely — today's header-routed
 	// behavior, byte for byte.
 	if id.Gateway {
+		if !gatewayRequestAllowed(r.Method, r.URL.Path) {
+			s.log.Warn.Printf("gateway: refusing route outside public inference surface method=%s path=%s org_id=%q",
+				r.Method, r.URL.Path, id.OrgID)
+			http.Error(w, "not found", http.StatusNotFound)
+			return
+		}
+		if r.Method == http.MethodOptions {
+			if id.OrgID == "" {
+				http.Error(w, "forbidden", http.StatusForbidden)
+				return
+			}
+			w.WriteHeader(http.StatusNoContent)
+			return
+		}
 		if !s.resolveGateway(w, r, &id) {
 			return
 		}
