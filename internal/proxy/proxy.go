@@ -337,13 +337,13 @@ func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	// SUBDOMAIN MODEL BINDING: assert the request-body `model=`
+	// SUBDOMAIN ROUTE AND MODEL BINDING: first restrict the resource URL to the
+	// explicit public inference surface, then assert the request-body `model=`
 	// is one the subdomain-authorized resource may serve, fail closed on mismatch.
 	// atlas-auth authorized the caller for this subdomain/resource; Dynamo routes
 	// on the body `model=` and both shared and dedicated graphs can front several
 	// served names behind one upstream. Only enforced when Atlas injected an
-	// allow-list (X-Saturn-Served-Model). GET/HEAD/OPTIONS requests such as health
-	// and model discovery carry no routed model and pass through. Runs BEFORE
+	// allow-list (X-Saturn-Served-Model). Runs BEFORE
 	// forwarding so a bad model never reaches the engine. Reads the body once and
 	// restores it for forceIncludeUsage.
 	//
@@ -357,7 +357,13 @@ func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request) {
 	// The binding check once also returned the singular matched model, for wake
 	// readiness's exact /v1/models match; the wake reconciliation (72f7ec1)
 	// removed that consumer, so nothing consumes it any more.
-	if id.ServedModel != "" && !id.Gateway && requestMethodCarriesModel(r.Method) {
+	if id.ServedModel != "" && !id.Gateway && !boundRequestAllowed(r.Method, r.URL.Path, id.ServedModel) {
+		s.log.Warn.Printf("model-binding: refused request_id=%s resource_id=%s (route not authorized for resource)",
+			requestID, id.ResourceID)
+		http.Error(w, "not found", http.StatusNotFound)
+		return
+	}
+	if id.ServedModel != "" && !id.Gateway && r.Method == "POST" {
 		body, rerr := readAndRestoreBody(r)
 		if rerr != nil {
 			s.log.Error.Printf("model-binding: read request body: %v", rerr)
@@ -377,13 +383,6 @@ func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request) {
 		case bindingOK:
 		}
 	}
-	if id.ServedModel != "" && !id.Gateway && !boundReadOnlyRequestAllowed(r.Method, r.URL.Path, id.ServedModel) {
-		s.log.Warn.Printf("model-binding: refused request_id=%s resource_id=%s (read-only path not authorized for resource)",
-			requestID, id.ResourceID)
-		http.Error(w, "not found", http.StatusNotFound)
-		return
-	}
-
 	// SHARED REQUEST POLICY + DISTRIBUTED ADMISSION. Trusted Dynamo hints and
 	// cache isolation are enforced for every shared request, even during an
 	// admission rollout with the distributed gate disabled; otherwise a client
@@ -475,7 +474,6 @@ func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request) {
 			}()
 		}
 	}
-
 	// Force streaming usage so we never under-bill a streamed response.
 	if err := forceIncludeUsage(r); err != nil {
 		s.log.Error.Printf("rewrite request body: %v", err)

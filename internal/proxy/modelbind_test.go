@@ -2,17 +2,6 @@ package proxy
 
 import "testing"
 
-func TestRequestMethodCarriesModel(t *testing.T) {
-	for _, method := range []string{"GET", "HEAD", "OPTIONS"} {
-		if requestMethodCarriesModel(method) {
-			t.Fatalf("%s must bypass body model binding", method)
-		}
-	}
-	if !requestMethodCarriesModel("POST") {
-		t.Fatal("POST must enforce body model binding")
-	}
-}
-
 func TestAuthorizedModelDiscoveryPath(t *testing.T) {
 	tests := []struct {
 		path       string
@@ -42,10 +31,10 @@ func TestAuthorizedModelDiscoveryPath(t *testing.T) {
 	}
 }
 
-func TestBoundReadOnlyRequestAllowed(t *testing.T) {
+func TestBoundRequestAllowed(t *testing.T) {
 	allow := "org/adapter"
 	for _, path := range []string{"/health", "/live", "/v1/models", "/v1/models/org/adapter"} {
-		if !boundReadOnlyRequestAllowed("GET", path, allow) {
+		if !boundRequestAllowed("GET", path, allow) {
 			t.Fatalf("GET %s must be allowed", path)
 		}
 	}
@@ -53,18 +42,27 @@ func TestBoundReadOnlyRequestAllowed(t *testing.T) {
 		"/metrics", "/busy_threshold", "/docs", "/openapi.json", "/unknown",
 		"/v1/models/org/sibling", "/v1/models/org/adapter/ready",
 	} {
-		if boundReadOnlyRequestAllowed("GET", path, allow) {
+		if boundRequestAllowed("GET", path, allow) {
 			t.Fatalf("GET %s must be blocked", path)
 		}
-		if boundReadOnlyRequestAllowed("HEAD", path, allow) {
+		if boundRequestAllowed("HEAD", path, allow) {
 			t.Fatalf("HEAD %s must be blocked", path)
 		}
 	}
-	if !boundReadOnlyRequestAllowed("OPTIONS", "/v1/chat/completions", allow) {
+	if !boundRequestAllowed("OPTIONS", "/v1/chat/completions", allow) {
 		t.Fatal("browser preflight must be allowed")
 	}
-	if !boundReadOnlyRequestAllowed("POST", "/v1/chat/completions", allow) {
-		t.Fatal("model-carrying methods are governed by body binding")
+	for _, path := range []string{"/v1/chat/completions", "/v1/completions", "/v1/embeddings", "/v1/responses"} {
+		if !boundRequestAllowed("POST", path, allow) {
+			t.Fatalf("POST %s must be allowed", path)
+		}
+	}
+	for _, method := range []string{"POST", "PUT", "PATCH", "DELETE"} {
+		for _, path := range []string{"/unknown", "/v1/models", "/metrics", "/busy_threshold"} {
+			if boundRequestAllowed(method, path, allow) {
+				t.Fatalf("%s %s must be blocked", method, path)
+			}
+		}
 	}
 }
 

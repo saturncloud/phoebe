@@ -148,6 +148,13 @@ func TestProxyBindsDedicatedEndpointToServedModel(t *testing.T) {
 			t.Fatalf("bound GET %s status = %d, want 404", path, rr.Code)
 		}
 	}
+	for _, method := range []string{http.MethodPost, http.MethodPut, http.MethodPatch, http.MethodDelete} {
+		for _, path := range []string{"/future-admin", "/v1/models", "/metrics", "/busy_threshold"} {
+			if rr := request(method, path, `{"model":"adapter-a"}`); rr.Code != http.StatusNotFound {
+				t.Fatalf("bound %s %s status = %d, want 404", method, path, rr.Code)
+			}
+		}
+	}
 	if rr := request(http.MethodGet, "/v1/models/adapter-a", ""); rr.Code != http.StatusOK {
 		t.Fatalf("bound model metadata status = %d, want 200", rr.Code)
 	}
@@ -164,6 +171,37 @@ func TestProxyBindsDedicatedEndpointToServedModel(t *testing.T) {
 	}
 	if upstreamCalls != 5 {
 		t.Fatalf("authorized requests made %d upstream calls, want 5", upstreamCalls)
+	}
+}
+
+func TestProxySanitizesModelListTrailers(t *testing.T) {
+	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Trailer", "X-Graph-Debug")
+		if r.Method == http.MethodGet {
+			w.WriteHeader(http.StatusServiceUnavailable)
+			_, _ = w.Write([]byte(`{"error":"adapter-b failed"}`))
+		} else {
+			w.WriteHeader(http.StatusOK)
+		}
+		w.Header().Set("X-Graph-Debug", "adapter-b")
+	}))
+	defer backend.Close()
+	upstream, _ := url.Parse(backend.URL)
+	srv := newTestServer(t, upstream)
+
+	for _, method := range []string{http.MethodGet, http.MethodHead} {
+		req := httptest.NewRequest(method, "/v1/models", nil)
+		setUpstream(req, upstream)
+		req.Header.Set(identity.HeaderAuthID, "auth-1")
+		req.Header.Set(identity.HeaderResourceID, "deployment-a")
+		req.Header.Set(identity.HeaderServedModel, "adapter-a")
+		rr := httptest.NewRecorder()
+		srv.Handler().ServeHTTP(rr, req)
+
+		resp := rr.Result()
+		if resp.Header.Get("Trailer") != "" || len(resp.Trailer) != 0 {
+			t.Fatalf("%s model list leaked upstream trailers: headers=%v trailers=%v", method, resp.Header, resp.Trailer)
+		}
 	}
 }
 
