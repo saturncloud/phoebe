@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -669,5 +670,37 @@ func TestStateFailureReturnsUnavailableForProxyBypass(t *testing.T) {
 	_, err := a.Admit(context.Background(), request("a", "m"))
 	if !errors.Is(err, ErrUnavailable) {
 		t.Fatalf("err=%v, want ErrUnavailable", err)
+	}
+}
+
+func TestBlackholedValkeyReturnsUnavailableWithinAdmissionBudget(t *testing.T) {
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = listener.Close() })
+	go func() {
+		for {
+			conn, acceptErr := listener.Accept()
+			if acceptErr != nil {
+				return
+			}
+			go func() {
+				defer conn.Close()
+				_, _ = io.Copy(io.Discard, conn)
+			}()
+		}
+	}()
+	client := NewValkeyClient(listener.Addr().String())
+	t.Cleanup(func() { _ = client.Close() })
+	a := New(client, config.AdmissionSettings{KeyPrefix: "blackhole", LeaseTTL: time.Minute, Platform: limits(1)})
+
+	started := time.Now()
+	_, err = a.Admit(context.Background(), request("org", "model"))
+	if !errors.Is(err, ErrUnavailable) {
+		t.Fatalf("err=%v, want ErrUnavailable", err)
+	}
+	if elapsed := time.Since(started); elapsed >= 2*time.Second {
+		t.Fatalf("admission took %s against accept/no-reply Valkey", elapsed)
 	}
 }

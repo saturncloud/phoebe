@@ -22,6 +22,14 @@ import (
 
 var ErrUnavailable = errors.New("distributed admission state unavailable")
 
+const (
+	// Admission is deliberately a soft, fail-open gate. Keep its network budget
+	// far below an inference request's latency budget so a blackholed Valkey
+	// cannot turn loss of fairness state into loss of inference availability.
+	valkeyIOTimeout      = 100 * time.Millisecond
+	admitOperationBudget = 750 * time.Millisecond
+)
+
 // Rejected is a capacity/policy rejection, as distinct from state failure.
 type Rejected struct {
 	Scope       string
@@ -107,6 +115,21 @@ func New(client redis.Cmdable, cfg config.AdmissionSettings) *RedisAdmitter {
 	}
 }
 
+// NewValkeyClient builds the admission-only Valkey client. Metering owns a
+// separate durable client/WAL path and must not inherit these fail-open
+// timeouts.
+func NewValkeyClient(addr string) *redis.Client {
+	return redis.NewClient(&redis.Options{
+		Addr:                  addr,
+		DialTimeout:           valkeyIOTimeout,
+		ReadTimeout:           valkeyIOTimeout,
+		WriteTimeout:          valkeyIOTimeout,
+		PoolTimeout:           valkeyIOTimeout,
+		MaxRetries:            -1,
+		ContextTimeoutEnabled: true,
+	})
+}
+
 func (a *RedisAdmitter) keys() []string {
 	return []string{a.counters, a.leases, a.expiries, a.windowExpiries}
 }
@@ -136,9 +159,12 @@ func (a *RedisAdmitter) Admit(ctx context.Context, req Request) (*Lease, error) 
 		w.Adapter = 1
 	}
 	b, _ := json.Marshal(w)
+	deadline := time.Now().Add(admitOperationBudget)
+	operationCtx, cancelOperation := context.WithDeadline(ctx, deadline)
+	defer cancelOperation()
 	var lastErr error
 	for attempt := 0; attempt < 2; attempt++ {
-		res, runErr := admitScript.Run(ctx, a.client, a.keys(), string(b)).Result()
+		res, runErr := admitScript.Run(operationCtx, a.client, a.keys(), string(b)).Result()
 		if runErr != nil {
 			lastErr = runErr
 			continue
@@ -166,7 +192,7 @@ func (a *RedisAdmitter) Admit(ctx context.Context, req Request) (*Lease, error) 
 
 	// Both replies were indeterminate. Compensate with the same request id:
 	// this releases a committed lease and is a no-op if neither attempt ran.
-	cleanupCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), time.Second)
+	cleanupCtx, cancel := context.WithDeadline(context.WithoutCancel(ctx), deadline)
 	defer cancel()
 	if _, cleanupErr := abandonScript.Run(cleanupCtx, a.client, a.keys(), id).Result(); cleanupErr != nil {
 		return nil, fmt.Errorf("%w: admit: %v; cleanup: %v", ErrUnavailable, lastErr, cleanupErr)

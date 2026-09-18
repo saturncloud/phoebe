@@ -78,7 +78,7 @@ func buildAdmission(s *config.Settings, log *logging.Logger) (admission.Admitter
 	if !s.Admission.Enabled {
 		return nil, func() {}
 	}
-	client := redis.NewClient(&redis.Options{Addr: s.Admission.ValkeyAddr})
+	client := admission.NewValkeyClient(s.Admission.ValkeyAddr)
 	// Admission is a fairness/capacity gate, not an authorization or billing
 	// authority. Start serving when Valkey is unavailable and bypass only this
 	// gate until it recovers; metering has its own durable path.

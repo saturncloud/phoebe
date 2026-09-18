@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"io"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -110,6 +111,30 @@ func TestSharedRequestBodyBoundariesBeforeAdmission(t *testing.T) {
 	}
 }
 
+func TestSharedRequestAtExactBodyLimitAdmitsWithRedisAdmitter(t *testing.T) {
+	const limit = 128
+	var upstreamHits int
+	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		upstreamHits++
+		_, _ = w.Write([]byte(`{"model":"model-a","usage":{"prompt_tokens":1,"completion_tokens":1}}`))
+	}))
+	defer backend.Close()
+	up, _ := url.Parse(backend.URL)
+	mr := miniredis.RunT(t)
+	cfg := proxyAdmissionConfig(2)
+	cfg.Platform.MaxPromptBytes = limit
+	client := redis.NewClient(&redis.Options{Addr: mr.Addr()})
+	t.Cleanup(func() { _ = client.Close() })
+	s := New(&config.Settings{Admission: cfg}, logging.New(logging.ERROR), &recordingEmitter{}).
+		WithAdmitter(admission.New(client, cfg))
+
+	rr := httptest.NewRecorder()
+	s.Handler().ServeHTTP(rr, sharedRequestBodyOfSize(t, up, limit))
+	if rr.Code != http.StatusOK || upstreamHits != 1 {
+		t.Fatalf("status=%d upstream=%d, exact original JSON limit must admit", rr.Code, upstreamHits)
+	}
+}
+
 func TestSharedRequestBodyLimitUsesSafeUnlimitedFallback(t *testing.T) {
 	if got := sharedRequestBodyLimit(config.AdmissionSettings{}, config.AdmissionTier{}); got != defaultSharedRequestBodyLimit {
 		t.Fatalf("unlimited fallback=%d, want %d", got, defaultSharedRequestBodyLimit)
@@ -161,6 +186,23 @@ func TestAdmissionAcrossProxyReplicasAndLifecycleRelease(t *testing.T) {
 }
 
 func TestAdmissionStateFailureBypassesGate(t *testing.T) {
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = listener.Close() })
+	go func() {
+		for {
+			conn, acceptErr := listener.Accept()
+			if acceptErr != nil {
+				return
+			}
+			go func() {
+				defer conn.Close()
+				_, _ = io.Copy(io.Discard, conn)
+			}()
+		}
+	}()
 	var hits int
 	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		hits++
@@ -169,11 +211,16 @@ func TestAdmissionStateFailureBypassesGate(t *testing.T) {
 	defer backend.Close()
 	up, _ := url.Parse(backend.URL)
 	cfg := proxyAdmissionConfig(1)
-	client := redis.NewClient(&redis.Options{Addr: "127.0.0.1:1", DialTimeout: 20 * time.Millisecond, ReadTimeout: 20 * time.Millisecond, WriteTimeout: 20 * time.Millisecond, MaxRetries: 0})
+	client := admission.NewValkeyClient(listener.Addr().String())
+	t.Cleanup(func() { _ = client.Close() })
 	em := &recordingEmitter{}
 	s := New(&config.Settings{Admission: cfg}, logging.New(logging.ERROR), em).WithAdmitter(admission.New(client, cfg))
 	rr := httptest.NewRecorder()
+	started := time.Now()
 	s.Handler().ServeHTTP(rr, sharedRequest(up))
+	if elapsed := time.Since(started); elapsed >= 2*time.Second {
+		t.Fatalf("fail-open admission took %s against accept/no-reply Valkey", elapsed)
+	}
 	if rr.Code != http.StatusOK {
 		t.Fatalf("status=%d, want 200", rr.Code)
 	}

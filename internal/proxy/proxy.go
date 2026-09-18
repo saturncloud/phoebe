@@ -373,6 +373,10 @@ func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request) {
 			writeRequestBodyError(w, rerr)
 			return
 		}
+		// Physical prompt-byte accounting is defined over the original bounded
+		// OpenAI JSON. Phoebe's cache-isolation and scheduler metadata is internal
+		// forwarding overhead, not tenant prompt work.
+		originalPromptBytes := int64(len(body))
 		defaultOutput := s.settings.Admission.DefaultMaxOutputTokens
 		if defaultOutput <= 0 {
 			defaultOutput = 512
@@ -409,7 +413,7 @@ func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request) {
 			}
 			admitted, err = s.admitter.Admit(r.Context(), admission.Request{
 				Graph: graph, Organization: id.OrgID, Model: estimate.Model,
-				PromptBytes: int64(len(body)), EstimatedInputTokens: estimate.InputTokens,
+				PromptBytes: originalPromptBytes, EstimatedInputTokens: estimate.InputTokens,
 				ReservedOutputTokens: estimate.OutputTokens,
 				Adapter:              id.Adapter != "", ServiceTier: id.ServiceTier, RateLimits: rateLimits,
 			})
