@@ -59,13 +59,13 @@ func TestGraphFromUpstreamHost(t *testing.T) {
 }
 
 func TestIsWakeable(t *testing.T) {
-	if !isWakeable(identity.Identity{ResourceID: "r1", ServedModel: "m"}) {
+	if !isWakeable(identity.Identity{ResourceID: "r1", ServedModel: "m", ServingMode: "shared"}) {
 		t.Fatal("shared route with resource id should be wakeable")
 	}
-	if isWakeable(identity.Identity{ResourceID: "r1"}) {
-		t.Fatal("no served-model allow-list (dedicated) must NOT be wakeable")
+	if isWakeable(identity.Identity{ResourceID: "r1", ServedModel: "m"}) {
+		t.Fatal("dedicated route must NOT be wakeable even with a model binding")
 	}
-	if isWakeable(identity.Identity{ServedModel: "m"}) {
+	if isWakeable(identity.Identity{ServedModel: "m", ServingMode: "shared"}) {
 		t.Fatal("no resource id (unauthorized) must NOT be wakeable")
 	}
 }

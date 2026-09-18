@@ -8,6 +8,7 @@ import (
 	"net/url"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -86,6 +87,181 @@ func TestHealthz(t *testing.T) {
 	srv.Handler().ServeHTTP(rr, req)
 	if rr.Code != http.StatusOK {
 		t.Fatalf("healthz: got %d, want 200", rr.Code)
+	}
+}
+
+func TestProxyBindsDedicatedEndpointToServedModel(t *testing.T) {
+	var upstreamCalls int
+	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		upstreamCalls++
+		_, _ = w.Write([]byte(`{"object":"list","data":[{"id":"adapter-a","object":"model"},{"id":"adapter-b","object":"model"},{"id":"base-internal","object":"model"}]}`))
+	}))
+	defer backend.Close()
+	upstream, _ := url.Parse(backend.URL)
+	srv := newTestServer(t, upstream)
+
+	request := func(method, path, body string) *httptest.ResponseRecorder {
+		req := httptest.NewRequest(method, path, strings.NewReader(body))
+		setUpstream(req, upstream)
+		req.Header.Set(identity.HeaderAuthID, "auth-1")
+		req.Header.Set(identity.HeaderResourceID, "deployment-a")
+		req.Header.Set(identity.HeaderServedModel, "adapter-a")
+		rr := httptest.NewRecorder()
+		srv.Handler().ServeHTTP(rr, req)
+		return rr
+	}
+
+	if rr := request(http.MethodPost, "/v1/chat/completions", `{"model":"adapter-b"}`); rr.Code != http.StatusForbidden {
+		t.Fatalf("cross-model status = %d, want 403", rr.Code)
+	}
+	if upstreamCalls != 0 {
+		t.Fatalf("cross-model request reached Dynamo (%d calls)", upstreamCalls)
+	}
+	if rr := request(http.MethodPost, "/v1/chat/completions", `{"model":"adapter-a"}`); rr.Code != http.StatusOK {
+		t.Fatalf("bound model status = %d, want 200", rr.Code)
+	}
+	if rr := request(http.MethodGet, "/v1/models", ""); rr.Code != http.StatusOK {
+		t.Fatalf("model-list status = %d, want 200", rr.Code)
+	} else {
+		body := rr.Body.String()
+		if !strings.Contains(body, `"id":"adapter-a"`) {
+			t.Fatalf("model list omitted authorized model: %s", body)
+		}
+		if strings.Contains(body, "adapter-b") || strings.Contains(body, "base-internal") {
+			t.Fatalf("model list disclosed graph-wide names: %s", body)
+		}
+	}
+	if rr := request(http.MethodGet, "/v1/models/adapter-b", ""); rr.Code != http.StatusNotFound {
+		t.Fatalf("sibling model metadata status = %d, want 404", rr.Code)
+	}
+	if rr := request(http.MethodGet, "/v1/models/adapter-b/ready", ""); rr.Code != http.StatusNotFound {
+		t.Fatalf("sibling model readiness status = %d, want 404", rr.Code)
+	}
+	if rr := request(http.MethodHead, "/v1/models/adapter-b", ""); rr.Code != http.StatusNotFound {
+		t.Fatalf("sibling HEAD metadata status = %d, want 404", rr.Code)
+	}
+	if rr := request(http.MethodHead, "/v1/models/adapter-b/ready", ""); rr.Code != http.StatusNotFound {
+		t.Fatalf("sibling HEAD readiness status = %d, want 404", rr.Code)
+	}
+	for _, path := range []string{"/metrics", "/busy_threshold", "/docs", "/openapi.json", "/future-admin"} {
+		if rr := request(http.MethodGet, path, ""); rr.Code != http.StatusNotFound {
+			t.Fatalf("bound GET %s status = %d, want 404", path, rr.Code)
+		}
+	}
+	for _, method := range []string{http.MethodPost, http.MethodPut, http.MethodPatch, http.MethodDelete} {
+		for _, path := range []string{"/future-admin", "/v1/models", "/metrics", "/busy_threshold"} {
+			if rr := request(method, path, `{"model":"adapter-a"}`); rr.Code != http.StatusNotFound {
+				t.Fatalf("bound %s %s status = %d, want 404", method, path, rr.Code)
+			}
+		}
+	}
+	if rr := request(http.MethodGet, "/v1/models/adapter-a", ""); rr.Code != http.StatusOK {
+		t.Fatalf("bound model metadata status = %d, want 200", rr.Code)
+	}
+	if rr := request(http.MethodGet, "/v1/models/adapter-a/ready", ""); rr.Code != http.StatusNotFound {
+		t.Fatalf("ambiguous model readiness status = %d, want 404", rr.Code)
+	}
+	if rr := request(http.MethodHead, "/v1/models/adapter-a", ""); rr.Code != http.StatusOK {
+		t.Fatalf("bound HEAD metadata status = %d, want 200", rr.Code)
+	}
+	if rr := request(http.MethodHead, "/v1/models", ""); rr.Code != http.StatusOK {
+		t.Fatalf("bound HEAD list status = %d, want 200", rr.Code)
+	} else if rr.Header().Get("Content-Length") != "" || rr.Header().Get("X-Graph-Debug") != "" {
+		t.Fatalf("HEAD list leaked graph-wide representation headers: %v", rr.Header())
+	}
+	if upstreamCalls != 5 {
+		t.Fatalf("authorized requests made %d upstream calls, want 5", upstreamCalls)
+	}
+}
+
+func TestProxySanitizesModelListTrailers(t *testing.T) {
+	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Trailer", "X-Graph-Debug")
+		if r.Method == http.MethodGet {
+			w.WriteHeader(http.StatusServiceUnavailable)
+			_, _ = w.Write([]byte(`{"error":"adapter-b failed"}`))
+		} else {
+			w.WriteHeader(http.StatusOK)
+		}
+		w.Header().Set("X-Graph-Debug", "adapter-b")
+	}))
+	defer backend.Close()
+	upstream, _ := url.Parse(backend.URL)
+	srv := newTestServer(t, upstream)
+
+	for _, method := range []string{http.MethodGet, http.MethodHead} {
+		req := httptest.NewRequest(method, "/v1/models", nil)
+		setUpstream(req, upstream)
+		req.Header.Set(identity.HeaderAuthID, "auth-1")
+		req.Header.Set(identity.HeaderResourceID, "deployment-a")
+		req.Header.Set(identity.HeaderServedModel, "adapter-a")
+		rr := httptest.NewRecorder()
+		srv.Handler().ServeHTTP(rr, req)
+
+		resp := rr.Result()
+		if resp.Header.Get("Trailer") != "" || len(resp.Trailer) != 0 {
+			t.Fatalf("%s model list leaked upstream trailers: headers=%v trailers=%v", method, resp.Header, resp.Trailer)
+		}
+	}
+}
+
+func TestProxyModelListFilterFailureKeepsRequestID(t *testing.T) {
+	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = w.Write([]byte(`{"data":[{"id":"sibling","id":"adapter-a"}]}`))
+	}))
+	defer backend.Close()
+	upstream, _ := url.Parse(backend.URL)
+	srv := newTestServer(t, upstream)
+	req := httptest.NewRequest(http.MethodGet, "/v1/models", nil)
+	setUpstream(req, upstream)
+	req.Header.Set(identity.HeaderAuthID, "auth-1")
+	req.Header.Set(identity.HeaderResourceID, "deployment-a")
+	req.Header.Set(identity.HeaderServedModel, "adapter-a")
+	rr := httptest.NewRecorder()
+	srv.Handler().ServeHTTP(rr, req)
+
+	if rr.Code != http.StatusBadGateway {
+		t.Fatalf("status = %d, want 502", rr.Code)
+	}
+	if id := rr.Header().Get(requestIDHeader); !strings.HasPrefix(id, "phoebe-") {
+		t.Fatalf("response request id = %q, want generated correlation id", id)
+	}
+	if strings.Contains(rr.Body.String(), "sibling") {
+		t.Fatalf("error leaked upstream model data: %s", rr.Body.String())
+	}
+}
+
+func TestDedicatedBoundRouteDoesNotUseSharedWakeProbe(t *testing.T) {
+	var upstreamCalls int32
+	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		atomic.AddInt32(&upstreamCalls, 1)
+		_, _ = w.Write([]byte(`{"model":"adapter-a","choices":[],"usage":{"prompt_tokens":1,"completion_tokens":1,"total_tokens":2}}`))
+	}))
+	defer backend.Close()
+	upstream, _ := url.Parse(backend.URL)
+	waker := &fakeWaker{}
+	srv := newTestServer(t, upstream).WithWaker(waker, time.Second, 2)
+	req := httptest.NewRequest(
+		http.MethodPost,
+		"/v1/chat/completions",
+		strings.NewReader(`{"model":"adapter-a","messages":[]}`),
+	)
+	setUpstream(req, upstream)
+	req.Header.Set(identity.HeaderAuthID, "auth-1")
+	req.Header.Set(identity.HeaderResourceID, "deployment-a")
+	req.Header.Set(identity.HeaderServedModel, "adapter-a")
+	// Empty ServingMode is the dedicated SKU contract.
+	rr := httptest.NewRecorder()
+	srv.Handler().ServeHTTP(rr, req)
+
+	if rr.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200", rr.Code)
+	}
+	if got := atomic.LoadInt32(&upstreamCalls); got != 1 {
+		t.Fatalf("dedicated inference reached upstream %d times, want 1", got)
+	}
+	if got := atomic.LoadInt32(&waker.calls); got != 0 {
+		t.Fatalf("dedicated inference invoked shared waker %d times, want 0", got)
 	}
 }
 

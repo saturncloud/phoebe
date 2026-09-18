@@ -7,6 +7,66 @@ import (
 	"strings"
 )
 
+// authorizedModelDiscoveryPath validates Dynamo's graph-wide per-model GET
+// subtree against the endpoint's served-model allow-list. The wildcard model id
+// may contain slashes. Bound routes authorize exact model ids only: Dynamo gives
+// an exact sibling named <allowed>/ready precedence over the readiness
+// subresource, so suffix-based authorization would be ambiguous and fail open.
+func authorizedModelDiscoveryPath(path, servedModelAllowList string) (discovery, authorized bool) {
+	const prefix = "/v1/models/"
+	if !strings.HasPrefix(path, prefix) {
+		return false, false
+	}
+	requested := strings.TrimPrefix(path, prefix)
+	allow := parseServedModelAllowList(servedModelAllowList)
+	if _, ok := allow[requested]; ok {
+		return true, true
+	}
+	return true, false
+}
+
+// boundRequestAllowed is the complete public surface for a deployment-scoped
+// endpoint. Dynamo's frontend also exposes graph-wide admin, metrics,
+// documentation, batch storage, and future extension routes; those must not
+// become customer APIs merely because the reverse proxy can reach them.
+func boundRequestAllowed(method, path, servedModelAllowList string) bool {
+	if method == "OPTIONS" {
+		return true // browser preflight carries no Dynamo response data
+	}
+	if method == "POST" {
+		return inferenceRequestPathAllowed(path)
+	}
+	if method != "GET" && method != "HEAD" {
+		return false
+	}
+	switch path {
+	case "/health", "/live", "/v1/models":
+		return true
+	default:
+		discovery, authorized := authorizedModelDiscoveryPath(path, servedModelAllowList)
+		return discovery && authorized
+	}
+}
+
+// inferenceRequestPathAllowed lists the model-bearing APIs whose response
+// usage schema Phoebe can meter. Responses API uses different token field names
+// and remains closed until its billing parser is implemented.
+func inferenceRequestPathAllowed(path string) bool {
+	switch path {
+	case "/v1/chat/completions", "/v1/completions", "/v1/embeddings":
+		return true
+	default:
+		return false
+	}
+}
+
+// gatewayRequestAllowed is narrower than the bound-resource surface because a
+// shared gateway URL does not identify one model for health or discovery. The
+// request body supplies that identity only on model-bearing POST requests.
+func gatewayRequestAllowed(method, path string) bool {
+	return method == "OPTIONS" || (method == "POST" && inferenceRequestPathAllowed(path))
+}
+
 var errNotObject = errors.New("request body is not a JSON object")
 
 // modelBindingResult is the outcome of the request-body model= binding check.
@@ -37,13 +97,13 @@ const (
 // without this check a caller authorized for model-A could send `model=B` and be
 // served B. This binds the two: request model ∈ allow-list, else fail closed.
 //
-// The allow-list is empty for routes that don't enforce binding (a dedicated
-// single-model endpoint: one subdomain == one model, the engine can only serve
-// the one thing) → bindingOK, no parse, no cost. atlas DECIDES access; this only
-// guarantees the body can't escape the atlas-authorized resource.
+// The allow-list is empty for routes that don't enforce binding. Atlas decides
+// access; this only guarantees the body can't escape the Atlas-authorized
+// resource. Dedicated Dynamo routes carry a single served name because one
+// graph may host a base model plus several attached adapters.
 func checkModelBinding(body []byte, servedModelAllowList string) modelBindingResult {
-	// An ABSENT header (empty string) = binding not enforced (dedicated
-	// single-model route). But a PRESENT header that parses to an EMPTY set
+	// An ABSENT header (empty string) = binding not enforced. But a PRESENT
+	// header that parses to an EMPTY set
 	// (e.g. a whitespace-only served name, or all-empty CSV parts) must fail
 	// CLOSED, not open: an empty allow-list on a shared route would let ANY
 	// model= through, defeating the binding. The caller only reaches here when

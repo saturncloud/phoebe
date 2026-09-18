@@ -205,6 +205,20 @@ func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request) {
 	// response. Non-gateway requests skip this entirely — today's header-routed
 	// behavior, byte for byte.
 	if id.Gateway {
+		if !gatewayRequestAllowed(r.Method, r.URL.Path) {
+			s.log.Warn.Printf("gateway: refusing route outside public inference surface method=%s path=%s org_id=%q",
+				r.Method, r.URL.Path, id.OrgID)
+			http.Error(w, "not found", http.StatusNotFound)
+			return
+		}
+		if r.Method == http.MethodOptions {
+			if id.OrgID == "" {
+				http.Error(w, "forbidden", http.StatusForbidden)
+				return
+			}
+			w.WriteHeader(http.StatusNoContent)
+			return
+		}
 		if !s.resolveGateway(w, r, &id) {
 			return
 		}
@@ -293,15 +307,15 @@ func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	// SHARED-MODE MODEL BINDING (security crux): assert the request-body `model=`
+	// SUBDOMAIN ROUTE AND MODEL BINDING: first restrict the resource URL to the
+	// explicit public inference surface, then assert the request-body `model=`
 	// is one the subdomain-authorized resource may serve, fail closed on mismatch.
 	// atlas-auth authorized the caller for this subdomain/resource; Dynamo routes
-	// on the body `model=` and a shared graph fronts many tenants behind one
-	// upstream — so bind the two or a caller could send `model=<someone-else's>`
-	// and be served it. Only enforced when Atlas injected an allow-list
-	// (X-Saturn-Served-Model); dedicated single-model routes carry none and skip
-	// this at zero cost. Runs BEFORE forwarding so a bad model never reaches the
-	// engine. Reads the body once and restores it for forceIncludeUsage.
+	// on the body `model=` and both shared and dedicated graphs can front several
+	// served names behind one upstream. Only enforced when Atlas injected an
+	// allow-list (X-Saturn-Served-Model). Runs BEFORE
+	// forwarding so a bad model never reaches the engine. Reads the body once and
+	// restores it for forceIncludeUsage.
 	//
 	// GATEWAY requests skip this check — THE PATHS DIVERGE HERE: on the
 	// subdomain path Atlas authorizes a resource and injects its allow-list,
@@ -310,7 +324,13 @@ func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request) {
 	// THE ORG, so resolution IS the binding (id.ServedModel was set FROM the
 	// resolved request model; re-checking it against itself would be a
 	// tautology).
-	if id.ServedModel != "" && !id.Gateway {
+	if id.ServedModel != "" && !id.Gateway && !boundRequestAllowed(r.Method, r.URL.Path, id.ServedModel) {
+		s.log.Warn.Printf("model-binding: refused request_id=%s resource_id=%s (route not authorized for resource)",
+			requestID, id.ResourceID)
+		http.Error(w, "not found", http.StatusNotFound)
+		return
+	}
+	if id.ServedModel != "" && !id.Gateway && r.Method == "POST" {
 		body, rerr := readAndRestoreBody(r)
 		if rerr != nil {
 			s.log.Error.Printf("model-binding: read request body: %v", rerr)
@@ -330,7 +350,6 @@ func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request) {
 		case bindingOK:
 		}
 	}
-
 	// SHARED REQUEST POLICY + DISTRIBUTED ADMISSION. Trusted Dynamo hints and
 	// cache isolation are enforced for every shared request, even during an
 	// admission rollout with the distributed gate disabled; otherwise a client
@@ -422,7 +441,6 @@ func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request) {
 			}()
 		}
 	}
-
 	// Force streaming usage so we never under-bill a streamed response.
 	if err := forceIncludeUsage(r); err != nil {
 		s.log.Error.Printf("rewrite request body: %v", err)
@@ -457,6 +475,20 @@ func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request) {
 	rp.FlushInterval = -1
 
 	rp.ModifyResponse = func(resp *http.Response) error {
+		// Dynamo's model-list endpoint is graph-wide. A dedicated subdomain is
+		// deployment-scoped, so expose only the served name Atlas authorized for
+		// this route; otherwise endpoint A could enumerate attached endpoint B.
+		if id.ServedModel != "" && !id.Gateway && r.URL.Path == "/v1/models" {
+			switch r.Method {
+			case http.MethodGet:
+				if err := filterModelListResponse(resp, id.ServedModel); err != nil {
+					return fmt.Errorf("filter model list: %w", err)
+				}
+			case http.MethodHead:
+				sanitizeModelListHeadResponse(resp)
+			}
+		}
+
 		// Echo the request id to the client (Set, not Add, so an upstream echo
 		// can't duplicate it) — with a generated id this is the client's only
 		// handle for correlating a support question to its billing record.
@@ -593,7 +625,8 @@ func (s *Server) errorHandler(upstream string, id identity.Identity, requestID s
 			s.emit(ctx, id, requestID, capture.Result{Aborted: true, UsageFound: false})
 			return
 		}
-		s.log.Error.Printf("upstream %s error: %v", upstream, err)
+		s.log.Error.Printf("upstream %s error: %v (request_id=%s)", upstream, err, requestID)
+		w.Header().Set(requestIDHeader, requestID)
 		http.Error(w, "upstream error", http.StatusBadGateway)
 	}
 }

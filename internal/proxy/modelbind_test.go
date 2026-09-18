@@ -2,6 +2,89 @@ package proxy
 
 import "testing"
 
+func TestAuthorizedModelDiscoveryPath(t *testing.T) {
+	tests := []struct {
+		path       string
+		discovery  bool
+		authorized bool
+	}{
+		{"/v1/models", false, false},
+		{"/health", false, false},
+		{"/v1/models/org/adapter", true, true},
+		{"/v1/models/org/adapter/ready", true, false},
+		{"/v1/models/org/other", true, false},
+		{"/v1/models/org/other/ready", true, false},
+	}
+	for _, tc := range tests {
+		discovery, authorized := authorizedModelDiscoveryPath(tc.path, "org/adapter")
+		if discovery != tc.discovery || authorized != tc.authorized {
+			t.Fatalf("path %q = (%v,%v), want (%v,%v)", tc.path, discovery, authorized, tc.discovery, tc.authorized)
+		}
+	}
+
+	// An endpoint whose own exact id ends in /ready remains addressable.
+	discovery, authorized := authorizedModelDiscoveryPath(
+		"/v1/models/org/adapter/ready", "org/adapter/ready",
+	)
+	if !discovery || !authorized {
+		t.Fatal("exact model id ending in /ready must be authorized")
+	}
+}
+
+func TestBoundRequestAllowed(t *testing.T) {
+	allow := "org/adapter"
+	for _, path := range []string{"/health", "/live", "/v1/models", "/v1/models/org/adapter"} {
+		if !boundRequestAllowed("GET", path, allow) {
+			t.Fatalf("GET %s must be allowed", path)
+		}
+	}
+	for _, path := range []string{
+		"/metrics", "/busy_threshold", "/docs", "/openapi.json", "/unknown",
+		"/v1/models/org/sibling", "/v1/models/org/adapter/ready",
+	} {
+		if boundRequestAllowed("GET", path, allow) {
+			t.Fatalf("GET %s must be blocked", path)
+		}
+		if boundRequestAllowed("HEAD", path, allow) {
+			t.Fatalf("HEAD %s must be blocked", path)
+		}
+	}
+	if !boundRequestAllowed("OPTIONS", "/v1/chat/completions", allow) {
+		t.Fatal("browser preflight must be allowed")
+	}
+	for _, path := range []string{"/v1/chat/completions", "/v1/completions", "/v1/embeddings"} {
+		if !boundRequestAllowed("POST", path, allow) {
+			t.Fatalf("POST %s must be allowed", path)
+		}
+	}
+	if boundRequestAllowed("POST", "/v1/responses", allow) {
+		t.Fatal("Responses API must remain closed until its usage schema is billable")
+	}
+	for _, method := range []string{"POST", "PUT", "PATCH", "DELETE"} {
+		for _, path := range []string{"/unknown", "/v1/models", "/metrics", "/busy_threshold"} {
+			if boundRequestAllowed(method, path, allow) {
+				t.Fatalf("%s %s must be blocked", method, path)
+			}
+		}
+	}
+}
+
+func TestGatewayRequestAllowed(t *testing.T) {
+	if !gatewayRequestAllowed("OPTIONS", "/v1/chat/completions") {
+		t.Fatal("gateway preflight must be allowed")
+	}
+	for _, path := range []string{"/v1/chat/completions", "/v1/completions", "/v1/embeddings"} {
+		if !gatewayRequestAllowed("POST", path) {
+			t.Fatalf("POST %s must be allowed", path)
+		}
+	}
+	for _, path := range []string{"/health", "/live", "/v1/models", "/v1/responses", "/metrics", "/future-admin"} {
+		if gatewayRequestAllowed("POST", path) || gatewayRequestAllowed("GET", path) {
+			t.Fatalf("gateway route %s must be blocked", path)
+		}
+	}
+}
+
 func TestCheckModelBinding(t *testing.T) {
 	cases := []struct {
 		name  string
