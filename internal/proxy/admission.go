@@ -8,23 +8,28 @@ import (
 	"math"
 	"net/http"
 	"strconv"
-	"time"
 
 	"github.com/saturncloud/phoebe/internal/admission"
 	"github.com/saturncloud/phoebe/internal/config"
 	"github.com/saturncloud/phoebe/internal/identity"
 )
 
-// admissionWork returns the exact routed model and a conservative output-token
-// reservation. Phoebe cannot render model-specific chat templates or tokenize
-// without duplicating engine state, so input work is intentionally the complete
-// JSON byte count; Dynamo remains authoritative for tokenization/KV placement.
-func admissionWork(body []byte, defaultOutput int64) (string, int64, bool) {
+type admissionEstimate struct {
+	Model        string
+	InputTokens  int64
+	OutputTokens int64
+}
+
+// admissionWork returns the exact routed model and cheap, conservative token
+// reservations. The input estimate follows the common bytes/4 approximation;
+// Dynamo remains authoritative and Phoebe reconciles its actual cache-aware
+// token counts after the response.
+func admissionWork(body []byte, defaultOutput int64) (admissionEstimate, bool) {
 	counts, err := countTopLevelKeys(body, map[string]struct{}{
 		"model": {}, "max_tokens": {}, "max_completion_tokens": {},
 	})
 	if err != nil || counts["model"] != 1 || counts["max_tokens"] > 1 || counts["max_completion_tokens"] > 1 {
-		return "", 0, false
+		return admissionEstimate{}, false
 	}
 	var v struct {
 		Model               string `json:"model"`
@@ -32,7 +37,7 @@ func admissionWork(body []byte, defaultOutput int64) (string, int64, bool) {
 		MaxCompletionTokens *int64 `json:"max_completion_tokens"`
 	}
 	if err := json.Unmarshal(body, &v); err != nil || v.Model == "" {
-		return "", 0, false
+		return admissionEstimate{}, false
 	}
 	maximum := defaultOutput
 	if v.MaxTokens != nil {
@@ -40,14 +45,18 @@ func admissionWork(body []byte, defaultOutput int64) (string, int64, bool) {
 	}
 	if v.MaxCompletionTokens != nil {
 		if v.MaxTokens != nil && *v.MaxTokens != *v.MaxCompletionTokens {
-			return "", 0, false
+			return admissionEstimate{}, false
 		}
 		maximum = *v.MaxCompletionTokens
 	}
 	if maximum <= 0 || maximum > math.MaxUint32 {
-		return "", 0, false
+		return admissionEstimate{}, false
 	}
-	return v.Model, maximum, true
+	input := int64((len(body) + 3) / 4)
+	if input < 1 {
+		input = 1
+	}
+	return admissionEstimate{Model: v.Model, InputTokens: input, OutputTokens: maximum}, true
 }
 
 // prepareSharedDynamoRequest replaces every client-controlled scheduling and
@@ -135,7 +144,7 @@ func prepareSharedDynamoRequest(body []byte, org string, maxOutput int64, tier c
 func (s *Server) writeAdmissionError(w http.ResponseWriter, err error) {
 	var rejected *admission.Rejected
 	if errors.As(err, &rejected) {
-		retry := int64(rejected.RetryAfter.Round(time.Second) / time.Second)
+		retry := int64(math.Ceil(rejected.RetryAfter.Seconds()))
 		if retry < 1 {
 			retry = 1
 		}
@@ -151,7 +160,7 @@ func (s *Server) writeAdmissionError(w http.ResponseWriter, err error) {
 		return
 	}
 	http.Error(w, "shared inference admission state unavailable", http.StatusServiceUnavailable)
-	s.log.Error.Printf("admission: fail closed: %v", err)
+	s.log.Error.Printf("admission: unexpected error: %v", err)
 }
 
 func parseTrustedRateLimits(id identity.Identity) (admission.RateLimits, error) {

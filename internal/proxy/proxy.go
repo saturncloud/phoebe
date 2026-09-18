@@ -353,7 +353,7 @@ func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request) {
 		if defaultOutput <= 0 {
 			defaultOutput = 512
 		}
-		model, maxOutput, ok := admissionWork(body, defaultOutput)
+		estimate, ok := admissionWork(body, defaultOutput)
 		if !ok {
 			http.Error(w, "invalid shared inference request", http.StatusBadRequest)
 			return
@@ -369,7 +369,7 @@ func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request) {
 		if tierName, mapped := s.settings.Admission.OrganizationTiers[id.OrgID]; mapped {
 			tier = s.settings.Admission.Tiers[tierName]
 		}
-		body, tenant, rerr := prepareSharedDynamoRequest(body, id.OrgID, maxOutput, tier)
+		body, tenant, rerr := prepareSharedDynamoRequest(body, id.OrgID, estimate.OutputTokens, tier)
 		if rerr != nil {
 			http.Error(w, "invalid shared inference request", http.StatusBadRequest)
 			return
@@ -395,31 +395,34 @@ func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request) {
 				graph = graphFromUpstreamHost(upstream.Host)
 			}
 			admitted, err = s.admitter.Admit(r.Context(), admission.Request{
-				Graph: graph, Organization: id.OrgID, Model: model,
-				PromptBytes: int64(len(body)), ReservedOutputTokens: maxOutput,
-				Adapter: id.Adapter != "", ServiceTier: id.ServiceTier, RateLimits: rateLimits,
+				Graph: graph, Organization: id.OrgID, Model: estimate.Model,
+				PromptBytes: int64(len(body)), EstimatedInputTokens: estimate.InputTokens,
+				ReservedOutputTokens: estimate.OutputTokens,
+				Adapter:              id.Adapter != "", ServiceTier: id.ServiceTier, RateLimits: rateLimits,
 			})
 			if err != nil {
-				s.writeAdmissionError(w, err)
-				return
-			}
-			// Renewal failure means the distributed authority can no longer prove
-			// this request owns capacity. Cancel the upstream request rather than
-			// merely logging and allowing an unaccounted stream to continue.
-			proxyCtx, stopProxy := context.WithCancelCause(r.Context())
-			r = r.WithContext(proxyCtx)
-			defer stopProxy(nil)
-			go admitted.KeepAlive(proxyCtx, func(e error) {
-				s.log.Error.Printf("admission: lease renewal failed for request_id=%s: %v", requestID, e)
-				stopProxy(e)
-			})
-			// Safety net for every early return. Normal response completion wins the
-			// lease's idempotent Complete race and charges actual generated tokens.
-			defer func() {
-				if e := admitted.Complete(context.WithoutCancel(r.Context()), 0); e != nil {
-					s.log.Error.Printf("admission: release fallback failed: %v", e)
+				if errors.Is(err, admission.ErrUnavailable) {
+					s.log.Error.Printf("admission: distributed gate unavailable; bypassing for otherwise valid request_id=%s: %v", requestID, err)
+					admitted = nil
+				} else {
+					s.writeAdmissionError(w, err)
+					return
 				}
-			}()
+			}
+			if admitted != nil {
+				// Losing the fairness store must not terminate otherwise authorized
+				// inference. Metering is independent and still records actual usage.
+				go admitted.KeepAlive(r.Context(), func(e error) {
+					s.log.Error.Printf("admission: lease renewal failed; bypassing distributed gate for running request_id=%s: %v", requestID, e)
+				})
+				// Safety net for every early return. Normal response completion wins the
+				// lease's idempotent Complete race and charges actual generated tokens.
+				defer func() {
+					if e := admitted.Complete(context.WithoutCancel(r.Context()), 0); e != nil {
+						s.log.Error.Printf("admission: release fallback failed: %v", e)
+					}
+				}()
+			}
 		}
 	}
 
@@ -579,10 +582,6 @@ func (s *Server) errorHandler(upstream string, id identity.Identity, requestID s
 			if e := admitted.Complete(context.WithoutCancel(r.Context()), 0); e != nil {
 				s.log.Error.Printf("admission: upstream-failure release failed: %v", e)
 			}
-		}
-		if cause := context.Cause(r.Context()); errors.Is(cause, admission.ErrUnavailable) {
-			s.writeAdmissionError(w, cause)
-			return
 		}
 		if isClientAbort(err) {
 			s.log.Debug.Printf("client disconnected for %s", upstream)

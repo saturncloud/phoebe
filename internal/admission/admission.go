@@ -12,6 +12,7 @@ import (
 	"errors"
 	"fmt"
 	"math"
+	"sync"
 	"time"
 
 	"github.com/redis/go-redis/v9"
@@ -38,6 +39,7 @@ type Request struct {
 	Organization         string
 	Model                string
 	PromptBytes          int64
+	EstimatedInputTokens int64
 	ReservedOutputTokens int64
 	Adapter              bool
 	ServiceTier          string
@@ -54,31 +56,32 @@ type RateLimits struct {
 }
 
 type scope struct {
-	ID             string `json:"id"`
-	Name           string `json:"name"`
-	Active         int64  `json:"active"`
-	Prefills       int64  `json:"prefills"`
-	Decodes        int64  `json:"decodes"`
-	Prompt         int64  `json:"prompt"`
-	Output         int64  `json:"output"`
-	Adapters       int64  `json:"adapters"`
-	Requests       int64  `json:"requests"`
-	TotalPrompt    int64  `json:"total_prompt"`
-	UncachedPrompt int64  `json:"uncached_prompt"`
-	Generated      int64  `json:"generated"`
-	Cold           int64  `json:"cold"`
-	Wakes          int64  `json:"wakes"`
-	WindowMs       int64  `json:"window_ms"`
-	Contractual    bool   `json:"contractual"`
+	ID                  string `json:"id"`
+	Name                string `json:"name"`
+	Active              int64  `json:"active"`
+	Prefills            int64  `json:"prefills"`
+	ReservedDecodeSlots int64  `json:"reserved_decode_slots"`
+	Prompt              int64  `json:"prompt"`
+	Output              int64  `json:"output"`
+	Adapters            int64  `json:"adapters"`
+	Requests            int64  `json:"requests"`
+	TotalPrompt         int64  `json:"total_prompt"`
+	UncachedPrompt      int64  `json:"uncached_prompt"`
+	Generated           int64  `json:"generated"`
+	Cold                int64  `json:"cold"`
+	Wakes               int64  `json:"wakes"`
+	WindowMs            int64  `json:"window_ms"`
+	Contractual         bool   `json:"contractual"`
 }
 
 type wireRequest struct {
-	ID      string  `json:"id"`
-	LeaseMs int64   `json:"lease_ms"`
-	Prompt  int64   `json:"prompt"`
-	Output  int64   `json:"output"`
-	Adapter int64   `json:"adapter"`
-	Scopes  []scope `json:"scopes"`
+	ID             string  `json:"id"`
+	LeaseMs        int64   `json:"lease_ms"`
+	Prompt         int64   `json:"prompt"`
+	EstimatedInput int64   `json:"estimated_input"`
+	Output         int64   `json:"output"`
+	Adapter        int64   `json:"adapter"`
+	Scopes         []scope `json:"scopes"`
 }
 
 // Admitter is the proxy-facing seam, allowing deterministic lifecycle tests.
@@ -90,6 +93,7 @@ type RedisAdmitter struct {
 	client                     redis.Cmdable
 	cfg                        config.AdmissionSettings
 	counters, leases, expiries string
+	windowExpiries             string
 }
 
 func New(client redis.Cmdable, cfg config.AdmissionSettings) *RedisAdmitter {
@@ -97,7 +101,14 @@ func New(client redis.Cmdable, cfg config.AdmissionSettings) *RedisAdmitter {
 	// One cluster hash slot makes each multi-key Lua operation valid on Redis
 	// Cluster as well as single-node Valkey.
 	tag := "{" + prefix + "}"
-	return &RedisAdmitter{client: client, cfg: cfg, counters: tag + ":counters", leases: tag + ":leases", expiries: tag + ":expiries"}
+	return &RedisAdmitter{
+		client: client, cfg: cfg, counters: tag + ":counters", leases: tag + ":leases",
+		expiries: tag + ":expiries", windowExpiries: tag + ":window-expiries",
+	}
+}
+
+func (a *RedisAdmitter) keys() []string {
+	return []string{a.counters, a.leases, a.expiries, a.windowExpiries}
 }
 
 func randomID() (string, error) {
@@ -112,36 +123,55 @@ func (a *RedisAdmitter) Admit(ctx context.Context, req Request) (*Lease, error) 
 	if req.Organization == "" || req.Model == "" || req.Graph == "" {
 		return nil, fmt.Errorf("%w: missing trusted organization/model/graph identity", ErrUnavailable)
 	}
-	if req.PromptBytes < 0 || req.ReservedOutputTokens <= 0 {
+	if req.PromptBytes < 0 || req.EstimatedInputTokens <= 0 || req.ReservedOutputTokens <= 0 {
 		return nil, &Rejected{Scope: "request", Dimension: "work estimate", RetryAfter: time.Second}
 	}
 	id, err := randomID()
 	if err != nil {
 		return nil, fmt.Errorf("%w: lease id: %v", ErrUnavailable, err)
 	}
-	w := wireRequest{ID: id, LeaseMs: a.cfg.LeaseTTL.Milliseconds(), Prompt: req.PromptBytes, Output: req.ReservedOutputTokens, Scopes: a.scopes(req)}
+	w := wireRequest{ID: id, LeaseMs: a.cfg.LeaseTTL.Milliseconds(), Prompt: req.PromptBytes,
+		EstimatedInput: req.EstimatedInputTokens, Output: req.ReservedOutputTokens, Scopes: a.scopes(req)}
 	if req.Adapter {
 		w.Adapter = 1
 	}
 	b, _ := json.Marshal(w)
-	res, err := admitScript.Run(ctx, a.client, []string{a.counters, a.leases, a.expiries}, string(b)).Result()
-	if err != nil {
-		return nil, fmt.Errorf("%w: %v", ErrUnavailable, err)
-	}
-	parts, ok := res.([]interface{})
-	if !ok || len(parts) == 0 {
-		return nil, fmt.Errorf("%w: malformed response", ErrUnavailable)
-	}
-	if number(parts[0]) != 1 {
-		scopeName, dimension := "unknown", "capacity"
-		if len(parts) > 2 {
-			scopeName = fmt.Sprint(parts[1])
-			dimension = fmt.Sprint(parts[2])
+	var lastErr error
+	for attempt := 0; attempt < 2; attempt++ {
+		res, runErr := admitScript.Run(ctx, a.client, a.keys(), string(b)).Result()
+		if runErr != nil {
+			lastErr = runErr
+			continue
 		}
-		contractual := len(parts) > 3 && number(parts[3]) == 1
-		return nil, &Rejected{Scope: scopeName, Dimension: dimension, RetryAfter: a.retryAfter(w.Scopes), Contractual: contractual}
+		parts, ok := res.([]interface{})
+		if !ok || len(parts) == 0 {
+			lastErr = errors.New("malformed response")
+			continue
+		}
+		if number(parts[0]) != 1 {
+			scopeName, dimension := "unknown", "capacity"
+			if len(parts) > 2 {
+				scopeName = fmt.Sprint(parts[1])
+				dimension = fmt.Sprint(parts[2])
+			}
+			contractual := len(parts) > 3 && number(parts[3]) == 1
+			retryAfter := a.retryAfter(w.Scopes)
+			if len(parts) > 4 && number(parts[4]) > 0 {
+				retryAfter = time.Duration(number(parts[4])) * time.Millisecond
+			}
+			return nil, &Rejected{Scope: scopeName, Dimension: dimension, RetryAfter: retryAfter, Contractual: contractual}
+		}
+		return &Lease{owner: a, id: id}, nil
 	}
-	return &Lease{owner: a, id: id}, nil
+
+	// Both replies were indeterminate. Compensate with the same request id:
+	// this releases a committed lease and is a no-op if neither attempt ran.
+	cleanupCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), time.Second)
+	defer cancel()
+	if _, cleanupErr := abandonScript.Run(cleanupCtx, a.client, a.keys(), id).Result(); cleanupErr != nil {
+		return nil, fmt.Errorf("%w: admit: %v; cleanup: %v", ErrUnavailable, lastErr, cleanupErr)
+	}
+	return nil, fmt.Errorf("%w: admit: %v", ErrUnavailable, lastErr)
 }
 
 func number(v interface{}) int64 {
@@ -178,7 +208,7 @@ func scaled(l config.AdmissionLimits, weight int64) config.AdmissionLimits {
 	}
 	l.MaxActiveRequests = mul(l.MaxActiveRequests)
 	l.MaxConcurrentPrefills = mul(l.MaxConcurrentPrefills)
-	l.MaxActiveDecodes = mul(l.MaxActiveDecodes)
+	l.MaxReservedDecodeSlots = mul(l.MaxReservedDecodeSlots)
 	l.MaxPromptBytes = mul(l.MaxPromptBytes)
 	l.MaxReservedOutputTokens = mul(l.MaxReservedOutputTokens)
 	l.MaxActiveAdapters = mul(l.MaxActiveAdapters)
@@ -198,8 +228,8 @@ func makeScope(name, id string, l config.AdmissionLimits) scope {
 	}
 	digest := sha256.Sum256([]byte(id))
 	return scope{ID: name + ":" + hex.EncodeToString(digest[:]), Name: name, Active: l.MaxActiveRequests, Prefills: l.MaxConcurrentPrefills,
-		Decodes: l.MaxActiveDecodes,
-		Prompt:  l.MaxPromptBytes, Output: l.MaxReservedOutputTokens, Adapters: l.MaxActiveAdapters,
+		ReservedDecodeSlots: l.MaxReservedDecodeSlots,
+		Prompt:              l.MaxPromptBytes, Output: l.MaxReservedOutputTokens, Adapters: l.MaxActiveAdapters,
 		Requests: l.RequestsPerWindow, TotalPrompt: l.TotalPromptTokensPerWindow,
 		UncachedPrompt: l.UncachedPromptTokensPerWindow, Generated: l.GeneratedTokensPerWindow, Cold: l.MaxColdHolds,
 		Wakes: l.WakesPerWindow, WindowMs: windowMs}
@@ -249,6 +279,10 @@ func (a *RedisAdmitter) scopes(r Request) []scope {
 type Lease struct {
 	owner *RedisAdmitter
 	id    string
+
+	mu      sync.Mutex
+	settled bool
+	pending *Usage
 }
 
 func (l *Lease) PrefillDone(ctx context.Context) error {
@@ -271,11 +305,11 @@ type Usage struct {
 	GeneratedTokens    int64
 }
 
-// CompleteUsage releases physical reservations and atomically records the
-// exact token currencies reported by the engine. Prompt windows are checked
-// on subsequent admission because exact rendered/cache-aware counts become
-// available only after Dynamo tokenization and execution; generated capacity
-// remains strictly reserved from max_tokens before dispatch.
+// CompleteUsage releases physical reservations and atomically reconciles the
+// conservative input-token reservation with exact engine-reported usage.
+// Estimated input is reserved as uncached before dispatch; settlement refunds
+// overestimates or records underestimates as debt in the current window.
+// Generated capacity remains strictly reserved from max_tokens before dispatch.
 func (l *Lease) CompleteUsage(ctx context.Context, usage Usage) error {
 	// The Lua transition is idempotent (a missing lease is success), so retrying
 	// after a transient Valkey failure is both safe and preferable to waiting for
@@ -285,14 +319,35 @@ func (l *Lease) CompleteUsage(ctx context.Context, usage Usage) error {
 	if cachedPrompt > totalPrompt {
 		cachedPrompt = totalPrompt
 	}
-	uncachedPrompt := totalPrompt - cachedPrompt
-	return l.run(ctx, finishScript, "finish", max(usage.GeneratedTokens, 0), totalPrompt, uncachedPrompt)
+	normalized := Usage{TotalPromptTokens: totalPrompt, CachedPromptTokens: cachedPrompt, GeneratedTokens: max(usage.GeneratedTokens, 0)}
+
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if l.settled {
+		return nil
+	}
+	// First completion data wins. In the normal response path this is the
+	// engine-authoritative usage. If its transaction fails transiently, the
+	// deferred Complete(0) retries these retained counts instead of deleting the
+	// lease with zero usage.
+	if l.pending == nil {
+		l.pending = &normalized
+	}
+	pending := *l.pending
+	uncachedPrompt := pending.TotalPromptTokens - pending.CachedPromptTokens
+	if err := l.run(ctx, finishScript, "finish", pending.GeneratedTokens, pending.TotalPromptTokens, uncachedPrompt); err != nil {
+		return err
+	}
+	l.settled = true
+	l.pending = nil
+	return nil
 }
 
 // KeepAlive renews a live request's expiry until ctx is cancelled. A healthy
 // replica therefore retains reservations for arbitrarily long streams; a dead
 // replica stops renewing and is reaped after leaseTtl. onError is invoked once
-// if renewal fails, after which new requests still fail closed through Admit.
+// if renewal fails. The proxy treats distributed-state failure as a temporary
+// bypass of the fairness gate; authorization and independent metering remain.
 func (l *Lease) KeepAlive(ctx context.Context, onError func(error)) {
 	interval := l.owner.cfg.LeaseTTL / 3
 	if interval < 10*time.Millisecond {
@@ -305,16 +360,27 @@ func (l *Lease) KeepAlive(ctx context.Context, onError func(error)) {
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
-			res, err := renewScript.Run(ctx, l.owner.client, []string{l.owner.counters, l.owner.leases, l.owner.expiries}, l.id, l.owner.cfg.LeaseTTL.Milliseconds()).Int64()
+			l.mu.Lock()
+			if l.settled {
+				l.mu.Unlock()
+				return
+			}
+			res, err := renewScript.Run(ctx, l.owner.client, l.owner.keys(), l.id, l.owner.cfg.LeaseTTL.Milliseconds()).Int64()
 			if err != nil {
+				l.mu.Unlock()
 				if onError != nil {
 					onError(fmt.Errorf("%w: renew lease: %v", ErrUnavailable, err))
 				}
 				return
 			}
 			if res == 0 {
+				l.mu.Unlock()
+				if onError != nil {
+					onError(fmt.Errorf("%w: lease expired or was reaped", ErrUnavailable))
+				}
 				return
-			} // completed or already reaped
+			}
+			l.mu.Unlock()
 		}
 	}
 }
@@ -324,7 +390,7 @@ func (l *Lease) run(ctx context.Context, script *redis.Script, action string, va
 	for _, value := range values {
 		args = append(args, value)
 	}
-	res, err := script.Run(ctx, l.owner.client, []string{l.owner.counters, l.owner.leases, l.owner.expiries}, args...).Result()
+	res, err := script.Run(ctx, l.owner.client, l.owner.keys(), args...).Result()
 	if err != nil {
 		return fmt.Errorf("%w: %v", ErrUnavailable, err)
 	}
@@ -336,7 +402,11 @@ func (l *Lease) run(ctx context.Context, script *redis.Script, action string, va
 			dim = fmt.Sprint(parts[2])
 		}
 		contractual := len(parts) > 3 && number(parts[3]) == 1
-		return &Rejected{Scope: sn, Dimension: dim, RetryAfter: time.Minute, Contractual: contractual}
+		retryAfter := time.Minute
+		if len(parts) > 4 && number(parts[4]) > 0 {
+			retryAfter = time.Duration(number(parts[4])) * time.Millisecond
+		}
+		return &Rejected{Scope: sn, Dimension: dim, RetryAfter: retryAfter, Contractual: contractual}
 	}
 	return nil
 }

@@ -57,8 +57,8 @@ type Settings struct {
 
 	// Admission configures distributed shared-tier admission. It is deliberately
 	// separate from Emit even though both normally use Valkey: metering may fall
-	// back to its WAL, while admission MUST fail closed when its authoritative
-	// distributed state is unavailable.
+	// back to its WAL, while an unavailable admission store temporarily bypasses
+	// only fairness/capacity limits for otherwise authorized, valid requests.
 	Admission AdmissionSettings `yaml:"admission"`
 
 	// --- Parsed settings (populated by parse) ---
@@ -79,7 +79,7 @@ type Settings struct {
 type AdmissionLimits struct {
 	MaxActiveRequests             int64         `yaml:"maxActiveRequests"`
 	MaxConcurrentPrefills         int64         `yaml:"maxConcurrentPrefills"`
-	MaxActiveDecodes              int64         `yaml:"maxActiveDecodes"`
+	MaxReservedDecodeSlots        int64         `yaml:"maxReservedDecodeSlots"`
 	MaxPromptBytes                int64         `yaml:"maxPromptBytes"`
 	MaxReservedOutputTokens       int64         `yaml:"maxReservedOutputTokens"`
 	MaxActiveAdapters             int64         `yaml:"maxActiveAdapters"`
@@ -377,14 +377,14 @@ func (a *AdmissionSettings) parse() error {
 }
 
 func limitValues(l AdmissionLimits) []int64 {
-	return []int64{l.MaxActiveRequests, l.MaxConcurrentPrefills, l.MaxActiveDecodes, l.MaxPromptBytes,
+	return []int64{l.MaxActiveRequests, l.MaxConcurrentPrefills, l.MaxReservedDecodeSlots, l.MaxPromptBytes,
 		l.MaxReservedOutputTokens, l.MaxActiveAdapters, l.RequestsPerWindow,
 		l.TotalPromptTokensPerWindow, l.UncachedPromptTokensPerWindow,
 		l.GeneratedTokensPerWindow, l.MaxColdHolds, l.WakesPerWindow}
 }
 
 func (a *AdmissionSettings) validateTierShares() error {
-	names := []string{"maxActiveRequests", "maxConcurrentPrefills", "maxActiveDecodes", "maxPromptBytes",
+	names := []string{"maxActiveRequests", "maxConcurrentPrefills", "maxReservedDecodeSlots", "maxPromptBytes",
 		"maxReservedOutputTokens", "maxActiveAdapters", "requestsPerWindow",
 		"totalPromptTokensPerWindow", "uncachedPromptTokensPerWindow",
 		"generatedTokensPerWindow", "maxColdHolds", "wakesPerWindow"}
@@ -414,7 +414,7 @@ func (a *AdmissionSettings) validateTierShares() error {
 }
 
 func (l *AdmissionLimits) parse(name string) error {
-	values := []int64{l.MaxActiveRequests, l.MaxConcurrentPrefills, l.MaxActiveDecodes, l.MaxPromptBytes, l.MaxReservedOutputTokens, l.MaxActiveAdapters,
+	values := []int64{l.MaxActiveRequests, l.MaxConcurrentPrefills, l.MaxReservedDecodeSlots, l.MaxPromptBytes, l.MaxReservedOutputTokens, l.MaxActiveAdapters,
 		l.RequestsPerWindow, l.TotalPromptTokensPerWindow, l.UncachedPromptTokensPerWindow,
 		l.GeneratedTokensPerWindow, l.MaxColdHolds, l.WakesPerWindow}
 	for _, value := range values {
@@ -424,6 +424,12 @@ func (l *AdmissionLimits) parse(name string) error {
 	}
 	if l.TotalPromptTokensPerWindow > 0 && l.UncachedPromptTokensPerWindow > l.TotalPromptTokensPerWindow {
 		return fmt.Errorf("%s.uncachedPromptTokensPerWindow cannot exceed totalPromptTokensPerWindow", name)
+	}
+	if l.MaxActiveRequests > 0 && l.MaxConcurrentPrefills > l.MaxActiveRequests {
+		return fmt.Errorf("%s.maxConcurrentPrefills cannot exceed maxActiveRequests", name)
+	}
+	if l.MaxActiveRequests > 0 && l.MaxReservedDecodeSlots > l.MaxActiveRequests {
+		return fmt.Errorf("%s.maxReservedDecodeSlots cannot exceed maxActiveRequests", name)
 	}
 	if l.WindowStr == "" {
 		l.WindowStr = "1m"

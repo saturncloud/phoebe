@@ -39,7 +39,7 @@ func TestRealValkeyAtomicAdmission(t *testing.T) {
 	}
 	a, b := New(one, cfg), New(two, cfg)
 	t.Cleanup(func() {
-		_ = one.Del(context.Background(), a.counters, a.leases, a.expiries).Err()
+		_ = one.Del(context.Background(), a.counters, a.leases, a.expiries, a.windowExpiries).Err()
 		_ = one.Close()
 		_ = two.Close()
 	})
@@ -78,5 +78,60 @@ func TestRealValkeyAtomicAdmission(t *testing.T) {
 	}
 	if err := lease.Complete(ctx, 3); err != nil {
 		t.Fatalf("complete real Valkey lease: %v", err)
+	}
+}
+
+func TestRealValkeyReapsRetiredScopeWindows(t *testing.T) {
+	addr := os.Getenv("PHOEBE_TEST_ADMISSION_VALKEY_ADDR")
+	if addr == "" {
+		t.Fatal("PHOEBE_TEST_ADMISSION_VALKEY_ADDR is required")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	client := redis.NewClient(&redis.Options{Addr: addr})
+	if err := client.Ping(ctx).Err(); err != nil {
+		t.Fatalf("ping real Valkey: %v", err)
+	}
+
+	l := limits(64)
+	l.Window = 100 * time.Millisecond
+	cfg := config.AdmissionSettings{
+		KeyPrefix: fmt.Sprintf("phoebe-admission-window-churn-%d", time.Now().UnixNano()),
+		LeaseTTL:  time.Second, Platform: l, Graph: l, Organization: l, OrganizationModel: l,
+	}
+	a := New(client, cfg)
+	t.Cleanup(func() {
+		_ = client.Del(context.Background(), a.counters, a.leases, a.expiries, a.windowExpiries).Err()
+		_ = client.Close()
+	})
+
+	for i := 0; i < 20; i++ {
+		lease, err := a.Admit(ctx, request(fmt.Sprintf("org-%d", i), fmt.Sprintf("model-%d", i)))
+		if err != nil {
+			t.Fatalf("admit churn scope %d: %v", i, err)
+		}
+		if err := lease.CompleteUsage(ctx, Usage{TotalPromptTokens: 10, GeneratedTokens: 1}); err != nil {
+			t.Fatalf("complete churn scope %d: %v", i, err)
+		}
+	}
+	before, err := client.HLen(ctx, a.counters).Result()
+	if err != nil || before == 0 {
+		t.Fatalf("window fields before expiry = %d, err=%v", before, err)
+	}
+
+	time.Sleep(150 * time.Millisecond)
+	lease, err := a.Admit(ctx, request("live-org", "live-model"))
+	if err != nil {
+		t.Fatalf("trigger expiry reap: %v", err)
+	}
+	if err := lease.Complete(ctx, 0); err != nil {
+		t.Fatalf("complete reap trigger: %v", err)
+	}
+	after, err := client.HLen(ctx, a.counters).Result()
+	if err != nil {
+		t.Fatalf("window fields after expiry: %v", err)
+	}
+	if after >= before {
+		t.Fatalf("retired window fields were not reclaimed: before=%d after=%d", before, after)
 	}
 }

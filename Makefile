@@ -28,7 +28,7 @@ integration-test:
 admission-integration-test:
 	@test -n "$$PHOEBE_TEST_ADMISSION_VALKEY_ADDR" || \
 		( echo "PHOEBE_TEST_ADMISSION_VALKEY_ADDR is required"; exit 1 )
-	go test -tags=admissionintegration ./internal/admission -run TestRealValkeyAtomicAdmission -count=1
+	go test -tags=admissionintegration ./internal/admission -run '^TestRealValkey' -count=1
 
 .PHONY: vet
 vet:

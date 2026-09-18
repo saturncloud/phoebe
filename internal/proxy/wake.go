@@ -3,6 +3,7 @@ package proxy
 import (
 	"bytes"
 	"context"
+	"errors"
 	"io"
 	"net"
 	"net/http"
@@ -247,8 +248,12 @@ func (s *Server) serveWithWake(
 		// Cold. Trigger the wake and block until ready (bounded), then retry.
 		if lease != nil {
 			if aerr := lease.BeginColdHold(r.Context()); aerr != nil {
-				s.writeAdmissionError(w, aerr)
-				return true
+				if errors.Is(aerr, admission.ErrUnavailable) {
+					s.log.Error.Printf("admission: cold-hold state unavailable; bypassing distributed gate for request_id=%s: %v", requestID, aerr)
+				} else {
+					s.writeAdmissionError(w, aerr)
+					return true
+				}
 			}
 		}
 		ctx := r.Context()

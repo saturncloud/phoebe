@@ -23,7 +23,7 @@ import (
 func proxyAdmissionConfig(active int64) config.AdmissionSettings {
 	return config.AdmissionSettings{Enabled: true, KeyPrefix: "proxy-test", LeaseTTL: time.Minute,
 		DefaultMaxOutputTokens: 20, Platform: config.AdmissionLimits{MaxActiveRequests: active,
-			MaxConcurrentPrefills: active, MaxPromptBytes: 1024, MaxReservedOutputTokens: 100,
+			MaxConcurrentPrefills: active, MaxReservedDecodeSlots: active, MaxPromptBytes: 1024, MaxReservedOutputTokens: 100,
 			RequestsPerWindow: 100, GeneratedTokensPerWindow: 1000, Window: time.Minute}}
 }
 
@@ -82,21 +82,29 @@ func TestAdmissionAcrossProxyReplicasAndLifecycleRelease(t *testing.T) {
 	}
 }
 
-func TestAdmissionStateFailureReturns503BeforeUpstream(t *testing.T) {
+func TestAdmissionStateFailureBypassesGate(t *testing.T) {
 	var hits int
-	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) { hits++; w.WriteHeader(200) }))
+	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		hits++
+		_, _ = w.Write([]byte(`{"model":"model-a","usage":{"prompt_tokens":7,"completion_tokens":3,"prompt_tokens_details":{"cached_tokens":2}}}`))
+	}))
 	defer backend.Close()
 	up, _ := url.Parse(backend.URL)
 	cfg := proxyAdmissionConfig(1)
 	client := redis.NewClient(&redis.Options{Addr: "127.0.0.1:1", DialTimeout: 20 * time.Millisecond, ReadTimeout: 20 * time.Millisecond, WriteTimeout: 20 * time.Millisecond, MaxRetries: 0})
-	s := New(&config.Settings{Admission: cfg}, logging.New(logging.ERROR), &recordingEmitter{}).WithAdmitter(admission.New(client, cfg))
+	em := &recordingEmitter{}
+	s := New(&config.Settings{Admission: cfg}, logging.New(logging.ERROR), em).WithAdmitter(admission.New(client, cfg))
 	rr := httptest.NewRecorder()
 	s.Handler().ServeHTTP(rr, sharedRequest(up))
-	if rr.Code != http.StatusServiceUnavailable {
-		t.Fatalf("status=%d, want 503", rr.Code)
+	if rr.Code != http.StatusOK {
+		t.Fatalf("status=%d, want 200", rr.Code)
 	}
-	if hits != 0 {
-		t.Fatal("failed-closed request reached upstream")
+	if hits != 1 {
+		t.Fatalf("fail-open request reached upstream %d times, want 1", hits)
+	}
+	events := em.waitForEvents(1, time.Second)
+	if len(events) != 1 || events[0].PromptTokens != 7 || events[0].CachedTokens != 2 || events[0].CompletionTokens != 3 {
+		t.Fatalf("fail-open request was not independently metered: %+v", events)
 	}
 }
 
@@ -138,6 +146,18 @@ func TestContractRateLimitReturns429BeforeUpstream(t *testing.T) {
 	}
 	if hits != 0 {
 		t.Fatal("contractually over-limit request reached upstream")
+	}
+}
+
+func TestAdmissionRetryAfterCeilsRemainingFixedWindow(t *testing.T) {
+	s := New(&config.Settings{}, logging.New(logging.ERROR), &recordingEmitter{})
+	rr := httptest.NewRecorder()
+	s.writeAdmissionError(rr, &admission.Rejected{
+		Scope: "contract_organization", Dimension: "requests", Contractual: true,
+		RetryAfter: 1500 * time.Millisecond,
+	})
+	if got := rr.Header().Get("Retry-After"); got != "2" {
+		t.Fatalf("Retry-After=%q, want ceil(1.5s)=2", got)
 	}
 }
 
@@ -220,14 +240,14 @@ func TestAdmissionReleasesAbortedStream(t *testing.T) {
 	case <-time.After(time.Second):
 		t.Fatal("aborted proxy did not return")
 	}
-	lease, err := a.Admit(context.Background(), admission.Request{Graph: "graph", Organization: "other", Model: "m", PromptBytes: 1, ReservedOutputTokens: 1})
+	lease, err := a.Admit(context.Background(), admission.Request{Graph: "graph", Organization: "other", Model: "m", PromptBytes: 1, EstimatedInputTokens: 1, ReservedOutputTokens: 1})
 	if err != nil {
 		t.Fatalf("aborted stream leaked reservation: %v", err)
 	}
 	_ = lease.Complete(context.Background(), 0)
 }
 
-func TestAdmissionRenewalFailureCancelsUpstreamAndReturns503(t *testing.T) {
+func TestAdmissionRenewalFailureDoesNotCancelUpstream(t *testing.T) {
 	started := make(chan struct{})
 	releaseBackend := make(chan struct{})
 	backend := httptest.NewServer(http.HandlerFunc(func(_ http.ResponseWriter, r *http.Request) {
@@ -238,7 +258,6 @@ func TestAdmissionRenewalFailureCancelsUpstreamAndReturns503(t *testing.T) {
 		}
 	}))
 	defer backend.Close()
-	defer close(releaseBackend)
 	up, _ := url.Parse(backend.URL)
 	mr := miniredis.RunT(t)
 	cfg := proxyAdmissionConfig(1)
@@ -262,13 +281,15 @@ func TestAdmissionRenewalFailureCancelsUpstreamAndReturns503(t *testing.T) {
 		t.Fatal("request never reached upstream")
 	}
 	mr.Close()
+	time.Sleep(100 * time.Millisecond)
+	close(releaseBackend)
 	select {
 	case <-done:
 	case <-time.After(2 * time.Second):
-		t.Fatal("proxy did not cancel upstream after lease renewal failed")
+		t.Fatal("proxy did not complete after backend release")
 	}
-	if rr.Code != http.StatusServiceUnavailable {
-		t.Fatalf("status=%d, want 503 after admission authority loss", rr.Code)
+	if rr.Code != http.StatusOK {
+		t.Fatalf("status=%d, want 200 after admission authority loss", rr.Code)
 	}
 }
 
@@ -321,11 +342,12 @@ func TestSharedPolicyOverwritesClientPriorityWhenAdmissionDisabled(t *testing.T)
 }
 
 func TestAdmissionWorkRejectsAmbiguousOrImpossibleRequests(t *testing.T) {
-	if _, _, ok := admissionWork([]byte(`{"model":"m","max_tokens":2,"max_completion_tokens":3}`), 10); ok {
+	if _, ok := admissionWork([]byte(`{"model":"m","max_tokens":2,"max_completion_tokens":3}`), 10); ok {
 		t.Fatal("conflicting output limits accepted")
 	}
-	if model, n, ok := admissionWork([]byte(`{"model":"m"}`), 10); !ok || model != "m" || n != 10 {
-		t.Fatalf("defaults=(%q,%d,%t)", model, n, ok)
+	body := []byte(`{"model":"m"}`)
+	if estimate, ok := admissionWork(body, 10); !ok || estimate.Model != "m" || estimate.OutputTokens != 10 || estimate.InputTokens != int64((len(body)+3)/4) {
+		t.Fatalf("estimate=(%+v,%t)", estimate, ok)
 	}
 	for _, body := range []string{
 		`{"model":"m","model":"other","max_tokens":2}`,
@@ -333,7 +355,7 @@ func TestAdmissionWorkRejectsAmbiguousOrImpossibleRequests(t *testing.T) {
 		`{"model":"m","max_completion_tokens":200,"max_completion_tokens":2}`,
 		`{"model":"m","max_tokens":4294967296}`,
 	} {
-		if _, _, ok := admissionWork([]byte(body), 10); ok {
+		if _, ok := admissionWork([]byte(body), 10); ok {
 			t.Fatalf("ambiguous admission work accepted: %s", body)
 		}
 	}
