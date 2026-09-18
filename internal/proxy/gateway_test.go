@@ -58,7 +58,11 @@ func newGatewayTestServer(t *testing.T, em *recordingEmitter, resolver gateway.R
 // It carries none of the per-resource routing headers, exactly as the gateway
 // route contract specifies.
 func gatewayRequest(org, body string) *http.Request {
-	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(body))
+	return gatewayRequestFor(http.MethodPost, "/v1/chat/completions", org, body)
+}
+
+func gatewayRequestFor(method, path, org, body string) *http.Request {
+	req := httptest.NewRequest(method, path, strings.NewReader(body))
 	req.Header.Set(identity.HeaderGateway, "true")
 	if org != "" {
 		req.Header.Set(identity.HeaderOrgID, org)
@@ -70,6 +74,61 @@ func gatewayRequest(org, body string) *http.Request {
 	req.Header.Set(identity.HeaderRateLimitUncachedPromptTokens, "0")
 	req.Header.Set(identity.HeaderRateLimitGeneratedTokens, "0")
 	return req
+}
+
+func TestGateway_RejectsRoutesBeforeResolution(t *testing.T) {
+	resolver := &mapResolver{}
+	srv := newGatewayTestServer(t, &recordingEmitter{}, resolver, nil)
+	for _, tc := range []struct{ method, path string }{
+		{http.MethodPost, "/future-admin"},
+		{http.MethodPost, "/v1/models"},
+		{http.MethodPost, "/v1/responses"},
+		{http.MethodGet, "/health"},
+		{http.MethodPut, "/v1/chat/completions"},
+	} {
+		rr := httptest.NewRecorder()
+		srv.Handler().ServeHTTP(rr, gatewayRequestFor(tc.method, tc.path, "org-1", `{"model":"m"}`))
+		if rr.Code != http.StatusNotFound {
+			t.Fatalf("%s %s status = %d, want 404", tc.method, tc.path, rr.Code)
+		}
+	}
+	if atomic.LoadInt32(&resolver.calls) != 0 {
+		t.Fatalf("blocked gateway routes invoked resolver %d times", resolver.calls)
+	}
+}
+
+func TestGateway_PreflightDoesNotRequireModelResolution(t *testing.T) {
+	resolver := &mapResolver{}
+	srv := newGatewayTestServer(t, &recordingEmitter{}, resolver, nil)
+	rr := httptest.NewRecorder()
+	srv.Handler().ServeHTTP(rr, gatewayRequestFor(http.MethodOptions, "/v1/chat/completions", "org-1", ""))
+	if rr.Code != http.StatusNoContent {
+		t.Fatalf("preflight status = %d, want 204", rr.Code)
+	}
+	if atomic.LoadInt32(&resolver.calls) != 0 {
+		t.Fatal("preflight must not invoke model resolution")
+	}
+}
+
+func TestGateway_AllBillableInferencePathsResolveAndForward(t *testing.T) {
+	be, beURL := usageBackend(t)
+	defer be.Close()
+	resolver := &mapResolver{m: map[[2]string]gateway.Resolution{
+		{"org-1", "served-m"}: {
+			ResourceID: "tfm-1", BaseModel: "base", ServingMode: "shared", GraphK8sName: "graph",
+		},
+	}}
+	srv := newGatewayTestServer(t, &recordingEmitter{}, resolver, beURL)
+	for _, path := range []string{"/v1/chat/completions", "/v1/completions", "/v1/embeddings"} {
+		rr := httptest.NewRecorder()
+		srv.Handler().ServeHTTP(rr, gatewayRequestFor(http.MethodPost, path, "org-1", `{"model":"served-m"}`))
+		if rr.Code != http.StatusOK {
+			t.Fatalf("POST %s status = %d, want 200 (body %q)", path, rr.Code, rr.Body.String())
+		}
+	}
+	if calls := atomic.LoadInt32(&resolver.calls); calls != 3 {
+		t.Fatalf("resolver calls = %d, want 3", calls)
+	}
 }
 
 // usageBackend returns an httptest server answering like a vLLM engine (model

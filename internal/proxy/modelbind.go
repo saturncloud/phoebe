@@ -34,12 +34,7 @@ func boundRequestAllowed(method, path, servedModelAllowList string) bool {
 		return true // browser preflight carries no Dynamo response data
 	}
 	if method == "POST" {
-		switch path {
-		case "/v1/chat/completions", "/v1/completions", "/v1/embeddings", "/v1/responses":
-			return true
-		default:
-			return false
-		}
+		return inferenceRequestPathAllowed(path)
 	}
 	if method != "GET" && method != "HEAD" {
 		return false
@@ -51,6 +46,25 @@ func boundRequestAllowed(method, path, servedModelAllowList string) bool {
 		discovery, authorized := authorizedModelDiscoveryPath(path, servedModelAllowList)
 		return discovery && authorized
 	}
+}
+
+// inferenceRequestPathAllowed lists the model-bearing APIs whose response
+// usage schema Phoebe can meter. Responses API uses different token field names
+// and remains closed until its billing parser is implemented.
+func inferenceRequestPathAllowed(path string) bool {
+	switch path {
+	case "/v1/chat/completions", "/v1/completions", "/v1/embeddings":
+		return true
+	default:
+		return false
+	}
+}
+
+// gatewayRequestAllowed is narrower than the bound-resource surface because a
+// shared gateway URL does not identify one model for health or discovery. The
+// request body supplies that identity only on model-bearing POST requests.
+func gatewayRequestAllowed(method, path string) bool {
+	return method == "OPTIONS" || (method == "POST" && inferenceRequestPathAllowed(path))
 }
 
 var errNotObject = errors.New("request body is not a JSON object")

@@ -52,16 +52,35 @@ func TestBoundRequestAllowed(t *testing.T) {
 	if !boundRequestAllowed("OPTIONS", "/v1/chat/completions", allow) {
 		t.Fatal("browser preflight must be allowed")
 	}
-	for _, path := range []string{"/v1/chat/completions", "/v1/completions", "/v1/embeddings", "/v1/responses"} {
+	for _, path := range []string{"/v1/chat/completions", "/v1/completions", "/v1/embeddings"} {
 		if !boundRequestAllowed("POST", path, allow) {
 			t.Fatalf("POST %s must be allowed", path)
 		}
+	}
+	if boundRequestAllowed("POST", "/v1/responses", allow) {
+		t.Fatal("Responses API must remain closed until its usage schema is billable")
 	}
 	for _, method := range []string{"POST", "PUT", "PATCH", "DELETE"} {
 		for _, path := range []string{"/unknown", "/v1/models", "/metrics", "/busy_threshold"} {
 			if boundRequestAllowed(method, path, allow) {
 				t.Fatalf("%s %s must be blocked", method, path)
 			}
+		}
+	}
+}
+
+func TestGatewayRequestAllowed(t *testing.T) {
+	if !gatewayRequestAllowed("OPTIONS", "/v1/chat/completions") {
+		t.Fatal("gateway preflight must be allowed")
+	}
+	for _, path := range []string{"/v1/chat/completions", "/v1/completions", "/v1/embeddings"} {
+		if !gatewayRequestAllowed("POST", path) {
+			t.Fatalf("POST %s must be allowed", path)
+		}
+	}
+	for _, path := range []string{"/health", "/live", "/v1/models", "/v1/responses", "/metrics", "/future-admin"} {
+		if gatewayRequestAllowed("POST", path) || gatewayRequestAllowed("GET", path) {
+			t.Fatalf("gateway route %s must be blocked", path)
 		}
 	}
 }
