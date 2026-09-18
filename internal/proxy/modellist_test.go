@@ -51,6 +51,7 @@ func TestFilterModelListResponseSanitizesUpstreamErrors(t *testing.T) {
 	resp := modelListResponse(`{"error":"adapter-b on base-internal failed"}`)
 	resp.StatusCode = http.StatusServiceUnavailable
 	resp.Header.Set("X-Graph-Debug", "adapter-b")
+	resp.Trailer = http.Header{"X-Graph-Trailer": []string{"adapter-b"}}
 	if err := filterModelListResponse(resp, "adapter-a"); err != nil {
 		t.Fatal(err)
 	}
@@ -61,8 +62,8 @@ func TestFilterModelListResponseSanitizesUpstreamErrors(t *testing.T) {
 	if strings.Contains(string(body), "adapter-b") || strings.Contains(string(body), "base-internal") {
 		t.Fatalf("sanitized error leaked upstream names: %s", body)
 	}
-	if resp.Header.Get("X-Graph-Debug") != "" {
-		t.Fatalf("sanitized error leaked upstream headers: %v", resp.Header)
+	if resp.Header.Get("X-Graph-Debug") != "" || resp.Trailer != nil {
+		t.Fatalf("sanitized error leaked upstream metadata: headers=%v trailer=%v", resp.Header, resp.Trailer)
 	}
 }
 

@@ -42,6 +42,7 @@ func filterModelListResponse(resp *http.Response, servedModelAllowList string) e
 		resp.Header = make(http.Header)
 		resp.Header.Set("Content-Type", "application/json")
 		resp.Header.Set("Content-Length", fmt.Sprintf("%d", len(body)))
+		resp.Trailer = nil
 		return nil
 	}
 	allow := parseServedModelAllowList(servedModelAllowList)
@@ -122,6 +123,7 @@ func filterModelListResponse(resp *http.Response, servedModelAllowList string) e
 func sanitizeModelListHeadResponse(resp *http.Response) {
 	resp.Header = make(http.Header)
 	resp.ContentLength = -1
+	resp.Trailer = nil
 }
 
 func countTopLevelJSONKey(body []byte, key string) (int, error) {

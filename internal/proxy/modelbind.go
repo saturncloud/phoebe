@@ -7,18 +7,6 @@ import (
 	"strings"
 )
 
-// requestMethodCarriesModel identifies requests that can ask Dynamo to route
-// to a served model. Read-only methods and preflight have no model body; their
-// path surface is checked separately by boundReadOnlyRequestAllowed.
-func requestMethodCarriesModel(method string) bool {
-	switch method {
-	case "GET", "HEAD", "OPTIONS":
-		return false
-	default:
-		return true
-	}
-}
-
 // authorizedModelDiscoveryPath validates Dynamo's graph-wide per-model GET
 // subtree against the endpoint's served-model allow-list. The wildcard model id
 // may contain slashes. Bound routes authorize exact model ids only: Dynamo gives
@@ -37,16 +25,24 @@ func authorizedModelDiscoveryPath(path, servedModelAllowList string) (discovery,
 	return true, false
 }
 
-// boundReadOnlyRequestAllowed is the public read-only surface for a
-// deployment-scoped endpoint. Dynamo's frontend also exposes graph-wide admin,
-// metrics, documentation, and future extension routes; those must not become
-// customer APIs merely because the reverse proxy can reach them.
-func boundReadOnlyRequestAllowed(method, path, servedModelAllowList string) bool {
+// boundRequestAllowed is the complete public surface for a deployment-scoped
+// endpoint. Dynamo's frontend also exposes graph-wide admin, metrics,
+// documentation, batch storage, and future extension routes; those must not
+// become customer APIs merely because the reverse proxy can reach them.
+func boundRequestAllowed(method, path, servedModelAllowList string) bool {
 	if method == "OPTIONS" {
 		return true // browser preflight carries no Dynamo response data
 	}
+	if method == "POST" {
+		switch path {
+		case "/v1/chat/completions", "/v1/completions", "/v1/embeddings", "/v1/responses":
+			return true
+		default:
+			return false
+		}
+	}
 	if method != "GET" && method != "HEAD" {
-		return true // model-carrying methods are checked by checkModelBinding
+		return false
 	}
 	switch path {
 	case "/health", "/live", "/v1/models":
