@@ -131,23 +131,28 @@ func TestProxyBindsDedicatedEndpointToServedModel(t *testing.T) {
 			t.Fatalf("model list disclosed graph-wide names: %s", body)
 		}
 	}
-	if rr := request(http.MethodGet, "/v1/models/adapter-b", ""); rr.Code != http.StatusForbidden {
-		t.Fatalf("sibling model metadata status = %d, want 403", rr.Code)
+	if rr := request(http.MethodGet, "/v1/models/adapter-b", ""); rr.Code != http.StatusNotFound {
+		t.Fatalf("sibling model metadata status = %d, want 404", rr.Code)
 	}
-	if rr := request(http.MethodGet, "/v1/models/adapter-b/ready", ""); rr.Code != http.StatusForbidden {
-		t.Fatalf("sibling model readiness status = %d, want 403", rr.Code)
+	if rr := request(http.MethodGet, "/v1/models/adapter-b/ready", ""); rr.Code != http.StatusNotFound {
+		t.Fatalf("sibling model readiness status = %d, want 404", rr.Code)
 	}
-	if rr := request(http.MethodHead, "/v1/models/adapter-b", ""); rr.Code != http.StatusForbidden {
-		t.Fatalf("sibling HEAD metadata status = %d, want 403", rr.Code)
+	if rr := request(http.MethodHead, "/v1/models/adapter-b", ""); rr.Code != http.StatusNotFound {
+		t.Fatalf("sibling HEAD metadata status = %d, want 404", rr.Code)
 	}
-	if rr := request(http.MethodHead, "/v1/models/adapter-b/ready", ""); rr.Code != http.StatusForbidden {
-		t.Fatalf("sibling HEAD readiness status = %d, want 403", rr.Code)
+	if rr := request(http.MethodHead, "/v1/models/adapter-b/ready", ""); rr.Code != http.StatusNotFound {
+		t.Fatalf("sibling HEAD readiness status = %d, want 404", rr.Code)
+	}
+	for _, path := range []string{"/metrics", "/busy_threshold", "/docs", "/openapi.json", "/future-admin"} {
+		if rr := request(http.MethodGet, path, ""); rr.Code != http.StatusNotFound {
+			t.Fatalf("bound GET %s status = %d, want 404", path, rr.Code)
+		}
 	}
 	if rr := request(http.MethodGet, "/v1/models/adapter-a", ""); rr.Code != http.StatusOK {
 		t.Fatalf("bound model metadata status = %d, want 200", rr.Code)
 	}
-	if rr := request(http.MethodGet, "/v1/models/adapter-a/ready", ""); rr.Code != http.StatusForbidden {
-		t.Fatalf("ambiguous model readiness status = %d, want 403", rr.Code)
+	if rr := request(http.MethodGet, "/v1/models/adapter-a/ready", ""); rr.Code != http.StatusNotFound {
+		t.Fatalf("ambiguous model readiness status = %d, want 404", rr.Code)
 	}
 	if rr := request(http.MethodHead, "/v1/models/adapter-a", ""); rr.Code != http.StatusOK {
 		t.Fatalf("bound HEAD metadata status = %d, want 200", rr.Code)
