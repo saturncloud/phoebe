@@ -42,6 +42,32 @@ func TestAuthorizedModelDiscoveryPath(t *testing.T) {
 	}
 }
 
+func TestBoundReadOnlyRequestAllowed(t *testing.T) {
+	allow := "org/adapter"
+	for _, path := range []string{"/health", "/live", "/v1/models", "/v1/models/org/adapter"} {
+		if !boundReadOnlyRequestAllowed("GET", path, allow) {
+			t.Fatalf("GET %s must be allowed", path)
+		}
+	}
+	for _, path := range []string{
+		"/metrics", "/busy_threshold", "/docs", "/openapi.json", "/unknown",
+		"/v1/models/org/sibling", "/v1/models/org/adapter/ready",
+	} {
+		if boundReadOnlyRequestAllowed("GET", path, allow) {
+			t.Fatalf("GET %s must be blocked", path)
+		}
+		if boundReadOnlyRequestAllowed("HEAD", path, allow) {
+			t.Fatalf("HEAD %s must be blocked", path)
+		}
+	}
+	if !boundReadOnlyRequestAllowed("OPTIONS", "/v1/chat/completions", allow) {
+		t.Fatal("browser preflight must be allowed")
+	}
+	if !boundReadOnlyRequestAllowed("POST", "/v1/chat/completions", allow) {
+		t.Fatal("model-carrying methods are governed by body binding")
+	}
+}
+
 func TestCheckModelBinding(t *testing.T) {
 	cases := []struct {
 		name  string

@@ -8,8 +8,8 @@ import (
 )
 
 // requestMethodCarriesModel identifies requests that can ask Dynamo to route
-// to a served model. Read-only discovery and health requests have no model body
-// and must continue to work on a bound endpoint.
+// to a served model. Read-only methods and preflight have no model body; their
+// path surface is checked separately by boundReadOnlyRequestAllowed.
 func requestMethodCarriesModel(method string) bool {
 	switch method {
 	case "GET", "HEAD", "OPTIONS":
@@ -35,6 +35,26 @@ func authorizedModelDiscoveryPath(path, servedModelAllowList string) (discovery,
 		return true, true
 	}
 	return true, false
+}
+
+// boundReadOnlyRequestAllowed is the public read-only surface for a
+// deployment-scoped endpoint. Dynamo's frontend also exposes graph-wide admin,
+// metrics, documentation, and future extension routes; those must not become
+// customer APIs merely because the reverse proxy can reach them.
+func boundReadOnlyRequestAllowed(method, path, servedModelAllowList string) bool {
+	if method == "OPTIONS" {
+		return true // browser preflight carries no Dynamo response data
+	}
+	if method != "GET" && method != "HEAD" {
+		return true // model-carrying methods are checked by checkModelBinding
+	}
+	switch path {
+	case "/health", "/live", "/v1/models":
+		return true
+	default:
+		discovery, authorized := authorizedModelDiscoveryPath(path, servedModelAllowList)
+		return discovery && authorized
+	}
 }
 
 var errNotObject = errors.New("request body is not a JSON object")

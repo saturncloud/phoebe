@@ -330,13 +330,11 @@ func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request) {
 		case bindingOK:
 		}
 	}
-	if id.ServedModel != "" && !id.Gateway && (r.Method == http.MethodGet || r.Method == http.MethodHead) {
-		if discovery, authorized := authorizedModelDiscoveryPath(r.URL.Path, id.ServedModel); discovery && !authorized {
-			s.log.Warn.Printf("model-binding: refused request_id=%s resource_id=%s (model discovery not authorized for resource)",
-				requestID, id.ResourceID)
-			http.Error(w, "requested model is not authorized for this endpoint", http.StatusForbidden)
-			return
-		}
+	if id.ServedModel != "" && !id.Gateway && !boundReadOnlyRequestAllowed(r.Method, r.URL.Path, id.ServedModel) {
+		s.log.Warn.Printf("model-binding: refused request_id=%s resource_id=%s (read-only path not authorized for resource)",
+			requestID, id.ResourceID)
+		http.Error(w, "not found", http.StatusNotFound)
+		return
 	}
 
 	// SHARED REQUEST POLICY + DISTRIBUTED ADMISSION. Trusted Dynamo hints and
