@@ -78,6 +78,12 @@ func readAndRestoreBody(r *http.Request) ([]byte, error) {
 	return body, nil
 }
 
+func replaceRequestBody(r *http.Request, body []byte) {
+	r.Body = io.NopCloser(bytes.NewReader(body))
+	r.ContentLength = int64(len(body))
+	r.Header.Set("Content-Length", strconv.Itoa(len(body)))
+}
+
 func forceIncludeUsage(r *http.Request) error {
 	if r.Body == nil {
 		return nil

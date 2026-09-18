@@ -55,6 +55,12 @@ type Settings struct {
 	// crash.
 	Wake WakeSettings `yaml:"wake"`
 
+	// Admission configures distributed shared-tier admission. It is deliberately
+	// separate from Emit even though both normally use Valkey: metering may fall
+	// back to its WAL, while admission MUST fail closed when its authoritative
+	// distributed state is unavailable.
+	Admission AdmissionSettings `yaml:"admission"`
+
 	// --- Parsed settings (populated by parse) ---
 
 	ListenAddr  string        `yaml:"-"`
@@ -63,6 +69,59 @@ type Settings struct {
 	// configDir is the directory the settings file was loaded from; relative
 	// paths in the YAML are resolved against it.
 	configDir string
+}
+
+// AdmissionLimits is one independently-enforced scope budget. Zero means that
+// dimension is unlimited. Window applies to RequestsPerWindow, the three
+// token-throughput windows, and WakesPerWindow. Total prompt includes cached
+// and uncached prompt tokens; uncached prompt is the subset that required
+// prefill compute.
+type AdmissionLimits struct {
+	MaxActiveRequests             int64         `yaml:"maxActiveRequests"`
+	MaxConcurrentPrefills         int64         `yaml:"maxConcurrentPrefills"`
+	MaxActiveDecodes              int64         `yaml:"maxActiveDecodes"`
+	MaxPromptBytes                int64         `yaml:"maxPromptBytes"`
+	MaxReservedOutputTokens       int64         `yaml:"maxReservedOutputTokens"`
+	MaxActiveAdapters             int64         `yaml:"maxActiveAdapters"`
+	RequestsPerWindow             int64         `yaml:"requestsPerWindow"`
+	TotalPromptTokensPerWindow    int64         `yaml:"totalPromptTokensPerWindow"`
+	UncachedPromptTokensPerWindow int64         `yaml:"uncachedPromptTokensPerWindow"`
+	GeneratedTokensPerWindow      int64         `yaml:"generatedTokensPerWindow"`
+	MaxColdHolds                  int64         `yaml:"maxColdHolds"`
+	WakesPerWindow                int64         `yaml:"wakesPerWindow"`
+	WindowStr                     string        `yaml:"window"`
+	Window                        time.Duration `yaml:"-"`
+}
+
+// AdmissionTier gives an operator-defined service tier an isolated protected
+// lane. The lane is intentionally a hard partition: unused capacity is not
+// borrowed, so another tier can never consume a protected share. Weight is an
+// explicit capacity multiplier for the lane, not a claim of request-ordering
+// fairness inside Dynamo.
+type AdmissionTier struct {
+	Weight int64 `yaml:"weight"`
+	// DynamoPriority is the trusted soft priority propagated through Dynamo to
+	// engines that support per-request scheduling. Higher values are more
+	// important. DynamoStrictPriority is the unsigned router queue tier.
+	DynamoPriority       int64           `yaml:"dynamoPriority"`
+	DynamoStrictPriority int64           `yaml:"dynamoStrictPriority"`
+	Limits               AdmissionLimits `yaml:"limits"`
+}
+
+// AdmissionSettings is the YAML shape for Saturn-owned HTTP admission.
+type AdmissionSettings struct {
+	Enabled                bool                     `yaml:"enabled"`
+	ValkeyAddr             string                   `yaml:"valkeyAddr"`
+	KeyPrefix              string                   `yaml:"keyPrefix"`
+	LeaseTTLStr            string                   `yaml:"leaseTtl"`
+	LeaseTTL               time.Duration            `yaml:"-"`
+	DefaultMaxOutputTokens int64                    `yaml:"defaultMaxOutputTokens"`
+	Platform               AdmissionLimits          `yaml:"platform"`
+	Graph                  AdmissionLimits          `yaml:"graph"`
+	Organization           AdmissionLimits          `yaml:"organization"`
+	OrganizationModel      AdmissionLimits          `yaml:"organizationModel"`
+	Tiers                  map[string]AdmissionTier `yaml:"tiers"`
+	OrganizationTiers      map[string]string        `yaml:"organizationTiers"`
 }
 
 // EmitSettings is the YAML shape for the durable emitter. Mirrors emit.Config
@@ -247,6 +306,131 @@ func (s *Settings) parse() error {
 		if s.Wake.Timeout <= 0 {
 			return fmt.Errorf("wake.timeout %q must be positive", s.Wake.TimeoutStr)
 		}
+	}
+	if err := s.Admission.parse(); err != nil {
+		return err
+	}
+	return nil
+}
+
+func (a *AdmissionSettings) parse() error {
+	if !a.Enabled {
+		return nil
+	}
+	if a.ValkeyAddr == "" {
+		return fmt.Errorf("admission.enabled=true requires admission.valkeyAddr")
+	}
+	if a.KeyPrefix == "" {
+		a.KeyPrefix = "phoebe:admission"
+	}
+	if a.LeaseTTLStr == "" {
+		a.LeaseTTLStr = "15m"
+	}
+	var err error
+	if a.LeaseTTL, err = time.ParseDuration(a.LeaseTTLStr); err != nil || a.LeaseTTL <= 0 {
+		return fmt.Errorf("invalid admission.leaseTtl %q", a.LeaseTTLStr)
+	}
+	if a.DefaultMaxOutputTokens <= 0 {
+		a.DefaultMaxOutputTokens = 512
+	}
+	limits := []struct {
+		name  string
+		value *AdmissionLimits
+	}{
+		{"platform", &a.Platform}, {"graph", &a.Graph},
+		{"organization", &a.Organization}, {"organizationModel", &a.OrganizationModel},
+	}
+	for name, tier := range a.Tiers {
+		if tier.Weight <= 0 {
+			return fmt.Errorf("admission.tiers.%s.weight must be positive", name)
+		}
+		if tier.DynamoPriority < -(1<<31) || tier.DynamoPriority > 1<<31-1 {
+			return fmt.Errorf("admission.tiers.%s.dynamoPriority must fit in a signed 32-bit integer", name)
+		}
+		if tier.DynamoStrictPriority < 0 || tier.DynamoStrictPriority > 1<<32-1 {
+			return fmt.Errorf("admission.tiers.%s.dynamoStrictPriority must fit in an unsigned 32-bit integer", name)
+		}
+		if err := tier.Limits.parse("admission.tiers." + name); err != nil {
+			return err
+		}
+		a.Tiers[name] = tier
+	}
+	for _, item := range limits {
+		if err := item.value.parse("admission." + item.name); err != nil {
+			return err
+		}
+	}
+	if len(a.Tiers) > 0 {
+		if _, ok := a.Tiers["default"]; !ok {
+			return fmt.Errorf("admission.tiers requires a default tier for unmapped organizations")
+		}
+		if err := a.validateTierShares(); err != nil {
+			return err
+		}
+	}
+	for org, tier := range a.OrganizationTiers {
+		if _, ok := a.Tiers[tier]; !ok {
+			return fmt.Errorf("admission.organizationTiers.%s names unknown tier %q", org, tier)
+		}
+	}
+	return nil
+}
+
+func limitValues(l AdmissionLimits) []int64 {
+	return []int64{l.MaxActiveRequests, l.MaxConcurrentPrefills, l.MaxActiveDecodes, l.MaxPromptBytes,
+		l.MaxReservedOutputTokens, l.MaxActiveAdapters, l.RequestsPerWindow,
+		l.TotalPromptTokensPerWindow, l.UncachedPromptTokensPerWindow,
+		l.GeneratedTokensPerWindow, l.MaxColdHolds, l.WakesPerWindow}
+}
+
+func (a *AdmissionSettings) validateTierShares() error {
+	names := []string{"maxActiveRequests", "maxConcurrentPrefills", "maxActiveDecodes", "maxPromptBytes",
+		"maxReservedOutputTokens", "maxActiveAdapters", "requestsPerWindow",
+		"totalPromptTokensPerWindow", "uncachedPromptTokensPerWindow",
+		"generatedTokensPerWindow", "maxColdHolds", "wakesPerWindow"}
+	platform := limitValues(a.Platform)
+	sums := make([]int64, len(platform))
+	for tierName, tier := range a.Tiers {
+		for i, v := range limitValues(tier.Limits) {
+			if platform[i] > 0 && v == 0 {
+				return fmt.Errorf("admission.tiers.%s.%s must be set when the platform limit is set", tierName, names[i])
+			}
+			if v > 0 && tier.Weight > (1<<63-1)/v {
+				return fmt.Errorf("admission.tiers.%s.%s overflows after weight", tierName, names[i])
+			}
+			weighted := v * tier.Weight
+			if weighted > 0 && sums[i] > (1<<63-1)-weighted {
+				return fmt.Errorf("weighted admission tier shares for %s overflow", names[i])
+			}
+			sums[i] += weighted
+		}
+	}
+	for i, max := range platform {
+		if max > 0 && sums[i] > max {
+			return fmt.Errorf("weighted admission tier shares for %s total %d above platform limit %d", names[i], sums[i], max)
+		}
+	}
+	return nil
+}
+
+func (l *AdmissionLimits) parse(name string) error {
+	values := []int64{l.MaxActiveRequests, l.MaxConcurrentPrefills, l.MaxActiveDecodes, l.MaxPromptBytes, l.MaxReservedOutputTokens, l.MaxActiveAdapters,
+		l.RequestsPerWindow, l.TotalPromptTokensPerWindow, l.UncachedPromptTokensPerWindow,
+		l.GeneratedTokensPerWindow, l.MaxColdHolds, l.WakesPerWindow}
+	for _, value := range values {
+		if value < 0 {
+			return fmt.Errorf("%s limits cannot be negative", name)
+		}
+	}
+	if l.TotalPromptTokensPerWindow > 0 && l.UncachedPromptTokensPerWindow > l.TotalPromptTokensPerWindow {
+		return fmt.Errorf("%s.uncachedPromptTokensPerWindow cannot exceed totalPromptTokensPerWindow", name)
+	}
+	if l.WindowStr == "" {
+		l.WindowStr = "1m"
+	}
+	var err error
+	if l.Window, err = time.ParseDuration(l.WindowStr); err != nil || l.Window <= 0 {
+		return fmt.Errorf("invalid %s.window %q", name, l.WindowStr)
 	}
 	return nil
 }

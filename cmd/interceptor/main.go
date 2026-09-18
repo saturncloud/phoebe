@@ -12,6 +12,7 @@ import (
 	_ "github.com/jackc/pgx/v5/stdlib"
 	"github.com/redis/go-redis/v9"
 
+	"github.com/saturncloud/phoebe/internal/admission"
 	"github.com/saturncloud/phoebe/internal/config"
 	"github.com/saturncloud/phoebe/internal/emit"
 	"github.com/saturncloud/phoebe/internal/gateway"
@@ -44,6 +45,10 @@ func main() {
 	ioPolicy, ioSink, ioMaxBody, closeIOLog := buildIOLog(settings, log)
 
 	srv := proxy.NewWithIOLog(settings, log, emitter, ioPolicy, ioSink, ioMaxBody)
+	admitter, closeAdmission := buildAdmission(settings, log)
+	if admitter != nil {
+		srv = srv.WithAdmitter(admitter)
+	}
 	if gwResolver != nil {
 		srv = srv.WithGateway(gwResolver, settings.Gateway.Namespace, settings.Gateway.Port)
 	}
@@ -61,11 +66,28 @@ func main() {
 	closeIOLog()
 	closeEmitter()
 	closeGateway()
+	closeAdmission()
 
 	if srvErr != nil {
 		log.Error.Printf("server error: %v", srvErr)
 		os.Exit(1)
 	}
+}
+
+func buildAdmission(s *config.Settings, log *logging.Logger) (admission.Admitter, func()) {
+	if !s.Admission.Enabled {
+		return nil, func() {}
+	}
+	client := redis.NewClient(&redis.Options{Addr: s.Admission.ValkeyAddr})
+	// Startup reachability is checked, and every request operation still fails
+	// closed if state disappears later.
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if err := client.Ping(ctx).Err(); err != nil {
+		log.Error.Fatalf("admission: Valkey unavailable at %s: %v", s.Admission.ValkeyAddr, err)
+	}
+	log.Info.Printf("admission: enabled (valkey %s, lease ttl %s)", s.Admission.ValkeyAddr, s.Admission.LeaseTTL)
+	return admission.New(client, s.Admission), func() { _ = client.Close() }
 }
 
 // buildGateway constructs the TF gateway (org, model) resolver. DEFAULT: the
