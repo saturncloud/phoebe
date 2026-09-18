@@ -27,9 +27,10 @@ trusts the identity headers atlas-auth injects.
 - **Streaming correctness.** Forward-then-inspect SSE: streams each chunk to
   the client immediately, captures the trailing usage chunk, handles client
   aborts. See `internal/proxy`.
-- **Shared-tier admission.** Optional fail-closed Valkey reservations protect
-  platform, serving-graph, organization, and organization×model capacity across
-  every proxy replica. See `internal/admission` and
+- **Shared-tier admission.** Optional distributed Valkey reservations shape
+  platform, serving-graph, organization, and organization×model fairness across
+  every proxy replica. Store outages bypass only this soft gate; authorization
+  and independent usage metering remain enforced. See `internal/admission` and
   `docs/shared-tier-admission.md`.
 
 It is **topology-independent**: it behaves identically whether the upstream is
