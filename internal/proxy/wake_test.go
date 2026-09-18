@@ -115,6 +115,7 @@ type coldToWarmBackend struct {
 	warm      atomic.Bool
 	requests  atomic.Int32
 	successes atomic.Int32
+	warmBody  string
 }
 
 func (c *coldToWarmBackend) ServeHTTP(w http.ResponseWriter, _ *http.Request) {
@@ -122,7 +123,11 @@ func (c *coldToWarmBackend) ServeHTTP(w http.ResponseWriter, _ *http.Request) {
 	if c.warm.Load() {
 		c.successes.Add(1)
 		w.WriteHeader(200)
-		_, _ = w.Write([]byte(`{"served":true}`))
+		body := c.warmBody
+		if body == "" {
+			body = `{"served":true}`
+		}
+		_, _ = w.Write([]byte(body))
 		return
 	}
 	w.WriteHeader(404)

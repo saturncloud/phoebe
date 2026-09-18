@@ -11,8 +11,11 @@ import (
 	"testing"
 	"time"
 
+	"github.com/alicebob/miniredis/v2"
+	"github.com/redis/go-redis/v9"
 	k8sfake "k8s.io/client-go/kubernetes/fake"
 
+	"github.com/saturncloud/phoebe/internal/admission"
 	"github.com/saturncloud/phoebe/internal/config"
 	"github.com/saturncloud/phoebe/internal/gateway"
 	"github.com/saturncloud/phoebe/internal/identity"
@@ -453,7 +456,7 @@ func TestGateway_UpstreamHostShape(t *testing.T) {
 // populated by resolveGateway) — so a cold (scaled-to-zero) upstream triggers
 // the waker and the request is served after warm-up rather than 404ing.
 func TestGateway_WakeEligible(t *testing.T) {
-	backend := &coldToWarmBackend{}
+	backend := &coldToWarmBackend{warmBody: `{"model":"sleepy-bot","usage":{"prompt_tokens":7,"completion_tokens":3,"total_tokens":10,"prompt_tokens_details":{"cached_tokens":2}}}`}
 	be := httptest.NewServer(backend)
 	defer be.Close()
 	beURL, _ := url.Parse(be.URL)
@@ -468,10 +471,18 @@ func TestGateway_WakeEligible(t *testing.T) {
 	}}
 	waker := &fakeWaker{warmsAt: 1, backend: backend}
 	em := &recordingEmitter{}
-	srv := newGatewayTestServer(t, em, resolver, beURL).WithWaker(waker, 5*time.Second, 3)
+	mr := miniredis.RunT(t)
+	cfg := proxyAdmissionConfig(1)
+	cfg.Platform.MaxColdHolds = 1
+	client := redis.NewClient(&redis.Options{Addr: mr.Addr()})
+	t.Cleanup(func() { _ = client.Close() })
+	a := admission.New(client, cfg)
+	srv := newGatewayTestServer(t, em, resolver, beURL)
+	srv.settings.Admission = cfg
+	srv.WithAdmitter(a).WithWaker(waker, 5*time.Second, 3)
 
 	rr := httptest.NewRecorder()
-	srv.Handler().ServeHTTP(rr, gatewayRequest("org-1", `{"model":"sleepy-bot"}`))
+	srv.Handler().ServeHTTP(rr, gatewayRequest("org-1", `{"model":"sleepy-bot","max_tokens":20}`))
 
 	if rr.Code != http.StatusOK {
 		t.Fatalf("status = %d, want 200 after wake (body %q)", rr.Code, rr.Body.String())
@@ -479,9 +490,37 @@ func TestGateway_WakeEligible(t *testing.T) {
 	if got := atomic.LoadInt32(&waker.calls); got != 1 {
 		t.Fatalf("waker called %d times, want 1 (gateway route must be wakeable)", got)
 	}
+	if backend.requests.Load() != 2 || backend.successes.Load() != 1 {
+		t.Fatalf("backend requests=%d successes=%d, want one cold plus one successful inference", backend.requests.Load(), backend.successes.Load())
+	}
+	events := em.waitForEvents(1, time.Second)
+	if len(events) != 1 || events[0].PromptTokens != 7 || events[0].CachedTokens != 2 || events[0].CompletionTokens != 3 {
+		t.Fatalf("metering events=%+v, want exactly one authoritative 7/2/3 event", events)
+	}
 	// The RESOLVED graph name is threaded onto the wake target verbatim —
 	// never re-derived from the upstream host the gateway composed from it.
 	if tgt := waker.last(); tgt.GraphK8sName != "graph-llama31" || tgt.ResourceID != "tfm-cold-1" {
 		t.Fatalf("wake target = %+v, want the resolved graph/resource", tgt)
+	}
+
+	// With active, prefill, and decode each capped at one, admitting another
+	// request at the same graph/org/model scopes proves the completed inference
+	// released all three reservations. Beginning a cold hold on that lease
+	// separately proves the wake path released its one allowed cold hold as well.
+	next, err := a.Admit(context.Background(), admission.Request{
+		Graph: "graph-llama31", Organization: "org-1", Model: "sleepy-bot",
+		PromptBytes: 1, EstimatedInputTokens: 1, ReservedOutputTokens: 1,
+	})
+	if err != nil {
+		t.Fatalf("cold-to-warm request did not release admission reservations: %v", err)
+	}
+	if err := next.BeginColdHold(context.Background()); err != nil {
+		t.Fatalf("cold-to-warm request did not release its cold hold: %v", err)
+	}
+	if err := next.EndColdHold(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if err := next.Complete(context.Background(), 0); err != nil {
+		t.Fatal(err)
 	}
 }
