@@ -38,9 +38,7 @@ func captureRequestBody(r *http.Request, maxBodyBytes int) (body string, truncat
 	}
 	// Restore the FULL body so forceIncludeUsage (and the upstream) read every
 	// byte — the cap only bounds the LOG copy, never the forwarded request.
-	r.Body = io.NopCloser(bytes.NewReader(raw))
-	r.ContentLength = int64(len(raw))
-	r.Header.Set("Content-Length", strconv.Itoa(len(raw)))
+	replaceRequestBody(r, raw)
 
 	logCopy, truncated := truncateAtRuneBoundary(raw, maxBodyBytes)
 	return string(logCopy), truncated, len(raw), nil
@@ -73,8 +71,7 @@ func readAndRestoreBody(r *http.Request) ([]byte, error) {
 	if err != nil {
 		return nil, err
 	}
-	r.Body = io.NopCloser(bytes.NewReader(body))
-	r.ContentLength = int64(len(body))
+	replaceRequestBody(r, body)
 	return body, nil
 }
 
@@ -82,6 +79,9 @@ func replaceRequestBody(r *http.Request, body []byte) {
 	r.Body = io.NopCloser(bytes.NewReader(body))
 	r.ContentLength = int64(len(body))
 	r.Header.Set("Content-Length", strconv.Itoa(len(body)))
+	r.GetBody = func() (io.ReadCloser, error) {
+		return io.NopCloser(bytes.NewReader(body)), nil
+	}
 }
 
 func forceIncludeUsage(r *http.Request) error {
@@ -100,16 +100,11 @@ func forceIncludeUsage(r *http.Request) error {
 
 	rewritten, changed := rewriteIncludeUsage(body)
 	if !changed {
-		// Restore the original body unchanged.
-		r.Body = io.NopCloser(bytes.NewReader(body))
-		r.ContentLength = int64(len(body))
-		r.Header.Set("Content-Length", strconv.Itoa(len(body)))
+		replaceRequestBody(r, body)
 		return nil
 	}
 
-	r.Body = io.NopCloser(bytes.NewReader(rewritten))
-	r.ContentLength = int64(len(rewritten))
-	r.Header.Set("Content-Length", strconv.Itoa(len(rewritten)))
+	replaceRequestBody(r, rewritten)
 	return nil
 }
 

@@ -72,6 +72,65 @@ func gatewayRequest(org, body string) *http.Request {
 	return req
 }
 
+func gatewayRequestBodyOfSize(t *testing.T, org string, size int) *http.Request {
+	t.Helper()
+	prefix := `{"model":"model-a","max_tokens":20,"padding":"`
+	suffix := `"}`
+	if size < len(prefix)+len(suffix) {
+		t.Fatalf("body size %d too small", size)
+	}
+	return gatewayRequest(org, prefix+strings.Repeat("x", size-len(prefix)-len(suffix))+suffix)
+}
+
+func TestGatewayRequestBodyBoundedBeforeResolution(t *testing.T) {
+	const limit = 128
+	var upstreamHits int
+	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		upstreamHits++
+		_, _ = w.Write([]byte(`{"model":"model-a","usage":{"prompt_tokens":1,"completion_tokens":1}}`))
+	}))
+	defer backend.Close()
+	up, _ := url.Parse(backend.URL)
+	resolver := &mapResolver{m: map[[2]string]gateway.Resolution{
+		{"org-1", "model-a"}: {
+			ResourceID: "resource-a", BaseModel: "model-a", ServingMode: "shared",
+			GraphK8sName: "graph-a",
+		},
+	}}
+	s := newGatewayTestServer(t, &recordingEmitter{}, resolver, up)
+	s.settings.Admission.Platform.MaxPromptBytes = limit
+
+	rr := httptest.NewRecorder()
+	s.Handler().ServeHTTP(rr, gatewayRequestBodyOfSize(t, "org-1", limit))
+	if rr.Code != http.StatusOK || atomic.LoadInt32(&resolver.calls) != 1 || upstreamHits != 1 {
+		t.Fatalf("exact limit status=%d resolver=%d upstream=%d", rr.Code, resolver.calls, upstreamHits)
+	}
+
+	for _, tc := range []struct {
+		name    string
+		chunked bool
+	}{
+		{name: "known content length plus one"},
+		{name: "chunked plus one", chunked: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			req := gatewayRequestBodyOfSize(t, "org-1", limit+1)
+			if tc.chunked {
+				req.ContentLength = -1
+				req.Header.Del("Content-Length")
+			}
+			rr := httptest.NewRecorder()
+			s.Handler().ServeHTTP(rr, req)
+			if rr.Code != http.StatusRequestEntityTooLarge {
+				t.Fatalf("status=%d, want 413", rr.Code)
+			}
+			if got := atomic.LoadInt32(&resolver.calls); got != 1 || upstreamHits != 1 {
+				t.Fatalf("oversized gateway reached resolver=%d or upstream=%d", got, upstreamHits)
+			}
+		})
+	}
+}
+
 // usageBackend returns an httptest server answering like a vLLM engine (model
 // name + usage block), so the full metering path runs.
 func usageBackend(t *testing.T) (*httptest.Server, *url.URL) {

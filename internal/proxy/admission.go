@@ -20,6 +20,78 @@ type admissionEstimate struct {
 	OutputTokens int64
 }
 
+const defaultSharedRequestBodyLimit int64 = 64 << 20
+
+func admissionTierForIdentity(settings config.AdmissionSettings, id identity.Identity) config.AdmissionTier {
+	tierName := id.ServiceTier
+	if tierName == "" {
+		tierName = "default"
+	}
+	tier, ok := settings.Tiers[tierName]
+	if !ok {
+		tier = settings.Tiers["default"]
+	}
+	if mapped, ok := settings.OrganizationTiers[id.OrgID]; ok {
+		tier = settings.Tiers[mapped]
+	}
+	return tier
+}
+
+// sharedRequestBodyLimit returns the tightest individual body size that could
+// possibly fit every applicable aggregate prompt-byte scope. Even when every
+// scope is configured as unlimited, retain a process-safety ceiling so an
+// authenticated request cannot force an unbounded io.ReadAll allocation.
+func sharedRequestBodyLimit(settings config.AdmissionSettings, tier config.AdmissionTier) int64 {
+	limit := int64(0)
+	add := func(candidate int64) {
+		if candidate > 0 && (limit == 0 || candidate < limit) {
+			limit = candidate
+		}
+	}
+	add(settings.Platform.MaxPromptBytes)
+	add(settings.Graph.MaxPromptBytes)
+	add(settings.Organization.MaxPromptBytes)
+	add(settings.OrganizationModel.MaxPromptBytes)
+	tierBytes := tier.Limits.MaxPromptBytes
+	if tierBytes > 0 {
+		weight := tier.Weight
+		if weight < 1 {
+			weight = 1
+		}
+		if tierBytes <= math.MaxInt64/weight {
+			tierBytes *= weight
+		}
+		add(tierBytes)
+	}
+	if limit == 0 {
+		return defaultSharedRequestBodyLimit
+	}
+	return limit
+}
+
+func boundSharedRequestBody(w http.ResponseWriter, r *http.Request, limit int64) bool {
+	if limit <= 0 {
+		limit = defaultSharedRequestBodyLimit
+	}
+	if r.ContentLength > limit {
+		http.Error(w, "shared inference request body too large", http.StatusRequestEntityTooLarge)
+		return false
+	}
+	if r.Body != nil {
+		r.Body = http.MaxBytesReader(w, r.Body, limit)
+	}
+	return true
+}
+
+func writeRequestBodyError(w http.ResponseWriter, err error) {
+	var tooLarge *http.MaxBytesError
+	if errors.As(err, &tooLarge) {
+		http.Error(w, "shared inference request body too large", http.StatusRequestEntityTooLarge)
+		return
+	}
+	http.Error(w, "bad request body", http.StatusBadRequest)
+}
+
 // admissionWork returns the exact routed model and cheap, conservative token
 // reservations. The input estimate follows the common bytes/4 approximation;
 // Dynamo remains authoritative and Phoebe reconciles its actual cache-aware

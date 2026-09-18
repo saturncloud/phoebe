@@ -2,6 +2,7 @@ package proxy
 
 import (
 	"context"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -31,11 +32,20 @@ func TestIsColdWakeable(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			b := newBufferingResponseWriter()
-			b.WriteHeader(tc.status)
-			_, _ = b.Write([]byte(tc.body))
-			if b.isColdWakeable() != tc.want {
-				t.Fatalf("isColdWakeable(status=%d)=%v want %v", tc.status, b.isColdWakeable(), tc.want)
+			resp := &http.Response{
+				StatusCode: tc.status,
+				Body:       io.NopCloser(strings.NewReader(tc.body)),
+			}
+			got, err := isColdResponse(resp)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if got != tc.want {
+				t.Fatalf("isColdResponse(status=%d)=%v want %v", tc.status, got, tc.want)
+			}
+			preserved, err := io.ReadAll(resp.Body)
+			if err != nil || string(preserved) != tc.body {
+				t.Fatalf("response body not preserved: %q, %v", preserved, err)
 			}
 		})
 	}
@@ -101,10 +111,16 @@ func (f *fakeWaker) last() WakeTarget {
 }
 
 // coldToWarmBackend serves cold (404) until warm is set, then 200.
-type coldToWarmBackend struct{ warm atomic.Bool }
+type coldToWarmBackend struct {
+	warm      atomic.Bool
+	requests  atomic.Int32
+	successes atomic.Int32
+}
 
 func (c *coldToWarmBackend) ServeHTTP(w http.ResponseWriter, _ *http.Request) {
+	c.requests.Add(1)
 	if c.warm.Load() {
+		c.successes.Add(1)
 		w.WriteHeader(200)
 		_, _ = w.Write([]byte(`{"served":true}`))
 		return
@@ -131,7 +147,7 @@ func testServerWithWaker(waker Waker) *Server {
 	return s.WithWaker(waker, 5*time.Second, 3)
 }
 
-func TestServeWithWake_ColdThenWarm(t *testing.T) {
+func TestWakeRoundTripper_ColdThenWarmExecutesOneSuccessfulInference(t *testing.T) {
 	backend := &coldToWarmBackend{}
 	be := httptest.NewServer(backend)
 	defer be.Close()
@@ -141,21 +157,52 @@ func TestServeWithWake_ColdThenWarm(t *testing.T) {
 	s := testServerWithWaker(waker)
 
 	req := httptest.NewRequest("POST", "http://x/v1/chat/completions", strings.NewReader(`{"model":"m"}`))
+	replaceRequestBody(req, []byte(`{"model":"m"}`))
 	id := identity.Identity{ResourceID: "r1", ServedModel: "m"}
-	rec := httptest.NewRecorder()
-
-	served := s.serveWithWake(rec, req, up, id, "req-1", nil)
-	// Cold-then-warm: serveWithWake wakes, sees warm on re-probe, returns false
-	// (caller does the real forward). Waker called exactly once.
-	if served {
-		t.Fatalf("expected served=false (warm -> caller forwards), got true")
+	req.URL = up
+	resp, err := s.newWakeRoundTripper(up.Host, "req-1", id, nil).RoundTrip(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status=%d, want 200", resp.StatusCode)
 	}
 	if got := atomic.LoadInt32(&waker.calls); got != 1 {
 		t.Fatalf("waker called %d times, want 1", got)
 	}
+	if backend.requests.Load() != 2 || backend.successes.Load() != 1 {
+		t.Fatalf("backend requests=%d successes=%d, want one cold + one successful inference", backend.requests.Load(), backend.successes.Load())
+	}
 }
 
-func TestServeWithWake_WakeErrorReturnsCold(t *testing.T) {
+func TestWakeRoundTripper_WarmRequestExecutesExactlyOnce(t *testing.T) {
+	backend := &coldToWarmBackend{}
+	backend.warm.Store(true)
+	be := httptest.NewServer(backend)
+	defer be.Close()
+	up, _ := url.Parse(be.URL)
+	waker := &fakeWaker{}
+	s := testServerWithWaker(waker)
+	req := httptest.NewRequest("POST", up.String(), strings.NewReader(`{"model":"m"}`))
+	replaceRequestBody(req, []byte(`{"model":"m"}`))
+	id := identity.Identity{ResourceID: "r1", ServedModel: "m"}
+
+	resp, err := s.newWakeRoundTripper(up.Host, "req-1", id, nil).RoundTrip(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, _ = io.Copy(io.Discard, resp.Body)
+	_ = resp.Body.Close()
+	if backend.requests.Load() != 1 || backend.successes.Load() != 1 {
+		t.Fatalf("backend requests=%d successes=%d, want exactly one inference", backend.requests.Load(), backend.successes.Load())
+	}
+	if waker.calls != 0 {
+		t.Fatalf("waker called %d times for warm request", waker.calls)
+	}
+}
+
+func TestWakeRoundTripper_WakeErrorReturnsCold(t *testing.T) {
 	backend := &coldToWarmBackend{} // stays cold
 	be := httptest.NewServer(backend)
 	defer be.Close()
@@ -165,14 +212,15 @@ func TestServeWithWake_WakeErrorReturnsCold(t *testing.T) {
 	s := testServerWithWaker(waker)
 
 	req := httptest.NewRequest("POST", "http://x/v1/chat/completions", strings.NewReader(`{"model":"m"}`))
+	replaceRequestBody(req, []byte(`{"model":"m"}`))
 	id := identity.Identity{ResourceID: "r1", ServedModel: "m"}
-	rec := httptest.NewRecorder()
-
-	served := s.serveWithWake(rec, req, up, id, "req-1", nil)
-	if !served {
-		t.Fatal("wake error should serve the cold response (served=true)")
+	req.URL = up
+	resp, err := s.newWakeRoundTripper(up.Host, "req-1", id, nil).RoundTrip(req)
+	if err != nil {
+		t.Fatal(err)
 	}
-	if rec.Code != 404 {
-		t.Fatalf("expected the cold 404 flushed to client, got %d", rec.Code)
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusNotFound {
+		t.Fatalf("expected cold 404, got %d", resp.StatusCode)
 	}
 }

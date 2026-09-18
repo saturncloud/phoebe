@@ -107,7 +107,7 @@ func (s *Server) resolveGateway(w http.ResponseWriter, r *http.Request, id *iden
 	body, err := readAndRestoreBody(r)
 	if err != nil {
 		s.log.Error.Printf("gateway: read request body: %v (request_id=%q)", err, requestID)
-		http.Error(w, "bad request body", http.StatusBadRequest)
+		writeRequestBodyError(w, err)
 		return false
 	}
 	model, ok := extractRequestModel(body)

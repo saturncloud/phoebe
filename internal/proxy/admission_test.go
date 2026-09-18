@@ -38,6 +38,84 @@ func sharedRequest(upstream *url.URL) *http.Request {
 	return r
 }
 
+type countingAdmitter struct{ calls int }
+
+func (a *countingAdmitter) Admit(context.Context, admission.Request) (*admission.Lease, error) {
+	a.calls++
+	return nil, nil
+}
+
+func sharedRequestBodyOfSize(t *testing.T, upstream *url.URL, size int) *http.Request {
+	t.Helper()
+	prefix := `{"model":"model-a","max_tokens":20,"padding":"`
+	suffix := `"}`
+	if size < len(prefix)+len(suffix) {
+		t.Fatalf("body size %d too small", size)
+	}
+	body := prefix + strings.Repeat("x", size-len(prefix)-len(suffix)) + suffix
+	req := sharedRequest(upstream)
+	replaceRequestBody(req, []byte(body))
+	return req
+}
+
+func TestSharedRequestBodyBoundariesBeforeAdmission(t *testing.T) {
+	const limit = 128
+	var upstreamHits int
+	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		upstreamHits++
+		_, _ = w.Write([]byte(`{"model":"model-a","usage":{"prompt_tokens":1,"completion_tokens":1}}`))
+	}))
+	defer backend.Close()
+	up, _ := url.Parse(backend.URL)
+
+	newServer := func(a *countingAdmitter) *Server {
+		cfg := proxyAdmissionConfig(2)
+		cfg.Platform.MaxPromptBytes = limit
+		return New(&config.Settings{Admission: cfg}, logging.New(logging.ERROR), &recordingEmitter{}).
+			WithAdmitter(a)
+	}
+
+	t.Run("exact limit reaches admission and upstream", func(t *testing.T) {
+		a := &countingAdmitter{}
+		rr := httptest.NewRecorder()
+		newServer(a).Handler().ServeHTTP(rr, sharedRequestBodyOfSize(t, up, limit))
+		if rr.Code != http.StatusOK || a.calls != 1 || upstreamHits != 1 {
+			t.Fatalf("status=%d admission=%d upstream=%d", rr.Code, a.calls, upstreamHits)
+		}
+	})
+
+	for _, tc := range []struct {
+		name    string
+		chunked bool
+	}{
+		{name: "known content length plus one"},
+		{name: "chunked plus one", chunked: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			a := &countingAdmitter{}
+			req := sharedRequestBodyOfSize(t, up, limit+1)
+			if tc.chunked {
+				req.ContentLength = -1
+				req.Header.Del("Content-Length")
+			}
+			rr := httptest.NewRecorder()
+			newServer(a).Handler().ServeHTTP(rr, req)
+			if rr.Code != http.StatusRequestEntityTooLarge {
+				t.Fatalf("status=%d, want 413", rr.Code)
+			}
+			if a.calls != 0 || upstreamHits != 1 {
+				t.Fatalf("oversized request reached admission=%d or upstream total=%d", a.calls, upstreamHits)
+			}
+		})
+	}
+}
+
+func TestSharedRequestBodyLimitUsesSafeUnlimitedFallback(t *testing.T) {
+	if got := sharedRequestBodyLimit(config.AdmissionSettings{}, config.AdmissionTier{}); got != defaultSharedRequestBodyLimit {
+		t.Fatalf("unlimited fallback=%d, want %d", got, defaultSharedRequestBodyLimit)
+	}
+}
+
 func TestAdmissionAcrossProxyReplicasAndLifecycleRelease(t *testing.T) {
 	release := make(chan struct{})
 	hit := make(chan struct{}, 1)
@@ -106,6 +184,44 @@ func TestAdmissionStateFailureBypassesGate(t *testing.T) {
 	if len(events) != 1 || events[0].PromptTokens != 7 || events[0].CachedTokens != 2 || events[0].CompletionTokens != 3 {
 		t.Fatalf("fail-open request was not independently metered: %+v", events)
 	}
+}
+
+func TestWakeEnabledWarmRequestExecutesMetersAndSettlesOnce(t *testing.T) {
+	var hits int
+	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		hits++
+		_, _ = w.Write([]byte(`{"model":"model-a","usage":{"prompt_tokens":7,"completion_tokens":3,"prompt_tokens_details":{"cached_tokens":2}}}`))
+	}))
+	defer backend.Close()
+	up, _ := url.Parse(backend.URL)
+	mr := miniredis.RunT(t)
+	cfg := proxyAdmissionConfig(1)
+	client := redis.NewClient(&redis.Options{Addr: mr.Addr()})
+	t.Cleanup(func() { _ = client.Close() })
+	a := admission.New(client, cfg)
+	em := &recordingEmitter{}
+	waker := &fakeWaker{}
+	s := New(&config.Settings{Admission: cfg}, logging.New(logging.ERROR), em).
+		WithAdmitter(a).
+		WithWaker(waker, time.Second, 3)
+
+	rr := httptest.NewRecorder()
+	s.Handler().ServeHTTP(rr, sharedRequest(up))
+	if rr.Code != http.StatusOK || hits != 1 || waker.calls != 0 {
+		t.Fatalf("status=%d backend hits=%d wake calls=%d", rr.Code, hits, waker.calls)
+	}
+	events := em.waitForEvents(1, time.Second)
+	if len(events) != 1 || events[0].PromptTokens != 7 || events[0].CompletionTokens != 3 {
+		t.Fatalf("metering events=%+v, want exactly one authoritative event", events)
+	}
+	lease, err := a.Admit(context.Background(), admission.Request{
+		Graph: "graph-a", Organization: "org-b", Model: "model-a",
+		PromptBytes: 1, EstimatedInputTokens: 1, ReservedOutputTokens: 1,
+	})
+	if err != nil {
+		t.Fatalf("warm request did not settle its admission lease: %v", err)
+	}
+	_ = lease.Complete(context.Background(), 0)
 }
 
 func TestAdmissionImpossibleOutputRejectedBeforeUpstream(t *testing.T) {

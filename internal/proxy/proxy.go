@@ -193,6 +193,21 @@ func (s *Server) handleHealth(w http.ResponseWriter, _ *http.Request) {
 // onDone fires exactly once regardless of whether EOF or Close reaches it first.
 func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request) {
 	id := identity.FromRequest(r)
+	var sharedTier config.AdmissionTier
+	bodyBound := false
+
+	// Gateway resolution must inspect model=, so apply the shared-tier body
+	// ceiling before that first read. The gateway ForwardAuth has already
+	// stamped the trusted organization and service tier. Preserve the existing
+	// fail-closed gateway-not-configured/missing-org responses without reading
+	// a body in those cases.
+	if id.Gateway && s.gateway != nil && id.OrgID != "" {
+		sharedTier = admissionTierForIdentity(s.settings.Admission, id)
+		if !boundSharedRequestBody(w, r, sharedRequestBodyLimit(s.settings.Admission, sharedTier)) {
+			return
+		}
+		bodyBound = true
+	}
 
 	// GATEWAY RESOLUTION (TF single-host gateway): a request the trusted
 	// middleware marked X-Saturn-Gateway carries NO per-resource routing
@@ -256,6 +271,15 @@ func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	if id.ServingMode == "shared" {
+		if !bodyBound {
+			sharedTier = admissionTierForIdentity(s.settings.Admission, id)
+			if !boundSharedRequestBody(w, r, sharedRequestBodyLimit(s.settings.Admission, sharedTier)) {
+				return
+			}
+		}
+	}
+
 	// M5 I/O-logging gate — computed ONCE. Everything that adds hot-path cost
 	// (capturing the request body, buffering the response) is guarded by this
 	// single boolean. When false (the default, and the common case), the proxy
@@ -281,7 +305,7 @@ func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request) {
 		reqBody, reqTruncated, reqOrigLen, err = captureRequestBody(r, s.ioMaxBodyLen)
 		if err != nil {
 			s.log.Error.Printf("capture request body: %v", err)
-			http.Error(w, "bad request body", http.StatusBadRequest)
+			writeRequestBodyError(w, err)
 			return
 		}
 		// Hard truncation is intentional (an uncapped body fails the to_tsvector
@@ -314,7 +338,7 @@ func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request) {
 		body, rerr := readAndRestoreBody(r)
 		if rerr != nil {
 			s.log.Error.Printf("model-binding: read request body: %v", rerr)
-			http.Error(w, "bad request body", http.StatusBadRequest)
+			writeRequestBodyError(w, rerr)
 			return
 		}
 		switch checkModelBinding(body, id.ServedModel) {
@@ -346,7 +370,7 @@ func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request) {
 		}
 		body, rerr := readAndRestoreBody(r)
 		if rerr != nil {
-			http.Error(w, "bad request body", http.StatusBadRequest)
+			writeRequestBodyError(w, rerr)
 			return
 		}
 		defaultOutput := s.settings.Admission.DefaultMaxOutputTokens
@@ -358,18 +382,7 @@ func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request) {
 			http.Error(w, "invalid shared inference request", http.StatusBadRequest)
 			return
 		}
-		tierName := id.ServiceTier
-		if tierName == "" {
-			tierName = "default"
-		}
-		tier, ok := s.settings.Admission.Tiers[tierName]
-		if !ok {
-			tier = s.settings.Admission.Tiers["default"]
-		}
-		if tierName, mapped := s.settings.Admission.OrganizationTiers[id.OrgID]; mapped {
-			tier = s.settings.Admission.Tiers[tierName]
-		}
-		body, tenant, rerr := prepareSharedDynamoRequest(body, id.OrgID, estimate.OutputTokens, tier)
+		body, tenant, rerr := prepareSharedDynamoRequest(body, id.OrgID, estimate.OutputTokens, sharedTier)
 		if rerr != nil {
 			http.Error(w, "invalid shared inference request", http.StatusBadRequest)
 			return
@@ -378,8 +391,8 @@ func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request) {
 		// Replace a client-supplied tenant header. Dynamo gives this header
 		// precedence over every body salt, so it must come from trusted identity.
 		r.Header.Set("X-Tenant-ID", tenant)
-		r.Header.Set("X-Dynamo-Request-Priority", strconv.FormatInt(tier.DynamoPriority, 10))
-		r.Header.Set("X-Dynamo-Request-Strict-Priority", strconv.FormatInt(tier.DynamoStrictPriority, 10))
+		r.Header.Set("X-Dynamo-Request-Priority", strconv.FormatInt(sharedTier.DynamoPriority, 10))
+		r.Header.Set("X-Dynamo-Request-Strict-Priority", strconv.FormatInt(sharedTier.DynamoStrictPriority, 10))
 		for _, header := range []string{
 			"X-Dynamo-Worker-Instance-ID", "X-Dynamo-Prefill-Instance-ID",
 			"X-Dynamo-DP-Rank", "X-Dynamo-Prefill-DP-Rank",
@@ -429,29 +442,14 @@ func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request) {
 	// Force streaming usage so we never under-bill a streamed response.
 	if err := forceIncludeUsage(r); err != nil {
 		s.log.Error.Printf("rewrite request body: %v", err)
-		http.Error(w, "bad request body", http.StatusBadRequest)
+		writeRequestBodyError(w, err)
 		return
 	}
 
-	// WAKE-FROM-ZERO (shared serverless mode, the 0->1 leg). On a wakeable route
-	// (shared + authorized resource id) with a waker configured, probe the
-	// upstream; if it returns a COLD response (scaled-to-zero base), trigger a
-	// 0->1 wake and retry rather than serving the client a 404/503. The probe
-	// buffers the response (a cold response is a tiny JSON error), so nothing
-	// cold reaches the client; the request is replayed (body restored) after the
-	// wake. Once a NON-cold response arrives (or tries are exhausted), we fall
-	// through to the normal streaming forward below, which serves + meters it.
-	// Non-wakeable routes skip this entirely — zero overhead.
-	if s.wakeEnabled(id) {
-		if served := s.serveWithWake(w, r, upstream, id, requestID, admitted); served {
-			return
-		}
-		// Not served here means: the base is now warm (or wake was a no-op) —
-		// fall through to the normal metered streaming forward. The request body
-		// was restored by serveWithWake for the final attempt.
-	}
-
 	rp := httputil.NewSingleHostReverseProxy(upstream)
+	if s.wakeEnabled(id) {
+		rp.Transport = s.newWakeRoundTripper(upstream.Host, requestID, id, admitted)
+	}
 
 	// FlushInterval=-1 flushes every write immediately — per-chunk SSE
 	// delivery with no buffering. This is the streaming-correctness linchpin.
@@ -590,6 +588,11 @@ func (s *Server) errorHandler(upstream string, id identity.Identity, requestID s
 			// to billing. Best-effort, non-blocking — like onDone's emit.
 			ctx := context.WithoutCancel(r.Context())
 			s.emit(ctx, id, requestID, capture.Result{Aborted: true, UsageFound: false})
+			return
+		}
+		var admissionErr *admissionRoundTripError
+		if errors.As(err, &admissionErr) {
+			s.writeAdmissionError(w, admissionErr.err)
 			return
 		}
 		s.log.Error.Printf("upstream %s error: %v", upstream, err)
