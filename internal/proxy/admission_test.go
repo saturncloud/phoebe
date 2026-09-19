@@ -715,10 +715,61 @@ func TestDedicatedTrafficBypassesSharedAdmission(t *testing.T) {
 	s := New(&config.Settings{Admission: cfg}, logging.New(logging.ERROR), &recordingEmitter{}).WithAdmitter(admission.New(client, cfg))
 	req := sharedRequest(up)
 	req.Header.Set(identity.HeaderServingMode, "dedicated")
+	req.Header.Del(identity.HeaderServedModel)
 	rr := httptest.NewRecorder()
 	s.Handler().ServeHTTP(rr, req)
 	if rr.Code != http.StatusOK {
 		t.Fatalf("dedicated status=%d, want 200", rr.Code)
+	}
+}
+
+func TestPerResourceServingIdentityFailsClosedWhenInconsistent(t *testing.T) {
+	var upstreamHits int
+	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		upstreamHits++
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer backend.Close()
+	up, _ := url.Parse(backend.URL)
+
+	tests := []struct {
+		name        string
+		servingMode string
+		servedModel string
+	}{
+		{name: "model with absent mode", servedModel: "model-a"},
+		{name: "model with dedicated mode", servingMode: "dedicated", servedModel: "model-a"},
+		{name: "model with unknown mode", servingMode: "shraed", servedModel: "model-a"},
+		{name: "shared mode without model", servingMode: "shared"},
+		{name: "unknown mode without model", servingMode: "shraed"},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			a := &countingAdmitter{}
+			s := New(&config.Settings{}, logging.New(logging.ERROR), &recordingEmitter{}).WithAdmitter(a)
+			req := sharedRequest(up)
+			if tc.servingMode == "" {
+				req.Header.Del(identity.HeaderServingMode)
+			} else {
+				req.Header.Set(identity.HeaderServingMode, tc.servingMode)
+			}
+			if tc.servedModel == "" {
+				req.Header.Del(identity.HeaderServedModel)
+			} else {
+				req.Header.Set(identity.HeaderServedModel, tc.servedModel)
+			}
+			rr := httptest.NewRecorder()
+			s.Handler().ServeHTTP(rr, req)
+			if rr.Code != http.StatusServiceUnavailable {
+				t.Fatalf("status=%d, want 503", rr.Code)
+			}
+			if a.calls != 0 {
+				t.Fatalf("admission calls=%d, want 0", a.calls)
+			}
+			if upstreamHits != 0 {
+				t.Fatalf("upstream hits=%d, want 0", upstreamHits)
+			}
+		})
 	}
 }
 

@@ -139,6 +139,10 @@ gateway-marked requests. The historical per-resource auth path does not stamp
 this policy contract, so drain or remove those shared routes before enabling
 admission; once enabled, a missing or partial envelope on such a route fails
 closed with 503 instead of silently granting unlimited quota.
+Per-resource routing metadata must also be internally coherent: shared mode
+requires a non-empty served-model allow-list, dedicated or legacy-empty mode
+requires that allow-list to be absent, and unknown modes fail closed. This keeps
+model authorization and the shared isolation/admission boundary inseparable.
 During the admission-disabled migration window, a historical shared route that
 lacks organization identity remains isolated by its trusted resource ID rather
 than sharing the empty-organization cache namespace. Enabling admission also

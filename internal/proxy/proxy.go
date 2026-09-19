@@ -226,6 +226,27 @@ func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
+	// On per-resource routes, serving mode and the authorized model allow-list
+	// are one trusted edge contract. Accepting either half independently would
+	// let malformed middleware metadata skip model binding or skip the shared
+	// quota, tenancy, priority, and header-sanitization boundary. Gateway
+	// resolution is validated separately and constructs both values together.
+	if !id.Gateway {
+		validServingIdentity := false
+		switch id.ServingMode {
+		case "shared":
+			validServingIdentity = id.ServedModel != ""
+		case "", "dedicated":
+			validServingIdentity = id.ServedModel == ""
+		}
+		if !validServingIdentity {
+			s.log.Error.Printf("refusing inconsistent trusted serving identity: mode=%q served_model_present=%t resource_id=%q",
+				id.ServingMode, id.ServedModel != "", id.ResourceID)
+			http.Error(w, "serving identity unavailable", http.StatusServiceUnavailable)
+			return
+		}
+	}
+
 	// Billing-identity gate: fail closed if we lack what we need to attribute
 	// consumption. A billing product must not serve traffic it can't bill — a
 	// missing identity header means the edge contract is broken (auth-server

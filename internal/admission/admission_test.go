@@ -605,11 +605,15 @@ func TestKeepAlivePreventsLongStreamExpiry(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	// Advance Redis deterministically while the original lease is still live.
+	// KeepAlive's synchronous first renewal must move the score forward from
+	// this exact server time; no assertion depends on wall-clock scheduling.
+	mr.SetTime(time.UnixMilli(int64(initialExpiry) - 20))
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan struct{})
 	go func() { defer close(done); l.KeepAlive(ctx, func(e error) { t.Errorf("keepalive: %v", e) }) }()
-	// Wait for an observed renewal instead of assuming a busy CI runner will
-	// schedule the keepalive goroutine inside a sub-100ms sleep window.
+	// Wait only for goroutine execution. Miniredis time is fixed, so the lease
+	// cannot expire merely because a loaded test runner schedules this late.
 	deadline := time.Now().Add(time.Second)
 	var latestExpiry float64
 	for {
@@ -639,6 +643,23 @@ func TestKeepAlivePreventsLongStreamExpiry(t *testing.T) {
 		t.Fatalf("stopped keepalive was not reaped: %v", err)
 	}
 	_ = next.Complete(context.Background(), 0)
+}
+
+func TestKeepAliveCancellationIsNotAnOutage(t *testing.T) {
+	a, _ := testAdmitter(t, config.AdmissionSettings{Platform: limits(1), LeaseTTL: 30 * time.Millisecond})
+	l, err := a.Admit(context.Background(), request("a", "m"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	called := make(chan error, 1)
+	l.KeepAlive(ctx, func(err error) { called <- err })
+	select {
+	case err := <-called:
+		t.Fatalf("normal cancellation reported as outage: %v", err)
+	default:
+	}
 }
 
 func TestKeepAliveReportsLeaseReapedBeforeRenewal(t *testing.T) {

@@ -403,6 +403,42 @@ func (l *Lease) KeepAlive(ctx context.Context, onError func(error)) {
 	if interval < 10*time.Millisecond {
 		interval = 10 * time.Millisecond
 	}
+	renew := func() bool {
+		// A request can sit in a scheduler queue long enough that waiting for the
+		// first ticker edge would put a short lease needlessly close to expiry.
+		// Renew once synchronously, then maintain it on the regular cadence.
+		if ctx.Err() != nil {
+			return false
+		}
+		l.mu.Lock()
+		defer l.mu.Unlock()
+		if l.settled {
+			return false
+		}
+		res, err := renewScript.Run(ctx, l.owner.client, l.owner.keys(), l.id, l.owner.cfg.LeaseTTL.Milliseconds()).Int64()
+		if err != nil {
+			// Request completion normally cancels this context. If cancellation
+			// races the Redis call, it is not evidence that the admission store
+			// failed and must not be reported as an availability incident.
+			if ctx.Err() != nil {
+				return false
+			}
+			if onError != nil {
+				onError(fmt.Errorf("%w: renew lease: %v", ErrUnavailable, err))
+			}
+			return false
+		}
+		if res == 0 {
+			if onError != nil {
+				onError(fmt.Errorf("%w: lease expired or was reaped", ErrUnavailable))
+			}
+			return false
+		}
+		return true
+	}
+	if !renew() {
+		return
+	}
 	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
 	for {
@@ -410,27 +446,9 @@ func (l *Lease) KeepAlive(ctx context.Context, onError func(error)) {
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
-			l.mu.Lock()
-			if l.settled {
-				l.mu.Unlock()
+			if !renew() {
 				return
 			}
-			res, err := renewScript.Run(ctx, l.owner.client, l.owner.keys(), l.id, l.owner.cfg.LeaseTTL.Milliseconds()).Int64()
-			if err != nil {
-				l.mu.Unlock()
-				if onError != nil {
-					onError(fmt.Errorf("%w: renew lease: %v", ErrUnavailable, err))
-				}
-				return
-			}
-			if res == 0 {
-				l.mu.Unlock()
-				if onError != nil {
-					onError(fmt.Errorf("%w: lease expired or was reaped", ErrUnavailable))
-				}
-				return
-			}
-			l.mu.Unlock()
 		}
 	}
 }
