@@ -31,6 +31,7 @@ import (
 	"net/url"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"github.com/saturncloud/phoebe/internal/admission"
@@ -361,6 +362,8 @@ func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request) {
 	// could self-promote precisely while the rollout switch is off. Dedicated
 	// endpoints own their engine and bypass both shared-pool mechanisms.
 	var admitted *admission.Lease
+	var responseCaptureInstalled atomic.Bool
+	responseCaptureDone := make(chan struct{})
 	if id.ServingMode == "shared" {
 		body, rerr := readAndRestoreBody(r)
 		if rerr != nil {
@@ -436,9 +439,14 @@ func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request) {
 				go admitted.KeepAlive(r.Context(), func(e error) {
 					s.log.Error.Printf("admission: lease renewal failed; bypassing distributed gate for running request_id=%s: %v", requestID, e)
 				})
-				// Safety net for every early return. Normal response completion wins the
-				// lease's idempotent Complete race and charges actual generated tokens.
+				// Safety net only for exits before an upstream response is attached.
+				// Once ModifyResponse installs capture, its completion callback owns
+				// settlement; racing it with Complete(0) could turn unknown usage into a
+				// free request because lease settlement is first-writer-wins.
 				defer func() {
+					if responseCaptureInstalled.Load() {
+						return
+					}
 					if e := admitted.Complete(context.WithoutCancel(r.Context()), 0); e != nil {
 						s.log.Error.Printf("admission: release fallback failed: %v", e)
 					}
@@ -479,6 +487,7 @@ func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request) {
 		var cr *captureReader
 
 		onDone := func(res capture.Result) {
+			defer close(responseCaptureDone)
 			// Everything downstream of onDone gets a context DECOUPLED from the
 			// client request: onDone runs on the abort path precisely BECAUSE
 			// r.Context() was cancelled (that is how Aborted is detected), and
@@ -552,12 +561,20 @@ func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request) {
 			cr.enableBodyLog(s.ioMaxBodyLen)
 		}
 		resp.Body = cr
+		responseCaptureInstalled.Store(true)
 		return nil
 	}
 
-	rp.ErrorHandler = s.errorHandler(upstream.String(), id, requestID, admitted)
+	rp.ErrorHandler = s.errorHandler(upstream.String(), id, requestID, admitted, &responseCaptureInstalled)
 
 	rp.ServeHTTP(w, r)
+	if responseCaptureInstalled.Load() {
+		// ReverseProxy can return on a client abort while the response body's
+		// deferred Close is still finalizing in its copy goroutine. Wait for the
+		// capture callback so the pre-response zero fallback cannot race or the
+		// next request cannot observe an unsettled physical reservation.
+		<-responseCaptureDone
+	}
 }
 
 // errorHandler builds the ReverseProxy ErrorHandler for one request. The handler
@@ -588,14 +605,25 @@ func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request) {
 // a bogus zero-token billing row. The context is decoupled from the cancelled
 // client ctx (WithoutCancel) — the abort is precisely WHY we are here, so a
 // cancelled ctx must not be able to drop the emit (mirrors onDone).
-func (s *Server) errorHandler(upstream string, id identity.Identity, requestID string, admitted *admission.Lease) func(http.ResponseWriter, *http.Request, error) {
+func (s *Server) errorHandler(upstream string, id identity.Identity, requestID string, admitted *admission.Lease, responseCaptureInstalled *atomic.Bool) func(http.ResponseWriter, *http.Request, error) {
 	return func(w http.ResponseWriter, r *http.Request, err error) {
-		if admitted != nil {
-			if e := admitted.Complete(context.WithoutCancel(r.Context()), 0); e != nil {
-				s.log.Error.Printf("admission: upstream-failure release failed: %v", e)
+		clientAbort := isClientAbort(err)
+		if admitted != nil && (responseCaptureInstalled == nil || !responseCaptureInstalled.Load()) {
+			ctx := context.WithoutCancel(r.Context())
+			var settlementErr error
+			if clientAbort {
+				// Once dispatched, a client can cancel before Phoebe observes response
+				// headers even though the engine has already done work. With no usage
+				// block available, retain the conservative token reservation.
+				settlementErr = admitted.CompleteUnknownUsage(ctx)
+			} else {
+				settlementErr = admitted.Complete(ctx, 0)
+			}
+			if settlementErr != nil {
+				s.log.Error.Printf("admission: upstream-failure release failed: %v", settlementErr)
 			}
 		}
-		if isClientAbort(err) {
+		if clientAbort {
 			s.log.Debug.Printf("client disconnected for %s", upstream)
 			// Pre-header abort: ModifyResponse never ran, so onDone will not emit.
 			// Emit a zero-token attributable event so the request is not invisible

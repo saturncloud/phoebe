@@ -338,8 +338,9 @@ func (l *Lease) Complete(ctx context.Context, generatedTokens int64) error {
 
 // CompleteUnknownUsage releases physical capacity while retaining the
 // conservative input and output token charges reserved before dispatch. Use it
-// only after upstream response work began but no authoritative usage block was
-// captured; early transport failures continue to use Complete(0).
+// whenever a dispatched request's usage is indeterminate (including a client
+// abort before response headers); definite pre-dispatch/transport failures
+// continue to use Complete(0).
 func (l *Lease) CompleteUnknownUsage(ctx context.Context) error {
 	return l.CompleteUsage(ctx, l.unknownUsage)
 }
