@@ -191,7 +191,14 @@ func (a *RedisAdmitter) Admit(ctx context.Context, req Request) (*Lease, error) 
 			}
 			return nil, &Rejected{Scope: scopeName, Dimension: dimension, RetryAfter: retryAfter, Contractual: contractual}
 		}
-		return &Lease{owner: a, id: id}, nil
+		return &Lease{
+			owner: a,
+			id:    id,
+			unknownUsage: Usage{
+				TotalPromptTokens: req.EstimatedInputTokens,
+				GeneratedTokens:   req.ReservedOutputTokens,
+			},
+		}, nil
 	}
 
 	// Both replies were indeterminate. Compensate with the same request id:
@@ -310,6 +317,13 @@ type Lease struct {
 	mu      sync.Mutex
 	settled bool
 	pending *Usage
+
+	// unknownUsage is the conservative contractual charge when the engine's
+	// authoritative usage block never arrives. The estimate was already
+	// reserved as wholly uncached input, and generated capacity was reserved at
+	// the request's maximum output, so retaining both prevents an abort-before-
+	// usage client from turning consumed model work into a zero-token request.
+	unknownUsage Usage
 }
 
 func (l *Lease) PrefillDone(ctx context.Context) error {
@@ -320,6 +334,14 @@ func (l *Lease) EndColdHold(ctx context.Context) error   { return l.run(ctx, col
 
 func (l *Lease) Complete(ctx context.Context, generatedTokens int64) error {
 	return l.CompleteUsage(ctx, Usage{GeneratedTokens: generatedTokens})
+}
+
+// CompleteUnknownUsage releases physical capacity while retaining the
+// conservative input and output token charges reserved before dispatch. Use it
+// only after upstream response work began but no authoritative usage block was
+// captured; early transport failures continue to use Complete(0).
+func (l *Lease) CompleteUnknownUsage(ctx context.Context) error {
+	return l.CompleteUsage(ctx, l.unknownUsage)
 }
 
 // Usage is the engine-authoritative token result used to settle contractual

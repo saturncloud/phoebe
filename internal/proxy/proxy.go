@@ -488,11 +488,17 @@ func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request) {
 			// honours ctx would otherwise lose every aborted request).
 			ctx := context.WithoutCancel(r.Context())
 			if admitted != nil {
-				if e := admitted.CompleteUsage(ctx, admission.Usage{
-					TotalPromptTokens:  int64(res.Usage.PromptTokens),
-					CachedPromptTokens: int64(res.Usage.CachedTokens()),
-					GeneratedTokens:    int64(res.Usage.CompletionTokens),
-				}); e != nil {
+				var e error
+				if res.UsageFound {
+					e = admitted.CompleteUsage(ctx, admission.Usage{
+						TotalPromptTokens:  int64(res.Usage.PromptTokens),
+						CachedPromptTokens: int64(res.Usage.CachedTokens()),
+						GeneratedTokens:    int64(res.Usage.CompletionTokens),
+					})
+				} else {
+					e = admitted.CompleteUnknownUsage(ctx)
+				}
+				if e != nil {
 					s.log.Error.Printf("admission: completion release failed: %v", e)
 				}
 			}

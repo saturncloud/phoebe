@@ -444,6 +444,50 @@ func TestEstimatedPromptTokensReserveThenReconcileActual(t *testing.T) {
 	})
 }
 
+func TestUnknownUsageRetainsConservativeOwnerAndOrganizationCharges(t *testing.T) {
+	ctx := context.Background()
+	contract := RateLimits{TotalPromptTokens: 10, UncachedPromptTokens: 10, GeneratedTokens: 20}
+	a, _ := testAdmitter(t, config.AdmissionSettings{Platform: limits(10)})
+	first := request("org-a", "model-a")
+	first.Owner = "owner-a"
+	first.OrganizationLimits = contract
+	first.OwnerLimits = contract
+	lease, err := a.Admit(ctx, first)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := lease.CompleteUnknownUsage(ctx); err != nil {
+		t.Fatal(err)
+	}
+
+	for _, tc := range []struct {
+		name string
+		req  Request
+		want string
+	}{
+		{
+			name: "organization",
+			req: Request{Graph: "graph-a", Organization: "org-a", Owner: "other-owner", Model: "model-a",
+				PromptBytes: 1, EstimatedInputTokens: 1, ReservedOutputTokens: 1, OrganizationLimits: contract},
+			want: "contract_organization",
+		},
+		{
+			name: "owner",
+			req: Request{Graph: "graph-a", Organization: "other-org", Owner: "owner-a", Model: "model-a",
+				PromptBytes: 1, EstimatedInputTokens: 1, ReservedOutputTokens: 1, OwnerLimits: contract},
+			want: "contract_owner",
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			_, err := a.Admit(ctx, tc.req)
+			var rejected *Rejected
+			if !errors.As(err, &rejected) || rejected.Scope != tc.want || rejected.Dimension != "total_prompt_tokens" {
+				t.Fatalf("err=%v, want %s total_prompt_tokens rejection", err, tc.want)
+			}
+		})
+	}
+}
+
 func TestPromptUsageClampsMalformedCachedSubset(t *testing.T) {
 	l := limits(5)
 	l.TotalPromptTokensPerWindow = 10
