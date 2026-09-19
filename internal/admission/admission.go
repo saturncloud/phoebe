@@ -45,13 +45,14 @@ func (r *Rejected) Error() string {
 type Request struct {
 	Graph                string
 	Organization         string
+	Owner                string
 	Model                string
 	PromptBytes          int64
 	EstimatedInputTokens int64
 	ReservedOutputTokens int64
 	Adapter              bool
-	ServiceTier          string
-	RateLimits           RateLimits
+	OrganizationLimits   RateLimits
+	OwnerLimits          RateLimits
 }
 
 // RateLimits is the authenticated customer contract. Zero means unlimited.
@@ -145,6 +146,9 @@ func randomID() (string, error) {
 func (a *RedisAdmitter) Admit(ctx context.Context, req Request) (*Lease, error) {
 	if req.Organization == "" || req.Model == "" || req.Graph == "" {
 		return nil, fmt.Errorf("%w: missing trusted organization/model/graph identity", ErrUnavailable)
+	}
+	if req.OwnerLimits.any() && req.Owner == "" {
+		return nil, fmt.Errorf("%w: missing trusted owner identity", ErrUnavailable)
 	}
 	if req.PromptBytes < 0 || req.EstimatedInputTokens <= 0 || req.ReservedOutputTokens <= 0 {
 		return nil, &Rejected{Scope: "request", Dimension: "work estimate", RetryAfter: time.Second}
@@ -278,24 +282,21 @@ func (l RateLimits) any() bool {
 func (a *RedisAdmitter) scopes(r Request) []scope {
 	out := []scope{makeScope("platform", "all", a.cfg.Platform), makeScope("graph", r.Graph, a.cfg.Graph),
 		makeScope("organization", r.Organization, a.cfg.Organization), makeScope("organization_model", r.Organization+"\x1f"+r.Model, a.cfg.OrganizationModel)}
-	if r.RateLimits.any() {
-		out = append(out,
-			makeContractScope("contract_organization", r.Organization, r.RateLimits),
-			makeContractScope("contract_organization_model", r.Organization+"\x1f"+r.Model, r.RateLimits),
-		)
+	if r.OrganizationLimits.any() {
+		out = append(out, makeContractScope("contract_organization", r.Organization, r.OrganizationLimits))
 	}
-	tierName := r.ServiceTier
-	if mapped := a.cfg.OrganizationTiers[r.Organization]; mapped != "" {
-		tierName = mapped
+	if r.OwnerLimits.any() {
+		out = append(out, makeContractScope("contract_owner", r.Owner, r.OwnerLimits))
 	}
-	if tierName == "" {
-		tierName = "default"
+	laneName := a.cfg.OrganizationLanes[r.Organization]
+	if laneName == "" {
+		laneName = "default"
 	}
-	if _, ok := a.cfg.Tiers[tierName]; !ok {
-		tierName = "default"
+	if _, ok := a.cfg.Lanes[laneName]; !ok {
+		laneName = "default"
 	}
-	if t, ok := a.cfg.Tiers[tierName]; ok {
-		out = append(out, makeScope("tier", tierName, scaled(t.Limits, t.Weight)))
+	if t, ok := a.cfg.Lanes[laneName]; ok {
+		out = append(out, makeScope("lane", laneName, scaled(t.Limits, t.Weight)))
 	}
 	return out
 }

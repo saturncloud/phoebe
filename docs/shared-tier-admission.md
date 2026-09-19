@@ -1,4 +1,4 @@
-# Shared-tier admission and fairness ownership
+# Shared-inference admission and fairness ownership
 
 ## Decision point
 
@@ -25,7 +25,7 @@ engine-usage metering continues through its Valkey/WAL/log path.
 | Request and token-throughput windows | Saturn-owned, implemented here | Separate request, total-prompt, uncached-prompt, and generated-token windows. Admission reserves `ceil(original JSON bytes / 4)` as fully uncached input plus the declared maximum output; engine usage then reconciles estimates to exact total, cached, uncached, and generated currencies. Concurrent estimates therefore cannot overbook a window, overestimates are refunded, and underestimates create debt for later requests. |
 | Cold holds and wake churn | Partially implemented before; completed here | Phoebe already detected/actuated wake-from-zero. Distributed hold and wake-window admission now surrounds actuation. |
 | Adapter and KV pressure | Layered implementation | Phoebe bounds active adapter-bearing requests and reserved work. Saturn enables backend prefix caches and KV event publication; Dynamo routes on actual cache residency and load, while each engine owns allocation/eviction. |
-| Service-tier protected shares | Layered implementation | Atlas derives the tier from effective UsageLimits; an operator-owned org→tier map can override it. Hard Phoebe lanes protect capacity, and Phoebe replaces client hints with the tier's trusted Dynamo soft and strict priorities. |
+| Operator protected lanes | Layered implementation | An operator-owned organization→lane map partitions capacity. Phoebe replaces client hints with the lane's trusted Dynamo soft and strict priorities. Admission lanes are unrelated to Atlas instance-size tiers and UsageLimits names. |
 | Cache-aware/worker routing and prefill/decode scheduling | Saturn-configured Dynamo capability | Shared graphs enable KV routing, output-block tracking, a capacity-triggered WSPT queue, and backend priority scheduling where supported. |
 | Gang lifecycle and replica topology | Saturn-configured Grove/Dynamo capability | The graph remains the lifecycle and gang unit; request fairness is enforced above and inside it. |
 | GPU queue quota, DRF, placement, and preemption | Saturn-configured KAI capability | KAI protects graph/pod scheduling. Many organizations share one graph, so organization request fairness cannot be delegated to a pod scheduler. |
@@ -46,14 +46,17 @@ tokens. Cached prompt tokens therefore participate in total-prompt throughput
 without being double-counted as uncached work. This mirrors the resource-aware
 shared-inference convention while keeping invoice prices independent.
 
-Atlas resolves each authenticated owner's UsageLimits over its organization
-fallback and stamps the effective service tier plus all four rate dimensions
-through gateway ForwardAuth. Traefik allowlists that complete envelope, so a
-client-supplied tier or ceiling is overwritten before Phoebe. Phoebe enforces
-the same contract at aggregate organization and organization×model scopes;
-zero means no contractual ceiling, while independent operator capacity limits
-still apply. Atlas must stamp every field; a missing field is a broken trusted
-contract and fails closed, while the explicit string `0` represents unlimited.
+Saturn stamps the authenticated stable owner ID and two independent four-currency
+contracts through gateway ForwardAuth: one for the organization and one for the
+user/group owner. Traefik allowlists that complete envelope, so client-supplied
+identity or ceilings are overwritten before Phoebe. Phoebe enforces the
+organization contract at an aggregate organization scope and the owner contract
+at a stable user/group-owner scope. API-key rotation cannot reset an owner budget,
+and another owner cannot bypass the aggregate organization budget.
+Zero means no contractual ceiling within that scope, while independent operator
+capacity limits still apply. Saturn must stamp every field; a missing field is a
+broken trusted contract and fails closed, while the explicit string `0`
+represents unlimited.
 An exhausted contract returns 429 with Retry-After, and physical pool
 saturation returns 503. Admission-store unavailability bypasses only these
 soft limits and is logged; it does not bypass trusted-policy validation.
@@ -69,10 +72,10 @@ and are never written as billing usage.
 
 ## Trusted Dynamo request policy
 
-For admitted shared requests, Phoebe selects the configured tier named by the
-trusted Atlas service-tier header (with operator `organizationTiers` as an
-explicit override), then normalizes `nvext.agent_hints.priority`,
-`strict_priority`, and `osl` from the operator-owned tier and output-token
+For admitted shared requests, Phoebe selects the configured admission lane from
+the operator-owned `organizationLanes` map (falling back to `default`), then
+normalizes `nvext.agent_hints.priority`, `strict_priority`, and `osl` from the
+operator-owned lane and output-token
 reservation. It also replaces `X-Dynamo-Request-Priority` and
 `X-Dynamo-Request-Strict-Priority`, because Dynamo gives those headers
 precedence over body hints. A client therefore cannot self-promote.
@@ -112,9 +115,16 @@ downstream JSON stack cannot select different values and under-reserve work.
 
 ## Rollout and rollback
 
-Roll out the Atlas migration/headers and Traefik seven-header ForwardAuth
-allowlist before the new Phoebe image. Then keep `admission.enabled: false`,
-deploy all Phoebe replicas, configure one shared Valkey and conservative measured limits, and enable admission. Watch
+The transition is order-independent. Saturn emits both the new independent
+eleven-header envelope and a conservative five-header legacy projection. Traefik
+allowlists both during the rolling upgrade. New Phoebe prefers the complete new
+envelope, rejects a partial one, and accepts the complete legacy envelope only
+when every new field is absent. The legacy service-tier marker is constant and
+never selects an admission lane. Remove the five compatibility headers after all
+Saturn, Traefik, and Phoebe replicas use the new contract.
+
+Keep `admission.enabled: false` while deploying all Phoebe replicas, then
+configure one shared Valkey and conservative measured limits and enable admission. Watch
 429 contract rejections, 503 capacity rejections by scope/dimension, and logged
 Valkey bypass/latency errors. Roll back by disabling the feature; existing leases expire without affecting billing or Dynamo. Do not
 point replicas at different Valkey instances during a rolling update.
@@ -123,7 +133,7 @@ point replicas at different Valkey instances during a rolling update.
 
 Fairness is deliberately layered instead of pretending one counter is an exact
 GPU cost model. While its store is healthy, Phoebe provides globally coordinated
-admission plus trusted tenant/tier metadata; store failure deliberately weakens
+admission plus trusted tenant/lane metadata; store failure deliberately weakens
 only that soft fairness layer. Dynamo uses actual tokenization, uncached-prefix work, KV residency,
 and active output blocks for routing. vLLM and SGLang apply supported engine
 priority and cache policy. KAI and Grove govern the graph pods. These layers do

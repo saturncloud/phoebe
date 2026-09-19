@@ -76,7 +76,7 @@ func testAdmitter(t *testing.T, cfg config.AdmissionSettings) (*RedisAdmitter, *
 }
 
 func request(org, model string) Request {
-	return Request{Graph: "graph-a", Organization: org, Model: model, PromptBytes: 10, EstimatedInputTokens: 10, ReservedOutputTokens: 20, Adapter: true}
+	return Request{Graph: "graph-a", Organization: org, Owner: "owner-" + org, Model: model, PromptBytes: 10, EstimatedInputTokens: 10, ReservedOutputTokens: 20, Adapter: true}
 }
 
 func TestConcurrentReplicasShareOneAtomicCapacityPool(t *testing.T) {
@@ -182,12 +182,55 @@ func TestOrganizationIsolationAndRelease(t *testing.T) {
 	_ = b1.Complete(context.Background(), 0)
 }
 
-func TestWeightedTierLanesAreIsolated(t *testing.T) {
+func TestOrganizationAndOwnerContractsApplyIndependently(t *testing.T) {
+	a, _ := testAdmitter(t, config.AdmissionSettings{Platform: limits(10)})
+	first := request("org-a", "m")
+	first.Owner = "owner-a"
+	first.OrganizationLimits = RateLimits{Requests: 2}
+	first.OwnerLimits = RateLimits{Requests: 1}
+	lease, err := a.Admit(context.Background(), first)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = lease.Complete(context.Background(), 0)
+	if _, err = a.Admit(context.Background(), first); err == nil {
+		t.Fatal("second API key for the same owner bypassed the owner contract")
+	} else if rejected, ok := err.(*Rejected); !ok || rejected.Scope != "contract_owner" {
+		t.Fatalf("same-owner rejection = %T %v", err, err)
+	}
+
+	secondOwner := first
+	secondOwner.Owner = "owner-b"
+	lease, err = a.Admit(context.Background(), secondOwner)
+	if err != nil {
+		t.Fatalf("independent owner was rejected before org aggregate filled: %v", err)
+	}
+	_ = lease.Complete(context.Background(), 0)
+	thirdOwner := first
+	thirdOwner.Owner = "owner-c"
+	if _, err = a.Admit(context.Background(), thirdOwner); err == nil {
+		t.Fatal("organization aggregate was bypassed through another owner")
+	} else if rejected, ok := err.(*Rejected); !ok || rejected.Scope != "contract_organization" {
+		t.Fatalf("organization rejection = %T %v", err, err)
+	}
+}
+
+func TestOwnerContractRequiresStableOwnerIdentity(t *testing.T) {
+	a, _ := testAdmitter(t, config.AdmissionSettings{Platform: limits(10)})
+	req := request("org-a", "m")
+	req.Owner = ""
+	req.OwnerLimits = RateLimits{Requests: 1}
+	if _, err := a.Admit(context.Background(), req); !errors.Is(err, ErrUnavailable) {
+		t.Fatalf("missing owner identity error = %v, want ErrUnavailable", err)
+	}
+}
+
+func TestWeightedAdmissionLanesAreIsolated(t *testing.T) {
 	cfg := config.AdmissionSettings{Platform: config.AdmissionLimits{MaxActiveRequests: 3, Window: time.Minute},
-		Tiers: map[string]config.AdmissionTier{
+		Lanes: map[string]config.AdmissionLane{
 			"default":   {Weight: 1, Limits: config.AdmissionLimits{MaxActiveRequests: 1, Window: time.Minute}},
 			"protected": {Weight: 2, Limits: config.AdmissionLimits{MaxActiveRequests: 1, Window: time.Minute}},
-		}, OrganizationTiers: map[string]string{"org-p": "protected"}}
+		}, OrganizationLanes: map[string]string{"org-p": "protected"}}
 	a, _ := testAdmitter(t, cfg)
 	d1, err := a.Admit(context.Background(), request("org-d", "m"))
 	if err != nil {

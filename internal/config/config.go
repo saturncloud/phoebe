@@ -55,7 +55,7 @@ type Settings struct {
 	// crash.
 	Wake WakeSettings `yaml:"wake"`
 
-	// Admission configures distributed shared-tier admission. It is deliberately
+	// Admission configures distributed shared-lane admission. It is deliberately
 	// separate from Emit even though both normally use Valkey: metering may fall
 	// back to its WAL, while an unavailable admission store temporarily bypasses
 	// only fairness/capacity limits for otherwise authorized, valid requests.
@@ -93,16 +93,16 @@ type AdmissionLimits struct {
 	Window                        time.Duration `yaml:"-"`
 }
 
-// AdmissionTier gives an operator-defined service tier an isolated protected
+// AdmissionLane gives an operator-defined scheduling class an isolated protected
 // lane. The lane is intentionally a hard partition: unused capacity is not
-// borrowed, so another tier can never consume a protected share. Weight is an
+// borrowed, so another lane can never consume a protected share. Weight is an
 // explicit capacity multiplier for the lane, not a claim of request-ordering
 // fairness inside Dynamo.
-type AdmissionTier struct {
+type AdmissionLane struct {
 	Weight int64 `yaml:"weight"`
 	// DynamoPriority is the trusted soft priority propagated through Dynamo to
 	// engines that support per-request scheduling. Higher values are more
-	// important. DynamoStrictPriority is the unsigned router queue tier.
+	// important. DynamoStrictPriority is the unsigned strict-priority queue band.
 	DynamoPriority       int64           `yaml:"dynamoPriority"`
 	DynamoStrictPriority int64           `yaml:"dynamoStrictPriority"`
 	Limits               AdmissionLimits `yaml:"limits"`
@@ -120,8 +120,8 @@ type AdmissionSettings struct {
 	Graph                  AdmissionLimits          `yaml:"graph"`
 	Organization           AdmissionLimits          `yaml:"organization"`
 	OrganizationModel      AdmissionLimits          `yaml:"organizationModel"`
-	Tiers                  map[string]AdmissionTier `yaml:"tiers"`
-	OrganizationTiers      map[string]string        `yaml:"organizationTiers"`
+	Lanes                  map[string]AdmissionLane `yaml:"lanes"`
+	OrganizationLanes      map[string]string        `yaml:"organizationLanes"`
 }
 
 // EmitSettings is the YAML shape for the durable emitter. Mirrors emit.Config
@@ -340,37 +340,37 @@ func (a *AdmissionSettings) parse() error {
 		{"platform", &a.Platform}, {"graph", &a.Graph},
 		{"organization", &a.Organization}, {"organizationModel", &a.OrganizationModel},
 	}
-	for name, tier := range a.Tiers {
-		if tier.Weight <= 0 {
-			return fmt.Errorf("admission.tiers.%s.weight must be positive", name)
+	for name, lane := range a.Lanes {
+		if lane.Weight <= 0 {
+			return fmt.Errorf("admission.lanes.%s.weight must be positive", name)
 		}
-		if tier.DynamoPriority < -(1<<31) || tier.DynamoPriority > 1<<31-1 {
-			return fmt.Errorf("admission.tiers.%s.dynamoPriority must fit in a signed 32-bit integer", name)
+		if lane.DynamoPriority < -(1<<31) || lane.DynamoPriority > 1<<31-1 {
+			return fmt.Errorf("admission.lanes.%s.dynamoPriority must fit in a signed 32-bit integer", name)
 		}
-		if tier.DynamoStrictPriority < 0 || tier.DynamoStrictPriority > 1<<32-1 {
-			return fmt.Errorf("admission.tiers.%s.dynamoStrictPriority must fit in an unsigned 32-bit integer", name)
+		if lane.DynamoStrictPriority < 0 || lane.DynamoStrictPriority > 1<<32-1 {
+			return fmt.Errorf("admission.lanes.%s.dynamoStrictPriority must fit in an unsigned 32-bit integer", name)
 		}
-		if err := tier.Limits.parse("admission.tiers." + name); err != nil {
+		if err := lane.Limits.parse("admission.lanes." + name); err != nil {
 			return err
 		}
-		a.Tiers[name] = tier
+		a.Lanes[name] = lane
 	}
 	for _, item := range limits {
 		if err := item.value.parse("admission." + item.name); err != nil {
 			return err
 		}
 	}
-	if len(a.Tiers) > 0 {
-		if _, ok := a.Tiers["default"]; !ok {
-			return fmt.Errorf("admission.tiers requires a default tier for unmapped organizations")
+	if len(a.Lanes) > 0 {
+		if _, ok := a.Lanes["default"]; !ok {
+			return fmt.Errorf("admission.lanes requires a default lane for unmapped organizations")
 		}
-		if err := a.validateTierShares(); err != nil {
+		if err := a.validateLaneShares(); err != nil {
 			return err
 		}
 	}
-	for org, tier := range a.OrganizationTiers {
-		if _, ok := a.Tiers[tier]; !ok {
-			return fmt.Errorf("admission.organizationTiers.%s names unknown tier %q", org, tier)
+	for org, lane := range a.OrganizationLanes {
+		if _, ok := a.Lanes[lane]; !ok {
+			return fmt.Errorf("admission.organizationLanes.%s names unknown lane %q", org, lane)
 		}
 	}
 	return nil
@@ -383,31 +383,31 @@ func limitValues(l AdmissionLimits) []int64 {
 		l.GeneratedTokensPerWindow, l.MaxColdHolds, l.WakesPerWindow}
 }
 
-func (a *AdmissionSettings) validateTierShares() error {
+func (a *AdmissionSettings) validateLaneShares() error {
 	names := []string{"maxActiveRequests", "maxConcurrentPrefills", "maxReservedDecodeSlots", "maxPromptBytes",
 		"maxReservedOutputTokens", "maxActiveAdapters", "requestsPerWindow",
 		"totalPromptTokensPerWindow", "uncachedPromptTokensPerWindow",
 		"generatedTokensPerWindow", "maxColdHolds", "wakesPerWindow"}
 	platform := limitValues(a.Platform)
 	sums := make([]int64, len(platform))
-	for tierName, tier := range a.Tiers {
-		for i, v := range limitValues(tier.Limits) {
+	for laneName, lane := range a.Lanes {
+		for i, v := range limitValues(lane.Limits) {
 			if platform[i] > 0 && v == 0 {
-				return fmt.Errorf("admission.tiers.%s.%s must be set when the platform limit is set", tierName, names[i])
+				return fmt.Errorf("admission.lanes.%s.%s must be set when the platform limit is set", laneName, names[i])
 			}
-			if v > 0 && tier.Weight > (1<<63-1)/v {
-				return fmt.Errorf("admission.tiers.%s.%s overflows after weight", tierName, names[i])
+			if v > 0 && lane.Weight > (1<<63-1)/v {
+				return fmt.Errorf("admission.lanes.%s.%s overflows after weight", laneName, names[i])
 			}
-			weighted := v * tier.Weight
+			weighted := v * lane.Weight
 			if weighted > 0 && sums[i] > (1<<63-1)-weighted {
-				return fmt.Errorf("weighted admission tier shares for %s overflow", names[i])
+				return fmt.Errorf("weighted admission lane shares for %s overflow", names[i])
 			}
 			sums[i] += weighted
 		}
 	}
 	for i, max := range platform {
 		if max > 0 && sums[i] > max {
-			return fmt.Errorf("weighted admission tier shares for %s total %d above platform limit %d", names[i], sums[i], max)
+			return fmt.Errorf("weighted admission lane shares for %s total %d above platform limit %d", names[i], sums[i], max)
 		}
 	}
 	return nil

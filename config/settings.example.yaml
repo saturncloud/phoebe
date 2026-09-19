@@ -71,7 +71,7 @@ emit:
 #   kubeconfig: ""
 #   timeout: "300s"
 
-# Distributed admission for the SHARED serving tier (OFF by default). This is
+# Distributed admission for SHARED serving mode (OFF by default). This is
 # a fairness and capacity-shaping gate, not an authorization or hard-spend
 # boundary. All Phoebe replicas should use the same Valkey. If that state is
 # unavailable or reset, otherwise authorized and valid traffic continues while
@@ -90,8 +90,8 @@ emit:
 # abort, or failure. Live streams renew their lease;
 # leaseTtl is the crash-recovery bound when a replica stops renewing.
 #
-# Tier lanes are hard protected partitions. organizationTiers is operator-owned
-# policy keyed by trusted org id; no client header chooses a tier. weight scales
+# Admission lanes are hard protected partitions. organizationLanes is operator-owned
+# policy keyed by trusted org id; no client header chooses a lane. weight scales
 # that lane's configured capacities. This is weighted admission, not a claim of
 # exact request-order scheduling inside Dynamo.
 # admission:
@@ -156,10 +156,10 @@ emit:
 #     maxColdHolds: 1
 #     wakesPerWindow: 2
 #     window: "1m"
-#   tiers:
+#   lanes:
 #     default:
 #       weight: 1
-#       limits: &tierLimits
+#       limits: &defaultLaneLimits
 #         maxActiveRequests: 64
 #         maxConcurrentPrefills: 8
 #         maxReservedDecodeSlots: 64
@@ -189,5 +189,5 @@ emit:
 #         maxColdHolds: 4
 #         wakesPerWindow: 6
 #         window: "1m"
-#   organizationTiers:
+#   organizationLanes:
 #     "org-id-with-protected-share": "protected"

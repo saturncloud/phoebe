@@ -32,6 +32,7 @@ func sharedRequest(upstream *url.URL) *http.Request {
 	r := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(`{"model":"model-a","max_tokens":20}`))
 	setUpstream(r, upstream)
 	r.Header.Set(identity.HeaderAuthID, "auth-a")
+	r.Header.Set(identity.HeaderOwnerID, "owner-a")
 	r.Header.Set(identity.HeaderResourceID, "resource-a")
 	r.Header.Set(identity.HeaderOrgID, "org-a")
 	r.Header.Set(identity.HeaderServingMode, "shared")
@@ -136,7 +137,7 @@ func TestSharedRequestAtExactBodyLimitAdmitsWithRedisAdmitter(t *testing.T) {
 }
 
 func TestSharedRequestBodyLimitUsesSafeUnlimitedFallback(t *testing.T) {
-	if got := sharedRequestBodyLimit(config.AdmissionSettings{}, config.AdmissionTier{}); got != defaultSharedRequestBodyLimit {
+	if got := sharedRequestBodyLimit(config.AdmissionSettings{}, config.AdmissionLane{}); got != defaultSharedRequestBodyLimit {
 		t.Fatalf("unlimited fallback=%d, want %d", got, defaultSharedRequestBodyLimit)
 	}
 }
@@ -301,7 +302,7 @@ func TestContractRateLimitReturns429BeforeUpstream(t *testing.T) {
 	c := redis.NewClient(&redis.Options{Addr: mr.Addr()})
 	s := New(&config.Settings{Admission: cfg}, logging.New(logging.ERROR), &recordingEmitter{}).WithAdmitter(admission.New(c, cfg))
 	req := sharedRequest(up)
-	req.Header.Set(identity.HeaderRateLimitGeneratedTokens, "10")
+	req.Header.Set(identity.HeaderOwnerRateLimitGeneratedTokens, "10")
 	rr := httptest.NewRecorder()
 	s.Handler().ServeHTTP(rr, req)
 	if rr.Code != http.StatusTooManyRequests {
@@ -331,7 +332,7 @@ func TestMalformedTrustedRateLimitFailsClosed(t *testing.T) {
 	cfg := proxyAdmissionConfig(2)
 	s := New(&config.Settings{Admission: cfg}, logging.New(logging.ERROR), &recordingEmitter{})
 	req := sharedRequest(up)
-	req.Header.Set(identity.HeaderRateLimitRequests, "not-a-number")
+	req.Header.Set(identity.HeaderOrgRateLimitRequests, "not-a-number")
 	rr := httptest.NewRecorder()
 	s.Handler().ServeHTTP(rr, req)
 	if rr.Code != http.StatusServiceUnavailable {
@@ -340,17 +341,36 @@ func TestMalformedTrustedRateLimitFailsClosed(t *testing.T) {
 }
 
 func TestGatewayMissingTrustedRateLimitPolicyFailsClosed(t *testing.T) {
-	_, err := parseTrustedRateLimits(identity.Identity{Gateway: true})
+	_, _, err := parseTrustedRateLimits(identity.Identity{Gateway: true})
 	if err == nil {
 		t.Fatal("gateway request without Atlas policy was accepted as unlimited")
 	}
-	limits, err := parseTrustedRateLimits(identity.Identity{
-		Gateway: true, ServiceTier: "default", RateLimitRequests: "0",
-		RateLimitTotalPromptTokens: "0", RateLimitUncachedPromptTokens: "0",
-		RateLimitGeneratedTokens: "0",
+	organization, owner, err := parseTrustedRateLimits(identity.Identity{
+		Gateway: true, OwnerID: "owner-1",
+		OrgRateLimitRequests: "0", OrgRateLimitTotalPromptTokens: "0",
+		OrgRateLimitUncachedPromptTokens: "0", OrgRateLimitGeneratedTokens: "0",
+		OwnerRateLimitRequests: "0", OwnerRateLimitTotalPromptTokens: "0",
+		OwnerRateLimitUncachedPromptTokens: "0", OwnerRateLimitGeneratedTokens: "0",
 	})
-	if err != nil || limits != (admission.RateLimits{}) {
-		t.Fatalf("explicit unlimited gateway policy = %+v, %v", limits, err)
+	if err != nil || organization != (admission.RateLimits{}) || owner != (admission.RateLimits{}) {
+		t.Fatalf("explicit unlimited gateway policy = org=%+v owner=%+v, %v", organization, owner, err)
+	}
+	legacyOrg, legacyOwner, err := parseTrustedRateLimits(identity.Identity{
+		Gateway: true, LegacyServiceTier: "default", LegacyRateLimitRequests: "7",
+		LegacyRateLimitTotalPromptTokens: "100", LegacyRateLimitUncachedPromptTokens: "25",
+		LegacyRateLimitGeneratedTokens: "50",
+	})
+	if err != nil || legacyOrg != (admission.RateLimits{Requests: 7, TotalPromptTokens: 100, UncachedPromptTokens: 25, GeneratedTokens: 50}) ||
+		legacyOwner != (admission.RateLimits{}) {
+		t.Fatalf("legacy gateway policy = org=%+v owner=%+v, %v", legacyOrg, legacyOwner, err)
+	}
+	_, _, err = parseTrustedRateLimits(identity.Identity{
+		Gateway: true, OwnerID: "partial-new", LegacyServiceTier: "default",
+		LegacyRateLimitRequests: "0", LegacyRateLimitTotalPromptTokens: "0",
+		LegacyRateLimitUncachedPromptTokens: "0", LegacyRateLimitGeneratedTokens: "0",
+	})
+	if err == nil {
+		t.Fatal("partial new envelope incorrectly fell back to the legacy policy")
 	}
 }
 
@@ -526,8 +546,8 @@ func TestAdmissionWorkRejectsAmbiguousOrImpossibleRequests(t *testing.T) {
 
 func TestPrepareSharedDynamoRequestOverwritesUntrustedHints(t *testing.T) {
 	body := []byte(`{"model":"m","max_tokens":41,"stream":true,"stream_options":{"include_usage":false},"cache_salt":"attacker","nvext":{"cache_salt":"attacker","keep":"yes","backend_instance_id":99,"token_data":[1,2],"agent_hints":{"priority":2147483647,"strict_priority":4294967295,"osl":1,"speculative_prefill":true}}}`)
-	tier := config.AdmissionTier{DynamoPriority: 9, DynamoStrictPriority: 2}
-	out, tenant, err := prepareSharedDynamoRequest(body, "org-a", 41, tier)
+	lane := config.AdmissionLane{DynamoPriority: 9, DynamoStrictPriority: 2}
+	out, tenant, err := prepareSharedDynamoRequest(body, "org-a", 41, lane)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -561,7 +581,7 @@ func TestPrepareSharedDynamoRequestOverwritesUntrustedHints(t *testing.T) {
 	if got.Nvext.Keep != "yes" || got.Nvext.BackendInstanceID != nil || got.Nvext.TokenData != nil || got.Nvext.Hints.SpeculativePrefill || !got.StreamOptions.IncludeUsage {
 		t.Fatalf("unrelated extensions or usage flag lost: %+v", got)
 	}
-	_, otherTenant, err := prepareSharedDynamoRequest(body, "org-b", 41, tier)
+	_, otherTenant, err := prepareSharedDynamoRequest(body, "org-b", 41, lane)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -570,7 +590,7 @@ func TestPrepareSharedDynamoRequestOverwritesUntrustedHints(t *testing.T) {
 	}
 }
 
-func TestProxyForwardsAtlasServiceTierDynamoHints(t *testing.T) {
+func TestProxyForwardsOperatorAdmissionLaneDynamoHints(t *testing.T) {
 	seen := make(chan *http.Request, 1)
 	seenBody := make(chan []byte, 1)
 	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -583,14 +603,14 @@ func TestProxyForwardsAtlasServiceTierDynamoHints(t *testing.T) {
 	up, _ := url.Parse(backend.URL)
 	mr := miniredis.RunT(t)
 	cfg := proxyAdmissionConfig(1)
-	cfg.Tiers = map[string]config.AdmissionTier{
+	cfg.Lanes = map[string]config.AdmissionLane{
 		"default": {Weight: 1},
 		"gold":    {Weight: 1, DynamoPriority: 11, DynamoStrictPriority: 4},
 	}
+	cfg.OrganizationLanes = map[string]string{"org-a": "gold"}
 	c := redis.NewClient(&redis.Options{Addr: mr.Addr()})
 	s := New(&config.Settings{Admission: cfg}, logging.New(logging.ERROR), &recordingEmitter{}).WithAdmitter(admission.New(c, cfg))
 	req := sharedRequest(up)
-	req.Header.Set(identity.HeaderServiceTier, "gold")
 	req.Header.Set("X-Tenant-ID", "attacker")
 	req.Header.Set("X-Dynamo-Request-Priority", "2147483647")
 	req.Header.Set("X-Dynamo-Request-Strict-Priority", "4294967295")

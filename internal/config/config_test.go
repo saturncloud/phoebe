@@ -279,7 +279,7 @@ admission:
   valkeyAddr: "valkey:6379"
   platform:
     maxActiveRequests: 10
-  tiers:
+  lanes:
     default:
       weight: 1
       limits:
@@ -292,7 +292,7 @@ admission:
         maxActiveRequests: 2
         requestsPerWindow: 5
         window: "30s"
-  organizationTiers:
+  organizationLanes:
     org-a: protected
 `))
 	if err != nil {
@@ -301,10 +301,10 @@ admission:
 	if s.Admission.LeaseTTL != 15*time.Minute || s.Admission.DefaultMaxOutputTokens != 512 {
 		t.Fatalf("admission defaults wrong: %+v", s.Admission)
 	}
-	if got := s.Admission.Tiers["protected"].Limits.Window; got != 30*time.Second {
-		t.Fatalf("tier window=%s, want 30s", got)
+	if got := s.Admission.Lanes["protected"].Limits.Window; got != 30*time.Second {
+		t.Fatalf("lane window=%s, want 30s", got)
 	}
-	if got := s.Admission.Tiers["protected"]; got.DynamoPriority != 17 || got.DynamoStrictPriority != 3 {
+	if got := s.Admission.Lanes["protected"]; got.DynamoPriority != 17 || got.DynamoStrictPriority != 3 {
 		t.Fatalf("protected Dynamo hints wrong: %+v", got)
 	}
 }
@@ -312,10 +312,10 @@ admission:
 func TestLoadAdmissionRejectsInvalidPolicy(t *testing.T) {
 	tests := []string{
 		"admission:\n  enabled: true\n  valkeyAddr: v\n  platform:\n    maxActiveRequests: -1\n",
-		"admission:\n  enabled: true\n  valkeyAddr: v\n  tiers:\n    bad:\n      weight: 0\n",
-		"admission:\n  enabled: true\n  valkeyAddr: v\n  tiers:\n    default:\n      weight: 1\n      dynamoPriority: 2147483648\n",
-		"admission:\n  enabled: true\n  valkeyAddr: v\n  tiers:\n    default:\n      weight: 1\n      dynamoStrictPriority: -1\n",
-		"admission:\n  enabled: true\n  valkeyAddr: v\n  organizationTiers:\n    org-a: missing\n",
+		"admission:\n  enabled: true\n  valkeyAddr: v\n  lanes:\n    bad:\n      weight: 0\n",
+		"admission:\n  enabled: true\n  valkeyAddr: v\n  lanes:\n    default:\n      weight: 1\n      dynamoPriority: 2147483648\n",
+		"admission:\n  enabled: true\n  valkeyAddr: v\n  lanes:\n    default:\n      weight: 1\n      dynamoStrictPriority: -1\n",
+		"admission:\n  enabled: true\n  valkeyAddr: v\n  organizationLanes:\n    org-a: missing\n",
 		"admission:\n  enabled: true\n  valkeyAddr: v\n  platform:\n    totalPromptTokensPerWindow: 10\n    uncachedPromptTokensPerWindow: 11\n",
 		"admission:\n  enabled: true\n  valkeyAddr: v\n  platform:\n    maxActiveRequests: 10\n    maxConcurrentPrefills: 11\n",
 		"admission:\n  enabled: true\n  valkeyAddr: v\n  platform:\n    maxActiveRequests: 10\n    maxReservedDecodeSlots: 11\n",

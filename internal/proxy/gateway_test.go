@@ -67,11 +67,19 @@ func gatewayRequest(org, body string) *http.Request {
 		req.Header.Set(identity.HeaderOrgID, org)
 	}
 	req.Header.Set(identity.HeaderAuthID, "auth-1")
-	req.Header.Set(identity.HeaderServiceTier, "default")
-	req.Header.Set(identity.HeaderRateLimitRequests, "0")
-	req.Header.Set(identity.HeaderRateLimitTotalPromptTokens, "0")
-	req.Header.Set(identity.HeaderRateLimitUncachedPromptTokens, "0")
-	req.Header.Set(identity.HeaderRateLimitGeneratedTokens, "0")
+	req.Header.Set(identity.HeaderOwnerID, "owner-1")
+	for _, header := range []string{
+		identity.HeaderOrgRateLimitRequests,
+		identity.HeaderOrgRateLimitTotalPromptTokens,
+		identity.HeaderOrgRateLimitUncachedPromptTokens,
+		identity.HeaderOrgRateLimitGeneratedTokens,
+		identity.HeaderOwnerRateLimitRequests,
+		identity.HeaderOwnerRateLimitTotalPromptTokens,
+		identity.HeaderOwnerRateLimitUncachedPromptTokens,
+		identity.HeaderOwnerRateLimitGeneratedTokens,
+	} {
+		req.Header.Set(header, "0")
+	}
 	return req
 }
 

@@ -84,7 +84,7 @@ type Server struct {
 	// gateway-marked requests fail closed with 503. Set via WithGateway.
 	gateway *gatewayRoute
 
-	// admitter is the distributed shared-tier physical-capacity gate. nil means
+	// admitter is the distributed shared-inference physical-capacity gate. nil means
 	// the feature is disabled. It runs only after trusted org/model resolution
 	// and model binding, and before any engine request.
 	admitter admission.Admitter
@@ -193,17 +193,17 @@ func (s *Server) handleHealth(w http.ResponseWriter, _ *http.Request) {
 // onDone fires exactly once regardless of whether EOF or Close reaches it first.
 func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request) {
 	id := identity.FromRequest(r)
-	var sharedTier config.AdmissionTier
+	var sharedLane config.AdmissionLane
 	bodyBound := false
 
-	// Gateway resolution must inspect model=, so apply the shared-tier body
+	// Gateway resolution must inspect model=, so apply the shared-inference body
 	// ceiling before that first read. The gateway ForwardAuth has already
-	// stamped the trusted organization and service tier. Preserve the existing
+	// stamped the trusted organization. Preserve the existing
 	// fail-closed gateway-not-configured/missing-org responses without reading
 	// a body in those cases.
 	if id.Gateway && s.gateway != nil && id.OrgID != "" {
-		sharedTier = admissionTierForIdentity(s.settings.Admission, id)
-		if !boundSharedRequestBody(w, r, sharedRequestBodyLimit(s.settings.Admission, sharedTier)) {
+		sharedLane = admissionLaneForIdentity(s.settings.Admission, id)
+		if !boundSharedRequestBody(w, r, sharedRequestBodyLimit(s.settings.Admission, sharedLane)) {
 			return
 		}
 		bodyBound = true
@@ -273,8 +273,8 @@ func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request) {
 
 	if id.ServingMode == "shared" {
 		if !bodyBound {
-			sharedTier = admissionTierForIdentity(s.settings.Admission, id)
-			if !boundSharedRequestBody(w, r, sharedRequestBodyLimit(s.settings.Admission, sharedTier)) {
+			sharedLane = admissionLaneForIdentity(s.settings.Admission, id)
+			if !boundSharedRequestBody(w, r, sharedRequestBodyLimit(s.settings.Admission, sharedLane)) {
 				return
 			}
 		}
@@ -362,7 +362,7 @@ func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request) {
 	// endpoints own their engine and bypass both shared-pool mechanisms.
 	var admitted *admission.Lease
 	if id.ServingMode == "shared" {
-		rateLimits, rerr := parseTrustedRateLimits(id)
+		organizationLimits, ownerLimits, rerr := parseTrustedRateLimits(id)
 		if rerr != nil {
 			s.log.Error.Printf("admission: invalid trusted rate-limit policy: %v", rerr)
 			http.Error(w, "shared inference policy unavailable", http.StatusServiceUnavailable)
@@ -386,7 +386,7 @@ func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request) {
 			http.Error(w, "invalid shared inference request", http.StatusBadRequest)
 			return
 		}
-		body, tenant, rerr := prepareSharedDynamoRequest(body, id.OrgID, estimate.OutputTokens, sharedTier)
+		body, tenant, rerr := prepareSharedDynamoRequest(body, id.OrgID, estimate.OutputTokens, sharedLane)
 		if rerr != nil {
 			http.Error(w, "invalid shared inference request", http.StatusBadRequest)
 			return
@@ -395,8 +395,8 @@ func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request) {
 		// Replace a client-supplied tenant header. Dynamo gives this header
 		// precedence over every body salt, so it must come from trusted identity.
 		r.Header.Set("X-Tenant-ID", tenant)
-		r.Header.Set("X-Dynamo-Request-Priority", strconv.FormatInt(sharedTier.DynamoPriority, 10))
-		r.Header.Set("X-Dynamo-Request-Strict-Priority", strconv.FormatInt(sharedTier.DynamoStrictPriority, 10))
+		r.Header.Set("X-Dynamo-Request-Priority", strconv.FormatInt(sharedLane.DynamoPriority, 10))
+		r.Header.Set("X-Dynamo-Request-Strict-Priority", strconv.FormatInt(sharedLane.DynamoStrictPriority, 10))
 		for _, header := range []string{
 			"X-Dynamo-Worker-Instance-ID", "X-Dynamo-Prefill-Instance-ID",
 			"X-Dynamo-DP-Rank", "X-Dynamo-Prefill-DP-Rank",
@@ -412,10 +412,10 @@ func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request) {
 				graph = graphFromUpstreamHost(upstream.Host)
 			}
 			admitted, err = s.admitter.Admit(r.Context(), admission.Request{
-				Graph: graph, Organization: id.OrgID, Model: estimate.Model,
+				Graph: graph, Organization: id.OrgID, Owner: id.OwnerID, Model: estimate.Model,
 				PromptBytes: originalPromptBytes, EstimatedInputTokens: estimate.InputTokens,
 				ReservedOutputTokens: estimate.OutputTokens,
-				Adapter:              id.Adapter != "", ServiceTier: id.ServiceTier, RateLimits: rateLimits,
+				Adapter:              id.Adapter != "", OrganizationLimits: organizationLimits, OwnerLimits: ownerLimits,
 			})
 			if err != nil {
 				if errors.Is(err, admission.ErrUnavailable) {
