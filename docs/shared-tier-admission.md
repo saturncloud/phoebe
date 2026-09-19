@@ -134,6 +134,12 @@ and conservative measured limits and enable admission. Watch
 Valkey bypass/latency errors. Roll back by disabling the feature; existing leases expire without affecting billing or Dynamo. Do not
 point replicas at different Valkey instances during a rolling update.
 
+The envelope requirement applies to every shared-inference request, not only
+gateway-marked requests. The historical per-resource auth path does not stamp
+this policy contract, so drain or remove those shared routes before enabling
+admission; once enabled, a missing or partial envelope on such a route fails
+closed with 503 instead of silently granting unlimited quota.
+
 ## Enforcement boundaries
 
 Fairness is deliberately layered instead of pretending one counter is an exact

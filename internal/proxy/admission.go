@@ -285,12 +285,12 @@ func parseTrustedRateLimits(id identity.Identity) (admission.RateLimits, admissi
 	}
 	newAny, newComplete := completeness(newValues[:])
 	legacyAny, legacyComplete := completeness(legacyValues[:])
-	if id.Gateway && newAny && !newComplete {
-		return admission.RateLimits{}, admission.RateLimits{}, fmt.Errorf("incomplete trusted gateway rate-limit policy")
+	if newAny && !newComplete {
+		return admission.RateLimits{}, admission.RateLimits{}, fmt.Errorf("incomplete trusted shared-inference rate-limit policy")
 	}
-	if id.Gateway && !newAny {
+	if !newAny {
 		if !legacyAny || !legacyComplete {
-			return admission.RateLimits{}, admission.RateLimits{}, fmt.Errorf("incomplete trusted gateway rate-limit policy")
+			return admission.RateLimits{}, admission.RateLimits{}, fmt.Errorf("incomplete trusted shared-inference rate-limit policy")
 		}
 		legacy, err := parseScope(
 			[4]string{identity.HeaderLegacyRateLimitRequests, identity.HeaderLegacyRateLimitTotalPromptTokens, identity.HeaderLegacyRateLimitUncachedPromptTokens, identity.HeaderLegacyRateLimitGeneratedTokens},

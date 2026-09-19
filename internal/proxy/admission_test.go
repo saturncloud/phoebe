@@ -38,6 +38,21 @@ func sharedRequest(upstream *url.URL) *http.Request {
 	r.Header.Set(identity.HeaderOrgID, "org-a")
 	r.Header.Set(identity.HeaderServingMode, "shared")
 	r.Header.Set(identity.HeaderServedModel, "model-a")
+	// Admission-enabled shared requests require the complete authenticated
+	// policy envelope regardless of whether they use the single-host gateway or
+	// a transitional per-resource route. Explicit zero means unlimited.
+	for _, header := range []string{
+		identity.HeaderOrgRateLimitRequests,
+		identity.HeaderOrgRateLimitTotalPromptTokens,
+		identity.HeaderOrgRateLimitUncachedPromptTokens,
+		identity.HeaderOrgRateLimitGeneratedTokens,
+		identity.HeaderOwnerRateLimitRequests,
+		identity.HeaderOwnerRateLimitTotalPromptTokens,
+		identity.HeaderOwnerRateLimitUncachedPromptTokens,
+		identity.HeaderOwnerRateLimitGeneratedTokens,
+	} {
+		r.Header.Set(header, "0")
+	}
 	return r
 }
 
@@ -343,10 +358,14 @@ func TestMalformedTrustedRateLimitFailsClosed(t *testing.T) {
 	}
 }
 
-func TestGatewayMissingTrustedRateLimitPolicyFailsClosed(t *testing.T) {
+func TestMissingOrPartialTrustedRateLimitPolicyFailsClosed(t *testing.T) {
 	_, _, err := parseTrustedRateLimits(identity.Identity{Gateway: true})
 	if err == nil {
 		t.Fatal("gateway request without Atlas policy was accepted as unlimited")
+	}
+	_, _, err = parseTrustedRateLimits(identity.Identity{OwnerID: "owner-1"})
+	if err == nil {
+		t.Fatal("per-resource shared request without policy was accepted as unlimited")
 	}
 	organization, owner, err := parseTrustedRateLimits(identity.Identity{
 		Gateway: true, OwnerID: "owner-1",
@@ -374,6 +393,62 @@ func TestGatewayMissingTrustedRateLimitPolicyFailsClosed(t *testing.T) {
 	})
 	if err == nil {
 		t.Fatal("partial new envelope incorrectly fell back to the legacy policy")
+	}
+}
+
+func TestAdmissionEnabledPerResourceRequestWithoutPolicyFailsClosed(t *testing.T) {
+	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer backend.Close()
+	up, _ := url.Parse(backend.URL)
+	cfg := proxyAdmissionConfig(1)
+	mr := miniredis.RunT(t)
+	c := redis.NewClient(&redis.Options{Addr: mr.Addr()})
+	s := New(&config.Settings{Admission: cfg}, logging.New(logging.ERROR), &recordingEmitter{}).WithAdmitter(admission.New(c, cfg))
+
+	for _, tc := range []struct {
+		name   string
+		mutate func(*http.Request)
+	}{
+		{
+			name: "missing",
+			mutate: func(req *http.Request) {
+				for _, header := range []string{
+					identity.HeaderOrgRateLimitRequests,
+					identity.HeaderOrgRateLimitTotalPromptTokens,
+					identity.HeaderOrgRateLimitUncachedPromptTokens,
+					identity.HeaderOrgRateLimitGeneratedTokens,
+					identity.HeaderOwnerRateLimitRequests,
+					identity.HeaderOwnerRateLimitTotalPromptTokens,
+					identity.HeaderOwnerRateLimitUncachedPromptTokens,
+					identity.HeaderOwnerRateLimitGeneratedTokens,
+				} {
+					req.Header.Del(header)
+				}
+			},
+		},
+		{
+			name: "partial new plus complete legacy",
+			mutate: func(req *http.Request) {
+				req.Header.Del(identity.HeaderOwnerRateLimitGeneratedTokens)
+				req.Header.Set(identity.HeaderLegacyServiceTier, "default")
+				req.Header.Set(identity.HeaderLegacyRateLimitRequests, "0")
+				req.Header.Set(identity.HeaderLegacyRateLimitTotalPromptTokens, "0")
+				req.Header.Set(identity.HeaderLegacyRateLimitUncachedPromptTokens, "0")
+				req.Header.Set(identity.HeaderLegacyRateLimitGeneratedTokens, "0")
+			},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			req := sharedRequest(up)
+			tc.mutate(req)
+			rr := httptest.NewRecorder()
+			s.Handler().ServeHTTP(rr, req)
+			if rr.Code != http.StatusServiceUnavailable {
+				t.Fatalf("status=%d, want 503", rr.Code)
+			}
+		})
 	}
 }
 
