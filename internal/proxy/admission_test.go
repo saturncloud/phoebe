@@ -464,6 +464,73 @@ func TestAdmissionReleasesAbortedStream(t *testing.T) {
 	_ = lease.Complete(context.Background(), 0)
 }
 
+func TestAdmissionChargesUnknownUsageOnPreHeaderAbort(t *testing.T) {
+	started := make(chan struct{})
+	unblock := make(chan struct{})
+	backend := httptest.NewServer(http.HandlerFunc(func(_ http.ResponseWriter, r *http.Request) {
+		close(started)
+		select {
+		case <-r.Context().Done():
+		case <-unblock:
+		}
+	}))
+	defer backend.Close()
+	defer close(unblock)
+	up, _ := url.Parse(backend.URL)
+	mr := miniredis.RunT(t)
+	cfg := proxyAdmissionConfig(1)
+	c := redis.NewClient(&redis.Options{Addr: mr.Addr()})
+	a := admission.New(c, cfg)
+	s := New(&config.Settings{Admission: cfg, BillPartialOnAbort: true}, logging.New(logging.ERROR), &recordingEmitter{}).WithAdmitter(a)
+	ctx, cancel := context.WithCancel(context.Background())
+	req := sharedRequest(up)
+	req.Header.Set(identity.HeaderOrgRateLimitGeneratedTokens, "20")
+	req.Header.Set(identity.HeaderOwnerRateLimitGeneratedTokens, "20")
+	req = req.WithContext(ctx)
+	done := make(chan struct{})
+	go func() { defer close(done); s.Handler().ServeHTTP(httptest.NewRecorder(), req) }()
+	select {
+	case <-started:
+	case <-time.After(time.Second):
+		t.Fatal("request never reached backend")
+	}
+	cancel()
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("pre-header abort did not return")
+	}
+
+	for _, tc := range []struct {
+		name string
+		req  admission.Request
+		want string
+	}{
+		{
+			name: "organization contract",
+			req: admission.Request{Graph: "graph", Organization: "org-a", Owner: "other-owner", Model: "m",
+				PromptBytes: 1, EstimatedInputTokens: 1, ReservedOutputTokens: 1,
+				OrganizationLimits: admission.RateLimits{GeneratedTokens: 20}},
+			want: "contract_organization",
+		},
+		{
+			name: "owner contract",
+			req: admission.Request{Graph: "graph", Organization: "other-org", Owner: "owner-a", Model: "m",
+				PromptBytes: 1, EstimatedInputTokens: 1, ReservedOutputTokens: 1,
+				OwnerLimits: admission.RateLimits{GeneratedTokens: 20}},
+			want: "contract_owner",
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			_, err := a.Admit(context.Background(), tc.req)
+			var rejected *admission.Rejected
+			if !errors.As(err, &rejected) || rejected.Scope != tc.want || rejected.Dimension != "generated_tokens" {
+				t.Fatalf("err=%v, want %s generated_tokens rejection", err, tc.want)
+			}
+		})
+	}
+}
+
 func TestAdmissionRenewalFailureDoesNotCancelUpstream(t *testing.T) {
 	started := make(chan struct{})
 	releaseBackend := make(chan struct{})
