@@ -98,7 +98,7 @@ emit:
 #   enabled: true
 #   valkeyAddr: "valkey.saturn.svc.cluster.local:6379"
 #   keyPrefix: "phoebe:admission"
-#   leaseTtl: "15m"
+#   leaseTtl: "15m" # minimum 1s; must exceed admission Valkey I/O latency
 #   defaultMaxOutputTokens: 512
 #   platform:
 #     maxActiveRequests: 256

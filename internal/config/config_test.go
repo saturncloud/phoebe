@@ -311,6 +311,7 @@ admission:
 
 func TestLoadAdmissionRejectsInvalidPolicy(t *testing.T) {
 	tests := []string{
+		"admission:\n  enabled: true\n  valkeyAddr: v\n  leaseTtl: 999ms\n",
 		"admission:\n  enabled: true\n  valkeyAddr: v\n  platform:\n    maxActiveRequests: -1\n",
 		"admission:\n  enabled: true\n  valkeyAddr: v\n  lanes:\n    bad:\n      weight: 0\n",
 		"admission:\n  enabled: true\n  valkeyAddr: v\n  lanes:\n    default:\n      weight: 1\n      dynamoPriority: 2147483648\n",

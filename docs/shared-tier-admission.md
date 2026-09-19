@@ -105,7 +105,9 @@ renews the expiry throughout long streams. Pre-header aborts, upstream errors, o
 rejections, wake failures, and handler early returns run the same idempotent
 release. A replica crash cannot execute cleanup, so every operation first reaps
 expired leases. `leaseTtl` is the maximum crash-leak interval, not a stream
-duration limit. A Valkey reset starts fresh best-effort counters; callbacks for
+duration limit. Phoebe rejects values below one second so the lease remains
+comfortably longer than its 100 ms admission-Valkey operation budget. A Valkey
+reset starts fresh best-effort counters; callbacks for
 old random lease IDs become no-ops, while independent metering remains the
 usage authority.
 

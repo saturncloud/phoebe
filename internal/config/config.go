@@ -124,6 +124,8 @@ type AdmissionSettings struct {
 	OrganizationLanes      map[string]string        `yaml:"organizationLanes"`
 }
 
+const minimumAdmissionLeaseTTL = time.Second
+
 // EmitSettings is the YAML shape for the durable emitter. Mirrors emit.Config
 // without importing it.
 type EmitSettings struct {
@@ -327,7 +329,7 @@ func (a *AdmissionSettings) parse() error {
 		a.LeaseTTLStr = "15m"
 	}
 	var err error
-	if a.LeaseTTL, err = time.ParseDuration(a.LeaseTTLStr); err != nil || a.LeaseTTL <= 0 {
+	if a.LeaseTTL, err = time.ParseDuration(a.LeaseTTLStr); err != nil || a.LeaseTTL < minimumAdmissionLeaseTTL {
 		return fmt.Errorf("invalid admission.leaseTtl %q", a.LeaseTTLStr)
 	}
 	if a.DefaultMaxOutputTokens <= 0 {

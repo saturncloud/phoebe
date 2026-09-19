@@ -596,7 +596,8 @@ func TestExpiredLeaseReapingIsBoundedAndConverges(t *testing.T) {
 }
 
 func TestKeepAlivePreventsLongStreamExpiry(t *testing.T) {
-	a, mr := testAdmitter(t, config.AdmissionSettings{Platform: limits(1), LeaseTTL: 30 * time.Millisecond})
+	const leaseTTL = time.Second
+	a, mr := testAdmitter(t, config.AdmissionSettings{Platform: limits(1), LeaseTTL: leaseTTL})
 	l, err := a.Admit(context.Background(), request("a", "m"))
 	if err != nil {
 		t.Fatal(err)
@@ -608,7 +609,7 @@ func TestKeepAlivePreventsLongStreamExpiry(t *testing.T) {
 	// Advance Redis deterministically while the original lease is still live.
 	// KeepAlive's synchronous first renewal must move the score forward from
 	// this exact server time; no assertion depends on wall-clock scheduling.
-	mr.SetTime(time.UnixMilli(int64(initialExpiry) - 20))
+	mr.SetTime(time.UnixMilli(int64(initialExpiry) - leaseTTL.Milliseconds()/2))
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan struct{})
 	go func() { defer close(done); l.KeepAlive(ctx, func(e error) { t.Errorf("keepalive: %v", e) }) }()
@@ -646,7 +647,7 @@ func TestKeepAlivePreventsLongStreamExpiry(t *testing.T) {
 }
 
 func TestKeepAliveCancellationIsNotAnOutage(t *testing.T) {
-	a, _ := testAdmitter(t, config.AdmissionSettings{Platform: limits(1), LeaseTTL: 30 * time.Millisecond})
+	a, _ := testAdmitter(t, config.AdmissionSettings{Platform: limits(1), LeaseTTL: time.Second})
 	l, err := a.Admit(context.Background(), request("a", "m"))
 	if err != nil {
 		t.Fatal(err)
@@ -663,7 +664,7 @@ func TestKeepAliveCancellationIsNotAnOutage(t *testing.T) {
 }
 
 func TestKeepAliveReportsLeaseReapedBeforeRenewal(t *testing.T) {
-	a, mr := testAdmitter(t, config.AdmissionSettings{Platform: limits(1), LeaseTTL: 30 * time.Millisecond})
+	a, mr := testAdmitter(t, config.AdmissionSettings{Platform: limits(1), LeaseTTL: time.Second})
 	l, err := a.Admit(context.Background(), request("a", "m"))
 	if err != nil {
 		t.Fatal(err)
