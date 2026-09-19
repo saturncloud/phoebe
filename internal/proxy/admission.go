@@ -134,7 +134,7 @@ func admissionWork(body []byte, defaultOutput int64) (admissionEstimate, bool) {
 // nvext.agent_hints; the caller also overwrites Dynamo's higher-precedence
 // priority headers. x-tenant-id has highest precedence for cache isolation;
 // nvext.cache_salt is also set so the invariant remains visible in the body.
-func prepareSharedDynamoRequest(body []byte, org string, maxOutput int64, lane config.AdmissionLane) ([]byte, string, error) {
+func prepareSharedDynamoRequest(body []byte, tenantIdentity string, maxOutput int64, lane config.AdmissionLane) ([]byte, string, error) {
 	var root map[string]json.RawMessage
 	if err := json.Unmarshal(body, &root); err != nil || root == nil {
 		return nil, "", fmt.Errorf("request body must be a JSON object")
@@ -165,7 +165,7 @@ func prepareSharedDynamoRequest(body []byte, org string, maxOutput int64, lane c
 	}
 	delete(hints, "speculative_prefill")
 
-	tenantHash := sha256.Sum256([]byte("phoebe-dynamo-tenant\x00" + org))
+	tenantHash := sha256.Sum256([]byte("phoebe-dynamo-tenant\x00" + tenantIdentity))
 	tenant := fmt.Sprintf("saturn-%x", tenantHash[:])
 	setJSON := func(dst map[string]json.RawMessage, key string, value any) error {
 		raw, err := json.Marshal(value)

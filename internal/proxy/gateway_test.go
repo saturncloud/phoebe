@@ -142,6 +142,35 @@ func TestGatewayRequestBodyBoundedBeforeResolution(t *testing.T) {
 	}
 }
 
+func TestGatewayRejectsNonSharedRegistryResolution(t *testing.T) {
+	for _, mode := range []string{"", "dedicated"} {
+		t.Run("serving_mode="+mode, func(t *testing.T) {
+			var upstreamHits int
+			backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				upstreamHits++
+				w.WriteHeader(http.StatusOK)
+			}))
+			defer backend.Close()
+			up, _ := url.Parse(backend.URL)
+			resolver := &mapResolver{m: map[[2]string]gateway.Resolution{
+				{"org-1", "model-a"}: {
+					ResourceID: "resource-a", BaseModel: "model-a", ServingMode: mode,
+					GraphK8sName: "graph-a",
+				},
+			}}
+			s := newGatewayTestServer(t, &recordingEmitter{}, resolver, up)
+			rr := httptest.NewRecorder()
+			s.Handler().ServeHTTP(rr, gatewayRequest("org-1", `{"model":"model-a","max_tokens":20}`))
+			if rr.Code != http.StatusServiceUnavailable {
+				t.Fatalf("status=%d, want 503", rr.Code)
+			}
+			if upstreamHits != 0 {
+				t.Fatalf("non-shared gateway resolution reached upstream %d times", upstreamHits)
+			}
+		})
+	}
+}
+
 func TestGatewayPolicyEnvelopeCanRollOutBeforeAdmissionIsEnabled(t *testing.T) {
 	backend, backendURL := usageBackend(t)
 	defer backend.Close()

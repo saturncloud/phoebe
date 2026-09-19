@@ -452,6 +452,58 @@ func TestAdmissionEnabledPerResourceRequestWithoutPolicyFailsClosed(t *testing.T
 	}
 }
 
+func TestSharedRequestMissingOrganizationIdentity(t *testing.T) {
+	const requestBody = `{"model":"model-a","max_tokens":20}`
+	var upstreamHits int
+	var observedTenant string
+	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		upstreamHits++
+		observedTenant = r.Header.Get("X-Tenant-ID")
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"model":"model-a","usage":{"prompt_tokens":1,"completion_tokens":1}}`))
+	}))
+	defer backend.Close()
+	up, _ := url.Parse(backend.URL)
+
+	t.Run("enabled admission fails closed before upstream", func(t *testing.T) {
+		cfg := proxyAdmissionConfig(1)
+		mr := miniredis.RunT(t)
+		c := redis.NewClient(&redis.Options{Addr: mr.Addr()})
+		s := New(&config.Settings{Admission: cfg}, logging.New(logging.ERROR), &recordingEmitter{}).WithAdmitter(admission.New(c, cfg))
+		req := sharedRequest(up)
+		req.Header.Del(identity.HeaderOrgID)
+		rr := httptest.NewRecorder()
+		s.Handler().ServeHTTP(rr, req)
+		if rr.Code != http.StatusServiceUnavailable {
+			t.Fatalf("status=%d, want 503", rr.Code)
+		}
+		if upstreamHits != 0 {
+			t.Fatalf("missing organization reached upstream %d times", upstreamHits)
+		}
+	})
+
+	t.Run("disabled admission uses trusted resource isolation", func(t *testing.T) {
+		cfg := proxyAdmissionConfig(1)
+		s := New(&config.Settings{Admission: cfg}, logging.New(logging.ERROR), &recordingEmitter{})
+		req := sharedRequest(up)
+		req.Header.Del(identity.HeaderOrgID)
+		rr := httptest.NewRecorder()
+		s.Handler().ServeHTTP(rr, req)
+		if rr.Code != http.StatusOK {
+			t.Fatalf("status=%d, want 200", rr.Code)
+		}
+		_, expectedTenant, err := prepareSharedDynamoRequest(
+			[]byte(requestBody), "resource:resource-a", 20, config.AdmissionLane{},
+		)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if observedTenant != expectedTenant {
+			t.Fatalf("tenant=%q, want resource-isolated %q", observedTenant, expectedTenant)
+		}
+	})
+}
+
 func TestAdmissionReleasesOnUpstreamFailure(t *testing.T) {
 	up, _ := url.Parse("http://127.0.0.1:1")
 	mr := miniredis.RunT(t)

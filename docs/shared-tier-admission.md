@@ -139,6 +139,12 @@ gateway-marked requests. The historical per-resource auth path does not stamp
 this policy contract, so drain or remove those shared routes before enabling
 admission; once enabled, a missing or partial envelope on such a route fails
 closed with 503 instead of silently granting unlimited quota.
+During the admission-disabled migration window, a historical shared route that
+lacks organization identity remains isolated by its trusted resource ID rather
+than sharing the empty-organization cache namespace. Enabling admission also
+requires a non-empty trusted organization ID and rejects a broken identity
+contract before the Valkey fail-open boundary. Gateway registry entries must
+resolve with `serving_mode: shared`; empty or dedicated entries fail closed.
 
 ## Enforcement boundaries
 

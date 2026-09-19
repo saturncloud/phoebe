@@ -140,6 +140,16 @@ func (s *Server) resolveGateway(w http.ResponseWriter, r *http.Request, id *iden
 		http.Error(w, "service unavailable", http.StatusServiceUnavailable)
 		return false
 	}
+	if res.ServingMode != "shared" {
+		// The gateway is exclusively the shared-inference entry point. Treat a
+		// non-shared registry row as a broken trusted contract; otherwise the
+		// request would skip tenant isolation, scheduler sanitization, and quota
+		// admission after resolving onto a shared graph.
+		s.log.Error.Printf("gateway: resolved non-shared model org_id=%s model=%q serving_mode=%q request_id=%q",
+			id.OrgID, model, res.ServingMode, requestID)
+		http.Error(w, "service unavailable", http.StatusServiceUnavailable)
+		return false
+	}
 
 	id.ResourceID = res.ResourceID
 	id.BaseModel = res.BaseModel

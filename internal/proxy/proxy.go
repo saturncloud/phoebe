@@ -365,6 +365,22 @@ func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request) {
 	var responseCaptureInstalled atomic.Bool
 	responseCaptureDone := make(chan struct{})
 	if id.ServingMode == "shared" {
+		tenantIdentity := id.OrgID
+		if tenantIdentity == "" {
+			if s.admitter != nil {
+				// A missing organization is a broken trusted identity contract, not
+				// a Valkey outage. Reject before deriving cache/scheduler tenancy so
+				// it can never enter the admission fail-open path.
+				s.log.Error.Printf("admission: missing trusted organization identity request_id=%s", requestID)
+				http.Error(w, "shared inference identity unavailable", http.StatusServiceUnavailable)
+				return
+			}
+			// During the admission-disabled compatibility window, historical
+			// per-resource routes may not yet stamp OrgID. Preserve availability
+			// without putting every such route in one empty-org cache namespace:
+			// ResourceID is trusted, mandatory, and unique to the authorized route.
+			tenantIdentity = "resource:" + id.ResourceID
+		}
 		body, rerr := readAndRestoreBody(r)
 		if rerr != nil {
 			writeRequestBodyError(w, rerr)
@@ -383,7 +399,7 @@ func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request) {
 			http.Error(w, "invalid shared inference request", http.StatusBadRequest)
 			return
 		}
-		body, tenant, rerr := prepareSharedDynamoRequest(body, id.OrgID, estimate.OutputTokens, sharedLane)
+		body, tenant, rerr := prepareSharedDynamoRequest(body, tenantIdentity, estimate.OutputTokens, sharedLane)
 		if rerr != nil {
 			http.Error(w, "invalid shared inference request", http.StatusBadRequest)
 			return
