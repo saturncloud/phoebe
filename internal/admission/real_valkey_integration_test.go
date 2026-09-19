@@ -135,3 +135,88 @@ func TestRealValkeyReapsRetiredScopeWindows(t *testing.T) {
 		t.Fatalf("retired window fields were not reclaimed: before=%d after=%d", before, after)
 	}
 }
+
+func TestRealValkeySettlesIndependentContractsExactly(t *testing.T) {
+	addr := os.Getenv("PHOEBE_TEST_ADMISSION_VALKEY_ADDR")
+	if addr == "" {
+		t.Fatal("PHOEBE_TEST_ADMISSION_VALKEY_ADDR is required")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	client := redis.NewClient(&redis.Options{Addr: addr})
+	cfg := config.AdmissionSettings{
+		KeyPrefix: fmt.Sprintf("phoebe-admission-settlement-%d", time.Now().UnixNano()),
+		LeaseTTL:  time.Second,
+		Platform:  limits(64),
+	}
+	a := New(client, cfg)
+	t.Cleanup(func() {
+		_ = client.Del(context.Background(), a.counters, a.leases, a.expiries, a.windowExpiries).Err()
+		_ = client.Close()
+	})
+
+	contractRequest := func(owner string, input, output int64) Request {
+		r := request("org", "model")
+		r.Owner = owner
+		r.EstimatedInputTokens = input
+		r.ReservedOutputTokens = output
+		r.OrganizationLimits = RateLimits{
+			TotalPromptTokens: 12, UncachedPromptTokens: 8, GeneratedTokens: 7,
+		}
+		r.OwnerLimits = RateLimits{
+			TotalPromptTokens: 9, UncachedPromptTokens: 5, GeneratedTokens: 6,
+		}
+		return r
+	}
+
+	first, err := a.Admit(ctx, contractRequest("owner-a", 4, 5))
+	if err != nil {
+		t.Fatalf("admit first request: %v", err)
+	}
+	// Exact usage is total=6, uncached=2, generated=3. This deliberately
+	// exceeds the input estimate while refunding cached and generated capacity.
+	if err := first.CompleteUsage(ctx, Usage{
+		TotalPromptTokens: 6, CachedPromptTokens: 4, GeneratedTokens: 3,
+	}); err != nil {
+		t.Fatalf("settle first request: %v", err)
+	}
+
+	ownerBoundary, err := a.Admit(ctx, contractRequest("owner-a", 3, 3))
+	if err != nil {
+		t.Fatalf("exact owner boundary rejected after settlement: %v", err)
+	}
+	if _, err := a.Admit(ctx, contractRequest("owner-a", 1, 1)); err == nil {
+		t.Fatal("owner total/uncached/generated boundary was not enforced")
+	} else if rejected, ok := err.(*Rejected); !ok || rejected.Scope != "contract_owner" {
+		t.Fatalf("owner boundary rejection = %T %v", err, err)
+	}
+	// A zero-usage completion refunds the outstanding conservative reservation.
+	if err := ownerBoundary.CompleteUsage(ctx, Usage{}); err != nil {
+		t.Fatalf("refund owner reservation: %v", err)
+	}
+	refunded, err := a.Admit(ctx, contractRequest("owner-a", 3, 3))
+	if err != nil {
+		t.Fatalf("refunded owner reservation remained charged: %v", err)
+	}
+	if err := refunded.CompleteUsage(ctx, Usage{}); err != nil {
+		t.Fatalf("complete refunded-boundary request: %v", err)
+	}
+
+	// Other owners get independent owner scopes while sharing the remaining org
+	// budget. Together these reservations reach each exact organization bound.
+	ownerB, err := a.Admit(ctx, contractRequest("owner-b", 3, 3))
+	if err != nil {
+		t.Fatalf("owner-b admission: %v", err)
+	}
+	ownerC, err := a.Admit(ctx, contractRequest("owner-c", 3, 1))
+	if err != nil {
+		t.Fatalf("owner-c exact organization boundary: %v", err)
+	}
+	if _, err := a.Admit(ctx, contractRequest("owner-d", 1, 1)); err == nil {
+		t.Fatal("aggregate organization boundary was not enforced")
+	} else if rejected, ok := err.(*Rejected); !ok || rejected.Scope != "contract_organization" {
+		t.Fatalf("organization boundary rejection = %T %v", err, err)
+	}
+	_ = ownerB.CompleteUsage(ctx, Usage{})
+	_ = ownerC.CompleteUsage(ctx, Usage{})
+}

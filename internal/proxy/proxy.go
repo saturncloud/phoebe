@@ -362,12 +362,6 @@ func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request) {
 	// endpoints own their engine and bypass both shared-pool mechanisms.
 	var admitted *admission.Lease
 	if id.ServingMode == "shared" {
-		organizationLimits, ownerLimits, rerr := parseTrustedRateLimits(id)
-		if rerr != nil {
-			s.log.Error.Printf("admission: invalid trusted rate-limit policy: %v", rerr)
-			http.Error(w, "shared inference policy unavailable", http.StatusServiceUnavailable)
-			return
-		}
 		body, rerr := readAndRestoreBody(r)
 		if rerr != nil {
 			writeRequestBodyError(w, rerr)
@@ -407,6 +401,16 @@ func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request) {
 			r.Header.Del(header)
 		}
 		if s.admitter != nil {
+			// The trusted quota envelope is part of enabled admission, not of
+			// request routing. Keeping this check behind the feature gate lets
+			// operators deploy Phoebe before Saturn begins stamping the envelope;
+			// once admission is enabled, absent or partial policy still fails closed.
+			organizationLimits, ownerLimits, policyErr := parseTrustedRateLimits(id)
+			if policyErr != nil {
+				s.log.Error.Printf("admission: invalid trusted rate-limit policy: %v", policyErr)
+				http.Error(w, "shared inference policy unavailable", http.StatusServiceUnavailable)
+				return
+			}
 			graph := id.GraphK8sName
 			if graph == "" {
 				graph = graphFromUpstreamHost(upstream.Host)

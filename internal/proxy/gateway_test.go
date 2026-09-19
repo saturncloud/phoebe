@@ -142,6 +142,51 @@ func TestGatewayRequestBodyBoundedBeforeResolution(t *testing.T) {
 	}
 }
 
+func TestGatewayPolicyEnvelopeCanRollOutBeforeAdmissionIsEnabled(t *testing.T) {
+	backend, backendURL := usageBackend(t)
+	defer backend.Close()
+	resolver := &mapResolver{m: map[[2]string]gateway.Resolution{
+		{"org-1", "model-a"}: {
+			ResourceID: "resource-a", BaseModel: "model-a", ServingMode: "shared",
+			GraphK8sName: "graph-a",
+		},
+	}}
+	s := newGatewayTestServer(t, &recordingEmitter{}, resolver, backendURL)
+	missingPolicyRequest := func() *http.Request {
+		req := gatewayRequest("org-1", `{"model":"model-a","max_tokens":20}`)
+		for _, header := range []string{
+			identity.HeaderOwnerID,
+			identity.HeaderOrgRateLimitRequests,
+			identity.HeaderOrgRateLimitTotalPromptTokens,
+			identity.HeaderOrgRateLimitUncachedPromptTokens,
+			identity.HeaderOrgRateLimitGeneratedTokens,
+			identity.HeaderOwnerRateLimitRequests,
+			identity.HeaderOwnerRateLimitTotalPromptTokens,
+			identity.HeaderOwnerRateLimitUncachedPromptTokens,
+			identity.HeaderOwnerRateLimitGeneratedTokens,
+		} {
+			req.Header.Del(header)
+		}
+		return req
+	}
+	rr := httptest.NewRecorder()
+	s.Handler().ServeHTTP(rr, missingPolicyRequest())
+	if rr.Code != http.StatusOK {
+		t.Fatalf("disabled-admission rollout status=%d, want 200 (body %q)", rr.Code, rr.Body.String())
+	}
+
+	cfg := proxyAdmissionConfig(2)
+	s.settings.Admission = cfg
+	mr := miniredis.RunT(t)
+	client := redis.NewClient(&redis.Options{Addr: mr.Addr()})
+	s.WithAdmitter(admission.New(client, cfg))
+	rr = httptest.NewRecorder()
+	s.Handler().ServeHTTP(rr, missingPolicyRequest())
+	if rr.Code != http.StatusServiceUnavailable {
+		t.Fatalf("enabled-admission missing-policy status=%d, want 503", rr.Code)
+	}
+}
+
 // usageBackend returns an httptest server answering like a vLLM engine (model
 // name + usage block), so the full metering path runs.
 func usageBackend(t *testing.T) (*httptest.Server, *url.URL) {

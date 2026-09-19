@@ -115,16 +115,21 @@ downstream JSON stack cannot select different values and under-reserve work.
 
 ## Rollout and rollback
 
-The transition is order-independent. Saturn emits both the new independent
+Component deployment order is independent while admission remains disabled.
+Saturn emits both the new independent
 eleven-header envelope and a conservative five-header legacy projection. Traefik
 allowlists both during the rolling upgrade. New Phoebe prefers the complete new
 envelope, rejects a partial one, and accepts the complete legacy envelope only
-when every new field is absent. The legacy service-tier marker is constant and
-never selects an admission lane. Remove the five compatibility headers after all
+when every new field is absent. While admission is disabled, Phoebe does not
+require a policy envelope, allowing Saturn's producer headers to roll out after
+the proxy. Once admission is enabled, missing or partial policy fails closed.
+The legacy service-tier marker is constant and never selects an admission lane. Remove the five compatibility headers after all
 Saturn, Traefik, and Phoebe replicas use the new contract.
 
-Keep `admission.enabled: false` while deploying all Phoebe replicas, then
-configure one shared Valkey and conservative measured limits and enable admission. Watch
+Keep `admission.enabled: false` until Saturn, Traefik, and all Phoebe replicas
+have the new envelope contract; enabling earlier is unsupported because an old
+edge does not authenticate the new headers. Then configure one shared Valkey
+and conservative measured limits and enable admission. Watch
 429 contract rejections, 503 capacity rejections by scope/dimension, and logged
 Valkey bypass/latency errors. Roll back by disabling the feature; existing leases expire without affecting billing or Dynamo. Do not
 point replicas at different Valkey instances during a rolling update.
