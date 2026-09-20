@@ -156,20 +156,22 @@ func TestIntegration_RateWindow_ConformsToOracle(t *testing.T) {
 	hour := mustTime("2026-06-08T10:00:00Z")
 	book := conformanceBook()
 
-	// Events: priced base, priced derived, unpriced, unattributable. Each priced/unpriced
-	// event carries a resource_id (E2 grain); the unattributable one has none.
+	// Events: priced aborted base, priced derived, unpriced, unattributable. The
+	// aborted event proves disconnect never removes authoritative usage from
+	// money. Each priced/unpriced event carries a resource_id (E2 grain); the
+	// unattributable one has none.
 	events := []RatedEvent{
-		{AuthID: "a", ResourceID: "r", ModelID: "b", PromptTokens: 100, CachedTokens: 30, CompletionTokens: 50, At: hour.Add(5 * time.Minute)},
+		{AuthID: "a", ResourceID: "r", ModelID: "b", PromptTokens: 100, CachedTokens: 30, CompletionTokens: 50, Aborted: true, At: hour.Add(5 * time.Minute)},
 		{AuthID: "a", ResourceID: "r", ModelID: "f", PromptTokens: 100, CachedTokens: 0, CompletionTokens: 0, At: hour.Add(15 * time.Minute)},
 		{AuthID: "a", ResourceID: "r", ModelID: "unpriced", PromptTokens: 9, At: hour.Add(1 * time.Minute)},
 		{AuthID: "", ResourceID: "r", ModelID: "b", PromptTokens: 9, At: hour.Add(2 * time.Minute)},
 	}
 	for i, e := range events {
 		_, err := db.ExecContext(ctx,
-			`INSERT INTO billing_event (request_id, auth_id, resource_id, model, prompt_tokens, cached_tokens, completion_tokens, event_ts)
-			 VALUES ($1,$2,$3,$4,$5,$6,$7,$8)`,
+			`INSERT INTO billing_event (request_id, auth_id, resource_id, model, prompt_tokens, cached_tokens, completion_tokens, aborted, event_ts)
+			 VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)`,
 			fmt.Sprintf("req-%d", i), nullableStr(e.AuthID), nullableStr(e.ResourceID), nullableStr(e.ModelID),
-			e.PromptTokens, e.CachedTokens, e.CompletionTokens, e.At)
+			e.PromptTokens, e.CachedTokens, e.CompletionTokens, e.Aborted, e.At)
 		if err != nil {
 			t.Fatalf("seed event %d: %v", i, err)
 		}
@@ -833,11 +835,10 @@ func TestIntegration_ReRatePreservesHistoricalPrice(t *testing.T) {
 	}
 }
 
-// TestIntegration_LegacyInvalidUsageNeverEntersMoney proves the NOT VALID
-// rollout contract: malformed pre-0005 evidence remains queryable after the
-// migration, but the rater partitions it into InvalidUsageEvents and writes no
-// rated money.
-func TestIntegration_LegacyInvalidUsageNeverEntersMoney(t *testing.T) {
+// TestIntegration_InvalidUsageEvidenceNeverEntersMoney proves malformed engine
+// evidence remains insertable and queryable after the invoice-grade migration,
+// while the rater partitions it into InvalidUsageEvents and writes no money.
+func TestIntegration_InvalidUsageEvidenceNeverEntersMoney(t *testing.T) {
 	dsn := os.Getenv("PHOEBE_TEST_DATABASE_URL")
 	if dsn == "" {
 		t.Skip("PHOEBE_TEST_DATABASE_URL not set; skipping live-Postgres conformance")
@@ -849,7 +850,7 @@ func TestIntegration_LegacyInvalidUsageNeverEntersMoney(t *testing.T) {
 	}
 	defer db.Close()
 
-	const sch = "phoebe_rating_legacy_invalid_it"
+	const sch = "phoebe_rating_invalid_it"
 	exec(t, db, "DROP SCHEMA IF EXISTS "+sch+" CASCADE")
 	exec(t, db, "CREATE SCHEMA "+sch)
 	exec(t, db, "SET search_path TO "+sch)
@@ -867,20 +868,21 @@ func TestIntegration_LegacyInvalidUsageNeverEntersMoney(t *testing.T) {
 		"0001_billing_event.up.sql",
 		"0002_rating.up.sql",
 		"0004_billing_event_serving_mode.up.sql",
+		"0005_invoice_grade_attempts.up.sql",
+		"0006_reconciliation_org_grain.up.sql",
 	} {
 		apply(name)
 	}
 
 	hour := mustTime("2026-06-08T10:00:00Z")
-	// This row is legal before 0005 and deliberately violates cached <= prompt.
+	// This newly received authoritative row deliberately violates cached <=
+	// prompt. The raw ledger must retain it rather than rejecting the attempt.
 	if _, err := db.ExecContext(ctx,
 		`INSERT INTO billing_event
-		 (request_id, auth_id, resource_id, org_id, model, prompt_tokens, cached_tokens, completion_tokens, event_ts)
-		 VALUES ('legacy-invalid','a','d1','org-1','b',10,40,0,$1)`, hour.Add(5*time.Minute)); err != nil {
-		t.Fatalf("seed legacy invalid event: %v", err)
+		 (request_id, auth_id, resource_id, org_id, model, prompt_tokens, cached_tokens, completion_tokens, usage_found, event_ts)
+		 VALUES ('engine-invalid','a','d1','org-1','b',10,40,0,TRUE,$1)`, hour.Add(5*time.Minute)); err != nil {
+		t.Fatalf("insert invalid engine evidence: %v", err)
 	}
-	apply("0005_invoice_grade_attempts.up.sql")
-	apply("0006_reconciliation_org_grain.up.sql")
 
 	book := newTestBook(map[string]Rate3{"b": rate3("0.000005", "0.000001", "0")}, nil, PolicyIdentity, Dec{}, Dec{})
 	res, err := NewPostgresStore(db).RateWindow(ctx, book, hour, hour.Add(time.Hour))
@@ -888,7 +890,7 @@ func TestIntegration_LegacyInvalidUsageNeverEntersMoney(t *testing.T) {
 		t.Fatalf("RateWindow: %v", err)
 	}
 	if res.InvalidUsageEvents != 1 || res.EventsRated != 0 || res.RollupsWritten != 0 {
-		t.Fatalf("legacy invalid result = invalid/rated/rollups %d/%d/%d, want 1/0/0",
+		t.Fatalf("invalid result = invalid/rated/rollups %d/%d/%d, want 1/0/0",
 			res.InvalidUsageEvents, res.EventsRated, res.RollupsWritten)
 	}
 	var rawRows, invalidAttempts, ratedRows int64
@@ -902,7 +904,7 @@ func TestIntegration_LegacyInvalidUsageNeverEntersMoney(t *testing.T) {
 		t.Fatalf("count rated rows: %v", err)
 	}
 	if rawRows != 1 || invalidAttempts != 1 || ratedRows != 0 {
-		t.Fatalf("legacy invalid persistence = raw/invalid/rated %d/%d/%d, want 1/1/0", rawRows, invalidAttempts, ratedRows)
+		t.Fatalf("invalid persistence = raw/invalid/rated %d/%d/%d, want 1/1/0", rawRows, invalidAttempts, ratedRows)
 	}
 }
 

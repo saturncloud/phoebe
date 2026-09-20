@@ -389,7 +389,7 @@ func TestGateway_UpstreamHostShape(t *testing.T) {
 // populated by resolveGateway) — so a cold (scaled-to-zero) upstream triggers
 // the waker and the request is served after warm-up rather than 404ing.
 func TestGateway_WakeEligible(t *testing.T) {
-	backend := &coldToWarmBackend{}
+	backend := &inferenceBackend{}
 	be := httptest.NewServer(backend)
 	defer be.Close()
 	beURL, _ := url.Parse(be.URL)
@@ -402,9 +402,12 @@ func TestGateway_WakeEligible(t *testing.T) {
 			GraphK8sName: "graph-llama31",
 		},
 	}}
-	waker := &fakeWaker{warmsAt: 1, backend: backend}
+	waker := &fakeWaker{wake: func(context.Context, WakeTarget) error {
+		backend.warm.Store(true)
+		return nil
+	}}
 	em := &recordingEmitter{}
-	srv := newGatewayTestServer(t, em, resolver, beURL).WithWaker(waker, 5*time.Second, 3)
+	srv := newGatewayTestServer(t, em, resolver, beURL).WithWaker(waker, 5*time.Second)
 
 	rr := httptest.NewRecorder()
 	srv.Handler().ServeHTTP(rr, gatewayRequest("org-1", `{"model":"sleepy-bot"}`))
@@ -417,7 +420,7 @@ func TestGateway_WakeEligible(t *testing.T) {
 	}
 	// The RESOLVED graph name is threaded onto the wake target verbatim —
 	// never re-derived from the upstream host the gateway composed from it.
-	if tgt := waker.last(); tgt.GraphK8sName != "graph-llama31" || tgt.ResourceID != "tfm-cold-1" {
+	if tgt := waker.last(); tgt.GraphK8sName != "graph-llama31" || tgt.ResourceID != "tfm-cold-1" || tgt.ServedModel != "sleepy-bot" {
 		t.Fatalf("wake target = %+v, want the resolved graph/resource", tgt)
 	}
 }

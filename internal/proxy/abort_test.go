@@ -1,7 +1,7 @@
 package proxy
 
-// M3 abort-correctness tests: client-disconnect detection, bill-partial policy,
-// and race-freedom under concurrent abort + normal completion paths.
+// M3 abort-correctness tests: client-disconnect detection, always-bill-known-
+// usage policy, and race-freedom under abort + normal completion paths.
 //
 // Design of the "slow backend" pattern used throughout: the backend writes the
 // first chunk(s) and then blocks on a channel. The test cancels the client
@@ -29,11 +29,10 @@ import (
 	"github.com/saturncloud/phoebe/internal/metering"
 )
 
-// newTestServerWithSettings constructs a Server with explicit settings so
-// BillPartialOnAbort can be controlled per-test.
-func newTestServerWithSettings(t *testing.T, _ *url.URL, em metering.Emitter, billPartial bool) *Server {
+// newTestServerWithSettings constructs a Server for abort-path tests.
+func newTestServerWithSettings(t *testing.T, _ *url.URL, em metering.Emitter) *Server {
 	t.Helper()
-	s := &config.Settings{ListenAddr: ":0", BillPartialOnAbort: billPartial}
+	s := &config.Settings{ListenAddr: ":0"}
 	log := logging.New(logging.ERROR)
 	return New(s, log, em)
 }
@@ -107,7 +106,7 @@ func TestAbortMidStreamEmitsAbortedEvent(t *testing.T) {
 
 	upstream, _ := url.Parse(backend.URL)
 	em := &recordingEmitter{}
-	srv := newTestServerWithSettings(t, upstream, em, true /* billPartial */)
+	srv := newTestServerWithSettings(t, upstream, em)
 
 	doAbortRequest(t, srv, upstream, 10*time.Millisecond)
 
@@ -120,9 +119,9 @@ func TestAbortMidStreamEmitsAbortedEvent(t *testing.T) {
 	}
 }
 
-// TestAbortBillPartialTrue_NoUsage verifies that with BillPartialOnAbort=true
-// an abort with no usage block still emits a partial event with Aborted=true.
-func TestAbortBillPartialTrue_NoUsage(t *testing.T) {
+// TestAbortWithoutUsageRecordsZeroChargeAttempt verifies that an abort with no
+// authoritative usage still remains visible without fabricating a charge.
+func TestAbortWithoutUsageRecordsZeroChargeAttempt(t *testing.T) {
 	// Backend sends only a content chunk (no usage) then blocks.
 	backend, unblock := slowBackend(t, `data: {"choices":[{"index":0,"delta":{"content":"Hi"}}]}`+"\n\n")
 	defer backend.Close()
@@ -130,13 +129,13 @@ func TestAbortBillPartialTrue_NoUsage(t *testing.T) {
 
 	upstream, _ := url.Parse(backend.URL)
 	em := &recordingEmitter{}
-	srv := newTestServerWithSettings(t, upstream, em, true /* billPartial */)
+	srv := newTestServerWithSettings(t, upstream, em)
 
 	doAbortRequest(t, srv, upstream, 10*time.Millisecond)
 
 	events := em.waitForEvents(1, 2*time.Second)
 	if len(events) != 1 {
-		t.Fatalf("BillPartialOnAbort=true, abort, no usage: expected 1 event, got %d", len(events))
+		t.Fatalf("abort without usage: expected 1 event, got %d", len(events))
 	}
 	e := events[0]
 	if !e.Aborted {
@@ -149,28 +148,9 @@ func TestAbortBillPartialTrue_NoUsage(t *testing.T) {
 	}
 }
 
-// TestAbortBillPartialFalse_NoUsageRecordsAttempt verifies that disabling
-// partial billing affects the charge, not raw-ledger visibility.
-func TestAbortBillPartialFalse_NoUsageRecordsAttempt(t *testing.T) {
-	backend, unblock := slowBackend(t, `data: {"choices":[{"index":0,"delta":{"content":"Hi"}}]}`+"\n\n")
-	defer backend.Close()
-	defer close(unblock)
-
-	upstream, _ := url.Parse(backend.URL)
-	em := &recordingEmitter{}
-	srv := newTestServerWithSettings(t, upstream, em, false /* billPartial */)
-
-	doAbortRequest(t, srv, upstream, 10*time.Millisecond)
-
-	events := em.waitForEvents(1, 200*time.Millisecond)
-	if len(events) != 1 || !events[0].Aborted || events[0].UsageFound || events[0].PromptTokens != 0 || events[0].CompletionTokens != 0 {
-		t.Fatalf("BillPartialOnAbort=false abort = %+v, want one zero-charge observable attempt", events)
-	}
-}
-
 // TestAbortWithUsage verifies that when a usage block arrives before the abort,
-// the event carries the captured counts AND Aborted=true, regardless of
-// BillPartialOnAbort (usage-present always bills).
+// the event carries authoritative counts, UsageFound=true, and Aborted=true.
+// The rater therefore charges it normally: disconnect never erases served work.
 func TestAbortWithUsage(t *testing.T) {
 	// Stream has finish_reason and usage chunks, but no [DONE] — simulates a
 	// backend that sent everything except the final terminator.
@@ -183,26 +163,22 @@ data: {"choices":[],"usage":{"prompt_tokens":50,"total_tokens":70,"completion_to
 	defer backend.Close()
 	defer close(unblock)
 
-	for _, billPartial := range []bool{true, false} {
-		t.Run(fmt.Sprintf("billPartial=%v", billPartial), func(t *testing.T) {
-			upstream, _ := url.Parse(backend.URL)
-			em := &recordingEmitter{}
-			srv := newTestServerWithSettings(t, upstream, em, billPartial)
+	upstream, _ := url.Parse(backend.URL)
+	em := &recordingEmitter{}
+	srv := newTestServerWithSettings(t, upstream, em)
 
-			doAbortRequest(t, srv, upstream, 20*time.Millisecond)
+	doAbortRequest(t, srv, upstream, 20*time.Millisecond)
 
-			events := em.waitForEvents(1, 2*time.Second)
-			if len(events) != 1 {
-				t.Fatalf("abort+usage: expected 1 event, got %d", len(events))
-			}
-			e := events[0]
-			if !e.Aborted {
-				t.Fatalf("event.Aborted = false: %+v", e)
-			}
-			if e.PromptTokens != 50 || e.CompletionTokens != 20 {
-				t.Fatalf("wrong token counts: %+v", e)
-			}
-		})
+	events := em.waitForEvents(1, 2*time.Second)
+	if len(events) != 1 {
+		t.Fatalf("abort+usage: expected 1 event, got %d", len(events))
+	}
+	e := events[0]
+	if !e.Aborted || !e.UsageFound {
+		t.Fatalf("abort with authoritative usage = %+v, want Aborted and UsageFound", e)
+	}
+	if e.PromptTokens != 50 || e.CompletionTokens != 20 {
+		t.Fatalf("wrong token counts: %+v", e)
 	}
 }
 
@@ -216,7 +192,7 @@ func TestAbortOnDoneFiresExactlyOnceViaProxy(t *testing.T) {
 
 	upstream, _ := url.Parse(backend.URL)
 	em := &recordingEmitter{}
-	srv := newTestServerWithSettings(t, upstream, em, true)
+	srv := newTestServerWithSettings(t, upstream, em)
 
 	doAbortRequest(t, srv, upstream, 10*time.Millisecond)
 
@@ -248,7 +224,7 @@ func TestNormalCompletionNotAffectedByAbortWatcher(t *testing.T) {
 
 	upstream, _ := url.Parse(backend.URL)
 	em := &recordingEmitter{}
-	srv := newTestServerWithSettings(t, upstream, em, true)
+	srv := newTestServerWithSettings(t, upstream, em)
 
 	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions",
 		strings.NewReader(`{"model":"m","stream":true,"messages":[]}`))
@@ -299,7 +275,7 @@ func TestAbortRaceStress(t *testing.T) {
 
 	upstream, _ := url.Parse(backend.URL)
 	em := &recordingEmitter{}
-	srv := newTestServerWithSettings(t, upstream, em, true)
+	srv := newTestServerWithSettings(t, upstream, em)
 
 	var wg sync.WaitGroup
 	for i := 0; i < N; i++ {
@@ -379,7 +355,7 @@ func TestLongStreamNoDeadlineSever(t *testing.T) {
 
 	upstream, _ := url.Parse(backend.URL)
 	em := &recordingEmitter{}
-	srv := newTestServerWithSettings(t, upstream, em, true)
+	srv := newTestServerWithSettings(t, upstream, em)
 
 	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions",
 		strings.NewReader(`{"model":"m","stream":true,"messages":[]}`))

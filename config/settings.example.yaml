@@ -13,10 +13,6 @@ listenPort: 8080
 # Long idle timeout: token streams can idle between chunks.
 idleTimeout: "10m"
 
-# Explicit policy: whether a client-aborted request still bills its partial
-# token count.
-billPartialOnAbort: true
-
 # Durable metering emit (M2). Valkey Streams hot path → local-disk WAL fallback
 # → structured-log floor. Leave valkeyAddr empty to run WAL-only.
 # walPath is a DIRECTORY (tidwall/wal segment log); the historical .jsonl name

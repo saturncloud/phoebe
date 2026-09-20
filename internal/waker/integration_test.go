@@ -1,6 +1,6 @@
 package waker
 
-// The serveWithWake <-> KubeWaker integration seam, exercised through the
+// The proxy <-> KubeWaker integration seam, exercised through the
 // proxy's PUBLIC surface (this lives in package waker because the proxy's
 // in-package tests cannot import waker without a cycle — waker implements the
 // proxy's Waker interface).
@@ -19,10 +19,10 @@ import (
 	"github.com/saturncloud/phoebe/internal/proxy"
 )
 
-// TestServeWithWake_DGDSAMissing_ServesColdResponse: end to end through the
+// TestWake_DGDSAMissing_ServesColdResponse: end to end through the
 // real proxy handler — a wakeable cold request whose graph has NO DGDSA gets
 // the honest cold response (the wake errors, nothing hangs, nothing 500s).
-func TestServeWithWake_DGDSAMissing_ServesColdResponse(t *testing.T) {
+func TestWake_DGDSAMissing_ServesColdResponse(t *testing.T) {
 	// A permanently-cold Dynamo-shaped backend (model scaled to 0 -> 404).
 	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		w.WriteHeader(http.StatusNotFound)
@@ -34,7 +34,7 @@ func TestServeWithWake_DGDSAMissing_ServesColdResponse(t *testing.T) {
 	w, client := newFakeWaker(t)
 
 	srv := proxy.New(&config.Settings{ListenAddr: ":0"}, logging.New(logging.ERROR), &metering.LogEmitter{Log: logging.New(logging.ERROR)}).
-		WithWaker(w, time.Second, 3)
+		WithWaker(w, time.Second)
 
 	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(`{"model":"m"}`))
 	req.Header.Set(identity.HeaderAuthID, "auth-1")
@@ -44,8 +44,8 @@ func TestServeWithWake_DGDSAMissing_ServesColdResponse(t *testing.T) {
 	rr := httptest.NewRecorder()
 	srv.Handler().ServeHTTP(rr, req)
 
-	// The client sees the honest cold 404 (flushed by serveWithWake after the
-	// wake failed), not a hang and not a phoebe-made 5xx.
+	// The client sees the honest cold 404 from the one inference forward after
+	// the wake failed, not a hang and not a phoebe-made 5xx.
 	if rr.Code != http.StatusNotFound {
 		t.Fatalf("status = %d, want the cold 404 passed through", rr.Code)
 	}

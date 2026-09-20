@@ -1,7 +1,8 @@
 -- Separate the trusted billable attempt identity (request_id, retained for wire
 -- compatibility) from the caller's untrusted logical/correlation id.  Also keep
--- outcome evidence for every execution attempt and enforce the engine usage
--- invariants before raw events can enter the invoice path.
+-- outcome evidence for every execution attempt. Raw engine evidence remains
+-- insertable even when token counts are invalid; the rater excludes it from
+-- money and reconciliation exposes it for repair.
 ALTER TABLE billing_event ADD COLUMN client_request_id VARCHAR(255);
 ALTER TABLE billing_event ADD COLUMN usage_found BOOLEAN;
 ALTER TABLE billing_event ADD COLUMN status_code INTEGER;
@@ -9,9 +10,10 @@ ALTER TABLE billing_event ADD COLUMN streamed BOOLEAN NOT NULL DEFAULT FALSE;
 ALTER TABLE billing_event ADD COLUMN fresh_input_tokens INTEGER
     GENERATED ALWAYS AS (prompt_tokens - cached_tokens) STORED;
 
--- Pre-migration Phoebe emitted normal rows only after finding usage, except for
--- an aborted zero-token row when partial-abort recording was enabled. Preserve
--- that distinction as closely as the old schema permits.
+-- The supported rollout is a verified-empty clean cutover: no legacy database,
+-- Valkey, or WAL events and no mixed-version drainer (see migrations/README.md).
+-- Keep this defensive development-database backfill deterministic, but do not
+-- treat it as a rolling-version compatibility mechanism.
 UPDATE billing_event
 SET usage_found = NOT (
     aborted AND prompt_tokens = 0 AND cached_tokens = 0 AND completion_tokens = 0
@@ -20,12 +22,6 @@ ALTER TABLE billing_event ALTER COLUMN usage_found SET DEFAULT FALSE;
 ALTER TABLE billing_event ALTER COLUMN usage_found SET NOT NULL;
 
 ALTER TABLE billing_event
-    ADD CONSTRAINT billing_event_token_counts_nonnegative_ck CHECK (
-        prompt_tokens >= 0 AND cached_tokens >= 0 AND completion_tokens >= 0
-    ) NOT VALID,
-    ADD CONSTRAINT billing_event_cached_subset_ck CHECK (
-        cached_tokens <= prompt_tokens
-    ) NOT VALID,
     ADD CONSTRAINT billing_event_status_code_ck CHECK (
         status_code IS NULL OR status_code BETWEEN 100 AND 599
     );
@@ -33,7 +29,7 @@ ALTER TABLE billing_event
 COMMENT ON COLUMN billing_event.request_id IS
     'Trusted Phoebe-minted billable execution-attempt id; deduplication key.';
 COMMENT ON COLUMN billing_event.client_request_id IS
-    'Untrusted caller correlation/idempotency value; never used for billing deduplication.';
+    'Untrusted caller correlation/idempotency value; ingress requires printable ASCII shorter than 255 bytes; never used for billing deduplication.';
 COMMENT ON COLUMN billing_event.usage_found IS
     'True only when the serving engine supplied an authoritative OpenAI usage block.';
 

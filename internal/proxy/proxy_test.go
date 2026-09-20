@@ -229,6 +229,63 @@ func TestProxyRequestID_ClientReplayCannotReuseBillingID(t *testing.T) {
 	}
 }
 
+func TestProxyRequestID_ClientValueBoundary(t *testing.T) {
+	tests := []struct {
+		name       string
+		value      string
+		wantStatus int
+		wantCalls  int
+	}{
+		{name: "254 bytes accepted", value: strings.Repeat("a", 254), wantStatus: http.StatusOK, wantCalls: 1},
+		{name: "255 bytes rejected", value: strings.Repeat("a", 255), wantStatus: http.StatusBadRequest},
+		{name: "non-ASCII rejected", value: "request-é", wantStatus: http.StatusBadRequest},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			var mu sync.Mutex
+			upstreamCalls := 0
+			backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				mu.Lock()
+				upstreamCalls++
+				mu.Unlock()
+				_, _ = w.Write([]byte(`{"model":"m1","usage":{"prompt_tokens":1,"completion_tokens":1}}`))
+			}))
+			defer backend.Close()
+			upstream, _ := url.Parse(backend.URL)
+			em := &recordingEmitter{}
+			srv := newTestServerE(t, upstream, em)
+
+			rr := httptest.NewRecorder()
+			req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", nil)
+			setUpstream(req, upstream)
+			req.Header.Set(identity.HeaderAuthID, "auth-1")
+			req.Header.Set(identity.HeaderResourceID, "model-abc")
+			req.Header.Set(requestIDHeader, tt.value)
+			srv.Handler().ServeHTTP(rr, req)
+
+			if rr.Code != tt.wantStatus {
+				t.Fatalf("status = %d, want %d", rr.Code, tt.wantStatus)
+			}
+			mu.Lock()
+			gotCalls := upstreamCalls
+			mu.Unlock()
+			if gotCalls != tt.wantCalls {
+				t.Fatalf("upstream calls = %d, want %d", gotCalls, tt.wantCalls)
+			}
+			if tt.wantStatus != http.StatusOK && em.count() != 0 {
+				t.Fatalf("rejected request emitted %d billing events, want 0", em.count())
+			}
+			if tt.wantStatus == http.StatusOK {
+				events := em.waitForEvents(1, 2*time.Second)
+				if len(events) != 1 || events[0].ClientRequestID != tt.value {
+					t.Fatalf("accepted client request id not preserved: %#v", events)
+				}
+			}
+		})
+	}
+}
+
 func TestProxyForwardsToUpstream(t *testing.T) {
 	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		_, _ = w.Write([]byte(`{"ok":true}`))

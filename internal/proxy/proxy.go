@@ -2,7 +2,7 @@
 // proxy that sits behind Traefik and in front of the inference router/engine.
 //
 // M1 implemented the forward-then-inspect streaming tee. M3 (this milestone)
-// wires client-abort detection and applies the bill-partial-on-abort policy:
+// wires client-abort detection and its billing contract:
 //   - read trusted identity headers (does NOT authenticate)
 //   - forward to the Atlas-injected X-Saturn-Upstream backend (the routing
 //     authority; fail closed when absent/malformed — phoebe never guesses)
@@ -15,9 +15,8 @@
 //     Aborted=true without a separate watcher goroutine racing the body Close
 //   - capture the engine-reported model name from the response body as the
 //     stable price key (Event.Model), distinct from the routing resource id
-//   - apply BillPartialOnAbort policy in emit: if aborted and usage present,
-//     always bill; if aborted and no usage, bill only if BillPartialOnAbort;
-//     if not aborted and no usage, log for reconciliation only
+//   - always bill authoritative engine usage even when the client aborted;
+//     without usage, retain a zero-charge raw attempt for reconciliation
 package proxy
 
 import (
@@ -40,9 +39,32 @@ import (
 	"github.com/saturncloud/phoebe/internal/metering"
 )
 
-// requestIDHeader is the public request-correlation header. It is never trusted
-// as billing_event's idempotency key: clients can choose and replay it.
-const requestIDHeader = "X-Request-Id"
+const (
+	// requestIDHeader is the public request-correlation header. It is never trusted
+	// as billing_event's idempotency key: clients can choose and replay it.
+	requestIDHeader = "X-Request-Id"
+
+	// clientRequestIDLimit is an exclusive byte bound. The persisted column is
+	// VARCHAR(255), so rejecting 255-byte and larger caller values before any
+	// upstream work makes the storage constraint unreachable from untrusted input.
+	clientRequestIDLimit = 255
+)
+
+// validClientRequestID accepts the conventional HTTP identifier alphabet:
+// printable ASCII, strictly shorter than clientRequestIDLimit bytes. Empty is
+// valid because Phoebe generates the trusted attempt id when the caller omits
+// this optional correlation value.
+func validClientRequestID(value string) bool {
+	if len(value) >= clientRequestIDLimit {
+		return false
+	}
+	for i := 0; i < len(value); i++ {
+		if value[i] < 0x20 || value[i] > 0x7e {
+			return false
+		}
+	}
+	return true
+}
 
 // generateRequestID mints the internal billing-attempt id at Phoebe ingress.
 // It is called exactly once per inbound inference request; retries and durable
@@ -69,13 +91,11 @@ type Server struct {
 	ioSink       iolog.Sink
 	ioMaxBodyLen int
 
-	// waker triggers a shared base graph's 0->1 scale-up on a cold response,
-	// for the shared serverless mode. nil (the default) = wake disabled: a cold
-	// response passes straight through to the client, exactly as before. Set via
-	// WithWaker when shared serving is enabled.
-	waker        Waker
-	wakeTimeout  time.Duration
-	wakeMaxTries int
+	// waker proactively prepares a shared base graph before the customer's one
+	// inference forward. nil (the default) = wake disabled. Set via WithWaker
+	// when shared serving is enabled.
+	waker       Waker
+	wakeTimeout time.Duration
 
 	// gateway wires the TF gateway resolution path ((org, body model=) →
 	// tf_model → identity + upstream). nil (the default) = gateway disabled:
@@ -118,7 +138,7 @@ func NewWithIOLog(s *config.Settings, log *logging.Logger, emitter metering.Emit
 	return srv
 }
 
-// Default wake bounds when a waker is wired without explicit values.
+// Default wake bound when a waker is wired without an explicit value.
 const (
 	// defaultWakeTimeout is the per-wake ceiling the woken request is held for.
 	// 300s, sized to the MEASURED cold path: a vLLM worker's cold reload is
@@ -131,23 +151,19 @@ const (
 	// multi-minute holds, and the alternative (a budget shorter than the
 	// cold start) makes the wake feature a no-op. Still bounded; operators can
 	// tune per install via wake.timeout in the settings.
-	defaultWakeTimeout  = 300 * time.Second
-	defaultWakeMaxTries = 3 // probe -> wake -> re-probe attempts
+	defaultWakeTimeout = 300 * time.Second
 )
 
-// WithWaker enables shared-mode wake-from-zero: on a cold response for a
-// wakeable route, the proxy triggers a 0->1 scale via the waker and holds the
-// request until warm. nil waker leaves wake disabled (cold responses pass
-// through). timeout/maxTries <= 0 use the defaults.
-func (s *Server) WithWaker(waker Waker, timeout time.Duration, maxTries int) *Server {
+// WithWaker enables shared-mode wake-from-zero. Before forwarding a wakeable
+// request, the proxy triggers a 0->1 scale and waits for the requested model to
+// appear in non-billable readiness discovery. It then forwards the customer's
+// inference request exactly once. A wake failure also falls through to that one
+// honest, metered forward. A timeout <= 0 uses the default.
+func (s *Server) WithWaker(waker Waker, timeout time.Duration) *Server {
 	s.waker = waker
 	s.wakeTimeout = timeout
 	if s.wakeTimeout <= 0 {
 		s.wakeTimeout = defaultWakeTimeout
-	}
-	s.wakeMaxTries = maxTries
-	if s.wakeMaxTries <= 0 {
-		s.wakeMaxTries = defaultWakeMaxTries
 	}
 	return s
 }
@@ -185,6 +201,16 @@ func (s *Server) handleHealth(w http.ResponseWriter, _ *http.Request) {
 func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request) {
 	id := identity.FromRequest(r)
 	clientRequestID := r.Header.Get(requestIDHeader)
+	if !validClientRequestID(clientRequestID) {
+		// Do not log or echo the untrusted value: it can be large or contain
+		// terminal-confusing bytes. Most importantly, reject before gateway
+		// resolution, waking, or forwarding so an invalid correlation field can
+		// never produce served-but-unpersistable usage.
+		s.log.Warn.Printf("rejecting invalid %s (must be printable ASCII and fewer than %d bytes)",
+			requestIDHeader, clientRequestIDLimit)
+		http.Error(w, "invalid X-Request-Id", http.StatusBadRequest)
+		return
+	}
 
 	// GATEWAY RESOLUTION (TF single-host gateway): a request the trusted
 	// middleware marked X-Saturn-Gateway carries NO per-resource routing
@@ -330,22 +356,41 @@ func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// WAKE-FROM-ZERO (shared serverless mode, the 0->1 leg). On a wakeable route
-	// (shared + authorized resource id) with a waker configured, probe the
-	// upstream; if it returns a COLD response (scaled-to-zero base), trigger a
-	// 0->1 wake and retry rather than serving the client a 404/503. The probe
-	// buffers the response (a cold response is a tiny JSON error), so nothing
-	// cold reaches the client; the request is replayed (body restored) after the
-	// wake. Once a NON-cold response arrives (or tries are exhausted), we fall
-	// through to the normal streaming forward below, which serves + meters it.
-	// Non-wakeable routes skip this entirely — zero overhead.
+	// WAKE-FROM-ZERO (shared serverless mode, the 0->1 leg). Prepare the graph
+	// with Kubernetes actuation and non-billable GET /v1/models readiness before
+	// the inference POST. Regardless of wake success or failure, the normal path
+	// below forwards the customer's POST at most once and meters its honest
+	// response. No inference response is ever discarded and replayed.
 	if s.wakeEnabled(id) {
-		if served := s.serveWithWake(w, r, upstream, id, requestID); served {
+		target := WakeTarget{
+			UpstreamHost: upstream.Host,
+			GraphK8sName: id.GraphK8sName,
+			ResourceID:   id.ResourceID,
+			ServedModel:  id.ServedModel,
+		}
+		if target.GraphK8sName == "" {
+			target.GraphK8sName = graphFromUpstreamHost(upstream.Host)
+		}
+		wakeCtx := r.Context()
+		cancel := func() {}
+		if s.wakeTimeout > 0 {
+			wakeCtx, cancel = context.WithTimeout(wakeCtx, s.wakeTimeout)
+		}
+		wakeErr := s.waker.Wake(wakeCtx, target)
+		cancel()
+		if wakeErr != nil {
+			s.log.Warn.Printf("wake: could not prepare base for request_id=%s resource_id=%s: %v",
+				requestID, id.ResourceID, wakeErr)
+		}
+
+		// If the client left while it was waiting, do not execute inference. This
+		// pre-forward abort branch is mutually exclusive with ReverseProxy's
+		// completion/error branches, so it emits exactly one zero-charge attempt.
+		if r.Context().Err() != nil {
+			s.emit(context.WithoutCancel(r.Context()), id, requestID, clientRequestID,
+				499, capture.Result{Aborted: true, UsageFound: false})
 			return
 		}
-		// Not served here means: the base is now warm (or wake was a no-op) —
-		// fall through to the normal metered streaming forward. The request body
-		// was restored by serveWithWake for the final attempt.
 	}
 
 	rp := httputil.NewSingleHostReverseProxy(upstream)
@@ -441,7 +486,7 @@ func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request) {
 // completely invisible to billing/reconciliation. So on an abort we emit exactly
 // ONE zero-token, attributable event (Aborted=true, no usage) with the already-
 // resolved identity, via the SAME s.emit path the completion path uses — so the
-// pre-header abort obeys the SAME BillPartialOnAbort policy (no second policy).
+// pre-header abort uses the same always-record contract as every other abort.
 //
 // Invariant: every request past the billing-identity gate emits exactly one
 // attributable event — real usage on completion, or a zero-token Aborted event on
@@ -489,10 +534,9 @@ func (s *Server) errorHandler(upstream string, id identity.Identity, requestID, 
 func (s *Server) emit(ctx context.Context, id identity.Identity, requestID, clientRequestID string, statusCode int, res capture.Result) {
 	if res.Aborted && !res.UsageFound {
 		// A missing usage block is never guessed or tokenized locally. The raw
-		// zero-token attempt is nevertheless durable for reconciliation; the
-		// BillPartialOnAbort switch controls policy, not ledger visibility.
-		s.log.Warn.Printf("aborted, no usage, recording unmetered attempt resource=%s request_id=%s streamed=%t bill_partial=%t",
-			id.ResourceID, requestID, res.Streamed, s.settings.BillPartialOnAbort)
+		// zero-token attempt is nevertheless durable for reconciliation.
+		s.log.Warn.Printf("aborted, no usage, recording unmetered attempt resource=%s request_id=%s streamed=%t",
+			id.ResourceID, requestID, res.Streamed)
 	}
 
 	if !res.UsageFound && !res.Aborted {

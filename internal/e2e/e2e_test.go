@@ -195,7 +195,7 @@ func newHarness(t *testing.T, schema string) *harness {
 // it per route), so this helper takes no upstream.
 func (h *harness) proxyServer(t *testing.T) *proxy.Server {
 	t.Helper()
-	settings := &config.Settings{ListenAddr: ":0", BillPartialOnAbort: true}
+	settings := &config.Settings{ListenAddr: ":0"}
 	return proxy.New(settings, h.log, h.emitter)
 }
 
@@ -744,8 +744,8 @@ func TestE2E_ModellessEventWithoutUsageIsMissingUsage(t *testing.T) {
 	h := newHarness(t, "phoebe_e2e_modelless")
 
 	// Emit directly through the REAL emitter, exactly as the proxy does for a
-	// BillPartialOnAbort=true abort with no usage chunk: empty Model, zero
-	// counts, Aborted. (See proxy.Server.emit.)
+	// An abort with no usage chunk: empty Model, zero counts, Aborted. Phoebe
+	// always records the attempt but has no authoritative counts to charge.
 	h.emitter.Emit(context.Background(), metering.Event{
 		RequestID:    "phoebe-e2e-modelless-0001",
 		AuthID:       testAuthID,
@@ -791,6 +791,53 @@ func TestE2E_ModellessEventWithoutUsageIsMissingUsage(t *testing.T) {
 		t.Error("Result.HasAnomaly() = false — the leak must drive the exit-nonzero path")
 	}
 	h.assertNumericEqual(t, res.TotalCost, "0", "Result.TotalCost")
+}
+
+// TestE2E_InvalidEngineEvidenceIsRetainedButNeverRated proves an authoritative
+// malformed usage block survives emitter -> stream -> drainer -> Postgres. It
+// must be a loud reconciliation anomaly, never a poison drop and never money.
+func TestE2E_InvalidEngineEvidenceIsRetainedButNeverRated(t *testing.T) {
+	h := newHarness(t, "phoebe_e2e_invalid_usage")
+	h.emitter.Emit(context.Background(), metering.Event{
+		RequestID:        "phoebe-e2e-invalid-0001",
+		AuthID:           testAuthID,
+		ResourceID:       testResourceID,
+		ResourceType:     "deployment",
+		OrgID:            testOrgID,
+		Model:            testModelName,
+		PromptTokens:     10,
+		CachedTokens:     20, // impossible: cached input cannot exceed prompt input
+		CompletionTokens: 1,
+		UsageFound:       true,
+		StatusCode:       http.StatusOK,
+	})
+
+	h.waitForStreamLen(t, 1, 5*time.Second)
+	h.drainUntilRows(t, 1, 10*time.Second) // also asserts drainer Poisoned() == 0
+
+	res := h.rateEventHour(t, h.priceBook(t))
+	if res.InvalidUsageEvents != 1 || res.EventsRated != 0 || res.RollupsWritten != 0 {
+		t.Fatalf("invalid evidence result = invalid/rated/rollups %d/%d/%d, want 1/0/0",
+			res.InvalidUsageEvents, res.EventsRated, res.RollupsWritten)
+	}
+	if !res.HasAnomaly() {
+		t.Fatal("invalid engine evidence must drive the fail-loud anomaly path")
+	}
+
+	var rawRows, invalidAttempts, ratedRows int64
+	if err := h.db.QueryRow("SELECT COUNT(*) FROM billing_event WHERE request_id='phoebe-e2e-invalid-0001'").Scan(&rawRows); err != nil {
+		t.Fatalf("count raw invalid evidence: %v", err)
+	}
+	if err := h.db.QueryRow("SELECT COALESCE(SUM(invalid_usage_attempts),0) FROM billing_reconciliation_hourly").Scan(&invalidAttempts); err != nil {
+		t.Fatalf("read invalid reconciliation evidence: %v", err)
+	}
+	if err := h.db.QueryRow("SELECT COUNT(*) FROM rated_usage").Scan(&ratedRows); err != nil {
+		t.Fatalf("count rated rows: %v", err)
+	}
+	if rawRows != 1 || invalidAttempts != 1 || ratedRows != 0 {
+		t.Fatalf("invalid evidence persistence = raw/invalid/rated %d/%d/%d, want 1/1/0",
+			rawRows, invalidAttempts, ratedRows)
+	}
 }
 
 // epVllmStream is the vLLM SSE fixture for a C4 Token Factory deployment: the engine

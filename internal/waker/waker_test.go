@@ -3,6 +3,8 @@ package waker
 import (
 	"context"
 	"encoding/json"
+	"net/http"
+	"net/http/httptest"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -57,7 +59,7 @@ func newFakeWaker(t *testing.T, objs ...runtime.Object) (*KubeWaker, *dynamicfak
 		scaledObjectGVR: "ScaledObjectList",
 	}, objs...)
 	w := NewWithClient(client, Config{Namespace: testNS, PollInterval: time.Millisecond}, logging.New(logging.ERROR))
-	w.ready = func(context.Context, string) bool { return true }
+	w.ready = func(context.Context, string, string) bool { return true }
 	return w, client
 }
 
@@ -66,6 +68,7 @@ func target(graph string) proxy.WakeTarget {
 		UpstreamHost: DGDSAName(graph) + "-frontend." + testNS + ".svc.cluster.local:8000",
 		GraphK8sName: graph,
 		ResourceID:   "tfm-1",
+		ServedModel:  "m",
 	}
 }
 
@@ -207,7 +210,7 @@ func TestWake_LegacyVllmWorkerFallback(t *testing.T) {
 // TestWake_BothDGDSANamesMissingErrors: neither the uniform nor the legacy
 // adapter exists — the wake errors (naming BOTH candidates for diagnosis) and
 // writes nothing; the proxy then serves the honest cold response (see the
-// serveWithWake integration test below).
+// proxy integration test).
 func TestWake_BothDGDSANamesMissingErrors(t *testing.T) {
 	w, client := newFakeWaker(t) // empty cluster
 
@@ -298,7 +301,7 @@ func TestWake_NeverScalesDown(t *testing.T) {
 func TestWake_HoldsUntilReadyOrDeadline(t *testing.T) {
 	// Never-ready: Wake must return the deadline error, not hang, not succeed.
 	w, _ := newFakeWaker(t, dgdsaObj("g1", 0))
-	w.ready = func(context.Context, string) bool { return false }
+	w.ready = func(context.Context, string, string) bool { return false }
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Millisecond)
 	defer cancel()
 	if err := w.Wake(ctx, target("g1")); err == nil || !strings.Contains(err.Error(), "not ready before deadline") {
@@ -308,7 +311,7 @@ func TestWake_HoldsUntilReadyOrDeadline(t *testing.T) {
 	// Ready-after-a-few-polls: Wake returns nil once the probe flips.
 	w2, _ := newFakeWaker(t, dgdsaObj("g2", 0))
 	var polls int32
-	w2.ready = func(context.Context, string) bool { return atomic.AddInt32(&polls, 1) >= 3 }
+	w2.ready = func(context.Context, string, string) bool { return atomic.AddInt32(&polls, 1) >= 3 }
 	if err := w2.Wake(context.Background(), target("g2")); err != nil {
 		t.Fatalf("eventually-ready Wake: %v", err)
 	}
@@ -321,10 +324,40 @@ func TestWake_HoldsUntilReadyOrDeadline(t *testing.T) {
 // programming error upstream — refuse rather than patch a guessed name.
 func TestWake_EmptyGraphNameErrors(t *testing.T) {
 	w, client := newFakeWaker(t, dgdsaObj("g1", 0))
-	if err := w.Wake(context.Background(), proxy.WakeTarget{UpstreamHost: "h:1", ResourceID: "r"}); err == nil {
+	if err := w.Wake(context.Background(), proxy.WakeTarget{UpstreamHost: "h:1", ResourceID: "r", ServedModel: "m"}); err == nil {
 		t.Fatal("Wake with empty GraphK8sName must error")
 	}
 	if patches := patchActions(client); len(patches) != 0 {
 		t.Fatalf("issued %d patches, want 0", len(patches))
+	}
+}
+
+func TestWake_EmptyServedModelErrorsBeforeActuation(t *testing.T) {
+	w, client := newFakeWaker(t, dgdsaObj("g1", 0))
+	tgt := target("g1")
+	tgt.ServedModel = ""
+	if err := w.Wake(context.Background(), tgt); err == nil {
+		t.Fatal("Wake with empty ServedModel must error")
+	}
+	if patches := patchActions(client); len(patches) != 0 {
+		t.Fatalf("issued %d patches, want 0", len(patches))
+	}
+}
+
+func TestUpstreamServesModelsRequiresRequestedModel(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet || r.URL.Path != "/v1/models" {
+			t.Fatalf("readiness request = %s %s, want GET /v1/models", r.Method, r.URL.Path)
+		}
+		_, _ = w.Write([]byte(`{"data":[{"id":"other-model"},{"id":"requested-model"}]}`))
+	}))
+	defer server.Close()
+	host := strings.TrimPrefix(server.URL, "http://")
+	w := &KubeWaker{}
+	if w.upstreamServesModels(context.Background(), host, "missing-model") {
+		t.Fatal("another registered model must not make the requested model ready")
+	}
+	if !w.upstreamServesModels(context.Background(), host, "requested-model") {
+		t.Fatal("requested registered model should be ready")
 	}
 }

@@ -46,7 +46,7 @@ type Result struct {
 	UnpricedEvents       int64  // events whose model had NO resolvable price (NOT $0-billed)
 	UnattributableEvents int64  // in-window rows with NULL auth_id/resource_id/model_id (upstream leak)
 	MissingUsageEvents   int64  // attempts with no authoritative engine usage block (zero-charge, fail loud)
-	InvalidUsageEvents   int64  // authoritative legacy evidence with malformed token counts (never money)
+	InvalidUsageEvents   int64  // authoritative evidence with malformed token counts (never money)
 	AmbiguousBaseEvents  int64  // events under an ft: rollup spanning >1 base_model (E3 violation)
 	AmbiguousOrgEvents   int64  // events under a rollup spanning >1 non-NULL org_id (E2 attribution bug)
 	RollupsWritten       int64  // distinct (auth_id, resource_id, model_id, hour) rows upserted

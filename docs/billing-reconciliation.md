@@ -11,14 +11,17 @@ central billing service.
    and serving-mode headers. Saturn creates those route headers when the endpoint
    is created.
 2. Phoebe rejects requests missing the mandatory attribution fields, stores the
-   caller's `X-Request-Id` only as `client_request_id`, and mints a cryptographically
+   caller's `X-Request-Id` only as `client_request_id` (printable ASCII, fewer
+   than 255 bytes; invalid values are rejected before forwarding), and mints a cryptographically
    random `request_id` for the billable execution attempt. Each client retry is a
    new attempt; redelivery of one metering event retains the same attempt id.
 3. Phoebe forces streaming usage on, forwards the request, and records the serving
    engine's prompt, cached-prompt, and completion counts. It never re-tokenizes.
    Completed, streamed, aborted, and failed upstream attempts all produce one raw
    event. Missing usage is an explicit `usage_found=false` zero-charge row, not a
-   silently dropped event or guessed token count.
+   silently dropped event or guessed token count. A client disconnect never
+   erases served work: an aborted attempt with authoritative engine usage is
+   rated normally; without authoritative usage it remains a zero-charge raw row.
 4. The emitter delivers through Valkey Streams, falling back to its fsync'd WAL and
    then a structured `METERING_FLOOR` log. The drainer acknowledges Valkey only after
    the Postgres transaction commits and deduplicates redelivery on the server-minted
@@ -83,9 +86,30 @@ balance while two customers are mis-attributed.
 
 1. Quiesce the affected invoice window in the central manager. Do not delete local
    raw events or edit rated money manually.
-2. Recover any `METERING_FLOOR` JSON or quarantined/imported WAL entries into the
-   configured Valkey stream with the original `request_id`. Duplicate recovery is
-   safe; changing the id is not.
+2. Copy the recovery artifact away from any live writer, then validate it without
+   making changes. `phoebe-recover` accepts a tidwall WAL directory, legacy/imported
+   JSONL, or logs containing `METERING_FLOOR` records. It opens a temporary copy of
+   WAL directories so the forensic source is not mutated:
+
+   ```console
+   /app/phoebe-recover -input /evidence/phoebe-metering-wal
+   ```
+
+   Review the reported record count, duplicate count, and request-id-set digest.
+   Replay only that validated set into the configured Valkey stream by repeating
+   the reported unique count:
+
+   ```console
+   /app/phoebe-recover -input /evidence/phoebe-metering-wal \
+     -valkey-addr valkey:6379 -stream phoebe:metering \
+     -apply -expected-count 42
+   ```
+
+   The command preserves every original `request_id`, refuses conflicting
+   duplicates and schema-poisoning values, and is dry-run-only without both apply
+   guards. A retry after a partial write is safe because the drainer deduplicates
+   on `request_id`. Never replay a live WAL directory while the interceptor is
+   appending or auto-draining it.
 3. Run the drainer until the consumer group has no pending/lagging entries. Confirm
    the recovered attempt ids exist once in `billing_event`.
 4. Restore the price-book version or attribution headers if the natural-key/hour
@@ -104,11 +128,15 @@ Endpoint deletion does not remove `billing_event` or `rated_usage`; attribution 
 prices are captured before teardown. Never reconstruct historical ownership by
 joining the current endpoint table.
 
-Migration 0005 backfills `usage_found=true` for legacy rows except aborted rows
-whose three counts are zero, the only old shape known to represent missing usage.
-Token-validity constraints are installed `NOT VALID`: they protect every new row
-without making deployment fail on legacy bad evidence. Repair or quarantine any
-`invalid_usage_attempts`, then validate both constraints explicitly.
+Migration 0005 is supported as a verified-empty clean cutover with no legacy
+database rows, buffered events, or mixed-version drainers; see
+`migrations/README.md`. Its defensive development-database backfill sets
+`usage_found=true` for legacy rows except aborted rows whose three counts are
+zero, but it is not a rolling-upgrade compatibility guarantee.
+The raw ledger deliberately accepts invalid engine counts so evidence is never
+discarded merely because it cannot become money. The rater excludes those rows
+and reports `invalid_usage_attempts`; repair or explicitly quarantine them before
+settling the invoice window.
 
 ## Failure-injection checklist
 
@@ -123,11 +151,12 @@ unavailable.
 
 - Header authenticity depends on auth-server and the saturn-k8s ForwardAuth
   allowlist being deployed before this release.
-- WAL survival across pod or node loss is **not guaranteed by Phoebe code**. The
-  current chart mounts `emptyDir`; invoice-grade recovery requires a persistent
-  volume (or a remote durable append before response completion). Until that chart
-  change is deployed, simultaneous Valkey outage and pod death is a declared loss
-  window and engine-log reconciliation is mandatory.
+- WAL survival across pod or node loss depends on deployment storage, not Phoebe
+  code alone. The official chart gives every interceptor StatefulSet ordinal a
+  retained `ReadWriteOnce` PVC, defaulting to the same `saturn-default-storage`
+  class as Atlas Postgres. Custom manifests must provide equivalent durable
+  storage; engine-log reconciliation remains the backstop for misconfiguration,
+  storage failure, or quarantined corrupt WAL data.
 - Exact counts depend on the deployed engine emitting the OpenAI usage block,
   including cached prompt tokens. Phoebe records missing/invalid usage but never
   invents it.

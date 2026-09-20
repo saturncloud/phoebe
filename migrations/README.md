@@ -39,7 +39,7 @@ golang-migrate up/down pairs, applied in version order:
 | 0002 | `0002_rating.{up,down}.sql` | `rated_usage` (+ `org_id`, indexes) + the billing_event rating-instant index |
 | 0003 | `0003_io_log.{up,down}.sql` | `io_log` (+ GIN body index, retention indexes) |
 | 0004 | `0004_billing_event_serving_mode.{up,down}.sql` | `billing_event.serving_mode` (the serving-mode SKU axis; NULL = dedicated) |
-| 0005 | `0005_invoice_grade_attempts.{up,down}.sql` | trusted/client request identity, attempt outcome and usage evidence, token constraints, `rating_price_lock`, and the hourly reconciliation view |
+| 0005 | `0005_invoice_grade_attempts.{up,down}.sql` | trusted/client request identity, attempt outcome and usage evidence, invalid-usage reconciliation, `rating_price_lock`, and the hourly reconciliation view |
 | 0006 | `0006_reconciliation_org_grain.{up,down}.sql` | aligns raw reconciliation with the rated natural key while exposing missing/conflicting org evidence |
 
 `embed.go` embeds these into the `migrations` package; `cmd/migrate` applies them.
@@ -62,6 +62,20 @@ In the phoebe chart, `cmd/migrate up` runs as a one-shot Job / init-container
 against phoebe's own Postgres **before** the drainer starts. A serving-only /
 spoke install that runs the interceptor ONLY (no drainer/rater/token-push, no DB)
 does not run the migrate Job.
+
+### Invoice-grade cutover for migration 0005
+
+Migration 0005 is a coordinated clean cutover, not a mixed-version rolling
+migration. Phoebe has no production `billing_event` rows or legacy Valkey/WAL
+backlog to preserve. Before applying it, stop old interceptors and billing jobs,
+verify `billing_event` and the configured Valkey/WAL buffers are empty, then
+apply the migration and deploy the new interceptor, drainer, rater, and push job
+as one release. Do not run an old drainer against schema 0005 or replay an old
+event encoding after the cutover.
+
+If any installation has legacy rows or buffered events, stop: that installation
+does not satisfy this migration's preconditions and needs a separate expand /
+contract migration before upgrading.
 
 ## Local dev
 

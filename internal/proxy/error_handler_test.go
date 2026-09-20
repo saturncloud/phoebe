@@ -65,7 +65,7 @@ func TestErrorHandlerClassifiesWrappedCancel(t *testing.T) {
 	// Only context.Canceled is a client abort (DeadlineExceeded is an upstream
 	// fault here — covered by TestErrorHandlerUpstreamFaultStill502). A wrapped
 	// cancel must NOT 502 over the already-dead connection. (The abort's
-	// zero-token emit and its BillPartialOnAbort gating are covered by the
+	// zero-token abort emit is covered by the
 	// dedicated TestPreHeaderAbort* tests, not re-asserted here.)
 	h := srv.errorHandler(upstream.String(), id, "req-1", "logical-1")
 	rr := httptest.NewRecorder()

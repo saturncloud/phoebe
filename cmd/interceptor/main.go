@@ -49,8 +49,8 @@ func main() {
 	}
 	if w := buildWaker(settings, log); w != nil {
 		// Timeout 0 = the proxy default (300s — sized above vLLM's measured
-		// ~2.5min cold reload); tries 0 = the proxy default (3).
-		srv = srv.WithWaker(w, settings.Wake.Timeout, 0)
+		// ~2.5min cold reload).
+		srv = srv.WithWaker(w, settings.Wake.Timeout)
 	}
 	srvErr := srv.Run()
 
@@ -138,9 +138,9 @@ func buildLegacyPGGateway(s *config.Settings, log *logging.Logger) (gateway.Reso
 // in the MAIN phoebe container — no separate waker pod; see
 // deploy/rbac-waker.yaml for the RBAC it needs). Returns nil when wake is
 // disabled (the default) OR when the kubernetes config is unavailable: the
-// proxy then runs with wake off — cold responses pass through exactly as
-// before — because a broken wake path must degrade the cold-start UX, never
-// crash or block the proxy (which also serves warm traffic).
+// proxy then runs with wake off — requests forward directly — because a broken
+// wake path must degrade the cold-start UX, never crash or block the proxy
+// (which also serves warm traffic).
 func buildWaker(s *config.Settings, log *logging.Logger) proxy.Waker {
 	if !s.Wake.Enabled {
 		return nil
@@ -150,7 +150,7 @@ func buildWaker(s *config.Settings, log *logging.Logger) proxy.Waker {
 		Kubeconfig: s.Wake.Kubeconfig,
 	}, log)
 	if err != nil {
-		log.Error.Printf("wake: kubernetes client unavailable (%v); wake-from-zero DISABLED — cold responses pass through", err)
+		log.Error.Printf("wake: kubernetes client unavailable (%v); wake-from-zero DISABLED — requests forward directly", err)
 		return nil
 	}
 	log.Info.Printf("wake: enabled (DGDSA namespace=%s)", s.Gateway.Namespace)

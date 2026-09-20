@@ -60,7 +60,7 @@ type RateResult struct {
 	// supplied no authoritative usage block. They are retained as zero-charge audit
 	// evidence, excluded from rated_usage, and surfaced as a fail-loud anomaly.
 	MissingUsageEvents int64
-	// InvalidUsageEvents are legacy authoritative rows that violate token
+	// InvalidUsageEvents are authoritative rows that violate token
 	// invariants. They remain raw evidence but are excluded from money.
 	InvalidUsageEvents int64
 	// AmbiguousBaseEvents counts events under rollups whose base_model-priced rows
@@ -585,8 +585,8 @@ SELECT
     -- Missing engine usage is its own exclusive audit bucket. It must not become a
     -- zero-token rated rollup or be misreported as an attribution/price failure.
     (SELECT COUNT(*)::bigint FROM ev WHERE NOT usage_found)            AS missing_usage_events,
-    -- Invalid authoritative legacy evidence predates the NOT VALID constraints.
-    -- Retain it in billing_event for repair, but never let malformed counts enter
+    -- Retain invalid authoritative engine evidence in billing_event for repair,
+    -- but never let malformed counts enter
     -- money or overlap another anomaly bucket.
     (SELECT COUNT(*)::bigint FROM ev
       WHERE usage_found AND NOT valid_usage)                           AS invalid_usage_events,
