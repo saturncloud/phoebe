@@ -163,6 +163,25 @@ discarded merely because it cannot become money. The rater excludes those rows
 and reports `invalid_usage_attempts`; repair or explicitly quarantine them before
 settling the invoice window.
 
+### Upgrading an install that already carries billing traffic
+
+The interceptor moved from a Deployment with an `emptyDir` WAL to a StatefulSet
+with one retained PVC per ordinal. Helm performs that replacement by DELETING
+the old Deployment and its pod, which destroys that pod's `emptyDir` — so any
+metering event still buffered in the old WAL is lost, not migrated. Rolling back
+to the Deployment has the mirror-image problem: the restored pod does not mount
+the retained StatefulSet PVCs, so evidence written after the upgrade is stranded
+on those claims (retained, but invisible until an operator mounts them
+deliberately).
+
+Neither direction is a problem on an install with no billing traffic to lose,
+which is the supported cutover today. Before performing this upgrade on an
+install that IS carrying billing traffic, quiesce inference to the interceptor
+first, then confirm the old WAL is empty and Valkey has no pending or lagging
+entries, and only then replace the workload. Treat a non-empty WAL at that point
+as evidence to recover (see Repair and replay) rather than something the upgrade
+will carry across for you.
+
 ## Failure-injection checklist
 
 The Make suite covers client-id replay, streaming/non-streaming usage, pre/post-header
