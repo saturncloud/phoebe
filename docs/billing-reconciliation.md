@@ -87,7 +87,20 @@ balance while two customers are mis-attributed.
 1. Quiesce the affected invoice window in the central manager. Do not delete local
    raw events or edit rated money manually.
 2. Copy the recovery artifact away from any live writer, then validate it without
-   making changes. `phoebe-recover` accepts a tidwall WAL directory, legacy/imported
+   making changes.
+
+   **Recover every interceptor ordinal, not just one.** Each StatefulSet ordinal
+   owns its OWN retained WAL PVC (the chart defaults to two interceptor
+   replicas), and an ordinal's WAL holds only the attempts that ordinal served.
+   Recovering `phoebe-interceptor-0` and stopping leaves every attempt buffered
+   on `phoebe-interceptor-1` unbilled, with nothing in the reconciliation view
+   to indicate that a whole replica's evidence was skipped. Enumerate the claims
+   (they are named `phoebe-wal-phoebe-interceptor-<ordinal>`:
+   `kubectl -n saturn get pvc | grep '^phoebe-wal-'`) and run the dry-run/apply
+   pair below once per ordinal, reviewing each digest separately. Claims are
+   retained, so an ordinal scaled away still has evidence to recover.
+
+   `phoebe-recover` accepts a tidwall WAL directory, legacy/imported
    JSONL, or logs containing `METERING_FLOOR` records. It opens a temporary copy of
    WAL directories so the forensic source is not mutated:
 
