@@ -328,6 +328,10 @@ func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request) {
 	// THE ORG, so resolution IS the binding (id.ServedModel was set FROM the
 	// resolved request model; re-checking it against itself would be a
 	// tautology).
+	// selectedModel is the singular model this request actually asked for, as
+	// proven by the binding check. Wake readiness requires it: id.ServedModel
+	// may be a comma-separated allow-list, which no /v1/models entry can equal.
+	selectedModel := ""
 	if id.ServedModel != "" && !id.Gateway {
 		body, rerr := readAndRestoreBody(r)
 		if rerr != nil {
@@ -335,7 +339,9 @@ func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request) {
 			http.Error(w, "bad request body", http.StatusBadRequest)
 			return
 		}
-		switch checkModelBinding(body, id.ServedModel) {
+		result, bound := checkModelBinding(body, id.ServedModel)
+		selectedModel = bound
+		switch result {
 		case bindingMismatch, bindingUnparseable:
 			// Fail closed: the request names a model this resource is not
 			// authorized to serve (or one we cannot verify). Log with the
@@ -362,11 +368,20 @@ func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request) {
 	// below forwards the customer's POST at most once and meters its honest
 	// response. No inference response is ever discarded and replayed.
 	if s.wakeEnabled(id) {
+		// Readiness matches /v1/models EXACTLY, so pass the singular model the
+		// binding check proved this request selected. id.ServedModel is only
+		// usable directly when it is not an allow-list: on the gateway path it
+		// was set FROM the resolved request model, and on a dedicated route it
+		// is the route's one served model.
+		wakeModel := selectedModel
+		if wakeModel == "" {
+			wakeModel = id.ServedModel
+		}
 		target := WakeTarget{
 			UpstreamHost: upstream.Host,
 			GraphK8sName: id.GraphK8sName,
 			ResourceID:   id.ResourceID,
-			ServedModel:  id.ServedModel,
+			ServedModel:  wakeModel,
 		}
 		if target.GraphK8sName == "" {
 			target.GraphK8sName = graphFromUpstreamHost(upstream.Host)

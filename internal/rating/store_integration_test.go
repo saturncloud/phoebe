@@ -1996,3 +1996,119 @@ func TestIntegration_C4AmbiguityFailsLoud(t *testing.T) {
 		t.Errorf("tf-ep-clean cost = %s, want 0.001000000 (plain base rate, no premium)", cost)
 	}
 }
+
+// TestIntegration_FreshInputTokensSurvivesInt32Overflow pins the generated
+// fresh_input_tokens column against int32 overflow of its own subtraction.
+//
+// prompt_tokens and cached_tokens are INTEGER, so each value below is
+// individually valid engine evidence, but `prompt_tokens - cached_tokens`
+// exceeds int32 range. Declared as INTEGER over unwidened operands, PostgreSQL
+// raises 22003 and rejects the INSERT — destroying the raw invalid evidence the
+// ledger exists to retain, and turning an engine bug into lost billing
+// forensics. Declared BIGINT over explicitly cast BIGINT operands, the row
+// persists, reconciliation counts it as an invalid-usage attempt, and it still
+// never reaches money.
+func TestIntegration_FreshInputTokensSurvivesInt32Overflow(t *testing.T) {
+	dsn := os.Getenv("PHOEBE_TEST_DATABASE_URL")
+	if dsn == "" {
+		t.Skip("PHOEBE_TEST_DATABASE_URL not set; skipping live-Postgres conformance")
+	}
+	ctx := context.Background()
+	db, err := sql.Open("pgx", dsn)
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	defer db.Close()
+
+	const sch = "phoebe_rating_overflow_it"
+	exec(t, db, "DROP SCHEMA IF EXISTS "+sch+" CASCADE")
+	exec(t, db, "CREATE SCHEMA "+sch)
+	exec(t, db, "SET search_path TO "+sch)
+	defer func() { exec(t, db, "DROP SCHEMA IF EXISTS "+sch+" CASCADE") }()
+
+	for _, name := range []string{
+		"0001_billing_event.up.sql",
+		"0002_rating.up.sql",
+		"0004_billing_event_serving_mode.up.sql",
+		"0005_invoice_grade_attempts.up.sql",
+		"0006_reconciliation_org_grain.up.sql",
+	} {
+		ddl, readErr := os.ReadFile("../../migrations/" + name)
+		if readErr != nil {
+			t.Fatalf("read migration %s: %v", name, readErr)
+		}
+		exec(t, db, string(ddl))
+	}
+
+	// The generated column must be wide enough to hold the difference.
+	var dataType string
+	if err := db.QueryRowContext(ctx,
+		`SELECT data_type FROM information_schema.columns
+		 WHERE table_schema = $1 AND table_name = 'billing_event'
+		   AND column_name = 'fresh_input_tokens'`, sch).Scan(&dataType); err != nil {
+		t.Fatalf("read fresh_input_tokens type: %v", err)
+	}
+	if dataType != "bigint" {
+		t.Fatalf("fresh_input_tokens is %s, want bigint: an INTEGER generated column "+
+			"overflows on valid int32 operands and rejects raw evidence", dataType)
+	}
+
+	hour := mustTime("2026-06-08T10:00:00Z")
+	const (
+		maxInt32 = 2147483647
+		minInt32 = -2147483648
+	)
+	// Each operand is a valid INTEGER; both differences exceed int32 range.
+	cases := []struct {
+		requestID string
+		prompt    int64
+		cached    int64
+		wantFresh int64
+	}{
+		{"engine-overflow-positive", maxInt32, minInt32, int64(maxInt32) - int64(minInt32)},
+		{"engine-overflow-negative", minInt32, maxInt32, int64(minInt32) - int64(maxInt32)},
+	}
+	for _, tc := range cases {
+		if _, err := db.ExecContext(ctx,
+			`INSERT INTO billing_event
+			 (request_id, auth_id, resource_id, org_id, model, prompt_tokens, cached_tokens, completion_tokens, usage_found, event_ts)
+			 VALUES ($1,'a','d1','org-1','b',$2,$3,0,TRUE,$4)`,
+			tc.requestID, tc.prompt, tc.cached, hour.Add(5*time.Minute)); err != nil {
+			t.Fatalf("insert %s: %v (raw invalid evidence must remain persistable)", tc.requestID, err)
+		}
+		var fresh int64
+		if err := db.QueryRowContext(ctx,
+			`SELECT fresh_input_tokens FROM billing_event WHERE request_id = $1`, tc.requestID).Scan(&fresh); err != nil {
+			t.Fatalf("read fresh_input_tokens for %s: %v", tc.requestID, err)
+		}
+		if fresh != tc.wantFresh {
+			t.Fatalf("%s fresh_input_tokens = %d, want %d", tc.requestID, fresh, tc.wantFresh)
+		}
+	}
+
+	// Both rows are invalid evidence (cached > prompt, or negative counts), so
+	// they are reported for repair and excluded from money.
+	book := newTestBook(map[string]Rate3{"b": rate3("0.000005", "0.000001", "0")}, nil, PolicyIdentity, Dec{}, Dec{})
+	res, err := NewPostgresStore(db).RateWindow(ctx, book, hour, hour.Add(time.Hour))
+	if err != nil {
+		t.Fatalf("RateWindow: %v", err)
+	}
+	if res.InvalidUsageEvents != 2 || res.EventsRated != 0 || res.RollupsWritten != 0 {
+		t.Fatalf("overflow result = invalid/rated/rollups %d/%d/%d, want 2/0/0",
+			res.InvalidUsageEvents, res.EventsRated, res.RollupsWritten)
+	}
+	var rawRows, invalidAttempts, ratedRows int64
+	if err := db.QueryRowContext(ctx, `SELECT COUNT(*) FROM billing_event`).Scan(&rawRows); err != nil {
+		t.Fatalf("count raw evidence: %v", err)
+	}
+	if err := db.QueryRowContext(ctx,
+		`SELECT COALESCE(SUM(invalid_usage_attempts),0) FROM billing_reconciliation_hourly`).Scan(&invalidAttempts); err != nil {
+		t.Fatalf("read invalid reconciliation evidence: %v", err)
+	}
+	if err := db.QueryRowContext(ctx, `SELECT COUNT(*) FROM rated_usage`).Scan(&ratedRows); err != nil {
+		t.Fatalf("count rated rows: %v", err)
+	}
+	if rawRows != 2 || invalidAttempts != 2 || ratedRows != 0 {
+		t.Fatalf("overflow persistence = raw/invalid/rated %d/%d/%d, want 2/2/0", rawRows, invalidAttempts, ratedRows)
+	}
+}

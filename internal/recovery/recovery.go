@@ -32,17 +32,34 @@ type Evidence struct {
 	Duplicates int
 }
 
-// Digest returns a stable SHA-256 digest of the sorted request-id set. It lets
-// an operator identify the exact dry-run input without logging customer data.
+// Digest returns a stable SHA-256 digest binding the COMPLETE validated,
+// de-duplicated event set — not merely its request-id set. -apply compares this
+// value so that the artifact an operator reviewed during dry-run is provably
+// the artifact that gets replayed: swapping in a different set with the same
+// cardinality, or altering token counts / org attribution under the same
+// request ids, changes the digest and is refused before any write.
+//
+// Events are canonically serialized (encoding/json emits struct fields in
+// declaration order, so a given build produces one byte sequence per event) and
+// sorted by the trusted request id, which validateAndDedupe has already proven
+// unique. Framing each record with its length keeps concatenation unambiguous.
 func (e Evidence) Digest() string {
-	ids := make([]string, len(e.Events))
+	encoded := make([][]byte, 0, len(e.Events))
 	for i := range e.Events {
-		ids[i] = e.Events[i].RequestID
+		data, err := json.Marshal(e.Events[i])
+		if err != nil {
+			// metering.Event is a flat struct of JSON-representable scalars, so
+			// this is unreachable; degrade closed rather than emit a digest
+			// that would falsely certify an unserializable set.
+			return ""
+		}
+		encoded = append(encoded, data)
 	}
-	sort.Strings(ids)
+	sort.Slice(encoded, func(i, j int) bool { return bytes.Compare(encoded[i], encoded[j]) < 0 })
 	h := sha256.New()
-	for _, id := range ids {
-		_, _ = io.WriteString(h, id)
+	for _, data := range encoded {
+		_, _ = fmt.Fprintf(h, "%d:", len(data))
+		_, _ = h.Write(data)
 		_, _ = h.Write([]byte{0})
 	}
 	return hex.EncodeToString(h.Sum(nil))
@@ -268,6 +285,13 @@ func validate(ev metering.Event) error {
 	}
 	if ev.TimestampUnixMs <= 0 {
 		return fmt.Errorf("timestamp_unix_ms must be positive")
+	}
+	// billing_event_status_code_ck admits NULL or 100..599. Zero marshals as
+	// the omitted/NULL case, but any other out-of-range value would replay into
+	// Valkey successfully and then poison the drainer on insert, so reject it
+	// here where the failure is still an operator-visible dry-run error.
+	if ev.StatusCode != 0 && (ev.StatusCode < 100 || ev.StatusCode > 599) {
+		return fmt.Errorf("status_code %d is outside the database range 100..599", ev.StatusCode)
 	}
 	return nil
 }

@@ -126,8 +126,12 @@ func TestRateWindowSQL_Shape(t *testing.T) {
 		// The first rate is durable even if rated_usage is reconciled away.
 		"INSERT INTO rating_price_lock",
 		"ON CONFLICT (auth_id, resource_id, model_id, window_start) DO NOTHING",
-		// billable-prompt clamp + the cost formula (cached charged once)
-		"GREATEST(ev.prompt_tokens - ev.cached_tokens, 0)",
+		// billable-prompt clamp + the cost formula (cached charged once).
+		// The operands are cast to BIGINT BEFORE subtracting: this projection
+		// runs over every event in the window before valid_usage filters, so an
+		// int32 subtraction would fail the whole hour's rating (22003) on one
+		// malformed row.
+		"GREATEST(ev.prompt_tokens::bigint - ev.cached_tokens::bigint, 0)",
 		"billable_prompt   * prompt_price",
 		"cached_tokens     * cached_price",
 		"completion_tokens * completion_price",
@@ -214,6 +218,11 @@ func TestRateWindowSQL_Shape(t *testing.T) {
 	// The session-TZ-DEPENDENT bucket must be gone everywhere.
 	if strings.Contains(rateWindowSQL, "date_trunc('hour', ev_ts)") {
 		t.Error("rateWindowSQL still contains the session-TZ-dependent date_trunc('hour', ev_ts)")
+	}
+	// The unwidened int32 subtraction must never come back.
+	if strings.Contains(rateWindowSQL, "GREATEST(ev.prompt_tokens - ev.cached_tokens, 0)") {
+		t.Error("rateWindowSQL computes billable_prompt on unwidened INTEGER operands; " +
+			"valid int32 counts can overflow the difference and fail the entire window")
 	}
 	for _, f := range wantFragments {
 		if !strings.Contains(rateWindowSQL, f) {

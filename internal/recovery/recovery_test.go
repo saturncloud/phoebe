@@ -178,3 +178,91 @@ func TestReplayUsesEmitterStreamShapeAndPreservesIDs(t *testing.T) {
 		}
 	}
 }
+
+// TestLoadRejectsStatusCodesOutsideDatabaseRange pins validation against the
+// billing_event_status_code_ck CHECK (NULL or 100..599). An out-of-range code
+// would replay into Valkey successfully and only then poison the drainer on
+// INSERT, stalling the queue on a row that can never be accepted. Reject it
+// during dry-run, where it is an operator-visible error instead.
+func TestLoadRejectsStatusCodesOutsideDatabaseRange(t *testing.T) {
+	cases := []struct {
+		name    string
+		status  int
+		wantErr bool
+	}{
+		// Zero marshals as the omitted/NULL case, which the CHECK admits.
+		{"zero is the NULL case", 0, false},
+		{"lower bound", 100, false},
+		{"upper bound", 599, false},
+		{"just below lower bound", 99, true},
+		{"just above upper bound", 600, true},
+		{"negative", -1, true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			ev := testEvent("req-status")
+			ev.StatusCode = tc.status
+			data, err := json.Marshal(ev)
+			if err != nil {
+				t.Fatal(err)
+			}
+			path := filepath.Join(t.TempDir(), "evidence.jsonl")
+			if err := os.WriteFile(path, data, 0o600); err != nil {
+				t.Fatal(err)
+			}
+			evidence, err := Load(path)
+			if tc.wantErr {
+				if err == nil {
+					t.Fatalf("status_code %d was accepted; the database CHECK would reject it", tc.status)
+				}
+				if !strings.Contains(err.Error(), "status_code") {
+					t.Fatalf("error %q does not name status_code", err)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("status_code %d must be accepted: %v", tc.status, err)
+			}
+			if len(evidence.Events) != 1 || evidence.Events[0].StatusCode != tc.status {
+				t.Fatalf("events = %+v, want one event with status %d", evidence.Events, tc.status)
+			}
+		})
+	}
+}
+
+// TestDigestBindsCompleteEventSet proves the digest is a function of the whole
+// event content, not merely the request-id set, and is order-independent.
+func TestDigestBindsCompleteEventSet(t *testing.T) {
+	base := Evidence{Events: []metering.Event{testEvent("req-a"), testEvent("req-b")}}
+	reordered := Evidence{Events: []metering.Event{testEvent("req-b"), testEvent("req-a")}}
+	if base.Digest() != reordered.Digest() {
+		t.Fatal("digest must not depend on event ordering")
+	}
+	if base.Digest() == "" {
+		t.Fatal("digest must be computable for a valid event set")
+	}
+
+	// Same ids and cardinality, different payload -> different digest.
+	tamperedTokens := Evidence{Events: []metering.Event{testEvent("req-a"), testEvent("req-b")}}
+	tamperedTokens.Events[0].CompletionTokens = 4242
+	if tamperedTokens.Digest() == base.Digest() {
+		t.Fatal("altered token counts must change the digest")
+	}
+	tamperedOrg := Evidence{Events: []metering.Event{testEvent("req-a"), testEvent("req-b")}}
+	tamperedOrg.Events[1].OrgID = "org-attacker"
+	if tamperedOrg.Digest() == base.Digest() {
+		t.Fatal("altered org attribution must change the digest")
+	}
+
+	// Same cardinality, different ids -> different digest.
+	swapped := Evidence{Events: []metering.Event{testEvent("req-a"), testEvent("req-c")}}
+	if swapped.Digest() == base.Digest() {
+		t.Fatal("a different request-id set must change the digest")
+	}
+
+	// Different cardinality -> different digest.
+	shorter := Evidence{Events: []metering.Event{testEvent("req-a")}}
+	if shorter.Digest() == base.Digest() {
+		t.Fatal("a different event count must change the digest")
+	}
+}

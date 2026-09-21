@@ -7,8 +7,15 @@ ALTER TABLE billing_event ADD COLUMN client_request_id VARCHAR(255);
 ALTER TABLE billing_event ADD COLUMN usage_found BOOLEAN;
 ALTER TABLE billing_event ADD COLUMN status_code INTEGER;
 ALTER TABLE billing_event ADD COLUMN streamed BOOLEAN NOT NULL DEFAULT FALSE;
-ALTER TABLE billing_event ADD COLUMN fresh_input_tokens INTEGER
-    GENERATED ALWAYS AS (prompt_tokens - cached_tokens) STORED;
+-- BIGINT from explicitly widened operands: prompt_tokens and cached_tokens are
+-- individually valid int32 engine evidence, but their difference can exceed
+-- int32 (e.g. prompt_tokens = 2147483647 with cached_tokens = -1). An INTEGER
+-- generated column would make PostgreSQL reject the INSERT outright, destroying
+-- the raw invalid evidence this table exists to retain. Widening before the
+-- subtraction keeps the row insertable; the rater still excludes it from money
+-- and reconciliation still counts it as an invalid-usage attempt.
+ALTER TABLE billing_event ADD COLUMN fresh_input_tokens BIGINT
+    GENERATED ALWAYS AS (prompt_tokens::BIGINT - cached_tokens::BIGINT) STORED;
 
 -- The supported rollout is a verified-empty clean cutover: no legacy database,
 -- Valkey, or WAL events and no mixed-version drainer (see migrations/README.md).

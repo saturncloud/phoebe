@@ -200,3 +200,108 @@ func TestClientDisconnectWhileWakingNeverExecutesInference(t *testing.T) {
 		t.Fatalf("events = %+v, want one aborted zero-charge attempt", events)
 	}
 }
+
+// TestWakeUsesSelectedModelNotAllowList pins the wake-readiness contract for a
+// MULTI-MODEL shared route. atlas injects the whole comma-separated allow-list
+// as X-Saturn-Served-Model, but readiness polls GET /v1/models for an EXACT
+// match — a CSV string can never equal any single served-model entry, so waking
+// on the raw header could never observe readiness and would burn the full wake
+// budget before every cold request. The waker must receive the singular model
+// the request body selected, which the binding check already proved authorized.
+func TestWakeUsesSelectedModelNotAllowList(t *testing.T) {
+	backendHandler := &inferenceBackend{}
+	backend := httptest.NewServer(backendHandler)
+	defer backend.Close()
+	em := &recordingEmitter{}
+	waker := &fakeWaker{wake: func(context.Context, WakeTarget) error {
+		backendHandler.warm.Store(true)
+		return nil
+	}}
+	s := New(&config.Settings{}, logging.New(logging.ERROR), em).WithWaker(waker, time.Second)
+
+	// Body selects model-b; the route authorizes both model-a and model-b.
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(`{"model":"model-b"}`))
+	req.Header.Set(identity.HeaderAuthID, "auth-1")
+	req.Header.Set(identity.HeaderResourceID, "r1")
+	req.Header.Set(identity.HeaderServedModel, "model-a,model-b")
+	req.Header.Set(identity.HeaderUpstream, strings.TrimPrefix(backend.URL, "http://"))
+	req.Header.Set(requestIDHeader, "client-request")
+
+	rr := httptest.NewRecorder()
+	s.Handler().ServeHTTP(rr, req)
+
+	if rr.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200 (body %q)", rr.Code, rr.Body.String())
+	}
+	if got := waker.last().ServedModel; got != "model-b" {
+		t.Fatalf("wake target ServedModel = %q, want the selected %q (never the allow-list)", got, "model-b")
+	}
+	if got := atomic.LoadInt32(&backendHandler.calls); got != 1 {
+		t.Fatalf("inference POST executions = %d, want exactly 1", got)
+	}
+}
+
+// TestWakeUsesSelectedModelFirstOfAllowList covers the other multi-model entry,
+// so a fix that accidentally hard-coded the last CSV element would still fail.
+func TestWakeUsesSelectedModelFirstOfAllowList(t *testing.T) {
+	backendHandler := &inferenceBackend{}
+	backend := httptest.NewServer(backendHandler)
+	defer backend.Close()
+	waker := &fakeWaker{wake: func(context.Context, WakeTarget) error {
+		backendHandler.warm.Store(true)
+		return nil
+	}}
+	s := New(&config.Settings{}, logging.New(logging.ERROR), &recordingEmitter{}).WithWaker(waker, time.Second)
+
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(`{"model":"model-a"}`))
+	req.Header.Set(identity.HeaderAuthID, "auth-1")
+	req.Header.Set(identity.HeaderResourceID, "r1")
+	req.Header.Set(identity.HeaderServedModel, "model-a,model-b")
+	req.Header.Set(identity.HeaderUpstream, strings.TrimPrefix(backend.URL, "http://"))
+	req.Header.Set(requestIDHeader, "client-request")
+
+	s.Handler().ServeHTTP(httptest.NewRecorder(), req)
+
+	if got := waker.last().ServedModel; got != "model-a" {
+		t.Fatalf("wake target ServedModel = %q, want the selected %q", got, "model-a")
+	}
+}
+
+// TestWakeSucceedsThenBackendColdReturnsHonestResponse pins the no-replay
+// contract for the race where readiness SUCCEEDS but the backend goes cold again
+// before the single inference POST (e.g. the graph scaled back to zero between
+// the /v1/models poll and the forward). The customer must receive that honest
+// cold response — never a retried or replayed inference — and it must be
+// metered exactly once as a zero-charge attempt.
+func TestWakeSucceedsThenBackendColdReturnsHonestResponse(t *testing.T) {
+	backendHandler := &inferenceBackend{} // stays cold: wake reports success anyway
+	backend := httptest.NewServer(backendHandler)
+	defer backend.Close()
+	em := &recordingEmitter{}
+	// Readiness succeeds (no error) but never warms the backend.
+	waker := &fakeWaker{}
+	s := New(&config.Settings{}, logging.New(logging.ERROR), em).WithWaker(waker, time.Second)
+
+	rr := httptest.NewRecorder()
+	s.Handler().ServeHTTP(rr, wakeableRequest(backend))
+
+	if got := atomic.LoadInt32(&waker.calls); got != 1 {
+		t.Fatalf("waker calls = %d, want 1 successful wake", got)
+	}
+	if rr.Code != http.StatusNotFound || !strings.Contains(rr.Body.String(), "Model not found") {
+		t.Fatalf("response = %d %q, want the honest cold upstream response", rr.Code, rr.Body.String())
+	}
+	if got := atomic.LoadInt32(&backendHandler.calls); got != 1 {
+		t.Fatalf("inference POST executions = %d, want exactly 1 (no replay)", got)
+	}
+	events := em.waitForEvents(1, time.Second)
+	if len(events) != 1 {
+		t.Fatalf("events = %d, want exactly 1 raw attempt", len(events))
+	}
+	if events[0].UsageFound || events[0].StatusCode != http.StatusNotFound {
+		t.Fatalf("event = %+v, want one zero-charge 404 attempt", events[0])
+	}
+	if events[0].PromptTokens != 0 || events[0].CompletionTokens != 0 {
+		t.Fatalf("event = %+v, want zero billable tokens", events[0])
+	}
+}

@@ -310,7 +310,15 @@ resolved AS (
         ev.prompt_tokens,
         ev.cached_tokens,
         ev.completion_tokens,
-        GREATEST(ev.prompt_tokens - ev.cached_tokens, 0) AS billable_prompt,
+        -- Widen BEFORE subtracting. prompt_tokens and cached_tokens are INTEGER,
+        -- so individually valid engine evidence can overflow int32 on the
+        -- difference (e.g. 2147483647 - (-2147483648)). This projection runs over
+        -- EVERY event in the window before valid_usage filters anything, so an
+        -- int32 subtraction here fails the whole hour's rating with 22003 —
+        -- one malformed row would block all billing for that window, not just
+        -- its own. BIGINT operands keep the row computable; it is then excluded
+        -- from money by valid_usage and reported as an invalid-usage attempt.
+        GREATEST(ev.prompt_tokens::bigint - ev.cached_tokens::bigint, 0) AS billable_prompt,
         -- The C4 ladder: direct (a) wins; else derived base x premium (b) for
         -- fine-tune traffic; else the plain base rate (c) for a base-model endpoint.
         -- The rd and rpb join guards are mutually exclusive on the fine-tune marker,

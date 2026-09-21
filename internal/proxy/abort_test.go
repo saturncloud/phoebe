@@ -263,9 +263,13 @@ func TestNormalCompletionNotAffectedByAbortWatcher(t *testing.T) {
 // ErrorHandler — so an aborted request is never billing-invisible regardless of
 // whether the cancel landed pre- or post-header. (Previously such a request
 // emitted nothing, which this test documented as "correct"; Fix A changed that
-// contract.) Either way the event is Aborted=true, which is what we assert. We do
-// not assert an exact total because pre-/post-header split is scheduling-
-// dependent, but every emitted event must be Aborted.
+// contract.)
+//
+// Because BOTH the pre-header (ErrorHandler) and post-header (onDone) paths now
+// emit, and they are mutually exclusive, the count is NOT scheduling-dependent:
+// exactly N events, N distinct trusted request ids, and exactly one event per
+// client correlation id. Asserting only "> 0" would let a lost or duplicated
+// billing event pass, which is the whole risk this stress test exists to catch.
 func TestAbortRaceStress(t *testing.T) {
 	const N = 50
 
@@ -312,12 +316,45 @@ func TestAbortRaceStress(t *testing.T) {
 			t.Fatalf("stress: event not aborted: %+v", e)
 		}
 	}
-	// Sanity: we expect most requests got far enough to emit. If we got zero
-	// events, the test infrastructure is broken (backend never flushed).
-	if len(events) == 0 {
-		t.Fatal("stress: no events emitted — slow backend may not have flushed")
+	// Exactly one billing event per request: no aborted request goes
+	// billing-invisible, and none is double-emitted.
+	if len(events) != N {
+		t.Fatalf("stress: emitted %d events, want exactly %d (one per request)", len(events), N)
 	}
-	t.Logf("stress: %d/%d requests emitted aborted events (rest cancelled before ModifyResponse)", len(events), N)
+	// Trusted attempt ids are server-minted and must be unique per attempt.
+	trusted := make(map[string]struct{}, len(events))
+	for _, e := range events {
+		if e.RequestID == "" {
+			t.Fatalf("stress: event has no trusted request id: %+v", e)
+		}
+		if _, dup := trusted[e.RequestID]; dup {
+			t.Fatalf("stress: duplicate trusted request id %q", e.RequestID)
+		}
+		trusted[e.RequestID] = struct{}{}
+	}
+	if len(trusted) != N {
+		t.Fatalf("stress: %d distinct trusted request ids, want %d", len(trusted), N)
+	}
+	// Exactly one event per client correlation id — the untrusted X-Request-Id
+	// each goroutine sent. A missing or doubled id means a lost or duplicated
+	// billable attempt for that client request.
+	perClient := make(map[string]int, N)
+	for _, e := range events {
+		perClient[e.ClientRequestID]++
+	}
+	for i := 0; i < N; i++ {
+		id := fmt.Sprintf("req-%d", i)
+		switch perClient[id] {
+		case 1:
+		case 0:
+			t.Fatalf("stress: no event emitted for client correlation id %q", id)
+		default:
+			t.Fatalf("stress: %d events emitted for client correlation id %q, want 1", perClient[id], id)
+		}
+	}
+	if len(perClient) != N {
+		t.Fatalf("stress: %d distinct client correlation ids, want %d", len(perClient), N)
+	}
 }
 
 // TestIdleTimeoutNotIntroduced is a documentation test. The http.Server has no

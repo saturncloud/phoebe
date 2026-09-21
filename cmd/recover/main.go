@@ -1,5 +1,6 @@
 // Command recover validates and replays Phoebe metering recovery artifacts.
-// It is dry-run-only unless -apply and an exact -expected-count are supplied.
+// It is dry-run-only unless -apply with an exact -expected-count and
+// -expected-digest binding the complete reviewed event set are supplied.
 package main
 
 import (
@@ -9,6 +10,7 @@ import (
 	"io"
 	"os"
 	"os/signal"
+	"strings"
 	"syscall"
 	"time"
 
@@ -33,6 +35,7 @@ func run(parent context.Context, args []string, stdout, stderr io.Writer) error 
 	timeout := flags.Duration("timeout", 2*time.Second, "timeout for each XADD")
 	apply := flags.Bool("apply", false, "write validated events (otherwise dry-run only)")
 	expected := flags.Int("expected-count", -1, "required with -apply; must equal validated unique count")
+	expectedDigest := flags.String("expected-digest", "", "required with -apply; must equal the dry-run event_set_sha256")
 	if err := flags.Parse(args); err != nil {
 		return err
 	}
@@ -47,17 +50,31 @@ func run(parent context.Context, args []string, stdout, stderr io.Writer) error 
 	if err != nil {
 		return err
 	}
-	fmt.Fprintf(stdout, "validated records=%d unique=%d duplicates=%d request_id_sha256=%s\n",
-		evidence.Records, len(evidence.Events), evidence.Duplicates, evidence.Digest())
+	digest := evidence.Digest()
+	if digest == "" {
+		return fmt.Errorf("unable to compute the recovery event digest")
+	}
+	fmt.Fprintf(stdout, "validated records=%d unique=%d duplicates=%d event_set_sha256=%s\n",
+		evidence.Records, len(evidence.Events), evidence.Duplicates, digest)
 	if !*apply {
-		fmt.Fprintf(stdout, "dry-run only; replay with -apply -expected-count %d after reviewing this result\n", len(evidence.Events))
+		fmt.Fprintf(stdout, "dry-run only; replay with -apply -expected-count %d -expected-digest %s after reviewing this result\n",
+			len(evidence.Events), digest)
 		return nil
 	}
+	// Bind the replay to the exact artifact reviewed during dry-run. Both
+	// checks run before a Valkey client is constructed so a mismatched or
+	// tampered set never reaches the network.
 	if *expected < 0 {
 		return fmt.Errorf("-expected-count is required with -apply")
 	}
+	if *expectedDigest == "" {
+		return fmt.Errorf("-expected-digest is required with -apply")
+	}
 	if *expected != len(evidence.Events) {
 		return fmt.Errorf("expected count %d does not match validated unique count %d", *expected, len(evidence.Events))
+	}
+	if !strings.EqualFold(*expectedDigest, digest) {
+		return fmt.Errorf("expected digest %s does not match validated event digest %s", *expectedDigest, digest)
 	}
 	if len(evidence.Events) == 0 {
 		return fmt.Errorf("refuse to apply an empty recovery set")

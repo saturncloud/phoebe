@@ -95,20 +95,32 @@ balance while two customers are mis-attributed.
    /app/phoebe-recover -input /evidence/phoebe-metering-wal
    ```
 
-   Review the reported record count, duplicate count, and request-id-set digest.
+   Review the reported record count, duplicate count, and `event_set_sha256`.
+   That digest covers the COMPLETE validated event set — every field of every
+   event, not just the request ids — so it changes if any token count, org
+   attribution, or id differs from what you reviewed.
+
    Replay only that validated set into the configured Valkey stream by repeating
-   the reported unique count:
+   BOTH the reported unique count and the reported digest verbatim:
 
    ```console
    /app/phoebe-recover -input /evidence/phoebe-metering-wal \
      -valkey-addr valkey:6379 -stream phoebe:metering \
-     -apply -expected-count 42
+     -apply -expected-count 42 \
+     -expected-digest 9f2c1d...a71b
    ```
 
+   Both guards are required for `-apply` and are checked before any Valkey
+   connection is opened, so the artifact you reviewed is provably the artifact
+   that gets replayed: a different set with the same count, or the same ids with
+   altered payloads, is refused without writing anything. Do not copy a digest
+   from an older run — re-read it from the dry-run you are actually approving.
+
    The command preserves every original `request_id`, refuses conflicting
-   duplicates and schema-poisoning values, and is dry-run-only without both apply
-   guards. A retry after a partial write is safe because the drainer deduplicates
-   on `request_id`. Never replay a live WAL directory while the interceptor is
+   duplicates, schema-poisoning values, and status codes outside the database's
+   `100..599` range, and is dry-run-only without both apply guards. A retry
+   after a partial write is safe because the drainer deduplicates on
+   `request_id`. Never replay a live WAL directory while the interceptor is
    appending or auto-draining it.
 3. Run the drainer until the consumer group has no pending/lagging entries. Confirm
    the recovered attempt ids exist once in `billing_event`.
