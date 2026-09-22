@@ -72,6 +72,11 @@ is not automatically revenue loss: it means the engine did
 not provide authoritative counts, so Phoebe charged zero and requires engine-log
 review.
 
+"Failed" means `status_code >= 400` everywhere — the reconciliation view's
+`failed_attempts` and the rater's routine-vs-alarming split use the SAME
+threshold, so the view you audit and the decision to page can never disagree
+about the same rows.
+
 **Missing usage is paged by CAUSE, not by count.** A client disconnect or an
 upstream failure legitimately produces a zero-usage attempt, so those are routine
 on any install with traffic: they are reported (INFO, and counted in

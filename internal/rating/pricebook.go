@@ -33,7 +33,8 @@ const ftLikePattern = fineTunePrefix + "%"
 
 // --- THE PRICE FILE SCHEMA (the operator-facing contract) -------------------
 //
-// The price file is the SINGLE source of truth for what every model costs (E1).
+// A price book is one effective snapshot of what every model costs (E1), served by
+// the pricing service which owns the effective-dated series.
 // In file mode an operator authors and version-controls it and the file's history
 // is the price audit trail. In manager mode the parsed book is ONE HOUR's effective
 // prices, fetched per hour from the service that owns the effective-dated series
@@ -139,15 +140,14 @@ type fineTuneEntry struct {
 	Rate        *rateYAML `yaml:"rate"` // optional own rate (escape hatch; bypasses premium)
 }
 
-// LoadPriceBook reads, parses, and validates the price file at path, returning an
-// immutable PriceBook. It FAILS CLOSED: a missing file, malformed YAML, an unknown
-// schema version, a non-decimal/negative rate, or an inconsistent premium policy is
-// an error — the rater refuses to run rather than rate at $0 or a wrong rate.
+// LoadPriceBook reads, parses, and validates a price book FILE, returning an
+// immutable PriceBook. It FAILS CLOSED exactly like ParsePriceBook.
 //
-// SEAM FOR S3 (out of scope here): the file is loaded from a local path. To fetch
-// from S3, fetch-to-local then call LoadPriceBook(localPath) — the create-time price
-// gate (E4) and the rater MUST read the same file/version, so a single fetched copy
-// is the natural shared artifact.
+// NOT the rating path: the rater obtains each hour's book from the pricing service
+// (internal/pricefetch) and parses the bytes with ParsePriceBook — there is no
+// local price file. This remains for tooling and for the test that parses the
+// shipped config/prices.example.yaml, which keeps the documented wire shape honest
+// by running it through the real loader.
 func LoadPriceBook(path string) (*PriceBook, error) {
 	data, err := os.ReadFile(path)
 	if err != nil {

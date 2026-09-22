@@ -1,6 +1,8 @@
 package main
 
 import (
+	"os"
+	"path/filepath"
 	"testing"
 	"time"
 )
@@ -183,5 +185,53 @@ func TestResolveWindow_RejectsUnaligned(t *testing.T) {
 	// A fully hour-aligned explicit window is still accepted.
 	if _, _, _, err := resolveWindow("2026-06-01T00:00:00Z", "2026-06-01T03:00:00Z", defaultRateTrailingHours, now); err != nil {
 		t.Fatalf("hour-aligned window should be accepted, got %v", err)
+	}
+}
+
+// TestRaterSettings_ManagerURLIsTheOnlyPriceSource pins the settings contract after
+// the mandatory-manager collapse (Hugo, 2026-09-22): the rater reads managerURL out
+// of the file the chart renders, and there is no priceFile key to fall back to.
+//
+// The chart writes this settings file, so a key the rater silently ignored would
+// make the whole price path inert with nothing to notice it — the exact failure
+// mode a cross-repo review missed on the previous wiring.
+func TestRaterSettings_ManagerURLIsTheOnlyPriceSource(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "rater.yaml")
+	// Exactly the shape charts/phoebe/templates/configmap.yaml renders.
+	settings := "debug: false\n" +
+		"rateTrailingHours: 24\n" +
+		"managerURL: \"https://manager.example\"\n"
+	if err := os.WriteFile(path, []byte(settings), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	_, opts, err := loadConfig(path)
+	if err != nil {
+		t.Fatalf("loadConfig: %v", err)
+	}
+	if opts.managerURL != "https://manager.example" {
+		t.Fatalf("managerURL = %q, want the configured URL — the chart key would be inert", opts.managerURL)
+	}
+}
+
+// TestRaterSettings_PriceFileKeyIsGone: a leftover priceFile in an operator's
+// settings must not look like a working price source. The manager is the only one;
+// an install that cannot egress runs its own manager instance.
+func TestRaterSettings_PriceFileKeyIsGone(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "rater.yaml")
+	settings := "debug: false\n" +
+		"priceFile: /etc/saturn/prices/prices.yaml\n"
+	if err := os.WriteFile(path, []byte(settings), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	_, opts, err := loadConfig(path)
+	if err != nil {
+		t.Fatalf("loadConfig: %v", err)
+	}
+	if opts.managerURL != "" {
+		t.Fatalf("managerURL = %q, want empty — a priceFile key must not stand in for one", opts.managerURL)
 	}
 }

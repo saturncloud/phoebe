@@ -1,32 +1,28 @@
 # =====================================================================
-#  phoebe price file — the OPERATOR-FACING CONTRACT (E1).
+#  phoebe price book — the WIRE SHAPE served by the pricing service (E1).
 # =====================================================================
 #
-# WHO OWNS PRICES (read this first):
-#   The central pricing service (saturn-aws-manager) is the AUTHORITATIVE source of
-#   both live and historical prices. Its price rows are effective-dated, so "what
-#   did this model cost at time T" is always answerable. When the rater is
-#   configured with a managerURL it asks for the prices effective during EACH HOUR
-#   it rates, and phoebe keeps NO price history of its own.
+# WHO OWNS PRICES:
+#   The pricing service (saturn-aws-manager) is the ONLY source of prices, live
+#   and historical. Its price rows are effective-dated, so the rater asks for the
+#   rates effective during EACH HOUR it rates, and phoebe keeps no price history
+#   and no local price file. An install that cannot egress to the central manager
+#   runs its own manager instance, seeded with that deployment's prices.
 #
-#   THIS FILE is the AIR-GAPPED / operator-authored alternative, used when no
-#   managerURL is set. An operator authors and version-controls it; the file's
-#   history is then the price audit trail.
+# WHAT THIS FILE IS NOW:
+#   The WIRE SHAPE the manager renders and the rater parses — a reference for the
+#   format, not a file anyone authors or the rater reads. `GET /customer/token-prices`
+#   returns exactly this document (plus an X-Saturn-Price-Version header), and
+#   `?at=<ISO8601>` returns the version effective at that instant.
 #
-# HOW IT IS USED (file mode):
-#   - The hourly rater (cmd/rater) loads this file at run start and uses it for
-#     EVERY hour in the window, then freezes the applied per-token rate onto each
-#     rated_usage row so the row is self-auditing.
-#   - LIMITATION vs the manager: this file is a flat snapshot with no time
-#     dimension. Re-rating a window that spans a price edit prices every hour from
-#     the CURRENT file, so an edit can reprice already-served traffic in a re-run.
-#     Manager mode does not have this problem (each hour resolves the rates that
-#     were in force during it). Edit this file between runs, and re-rate a past
-#     window only deliberately.
-#   - The create-time PRICE GATE (Atlas, E4) reads THIS SAME file: a deployment whose
-#     model is not priced here cannot be created/served. So the rater should never
-#     meet an unpriced model — but it keeps a fail-loud backstop (an unpriced model
-#     is COUNTED and logged, NEVER billed $0).
+#   To change prices, use the manager's pricing CLI (`pricing apply` against its
+#   YAML, or `pricing reprice-token`); a price change there is an effective-dated
+#   row, which is what lets a past window re-rate at the rates it originally used.
+#
+# The create-time PRICE GATE (Atlas, E4) reads the same served book: a deployment
+# whose model is not priced cannot be created/served. So the rater should never meet
+# an unpriced model — but it keeps a fail-loud backstop (an unpriced model is
+# COUNTED and logged, NEVER billed $0).
 #
 # MONEY UNIT (read before touching a number):
 #   Rates are per-token USD, written as EXACT DECIMAL STRINGS (quoted). They are

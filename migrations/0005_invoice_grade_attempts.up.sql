@@ -69,7 +69,9 @@ WITH raw AS (
                               OR completion_tokens < 0 OR cached_tokens > prompt_tokens)::bigint
             AS invalid_usage_attempts,
         COUNT(*) FILTER (WHERE aborted)::bigint AS aborted_attempts,
-        COUNT(*) FILTER (WHERE status_code >= 500)::bigint AS failed_attempts,
+        -- "FAILED" is status_code >= 400 — the same threshold the rater uses to
+        -- separate routine zero-usage attempts from alarming ones (see 0006).
+        COUNT(*) FILTER (WHERE status_code >= 400)::bigint AS failed_attempts,
         SUM(prompt_tokens)::bigint AS raw_prompt_tokens,
         SUM(fresh_input_tokens)::bigint AS raw_fresh_input_tokens,
         SUM(cached_tokens)::bigint AS raw_cached_tokens,

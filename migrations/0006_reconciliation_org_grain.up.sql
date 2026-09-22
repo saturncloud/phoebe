@@ -20,7 +20,12 @@ WITH raw AS (
                               OR completion_tokens < 0 OR cached_tokens > prompt_tokens)::bigint
             AS invalid_usage_attempts,
         COUNT(*) FILTER (WHERE aborted)::bigint AS aborted_attempts,
-        COUNT(*) FILTER (WHERE status_code >= 500)::bigint AS failed_attempts,
+        -- "FAILED" is status_code >= 400, the SAME threshold the rater uses to
+        -- decide whether a zero-usage attempt is routine (expected) or alarming
+        -- (unexplained). The two must agree: a 4xx zero-usage attempt excused by
+        -- the rater but shown here as un-failed would make the operator's audit
+        -- view disagree with the paging decision about the very same rows.
+        COUNT(*) FILTER (WHERE status_code >= 400)::bigint AS failed_attempts,
         SUM(prompt_tokens)::bigint AS raw_prompt_tokens,
         SUM(fresh_input_tokens)::bigint AS raw_fresh_input_tokens,
         SUM(cached_tokens)::bigint AS raw_cached_tokens,
