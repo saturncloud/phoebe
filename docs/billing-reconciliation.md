@@ -98,6 +98,17 @@ The view groups raw evidence at the exact rated natural key and exposes
 NULL and one real org therefore reconciles to one rated row without false token
 deltas, while conflicting non-NULL orgs remain explicit.
 
+**`rated_attempts = 0` with a non-zero `raw_attempts` is NOT by itself lost
+rating.** It has two very different causes and the view alone cannot tell them
+apart, so never treat the row as a drainer/rating incident before ruling out the
+first: either (a) the rater deliberately WITHHELD the rollup at an ambiguity gate
+— check `distinct_org_ids > 1` on the row for org-ambiguity, and the same run's
+`ambiguous_base_events` count for base-ambiguity, which the view does not surface
+at all (the base gate keys on `rating_price`/`rating_derived` join outcomes that
+exist only inside the rater, not on `billing_event`) — or (b) the rater has not
+yet run for that hour. Check the rater's run report for the window before
+escalating.
+
 For the invoice boundary, export `rated_usage.id`, `window_start`, `org_id`, and
 `cost` for the same interval and compare it to the central manager's received-rollup
 and invoice-line exports. Require set equality on id and exact NUMERIC equality on

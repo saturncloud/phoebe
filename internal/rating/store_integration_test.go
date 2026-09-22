@@ -2264,3 +2264,131 @@ func TestIntegration_MissingUsagePartitionedByCause(t *testing.T) {
 		t.Fatal("a window of only client aborts and upstream failures must NOT page")
 	}
 }
+
+// TestIntegration_AmbiguousBaseIsIndistinguishableFromUnratedInTheView pins the
+// blind spot that docs/billing-reconciliation.md warns about, so the warning can
+// never silently drift from what the view actually exposes.
+//
+// THE INVARIANT: a rollup WITHHELD by the rater's ambiguous_base gate appears in
+// billing_reconciliation_hourly as raw_attempts > 0 with rated_attempts = 0 and
+// rated_cost = 0 — byte-identical in shape to an hour the rater never rated — and
+// the view carries NO column that distinguishes the two. The base gate keys on
+// rating_price/rating_derived join outcomes (via_derived/via_base) that exist only
+// inside the rater, not as billing_event columns, so the view CANNOT compute it;
+// the only signal is the run report's AmbiguousBaseEvents. An operator auditing
+// deltas must therefore consult the run report before calling such a row lost
+// rating. If a future migration ever DOES surface an ambiguous/withheld column,
+// this test fails and the doc paragraph must be rewritten to point at it.
+//
+// This is deliberately asymmetric with the org case, which the view DOES explain
+// via distinct_org_ids > 1 (asserted below as the contrast).
+func TestIntegration_AmbiguousBaseIsIndistinguishableFromUnratedInTheView(t *testing.T) {
+	dsn := os.Getenv("PHOEBE_TEST_DATABASE_URL")
+	if dsn == "" {
+		t.Skip("PHOEBE_TEST_DATABASE_URL not set; skipping live-Postgres conformance")
+	}
+	ctx := context.Background()
+	db, err := sql.Open("pgx", dsn)
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	defer db.Close()
+
+	const sch = "phoebe_rating_ambig_view_it"
+	exec(t, db, "DROP SCHEMA IF EXISTS "+sch+" CASCADE")
+	exec(t, db, "CREATE SCHEMA "+sch)
+	exec(t, db, "SET search_path TO "+sch)
+	defer func() { exec(t, db, "DROP SCHEMA IF EXISTS "+sch+" CASCADE") }()
+	exec(t, db, ratingSchemaDDL(t))
+
+	hour := mustTime("2026-06-08T10:00:00Z")
+	book := newTestBook(
+		map[string]Rate3{
+			"cheap/base":     rate3("0.000001", "0", "0"),
+			"expensive/base": rate3("0.000009", "0", "0"),
+		},
+		nil, PolicyMultiplier, MustDec("1.5"), Dec{},
+	)
+
+	// One ft: id under TWO base_models in one hour → the base gate withholds it.
+	for _, s := range []struct{ req, base string }{
+		{"ab-1", "cheap/base"}, {"ab-2", "expensive/base"},
+	} {
+		if _, err := db.ExecContext(ctx,
+			`INSERT INTO billing_event (request_id, auth_id, resource_id, org_id, model, base_model, prompt_tokens, completion_tokens, event_ts)
+			 VALUES ($1,'a','r-ambig','org-1','ft:dupe',$2,1000,0,$3)`,
+			s.req, s.base, hour.Add(5*time.Minute)); err != nil {
+			t.Fatalf("seed %s: %v", s.req, err)
+		}
+	}
+	// A second resource the rater is simply never asked to rate: the "rater has not
+	// run for this hour" cause, seeded in an hour outside the rated window.
+	unratedHour := hour.Add(time.Hour)
+	if _, err := db.ExecContext(ctx,
+		`INSERT INTO billing_event (request_id, auth_id, resource_id, org_id, model, base_model, prompt_tokens, completion_tokens, event_ts)
+		 VALUES ('ur-1','a','r-unrated','org-1','ft:clean','cheap/base',1000,0,$1)`,
+		unratedHour.Add(5*time.Minute)); err != nil {
+		t.Fatalf("seed unrated: %v", err)
+	}
+
+	store := NewPostgresStore(db)
+	res, err := store.RateWindow(ctx, book, hour, hour.Add(time.Hour))
+	if err != nil {
+		t.Fatalf("RateWindow: %v", err)
+	}
+	if res.AmbiguousBaseEvents != 2 {
+		t.Fatalf("AmbiguousBaseEvents = %d, want 2 — the run report is the ONLY place this cause is visible",
+			res.AmbiguousBaseEvents)
+	}
+
+	type viewRow struct {
+		raw, rated, distinctOrgs, delta int64
+		cost                            string
+	}
+	read := func(resource string, win time.Time) viewRow {
+		var r viewRow
+		if err := db.QueryRowContext(ctx, `
+			SELECT raw_attempts, rated_attempts, distinct_org_ids, attempt_delta, rated_cost::text
+			FROM billing_reconciliation_hourly
+			WHERE window_start=$1 AND auth_id='a' AND resource_id=$2`, win, resource).
+			Scan(&r.raw, &r.rated, &r.distinctOrgs, &r.delta, &r.cost); err != nil {
+			t.Fatalf("read view for %s: %v", resource, err)
+		}
+		return r
+	}
+
+	withheld := read("r-ambig", hour)
+	neverRated := read("r-unrated", unratedHour)
+
+	// The withheld rollup looks exactly like lost rating.
+	if withheld.raw != 2 || withheld.rated != 0 || withheld.delta != 2 || MustDec(withheld.cost).String() != "0.000000000" {
+		t.Fatalf("withheld row = raw/rated/delta/cost %d/%d/%d/%s, want 2/0/2/0 (the gate excludes it from rated_usage entirely)",
+			withheld.raw, withheld.rated, withheld.delta, withheld.cost)
+	}
+	// And the never-rated hour is the SAME shape, per raw attempt — that sameness
+	// IS the blind spot the docs tell the operator to resolve via the run report.
+	if neverRated.rated != 0 || neverRated.delta != neverRated.raw {
+		t.Fatalf("never-rated row = raw/rated/delta %d/%d/%d, want rated 0 and delta == raw",
+			neverRated.raw, neverRated.rated, neverRated.delta)
+	}
+	// Neither row carries an org-ambiguity signal, so distinct_org_ids cannot be
+	// mistaken for a base-ambiguity explanation.
+	if withheld.distinctOrgs != 1 || neverRated.distinctOrgs != 1 {
+		t.Fatalf("distinct_org_ids withheld/never-rated = %d/%d, want 1/1 (single org on both; base ambiguity is invisible here)",
+			withheld.distinctOrgs, neverRated.distinctOrgs)
+	}
+
+	// The view exposes NO ambiguous/withheld column. If one is ever added, the
+	// documented "the view does not surface it" guidance is stale — fail here.
+	var explanatory int64
+	if err := db.QueryRowContext(ctx, `
+		SELECT COUNT(*) FROM information_schema.columns
+		WHERE table_name='billing_reconciliation_hourly'
+		  AND (column_name LIKE '%ambiguous%' OR column_name LIKE '%withheld%'
+		       OR column_name LIKE '%distinct_base%')`).Scan(&explanatory); err != nil {
+		t.Fatalf("inspect view columns: %v", err)
+	}
+	if explanatory != 0 {
+		t.Fatalf("billing_reconciliation_hourly now has %d ambiguity/withheld column(s); docs/billing-reconciliation.md still tells operators the view does not surface base ambiguity — update the doc", explanatory)
+	}
+}
