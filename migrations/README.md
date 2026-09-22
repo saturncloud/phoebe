@@ -1,4 +1,4 @@
-# phoebe migrations — raw events, rated usage, price locks, and I/O logs
+# phoebe migrations — raw events, rated usage, reconciliation, and I/O logs
 
 phoebe **owns its billing schema in its OWN Postgres** (deployed by the phoebe
 Helm chart), applied by **`cmd/migrate`** (golang-migrate). phoebe is
@@ -38,8 +38,7 @@ golang-migrate up/down pairs, applied in version order:
 | 0002 | `0002_rating.{up,down}.sql` | `rated_usage` (+ `org_id`, indexes) + the billing_event rating-instant index |
 | 0003 | `0003_io_log.{up,down}.sql` | `io_log` (+ GIN body index, retention indexes) |
 | 0004 | `0004_billing_event_serving_mode.{up,down}.sql` | `billing_event.serving_mode` (the serving-mode SKU axis; NULL = dedicated) |
-| 0005 | `0005_invoice_grade_attempts.{up,down}.sql` | trusted/client request identity, attempt outcome and usage evidence, invalid-usage reconciliation, and the hourly reconciliation view |
-| 0006 | `0006_reconciliation_org_grain.{up,down}.sql` | aligns raw reconciliation with the rated natural key while exposing missing/conflicting org evidence |
+| 0005 | `0005_invoice_grade_attempts.{up,down}.sql` | trusted/client request identity, attempt outcome and usage evidence, invalid-usage reconciliation, and the hourly reconciliation view at the rated natural key (exposing missing/conflicting org evidence) |
 
 `embed.go` embeds these into the `migrations` package; `cmd/migrate` applies them.
 

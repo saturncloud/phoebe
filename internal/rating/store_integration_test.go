@@ -18,6 +18,8 @@ import (
 	"database/sql"
 	"fmt"
 	"os"
+	"path/filepath"
+	"sort"
 	"strings"
 	"testing"
 	"time"
@@ -48,7 +50,6 @@ func ratingSchemaDDL(t *testing.T) string {
 		// serving-mode SKU axis). Skipping it reproduces the staging 42703.
 		"../../migrations/0004_billing_event_serving_mode.up.sql",
 		"../../migrations/0005_invoice_grade_attempts.up.sql",
-		"../../migrations/0006_reconciliation_org_grain.up.sql",
 	} {
 		ddl, err := os.ReadFile(f)
 		if err != nil {
@@ -919,7 +920,6 @@ func TestIntegration_InvalidUsageEvidenceNeverEntersMoney(t *testing.T) {
 		"0002_rating.up.sql",
 		"0004_billing_event_serving_mode.up.sql",
 		"0005_invoice_grade_attempts.up.sql",
-		"0006_reconciliation_org_grain.up.sql",
 	} {
 		apply(name)
 	}
@@ -2081,7 +2081,6 @@ func TestIntegration_FreshInputTokensSurvivesInt32Overflow(t *testing.T) {
 		"0002_rating.up.sql",
 		"0004_billing_event_serving_mode.up.sql",
 		"0005_invoice_grade_attempts.up.sql",
-		"0006_reconciliation_org_grain.up.sql",
 	} {
 		ddl, readErr := os.ReadFile("../../migrations/" + name)
 		if readErr != nil {
@@ -2191,7 +2190,6 @@ func TestIntegration_MissingUsagePartitionedByCause(t *testing.T) {
 		"0002_rating.up.sql",
 		"0004_billing_event_serving_mode.up.sql",
 		"0005_invoice_grade_attempts.up.sql",
-		"0006_reconciliation_org_grain.up.sql",
 	} {
 		ddl, readErr := os.ReadFile("../../migrations/" + name)
 		if readErr != nil {
@@ -2390,5 +2388,108 @@ func TestIntegration_AmbiguousBaseIsIndistinguishableFromUnratedInTheView(t *tes
 	}
 	if explanatory != 0 {
 		t.Fatalf("billing_reconciliation_hourly now has %d ambiguity/withheld column(s); docs/billing-reconciliation.md still tells operators the view does not surface base ambiguity — update the doc", explanatory)
+	}
+}
+
+// TestIntegration_MigrationsCreateOrgGrainViewWithoutReplacement guards the
+// invariant that the ENTIRE embedded migration set, applied in version order
+// exactly as cmd/migrate applies it, creates billing_reconciliation_hourly ONCE
+// at the rated natural grain — it is never created in a known-wrong org-grouped
+// shape and then dropped and replaced by a later migration. The reconciliation
+// view's shape is the operator's audit contract; an operator applying the
+// migrations must never materialize a view shape nobody intends to run.
+//
+// It asserts three things: exactly one CREATE VIEW of that name exists across
+// every up migration and no up migration DROPs it; the applied view exposes the
+// org-evidence columns (missing_org_attempts, distinct_org_ids); and raw
+// evidence is grouped at the rater's grain, so a rollout-era NULL org_id and a
+// real org_id on the same (hour, auth, resource, model) collapse into ONE row
+// rather than two false mismatch rows.
+func TestIntegration_MigrationsCreateOrgGrainViewWithoutReplacement(t *testing.T) {
+	dsn := os.Getenv("PHOEBE_TEST_DATABASE_URL")
+	if dsn == "" {
+		t.Skip("PHOEBE_TEST_DATABASE_URL not set; skipping live-Postgres conformance")
+	}
+
+	ups, err := filepath.Glob("../../migrations/*.up.sql")
+	if err != nil || len(ups) == 0 {
+		t.Fatalf("glob up migrations: %v (found %d)", err, len(ups))
+	}
+	sort.Strings(ups)
+	creates, drops := 0, 0
+	for _, f := range ups {
+		body, readErr := os.ReadFile(f)
+		if readErr != nil {
+			t.Fatalf("read %s: %v", f, readErr)
+		}
+		creates += strings.Count(string(body), "CREATE VIEW billing_reconciliation_hourly")
+		drops += strings.Count(string(body), "DROP VIEW billing_reconciliation_hourly")
+		drops += strings.Count(string(body), "DROP VIEW IF EXISTS billing_reconciliation_hourly")
+	}
+	if creates != 1 || drops != 0 {
+		t.Fatalf("up migrations CREATE billing_reconciliation_hourly %d time(s) and DROP it %d time(s); want exactly 1 create and 0 drops — operators must not apply a view shape that a later migration immediately replaces", creates, drops)
+	}
+
+	ctx := context.Background()
+	db, err := sql.Open("pgx", dsn)
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	defer db.Close()
+
+	const sch = "phoebe_migration_view_it"
+	exec(t, db, "DROP SCHEMA IF EXISTS "+sch+" CASCADE")
+	exec(t, db, "CREATE SCHEMA "+sch)
+	exec(t, db, "SET search_path TO "+sch)
+	defer func() { exec(t, db, "DROP SCHEMA IF EXISTS "+sch+" CASCADE") }()
+
+	// Apply EVERY up migration in version order — the real cmd/migrate sequence,
+	// io_log included, so nothing about the ordering is hand-curated here.
+	for _, f := range ups {
+		ddl, readErr := os.ReadFile(f)
+		if readErr != nil {
+			t.Fatalf("read %s: %v", f, readErr)
+		}
+		exec(t, db, string(ddl))
+	}
+
+	for _, col := range []string{"missing_org_attempts", "distinct_org_ids"} {
+		var n int64
+		if err := db.QueryRowContext(ctx, `
+			SELECT COUNT(*) FROM information_schema.columns
+			WHERE table_schema=$1 AND table_name='billing_reconciliation_hourly'
+			  AND column_name=$2`, sch, col).Scan(&n); err != nil {
+			t.Fatalf("inspect view column %s: %v", col, err)
+		}
+		if n != 1 {
+			t.Fatalf("billing_reconciliation_hourly is missing %s after applying all migrations; the org-grain view did not survive the migration set", col)
+		}
+	}
+
+	// Two attempts on the same natural key, one carrying a rollout-era NULL org.
+	// At the rater's grain they are ONE reconciliation row; grouping raw by
+	// org_id would split them into two rows that each look like a mismatch.
+	hour := mustTime("2026-06-08T10:00:00Z")
+	for i, org := range []interface{}{nil, "org-1"} {
+		if _, err := db.ExecContext(ctx,
+			`INSERT INTO billing_event
+			 (request_id, auth_id, resource_id, org_id, model, prompt_tokens, cached_tokens, completion_tokens, usage_found, event_ts)
+			 VALUES ($1,'a','d1',$2,'b',10,0,5,TRUE,$3)`,
+			fmt.Sprintf("org-grain-%d", i), org, hour.Add(time.Duration(i)*time.Minute)); err != nil {
+			t.Fatalf("insert attempt %d: %v", i, err)
+		}
+	}
+	var rows, rawAttempts, missingOrg, distinctOrgs int64
+	if err := db.QueryRowContext(ctx, `
+		SELECT COUNT(*), COALESCE(MAX(raw_attempts),0), COALESCE(MAX(missing_org_attempts),0),
+		       COALESCE(MAX(distinct_org_ids),0)
+		FROM billing_reconciliation_hourly`).Scan(&rows, &rawAttempts, &missingOrg, &distinctOrgs); err != nil {
+		t.Fatalf("query view: %v", err)
+	}
+	if rows != 1 || rawAttempts != 2 {
+		t.Fatalf("view has %d row(s) with max raw_attempts=%d, want 1 row of 2 attempts — a NULL org and a real org on one natural key must not split into false mismatch rows", rows, rawAttempts)
+	}
+	if missingOrg != 1 || distinctOrgs != 1 {
+		t.Fatalf("missing_org_attempts/distinct_org_ids = %d/%d, want 1/1 — the org evidence the grain change replaced org grouping with", missingOrg, distinctOrgs)
 	}
 }
