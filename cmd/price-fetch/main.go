@@ -63,9 +63,6 @@ import (
 	"errors"
 	"flag"
 	"fmt"
-	"io"
-	"net/http"
-	neturl "net/url"
 	"os"
 	"os/signal"
 	"path/filepath"
@@ -76,6 +73,7 @@ import (
 	"gopkg.in/yaml.v2"
 
 	"github.com/saturncloud/phoebe/internal/logging"
+	"github.com/saturncloud/phoebe/internal/pricefetch"
 	"github.com/saturncloud/phoebe/internal/rating"
 )
 
@@ -247,52 +245,11 @@ func fetchAndInstall(ctx context.Context, log *logging.Logger, opts fetchOptions
 // times prices have changed since. The zero time means "current", the behaviour the
 // periodic sync wants.
 func fetchPrices(ctx context.Context, opts fetchOptions, token string, asOf time.Time) ([]byte, string, error) {
-	url := opts.managerURL + tokenPricesPath
-	if !asOf.IsZero() {
-		// RFC3339 in UTC: an unambiguous instant. The manager reads a naive
-		// timestamp as UTC, but we never rely on that — always send the offset.
-		url += "?at=" + neturl.QueryEscape(asOf.UTC().Format(time.RFC3339Nano))
-	}
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
-	if err != nil {
-		return nil, "", fmt.Errorf("build request: %w", err)
-	}
-	// Same Authorization scheme as the rest of the install->manager direction.
-	req.Header.Set("Authorization", "token "+token)
-
-	client := &http.Client{Timeout: opts.requestTimeout}
-	resp, err := client.Do(req)
-	if err != nil {
-		return nil, "", fmt.Errorf("GET %s: %w", url, err)
-	}
-	defer func() { _ = resp.Body.Close() }()
-
-	// Cap the read so a misbehaving/huge response cannot exhaust memory, reading ONE
-	// byte past the cap so we can DISTINGUISH a body that is exactly at the cap from one
-	// that overran it. An over-cap body is rejected (not silently truncated): a
-	// truncated valid-YAML prefix would install a partial book, so we fail closed.
-	body, err := io.ReadAll(io.LimitReader(resp.Body, maxPriceBodyBytes+1))
-	if err != nil {
-		return nil, "", fmt.Errorf("read response from %s: %w", url, err)
-	}
-	if len(body) > maxPriceBodyBytes {
-		return nil, "", fmt.Errorf("price file from %s exceeds %d bytes (refusing a possibly-truncated body)", url, maxPriceBodyBytes)
-	}
-	if resp.StatusCode != http.StatusOK {
-		return nil, "", fmt.Errorf("GET %s: status %d (not serving prices)", url, resp.StatusCode)
-	}
-	// The manager ALWAYS sets X-Saturn-Price-Version on a 200: it is a deterministic
-	// content hash of the served prices, set unconditionally (the endpoint raises an
-	// error rather than serve a body without it). So an empty header on a 200 is not a
-	// "best-effort omission" — it means something is wrong (a bug, a proxy stripping the
-	// header, or the wrong endpoint answering). Fail closed: refuse the body and leave
-	// the prior good file in place, rather than install prices we could never attribute
-	// in a billing reconcile ("phoebe billed window W against price-version V" needs V).
-	version := strings.TrimSpace(resp.Header.Get(priceVersionHeader))
-	if version == "" {
-		return nil, "", fmt.Errorf("GET %s: 200 response is missing the %s header (the manager always sets it; refusing an unversioned price file)", url, priceVersionHeader)
-	}
-	return body, version, nil
+	return pricefetch.Client{
+		ManagerURL: opts.managerURL,
+		Token:      token,
+		Timeout:    opts.requestTimeout,
+	}.Fetch(ctx, asOf)
 }
 
 // installAtomically writes body to the destination via a temp file + rename(2), so a

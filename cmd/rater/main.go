@@ -84,12 +84,14 @@ package main
 import (
 	"context"
 	"flag"
+	"fmt"
 	"os"
 	"time"
 
 	"gopkg.in/yaml.v2"
 
 	"github.com/saturncloud/phoebe/internal/logging"
+	"github.com/saturncloud/phoebe/internal/pricefetch"
 	"github.com/saturncloud/phoebe/internal/rating"
 )
 
@@ -105,16 +107,32 @@ type raterSettings struct {
 	// explicit 0 fails loud instead of silently meaning "default".
 	RateTrailingHours *int `yaml:"rateTrailingHours"`
 
-	// PriceFile is the path to the YAML price book (E1). Required (via settings or
-	// the -prices flag): the rater cannot price without it. A local path now; the
-	// S3-fetch is out of scope (fetch-to-local then point this at the local copy —
-	// the create-time price gate and the rater must read the same file/version).
+	// PriceFile is the path to the YAML price book (E1). It is the AIR-GAPPED /
+	// operator-authored path and the fallback when no managerURL is set: one flat
+	// snapshot used for every hour in the window.
+	//
+	// Prefer ManagerURL. A flat file has no time dimension, so re-rating a window
+	// that spans a price change prices some of its hours wrong — see ManagerURL.
 	PriceFile string `yaml:"priceFile"`
+
+	// ManagerURL is the base URL of the central pricing service
+	// (saturn-aws-manager), which owns the effective-dated price series. When set,
+	// the rater asks it for the prices EFFECTIVE DURING EACH HOUR it rates, instead
+	// of pricing the whole window from one snapshot. That is what makes re-rating
+	// idempotent: an hour always resolves to the rates that were in force during it,
+	// however many times prices have changed since. The customer auth token comes
+	// from SATURN_TOKEN, the same install->manager direction as the usage push.
+	ManagerURL string `yaml:"managerURL"`
 
 	MaxOpenConns    int    `yaml:"maxOpenConns"`
 	MaxIdleConns    int    `yaml:"maxIdleConns"`
 	ConnMaxLifetime string `yaml:"connMaxLifetime"`
 }
+
+// priceTokenEnv is the env var carrying the customer auth token used to call the
+// manager for prices. Same install->manager direction (customer token) as the usage
+// push and cmd/price-fetch; not a new auth surface.
+const priceTokenEnv = "SATURN_TOKEN"
 
 // defaultRateTrailingHours is the default N for the trailing window. 24 trades a
 // cheap re-rate of already-correct hours (the upsert is a no-op REPLACE) for a full
@@ -157,6 +175,7 @@ func main() {
 func run() int {
 	settingsFile := flag.String("f", "/etc/saturn/config/rater.yaml", "Settings YAML file path")
 	pricesFlag := flag.String("prices", "", "Price YAML file path (overrides settings priceFile)")
+	managerFlag := flag.String("manager-url", "", "Manager base URL for per-hour prices (overrides settings managerURL)")
 	since := flag.String("since", "", "Window start, RFC3339 (default: floor(now) minus rateTrailingHours)")
 	until := flag.String("until", "", "Window end, RFC3339 (default: start of the current hour)")
 	flag.Parse()
@@ -172,21 +191,69 @@ func run() int {
 		log.SetLevel(logging.DEBUG)
 	}
 
-	// The -prices flag overrides the settings priceFile. The price file is REQUIRED:
-	// without it the rater cannot price (it must never default to $0). Load+validate
-	// up front so a bad file fails the job before any DB work — fail closed.
+	// TWO PRICE SOURCES, and the rater must have exactly one.
+	//
+	//  - managerURL (PREFERRED): the manager owns the effective-dated price series,
+	//    so each hour is rated against the prices in force DURING that hour. This is
+	//    what makes re-rating idempotent across a price change.
+	//  - priceFile: one flat snapshot for the whole window — the air-gapped /
+	//    operator-authored path. Correct only when the file is the right book for
+	//    every hour being rated.
+	//
+	// Neither configured is FATAL: the rater must never default to $0.
 	pricePath := opts.priceFile
 	if *pricesFlag != "" {
 		pricePath = *pricesFlag
 	}
-	if pricePath == "" {
-		log.Error.Printf("rater: no price file configured (set priceFile in the settings file or pass -prices); the rater cannot rate without prices")
+	managerURL := opts.managerURL
+	if *managerFlag != "" {
+		managerURL = *managerFlag
+	}
+	if managerURL == "" && pricePath == "" {
+		log.Error.Printf("rater: no price source configured (set managerURL, or priceFile / -prices); the rater cannot rate without prices")
 		return exitFatal
 	}
-	book, err := rating.LoadPriceBook(pricePath)
-	if err != nil {
-		log.Error.Printf("rater: load price file %q: %v (refusing to rate — never bill at $0)", pricePath, err)
-		return exitFatal
+
+	// book is the static snapshot (file mode); bookForHour is the per-hour lookup
+	// (manager mode). Exactly one is non-nil.
+	var book *rating.PriceBook
+	var bookForHour rating.BookForHour
+	if managerURL != "" {
+		token := os.Getenv(priceTokenEnv)
+		if token == "" {
+			log.Error.Printf("rater: %s is empty; the manager authenticates the customer by this token and will not serve prices without it", priceTokenEnv)
+			return exitFatal
+		}
+		client := pricefetch.Client{ManagerURL: managerURL, Token: token}
+		// Hours repeat across a run (a 24-hour window re-rated hourly) and prices
+		// rarely change, so cache per hour within ONE run. The cache never outlives
+		// the process, so a price change is picked up by the next run.
+		cache := map[time.Time]*rating.PriceBook{}
+		bookForHour = func(ctx context.Context, hourStart time.Time) (*rating.PriceBook, error) {
+			hourStart = hourStart.UTC()
+			if cached, ok := cache[hourStart]; ok {
+				return cached, nil
+			}
+			body, version, err := client.Fetch(ctx, hourStart)
+			if err != nil {
+				return nil, err
+			}
+			hourBook, err := rating.ParsePriceBook(body)
+			if err != nil {
+				return nil, fmt.Errorf("parse prices for %s (version %s): %w", hourStart.Format(time.RFC3339), version, err)
+			}
+			log.Debug.Printf("rater: hour %s priced from manager price-version %s", hourStart.Format(time.RFC3339), version)
+			cache[hourStart] = hourBook
+			return hourBook, nil
+		}
+	} else {
+		// Load+validate up front so a bad file fails the job before any DB work.
+		book, err = rating.LoadPriceBook(pricePath)
+		if err != nil {
+			log.Error.Printf("rater: load price file %q: %v (refusing to rate — never bill at $0)", pricePath, err)
+			return exitFatal
+		}
+		log.Info.Printf("rater: pricing from the local file %q (no managerURL; a window spanning a price change may be mispriced)", pricePath)
 	}
 
 	windowStart, windowEnd, windowExplicit, err := resolveWindow(*since, *until, opts.trailingHours, time.Now())
@@ -208,7 +275,10 @@ func run() int {
 	defer func() { _ = store.Close() }()
 
 	r := rating.New(store, book, log)
-	res, err := r.Run(ctx, windowStart, windowEnd, windowExplicit)
+	if bookForHour != nil {
+		r = r.WithBookForHour(bookForHour)
+	}
+	res, err := r.RunWindow(ctx, windowStart, windowEnd, windowExplicit)
 	if err != nil {
 		log.Error.Printf("rater: run: %v", err)
 		return exitFatal
@@ -293,6 +363,7 @@ type raterOptions struct {
 	debug         bool
 	trailingHours int    // validated >= 1, defaulted to defaultRateTrailingHours
 	priceFile     string // path to the YAML price book (may be overridden by -prices)
+	managerURL    string // when set, prices come from the manager PER HOUR rated
 }
 
 // loadConfig reads the YAML settings file, applies rating.DefaultConfig, then
@@ -335,6 +406,7 @@ func loadConfig(path string) (rating.Config, raterOptions, error) {
 	cfg.DatabaseURL = os.Getenv("DATABASE_URL")
 
 	opts.priceFile = s.PriceFile
+	opts.managerURL = s.ManagerURL
 	opts.debug = s.Debug
 	return cfg, opts, nil
 }
