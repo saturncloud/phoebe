@@ -342,6 +342,18 @@ func TestLoadAdmissionRejectsInvalidPolicy(t *testing.T) {
 	}
 }
 
+// The leaseTtl floor is inclusive: 999ms is rejected above, but exactly one
+// second (the minimum) must load.
+func TestLoadAdmissionLeaseTTLInclusiveFloor(t *testing.T) {
+	s, err := Load(writeTemp(t, "admission:\n  enabled: true\n  valkeyAddr: v\n  leaseTtl: 1s\n"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if s.Admission.LeaseTTL != time.Second {
+		t.Fatalf("LeaseTTL=%s, want 1s", s.Admission.LeaseTTL)
+	}
+}
+
 // While admission is disabled, valid lanes must still load (weight, lane-share,
 // leaseTtl, and valkeyAddr validation stay behind the Enabled gate).
 func TestLoadAdmissionDisabledWithValidLanes(t *testing.T) {

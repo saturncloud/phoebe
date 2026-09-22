@@ -898,6 +898,38 @@ func TestImpossibleRequestRejectedBeforeReservation(t *testing.T) {
 	}
 }
 
+// A request with an unusable work estimate is rejected before any reservation:
+// no lease is created and no counter or lease state is written.
+func TestInvalidWorkEstimateRejectedBeforeReservation(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		mutate func(*Request)
+	}{
+		{name: "negative prompt bytes", mutate: func(r *Request) { r.PromptBytes = -1 }},
+		{name: "zero estimated input", mutate: func(r *Request) { r.EstimatedInputTokens = 0 }},
+		{name: "zero reserved output", mutate: func(r *Request) { r.ReservedOutputTokens = 0 }},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			a, _ := testAdmitter(t, config.AdmissionSettings{Platform: limits(5)})
+			req := request("a", "m")
+			tc.mutate(&req)
+			lease, err := a.Admit(context.Background(), req)
+			if lease != nil {
+				t.Fatalf("invalid work estimate returned a lease: %+v", lease)
+			}
+			var rejected *Rejected
+			if !errors.As(err, &rejected) || rejected.Dimension != "work estimate" {
+				t.Fatalf("err=%v, want work estimate rejection", err)
+			}
+			for key, name := range map[string]string{a.counters: "counters", a.leases: "leases"} {
+				if n, herr := a.client.HLen(context.Background(), key).Result(); herr != nil || n != 0 {
+					t.Fatalf("%s HLen=%d, %v; want 0 written by the rejected estimate", name, n, herr)
+				}
+			}
+		})
+	}
+}
+
 func TestStateFailureReturnsUnavailableForProxyBypass(t *testing.T) {
 	client := redis.NewClient(&redis.Options{Addr: "127.0.0.1:1", DialTimeout: 20 * time.Millisecond, ReadTimeout: 20 * time.Millisecond, WriteTimeout: 20 * time.Millisecond, MaxRetries: 0})
 	a := New(client, config.AdmissionSettings{Platform: limits(1), LeaseTTL: time.Minute, KeyPrefix: "down"})
