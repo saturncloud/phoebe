@@ -303,7 +303,14 @@ func (r *Rater) Run(ctx context.Context, windowStart, windowEnd time.Time, windo
 // FAIL CLOSED PER HOUR: if an hour's prices cannot be obtained, that hour is not
 // rated and the run returns the error. A partially-rated window is reported through
 // the aggregate (hours already committed keep their rollups — each hour's SQL is its
-// own transaction), so a retry converges rather than double-counting.
+// own transaction), so a retry converges rather than double-counting. That report is
+// SELF-CONSISTENT: agg.TotalCost is kept in step with the counters as each hour is
+// folded in, so an error return never claims N events rated at a total of $0.
+//
+// HOUR-ALIGNED ONLY: the rating SQL buckets on date_trunc('hour') and REPLACES a
+// bucket, so a partial hour would overwrite a complete rollup with a partial sum
+// (and its reconcile-delete would erase a neighbouring hour's rows). Unaligned
+// bounds are therefore refused, not clamped.
 //
 // Anomaly counts, reconcile deletions and cost SUM across the hours, so the caller's
 // exit-code contract (see cmd/rater) is unchanged: any hour leaking an anomaly makes
@@ -316,11 +323,16 @@ func (r *Rater) RunWindow(ctx context.Context, windowStart, windowEnd time.Time,
 	if !windowStart.Before(windowEnd) {
 		return agg, fmt.Errorf("rating: empty/inverted window [%s,%s)", windowStart.Format(time.RFC3339), windowEnd.Format(time.RFC3339))
 	}
-	// Without a per-hour provider the rater has exactly one book, so the whole
-	// window is rated in a single call (the operator-authored-file / air-gapped
-	// path, and every existing caller).
+	if !windowStart.Truncate(time.Hour).Equal(windowStart) || !windowEnd.Truncate(time.Hour).Equal(windowEnd) {
+		return agg, fmt.Errorf("rating: window [%s,%s) is not hour-aligned; the rating SQL buckets on date_trunc('hour') and REPLACES a bucket, so a partial hour would overwrite a complete rollup",
+			windowStart.Format(time.RFC3339), windowEnd.Format(time.RFC3339))
+	}
+	// A per-hour provider is mandatory: rating a multi-hour window from one
+	// snapshot is exactly the mispricing RunWindow exists to prevent, and the
+	// manager is the only price source, so there is no book to fall back to.
 	if r.bookForHour == nil {
-		return r.Run(ctx, windowStart, windowEnd, windowExplicit)
+		return agg, fmt.Errorf("rating: no per-hour price provider configured (refusing to rate [%s,%s) from a single snapshot)",
+			windowStart.Format(time.RFC3339), windowEnd.Format(time.RFC3339))
 	}
 
 	// The zero Dec is exact 0 (see decimal.go); money is summed as exact decimal,
@@ -328,11 +340,6 @@ func (r *Rater) RunWindow(ctx context.Context, windowStart, windowEnd time.Time,
 	var total Dec
 	for hourStart := windowStart; hourStart.Before(windowEnd); hourStart = hourStart.Add(time.Hour) {
 		hourEnd := hourStart.Add(time.Hour)
-		if hourEnd.After(windowEnd) {
-			// A caller may pass a sub-hour or unaligned window; never rate past
-			// the requested end.
-			hourEnd = windowEnd
-		}
 		book, err := r.bookForHour(ctx, hourStart)
 		if err != nil {
 			return agg, fmt.Errorf("rating: prices for hour %s: %w (refusing to rate this hour at the wrong prices)",
@@ -349,11 +356,18 @@ func (r *Rater) RunWindow(ctx context.Context, windowStart, windowEnd time.Time,
 		}
 		hourCost, err := ParseDec(hourRes.TotalCost)
 		if err != nil {
+			// This hour's counters are already folded in but its cost is NOT: an
+			// unparseable total is precisely the case where the hour's cost is
+			// unknown, so it must not be invented. agg.TotalCost keeps the sum of
+			// the hours whose cost IS known.
 			return agg, fmt.Errorf("rating: hour %s total %q: %w", hourStart.Format(time.RFC3339), hourRes.TotalCost, err)
 		}
 		total = total.Add(hourCost)
+		// Keep the aggregate's cost in step with the counters accumulate() already
+		// folded in, so an error return below reports the cost actually committed
+		// rather than a self-contradicting "0".
+		agg.TotalCost = total.String()
 	}
-	agg.TotalCost = total.String()
 	return agg, nil
 }
 

@@ -741,7 +741,7 @@ func TestIntegration_ReRatePreservesHistoricalPrice(t *testing.T) {
 	}
 	defer db.Close()
 
-	const sch = "phoebe_rating_pricefreeze_it"
+	const sch = "phoebe_rating_hourly_book_it"
 	exec(t, db, "DROP SCHEMA IF EXISTS "+sch+" CASCADE")
 	exec(t, db, "CREATE SCHEMA "+sch)
 	exec(t, db, "SET search_path TO "+sch)
@@ -757,7 +757,6 @@ func TestIntegration_ReRatePreservesHistoricalPrice(t *testing.T) {
 	// per-hour lookup, not a local freeze table (which no longer exists).
 	oldBook := newTestBook(map[string]Rate3{"b": rate3("0.000001", "0", "0")}, nil, PolicyIdentity, Dec{}, Dec{})
 	newBook := newTestBook(map[string]Rate3{"b": rate3("0.000009", "0", "0")}, nil, PolicyIdentity, Dec{}, Dec{})
-	_ = newBook // asserted below only via bookForHour, never passed for `hour`
 
 	// bookForHour models the manager's effective-dated series: this hour always
 	// resolves to the rates in force during it.
@@ -832,6 +831,33 @@ func TestIntegration_ReRatePreservesHistoricalPrice(t *testing.T) {
 	if tokens != 100 || MustDec(rate).String() != "0.000001000" || MustDec(cost).String() != "0.000100000" {
 		t.Fatalf("recreated rollup tokens/rate/cost = %d/%s/%s, want 100/0.000001000/0.000100000", tokens, rate, cost)
 	}
+}
+
+// TestIntegration_MissingUsageAttemptIsNeverBilled: a failed attempt with no engine
+// usage is retained for audit, but must never become money — it is counted in the
+// missing-usage partition, not as unattributable, and writes no rollup.
+func TestIntegration_MissingUsageAttemptIsNeverBilled(t *testing.T) {
+	dsn := os.Getenv("PHOEBE_TEST_DATABASE_URL")
+	if dsn == "" {
+		t.Skip("PHOEBE_TEST_DATABASE_URL not set; skipping live-Postgres conformance")
+	}
+	ctx := context.Background()
+	db, err := sql.Open("pgx", dsn)
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	defer db.Close()
+
+	const sch = "phoebe_rating_missingusage_it"
+	exec(t, db, "DROP SCHEMA IF EXISTS "+sch+" CASCADE")
+	exec(t, db, "CREATE SCHEMA "+sch)
+	exec(t, db, "SET search_path TO "+sch)
+	defer func() { exec(t, db, "DROP SCHEMA IF EXISTS "+sch+" CASCADE") }()
+	exec(t, db, ratingSchemaDDL(t))
+
+	hour := mustTime("2026-06-08T10:00:00Z")
+	store := NewPostgresStore(db)
+	book := newTestBook(map[string]Rate3{"b": rate3("0.000009", "0", "0")}, nil, PolicyIdentity, Dec{}, Dec{})
 
 	// A failed attempt with no engine usage is retained for audit, but is neither
 	// billed as a zero-token rollup nor mislabeled as unattributable when model is
@@ -842,7 +868,7 @@ func TestIntegration_ReRatePreservesHistoricalPrice(t *testing.T) {
 		 VALUES ('failed-no-usage','a','d2','org-1',NULL,FALSE,502,$1)`, hour.Add(8*time.Minute)); err != nil {
 		t.Fatalf("seed missing-usage attempt: %v", err)
 	}
-	missingRes, err := store.RateWindow(ctx, newBook, hour, hour.Add(time.Hour))
+	missingRes, err := store.RateWindow(ctx, book, hour, hour.Add(time.Hour))
 	if err != nil {
 		t.Fatalf("rate missing-usage attempt: %v", err)
 	}

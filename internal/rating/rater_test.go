@@ -1445,48 +1445,91 @@ func TestRunWindow_NilBookIsRefused(t *testing.T) {
 	}
 }
 
-// TestRunWindow_WithoutProviderRatesWholeWindowOnce preserves the existing
-// single-book path (operator-authored file / air-gapped installs): one call, one book.
-func TestRunWindow_WithoutProviderRatesWholeWindowOnce(t *testing.T) {
+// TestRunWindow_WithoutProviderIsRefused: the manager is the only price source, so
+// a rater with no per-hour provider must refuse rather than rate a whole window
+// from one snapshot (the mispricing RunWindow exists to prevent).
+func TestRunWindow_WithoutProviderIsRefused(t *testing.T) {
 	start := mustTime("2026-06-08T10:00:00Z")
-	end := start.Add(5 * time.Hour)
 	book := newTestBook(map[string]Rate3{"m": rate3("0.000001", "0", "0")}, nil, PolicyIdentity, Dec{}, Dec{})
 	store := &recordingStore{}
 	r := New(store, book, logging.New(logging.ERROR))
 
-	if _, err := r.RunWindow(context.Background(), start, end, false); err != nil {
-		t.Fatalf("RunWindow: %v", err)
+	_, err := r.RunWindow(context.Background(), start, start.Add(5*time.Hour), false)
+	if err == nil || !strings.Contains(err.Error(), "no per-hour price provider") {
+		t.Fatalf("RunWindow without a provider must fail closed, got %v", err)
 	}
-	if len(store.calls) != 1 {
-		t.Fatalf("RateWindow calls = %d, want 1 (no per-hour provider configured)", len(store.calls))
-	}
-	if !store.calls[0].start.Equal(start) || !store.calls[0].end.Equal(end) {
-		t.Fatal("the whole window must be rated in one call when there is one book")
-	}
-	if store.calls[0].book != book {
-		t.Fatal("the configured static book must be used")
+	if len(store.calls) != 0 {
+		t.Fatalf("RateWindow calls = %d, want 0 (nothing may be rated from a single snapshot)", len(store.calls))
 	}
 }
 
-// TestRunWindow_UnalignedTailNeverRatesPastTheEnd: a sub-hour or unaligned window
-// must not rate beyond what was asked for.
-func TestRunWindow_UnalignedTailNeverRatesPastTheEnd(t *testing.T) {
-	start := mustTime("2026-06-08T10:00:00Z")
-	end := start.Add(90 * time.Minute) // one full hour + a half-hour tail
-	book := newTestBook(map[string]Rate3{"m": rate3("0.000001", "0", "0")}, nil, PolicyIdentity, Dec{}, Dec{})
-	store := &recordingStore{}
-	r := New(store, nil, logging.New(logging.ERROR)).
-		WithBookForHour(func(context.Context, time.Time) (*PriceBook, error) { return book, nil })
+// TestRunWindow_RefusesUnalignedWindow: the rating SQL buckets on
+// date_trunc('hour') and REPLACES a bucket, so a partial hour would overwrite a
+// complete rollup (and its reconcile-delete would erase a neighbouring hour's
+// rows). Unaligned bounds must be refused before anything is rated, never clamped.
+func TestRunWindow_RefusesUnalignedWindow(t *testing.T) {
+	aligned := mustTime("2026-06-08T10:00:00Z")
+	for _, tc := range []struct {
+		name       string
+		start, end time.Time
+	}{
+		{"unaligned end", aligned, aligned.Add(90 * time.Minute)},
+		{"unaligned start", aligned.Add(30 * time.Minute), aligned.Add(2 * time.Hour)},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			book := newTestBook(map[string]Rate3{"m": rate3("0.000001", "0", "0")}, nil, PolicyIdentity, Dec{}, Dec{})
+			store := &recordingStore{}
+			r := New(store, nil, logging.New(logging.ERROR)).
+				WithBookForHour(func(context.Context, time.Time) (*PriceBook, error) { return book, nil })
 
-	if _, err := r.RunWindow(context.Background(), start, end, false); err != nil {
-		t.Fatalf("RunWindow: %v", err)
+			_, err := r.RunWindow(context.Background(), tc.start, tc.end, false)
+			if err == nil || !strings.Contains(err.Error(), "not hour-aligned") {
+				t.Fatalf("an unaligned window must be refused, got %v", err)
+			}
+			if len(store.calls) != 0 {
+				t.Fatalf("RateWindow calls = %d, want 0 (refuse before rating anything)", len(store.calls))
+			}
+		})
 	}
-	if len(store.calls) != 2 {
-		t.Fatalf("calls = %d, want 2 (a full hour and the half-hour tail)", len(store.calls))
+}
+
+// TestRunWindow_PartialWindowReportsCommittedCost: when a later hour fails, the
+// hours already committed to rated_usage keep their rollups — so the returned
+// aggregate's TotalCost must describe the SAME set of hours as its counters, never
+// a self-contradicting "0" alongside a nonzero RollupsWritten/EventsRated.
+func TestRunWindow_PartialWindowReportsCommittedCost(t *testing.T) {
+	start := mustTime("2026-06-08T10:00:00Z")
+	bookFor := func(_ context.Context, hourStart time.Time) (*PriceBook, error) {
+		if hourStart.UTC().Before(start.Add(2 * time.Hour)) {
+			return newTestBook(map[string]Rate3{"m": rate3("0.000001", "0", "0")}, nil, PolicyIdentity, Dec{}, Dec{}), nil
+		}
+		return nil, fmt.Errorf("manager unreachable")
 	}
-	if !store.calls[1].end.Equal(end) {
-		t.Fatalf("tail rated to %s, want the requested end %s — never rate past the window",
-			store.calls[1].end.Format(time.RFC3339), end.Format(time.RFC3339))
+
+	// Reference: the same first two hours rated on their own.
+	refStore := &recordingStore{}
+	ref := New(refStore, nil, logging.New(logging.ERROR)).WithBookForHour(bookFor)
+	want, err := ref.RunWindow(context.Background(), start, start.Add(2*time.Hour), false)
+	if err != nil {
+		t.Fatalf("reference two-hour run: %v", err)
+	}
+	if want.RollupsWritten == 0 || MustDec(want.TotalCost).IsZero() {
+		t.Fatalf("reference run must commit a nonzero cost, got %+v", want)
+	}
+
+	store := &recordingStore{}
+	r := New(store, nil, logging.New(logging.ERROR)).WithBookForHour(bookFor)
+	res, err := r.RunWindow(context.Background(), start, start.Add(4*time.Hour), false)
+	if err == nil {
+		t.Fatal("RunWindow must still fail closed when a later hour's prices are unavailable")
+	}
+	if res.EventsRated != want.EventsRated || res.RollupsWritten != want.RollupsWritten {
+		t.Fatalf("counters = %d events / %d rollups, want the committed hours' %d/%d",
+			res.EventsRated, res.RollupsWritten, want.EventsRated, want.RollupsWritten)
+	}
+	if !MustDec(res.TotalCost).Equal(MustDec(want.TotalCost)) {
+		t.Fatalf("partial-window TotalCost = %s, want the committed hours' %s (counters and cost must describe the same hours)",
+			res.TotalCost, want.TotalCost)
 	}
 }
 

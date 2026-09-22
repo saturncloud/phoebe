@@ -14,7 +14,7 @@
 //
 // The file's version history IS the price audit trail: there is no price table, no
 // effective-dating, no GiST exclusion constraint, no operator-writes-to-DB authz
-// surface. LoadPriceBook reads and validates the file, FAILING CLOSED on anything
+// surface. ParsePriceBook validates the book bytes, FAILING CLOSED on anything
 // malformed (missing file, bad YAML, unknown version, a float-shaped or negative
 // rate, an inconsistent premium) — the rater refuses to run rather than rate at $0.
 //

@@ -2,7 +2,6 @@ package rating
 
 import (
 	"fmt"
-	"os"
 	"sort"
 	"strings"
 
@@ -140,24 +139,10 @@ type fineTuneEntry struct {
 	Rate        *rateYAML `yaml:"rate"` // optional own rate (escape hatch; bypasses premium)
 }
 
-// LoadPriceBook reads, parses, and validates a price book FILE, returning an
-// immutable PriceBook. It FAILS CLOSED exactly like ParsePriceBook.
-//
-// NOT the rating path: the rater obtains each hour's book from the pricing service
-// (internal/pricefetch) and parses the bytes with ParsePriceBook — there is no
-// local price file. This remains for tooling and for the test that parses the
-// shipped config/prices.example.yaml, which keeps the documented wire shape honest
-// by running it through the real loader.
-func LoadPriceBook(path string) (*PriceBook, error) {
-	data, err := os.ReadFile(path)
-	if err != nil {
-		return nil, fmt.Errorf("rating: read price file %q: %w", path, err)
-	}
-	return ParsePriceBook(data)
-}
-
-// ParsePriceBook parses+validates raw YAML bytes into a PriceBook. Split from
-// LoadPriceBook so tests can exercise the parser without touching the filesystem.
+// ParsePriceBook parses+validates raw YAML bytes into a PriceBook, FAILING CLOSED
+// on anything malformed. This is the only way a book is built: the rater obtains
+// each hour's book from the pricing service (internal/pricefetch) and parses the
+// bytes here — there is no local price file and no file loader.
 // UnmarshalStrict rejects unknown keys, so a typo'd field (e.g. `promt:`) fails the
 // load rather than silently pricing a token at $0.
 func ParsePriceBook(data []byte) (*PriceBook, error) {
