@@ -76,6 +76,26 @@ is not automatically revenue loss: it means the engine did
 not provide authoritative counts, so Phoebe charged zero and requires engine-log
 review.
 
+### A pricing-service outage delays rating; it does not lose it
+
+The rater has no local price book, so an hour whose prices cannot be fetched is
+**skipped, not failed**: the run logs it, continues with the remaining hours, and
+exits `3` (incomplete) rather than `0`. Because each hour is rated in its own
+transaction and the upsert is idempotent, a skipped hour is rated by any later run
+whose trailing window still covers it — the default 24-hour trailing window means
+an outage shorter than a day self-heals with no operator action.
+
+This is the same shape as `token-push`, which withholds a window and lets the next
+run re-push, and as the `usage-patch` reconciler, where an item stays queued until
+it is confirmed filled. Exit `3` is therefore "check the pricing service, then
+confirm a later run caught up", distinct from exit `2` ("the billing evidence is
+wrong; investigate the data").
+
+The bound worth watching: an outage **longer than the trailing window** moves
+hours out of every subsequent run's range, and those hours are then never rated by
+the routine cadence. Alert on a sustained nonzero exit-3 rate, and re-rate the
+affected span explicitly with `--since/--until` once the service is healthy.
+
 "Failed" means `status_code >= 400` everywhere — the reconciliation view's
 `failed_attempts` and the rater's routine-vs-alarming split use the SAME
 threshold, so the view you audit and the decision to page can never disagree

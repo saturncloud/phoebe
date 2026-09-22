@@ -77,12 +77,18 @@ type Result struct {
 	// carrying no usage block, i.e. served work we cannot bill. This is the
 	// missing-usage signal that pages.
 	UnexplainedMissingUsageEvents int64
-	InvalidUsageEvents            int64  // authoritative evidence with malformed token counts (never money)
-	AmbiguousBaseEvents           int64  // events under an ft: rollup spanning >1 base_model (E3 violation)
-	AmbiguousOrgEvents            int64  // events under a rollup spanning >1 non-NULL org_id (E2 attribution bug)
-	RollupsWritten                int64  // distinct (auth_id, resource_id, model_id, hour) rows upserted
-	ReconciledDeletions           int64  // stale in-window rollups DELETED because this re-run no longer produces them
-	TotalCost                     string // sum of all rollup costs, NUMERIC as text
+	InvalidUsageEvents            int64 // authoritative evidence with malformed token counts (never money)
+	AmbiguousBaseEvents           int64 // events under an ft: rollup spanning >1 base_model (E3 violation)
+	AmbiguousOrgEvents            int64 // events under a rollup spanning >1 non-NULL org_id (E2 attribution bug)
+	RollupsWritten                int64 // distinct (auth_id, resource_id, model_id, hour) rows upserted
+	// UnratedHours counts hours in the window that were SKIPPED — prices could not
+	// be obtained, or rating them failed. Each hour is independent and the upsert is
+	// idempotent, so a skipped hour is rated by a later run whose trailing window
+	// still covers it. Nonzero means this run did NOT cover its whole window, so its
+	// totals are partial and the run exits non-zero (see cmd/rater).
+	UnratedHours        int64
+	ReconciledDeletions int64  // stale in-window rollups DELETED because this re-run no longer produces them
+	TotalCost           string // sum of all rollup costs, NUMERIC as text
 }
 
 // HasUnpriced reports whether any event could not be priced (a loud outcome even
@@ -100,6 +106,15 @@ func (r Result) HasUnattributable() bool { return r.UnattributableEvents > 0 }
 // the TOTAL across both causes and is REPORTED, not paged — see
 // HasUnexplainedMissingUsage for the paging signal and HasAnomaly for why.
 func (r Result) HasMissingUsage() bool { return r.MissingUsageEvents > 0 }
+
+// HasUnratedHours reports that this run left part of its window unrated — prices
+// for an hour were unavailable, or rating it failed. It is NOT folded into
+// HasAnomaly: an anomaly is a statement about the EVIDENCE (something could not
+// become money and needs investigation), while an unrated hour is a statement
+// about this RUN (it did not finish its window). Both exit non-zero, but they mean
+// different operator actions: an anomaly means investigate the data; an unrated
+// hour means check the pricing service and confirm a later run caught up.
+func (r Result) HasUnratedHours() bool { return r.UnratedHours > 0 }
 
 // HasUnexplainedMissingUsage reports the alarming share of missing usage: the
 // attempt was neither aborted by the client nor terminated with a failure status,
@@ -342,30 +357,48 @@ func (r *Rater) RunWindow(ctx context.Context, windowStart, windowEnd time.Time,
 		hourEnd := hourStart.Add(time.Hour)
 		book, err := r.bookForHour(ctx, hourStart)
 		if err != nil {
-			return agg, fmt.Errorf("rating: prices for hour %s: %w (refusing to rate this hour at the wrong prices)",
+			// SKIP, don't abort. Each hour is independent: its rating is its own
+			// transaction and the upsert is idempotent, so an hour left unrated is
+			// simply rated by a later run whose trailing window still covers it.
+			// Aborting instead would mean one transient manager blip on hour 19
+			// discards the remaining hours too — and with a trailing-24h default,
+			// a brief outage would otherwise stall every hour behind it.
+			// Same shape as cmd/token-push, which withholds a window and lets the
+			// next run re-push rather than failing the batch.
+			r.log.Error.Printf("rating: hour %s SKIPPED — prices unavailable: %v (the hour is left unrated; a later run whose window still covers it will rate it)",
 				hourStart.Format(time.RFC3339), err)
+			agg.UnratedHours++
+			continue
 		}
 		if book == nil {
-			return agg, fmt.Errorf("rating: no price book for hour %s (refusing to rate at $0)", hourStart.Format(time.RFC3339))
+			r.log.Error.Printf("rating: hour %s SKIPPED — no price book (refusing to rate at $0)", hourStart.Format(time.RFC3339))
+			agg.UnratedHours++
+			continue
 		}
 		hourRater := &Rater{store: r.store, book: book, log: r.log}
 		hourRes, err := hourRater.Run(ctx, hourStart, hourEnd, windowExplicit)
 		agg.accumulate(hourRes)
 		if err != nil {
-			return agg, err
+			// A rating failure for one hour is likewise not the window's failure.
+			// Its counters are folded in above (they describe what the statement
+			// reported before failing); the hour stays unrated and converges later.
+			r.log.Error.Printf("rating: hour %s SKIPPED — rating failed: %v", hourStart.Format(time.RFC3339), err)
+			agg.UnratedHours++
+			continue
 		}
 		hourCost, err := ParseDec(hourRes.TotalCost)
 		if err != nil {
-			// This hour's counters are already folded in but its cost is NOT: an
-			// unparseable total is precisely the case where the hour's cost is
-			// unknown, so it must not be invented. agg.TotalCost keeps the sum of
-			// the hours whose cost IS known.
-			return agg, fmt.Errorf("rating: hour %s total %q: %w", hourStart.Format(time.RFC3339), hourRes.TotalCost, err)
+			// An unparseable total is precisely the case where the hour's cost is
+			// unknown, so it must not be invented or summed. agg.TotalCost keeps
+			// the sum of the hours whose cost IS known.
+			r.log.Error.Printf("rating: hour %s total %q is unparseable: %v (cost excluded from the window total)",
+				hourStart.Format(time.RFC3339), hourRes.TotalCost, err)
+			agg.UnratedHours++
+			continue
 		}
 		total = total.Add(hourCost)
-		// Keep the aggregate's cost in step with the counters accumulate() already
-		// folded in, so an error return below reports the cost actually committed
-		// rather than a self-contradicting "0".
+		// Keep the aggregate's cost in step with the counters accumulate() folded
+		// in, so a partial run reports the cost actually committed.
 		agg.TotalCost = total.String()
 	}
 	return agg, nil

@@ -1404,41 +1404,101 @@ func TestRunWindow_PricesEachHourFromItsOwnBook(t *testing.T) {
 	}
 }
 
-// TestRunWindow_FailsClosedWhenAnHourHasNoPrices: an hour whose prices cannot be
-// obtained must stop the run, not be rated at the previous hour's prices or at $0.
-func TestRunWindow_FailsClosedWhenAnHourHasNoPrices(t *testing.T) {
+// TestRunWindow_SkipsAnHourWhosePricesAreUnavailable: an hour whose prices cannot
+// be obtained is SKIPPED, not rated at the previous hour's prices or at $0 — and it
+// does not abort the rest of the window. Each hour is independent and the upsert is
+// idempotent, so the skipped hour converges on a later run whose trailing window
+// still covers it. Aborting would mean one transient blip on hour 19 discards every
+// remaining hour too. Same shape as cmd/token-push, which withholds a window and
+// lets the next run re-push.
+func TestRunWindow_SkipsAnHourWhosePricesAreUnavailable(t *testing.T) {
+	start := mustTime("2026-06-08T10:00:00Z")
+	unavailable := start.Add(time.Hour)
+	store := &recordingStore{}
+	r := New(store, nil, logging.New(logging.ERROR)).
+		WithBookForHour(func(_ context.Context, hourStart time.Time) (*PriceBook, error) {
+			if hourStart.UTC().Equal(unavailable) {
+				return nil, fmt.Errorf("manager unreachable")
+			}
+			return newTestBook(map[string]Rate3{"m": rate3("0.000001", "0", "0")}, nil, PolicyIdentity, Dec{}, Dec{}), nil
+		})
+
+	res, err := r.RunWindow(context.Background(), start, start.Add(3*time.Hour), false)
+	if err != nil {
+		t.Fatalf("a skipped hour must not fail the window: %v", err)
+	}
+	// The two available hours ARE rated; only the unavailable one is skipped.
+	if len(store.calls) != 2 {
+		t.Fatalf("RateWindow calls = %d, want 2 (the window continues past the bad hour)", len(store.calls))
+	}
+	for _, c := range store.calls {
+		if c.start.Equal(unavailable) {
+			t.Fatal("the unavailable hour was rated — it must never be rated at another hour's prices")
+		}
+	}
+	if res.UnratedHours != 1 {
+		t.Fatalf("UnratedHours = %d, want 1", res.UnratedHours)
+	}
+	if !res.HasUnratedHours() {
+		t.Fatal("HasUnratedHours() must report the partial window so the run exits non-zero")
+	}
+	// The run is incomplete, but skipping an hour does not BY ITSELF create an
+	// evidence anomaly: they are different operator actions (check the pricing
+	// service vs investigate the data). Asserted on a Result carrying only the
+	// skip, since recordingStore's rated hours deliberately emit every anomaly.
+	skipOnly := Result{UnratedHours: res.UnratedHours}
+	if skipOnly.HasAnomaly() {
+		t.Fatal("a skipped hour must not masquerade as an evidence anomaly")
+	}
+	if !skipOnly.HasUnratedHours() {
+		t.Fatal("the skip must be reported on its own signal")
+	}
+}
+
+// TestRunWindow_SkippedHourStillReportsCommittedCost: the hours that DID rate keep
+// their cost and counters, so a partial run reports what it actually committed
+// rather than zero.
+func TestRunWindow_SkippedHourStillReportsCommittedCost(t *testing.T) {
 	start := mustTime("2026-06-08T10:00:00Z")
 	store := &recordingStore{}
 	r := New(store, nil, logging.New(logging.ERROR)).
 		WithBookForHour(func(_ context.Context, hourStart time.Time) (*PriceBook, error) {
 			if hourStart.UTC().Equal(start) {
-				return newTestBook(map[string]Rate3{"m": rate3("0.000001", "0", "0")}, nil, PolicyIdentity, Dec{}, Dec{}), nil
+				return nil, fmt.Errorf("manager unreachable")
 			}
-			return nil, fmt.Errorf("manager unreachable")
+			return newTestBook(map[string]Rate3{"m": rate3("0.000001", "0", "0")}, nil, PolicyIdentity, Dec{}, Dec{}), nil
 		})
 
-	_, err := r.RunWindow(context.Background(), start, start.Add(3*time.Hour), false)
-	if err == nil {
-		t.Fatal("RunWindow must fail when an hour's prices are unavailable")
+	res, err := r.RunWindow(context.Background(), start, start.Add(3*time.Hour), false)
+	if err != nil {
+		t.Fatalf("RunWindow: %v", err)
 	}
-	if !strings.Contains(err.Error(), "manager unreachable") {
-		t.Fatalf("error %q should name the underlying cause", err)
+	// recordingStore bills 1.000000000 per rated hour; 2 of 3 hours rated.
+	if got := MustDec(res.TotalCost); !got.Equal(MustDec("2.000000000")) {
+		t.Fatalf("TotalCost = %s, want 2.000000000 (the cost actually committed)", res.TotalCost)
 	}
-	// Only the first hour was rated; the unpriced hour was NOT rated at the wrong prices.
-	if len(store.calls) != 1 {
-		t.Fatalf("RateWindow calls = %d, want 1 (stop at the first unavailable hour)", len(store.calls))
+	if res.EventsRated != 2 || res.RollupsWritten != 2 {
+		t.Fatalf("rated/rollups = %d/%d, want 2/2", res.EventsRated, res.RollupsWritten)
+	}
+	if res.UnratedHours != 1 {
+		t.Fatalf("UnratedHours = %d, want 1", res.UnratedHours)
 	}
 }
 
-// TestRunWindow_NilBookIsRefused: a provider returning (nil, nil) must not rate at $0.
+// TestRunWindow_NilBookIsRefused: a provider returning (nil, nil) must not rate at
+// $0. The hour is SKIPPED (counted in UnratedHours) rather than rated — the
+// invariant is "never bill at a price we do not have", not "abort the window".
 func TestRunWindow_NilBookIsRefused(t *testing.T) {
 	start := mustTime("2026-06-08T10:00:00Z")
 	store := &recordingStore{}
 	r := New(store, nil, logging.New(logging.ERROR)).
 		WithBookForHour(func(context.Context, time.Time) (*PriceBook, error) { return nil, nil })
-	_, err := r.RunWindow(context.Background(), start, start.Add(time.Hour), false)
-	if err == nil || !strings.Contains(err.Error(), "no price book") {
-		t.Fatalf("a nil book must be refused, got %v", err)
+	res, err := r.RunWindow(context.Background(), start, start.Add(time.Hour), false)
+	if err != nil {
+		t.Fatalf("a skipped hour must not fail the window: %v", err)
+	}
+	if res.UnratedHours != 1 || !res.HasUnratedHours() {
+		t.Fatalf("UnratedHours = %d, want 1 (the hour must be reported as unrated)", res.UnratedHours)
 	}
 	if len(store.calls) != 0 {
 		t.Fatal("nothing may be rated without a price book")
@@ -1520,8 +1580,12 @@ func TestRunWindow_PartialWindowReportsCommittedCost(t *testing.T) {
 	store := &recordingStore{}
 	r := New(store, nil, logging.New(logging.ERROR)).WithBookForHour(bookFor)
 	res, err := r.RunWindow(context.Background(), start, start.Add(4*time.Hour), false)
-	if err == nil {
-		t.Fatal("RunWindow must still fail closed when a later hour's prices are unavailable")
+	if err != nil {
+		t.Fatalf("unavailable hours are skipped, not fatal: %v", err)
+	}
+	// Hours 3 and 4 had no prices: skipped, and reported as such.
+	if res.UnratedHours != 2 {
+		t.Fatalf("UnratedHours = %d, want 2", res.UnratedHours)
 	}
 	if res.EventsRated != want.EventsRated || res.RollupsWritten != want.RollupsWritten {
 		t.Fatalf("counters = %d events / %d rollups, want the committed hours' %d/%d",

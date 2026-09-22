@@ -127,15 +127,15 @@ func TestRater_RoutineRunReconcileDeleteExitsNonzero(t *testing.T) {
 		windowExplicit = false // routine default trailing-hours window
 		hasAnomaly     = false // ONLY a reconcile-delete; no unpriced/unattributable/ambiguous
 	)
-	if got := exitCode(1, windowExplicit, hasAnomaly); got != exitAnomaly {
+	if got := exitCode(1, windowExplicit, hasAnomaly, false); got != exitAnomaly {
 		t.Fatalf("routine run with a reconcile-delete: exit = %d, want exitAnomaly (%d) — a prior bill vanished on a routine cadence; page someone", got, exitAnomaly)
 	}
 	// And with MORE than one delete (count is just a signal, not a threshold).
-	if got := exitCode(7, windowExplicit, hasAnomaly); got != exitAnomaly {
+	if got := exitCode(7, windowExplicit, hasAnomaly, false); got != exitAnomaly {
 		t.Fatalf("routine run with 7 reconcile-deletes: exit = %d, want exitAnomaly (%d)", got, exitAnomaly)
 	}
 	// Sanity: a routine run with NO reconcile-delete and no anomaly is the clean path.
-	if got := exitCode(0, windowExplicit, hasAnomaly); got != exitOK {
+	if got := exitCode(0, windowExplicit, hasAnomaly, false); got != exitOK {
 		t.Fatalf("clean routine run: exit = %d, want exitOK (%d)", got, exitOK)
 	}
 }
@@ -149,16 +149,16 @@ func TestRater_RoutineRunReconcileDeleteExitsNonzero(t *testing.T) {
 func TestRater_BackfillReconcileDeleteExitsZero(t *testing.T) {
 	const windowExplicit = true // operator named the window
 	// Reconcile-delete on an explicit backfill, nothing else leaked → exit 0.
-	if got := exitCode(3, windowExplicit, false); got != exitOK {
+	if got := exitCode(3, windowExplicit, false, false); got != exitOK {
 		t.Fatalf("explicit backfill with a reconcile-delete: exit = %d, want exitOK (%d) — convergence the operator asked for", got, exitOK)
 	}
 	// But a real anomaly during a backfill STILL exits nonzero (the flag never
 	// suppresses unpriced/unattributable/ambiguous).
-	if got := exitCode(3, windowExplicit, true); got != exitAnomaly {
+	if got := exitCode(3, windowExplicit, true, false); got != exitAnomaly {
 		t.Fatalf("explicit backfill that ALSO leaked an anomaly: exit = %d, want exitAnomaly (%d) — --since must not mask a real anomaly", got, exitAnomaly)
 	}
 	// A clean explicit backfill (no deletes, no anomaly) is exit 0.
-	if got := exitCode(0, windowExplicit, false); got != exitOK {
+	if got := exitCode(0, windowExplicit, false, false); got != exitOK {
 		t.Fatalf("clean explicit backfill: exit = %d, want exitOK (%d)", got, exitOK)
 	}
 }
@@ -307,5 +307,36 @@ func TestReconciliationDoc_DocumentsNoLocalPriceFileFallback(t *testing.T) {
 		if strings.Contains(doc, forbidden) {
 			t.Errorf("reconciliation doc mentions %q — there is no local-price-file mode; the manager is the only price source", forbidden)
 		}
+	}
+}
+
+// TestExitCode_UnratedHoursIsItsOwnSignal: a run that SKIPPED an hour (prices
+// unavailable, or rating it failed) did not cover its whole window, so it must not
+// exit 0 — but it is a different operator action from an evidence anomaly ("check
+// the pricing service and confirm a later run caught up" vs "investigate the
+// data"), so it gets its own code. An anomaly outranks it: bad evidence is the more
+// urgent signal, and a run can be both.
+func TestExitCode_UnratedHoursIsItsOwnSignal(t *testing.T) {
+	const (
+		noDeletes     = int64(0)
+		routine       = false
+		noAnomaly     = false
+		anomaly       = true
+		unrated       = true
+		allHoursRated = false
+	)
+	if got := exitCode(noDeletes, routine, noAnomaly, unrated); got != exitIncomplete {
+		t.Fatalf("skipped hour: exit = %d, want exitIncomplete (%d) — the window was not fully rated", got, exitIncomplete)
+	}
+	if got := exitCode(noDeletes, routine, noAnomaly, allHoursRated); got != exitOK {
+		t.Fatalf("fully rated clean run: exit = %d, want exitOK (%d)", got, exitOK)
+	}
+	// An anomaly wins when both are present.
+	if got := exitCode(noDeletes, routine, anomaly, unrated); got != exitAnomaly {
+		t.Fatalf("anomaly + skipped hour: exit = %d, want exitAnomaly (%d) — bad evidence outranks an incomplete run", got, exitAnomaly)
+	}
+	// The codes must be distinguishable, else the distinction is decorative.
+	if exitIncomplete == exitAnomaly || exitIncomplete == exitOK || exitIncomplete == exitFatal {
+		t.Fatal("exitIncomplete must be distinct from the other exit codes")
 	}
 }

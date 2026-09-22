@@ -141,6 +141,14 @@ const (
 	exitOK      = 0
 	exitFatal   = 1
 	exitAnomaly = 2 // window rated but something leaked: pricing, attribution, or usage evidence
+	// exitIncomplete: the run SKIPPED one or more hours (prices unavailable, or
+	// rating that hour failed) and therefore did not cover its whole window. Each
+	// hour is independent and the upsert is idempotent, so a later run whose
+	// trailing window still covers the hour rates it — this is "check the pricing
+	// service and confirm the next run caught up", NOT "the billing data is wrong".
+	// Distinct from exitAnomaly so an operator can tell a flaky dependency from
+	// bad evidence, and so a transient blip does not look like a money problem.
+	exitIncomplete = 3
 )
 
 // exitCode maps a completed rating run to its process exit code, encoding the
@@ -153,12 +161,17 @@ const (
 // reconcile-deletes are intended convergence (a backfill) and do NOT raise the exit
 // code on their own. This is the single place the routine-vs-backfill decision is
 // made, because only cmd/rater knows whether the window was explicit.
-func exitCode(reconciledDeletions int64, windowExplicit, hasAnomaly bool) int {
+func exitCode(reconciledDeletions int64, windowExplicit, hasAnomaly, hasUnratedHours bool) int {
+	// An anomaly outranks an incomplete run: bad evidence is the more urgent
+	// signal, and a run can be both (an hour skipped AND another hour leaking).
 	if hasAnomaly {
 		return exitAnomaly
 	}
 	if reconciledDeletions > 0 && !windowExplicit {
 		return exitAnomaly
+	}
+	if hasUnratedHours {
+		return exitIncomplete
 	}
 	return exitOK
 }
@@ -263,7 +276,7 @@ func run() int {
 	// run (default window) that rewrote a prior bill is alarming and exits nonzero,
 	// while an explicit backfill (--since/--until) that did so is intended and exits
 	// 0. See exitCode and the package doc.
-	return exitCode(res.ReconciledDeletions, windowExplicit, res.HasAnomaly())
+	return exitCode(res.ReconciledDeletions, windowExplicit, res.HasAnomaly(), res.HasUnratedHours())
 }
 
 // resolveWindow computes [start, end). Defaults (both flags empty) rate the
