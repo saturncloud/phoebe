@@ -218,6 +218,19 @@ func copyTree(source, destination string) error {
 
 func decodeEvent(data []byte) (metering.Event, error) {
 	var ev metering.Event
+	// usage_found decides whether an attempt can EVER become money, and Go decodes a
+	// missing bool to false — so a record predating that field would replay as
+	// "engine supplied no usage", be excluded from money permanently, and report
+	// nothing. Refuse it instead: an operator can assert the right value and
+	// re-import, but they cannot recover revenue that was silently zeroed.
+	var probe map[string]json.RawMessage
+	if err := json.Unmarshal(data, &probe); err != nil {
+		return ev, fmt.Errorf("decode event JSON: %w", err)
+	}
+	if _, ok := probe["usage_found"]; !ok {
+		return ev, fmt.Errorf("event has no usage_found field (pre-hardening evidence); " +
+			"refusing to replay it as unmetered — assert the correct value and re-import")
+	}
 	dec := json.NewDecoder(bytes.NewReader(data))
 	if err := dec.Decode(&ev); err != nil {
 		return ev, fmt.Errorf("decode event JSON: %w", err)

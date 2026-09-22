@@ -274,6 +274,17 @@ func (r *Rater) Run(ctx context.Context, windowStart, windowEnd time.Time, windo
 // RunWindow rates [windowStart, windowEnd) HOUR BY HOUR, pricing each hour from
 // the book effective DURING that hour, and returns the aggregate.
 //
+// THE PRICING INSTANT IS THE HOUR START (Hugo, 2026-09-22). Each hour is priced
+// from the book effective at hourStart, so a price change takes effect at the NEXT
+// HOUR BOUNDARY: a reprice landing at 10:30 applies to the 11:00 hour, not to any
+// part of 10:00. That is the deliberate quantum, not an accident of the loop.
+//
+// The alternative — splitting an hour at the reprice instant — was rejected: the
+// rating SQL buckets on date_trunc('hour', ...), so sub-hour pricing cannot be
+// expressed without a schema change, and the precision is not worth a one-way
+// door. Operators scheduling a price change should therefore pick an hour
+// boundary; anything else silently rounds forward to one.
+//
 // WHY PER HOUR (the correctness reason): prices are effective-dated in the manager,
 // but one PriceBook is a flat snapshot with no time dimension. The default run
 // covers 24 trailing hours, so pricing the whole span from any single snapshot

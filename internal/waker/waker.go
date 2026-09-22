@@ -190,6 +190,20 @@ func (w *KubeWaker) Wake(ctx context.Context, target proxy.WakeTarget) error {
 	if target.ServedModel == "" {
 		return errors.New("waker: no served model on wake target")
 	}
+	// WARM SHORT-CIRCUIT. Wake runs on EVERY wakeable request, not only cold ones,
+	// so without this a warm shared graph pays a Kubernetes DGDSA GET — serialized
+	// behind the per-graph mutex in scaleUp — on every inference request, which
+	// head-of-line blocks the whole graph's traffic behind one apiserver round trip
+	// and amplifies apiserver load by one GET per request. A readiness probe is a
+	// cheap HTTP GET against the upstream and costs the cold path nothing: waitReady
+	// probes once before ticking anyway, so a cold graph performs exactly the same
+	// number of probes as before.
+	//
+	// This keeps the ratified contract intact: never an inference POST as a probe;
+	// actuate Kubernetes, then poll /v1/models for the exact requested model.
+	if w.ready(ctx, target.UpstreamHost, target.ServedModel) {
+		return nil
+	}
 	if err := w.scaleUp(ctx, target.GraphK8sName, target.ResourceID); err != nil {
 		return err
 	}

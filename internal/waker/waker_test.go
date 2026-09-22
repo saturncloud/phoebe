@@ -49,8 +49,11 @@ func scaledObjectObj(graph string, paused string) *unstructured.Unstructured {
 }
 
 // newFakeWaker builds a KubeWaker over client-go's fake dynamic client seeded
-// with objs, with readiness stubbed to always-ready (readiness has its own
-// tests). Returns the waker and the fake for action assertions.
+// with objs, readiness stubbed COLD-THEN-READY: the first probe reports not-ready
+// (so the warm short-circuit in Wake does not fire and the actuation path runs —
+// which is what these tests assert), and every later probe reports ready (so
+// waitReady returns immediately instead of polling). Readiness itself has its own
+// tests. Returns the waker and the fake for action assertions.
 func newFakeWaker(t *testing.T, objs ...runtime.Object) (*KubeWaker, *dynamicfake.FakeDynamicClient) {
 	t.Helper()
 	scheme := runtime.NewScheme()
@@ -59,6 +62,19 @@ func newFakeWaker(t *testing.T, objs ...runtime.Object) (*KubeWaker, *dynamicfak
 		scaledObjectGVR: "ScaledObjectList",
 	}, objs...)
 	w := NewWithClient(client, Config{Namespace: testNS, PollInterval: time.Millisecond}, logging.New(logging.ERROR))
+	// Atomic: concurrent-wake tests call readiness from several goroutines.
+	var probes int32
+	w.ready = func(context.Context, string, string) bool {
+		return atomic.AddInt32(&probes, 1) > 1
+	}
+	return w, client
+}
+
+// newWarmFakeWaker is the same fake with readiness stubbed ALWAYS-READY, i.e. a
+// graph that is already serving the requested model.
+func newWarmFakeWaker(t *testing.T, objs ...runtime.Object) (*KubeWaker, *dynamicfake.FakeDynamicClient) {
+	t.Helper()
+	w, client := newFakeWaker(t, objs...)
 	w.ready = func(context.Context, string, string) bool { return true }
 	return w, client
 }
@@ -359,5 +375,40 @@ func TestUpstreamServesModelsRequiresRequestedModel(t *testing.T) {
 	}
 	if !w.upstreamServesModels(context.Background(), host, "requested-model") {
 		t.Fatal("requested registered model should be ready")
+	}
+}
+
+// TestWake_WarmGraphTouchesNoApiserver pins the warm short-circuit. Wake runs on
+// EVERY wakeable request, not only cold ones, so without the short-circuit a warm
+// shared graph pays a DGDSA GET — serialized behind the per-graph mutex — on every
+// inference request: head-of-line blocking for the whole graph's traffic behind one
+// apiserver round trip, plus one GET of apiserver load per request.
+func TestWake_WarmGraphTouchesNoApiserver(t *testing.T) {
+	w, client := newWarmFakeWaker(t, dgdsaObj("g1", 1), scaledObjectObj("g1", "false"))
+	client.ClearActions()
+
+	if err := w.Wake(context.Background(), target("g1")); err != nil {
+		t.Fatalf("Wake on a warm graph: %v", err)
+	}
+
+	if actions := client.Actions(); len(actions) != 0 {
+		verbs := make([]string, 0, len(actions))
+		for _, a := range actions {
+			verbs = append(verbs, a.GetVerb()+" "+a.GetResource().Resource)
+		}
+		t.Fatalf("warm wake issued %d apiserver call(s) %v, want none", len(actions), verbs)
+	}
+}
+
+// TestWake_ColdGraphStillActuates is the other half: the short-circuit must not
+// suppress a real wake. A cold graph is still read, scaled and unpaused.
+func TestWake_ColdGraphStillActuates(t *testing.T) {
+	w, client := newFakeWaker(t, dgdsaObj("g1", 0), scaledObjectObj("g1", "true"))
+
+	if err := w.Wake(context.Background(), target("g1")); err != nil {
+		t.Fatalf("Wake: %v", err)
+	}
+	if patches := patchActions(client); len(patches) != 2 {
+		t.Fatalf("cold wake issued %d patches, want 2 (scale, then unpause)", len(patches))
 	}
 }

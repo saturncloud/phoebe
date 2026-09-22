@@ -1489,3 +1489,33 @@ func TestRunWindow_UnalignedTailNeverRatesPastTheEnd(t *testing.T) {
 			store.calls[1].end.Format(time.RFC3339), end.Format(time.RFC3339))
 	}
 }
+
+// TestRunWindow_PricesFromTheHourStartInstant pins the pricing quantum (Hugo,
+// 2026-09-22): each hour is priced from the book effective at its START, so a
+// price change takes effect at the next hour boundary rather than part-way
+// through an hour. A reprice at 10:30 must not touch the 10:00 hour.
+func TestRunWindow_PricesFromTheHourStartInstant(t *testing.T) {
+	start := mustTime("2026-06-08T10:00:00Z")
+	var asked []time.Time
+	store := &recordingStore{}
+	book := newTestBook(map[string]Rate3{"m": rate3("0.000001", "0", "0")}, nil, PolicyIdentity, Dec{}, Dec{})
+	r := New(store, nil, logging.New(logging.ERROR)).
+		WithBookForHour(func(_ context.Context, hourStart time.Time) (*PriceBook, error) {
+			asked = append(asked, hourStart.UTC())
+			return book, nil
+		})
+
+	if _, err := r.RunWindow(context.Background(), start, start.Add(3*time.Hour), false); err != nil {
+		t.Fatalf("RunWindow: %v", err)
+	}
+	for i, got := range asked {
+		want := start.Add(time.Duration(i) * time.Hour)
+		if !got.Equal(want) {
+			t.Fatalf("asked for prices at %s, want the HOUR START %s", got.Format(time.RFC3339Nano), want.Format(time.RFC3339Nano))
+		}
+		// Explicitly: never a mid-hour instant.
+		if got.Truncate(time.Hour) != got {
+			t.Fatalf("asked for prices at a non-hour-boundary instant %s", got.Format(time.RFC3339Nano))
+		}
+	}
+}

@@ -266,3 +266,53 @@ func TestDigestBindsCompleteEventSet(t *testing.T) {
 		t.Fatal("a different event count must change the digest")
 	}
 }
+
+// TestLoadRefusesEvidenceMissingUsageFound: usage_found decides whether an attempt
+// can ever become money, and Go decodes a missing bool to false. A record predating
+// that field would therefore replay as "the engine supplied no usage", be excluded
+// from money permanently, and report nothing — silent revenue loss with no error to
+// notice. Refuse it so an operator can assert the correct value and re-import.
+func TestLoadRefusesEvidenceMissingUsageFound(t *testing.T) {
+	// A pre-hardening record: valid in every other respect, but no usage_found key.
+	legacy := `{"request_id":"req-legacy","auth_id":"auth-1","prompt_tokens":10,` +
+		`"completion_tokens":5,"timestamp_unix_ms":1750000000000}`
+	path := filepath.Join(t.TempDir(), "legacy.jsonl")
+	if err := os.WriteFile(path, []byte(legacy), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	_, err := Load(path)
+	if err == nil {
+		t.Fatal("a record with no usage_found must be refused, not replayed as unmetered")
+	}
+	if !strings.Contains(err.Error(), "usage_found") {
+		t.Fatalf("error %q should name the missing field so an operator can fix it", err)
+	}
+}
+
+// TestLoadAcceptsExplicitUsageFoundBothWays: the refusal is about ABSENCE, not
+// about the value — an explicit false is legitimate evidence (an abort, a failed
+// attempt) and must still replay.
+func TestLoadAcceptsExplicitUsageFoundBothWays(t *testing.T) {
+	for _, usageFound := range []bool{true, false} {
+		ev := testEvent("req-explicit")
+		ev.UsageFound = usageFound
+		data, err := json.Marshal(ev)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !strings.Contains(string(data), "usage_found") {
+			t.Fatalf("the emitter must always write usage_found; got %s", data)
+		}
+		path := filepath.Join(t.TempDir(), "evidence.jsonl")
+		if err := os.WriteFile(path, data, 0o600); err != nil {
+			t.Fatal(err)
+		}
+		evidence, err := Load(path)
+		if err != nil {
+			t.Fatalf("usage_found=%v must be accepted: %v", usageFound, err)
+		}
+		if len(evidence.Events) != 1 || evidence.Events[0].UsageFound != usageFound {
+			t.Fatalf("events = %+v, want one event with usage_found=%v", evidence.Events, usageFound)
+		}
+	}
+}
