@@ -12,12 +12,7 @@ run: build
 
 .PHONY: test
 test:
-	go test ./...
-
-# Race-detector gate over the admission/proxy concurrency surface.
-.PHONY: test-race
-test-race:
-	go test -race ./internal/admission/... ./internal/proxy/...
+	go test -race ./...
 
 # Runs the live-Postgres conformance tests (the `integration` build tag). These
 # prove the production SQL rater computes the same money as the Rate() oracle —
