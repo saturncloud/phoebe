@@ -873,8 +873,14 @@ func TestIntegration_MissingUsageAttemptIsNeverBilled(t *testing.T) {
 	if err != nil {
 		t.Fatalf("rate missing-usage attempt: %v", err)
 	}
-	if missingRes.MissingUsageEvents != 1 || missingRes.UnattributableEvents != 0 || missingRes.EventsRated != 1 {
-		t.Fatalf("missing-usage partition = missing %d / unattributable %d / rated %d, want 1/0/1",
+	// The anomaly counts strictly PARTITION the window's events (see store.go:
+	// events_rated + missing_usage + ... == total in-window events), and
+	// events_rated sums event_count over the UPSERTED rollups. A missing-usage
+	// attempt writes no rollup, so it is counted ONCE, as missing usage, and
+	// rated is 0. Expecting rated=1 here would double-count the same event in two
+	// buckets and contradict the "no rollups written" assertion just below.
+	if missingRes.MissingUsageEvents != 1 || missingRes.UnattributableEvents != 0 || missingRes.EventsRated != 0 {
+		t.Fatalf("missing-usage partition = missing %d / unattributable %d / rated %d, want 1/0/0",
 			missingRes.MissingUsageEvents, missingRes.UnattributableEvents, missingRes.EventsRated)
 	}
 	var failedRollups int
