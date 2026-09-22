@@ -1083,6 +1083,74 @@ func TestAdmissionDialFailureChargesNothing(t *testing.T) {
 	_ = lease.Complete(context.Background(), 0)
 }
 
+// Broken trusted identity/policy fails closed BEFORE the Valkey fail-open
+// boundary — and must keep failing closed when the admission store is down.
+// Only a complete, valid envelope may bypass a dead store.
+func TestStoreDownStillFailsClosedOnBrokenIdentityAndPolicy(t *testing.T) {
+	var hits int
+	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		hits++
+		_, _ = w.Write([]byte(`{"model":"model-a","usage":{"prompt_tokens":7,"completion_tokens":3}}`))
+	}))
+	defer backend.Close()
+	up, _ := url.Parse(backend.URL)
+	cfg := proxyAdmissionConfig(1)
+	// The admitter points at a closed port: every Admit returns ErrUnavailable,
+	// the exact condition the fail-open bypass exists for.
+	newDeadStoreServer := func() *Server {
+		client := admission.NewValkeyClient("127.0.0.1:1")
+		t.Cleanup(func() { _ = client.Close() })
+		return New(&config.Settings{Admission: cfg}, logging.New(logging.ERROR), &recordingEmitter{}).
+			WithAdmitter(admission.New(client, cfg))
+	}
+
+	for _, tc := range []struct {
+		name   string
+		mutate func(*http.Request)
+	}{
+		{
+			name:   "missing organization",
+			mutate: func(req *http.Request) { req.Header.Del(identity.HeaderOrgID) },
+		},
+		{
+			name:   "malformed policy envelope",
+			mutate: func(req *http.Request) { req.Header.Set(identity.HeaderOrgRateLimitRequests, "not-a-number") },
+		},
+		{
+			name:   "partial policy envelope",
+			mutate: func(req *http.Request) { req.Header.Del(identity.HeaderOwnerRateLimitGeneratedTokens) },
+		},
+		{
+			name:   "degenerate upstream graph",
+			mutate: func(req *http.Request) { req.Header.Set(identity.HeaderUpstream, ":8000") },
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			req := sharedRequest(up)
+			tc.mutate(req)
+			rr := httptest.NewRecorder()
+			newDeadStoreServer().Handler().ServeHTTP(rr, req)
+			if rr.Code != http.StatusServiceUnavailable {
+				t.Fatalf("status=%d with the admission store down, want the fail-closed 503 — a fail-open bypass would forward", rr.Code)
+			}
+		})
+	}
+	if hits != 0 {
+		t.Fatalf("broken identity/policy reached the upstream %d times under a store outage; the fail-open bypass was taken", hits)
+	}
+
+	// Positive control: a complete valid envelope with the store down still
+	// bypasses the distributed gate and is served.
+	rr := httptest.NewRecorder()
+	newDeadStoreServer().Handler().ServeHTTP(rr, sharedRequest(up))
+	if rr.Code != http.StatusOK {
+		t.Fatalf("control status=%d, want 200 (valid request bypasses a dead store)", rr.Code)
+	}
+	if hits != 1 {
+		t.Fatalf("upstream hits=%d, want exactly the valid control request", hits)
+	}
+}
+
 func TestAdmissionRenewalFailureDoesNotCancelUpstream(t *testing.T) {
 	started := make(chan struct{})
 	releaseBackend := make(chan struct{})
