@@ -31,9 +31,9 @@ central billing service.
    which owns the effective-dated series: the rater asks for the prices effective
    during EACH HOUR it rates, so a late or recovered event bills at its own hour's
    rate however many times the price book has changed since — and a re-rate of that
-   hour is idempotent. phoebe keeps no local price history. (An install with no
-   `managerURL` uses the operator-authored price file for every hour instead; see
-   `config/prices.example.yaml` for that mode's limitation.) The applied rates are
+   hour is idempotent. phoebe keeps no local price history. An install that cannot
+   egress to the central manager runs its own manager instance seeded with that
+   deployment's prices. The applied rates are
    frozen onto each `rated_usage` row, so the row stays self-auditing. Attempts
    without authoritative engine usage are excluded from money, and an UNEXPLAINED
    missing-usage attempt makes the rater exit non-zero.

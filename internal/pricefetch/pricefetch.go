@@ -6,13 +6,15 @@
 // time T" is a question it can always answer. phoebe keeps NO price history of its
 // own — it asks.
 //
-// Two callers, one client:
-//   - cmd/price-fetch syncs the CURRENT prices to a local file (zero asOf), so the
-//     rater can still run against last-good prices when the manager is unreachable.
+// The one caller:
 //   - cmd/rater asks for the prices EFFECTIVE DURING EACH HOUR it rates (non-zero
 //     asOf), which is what makes re-rating an old hour idempotent: the hour always
 //     resolves to the rates that were in force during it, however many times prices
 //     have changed since.
+//
+// There is no local price file and no last-good fallback: the manager is the only
+// price source, so a manager outage is a rating outage (the trailing-24h re-rate
+// window catches up).
 package pricefetch
 
 import (

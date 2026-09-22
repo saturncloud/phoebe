@@ -209,7 +209,7 @@ func (p *pusher) ratedUsageHasAnyRow(ctx context.Context) (bool, error) {
 // didn't inject X-Saturn-Org-Id, or org_id propagation broke) would silently DELETE the
 // prior, possibly-already-billed charge for that row — a money-loss, not a "hold". We
 // instead WITHHOLD the whole window (leave the manager's prior good state for it
-// standing) and scream + exit 2. This is the price-fetch fail-closed posture:
+// standing) and scream + exit 2. This is the cmd/rater fail-closed posture:
 // stale-but-billed beats silently-un-billed. Convergence resumes automatically on the
 // next run once the org propagates (the trailing re-push window re-covers the hour, and
 // a re-rate refreshes a NULL-org rollup to its real org). The interim cost is possibly

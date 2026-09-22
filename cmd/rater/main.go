@@ -74,11 +74,13 @@
 // explicitly with --since/--until).
 //
 // Config, like the drainer: a YAML settings file (flag -f) for pool knobs and
-// rateTrailingHours, the DATABASE_URL env var (Atlas convention) for Postgres, and a
-// price-file path (settings `priceFile` or flag -prices) for the YAML price book. The
-// rater does NOT run migrations — it assumes billing_event/rated_usage exist (see
-// migrations/README.md). It FAILS CLOSED if the price file is missing or malformed:
-// it refuses to rate rather than bill at $0.
+// rateTrailingHours, the DATABASE_URL env var (Atlas convention) for Postgres, and
+// `managerURL` (settings, or flag -manager-url) plus the SATURN_TOKEN env var for
+// prices. managerURL is REQUIRED — the manager is the only price source, and the
+// rater exits fatal without it. The rater does NOT run migrations — it assumes
+// billing_event/rated_usage exist (see migrations/README.md). It FAILS CLOSED on an
+// unresolvable price (internal/rating/policy.go ErrNoPrice): it refuses to rate
+// rather than bill at $0.
 package main
 
 import (
@@ -126,7 +128,7 @@ type raterSettings struct {
 
 // priceTokenEnv is the env var carrying the customer auth token used to call the
 // manager for prices. Same install->manager direction (customer token) as the usage
-// push and cmd/price-fetch; not a new auth surface.
+// push; not a new auth surface.
 const priceTokenEnv = "SATURN_TOKEN"
 
 // defaultRateTrailingHours is the default N for the trailing window. 24 trades a
