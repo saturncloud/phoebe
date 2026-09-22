@@ -65,7 +65,19 @@ ORDER BY window_start, org_id, resource_id, model_id;
 three billable classes remain independently reconcilable. `missing_usage_attempts`
 is not automatically revenue loss: it means the engine did
 not provide authoritative counts, so Phoebe charged zero and requires engine-log
-review. Page on any new missing-usage row, rater anomaly/non-zero exit, reconcile
+review.
+
+**Missing usage is paged by CAUSE, not by count.** A client disconnect or an
+upstream failure legitimately produces a zero-usage attempt, so those are routine
+on any install with traffic: they are reported (INFO, and counted in
+`missing_usage_attempts`) and reviewed here, never paged. What pages is an attempt
+that was NOT aborted and did NOT fail — a response the engine reported as
+SUCCESSFUL while supplying no usage block, meaning work may have been served that
+cannot be billed. The rater exits non-zero only on that unexplained subset, so
+exit 2 stays reserved for rare, wrong conditions (unpriced, unattributable,
+invalid-usage, ambiguous base/org) rather than firing every hour.
+
+Page on an unexplained missing-usage attempt, rater anomaly/non-zero exit, reconcile
 deletion during a routine run, drainer poison row, `METERING_FLOOR`, WAL corruption,
 token-push withheld window, or push failure. Alert separately when the oldest Valkey
 pending entry, oldest WAL entry, or oldest unpushed rated hour exceeds two job

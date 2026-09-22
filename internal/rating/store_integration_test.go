@@ -2112,3 +2112,105 @@ func TestIntegration_FreshInputTokensSurvivesInt32Overflow(t *testing.T) {
 		t.Fatalf("overflow persistence = raw/invalid/rated %d/%d/%d, want 2/2/0", rawRows, invalidAttempts, ratedRows)
 	}
 }
+
+// TestIntegration_MissingUsagePartitionedByCause proves the paging partition
+// against live Postgres: routine zero-usage attempts (client abort, upstream
+// failure) are counted as EXPECTED and must not page, while a SUCCESSFUL response
+// carrying no usage block is counted as UNEXPLAINED and must page. Ratified with
+// Hugo 2026-09-21 — paging on the cause-blind total fired hourly on any install
+// with real traffic and buried the rare anomalies sharing the exit-2 channel.
+func TestIntegration_MissingUsagePartitionedByCause(t *testing.T) {
+	dsn := os.Getenv("PHOEBE_TEST_DATABASE_URL")
+	if dsn == "" {
+		t.Skip("PHOEBE_TEST_DATABASE_URL not set; skipping live-Postgres conformance")
+	}
+	ctx := context.Background()
+	db, err := sql.Open("pgx", dsn)
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	defer db.Close()
+
+	const sch = "phoebe_rating_missing_cause_it"
+	exec(t, db, "DROP SCHEMA IF EXISTS "+sch+" CASCADE")
+	exec(t, db, "CREATE SCHEMA "+sch)
+	exec(t, db, "SET search_path TO "+sch)
+	defer func() { exec(t, db, "DROP SCHEMA IF EXISTS "+sch+" CASCADE") }()
+	for _, name := range []string{
+		"0001_billing_event.up.sql",
+		"0002_rating.up.sql",
+		"0004_billing_event_serving_mode.up.sql",
+		"0005_invoice_grade_attempts.up.sql",
+		"0006_reconciliation_org_grain.up.sql",
+	} {
+		ddl, readErr := os.ReadFile("../../migrations/" + name)
+		if readErr != nil {
+			t.Fatalf("read migration %s: %v", name, readErr)
+		}
+		exec(t, db, string(ddl))
+	}
+
+	hour := mustTime("2026-06-08T10:00:00Z")
+	insert := func(id string, aborted bool, status any) {
+		t.Helper()
+		if _, err := db.ExecContext(ctx,
+			`INSERT INTO billing_event
+			 (request_id, auth_id, resource_id, org_id, model, prompt_tokens, cached_tokens,
+			  completion_tokens, usage_found, aborted, status_code, event_ts)
+			 VALUES ($1,'a','d1','org-1','b',0,0,0,FALSE,$2,$3,$4)`,
+			id, aborted, status, hour.Add(5*time.Minute)); err != nil {
+			t.Fatalf("insert %s: %v", id, err)
+		}
+	}
+	// Routine: a client disconnect (499) and an upstream failure (502).
+	insert("abort-499", true, 499)
+	insert("upstream-502", false, 502)
+	// Alarming: the engine returned 200 and reported no tokens.
+	insert("success-no-usage", false, 200)
+
+	book := newTestBook(map[string]Rate3{"b": rate3("0.000005", "0.000001", "0")}, nil, PolicyIdentity, Dec{}, Dec{})
+	res, err := NewPostgresStore(db).RateWindow(ctx, book, hour, hour.Add(time.Hour))
+	if err != nil {
+		t.Fatalf("RateWindow: %v", err)
+	}
+	if res.MissingUsageEvents != 3 {
+		t.Fatalf("missing-usage total = %d, want 3", res.MissingUsageEvents)
+	}
+	if res.ExpectedMissingUsageEvents != 2 {
+		t.Fatalf("expected(routine) missing-usage = %d, want 2 (the 499 abort and the 502)",
+			res.ExpectedMissingUsageEvents)
+	}
+	if res.UnexplainedMissingUsageEvents != 1 {
+		t.Fatalf("unexplained missing-usage = %d, want 1 (the 200 with no usage block)",
+			res.UnexplainedMissingUsageEvents)
+	}
+	if res.ExpectedMissingUsageEvents+res.UnexplainedMissingUsageEvents != res.MissingUsageEvents {
+		t.Fatalf("causes %d+%d do not partition the total %d",
+			res.ExpectedMissingUsageEvents, res.UnexplainedMissingUsageEvents, res.MissingUsageEvents)
+	}
+	// None of them is money.
+	if res.EventsRated != 0 || res.RollupsWritten != 0 {
+		t.Fatalf("rated/rollups = %d/%d, want 0/0: zero-usage attempts never become money",
+			res.EventsRated, res.RollupsWritten)
+	}
+
+	// A window of ONLY routine attempts must not page.
+	if _, err := db.ExecContext(ctx, `DELETE FROM billing_event WHERE request_id = 'success-no-usage'`); err != nil {
+		t.Fatalf("delete unexplained row: %v", err)
+	}
+	routine, err := NewPostgresStore(db).RateWindow(ctx, book, hour, hour.Add(time.Hour))
+	if err != nil {
+		t.Fatalf("RateWindow (routine only): %v", err)
+	}
+	if routine.UnexplainedMissingUsageEvents != 0 {
+		t.Fatalf("unexplained = %d on a routine-only window, want 0", routine.UnexplainedMissingUsageEvents)
+	}
+	rr := Result{
+		MissingUsageEvents:            routine.MissingUsageEvents,
+		ExpectedMissingUsageEvents:    routine.ExpectedMissingUsageEvents,
+		UnexplainedMissingUsageEvents: routine.UnexplainedMissingUsageEvents,
+	}
+	if rr.HasAnomaly() {
+		t.Fatal("a window of only client aborts and upstream failures must NOT page")
+	}
+}

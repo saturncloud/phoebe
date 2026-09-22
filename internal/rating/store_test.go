@@ -40,8 +40,11 @@ func TestPostgresStore_RateWindowSQL(t *testing.T) {
 	mock.ExpectExec(`INSERT INTO rating_derived`).
 		WithArgs("m", "0.000003000", "0.000000300", "0.000010000").
 		WillReturnResult(sqlmock.NewResult(0, 1))
-	rows := sqlmock.NewRows([]string{"rollups_written", "events_rated", "total_cost", "reconciled_deletions", "unpriced_events", "unattributable_events", "missing_usage_events", "invalid_usage_events", "ambiguous_base_events", "ambiguous_org_events"}).
-		AddRow(2, 5, "0.001234500", 0, 3, 1, 6, 7, 4, 2)
+	// missing_usage_events is the TOTAL; expected + unexplained partition it
+	// (6 = 4 routine aborts/failures + 2 successes with no usage block), so the
+	// fixture cannot pass while the SQL's partition is wrong.
+	rows := sqlmock.NewRows([]string{"rollups_written", "events_rated", "total_cost", "reconciled_deletions", "unpriced_events", "unattributable_events", "missing_usage_events", "expected_missing_usage_events", "unexplained_missing_usage_events", "invalid_usage_events", "ambiguous_base_events", "ambiguous_org_events"}).
+		AddRow(2, 5, "0.001234500", 0, 3, 1, 6, 4, 2, 7, 4, 2)
 	// The statement binds $3 = the ft: LIKE pattern (single-sourced from fineTunePrefix).
 	mock.ExpectQuery(`INSERT INTO rated_usage`).
 		WithArgs(start.UTC(), end.UTC(), ftLikePattern).
@@ -57,6 +60,16 @@ func TestPostgresStore_RateWindowSQL(t *testing.T) {
 	}
 	if res.UnpricedEvents != 3 || res.UnattributableEvents != 1 || res.AmbiguousBaseEvents != 4 || res.AmbiguousOrgEvents != 2 {
 		t.Fatalf("anomaly counts = %d/%d/%d/%d, want 3/1/4/2 (must ride the same statement)", res.UnpricedEvents, res.UnattributableEvents, res.AmbiguousBaseEvents, res.AmbiguousOrgEvents)
+	}
+	// The missing-usage partition must ride the same statement, and the two causes
+	// must sum to the reported total.
+	if res.MissingUsageEvents != 6 || res.ExpectedMissingUsageEvents != 4 || res.UnexplainedMissingUsageEvents != 2 {
+		t.Fatalf("missing-usage = total %d / expected %d / unexplained %d, want 6/4/2",
+			res.MissingUsageEvents, res.ExpectedMissingUsageEvents, res.UnexplainedMissingUsageEvents)
+	}
+	if res.ExpectedMissingUsageEvents+res.UnexplainedMissingUsageEvents != res.MissingUsageEvents {
+		t.Fatalf("missing-usage causes %d+%d do not partition the total %d",
+			res.ExpectedMissingUsageEvents, res.UnexplainedMissingUsageEvents, res.MissingUsageEvents)
 	}
 	if res.MissingUsageEvents != 6 {
 		t.Fatalf("missing usage = %d, want 6 (must ride the same statement)", res.MissingUsageEvents)
@@ -122,6 +135,11 @@ func TestRateWindowSQL_Shape(t *testing.T) {
 		// its own strict-partition bucket.
 		"WHERE usage_found",
 		"WHERE NOT usage_found)            AS missing_usage_events",
+		// The paging partition: routine (aborted/failed) vs unexplained (success
+		// with no usage). HasAnomaly pages only on the latter.
+		"AS expected_missing_usage_events",
+		"AS unexplained_missing_usage_events",
+		"AND NOT aborted",
 		"WHERE usage_found AND NOT valid_usage)                           AS invalid_usage_events",
 		// The first rate is durable even if rated_usage is reconciled away.
 		"INSERT INTO rating_price_lock",

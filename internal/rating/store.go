@@ -58,8 +58,20 @@ type RateResult struct {
 	UnattributableEvents int64
 	// MissingUsageEvents are execution-attempt records for which the serving engine
 	// supplied no authoritative usage block. They are retained as zero-charge audit
-	// evidence, excluded from rated_usage, and surfaced as a fail-loud anomaly.
+	// evidence and excluded from rated_usage. This is the TOTAL; it is reported for
+	// reconciliation and is deliberately NOT the paging signal, because it is
+	// dominated by routine client aborts and upstream failures.
 	MissingUsageEvents int64
+	// ExpectedMissingUsageEvents is the routine share of MissingUsageEvents: the
+	// client disconnected, or the attempt terminated with a non-success status.
+	// Correctly billed zero; reviewed in the reconciliation view, never paged.
+	ExpectedMissingUsageEvents int64
+	// UnexplainedMissingUsageEvents is the alarming share: NOT aborted and NOT
+	// failed, so the engine reported success while reporting no tokens — work we
+	// may have served and cannot bill. This is the fail-loud missing-usage signal.
+	// A NULL status_code counts here (fail closed: an attempt we cannot prove
+	// failed is not silently excused).
+	UnexplainedMissingUsageEvents int64
 	// InvalidUsageEvents are authoritative rows that violate token
 	// invariants. They remain raw evidence but are excluded from money.
 	InvalidUsageEvents int64
@@ -83,12 +95,14 @@ type RateResult struct {
 // and rows that could not be attributed. Both drive the exit-nonzero path. int64 to
 // match RateResult's widened counts.
 type Anomalies struct {
-	UnpricedEvents       int64
-	UnattributableEvents int64
-	MissingUsageEvents   int64
-	InvalidUsageEvents   int64
-	AmbiguousBaseEvents  int64
-	AmbiguousOrgEvents   int64
+	UnpricedEvents                int64
+	UnattributableEvents          int64
+	MissingUsageEvents            int64
+	ExpectedMissingUsageEvents    int64
+	UnexplainedMissingUsageEvents int64
+	InvalidUsageEvents            int64
+	AmbiguousBaseEvents           int64
+	AmbiguousOrgEvents            int64
 }
 
 // PostgresStore reads billing_event and writes rated_usage in the shared Atlas
@@ -287,6 +301,12 @@ WITH ev AS (
         -- checkpoint deployments. Its PRESENCE is the premium trigger (C4).
         adapter,
         usage_found,
+        -- aborted / status_code partition the missing-usage bucket by CAUSE (see
+        -- the counts below). A client disconnect or an upstream failure with no
+        -- usage block is EXPECTED; a SUCCESSFUL response with no usage block is
+        -- the alarming case, because the engine served work we cannot bill.
+        aborted,
+        status_code,
         (prompt_tokens >= 0 AND cached_tokens >= 0 AND completion_tokens >= 0
          AND cached_tokens <= prompt_tokens) AS valid_usage,
         prompt_tokens,
@@ -592,7 +612,26 @@ SELECT
         AND (auth_id IS NULL OR resource_id IS NULL OR model_id IS NULL)) AS unattributable_events,
     -- Missing engine usage is its own exclusive audit bucket. It must not become a
     -- zero-token rated rollup or be misreported as an attribution/price failure.
+    -- This is the TOTAL, reported for reconciliation; the paging decision uses the
+    -- cause-partitioned counts below, not this one.
     (SELECT COUNT(*)::bigint FROM ev WHERE NOT usage_found)            AS missing_usage_events,
+    -- EXPECTED missing usage: the client disconnected (aborted) or the attempt
+    -- terminated with a non-success status. Routine internet, correctly billed
+    -- zero, reviewed in billing_reconciliation_hourly — NOT paged.
+    (SELECT COUNT(*)::bigint FROM ev
+      WHERE NOT usage_found
+        AND (aborted OR (status_code IS NOT NULL AND status_code >= 400)))
+                                                                       AS expected_missing_usage_events,
+    -- UNEXPLAINED missing usage: the attempt was NOT aborted and did NOT fail, so
+    -- the engine reported success while telling us nothing about tokens. We may
+    -- have served real work that cannot be billed. This is the fail-loud bucket.
+    -- A NULL status_code counts here: an attempt we cannot prove failed is not
+    -- allowed to be silently excused (fail closed).
+    (SELECT COUNT(*)::bigint FROM ev
+      WHERE NOT usage_found
+        AND NOT aborted
+        AND (status_code IS NULL OR status_code < 400))
+                                                                       AS unexplained_missing_usage_events,
     -- Retain invalid authoritative engine evidence in billing_event for repair,
     -- but never let malformed counts enter
     -- money or overlap another anomaly bucket.
@@ -665,7 +704,9 @@ func (s *PostgresStore) RateWindow(ctx context.Context, book *PriceBook, start, 
 	var total string
 	err = tx.QueryRowContext(ctx, rateWindowSQL, start.UTC(), end.UTC(), ftLikePattern).
 		Scan(&res.RollupsWritten, &res.EventsRated, &total, &res.ReconciledDeletions,
-			&res.UnpricedEvents, &res.UnattributableEvents, &res.MissingUsageEvents, &res.InvalidUsageEvents, &res.AmbiguousBaseEvents,
+			&res.UnpricedEvents, &res.UnattributableEvents, &res.MissingUsageEvents,
+			&res.ExpectedMissingUsageEvents, &res.UnexplainedMissingUsageEvents,
+			&res.InvalidUsageEvents, &res.AmbiguousBaseEvents,
 			&res.AmbiguousOrgEvents)
 	if err != nil {
 		return RateResult{}, fmt.Errorf("rating: rate window [%s,%s): %w",

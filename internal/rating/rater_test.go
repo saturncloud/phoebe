@@ -36,10 +36,40 @@ func TestResult_HasAmbiguousOrgDrivesAnomaly(t *testing.T) {
 	}
 }
 
-func TestResult_MissingUsageDrivesAnomaly(t *testing.T) {
-	res := Result{MissingUsageEvents: 1}
-	if !res.HasMissingUsage() || !res.HasAnomaly() {
-		t.Fatal("missing usage must be a fail-loud billing anomaly")
+// TestResult_MissingUsagePagesOnlyWhenUnexplained pins the paging contract for
+// missing engine usage (ratified with Hugo, 2026-09-21).
+//
+// Zero-usage rows are ROUTINE: every client abort and every upstream failure emits
+// one. Paging on the total would fire hourly on any install with real traffic and
+// bury the rare anomalies that share the exit-2 channel (unpriced, unattributable,
+// ambiguous). Only a SUCCESSFUL response carrying no usage block means work may
+// have been served that cannot be billed — that is the alarming case.
+func TestResult_MissingUsagePagesOnlyWhenUnexplained(t *testing.T) {
+	// Routine: aborts/upstream failures. Reported, NOT paged.
+	routine := Result{MissingUsageEvents: 12, ExpectedMissingUsageEvents: 12}
+	if !routine.HasMissingUsage() {
+		t.Fatal("HasMissingUsage() must still report the total for reconciliation")
+	}
+	if routine.HasUnexplainedMissingUsage() {
+		t.Fatal("wholly-expected missing usage must not be classed unexplained")
+	}
+	if routine.HasAnomaly() {
+		t.Fatal("routine aborts/failures must NOT page: exit 2 is reserved for rare, wrong conditions")
+	}
+
+	// A success with no usage block: work possibly served, unbillable. Pages.
+	unexplained := Result{MissingUsageEvents: 1, UnexplainedMissingUsageEvents: 1}
+	if !unexplained.HasUnexplainedMissingUsage() {
+		t.Fatal("a success with no usage block must be classed unexplained")
+	}
+	if !unexplained.HasAnomaly() {
+		t.Fatal("unexplained missing usage must be a fail-loud billing anomaly")
+	}
+
+	// Mixed window: the routine share must not mask the unexplained one.
+	mixed := Result{MissingUsageEvents: 50, ExpectedMissingUsageEvents: 49, UnexplainedMissingUsageEvents: 1}
+	if !mixed.HasAnomaly() {
+		t.Fatal("one unexplained attempt among many routine ones must still page")
 	}
 }
 

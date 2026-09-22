@@ -43,15 +43,22 @@ type Result struct {
 	// int64: COUNT/SUM over an arbitrary backfill window can exceed 2^31; the SQL
 	// casts these as ::bigint to avoid a silent 32-bit overflow (see store.go).
 	EventsRated          int64
-	UnpricedEvents       int64  // events whose model had NO resolvable price (NOT $0-billed)
-	UnattributableEvents int64  // in-window rows with NULL auth_id/resource_id/model_id (upstream leak)
-	MissingUsageEvents   int64  // attempts with no authoritative engine usage block (zero-charge, fail loud)
-	InvalidUsageEvents   int64  // authoritative evidence with malformed token counts (never money)
-	AmbiguousBaseEvents  int64  // events under an ft: rollup spanning >1 base_model (E3 violation)
-	AmbiguousOrgEvents   int64  // events under a rollup spanning >1 non-NULL org_id (E2 attribution bug)
-	RollupsWritten       int64  // distinct (auth_id, resource_id, model_id, hour) rows upserted
-	ReconciledDeletions  int64  // stale in-window rollups DELETED because this re-run no longer produces them
-	TotalCost            string // sum of all rollup costs, NUMERIC as text
+	UnpricedEvents       int64 // events whose model had NO resolvable price (NOT $0-billed)
+	UnattributableEvents int64 // in-window rows with NULL auth_id/resource_id/model_id (upstream leak)
+	MissingUsageEvents   int64 // attempts with no authoritative engine usage block (zero-charge) — TOTAL, reported not paged
+	// ExpectedMissingUsageEvents is the routine share of MissingUsageEvents: the
+	// client aborted, or the attempt terminated non-success. Reported, never paged.
+	ExpectedMissingUsageEvents int64
+	// UnexplainedMissingUsageEvents is the alarming share: a SUCCESSFUL response
+	// carrying no usage block, i.e. served work we cannot bill. This is the
+	// missing-usage signal that pages.
+	UnexplainedMissingUsageEvents int64
+	InvalidUsageEvents            int64  // authoritative evidence with malformed token counts (never money)
+	AmbiguousBaseEvents           int64  // events under an ft: rollup spanning >1 base_model (E3 violation)
+	AmbiguousOrgEvents            int64  // events under a rollup spanning >1 non-NULL org_id (E2 attribution bug)
+	RollupsWritten                int64  // distinct (auth_id, resource_id, model_id, hour) rows upserted
+	ReconciledDeletions           int64  // stale in-window rollups DELETED because this re-run no longer produces them
+	TotalCost                     string // sum of all rollup costs, NUMERIC as text
 }
 
 // HasUnpriced reports whether any event could not be priced (a loud outcome even
@@ -65,8 +72,22 @@ func (r Result) HasUnpriced() bool { return r.UnpricedEvents > 0 }
 func (r Result) HasUnattributable() bool { return r.UnattributableEvents > 0 }
 
 // HasMissingUsage reports attempts retained for audit but excluded from money
-// because the serving engine did not supply authoritative token counts.
+// because the serving engine did not supply authoritative token counts. This is
+// the TOTAL across both causes and is REPORTED, not paged — see
+// HasUnexplainedMissingUsage for the paging signal and HasAnomaly for why.
 func (r Result) HasMissingUsage() bool { return r.MissingUsageEvents > 0 }
+
+// HasUnexplainedMissingUsage reports the alarming share of missing usage: the
+// attempt was neither aborted by the client nor terminated with a failure status,
+// so the engine reported SUCCESS while reporting no tokens. That is work we may
+// have served and cannot bill, so it is the fail-loud, exit-nonzero signal.
+//
+// The routine share (client aborts, upstream failures) is deliberately excluded:
+// this branch made zero-usage rows a NORMAL product of every abort and every 5xx,
+// so paging on the total would fire hourly on any install with real traffic and
+// would bury the rare anomalies (unpriced, unattributable, ambiguous) that share
+// the exit-2 channel. Ratified with Hugo, 2026-09-21.
+func (r Result) HasUnexplainedMissingUsage() bool { return r.UnexplainedMissingUsageEvents > 0 }
 
 // HasInvalidUsage reports authoritative raw evidence whose token counts violate
 // the billing invariants. It is retained for repair but excluded from money.
@@ -87,11 +108,18 @@ func (r Result) HasAmbiguousBase() bool { return r.AmbiguousBaseEvents > 0 }
 func (r Result) HasAmbiguousOrg() bool { return r.AmbiguousOrgEvents > 0 }
 
 // HasAnomaly reports whether something leaked: events that could not be priced,
-// rows that could not be attributed, attempts missing engine usage, an ft: rollup
-// spanning multiple base_models, or a rollup spanning multiple orgs. All are
-// fail-loud signals, so cmd/rater exits non-zero on any of them.
+// rows that could not be attributed, a SUCCESSFUL attempt that reported no engine
+// usage, malformed authoritative counts, an ft: rollup spanning multiple
+// base_models, or a rollup spanning multiple orgs. All are RARE and WRONG, so
+// cmd/rater exits non-zero on any of them and an operator should be paged.
+//
+// Deliberately NOT here: the missing-usage TOTAL. Client aborts and upstream
+// failures legitimately produce zero-usage rows on every install with traffic, so
+// including them would make exit 2 fire hourly and destroy its meaning for the
+// conditions above. Those are reported (and land in
+// billing_reconciliation_hourly) rather than paged.
 func (r Result) HasAnomaly() bool {
-	return r.HasUnpriced() || r.HasUnattributable() || r.HasMissingUsage() || r.HasInvalidUsage() || r.HasAmbiguousBase() || r.HasAmbiguousOrg()
+	return r.HasUnpriced() || r.HasUnattributable() || r.HasUnexplainedMissingUsage() || r.HasInvalidUsage() || r.HasAmbiguousBase() || r.HasAmbiguousOrg()
 }
 
 // Run rates [windowStart, windowEnd): it runs the SINGLE SQL statement that
@@ -146,6 +174,8 @@ func (r *Rater) Run(ctx context.Context, windowStart, windowEnd time.Time, windo
 	res.UnpricedEvents = rr.UnpricedEvents
 	res.UnattributableEvents = rr.UnattributableEvents
 	res.MissingUsageEvents = rr.MissingUsageEvents
+	res.ExpectedMissingUsageEvents = rr.ExpectedMissingUsageEvents
+	res.UnexplainedMissingUsageEvents = rr.UnexplainedMissingUsageEvents
 	res.InvalidUsageEvents = rr.InvalidUsageEvents
 	res.AmbiguousBaseEvents = rr.AmbiguousBaseEvents
 	res.AmbiguousOrgEvents = rr.AmbiguousOrgEvents
@@ -166,9 +196,16 @@ func (r *Rater) Run(ctx context.Context, windowStart, windowEnd time.Time, windo
 		r.log.Error.Printf("rating: window [%s,%s) has %d UNPRICED events (nothing resolved: model_id absent from the price file AND base_model empty/unpriced — which for fine-tune traffic (X-Saturn-Adapter present or an ft: id) is a base_model PROPAGATION BUG, not a free model) — these are NOT billed; the create-time price gate should prevent this, so a nonzero count means an unpriced model was served (or a header stopped propagating). Add the price/fix the header and re-rate this window",
 			windowStart.Format(time.RFC3339), windowEnd.Format(time.RFC3339), res.UnpricedEvents)
 	}
-	if res.HasMissingUsage() {
-		r.log.Error.Printf("rating: window [%s,%s) has %d MISSING-USAGE execution attempts — Phoebe retained zero-charge audit rows but excluded them from rated_usage because the engine supplied no authoritative usage block. Reconcile against engine logs before settling the invoice",
-			windowStart.Format(time.RFC3339), windowEnd.Format(time.RFC3339), res.MissingUsageEvents)
+	if res.HasUnexplainedMissingUsage() {
+		r.log.Error.Printf("rating: window [%s,%s) has %d UNEXPLAINED MISSING-USAGE attempts — the response was NOT aborted and did NOT fail, so the engine reported success while supplying no authoritative usage block: work may have been served that cannot be billed. Reconcile against engine logs before settling the invoice",
+			windowStart.Format(time.RFC3339), windowEnd.Format(time.RFC3339), res.UnexplainedMissingUsageEvents)
+	}
+	if res.ExpectedMissingUsageEvents > 0 {
+		// Routine: client aborts and upstream failures. Zero-charge by design and
+		// reviewed in billing_reconciliation_hourly — reported at INFO so it never
+		// competes with the fail-loud channel above.
+		r.log.Info.Printf("rating: window [%s,%s) has %d expected missing-usage attempts (client aborted or upstream failed) — retained at zero charge, excluded from rated_usage, no action required",
+			windowStart.Format(time.RFC3339), windowEnd.Format(time.RFC3339), res.ExpectedMissingUsageEvents)
 	}
 	if res.HasInvalidUsage() {
 		r.log.Error.Printf("rating: window [%s,%s) has %d INVALID-USAGE events — authoritative raw evidence was retained but excluded from rated_usage because token counts were negative or cached tokens exceeded prompt tokens. Repair or quarantine the evidence before settling the invoice",
@@ -198,9 +235,10 @@ func (r *Rater) Run(ctx context.Context, windowStart, windowEnd time.Time, windo
 	}
 
 	if res.HasAnomaly() {
-		r.log.Error.Printf("rating: window [%s,%s) rated %d events into %d rollups, total=%s USD; %d UNPRICED events dropped (backfill prices and re-rate), %d UNATTRIBUTABLE rows skipped (NULL auth_id/resource_id/model_id — upstream billing-gate leak), %d MISSING-USAGE attempts held at zero charge (reconcile engine logs), %d INVALID-USAGE events excluded from money, %d AMBIGUOUS-BASE events dropped (one model_id, more than one base_model-derived rate — fix base_model/adapter propagation and re-rate), %d AMBIGUOUS-ORG events dropped (one resource spanning multiple orgs — fix org_id propagation and re-rate)",
+		r.log.Error.Printf("rating: window [%s,%s) rated %d events into %d rollups, total=%s USD; %d UNPRICED events dropped (backfill prices and re-rate), %d UNATTRIBUTABLE rows skipped (NULL auth_id/resource_id/model_id — upstream billing-gate leak), %d UNEXPLAINED MISSING-USAGE attempts (success with no usage block — reconcile engine logs) of %d missing-usage total, %d INVALID-USAGE events excluded from money, %d AMBIGUOUS-BASE events dropped (one model_id, more than one base_model-derived rate — fix base_model/adapter propagation and re-rate), %d AMBIGUOUS-ORG events dropped (one resource spanning multiple orgs — fix org_id propagation and re-rate)",
 			windowStart.Format(time.RFC3339), windowEnd.Format(time.RFC3339),
-			res.EventsRated, res.RollupsWritten, res.TotalCost, res.UnpricedEvents, res.UnattributableEvents, res.MissingUsageEvents, res.InvalidUsageEvents, res.AmbiguousBaseEvents, res.AmbiguousOrgEvents)
+			res.EventsRated, res.RollupsWritten, res.TotalCost, res.UnpricedEvents, res.UnattributableEvents,
+			res.UnexplainedMissingUsageEvents, res.MissingUsageEvents, res.InvalidUsageEvents, res.AmbiguousBaseEvents, res.AmbiguousOrgEvents)
 	} else {
 		r.log.Info.Printf("rating: window [%s,%s) rated %d events into %d rollups, total=%s USD",
 			windowStart.Format(time.RFC3339), windowEnd.Format(time.RFC3339),

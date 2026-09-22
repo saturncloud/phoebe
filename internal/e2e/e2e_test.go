@@ -778,6 +778,15 @@ func TestE2E_ModellessEventWithoutUsageIsMissingUsage(t *testing.T) {
 	if res.MissingUsageEvents != 1 {
 		t.Errorf("MissingUsageEvents = %d, want 1 (the no-usage attempt)", res.MissingUsageEvents)
 	}
+	// Cause partition: this attempt was ABORTED, so it is routine — reported for
+	// reconciliation, never paged (ratified with Hugo 2026-09-21). Paging on the
+	// cause-blind total fired hourly on any install with traffic.
+	if res.ExpectedMissingUsageEvents != 1 {
+		t.Errorf("ExpectedMissingUsageEvents = %d, want 1 (an abort is a routine zero-usage cause)", res.ExpectedMissingUsageEvents)
+	}
+	if res.UnexplainedMissingUsageEvents != 0 {
+		t.Errorf("UnexplainedMissingUsageEvents = %d, want 0 (the attempt aborted; it did not report success)", res.UnexplainedMissingUsageEvents)
+	}
 	if res.UnattributableEvents != 0 {
 		t.Errorf("UnattributableEvents = %d, want 0 — missing usage is the exclusive, more specific bucket", res.UnattributableEvents)
 	}
@@ -787,8 +796,56 @@ func TestE2E_ModellessEventWithoutUsageIsMissingUsage(t *testing.T) {
 	if res.EventsRated != 0 || res.RollupsWritten != 0 {
 		t.Errorf("rater billed a model-less event: %+v (must never be rated, let alone $0-billed)", res)
 	}
+	// An aborted attempt is correctly billed zero and is NOT a pageable anomaly:
+	// exit 2 is reserved for rare, wrong conditions. The attempt is still fully
+	// recorded (asserted above) and surfaces in billing_reconciliation_hourly.
+	if res.HasAnomaly() {
+		t.Error("Result.HasAnomaly() = true for a routine client abort — exit 2 must stay reserved for rare, wrong conditions")
+	}
+	h.assertNumericEqual(t, res.TotalCost, "0", "Result.TotalCost")
+}
+
+// TestE2E_SuccessWithoutUsagePages is the other half of the missing-usage cause
+// partition: an attempt the engine reported as SUCCESSFUL while supplying no usage
+// block means work may have been served that cannot be billed. That is the
+// unexplained case and it MUST drive the exit-nonzero path, end to end through the
+// emitter, stream, drainer and rater.
+func TestE2E_SuccessWithoutUsagePages(t *testing.T) {
+	h := newHarness(t, "phoebe_e2e_success_no_usage")
+
+	h.emitter.Emit(context.Background(), metering.Event{
+		RequestID:    "phoebe-e2e-success-no-usage-0001",
+		AuthID:       testAuthID,
+		UserID:       "user-e2e",
+		GroupID:      "group-e2e",
+		ResourceID:   testResourceID,
+		ResourceType: "deployment",
+		Model:        testModelName,
+		// Not aborted, HTTP 200, yet the engine reported no usage block.
+		Aborted:    false,
+		StatusCode: 200,
+		UsageFound: false,
+	})
+
+	h.waitForStreamLen(t, 1, 5*time.Second)
+	h.drainUntilRows(t, 1, 10*time.Second)
+
+	res := h.rateEventHour(t, h.priceBook(t))
+
+	if res.MissingUsageEvents != 1 {
+		t.Errorf("MissingUsageEvents = %d, want 1", res.MissingUsageEvents)
+	}
+	if res.UnexplainedMissingUsageEvents != 1 {
+		t.Errorf("UnexplainedMissingUsageEvents = %d, want 1 (success with no usage block)", res.UnexplainedMissingUsageEvents)
+	}
+	if res.ExpectedMissingUsageEvents != 0 {
+		t.Errorf("ExpectedMissingUsageEvents = %d, want 0 (neither aborted nor failed)", res.ExpectedMissingUsageEvents)
+	}
+	if res.EventsRated != 0 || res.RollupsWritten != 0 {
+		t.Errorf("rater billed an attempt with no authoritative usage: %+v", res)
+	}
 	if !res.HasAnomaly() {
-		t.Error("Result.HasAnomaly() = false — the leak must drive the exit-nonzero path")
+		t.Error("Result.HasAnomaly() = false — a success with no usage block must drive the exit-nonzero path")
 	}
 	h.assertNumericEqual(t, res.TotalCost, "0", "Result.TotalCost")
 }
