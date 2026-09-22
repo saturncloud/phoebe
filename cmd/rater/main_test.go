@@ -215,23 +215,50 @@ func TestRaterSettings_ManagerURLIsTheOnlyPriceSource(t *testing.T) {
 	}
 }
 
-// TestRaterSettings_PriceFileKeyIsGone: a leftover priceFile in an operator's
-// settings must not look like a working price source. The manager is the only one;
-// an install that cannot egress runs its own manager instance.
-func TestRaterSettings_PriceFileKeyIsGone(t *testing.T) {
+// TestRaterSettings_PriceFileKeyIsInertAndFailsClosed pins what actually happens to a
+// leftover priceFile key from the price-file world: loadConfig uses plain
+// yaml.Unmarshal (not UnmarshalStrict), so priceFile is an UNKNOWN key and is
+// silently DROPPED — it is ignored, not rejected. The guarantee this test holds is
+// therefore not "the key errors" but "the key is inert": it cannot stand in for
+// managerURL, so an operator whose settings file carries only priceFile gets an
+// empty managerURL and run() exits fatal (main.go:201) rather than pricing from a
+// stale local file or defaulting to $0. The positive control below proves the
+// assertion is not vacuous — the loader really does read the file, and priceFile
+// sitting next to managerURL does not disturb it.
+func TestRaterSettings_PriceFileKeyIsInertAndFailsClosed(t *testing.T) {
 	dir := t.TempDir()
-	path := filepath.Join(dir, "rater.yaml")
-	settings := "debug: false\n" +
+
+	// Case 1: priceFile ONLY — the migration hazard. Ignored, not an error, and it
+	// leaves managerURL empty so run() fails closed.
+	stalePath := filepath.Join(dir, "stale.yaml")
+	stale := "debug: false\n" +
 		"priceFile: /etc/saturn/prices/prices.yaml\n"
-	if err := os.WriteFile(path, []byte(settings), 0o600); err != nil {
+	if err := os.WriteFile(stalePath, []byte(stale), 0o600); err != nil {
 		t.Fatal(err)
 	}
-
-	_, opts, err := loadConfig(path)
+	_, opts, err := loadConfig(stalePath)
 	if err != nil {
-		t.Fatalf("loadConfig: %v", err)
+		t.Fatalf("loadConfig: %v, want nil — an unknown priceFile key is ignored by the non-strict loader, not an error", err)
 	}
 	if opts.managerURL != "" {
 		t.Fatalf("managerURL = %q, want empty — a priceFile key must not stand in for one", opts.managerURL)
+	}
+
+	// Case 2 (positive control): priceFile ALONGSIDE managerURL. Proves the loader
+	// reads the file at all — so case 1's empty managerURL means "dropped", not
+	// "nothing was parsed" — and that the stale key does not clobber the real one.
+	bothPath := filepath.Join(dir, "both.yaml")
+	both := "debug: false\n" +
+		"priceFile: /etc/saturn/prices/prices.yaml\n" +
+		"managerURL: \"https://manager.example\"\n"
+	if err := os.WriteFile(bothPath, []byte(both), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	_, opts, err = loadConfig(bothPath)
+	if err != nil {
+		t.Fatalf("loadConfig: %v", err)
+	}
+	if opts.managerURL != "https://manager.example" {
+		t.Fatalf("managerURL = %q, want the configured URL — a leftover priceFile must not disturb the real price source", opts.managerURL)
 	}
 }
