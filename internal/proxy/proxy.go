@@ -26,6 +26,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"net"
 	"net/http"
 	"net/http/httputil"
 	"net/url"
@@ -455,6 +456,15 @@ func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request) {
 			if graph == "" {
 				graph = graphFromUpstreamHost(upstream.Host)
 			}
+			if graph == "" {
+				// A degenerate upstream host (e.g. ":8000") cannot be bound to a
+				// graph scope. Like a missing organization, this is a broken
+				// trusted identity contract, not a Valkey outage: reject before
+				// Admit so it can never enter the fail-open bypass below.
+				s.log.Error.Printf("admission: cannot derive graph scope from upstream host %q request_id=%s", upstream.Host, requestID)
+				http.Error(w, "shared inference identity unavailable", http.StatusServiceUnavailable)
+				return
+			}
 			admitted, err = s.admitter.Admit(r.Context(), admission.Request{
 				Graph: graph, Organization: id.OrgID, Owner: id.OwnerID, Model: estimate.Model,
 				PromptBytes: originalPromptBytes, EstimatedInputTokens: estimate.InputTokens,
@@ -462,6 +472,13 @@ func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request) {
 				Adapter:              id.Adapter != "", OrganizationLimits: organizationLimits, OwnerLimits: ownerLimits,
 			})
 			if err != nil {
+				if errors.Is(err, admission.ErrInvalidIdentity) {
+					// A broken trusted identity contract fails closed; only a
+					// genuinely unavailable admission store may bypass.
+					s.log.Error.Printf("admission: broken trusted identity request_id=%s: %v", requestID, err)
+					http.Error(w, "shared inference identity unavailable", http.StatusServiceUnavailable)
+					return
+				}
 				if errors.Is(err, admission.ErrUnavailable) {
 					s.log.Error.Printf("admission: distributed gate unavailable; bypassing for otherwise valid request_id=%s: %v", requestID, err)
 					admitted = nil
@@ -637,23 +654,37 @@ func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request) {
 //
 // NO double-emit: in phoebe ModifyResponse always returns nil, so ErrorHandler
 // fires ONLY on a RoundTrip error (pre-header) — mutually exclusive with the
-// onDone path (post-header), which needs ModifyResponse to have run. The emit is
-// gated on isClientAbort, so a genuine upstream/ModifyResponse fault never writes
-// a bogus zero-token billing row. The context is decoupled from the cancelled
-// client ctx (WithoutCancel) — the abort is precisely WHY we are here, so a
-// cancelled ctx must not be able to drop the emit (mirrors onDone).
+// onDone path (post-header), which needs ModifyResponse to have run. The abort
+// emit is gated on isClientAbort; an admitted request whose non-abort failure is
+// indeterminate (not a verifiable pre-write dial failure) emits the same
+// zero-token attributable event, because the engine may already have done work
+// and the request must not be invisible to billing. Unaffected non-admitted
+// faults (dedicated traffic, gateway resolution) never emit here.
+//
+// LEASE SETTLEMENT: an abort or an indeterminate non-abort failure settles with
+// CompleteUnknownUsage — the conservative token reservation is retained, because
+// consumed engine work must not vanish from the contract windows. Only a
+// verified pre-write dial failure (the request provably never left the process)
+// settles Complete(0). The context is decoupled from the cancelled client ctx
+// (WithoutCancel) — the abort is precisely WHY we are here, so a cancelled ctx
+// must not be able to drop the emit or the settlement (mirrors onDone).
 func (s *Server) errorHandler(upstream string, id identity.Identity, requestID string, admitted *admission.Lease, responseCaptureInstalled *atomic.Bool) func(http.ResponseWriter, *http.Request, error) {
 	return func(w http.ResponseWriter, r *http.Request, err error) {
 		clientAbort := isClientAbort(err)
+		indeterminate := false
 		if admitted != nil && (responseCaptureInstalled == nil || !responseCaptureInstalled.Load()) {
 			ctx := context.WithoutCancel(r.Context())
 			var settlementErr error
-			if clientAbort {
-				// Once dispatched, a client can cancel before Phoebe observes response
-				// headers even though the engine has already done work. With no usage
-				// block available, retain the conservative token reservation.
+			if clientAbort || !isPreWriteDialFailure(err) {
+				// Once dispatched, a client can cancel — or the upstream can read
+				// the full request and then reset before headers — even though the
+				// engine has already done work. With no usage block available,
+				// retain the conservative token reservation.
+				indeterminate = true
 				settlementErr = admitted.CompleteUnknownUsage(ctx)
 			} else {
+				// A dial failure proves the request never left the process, so no
+				// engine work could have been consumed: settle zero.
 				settlementErr = admitted.Complete(ctx, 0)
 			}
 			if settlementErr != nil {
@@ -675,6 +706,15 @@ func (s *Server) errorHandler(upstream string, id identity.Identity, requestID s
 			return
 		}
 		s.log.Error.Printf("upstream %s error: %v", upstream, err)
+		if indeterminate {
+			// An admitted request whose usage is indeterminate (the upstream may
+			// have consumed engine work before failing) gets the same zero-token
+			// attributable event as the pre-header abort, under the same
+			// BillPartialOnAbort policy. Verifiable pre-write dial failures settle
+			// zero and emit nothing — no engine work was possible.
+			ctx := context.WithoutCancel(r.Context())
+			s.emit(ctx, id, requestID, capture.Result{Aborted: true, UsageFound: false})
+		}
 		http.Error(w, "upstream error", http.StatusBadGateway)
 	}
 }
@@ -856,4 +896,15 @@ func isEventStream(resp *http.Response) bool {
 // two must agree on what "abort" means, hence one helper.
 func isClientAbort(err error) bool {
 	return errors.Is(err, context.Canceled)
+}
+
+// isPreWriteDialFailure reports whether err proves the request never left the
+// process: the transport failed while dialing (connection refused, DNS, dial
+// timeout), before a single request byte could be written. Only such failures
+// may settle an admission lease with zero usage; every other non-abort
+// RoundTrip error is indeterminate — the upstream may have read the request
+// and consumed engine work — and is charged conservatively.
+func isPreWriteDialFailure(err error) bool {
+	var opErr *net.OpError
+	return errors.As(err, &opErr) && opErr.Op == "dial"
 }

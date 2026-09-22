@@ -22,6 +22,12 @@ import (
 
 var ErrUnavailable = errors.New("distributed admission state unavailable")
 
+// ErrInvalidIdentity marks a broken trusted identity contract (a missing
+// organization, model, graph, or required owner). It is deliberately distinct
+// from ErrUnavailable: an unavailable fairness store bypasses soft limits for
+// otherwise valid traffic, while broken trusted identity must fail closed.
+var ErrInvalidIdentity = errors.New("trusted admission identity invalid")
+
 const (
 	// Admission is deliberately a soft, fail-open gate. Keep its network budget
 	// far below an inference request's latency budget so a blackholed Valkey
@@ -145,10 +151,10 @@ func randomID() (string, error) {
 
 func (a *RedisAdmitter) Admit(ctx context.Context, req Request) (*Lease, error) {
 	if req.Organization == "" || req.Model == "" || req.Graph == "" {
-		return nil, fmt.Errorf("%w: missing trusted organization/model/graph identity", ErrUnavailable)
+		return nil, fmt.Errorf("%w: missing trusted organization/model/graph identity", ErrInvalidIdentity)
 	}
 	if req.OwnerLimits.any() && req.Owner == "" {
-		return nil, fmt.Errorf("%w: missing trusted owner identity", ErrUnavailable)
+		return nil, fmt.Errorf("%w: missing trusted owner identity", ErrInvalidIdentity)
 	}
 	if req.PromptBytes < 0 || req.EstimatedInputTokens <= 0 || req.ReservedOutputTokens <= 0 {
 		return nil, &Rejected{Scope: "request", Dimension: "work estimate", RetryAfter: time.Second}

@@ -14,6 +14,11 @@ run: build
 test:
 	go test ./...
 
+# Race-detector gate over the admission/proxy concurrency surface.
+.PHONY: test-race
+test-race:
+	go test -race ./internal/admission/... ./internal/proxy/...
+
 # Runs the live-Postgres conformance tests (the `integration` build tag). These
 # prove the production SQL rater computes the same money as the Rate() oracle —
 # including the sum-then-round behavior a unit test can't exercise. Requires

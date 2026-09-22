@@ -320,10 +320,36 @@ func TestLoadAdmissionRejectsInvalidPolicy(t *testing.T) {
 		"admission:\n  enabled: true\n  valkeyAddr: v\n  platform:\n    totalPromptTokensPerWindow: 10\n    uncachedPromptTokensPerWindow: 11\n",
 		"admission:\n  enabled: true\n  valkeyAddr: v\n  platform:\n    maxActiveRequests: 10\n    maxConcurrentPrefills: 11\n",
 		"admission:\n  enabled: true\n  valkeyAddr: v\n  platform:\n    maxActiveRequests: 10\n    maxReservedDecodeSlots: 11\n",
+		// Lane hints are stamped on shared requests even while admission is
+		// disabled, so hint ranges and lane-map integrity validate regardless.
+		"admission:\n  enabled: false\n  lanes:\n    default:\n      weight: 1\n      dynamoStrictPriority: -1\n",
+		"admission:\n  enabled: false\n  lanes:\n    default:\n      weight: 1\n      dynamoPriority: 2147483648\n",
+		"admission:\n  enabled: false\n  organizationLanes:\n    org-a: missing\n",
+		"admission:\n  enabled: false\n  lanes:\n    gold:\n      weight: 1\n",
+		// Weighted lane shares above the platform limit.
+		"admission:\n  enabled: true\n  valkeyAddr: v\n  platform:\n    maxActiveRequests: 2\n  lanes:\n    default:\n      weight: 1\n      limits:\n        maxActiveRequests: 2\n    gold:\n      weight: 1\n      limits:\n        maxActiveRequests: 1\n",
+		// weight*value int64 overflow.
+		"admission:\n  enabled: true\n  valkeyAddr: v\n  lanes:\n    default:\n      weight: 9223372036854775807\n      limits:\n        maxActiveRequests: 2\n",
+		// The platform sets a dimension the lane omits.
+		"admission:\n  enabled: true\n  valkeyAddr: v\n  platform:\n    maxActiveRequests: 10\n  lanes:\n    default:\n      weight: 1\n      limits:\n        maxPromptBytes: 1024\n",
+		// Individually valid weighted shares whose sum overflows int64.
+		"admission:\n  enabled: true\n  valkeyAddr: v\n  lanes:\n    default:\n      weight: 4611686018427387904\n      limits:\n        maxActiveRequests: 1\n    gold:\n      weight: 4611686018427387904\n      limits:\n        maxActiveRequests: 1\n",
 	}
 	for _, body := range tests {
 		if _, err := Load(writeTemp(t, body)); err == nil {
 			t.Fatalf("expected invalid policy rejection for:\n%s", body)
 		}
+	}
+}
+
+// While admission is disabled, valid lanes must still load (weight, lane-share,
+// leaseTtl, and valkeyAddr validation stay behind the Enabled gate).
+func TestLoadAdmissionDisabledWithValidLanes(t *testing.T) {
+	s, err := Load(writeTemp(t, "admission:\n  enabled: false\n  lanes:\n    default:\n      weight: 0\n      dynamoPriority: 5\n      dynamoStrictPriority: 2\n  organizationLanes:\n    org-a: default\n"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := s.Admission.Lanes["default"]; got.DynamoPriority != 5 || got.DynamoStrictPriority != 2 {
+		t.Fatalf("disabled-admission lane hints wrong: %+v", got)
 	}
 }

@@ -81,6 +81,119 @@ func TestRealValkeyAtomicAdmission(t *testing.T) {
 	}
 }
 
+// TestRealValkeyLeaseLifecycleTransitions exercises the lease transition
+// scripts (prefill, cold hold, renew) against a real server, asserting the
+// prefill and cold counters actually release capacity and that a short
+// KeepAlive renewal advances the lease expiry.
+func TestRealValkeyLeaseLifecycleTransitions(t *testing.T) {
+	addr := os.Getenv("PHOEBE_TEST_ADMISSION_VALKEY_ADDR")
+	if addr == "" {
+		t.Fatal("PHOEBE_TEST_ADMISSION_VALKEY_ADDR is required")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	client := redis.NewClient(&redis.Options{Addr: addr})
+	if err := client.Ping(ctx).Err(); err != nil {
+		t.Fatalf("ping real Valkey: %v", err)
+	}
+
+	l := limits(2)
+	l.MaxConcurrentPrefills = 1
+	l.MaxColdHolds = 1
+	l.WakesPerWindow = 10
+	cfg := config.AdmissionSettings{
+		KeyPrefix: fmt.Sprintf("phoebe-admission-lifecycle-%d", time.Now().UnixNano()),
+		LeaseTTL:  300 * time.Millisecond,
+		Platform:  l,
+	}
+	a := New(client, cfg)
+	t.Cleanup(func() {
+		_ = client.Del(context.Background(), a.counters, a.leases, a.expiries, a.windowExpiries).Err()
+		_ = client.Close()
+	})
+
+	// Prefill cap: the second admit is blocked until the first lease's prefill
+	// reservation is released by PrefillDone.
+	first, err := a.Admit(ctx, request("org-a", "model"))
+	if err != nil {
+		t.Fatalf("admit first: %v", err)
+	}
+	if _, err := a.Admit(ctx, request("org-b", "model")); err == nil {
+		t.Fatal("second concurrent prefill admitted past the cap")
+	} else if _, ok := err.(*Rejected); !ok {
+		t.Fatalf("prefill contention error = %T %v, want Rejected", err, err)
+	}
+	if err := first.PrefillDone(ctx); err != nil {
+		t.Fatalf("prefill transition: %v", err)
+	}
+	second, err := a.Admit(ctx, request("org-b", "model"))
+	if err != nil {
+		t.Fatalf("released prefill counter did not reopen capacity: %v", err)
+	}
+
+	// Cold-hold cap: BeginColdHold is exclusive at one hold; EndColdHold must
+	// release the counter for the next holder.
+	if err := first.BeginColdHold(ctx); err != nil {
+		t.Fatalf("begin cold hold: %v", err)
+	}
+	if err := second.BeginColdHold(ctx); err == nil {
+		t.Fatal("concurrent cold hold admitted past the cap")
+	} else if _, ok := err.(*Rejected); !ok {
+		t.Fatalf("cold-hold contention error = %T %v, want Rejected", err, err)
+	}
+	if err := first.EndColdHold(ctx); err != nil {
+		t.Fatalf("end cold hold: %v", err)
+	}
+	if err := second.BeginColdHold(ctx); err != nil {
+		t.Fatalf("released cold-hold counter did not reopen capacity: %v", err)
+	}
+	if err := second.EndColdHold(ctx); err != nil {
+		t.Fatalf("end second cold hold: %v", err)
+	}
+
+	// A short KeepAlive renewal must advance the lease expiry on the real
+	// server's TIME and must not report an error for a healthy lease.
+	expiry0, err := client.ZScore(ctx, a.expiries, first.id).Result()
+	if err != nil {
+		t.Fatalf("read initial expiry: %v", err)
+	}
+	keepaliveCtx, stopKeepalive := context.WithCancel(ctx)
+	renewErr := make(chan error, 1)
+	go first.KeepAlive(keepaliveCtx, func(e error) {
+		select {
+		case renewErr <- e:
+		default:
+		}
+	})
+	deadline := time.Now().Add(3 * time.Second)
+	for {
+		expiry, zerr := client.ZScore(ctx, a.expiries, first.id).Result()
+		if zerr != nil {
+			t.Fatalf("read renewed expiry: %v", zerr)
+		}
+		if expiry > expiry0 {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("KeepAlive did not renew the lease on the real server")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	stopKeepalive()
+	select {
+	case e := <-renewErr:
+		t.Fatalf("healthy keepalive reported an error: %v", e)
+	default:
+	}
+
+	if err := first.Complete(ctx, 1); err != nil {
+		t.Fatalf("complete first: %v", err)
+	}
+	if err := second.Complete(ctx, 1); err != nil {
+		t.Fatalf("complete second: %v", err)
+	}
+}
+
 func TestRealValkeyReapsRetiredScopeWindows(t *testing.T) {
 	addr := os.Getenv("PHOEBE_TEST_ADMISSION_VALKEY_ADDR")
 	if addr == "" {

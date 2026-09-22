@@ -316,6 +316,28 @@ func (s *Settings) parse() error {
 }
 
 func (a *AdmissionSettings) parse() error {
+	// Trusted lane hints are stamped onto every shared request even while
+	// admission is disabled (the proxy overwrites client-supplied Dynamo
+	// priority headers from the lane), so hint ranges and the lane map's
+	// referential integrity are validated regardless of the rollout switch.
+	for name, lane := range a.Lanes {
+		if lane.DynamoPriority < -(1<<31) || lane.DynamoPriority > 1<<31-1 {
+			return fmt.Errorf("admission.lanes.%s.dynamoPriority must fit in a signed 32-bit integer", name)
+		}
+		if lane.DynamoStrictPriority < 0 || lane.DynamoStrictPriority > 1<<32-1 {
+			return fmt.Errorf("admission.lanes.%s.dynamoStrictPriority must fit in an unsigned 32-bit integer", name)
+		}
+	}
+	if len(a.Lanes) > 0 {
+		if _, ok := a.Lanes["default"]; !ok {
+			return fmt.Errorf("admission.lanes requires a default lane for unmapped organizations")
+		}
+	}
+	for org, lane := range a.OrganizationLanes {
+		if _, ok := a.Lanes[lane]; !ok {
+			return fmt.Errorf("admission.organizationLanes.%s names unknown lane %q", org, lane)
+		}
+	}
 	if !a.Enabled {
 		return nil
 	}
@@ -346,12 +368,6 @@ func (a *AdmissionSettings) parse() error {
 		if lane.Weight <= 0 {
 			return fmt.Errorf("admission.lanes.%s.weight must be positive", name)
 		}
-		if lane.DynamoPriority < -(1<<31) || lane.DynamoPriority > 1<<31-1 {
-			return fmt.Errorf("admission.lanes.%s.dynamoPriority must fit in a signed 32-bit integer", name)
-		}
-		if lane.DynamoStrictPriority < 0 || lane.DynamoStrictPriority > 1<<32-1 {
-			return fmt.Errorf("admission.lanes.%s.dynamoStrictPriority must fit in an unsigned 32-bit integer", name)
-		}
 		if err := lane.Limits.parse("admission.lanes." + name); err != nil {
 			return err
 		}
@@ -363,16 +379,8 @@ func (a *AdmissionSettings) parse() error {
 		}
 	}
 	if len(a.Lanes) > 0 {
-		if _, ok := a.Lanes["default"]; !ok {
-			return fmt.Errorf("admission.lanes requires a default lane for unmapped organizations")
-		}
 		if err := a.validateLaneShares(); err != nil {
 			return err
-		}
-	}
-	for org, lane := range a.OrganizationLanes {
-		if _, ok := a.Lanes[lane]; !ok {
-			return fmt.Errorf("admission.organizationLanes.%s names unknown lane %q", org, lane)
 		}
 	}
 	return nil

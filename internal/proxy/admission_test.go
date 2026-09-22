@@ -10,6 +10,7 @@ import (
 	"net/http/httptest"
 	"net/url"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -288,6 +289,70 @@ func TestWakeEnabledWarmRequestExecutesMetersAndSettlesOnce(t *testing.T) {
 	_ = lease.Complete(context.Background(), 0)
 }
 
+// A wakeable request that loses the cold-hold race must get the admission
+// rejection (503 + Retry-After), never invoke the waker, and release its lease
+// completely.
+func TestWakeColdHoldRejectionFailsClosedAndReleasesLease(t *testing.T) {
+	backend := &coldToWarmBackend{} // stays cold: every response is the cold 404
+	be := httptest.NewServer(backend)
+	defer be.Close()
+	up, _ := url.Parse(be.URL)
+	mr := miniredis.RunT(t)
+	cfg := proxyAdmissionConfig(2)
+	cfg.Platform.MaxColdHolds = 1
+	c := redis.NewClient(&redis.Options{Addr: mr.Addr()})
+	t.Cleanup(func() { _ = c.Close() })
+	a := admission.New(c, cfg)
+	waker := &fakeWaker{}
+	s := New(&config.Settings{Admission: cfg}, logging.New(logging.ERROR), &recordingEmitter{}).
+		WithAdmitter(a).
+		WithWaker(waker, time.Second, 3)
+
+	// A contending hold occupies the platform's single cold-hold slot.
+	holder, err := a.Admit(context.Background(), admission.Request{
+		Graph: "graph", Organization: "holder", Model: "m",
+		PromptBytes: 1, EstimatedInputTokens: 1, ReservedOutputTokens: 1,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := holder.BeginColdHold(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+
+	rr := httptest.NewRecorder()
+	s.Handler().ServeHTTP(rr, sharedRequest(up))
+	if rr.Code != http.StatusServiceUnavailable {
+		t.Fatalf("status=%d, want the cold-hold rejection's 503", rr.Code)
+	}
+	if rr.Header().Get("Retry-After") == "" {
+		t.Fatal("cold-hold rejection must carry Retry-After")
+	}
+	if calls := atomic.LoadInt32(&waker.calls); calls != 0 {
+		t.Fatalf("waker invoked %d times despite the rejected cold hold", calls)
+	}
+
+	// The rejected request's lease must be fully released: of the two platform
+	// active slots the holder owns exactly one, so the next Admit succeeds and
+	// the one after fails. A leaked lease would reject the first.
+	lease, err := a.Admit(context.Background(), admission.Request{
+		Graph: "graph", Organization: "org-b", Model: "m",
+		PromptBytes: 1, EstimatedInputTokens: 1, ReservedOutputTokens: 1,
+	})
+	if err != nil {
+		t.Fatalf("cold-hold rejection leaked its lease: %v", err)
+	}
+	if _, err := a.Admit(context.Background(), admission.Request{
+		Graph: "graph", Organization: "org-c", Model: "m",
+		PromptBytes: 1, EstimatedInputTokens: 1, ReservedOutputTokens: 1,
+	}); err == nil {
+		t.Fatal("platform active limit not enforced after cold-hold rejection")
+	}
+	_ = lease.Complete(context.Background(), 0)
+	_ = holder.EndColdHold(context.Background())
+	_ = holder.Complete(context.Background(), 0)
+}
+
 func TestAdmissionImpossibleOutputRejectedBeforeUpstream(t *testing.T) {
 	var hits int
 	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) { hits++; w.WriteHeader(200) }))
@@ -504,6 +569,35 @@ func TestSharedRequestMissingOrganizationIdentity(t *testing.T) {
 	})
 }
 
+// A degenerate trusted upstream (":8000") parses but yields no graph scope.
+// The request must fail closed with 503 — never enter the fail-open admission
+// bypass (which would forward it with every limit disabled).
+func TestDegenerateUpstreamGraphFailsClosedNoBypass(t *testing.T) {
+	up, _ := url.Parse("http://127.0.0.1:1") // target irrelevant; request never forwards
+	mr := miniredis.RunT(t)
+	cfg := proxyAdmissionConfig(1)
+	c := redis.NewClient(&redis.Options{Addr: mr.Addr()})
+	t.Cleanup(func() { _ = c.Close() })
+	s := New(&config.Settings{Admission: cfg}, logging.New(logging.ERROR), &recordingEmitter{}).WithAdmitter(admission.New(c, cfg))
+	req := sharedRequest(up)
+	req.Header.Set(identity.HeaderUpstream, ":8000")
+	rr := httptest.NewRecorder()
+	s.Handler().ServeHTTP(rr, req)
+	if rr.Code != http.StatusServiceUnavailable {
+		t.Fatalf("status=%d, want 503 (a fail-open bypass would attempt to forward and 502)", rr.Code)
+	}
+	// Zero bypass: no lease was admitted, so a contending request at the same
+	// platform scope (capacity 1) must succeed immediately.
+	lease, err := admission.New(c, cfg).Admit(context.Background(), admission.Request{
+		Graph: "graph-a", Organization: "org-a", Owner: "owner-a", Model: "model-a",
+		PromptBytes: 1, EstimatedInputTokens: 1, ReservedOutputTokens: 1,
+	})
+	if err != nil {
+		t.Fatalf("degenerate upstream request leaked into admission state: %v", err)
+	}
+	_ = lease.Complete(context.Background(), 0)
+}
+
 func TestAdmissionReleasesOnUpstreamFailure(t *testing.T) {
 	up, _ := url.Parse("http://127.0.0.1:1")
 	mr := miniredis.RunT(t)
@@ -516,7 +610,7 @@ func TestAdmissionReleasesOnUpstreamFailure(t *testing.T) {
 		req = req.WithContext(context.Background())
 		s.Handler().ServeHTTP(rr, req)
 		if rr.Code != http.StatusBadGateway {
-			t.Fatalf("attempt %d status=%d, want 502 (a leaked lease would be 429)", i, rr.Code)
+			t.Fatalf("attempt %d status=%d, want 502 (a leaked lease would surface as 503)", i, rr.Code)
 		}
 	}
 }
@@ -656,6 +750,79 @@ func TestAdmissionChargesUnknownUsageOnPreHeaderAbort(t *testing.T) {
 			}
 		})
 	}
+}
+
+// An upstream that consumes the full request and then resets before writing
+// response headers fails RoundTrip with EOF — not a client cancel. The engine's
+// usage is indeterminate, so the conservative reservation must be retained in
+// the org/owner contract windows and the request must be metered exactly like
+// the pre-header abort path.
+func TestAdmissionChargesUnknownUsageOnUpstreamReset(t *testing.T) {
+	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = io.Copy(io.Discard, r.Body) // consume the full request, then vanish
+		conn, _, herr := w.(http.Hijacker).Hijack()
+		if herr != nil {
+			return
+		}
+		_ = conn.Close()
+	}))
+	defer backend.Close()
+	up, _ := url.Parse(backend.URL)
+	mr := miniredis.RunT(t)
+	cfg := proxyAdmissionConfig(1)
+	c := redis.NewClient(&redis.Options{Addr: mr.Addr()})
+	a := admission.New(c, cfg)
+	em := &recordingEmitter{}
+	s := New(&config.Settings{Admission: cfg, BillPartialOnAbort: true}, logging.New(logging.ERROR), em).WithAdmitter(a)
+	req := sharedRequest(up)
+	req.Header.Set(identity.HeaderOrgRateLimitGeneratedTokens, "20")
+	req.Header.Set(identity.HeaderOwnerRateLimitGeneratedTokens, "20")
+	rr := httptest.NewRecorder()
+	s.Handler().ServeHTTP(rr, req)
+	if rr.Code != http.StatusBadGateway {
+		t.Fatalf("status=%d, want 502", rr.Code)
+	}
+
+	events := em.waitForEvents(1, time.Second)
+	if len(events) != 1 || !events[0].Aborted || events[0].PromptTokens != 0 || events[0].CompletionTokens != 0 {
+		t.Fatalf("metering events=%+v, want the same zero-token attributable event as the abort path", events)
+	}
+
+	for _, tc := range []struct {
+		name string
+		req  admission.Request
+		want string
+	}{
+		{
+			name: "organization contract",
+			req: admission.Request{Graph: "graph", Organization: "org-a", Owner: "other-owner", Model: "m",
+				PromptBytes: 1, EstimatedInputTokens: 1, ReservedOutputTokens: 1,
+				OrganizationLimits: admission.RateLimits{GeneratedTokens: 20}},
+			want: "contract_organization",
+		},
+		{
+			name: "owner contract",
+			req: admission.Request{Graph: "graph", Organization: "other-org", Owner: "owner-a", Model: "m",
+				PromptBytes: 1, EstimatedInputTokens: 1, ReservedOutputTokens: 1,
+				OwnerLimits: admission.RateLimits{GeneratedTokens: 20}},
+			want: "contract_owner",
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			_, err := a.Admit(context.Background(), tc.req)
+			var rejected *admission.Rejected
+			if !errors.As(err, &rejected) || rejected.Scope != tc.want || rejected.Dimension != "generated_tokens" {
+				t.Fatalf("err=%v, want %s generated_tokens rejection", err, tc.want)
+			}
+		})
+	}
+	// Physical capacity itself is released; only the conservative contract
+	// charges are retained.
+	lease, err := a.Admit(context.Background(), admission.Request{Graph: "graph", Organization: "other", Model: "m", PromptBytes: 1, EstimatedInputTokens: 1, ReservedOutputTokens: 1})
+	if err != nil {
+		t.Fatalf("reset upstream leaked physical reservation: %v", err)
+	}
+	_ = lease.Complete(context.Background(), 0)
 }
 
 func TestAdmissionRenewalFailureDoesNotCancelUpstream(t *testing.T) {

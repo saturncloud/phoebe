@@ -220,8 +220,10 @@ func TestOwnerContractRequiresStableOwnerIdentity(t *testing.T) {
 	req := request("org-a", "m")
 	req.Owner = ""
 	req.OwnerLimits = RateLimits{Requests: 1}
-	if _, err := a.Admit(context.Background(), req); !errors.Is(err, ErrUnavailable) {
-		t.Fatalf("missing owner identity error = %v, want ErrUnavailable", err)
+	if _, err := a.Admit(context.Background(), req); !errors.Is(err, ErrInvalidIdentity) {
+		t.Fatalf("missing owner identity error = %v, want ErrInvalidIdentity", err)
+	} else if errors.Is(err, ErrUnavailable) {
+		t.Fatalf("broken identity must fail closed, not enter the fail-open class: %v", err)
 	}
 }
 
