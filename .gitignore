@@ -26,4 +26,10 @@ config/settings.yaml
 vendor/
 
 # built binaries (go build ./cmd/...)
+/drainer
+/engine-conformance
+/interceptor
 /migrate
+/rater
+/recover
+/token-push
