@@ -3,6 +3,7 @@ package main
 import (
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 )
@@ -260,5 +261,51 @@ func TestRaterSettings_PriceFileKeyIsInertAndFailsClosed(t *testing.T) {
 	}
 	if opts.managerURL != "https://manager.example" {
 		t.Fatalf("managerURL = %q, want the configured URL — a leftover priceFile must not disturb the real price source", opts.managerURL)
+	}
+}
+
+// TestReconciliationDoc_DocumentsNoLocalPriceFileFallback guards the operator doc
+// against drifting back to the price-file world the rater no longer supports.
+// docs/billing-reconciliation.md is what an operator reads when an invoice does not
+// tie out; if it describes a no-managerURL local-price-file mode, an operator will
+// try to configure one and the rater will simply exit 1 (see run(): an empty
+// managerURL is FATAL because the manager is the only price source). The doc must
+// therefore state the rule the binary enforces — managerURL is required, and the
+// egress-less install runs its own manager — and may cite config/prices.example.yaml
+// only as the served WIRE SHAPE, never as a file the rater reads.
+func TestReconciliationDoc_DocumentsNoLocalPriceFileFallback(t *testing.T) {
+	data, err := os.ReadFile("../../docs/billing-reconciliation.md")
+	if err != nil {
+		t.Fatalf("read reconciliation doc: %v", err)
+	}
+	doc := string(data)
+
+	for _, want := range []string{
+		// The enforced rule: required, and fatal when unset.
+		"`managerURL` is REQUIRED",
+		"exits 1",
+		// The supported answer for an install that cannot reach the central manager.
+		"runs its own manager instance seeded with that\n   deployment's prices",
+		// The example file, framed as the wire shape only.
+		"`config/prices.example.yaml` documents the WIRE SHAPE",
+	} {
+		if !strings.Contains(doc, want) {
+			t.Errorf("reconciliation doc is missing %q — it must state the price-source rule the rater enforces", want)
+		}
+	}
+
+	// No resurrected fallback language. These are the AFFIRMATIVE forms — an
+	// install being offered a price file as a mode. The doc's own negative
+	// statement ("keeps ... no local price file") is the rule, not a violation of
+	// it, so the patterns below are written to miss it.
+	for _, forbidden := range []string{
+		"uses the operator-authored price file",
+		"operator-authored price file for every hour",
+		"no `managerURL` uses",
+		"falls back to the price file",
+	} {
+		if strings.Contains(doc, forbidden) {
+			t.Errorf("reconciliation doc mentions %q — there is no local-price-file mode; the manager is the only price source", forbidden)
+		}
 	}
 }
