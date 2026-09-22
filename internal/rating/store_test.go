@@ -127,10 +127,11 @@ func TestRateWindowSQL_Shape(t *testing.T) {
 		"LEFT JOIN rating_price rpb",
 		"rpb.model_id = ev.sku_base",
 		"NOT (ev.model_id LIKE $3 OR ev.adapter IS NOT NULL)",
-		// An existing rollup's frozen rate outranks the current book; only a new
-		// natural-key/hour resolves through direct/derived/plain-base pricing.
-		"LEFT JOIN rating_price_lock old",
-		"COALESCE(old.applied_prompt_rate,     rp.prompt_price,     rd.prompt_price,     rpb.prompt_price)",
+		// Pricing resolves ONLY through the passed book's direct/derived/plain-base
+		// joins. There is no local price-freeze table in the chain: the caller rates
+		// each hour against the book effective during that hour, so "never reprice
+		// served traffic" comes from the price series being a function of TIME.
+		"COALESCE(rp.prompt_price,     rd.prompt_price,     rpb.prompt_price)",
 		// Missing authoritative engine usage is excluded from money and counted in
 		// its own strict-partition bucket.
 		"WHERE usage_found",
@@ -141,9 +142,6 @@ func TestRateWindowSQL_Shape(t *testing.T) {
 		"AS unexplained_missing_usage_events",
 		"AND NOT aborted",
 		"WHERE usage_found AND NOT valid_usage)                           AS invalid_usage_events",
-		// The first rate is durable even if rated_usage is reconciled away.
-		"INSERT INTO rating_price_lock",
-		"ON CONFLICT (auth_id, resource_id, model_id, window_start) DO NOTHING",
 		// billable-prompt clamp + the cost formula (cached charged once).
 		// The operands are cast to BIGINT BEFORE subtracting: this projection
 		// runs over every event in the window before valid_usage filters, so an
@@ -228,7 +226,12 @@ func TestRateWindowSQL_Shape(t *testing.T) {
 	}
 	// The price tables are GONE (prices are YAML now): no reference to model_price,
 	// derivation_policy, effective-dating, or a derivation CASE may remain.
-	for _, gone := range []string{"model_price", "derivation_policy", "effective_from", "effective_to", "der.derived_from", "pol.factor"} {
+	// rating_price_lock is gone too — phoebe keeps NO price history of its own; the
+	// manager owns the effective-dated series and the rater asks it per hour. A
+	// local freeze outranking the book is exactly the bug that removal fixed: for a
+	// locked key, traffic that resolved through NO price row was billed at the
+	// frozen rate instead of counting UNPRICED.
+	for _, gone := range []string{"model_price", "derivation_policy", "effective_from", "effective_to", "der.derived_from", "pol.factor", "rating_price_lock", "old.applied_prompt_rate"} {
 		if strings.Contains(rateWindowSQL, gone) {
 			t.Errorf("rateWindowSQL still references removed price-table machinery: %q", gone)
 		}

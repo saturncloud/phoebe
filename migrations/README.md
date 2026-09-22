@@ -17,17 +17,16 @@ with the Atlas schema; they live in phoebe's own database.
   `org_id` is carried from `billing_event` so `cmd/token-push` reads org straight
   off the rollup. **Money is `NUMERIC(20,9)` — exact decimal, never float; all
   money math happens in SQL, not Go.**
-- **`rating_price_lock`** — append-only first-applied rates keyed by the same
-  natural key/hour. It survives a `rated_usage` reconciliation delete so a later
-  recovery cannot reprice already-served traffic from the current YAML book.
 - **`io_log`** — optional, sampled, short-retention request/response body capture
   (M5 I/O logging). Written by the interceptor's iolog sink; OFF by default.
 
-**The price catalog is a YAML config file, NOT a DB table (E1).** There is no
-`model_price` table. The hourly rater loads the current price YAML, projects it
-into a transient TEMP table, rates the last complete hour, and persists only the
-first applied rate for each natural-key/hour in `rating_price_lock` and the
-self-auditing `rated_usage` row.
+**The price catalog is not a DB table here (E1).** There is no `model_price` table
+and no local price history. The manager owns the effective-dated price series; the
+rater obtains the prices effective during EACH HOUR it rates, projects that book
+into a transient TEMP table, and persists the applied rates onto the self-auditing
+`rated_usage` row. "Never reprice served traffic" therefore holds because the price
+series is a function of TIME, not because phoebe froze a rate locally: re-rating an
+old hour resolves the same rates it originally did.
 
 ## The migration files
 
@@ -39,7 +38,7 @@ golang-migrate up/down pairs, applied in version order:
 | 0002 | `0002_rating.{up,down}.sql` | `rated_usage` (+ `org_id`, indexes) + the billing_event rating-instant index |
 | 0003 | `0003_io_log.{up,down}.sql` | `io_log` (+ GIN body index, retention indexes) |
 | 0004 | `0004_billing_event_serving_mode.{up,down}.sql` | `billing_event.serving_mode` (the serving-mode SKU axis; NULL = dedicated) |
-| 0005 | `0005_invoice_grade_attempts.{up,down}.sql` | trusted/client request identity, attempt outcome and usage evidence, invalid-usage reconciliation, `rating_price_lock`, and the hourly reconciliation view |
+| 0005 | `0005_invoice_grade_attempts.{up,down}.sql` | trusted/client request identity, attempt outcome and usage evidence, invalid-usage reconciliation, and the hourly reconciliation view |
 | 0006 | `0006_reconciliation_org_grain.{up,down}.sql` | aligns raw reconciliation with the rated natural key while exposing missing/conflicting org evidence |
 
 `embed.go` embeds these into the `migrations` package; `cmd/migrate` applies them.

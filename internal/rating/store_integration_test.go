@@ -23,6 +23,8 @@ import (
 	"time"
 
 	_ "github.com/jackc/pgx/v5/stdlib"
+
+	"github.com/saturncloud/phoebe/internal/logging"
 )
 
 // ratingSchemaDDL returns the rating schema applied before each integration test
@@ -748,8 +750,23 @@ func TestIntegration_ReRatePreservesHistoricalPrice(t *testing.T) {
 
 	hour := mustTime("2026-06-08T10:00:00Z")
 	store := NewPostgresStore(db)
+	// The prices EFFECTIVE DURING `hour`. Re-rating that hour always resolves these,
+	// because the caller asks the manager for the book effective during the hour it
+	// is rating — not for today's book. newBook is what the price list says LATER;
+	// it must never touch this hour, and the mechanism that guarantees that is the
+	// per-hour lookup, not a local freeze table (which no longer exists).
 	oldBook := newTestBook(map[string]Rate3{"b": rate3("0.000001", "0", "0")}, nil, PolicyIdentity, Dec{}, Dec{})
 	newBook := newTestBook(map[string]Rate3{"b": rate3("0.000009", "0", "0")}, nil, PolicyIdentity, Dec{}, Dec{})
+	_ = newBook // asserted below only via bookForHour, never passed for `hour`
+
+	// bookForHour models the manager's effective-dated series: this hour always
+	// resolves to the rates in force during it.
+	bookForHour := func(_ context.Context, hourStart time.Time) (*PriceBook, error) {
+		if hourStart.UTC().Equal(hour) {
+			return oldBook, nil
+		}
+		return newBook, nil
+	}
 
 	if _, err := db.ExecContext(ctx,
 		`INSERT INTO billing_event (request_id, auth_id, resource_id, org_id, model, prompt_tokens, event_ts)
@@ -766,8 +783,12 @@ func TestIntegration_ReRatePreservesHistoricalPrice(t *testing.T) {
 		 VALUES ('p2','a','d1','org-1','b',100,$1)`, hour.Add(6*time.Minute)); err != nil {
 		t.Fatalf("seed late event: %v", err)
 	}
-	if _, err := store.RateWindow(ctx, newBook, hour, hour.Add(time.Hour)); err != nil {
-		t.Fatalf("re-rate with changed book: %v", err)
+	// Re-rate AFTER the price list changed. The rater asks for this hour's prices,
+	// so the late event bills at the hour's own rate — today's higher rate never
+	// reaches it.
+	rater := New(store, nil, logging.New(logging.ERROR)).WithBookForHour(bookForHour)
+	if _, err := rater.RunWindow(ctx, hour, hour.Add(time.Hour), true); err != nil {
+		t.Fatalf("re-rate after a price change: %v", err)
 	}
 
 	var tokens int64
@@ -786,7 +807,7 @@ func TestIntegration_ReRatePreservesHistoricalPrice(t *testing.T) {
 	if _, err := db.ExecContext(ctx, `DELETE FROM billing_event WHERE request_id IN ('p1','p2')`); err != nil {
 		t.Fatalf("remove raw events: %v", err)
 	}
-	if res, err := store.RateWindow(ctx, newBook, hour, hour.Add(time.Hour)); err != nil {
+	if res, err := rater.RunWindow(ctx, hour, hour.Add(time.Hour), true); err != nil {
 		t.Fatalf("reconcile delete: %v", err)
 	} else if res.ReconciledDeletions != 1 {
 		t.Fatalf("reconcile deletions = %d, want 1", res.ReconciledDeletions)
@@ -796,8 +817,11 @@ func TestIntegration_ReRatePreservesHistoricalPrice(t *testing.T) {
 		 VALUES ('p3','a','d1','org-1','b',100,$1)`, hour.Add(7*time.Minute)); err != nil {
 		t.Fatalf("seed recovered event: %v", err)
 	}
-	if _, err := store.RateWindow(ctx, newBook, hour, hour.Add(time.Hour)); err != nil {
-		t.Fatalf("recreate with changed book: %v", err)
+	// Recreate the rollup after the reconcile delete. Without a local price freeze,
+	// the hour STILL prices at its own rates — the deleted-and-recreated rollup
+	// cannot pick up the newer rate, because the price is a function of the hour.
+	if _, err := rater.RunWindow(ctx, hour, hour.Add(time.Hour), true); err != nil {
+		t.Fatalf("recreate after reconcile delete: %v", err)
 	}
 	if err := db.QueryRowContext(ctx,
 		`SELECT prompt_tokens, applied_prompt_rate::text, cost::text

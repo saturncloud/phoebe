@@ -234,11 +234,15 @@ CREATE TEMP TABLE rating_derived (
 //
 // APPLIED RATE STORED ON THE ROW (E1 self-auditing rollup): the rated_usage row
 // carries applied_prompt_rate / applied_cached_rate / applied_completion_rate — the
-// exact per-token rates this rollup was billed at. The first rate is also retained
-// in rating_price_lock, whose lifecycle is independent of rated_usage reconciliation
-// deletes. That append-only lock is the one-way door: even if an anomalous rollup is
-// deleted and later recreated, already-served traffic cannot pick up a newer YAML
-// rate. A rollup mixes only one model_id, so one rate triple is well-defined.
+// exact per-token rates this rollup was billed at, so the row is auditable on its
+// own. A rollup mixes only one model_id, so one rate triple is well-defined.
+//
+// "NEVER REPRICE SERVED TRAFFIC" holds WITHOUT a local price-freeze table: the
+// caller rates each hour against the book EFFECTIVE DURING that hour (the manager
+// owns the effective-dated series), so re-rating an old hour resolves the same
+// rates it originally did. Deleting and recreating an anomalous rollup therefore
+// cannot pick up a newer rate — the price is a function of the hour, not of when
+// the rater ran. phoebe keeps NO price history of its own.
 //
 // HOUR BUCKET IS SESSION-TZ-INDEPENDENT (date_trunc on a UTC wall-clock timestamp),
 // so rollup keys can never disagree across sessions and re-rates can't overlap.
@@ -347,26 +351,20 @@ resolved AS (
         -- Fine-tune traffic with a NULL base_model can only miss its join (NULL =
         -- NULL is never true) and is BARRED from the plain-base join by the marker
         -- guard, so it correctly falls through to UNPRICED and screams.
-        -- Historical-price one-way door: once this natural-key/hour has a
-        -- rating_price_lock row, its applied rates outrank the CURRENT YAML book.
-        -- The lock survives rated_usage reconcile deletion, so re-rating can
-        -- incorporate late raw events and repair anomalies without repricing.
-        COALESCE(old.applied_prompt_rate,     rp.prompt_price,     rd.prompt_price,     rpb.prompt_price)     AS prompt_price,
-        COALESCE(old.applied_cached_rate,     rp.cached_price,     rd.cached_price,     rpb.cached_price)     AS cached_price,
-        COALESCE(old.applied_completion_rate, rp.completion_price, rd.completion_price, rpb.completion_price) AS completion_price,
+        -- The book passed in is the one EFFECTIVE DURING THIS HOUR (the caller
+        -- rates hour by hour against the manager's effective-dated series), so
+        -- re-rating an old hour resolves the same rates it originally did. There is
+        -- no local price-freeze table: "never reprice served traffic" holds because
+        -- the price series is a function of TIME, not of when the rater last ran.
+        COALESCE(rp.prompt_price,     rd.prompt_price,     rpb.prompt_price)     AS prompt_price,
+        COALESCE(rp.cached_price,     rd.cached_price,     rpb.cached_price)     AS cached_price,
+        COALESCE(rp.completion_price, rd.completion_price, rpb.completion_price) AS completion_price,
         -- Whether this row priced through the DERIVED (base x premium) path (b), or
         -- the PLAIN-BASE path (c). Both key the rate on base_model, so both feed the
         -- single-rate ambiguity gate below.
-        ((old.auth_id IS NOT NULL AND (ev.model_id LIKE $3 OR ev.adapter IS NOT NULL) AND ev.base_model IS NOT NULL)
-          OR (old.auth_id IS NULL AND rp.model_id IS NULL AND rd.base_model IS NOT NULL)) AS via_derived,
-        ((old.auth_id IS NOT NULL AND NOT (ev.model_id LIKE $3 OR ev.adapter IS NOT NULL) AND ev.base_model IS NOT NULL)
-          OR (old.auth_id IS NULL AND rp.model_id IS NULL AND rpb.model_id IS NOT NULL)) AS via_base
+        (rp.model_id IS NULL AND rd.base_model IS NOT NULL) AS via_derived,
+        (rp.model_id IS NULL AND rpb.model_id IS NOT NULL)  AS via_base
     FROM ev
-    LEFT JOIN rating_price_lock old
-        ON old.auth_id = ev.auth_id
-       AND old.resource_id = ev.resource_id
-       AND old.model_id = ev.model_id
-       AND old.window_start = date_trunc('hour', ev.ev_ts AT TIME ZONE 'UTC') AT TIME ZONE 'UTC'
     -- (a) The YAML-projected DIRECT price table (keyed on model_id).
     LEFT JOIN rating_price rp ON rp.model_id = ev.model_id
     -- (b) The DERIVED price table (keyed on base_model): consulted ONLY for
@@ -476,21 +474,6 @@ grouped AS (
 ),
 priced AS (
     SELECT * FROM grouped WHERE NOT ambiguous_base AND NOT ambiguous_org
-),
--- Persist the first applied rate independently of rated_usage. A later reconcile
--- may delete the rollup, but it never deletes this append-only price decision.
-price_locked AS (
-    INSERT INTO rating_price_lock (
-        auth_id, resource_id, model_id, window_start,
-        applied_prompt_rate, applied_cached_rate, applied_completion_rate
-    )
-    SELECT
-        auth_id, resource_id, model_id, window_start,
-        applied_prompt_rate, applied_cached_rate, applied_completion_rate
-    FROM priced
-    ORDER BY auth_id, resource_id, model_id, window_start
-    ON CONFLICT (auth_id, resource_id, model_id, window_start) DO NOTHING
-    RETURNING auth_id
 ),
 -- RECONCILE (re-rate deletes superseded rollups): a rated_usage row whose
 -- (auth_id, resource_id, model_id, window_start) falls IN this run's window but is
