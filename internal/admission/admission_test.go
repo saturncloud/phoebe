@@ -227,6 +227,30 @@ func TestOwnerContractRequiresStableOwnerIdentity(t *testing.T) {
 	}
 }
 
+func TestAdmitRequiresCompleteTrustedIdentity(t *testing.T) {
+	a, _ := testAdmitter(t, config.AdmissionSettings{Platform: limits(10)})
+	for _, tc := range []struct {
+		name   string
+		mutate func(*Request)
+	}{
+		{name: "organization", mutate: func(r *Request) { r.Organization = "" }},
+		{name: "model", mutate: func(r *Request) { r.Model = "" }},
+		{name: "graph", mutate: func(r *Request) { r.Graph = "" }},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			req := request("org-a", "m")
+			tc.mutate(&req)
+			_, err := a.Admit(context.Background(), req)
+			if !errors.Is(err, ErrInvalidIdentity) {
+				t.Fatalf("missing %s error = %v, want ErrInvalidIdentity", tc.name, err)
+			}
+			if errors.Is(err, ErrUnavailable) {
+				t.Fatalf("missing %s must fail closed, not enter the fail-open class: %v", tc.name, err)
+			}
+		})
+	}
+}
+
 func TestWeightedAdmissionLanesAreIsolated(t *testing.T) {
 	cfg := config.AdmissionSettings{Platform: config.AdmissionLimits{MaxActiveRequests: 3, Window: time.Minute},
 		Lanes: map[string]config.AdmissionLane{
@@ -717,6 +741,105 @@ func TestCompletionRetryRetainsAuthoritativeUsage(t *testing.T) {
 	var rejected *Rejected
 	if !errors.As(err, &rejected) || rejected.Dimension != "total_prompt_tokens" {
 		t.Fatalf("err=%v, want retained total_prompt_tokens charge", err)
+	}
+}
+
+// blockingScriptHook blocks the first invocation of one Lua script inside
+// ProcessHook until the test releases it, simulating a settlement that is
+// in-flight against the store while another goroutine races it.
+type blockingScriptHook struct {
+	hash    string
+	entered chan struct{}
+	release chan struct{}
+	once    sync.Once
+}
+
+func (h *blockingScriptHook) DialHook(next redis.DialHook) redis.DialHook { return next }
+func (h *blockingScriptHook) ProcessPipelineHook(next redis.ProcessPipelineHook) redis.ProcessPipelineHook {
+	return next
+}
+func (h *blockingScriptHook) ProcessHook(next redis.ProcessHook) redis.ProcessHook {
+	return func(ctx context.Context, cmd redis.Cmder) error {
+		args := cmd.Args()
+		if cmd.Name() == "evalsha" && len(args) > 1 && fmt.Sprint(args[1]) == h.hash {
+			blocked := false
+			h.once.Do(func() { blocked = true; close(h.entered) })
+			if blocked {
+				select {
+				case <-h.release:
+				case <-ctx.Done():
+					return ctx.Err()
+				}
+			}
+		}
+		return next(ctx, cmd)
+	}
+}
+
+// A zero-usage settlement racing an in-flight exact settlement must never
+// overwrite the engine-authoritative counts: the lease mutex serializes the
+// two and the first completion's data wins. Run under -race.
+func TestConcurrentSettlementKeepsAuthoritativeUsage(t *testing.T) {
+	mr := miniredis.RunT(t)
+	client := redis.NewClient(&redis.Options{Addr: mr.Addr(), MaxRetries: 0})
+	t.Cleanup(func() { _ = client.Close() })
+	if err := finishScript.Load(context.Background(), client).Err(); err != nil {
+		t.Fatal(err)
+	}
+	hook := &blockingScriptHook{hash: finishScript.Hash(), entered: make(chan struct{}), release: make(chan struct{})}
+	client.AddHook(hook)
+	a := New(client, config.AdmissionSettings{Platform: limits(5), LeaseTTL: time.Minute, KeyPrefix: "concurrent-settle"})
+	req := request("a", "m") // reserves 20 generated tokens
+	req.OrganizationLimits = RateLimits{GeneratedTokens: 23}
+	lease, err := a.Admit(context.Background(), req)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Goroutine A settles the engine-authoritative usage but blocks inside the
+	// finish script while holding the lease mutex.
+	exactDone := make(chan error, 1)
+	go func() {
+		exactDone <- lease.CompleteUsage(context.Background(), Usage{TotalPromptTokens: 6, GeneratedTokens: 3})
+	}()
+	<-hook.entered
+
+	// Goroutine B's zero settlement must serialize behind A, not race past it.
+	zeroDone := make(chan error, 1)
+	go func() { zeroDone <- lease.Complete(context.Background(), 0) }()
+	select {
+	case err := <-zeroDone:
+		close(hook.release)
+		t.Fatalf("zero settlement completed while the exact settlement held the lease: %v", err)
+	case <-time.After(50 * time.Millisecond):
+	}
+	close(hook.release)
+	if err := <-exactDone; err != nil {
+		t.Fatalf("exact settlement: %v", err)
+	}
+	if err := <-zeroDone; err != nil {
+		t.Fatalf("racing zero settlement: %v", err)
+	}
+
+	// The generated window carries exactly the authoritative 3 tokens: a
+	// 20-token reservation fits (3+20=23), a 21st token does not. A zero
+	// settlement would wrongly admit both; an unrefunded reservation would
+	// wrongly reject the first. Probes use the settled request's organization
+	// because contract scopes are per-organization.
+	boundary := request("a", "m2")
+	boundary.OrganizationLimits = RateLimits{GeneratedTokens: 23}
+	held, err := a.Admit(context.Background(), boundary)
+	if err != nil {
+		t.Fatalf("window after concurrent settlement rejected the exact boundary: %v", err)
+	}
+	_ = held.Complete(context.Background(), 0)
+	over := request("a", "m3")
+	over.OrganizationLimits = RateLimits{GeneratedTokens: 23}
+	over.ReservedOutputTokens = 21
+	_, err = a.Admit(context.Background(), over)
+	var rejected *Rejected
+	if !errors.As(err, &rejected) || rejected.Dimension != "generated_tokens" {
+		t.Fatalf("err=%v, want generated_tokens rejection at exactly the authoritative charge", err)
 	}
 }
 

@@ -10,6 +10,7 @@ import (
 	"net/http/httptest"
 	"net/url"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -353,6 +354,174 @@ func TestWakeColdHoldRejectionFailsClosedAndReleasesLease(t *testing.T) {
 	_ = holder.Complete(context.Background(), 0)
 }
 
+// The prefill reservation must release at the first response BODY byte, not at
+// header arrival: headers can arrive long before the engine finishes prefill,
+// and releasing there would under-protect prefill bursts. The first request
+// goes through a real HTTP client so "response headers arrived" is observed
+// AFTER the proxy's ModifyResponse ran, with no backend-to-proxy race.
+func TestPrefillReservationReleasesAtFirstBodyByte(t *testing.T) {
+	writeFirstByte := make(chan struct{})
+	firstByteWritten := make(chan struct{})
+	finishFirst := make(chan struct{})
+	var startOnce, finishOnce sync.Once
+	startBody := func() { startOnce.Do(func() { close(writeFirstByte) }) }
+	releaseFirst := func() { finishOnce.Do(func() { close(finishFirst) }) }
+	var requests atomic.Int32
+	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		if requests.Add(1) == 1 {
+			// First request: headers immediately, then withhold the body.
+			w.WriteHeader(http.StatusOK)
+			w.(http.Flusher).Flush()
+			<-writeFirstByte
+			_, _ = w.Write([]byte(`{"model"`))
+			w.(http.Flusher).Flush()
+			close(firstByteWritten)
+			<-finishFirst
+			_, _ = w.Write([]byte(`:"model-a","usage":{"prompt_tokens":1,"completion_tokens":1}}`))
+			return
+		}
+		_, _ = w.Write([]byte(`{"model":"model-a","usage":{"prompt_tokens":1,"completion_tokens":1}}`))
+	}))
+	defer backend.Close()
+	up, _ := url.Parse(backend.URL)
+	mr := miniredis.RunT(t)
+	cfg := proxyAdmissionConfig(2)
+	cfg.Platform.MaxConcurrentPrefills = 1 // prefill is the only binding dimension
+	c := redis.NewClient(&redis.Options{Addr: mr.Addr()})
+	t.Cleanup(func() { _ = c.Close() })
+	s := New(&config.Settings{Admission: cfg}, logging.New(logging.ERROR), &recordingEmitter{}).WithAdmitter(admission.New(c, cfg))
+	front := httptest.NewServer(s.Handler())
+	defer front.Close()
+	// Registered after the servers so it runs before their blocking Close():
+	// never leave the first backend handler stuck on a failure path.
+	defer func() { startBody(); releaseFirst() }()
+
+	// Real client request: Do returns once response headers arrive, i.e. after
+	// the proxy received headers and ran ModifyResponse.
+	first, err := http.NewRequestWithContext(context.Background(), http.MethodPost, front.URL+"/v1/chat/completions",
+		strings.NewReader(`{"model":"model-a","max_tokens":20}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for k, vs := range sharedRequest(up).Header {
+		first.Header[k] = vs
+	}
+	resp, err := front.Client().Do(first)
+	if err != nil {
+		t.Fatalf("first request: %v", err)
+	}
+	defer resp.Body.Close()
+
+	// While the first response's body is withheld, its prefill slot is still
+	// held: a second request at the same platform scope is rejected at the
+	// prefill dimension (the only dimension that can bind here).
+	second := httptest.NewRecorder()
+	s.Handler().ServeHTTP(second, sharedRequest(up))
+	if second.Code != http.StatusServiceUnavailable {
+		t.Fatalf("status=%d while the first body was withheld, want 503 prefill rejection", second.Code)
+	}
+
+	// The first body byte is the prefill→decode boundary: capacity opens even
+	// though the first response has not completed.
+	startBody()
+	select {
+	case <-firstByteWritten:
+	case <-time.After(2 * time.Second):
+		t.Fatal("backend never wrote the first body byte")
+	}
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		rr := httptest.NewRecorder()
+		s.Handler().ServeHTTP(rr, sharedRequest(up))
+		if rr.Code == http.StatusOK {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("prefill capacity did not open at the first body byte; last status=%d", rr.Code)
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+
+	releaseFirst()
+	if _, err := io.Copy(io.Discard, resp.Body); err != nil {
+		t.Fatalf("read first response body: %v", err)
+	}
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("first request status=%d, want 200", resp.StatusCode)
+	}
+}
+
+// When every wake attempt stays cold, the client receives the final cold
+// response and the request's lease is fully settled — no capacity leaks even
+// though no warm response ever arrived.
+func TestWakeExhaustedReturnsColdAndReleasesCapacity(t *testing.T) {
+	backend := &coldToWarmBackend{} // never warms
+	be := httptest.NewServer(backend)
+	defer be.Close()
+	up, _ := url.Parse(be.URL)
+	mr := miniredis.RunT(t)
+	cfg := proxyAdmissionConfig(1)
+	cfg.Platform.MaxColdHolds = 1
+	c := redis.NewClient(&redis.Options{Addr: mr.Addr()})
+	t.Cleanup(func() { _ = c.Close() })
+	a := admission.New(c, cfg)
+	waker := &fakeWaker{warmsAt: 99, backend: backend}
+	s := New(&config.Settings{Admission: cfg}, logging.New(logging.ERROR), &recordingEmitter{}).
+		WithAdmitter(a).
+		WithWaker(waker, time.Second, 2)
+
+	rr := httptest.NewRecorder()
+	s.Handler().ServeHTTP(rr, sharedRequest(up))
+	if rr.Code != http.StatusNotFound {
+		t.Fatalf("status=%d, want the final cold 404 after wake exhaustion", rr.Code)
+	}
+	if calls := atomic.LoadInt32(&waker.calls); calls != 1 {
+		t.Fatalf("waker calls=%d, want 1 for maxTries=2", calls)
+	}
+	lease, err := a.Admit(context.Background(), admission.Request{
+		Graph: "graph", Organization: "org-b", Model: "m",
+		PromptBytes: 1, EstimatedInputTokens: 1, ReservedOutputTokens: 1,
+	})
+	if err != nil {
+		t.Fatalf("exhausted wake leaked its lease: %v", err)
+	}
+	_ = lease.Complete(context.Background(), 0)
+}
+
+// A store outage at BeginColdHold degrades to a logged bypass: the wake flow
+// and the request complete normally instead of failing closed.
+func TestWakeColdHoldStoreOutageDegradesToBypass(t *testing.T) {
+	mr := miniredis.RunT(t)
+	var killOnce sync.Once
+	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		// Kill the admission store after Admit succeeded but before the cold
+		// response drives BeginColdHold.
+		killOnce.Do(mr.Close)
+		w.WriteHeader(http.StatusNotFound)
+		_, _ = w.Write([]byte(`{"message":"Model not found"}`))
+	}))
+	defer backend.Close()
+	up, _ := url.Parse(backend.URL)
+	cfg := proxyAdmissionConfig(1)
+	cfg.Platform.MaxColdHolds = 1
+	c := redis.NewClient(&redis.Options{Addr: mr.Addr()})
+	t.Cleanup(func() { _ = c.Close() })
+	a := admission.New(c, cfg)
+	waker := &fakeWaker{}
+	s := New(&config.Settings{Admission: cfg}, logging.New(logging.ERROR), &recordingEmitter{}).
+		WithAdmitter(a).
+		WithWaker(waker, time.Second, 2)
+
+	rr := httptest.NewRecorder()
+	s.Handler().ServeHTTP(rr, sharedRequest(up))
+	if rr.Code != http.StatusNotFound {
+		t.Fatalf("status=%d, want the cold 404 — a cold-hold store outage must bypass, not reject", rr.Code)
+	}
+	if calls := atomic.LoadInt32(&waker.calls); calls != 1 {
+		t.Fatalf("waker calls=%d, want 1 (the bypass must not skip the wake)", calls)
+	}
+}
+
 func TestAdmissionImpossibleOutputRejectedBeforeUpstream(t *testing.T) {
 	var hits int
 	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) { hits++; w.WriteHeader(200) }))
@@ -420,6 +589,54 @@ func TestMalformedTrustedRateLimitFailsClosed(t *testing.T) {
 	s.Handler().ServeHTTP(rr, req)
 	if rr.Code != http.StatusServiceUnavailable {
 		t.Fatalf("status=%d, want 503", rr.Code)
+	}
+}
+
+func TestTrustedRateLimitParserBoundaries(t *testing.T) {
+	var hits int
+	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		hits++
+		_, _ = w.Write([]byte(`{"model":"model-a","usage":{"prompt_tokens":1,"completion_tokens":1}}`))
+	}))
+	defer backend.Close()
+	up, _ := url.Parse(backend.URL)
+	cfg := proxyAdmissionConfig(2)
+	mr := miniredis.RunT(t)
+	c := redis.NewClient(&redis.Options{Addr: mr.Addr()})
+	t.Cleanup(func() { _ = c.Close() })
+	s := New(&config.Settings{Admission: cfg}, logging.New(logging.ERROR), &recordingEmitter{}).WithAdmitter(admission.New(c, cfg))
+
+	t.Run("negative limit fails closed", func(t *testing.T) {
+		req := sharedRequest(up)
+		req.Header.Set(identity.HeaderOrgRateLimitRequests, "-1")
+		rr := httptest.NewRecorder()
+		s.Handler().ServeHTTP(rr, req)
+		if rr.Code != http.StatusServiceUnavailable {
+			t.Fatalf("status=%d, want 503", rr.Code)
+		}
+	})
+	t.Run("uncached above total fails closed", func(t *testing.T) {
+		req := sharedRequest(up)
+		req.Header.Set(identity.HeaderOrgRateLimitTotalPromptTokens, "100")
+		req.Header.Set(identity.HeaderOrgRateLimitUncachedPromptTokens, "101")
+		rr := httptest.NewRecorder()
+		s.Handler().ServeHTTP(rr, req)
+		if rr.Code != http.StatusServiceUnavailable {
+			t.Fatalf("status=%d, want 503", rr.Code)
+		}
+	})
+	t.Run("uncached equal to total is valid", func(t *testing.T) {
+		req := sharedRequest(up)
+		req.Header.Set(identity.HeaderOrgRateLimitTotalPromptTokens, "100")
+		req.Header.Set(identity.HeaderOrgRateLimitUncachedPromptTokens, "100")
+		rr := httptest.NewRecorder()
+		s.Handler().ServeHTTP(rr, req)
+		if rr.Code != http.StatusOK {
+			t.Fatalf("status=%d, want 200", rr.Code)
+		}
+	})
+	if hits != 1 {
+		t.Fatalf("upstream hits=%d, want exactly the valid boundary request", hits)
 	}
 }
 
