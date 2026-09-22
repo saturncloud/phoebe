@@ -65,6 +65,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	neturl "net/url"
 	"os"
 	"os/signal"
 	"path/filepath"
@@ -198,7 +199,9 @@ func runWith(argv []string) int {
 // error WITHOUT touching the destination file on any failure before the final
 // rename, so a failure always leaves the prior file (if any) intact.
 func fetchAndInstall(ctx context.Context, log *logging.Logger, opts fetchOptions, token string) error {
-	body, version, err := fetchPrices(ctx, opts, token)
+	// The periodic sync installs the CURRENT prices (zero asOf). Rating an old
+	// window asks for that window's prices instead — see rateWindowPrices.
+	body, version, err := fetchPrices(ctx, opts, token, time.Time{})
 	if err != nil {
 		return err
 	}
@@ -236,8 +239,20 @@ func fetchAndInstall(ctx context.Context, log *logging.Logger, opts fetchOptions
 // fetchPrices GETs the price file from the manager and returns the body and the
 // X-Saturn-Price-Version header. A non-2xx status (including the endpoint's own 503
 // for no-plan / incomplete-card) is an error: phoebe never installs a non-OK body.
-func fetchPrices(ctx context.Context, opts fetchOptions, token string) ([]byte, string, error) {
+//
+// A non-zero asOf requests the prices EFFECTIVE AT THAT INSTANT (?at=<RFC3339>)
+// rather than the current ones. The manager owns the effective-dated price series,
+// so this is how a rating run gets the rates that were in force during the window
+// it is rating — which makes re-rating an old window idempotent no matter how many
+// times prices have changed since. The zero time means "current", the behaviour the
+// periodic sync wants.
+func fetchPrices(ctx context.Context, opts fetchOptions, token string, asOf time.Time) ([]byte, string, error) {
 	url := opts.managerURL + tokenPricesPath
+	if !asOf.IsZero() {
+		// RFC3339 in UTC: an unambiguous instant. The manager reads a naive
+		// timestamp as UTC, but we never rely on that — always send the offset.
+		url += "?at=" + neturl.QueryEscape(asOf.UTC().Format(time.RFC3339Nano))
+	}
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
 	if err != nil {
 		return nil, "", fmt.Errorf("build request: %w", err)

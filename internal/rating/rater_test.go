@@ -3,6 +3,7 @@ package rating
 import (
 	"bytes"
 	"context"
+	"fmt"
 	"strings"
 	"testing"
 	"time"
@@ -1283,5 +1284,208 @@ func TestRater_BaseEndpointAmbiguousBaseModelFailsLoud(t *testing.T) {
 		if k.modelID == "tf-ep-reused" {
 			t.Fatal("a rollup exists for the two-base endpoint name — it must NOT be billed (silent MIN under-charge)")
 		}
+	}
+}
+
+// recordingStore captures the (book, start, end) of every RateWindow call so a test
+// can assert WHICH price book each hour was rated against — the property per-hour
+// pricing exists to guarantee.
+type recordingStore struct {
+	calls []recordedCall
+	err   error
+}
+
+type recordedCall struct {
+	book  *PriceBook
+	start time.Time
+	end   time.Time
+}
+
+func (s *recordingStore) RateWindow(_ context.Context, book *PriceBook, start, end time.Time) (RateResult, error) {
+	s.calls = append(s.calls, recordedCall{book: book, start: start.UTC(), end: end.UTC()})
+	if s.err != nil {
+		return RateResult{}, s.err
+	}
+	// One rated event per hour, costing 1 unit, plus one of each anomaly every
+	// hour so the aggregate's summing is observable.
+	return RateResult{
+		EventsRated:                   1,
+		RollupsWritten:                1,
+		TotalCost:                     "1.000000000",
+		ReconciledDeletions:           1,
+		UnpricedEvents:                1,
+		UnattributableEvents:          1,
+		MissingUsageEvents:            2,
+		ExpectedMissingUsageEvents:    1,
+		UnexplainedMissingUsageEvents: 1,
+		InvalidUsageEvents:            1,
+		AmbiguousBaseEvents:           1,
+		AmbiguousOrgEvents:            1,
+	}, nil
+}
+
+func (s *recordingStore) Ping(context.Context) error { return nil }
+func (s *recordingStore) Close() error               { return nil }
+
+// TestRunWindow_PricesEachHourFromItsOwnBook is the core per-hour-pricing contract:
+// a multi-hour window must rate each hour against the prices EFFECTIVE DURING THAT
+// HOUR, not one snapshot for the whole span. Pricing a 24-hour window from a single
+// book silently misprices every hour on the far side of a mid-window price change.
+func TestRunWindow_PricesEachHourFromItsOwnBook(t *testing.T) {
+	start := mustTime("2026-06-08T10:00:00Z")
+	end := start.Add(3 * time.Hour)
+
+	// A distinct book per hour, so a test can tell them apart by identity.
+	books := map[time.Time]*PriceBook{
+		start:                    newTestBook(map[string]Rate3{"m": rate3("0.000001", "0", "0")}, nil, PolicyIdentity, Dec{}, Dec{}),
+		start.Add(time.Hour):     newTestBook(map[string]Rate3{"m": rate3("0.000002", "0", "0")}, nil, PolicyIdentity, Dec{}, Dec{}),
+		start.Add(2 * time.Hour): newTestBook(map[string]Rate3{"m": rate3("0.000003", "0", "0")}, nil, PolicyIdentity, Dec{}, Dec{}),
+	}
+	var asked []time.Time
+	store := &recordingStore{}
+	r := New(store, nil, logging.New(logging.ERROR)).
+		WithBookForHour(func(_ context.Context, hourStart time.Time) (*PriceBook, error) {
+			asked = append(asked, hourStart.UTC())
+			b, ok := books[hourStart.UTC()]
+			if !ok {
+				return nil, fmt.Errorf("no book for %s", hourStart)
+			}
+			return b, nil
+		})
+
+	res, err := r.RunWindow(context.Background(), start, end, false)
+	if err != nil {
+		t.Fatalf("RunWindow: %v", err)
+	}
+
+	// One call per hour, each covering exactly that hour.
+	if len(store.calls) != 3 {
+		t.Fatalf("RateWindow calls = %d, want 3 (one per hour)", len(store.calls))
+	}
+	for i, c := range store.calls {
+		wantStart := start.Add(time.Duration(i) * time.Hour)
+		if !c.start.Equal(wantStart) || !c.end.Equal(wantStart.Add(time.Hour)) {
+			t.Fatalf("call %d rated [%s,%s), want [%s,%s)", i,
+				c.start.Format(time.RFC3339), c.end.Format(time.RFC3339),
+				wantStart.Format(time.RFC3339), wantStart.Add(time.Hour).Format(time.RFC3339))
+		}
+		// THE POINT: the book handed to each hour is that hour's book.
+		if c.book != books[wantStart] {
+			t.Fatalf("hour %s was rated against the wrong price book — a mid-window price change would misprice it",
+				wantStart.Format(time.RFC3339))
+		}
+	}
+	if len(asked) != 3 {
+		t.Fatalf("asked for %d hourly books, want 3", len(asked))
+	}
+
+	// Aggregate: counts SUM across hours so the exit-code contract still sees any
+	// hour's leak, and cost sums as exact decimal.
+	if res.EventsRated != 3 || res.RollupsWritten != 3 || res.ReconciledDeletions != 3 {
+		t.Fatalf("aggregate rated/rollups/deletions = %d/%d/%d, want 3/3/3",
+			res.EventsRated, res.RollupsWritten, res.ReconciledDeletions)
+	}
+	if res.UnpricedEvents != 3 || res.UnattributableEvents != 3 || res.InvalidUsageEvents != 3 ||
+		res.AmbiguousBaseEvents != 3 || res.AmbiguousOrgEvents != 3 {
+		t.Fatalf("anomaly counts did not sum across hours: %+v", res)
+	}
+	if res.MissingUsageEvents != 6 || res.ExpectedMissingUsageEvents != 3 || res.UnexplainedMissingUsageEvents != 3 {
+		t.Fatalf("missing-usage counts did not sum: total=%d expected=%d unexplained=%d",
+			res.MissingUsageEvents, res.ExpectedMissingUsageEvents, res.UnexplainedMissingUsageEvents)
+	}
+	if !res.HasAnomaly() {
+		t.Fatal("aggregate must report an anomaly when any hour leaked one (exit-code contract)")
+	}
+	if got := MustDec(res.TotalCost); !got.Equal(MustDec("3.000000000")) {
+		t.Fatalf("aggregate TotalCost = %s, want 3.000000000", res.TotalCost)
+	}
+	if !res.WindowStart.Equal(start) || !res.WindowEnd.Equal(end) {
+		t.Fatalf("aggregate window = [%s,%s), want the REQUESTED window", res.WindowStart, res.WindowEnd)
+	}
+}
+
+// TestRunWindow_FailsClosedWhenAnHourHasNoPrices: an hour whose prices cannot be
+// obtained must stop the run, not be rated at the previous hour's prices or at $0.
+func TestRunWindow_FailsClosedWhenAnHourHasNoPrices(t *testing.T) {
+	start := mustTime("2026-06-08T10:00:00Z")
+	store := &recordingStore{}
+	r := New(store, nil, logging.New(logging.ERROR)).
+		WithBookForHour(func(_ context.Context, hourStart time.Time) (*PriceBook, error) {
+			if hourStart.UTC().Equal(start) {
+				return newTestBook(map[string]Rate3{"m": rate3("0.000001", "0", "0")}, nil, PolicyIdentity, Dec{}, Dec{}), nil
+			}
+			return nil, fmt.Errorf("manager unreachable")
+		})
+
+	_, err := r.RunWindow(context.Background(), start, start.Add(3*time.Hour), false)
+	if err == nil {
+		t.Fatal("RunWindow must fail when an hour's prices are unavailable")
+	}
+	if !strings.Contains(err.Error(), "manager unreachable") {
+		t.Fatalf("error %q should name the underlying cause", err)
+	}
+	// Only the first hour was rated; the unpriced hour was NOT rated at the wrong prices.
+	if len(store.calls) != 1 {
+		t.Fatalf("RateWindow calls = %d, want 1 (stop at the first unavailable hour)", len(store.calls))
+	}
+}
+
+// TestRunWindow_NilBookIsRefused: a provider returning (nil, nil) must not rate at $0.
+func TestRunWindow_NilBookIsRefused(t *testing.T) {
+	start := mustTime("2026-06-08T10:00:00Z")
+	store := &recordingStore{}
+	r := New(store, nil, logging.New(logging.ERROR)).
+		WithBookForHour(func(context.Context, time.Time) (*PriceBook, error) { return nil, nil })
+	_, err := r.RunWindow(context.Background(), start, start.Add(time.Hour), false)
+	if err == nil || !strings.Contains(err.Error(), "no price book") {
+		t.Fatalf("a nil book must be refused, got %v", err)
+	}
+	if len(store.calls) != 0 {
+		t.Fatal("nothing may be rated without a price book")
+	}
+}
+
+// TestRunWindow_WithoutProviderRatesWholeWindowOnce preserves the existing
+// single-book path (operator-authored file / air-gapped installs): one call, one book.
+func TestRunWindow_WithoutProviderRatesWholeWindowOnce(t *testing.T) {
+	start := mustTime("2026-06-08T10:00:00Z")
+	end := start.Add(5 * time.Hour)
+	book := newTestBook(map[string]Rate3{"m": rate3("0.000001", "0", "0")}, nil, PolicyIdentity, Dec{}, Dec{})
+	store := &recordingStore{}
+	r := New(store, book, logging.New(logging.ERROR))
+
+	if _, err := r.RunWindow(context.Background(), start, end, false); err != nil {
+		t.Fatalf("RunWindow: %v", err)
+	}
+	if len(store.calls) != 1 {
+		t.Fatalf("RateWindow calls = %d, want 1 (no per-hour provider configured)", len(store.calls))
+	}
+	if !store.calls[0].start.Equal(start) || !store.calls[0].end.Equal(end) {
+		t.Fatal("the whole window must be rated in one call when there is one book")
+	}
+	if store.calls[0].book != book {
+		t.Fatal("the configured static book must be used")
+	}
+}
+
+// TestRunWindow_UnalignedTailNeverRatesPastTheEnd: a sub-hour or unaligned window
+// must not rate beyond what was asked for.
+func TestRunWindow_UnalignedTailNeverRatesPastTheEnd(t *testing.T) {
+	start := mustTime("2026-06-08T10:00:00Z")
+	end := start.Add(90 * time.Minute) // one full hour + a half-hour tail
+	book := newTestBook(map[string]Rate3{"m": rate3("0.000001", "0", "0")}, nil, PolicyIdentity, Dec{}, Dec{})
+	store := &recordingStore{}
+	r := New(store, nil, logging.New(logging.ERROR)).
+		WithBookForHour(func(context.Context, time.Time) (*PriceBook, error) { return book, nil })
+
+	if _, err := r.RunWindow(context.Background(), start, end, false); err != nil {
+		t.Fatalf("RunWindow: %v", err)
+	}
+	if len(store.calls) != 2 {
+		t.Fatalf("calls = %d, want 2 (a full hour and the half-hour tail)", len(store.calls))
+	}
+	if !store.calls[1].end.Equal(end) {
+		t.Fatalf("tail rated to %s, want the requested end %s — never rate past the window",
+			store.calls[1].end.Format(time.RFC3339), end.Format(time.RFC3339))
 	}
 }

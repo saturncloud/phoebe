@@ -22,12 +22,36 @@ import (
 type Rater struct {
 	store Store
 	book  *PriceBook
-	log   *logging.Logger
+	// bookForHour, when set, supplies the price book EFFECTIVE DURING a given hour
+	// instead of using the single static book. See RunWindow.
+	bookForHour BookForHour
+	log         *logging.Logger
 }
 
+// BookForHour returns the price book effective during the hour starting at
+// hourStart. The manager owns the effective-dated price series, so this is how a
+// rating run prices each hour at the rates that were in force during it —
+// which is what makes re-rating an old window idempotent, however many times
+// prices have changed since.
+//
+// It returns an error rather than a fallback book when the prices for that hour
+// cannot be obtained: rating an hour at the WRONG prices is worse than not rating
+// it, because the resulting rollup looks authoritative.
+type BookForHour func(ctx context.Context, hourStart time.Time) (*PriceBook, error)
+
 // New constructs a Rater over a Store and a loaded PriceBook (the YAML price file).
+// Rating uses this one book for every hour — correct only when the book is known to
+// be the right one for the window (an operator-authored file, or a single-hour run).
+// Prefer WithBookForHour for multi-hour windows against the manager.
 func New(store Store, book *PriceBook, log *logging.Logger) *Rater {
 	return &Rater{store: store, book: book, log: log}
+}
+
+// WithBookForHour makes the rater price each hour from the book effective during
+// that hour, rather than from one snapshot for the whole window.
+func (r *Rater) WithBookForHour(f BookForHour) *Rater {
+	r.bookForHour = f
+	return r
 }
 
 // Result summarises one rating run. It is returned to the caller AND logged, so an
@@ -245,4 +269,95 @@ func (r *Rater) Run(ctx context.Context, windowStart, windowEnd time.Time, windo
 			res.EventsRated, res.RollupsWritten, res.TotalCost)
 	}
 	return res, nil
+}
+
+// RunWindow rates [windowStart, windowEnd) HOUR BY HOUR, pricing each hour from
+// the book effective DURING that hour, and returns the aggregate.
+//
+// WHY PER HOUR (the correctness reason): prices are effective-dated in the manager,
+// but one PriceBook is a flat snapshot with no time dimension. The default run
+// covers 24 trailing hours, so pricing the whole span from any single snapshot
+// would misprice every hour on the far side of a mid-window price change — silently,
+// since the resulting rollups look authoritative. Rating each hour against its own
+// book removes that class of error entirely, and makes a re-rate idempotent by
+// construction: an hour always resolves to the rates that were in force during it,
+// however many times prices have changed since. This is what replaced phoebe's local
+// price-freeze table (rating_price_lock): the freeze was a local workaround for a
+// time dimension the wire call used to discard.
+//
+// The rating SQL is UNCHANGED: each hour is still one RateWindow call with one flat
+// book, so the money path keeps its single-snapshot semantics. Only the number of
+// calls and which book each gets are new.
+//
+// FAIL CLOSED PER HOUR: if an hour's prices cannot be obtained, that hour is not
+// rated and the run returns the error. A partially-rated window is reported through
+// the aggregate (hours already committed keep their rollups — each hour's SQL is its
+// own transaction), so a retry converges rather than double-counting.
+//
+// Anomaly counts, reconcile deletions and cost SUM across the hours, so the caller's
+// exit-code contract (see cmd/rater) is unchanged: any hour leaking an anomaly makes
+// the aggregate report it.
+func (r *Rater) RunWindow(ctx context.Context, windowStart, windowEnd time.Time, windowExplicit bool) (Result, error) {
+	windowStart = windowStart.UTC()
+	windowEnd = windowEnd.UTC()
+	agg := Result{WindowStart: windowStart, WindowEnd: windowEnd, TotalCost: "0"}
+
+	if !windowStart.Before(windowEnd) {
+		return agg, fmt.Errorf("rating: empty/inverted window [%s,%s)", windowStart.Format(time.RFC3339), windowEnd.Format(time.RFC3339))
+	}
+	// Without a per-hour provider the rater has exactly one book, so the whole
+	// window is rated in a single call (the operator-authored-file / air-gapped
+	// path, and every existing caller).
+	if r.bookForHour == nil {
+		return r.Run(ctx, windowStart, windowEnd, windowExplicit)
+	}
+
+	// The zero Dec is exact 0 (see decimal.go); money is summed as exact decimal,
+	// never a float.
+	var total Dec
+	for hourStart := windowStart; hourStart.Before(windowEnd); hourStart = hourStart.Add(time.Hour) {
+		hourEnd := hourStart.Add(time.Hour)
+		if hourEnd.After(windowEnd) {
+			// A caller may pass a sub-hour or unaligned window; never rate past
+			// the requested end.
+			hourEnd = windowEnd
+		}
+		book, err := r.bookForHour(ctx, hourStart)
+		if err != nil {
+			return agg, fmt.Errorf("rating: prices for hour %s: %w (refusing to rate this hour at the wrong prices)",
+				hourStart.Format(time.RFC3339), err)
+		}
+		if book == nil {
+			return agg, fmt.Errorf("rating: no price book for hour %s (refusing to rate at $0)", hourStart.Format(time.RFC3339))
+		}
+		hourRater := &Rater{store: r.store, book: book, log: r.log}
+		hourRes, err := hourRater.Run(ctx, hourStart, hourEnd, windowExplicit)
+		agg.accumulate(hourRes)
+		if err != nil {
+			return agg, err
+		}
+		hourCost, err := ParseDec(hourRes.TotalCost)
+		if err != nil {
+			return agg, fmt.Errorf("rating: hour %s total %q: %w", hourStart.Format(time.RFC3339), hourRes.TotalCost, err)
+		}
+		total = total.Add(hourCost)
+	}
+	agg.TotalCost = total.String()
+	return agg, nil
+}
+
+// accumulate folds one hour's outcome into the window aggregate. Costs are summed
+// separately (exact decimal, never a float).
+func (r *Result) accumulate(hour Result) {
+	r.EventsRated += hour.EventsRated
+	r.RollupsWritten += hour.RollupsWritten
+	r.ReconciledDeletions += hour.ReconciledDeletions
+	r.UnpricedEvents += hour.UnpricedEvents
+	r.UnattributableEvents += hour.UnattributableEvents
+	r.MissingUsageEvents += hour.MissingUsageEvents
+	r.ExpectedMissingUsageEvents += hour.ExpectedMissingUsageEvents
+	r.UnexplainedMissingUsageEvents += hour.UnexplainedMissingUsageEvents
+	r.InvalidUsageEvents += hour.InvalidUsageEvents
+	r.AmbiguousBaseEvents += hour.AmbiguousBaseEvents
+	r.AmbiguousOrgEvents += hour.AmbiguousOrgEvents
 }
