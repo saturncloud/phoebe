@@ -2,20 +2,27 @@
 #  phoebe price file — the OPERATOR-FACING CONTRACT (E1).
 # =====================================================================
 #
-# This file is the SINGLE source of truth for what every model costs. An operator
-# authors it and version-controls it; the file's history IS the price audit trail —
-# there is no DB price table, no effective-dating, no price-management UI, no
-# operator-writes-to-DB authz surface. This is the enterprise / air-gapped win: an
-# operator ships their own file.
+# WHO OWNS PRICES (read this first):
+#   The central pricing service (saturn-aws-manager) is the AUTHORITATIVE source of
+#   both live and historical prices. Its price rows are effective-dated, so "what
+#   did this model cost at time T" is always answerable. When the rater is
+#   configured with a managerURL it asks for the prices effective during EACH HOUR
+#   it rates, and phoebe keeps NO price history of its own.
 #
-# HOW IT IS USED:
-#   - The hourly rater (cmd/rater) loads the CURRENT file at run start, rates the
-#     last complete hour, and FREEZES the applied per-token rate onto each
-#     rated_usage row. The row is then immutable and self-auditing: "we never
-#     reprice traffic you've already served" holds by construction.
-#   - A mid-hour price edit affects at most that one hour, on a price whose timing
-#     the operator controls. Re-rating is a deliberate, audited re-run — never a
-#     silent side effect of editing this file.
+#   THIS FILE is the AIR-GAPPED / operator-authored alternative, used when no
+#   managerURL is set. An operator authors and version-controls it; the file's
+#   history is then the price audit trail.
+#
+# HOW IT IS USED (file mode):
+#   - The hourly rater (cmd/rater) loads this file at run start and uses it for
+#     EVERY hour in the window, then freezes the applied per-token rate onto each
+#     rated_usage row so the row is self-auditing.
+#   - LIMITATION vs the manager: this file is a flat snapshot with no time
+#     dimension. Re-rating a window that spans a price edit prices every hour from
+#     the CURRENT file, so an edit can reprice already-served traffic in a re-run.
+#     Manager mode does not have this problem (each hour resolves the rates that
+#     were in force during it). Edit this file between runs, and re-rate a past
+#     window only deliberately.
 #   - The create-time PRICE GATE (Atlas, E4) reads THIS SAME file: a deployment whose
 #     model is not priced here cannot be created/served. So the rater should never
 #     meet an unpriced model — but it keeps a fail-loud backstop (an unpriced model

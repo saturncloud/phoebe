@@ -27,11 +27,16 @@ central billing service.
    the Postgres transaction commits and deduplicates redelivery on the server-minted
    attempt id.
 5. The rater resolves prices and writes hourly `rated_usage` rows. Cached input is
-   charged once: `fresh = prompt - cached`. The first applied rate for each
-   natural-key/hour is retained in append-only `rating_price_lock`; it survives
-   rated-row reconciliation deletion, so late or recovered events use the original
-   rate even after the current price book changes. Attempts without authoritative
-   engine usage are excluded from money and make the rater exit non-zero.
+   charged once: `fresh = prompt - cached`. Prices come from the central manager,
+   which owns the effective-dated series: the rater asks for the prices effective
+   during EACH HOUR it rates, so a late or recovered event bills at its own hour's
+   rate however many times the price book has changed since — and a re-rate of that
+   hour is idempotent. phoebe keeps no local price history. (An install with no
+   `managerURL` uses the operator-authored price file for every hour instead; see
+   `config/prices.example.yaml` for that mode's limitation.) The applied rates are
+   frozen onto each `rated_usage` row, so the row stays self-auditing. Attempts
+   without authoritative engine usage are excluded from money, and an UNEXPLAINED
+   missing-usage attempt makes the rater exit non-zero.
 6. `token-push` sends authoritative hourly snapshots keyed by `rated_usage.id` to
    the central manager. Replays are deterministic; an unattributable window is
    withheld in full instead of partially deleting or mis-attributing prior billing.
@@ -149,10 +154,10 @@ balance while two customers are mis-attributed.
    appending or auto-draining it.
 3. Run the drainer until the consumer group has no pending/lagging entries. Confirm
    the recovered attempt ids exist once in `billing_event`.
-4. Restore the price-book version or attribution headers if the natural-key/hour
-   was never locked. For a previously rated key, `rating_price_lock` is the authority
-   and a normal re-rate cannot overwrite it, even if reconciliation deleted the
-   corresponding `rated_usage` row.
+4. Restore attribution headers if they were the problem. Prices need no restoring:
+   the rater re-resolves each hour against the manager's effective-dated series, so
+   a re-rate of an already-billed hour reproduces its original rates even if
+   reconciliation deleted the corresponding `rated_usage` row.
 5. Run the rater explicitly for the complete affected half-open window. Investigate
    every unpriced, unattributable, ambiguous, missing-usage, or reconcile-deletion
    signal before proceeding.

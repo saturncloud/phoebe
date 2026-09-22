@@ -34,8 +34,10 @@ const ftLikePattern = fineTunePrefix + "%"
 // --- THE PRICE FILE SCHEMA (the operator-facing contract) -------------------
 //
 // The price file is the SINGLE source of truth for what every model costs (E1).
-// An operator authors and version-controls it; the file's history IS the price
-// audit trail (no DB price table, no effective-dating, no audit table). The hourly
+// In file mode an operator authors and version-controls it and the file's history
+// is the price audit trail. In manager mode the parsed book is ONE HOUR's effective
+// prices, fetched per hour from the service that owns the effective-dated series
+// (see internal/pricefetch); phoebe stores no price history either way. The hourly
 // rater loads the CURRENT file at run start and rates the last complete hour with
 // whatever rate the file carries — and freezes that rate onto the rated_usage row.
 //

@@ -12,12 +12,17 @@
 // the file on disk.
 //
 // AUTHORSHIP vs RATING (the design this rests on): the central pricing service owns
-// price authorship AND effective-dating/history. /customer/token-prices serves a
-// POINT-IN-TIME effective snapshot for the customer's plan plus an
-// X-Saturn-Price-Version content-hash header. phoebe does NOT keep a local price
-// history; it fetches the current effective snapshot and rates against it. "Rate an
-// old event at the old price" is the manager's effective-window responsibility, not
-// phoebe's — so this binary keeps NO effective-dated tables, just the current file.
+// price authorship AND effective-dating/history. /customer/token-prices serves the
+// effective snapshot for the customer's plan plus an X-Saturn-Price-Version
+// content-hash header, and takes ?at=<ISO8601> to serve the snapshot effective at a
+// past instant. phoebe keeps NO price history of its own: "rate an old event at the
+// old price" is answered by ASKING the manager for that hour's prices (cmd/rater
+// does exactly that, per hour), not by phoebe freezing rates locally.
+//
+// THIS binary syncs the CURRENT prices to a local file. That file is the
+// last-good/air-gapped path: it lets the rater keep running when the manager is
+// unreachable, and it is the whole price source on an install with no managerURL.
+// The shared client lives in internal/pricefetch.
 //
 // It is a ONE-SHOT job (run by cron / a k8s CronJob), NOT a daemon: it fetches once
 // and exits. Exit codes:
