@@ -787,10 +787,10 @@ func TestE2E_ModellessEventWithoutUsageIsMissingUsage(t *testing.T) {
 		t.Errorf("UnexplainedMissingUsageEvents = %d, want 0 (the attempt aborted; it did not report success)", res.UnexplainedMissingUsageEvents)
 	}
 	if res.UnattributableEvents != 0 {
-		t.Errorf("UnattributableEvents = %d, want 0 — missing usage is the exclusive, more specific bucket", res.UnattributableEvents)
+		t.Errorf("UnattributableEvents = %d, want 0 — a model-less attempt with no usage is MISSING-USAGE; that bucket is exclusive and more specific than UNATTRIBUTABLE", res.UnattributableEvents)
 	}
 	if res.UnpricedEvents != 0 {
-		t.Errorf("UnpricedEvents = %d, want 0 — a model-less event must land in UNATTRIBUTABLE, not UNPRICED (wrong runbook)", res.UnpricedEvents)
+		t.Errorf("UnpricedEvents = %d, want 0 — a model-less attempt with no usage is MISSING-USAGE, not UNPRICED; UNPRICED means a usage-bearing event whose price lookup failed (wrong runbook)", res.UnpricedEvents)
 	}
 	if res.EventsRated != 0 || res.RollupsWritten != 0 {
 		t.Errorf("rater billed a model-less event: %+v (must never be rated, let alone $0-billed)", res)
