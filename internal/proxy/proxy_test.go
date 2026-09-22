@@ -239,6 +239,11 @@ func TestProxyRequestID_ClientValueBoundary(t *testing.T) {
 		{name: "254 bytes accepted", value: strings.Repeat("a", 254), wantStatus: http.StatusOK, wantCalls: 1},
 		{name: "255 bytes rejected", value: strings.Repeat("a", 255), wantStatus: http.StatusBadRequest},
 		{name: "non-ASCII rejected", value: "request-é", wantStatus: http.StatusBadRequest},
+		// A NUL byte is what PostgreSQL rejects outright in a text column: it is
+		// exactly the value that would make an otherwise-served request
+		// unpersistable in client_request_id VARCHAR(255).
+		{name: "NUL byte rejected", value: "req-\x00-1", wantStatus: http.StatusBadRequest},
+		{name: "control byte rejected", value: "req\n1", wantStatus: http.StatusBadRequest},
 	}
 
 	for _, tt := range tests {
