@@ -1042,6 +1042,47 @@ func TestAdmissionChargesUnknownUsageOnUpstreamReset(t *testing.T) {
 	_ = lease.Complete(context.Background(), 0)
 }
 
+// A verifiable pre-write dial failure (connection refused) proves the request
+// never left the process: the lease settles Complete(0) — physical capacity is
+// released AND nothing is charged to the contract windows. This pins the dial
+// carve-out against the indeterminate-failure path, which retains the
+// conservative charge; an unlimited envelope cannot tell the two apart.
+func TestAdmissionDialFailureChargesNothing(t *testing.T) {
+	up, _ := url.Parse("http://127.0.0.1:1") // nothing listening: dial is refused
+	mr := miniredis.RunT(t)
+	cfg := proxyAdmissionConfig(1)
+	c := redis.NewClient(&redis.Options{Addr: mr.Addr()})
+	t.Cleanup(func() { _ = c.Close() })
+	a := admission.New(c, cfg)
+	em := &recordingEmitter{}
+	s := New(&config.Settings{Admission: cfg}, logging.New(logging.ERROR), em).WithAdmitter(a)
+	req := sharedRequest(up)
+	req.Header.Set(identity.HeaderOrgRateLimitGeneratedTokens, "20")
+	req.Header.Set(identity.HeaderOwnerRateLimitGeneratedTokens, "20")
+	rr := httptest.NewRecorder()
+	s.Handler().ServeHTTP(rr, req)
+	if rr.Code != http.StatusBadGateway {
+		t.Fatalf("status=%d, want 502", rr.Code)
+	}
+	// No engine work was possible, so nothing is metered either (the
+	// zero-token event is reserved for indeterminate failures).
+	if n := len(em.all()); n != 0 {
+		t.Fatalf("dial failure emitted %d events, want 0", n)
+	}
+	// The org and owner contract windows are empty: a fresh request reserving
+	// exactly the contract maximum succeeds at both scopes. A phantom
+	// conservative charge would have filled the window and rejected it.
+	probe := admission.Request{Graph: "graph", Organization: "org-a", Owner: "owner-a", Model: "m",
+		PromptBytes: 1, EstimatedInputTokens: 1, ReservedOutputTokens: 20,
+		OrganizationLimits: admission.RateLimits{GeneratedTokens: 20},
+		OwnerLimits:        admission.RateLimits{GeneratedTokens: 20}}
+	lease, err := a.Admit(context.Background(), probe)
+	if err != nil {
+		t.Fatalf("dial failure left a phantom charge in the contract windows: %v", err)
+	}
+	_ = lease.Complete(context.Background(), 0)
+}
+
 func TestAdmissionRenewalFailureDoesNotCancelUpstream(t *testing.T) {
 	started := make(chan struct{})
 	releaseBackend := make(chan struct{})
