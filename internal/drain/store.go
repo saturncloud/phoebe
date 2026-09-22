@@ -229,6 +229,15 @@ func nullStr(s string) any {
 	return s
 }
 
+// nullInt returns a driver NULL for 0 and the int otherwise. This is the ingest
+// side of the status_code invariant: metering.Event.StatusCode is 0 only when no
+// HTTP status was ever produced for the attempt (the proxy never got a response
+// to record), and billing_event_status_code_ck admits NULL or 100..599 — so 0
+// binds NULL deliberately. NULL means "no response was produced", not "unknown":
+// pre-status_code rows are also NULL, but they predate the column, and 0 is never
+// a real status. Mirrors the rule stated in internal/recovery/recovery.go
+// ("Zero marshals as the omitted/NULL case"), which rejects any other
+// out-of-range value before it can reach this bind.
 func nullInt(v int) any {
 	if v == 0 {
 		return nil

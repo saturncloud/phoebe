@@ -148,6 +148,24 @@ func TestPostgresStore_EmptyModelStoredAsNull(t *testing.T) {
 	}
 }
 
+// TestEventArgs_ZeroStatusCodeBindsNullNoResponse pins the status_code invariant
+// by name: StatusCode 0 means no HTTP status was ever produced for the attempt,
+// and billing_event_status_code_ck admits NULL or 100..599 — so 0 must bind NULL
+// (a never-answered attempt), while a real status binds through verbatim.
+func TestEventArgs_ZeroStatusCodeBindsNullNoResponse(t *testing.T) {
+	const statusCodeIdx = 19 // request_id..usage_found is 19 columns; status_code is next.
+
+	noResponse := eventArgs(metering.Event{RequestID: "r", Model: "m"})
+	if noResponse[statusCodeIdx] != nil {
+		t.Fatalf("status_code arg = %v, want nil for StatusCode 0 (no HTTP response produced)", noResponse[statusCodeIdx])
+	}
+
+	answered := eventArgs(metering.Event{RequestID: "r", Model: "m", StatusCode: 500})
+	if answered[statusCodeIdx] != 500 {
+		t.Fatalf("status_code arg = %v, want 500 (a real status must bind through)", answered[statusCodeIdx])
+	}
+}
+
 // TestEventArgs_NullsEmptyIdentities locks the encoding contract: empty identity
 // strings bind as NULL (so billing GROUP BY auth_id never gets a spurious ""
 // bucket), token counts always bind (never nil), and event_ts is NULL when the
