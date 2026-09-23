@@ -80,7 +80,17 @@ type Result struct {
 	InvalidUsageEvents            int64 // authoritative evidence with malformed token counts (never money)
 	AmbiguousBaseEvents           int64 // events under an ft: rollup spanning >1 base_model (E3 violation)
 	AmbiguousOrgEvents            int64 // events under a rollup spanning >1 non-NULL org_id (E2 attribution bug)
-	RollupsWritten                int64 // distinct (auth_id, resource_id, model_id, hour) rows upserted
+	// OwnerConflictEvents counts events under rollups where an event carried BOTH a
+	// user_id and a group_id. An identity is a user XOR a group, so both set is a
+	// producer bug; the rollup is NOT billed (neither owner can be assumed) and the
+	// raw events stay in billing_event as evidence.
+	OwnerConflictEvents int64
+	// AmbiguousGraphRollups counts ROLLUPS whose traffic spanned more than one serving
+	// graph. NOT a withholding signal and NOT in event units: these rollups ARE billed
+	// (the graph is cost-attribution evidence, not identity) with a NULL graph rather
+	// than a guessed one. Reported so lost attribution is visible.
+	AmbiguousGraphRollups int64
+	RollupsWritten        int64 // distinct grain rows upserted (see rated_usage_grain_uq)
 	// UnratedHours counts hours in the window that were SKIPPED — prices could not
 	// be obtained, or rating them failed. Each hour is independent and the upsert is
 	// idempotent, so a skipped hour is rated by a later run whose trailing window
@@ -146,19 +156,38 @@ func (r Result) HasAmbiguousBase() bool { return r.AmbiguousBaseEvents > 0 }
 // missing-header rows) is NOT ambiguous and never trips this.
 func (r Result) HasAmbiguousOrg() bool { return r.AmbiguousOrgEvents > 0 }
 
+// HasOwnerConflict reports whether any rollup contained an event carrying BOTH a
+// user_id and a group_id. Upstream an identity is a user XOR a group, so this is a
+// producer bug: the owner cannot be determined, the rollup is NOT billed (guessing
+// either side would mis-attribute), and it screams. Loud, exit-nonzero, like the other
+// anomalies. The raw events remain in billing_event for diagnosis.
+func (r Result) HasOwnerConflict() bool { return r.OwnerConflictEvents > 0 }
+
+// HasAmbiguousGraph reports whether any BILLED rollup drew traffic from more than one
+// serving graph. Deliberately NOT part of HasAnomaly: the graph is cost-attribution
+// evidence, not billing identity, so the money is still correct — only the pool the
+// cost is attributed against is unknown, and the rollup carries NULL rather than a
+// guess. Surfaced for operators, never a reason to withhold revenue.
+func (r Result) HasAmbiguousGraph() bool { return r.AmbiguousGraphRollups > 0 }
+
 // HasAnomaly reports whether something leaked: events that could not be priced,
 // rows that could not be attributed, a SUCCESSFUL attempt that reported no engine
 // usage, malformed authoritative counts, an ft: rollup spanning multiple
-// base_models, or a rollup spanning multiple orgs. All are RARE and WRONG, so
-// cmd/rater exits non-zero on any of them and an operator should be paged.
+// base_models, a rollup spanning multiple orgs, or an event claiming both a user and
+// a group owner. All are RARE and WRONG, so cmd/rater exits non-zero on any of them
+// and an operator should be paged.
 //
 // Deliberately NOT here: the missing-usage TOTAL. Client aborts and upstream
 // failures legitimately produce zero-usage rows on every install with traffic, so
 // including them would make exit 2 fire hourly and destroy its meaning for the
 // conditions above. Those are reported (and land in
 // billing_reconciliation_hourly) rather than paged.
+//
+// Also deliberately NOT here: AmbiguousGraphRollups. Those rollups ARE billed and
+// their money is correct; only the cost-attribution pool is unknown. Paging on it
+// would conflate "we may have mis-billed" with "we cannot compute margin".
 func (r Result) HasAnomaly() bool {
-	return r.HasUnpriced() || r.HasUnattributable() || r.HasUnexplainedMissingUsage() || r.HasInvalidUsage() || r.HasAmbiguousBase() || r.HasAmbiguousOrg()
+	return r.HasUnpriced() || r.HasUnattributable() || r.HasUnexplainedMissingUsage() || r.HasInvalidUsage() || r.HasAmbiguousBase() || r.HasAmbiguousOrg() || r.HasOwnerConflict()
 }
 
 // Run rates [windowStart, windowEnd): it runs the SINGLE SQL statement that
@@ -218,6 +247,8 @@ func (r *Rater) Run(ctx context.Context, windowStart, windowEnd time.Time, windo
 	res.InvalidUsageEvents = rr.InvalidUsageEvents
 	res.AmbiguousBaseEvents = rr.AmbiguousBaseEvents
 	res.AmbiguousOrgEvents = rr.AmbiguousOrgEvents
+	res.OwnerConflictEvents = rr.OwnerConflictEvents
+	res.AmbiguousGraphRollups = rr.AmbiguousGraphRollups
 
 	if res.HasAmbiguousBase() {
 		r.log.Error.Printf("rating: window [%s,%s) has %d events under AMBIGUOUS-BASE rollups (a single model_id whose base_model-priced events carried MORE THAN ONE rate in a window: >1 distinct base_model, or mixed premium/plain-base pricing from an X-Saturn-Adapter flap) — a base_model/adapter PROPAGATION violation, NOT a priceable rollup; these rollups are NOT billed (billing the MIN rate would silently under-charge). Fix header propagation and re-rate this window",
@@ -226,6 +257,16 @@ func (r *Rater) Run(ctx context.Context, windowStart, windowEnd time.Time, windo
 	if res.HasAmbiguousOrg() {
 		r.log.Error.Printf("rating: window [%s,%s) has %d events under AMBIGUOUS-ORG rollups (a single (auth, resource, model, hour) rollup carried MORE THAN ONE distinct non-NULL org_id) — a deployment owns exactly one org, so this is an E2 attribution PROPAGATION bug (Atlas injected conflicting X-Saturn-Org-Id values for one resource); these rollups are NOT billed (a guessed org would mis-attribute revenue). Fix org_id propagation and re-rate this window",
 			windowStart.Format(time.RFC3339), windowEnd.Format(time.RFC3339), res.AmbiguousOrgEvents)
+	}
+	if res.HasOwnerConflict() {
+		r.log.Error.Printf("rating: window [%s,%s) has %d events under OWNER-CONFLICT rollups (an event carried BOTH X-Saturn-User-Id and X-Saturn-Group-Id) — upstream an identity is a user XOR a group, so this is a producer PROPAGATION bug; the owner cannot be determined, so these rollups are NOT billed (attributing to either side would mis-charge a person or a team). The raw events are retained in billing_event as evidence. Fix the header producer and re-rate this window",
+			windowStart.Format(time.RFC3339), windowEnd.Format(time.RFC3339), res.OwnerConflictEvents)
+	}
+	if res.HasAmbiguousGraph() {
+		// WARN, not ERROR: these rollups ARE billed and the money is right. Only the
+		// cost-attribution pool is unknown, so this must not read like a revenue fault.
+		r.log.Warn.Printf("rating: window [%s,%s) has %d BILLED rollup(s) spanning MORE THAN ONE serving graph — the money is correct, but the rollup carries a NULL graph_k8s_name rather than a guessed one, so its cost cannot be attributed to a serving pool (margin analysis will not see it). Usually a deployment moved graphs mid-hour",
+			windowStart.Format(time.RFC3339), windowEnd.Format(time.RFC3339), res.AmbiguousGraphRollups)
 	}
 	if res.HasUnattributable() {
 		r.log.Error.Printf("rating: window [%s,%s) has %d UNATTRIBUTABLE billing_event rows (NULL auth_id/resource_id/model_id — a NULL resource_id can't name the deployment/org for E2 billing) — these cannot be rated; the interceptor's billing gate should reject them before metering, so a nonzero count means revenue is leaking upstream",
@@ -274,10 +315,10 @@ func (r *Rater) Run(ctx context.Context, windowStart, windowEnd time.Time, windo
 	}
 
 	if res.HasAnomaly() {
-		r.log.Error.Printf("rating: window [%s,%s) rated %d events into %d rollups, total=%s USD; %d UNPRICED events dropped (backfill prices and re-rate), %d UNATTRIBUTABLE rows skipped (NULL auth_id/resource_id/model_id — upstream billing-gate leak), %d UNEXPLAINED MISSING-USAGE attempts (success with no usage block — reconcile engine logs) of %d missing-usage total, %d INVALID-USAGE events excluded from money, %d AMBIGUOUS-BASE events dropped (one model_id, more than one base_model-derived rate — fix base_model/adapter propagation and re-rate), %d AMBIGUOUS-ORG events dropped (one resource spanning multiple orgs — fix org_id propagation and re-rate)",
+		r.log.Error.Printf("rating: window [%s,%s) rated %d events into %d rollups, total=%s USD; %d UNPRICED events dropped (backfill prices and re-rate), %d UNATTRIBUTABLE rows skipped (NULL auth_id/resource_id/model_id — upstream billing-gate leak), %d UNEXPLAINED MISSING-USAGE attempts (success with no usage block — reconcile engine logs) of %d missing-usage total, %d INVALID-USAGE events excluded from money, %d AMBIGUOUS-BASE events dropped (one model_id, more than one base_model-derived rate — fix base_model/adapter propagation and re-rate), %d AMBIGUOUS-ORG events dropped (one resource spanning multiple orgs — fix org_id propagation and re-rate), %d OWNER-CONFLICT events dropped (an event claimed both a user and a group owner — fix the identity header producer and re-rate)",
 			windowStart.Format(time.RFC3339), windowEnd.Format(time.RFC3339),
 			res.EventsRated, res.RollupsWritten, res.TotalCost, res.UnpricedEvents, res.UnattributableEvents,
-			res.UnexplainedMissingUsageEvents, res.MissingUsageEvents, res.InvalidUsageEvents, res.AmbiguousBaseEvents, res.AmbiguousOrgEvents)
+			res.UnexplainedMissingUsageEvents, res.MissingUsageEvents, res.InvalidUsageEvents, res.AmbiguousBaseEvents, res.AmbiguousOrgEvents, res.OwnerConflictEvents)
 	} else {
 		r.log.Info.Printf("rating: window [%s,%s) rated %d events into %d rollups, total=%s USD",
 			windowStart.Format(time.RFC3339), windowEnd.Format(time.RFC3339),
@@ -418,4 +459,6 @@ func (r *Result) accumulate(hour Result) {
 	r.InvalidUsageEvents += hour.InvalidUsageEvents
 	r.AmbiguousBaseEvents += hour.AmbiguousBaseEvents
 	r.AmbiguousOrgEvents += hour.AmbiguousOrgEvents
+	r.OwnerConflictEvents += hour.OwnerConflictEvents
+	r.AmbiguousGraphRollups += hour.AmbiguousGraphRollups
 }

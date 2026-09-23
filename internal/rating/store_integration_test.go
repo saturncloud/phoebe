@@ -50,6 +50,10 @@ func ratingSchemaDDL(t *testing.T) string {
 		// serving-mode SKU axis). Skipping it reproduces the staging 42703.
 		"../../migrations/0004_billing_event_serving_mode.up.sql",
 		"../../migrations/0005_invoice_grade_attempts.up.sql",
+		// 0006 widens the rated_usage grain (serving_mode/owner_type/owner_id join
+		// the natural key) and adds billing_event.graph_k8s_name, both of which
+		// rateWindowSQL reads and writes.
+		"../../migrations/0006_rollup_grain.up.sql",
 	} {
 		ddl, err := os.ReadFile(f)
 		if err != nil {
@@ -194,11 +198,11 @@ func TestIntegration_RateWindow_ConformsToOracle(t *testing.T) {
 	if res.UnpricedEvents != 1 || res.UnattributableEvents != 1 {
 		t.Fatalf("RateWindow anomaly counts = %d/%d, want 1/1 (single-snapshot accounting)", res.UnpricedEvents, res.UnattributableEvents)
 	}
-	// Full 5-bucket partition (ambiguous buckets are 0 in this fixture, but named so the
+	// Full 6-bucket partition (ambiguous buckets are 0 in this fixture, but named so the
 	// invariant holds by construction, not by coincidence).
 	if got := res.EventsRated + res.UnpricedEvents + res.UnattributableEvents +
-		res.AmbiguousBaseEvents + res.AmbiguousOrgEvents; got != int64(len(events)) {
-		t.Fatalf("rated+unpriced+unattr+ambiguous_base+ambiguous_org = %d, want %d", got, len(events))
+		res.AmbiguousBaseEvents + res.AmbiguousOrgEvents + res.OwnerConflictEvents; got != int64(len(events)) {
+		t.Fatalf("rated+unpriced+unattr+ambiguous_base+ambiguous_org+owner_conflict = %d, want %d", got, len(events))
 	}
 
 	// Oracle: independent Rate() over the priced+attributable events; also assert the
@@ -332,7 +336,7 @@ func TestIntegration_ResourceIDGrainAndFailClosed(t *testing.T) {
 	}
 	// PARTITION holds with resource_id in the mix (all five buckets; org is 0 here).
 	if got := res.EventsRated + res.UnpricedEvents + res.UnattributableEvents +
-		res.AmbiguousBaseEvents + res.AmbiguousOrgEvents; got != 3 {
+		res.AmbiguousBaseEvents + res.AmbiguousOrgEvents + res.OwnerConflictEvents; got != 3 {
 		t.Fatalf("rated+unpriced+unattr+ambiguous_base+ambiguous_org = %d, want 3 (all seeded events)", got)
 	}
 
@@ -436,7 +440,7 @@ func TestIntegration_AmbiguousOrgFailsLoud(t *testing.T) {
 	}
 	// PARTITION over all five buckets (org now nonzero).
 	if got := res.EventsRated + res.UnpricedEvents + res.UnattributableEvents +
-		res.AmbiguousBaseEvents + res.AmbiguousOrgEvents; got != 5 {
+		res.AmbiguousBaseEvents + res.AmbiguousOrgEvents + res.OwnerConflictEvents; got != 5 {
 		t.Fatalf("partition sum = %d, want 5 (all seeded events accounted exactly once)", got)
 	}
 
@@ -530,7 +534,7 @@ func TestIntegration_BothAmbiguousCountedOnceAsBase(t *testing.T) {
 	}
 	// Strict partition holds: no double-count.
 	if got := res.EventsRated + res.UnpricedEvents + res.UnattributableEvents +
-		res.AmbiguousBaseEvents + res.AmbiguousOrgEvents; got != 2 {
+		res.AmbiguousBaseEvents + res.AmbiguousOrgEvents + res.OwnerConflictEvents; got != 2 {
 		t.Fatalf("partition sum = %d, want 2 (the rollup must be counted exactly once, not double)", got)
 	}
 	// And nothing was billed (the rollup is withheld).
@@ -926,6 +930,7 @@ func TestIntegration_InvalidUsageEvidenceNeverEntersMoney(t *testing.T) {
 		"0002_rating.up.sql",
 		"0004_billing_event_serving_mode.up.sql",
 		"0005_invoice_grade_attempts.up.sql",
+		"0006_rollup_grain.up.sql",
 	} {
 		apply(name)
 	}
@@ -967,7 +972,7 @@ func TestIntegration_InvalidUsageEvidenceNeverEntersMoney(t *testing.T) {
 // readRatedUsageIDs returns natural-key → id for every rated_usage row.
 func readRatedUsageIDs(t *testing.T, db *sql.DB) map[string]string {
 	t.Helper()
-	rows, err := db.Query(`SELECT auth_id || '|' || resource_id || '|' || model_id || '|' || extract(epoch FROM window_start)::bigint::text, id FROM rated_usage`)
+	rows, err := db.Query(`SELECT auth_id || '|' || owner_type || '|' || owner_id || '|' || resource_id || '|' || model_id || '|' || serving_mode || '|' || extract(epoch FROM window_start)::bigint::text, id FROM rated_usage`)
 	if err != nil {
 		t.Fatalf("read rated_usage ids: %v", err)
 	}
@@ -2087,6 +2092,7 @@ func TestIntegration_FreshInputTokensSurvivesInt32Overflow(t *testing.T) {
 		"0002_rating.up.sql",
 		"0004_billing_event_serving_mode.up.sql",
 		"0005_invoice_grade_attempts.up.sql",
+		"0006_rollup_grain.up.sql",
 	} {
 		ddl, readErr := os.ReadFile("../../migrations/" + name)
 		if readErr != nil {
@@ -2196,6 +2202,7 @@ func TestIntegration_MissingUsagePartitionedByCause(t *testing.T) {
 		"0002_rating.up.sql",
 		"0004_billing_event_serving_mode.up.sql",
 		"0005_invoice_grade_attempts.up.sql",
+		"0006_rollup_grain.up.sql",
 	} {
 		ddl, readErr := os.ReadFile("../../migrations/" + name)
 		if readErr != nil {
@@ -2497,5 +2504,260 @@ func TestIntegration_MigrationsCreateOrgGrainViewWithoutReplacement(t *testing.T
 	}
 	if missingOrg != 1 || distinctOrgs != 1 {
 		t.Fatalf("missing_org_attempts/distinct_org_ids = %d/%d, want 1/1 — the org evidence the grain change replaced org grouping with", missingOrg, distinctOrgs)
+	}
+}
+
+// TestIntegration_ServingModeSplitsRollupAndPricesEachMode is THE regression test for
+// the defect migration 0006 exists to fix, against real Postgres.
+//
+// THE BUG (pre-0006): serving_mode was NOT part of the rollup grain, but it IS part of
+// the price key — shared traffic prices from 'shared:'||base_model, dedicated from the
+// bare base_model. So a bucket containing both modes collapsed into ONE rollup, and
+// MIN(prompt_price) applied the CHEAPER of the two rates to ALL of it. Silent
+// under-billing (or over-billing, depending which way the rates differ).
+//
+// The pre-existing ambiguous_base gate could not catch it: BOTH rows carry the SAME
+// base_model and BOTH resolve via the same pricing path, so COUNT(DISTINCT base_model)
+// is 1 and bool_or(via_derived)/bool_or(via_base) never mix. The gate stays false.
+//
+// REACHABILITY: serving_mode is a deploy-time property (a tf_model column, or the
+// anti-spoof X-Saturn-Serving-Mode header), so it cannot vary per request. But it CAN
+// change across an hour: Atlas flipping a deployment's mode, or the header rollout
+// landing mid-hour — an ABSENT header reads as dedicated, so pre-rollout events on an
+// already-shared deployment price as dedicated. That is the scenario seeded below.
+//
+// WHAT THIS PINS: one resource, one model, one hour, both modes → TWO rollups, each
+// priced at ITS OWN rate, with no withholding and no anomaly. Deliberately asserts the
+// per-row cost, not just the row count: a split that still priced both rows the same
+// would pass a count-only test while leaving the money wrong.
+func TestIntegration_ServingModeSplitsRollupAndPricesEachMode(t *testing.T) {
+	dsn := os.Getenv("PHOEBE_TEST_DATABASE_URL")
+	if dsn == "" {
+		t.Skip("PHOEBE_TEST_DATABASE_URL not set; skipping live-Postgres conformance")
+	}
+	ctx := context.Background()
+	db, err := sql.Open("pgx", dsn)
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	defer db.Close()
+
+	const sch = "phoebe_rating_servingmode_it"
+	exec(t, db, "DROP SCHEMA IF EXISTS "+sch+" CASCADE")
+	exec(t, db, "CREATE SCHEMA "+sch)
+	exec(t, db, "SET search_path TO "+sch)
+	defer func() { exec(t, db, "DROP SCHEMA IF EXISTS "+sch+" CASCADE") }()
+	exec(t, db, ratingSchemaDDL(t))
+
+	hour := mustTime("2026-06-08T10:00:00Z")
+	// Two DISTINCT rates for one base: the bare key (dedicated) and the mode-prefixed
+	// key (shared). Shared is 10x cheaper here, so a collapse would be visible as
+	// under-billing — and MIN() would pick the shared rate for the dedicated traffic.
+	book := newTestBook(
+		map[string]Rate3{
+			"b":        rate3("0.000010", "0", "0"),
+			"shared:b": rate3("0.000001", "0", "0"),
+		},
+		nil, PolicyIdentity, Dec{}, Dec{},
+	)
+
+	// ONE resource, ONE model, ONE hour, both modes — the mid-hour flip. 'd1'/'d2' are
+	// dedicated (NULL and '' respectively: both spellings of "absence = dedicated",
+	// which must land in the SAME rollup); 's1'/'s2' are shared.
+	if _, err := db.ExecContext(ctx,
+		`INSERT INTO billing_event (request_id, auth_id, resource_id, org_id, model, base_model, serving_mode, prompt_tokens, completion_tokens, event_ts)
+		 VALUES ('d1','a','res','org-1','m','b',NULL,100,0,$1),
+		        ('d2','a','res','org-1','m','b','',  100,0,$1),
+		        ('s1','a','res','org-1','m','b','shared',100,0,$1),
+		        ('s2','a','res','org-1','m','b','shared',100,0,$1)`, hour.Add(5*time.Minute)); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+
+	store := NewPostgresStore(db)
+	res, err := store.RateWindow(ctx, book, hour, hour.Add(time.Hour))
+	if err != nil {
+		t.Fatalf("RateWindow: %v", err)
+	}
+
+	// TWO rollups from one (auth, resource, model, hour) — the split. All four events
+	// rate; nothing is withheld, because differing modes are now a legitimate split
+	// rather than an ambiguity.
+	if res.RollupsWritten != 2 || res.EventsRated != 4 {
+		t.Fatalf("rollups/events = %d/%d, want 2/4 (one rollup per serving mode, all events rated)",
+			res.RollupsWritten, res.EventsRated)
+	}
+	if res.AmbiguousBaseEvents != 0 {
+		t.Fatalf("AmbiguousBaseEvents = %d, want 0 (a mode split is not a base ambiguity)", res.AmbiguousBaseEvents)
+	}
+
+	// THE MONEY. Each rollup must carry ITS OWN rate:
+	//   dedicated: 200 prompt tokens x 0.000010 = 0.002000000
+	//   shared   : 200 prompt tokens x 0.000001 = 0.000200000
+	// Pre-0006 this was ONE row of 400 tokens at MIN() = 0.000001 → 0.000400000,
+	// i.e. the dedicated traffic billed at the shared rate.
+	for _, want := range []struct {
+		mode string
+		cost string
+		rate string
+	}{
+		{"", "0.002000000", "0.000010000"},
+		{"shared", "0.000200000", "0.000001000"},
+	} {
+		var cost, rate string
+		var tokens int64
+		if err := db.QueryRowContext(ctx,
+			`SELECT cost::text, applied_prompt_rate::text, prompt_tokens
+			   FROM rated_usage
+			  WHERE resource_id = 'res' AND serving_mode = $1 AND window_start = $2`,
+			want.mode, hour).Scan(&cost, &rate, &tokens); err != nil {
+			t.Fatalf("read serving_mode=%q rollup: %v", want.mode, err)
+		}
+		if cost != want.cost || rate != want.rate || tokens != 200 {
+			t.Fatalf("serving_mode=%q: cost/rate/tokens = %s/%s/%d, want %s/%s/200",
+				want.mode, cost, rate, tokens, want.cost, want.rate)
+		}
+	}
+
+	// The two rollups must have DISTINCT ids: rated_usage_id is an md5 over the grain,
+	// so if serving_mode had not entered the hash they would collide and the second
+	// upsert would overwrite the first — the split would be undone at the id level even
+	// with a correct GROUP BY.
+	var distinctIDs int
+	if err := db.QueryRowContext(ctx,
+		`SELECT COUNT(DISTINCT id) FROM rated_usage WHERE resource_id = 'res' AND window_start = $1`,
+		hour).Scan(&distinctIDs); err != nil {
+		t.Fatalf("count distinct ids: %v", err)
+	}
+	if distinctIDs != 2 {
+		t.Fatalf("distinct rated_usage ids = %d, want 2 (serving_mode must be in the md5 grain)", distinctIDs)
+	}
+}
+
+// TestIntegration_OwnerConflictWithheldAndGraphCarried pins the two other net-new 0006
+// behaviours against real Postgres, which the oracle store cannot model:
+//
+//   - OWNER CONFLICT: an event carrying BOTH user_id and group_id contradicts the
+//     upstream user-XOR-group model. The owner cannot be determined, so the rollup is
+//     WITHHELD (never billed to a guessed owner) and counted. Note auth-server emits
+//     these headers under an else-if and so cannot produce this today — the gate guards
+//     against a FUTURE producer regression.
+//   - OWNER SPLITS the grain: two different owners on one (auth, resource, model, hour)
+//     are two rollups, not one, so per-person charges are presentable.
+//   - GRAPH is EVIDENCE, not grain: it is carried onto the rollup but never splits it,
+//     and a rollup spanning TWO graphs still BILLS (with a NULL graph rather than a
+//     guess) — unlike every other ambiguity, which withholds.
+func TestIntegration_OwnerConflictWithheldAndGraphCarried(t *testing.T) {
+	dsn := os.Getenv("PHOEBE_TEST_DATABASE_URL")
+	if dsn == "" {
+		t.Skip("PHOEBE_TEST_DATABASE_URL not set; skipping live-Postgres conformance")
+	}
+	ctx := context.Background()
+	db, err := sql.Open("pgx", dsn)
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	defer db.Close()
+
+	const sch = "phoebe_rating_owner_it"
+	exec(t, db, "DROP SCHEMA IF EXISTS "+sch+" CASCADE")
+	exec(t, db, "CREATE SCHEMA "+sch)
+	exec(t, db, "SET search_path TO "+sch)
+	defer func() { exec(t, db, "DROP SCHEMA IF EXISTS "+sch+" CASCADE") }()
+	exec(t, db, ratingSchemaDDL(t))
+
+	hour := mustTime("2026-06-08T10:00:00Z")
+	book := newTestBook(
+		map[string]Rate3{"b": rate3("0.000005", "0", "0")},
+		nil, PolicyIdentity, Dec{}, Dec{},
+	)
+
+	//   'bad'   : one event with BOTH user and group  → withheld.
+	//   'split' : two events, different owners        → TWO rollups.
+	//   'graph' : two events, TWO distinct graphs     → ONE rollup, BILLED, NULL graph.
+	//   'one'   : two events, one graph               → ONE rollup carrying that graph.
+	if _, err := db.ExecContext(ctx,
+		`INSERT INTO billing_event (request_id, auth_id, user_id, group_id, resource_id, org_id, model, base_model, graph_k8s_name, prompt_tokens, completion_tokens, event_ts)
+		 VALUES ('b1','a','u-1','g-1','bad',  'org-1','m','b',NULL,     100,0,$1),
+		        ('p1','a','u-1',NULL, 'split','org-1','m','b',NULL,     100,0,$1),
+		        ('p2','a',NULL, 'g-2','split','org-1','m','b',NULL,     100,0,$1),
+		        ('g1','a','u-3',NULL, 'graph','org-1','m','b','dgd-a',  100,0,$1),
+		        ('g2','a','u-3',NULL, 'graph','org-1','m','b','dgd-b',  100,0,$1),
+		        ('o1','a','u-4',NULL, 'one',  'org-1','m','b','dgd-c',  100,0,$1),
+		        ('o2','a','u-4',NULL, 'one',  'org-1','m','b',NULL,     100,0,$1)`,
+		hour.Add(5*time.Minute)); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+
+	store := NewPostgresStore(db)
+	res, err := store.RateWindow(ctx, book, hour, hour.Add(time.Hour))
+	if err != nil {
+		t.Fatalf("RateWindow: %v", err)
+	}
+
+	if res.OwnerConflictEvents != 1 {
+		t.Fatalf("OwnerConflictEvents = %d, want 1 (the both-owner event)", res.OwnerConflictEvents)
+	}
+	// split(2) + graph(2) + one(2) = 6 rated; bad(1) withheld.
+	// Rollups: split is TWO (one per owner), graph is one, one is one = 4.
+	if res.RollupsWritten != 4 || res.EventsRated != 6 {
+		t.Fatalf("rollups/events = %d/%d, want 4/6 (owner splits 'split' into two; 'bad' withheld)",
+			res.RollupsWritten, res.EventsRated)
+	}
+	// The two-graph rollup is BILLED, not withheld — the whole point of graph being
+	// evidence rather than identity.
+	if res.AmbiguousGraphRollups != 1 {
+		t.Fatalf("AmbiguousGraphRollups = %d, want 1 (the two-graph rollup, which still bills)", res.AmbiguousGraphRollups)
+	}
+
+	// 'bad' never reached rated_usage.
+	var badRows int
+	if err := db.QueryRowContext(ctx,
+		`SELECT COUNT(*) FROM rated_usage WHERE resource_id = 'bad'`).Scan(&badRows); err != nil {
+		t.Fatalf("count bad: %v", err)
+	}
+	if badRows != 0 {
+		t.Fatalf("rated_usage rows for the owner-conflict resource = %d, want 0 (withheld, never billed to a guessed owner)", badRows)
+	}
+
+	// The owner pair split 'split' into one rollup per owner, each carrying its own
+	// (type, id) — this is what makes per-person / per-team charges presentable.
+	rows, err := db.QueryContext(ctx,
+		`SELECT owner_type, owner_id FROM rated_usage WHERE resource_id = 'split' ORDER BY owner_type`)
+	if err != nil {
+		t.Fatalf("read split rollups: %v", err)
+	}
+	defer func() { _ = rows.Close() }()
+	var owners []string
+	for rows.Next() {
+		var ot, oid string
+		if err := rows.Scan(&ot, &oid); err != nil {
+			t.Fatalf("scan owner: %v", err)
+		}
+		owners = append(owners, ot+":"+oid)
+	}
+	if len(owners) != 2 || owners[0] != "group:g-2" || owners[1] != "user:u-1" {
+		t.Fatalf("split owners = %v, want [group:g-2 user:u-1] (one rollup per owner)", owners)
+	}
+
+	// A two-graph rollup carries NULL rather than a guessed graph: an unattributable
+	// cost must not LOOK attributable.
+	var graph sql.NullString
+	if err := db.QueryRowContext(ctx,
+		`SELECT graph_k8s_name FROM rated_usage WHERE resource_id = 'graph'`).Scan(&graph); err != nil {
+		t.Fatalf("read graph rollup: %v", err)
+	}
+	if graph.Valid {
+		t.Fatalf("two-graph rollup carries graph_k8s_name = %q, want NULL (never guess a cost centre)", graph.String)
+	}
+
+	// A partial-NULL graph resolves to the one known graph — same MAX()-ignores-NULL
+	// convergence org_id already relies on, so a late-propagating graph is not lost.
+	var oneGraph sql.NullString
+	if err := db.QueryRowContext(ctx,
+		`SELECT graph_k8s_name FROM rated_usage WHERE resource_id = 'one'`).Scan(&oneGraph); err != nil {
+		t.Fatalf("read one-graph rollup: %v", err)
+	}
+	if !oneGraph.Valid || oneGraph.String != "dgd-c" {
+		t.Fatalf("partial-NULL graph rollup = %v/%q, want dgd-c (MAX ignores NULLs)", oneGraph.Valid, oneGraph.String)
 	}
 }

@@ -149,6 +149,9 @@ func newHarness(t *testing.T, schema string) *harness {
 	// poison-dropped every event with SQLSTATE 42703).
 	mustExec(t, db, readMigration(t, "0004_billing_event_serving_mode.up.sql"))
 	mustExec(t, db, readMigration(t, "0005_invoice_grade_attempts.up.sql"))
+	// 0006 adds billing_event.graph_k8s_name (in the drainer's INSERT) and widens
+	// the rated_usage grain the rater upserts on — same drift class as 0004.
+	mustExec(t, db, readMigration(t, "0006_rollup_grain.up.sql"))
 
 	mr, err := miniredis.Run()
 	if err != nil {
@@ -381,8 +384,11 @@ func TestE2E_StreamedRequestBecomesMoney(t *testing.T) {
 	req.Header.Set(identity.HeaderAuthID, testAuthID)
 	req.Header.Set(identity.HeaderResourceID, testResourceID)
 	req.Header.Set(identity.HeaderResourceType, "deployment")
+	// A user XOR a group, never both (DESIGN §2: identity_auth joins org via
+	// user_id OR group_id). Setting both is a producer bug the rater now treats
+	// as an owner conflict and withholds from money, so the fixture carries the
+	// realistic user-owned identity.
 	req.Header.Set(identity.HeaderUserID, "user-e2e")
-	req.Header.Set(identity.HeaderGroupID, "group-e2e")
 	req.Header.Set(identity.HeaderOrgID, testOrgID)
 	req.Header.Set("X-Request-Id", "saturn-e2e-streamed-request")
 	srv.Handler().ServeHTTP(rr, req)
@@ -599,8 +605,11 @@ func TestE2E_FineTuneBillsAtBaseTimesPremium(t *testing.T) {
 	req.Header.Set(identity.HeaderAuthID, testAuthID)
 	req.Header.Set(identity.HeaderResourceID, testResourceID)
 	req.Header.Set(identity.HeaderResourceType, "deployment")
+	// A user XOR a group, never both (DESIGN §2: identity_auth joins org via
+	// user_id OR group_id). Setting both is a producer bug the rater now treats
+	// as an owner conflict and withholds from money, so the fixture carries the
+	// realistic user-owned identity.
 	req.Header.Set(identity.HeaderUserID, "user-e2e")
-	req.Header.Set(identity.HeaderGroupID, "group-e2e")
 	// The base_model header Atlas injects at deploy for a fine-tune endpoint.
 	req.Header.Set(identity.HeaderBaseModel, ftBaseModel)
 	srv.Handler().ServeHTTP(rr, req)
@@ -690,8 +699,11 @@ func TestE2E_FineTuneWithoutBaseModelHeaderIsUnpriced(t *testing.T) {
 	req.Header.Set(identity.HeaderAuthID, testAuthID)
 	req.Header.Set(identity.HeaderResourceID, testResourceID)
 	req.Header.Set(identity.HeaderResourceType, "deployment")
+	// A user XOR a group, never both (DESIGN §2: identity_auth joins org via
+	// user_id OR group_id). Setting both is a producer bug the rater now treats
+	// as an owner conflict and withholds from money, so the fixture carries the
+	// realistic user-owned identity.
 	req.Header.Set(identity.HeaderUserID, "user-e2e")
-	req.Header.Set(identity.HeaderGroupID, "group-e2e")
 	// DELIBERATELY no X-Saturn-Base-Model header — the propagation bug under test.
 	srv.Handler().ServeHTTP(rr, req)
 
@@ -746,10 +758,10 @@ func TestE2E_ModellessEventWithoutUsageIsMissingUsage(t *testing.T) {
 	// An abort with no usage chunk: empty Model, zero counts, Aborted. Phoebe
 	// always records the attempt but has no authoritative counts to charge.
 	h.emitter.Emit(context.Background(), metering.Event{
-		RequestID:    "phoebe-e2e-modelless-0001",
-		AuthID:       testAuthID,
-		UserID:       "user-e2e",
-		GroupID:      "group-e2e",
+		RequestID: "phoebe-e2e-modelless-0001",
+		AuthID:    testAuthID,
+		UserID:    "user-e2e", // a user XOR a group, never both
+
 		ResourceID:   testResourceID,
 		ResourceType: "deployment",
 		Model:        "", // upstream emitted no parseable model
@@ -813,10 +825,10 @@ func TestE2E_SuccessWithoutUsagePages(t *testing.T) {
 	h := newHarness(t, "phoebe_e2e_success_no_usage")
 
 	h.emitter.Emit(context.Background(), metering.Event{
-		RequestID:    "phoebe-e2e-success-no-usage-0001",
-		AuthID:       testAuthID,
-		UserID:       "user-e2e",
-		GroupID:      "group-e2e",
+		RequestID: "phoebe-e2e-success-no-usage-0001",
+		AuthID:    testAuthID,
+		UserID:    "user-e2e", // a user XOR a group, never both
+
 		ResourceID:   testResourceID,
 		ResourceType: "deployment",
 		Model:        testModelName,
@@ -955,8 +967,11 @@ func TestE2E_AdapterHeaderLandsInBillingEventAndTriggersPremium(t *testing.T) {
 	req.Header.Set(identity.HeaderAuthID, testAuthID)
 	req.Header.Set(identity.HeaderResourceID, testResourceID)
 	req.Header.Set(identity.HeaderResourceType, "deployment")
+	// A user XOR a group, never both (DESIGN §2: identity_auth joins org via
+	// user_id OR group_id). Setting both is a producer bug the rater now treats
+	// as an owner conflict and withholds from money, so the fixture carries the
+	// realistic user-owned identity.
 	req.Header.Set(identity.HeaderUserID, "user-e2e")
-	req.Header.Set(identity.HeaderGroupID, "group-e2e")
 	// The two per-deployment headers the Atlas middleware injects on a fine-tune
 	// checkpoint endpoint (C4).
 	req.Header.Set(identity.HeaderBaseModel, epBaseModel)

@@ -43,8 +43,8 @@ func TestPostgresStore_RateWindowSQL(t *testing.T) {
 	// missing_usage_events is the TOTAL; expected + unexplained partition it
 	// (6 = 4 routine aborts/failures + 2 successes with no usage block), so the
 	// fixture cannot pass while the SQL's partition is wrong.
-	rows := sqlmock.NewRows([]string{"rollups_written", "events_rated", "total_cost", "reconciled_deletions", "unpriced_events", "unattributable_events", "missing_usage_events", "expected_missing_usage_events", "unexplained_missing_usage_events", "invalid_usage_events", "ambiguous_base_events", "ambiguous_org_events"}).
-		AddRow(2, 5, "0.001234500", 0, 3, 1, 6, 4, 2, 7, 4, 2)
+	rows := sqlmock.NewRows([]string{"rollups_written", "events_rated", "total_cost", "reconciled_deletions", "unpriced_events", "unattributable_events", "missing_usage_events", "expected_missing_usage_events", "unexplained_missing_usage_events", "invalid_usage_events", "ambiguous_base_events", "ambiguous_org_events", "owner_conflict_events", "ambiguous_graph_rollups"}).
+		AddRow(2, 5, "0.001234500", 0, 3, 1, 6, 4, 2, 7, 4, 2, 3, 1)
 	// The statement binds $3 = the ft: LIKE pattern (single-sourced from fineTunePrefix).
 	mock.ExpectQuery(`INSERT INTO rated_usage`).
 		WithArgs(start.UTC(), end.UTC(), ftLikePattern).
@@ -76,6 +76,12 @@ func TestPostgresStore_RateWindowSQL(t *testing.T) {
 	}
 	if res.InvalidUsageEvents != 7 {
 		t.Fatalf("invalid usage = %d, want 7 (must ride the same statement)", res.InvalidUsageEvents)
+	}
+	if res.OwnerConflictEvents != 3 {
+		t.Fatalf("owner-conflict events = %d, want 3 (must ride the same statement)", res.OwnerConflictEvents)
+	}
+	if res.AmbiguousGraphRollups != 1 {
+		t.Fatalf("ambiguous-graph rollups = %d, want 1 (must ride the same statement)", res.AmbiguousGraphRollups)
 	}
 	if res.ReconciledDeletions != 0 {
 		t.Fatalf("reconciled deletions = %d, want 0 (the projected count must scan into the result)", res.ReconciledDeletions)
@@ -163,7 +169,7 @@ func TestRateWindowSQL_Shape(t *testing.T) {
 		// Anchor the grouped filter's resource_id guard to its GROUP BY (which uniquely
 		// follows it), so this pins the priced/grouped clause specifically — not the bare
 		// substring, which would also match the unpriced-count guard below.
-		"AND resource_id IS NOT NULL\n    GROUP BY auth_id, resource_id, model_id",
+		"AND resource_id IS NOT NULL\n    GROUP BY auth_id, owner_type, owner_id, resource_id, model_id, serving_mode,",
 		// session-TZ-independent hour bucket
 		"date_trunc('hour', ev_ts AT TIME ZONE 'UTC') AT TIME ZONE 'UTC'",
 		// deterministic natural-key surrogate id (re-runs regenerate the same id),
@@ -173,9 +179,9 @@ func TestRateWindowSQL_Shape(t *testing.T) {
 		"|| '|' || length(resource_id)::text || ':' || resource_id",
 		"|| '|' || length(model_id)::text || ':' || model_id",
 		// deterministic lock order across concurrent raters (no ABBA deadlock)
-		"ORDER BY auth_id, resource_id, model_id, window_start",
+		"ORDER BY auth_id, owner_type, owner_id, resource_id, model_id, serving_mode, window_start",
 		// idempotent upsert on the natural key
-		"ON CONFLICT (auth_id, resource_id, model_id, window_start) DO UPDATE SET",
+		"ON CONFLICT (auth_id, owner_type, owner_id, resource_id, model_id, serving_mode, window_start) DO UPDATE SET",
 		// RE-RATE RECONCILES (FIX 2): the `deleted` CTE removes any in-window rollup this
 		// run did NOT reproduce in priced, atomically with the upsert — so a superseded
 		// rollup cannot keep billing at its stale cost. Window-scoped + NOT EXISTS priced.
@@ -210,8 +216,8 @@ func TestRateWindowSQL_Shape(t *testing.T) {
 		// the rollup via MAX (NOT a GROUP BY key — org is a function of resource_id), and
 		// written into rated_usage. NOT part of the md5 natural key.
 		"MAX(org_id)                                      AS org_id",
-		"id, auth_id, resource_id, org_id, model_id, window_start, window_end",
-		"auth_id, resource_id, org_id, model_id, window_start, window_end,",
+		"id, auth_id, owner_type, owner_id, resource_id, org_id, model_id,\n        serving_mode, graph_k8s_name, window_start, window_end,",
+		"auth_id, owner_type, owner_id, resource_id, org_id, model_id,\n        serving_mode, graph_k8s_name, window_start, window_end,",
 		// COALESCE, not bare EXCLUDED: a re-rate may set NULL->real (convergence) but must
 		// NEVER overwrite a known org with NULL (real->NULL un-attribution).
 		"org_id                  = COALESCE(EXCLUDED.org_id, rated_usage.org_id)",

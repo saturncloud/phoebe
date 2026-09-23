@@ -105,10 +105,11 @@ var upsertColumns = []string{
 	"usage_found",
 	"status_code",
 	"streamed",
+	"graph_k8s_name",
 	"event_ts",
 }
 
-const colsPerRow = 22 // len(upsertColumns); created_at is DB-defaulted.
+const colsPerRow = 23 // len(upsertColumns); created_at is DB-defaulted.
 
 // Upsert writes a batch of events in a single transaction with a multi-row
 // INSERT ... ON CONFLICT (request_id) DO NOTHING.
@@ -217,6 +218,13 @@ func eventArgs(e metering.Event) []any {
 		e.UsageFound,
 		nullInt(e.StatusCode),
 		e.Streamed,
+		// GraphK8sName is the serving graph (the cost centre) — evidence only, never
+		// part of the billing grain. nullStr so an unresolvable graph stores NULL
+		// rather than '': the rater's MAX(graph_k8s_name) ignores NULLs (so a rollup
+		// whose events partly predate graph propagation still resolves to the one
+		// known graph), whereas a stored '' would read as a DISTINCT second graph and
+		// falsely trip the ambiguous-graph count.
+		nullStr(e.GraphK8sName),
 		eventTS,
 	}
 }

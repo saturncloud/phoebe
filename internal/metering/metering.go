@@ -95,6 +95,19 @@ type Event struct {
 	// dedicated).
 	ServingMode string `json:"serving_mode,omitempty"`
 
+	// GraphK8sName is the DynamoGraphDeployment (DGD) that served this request —
+	// the COST CENTRE. It is carried so a rollup's cost stays attributable to the
+	// hardware that produced it, and it is the only way to do so in SHARED mode:
+	// there, MANY tf_model rows across MANY orgs ride ONE platform-owned base
+	// graph, and that graph has no row in any database (it is keyed by a
+	// deterministic name and reference-counted), so resource_id cannot identify it.
+	//
+	// Sourced from gateway resolution (tf_model.graph_k8s_name) on the gateway
+	// path, and derived from the upstream host on the header path. Empty is valid
+	// and never withholds money — it only means the cost is not pool-attributable.
+	// EVIDENCE ONLY: never part of the billing grain (see migrations/0006).
+	GraphK8sName string `json:"graph_k8s_name,omitempty"`
+
 	// Token counts (the engine's own usage block; never re-tokenized).
 	PromptTokens     int `json:"prompt_tokens"`
 	CachedTokens     int `json:"cached_tokens"`

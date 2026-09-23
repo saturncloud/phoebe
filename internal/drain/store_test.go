@@ -43,14 +43,14 @@ func TestPostgresStore_UpsertSQL(t *testing.T) {
 
 	mock.ExpectBegin()
 	mock.ExpectExec(regexp.QuoteMeta(
-		"INSERT INTO billing_event (request_id, client_request_id, auth_id, user_id, group_id, resource_id, resource_type, org_id, model, base_model, adapter, serving_mode, prompt_tokens, cached_tokens, completion_tokens, finish_reason, gpu_type, aborted, usage_found, status_code, streamed, event_ts) VALUES",
+		"INSERT INTO billing_event (request_id, client_request_id, auth_id, user_id, group_id, resource_id, resource_type, org_id, model, base_model, adapter, serving_mode, prompt_tokens, cached_tokens, completion_tokens, finish_reason, gpu_type, aborted, usage_found, status_code, streamed, graph_k8s_name, event_ts) VALUES",
 	)).
 		WithArgs(
 			// row 1 (org_id + base_model + serving_mode NULL: a dedicated base-model event, no
 			// org header, no derived_from)
-			"req-1", "logical-1", "auth-1", nil, nil, nil, nil, nil, "m1", nil, nil, nil, 5, 0, 7, nil, nil, false, false, nil, false, time.UnixMilli(ts).UTC(),
+			"req-1", "logical-1", "auth-1", nil, nil, nil, nil, nil, "m1", nil, nil, nil, 5, 0, 7, nil, nil, false, false, nil, false, nil, time.UnixMilli(ts).UTC(),
 			// row 2 (no identity, no timestamp → event_ts NULL)
-			"req-2", nil, nil, nil, nil, nil, nil, nil, "m2", nil, nil, nil, 0, 0, 0, nil, nil, false, false, nil, false, nil,
+			"req-2", nil, nil, nil, nil, nil, nil, nil, "m2", nil, nil, nil, 0, 0, 0, nil, nil, false, false, nil, false, nil, nil,
 		).
 		WillReturnResult(sqlmock.NewResult(0, 2))
 	mock.ExpectCommit()
@@ -128,7 +128,9 @@ func TestPostgresStore_EmptyModelStoredAsNull(t *testing.T) {
 			nil, // base_model: "" must bind NULL
 			nil, // adapter: "" must bind NULL
 			nil, // serving_mode: "" must bind NULL (dedicated)
-			1, 0, 2, nil, nil, false, false, nil, false, nil,
+			1, 0, 2, nil, nil, false, false, nil, false,
+			nil, // graph_k8s_name: "" must bind NULL
+			nil,
 		).
 		WillReturnResult(sqlmock.NewResult(0, 1))
 	mock.ExpectCommit()

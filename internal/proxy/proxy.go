@@ -274,6 +274,16 @@ func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Resolve the serving graph ONCE, here, so every downstream consumer (the wake
+	// target and the metering event) reads one value rather than deriving its own.
+	// The gateway path already set it from tf_model.graph_k8s_name; the header path
+	// has no such header, so it is derived from the upstream host the middleware
+	// stamped (<graph>-frontend.<ns>.svc...). Best-effort: an underivable graph
+	// leaves this empty, which is valid and never affects billing.
+	if id.GraphK8sName == "" {
+		id.GraphK8sName = graphFromUpstreamHost(upstream.Host)
+	}
+
 	// M5 I/O-logging gate — computed ONCE. Everything that adds hot-path cost
 	// (capturing the request body, buffering the response) is guarded by this
 	// single boolean. When false (the default, and the common case), the proxy
@@ -382,9 +392,6 @@ func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request) {
 			GraphK8sName: id.GraphK8sName,
 			ResourceID:   id.ResourceID,
 			ServedModel:  wakeModel,
-		}
-		if target.GraphK8sName == "" {
-			target.GraphK8sName = graphFromUpstreamHost(upstream.Host)
 		}
 		wakeCtx := r.Context()
 		cancel := func() {}
@@ -597,6 +604,12 @@ func (s *Server) emit(ctx context.Context, id identity.Identity, requestID, clie
 		// the trusted middleware header. Empty = dedicated. Shared traffic prices
 		// from the distinct shared:<base> rate row.
 		ServingMode: id.ServingMode,
+		// GraphK8sName is the serving graph (the cost centre), resolved once on the
+		// request path: from tf_model on the gateway route, derived from the upstream
+		// host on a dedicated route. Evidence only — it never affects the charge, and
+		// empty is valid. Carried because in SHARED mode the graph is the only handle
+		// on the hardware: many orgs ride one platform graph that has no database row.
+		GraphK8sName: id.GraphK8sName,
 
 		PromptTokens:     res.Usage.PromptTokens,
 		CachedTokens:     res.Usage.CachedTokens(),
