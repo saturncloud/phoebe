@@ -659,11 +659,28 @@ upserted AS (
         -- silent re-rate flip: it is a distinct-org collision the ambiguous_org guard
         -- above already withholds + screams, so it never reaches this UPDATE.
         org_id                  = COALESCE(EXCLUDED.org_id, rated_usage.org_id),
-        -- Same COALESCE reasoning as org_id: a rollup first written before graph
-        -- propagation picks the graph up on a later re-rate, but a re-rate whose
-        -- snapshot has LOST the graph (or found two, which nulls it above) must not
-        -- erase a graph already recorded. Evidence only -- it never changes the money.
-        graph_k8s_name          = COALESCE(EXCLUDED.graph_k8s_name, rated_usage.graph_k8s_name),
+        -- PLAIN OVERWRITE, deliberately NOT the COALESCE-never-erase treatment org_id
+        -- gets one line above. The asymmetry is the whole point.
+        --
+        -- org_id can COALESCE safely because a real -> NULL org transition never reaches
+        -- this UPDATE: the only way one org becomes another is a distinct-org collision,
+        -- and ambiguous_org WITHHOLDS that rollup from priced entirely. So a NULL in
+        -- EXCLUDED.org_id can only ever mean "header not wired yet", never "we now know
+        -- this is unattributable".
+        --
+        -- graph is different precisely BECAUSE ambiguous_graph does not withhold: a
+        -- rollup that spans two graphs still bills, with the column nulled (see the
+        -- CASE in grouped) so an unattributable cost does not LOOK attributable. That
+        -- NULL therefore DOES reach this UPDATE, and it is a real finding, not a gap.
+        -- COALESCE here would restore the stale single-graph value and silently undo
+        -- the nulling -- leaving the rollup asserting a cost centre the rater has just
+        -- determined it cannot name.
+        --
+        -- The cost of the plain overwrite is that a re-rate over a window whose events
+        -- no longer carry a graph downgrades a known graph to NULL. That is the honest
+        -- direction to fail: the rollup then says "unknown" rather than asserting a
+        -- graph this run could not confirm. Evidence only -- it never changes the money.
+        graph_k8s_name          = EXCLUDED.graph_k8s_name,
         window_end              = EXCLUDED.window_end,
         prompt_tokens           = EXCLUDED.prompt_tokens,
         cached_tokens           = EXCLUDED.cached_tokens,

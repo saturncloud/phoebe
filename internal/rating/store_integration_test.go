@@ -2761,3 +2761,99 @@ func TestIntegration_OwnerConflictWithheldAndGraphCarried(t *testing.T) {
 		t.Fatalf("partial-NULL graph rollup = %v/%q, want dgd-c (MAX ignores NULLs)", oneGraph.Valid, oneGraph.String)
 	}
 }
+
+// TestIntegration_ReRateNullsAGraphThatBecameAmbiguous pins the ONE place where graph
+// and org_id deliberately behave DIFFERENTLY on re-rate, against real Postgres.
+//
+// org_id's upsert COALESCEs (never erase a known org), and that is safe only because a
+// real->NULL org transition cannot reach the UPDATE: ambiguous_org WITHHOLDS such a
+// rollup. graph has no such protection -- ambiguous_graph deliberately does NOT
+// withhold, because the graph decides what a cost is attributed AGAINST, not WHO is
+// billed. So its NULL genuinely reaches the UPDATE and must overwrite.
+//
+// The failure this guards: run A records one graph; run B (a late event arrives, or a
+// deployment moved) finds TWO and nulls the column to avoid asserting a cost centre it
+// can no longer name. Under a COALESCE the stale graph would be restored, silently
+// undoing the nulling and leaving the rollup claiming hardware the rater has just
+// determined it cannot identify.
+func TestIntegration_ReRateNullsAGraphThatBecameAmbiguous(t *testing.T) {
+	dsn := os.Getenv("PHOEBE_TEST_DATABASE_URL")
+	if dsn == "" {
+		t.Skip("PHOEBE_TEST_DATABASE_URL not set; skipping live-Postgres conformance")
+	}
+	ctx := context.Background()
+	db, err := sql.Open("pgx", dsn)
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	defer db.Close()
+
+	const sch = "phoebe_rating_graphrerate_it"
+	exec(t, db, "DROP SCHEMA IF EXISTS "+sch+" CASCADE")
+	exec(t, db, "CREATE SCHEMA "+sch)
+	exec(t, db, "SET search_path TO "+sch)
+	defer func() { exec(t, db, "DROP SCHEMA IF EXISTS "+sch+" CASCADE") }()
+	exec(t, db, ratingSchemaDDL(t))
+
+	hour := mustTime("2026-06-08T10:00:00Z")
+	book := newTestBook(
+		map[string]Rate3{"b": rate3("0.000005", "0", "0")},
+		nil, PolicyIdentity, Dec{}, Dec{},
+	)
+	store := NewPostgresStore(db)
+
+	// RUN A: one event, one graph. The rollup records it.
+	if _, err := db.ExecContext(ctx,
+		`INSERT INTO billing_event (request_id, auth_id, resource_id, org_id, model, base_model, graph_k8s_name, prompt_tokens, completion_tokens, event_ts)
+		 VALUES ('e1','a','res','org-1','m','b','dgd-a',100,0,$1)`, hour.Add(5*time.Minute)); err != nil {
+		t.Fatalf("seed run A: %v", err)
+	}
+	if _, err := store.RateWindow(ctx, book, hour, hour.Add(time.Hour)); err != nil {
+		t.Fatalf("RateWindow A: %v", err)
+	}
+	var graphA sql.NullString
+	if err := db.QueryRowContext(ctx,
+		`SELECT graph_k8s_name FROM rated_usage WHERE resource_id = 'res'`).Scan(&graphA); err != nil {
+		t.Fatalf("read run A: %v", err)
+	}
+	if !graphA.Valid || graphA.String != "dgd-a" {
+		t.Fatalf("run A graph = %v/%q, want dgd-a", graphA.Valid, graphA.String)
+	}
+
+	// RUN B: a second event on a DIFFERENT graph lands in the same hour. The rollup is
+	// now two-graph: it still BILLS (graph is evidence, not identity) but can no longer
+	// name its cost centre.
+	if _, err := db.ExecContext(ctx,
+		`INSERT INTO billing_event (request_id, auth_id, resource_id, org_id, model, base_model, graph_k8s_name, prompt_tokens, completion_tokens, event_ts)
+		 VALUES ('e2','a','res','org-1','m','b','dgd-b',100,0,$1)`, hour.Add(6*time.Minute)); err != nil {
+		t.Fatalf("seed run B: %v", err)
+	}
+	resB, err := store.RateWindow(ctx, book, hour, hour.Add(time.Hour))
+	if err != nil {
+		t.Fatalf("RateWindow B: %v", err)
+	}
+	if resB.AmbiguousGraphRollups != 1 {
+		t.Fatalf("AmbiguousGraphRollups = %d, want 1", resB.AmbiguousGraphRollups)
+	}
+	// It still bills -- BOTH events, at the full rate. Ambiguity here costs attribution,
+	// never revenue.
+	if resB.EventsRated != 2 || resB.RollupsWritten != 1 {
+		t.Fatalf("run B events/rollups = %d/%d, want 2/1 (a two-graph rollup still bills)",
+			resB.EventsRated, resB.RollupsWritten)
+	}
+
+	// THE ASSERTION: the previously-recorded graph is GONE, not restored by a COALESCE.
+	var graphB sql.NullString
+	var cost string
+	if err := db.QueryRowContext(ctx,
+		`SELECT graph_k8s_name, cost::text FROM rated_usage WHERE resource_id = 'res'`).
+		Scan(&graphB, &cost); err != nil {
+		t.Fatalf("read run B: %v", err)
+	}
+	if graphB.Valid {
+		t.Fatalf("after re-rate the rollup still claims graph %q — a COALESCE restored a cost centre the rater determined it cannot name", graphB.String)
+	}
+	if cost != "0.001000000" {
+		t.Fatalf("run B cost = %s, want 0.001000000 (200 tokens x 0.000005; ambiguity must not touch the money)", cost)
+	}
+}
