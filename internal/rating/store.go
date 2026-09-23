@@ -20,8 +20,9 @@ import (
 // caller loads the price file into a PriceBook and passes it to RateWindow; the
 // store PROJECTS the book's already-premium-applied per-token rates into a
 // transient (TEMP) price table for the window, then rates the whole window in SQL —
-// resolves the effective rate, computes per-event cost, sums it per (auth_id,
-// resource_id, model_id, hour) into rated_usage idempotently, AND counts the fail-loud anomalies,
+// resolves the effective rate, computes per-event cost, sums it per rollup grain
+// (auth_id, owner_type, owner_id, resource_id, model_id, serving_mode, hour) into
+// rated_usage idempotently, AND counts the fail-loud anomalies,
 // all in one snapshot so the rollups and the anomaly counts always agree on what
 // "priced" means.
 type Store interface {
@@ -107,6 +108,13 @@ type RateResult struct {
 // Anomalies are the fail-loud counts for a window: events that could not be priced
 // and rows that could not be attributed. Both drive the exit-nonzero path. int64 to
 // match RateResult's widened counts.
+//
+// NOTE: used ONLY by the test oracle (rater_test.go), not by production code, which
+// reads the counts off RateResult directly. It deliberately does NOT carry the
+// owner-conflict or ambiguous-graph counts: the oracle cannot model them (it has no
+// notion of owner headers or serving graphs), so those gates are covered by the
+// live-Postgres integration tests instead. Adding fields here without teaching the
+// oracle to populate them would make it silently assert zero.
 type Anomalies struct {
 	UnpricedEvents                int64
 	UnattributableEvents          int64
@@ -261,7 +269,8 @@ CREATE TEMP TABLE rating_derived (
 // so rollup keys can never disagree across sessions and re-rates can't overlap.
 //
 // IDEMPOTENCY IS RECONCILE, NOT UPSERT-ONLY: a re-run of a window makes rated_usage
-// EXACTLY what the latest run says. ON CONFLICT (auth_id, resource_id, model_id,
+// EXACTLY what the latest run says. ON CONFLICT (auth_id, owner_type, owner_id,
+// resource_id, model_id, serving_mode,
 // window_start) DO UPDATE replaces a surviving rollup's sums/cost/applied-rates with
 // the freshly recomputed ones (the surrogate id is DETERMINISTIC — md5 of the LENGTH-PREFIXED
 // natural key, injective, so no '|' in a field can collide two keys — so a re-run
@@ -443,7 +452,8 @@ resolved AS (
        AND rp.model_id IS NULL
        AND NOT (ev.model_id LIKE $3 OR ev.adapter IS NOT NULL)
 ),
--- grouped: the per-(auth_id, resource_id, model_id, hour) rollup BEFORE the
+-- grouped: the per-(auth_id, owner_type, owner_id, resource_id, model_id, serving_mode,
+-- hour) rollup BEFORE the
 -- single-rate gate.
 -- A rollup stores ONE applied-rate triple, so every priced row in it must have
 -- resolved to the SAME rate. Rows that priced through base_model (via_derived or
@@ -510,7 +520,8 @@ grouped AS (
         -- never affect it.
         (COUNT(DISTINCT base_model) FILTER (WHERE via_derived OR via_base) > 1
          OR (bool_or(via_derived) AND bool_or(via_base)))          AS ambiguous_base,
-        -- > 1 distinct NON-NULL org_id for one (auth, resource, model, hour) rollup →
+        -- > 1 distinct NON-NULL org_id for one rollup (see the GROUP BY for the full
+        -- grain) →
         -- ambiguous org. Org is a deployment property, so a resource resolving to two
         -- distinct orgs in one window is an attribution PROPAGATION bug (Atlas injected
         -- conflicting org labels). A blind MAX(org_id) would silently bill the whole
@@ -567,7 +578,7 @@ priced AS (
     WHERE NOT ambiguous_base AND NOT ambiguous_org AND NOT owner_conflict
 ),
 -- RECONCILE (re-rate deletes superseded rollups): a rated_usage row whose
--- (auth_id, resource_id, model_id, window_start) falls IN this run's window but is
+-- grain (see the unique constraint) falls IN this run's window but is
 -- NOT in the current priced set is STALE — it billed CLEAN in a prior run, but the latest run
 -- now excludes it (it became ambiguous-base, or unpriced, or its events vanished).
 -- "What the latest run says is what bills," so it is DELETED, atomically with the

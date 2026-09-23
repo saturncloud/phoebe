@@ -255,7 +255,7 @@ func (r *Rater) Run(ctx context.Context, windowStart, windowEnd time.Time, windo
 			windowStart.Format(time.RFC3339), windowEnd.Format(time.RFC3339), res.AmbiguousBaseEvents)
 	}
 	if res.HasAmbiguousOrg() {
-		r.log.Error.Printf("rating: window [%s,%s) has %d events under AMBIGUOUS-ORG rollups (a single (auth, resource, model, hour) rollup carried MORE THAN ONE distinct non-NULL org_id) — a deployment owns exactly one org, so this is an E2 attribution PROPAGATION bug (Atlas injected conflicting X-Saturn-Org-Id values for one resource); these rollups are NOT billed (a guessed org would mis-attribute revenue). Fix org_id propagation and re-rate this window",
+		r.log.Error.Printf("rating: window [%s,%s) has %d events under AMBIGUOUS-ORG rollups (a single rollup carried MORE THAN ONE distinct non-NULL org_id) — a deployment owns exactly one org, so this is an E2 attribution PROPAGATION bug (Atlas injected conflicting X-Saturn-Org-Id values for one resource); these rollups are NOT billed (a guessed org would mis-attribute revenue). Fix org_id propagation and re-rate this window",
 			windowStart.Format(time.RFC3339), windowEnd.Format(time.RFC3339), res.AmbiguousOrgEvents)
 	}
 	if res.HasOwnerConflict() {
