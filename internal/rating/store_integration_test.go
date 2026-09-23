@@ -2857,3 +2857,94 @@ func TestIntegration_ReRateNullsAGraphThatBecameAmbiguous(t *testing.T) {
 		t.Fatalf("run B cost = %s, want 0.001000000 (200 tokens x 0.000005; ambiguity must not touch the money)", cost)
 	}
 }
+
+// TestIntegration_OwnerConflictDoesNotPoisonItsBucket is the regression test for a bug
+// the FIRST owner-conflict test missed, because that test isolated the malformed event
+// on its own resource_id and so never made it share a bucket with anyone.
+//
+// THE BUG: a both-owner event has nowhere to go in the owner CASE, so it collapses to
+// owner_type=” / owner_id=” -- the SAME bucket as genuine no-owner traffic. The gate
+// was a group-level bool_or(owner_conflict) in `grouped`, which therefore withheld
+// EVERY legitimate no-owner rollup that merely shared a bucket with one malformed
+// event. One bad row zeroed other people's revenue, and the alarm counted the whole
+// group's events as conflicted, over-reporting the blast radius 3x on this fixture.
+//
+// THE FIX: drop conflicted events PER EVENT in grouped's WHERE (like the
+// unattributable filters) and count them from `ev`, so the damage is exactly the
+// offending event and the count names only it.
+//
+// Note this is a FUTURE-producer guard, not a live one: auth-server emits the two
+// identity headers under an else-if and structurally cannot send both. That is
+// precisely why the gate must not over-withhold -- when a new producer does regress,
+// the blast radius should be one event, not everyone who shared its hour.
+func TestIntegration_OwnerConflictDoesNotPoisonItsBucket(t *testing.T) {
+	dsn := os.Getenv("PHOEBE_TEST_DATABASE_URL")
+	if dsn == "" {
+		t.Skip("PHOEBE_TEST_DATABASE_URL not set; skipping live-Postgres conformance")
+	}
+	ctx := context.Background()
+	db, err := sql.Open("pgx", dsn)
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	defer db.Close()
+
+	const sch = "phoebe_rating_conflictbucket_it"
+	exec(t, db, "DROP SCHEMA IF EXISTS "+sch+" CASCADE")
+	exec(t, db, "CREATE SCHEMA "+sch)
+	exec(t, db, "SET search_path TO "+sch)
+	defer func() { exec(t, db, "DROP SCHEMA IF EXISTS "+sch+" CASCADE") }()
+	exec(t, db, ratingSchemaDDL(t))
+
+	hour := mustTime("2026-06-08T10:00:00Z")
+	book := newTestBook(
+		map[string]Rate3{"b": rate3("0.000005", "0", "0")},
+		nil, PolicyIdentity, Dec{}, Dec{},
+	)
+
+	// ALL THREE share one (auth, resource, model, serving_mode, hour) bucket, and the
+	// two good ones have NO owner -- so they land in the same '' / '' owner bucket the
+	// conflicted event collapses into. That collision is the whole point of the test.
+	if _, err := db.ExecContext(ctx,
+		`INSERT INTO billing_event (request_id, auth_id, user_id, group_id, resource_id, org_id, model, base_model, prompt_tokens, completion_tokens, event_ts)
+		 VALUES ('ok1','a',NULL, NULL, 'res','org-1','m','b',100,0,$1),
+		        ('ok2','a',NULL, NULL, 'res','org-1','m','b',100,0,$1),
+		        ('bad','a','u-1','g-1','res','org-1','m','b',100,0,$1)`,
+		hour.Add(5*time.Minute)); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+
+	store := NewPostgresStore(db)
+	res, err := store.RateWindow(ctx, book, hour, hour.Add(time.Hour))
+	if err != nil {
+		t.Fatalf("RateWindow: %v", err)
+	}
+
+	// The two legitimate events STILL BILL. Under the old group-level gate this was 0.
+	if res.EventsRated != 2 || res.RollupsWritten != 1 {
+		t.Fatalf("events/rollups = %d/%d, want 2/1 — one malformed event must not withhold the revenue of legitimate events sharing its bucket",
+			res.EventsRated, res.RollupsWritten)
+	}
+	// 200 tokens x 0.000005. The conflicted event contributes nothing.
+	if res.TotalCost != "0.001000000" {
+		t.Fatalf("TotalCost = %s, want 0.001000000 (the two good events only)", res.TotalCost)
+	}
+	// EXACTLY the offending event — not its innocent neighbours. Under the old gate
+	// this reported 3, sending an operator after 3x the real blast radius.
+	if res.OwnerConflictEvents != 1 {
+		t.Fatalf("OwnerConflictEvents = %d, want 1 (only one event carried both owners)", res.OwnerConflictEvents)
+	}
+
+	// The surviving rollup is the no-owner one, carrying only the good events.
+	var ownerType, ownerID string
+	var events int64
+	if err := db.QueryRowContext(ctx,
+		`SELECT owner_type, owner_id, event_count FROM rated_usage WHERE resource_id = 'res'`).
+		Scan(&ownerType, &ownerID, &events); err != nil {
+		t.Fatalf("read rollup: %v", err)
+	}
+	if ownerType != "" || ownerID != "" || events != 2 {
+		t.Fatalf("rollup = (%q,%q) with %d events, want ('','') with 2 (the conflicted event must not be counted into it)",
+			ownerType, ownerID, events)
+	}
+}

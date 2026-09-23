@@ -166,10 +166,19 @@ func TestRateWindowSQL_Shape(t *testing.T) {
 		"AND prompt_price IS NOT NULL",
 		"AND auth_id     IS NOT NULL",
 		"AND model_id    IS NOT NULL",
-		// Anchor the grouped filter's resource_id guard to its GROUP BY (which uniquely
-		// follows it), so this pins the priced/grouped clause specifically — not the bare
-		// substring, which would also match the unpriced-count guard below.
-		"AND resource_id IS NOT NULL\n    GROUP BY auth_id, owner_type, owner_id, resource_id, model_id, serving_mode,",
+		// Anchor the grouped filter's resource_id guard to the owner-conflict filter and
+		// GROUP BY that uniquely follow it, so this pins the priced/grouped clause
+		// specifically — not the bare substring, which would also match the
+		// unpriced-count guard below.
+		//
+		// The "AND NOT owner_conflict" between them is load-bearing, not incidental:
+		// conflicted events MUST be dropped PER EVENT here rather than gated at the
+		// group level. A group-level bool_or withheld every legitimate no-owner rollup
+		// sharing a bucket with one malformed event, because a conflicted event
+		// collapses into the same '' / '' owner bucket as genuine no-owner traffic.
+		// See TestIntegration_OwnerConflictDoesNotPoisonItsBucket.
+		"AND resource_id IS NOT NULL\n      -- OWNER CONFLICT is excluded PER EVENT",
+		"AND NOT owner_conflict\n    GROUP BY auth_id, owner_type, owner_id, resource_id, model_id, serving_mode,",
 		// session-TZ-independent hour bucket
 		"date_trunc('hour', ev_ts AT TIME ZONE 'UTC') AT TIME ZONE 'UTC'",
 		// deterministic natural-key surrogate id (re-runs regenerate the same id),

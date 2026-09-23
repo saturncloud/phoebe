@@ -20,9 +20,8 @@ import (
 // caller loads the price file into a PriceBook and passes it to RateWindow; the
 // store PROJECTS the book's already-premium-applied per-token rates into a
 // transient (TEMP) price table for the window, then rates the whole window in SQL —
-// resolves the effective rate, computes per-event cost, sums it per rollup grain
-// (auth_id, owner_type, owner_id, resource_id, model_id, serving_mode, hour) into
-// rated_usage idempotently, AND counts the fail-loud anomalies,
+// resolves the effective rate, computes per-event cost, sums it per (auth_id,
+// resource_id, model_id, hour) into rated_usage idempotently, AND counts the fail-loud anomalies,
 // all in one snapshot so the rollups and the anomaly counts always agree on what
 // "priced" means.
 type Store interface {
@@ -108,13 +107,6 @@ type RateResult struct {
 // Anomalies are the fail-loud counts for a window: events that could not be priced
 // and rows that could not be attributed. Both drive the exit-nonzero path. int64 to
 // match RateResult's widened counts.
-//
-// NOTE: used ONLY by the test oracle (rater_test.go), not by production code, which
-// reads the counts off RateResult directly. It deliberately does NOT carry the
-// owner-conflict or ambiguous-graph counts: the oracle cannot model them (it has no
-// notion of owner headers or serving graphs), so those gates are covered by the
-// live-Postgres integration tests instead. Adding fields here without teaching the
-// oracle to populate them would make it silently assert zero.
 type Anomalies struct {
 	UnpricedEvents                int64
 	UnattributableEvents          int64
@@ -269,8 +261,7 @@ CREATE TEMP TABLE rating_derived (
 // so rollup keys can never disagree across sessions and re-rates can't overlap.
 //
 // IDEMPOTENCY IS RECONCILE, NOT UPSERT-ONLY: a re-run of a window makes rated_usage
-// EXACTLY what the latest run says. ON CONFLICT (auth_id, owner_type, owner_id,
-// resource_id, model_id, serving_mode,
+// EXACTLY what the latest run says. ON CONFLICT (auth_id, resource_id, model_id,
 // window_start) DO UPDATE replaces a surviving rollup's sums/cost/applied-rates with
 // the freshly recomputed ones (the surrogate id is DETERMINISTIC — md5 of the LENGTH-PREFIXED
 // natural key, injective, so no '|' in a field can collide two keys — so a re-run
@@ -452,8 +443,7 @@ resolved AS (
        AND rp.model_id IS NULL
        AND NOT (ev.model_id LIKE $3 OR ev.adapter IS NOT NULL)
 ),
--- grouped: the per-(auth_id, owner_type, owner_id, resource_id, model_id, serving_mode,
--- hour) rollup BEFORE the
+-- grouped: the per-(auth_id, resource_id, model_id, hour) rollup BEFORE the
 -- single-rate gate.
 -- A rollup stores ONE applied-rate triple, so every priced row in it must have
 -- resolved to the SAME rate. Rows that priced through base_model (via_derived or
@@ -520,8 +510,7 @@ grouped AS (
         -- never affect it.
         (COUNT(DISTINCT base_model) FILTER (WHERE via_derived OR via_base) > 1
          OR (bool_or(via_derived) AND bool_or(via_base)))          AS ambiguous_base,
-        -- > 1 distinct NON-NULL org_id for one rollup (see the GROUP BY for the full
-        -- grain) →
+        -- > 1 distinct NON-NULL org_id for one (auth, resource, model, hour) rollup →
         -- ambiguous org. Org is a deployment property, so a resource resolving to two
         -- distinct orgs in one window is an attribution PROPAGATION bug (Atlas injected
         -- conflicting org labels). A blind MAX(org_id) would silently bill the whole
@@ -550,12 +539,10 @@ grouped AS (
         -- bills normally with a NULL graph rather than a guessed one, and the count
         -- below surfaces it. (Contrast ambiguous_org, which DOES withhold: org decides
         -- WHO is billed, graph only decides what the cost is attributed against.)
-        COUNT(DISTINCT graph_k8s_name) > 1 AS ambiguous_graph,
-        -- OWNER CONFLICT: any event in this rollup carried BOTH a user and a group.
-        -- That contradicts the upstream ownership model (user XOR group), so the owner
-        -- cannot be determined. Withheld from money rather than billed to a guessed
-        -- owner; the raw evidence stays in billing_event for diagnosis.
-        bool_or(owner_conflict) AS owner_conflict
+        -- NOTE: there is deliberately NO owner_conflict aggregate here. Conflicted
+        -- events are dropped by the WHERE below, per event, so none survives to be
+        -- aggregated -- see the comment there for why a group-level gate was wrong.
+        COUNT(DISTINCT graph_k8s_name) > 1 AS ambiguous_graph
     FROM resolved
     WHERE usage_found                       -- authoritative engine counts only
       AND valid_usage                       -- malformed legacy evidence never enters money
@@ -566,19 +553,29 @@ grouped AS (
       -- NULL resource_id row can't name its deployment/org, so it is NEVER billed; it
       -- is excluded here and COUNTED as unattributable below (fail closed).
       AND resource_id IS NOT NULL
+      -- OWNER CONFLICT is excluded PER EVENT, here, NOT via a bool_or gate over the
+      -- group. This is load-bearing and was a bug once: a conflicted event collapses to
+      -- owner_type='' / owner_id='' (the CASE has nowhere else to put it), which is the
+      -- SAME bucket as genuine no-owner traffic. A group-level bool_or therefore
+      -- withheld every legitimate no-owner rollup that merely SHARED a bucket with one
+      -- malformed event -- one bad row zeroing other people's revenue -- and counted
+      -- the whole group's events as conflicted, over-reporting the blast radius.
+      -- Dropping the row here keeps the damage to exactly the offending event, and the
+      -- count below is taken from ev so it reports that one event, not its neighbours.
+      AND NOT owner_conflict
     GROUP BY auth_id, owner_type, owner_id, resource_id, model_id, serving_mode,
              date_trunc('hour', ev_ts AT TIME ZONE 'UTC') AT TIME ZONE 'UTC'
 ),
--- owner_conflict joins the withholding gates: an owner that contradicts the upstream
--- user-XOR-group model cannot be billed to either side. ambiguous_graph is NOT here --
--- the graph is evidence, so a conflict nulls the column (above) rather than withholding
--- the money.
+-- owner_conflict is NOT a gate here: conflicted events never reach grouped (they are
+-- dropped per event in its WHERE), so there is no group left to filter. ambiguous_graph
+-- is not here either -- the graph is evidence, so a conflict nulls the column rather
+-- than withholding the money.
 priced AS (
     SELECT * FROM grouped
-    WHERE NOT ambiguous_base AND NOT ambiguous_org AND NOT owner_conflict
+    WHERE NOT ambiguous_base AND NOT ambiguous_org
 ),
 -- RECONCILE (re-rate deletes superseded rollups): a rated_usage row whose
--- grain (see the unique constraint) falls IN this run's window but is
+-- (auth_id, resource_id, model_id, window_start) falls IN this run's window but is
 -- NOT in the current priced set is STALE — it billed CLEAN in a prior run, but the latest run
 -- now excludes it (it became ambiguous-base, or unpriced, or its events vanished).
 -- "What the latest run says is what bills," so it is DELETED, atomically with the
@@ -793,9 +790,21 @@ SELECT
     -- LAST in the precedence chain (AND NOT the two above) so the partition stays
     -- strict: a rollup that is both owner-conflicted and base-ambiguous is counted
     -- ONLY as ambiguous_base. Same EVENT-unit convention throughout.
-    (SELECT COALESCE(SUM(event_count), 0)::bigint FROM grouped
-      WHERE owner_conflict AND NOT ambiguous_base AND NOT ambiguous_org)
-                                                            AS owner_conflict_events,
+    -- Counted from ev (PER EVENT), not from grouped: a conflicted event is dropped
+    -- before grouping, so it has no rollup to be summed under. This also keeps the
+    -- count honest -- exactly the events that carried both owners, never the innocent
+    -- neighbours that happened to share their bucket.
+    --
+    -- The attribution filters mirror the unattributable/unpriced buckets so the
+    -- partition stays strict: a conflicted row that ALSO lacks auth/resource/model is
+    -- counted once, as unattributable (the more specific upstream failure).
+    (SELECT COUNT(*)::bigint FROM ev
+      WHERE owner_conflict
+        AND usage_found
+        AND valid_usage
+        AND auth_id     IS NOT NULL
+        AND resource_id IS NOT NULL
+        AND model_id    IS NOT NULL)                        AS owner_conflict_events,
     -- AMBIGUOUS-GRAPH rollups: >1 distinct serving graph in one rollup. NOT part of
     -- the event partition above and NOT a withholding gate — the graph is evidence,
     -- so the rollup BILLS NORMALLY with a NULL graph rather than a guessed one. Counted
