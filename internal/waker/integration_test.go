@@ -39,7 +39,8 @@ func TestServeWithWake_DGDSAMissing_ServesColdResponse(t *testing.T) {
 	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(`{"model":"m"}`))
 	req.Header.Set(identity.HeaderAuthID, "auth-1")
 	req.Header.Set(identity.HeaderResourceID, "tfm-1")
-	req.Header.Set(identity.HeaderServedModel, "m") // wakeable route
+	req.Header.Set(identity.HeaderServingMode, "shared")
+	req.Header.Set(identity.HeaderServedModel, "m") // coherent shared, wakeable route
 	req.Header.Set(identity.HeaderUpstream, strings.TrimPrefix(backend.URL, "http://"))
 	rr := httptest.NewRecorder()
 	srv.Handler().ServeHTTP(rr, req)

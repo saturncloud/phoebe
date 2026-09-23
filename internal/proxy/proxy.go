@@ -26,11 +26,13 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"net"
 	"net/http"
 	"net/http/httputil"
 	"net/url"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"github.com/saturncloud/phoebe/internal/admission"
@@ -84,7 +86,7 @@ type Server struct {
 	// gateway-marked requests fail closed with 503. Set via WithGateway.
 	gateway *gatewayRoute
 
-	// admitter is the distributed shared-tier physical-capacity gate. nil means
+	// admitter is the distributed shared-inference physical-capacity gate. nil means
 	// the feature is disabled. It runs only after trusted org/model resolution
 	// and model binding, and before any engine request.
 	admitter admission.Admitter
@@ -193,6 +195,21 @@ func (s *Server) handleHealth(w http.ResponseWriter, _ *http.Request) {
 // onDone fires exactly once regardless of whether EOF or Close reaches it first.
 func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request) {
 	id := identity.FromRequest(r)
+	var sharedLane config.AdmissionLane
+	bodyBound := false
+
+	// Gateway resolution must inspect model=, so apply the shared-inference body
+	// ceiling before that first read. The gateway ForwardAuth has already
+	// stamped the trusted organization. Preserve the existing
+	// fail-closed gateway-not-configured/missing-org responses without reading
+	// a body in those cases.
+	if id.Gateway && s.gateway != nil && id.OrgID != "" {
+		sharedLane = admissionLaneForIdentity(s.settings.Admission, id)
+		if !boundSharedRequestBody(w, r, sharedRequestBodyLimit(s.settings.Admission, sharedLane)) {
+			return
+		}
+		bodyBound = true
+	}
 
 	// GATEWAY RESOLUTION (TF single-host gateway): a request the trusted
 	// middleware marked X-Saturn-Gateway carries NO per-resource routing
@@ -206,6 +223,27 @@ func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request) {
 	// behavior, byte for byte.
 	if id.Gateway {
 		if !s.resolveGateway(w, r, &id) {
+			return
+		}
+	}
+
+	// On per-resource routes, serving mode and the authorized model allow-list
+	// are one trusted edge contract. Accepting either half independently would
+	// let malformed middleware metadata skip model binding or skip the shared
+	// quota, tenancy, priority, and header-sanitization boundary. Gateway
+	// resolution is validated separately and constructs both values together.
+	if !id.Gateway {
+		validServingIdentity := false
+		switch id.ServingMode {
+		case "shared":
+			validServingIdentity = id.ServedModel != ""
+		case "", "dedicated":
+			validServingIdentity = id.ServedModel == ""
+		}
+		if !validServingIdentity {
+			s.log.Error.Printf("refusing inconsistent trusted serving identity: mode=%q served_model_present=%t resource_id=%q",
+				id.ServingMode, id.ServedModel != "", id.ResourceID)
+			http.Error(w, "serving identity unavailable", http.StatusServiceUnavailable)
 			return
 		}
 	}
@@ -256,6 +294,15 @@ func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	if id.ServingMode == "shared" {
+		if !bodyBound {
+			sharedLane = admissionLaneForIdentity(s.settings.Admission, id)
+			if !boundSharedRequestBody(w, r, sharedRequestBodyLimit(s.settings.Admission, sharedLane)) {
+				return
+			}
+		}
+	}
+
 	// M5 I/O-logging gate — computed ONCE. Everything that adds hot-path cost
 	// (capturing the request body, buffering the response) is guarded by this
 	// single boolean. When false (the default, and the common case), the proxy
@@ -281,7 +328,7 @@ func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request) {
 		reqBody, reqTruncated, reqOrigLen, err = captureRequestBody(r, s.ioMaxBodyLen)
 		if err != nil {
 			s.log.Error.Printf("capture request body: %v", err)
-			http.Error(w, "bad request body", http.StatusBadRequest)
+			writeRequestBodyError(w, err)
 			return
 		}
 		// Hard truncation is intentional (an uncapped body fails the to_tsvector
@@ -314,7 +361,7 @@ func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request) {
 		body, rerr := readAndRestoreBody(r)
 		if rerr != nil {
 			s.log.Error.Printf("model-binding: read request body: %v", rerr)
-			http.Error(w, "bad request body", http.StatusBadRequest)
+			writeRequestBodyError(w, rerr)
 			return
 		}
 		switch checkModelBinding(body, id.ServedModel) {
@@ -337,39 +384,44 @@ func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request) {
 	// could self-promote precisely while the rollout switch is off. Dedicated
 	// endpoints own their engine and bypass both shared-pool mechanisms.
 	var admitted *admission.Lease
+	var responseCaptureInstalled atomic.Bool
+	responseCaptureDone := make(chan struct{})
 	if id.ServingMode == "shared" {
-		rateLimits, rerr := parseTrustedRateLimits(id)
-		if rerr != nil {
-			s.log.Error.Printf("admission: invalid trusted rate-limit policy: %v", rerr)
-			http.Error(w, "shared inference policy unavailable", http.StatusServiceUnavailable)
-			return
+		tenantIdentity := id.OrgID
+		if tenantIdentity == "" {
+			if s.admitter != nil {
+				// A missing organization is a broken trusted identity contract, not
+				// a Valkey outage. Reject before deriving cache/scheduler tenancy so
+				// it can never enter the admission fail-open path.
+				s.log.Error.Printf("admission: missing trusted organization identity request_id=%s", requestID)
+				http.Error(w, "shared inference identity unavailable", http.StatusServiceUnavailable)
+				return
+			}
+			// During the admission-disabled compatibility window, historical
+			// per-resource routes may not yet stamp OrgID. Preserve availability
+			// without putting every such route in one empty-org cache namespace:
+			// ResourceID is trusted, mandatory, and unique to the authorized route.
+			tenantIdentity = "resource:" + id.ResourceID
 		}
 		body, rerr := readAndRestoreBody(r)
 		if rerr != nil {
-			http.Error(w, "bad request body", http.StatusBadRequest)
+			writeRequestBodyError(w, rerr)
 			return
 		}
+		// Physical prompt-byte accounting is defined over the original bounded
+		// OpenAI JSON. Phoebe's cache-isolation and scheduler metadata is internal
+		// forwarding overhead, not tenant prompt work.
+		originalPromptBytes := int64(len(body))
 		defaultOutput := s.settings.Admission.DefaultMaxOutputTokens
 		if defaultOutput <= 0 {
 			defaultOutput = 512
 		}
-		model, maxOutput, ok := admissionWork(body, defaultOutput)
+		estimate, ok := admissionWork(body, defaultOutput)
 		if !ok {
 			http.Error(w, "invalid shared inference request", http.StatusBadRequest)
 			return
 		}
-		tierName := id.ServiceTier
-		if tierName == "" {
-			tierName = "default"
-		}
-		tier, ok := s.settings.Admission.Tiers[tierName]
-		if !ok {
-			tier = s.settings.Admission.Tiers["default"]
-		}
-		if tierName, mapped := s.settings.Admission.OrganizationTiers[id.OrgID]; mapped {
-			tier = s.settings.Admission.Tiers[tierName]
-		}
-		body, tenant, rerr := prepareSharedDynamoRequest(body, id.OrgID, maxOutput, tier)
+		body, tenant, rerr := prepareSharedDynamoRequest(body, tenantIdentity, estimate.OutputTokens, sharedLane)
 		if rerr != nil {
 			http.Error(w, "invalid shared inference request", http.StatusBadRequest)
 			return
@@ -378,8 +430,8 @@ func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request) {
 		// Replace a client-supplied tenant header. Dynamo gives this header
 		// precedence over every body salt, so it must come from trusted identity.
 		r.Header.Set("X-Tenant-ID", tenant)
-		r.Header.Set("X-Dynamo-Request-Priority", strconv.FormatInt(tier.DynamoPriority, 10))
-		r.Header.Set("X-Dynamo-Request-Strict-Priority", strconv.FormatInt(tier.DynamoStrictPriority, 10))
+		r.Header.Set("X-Dynamo-Request-Priority", strconv.FormatInt(sharedLane.DynamoPriority, 10))
+		r.Header.Set("X-Dynamo-Request-Strict-Priority", strconv.FormatInt(sharedLane.DynamoStrictPriority, 10))
 		for _, header := range []string{
 			"X-Dynamo-Worker-Instance-ID", "X-Dynamo-Prefill-Instance-ID",
 			"X-Dynamo-DP-Rank", "X-Dynamo-Prefill-DP-Rank",
@@ -390,65 +442,84 @@ func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request) {
 			r.Header.Del(header)
 		}
 		if s.admitter != nil {
+			// The trusted quota envelope is part of enabled admission, not of
+			// request routing. Keeping this check behind the feature gate lets
+			// operators deploy Phoebe before Saturn begins stamping the envelope;
+			// once admission is enabled, absent or partial policy still fails closed.
+			organizationLimits, ownerLimits, policyErr := parseTrustedRateLimits(id)
+			if policyErr != nil {
+				s.log.Error.Printf("admission: invalid trusted rate-limit policy: %v", policyErr)
+				http.Error(w, "shared inference policy unavailable", http.StatusServiceUnavailable)
+				return
+			}
 			graph := id.GraphK8sName
 			if graph == "" {
 				graph = graphFromUpstreamHost(upstream.Host)
 			}
-			admitted, err = s.admitter.Admit(r.Context(), admission.Request{
-				Graph: graph, Organization: id.OrgID, Model: model,
-				PromptBytes: int64(len(body)), ReservedOutputTokens: maxOutput,
-				Adapter: id.Adapter != "", ServiceTier: id.ServiceTier, RateLimits: rateLimits,
-			})
-			if err != nil {
-				s.writeAdmissionError(w, err)
+			if graph == "" {
+				// A degenerate upstream host (e.g. ":8000") cannot be bound to a
+				// graph scope. Like a missing organization, this is a broken
+				// trusted identity contract, not a Valkey outage: reject before
+				// Admit so it can never enter the fail-open bypass below.
+				s.log.Error.Printf("admission: cannot derive graph scope from upstream host %q request_id=%s", upstream.Host, requestID)
+				http.Error(w, "shared inference identity unavailable", http.StatusServiceUnavailable)
 				return
 			}
-			// Renewal failure means the distributed authority can no longer prove
-			// this request owns capacity. Cancel the upstream request rather than
-			// merely logging and allowing an unaccounted stream to continue.
-			proxyCtx, stopProxy := context.WithCancelCause(r.Context())
-			r = r.WithContext(proxyCtx)
-			defer stopProxy(nil)
-			go admitted.KeepAlive(proxyCtx, func(e error) {
-				s.log.Error.Printf("admission: lease renewal failed for request_id=%s: %v", requestID, e)
-				stopProxy(e)
+			admitted, err = s.admitter.Admit(r.Context(), admission.Request{
+				Graph: graph, Organization: id.OrgID, Owner: id.OwnerID, Model: estimate.Model,
+				PromptBytes: originalPromptBytes, EstimatedInputTokens: estimate.InputTokens,
+				ReservedOutputTokens: estimate.OutputTokens,
+				Adapter:              id.Adapter != "", OrganizationLimits: organizationLimits, OwnerLimits: ownerLimits,
 			})
-			// Safety net for every early return. Normal response completion wins the
-			// lease's idempotent Complete race and charges actual generated tokens.
-			defer func() {
-				if e := admitted.Complete(context.WithoutCancel(r.Context()), 0); e != nil {
-					s.log.Error.Printf("admission: release fallback failed: %v", e)
+			if err != nil {
+				if errors.Is(err, admission.ErrInvalidIdentity) {
+					// A broken trusted identity contract fails closed; only a
+					// genuinely unavailable admission store may bypass.
+					s.log.Error.Printf("admission: broken trusted identity request_id=%s: %v", requestID, err)
+					http.Error(w, "shared inference identity unavailable", http.StatusServiceUnavailable)
+					return
 				}
-			}()
+				if errors.Is(err, admission.ErrUnavailable) {
+					s.log.Error.Printf("admission: distributed gate unavailable; bypassing for otherwise valid request_id=%s: %v", requestID, err)
+					admitted = nil
+				} else {
+					s.writeAdmissionError(w, err)
+					return
+				}
+			}
+			if admitted != nil {
+				// Losing the fairness store must not terminate otherwise authorized
+				// inference. Metering is independent and still records actual usage.
+				go admitted.KeepAlive(r.Context(), func(e error) {
+					s.log.Error.Printf("admission: lease renewal failed; bypassing distributed gate for running request_id=%s: %v", requestID, e)
+				})
+				// Safety net only for exits before an upstream response is attached.
+				// Once ModifyResponse installs capture, its completion callback owns
+				// settlement; racing it with Complete(0) could turn unknown usage into a
+				// free request because lease settlement is first-writer-wins.
+				defer func() {
+					if responseCaptureInstalled.Load() {
+						return
+					}
+					if e := admitted.Complete(context.WithoutCancel(r.Context()), 0); e != nil {
+						s.log.Error.Printf("admission: release fallback failed: %v", e)
+					}
+				}()
+			}
 		}
 	}
 
 	// Force streaming usage so we never under-bill a streamed response.
 	if err := forceIncludeUsage(r); err != nil {
 		s.log.Error.Printf("rewrite request body: %v", err)
-		http.Error(w, "bad request body", http.StatusBadRequest)
+		writeRequestBodyError(w, err)
 		return
 	}
 
-	// WAKE-FROM-ZERO (shared serverless mode, the 0->1 leg). On a wakeable route
-	// (shared + authorized resource id) with a waker configured, probe the
-	// upstream; if it returns a COLD response (scaled-to-zero base), trigger a
-	// 0->1 wake and retry rather than serving the client a 404/503. The probe
-	// buffers the response (a cold response is a tiny JSON error), so nothing
-	// cold reaches the client; the request is replayed (body restored) after the
-	// wake. Once a NON-cold response arrives (or tries are exhausted), we fall
-	// through to the normal streaming forward below, which serves + meters it.
-	// Non-wakeable routes skip this entirely — zero overhead.
-	if s.wakeEnabled(id) {
-		if served := s.serveWithWake(w, r, upstream, id, requestID, admitted); served {
-			return
-		}
-		// Not served here means: the base is now warm (or wake was a no-op) —
-		// fall through to the normal metered streaming forward. The request body
-		// was restored by serveWithWake for the final attempt.
-	}
-
 	rp := httputil.NewSingleHostReverseProxy(upstream)
+	if s.wakeEnabled(id) {
+		rp.Transport = s.newWakeRoundTripper(upstream.Host, requestID, id, admitted)
+	}
 
 	// FlushInterval=-1 flushes every write immediately — per-chunk SSE
 	// delivery with no buffering. This is the streaming-correctness linchpin.
@@ -470,6 +541,7 @@ func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request) {
 		var cr *captureReader
 
 		onDone := func(res capture.Result) {
+			defer close(responseCaptureDone)
 			// Everything downstream of onDone gets a context DECOUPLED from the
 			// client request: onDone runs on the abort path precisely BECAUSE
 			// r.Context() was cancelled (that is how Aborted is detected), and
@@ -479,11 +551,17 @@ func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request) {
 			// honours ctx would otherwise lose every aborted request).
 			ctx := context.WithoutCancel(r.Context())
 			if admitted != nil {
-				if e := admitted.CompleteUsage(ctx, admission.Usage{
-					TotalPromptTokens:  int64(res.Usage.PromptTokens),
-					CachedPromptTokens: int64(res.Usage.CachedTokens()),
-					GeneratedTokens:    int64(res.Usage.CompletionTokens),
-				}); e != nil {
+				var e error
+				if res.UsageFound {
+					e = admitted.CompleteUsage(ctx, admission.Usage{
+						TotalPromptTokens:  int64(res.Usage.PromptTokens),
+						CachedPromptTokens: int64(res.Usage.CachedTokens()),
+						GeneratedTokens:    int64(res.Usage.CompletionTokens),
+					})
+				} else {
+					e = admitted.CompleteUnknownUsage(ctx)
+				}
+				if e != nil {
 					s.log.Error.Printf("admission: completion release failed: %v", e)
 				}
 			}
@@ -537,12 +615,20 @@ func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request) {
 			cr.enableBodyLog(s.ioMaxBodyLen)
 		}
 		resp.Body = cr
+		responseCaptureInstalled.Store(true)
 		return nil
 	}
 
-	rp.ErrorHandler = s.errorHandler(upstream.String(), id, requestID, admitted)
+	rp.ErrorHandler = s.errorHandler(upstream.String(), id, requestID, admitted, &responseCaptureInstalled)
 
 	rp.ServeHTTP(w, r)
+	if responseCaptureInstalled.Load() {
+		// ReverseProxy can return on a client abort while the response body's
+		// deferred Close is still finalizing in its copy goroutine. Wait for the
+		// capture callback so the pre-response zero fallback cannot race or the
+		// next request cannot observe an unsettled physical reservation.
+		<-responseCaptureDone
+	}
 }
 
 // errorHandler builds the ReverseProxy ErrorHandler for one request. The handler
@@ -568,23 +654,44 @@ func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request) {
 //
 // NO double-emit: in phoebe ModifyResponse always returns nil, so ErrorHandler
 // fires ONLY on a RoundTrip error (pre-header) — mutually exclusive with the
-// onDone path (post-header), which needs ModifyResponse to have run. The emit is
-// gated on isClientAbort, so a genuine upstream/ModifyResponse fault never writes
-// a bogus zero-token billing row. The context is decoupled from the cancelled
-// client ctx (WithoutCancel) — the abort is precisely WHY we are here, so a
-// cancelled ctx must not be able to drop the emit (mirrors onDone).
-func (s *Server) errorHandler(upstream string, id identity.Identity, requestID string, admitted *admission.Lease) func(http.ResponseWriter, *http.Request, error) {
+// onDone path (post-header), which needs ModifyResponse to have run. The abort
+// emit is gated on isClientAbort; an admitted request whose non-abort failure is
+// indeterminate (not a verifiable pre-write dial failure) emits the same
+// zero-token attributable event, because the engine may already have done work
+// and the request must not be invisible to billing. Unaffected non-admitted
+// faults (dedicated traffic, gateway resolution) never emit here.
+//
+// LEASE SETTLEMENT: an abort or an indeterminate non-abort failure settles with
+// CompleteUnknownUsage — the conservative token reservation is retained, because
+// consumed engine work must not vanish from the contract windows. Only a
+// verified pre-write dial failure (the request provably never left the process)
+// settles Complete(0). The context is decoupled from the cancelled client ctx
+// (WithoutCancel) — the abort is precisely WHY we are here, so a cancelled ctx
+// must not be able to drop the emit or the settlement (mirrors onDone).
+func (s *Server) errorHandler(upstream string, id identity.Identity, requestID string, admitted *admission.Lease, responseCaptureInstalled *atomic.Bool) func(http.ResponseWriter, *http.Request, error) {
 	return func(w http.ResponseWriter, r *http.Request, err error) {
-		if admitted != nil {
-			if e := admitted.Complete(context.WithoutCancel(r.Context()), 0); e != nil {
-				s.log.Error.Printf("admission: upstream-failure release failed: %v", e)
+		clientAbort := isClientAbort(err)
+		indeterminate := false
+		if admitted != nil && (responseCaptureInstalled == nil || !responseCaptureInstalled.Load()) {
+			ctx := context.WithoutCancel(r.Context())
+			var settlementErr error
+			if clientAbort || !isPreWriteDialFailure(err) {
+				// Once dispatched, a client can cancel — or the upstream can read
+				// the full request and then reset before headers — even though the
+				// engine has already done work. With no usage block available,
+				// retain the conservative token reservation.
+				indeterminate = true
+				settlementErr = admitted.CompleteUnknownUsage(ctx)
+			} else {
+				// A dial failure proves the request never left the process, so no
+				// engine work could have been consumed: settle zero.
+				settlementErr = admitted.Complete(ctx, 0)
+			}
+			if settlementErr != nil {
+				s.log.Error.Printf("admission: upstream-failure release failed: %v", settlementErr)
 			}
 		}
-		if cause := context.Cause(r.Context()); errors.Is(cause, admission.ErrUnavailable) {
-			s.writeAdmissionError(w, cause)
-			return
-		}
-		if isClientAbort(err) {
+		if clientAbort {
 			s.log.Debug.Printf("client disconnected for %s", upstream)
 			// Pre-header abort: ModifyResponse never ran, so onDone will not emit.
 			// Emit a zero-token attributable event so the request is not invisible
@@ -593,7 +700,21 @@ func (s *Server) errorHandler(upstream string, id identity.Identity, requestID s
 			s.emit(ctx, id, requestID, capture.Result{Aborted: true, UsageFound: false})
 			return
 		}
+		var admissionErr *admissionRoundTripError
+		if errors.As(err, &admissionErr) {
+			s.writeAdmissionError(w, admissionErr.err)
+			return
+		}
 		s.log.Error.Printf("upstream %s error: %v", upstream, err)
+		if indeterminate {
+			// An admitted request whose usage is indeterminate (the upstream may
+			// have consumed engine work before failing) gets the same zero-token
+			// attributable event as the pre-header abort, under the same
+			// BillPartialOnAbort policy. Verifiable pre-write dial failures settle
+			// zero and emit nothing — no engine work was possible.
+			ctx := context.WithoutCancel(r.Context())
+			s.emit(ctx, id, requestID, capture.Result{Aborted: true, UsageFound: false})
+		}
 		http.Error(w, "upstream error", http.StatusBadGateway)
 	}
 }
@@ -775,4 +896,15 @@ func isEventStream(resp *http.Response) bool {
 // two must agree on what "abort" means, hence one helper.
 func isClientAbort(err error) bool {
 	return errors.Is(err, context.Canceled)
+}
+
+// isPreWriteDialFailure reports whether err proves the request never left the
+// process: the transport failed while dialing (connection refused, DNS, dial
+// timeout), before a single request byte could be written. Only such failures
+// may settle an admission lease with zero usage; every other non-abort
+// RoundTrip error is indeterminate — the upstream may have read the request
+// and consumed engine work — and is charged conservatively.
+func isPreWriteDialFailure(err error) bool {
+	var opErr *net.OpError
+	return errors.As(err, &opErr) && opErr.Op == "dial"
 }

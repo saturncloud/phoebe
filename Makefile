@@ -12,7 +12,7 @@ run: build
 
 .PHONY: test
 test:
-	go test ./...
+	go test -race ./...
 
 # Runs the live-Postgres conformance tests (the `integration` build tag). These
 # prove the production SQL rater computes the same money as the Rate() oracle —
@@ -28,7 +28,7 @@ integration-test:
 admission-integration-test:
 	@test -n "$$PHOEBE_TEST_ADMISSION_VALKEY_ADDR" || \
 		( echo "PHOEBE_TEST_ADMISSION_VALKEY_ADDR is required"; exit 1 )
-	go test -tags=admissionintegration ./internal/admission -run TestRealValkeyAtomicAdmission -count=1
+	go test -tags=admissionintegration ./internal/admission -run '^TestRealValkey' -count=1
 
 .PHONY: vet
 vet:

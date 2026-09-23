@@ -17,11 +17,20 @@ func TestFromRequestCapturesAllHeaders(t *testing.T) {
 	r.Header.Set(HeaderBaseModel, "meta-llama/Llama-3.1-8B-Instruct")
 	r.Header.Set(HeaderAdapter, "ckpt-artifact-42")
 	r.Header.Set(HeaderUpstream, "pd-x.main-namespace.svc.cluster.local:8000")
-	r.Header.Set(HeaderServiceTier, "pro")
-	r.Header.Set(HeaderRateLimitRequests, "700")
-	r.Header.Set(HeaderRateLimitTotalPromptTokens, "1600000")
-	r.Header.Set(HeaderRateLimitUncachedPromptTokens, "400000")
-	r.Header.Set(HeaderRateLimitGeneratedTokens, "200000")
+	r.Header.Set(HeaderOwnerID, "owner-3")
+	r.Header.Set(HeaderOrgRateLimitRequests, "700")
+	r.Header.Set(HeaderOrgRateLimitTotalPromptTokens, "1600000")
+	r.Header.Set(HeaderOrgRateLimitUncachedPromptTokens, "400000")
+	r.Header.Set(HeaderOrgRateLimitGeneratedTokens, "200000")
+	r.Header.Set(HeaderOwnerRateLimitRequests, "70")
+	r.Header.Set(HeaderOwnerRateLimitTotalPromptTokens, "160000")
+	r.Header.Set(HeaderOwnerRateLimitUncachedPromptTokens, "40000")
+	r.Header.Set(HeaderOwnerRateLimitGeneratedTokens, "20000")
+	r.Header.Set(HeaderLegacyServiceTier, "default")
+	r.Header.Set(HeaderLegacyRateLimitRequests, "70")
+	r.Header.Set(HeaderLegacyRateLimitTotalPromptTokens, "160000")
+	r.Header.Set(HeaderLegacyRateLimitUncachedPromptTokens, "40000")
+	r.Header.Set(HeaderLegacyRateLimitGeneratedTokens, "20000")
 
 	id := FromRequest(r)
 
@@ -49,10 +58,16 @@ func TestFromRequestCapturesAllHeaders(t *testing.T) {
 	if id.Adapter != "ckpt-artifact-42" {
 		t.Errorf("Adapter = %q, want ckpt-artifact-42", id.Adapter)
 	}
-	if id.ServiceTier != "pro" || id.RateLimitRequests != "700" ||
-		id.RateLimitTotalPromptTokens != "1600000" ||
-		id.RateLimitUncachedPromptTokens != "400000" ||
-		id.RateLimitGeneratedTokens != "200000" {
+	if id.OwnerID != "owner-3" || id.OrgRateLimitRequests != "700" ||
+		id.OrgRateLimitTotalPromptTokens != "1600000" ||
+		id.OrgRateLimitUncachedPromptTokens != "400000" ||
+		id.OrgRateLimitGeneratedTokens != "200000" ||
+		id.OwnerRateLimitRequests != "70" || id.OwnerRateLimitTotalPromptTokens != "160000" ||
+		id.OwnerRateLimitUncachedPromptTokens != "40000" ||
+		id.OwnerRateLimitGeneratedTokens != "20000" || id.LegacyServiceTier != "default" ||
+		id.LegacyRateLimitRequests != "70" || id.LegacyRateLimitTotalPromptTokens != "160000" ||
+		id.LegacyRateLimitUncachedPromptTokens != "40000" ||
+		id.LegacyRateLimitGeneratedTokens != "20000" {
 		t.Errorf("rate-limit identity fields = %+v", id)
 	}
 	if id.Upstream != "pd-x.main-namespace.svc.cluster.local:8000" {

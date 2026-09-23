@@ -71,37 +71,39 @@ emit:
 #   kubeconfig: ""
 #   timeout: "300s"
 
-# Distributed admission for the SHARED serving tier (OFF by default). This is
-# physical protection, not a billing or contractual quota. All Phoebe replicas
-# must use the same Valkey. Runtime Valkey failure returns 503 before Dynamo;
-# renewal failure cancels the affected upstream request so an expired lease
-# cannot become unaccounted work. There is deliberately no process-local
-# fallback that could over-admit.
+# Distributed admission for SHARED serving mode (OFF by default). This is
+# a fairness and capacity-shaping gate, not an authorization or hard-spend
+# boundary. All Phoebe replicas should use the same Valkey. If that state is
+# unavailable or reset, otherwise authorized and valid traffic continues while
+# these limits are temporarily bypassed. Independent metering still records
+# actual engine usage through its Valkey/WAL/log path.
 #
 # Each request is checked atomically at platform, serving-graph, organization,
 # and organization×model scopes. Prompt work is the complete OpenAI JSON body
-# size (Phoebe cannot safely duplicate model-specific template/tokenizer state);
-# output is max_completion_tokens/max_tokens, or defaultMaxOutputTokens.
-# Decode slots are reserved before forwarding because a proxy cannot safely
+# size for the physical byte guard. Token windows reserve a cheap ceil(JSON
+# bytes/4) estimate as uncached input, then reconcile the engine's exact total
+# and cached token counts after the response. Output is
+# max_completion_tokens/max_tokens, or defaultMaxOutputTokens. Decode capacity
+# is a future slot reserved before forwarding because a proxy cannot safely
 # queue once the engine starts responding. Leases release prefill/input work at
 # the first upstream body byte and active/decode/output work at completion,
 # abort, or failure. Live streams renew their lease;
 # leaseTtl is the crash-recovery bound when a replica stops renewing.
 #
-# Tier lanes are hard protected partitions. organizationTiers is operator-owned
-# policy keyed by trusted org id; no client header chooses a tier. weight scales
+# Admission lanes are hard protected partitions. organizationLanes is operator-owned
+# policy keyed by trusted org id; no client header chooses a lane. weight scales
 # that lane's configured capacities. This is weighted admission, not a claim of
 # exact request-order scheduling inside Dynamo.
 # admission:
 #   enabled: true
 #   valkeyAddr: "valkey.saturn.svc.cluster.local:6379"
 #   keyPrefix: "phoebe:admission"
-#   leaseTtl: "15m"
+#   leaseTtl: "15m" # minimum 1s; must exceed admission Valkey I/O latency
 #   defaultMaxOutputTokens: 512
 #   platform:
 #     maxActiveRequests: 256
 #     maxConcurrentPrefills: 32
-#     maxActiveDecodes: 224
+#     maxReservedDecodeSlots: 256
 #     maxPromptBytes: 67108864
 #     maxReservedOutputTokens: 262144
 #     maxActiveAdapters: 128
@@ -115,7 +117,7 @@ emit:
 #   graph:
 #     maxActiveRequests: 64
 #     maxConcurrentPrefills: 8
-#     maxActiveDecodes: 56
+#     maxReservedDecodeSlots: 64
 #     maxPromptBytes: 16777216
 #     maxReservedOutputTokens: 65536
 #     maxActiveAdapters: 32
@@ -129,7 +131,7 @@ emit:
 #   organization:
 #     maxActiveRequests: 32
 #     maxConcurrentPrefills: 4
-#     maxActiveDecodes: 28
+#     maxReservedDecodeSlots: 32
 #     maxPromptBytes: 8388608
 #     maxReservedOutputTokens: 32768
 #     maxActiveAdapters: 16
@@ -143,7 +145,7 @@ emit:
 #   organizationModel:
 #     maxActiveRequests: 16
 #     maxConcurrentPrefills: 2
-#     maxActiveDecodes: 14
+#     maxReservedDecodeSlots: 16
 #     maxPromptBytes: 4194304
 #     maxReservedOutputTokens: 16384
 #     maxActiveAdapters: 8
@@ -154,13 +156,13 @@ emit:
 #     maxColdHolds: 1
 #     wakesPerWindow: 2
 #     window: "1m"
-#   tiers:
+#   lanes:
 #     default:
 #       weight: 1
-#       limits: &tierLimits
+#       limits: &defaultLaneLimits
 #         maxActiveRequests: 64
 #         maxConcurrentPrefills: 8
-#         maxActiveDecodes: 48
+#         maxReservedDecodeSlots: 64
 #         maxPromptBytes: 16777216
 #         maxReservedOutputTokens: 65536
 #         maxActiveAdapters: 32
@@ -176,7 +178,7 @@ emit:
 #       limits:
 #         maxActiveRequests: 64
 #         maxConcurrentPrefills: 8
-#         maxActiveDecodes: 48
+#         maxReservedDecodeSlots: 64
 #         maxPromptBytes: 16777216
 #         maxReservedOutputTokens: 65536
 #         maxActiveAdapters: 32
@@ -187,5 +189,5 @@ emit:
 #         maxColdHolds: 4
 #         wakesPerWindow: 6
 #         window: "1m"
-#   organizationTiers:
+#   organizationLanes:
 #     "org-id-with-protected-share": "protected"

@@ -107,7 +107,7 @@ func (s *Server) resolveGateway(w http.ResponseWriter, r *http.Request, id *iden
 	body, err := readAndRestoreBody(r)
 	if err != nil {
 		s.log.Error.Printf("gateway: read request body: %v (request_id=%q)", err, requestID)
-		http.Error(w, "bad request body", http.StatusBadRequest)
+		writeRequestBodyError(w, err)
 		return false
 	}
 	model, ok := extractRequestModel(body)
@@ -137,6 +137,16 @@ func (s *Server) resolveGateway(w http.ResponseWriter, r *http.Request, id *iden
 		// Resolver (DB) failure: fail closed — phoebe must never forward
 		// traffic it cannot attribute, and must never guess a route.
 		s.log.Error.Printf("gateway: resolve failed org_id=%s request_id=%q: %v", id.OrgID, requestID, err)
+		http.Error(w, "service unavailable", http.StatusServiceUnavailable)
+		return false
+	}
+	if res.ServingMode != "shared" {
+		// The gateway is exclusively the shared-inference entry point. Treat a
+		// non-shared registry row as a broken trusted contract; otherwise the
+		// request would skip tenant isolation, scheduler sanitization, and quota
+		// admission after resolving onto a shared graph.
+		s.log.Error.Printf("gateway: resolved non-shared model org_id=%s model=%q serving_mode=%q request_id=%q",
+			id.OrgID, model, res.ServingMode, requestID)
 		http.Error(w, "service unavailable", http.StatusServiceUnavailable)
 		return false
 	}
