@@ -1222,13 +1222,16 @@ func TestAdmissionReleasesOnUpstreamFailure(t *testing.T) {
 }
 
 func TestAdmissionReleasesAbortedStream(t *testing.T) {
-	started := make(chan struct{})
+	// A buffered signal, not a close: the charge+probe section below re-issues
+	// the stream request once on a window rollover, and the backend handler
+	// signals once per request.
+	started := make(chan struct{}, 1)
 	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "text/event-stream")
 		w.WriteHeader(200)
 		_, _ = w.Write([]byte("data: {\"model\":\"model-a\",\"choices\":[]}\n\n"))
 		w.(http.Flusher).Flush()
-		close(started)
+		started <- struct{}{}
 		<-r.Context().Done()
 	}))
 	defer backend.Close()
@@ -1238,25 +1241,15 @@ func TestAdmissionReleasesAbortedStream(t *testing.T) {
 	c := redis.NewClient(&redis.Options{Addr: mr.Addr()})
 	a := admission.New(c, cfg)
 	s := New(&config.Settings{Admission: cfg, BillPartialOnAbort: true}, logging.New(logging.ERROR), &recordingEmitter{}).WithAdmitter(a)
-	ctx, cancel := context.WithCancel(context.Background())
-	req := sharedRequest(up)
-	req.Header.Set(identity.HeaderOrgRateLimitGeneratedTokens, "20")
-	req.Header.Set(identity.HeaderOwnerRateLimitGeneratedTokens, "20")
-	req = req.WithContext(ctx)
-	done := make(chan struct{})
-	go func() { defer close(done); s.Handler().ServeHTTP(httptest.NewRecorder(), req) }()
-	select {
-	case <-started:
-	case <-time.After(time.Second):
-		t.Fatal("stream never started")
-	}
-	cancel()
-	select {
-	case <-done:
-	case <-time.After(time.Second):
-		t.Fatal("aborted proxy did not return")
-	}
-	for _, tc := range []struct {
+
+	// The aborted stream's retained reservation was charged to the org/owner
+	// generated_tokens windows, so each probe reserving one more token must
+	// be rejected. That window is a fixed 1-minute bucket (floor(now/60000)):
+	// a minute tick between the aborted request's charge and the rejection
+	// probes empties the bucket and would spuriously ADMIT them. Capture the
+	// bucket around the charge+probe section and, on roll, re-charge and
+	// retry the section once.
+	probes := []struct {
 		name string
 		req  admission.Request
 		want string
@@ -1275,14 +1268,50 @@ func TestAdmissionReleasesAbortedStream(t *testing.T) {
 				OwnerLimits: admission.RateLimits{GeneratedTokens: 20}},
 			want: "contract_owner",
 		},
-	} {
-		t.Run(tc.name, func(t *testing.T) {
-			_, err := a.Admit(context.Background(), tc.req)
-			var rejected *admission.Rejected
-			if !errors.As(err, &rejected) || rejected.Scope != tc.want || rejected.Dimension != "generated_tokens" {
-				t.Fatalf("err=%v, want %s generated_tokens rejection", err, tc.want)
-			}
-		})
+	}
+	chargeAndProbe := func() (bool, []error) {
+		bucketBefore := fixedWindowBucket()
+		ctx, cancel := context.WithCancel(context.Background())
+		req := sharedRequest(up)
+		req.Header.Set(identity.HeaderOrgRateLimitGeneratedTokens, "20")
+		req.Header.Set(identity.HeaderOwnerRateLimitGeneratedTokens, "20")
+		req = req.WithContext(ctx)
+		done := make(chan struct{})
+		go func() { defer close(done); s.Handler().ServeHTTP(httptest.NewRecorder(), req) }()
+		select {
+		case <-started:
+		case <-time.After(time.Second):
+			t.Fatal("stream never started")
+		}
+		cancel()
+		select {
+		case <-done:
+		case <-time.After(time.Second):
+			t.Fatal("aborted proxy did not return")
+		}
+		errs := make([]error, len(probes))
+		for i, tc := range probes {
+			_, errs[i] = a.Admit(context.Background(), tc.req)
+		}
+		return bucketBefore != fixedWindowBucket(), errs
+	}
+	rolled, errs := chargeAndProbe()
+	if rolled {
+		// The window ticked between charge and probes: the probes' admits
+		// landed in the fresh bucket and charged it themselves. Flush the
+		// store back to the exact post-rollover empty-window state, then
+		// re-charge and retry once.
+		mr.FlushAll()
+		rolled, errs = chargeAndProbe()
+		if rolled {
+			t.Skip("fixed 1-minute admission window rolled twice during the test; the probes cannot be made deterministic — retry")
+		}
+	}
+	for i, tc := range probes {
+		var rejected *admission.Rejected
+		if !errors.As(errs[i], &rejected) || rejected.Scope != tc.want || rejected.Dimension != "generated_tokens" {
+			t.Errorf("%s: err=%v, want %s generated_tokens rejection", tc.name, errs[i], tc.want)
+		}
 	}
 	lease, err := a.Admit(context.Background(), admission.Request{Graph: "graph", Organization: "other", Model: "m", PromptBytes: 1, EstimatedInputTokens: 1, ReservedOutputTokens: 1})
 	if err != nil {
@@ -1292,10 +1321,13 @@ func TestAdmissionReleasesAbortedStream(t *testing.T) {
 }
 
 func TestAdmissionChargesUnknownUsageOnPreHeaderAbort(t *testing.T) {
-	started := make(chan struct{})
+	// A buffered signal, not a close: the charge+probe section below re-issues
+	// the request once on a window rollover, and the backend handler signals
+	// once per request.
+	started := make(chan struct{}, 1)
 	unblock := make(chan struct{})
 	backend := httptest.NewServer(http.HandlerFunc(func(_ http.ResponseWriter, r *http.Request) {
-		close(started)
+		started <- struct{}{}
 		select {
 		case <-r.Context().Done():
 		case <-unblock:
@@ -1309,26 +1341,15 @@ func TestAdmissionChargesUnknownUsageOnPreHeaderAbort(t *testing.T) {
 	c := redis.NewClient(&redis.Options{Addr: mr.Addr()})
 	a := admission.New(c, cfg)
 	s := New(&config.Settings{Admission: cfg, BillPartialOnAbort: true}, logging.New(logging.ERROR), &recordingEmitter{}).WithAdmitter(a)
-	ctx, cancel := context.WithCancel(context.Background())
-	req := sharedRequest(up)
-	req.Header.Set(identity.HeaderOrgRateLimitGeneratedTokens, "20")
-	req.Header.Set(identity.HeaderOwnerRateLimitGeneratedTokens, "20")
-	req = req.WithContext(ctx)
-	done := make(chan struct{})
-	go func() { defer close(done); s.Handler().ServeHTTP(httptest.NewRecorder(), req) }()
-	select {
-	case <-started:
-	case <-time.After(time.Second):
-		t.Fatal("request never reached backend")
-	}
-	cancel()
-	select {
-	case <-done:
-	case <-time.After(time.Second):
-		t.Fatal("pre-header abort did not return")
-	}
 
-	for _, tc := range []struct {
+	// The pre-header abort retained the conservative reservation in the
+	// org/owner generated_tokens windows, so each probe reserving one more
+	// token must be rejected. That window is a fixed 1-minute bucket
+	// (floor(now/60000)): a minute tick between the aborted request's charge
+	// and the rejection probes empties the bucket and would spuriously ADMIT
+	// them. Capture the bucket around the charge+probe section and, on roll,
+	// re-charge and retry the section once.
+	probes := []struct {
 		name string
 		req  admission.Request
 		want string
@@ -1347,14 +1368,50 @@ func TestAdmissionChargesUnknownUsageOnPreHeaderAbort(t *testing.T) {
 				OwnerLimits: admission.RateLimits{GeneratedTokens: 20}},
 			want: "contract_owner",
 		},
-	} {
-		t.Run(tc.name, func(t *testing.T) {
-			_, err := a.Admit(context.Background(), tc.req)
-			var rejected *admission.Rejected
-			if !errors.As(err, &rejected) || rejected.Scope != tc.want || rejected.Dimension != "generated_tokens" {
-				t.Fatalf("err=%v, want %s generated_tokens rejection", err, tc.want)
-			}
-		})
+	}
+	chargeAndProbe := func() (bool, []error) {
+		bucketBefore := fixedWindowBucket()
+		ctx, cancel := context.WithCancel(context.Background())
+		req := sharedRequest(up)
+		req.Header.Set(identity.HeaderOrgRateLimitGeneratedTokens, "20")
+		req.Header.Set(identity.HeaderOwnerRateLimitGeneratedTokens, "20")
+		req = req.WithContext(ctx)
+		done := make(chan struct{})
+		go func() { defer close(done); s.Handler().ServeHTTP(httptest.NewRecorder(), req) }()
+		select {
+		case <-started:
+		case <-time.After(time.Second):
+			t.Fatal("request never reached backend")
+		}
+		cancel()
+		select {
+		case <-done:
+		case <-time.After(time.Second):
+			t.Fatal("pre-header abort did not return")
+		}
+		errs := make([]error, len(probes))
+		for i, tc := range probes {
+			_, errs[i] = a.Admit(context.Background(), tc.req)
+		}
+		return bucketBefore != fixedWindowBucket(), errs
+	}
+	rolled, errs := chargeAndProbe()
+	if rolled {
+		// The window ticked between charge and probes: the probes' admits
+		// landed in the fresh bucket and charged it themselves. Flush the
+		// store back to the exact post-rollover empty-window state, then
+		// re-charge and retry once.
+		mr.FlushAll()
+		rolled, errs = chargeAndProbe()
+		if rolled {
+			t.Skip("fixed 1-minute admission window rolled twice during the test; the probes cannot be made deterministic — retry")
+		}
+	}
+	for i, tc := range probes {
+		var rejected *admission.Rejected
+		if !errors.As(errs[i], &rejected) || rejected.Scope != tc.want || rejected.Dimension != "generated_tokens" {
+			t.Errorf("%s: err=%v, want %s generated_tokens rejection", tc.name, errs[i], tc.want)
+		}
 	}
 }
 
@@ -1381,26 +1438,15 @@ func TestAdmissionChargesUnknownUsageOnUpstreamReset(t *testing.T) {
 	a := admission.New(c, cfg)
 	em := &recordingEmitter{}
 	s := New(&config.Settings{Admission: cfg, BillPartialOnAbort: true}, logging.New(logging.ERROR), em).WithAdmitter(a)
-	req := sharedRequest(up)
-	req.Header.Set(identity.HeaderOrgRateLimitGeneratedTokens, "20")
-	req.Header.Set(identity.HeaderOwnerRateLimitGeneratedTokens, "20")
-	rr := httptest.NewRecorder()
-	s.Handler().ServeHTTP(rr, req)
-	if rr.Code != http.StatusBadGateway {
-		t.Fatalf("status=%d, want 502", rr.Code)
-	}
 
-	events := em.waitForEvents(1, time.Second)
-	if len(events) != 1 || events[0].PromptTokens != 0 || events[0].CompletionTokens != 0 {
-		t.Fatalf("metering events=%+v, want the same zero-token attributable event as the abort path", events)
-	}
-	// The reset is an upstream fault, not a client abort: the event must be
-	// attributable without billing_event.aborted misrecording it as one.
-	if events[0].Aborted {
-		t.Fatalf("upstream fault event must have Aborted=false: %+v", events[0])
-	}
-
-	for _, tc := range []struct {
+	// The reset retained the conservative reservation in the org/owner
+	// generated_tokens windows, so each probe reserving one more token must
+	// be rejected. That window is a fixed 1-minute bucket (floor(now/60000)):
+	// a minute tick between the reset request's charge and the rejection
+	// probes empties the bucket and would spuriously ADMIT them. Capture the
+	// bucket around the charge+probe section and, on roll, re-charge and
+	// retry the section once.
+	probes := []struct {
 		name string
 		req  admission.Request
 		want string
@@ -1419,14 +1465,56 @@ func TestAdmissionChargesUnknownUsageOnUpstreamReset(t *testing.T) {
 				OwnerLimits: admission.RateLimits{GeneratedTokens: 20}},
 			want: "contract_owner",
 		},
-	} {
-		t.Run(tc.name, func(t *testing.T) {
-			_, err := a.Admit(context.Background(), tc.req)
-			var rejected *admission.Rejected
-			if !errors.As(err, &rejected) || rejected.Scope != tc.want || rejected.Dimension != "generated_tokens" {
-				t.Fatalf("err=%v, want %s generated_tokens rejection", err, tc.want)
-			}
-		})
+	}
+	chargeAndProbe := func() (bool, []error) {
+		bucketBefore := fixedWindowBucket()
+		// The emitter accumulates across attempts (and this attempt's emit
+		// lands synchronously inside ServeHTTP), so snapshot the count BEFORE
+		// the request and assert on the events THIS attempt produced.
+		before := em.count()
+		req := sharedRequest(up)
+		req.Header.Set(identity.HeaderOrgRateLimitGeneratedTokens, "20")
+		req.Header.Set(identity.HeaderOwnerRateLimitGeneratedTokens, "20")
+		rr := httptest.NewRecorder()
+		s.Handler().ServeHTTP(rr, req)
+		if rr.Code != http.StatusBadGateway {
+			t.Fatalf("status=%d, want 502", rr.Code)
+		}
+
+		events := em.waitForEvents(before+1, time.Second)
+		mine := events[before:]
+		if len(mine) != 1 || mine[0].PromptTokens != 0 || mine[0].CompletionTokens != 0 {
+			t.Fatalf("metering events=%+v, want the same zero-token attributable event as the abort path", mine)
+		}
+		// The reset is an upstream fault, not a client abort: the event must be
+		// attributable without billing_event.aborted misrecording it as one.
+		if mine[0].Aborted {
+			t.Fatalf("upstream fault event must have Aborted=false: %+v", mine[0])
+		}
+
+		errs := make([]error, len(probes))
+		for i, tc := range probes {
+			_, errs[i] = a.Admit(context.Background(), tc.req)
+		}
+		return bucketBefore != fixedWindowBucket(), errs
+	}
+	rolled, errs := chargeAndProbe()
+	if rolled {
+		// The window ticked between charge and probes: the probes' admits
+		// landed in the fresh bucket and charged it themselves. Flush the
+		// store back to the exact post-rollover empty-window state, then
+		// re-charge and retry once.
+		mr.FlushAll()
+		rolled, errs = chargeAndProbe()
+		if rolled {
+			t.Skip("fixed 1-minute admission window rolled twice during the test; the probes cannot be made deterministic — retry")
+		}
+	}
+	for i, tc := range probes {
+		var rejected *admission.Rejected
+		if !errors.As(errs[i], &rejected) || rejected.Scope != tc.want || rejected.Dimension != "generated_tokens" {
+			t.Errorf("%s: err=%v, want %s generated_tokens rejection", tc.name, errs[i], tc.want)
+		}
 	}
 	// Physical capacity itself is released; only the conservative contract
 	// charges are retained.
