@@ -209,7 +209,11 @@ func (a *RedisAdmitter) Admit(ctx context.Context, req Request) (*Lease, error) 
 
 	// Both replies were indeterminate. Compensate with the same request id:
 	// this releases a committed lease and is a no-op if neither attempt ran.
-	cleanupCtx, cancel := context.WithDeadline(context.WithoutCancel(ctx), deadline)
+	// The cleanup gets its own budget, independent of the attempt deadline:
+	// the attempts may have exhausted it — a slow store is exactly when a
+	// committed lease needs compensating — and a cancelled client context
+	// must not strand the reservation either.
+	cleanupCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), admitOperationBudget)
 	defer cancel()
 	if _, cleanupErr := abandonScript.Run(cleanupCtx, a.client, a.keys(), id).Result(); cleanupErr != nil {
 		return nil, fmt.Errorf("%w: admit: %v; cleanup: %v", ErrUnavailable, lastErr, cleanupErr)

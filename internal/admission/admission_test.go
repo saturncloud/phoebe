@@ -887,6 +887,146 @@ func TestAdmitCleansCommittedLeaseWhenRecoveryReplyAlsoLost(t *testing.T) {
 	_ = lease.Complete(context.Background(), 0)
 }
 
+// commitThenLoseHook makes the first admitScript call COMMIT against the
+// store (bypassing the caller's context, simulating a reply lost after the
+// transaction ran) and then fail with io.ErrUnexpectedEOF; every other call
+// passes through, so the cancelled request's idempotent retry fails with the
+// context while unrelated later Admits proceed normally. Every abandonScript
+// call is passed through and counted.
+type commitThenLoseHook struct {
+	admitHash   string
+	abandonHash string
+	abandons    atomic.Int64
+	commitOnce  sync.Once
+}
+
+func (h *commitThenLoseHook) DialHook(next redis.DialHook) redis.DialHook { return next }
+func (h *commitThenLoseHook) ProcessPipelineHook(next redis.ProcessPipelineHook) redis.ProcessPipelineHook {
+	return next
+}
+func (h *commitThenLoseHook) ProcessHook(next redis.ProcessHook) redis.ProcessHook {
+	return func(ctx context.Context, cmd redis.Cmder) error {
+		args := cmd.Args()
+		if cmd.Name() != "evalsha" || len(args) < 2 {
+			return next(ctx, cmd)
+		}
+		switch fmt.Sprint(args[1]) {
+		case h.admitHash:
+			committed := false
+			h.commitOnce.Do(func() { committed = true })
+			if committed {
+				// The transaction commits even though the request context is
+				// already done; only the reply is lost.
+				if err := next(context.WithoutCancel(ctx), cmd); err != nil {
+					return err
+				}
+				return io.ErrUnexpectedEOF
+			}
+		case h.abandonHash:
+			h.abandons.Add(1)
+		}
+		return next(ctx, cmd)
+	}
+}
+
+// The compensating abandon must execute even when the request context is
+// already cancelled: cancellation is precisely why the reply was lost, and a
+// cleanup that honours the dead context would strand the committed
+// reservation until lease TTL.
+func TestAdmitCleanupCompensatesWithCancelledRequestContext(t *testing.T) {
+	mr := miniredis.RunT(t)
+	// ContextTimeoutEnabled mirrors the production NewValkeyClient: context
+	// expiry must actually fail the wire call, or the cancelled-context
+	// partition this test drives would silently execute instead.
+	client := redis.NewClient(&redis.Options{Addr: mr.Addr(), MaxRetries: 0, ContextTimeoutEnabled: true})
+	t.Cleanup(func() { _ = client.Close() })
+	for _, script := range []*redis.Script{admitScript, abandonScript} {
+		if err := script.Load(context.Background(), client).Err(); err != nil {
+			t.Fatal(err)
+		}
+	}
+	hook := &commitThenLoseHook{admitHash: admitScript.Hash(), abandonHash: abandonScript.Hash()}
+	client.AddHook(hook)
+	a := New(client, config.AdmissionSettings{Platform: limits(1), LeaseTTL: time.Minute, KeyPrefix: "cancelled-cleanup"})
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if _, err := a.Admit(ctx, request("a", "m")); !errors.Is(err, ErrUnavailable) {
+		t.Fatalf("err=%v, want indeterminate admission failure", err)
+	}
+	if got := hook.abandons.Load(); got != 1 {
+		t.Fatalf("abandon ran %d times, want exactly 1 despite the cancelled request context", got)
+	}
+	// The committed lease was compensated: the single platform slot is free.
+	lease, err := a.Admit(context.Background(), request("b", "m"))
+	if err != nil {
+		t.Fatalf("cancelled request's cleanup stranded capacity: %v", err)
+	}
+	_ = lease.Complete(context.Background(), 0)
+}
+
+// slowCommitHook delays the first admitScript call until the shared attempt
+// deadline has certainly passed, then commits and loses the reply — the
+// partition where a committed lease most needs the compensating abandon.
+type slowCommitHook struct {
+	hash string
+	once sync.Once
+}
+
+func (h *slowCommitHook) DialHook(next redis.DialHook) redis.DialHook { return next }
+func (h *slowCommitHook) ProcessPipelineHook(next redis.ProcessPipelineHook) redis.ProcessPipelineHook {
+	return next
+}
+func (h *slowCommitHook) ProcessHook(next redis.ProcessHook) redis.ProcessHook {
+	return func(ctx context.Context, cmd redis.Cmder) error {
+		args := cmd.Args()
+		if cmd.Name() == "evalsha" && len(args) > 1 && fmt.Sprint(args[1]) == h.hash {
+			slow := false
+			h.once.Do(func() { slow = true })
+			if slow {
+				time.Sleep(admitOperationBudget + 50*time.Millisecond)
+				if err := next(context.WithoutCancel(ctx), cmd); err != nil {
+					return err
+				}
+				return io.ErrUnexpectedEOF
+			}
+		}
+		return next(ctx, cmd)
+	}
+}
+
+// The compensating abandon must run under a budget independent of the attempt
+// deadline: when the attempts exhaust admitOperationBudget (a slow store —
+// exactly when a reply is lost after commit), the cleanup must still execute,
+// not fail with an already-expired deadline and leak the lease to TTL.
+func TestAdmitCleanupBudgetIndependentOfAttemptDeadline(t *testing.T) {
+	mr := miniredis.RunT(t)
+	// ContextTimeoutEnabled mirrors the production NewValkeyClient: the
+	// exhausted attempt deadline must actually fail calls, or the cleanup
+	// would run despite its expired context and this test would prove nothing.
+	client := redis.NewClient(&redis.Options{Addr: mr.Addr(), MaxRetries: 0, ContextTimeoutEnabled: true})
+	t.Cleanup(func() { _ = client.Close() })
+	for _, script := range []*redis.Script{admitScript, abandonScript} {
+		if err := script.Load(context.Background(), client).Err(); err != nil {
+			t.Fatal(err)
+		}
+	}
+	client.AddHook(&slowCommitHook{hash: admitScript.Hash()})
+	a := New(client, config.AdmissionSettings{Platform: limits(1), LeaseTTL: time.Minute, KeyPrefix: "slow-commit-cleanup"})
+
+	if _, err := a.Admit(context.Background(), request("a", "m")); !errors.Is(err, ErrUnavailable) {
+		t.Fatalf("err=%v, want indeterminate admission failure", err)
+	}
+	if n, err := a.client.HLen(context.Background(), a.leases).Result(); err != nil || n != 0 {
+		t.Fatalf("leases HLen=%d err=%v, want the committed lease compensated", n, err)
+	}
+	lease, err := a.Admit(context.Background(), request("b", "m"))
+	if err != nil {
+		t.Fatalf("exhausted attempt budget starved the cleanup, stranding capacity: %v", err)
+	}
+	_ = lease.Complete(context.Background(), 0)
+}
+
 func TestImpossibleRequestRejectedBeforeReservation(t *testing.T) {
 	l := limits(5)
 	l.MaxPromptBytes = 9
