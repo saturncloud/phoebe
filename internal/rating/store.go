@@ -56,6 +56,25 @@ type RateResult struct {
 	// never disagree with what the rollups excluded.
 	UnpricedEvents       int64
 	UnattributableEvents int64
+	// MissingUsageEvents are execution-attempt records for which the serving engine
+	// supplied no authoritative usage block. They are retained as zero-charge audit
+	// evidence and excluded from rated_usage. This is the TOTAL; it is reported for
+	// reconciliation and is deliberately NOT the paging signal, because it is
+	// dominated by routine client aborts and upstream failures.
+	MissingUsageEvents int64
+	// ExpectedMissingUsageEvents is the routine share of MissingUsageEvents: the
+	// client disconnected, or the attempt terminated with a non-success status.
+	// Correctly billed zero; reviewed in the reconciliation view, never paged.
+	ExpectedMissingUsageEvents int64
+	// UnexplainedMissingUsageEvents is the alarming share: NOT aborted and NOT
+	// failed, so the engine reported success while reporting no tokens — work we
+	// may have served and cannot bill. This is the fail-loud missing-usage signal.
+	// A NULL status_code counts here (fail closed: an attempt we cannot prove
+	// failed is not silently excused).
+	UnexplainedMissingUsageEvents int64
+	// InvalidUsageEvents are authoritative rows that violate token
+	// invariants. They remain raw evidence but are excluded from money.
+	InvalidUsageEvents int64
 	// AmbiguousBaseEvents counts events under rollups whose base_model-priced rows
 	// (derived OR plain-base) did not share ONE rate in the window: a single model_id
 	// resolving through more than one distinct base_model (the E3 ft-uniqueness
@@ -70,16 +89,33 @@ type RateResult struct {
 	// billed to a guessed org. A partial-NULL org (real org + missing-header rows) is
 	// NOT ambiguous and does not count here.
 	AmbiguousOrgEvents int64
+	// OwnerConflictEvents counts events under rollups where some event carried BOTH a
+	// user_id and a group_id. Upstream an identity is a user XOR a group, so both set
+	// is a producer bug and the owner cannot be determined. Those rollups are excluded
+	// from the upsert and screamed about, never billed to a guessed owner; the raw
+	// events stay in billing_event as evidence.
+	OwnerConflictEvents int64
+	// AmbiguousGraphRollups counts ROLLUPS (not events) whose traffic came from more
+	// than one serving graph. Unlike the buckets above this is NOT a withholding
+	// signal: the graph is cost-attribution evidence, not identity, so the rollup bills
+	// normally with a NULL graph rather than a guessed one. Counted in rollup units
+	// because these events are already inside EventsRated — counting them in event
+	// units too would break the anomaly partition.
+	AmbiguousGraphRollups int64
 }
 
 // Anomalies are the fail-loud counts for a window: events that could not be priced
 // and rows that could not be attributed. Both drive the exit-nonzero path. int64 to
 // match RateResult's widened counts.
 type Anomalies struct {
-	UnpricedEvents       int64
-	UnattributableEvents int64
-	AmbiguousBaseEvents  int64
-	AmbiguousOrgEvents   int64
+	UnpricedEvents                int64
+	UnattributableEvents          int64
+	MissingUsageEvents            int64
+	ExpectedMissingUsageEvents    int64
+	UnexplainedMissingUsageEvents int64
+	InvalidUsageEvents            int64
+	AmbiguousBaseEvents           int64
+	AmbiguousOrgEvents            int64
 }
 
 // PostgresStore reads billing_event and writes rated_usage in the shared Atlas
@@ -211,10 +247,15 @@ CREATE TEMP TABLE rating_derived (
 //
 // APPLIED RATE STORED ON THE ROW (E1 self-auditing rollup): the rated_usage row
 // carries applied_prompt_rate / applied_cached_rate / applied_completion_rate — the
-// exact per-token rates this rollup was billed at. The row is then immutable and
-// self-auditing: "we never reprice traffic you've already served" holds by
-// construction, because the row froze its own rate. A rollup mixes only one
-// model_id, so a single applied-rate triple per row is well-defined.
+// exact per-token rates this rollup was billed at, so the row is auditable on its
+// own. A rollup mixes only one model_id, so one rate triple is well-defined.
+//
+// "NEVER REPRICE SERVED TRAFFIC" holds WITHOUT a local price-freeze table: the
+// caller rates each hour against the book EFFECTIVE DURING that hour (the manager
+// owns the effective-dated series), so re-rating an old hour resolves the same
+// rates it originally did. Deleting and recreating an anomalous rollup therefore
+// cannot pick up a newer rate — the price is a function of the hour, not of when
+// the rater ran. phoebe keeps NO price history of its own.
 //
 // HOUR BUCKET IS SESSION-TZ-INDEPENDENT (date_trunc on a UTC wall-clock timestamp),
 // so rollup keys can never disagree across sessions and re-rates can't overlap.
@@ -276,6 +317,44 @@ WITH ev AS (
         -- adapter: the fine-tune checkpoint artifact id, non-NULL ONLY on fine-tune
         -- checkpoint deployments. Its PRESENCE is the premium trigger (C4).
         adapter,
+        -- OWNER IDENTITY, collapsed from billing_event's two nullable columns into the
+        -- single (type, id) pair the upstream model actually has: an identity is a user
+        -- XOR a group, never both. NULL/'' on both sides means the producer supplied no
+        -- owner -- attribution is then by auth_id alone, which is not an error.
+        --
+        -- BOTH set is a producer bug (it contradicts the upstream ownership model). It
+        -- is NOT silently resolved to one side: owner_conflict below flags it, the
+        -- rollup is withheld from money, and the raw evidence stays in billing_event
+        -- for diagnosis (Hugo, 2026-09-23: retain raw, exclude from money, alarm).
+        CASE
+            WHEN COALESCE(user_id, '')  <> '' AND COALESCE(group_id, '') <> '' THEN ''
+            WHEN COALESCE(user_id, '')  <> '' THEN 'user'
+            WHEN COALESCE(group_id, '') <> '' THEN 'group'
+            ELSE ''
+        END AS owner_type,
+        CASE
+            WHEN COALESCE(user_id, '')  <> '' AND COALESCE(group_id, '') <> '' THEN ''
+            WHEN COALESCE(user_id, '')  <> '' THEN user_id
+            WHEN COALESCE(group_id, '') <> '' THEN group_id
+            ELSE ''
+        END AS owner_id,
+        -- owner_conflict: both a user AND a group on one event. Carried so the grouped
+        -- gate below can withhold the whole rollup rather than bill a guessed owner.
+        (COALESCE(user_id, '') <> '' AND COALESCE(group_id, '') <> '') AS owner_conflict,
+        -- graph_k8s_name: the DynamoGraphDeployment that served the request -- the cost
+        -- centre. Carried as EVIDENCE onto the rollup, never a grain key: a shared graph
+        -- serves many orgs and has no database row, so without it shared-mode cost is
+        -- unattributable. NULL is normal and never withholds money.
+        graph_k8s_name,
+        usage_found,
+        -- aborted / status_code partition the missing-usage bucket by CAUSE (see
+        -- the counts below). A client disconnect or an upstream failure with no
+        -- usage block is EXPECTED; a SUCCESSFUL response with no usage block is
+        -- the alarming case, because the engine served work we cannot bill.
+        aborted,
+        status_code,
+        (prompt_tokens >= 0 AND cached_tokens >= 0 AND completion_tokens >= 0
+         AND cached_tokens <= prompt_tokens) AS valid_usage,
         prompt_tokens,
         cached_tokens,
         completion_tokens,
@@ -291,11 +370,30 @@ resolved AS (
         ev.org_id,
         ev.model_id,
         ev.base_model,
+        -- serving_mode: a GRAIN key column from here on (see the grouped GROUP BY).
+        -- Normalized to '' for dedicated so the key column is never NULL -- UNIQUE
+        -- treats NULLs as distinct, so a NULL key column would let one logical rollup
+        -- be written twice and double-bill.
+        COALESCE(ev.serving_mode, '') AS serving_mode,
+        ev.owner_type,
+        ev.owner_id,
+        ev.owner_conflict,
+        ev.graph_k8s_name,
         ev.ev_ts,
+        ev.usage_found,
+        ev.valid_usage,
         ev.prompt_tokens,
         ev.cached_tokens,
         ev.completion_tokens,
-        GREATEST(ev.prompt_tokens - ev.cached_tokens, 0) AS billable_prompt,
+        -- Widen BEFORE subtracting. prompt_tokens and cached_tokens are INTEGER,
+        -- so individually valid engine evidence can overflow int32 on the
+        -- difference (e.g. 2147483647 - (-2147483648)). This projection runs over
+        -- EVERY event in the window before valid_usage filters anything, so an
+        -- int32 subtraction here fails the whole hour's rating with 22003 —
+        -- one malformed row would block all billing for that window, not just
+        -- its own. BIGINT operands keep the row computable; it is then excluded
+        -- from money by valid_usage and reported as an invalid-usage attempt.
+        GREATEST(ev.prompt_tokens::bigint - ev.cached_tokens::bigint, 0) AS billable_prompt,
         -- The C4 ladder: direct (a) wins; else derived base x premium (b) for
         -- fine-tune traffic; else the plain base rate (c) for a base-model endpoint.
         -- The rd and rpb join guards are mutually exclusive on the fine-tune marker,
@@ -304,6 +402,11 @@ resolved AS (
         -- Fine-tune traffic with a NULL base_model can only miss its join (NULL =
         -- NULL is never true) and is BARRED from the plain-base join by the marker
         -- guard, so it correctly falls through to UNPRICED and screams.
+        -- The book passed in is the one EFFECTIVE DURING THIS HOUR (the caller
+        -- rates hour by hour against the manager's effective-dated series), so
+        -- re-rating an old hour resolves the same rates it originally did. There is
+        -- no local price-freeze table: "never reprice served traffic" holds because
+        -- the price series is a function of TIME, not of when the rater last ran.
         COALESCE(rp.prompt_price,     rd.prompt_price,     rpb.prompt_price)     AS prompt_price,
         COALESCE(rp.cached_price,     rd.cached_price,     rpb.cached_price)     AS cached_price,
         COALESCE(rp.completion_price, rd.completion_price, rpb.completion_price) AS completion_price,
@@ -311,7 +414,7 @@ resolved AS (
         -- the PLAIN-BASE path (c). Both key the rate on base_model, so both feed the
         -- single-rate ambiguity gate below.
         (rp.model_id IS NULL AND rd.base_model IS NOT NULL) AS via_derived,
-        (rp.model_id IS NULL AND rpb.model_id  IS NOT NULL) AS via_base
+        (rp.model_id IS NULL AND rpb.model_id IS NOT NULL)  AS via_base
     FROM ev
     -- (a) The YAML-projected DIRECT price table (keyed on model_id).
     LEFT JOIN rating_price rp ON rp.model_id = ev.model_id
@@ -363,6 +466,14 @@ grouped AS (
         auth_id,
         resource_id,
         model_id,
+        -- GRAIN KEY: shared and dedicated price from different SKUs, so they must never
+        -- merge into one rollup (a merge would let MIN() below apply the cheaper rate
+        -- to both). Already normalized to '' for dedicated in resolved.
+        serving_mode,
+        -- GRAIN KEYS: the owner pair, so charges are presentable per person/team as
+        -- well as per API key. '' / '' means the producer supplied no owner.
+        owner_type,
+        owner_id,
         -- Session-TZ-independent hour bucket; see the statement comment.
         date_trunc('hour', ev_ts AT TIME ZONE 'UTC') AT TIME ZONE 'UTC'                     AS window_start,
         date_trunc('hour', ev_ts AT TIME ZONE 'UTC') AT TIME ZONE 'UTC' + interval '1 hour' AS window_end,
@@ -407,19 +518,61 @@ grouped AS (
         -- rollups are split out (counted as an anomaly, never upserted), exactly like
         -- ambiguous_base. A partial-NULL (one real org + missing-header rows) is NOT
         -- ambiguous (DISTINCT over non-NULLs is 1).
-        COUNT(DISTINCT org_id) > 1 AS ambiguous_org
+        COUNT(DISTINCT org_id) > 1 AS ambiguous_org,
+        -- graph_k8s_name carried onto the rollup via MAX (NOT a GROUP BY key -- the
+        -- graph is evidence, not identity, and keying on it could split a rollup on a
+        -- value that merely propagated late). MAX ignores NULLs, so a rollup whose
+        -- events partly predate graph propagation collapses to the one known graph.
+        -- NULL only when NO event in the rollup named a graph, which is normal and
+        -- never withholds money -- it only means the cost is not pool-attributable.
+        --
+        -- On a genuine two-graph conflict the value is forced to NULL rather than
+        -- letting MAX pick one: an unattributable rollup must not LOOK attributable.
+        -- "No graph" and "a guessed graph" read identically downstream, so the honest
+        -- one is chosen.
+        CASE WHEN COUNT(DISTINCT graph_k8s_name) > 1 THEN NULL
+             ELSE MAX(graph_k8s_name) END                AS graph_k8s_name,
+        -- > 1 distinct graph for one rollup. Unlike a partial-NULL (which MAX resolves
+        -- cleanly), two DIFFERENT non-NULL graphs in one bucket means the traffic was
+        -- served by two cost centres and a single MAX would silently attribute all of
+        -- it to one. Evidence-only, so this does NOT withhold the money -- the rollup
+        -- bills normally with a NULL graph rather than a guessed one, and the count
+        -- below surfaces it. (Contrast ambiguous_org, which DOES withhold: org decides
+        -- WHO is billed, graph only decides what the cost is attributed against.)
+        -- NOTE: there is deliberately NO owner_conflict aggregate here. Conflicted
+        -- events are dropped by the WHERE below, per event, so none survives to be
+        -- aggregated -- see the comment there for why a group-level gate was wrong.
+        COUNT(DISTINCT graph_k8s_name) > 1 AS ambiguous_graph
     FROM resolved
-    WHERE prompt_price IS NOT NULL          -- priced only
+    WHERE usage_found                       -- authoritative engine counts only
+      AND valid_usage                       -- malformed legacy evidence never enters money
+      AND prompt_price IS NOT NULL          -- priced only
       AND auth_id     IS NOT NULL           -- attributable only
       AND model_id    IS NOT NULL
       -- resource_id is a NON-NULL key column AND the E2 customer-attribution key. A
       -- NULL resource_id row can't name its deployment/org, so it is NEVER billed; it
       -- is excluded here and COUNTED as unattributable below (fail closed).
       AND resource_id IS NOT NULL
-    GROUP BY auth_id, resource_id, model_id, date_trunc('hour', ev_ts AT TIME ZONE 'UTC') AT TIME ZONE 'UTC'
+      -- OWNER CONFLICT is excluded PER EVENT, here, NOT via a bool_or gate over the
+      -- group. This is load-bearing and was a bug once: a conflicted event collapses to
+      -- owner_type='' / owner_id='' (the CASE has nowhere else to put it), which is the
+      -- SAME bucket as genuine no-owner traffic. A group-level bool_or therefore
+      -- withheld every legitimate no-owner rollup that merely SHARED a bucket with one
+      -- malformed event -- one bad row zeroing other people's revenue -- and counted
+      -- the whole group's events as conflicted, over-reporting the blast radius.
+      -- Dropping the row here keeps the damage to exactly the offending event, and the
+      -- count below is taken from ev so it reports that one event, not its neighbours.
+      AND NOT owner_conflict
+    GROUP BY auth_id, owner_type, owner_id, resource_id, model_id, serving_mode,
+             date_trunc('hour', ev_ts AT TIME ZONE 'UTC') AT TIME ZONE 'UTC'
 ),
+-- owner_conflict is NOT a gate here: conflicted events never reach grouped (they are
+-- dropped per event in its WHERE), so there is no group left to filter. ambiguous_graph
+-- is not here either -- the graph is evidence, so a conflict nulls the column rather
+-- than withholding the money.
 priced AS (
-    SELECT * FROM grouped WHERE NOT ambiguous_base AND NOT ambiguous_org
+    SELECT * FROM grouped
+    WHERE NOT ambiguous_base AND NOT ambiguous_org
 ),
 -- RECONCILE (re-rate deletes superseded rollups): a rated_usage row whose
 -- (auth_id, resource_id, model_id, window_start) falls IN this run's window but is
@@ -444,15 +597,19 @@ deleted AS (
       AND NOT EXISTS (
           SELECT 1 FROM priced p
           WHERE p.auth_id      = ru.auth_id
+            AND p.owner_type   = ru.owner_type
+            AND p.owner_id     = ru.owner_id
             AND p.resource_id  = ru.resource_id
             AND p.model_id     = ru.model_id
+            AND p.serving_mode = ru.serving_mode
             AND p.window_start = ru.window_start
       )
     RETURNING ru.id
 ),
 upserted AS (
     INSERT INTO rated_usage (
-        id, auth_id, resource_id, org_id, model_id, window_start, window_end,
+        id, auth_id, owner_type, owner_id, resource_id, org_id, model_id,
+        serving_mode, graph_k8s_name, window_start, window_end,
         prompt_tokens, cached_tokens, completion_tokens, billable_prompt_tokens,
         cost, applied_prompt_rate, applied_cached_rate, applied_completion_rate,
         event_count
@@ -460,20 +617,32 @@ upserted AS (
     SELECT
         -- DETERMINISTIC 32-char hex surrogate: md5 of the natural key, so re-rating
         -- regenerates the SAME id. The fields are LENGTH-PREFIXED (len || ':' || value)
-        -- so the encoding is INJECTIVE — a '|' inside auth_id, resource_id or model_id
-        -- can never shift the boundary and collide two different keys onto one id (e.g.
-        -- auth 'a|b' + resource 'c' vs auth 'a' + resource 'b|c'). The field ORDER is
-        -- FIXED and MUST equal the unique key (auth_id, resource_id, model_id,
-        -- window_start); epoch (a bounded integer, no separator hazard) keeps the hash
-        -- input session-TZ-independent.
+        -- so the encoding is INJECTIVE — a '|' inside any field can never shift the
+        -- boundary and collide two different keys onto one id (e.g. auth 'a|b' +
+        -- resource 'c' vs auth 'a' + resource 'b|c'). The field ORDER is FIXED and MUST
+        -- equal the unique key (auth_id, owner_type, owner_id, resource_id, model_id,
+        -- serving_mode, window_start); epoch (a bounded integer, no separator hazard)
+        -- keeps the hash input session-TZ-independent.
+        --
+        -- owner_type, owner_id and serving_mode are NOT NULL (defaulted to '' upstream),
+        -- so length() is never NULL here -- a NULL anywhere in this expression would
+        -- make the whole md5 NULL and violate the PK.
+        --
+        -- WIDENING THIS KEY CHANGES EVERY ID. Migration 0006 widened it from 4 fields to
+        -- 7; ids minted before that are not reproducible and were discarded with the
+        -- clean cutover. Do not add a field here without the same reckoning.
         md5(length(auth_id)::text || ':' || auth_id
+          || '|' || length(owner_type)::text || ':' || owner_type
+          || '|' || length(owner_id)::text || ':' || owner_id
           || '|' || length(resource_id)::text || ':' || resource_id
           || '|' || length(model_id)::text || ':' || model_id
+          || '|' || length(serving_mode)::text || ':' || serving_mode
           || '|' || extract(epoch FROM window_start)::bigint::text),
         -- org_id is NOT part of the md5 natural key (the key is auth/resource/model/
         -- window): org is DERIVED from resource_id, so a NULL→value org transition must
         -- NOT mint a new id and double-write. It is carried as a data column only.
-        auth_id, resource_id, org_id, model_id, window_start, window_end,
+        auth_id, owner_type, owner_id, resource_id, org_id, model_id,
+        serving_mode, graph_k8s_name, window_start, window_end,
         prompt_tokens, cached_tokens, completion_tokens, billable_prompt_tokens,
         cost, applied_prompt_rate, applied_cached_rate, applied_completion_rate,
         event_count
@@ -485,8 +654,8 @@ upserted AS (
     -- raters over overlapping windows (Atlas CronJob concurrencyPolicy: Forbid), so
     -- the cross-rater hazard is unreachable and no delete-lock-ordering machinery is
     -- added here. See cmd/rater's package doc for the single-flight contract.
-    ORDER BY auth_id, resource_id, model_id, window_start
-    ON CONFLICT (auth_id, resource_id, model_id, window_start) DO UPDATE SET
+    ORDER BY auth_id, owner_type, owner_id, resource_id, model_id, serving_mode, window_start
+    ON CONFLICT (auth_id, owner_type, owner_id, resource_id, model_id, serving_mode, window_start) DO UPDATE SET
         -- Refresh org_id on re-rate, but NEVER erase a known org: COALESCE prefers the
         -- new snapshot's org and FALLS BACK to the existing row's org when the new one is
         -- NULL. So a rollup first written with a NULL org (header not yet wired) picks up
@@ -498,6 +667,28 @@ upserted AS (
         -- silent re-rate flip: it is a distinct-org collision the ambiguous_org guard
         -- above already withholds + screams, so it never reaches this UPDATE.
         org_id                  = COALESCE(EXCLUDED.org_id, rated_usage.org_id),
+        -- PLAIN OVERWRITE, deliberately NOT the COALESCE-never-erase treatment org_id
+        -- gets one line above. The asymmetry is the whole point.
+        --
+        -- org_id can COALESCE safely because a real -> NULL org transition never reaches
+        -- this UPDATE: the only way one org becomes another is a distinct-org collision,
+        -- and ambiguous_org WITHHOLDS that rollup from priced entirely. So a NULL in
+        -- EXCLUDED.org_id can only ever mean "header not wired yet", never "we now know
+        -- this is unattributable".
+        --
+        -- graph is different precisely BECAUSE ambiguous_graph does not withhold: a
+        -- rollup that spans two graphs still bills, with the column nulled (see the
+        -- CASE in grouped) so an unattributable cost does not LOOK attributable. That
+        -- NULL therefore DOES reach this UPDATE, and it is a real finding, not a gap.
+        -- COALESCE here would restore the stale single-graph value and silently undo
+        -- the nulling -- leaving the rollup asserting a cost centre the rater has just
+        -- determined it cannot name.
+        --
+        -- The cost of the plain overwrite is that a re-rate over a window whose events
+        -- no longer carry a graph downgrades a known graph to NULL. That is the honest
+        -- direction to fail: the rollup then says "unknown" rather than asserting a
+        -- graph this run could not confirm. Evidence only -- it never changes the money.
+        graph_k8s_name          = EXCLUDED.graph_k8s_name,
         window_end              = EXCLUDED.window_end,
         prompt_tokens           = EXCLUDED.prompt_tokens,
         cached_tokens           = EXCLUDED.cached_tokens,
@@ -523,18 +714,49 @@ SELECT
     -- counted ONLY as unattributable (the more specific signal), never also as
     -- unpriced; likewise an ambiguous_org rollup that is ALSO ambiguous_base is counted
     -- ONLY as ambiguous_base. So the counts strictly PARTITION the in-window rows:
-    --   events_rated + unpriced + unattributable + ambiguous_base + ambiguous_org
+    --   events_rated + missing_usage + invalid_usage + unpriced + unattributable + ambiguous_base + ambiguous_org
     --     == total in-window events.
     -- The unpriced count requires FULL attribution (auth_id, resource_id, model_id all
     -- NON-NULL) for exactly this exclusivity: a NULL-resource_id row that is also
     -- unpriced must be counted ONLY as unattributable, never double-counted here.
     (SELECT COUNT(*)::bigint FROM resolved
-      WHERE prompt_price  IS NULL
+      WHERE usage_found
+        AND valid_usage
+        AND prompt_price  IS NULL
         AND auth_id     IS NOT NULL
         AND resource_id IS NOT NULL
         AND model_id    IS NOT NULL)                          AS unpriced_events,
     (SELECT COUNT(*)::bigint FROM ev
-      WHERE auth_id IS NULL OR resource_id IS NULL OR model_id IS NULL) AS unattributable_events,
+      WHERE usage_found
+        AND valid_usage
+        AND (auth_id IS NULL OR resource_id IS NULL OR model_id IS NULL)) AS unattributable_events,
+    -- Missing engine usage is its own exclusive audit bucket. It must not become a
+    -- zero-token rated rollup or be misreported as an attribution/price failure.
+    -- This is the TOTAL, reported for reconciliation; the paging decision uses the
+    -- cause-partitioned counts below, not this one.
+    (SELECT COUNT(*)::bigint FROM ev WHERE NOT usage_found)            AS missing_usage_events,
+    -- EXPECTED missing usage: the client disconnected (aborted) or the attempt
+    -- terminated with a non-success status. Routine internet, correctly billed
+    -- zero, reviewed in billing_reconciliation_hourly — NOT paged.
+    (SELECT COUNT(*)::bigint FROM ev
+      WHERE NOT usage_found
+        AND (aborted OR (status_code IS NOT NULL AND status_code >= 400)))
+                                                                       AS expected_missing_usage_events,
+    -- UNEXPLAINED missing usage: the attempt was NOT aborted and did NOT fail, so
+    -- the engine reported success while telling us nothing about tokens. We may
+    -- have served real work that cannot be billed. This is the fail-loud bucket.
+    -- A NULL status_code counts here: an attempt we cannot prove failed is not
+    -- allowed to be silently excused (fail closed).
+    (SELECT COUNT(*)::bigint FROM ev
+      WHERE NOT usage_found
+        AND NOT aborted
+        AND (status_code IS NULL OR status_code < 400))
+                                                                       AS unexplained_missing_usage_events,
+    -- Retain invalid authoritative engine evidence in billing_event for repair,
+    -- but never let malformed counts enter
+    -- money or overlap another anomaly bucket.
+    (SELECT COUNT(*)::bigint FROM ev
+      WHERE usage_found AND NOT valid_usage)                           AS invalid_usage_events,
     -- AMBIGUOUS-BASE events: the EVENT count under ambiguous rollups (a single
     -- model_id whose base_model-priced rows carried >1 rate in one window — >1
     -- distinct base_model, or mixed premium/plain-base pricing; see the grouped
@@ -552,12 +774,45 @@ SELECT
     -- anomaly counts stay a strict PARTITION: a rollup that is BOTH base- and
     -- org-ambiguous is counted ONLY as ambiguous_base (the more specific E3 signal),
     -- exactly as unattributable takes precedence over unpriced above. So
-    --   events_rated + unpriced + unattributable + ambiguous_base + ambiguous_org
-    --     == total in-window events
+    --   events_rated + missing_usage + invalid_usage + unpriced + unattributable
+    --     + ambiguous_base + ambiguous_org + owner_conflict == total in-window events
     -- holds with no double-count. Both still drive exit-nonzero, so precedence changes
     -- only which bucket reports the overlap, never whether it screams.
     (SELECT COALESCE(SUM(event_count), 0)::bigint FROM grouped
-      WHERE ambiguous_org AND NOT ambiguous_base)           AS ambiguous_org_events`
+      WHERE ambiguous_org AND NOT ambiguous_base)           AS ambiguous_org_events,
+    -- OWNER-CONFLICT events: the EVENT count under rollups where some event carried
+    -- BOTH a user and a group. Upstream an identity is a user XOR a group, so both
+    -- set is a producer bug and the owner cannot be determined. Excluded from priced
+    -- (never billed to a guessed owner), counted here from the same snapshot to drive
+    -- the fail-loud exit. The raw events remain in billing_event as evidence — retain
+    -- raw, exclude from money, alarm (Hugo, 2026-09-23).
+    --
+    -- LAST in the precedence chain (AND NOT the two above) so the partition stays
+    -- strict: a rollup that is both owner-conflicted and base-ambiguous is counted
+    -- ONLY as ambiguous_base. Same EVENT-unit convention throughout.
+    -- Counted from ev (PER EVENT), not from grouped: a conflicted event is dropped
+    -- before grouping, so it has no rollup to be summed under. This also keeps the
+    -- count honest -- exactly the events that carried both owners, never the innocent
+    -- neighbours that happened to share their bucket.
+    --
+    -- The attribution filters mirror the unattributable/unpriced buckets so the
+    -- partition stays strict: a conflicted row that ALSO lacks auth/resource/model is
+    -- counted once, as unattributable (the more specific upstream failure).
+    (SELECT COUNT(*)::bigint FROM ev
+      WHERE owner_conflict
+        AND usage_found
+        AND valid_usage
+        AND auth_id     IS NOT NULL
+        AND resource_id IS NOT NULL
+        AND model_id    IS NOT NULL)                        AS owner_conflict_events,
+    -- AMBIGUOUS-GRAPH rollups: >1 distinct serving graph in one rollup. NOT part of
+    -- the event partition above and NOT a withholding gate — the graph is evidence,
+    -- so the rollup BILLS NORMALLY with a NULL graph rather than a guessed one. Counted
+    -- as ROLLUPS (not events) precisely because these rows ARE rated: their events are
+    -- already inside events_rated, and counting them again in event units would break
+    -- the partition identity. Surfaced so lost cost attribution is observable.
+    (SELECT COUNT(*)::bigint FROM priced
+      WHERE ambiguous_graph)                                AS ambiguous_graph_rollups`
 
 // RateWindow runs the price-projection + the single resolve→sum→upsert→count
 // statement for [start, end) in ONE transaction, and reports the rollups written,
@@ -602,8 +857,11 @@ func (s *PostgresStore) RateWindow(ctx context.Context, book *PriceBook, start, 
 	var total string
 	err = tx.QueryRowContext(ctx, rateWindowSQL, start.UTC(), end.UTC(), ftLikePattern).
 		Scan(&res.RollupsWritten, &res.EventsRated, &total, &res.ReconciledDeletions,
-			&res.UnpricedEvents, &res.UnattributableEvents, &res.AmbiguousBaseEvents,
-			&res.AmbiguousOrgEvents)
+			&res.UnpricedEvents, &res.UnattributableEvents, &res.MissingUsageEvents,
+			&res.ExpectedMissingUsageEvents, &res.UnexplainedMissingUsageEvents,
+			&res.InvalidUsageEvents, &res.AmbiguousBaseEvents,
+			&res.AmbiguousOrgEvents, &res.OwnerConflictEvents,
+			&res.AmbiguousGraphRollups)
 	if err != nil {
 		return RateResult{}, fmt.Errorf("rating: rate window [%s,%s): %w",
 			start.UTC().Format(time.RFC3339), end.UTC().Format(time.RFC3339), err)

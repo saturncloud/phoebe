@@ -22,33 +22,83 @@ import (
 type Rater struct {
 	store Store
 	book  *PriceBook
-	log   *logging.Logger
+	// bookForHour, when set, supplies the price book EFFECTIVE DURING a given hour
+	// instead of using the single static book. See RunWindow.
+	bookForHour BookForHour
+	log         *logging.Logger
 }
 
+// BookForHour returns the price book effective during the hour starting at
+// hourStart. The manager owns the effective-dated price series, so this is how a
+// rating run prices each hour at the rates that were in force during it —
+// which is what makes re-rating an old window idempotent, however many times
+// prices have changed since.
+//
+// It returns an error rather than a fallback book when the prices for that hour
+// cannot be obtained: rating an hour at the WRONG prices is worse than not rating
+// it, because the resulting rollup looks authoritative.
+type BookForHour func(ctx context.Context, hourStart time.Time) (*PriceBook, error)
+
 // New constructs a Rater over a Store and a loaded PriceBook (the YAML price file).
+// Rating uses this one book for every hour — correct only when the book is known to
+// be the right one for the window (an operator-authored file, or a single-hour run).
+// Prefer WithBookForHour for multi-hour windows against the manager.
 func New(store Store, book *PriceBook, log *logging.Logger) *Rater {
 	return &Rater{store: store, book: book, log: log}
+}
+
+// WithBookForHour makes the rater price each hour from the book effective during
+// that hour, rather than from one snapshot for the whole window.
+func (r *Rater) WithBookForHour(f BookForHour) *Rater {
+	r.bookForHour = f
+	return r
 }
 
 // Result summarises one rating run. It is returned to the caller AND logged, so an
 // operator / CronJob can assert on it.
 //
 // TotalCost is the window's total as NUMERIC TEXT — money never becomes a Go
-// number. UnpricedEvents / UnattributableEvents are the fail-loud signals: real
-// traffic the price book could not price, and rows that could not be attributed.
+// number. UnpricedEvents, UnattributableEvents, MissingUsageEvents, and InvalidUsageEvents are
+// fail-loud signals: traffic the book could not price, rows that could not be
+// attributed, and attempts without authoritative engine counts.
 type Result struct {
 	WindowStart time.Time
 	WindowEnd   time.Time
 	// int64: COUNT/SUM over an arbitrary backfill window can exceed 2^31; the SQL
 	// casts these as ::bigint to avoid a silent 32-bit overflow (see store.go).
 	EventsRated          int64
-	UnpricedEvents       int64  // events whose model had NO resolvable price (NOT $0-billed)
-	UnattributableEvents int64  // in-window rows with NULL auth_id/resource_id/model_id (upstream leak)
-	AmbiguousBaseEvents  int64  // events under an ft: rollup spanning >1 base_model (E3 violation)
-	AmbiguousOrgEvents   int64  // events under a rollup spanning >1 non-NULL org_id (E2 attribution bug)
-	RollupsWritten       int64  // distinct (auth_id, resource_id, model_id, hour) rows upserted
-	ReconciledDeletions  int64  // stale in-window rollups DELETED because this re-run no longer produces them
-	TotalCost            string // sum of all rollup costs, NUMERIC as text
+	UnpricedEvents       int64 // events whose model had NO resolvable price (NOT $0-billed)
+	UnattributableEvents int64 // in-window rows with NULL auth_id/resource_id/model_id (upstream leak)
+	MissingUsageEvents   int64 // attempts with no authoritative engine usage block (zero-charge) — TOTAL, reported not paged
+	// ExpectedMissingUsageEvents is the routine share of MissingUsageEvents: the
+	// client aborted, or the attempt terminated non-success. Reported, never paged.
+	ExpectedMissingUsageEvents int64
+	// UnexplainedMissingUsageEvents is the alarming share: a SUCCESSFUL response
+	// carrying no usage block, i.e. served work we cannot bill. This is the
+	// missing-usage signal that pages.
+	UnexplainedMissingUsageEvents int64
+	InvalidUsageEvents            int64 // authoritative evidence with malformed token counts (never money)
+	AmbiguousBaseEvents           int64 // events under an ft: rollup spanning >1 base_model (E3 violation)
+	AmbiguousOrgEvents            int64 // events under a rollup spanning >1 non-NULL org_id (E2 attribution bug)
+	// OwnerConflictEvents counts events under rollups where an event carried BOTH a
+	// user_id and a group_id. An identity is a user XOR a group, so both set is a
+	// producer bug; the rollup is NOT billed (neither owner can be assumed) and the
+	// raw events stay in billing_event as evidence.
+	OwnerConflictEvents int64
+	// AmbiguousGraphRollups counts ROLLUPS whose traffic spanned more than one serving
+	// graph. NOT a withholding signal and NOT in event units: these rollups ARE billed
+	// (the graph is cost-attribution evidence, not identity) with a NULL graph rather
+	// than a guessed one. Reported so lost attribution is visible.
+	AmbiguousGraphRollups int64
+	RollupsWritten        int64 // distinct grain rows upserted (see rated_usage_grain_uq)
+	// UnratedHours counts hours in the window that were SKIPPED — prices could not
+	// be obtained, or rating them failed. Each hour is independent and the upsert is
+	// idempotent, so a skipped hour is rated by a later run whose trailing window
+	// still covers it. Nonzero means this run did NOT cover its whole window, so its
+	// totals are partial and the run exits non-zero (see cmd/rater).
+	UnratedHours        int64
+	ReconciledDeletions int64  // stale in-window rollups DELETED because this re-run no longer produces them
+	TotalCost           string // sum of all rollup costs, NUMERIC as text
 }
 
 // HasUnpriced reports whether any event could not be priced (a loud outcome even
@@ -60,6 +110,37 @@ func (r Result) HasUnpriced() bool { return r.UnpricedEvents > 0 }
 // NULL resource_id means the row can't name its deployment/org (E2), so it can't be
 // billed and is counted here rather than attributed to a NULL org.
 func (r Result) HasUnattributable() bool { return r.UnattributableEvents > 0 }
+
+// HasMissingUsage reports attempts retained for audit but excluded from money
+// because the serving engine did not supply authoritative token counts. This is
+// the TOTAL across both causes and is REPORTED, not paged — see
+// HasUnexplainedMissingUsage for the paging signal and HasAnomaly for why.
+func (r Result) HasMissingUsage() bool { return r.MissingUsageEvents > 0 }
+
+// HasUnratedHours reports that this run left part of its window unrated — prices
+// for an hour were unavailable, or rating it failed. It is NOT folded into
+// HasAnomaly: an anomaly is a statement about the EVIDENCE (something could not
+// become money and needs investigation), while an unrated hour is a statement
+// about this RUN (it did not finish its window). Both exit non-zero, but they mean
+// different operator actions: an anomaly means investigate the data; an unrated
+// hour means check the pricing service and confirm a later run caught up.
+func (r Result) HasUnratedHours() bool { return r.UnratedHours > 0 }
+
+// HasUnexplainedMissingUsage reports the alarming share of missing usage: the
+// attempt was neither aborted by the client nor terminated with a failure status,
+// so the engine reported SUCCESS while reporting no tokens. That is work we may
+// have served and cannot bill, so it is the fail-loud, exit-nonzero signal.
+//
+// The routine share (client aborts, upstream failures) is deliberately excluded:
+// this branch made zero-usage rows a NORMAL product of every abort and every 5xx,
+// so paging on the total would fire hourly on any install with real traffic and
+// would bury the rare anomalies (unpriced, unattributable, ambiguous) that share
+// the exit-2 channel. Ratified with Hugo, 2026-09-21.
+func (r Result) HasUnexplainedMissingUsage() bool { return r.UnexplainedMissingUsageEvents > 0 }
+
+// HasInvalidUsage reports authoritative raw evidence whose token counts violate
+// the billing invariants. It is retained for repair but excluded from money.
+func (r Result) HasInvalidUsage() bool { return r.InvalidUsageEvents > 0 }
 
 // HasAmbiguousBase reports whether any ft: rollup spanned more than one base_model in a
 // window — the E3 ft-uniqueness violation. A uuid4 checkpoint id cannot carry two
@@ -75,12 +156,38 @@ func (r Result) HasAmbiguousBase() bool { return r.AmbiguousBaseEvents > 0 }
 // missing-header rows) is NOT ambiguous and never trips this.
 func (r Result) HasAmbiguousOrg() bool { return r.AmbiguousOrgEvents > 0 }
 
-// HasAnomaly reports whether the run rated cleanly but something leaked: events that
-// could not be priced, rows that could not be attributed, an ft: rollup spanning
-// multiple base_models, OR a rollup spanning multiple orgs. All are the same class of
-// fail-loud signal, so cmd/rater exits non-zero on any of them.
+// HasOwnerConflict reports whether any rollup contained an event carrying BOTH a
+// user_id and a group_id. Upstream an identity is a user XOR a group, so this is a
+// producer bug: the owner cannot be determined, the rollup is NOT billed (guessing
+// either side would mis-attribute), and it screams. Loud, exit-nonzero, like the other
+// anomalies. The raw events remain in billing_event for diagnosis.
+func (r Result) HasOwnerConflict() bool { return r.OwnerConflictEvents > 0 }
+
+// HasAmbiguousGraph reports whether any BILLED rollup drew traffic from more than one
+// serving graph. Deliberately NOT part of HasAnomaly: the graph is cost-attribution
+// evidence, not billing identity, so the money is still correct — only the pool the
+// cost is attributed against is unknown, and the rollup carries NULL rather than a
+// guess. Surfaced for operators, never a reason to withhold revenue.
+func (r Result) HasAmbiguousGraph() bool { return r.AmbiguousGraphRollups > 0 }
+
+// HasAnomaly reports whether something leaked: events that could not be priced,
+// rows that could not be attributed, a SUCCESSFUL attempt that reported no engine
+// usage, malformed authoritative counts, an ft: rollup spanning multiple
+// base_models, a rollup spanning multiple orgs, or an event claiming both a user and
+// a group owner. All are RARE and WRONG, so cmd/rater exits non-zero on any of them
+// and an operator should be paged.
+//
+// Deliberately NOT here: the missing-usage TOTAL. Client aborts and upstream
+// failures legitimately produce zero-usage rows on every install with traffic, so
+// including them would make exit 2 fire hourly and destroy its meaning for the
+// conditions above. Those are reported (and land in
+// billing_reconciliation_hourly) rather than paged.
+//
+// Also deliberately NOT here: AmbiguousGraphRollups. Those rollups ARE billed and
+// their money is correct; only the cost-attribution pool is unknown. Paging on it
+// would conflate "we may have mis-billed" with "we cannot compute margin".
 func (r Result) HasAnomaly() bool {
-	return r.HasUnpriced() || r.HasUnattributable() || r.HasAmbiguousBase() || r.HasAmbiguousOrg()
+	return r.HasUnpriced() || r.HasUnattributable() || r.HasUnexplainedMissingUsage() || r.HasInvalidUsage() || r.HasAmbiguousBase() || r.HasAmbiguousOrg() || r.HasOwnerConflict()
 }
 
 // Run rates [windowStart, windowEnd): it runs the SINGLE SQL statement that
@@ -134,16 +241,32 @@ func (r *Rater) Run(ctx context.Context, windowStart, windowEnd time.Time, windo
 	res.TotalCost = rr.TotalCost
 	res.UnpricedEvents = rr.UnpricedEvents
 	res.UnattributableEvents = rr.UnattributableEvents
+	res.MissingUsageEvents = rr.MissingUsageEvents
+	res.ExpectedMissingUsageEvents = rr.ExpectedMissingUsageEvents
+	res.UnexplainedMissingUsageEvents = rr.UnexplainedMissingUsageEvents
+	res.InvalidUsageEvents = rr.InvalidUsageEvents
 	res.AmbiguousBaseEvents = rr.AmbiguousBaseEvents
 	res.AmbiguousOrgEvents = rr.AmbiguousOrgEvents
+	res.OwnerConflictEvents = rr.OwnerConflictEvents
+	res.AmbiguousGraphRollups = rr.AmbiguousGraphRollups
 
 	if res.HasAmbiguousBase() {
 		r.log.Error.Printf("rating: window [%s,%s) has %d events under AMBIGUOUS-BASE rollups (a single model_id whose base_model-priced events carried MORE THAN ONE rate in a window: >1 distinct base_model, or mixed premium/plain-base pricing from an X-Saturn-Adapter flap) — a base_model/adapter PROPAGATION violation, NOT a priceable rollup; these rollups are NOT billed (billing the MIN rate would silently under-charge). Fix header propagation and re-rate this window",
 			windowStart.Format(time.RFC3339), windowEnd.Format(time.RFC3339), res.AmbiguousBaseEvents)
 	}
 	if res.HasAmbiguousOrg() {
-		r.log.Error.Printf("rating: window [%s,%s) has %d events under AMBIGUOUS-ORG rollups (a single (auth, resource, model, hour) rollup carried MORE THAN ONE distinct non-NULL org_id) — a deployment owns exactly one org, so this is an E2 attribution PROPAGATION bug (Atlas injected conflicting X-Saturn-Org-Id values for one resource); these rollups are NOT billed (a guessed org would mis-attribute revenue). Fix org_id propagation and re-rate this window",
+		r.log.Error.Printf("rating: window [%s,%s) has %d events under AMBIGUOUS-ORG rollups (a single rollup carried MORE THAN ONE distinct non-NULL org_id) — a deployment owns exactly one org, so this is an E2 attribution PROPAGATION bug (Atlas injected conflicting X-Saturn-Org-Id values for one resource); these rollups are NOT billed (a guessed org would mis-attribute revenue). Fix org_id propagation and re-rate this window",
 			windowStart.Format(time.RFC3339), windowEnd.Format(time.RFC3339), res.AmbiguousOrgEvents)
+	}
+	if res.HasOwnerConflict() {
+		r.log.Error.Printf("rating: window [%s,%s) has %d events under OWNER-CONFLICT rollups (an event carried BOTH X-Saturn-User-Id and X-Saturn-Group-Id) — upstream an identity is a user XOR a group, so this is a producer PROPAGATION bug; the owner cannot be determined, so these rollups are NOT billed (attributing to either side would mis-charge a person or a team). The raw events are retained in billing_event as evidence. Fix the header producer and re-rate this window",
+			windowStart.Format(time.RFC3339), windowEnd.Format(time.RFC3339), res.OwnerConflictEvents)
+	}
+	if res.HasAmbiguousGraph() {
+		// WARN, not ERROR: these rollups ARE billed and the money is right. Only the
+		// cost-attribution pool is unknown, so this must not read like a revenue fault.
+		r.log.Warn.Printf("rating: window [%s,%s) has %d BILLED rollup(s) spanning MORE THAN ONE serving graph — the money is correct, but the rollup carries a NULL graph_k8s_name rather than a guessed one, so its cost cannot be attributed to a serving pool (margin analysis will not see it). Usually a deployment moved graphs mid-hour",
+			windowStart.Format(time.RFC3339), windowEnd.Format(time.RFC3339), res.AmbiguousGraphRollups)
 	}
 	if res.HasUnattributable() {
 		r.log.Error.Printf("rating: window [%s,%s) has %d UNATTRIBUTABLE billing_event rows (NULL auth_id/resource_id/model_id — a NULL resource_id can't name the deployment/org for E2 billing) — these cannot be rated; the interceptor's billing gate should reject them before metering, so a nonzero count means revenue is leaking upstream",
@@ -152,6 +275,21 @@ func (r *Rater) Run(ctx context.Context, windowStart, windowEnd time.Time, windo
 	if res.HasUnpriced() {
 		r.log.Error.Printf("rating: window [%s,%s) has %d UNPRICED events (nothing resolved: model_id absent from the price file AND base_model empty/unpriced — which for fine-tune traffic (X-Saturn-Adapter present or an ft: id) is a base_model PROPAGATION BUG, not a free model) — these are NOT billed; the create-time price gate should prevent this, so a nonzero count means an unpriced model was served (or a header stopped propagating). Add the price/fix the header and re-rate this window",
 			windowStart.Format(time.RFC3339), windowEnd.Format(time.RFC3339), res.UnpricedEvents)
+	}
+	if res.HasUnexplainedMissingUsage() {
+		r.log.Error.Printf("rating: window [%s,%s) has %d UNEXPLAINED MISSING-USAGE attempts — the response was NOT aborted and did NOT fail, so the engine reported success while supplying no authoritative usage block: work may have been served that cannot be billed. Reconcile against engine logs before settling the invoice",
+			windowStart.Format(time.RFC3339), windowEnd.Format(time.RFC3339), res.UnexplainedMissingUsageEvents)
+	}
+	if res.ExpectedMissingUsageEvents > 0 {
+		// Routine: client aborts and upstream failures. Zero-charge by design and
+		// reviewed in billing_reconciliation_hourly — reported at INFO so it never
+		// competes with the fail-loud channel above.
+		r.log.Info.Printf("rating: window [%s,%s) has %d expected missing-usage attempts (client aborted or upstream failed) — retained at zero charge, excluded from rated_usage, no action required",
+			windowStart.Format(time.RFC3339), windowEnd.Format(time.RFC3339), res.ExpectedMissingUsageEvents)
+	}
+	if res.HasInvalidUsage() {
+		r.log.Error.Printf("rating: window [%s,%s) has %d INVALID-USAGE events — authoritative raw evidence was retained but excluded from rated_usage because token counts were negative or cached tokens exceeded prompt tokens. Repair or quarantine the evidence before settling the invoice",
+			windowStart.Format(time.RFC3339), windowEnd.Format(time.RFC3339), res.InvalidUsageEvents)
 	}
 
 	// A re-rate that SUPERSEDES prior billing (deleted stale rollups) is significant —
@@ -177,13 +315,150 @@ func (r *Rater) Run(ctx context.Context, windowStart, windowEnd time.Time, windo
 	}
 
 	if res.HasAnomaly() {
-		r.log.Error.Printf("rating: window [%s,%s) rated %d events into %d rollups, total=%s USD; %d UNPRICED events dropped (backfill prices and re-rate), %d UNATTRIBUTABLE rows skipped (NULL auth_id/resource_id/model_id — upstream billing-gate leak), %d AMBIGUOUS-BASE events dropped (one model_id, more than one base_model-derived rate — fix base_model/adapter propagation and re-rate), %d AMBIGUOUS-ORG events dropped (one resource spanning multiple orgs — fix org_id propagation and re-rate)",
+		r.log.Error.Printf("rating: window [%s,%s) rated %d events into %d rollups, total=%s USD; %d UNPRICED events dropped (backfill prices and re-rate), %d UNATTRIBUTABLE rows skipped (NULL auth_id/resource_id/model_id — upstream billing-gate leak), %d UNEXPLAINED MISSING-USAGE attempts (success with no usage block — reconcile engine logs) of %d missing-usage total, %d INVALID-USAGE events excluded from money, %d AMBIGUOUS-BASE events dropped (one model_id, more than one base_model-derived rate — fix base_model/adapter propagation and re-rate), %d AMBIGUOUS-ORG events dropped (one resource spanning multiple orgs — fix org_id propagation and re-rate), %d OWNER-CONFLICT events dropped (an event claimed both a user and a group owner — fix the identity header producer and re-rate)",
 			windowStart.Format(time.RFC3339), windowEnd.Format(time.RFC3339),
-			res.EventsRated, res.RollupsWritten, res.TotalCost, res.UnpricedEvents, res.UnattributableEvents, res.AmbiguousBaseEvents, res.AmbiguousOrgEvents)
+			res.EventsRated, res.RollupsWritten, res.TotalCost, res.UnpricedEvents, res.UnattributableEvents,
+			res.UnexplainedMissingUsageEvents, res.MissingUsageEvents, res.InvalidUsageEvents, res.AmbiguousBaseEvents, res.AmbiguousOrgEvents, res.OwnerConflictEvents)
 	} else {
 		r.log.Info.Printf("rating: window [%s,%s) rated %d events into %d rollups, total=%s USD",
 			windowStart.Format(time.RFC3339), windowEnd.Format(time.RFC3339),
 			res.EventsRated, res.RollupsWritten, res.TotalCost)
 	}
 	return res, nil
+}
+
+// RunWindow rates [windowStart, windowEnd) HOUR BY HOUR, pricing each hour from
+// the book effective DURING that hour, and returns the aggregate.
+//
+// THE PRICING INSTANT IS THE HOUR START (Hugo, 2026-09-22). Each hour is priced
+// from the book effective at hourStart, so a price change takes effect at the NEXT
+// HOUR BOUNDARY: a reprice landing at 10:30 applies to the 11:00 hour, not to any
+// part of 10:00. That is the deliberate quantum, not an accident of the loop.
+//
+// The alternative — splitting an hour at the reprice instant — was rejected: the
+// rating SQL buckets on date_trunc('hour', ...), so sub-hour pricing cannot be
+// expressed without a schema change, and the precision is not worth a one-way
+// door. Operators scheduling a price change should therefore pick an hour
+// boundary; anything else silently rounds forward to one.
+//
+// WHY PER HOUR (the correctness reason): prices are effective-dated in the manager,
+// but one PriceBook is a flat snapshot with no time dimension. The default run
+// covers 24 trailing hours, so pricing the whole span from any single snapshot
+// would misprice every hour on the far side of a mid-window price change — silently,
+// since the resulting rollups look authoritative. Rating each hour against its own
+// book removes that class of error entirely, and makes a re-rate idempotent by
+// construction: an hour always resolves to the rates that were in force during it,
+// however many times prices have changed since. This is what replaced phoebe's local
+// price-freeze table (rating_price_lock): the freeze was a local workaround for a
+// time dimension the wire call used to discard.
+//
+// The rating SQL is UNCHANGED: each hour is still one RateWindow call with one flat
+// book, so the money path keeps its single-snapshot semantics. Only the number of
+// calls and which book each gets are new.
+//
+// FAIL CLOSED PER HOUR: if an hour's prices cannot be obtained, that hour is not
+// rated and the run returns the error. A partially-rated window is reported through
+// the aggregate (hours already committed keep their rollups — each hour's SQL is its
+// own transaction), so a retry converges rather than double-counting. That report is
+// SELF-CONSISTENT: agg.TotalCost is kept in step with the counters as each hour is
+// folded in, so an error return never claims N events rated at a total of $0.
+//
+// HOUR-ALIGNED ONLY: the rating SQL buckets on date_trunc('hour') and REPLACES a
+// bucket, so a partial hour would overwrite a complete rollup with a partial sum
+// (and its reconcile-delete would erase a neighbouring hour's rows). Unaligned
+// bounds are therefore refused, not clamped.
+//
+// Anomaly counts, reconcile deletions and cost SUM across the hours, so the caller's
+// exit-code contract (see cmd/rater) is unchanged: any hour leaking an anomaly makes
+// the aggregate report it.
+func (r *Rater) RunWindow(ctx context.Context, windowStart, windowEnd time.Time, windowExplicit bool) (Result, error) {
+	windowStart = windowStart.UTC()
+	windowEnd = windowEnd.UTC()
+	agg := Result{WindowStart: windowStart, WindowEnd: windowEnd, TotalCost: "0"}
+
+	if !windowStart.Before(windowEnd) {
+		return agg, fmt.Errorf("rating: empty/inverted window [%s,%s)", windowStart.Format(time.RFC3339), windowEnd.Format(time.RFC3339))
+	}
+	if !windowStart.Truncate(time.Hour).Equal(windowStart) || !windowEnd.Truncate(time.Hour).Equal(windowEnd) {
+		return agg, fmt.Errorf("rating: window [%s,%s) is not hour-aligned; the rating SQL buckets on date_trunc('hour') and REPLACES a bucket, so a partial hour would overwrite a complete rollup",
+			windowStart.Format(time.RFC3339), windowEnd.Format(time.RFC3339))
+	}
+	// A per-hour provider is mandatory: rating a multi-hour window from one
+	// snapshot is exactly the mispricing RunWindow exists to prevent, and the
+	// manager is the only price source, so there is no book to fall back to.
+	if r.bookForHour == nil {
+		return agg, fmt.Errorf("rating: no per-hour price provider configured (refusing to rate [%s,%s) from a single snapshot)",
+			windowStart.Format(time.RFC3339), windowEnd.Format(time.RFC3339))
+	}
+
+	// The zero Dec is exact 0 (see decimal.go); money is summed as exact decimal,
+	// never a float.
+	var total Dec
+	for hourStart := windowStart; hourStart.Before(windowEnd); hourStart = hourStart.Add(time.Hour) {
+		hourEnd := hourStart.Add(time.Hour)
+		book, err := r.bookForHour(ctx, hourStart)
+		if err != nil {
+			// SKIP, don't abort. Each hour is independent: its rating is its own
+			// transaction and the upsert is idempotent, so an hour left unrated is
+			// simply rated by a later run whose trailing window still covers it.
+			// Aborting instead would mean one transient manager blip on hour 19
+			// discards the remaining hours too — and with a trailing-24h default,
+			// a brief outage would otherwise stall every hour behind it.
+			// Same shape as cmd/token-push, which withholds a window and lets the
+			// next run re-push rather than failing the batch.
+			r.log.Error.Printf("rating: hour %s SKIPPED — prices unavailable: %v (the hour is left unrated; a later run whose window still covers it will rate it)",
+				hourStart.Format(time.RFC3339), err)
+			agg.UnratedHours++
+			continue
+		}
+		if book == nil {
+			r.log.Error.Printf("rating: hour %s SKIPPED — no price book (refusing to rate at $0)", hourStart.Format(time.RFC3339))
+			agg.UnratedHours++
+			continue
+		}
+		hourRater := &Rater{store: r.store, book: book, log: r.log}
+		hourRes, err := hourRater.Run(ctx, hourStart, hourEnd, windowExplicit)
+		agg.accumulate(hourRes)
+		if err != nil {
+			// A rating failure for one hour is likewise not the window's failure.
+			// Its counters are folded in above (they describe what the statement
+			// reported before failing); the hour stays unrated and converges later.
+			r.log.Error.Printf("rating: hour %s SKIPPED — rating failed: %v", hourStart.Format(time.RFC3339), err)
+			agg.UnratedHours++
+			continue
+		}
+		hourCost, err := ParseDec(hourRes.TotalCost)
+		if err != nil {
+			// An unparseable total is precisely the case where the hour's cost is
+			// unknown, so it must not be invented or summed. agg.TotalCost keeps
+			// the sum of the hours whose cost IS known.
+			r.log.Error.Printf("rating: hour %s total %q is unparseable: %v (cost excluded from the window total)",
+				hourStart.Format(time.RFC3339), hourRes.TotalCost, err)
+			agg.UnratedHours++
+			continue
+		}
+		total = total.Add(hourCost)
+		// Keep the aggregate's cost in step with the counters accumulate() folded
+		// in, so a partial run reports the cost actually committed.
+		agg.TotalCost = total.String()
+	}
+	return agg, nil
+}
+
+// accumulate folds one hour's outcome into the window aggregate. Costs are summed
+// separately (exact decimal, never a float).
+func (r *Result) accumulate(hour Result) {
+	r.EventsRated += hour.EventsRated
+	r.RollupsWritten += hour.RollupsWritten
+	r.ReconciledDeletions += hour.ReconciledDeletions
+	r.UnpricedEvents += hour.UnpricedEvents
+	r.UnattributableEvents += hour.UnattributableEvents
+	r.MissingUsageEvents += hour.MissingUsageEvents
+	r.ExpectedMissingUsageEvents += hour.ExpectedMissingUsageEvents
+	r.UnexplainedMissingUsageEvents += hour.UnexplainedMissingUsageEvents
+	r.InvalidUsageEvents += hour.InvalidUsageEvents
+	r.AmbiguousBaseEvents += hour.AmbiguousBaseEvents
+	r.AmbiguousOrgEvents += hour.AmbiguousOrgEvents
+	r.OwnerConflictEvents += hour.OwnerConflictEvents
+	r.AmbiguousGraphRollups += hour.AmbiguousGraphRollups
 }

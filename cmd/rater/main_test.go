@@ -1,6 +1,9 @@
 package main
 
 import (
+	"os"
+	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 )
@@ -124,15 +127,15 @@ func TestRater_RoutineRunReconcileDeleteExitsNonzero(t *testing.T) {
 		windowExplicit = false // routine default trailing-hours window
 		hasAnomaly     = false // ONLY a reconcile-delete; no unpriced/unattributable/ambiguous
 	)
-	if got := exitCode(1, windowExplicit, hasAnomaly); got != exitAnomaly {
+	if got := exitCode(1, windowExplicit, hasAnomaly, false); got != exitAnomaly {
 		t.Fatalf("routine run with a reconcile-delete: exit = %d, want exitAnomaly (%d) — a prior bill vanished on a routine cadence; page someone", got, exitAnomaly)
 	}
 	// And with MORE than one delete (count is just a signal, not a threshold).
-	if got := exitCode(7, windowExplicit, hasAnomaly); got != exitAnomaly {
+	if got := exitCode(7, windowExplicit, hasAnomaly, false); got != exitAnomaly {
 		t.Fatalf("routine run with 7 reconcile-deletes: exit = %d, want exitAnomaly (%d)", got, exitAnomaly)
 	}
 	// Sanity: a routine run with NO reconcile-delete and no anomaly is the clean path.
-	if got := exitCode(0, windowExplicit, hasAnomaly); got != exitOK {
+	if got := exitCode(0, windowExplicit, hasAnomaly, false); got != exitOK {
 		t.Fatalf("clean routine run: exit = %d, want exitOK (%d)", got, exitOK)
 	}
 }
@@ -146,16 +149,16 @@ func TestRater_RoutineRunReconcileDeleteExitsNonzero(t *testing.T) {
 func TestRater_BackfillReconcileDeleteExitsZero(t *testing.T) {
 	const windowExplicit = true // operator named the window
 	// Reconcile-delete on an explicit backfill, nothing else leaked → exit 0.
-	if got := exitCode(3, windowExplicit, false); got != exitOK {
+	if got := exitCode(3, windowExplicit, false, false); got != exitOK {
 		t.Fatalf("explicit backfill with a reconcile-delete: exit = %d, want exitOK (%d) — convergence the operator asked for", got, exitOK)
 	}
 	// But a real anomaly during a backfill STILL exits nonzero (the flag never
 	// suppresses unpriced/unattributable/ambiguous).
-	if got := exitCode(3, windowExplicit, true); got != exitAnomaly {
+	if got := exitCode(3, windowExplicit, true, false); got != exitAnomaly {
 		t.Fatalf("explicit backfill that ALSO leaked an anomaly: exit = %d, want exitAnomaly (%d) — --since must not mask a real anomaly", got, exitAnomaly)
 	}
 	// A clean explicit backfill (no deletes, no anomaly) is exit 0.
-	if got := exitCode(0, windowExplicit, false); got != exitOK {
+	if got := exitCode(0, windowExplicit, false, false); got != exitOK {
 		t.Fatalf("clean explicit backfill: exit = %d, want exitOK (%d)", got, exitOK)
 	}
 }
@@ -183,5 +186,157 @@ func TestResolveWindow_RejectsUnaligned(t *testing.T) {
 	// A fully hour-aligned explicit window is still accepted.
 	if _, _, _, err := resolveWindow("2026-06-01T00:00:00Z", "2026-06-01T03:00:00Z", defaultRateTrailingHours, now); err != nil {
 		t.Fatalf("hour-aligned window should be accepted, got %v", err)
+	}
+}
+
+// TestRaterSettings_ManagerURLIsTheOnlyPriceSource pins the settings contract after
+// the mandatory-manager collapse (Hugo, 2026-09-22): the rater reads managerURL out
+// of the file the chart renders, and there is no priceFile key to fall back to.
+//
+// The chart writes this settings file, so a key the rater silently ignored would
+// make the whole price path inert with nothing to notice it — the exact failure
+// mode a cross-repo review missed on the previous wiring.
+func TestRaterSettings_ManagerURLIsTheOnlyPriceSource(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "rater.yaml")
+	// Exactly the shape charts/phoebe/templates/configmap.yaml renders.
+	settings := "debug: false\n" +
+		"rateTrailingHours: 24\n" +
+		"managerURL: \"https://manager.example\"\n"
+	if err := os.WriteFile(path, []byte(settings), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	_, opts, err := loadConfig(path)
+	if err != nil {
+		t.Fatalf("loadConfig: %v", err)
+	}
+	if opts.managerURL != "https://manager.example" {
+		t.Fatalf("managerURL = %q, want the configured URL — the chart key would be inert", opts.managerURL)
+	}
+}
+
+// TestRaterSettings_PriceFileKeyIsInertAndFailsClosed pins what actually happens to a
+// leftover priceFile key from the price-file world: loadConfig uses plain
+// yaml.Unmarshal (not UnmarshalStrict), so priceFile is an UNKNOWN key and is
+// silently DROPPED — it is ignored, not rejected. The guarantee this test holds is
+// therefore not "the key errors" but "the key is inert": it cannot stand in for
+// managerURL, so an operator whose settings file carries only priceFile gets an
+// empty managerURL and run() exits fatal (main.go:201) rather than pricing from a
+// stale local file or defaulting to $0. The positive control below proves the
+// assertion is not vacuous — the loader really does read the file, and priceFile
+// sitting next to managerURL does not disturb it.
+func TestRaterSettings_PriceFileKeyIsInertAndFailsClosed(t *testing.T) {
+	dir := t.TempDir()
+
+	// Case 1: priceFile ONLY — the migration hazard. Ignored, not an error, and it
+	// leaves managerURL empty so run() fails closed.
+	stalePath := filepath.Join(dir, "stale.yaml")
+	stale := "debug: false\n" +
+		"priceFile: /etc/saturn/prices/prices.yaml\n"
+	if err := os.WriteFile(stalePath, []byte(stale), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	_, opts, err := loadConfig(stalePath)
+	if err != nil {
+		t.Fatalf("loadConfig: %v, want nil — an unknown priceFile key is ignored by the non-strict loader, not an error", err)
+	}
+	if opts.managerURL != "" {
+		t.Fatalf("managerURL = %q, want empty — a priceFile key must not stand in for one", opts.managerURL)
+	}
+
+	// Case 2 (positive control): priceFile ALONGSIDE managerURL. Proves the loader
+	// reads the file at all — so case 1's empty managerURL means "dropped", not
+	// "nothing was parsed" — and that the stale key does not clobber the real one.
+	bothPath := filepath.Join(dir, "both.yaml")
+	both := "debug: false\n" +
+		"priceFile: /etc/saturn/prices/prices.yaml\n" +
+		"managerURL: \"https://manager.example\"\n"
+	if err := os.WriteFile(bothPath, []byte(both), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	_, opts, err = loadConfig(bothPath)
+	if err != nil {
+		t.Fatalf("loadConfig: %v", err)
+	}
+	if opts.managerURL != "https://manager.example" {
+		t.Fatalf("managerURL = %q, want the configured URL — a leftover priceFile must not disturb the real price source", opts.managerURL)
+	}
+}
+
+// TestReconciliationDoc_DocumentsNoLocalPriceFileFallback guards the operator doc
+// against drifting back to the price-file world the rater no longer supports.
+// docs/billing-reconciliation.md is what an operator reads when an invoice does not
+// tie out; if it describes a no-managerURL local-price-file mode, an operator will
+// try to configure one and the rater will simply exit 1 (see run(): an empty
+// managerURL is FATAL because the manager is the only price source). The doc must
+// therefore state the rule the binary enforces — managerURL is required, and the
+// egress-less install runs its own manager — and may cite config/prices.example.yaml
+// only as the served WIRE SHAPE, never as a file the rater reads.
+func TestReconciliationDoc_DocumentsNoLocalPriceFileFallback(t *testing.T) {
+	data, err := os.ReadFile("../../docs/billing-reconciliation.md")
+	if err != nil {
+		t.Fatalf("read reconciliation doc: %v", err)
+	}
+	doc := string(data)
+
+	for _, want := range []string{
+		// The enforced rule: required, and fatal when unset.
+		"`managerURL` is REQUIRED",
+		"exits 1",
+		// The supported answer for an install that cannot reach the central manager.
+		"runs its own manager instance seeded with that\n   deployment's prices",
+		// The example file, framed as the wire shape only.
+		"`config/prices.example.yaml` documents the WIRE SHAPE",
+	} {
+		if !strings.Contains(doc, want) {
+			t.Errorf("reconciliation doc is missing %q — it must state the price-source rule the rater enforces", want)
+		}
+	}
+
+	// No resurrected fallback language. These are the AFFIRMATIVE forms — an
+	// install being offered a price file as a mode. The doc's own negative
+	// statement ("keeps ... no local price file") is the rule, not a violation of
+	// it, so the patterns below are written to miss it.
+	for _, forbidden := range []string{
+		"uses the operator-authored price file",
+		"operator-authored price file for every hour",
+		"no `managerURL` uses",
+		"falls back to the price file",
+	} {
+		if strings.Contains(doc, forbidden) {
+			t.Errorf("reconciliation doc mentions %q — there is no local-price-file mode; the manager is the only price source", forbidden)
+		}
+	}
+}
+
+// TestExitCode_UnratedHoursIsItsOwnSignal: a run that SKIPPED an hour (prices
+// unavailable, or rating it failed) did not cover its whole window, so it must not
+// exit 0 — but it is a different operator action from an evidence anomaly ("check
+// the pricing service and confirm a later run caught up" vs "investigate the
+// data"), so it gets its own code. An anomaly outranks it: bad evidence is the more
+// urgent signal, and a run can be both.
+func TestExitCode_UnratedHoursIsItsOwnSignal(t *testing.T) {
+	const (
+		noDeletes     = int64(0)
+		routine       = false
+		noAnomaly     = false
+		anomaly       = true
+		unrated       = true
+		allHoursRated = false
+	)
+	if got := exitCode(noDeletes, routine, noAnomaly, unrated); got != exitIncomplete {
+		t.Fatalf("skipped hour: exit = %d, want exitIncomplete (%d) — the window was not fully rated", got, exitIncomplete)
+	}
+	if got := exitCode(noDeletes, routine, noAnomaly, allHoursRated); got != exitOK {
+		t.Fatalf("fully rated clean run: exit = %d, want exitOK (%d)", got, exitOK)
+	}
+	// An anomaly wins when both are present.
+	if got := exitCode(noDeletes, routine, anomaly, unrated); got != exitAnomaly {
+		t.Fatalf("anomaly + skipped hour: exit = %d, want exitAnomaly (%d) — bad evidence outranks an incomplete run", got, exitAnomaly)
+	}
+	// The codes must be distinguishable, else the distinction is decorative.
+	if exitIncomplete == exitAnomaly || exitIncomplete == exitOK || exitIncomplete == exitFatal {
+		t.Fatal("exitIncomplete must be distinct from the other exit codes")
 	}
 }

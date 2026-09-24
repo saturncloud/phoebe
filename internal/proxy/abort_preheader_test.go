@@ -57,9 +57,7 @@ func TestPreHeaderAbortEmitsAttributableEvent(t *testing.T) {
 
 	upstream, _ := url.Parse(backend.URL)
 	em := &recordingEmitter{}
-	// BillPartialOnAbort=true so a no-usage abort emits a (zero-token) partial
-	// event rather than logging only — that is the path Fix A must drive.
-	srv := newTestServerWithSettings(t, upstream, em, true /* billPartial */)
+	srv := newTestServerWithSettings(t, upstream, em)
 
 	ctx, cancel := context.WithCancel(context.Background())
 	go func() {
@@ -101,39 +99,6 @@ func TestPreHeaderAbortEmitsAttributableEvent(t *testing.T) {
 	}
 }
 
-// TestPreHeaderAbortBillPartialFalseNoEvent: with BillPartialOnAbort=false a
-// pre-header abort with no usage must NOT emit a billable event — the abort-emit
-// obeys the SAME bill-partial policy as the completion path (it does not invent a
-// second, policy-bypassing emit). It is logged for reconciliation instead.
-func TestPreHeaderAbortBillPartialFalseNoEvent(t *testing.T) {
-	backend, unblock := blockBeforeHeadersBackend(t)
-	defer backend.Close()
-	defer close(unblock)
-
-	upstream, _ := url.Parse(backend.URL)
-	em := &recordingEmitter{}
-	srv := newTestServerWithSettings(t, upstream, em, false /* billPartial */)
-
-	ctx, cancel := context.WithCancel(context.Background())
-	go func() {
-		time.Sleep(20 * time.Millisecond)
-		cancel()
-	}()
-	req, _ := http.NewRequestWithContext(ctx, http.MethodPost, "/v1/chat/completions",
-		strings.NewReader(`{"model":"m","stream":true,"messages":[]}`))
-	req.Header.Set(identity.HeaderUpstream, upstream.Host)
-	req.Header.Set(identity.HeaderAuthID, "auth-1")
-	req.Header.Set(identity.HeaderResourceID, "model-abc")
-	req.Header.Set("X-Request-Id", "req-preheader-nobill")
-	rr := httptest.NewRecorder()
-	srv.Handler().ServeHTTP(rr, req)
-
-	events := em.waitForEvents(1, 200*time.Millisecond)
-	if len(events) != 0 {
-		t.Fatalf("BillPartialOnAbort=false, pre-header abort, no usage: expected 0 events, got %d: %+v", len(events), events)
-	}
-}
-
 // TestNormalCompletionEmitsExactlyOnce guards against double-emit on the NORMAL
 // path: a clean completion must produce EXACTLY ONE event from onDone, and the
 // ErrorHandler abort-emit must not also fire (ModifyResponse returns nil in
@@ -157,7 +122,7 @@ func TestNormalCompletionEmitsExactlyOnce(t *testing.T) {
 
 	upstream, _ := url.Parse(backend.URL)
 	em := &recordingEmitter{}
-	srv := newTestServerWithSettings(t, upstream, em, true)
+	srv := newTestServerWithSettings(t, upstream, em)
 
 	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions",
 		strings.NewReader(`{"model":"m","stream":true,"messages":[]}`))

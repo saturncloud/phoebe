@@ -1,4 +1,4 @@
-# phoebe migrations — `billing_event` + `rated_usage` + `io_log`
+# phoebe migrations — raw events, rated usage, reconciliation, and I/O logs
 
 phoebe **owns its billing schema in its OWN Postgres** (deployed by the phoebe
 Helm chart), applied by **`cmd/migrate`** (golang-migrate). phoebe is
@@ -20,10 +20,13 @@ with the Atlas schema; they live in phoebe's own database.
 - **`io_log`** — optional, sampled, short-retention request/response body capture
   (M5 I/O logging). Written by the interceptor's iolog sink; OFF by default.
 
-**Prices are a YAML config file, NOT a DB table (E1).** There is no `model_price`
-table. The hourly rater loads the current price YAML, projects it into a transient
-TEMP table, rates the last complete hour, and freezes the applied rate onto each
-`rated_usage` row.
+**The price catalog is not a DB table here (E1).** There is no `model_price` table
+and no local price history. The manager owns the effective-dated price series; the
+rater obtains the prices effective during EACH HOUR it rates, projects that book
+into a transient TEMP table, and persists the applied rates onto the self-auditing
+`rated_usage` row. "Never reprice served traffic" therefore holds because the price
+series is a function of TIME, not because phoebe froze a rate locally: re-rating an
+old hour resolves the same rates it originally did.
 
 ## The migration files
 
@@ -35,6 +38,7 @@ golang-migrate up/down pairs, applied in version order:
 | 0002 | `0002_rating.{up,down}.sql` | `rated_usage` (+ `org_id`, indexes) + the billing_event rating-instant index |
 | 0003 | `0003_io_log.{up,down}.sql` | `io_log` (+ GIN body index, retention indexes) |
 | 0004 | `0004_billing_event_serving_mode.{up,down}.sql` | `billing_event.serving_mode` (the serving-mode SKU axis; NULL = dedicated) |
+| 0005 | `0005_invoice_grade_attempts.{up,down}.sql` | trusted/client request identity, attempt outcome and usage evidence, invalid-usage reconciliation, and the hourly reconciliation view at the rated natural key (exposing missing/conflicting org evidence) |
 
 `embed.go` embeds these into the `migrations` package; `cmd/migrate` applies them.
 
@@ -56,6 +60,20 @@ In the phoebe chart, `cmd/migrate up` runs as a one-shot Job / init-container
 against phoebe's own Postgres **before** the drainer starts. A serving-only /
 spoke install that runs the interceptor ONLY (no drainer/rater/token-push, no DB)
 does not run the migrate Job.
+
+### Invoice-grade cutover for migration 0005
+
+Migration 0005 is a coordinated clean cutover, not a mixed-version rolling
+migration. Phoebe has no production `billing_event` rows or legacy Valkey/WAL
+backlog to preserve. Before applying it, stop old interceptors and billing jobs,
+verify `billing_event` and the configured Valkey/WAL buffers are empty, then
+apply the migration and deploy the new interceptor, drainer, rater, and push job
+as one release. Do not run an old drainer against schema 0005 or replay an old
+event encoding after the cutover.
+
+If any installation has legacy rows or buffered events, stop: that installation
+does not satisfy this migration's preconditions and needs a separate expand /
+contract migration before upgrading.
 
 ## Local dev
 

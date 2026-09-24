@@ -1,7 +1,7 @@
 package proxy
 
-// M3 abort-correctness tests: client-disconnect detection, bill-partial policy,
-// and race-freedom under concurrent abort + normal completion paths.
+// M3 abort-correctness tests: client-disconnect detection, always-bill-known-
+// usage policy, and race-freedom under abort + normal completion paths.
 //
 // Design of the "slow backend" pattern used throughout: the backend writes the
 // first chunk(s) and then blocks on a channel. The test cancels the client
@@ -29,11 +29,10 @@ import (
 	"github.com/saturncloud/phoebe/internal/metering"
 )
 
-// newTestServerWithSettings constructs a Server with explicit settings so
-// BillPartialOnAbort can be controlled per-test.
-func newTestServerWithSettings(t *testing.T, _ *url.URL, em metering.Emitter, billPartial bool) *Server {
+// newTestServerWithSettings constructs a Server for abort-path tests.
+func newTestServerWithSettings(t *testing.T, _ *url.URL, em metering.Emitter) *Server {
 	t.Helper()
-	s := &config.Settings{ListenAddr: ":0", BillPartialOnAbort: billPartial}
+	s := &config.Settings{ListenAddr: ":0"}
 	log := logging.New(logging.ERROR)
 	return New(s, log, em)
 }
@@ -107,7 +106,7 @@ func TestAbortMidStreamEmitsAbortedEvent(t *testing.T) {
 
 	upstream, _ := url.Parse(backend.URL)
 	em := &recordingEmitter{}
-	srv := newTestServerWithSettings(t, upstream, em, true /* billPartial */)
+	srv := newTestServerWithSettings(t, upstream, em)
 
 	doAbortRequest(t, srv, upstream, 10*time.Millisecond)
 
@@ -120,9 +119,9 @@ func TestAbortMidStreamEmitsAbortedEvent(t *testing.T) {
 	}
 }
 
-// TestAbortBillPartialTrue_NoUsage verifies that with BillPartialOnAbort=true
-// an abort with no usage block still emits a partial event with Aborted=true.
-func TestAbortBillPartialTrue_NoUsage(t *testing.T) {
+// TestAbortWithoutUsageRecordsZeroChargeAttempt verifies that an abort with no
+// authoritative usage still remains visible without fabricating a charge.
+func TestAbortWithoutUsageRecordsZeroChargeAttempt(t *testing.T) {
 	// Backend sends only a content chunk (no usage) then blocks.
 	backend, unblock := slowBackend(t, `data: {"choices":[{"index":0,"delta":{"content":"Hi"}}]}`+"\n\n")
 	defer backend.Close()
@@ -130,13 +129,13 @@ func TestAbortBillPartialTrue_NoUsage(t *testing.T) {
 
 	upstream, _ := url.Parse(backend.URL)
 	em := &recordingEmitter{}
-	srv := newTestServerWithSettings(t, upstream, em, true /* billPartial */)
+	srv := newTestServerWithSettings(t, upstream, em)
 
 	doAbortRequest(t, srv, upstream, 10*time.Millisecond)
 
 	events := em.waitForEvents(1, 2*time.Second)
 	if len(events) != 1 {
-		t.Fatalf("BillPartialOnAbort=true, abort, no usage: expected 1 event, got %d", len(events))
+		t.Fatalf("abort without usage: expected 1 event, got %d", len(events))
 	}
 	e := events[0]
 	if !e.Aborted {
@@ -149,30 +148,9 @@ func TestAbortBillPartialTrue_NoUsage(t *testing.T) {
 	}
 }
 
-// TestAbortBillPartialFalse_NoUsage verifies that with BillPartialOnAbort=false
-// an abort with no usage does NOT emit any billable event.
-func TestAbortBillPartialFalse_NoUsage(t *testing.T) {
-	backend, unblock := slowBackend(t, `data: {"choices":[{"index":0,"delta":{"content":"Hi"}}]}`+"\n\n")
-	defer backend.Close()
-	defer close(unblock)
-
-	upstream, _ := url.Parse(backend.URL)
-	em := &recordingEmitter{}
-	srv := newTestServerWithSettings(t, upstream, em, false /* billPartial */)
-
-	doAbortRequest(t, srv, upstream, 10*time.Millisecond)
-
-	// Wait briefly: if an event were wrongly emitted it would land within
-	// this window. None should, per BillPartialOnAbort=false.
-	events := em.waitForEvents(1, 200*time.Millisecond)
-	if len(events) != 0 {
-		t.Fatalf("BillPartialOnAbort=false, abort, no usage: expected 0 events, got %d: %+v", len(events), events)
-	}
-}
-
 // TestAbortWithUsage verifies that when a usage block arrives before the abort,
-// the event carries the captured counts AND Aborted=true, regardless of
-// BillPartialOnAbort (usage-present always bills).
+// the event carries authoritative counts, UsageFound=true, and Aborted=true.
+// The rater therefore charges it normally: disconnect never erases served work.
 func TestAbortWithUsage(t *testing.T) {
 	// Stream has finish_reason and usage chunks, but no [DONE] — simulates a
 	// backend that sent everything except the final terminator.
@@ -185,26 +163,22 @@ data: {"choices":[],"usage":{"prompt_tokens":50,"total_tokens":70,"completion_to
 	defer backend.Close()
 	defer close(unblock)
 
-	for _, billPartial := range []bool{true, false} {
-		t.Run(fmt.Sprintf("billPartial=%v", billPartial), func(t *testing.T) {
-			upstream, _ := url.Parse(backend.URL)
-			em := &recordingEmitter{}
-			srv := newTestServerWithSettings(t, upstream, em, billPartial)
+	upstream, _ := url.Parse(backend.URL)
+	em := &recordingEmitter{}
+	srv := newTestServerWithSettings(t, upstream, em)
 
-			doAbortRequest(t, srv, upstream, 20*time.Millisecond)
+	doAbortRequest(t, srv, upstream, 20*time.Millisecond)
 
-			events := em.waitForEvents(1, 2*time.Second)
-			if len(events) != 1 {
-				t.Fatalf("abort+usage: expected 1 event, got %d", len(events))
-			}
-			e := events[0]
-			if !e.Aborted {
-				t.Fatalf("event.Aborted = false: %+v", e)
-			}
-			if e.PromptTokens != 50 || e.CompletionTokens != 20 {
-				t.Fatalf("wrong token counts: %+v", e)
-			}
-		})
+	events := em.waitForEvents(1, 2*time.Second)
+	if len(events) != 1 {
+		t.Fatalf("abort+usage: expected 1 event, got %d", len(events))
+	}
+	e := events[0]
+	if !e.Aborted || !e.UsageFound {
+		t.Fatalf("abort with authoritative usage = %+v, want Aborted and UsageFound", e)
+	}
+	if e.PromptTokens != 50 || e.CompletionTokens != 20 {
+		t.Fatalf("wrong token counts: %+v", e)
 	}
 }
 
@@ -218,7 +192,7 @@ func TestAbortOnDoneFiresExactlyOnceViaProxy(t *testing.T) {
 
 	upstream, _ := url.Parse(backend.URL)
 	em := &recordingEmitter{}
-	srv := newTestServerWithSettings(t, upstream, em, true)
+	srv := newTestServerWithSettings(t, upstream, em)
 
 	doAbortRequest(t, srv, upstream, 10*time.Millisecond)
 
@@ -250,7 +224,7 @@ func TestNormalCompletionNotAffectedByAbortWatcher(t *testing.T) {
 
 	upstream, _ := url.Parse(backend.URL)
 	em := &recordingEmitter{}
-	srv := newTestServerWithSettings(t, upstream, em, true)
+	srv := newTestServerWithSettings(t, upstream, em)
 
 	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions",
 		strings.NewReader(`{"model":"m","stream":true,"messages":[]}`))
@@ -289,9 +263,13 @@ func TestNormalCompletionNotAffectedByAbortWatcher(t *testing.T) {
 // ErrorHandler — so an aborted request is never billing-invisible regardless of
 // whether the cancel landed pre- or post-header. (Previously such a request
 // emitted nothing, which this test documented as "correct"; Fix A changed that
-// contract.) Either way the event is Aborted=true, which is what we assert. We do
-// not assert an exact total because pre-/post-header split is scheduling-
-// dependent, but every emitted event must be Aborted.
+// contract.)
+//
+// Because BOTH the pre-header (ErrorHandler) and post-header (onDone) paths now
+// emit, and they are mutually exclusive, the count is NOT scheduling-dependent:
+// exactly N events, N distinct trusted request ids, and exactly one event per
+// client correlation id. Asserting only "> 0" would let a lost or duplicated
+// billing event pass, which is the whole risk this stress test exists to catch.
 func TestAbortRaceStress(t *testing.T) {
 	const N = 50
 
@@ -301,7 +279,7 @@ func TestAbortRaceStress(t *testing.T) {
 
 	upstream, _ := url.Parse(backend.URL)
 	em := &recordingEmitter{}
-	srv := newTestServerWithSettings(t, upstream, em, true)
+	srv := newTestServerWithSettings(t, upstream, em)
 
 	var wg sync.WaitGroup
 	for i := 0; i < N; i++ {
@@ -338,12 +316,45 @@ func TestAbortRaceStress(t *testing.T) {
 			t.Fatalf("stress: event not aborted: %+v", e)
 		}
 	}
-	// Sanity: we expect most requests got far enough to emit. If we got zero
-	// events, the test infrastructure is broken (backend never flushed).
-	if len(events) == 0 {
-		t.Fatal("stress: no events emitted — slow backend may not have flushed")
+	// Exactly one billing event per request: no aborted request goes
+	// billing-invisible, and none is double-emitted.
+	if len(events) != N {
+		t.Fatalf("stress: emitted %d events, want exactly %d (one per request)", len(events), N)
 	}
-	t.Logf("stress: %d/%d requests emitted aborted events (rest cancelled before ModifyResponse)", len(events), N)
+	// Trusted attempt ids are server-minted and must be unique per attempt.
+	trusted := make(map[string]struct{}, len(events))
+	for _, e := range events {
+		if e.RequestID == "" {
+			t.Fatalf("stress: event has no trusted request id: %+v", e)
+		}
+		if _, dup := trusted[e.RequestID]; dup {
+			t.Fatalf("stress: duplicate trusted request id %q", e.RequestID)
+		}
+		trusted[e.RequestID] = struct{}{}
+	}
+	if len(trusted) != N {
+		t.Fatalf("stress: %d distinct trusted request ids, want %d", len(trusted), N)
+	}
+	// Exactly one event per client correlation id — the untrusted X-Request-Id
+	// each goroutine sent. A missing or doubled id means a lost or duplicated
+	// billable attempt for that client request.
+	perClient := make(map[string]int, N)
+	for _, e := range events {
+		perClient[e.ClientRequestID]++
+	}
+	for i := 0; i < N; i++ {
+		id := fmt.Sprintf("req-%d", i)
+		switch perClient[id] {
+		case 1:
+		case 0:
+			t.Fatalf("stress: no event emitted for client correlation id %q", id)
+		default:
+			t.Fatalf("stress: %d events emitted for client correlation id %q, want 1", perClient[id], id)
+		}
+	}
+	if len(perClient) != N {
+		t.Fatalf("stress: %d distinct client correlation ids, want %d", len(perClient), N)
+	}
 }
 
 // TestIdleTimeoutNotIntroduced is a documentation test. The http.Server has no
@@ -381,7 +392,7 @@ func TestLongStreamNoDeadlineSever(t *testing.T) {
 
 	upstream, _ := url.Parse(backend.URL)
 	em := &recordingEmitter{}
-	srv := newTestServerWithSettings(t, upstream, em, true)
+	srv := newTestServerWithSettings(t, upstream, em)
 
 	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions",
 		strings.NewReader(`{"model":"m","stream":true,"messages":[]}`))

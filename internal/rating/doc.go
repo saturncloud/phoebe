@@ -1,5 +1,6 @@
 // Package rating is phoebe's REVENUE path. It turns the raw token counts in
-// billing_event into money: per (auth_id, resource_id, model_id, hour) cost rollups in
+// billing_event into money: per (auth_id, owner_type, owner_id, resource_id, model_id,
+// serving_mode, hour) cost rollups in
 // rated_usage, priced from a YAML PRICE FILE (E1) — not a DB price table.
 //
 // THE PRICE FILE IS THE CONTRACT (E1). An operator authors a versioned YAML file
@@ -14,7 +15,7 @@
 //
 // The file's version history IS the price audit trail: there is no price table, no
 // effective-dating, no GiST exclusion constraint, no operator-writes-to-DB authz
-// surface. LoadPriceBook reads and validates the file, FAILING CLOSED on anything
+// surface. ParsePriceBook validates the book bytes, FAILING CLOSED on anything
 // malformed (missing file, bad YAML, unknown version, a float-shaped or negative
 // rate, an inconsistent premium) — the rater refuses to run rather than rate at $0.
 //

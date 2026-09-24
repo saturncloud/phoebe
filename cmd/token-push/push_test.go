@@ -22,6 +22,7 @@ func quietLog() *logging.Logger { return logging.New(logging.ERROR) }
 // directly off rated_usage (captured at meter time), right after resource_id.
 var snapshotCols = []string{
 	"id", "resource_id", "org_id", "model_id",
+	"serving_mode", "owner_type", "owner_id", "graph_k8s_name",
 	"cost", "applied_prompt_rate", "applied_cached_rate", "applied_completion_rate",
 	"prompt_tokens", "cached_tokens", "completion_tokens", "billable_prompt_tokens",
 }
@@ -59,6 +60,7 @@ func TestBuildSnapshot_CarriesOrgAndShape(t *testing.T) {
 	p, mock := newMockPusher(t)
 	rows := sqlmock.NewRows(snapshotCols).AddRow(
 		"rated-id-1", "res-deploy-1", "org-acme", "meta-llama/Llama-3.1-8B-Instruct",
+		"shared", "user", "usr-17", "dyn-graph-llama31-8b",
 		"0.001234500", "0.000000150", "0.000000075", "0.000000600",
 		int64(8000), int64(2000), int64(500), int64(6000),
 	)
@@ -101,8 +103,10 @@ func TestBuildSnapshot_UnattributableOmitted(t *testing.T) {
 	p, mock := newMockPusher(t)
 	rows := sqlmock.NewRows(snapshotCols).
 		AddRow("rated-ok", "res-1", "org-acme", "m",
+			"", "user", "usr-1", "dyn-graph-1",
 									"0.001", "0.1", "0.05", "0.6", int64(1), int64(0), int64(1), int64(1)).
 		AddRow("rated-orphan", "res-vanished", nil, "m", // NULL org_id
+			"", "", "", nil,
 			"0.002", "0.1", "0.05", "0.6", int64(1), int64(0), int64(1), int64(1))
 	mock.ExpectQuery(`FROM rated_usage ru`).
 		WithArgs(win).WillReturnRows(rows)
@@ -128,6 +132,7 @@ func TestBuildSnapshot_EmptyStringOrgIsOmitted(t *testing.T) {
 	p, mock := newMockPusher(t)
 	rows := sqlmock.NewRows(snapshotCols).
 		AddRow("rated-blank", "res-1", "", "m", // non-NULL EMPTY-STRING org_id
+			"", "group", "grp-9", nil,
 			"0.001", "0.1", "0.05", "0.6", int64(1), int64(0), int64(1), int64(1))
 	mock.ExpectQuery(`FROM rated_usage ru`).WithArgs(win).WillReturnRows(rows)
 
@@ -240,8 +245,8 @@ func TestPushWindows_WithholdsWindowWithUnattributable(t *testing.T) {
 	p.managerURL = srv.URL
 	p.token = "t"
 	rows := sqlmock.NewRows(snapshotCols).
-		AddRow("ok", "res-1", "org-acme", "m", "0.001", "0.1", "0.05", "0.6", int64(1), int64(0), int64(1), int64(1)).
-		AddRow("orphan", "res-x", nil, "m", "0.002", "0.1", "0.05", "0.6", int64(1), int64(0), int64(1), int64(1))
+		AddRow("ok", "res-1", "org-acme", "m", "shared", "user", "usr-1", "dyn-graph-1", "0.001", "0.1", "0.05", "0.6", int64(1), int64(0), int64(1), int64(1)).
+		AddRow("orphan", "res-x", nil, "m", "", "", "", nil, "0.002", "0.1", "0.05", "0.6", int64(1), int64(0), int64(1), int64(1))
 	expectLiveness(mock, true)
 	mock.ExpectQuery(`FROM rated_usage ru`).WithArgs(win).WillReturnRows(rows)
 
@@ -278,10 +283,10 @@ func TestPushWindows_WithheldWindowDoesNotBlockCleanWindow(t *testing.T) {
 	expectLiveness(mock, true)
 	mock.ExpectQuery(`FROM rated_usage ru`).WithArgs(win).WillReturnRows(
 		sqlmock.NewRows(snapshotCols).
-			AddRow("orphan", "res-x", nil, "m", "0.002", "0.1", "0.05", "0.6", int64(1), int64(0), int64(1), int64(1)))
+			AddRow("orphan", "res-x", nil, "m", "", "", "", nil, "0.002", "0.1", "0.05", "0.6", int64(1), int64(0), int64(1), int64(1)))
 	mock.ExpectQuery(`FROM rated_usage ru`).WithArgs(win2).WillReturnRows(
 		sqlmock.NewRows(snapshotCols).
-			AddRow("ok", "res-1", "org-acme", "m", "0.001", "0.1", "0.05", "0.6", int64(1), int64(0), int64(1), int64(1)))
+			AddRow("ok", "res-1", "org-acme", "m", "shared", "user", "usr-1", "dyn-graph-1", "0.001", "0.1", "0.05", "0.6", int64(1), int64(0), int64(1), int64(1)))
 
 	code := p.pushWindows(context.Background(), []time.Time{win, win2})
 	if code != exitUnattrib {
@@ -311,7 +316,7 @@ func TestPushWindows_FatalOnPostError(t *testing.T) {
 	expectLiveness(mock, true)
 	mock.ExpectQuery(`FROM rated_usage ru`).WithArgs(win).
 		WillReturnRows(sqlmock.NewRows(snapshotCols).
-			AddRow("ok", "res-1", "org-acme", "m", "0.001", "0.1", "0.05", "0.6", int64(1), int64(0), int64(1), int64(1)))
+			AddRow("ok", "res-1", "org-acme", "m", "shared", "user", "usr-1", "dyn-graph-1", "0.001", "0.1", "0.05", "0.6", int64(1), int64(0), int64(1), int64(1)))
 
 	code := p.pushWindows(context.Background(), []time.Time{win})
 	if code != exitFatal {
@@ -361,10 +366,10 @@ func TestPushWindows_FatalDominatesWithheld(t *testing.T) {
 	// win: orphan -> withheld (no POST). win2: clean -> POST fails (fatal).
 	mock.ExpectQuery(`FROM rated_usage ru`).WithArgs(win).WillReturnRows(
 		sqlmock.NewRows(snapshotCols).
-			AddRow("orphan", "res-x", nil, "m", "0.002", "0.1", "0.05", "0.6", int64(1), int64(0), int64(1), int64(1)))
+			AddRow("orphan", "res-x", nil, "m", "", "", "", nil, "0.002", "0.1", "0.05", "0.6", int64(1), int64(0), int64(1), int64(1)))
 	mock.ExpectQuery(`FROM rated_usage ru`).WithArgs(win2).WillReturnRows(
 		sqlmock.NewRows(snapshotCols).
-			AddRow("ok", "res-1", "org-acme", "m", "0.001", "0.1", "0.05", "0.6", int64(1), int64(0), int64(1), int64(1)))
+			AddRow("ok", "res-1", "org-acme", "m", "shared", "user", "usr-1", "dyn-graph-1", "0.001", "0.1", "0.05", "0.6", int64(1), int64(0), int64(1), int64(1)))
 
 	code := p.pushWindows(context.Background(), []time.Time{win, win2})
 	if code != exitFatal {

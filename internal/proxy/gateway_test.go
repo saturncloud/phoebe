@@ -393,6 +393,11 @@ func TestGateway_UpstreamHostShape(t *testing.T) {
 // resolution succeeded IS the wakeability signal (ResourceID + ServedModel are
 // populated by resolveGateway) — so a cold (scaled-to-zero) upstream triggers
 // the waker and the request is served after warm-up rather than 404ing.
+//
+// The assertion that matters is the LAST one: the graph name resolved from
+// tf_model must reach the wake target VERBATIM, never re-derived by parsing the
+// upstream host the gateway itself composed from that same name. Re-deriving
+// would work by coincidence today and break the moment the host format changes.
 func TestGateway_WakeEligible(t *testing.T) {
 	backend := &coldToWarmBackend{}
 	be := httptest.NewServer(backend)
@@ -407,9 +412,11 @@ func TestGateway_WakeEligible(t *testing.T) {
 			GraphK8sName: "graph-llama31",
 		},
 	}}
-	waker := &fakeWaker{warmsAt: 1, backend: backend}
+	// warmsAt: 1 — the backend goes warm after the first wake, so serveWithWake's
+	// re-probe succeeds and the caller performs the real metered forward.
+	waker := &fakeWaker{backend: backend, warmsAt: 1}
 	em := &recordingEmitter{}
-	srv := newGatewayTestServer(t, em, resolver, beURL).WithWaker(waker, 5*time.Second, 3)
+	srv := newGatewayTestServer(t, em, resolver, beURL).WithWaker(waker, 5*time.Second, 0)
 
 	rr := httptest.NewRecorder()
 	srv.Handler().ServeHTTP(rr, gatewayRequest("org-1", `{"model":"sleepy-bot"}`))

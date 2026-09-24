@@ -40,8 +40,11 @@ func TestPostgresStore_RateWindowSQL(t *testing.T) {
 	mock.ExpectExec(`INSERT INTO rating_derived`).
 		WithArgs("m", "0.000003000", "0.000000300", "0.000010000").
 		WillReturnResult(sqlmock.NewResult(0, 1))
-	rows := sqlmock.NewRows([]string{"rollups_written", "events_rated", "total_cost", "reconciled_deletions", "unpriced_events", "unattributable_events", "ambiguous_base_events", "ambiguous_org_events"}).
-		AddRow(2, 5, "0.001234500", 0, 3, 1, 4, 2)
+	// missing_usage_events is the TOTAL; expected + unexplained partition it
+	// (6 = 4 routine aborts/failures + 2 successes with no usage block), so the
+	// fixture cannot pass while the SQL's partition is wrong.
+	rows := sqlmock.NewRows([]string{"rollups_written", "events_rated", "total_cost", "reconciled_deletions", "unpriced_events", "unattributable_events", "missing_usage_events", "expected_missing_usage_events", "unexplained_missing_usage_events", "invalid_usage_events", "ambiguous_base_events", "ambiguous_org_events", "owner_conflict_events", "ambiguous_graph_rollups"}).
+		AddRow(2, 5, "0.001234500", 0, 3, 1, 6, 4, 2, 7, 4, 2, 3, 1)
 	// The statement binds $3 = the ft: LIKE pattern (single-sourced from fineTunePrefix).
 	mock.ExpectQuery(`INSERT INTO rated_usage`).
 		WithArgs(start.UTC(), end.UTC(), ftLikePattern).
@@ -57,6 +60,28 @@ func TestPostgresStore_RateWindowSQL(t *testing.T) {
 	}
 	if res.UnpricedEvents != 3 || res.UnattributableEvents != 1 || res.AmbiguousBaseEvents != 4 || res.AmbiguousOrgEvents != 2 {
 		t.Fatalf("anomaly counts = %d/%d/%d/%d, want 3/1/4/2 (must ride the same statement)", res.UnpricedEvents, res.UnattributableEvents, res.AmbiguousBaseEvents, res.AmbiguousOrgEvents)
+	}
+	// The missing-usage partition must ride the same statement, and the two causes
+	// must sum to the reported total.
+	if res.MissingUsageEvents != 6 || res.ExpectedMissingUsageEvents != 4 || res.UnexplainedMissingUsageEvents != 2 {
+		t.Fatalf("missing-usage = total %d / expected %d / unexplained %d, want 6/4/2",
+			res.MissingUsageEvents, res.ExpectedMissingUsageEvents, res.UnexplainedMissingUsageEvents)
+	}
+	if res.ExpectedMissingUsageEvents+res.UnexplainedMissingUsageEvents != res.MissingUsageEvents {
+		t.Fatalf("missing-usage causes %d+%d do not partition the total %d",
+			res.ExpectedMissingUsageEvents, res.UnexplainedMissingUsageEvents, res.MissingUsageEvents)
+	}
+	if res.MissingUsageEvents != 6 {
+		t.Fatalf("missing usage = %d, want 6 (must ride the same statement)", res.MissingUsageEvents)
+	}
+	if res.InvalidUsageEvents != 7 {
+		t.Fatalf("invalid usage = %d, want 7 (must ride the same statement)", res.InvalidUsageEvents)
+	}
+	if res.OwnerConflictEvents != 3 {
+		t.Fatalf("owner-conflict events = %d, want 3 (must ride the same statement)", res.OwnerConflictEvents)
+	}
+	if res.AmbiguousGraphRollups != 1 {
+		t.Fatalf("ambiguous-graph rollups = %d, want 1 (must ride the same statement)", res.AmbiguousGraphRollups)
 	}
 	if res.ReconciledDeletions != 0 {
 		t.Fatalf("reconciled deletions = %d, want 0 (the projected count must scan into the result)", res.ReconciledDeletions)
@@ -108,10 +133,27 @@ func TestRateWindowSQL_Shape(t *testing.T) {
 		"LEFT JOIN rating_price rpb",
 		"rpb.model_id = ev.sku_base",
 		"NOT (ev.model_id LIKE $3 OR ev.adapter IS NOT NULL)",
-		// the effective rate COALESCEs direct over derived over plain-base
+		// Pricing resolves ONLY through the passed book's direct/derived/plain-base
+		// joins. There is no local price-freeze table in the chain: the caller rates
+		// each hour against the book effective during that hour, so "never reprice
+		// served traffic" comes from the price series being a function of TIME.
 		"COALESCE(rp.prompt_price,     rd.prompt_price,     rpb.prompt_price)",
-		// billable-prompt clamp + the cost formula (cached charged once)
-		"GREATEST(ev.prompt_tokens - ev.cached_tokens, 0)",
+		// Missing authoritative engine usage is excluded from money and counted in
+		// its own strict-partition bucket.
+		"WHERE usage_found",
+		"WHERE NOT usage_found)            AS missing_usage_events",
+		// The paging partition: routine (aborted/failed) vs unexplained (success
+		// with no usage). HasAnomaly pages only on the latter.
+		"AS expected_missing_usage_events",
+		"AS unexplained_missing_usage_events",
+		"AND NOT aborted",
+		"WHERE usage_found AND NOT valid_usage)                           AS invalid_usage_events",
+		// billable-prompt clamp + the cost formula (cached charged once).
+		// The operands are cast to BIGINT BEFORE subtracting: this projection
+		// runs over every event in the window before valid_usage filters, so an
+		// int32 subtraction would fail the whole hour's rating (22003) on one
+		// malformed row.
+		"GREATEST(ev.prompt_tokens::bigint - ev.cached_tokens::bigint, 0)",
 		"billable_prompt   * prompt_price",
 		"cached_tokens     * cached_price",
 		"completion_tokens * completion_price",
@@ -121,13 +163,22 @@ func TestRateWindowSQL_Shape(t *testing.T) {
 		"applied_completion_rate",
 		// priced + attributable filter (never $0-bill unpriced/unattributable). A NULL
 		// resource_id can't name the deployment/org (E2) → excluded + counted, never billed.
-		"WHERE prompt_price IS NOT NULL",
+		"AND prompt_price IS NOT NULL",
 		"AND auth_id     IS NOT NULL",
 		"AND model_id    IS NOT NULL",
-		// Anchor the grouped filter's resource_id guard to its GROUP BY (which uniquely
-		// follows it), so this pins the priced/grouped clause specifically — not the bare
-		// substring, which would also match the unpriced-count guard below.
-		"AND resource_id IS NOT NULL\n    GROUP BY auth_id, resource_id, model_id",
+		// Anchor the grouped filter's resource_id guard to the owner-conflict filter and
+		// GROUP BY that uniquely follow it, so this pins the priced/grouped clause
+		// specifically — not the bare substring, which would also match the
+		// unpriced-count guard below.
+		//
+		// The "AND NOT owner_conflict" between them is load-bearing, not incidental:
+		// conflicted events MUST be dropped PER EVENT here rather than gated at the
+		// group level. A group-level bool_or withheld every legitimate no-owner rollup
+		// sharing a bucket with one malformed event, because a conflicted event
+		// collapses into the same '' / '' owner bucket as genuine no-owner traffic.
+		// See TestIntegration_OwnerConflictDoesNotPoisonItsBucket.
+		"AND resource_id IS NOT NULL\n      -- OWNER CONFLICT is excluded PER EVENT",
+		"AND NOT owner_conflict\n    GROUP BY auth_id, owner_type, owner_id, resource_id, model_id, serving_mode,",
 		// session-TZ-independent hour bucket
 		"date_trunc('hour', ev_ts AT TIME ZONE 'UTC') AT TIME ZONE 'UTC'",
 		// deterministic natural-key surrogate id (re-runs regenerate the same id),
@@ -137,9 +188,9 @@ func TestRateWindowSQL_Shape(t *testing.T) {
 		"|| '|' || length(resource_id)::text || ':' || resource_id",
 		"|| '|' || length(model_id)::text || ':' || model_id",
 		// deterministic lock order across concurrent raters (no ABBA deadlock)
-		"ORDER BY auth_id, resource_id, model_id, window_start",
+		"ORDER BY auth_id, owner_type, owner_id, resource_id, model_id, serving_mode, window_start",
 		// idempotent upsert on the natural key
-		"ON CONFLICT (auth_id, resource_id, model_id, window_start) DO UPDATE SET",
+		"ON CONFLICT (auth_id, owner_type, owner_id, resource_id, model_id, serving_mode, window_start) DO UPDATE SET",
 		// RE-RATE RECONCILES (FIX 2): the `deleted` CTE removes any in-window rollup this
 		// run did NOT reproduce in priced, atomically with the upsert — so a superseded
 		// rollup cannot keep billing at its stale cost. Window-scoped + NOT EXISTS priced.
@@ -160,9 +211,9 @@ func TestRateWindowSQL_Shape(t *testing.T) {
 		// contiguous WHERE so the resource_id guard is anchored to THIS count clause — a
 		// bare "AND resource_id IS NOT NULL" would also match the grouped/priced filter and
 		// wouldn't catch the guard being dropped from the unpriced count.
-		"WHERE prompt_price  IS NULL\n        AND auth_id     IS NOT NULL\n        AND resource_id IS NOT NULL\n        AND model_id    IS NOT NULL)",
+		"WHERE usage_found\n        AND valid_usage\n        AND prompt_price  IS NULL\n        AND auth_id     IS NOT NULL\n        AND resource_id IS NOT NULL\n        AND model_id    IS NOT NULL)",
 		"AS unpriced_events",
-		"OR resource_id IS NULL OR model_id IS NULL) AS unattributable_events",
+		"AND (auth_id IS NULL OR resource_id IS NULL OR model_id IS NULL)) AS unattributable_events",
 		// the SINGLE-RATE gate: a rollup whose base_model-priced rows span >1 base
 		// (E3 ft-uniqueness / C4 endpoint-name reuse) or MIX derived and plain-base
 		// pricing (adapter flap) is split out — never MIN-billed
@@ -174,8 +225,8 @@ func TestRateWindowSQL_Shape(t *testing.T) {
 		// the rollup via MAX (NOT a GROUP BY key — org is a function of resource_id), and
 		// written into rated_usage. NOT part of the md5 natural key.
 		"MAX(org_id)                                      AS org_id",
-		"id, auth_id, resource_id, org_id, model_id, window_start, window_end",
-		"auth_id, resource_id, org_id, model_id, window_start, window_end,",
+		"id, auth_id, owner_type, owner_id, resource_id, org_id, model_id,\n        serving_mode, graph_k8s_name, window_start, window_end,",
+		"auth_id, owner_type, owner_id, resource_id, org_id, model_id,\n        serving_mode, graph_k8s_name, window_start, window_end,",
 		// COALESCE, not bare EXCLUDED: a re-rate may set NULL->real (convergence) but must
 		// NEVER overwrite a known org with NULL (real->NULL un-attribution).
 		"org_id                  = COALESCE(EXCLUDED.org_id, rated_usage.org_id)",
@@ -190,7 +241,12 @@ func TestRateWindowSQL_Shape(t *testing.T) {
 	}
 	// The price tables are GONE (prices are YAML now): no reference to model_price,
 	// derivation_policy, effective-dating, or a derivation CASE may remain.
-	for _, gone := range []string{"model_price", "derivation_policy", "effective_from", "effective_to", "der.derived_from", "pol.factor"} {
+	// rating_price_lock is gone too — phoebe keeps NO price history of its own; the
+	// manager owns the effective-dated series and the rater asks it per hour. A
+	// local freeze outranking the book is exactly the bug that removal fixed: for a
+	// locked key, traffic that resolved through NO price row was billed at the
+	// frozen rate instead of counting UNPRICED.
+	for _, gone := range []string{"model_price", "derivation_policy", "effective_from", "effective_to", "der.derived_from", "pol.factor", "rating_price_lock", "old.applied_prompt_rate"} {
 		if strings.Contains(rateWindowSQL, gone) {
 			t.Errorf("rateWindowSQL still references removed price-table machinery: %q", gone)
 		}
@@ -198,6 +254,11 @@ func TestRateWindowSQL_Shape(t *testing.T) {
 	// The session-TZ-DEPENDENT bucket must be gone everywhere.
 	if strings.Contains(rateWindowSQL, "date_trunc('hour', ev_ts)") {
 		t.Error("rateWindowSQL still contains the session-TZ-dependent date_trunc('hour', ev_ts)")
+	}
+	// The unwidened int32 subtraction must never come back.
+	if strings.Contains(rateWindowSQL, "GREATEST(ev.prompt_tokens - ev.cached_tokens, 0)") {
+		t.Error("rateWindowSQL computes billable_prompt on unwidened INTEGER operands; " +
+			"valid int32 counts can overflow the difference and fail the entire window")
 	}
 	for _, f := range wantFragments {
 		if !strings.Contains(rateWindowSQL, f) {

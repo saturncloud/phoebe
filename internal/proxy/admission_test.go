@@ -53,7 +53,7 @@ func TestAdmissionAcrossProxyReplicasAndLifecycleRelease(t *testing.T) {
 	newReplica := func() *Server {
 		c := redis.NewClient(&redis.Options{Addr: mr.Addr()})
 		t.Cleanup(func() { _ = c.Close() })
-		s := &config.Settings{Admission: cfg, BillPartialOnAbort: true}
+		s := &config.Settings{Admission: cfg}
 		return New(s, logging.New(logging.ERROR), &recordingEmitter{}).WithAdmitter(admission.New(c, cfg))
 	}
 	one, two := newReplica(), newReplica()
@@ -204,7 +204,7 @@ func TestAdmissionReleasesAbortedStream(t *testing.T) {
 	cfg := proxyAdmissionConfig(1)
 	c := redis.NewClient(&redis.Options{Addr: mr.Addr()})
 	a := admission.New(c, cfg)
-	s := New(&config.Settings{Admission: cfg, BillPartialOnAbort: true}, logging.New(logging.ERROR), &recordingEmitter{}).WithAdmitter(a)
+	s := New(&config.Settings{Admission: cfg}, logging.New(logging.ERROR), &recordingEmitter{}).WithAdmitter(a)
 	ctx, cancel := context.WithCancel(context.Background())
 	req := sharedRequest(up).WithContext(ctx)
 	done := make(chan struct{})

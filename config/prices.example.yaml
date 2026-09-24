@@ -1,25 +1,28 @@
 # =====================================================================
-#  phoebe price file — the OPERATOR-FACING CONTRACT (E1).
+#  phoebe price book — the WIRE SHAPE served by the pricing service (E1).
 # =====================================================================
 #
-# This file is the SINGLE source of truth for what every model costs. An operator
-# authors it and version-controls it; the file's history IS the price audit trail —
-# there is no DB price table, no effective-dating, no price-management UI, no
-# operator-writes-to-DB authz surface. This is the enterprise / air-gapped win: an
-# operator ships their own file.
+# WHO OWNS PRICES:
+#   The pricing service (saturn-aws-manager) is the ONLY source of prices, live
+#   and historical. Its price rows are effective-dated, so the rater asks for the
+#   rates effective during EACH HOUR it rates, and phoebe keeps no price history
+#   and no local price file. An install that cannot egress to the central manager
+#   runs its own manager instance, seeded with that deployment's prices.
 #
-# HOW IT IS USED:
-#   - The hourly rater (cmd/rater) loads the CURRENT file at run start, rates the
-#     last complete hour, and FREEZES the applied per-token rate onto each
-#     rated_usage row. The row is then immutable and self-auditing: "we never
-#     reprice traffic you've already served" holds by construction.
-#   - A mid-hour price edit affects at most that one hour, on a price whose timing
-#     the operator controls. Re-rating is a deliberate, audited re-run — never a
-#     silent side effect of editing this file.
-#   - The create-time PRICE GATE (Atlas, E4) reads THIS SAME file: a deployment whose
-#     model is not priced here cannot be created/served. So the rater should never
-#     meet an unpriced model — but it keeps a fail-loud backstop (an unpriced model
-#     is COUNTED and logged, NEVER billed $0).
+# WHAT THIS FILE IS NOW:
+#   The WIRE SHAPE the manager renders and the rater parses — a reference for the
+#   format, not a file anyone authors or the rater reads. `GET /customer/token-prices`
+#   returns exactly this document (plus an X-Saturn-Price-Version header), and
+#   `?at=<ISO8601>` returns the version effective at that instant.
+#
+#   To change prices, use the manager's pricing CLI (`pricing apply` against its
+#   YAML, or `pricing reprice-token`); a price change there is an effective-dated
+#   row, which is what lets a past window re-rate at the rates it originally used.
+#
+# The create-time PRICE GATE (Atlas, E4) reads the same served book: a deployment
+# whose model is not priced cannot be created/served. So the rater should never meet
+# an unpriced model — but it keeps a fail-loud backstop (an unpriced model is
+# COUNTED and logged, NEVER billed $0).
 #
 # MONEY UNIT (read before touching a number):
 #   Rates are per-token USD, written as EXACT DECIMAL STRINGS (quoted). They are

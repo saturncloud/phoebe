@@ -45,7 +45,12 @@ uses it for `billing_event.request_id`, and overwrites the engine-facing and
 response `X-Request-Id` with it for correlation. At-least-once stream redelivery
 retains the id already stored on the metering event and remains safely
 deduplicated by `ON CONFLICT (request_id) DO NOTHING`; replaying a public
-correlation id creates a fresh attempt id and a separate billable row.
+correlation id creates a fresh attempt id and a separate billable row. The
+untrusted original is retained separately as `client_request_id` for support
+and logical-request correlation; it is never a uniqueness or billing key. An
+incoming value must be printable ASCII and strictly shorter than 255 bytes;
+Phoebe rejects an invalid value before forwarding so it cannot poison the
+durable billing insert.
 
 ---
 
@@ -145,14 +150,13 @@ Phoebe.Emit (non-blocking, off hot path)
   product shipped/embeddable for neoclouds, the permissive license avoids
   Redis's SSPL/AGPL. Same Streams API. (Mirrors the org's OpenSearch-over-
   Elasticsearch posture.)
-- **WAL loss on pod death is ACCEPTABLE — but in-process loss during a drain is NOT.**
-  Two distinct losses, only one is tolerated:
-  - *Pod death* with un-shipped WAL events during a Valkey outage is a tolerable,
-    bounded, double-failure loss — Postgres is the system of record and
-    reconciliation is the backstop. **This is what lets Phoebe be a stateless
-    `Deployment`** — no StatefulSet, no per-replica PVC, `emptyDir` WAL is fine.
-    Do not "fix" *this* by demanding durable per-replica storage; that re-couples
-    Phoebe to stateful infra for no benefit.
+- **The official chart gives each interceptor ordinal a retained WAL PVC.**
+  - *Pod death or node rescheduling* during a Valkey outage reattaches that
+    ordinal's `ReadWriteOnce` claim instead of losing an `emptyDir`. The storage
+    class follows Atlas Postgres (`saturn-default-storage` by default, with the
+    same per-install override and cluster-default omission semantics). This is a
+    deployment guarantee rather than an in-process property: hand-written
+    manifests must provide equivalent durable storage.
   - *A live, healthy pod silently dropping an event during a drain is a bug, not a
     tolerated loss.* The WAL is **`github.com/tidwall/wal`** (chosen over the
     earlier hand-rolled file: small, MIT-licensed, widely tested, go1.13 — and
@@ -175,8 +179,9 @@ Phoebe.Emit (non-blocking, off hot path)
     single-file JSONL WAL found at the configured path is auto-imported on
     upgrade. See `internal/emit/wal.go` `append`/`pending`/`markShipped`.
 
-**Status:** Valkey emit + WAL + log floor are BUILT (`internal/emit`). The
-Postgres drainer and reconciliation are NOT yet built (see §8).
+**Status:** Valkey emit + persistent-chart WAL + log floor, Postgres drainer,
+raw-to-rated hourly reconciliation view, rater, and push are built. The external
+invoice-line comparison remains a billing-system dependency.
 
 ---
 
@@ -193,7 +198,9 @@ Postgres drainer and reconciliation are NOT yet built (see §8).
 - **Resolver cache is per-Phoebe-replica** (LRU + TTL). Benign: worst case is
   one TTL of routing-freshness skew across replicas; the short negative-TTL
   bounds it.
-- **WAL is node-local** — see §5; loss is accepted, so this is not a problem.
+- **WAL identity is per interceptor ordinal** — the StatefulSet gives each
+  replica its own retained PVC, so replicas never write one tidwall WAL directory
+  concurrently and replacement pods recover the same ordinal's backlog.
 
 ---
 

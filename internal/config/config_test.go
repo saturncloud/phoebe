@@ -28,9 +28,6 @@ func TestLoadDefaults(t *testing.T) {
 	if s.ListenAddr != ":8080" {
 		t.Fatalf("ListenAddr = %q, want :8080", s.ListenAddr)
 	}
-	if !s.BillPartialOnAbort {
-		t.Fatal("BillPartialOnAbort should default true")
-	}
 }
 
 // TestLoadIOLogOffByDefault verifies M5 I/O logging is OFF unless configured:

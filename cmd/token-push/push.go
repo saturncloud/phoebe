@@ -33,11 +33,26 @@ type pusher struct {
 // Money fields are exact-decimal STRINGS (C8) — read as ::text from Postgres, emitted
 // as JSON strings, never a Go float.
 type rollup struct {
-	RatedUsageID          string `json:"rated_usage_id"`
-	Rev                   int    `json:"rev"`
-	OrgID                 string `json:"org_id"`
-	ResourceID            string `json:"resource_id"`
-	ModelID               string `json:"model_id"`
+	RatedUsageID string `json:"rated_usage_id"`
+	Rev          int    `json:"rev"`
+	OrgID        string `json:"org_id"`
+	ResourceID   string `json:"resource_id"`
+	ModelID      string `json:"model_id"`
+	// ServingMode, OwnerType and OwnerID are GRAIN columns (migration 0006): they
+	// are part of what identifies a rollup, so the manager needs them to present
+	// charges per serving tier and per person/team, not only per API key. "" is a
+	// meaningful value -- dedicated, and "no owner supplied" respectively -- so
+	// these are NOT omitempty: a missing key and an empty key must not be
+	// indistinguishable on a billing wire.
+	ServingMode string `json:"serving_mode"`
+	OwnerType   string `json:"owner_type"`
+	OwnerID     string `json:"owner_id"`
+	// GraphK8sName is the serving graph (the cost centre) -- EVIDENCE, not grain.
+	// Carried so shared-mode cost stays attributable: there, many orgs ride one
+	// platform graph that has no database row, so resource_id cannot identify the
+	// hardware. omitempty because absence here is genuinely "unknown", not a
+	// distinct billing state, and it never affects the charge.
+	GraphK8sName          string `json:"graph_k8s_name,omitempty"`
 	Cost                  string `json:"cost"`
 	AppliedPromptRate     string `json:"applied_prompt_rate"`
 	AppliedCachedRate     string `json:"applied_cached_rate"`
@@ -97,6 +112,13 @@ SELECT
     ru.resource_id,
     ru.org_id,                       -- NULL when the producer header was absent at meter time
     ru.model_id,
+    -- Grain columns (0006). NOT NULL in the schema, so they scan into plain strings.
+    ru.serving_mode,
+    ru.owner_type,
+    ru.owner_id,
+    -- Evidence, nullable: NULL when no event named a graph, or when the rollup drew
+    -- from more than one (the rater nulls it rather than guessing).
+    ru.graph_k8s_name,
     ru.cost::text,
     ru.applied_prompt_rate::text,
     ru.applied_cached_rate::text,
@@ -131,11 +153,19 @@ func (p *pusher) buildSnapshot(ctx context.Context, windowStart time.Time) (snap
 	for rows.Next() {
 		var r rollup
 		var orgID sql.NullString
+		// Nullable evidence: a NULL graph is normal (no event named one, or the
+		// rollup spanned two and the rater refused to guess). It becomes "" and is
+		// omitted from the wire, which reads as "unknown" -- never withheld money.
+		var graphK8sName sql.NullString
 		if err := rows.Scan(
 			&r.RatedUsageID,
 			&r.ResourceID,
 			&orgID,
 			&r.ModelID,
+			&r.ServingMode,
+			&r.OwnerType,
+			&r.OwnerID,
+			&graphK8sName,
 			&r.Cost,
 			&r.AppliedPromptRate,
 			&r.AppliedCachedRate,
@@ -160,6 +190,10 @@ func (p *pusher) buildSnapshot(ctx context.Context, windowStart time.Time) (snap
 			continue
 		}
 		r.OrgID = orgID.String
+		// A NULL graph becomes "" and is then omitted from the wire (omitempty), which
+		// the manager reads as "unknown". Evidence only: it never gates the push, so a
+		// rollup with no resolvable graph still bills normally.
+		r.GraphK8sName = graphK8sName.String
 		// rev: phoebe's rated_usage carries no re-rate counter yet; the manager's
 		// idempotency is driven by the (rated_usage_id, emitted_cost) delta, not rev, so
 		// 0 is correct here. A real rev counter is a follow-up phoebe schema change.
@@ -209,7 +243,7 @@ func (p *pusher) ratedUsageHasAnyRow(ctx context.Context) (bool, error) {
 // didn't inject X-Saturn-Org-Id, or org_id propagation broke) would silently DELETE the
 // prior, possibly-already-billed charge for that row — a money-loss, not a "hold". We
 // instead WITHHOLD the whole window (leave the manager's prior good state for it
-// standing) and scream + exit 2. This is the price-fetch fail-closed posture:
+// standing) and scream + exit 2. This is the cmd/rater fail-closed posture:
 // stale-but-billed beats silently-un-billed. Convergence resumes automatically on the
 // next run once the org propagates (the trailing re-push window re-covers the hour, and
 // a re-rate refreshes a NULL-org rollup to its real org). The interim cost is possibly

@@ -26,11 +26,6 @@ type Settings struct {
 	// Token streams can idle between chunks, so this is intentionally long.
 	IdleTimeoutStr string `yaml:"idleTimeout"`
 
-	// BillPartialOnAbort decides whether a client-aborted request still emits
-	// a metering event for the partial token count. Explicit policy, not a
-	// silent default.
-	BillPartialOnAbort bool `yaml:"billPartialOnAbort"`
-
 	// Emit configures the durable metering emitter (M2). main.go translates
 	// these into an emit.Config for the same reason.
 	Emit EmitSettings `yaml:"emit"`
@@ -223,8 +218,8 @@ type GatewaySettings struct {
 // (validated in Settings.parse — fail closed rather than actuate in a guessed
 // namespace).
 type WakeSettings struct {
-	// Enabled turns the DGDSA waker on. Default false: cold responses pass
-	// through unchanged.
+	// Enabled turns the proactive DGDSA waker on. Default false: requests
+	// forward directly without a readiness wait.
 	Enabled bool `yaml:"enabled"`
 
 	// Kubeconfig is a kubeconfig file path for dev/tests. Empty (production)
@@ -234,11 +229,10 @@ type WakeSettings struct {
 	// TimeoutStr bounds how long a single wake may hold the woken request
 	// (empty = the proxy default, 300s). THE TRADEOFF: this must exceed the
 	// serving stack's real cold start (vLLM's cold reload measured ~2.5min on
-	// staging — a budget below it makes wake a no-op that holds clients and
-	// then serves the cold response anyway), but every second of it is also
-	// how long a doomed wake keeps a client waiting before the honest cold
-	// response. Size it to the measured cold start plus headroom, not to
-	// impatience.
+	// staging — a budget below it usually makes the eventual inference forward
+	// see a cold response), but every second is also how long a doomed wake
+	// keeps a client waiting before that one honest forward. Size it to the
+	// measured cold start plus headroom, not to impatience.
 	TimeoutStr string `yaml:"timeout"`
 
 	// Timeout is the parsed TimeoutStr (0 = proxy default).
@@ -248,10 +242,9 @@ type WakeSettings struct {
 // Load reads, defaults, and parses a settings YAML file.
 func Load(settingsFile string) (*Settings, error) {
 	s := &Settings{
-		Debug:              false,
-		ListenPort:         8080,
-		IdleTimeoutStr:     "10m",
-		BillPartialOnAbort: true,
+		Debug:          false,
+		ListenPort:     8080,
+		IdleTimeoutStr: "10m",
 		Emit: EmitSettings{
 			StreamName: "phoebe:metering",
 			WALPath:    "/var/lib/phoebe/metering-wal.jsonl",
