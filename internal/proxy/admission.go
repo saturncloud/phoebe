@@ -60,12 +60,18 @@ func (l *sampledErrorLog) logf(log *logging.Logger, format string, args ...inter
 	}
 	unixNano := now.UnixNano()
 	if last := l.lastUnixNano.Load(); last != 0 && unixNano-last > l.quietGapNanos() {
-		// Best-effort: two concurrent resets can lose one increment or
-		// under-report the suppressed count by one — never an extra flood.
-		l.n.Store(0)
-		l.suppressed.Store(0)
+		// Only the goroutine that wins the timestamp update resets the
+		// counters: a concurrent burst at an incident's onset must not each
+		// reset and each log an onset line. Losers fall through with their
+		// increment possibly wiped by the winner's reset — the acknowledged
+		// benign under-count, never an extra flood.
+		if l.lastUnixNano.CompareAndSwap(last, unixNano) {
+			l.n.Store(0)
+			l.suppressed.Store(0)
+		}
+	} else {
+		l.lastUnixNano.Store(unixNano)
 	}
-	l.lastUnixNano.Store(unixNano)
 	n := l.n.Add(1)
 	if n > 1 && n%admissionErrorLogEvery != 0 {
 		l.suppressed.Add(1)

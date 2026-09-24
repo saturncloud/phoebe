@@ -2129,3 +2129,56 @@ func TestSampledErrorLogQuietGapReset(t *testing.T) {
 		t.Fatalf("line 2 must be incident two's 100th occurrence with 98 suppressed: %q", lines[2])
 	}
 }
+
+// A concurrent burst at an incident's onset must log exactly ONE onset line:
+// the quiet-gap reset is gated on winning the lastUnixNano CAS, so only the
+// winner resets the counters. Without the gate, every goroutine that observed
+// the gap would Store(0) and log its own onset line — a bounded burst at
+// exactly the moment an incident starts.
+func TestSampledErrorLogQuietGapConcurrentOnset(t *testing.T) {
+	var buf bytes.Buffer
+	logger := &logging.Logger{Error: log.New(&buf, "", 0)}
+	var site sampledErrorLog
+	base := time.Unix(1_700_000_000, 0)
+	now := base
+	site.now = func() time.Time { return now }
+	site.quietGap = time.Minute
+
+	// Incident one: 3 occurrences, only the onset logs.
+	for i := 0; i < 3; i++ {
+		site.logf(logger, "incident-one occurrence %d", i)
+	}
+
+	// Over a minute of silence, then a concurrent second incident: exactly
+	// one onset line, whichever goroutine wins the reset CAS. The losers'
+	// increments may be wiped by the winner's reset (the acknowledged
+	// under-count); none of them may log. The start barrier releases every
+	// goroutine into logf at once, so they all observe the pre-reset
+	// timestamp — without the CAS gate each would reset and log its own
+	// onset line.
+	now = base.Add(2 * time.Minute)
+	const workers = 16
+	start := make(chan struct{})
+	var wg sync.WaitGroup
+	for i := 0; i < workers; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			<-start
+			site.logf(logger, "incident-two occurrence %d", i)
+		}(i)
+	}
+	close(start)
+	wg.Wait()
+
+	lines := strings.Split(strings.TrimSpace(buf.String()), "\n")
+	if len(lines) != 2 {
+		t.Fatalf("logged %d lines, want 2 (incident-one onset + exactly one incident-two onset): %q", len(lines), lines)
+	}
+	if !strings.Contains(lines[0], "incident-one occurrence 0") || strings.Contains(lines[0], "suppressed") {
+		t.Fatalf("line 0 must be incident one's onset, logged plainly: %q", lines[0])
+	}
+	if !strings.Contains(lines[1], "incident-two occurrence") {
+		t.Fatalf("line 1 must be the single incident-two onset: %q", lines[1])
+	}
+}
