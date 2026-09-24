@@ -204,13 +204,31 @@ func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request) {
 	// (403/400/404/503, generic bodies) and has then already written the
 	// response. Non-gateway requests skip this entirely — today's header-routed
 	// behavior, byte for byte.
+	// Authorize on a CANONICAL path only. The gates below decide on the decoded
+	// path while the reverse proxy forwards the raw target, so a request whose
+	// raw target is not byte-identical to its decoded form is refused outright
+	// rather than authorized as one string and forwarded as another (see
+	// canonicalRequestPath).
+	routePath, pathCanonical := canonicalRequestPath(r.URL)
+
 	if id.Gateway {
-		if !gatewayRequestAllowed(r.Method, r.URL.Path) {
-			s.log.Warn.Printf("gateway: refusing route outside public inference surface method=%s path=%s org_id=%q",
-				r.Method, r.URL.Path, id.OrgID)
+		if !pathCanonical || !gatewayRequestAllowed(r.Method, routePath) {
+			s.log.Warn.Printf("gateway: refusing route outside public inference surface method=%s raw_path=%q canonical=%v org_id=%q",
+				r.Method, r.URL.RawPath, pathCanonical, id.OrgID)
 			http.Error(w, "not found", http.StatusNotFound)
 			return
 		}
+		// Preflight is answered LOCALLY: phoebe writes 204 and no OPTIONS is
+		// ever forwarded, so no Dynamo response data (Allow enumeration, body,
+		// extension headers) can reach the caller through this method.
+		//
+		// Phoebe deliberately emits NO Access-Control-* headers here. Browser-
+		// origin clients are NOT a supported gateway client — Atlas proxies
+		// them server-side (pdc/managers/token_factory.py proxy_inference_chat)
+		// — so the 204 exists only so a preflight does not 404. Emitting a
+		// permissive allow-origin would be a security-posture change and is
+		// deliberately not made here. TestGatewayPreflightEmitsNoCORSHeaders
+		// pins the non-support so it stays a decision rather than an accident.
 		if r.Method == http.MethodOptions {
 			if id.OrgID == "" {
 				http.Error(w, "forbidden", http.StatusForbidden)
@@ -324,10 +342,21 @@ func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request) {
 	// THE ORG, so resolution IS the binding (id.ServedModel was set FROM the
 	// resolved request model; re-checking it against itself would be a
 	// tautology).
-	if id.ServedModel != "" && !id.Gateway && !boundRequestAllowed(r.Method, r.URL.Path, id.ServedModel) {
-		s.log.Warn.Printf("model-binding: refused request_id=%s resource_id=%s (route not authorized for resource)",
-			requestID, id.ResourceID)
+	if id.ServedModel != "" && !id.Gateway &&
+		(!pathCanonical || !boundRequestAllowed(r.Method, routePath, id.ServedModel)) {
+		s.log.Warn.Printf("model-binding: refused request_id=%s resource_id=%s raw_path=%q canonical=%v (route not authorized for resource)",
+			requestID, id.ResourceID, r.URL.RawPath, pathCanonical)
 		http.Error(w, "not found", http.StatusNotFound)
+		return
+	}
+	// Bound-route preflight is answered LOCALLY, mirroring the gateway branch
+	// above: OPTIONS is never forwarded, so Dynamo's graph-wide admin surface
+	// cannot answer a preflight with an Allow enumeration or a body. This sits
+	// AFTER the route gate, so an unauthorized path still 404s rather than
+	// getting a 204. It is NOT gated on ServedModel != "" — a route with no
+	// injected allow-list must not forward OPTIONS either.
+	if !id.Gateway && r.Method == http.MethodOptions {
+		w.WriteHeader(http.StatusNoContent)
 		return
 	}
 	if id.ServedModel != "" && !id.Gateway && r.Method == "POST" {
@@ -478,7 +507,7 @@ func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request) {
 		// Dynamo's model-list endpoint is graph-wide. A dedicated subdomain is
 		// deployment-scoped, so expose only the served name Atlas authorized for
 		// this route; otherwise endpoint A could enumerate attached endpoint B.
-		if id.ServedModel != "" && !id.Gateway && r.URL.Path == "/v1/models" {
+		if id.ServedModel != "" && !id.Gateway && routePath == "/v1/models" {
 			switch r.Method {
 			case http.MethodGet:
 				if err := filterModelListResponse(resp, id.ServedModel); err != nil {
@@ -486,6 +515,21 @@ func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request) {
 				}
 			case http.MethodHead:
 				sanitizeModelListHeadResponse(resp)
+			}
+		}
+
+		// Dynamo's readiness endpoints are graph-wide too: they enumerate the
+		// component/worker/model instances of the WHOLE graph, i.e. sibling
+		// tenants' attached adapters. Allowlisting /health and /live for a
+		// deployment-scoped subdomain would re-open through readiness exactly
+		// the enumeration the model-list filter above closes, so their payload
+		// is replaced with a status-only document. The status CODE is preserved,
+		// so liveness stays truthful.
+		if id.ServedModel != "" && !id.Gateway &&
+			(routePath == "/health" || routePath == "/live") &&
+			(r.Method == http.MethodGet || r.Method == http.MethodHead) {
+			if err := sanitizeReadinessResponse(resp, r.Method == http.MethodHead); err != nil {
+				return fmt.Errorf("sanitize readiness: %w", err)
 			}
 		}
 
@@ -598,11 +642,28 @@ func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request) {
 // attributable event — real usage on completion, or a zero-token Aborted event on
 // disconnect (pre- OR post-header).
 //
-// NO double-emit: in phoebe ModifyResponse always returns nil, so ErrorHandler
-// fires ONLY on a RoundTrip error (pre-header) — mutually exclusive with the
-// onDone path (post-header), which needs ModifyResponse to have run. The emit is
-// gated on isClientAbort, so a genuine upstream/ModifyResponse fault never writes
-// a bogus zero-token billing row. The context is decoupled from the cancelled
+// NO double-emit. ErrorHandler now fires on TWO paths, not one:
+//
+//	(a) a RoundTrip error — pre-header, no response was ever received;
+//	(b) a ModifyResponse error — filterModelListResponse /
+//	    sanitizeReadinessResponse can fail on a malformed, oversized,
+//	    duplicate-id or unsupported-encoding upstream response.
+//
+// Neither can double-emit or double-release, for a structural reason: every
+// ModifyResponse error return happens BEFORE `resp.Body = cr` installs the
+// captureReader, so onDone is never registered on those paths and cannot fire.
+// And the emit below is gated on isClientAbort (context.Canceled), which a
+// ModifyResponse fault never satisfies — so a filter failure writes no bogus
+// zero-token billing row; it only releases the admission lease, exactly once.
+// httputil also calls ErrorHandler before any response header reaches the
+// client on both paths, so the w.Header().Set(requestIDHeader, ...) + http.Error
+// below is still a pre-header write.
+//
+// WARNING: any future ModifyResponse error return placed AFTER the captureReader
+// is installed would break this — onDone would then be armed and would emit a
+// second event. Such a change must disarm onDone first.
+//
+// The context is decoupled from the cancelled
 // client ctx (WithoutCancel) — the abort is precisely WHY we are here, so a
 // cancelled ctx must not be able to drop the emit (mirrors onDone).
 func (s *Server) errorHandler(upstream string, id identity.Identity, requestID string, admitted *admission.Lease) func(http.ResponseWriter, *http.Request, error) {

@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"encoding/json"
 	"errors"
+	"net/url"
 	"strings"
 )
 
@@ -29,9 +30,16 @@ func authorizedModelDiscoveryPath(path, servedModelAllowList string) (discovery,
 // endpoint. Dynamo's frontend also exposes graph-wide admin, metrics,
 // documentation, batch storage, and future extension routes; those must not
 // become customer APIs merely because the reverse proxy can reach them.
+//
+// OPTIONS is scoped to the inference POST surface — the only surface a browser
+// preflights — and is answered LOCALLY by phoebe (handleProxy writes 204), never
+// forwarded. An unconditional OPTIONS allowance would have let `OPTIONS /metrics`
+// reach the Dynamo frontend, whose framework answers preflight with an Allow
+// header enumerating a graph-wide admin route's methods: the exact disclosure
+// the GET/HEAD gates below close, re-opened by one method.
 func boundRequestAllowed(method, path, servedModelAllowList string) bool {
 	if method == "OPTIONS" {
-		return true // browser preflight carries no Dynamo response data
+		return inferenceRequestPathAllowed(path)
 	}
 	if method == "POST" {
 		return inferenceRequestPathAllowed(path)
@@ -40,12 +48,44 @@ func boundRequestAllowed(method, path, servedModelAllowList string) bool {
 		return false
 	}
 	switch path {
-	case "/health", "/live", "/v1/models":
+	case "/health", "/live":
+		// Routable unconditionally — they carry no per-model data ONCE
+		// sanitized. proxy.go rewrites their body to a status-only document
+		// (sanitizeReadinessResponse), because Dynamo's readiness is
+		// graph-wide and would otherwise enumerate sibling adapters.
 		return true
+	case "/v1/models":
+		// Requires a non-empty PARSED allow-list. A present-but-empty header
+		// (whitespace, ",,") authorizes no model at all, so listing must fail
+		// CLOSED here — at the route gate, before the request reaches Dynamo —
+		// matching checkModelBinding's decision for the same input. Allowing it
+		// through only to have filterModelListResponse error made the request
+		// hit the graph and surfaced as an opaque 502.
+		return len(parseServedModelAllowList(servedModelAllowList)) > 0
 	default:
 		discovery, authorized := authorizedModelDiscoveryPath(path, servedModelAllowList)
 		return discovery && authorized
 	}
+}
+
+// canonicalRequestPath returns the path to authorize on, reporting ok=false
+// when the raw request target is not byte-identical to its decoded form.
+//
+// The authorization gates decide on the percent-DECODED r.URL.Path, but the
+// reverse proxy forwards the RAW target: `GET /v1/models/%6dine` decodes to
+// "/v1/models/mine" (authorized when "mine" is the served name) while the
+// forwarded RequestURI stays "/v1/models/%6dine", and `POST
+// /v1%2Fchat/completions` decodes to an allowlisted path while forwarding one
+// that is not. Any upstream router that normalizes percent-encoding differently
+// from net/url then resolves a path the allow-list never approved. Go populates
+// URL.RawPath only when the escaped form differs from the decoded form, so
+// RawPath != "" is exactly the "encoded path" signal; phoebe refuses those
+// rather than guessing which form the upstream will honour.
+func canonicalRequestPath(u *url.URL) (string, bool) {
+	if u.RawPath != "" && u.RawPath != u.Path {
+		return "", false
+	}
+	return u.Path, true
 }
 
 // inferenceRequestPathAllowed lists the model-bearing APIs whose response
@@ -63,8 +103,14 @@ func inferenceRequestPathAllowed(path string) bool {
 // gatewayRequestAllowed is narrower than the bound-resource surface because a
 // shared gateway URL does not identify one model for health or discovery. The
 // request body supplies that identity only on model-bearing POST requests.
+//
+// OPTIONS is scoped to the same inference surface as POST. handleProxy already
+// answers gateway preflight locally with a 204 before any forward, so this is
+// defense in depth rather than a behaviour change — but it keeps the two route
+// gates saying the same thing, so a future refactor that drops the
+// short-circuit cannot silently open every path to OPTIONS.
 func gatewayRequestAllowed(method, path string) bool {
-	return method == "OPTIONS" || (method == "POST" && inferenceRequestPathAllowed(path))
+	return (method == "OPTIONS" || method == "POST") && inferenceRequestPathAllowed(path)
 }
 
 var errNotObject = errors.New("request body is not a JSON object")
@@ -97,10 +143,20 @@ const (
 // without this check a caller authorized for model-A could send `model=B` and be
 // served B. This binds the two: request model ∈ allow-list, else fail closed.
 //
-// The allow-list is empty for routes that don't enforce binding. Atlas decides
-// access; this only guarantees the body can't escape the Atlas-authorized
-// resource. Dedicated Dynamo routes carry a single served name because one
-// graph may host a base model plus several attached adapters.
+// An ABSENT allow-list means Atlas did not mark this route as bound, and phoebe
+// then enforces NOTHING: not the body binding here, not the route gate
+// (proxy.go, also conditioned on ServedModel != ""), and not the /v1/models
+// filter — so such a route forwards Dynamo's full graph-wide model list. That
+// fail-open is safe ONLY because X-Saturn-Served-Model is injected and
+// anti-spoof overwritten server-side by the Atlas-rendered Traefik middleware
+// (identity.HeaderServedModel): a client cannot cause its absence. It is NOT
+// justified by "one subdomain == one model" — a dedicated Dynamo graph may host
+// a base model plus several attached adapters, which is exactly why dedicated
+// routes now carry a served-name allow-list too. An absent header on such a
+// graph would disable all three protections at once.
+//
+// Atlas decides access; this only guarantees the body can't escape the
+// Atlas-authorized resource.
 func checkModelBinding(body []byte, servedModelAllowList string) modelBindingResult {
 	// An ABSENT header (empty string) = binding not enforced. But a PRESENT
 	// header that parses to an EMPTY set

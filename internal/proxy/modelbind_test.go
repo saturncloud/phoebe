@@ -1,6 +1,9 @@
 package proxy
 
-import "testing"
+import (
+	"net/url"
+	"testing"
+)
 
 func TestAuthorizedModelDiscoveryPath(t *testing.T) {
 	tests := []struct {
@@ -49,8 +52,22 @@ func TestBoundRequestAllowed(t *testing.T) {
 			t.Fatalf("HEAD %s must be blocked", path)
 		}
 	}
-	if !boundRequestAllowed("OPTIONS", "/v1/chat/completions", allow) {
-		t.Fatal("browser preflight must be allowed")
+	// OPTIONS is the method that used to bypass the path switch entirely. It is
+	// now scoped to the inference surface a browser actually preflights, and
+	// handleProxy answers it locally (204) rather than forwarding it — so
+	// Dynamo can never answer a preflight for a graph-wide admin route.
+	for _, path := range []string{"/v1/chat/completions", "/v1/completions", "/v1/embeddings"} {
+		if !boundRequestAllowed("OPTIONS", path, allow) {
+			t.Fatalf("browser preflight on %s must be allowed", path)
+		}
+	}
+	for _, path := range []string{
+		"/metrics", "/busy_threshold", "/docs", "/openapi.json", "/unknown",
+		"/future-admin", "/v1/models", "/v1/models/org/sibling", "/health", "/live",
+	} {
+		if boundRequestAllowed("OPTIONS", path, allow) {
+			t.Fatalf("OPTIONS %s must be blocked (admin-surface preflight disclosure)", path)
+		}
 	}
 	for _, path := range []string{"/v1/chat/completions", "/v1/completions", "/v1/embeddings"} {
 		if !boundRequestAllowed("POST", path, allow) {
@@ -69,6 +86,64 @@ func TestBoundRequestAllowed(t *testing.T) {
 	}
 }
 
+// A PRESENT but empty-parsing allow-list authorizes no model at all, so
+// /v1/models must fail CLOSED at the route gate — before the request reaches
+// Dynamo — matching checkModelBinding's decision for the same input. Listing
+// used to be allowed unconditionally and only failed later inside
+// filterModelListResponse, which meant the request hit the graph and the caller
+// got an opaque 502. /health and /live stay routable: they carry no per-model
+// data once sanitized.
+func TestBoundRequestAllowedModelListRequiresNonEmptyAllowList(t *testing.T) {
+	for _, allow := range []string{"  ", " , , ", ","} {
+		if boundRequestAllowed("GET", "/v1/models", allow) {
+			t.Fatalf("GET /v1/models with empty-parsing allow-list %q must be blocked", allow)
+		}
+		if boundRequestAllowed("HEAD", "/v1/models", allow) {
+			t.Fatalf("HEAD /v1/models with empty-parsing allow-list %q must be blocked", allow)
+		}
+		if !boundRequestAllowed("GET", "/health", allow) {
+			t.Fatalf("GET /health must stay routable with allow-list %q", allow)
+		}
+		if !boundRequestAllowed("GET", "/live", allow) {
+			t.Fatalf("GET /live must stay routable with allow-list %q", allow)
+		}
+	}
+	if !boundRequestAllowed("GET", "/v1/models", "m") {
+		t.Fatal("GET /v1/models with a real allow-list must be allowed")
+	}
+}
+
+// The authorization gates decide on the decoded path while the reverse proxy
+// forwards the RAW target. A request whose raw target is not byte-identical to
+// its decoded form must be refused, never authorized as one string and
+// forwarded as another.
+func TestCanonicalRequestPathRefusesEncodedTargets(t *testing.T) {
+	for _, target := range []string{
+		"/v1%2Fchat/completions", // decodes to an allowlisted POST path
+		"/v1/models/%6dine",      // decodes to an allowlisted discovery path
+		"/v1/chat%2Fcompletions",
+		"/%2e%2e/metrics",
+	} {
+		u, err := url.ParseRequestURI(target)
+		if err != nil {
+			t.Fatalf("parse %q: %v", target, err)
+		}
+		if _, ok := canonicalRequestPath(u); ok {
+			t.Fatalf("encoded target %q must not be treated as canonical", target)
+		}
+	}
+	for _, target := range []string{"/v1/chat/completions", "/v1/models", "/v1/models/mine", "/health"} {
+		u, err := url.ParseRequestURI(target)
+		if err != nil {
+			t.Fatalf("parse %q: %v", target, err)
+		}
+		p, ok := canonicalRequestPath(u)
+		if !ok || p != target {
+			t.Fatalf("plain target %q = (%q,%v), want (%q,true)", target, p, ok, target)
+		}
+	}
+}
+
 func TestGatewayRequestAllowed(t *testing.T) {
 	if !gatewayRequestAllowed("OPTIONS", "/v1/chat/completions") {
 		t.Fatal("gateway preflight must be allowed")
@@ -81,6 +156,12 @@ func TestGatewayRequestAllowed(t *testing.T) {
 	for _, path := range []string{"/health", "/live", "/v1/models", "/v1/responses", "/metrics", "/future-admin"} {
 		if gatewayRequestAllowed("POST", path) || gatewayRequestAllowed("GET", path) {
 			t.Fatalf("gateway route %s must be blocked", path)
+		}
+		// OPTIONS must not be the one method that opens every path. The handler
+		// already 204s gateway preflight before forwarding, so this is defense
+		// in depth — but it keeps both route gates saying the same thing.
+		if gatewayRequestAllowed("OPTIONS", path) {
+			t.Fatalf("gateway OPTIONS %s must be blocked", path)
 		}
 	}
 }

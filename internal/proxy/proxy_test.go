@@ -94,6 +94,11 @@ func TestProxyBindsDedicatedEndpointToServedModel(t *testing.T) {
 	var upstreamCalls int
 	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		upstreamCalls++
+		// Emit the graph-wide headers the sanitizers exist to strip. Without
+		// these the "no X-Graph-Debug / ETag leaked" assertions below are
+		// vacuous — they would pass whether or not the sanitizer ran.
+		w.Header().Set("X-Graph-Debug", "adapter-b")
+		w.Header().Set("ETag", "graph-wide")
 		_, _ = w.Write([]byte(`{"object":"list","data":[{"id":"adapter-a","object":"model"},{"id":"adapter-b","object":"model"},{"id":"base-internal","object":"model"}]}`))
 	}))
 	defer backend.Close()
@@ -166,17 +171,58 @@ func TestProxyBindsDedicatedEndpointToServedModel(t *testing.T) {
 	}
 	if rr := request(http.MethodHead, "/v1/models", ""); rr.Code != http.StatusOK {
 		t.Fatalf("bound HEAD list status = %d, want 200", rr.Code)
-	} else if rr.Header().Get("Content-Length") != "" || rr.Header().Get("X-Graph-Debug") != "" {
+	} else if rr.Header().Get("Content-Length") != "" || rr.Header().Get("X-Graph-Debug") != "" ||
+		rr.Header().Get("ETag") != "" {
 		t.Fatalf("HEAD list leaked graph-wide representation headers: %v", rr.Header())
+	}
+	// OPTIONS used to bypass the path switch entirely and reach Dynamo, whose
+	// framework answers preflight with an Allow header enumerating a graph-wide
+	// admin route's methods. It is now refused on admin paths and answered
+	// LOCALLY (204, no body, no Allow echo) on the inference surface. The
+	// load-bearing assertion is the upstream call counter below: no OPTIONS
+	// reaches Dynamo on ANY path.
+	for _, path := range []string{"/metrics", "/busy_threshold", "/docs", "/openapi.json", "/future-admin", "/v1/models"} {
+		rr := request(http.MethodOptions, path, "")
+		if rr.Code != http.StatusNotFound {
+			t.Fatalf("bound OPTIONS %s status = %d, want 404", path, rr.Code)
+		}
+		if rr.Header().Get("Allow") != "" {
+			t.Fatalf("bound OPTIONS %s echoed an upstream method enumeration: %q", path, rr.Header().Get("Allow"))
+		}
+	}
+	for _, path := range []string{"/v1/chat/completions", "/v1/completions", "/v1/embeddings"} {
+		rr := request(http.MethodOptions, path, "")
+		if rr.Code != http.StatusNoContent {
+			t.Fatalf("bound OPTIONS %s status = %d, want 204", path, rr.Code)
+		}
+		if rr.Body.Len() != 0 || rr.Header().Get("Allow") != "" || rr.Header().Get("X-Graph-Debug") != "" {
+			t.Fatalf("bound OPTIONS %s returned upstream data: body=%q headers=%v", path, rr.Body.String(), rr.Header())
+		}
+	}
+	// Encoded targets decode to an allowlisted path but are FORWARDED raw, so
+	// an upstream that normalizes differently would resolve a path the
+	// allow-list never approved. They are refused, and never reach Dynamo.
+	for _, target := range []string{"/v1%2Fchat/completions", "/v1/models/%61dapter-a", "/v1/models/%61dapter-b"} {
+		if rr := request(http.MethodPost, target, `{"model":"adapter-a"}`); rr.Code != http.StatusNotFound {
+			t.Fatalf("encoded target %s status = %d, want 404", target, rr.Code)
+		}
 	}
 	if upstreamCalls != 5 {
 		t.Fatalf("authorized requests made %d upstream calls, want 5", upstreamCalls)
 	}
 }
 
+// A real client round-trip, not a ResponseRecorder: trailers are only
+// transported over the wire, and net/http sends none at all for HEAD — so the
+// recorder-based version of this test could not fail on the HEAD iteration. The
+// backend here announces AND emits a real trailer plus a plain leak header set
+// BEFORE WriteHeader (the previous Set-after-WriteHeader was a no-op, so the
+// header the test is named around never existed on the wire).
 func TestProxySanitizesModelListTrailers(t *testing.T) {
 	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Trailer", "X-Graph-Debug")
+		w.Header().Set("X-Graph-Debug-Hdr", "adapter-b")
+		w.Header().Set("ETag", "graph-wide")
 		if r.Method == http.MethodGet {
 			w.WriteHeader(http.StatusServiceUnavailable)
 			_, _ = w.Write([]byte(`{"error":"adapter-b failed"}`))
@@ -189,18 +235,32 @@ func TestProxySanitizesModelListTrailers(t *testing.T) {
 	upstream, _ := url.Parse(backend.URL)
 	srv := newTestServer(t, upstream)
 
+	front := httptest.NewServer(srv.Handler())
+	defer front.Close()
+
 	for _, method := range []string{http.MethodGet, http.MethodHead} {
-		req := httptest.NewRequest(method, "/v1/models", nil)
-		setUpstream(req, upstream)
+		req, err := http.NewRequest(method, front.URL+"/v1/models", nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		req.Header.Set(identity.HeaderUpstream, upstream.Host)
 		req.Header.Set(identity.HeaderAuthID, "auth-1")
 		req.Header.Set(identity.HeaderResourceID, "deployment-a")
 		req.Header.Set(identity.HeaderServedModel, "adapter-a")
-		rr := httptest.NewRecorder()
-		srv.Handler().ServeHTTP(rr, req)
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		// Go populates resp.Trailer only after the body is drained.
+		_, _ = io.ReadAll(resp.Body)
+		_ = resp.Body.Close()
 
-		resp := rr.Result()
 		if resp.Header.Get("Trailer") != "" || len(resp.Trailer) != 0 {
 			t.Fatalf("%s model list leaked upstream trailers: headers=%v trailers=%v", method, resp.Header, resp.Trailer)
+		}
+		if resp.Header.Get("X-Graph-Debug-Hdr") != "" || resp.Header.Get("X-Graph-Debug") != "" ||
+			resp.Header.Get("ETag") != "" {
+			t.Fatalf("%s model list leaked upstream extension headers: %v", method, resp.Header)
 		}
 	}
 }
@@ -680,5 +740,190 @@ func TestProxyStreamingEndToEnd(t *testing.T) {
 	}
 	if e.FinishReason != "stop" {
 		t.Fatalf("event finish_reason = %q, want stop", e.FinishReason)
+	}
+}
+
+// Documents an INTENTIONAL fail-open: a non-gateway route that reaches phoebe
+// with X-Saturn-Served-Model ABSENT gets none of the three protections keyed on
+// that header — no route gate, no body binding, no /v1/models filter — so it
+// forwards Dynamo's graph-wide surface. That is tolerable only because the
+// header is injected and anti-spoof overwritten server-side by the
+// Atlas-rendered Traefik middleware, so a client cannot cause its absence.
+// Pinned by name so any future change to it is deliberate rather than silent.
+func TestProxyUnboundRouteSkipsAllServedModelGates(t *testing.T) {
+	var upstreamCalls int32
+	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		atomic.AddInt32(&upstreamCalls, 1)
+		_, _ = w.Write([]byte(`{"object":"list","data":[{"id":"adapter-b"}]}`))
+	}))
+	defer backend.Close()
+	upstream, _ := url.Parse(backend.URL)
+	srv := newTestServer(t, upstream)
+
+	request := func(method, path, body string) *httptest.ResponseRecorder {
+		req := httptest.NewRequest(method, path, strings.NewReader(body))
+		setUpstream(req, upstream)
+		req.Header.Set(identity.HeaderAuthID, "auth-1")
+		req.Header.Set(identity.HeaderResourceID, "deployment-a")
+		// deliberately NO identity.HeaderServedModel
+		rr := httptest.NewRecorder()
+		srv.Handler().ServeHTTP(rr, req)
+		return rr
+	}
+
+	if rr := request(http.MethodPost, "/v1/chat/completions", `{"model":"anything"}`); rr.Code != http.StatusOK {
+		t.Fatalf("unbound POST status = %d, want 200 (binding not enforced without the header)", rr.Code)
+	}
+	if rr := request(http.MethodGet, "/metrics", ""); rr.Code == http.StatusNotFound {
+		t.Fatal("unbound GET /metrics is NOT route-gated today; update this test deliberately if that changes")
+	}
+	if atomic.LoadInt32(&upstreamCalls) != 2 {
+		t.Fatalf("unbound requests made %d upstream calls, want 2", atomic.LoadInt32(&upstreamCalls))
+	}
+	// OPTIONS is the one gate that is NOT keyed on the header: it must be
+	// answered locally even on an unbound route, so no Dynamo response data
+	// can reach the caller through preflight.
+	if rr := request(http.MethodOptions, "/metrics", ""); rr.Code != http.StatusNoContent {
+		t.Fatalf("unbound OPTIONS status = %d, want 204 (answered locally)", rr.Code)
+	}
+	if atomic.LoadInt32(&upstreamCalls) != 2 {
+		t.Fatalf("OPTIONS reached Dynamo: %d upstream calls", atomic.LoadInt32(&upstreamCalls))
+	}
+}
+
+// A PRESENT but empty-parsing allow-list authorizes no model at all and must
+// fail CLOSED at the route gate — before the request reaches Dynamo — not late
+// inside the response filter, which made the request hit the graph and surfaced
+// as an opaque 502. Either way no sibling name may appear in the body.
+func TestBoundRouteWithUnparseableAllowListFailsClosed(t *testing.T) {
+	var upstreamCalls int32
+	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		atomic.AddInt32(&upstreamCalls, 1)
+		_, _ = w.Write([]byte(`{"object":"list","data":[{"id":"adapter-b"},{"id":"base-internal"}]}`))
+	}))
+	defer backend.Close()
+	upstream, _ := url.Parse(backend.URL)
+	srv := newTestServer(t, upstream)
+
+	request := func(method, path, body string) *httptest.ResponseRecorder {
+		req := httptest.NewRequest(method, path, strings.NewReader(body))
+		setUpstream(req, upstream)
+		req.Header.Set(identity.HeaderAuthID, "auth-1")
+		req.Header.Set(identity.HeaderResourceID, "deployment-a")
+		req.Header.Set(identity.HeaderServedModel, " ,")
+		rr := httptest.NewRecorder()
+		srv.Handler().ServeHTTP(rr, req)
+		return rr
+	}
+
+	if rr := request(http.MethodPost, "/v1/chat/completions", `{"model":"adapter-b"}`); rr.Code != http.StatusForbidden {
+		t.Fatalf("POST with empty-parsing allow-list = %d, want 403", rr.Code)
+	}
+	rr := request(http.MethodGet, "/v1/models", "")
+	if rr.Code != http.StatusNotFound {
+		t.Fatalf("GET /v1/models with empty-parsing allow-list = %d, want 404 at the route gate", rr.Code)
+	}
+	if strings.Contains(rr.Body.String(), "adapter-b") || strings.Contains(rr.Body.String(), "base-internal") {
+		t.Fatalf("empty allow-list disclosed graph-wide names: %s", rr.Body.String())
+	}
+	if n := atomic.LoadInt32(&upstreamCalls); n != 0 {
+		t.Fatalf("empty-allow-list requests reached Dynamo (%d calls)", n)
+	}
+}
+
+// Dynamo's /health and /live are GRAPH-WIDE: they enumerate the whole graph's
+// components and workers, i.e. sibling tenants' attached adapters. On a
+// deployment-scoped subdomain they stay routable but must disclose nothing
+// beyond the status class, or readiness re-opens the enumeration /v1/models was
+// hardened against.
+func TestProxySanitizesBoundReadinessResponses(t *testing.T) {
+	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("ETag", "graph-wide")
+		w.Header().Set("X-Graph-Debug", "adapter-b")
+		_, _ = w.Write([]byte(`{"components":[{"model":"org/sibling","workers":2}],"instances":["base-internal"]}`))
+	}))
+	defer backend.Close()
+	upstream, _ := url.Parse(backend.URL)
+	srv := newTestServer(t, upstream)
+
+	for _, path := range []string{"/health", "/live"} {
+		for _, method := range []string{http.MethodGet, http.MethodHead} {
+			req := httptest.NewRequest(method, path, nil)
+			setUpstream(req, upstream)
+			req.Header.Set(identity.HeaderAuthID, "auth-1")
+			req.Header.Set(identity.HeaderResourceID, "deployment-a")
+			req.Header.Set(identity.HeaderServedModel, "adapter-a")
+			rr := httptest.NewRecorder()
+			srv.Handler().ServeHTTP(rr, req)
+
+			if rr.Code != http.StatusOK {
+				t.Fatalf("%s %s status = %d, want 200 (liveness stays truthful)", method, path, rr.Code)
+			}
+			body := rr.Body.String()
+			if strings.Contains(body, "sibling") || strings.Contains(body, "base-internal") ||
+				strings.Contains(body, "components") {
+				t.Fatalf("%s %s disclosed graph-wide readiness: %s", method, path, body)
+			}
+			if rr.Header().Get("ETag") != "" || rr.Header().Get("X-Graph-Debug") != "" {
+				t.Fatalf("%s %s leaked upstream headers: %v", method, path, rr.Header())
+			}
+			if method == http.MethodGet && body != `{"status":"ok"}` {
+				t.Fatalf("GET %s body = %s, want status-only document", path, body)
+			}
+		}
+	}
+}
+
+// Phoebe emits NO Access-Control-* headers on the gateway preflight: browser-
+// origin clients are not a supported gateway client (Atlas proxies them
+// server-side), so the 204 exists only so a preflight does not 404. Pinned so
+// the non-support stays a decision rather than an accident — adding a
+// permissive allow-origin would be a security-posture change.
+func TestGatewayPreflightEmitsNoCORSHeaders(t *testing.T) {
+	srv := newTestServer(t, &url.URL{Scheme: "http", Host: "localhost:1"})
+	req := httptest.NewRequest(http.MethodOptions, "/v1/chat/completions", nil)
+	req.Header.Set(identity.HeaderGateway, "true")
+	req.Header.Set(identity.HeaderOrgID, "org-1")
+	req.Header.Set("Origin", "https://example.test")
+	rr := httptest.NewRecorder()
+	srv.Handler().ServeHTTP(rr, req)
+
+	if rr.Code != http.StatusNoContent {
+		t.Fatalf("gateway preflight status = %d, want 204", rr.Code)
+	}
+	for k := range rr.Header() {
+		if strings.HasPrefix(http.CanonicalHeaderKey(k), "Access-Control-") {
+			t.Fatalf("gateway preflight emitted %s; browser clients are not supported here "+
+				"and a permissive origin would be a security-posture change", k)
+		}
+	}
+}
+
+// The errorHandler's no-double-emit invariant: a ModifyResponse fault is NOT a
+// client abort, so it releases the admission lease but writes no bogus
+// zero-token billing row. Named for the invariant it guards, because the
+// comment that used to justify it ("ModifyResponse always returns nil") is no
+// longer true.
+func TestModelListFilterErrorEmitsNoBillingEvent(t *testing.T) {
+	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = w.Write([]byte(`{"data":[{"id":"sibling","id":"adapter-a"}]}`))
+	}))
+	defer backend.Close()
+	upstream, _ := url.Parse(backend.URL)
+	em := &recordingEmitter{}
+	srv := newTestServerE(t, upstream, em)
+	req := httptest.NewRequest(http.MethodGet, "/v1/models", nil)
+	setUpstream(req, upstream)
+	req.Header.Set(identity.HeaderAuthID, "auth-1")
+	req.Header.Set(identity.HeaderResourceID, "deployment-a")
+	req.Header.Set(identity.HeaderServedModel, "adapter-a")
+	rr := httptest.NewRecorder()
+	srv.Handler().ServeHTTP(rr, req)
+
+	if rr.Code != http.StatusBadGateway {
+		t.Fatalf("status = %d, want 502", rr.Code)
+	}
+	if events := em.waitForEvents(1, 100*time.Millisecond); len(events) != 0 {
+		t.Fatalf("filter failure emitted %d billing events, want 0: %+v", len(events), events)
 	}
 }

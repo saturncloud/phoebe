@@ -53,9 +53,19 @@ const (
 	// a caller authorized for model-A's subdomain could put `model=B` in the body
 	// and reach B. Phoebe ASSERTS the request `model=` is in this allow-list and
 	// fails closed (403) on mismatch — atlas DECIDES access, phoebe only guarantees
-	// the body can't escape the atlas-authorized resource. Absent = the binding is
-	// not enforced for this route (dedicated single-model endpoints, where one
-	// subdomain == one model, need no binding); present = enforce.
+	// the body can't escape the atlas-authorized resource.
+	//
+	// It is present on BOTH shared and dedicated routes: a dedicated Dynamo graph
+	// can host a base model plus several attached adapters, so "one subdomain ==
+	// one model" is NOT an architectural guarantee. On a dedicated route the
+	// allow-list is additionally the authorization input for the route gate
+	// (proxy.boundRequestAllowed) and for the /v1/models response filter
+	// (proxy.filterModelListResponse).
+	//
+	// ABSENT = none of those three is enforced, and the route forwards Dynamo's
+	// unfiltered graph-wide model list — the legacy/unconfigured case. That
+	// fail-open is tolerable only because this header is injected and anti-spoof
+	// overwritten server-side, so a client cannot strip it. PRESENT = enforce.
 	HeaderServedModel = "X-Saturn-Served-Model"
 
 	// HeaderServingMode carries the serving mode of the deployment — "shared" or
