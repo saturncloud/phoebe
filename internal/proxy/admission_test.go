@@ -1270,10 +1270,12 @@ func TestAdmissionChargesUnknownUsageOnUpstreamReset(t *testing.T) {
 
 // A verifiable pre-write dial failure (connection refused) proves the request
 // never left the process: the lease settles Complete(0) — physical capacity is
-// released AND nothing is charged to the contract windows. This pins the dial
-// carve-out against the indeterminate-failure path, which retains the
-// conservative charge; an unlimited envelope cannot tell the two apart.
-func TestAdmissionDialFailureChargesNothing(t *testing.T) {
+// released and the generated/prompt contract windows are NOT charged. The
+// requests window IS charged: admitScript charges RPM at admit time and only
+// the compensating abandon (an Admit-path cleanup) ever subtracts it, so a
+// dial-failed request counts against the contract's requests-per-window. This
+// pins the contract as built; changing the settlement is a separate decision.
+func TestAdmissionDialFailureChargesOnlyRequestsWindow(t *testing.T) {
 	up, _ := url.Parse("http://127.0.0.1:1") // nothing listening: dial is refused
 	mr := miniredis.RunT(t)
 	cfg := proxyAdmissionConfig(1)
@@ -1283,6 +1285,8 @@ func TestAdmissionDialFailureChargesNothing(t *testing.T) {
 	em := &recordingEmitter{}
 	s := New(&config.Settings{Admission: cfg}, logging.New(logging.ERROR), em).WithAdmitter(a)
 	req := sharedRequest(up)
+	req.Header.Set(identity.HeaderOrgRateLimitRequests, "1")
+	req.Header.Set(identity.HeaderOwnerRateLimitRequests, "1")
 	req.Header.Set(identity.HeaderOrgRateLimitGeneratedTokens, "20")
 	req.Header.Set(identity.HeaderOwnerRateLimitGeneratedTokens, "20")
 	rr := httptest.NewRecorder()
@@ -1295,16 +1299,49 @@ func TestAdmissionDialFailureChargesNothing(t *testing.T) {
 	if n := len(em.all()); n != 0 {
 		t.Fatalf("dial failure emitted %d events, want 0", n)
 	}
-	// The org and owner contract windows are empty: a fresh request reserving
-	// exactly the contract maximum succeeds at both scopes. A phantom
-	// conservative charge would have filled the window and rejected it.
-	probe := admission.Request{Graph: "graph", Organization: "org-a", Owner: "owner-a", Model: "m",
-		PromptBytes: 1, EstimatedInputTokens: 1, ReservedOutputTokens: 20,
-		OrganizationLimits: admission.RateLimits{GeneratedTokens: 20},
-		OwnerLimits:        admission.RateLimits{GeneratedTokens: 20}}
-	lease, err := a.Admit(context.Background(), probe)
+
+	// The requests window was charged at admit time and never refunded: the
+	// dial-failed request's own org (resp. owner) is already at its
+	// requests-per-minute limit of 1.
+	for _, tc := range []struct {
+		name string
+		req  admission.Request
+		want string
+	}{
+		{
+			name: "organization requests window",
+			req: admission.Request{Graph: "graph", Organization: "org-a", Owner: "other-owner", Model: "m",
+				PromptBytes: 1, EstimatedInputTokens: 1, ReservedOutputTokens: 1,
+				OrganizationLimits: admission.RateLimits{Requests: 1}},
+			want: "contract_organization",
+		},
+		{
+			name: "owner requests window",
+			req: admission.Request{Graph: "graph", Organization: "other-org", Owner: "owner-a", Model: "m",
+				PromptBytes: 1, EstimatedInputTokens: 1, ReservedOutputTokens: 1,
+				OwnerLimits: admission.RateLimits{Requests: 1}},
+			want: "contract_owner",
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			_, err := a.Admit(context.Background(), tc.req)
+			var rejected *admission.Rejected
+			if !errors.As(err, &rejected) || rejected.Scope != tc.want || rejected.Dimension != "requests" {
+				t.Fatalf("err=%v, want %s requests rejection", err, tc.want)
+			}
+		})
+	}
+
+	// The generated and prompt windows were NOT charged: the same organization
+	// reserving exactly the dial-failed request's conservative estimate (7
+	// estimated input tokens, 20 reserved output tokens) still fits its
+	// contract. A phantom conservative charge would have filled the window and
+	// rejected this probe.
+	lease, err := a.Admit(context.Background(), admission.Request{Graph: "graph", Organization: "org-a", Owner: "other-owner", Model: "m",
+		PromptBytes: 1, EstimatedInputTokens: 7, ReservedOutputTokens: 20,
+		OrganizationLimits: admission.RateLimits{GeneratedTokens: 20, TotalPromptTokens: 7, UncachedPromptTokens: 7}})
 	if err != nil {
-		t.Fatalf("dial failure left a phantom charge in the contract windows: %v", err)
+		t.Fatalf("dial failure left a phantom prompt/generated charge: %v", err)
 	}
 	_ = lease.Complete(context.Background(), 0)
 }
