@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"strconv"
 	"sync/atomic"
+	"time"
 
 	"github.com/saturncloud/phoebe/internal/admission"
 	"github.com/saturncloud/phoebe/internal/config"
@@ -23,14 +24,48 @@ import (
 // the number of suppressed occurrences appended.
 const admissionErrorLogEvery = 100
 
+// admissionErrorLogQuietGap is the silence after which sampledErrorLog treats
+// the next occurrence as a NEW incident's onset — logging it — instead of
+// continuing the previous incident's 1-in-N cadence. Without the reset, a
+// second incident's onset stays suppressed until the counter reaches the next
+// 1-mod-100 boundary, and a short second incident can leave zero ERROR lines.
+const admissionErrorLogQuietGap = time.Minute
+
 // sampledErrorLog aggregates one recurring per-request error log site so a
 // sustained failure is visible at onset without flooding every request.
 type sampledErrorLog struct {
 	n          atomic.Int64
 	suppressed atomic.Int64
+	// lastUnixNano is the wall clock of the previous call, used to detect a
+	// quiet gap between two incidents.
+	lastUnixNano atomic.Int64
+
+	// now and quietGap exist so a test can simulate the passage of time; the
+	// zero values select the production defaults (time.Now, 1 minute).
+	now      func() time.Time
+	quietGap time.Duration
+}
+
+func (l *sampledErrorLog) quietGapNanos() int64 {
+	if l.quietGap > 0 {
+		return l.quietGap.Nanoseconds()
+	}
+	return admissionErrorLogQuietGap.Nanoseconds()
 }
 
 func (l *sampledErrorLog) logf(log *logging.Logger, format string, args ...interface{}) {
+	now := time.Now()
+	if l.now != nil {
+		now = l.now()
+	}
+	unixNano := now.UnixNano()
+	if last := l.lastUnixNano.Load(); last != 0 && unixNano-last > l.quietGapNanos() {
+		// Best-effort: two concurrent resets can lose one increment or
+		// under-report the suppressed count by one — never an extra flood.
+		l.n.Store(0)
+		l.suppressed.Store(0)
+	}
+	l.lastUnixNano.Store(unixNano)
 	n := l.n.Add(1)
 	if n > 1 && n%admissionErrorLogEvery != 0 {
 		l.suppressed.Add(1)

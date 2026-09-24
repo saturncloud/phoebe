@@ -1988,3 +1988,49 @@ func TestWakeColdHoldStoreOutageLogsSampled(t *testing.T) {
 		t.Fatalf("each site's 100th occurrence must report 98 suppressed, got %d such lines: %q", got, lines)
 	}
 }
+
+// A second incident after a quiet gap must log its own onset: sampledErrorLog
+// resets its counter when no occurrence has been seen for over a minute, so
+// the 1st + every-100th cadence applies within an incident, not across
+// incidents. A sub-gap pause does not reset anything.
+func TestSampledErrorLogQuietGapReset(t *testing.T) {
+	var buf bytes.Buffer
+	logger := &logging.Logger{Error: log.New(&buf, "", 0)}
+	var site sampledErrorLog
+	base := time.Unix(1_700_000_000, 0)
+	now := base
+	site.now = func() time.Time { return now }
+
+	// Incident one: 3 occurrences, only the onset logs.
+	for i := 0; i < 3; i++ {
+		site.logf(logger, "incident-one occurrence %d", i)
+	}
+	// Over a minute of silence, then a short second incident: its onset must
+	// log even though the previous incident's counter (n=3) would suppress it.
+	now = base.Add(2 * time.Minute)
+	site.logf(logger, "incident-two onset")
+	// The cadence still applies within the second incident: 98 suppressed
+	// occurrences, then the 100th logs with its suppressed count.
+	for i := 0; i < 99; i++ {
+		now = now.Add(time.Millisecond)
+		site.logf(logger, "incident-two occurrence %d", i)
+	}
+	// A sub-gap pause is NOT a new incident: the next occurrence is still
+	// cadence-suppressed.
+	now = now.Add(30 * time.Second)
+	site.logf(logger, "incident-two still going")
+
+	lines := strings.Split(strings.TrimSpace(buf.String()), "\n")
+	if len(lines) != 3 {
+		t.Fatalf("logged %d lines, want 3 (incident-one onset, incident-two onset, incident-two 100th): %q", len(lines), lines)
+	}
+	if !strings.Contains(lines[0], "incident-one occurrence 0") {
+		t.Fatalf("line 0 must be incident one's onset: %q", lines[0])
+	}
+	if !strings.Contains(lines[1], "incident-two onset") || strings.Contains(lines[1], "suppressed") {
+		t.Fatalf("line 1 must be incident two's onset, logged plainly: %q", lines[1])
+	}
+	if !strings.Contains(lines[2], "+98 similar suppressed") {
+		t.Fatalf("line 2 must be incident two's 100th occurrence with 98 suppressed: %q", lines[2])
+	}
+}
