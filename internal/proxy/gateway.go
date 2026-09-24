@@ -147,8 +147,13 @@ func (s *Server) resolveGateway(w http.ResponseWriter, r *http.Request, id *iden
 	id.ServingMode = res.ServingMode
 	// The resolved model is definitionally the single model this request is
 	// bound to — recorded on the identity both as documentation-of-binding and
-	// because wake eligibility (isWakeable) keys on ResourceID+ServedModel:
-	// "resolution succeeded" is exactly what makes a gateway route wakeable.
+	// because wake eligibility (isWakeable) keys on
+	// ServingMode+ResourceID+ServedModel. Resolution alone is NOT sufficient:
+	// a dedicated row resolves and is deliberately not wakeable (dedicated
+	// capacity never scales to zero through this path). The registry parser
+	// rejects a row whose serving_mode is blank or unrecognized
+	// (gateway.parseRegistryConfigMap), so ServingMode here is always exactly
+	// "shared" or "dedicated" and the shared case is never silently lost.
 	id.ServedModel = model
 	// The graph name rides the identity to the wake target verbatim, so a wake
 	// on this route actuates exactly the resolved graph — never a re-parse of
