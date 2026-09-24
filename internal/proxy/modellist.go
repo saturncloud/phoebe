@@ -39,7 +39,7 @@ func filterModelListResponse(resp *http.Response, servedModelAllowList string) e
 		body := []byte(`{"error":"model discovery unavailable"}`)
 		resp.Body = io.NopCloser(bytes.NewReader(body))
 		resp.ContentLength = int64(len(body))
-		resp.Header = make(http.Header)
+		resetGraphWideHeaders(resp)
 		resp.Header.Set("Content-Type", "application/json")
 		resp.Header.Set("Content-Length", fmt.Sprintf("%d", len(body)))
 		resp.Trailer = nil
@@ -91,9 +91,19 @@ func filterModelListResponse(resp *http.Response, servedModelAllowList string) e
 
 	filtered := make([]safeModelListing, 0, len(models))
 	for _, raw := range models {
+		// Split the two failure cases: countTopLevelJSONKey reports a
+		// duplicate/absent "id" through the COUNT with a nil error, so a
+		// combined `%w` on err would format a nil error as "%!w(<nil>)" —
+		// garbage in the operator's only diagnostic for exactly the
+		// duplicate-key smuggling attempt this guard exists to catch, and an
+		// error that errors.Is/As cannot inspect. Both branches still reject
+		// the whole response: fail-closed behaviour is unchanged.
 		count, err := countTopLevelJSONKey(raw, "id")
-		if err != nil || count != 1 {
-			return fmt.Errorf("decode model-list entry: id count=%d: %w", count, err)
+		if err != nil {
+			return fmt.Errorf("decode model-list entry: %w", err)
+		}
+		if count != 1 {
+			return fmt.Errorf("decode model-list entry: expected exactly one top-level \"id\" key, got %d", count)
 		}
 		var model safeModelListing
 		if err := json.Unmarshal(raw, &model); err != nil {
@@ -110,45 +120,98 @@ func filterModelListResponse(resp *http.Response, servedModelAllowList string) e
 
 	resp.Body = io.NopCloser(bytes.NewReader(encoded))
 	resp.ContentLength = int64(len(encoded))
-	resp.Header = make(http.Header)
+	resetGraphWideHeaders(resp)
 	resp.Header.Set("Content-Type", "application/json")
 	resp.Header.Set("Content-Length", fmt.Sprintf("%d", len(encoded)))
 	resp.Trailer = nil
 	return nil
 }
 
+// carryHeaders are the response headers a CLIENT CONTRACT depends on, carried
+// across a rebuilt body. Everything else upstream sent is dropped: the body
+// phoebe returns is not the upstream representation, so representation
+// metadata (ETag, Content-Encoding, Content-Length) would be a lie, and
+// graph-wide extension headers (X-*) are exactly the sibling disclosure these
+// filters exist to close. CORS is carried because phoebe emits none of its own
+// (grep Access-Control across internal/ — nothing), so wiping it turns a
+// working browser GET /v1/models into an opaque CORS failure while the POST on
+// the same origin keeps working. Retry-After is carried so a 503 keeps its
+// backoff guidance.
+var carryHeaders = []string{
+	"Access-Control-Allow-Origin",
+	"Access-Control-Allow-Credentials",
+	"Access-Control-Expose-Headers",
+	"Access-Control-Max-Age",
+	"Cache-Control",
+	"Vary",
+	"Retry-After",
+}
+
+// resetGraphWideHeaders replaces resp.Header with a fresh header set carrying
+// only carryHeaders. Callers then Set their own Content-Type/Content-Length,
+// which overwrite any carried value.
+func resetGraphWideHeaders(resp *http.Response) {
+	rebuilt := make(http.Header, len(carryHeaders))
+	for _, k := range carryHeaders {
+		if vs := resp.Header.Values(k); len(vs) > 0 {
+			rebuilt[http.CanonicalHeaderKey(k)] = append([]string(nil), vs...)
+		}
+	}
+	resp.Header = rebuilt
+}
+
 // sanitizeModelListHeadResponse preserves the upstream status while removing
 // graph-wide representation metadata (length, ETag, and extensions). HEAD has
 // no body to filter, and the request-id header is added after this step.
 func sanitizeModelListHeadResponse(resp *http.Response) {
-	resp.Header = make(http.Header)
+	resetGraphWideHeaders(resp)
 	resp.ContentLength = -1
 	resp.Trailer = nil
 }
 
+// sanitizeReadinessResponse replaces a bound endpoint's /health or /live
+// response with a status-only document.
+//
+// Dynamo's frontend readiness is GRAPH-WIDE: it enumerates the registered
+// component/worker/model instances of the whole graph, and one graph fronts a
+// base model plus every attached adapter — i.e. sibling tenants. A deployment-
+// scoped subdomain must not disclose those, which is the same invariant
+// filterModelListResponse enforces for /v1/models; leaving /health open would
+// re-open through a second route exactly what the model-list filter closes.
+// Liveness itself stays truthful: the upstream status code is preserved, only
+// the payload is reduced to its status class.
+func sanitizeReadinessResponse(resp *http.Response, head bool) error {
+	if err := resp.Body.Close(); err != nil {
+		return fmt.Errorf("close readiness response: %w", err)
+	}
+	resetGraphWideHeaders(resp)
+	resp.Trailer = nil
+	if head {
+		resp.Body = io.NopCloser(bytes.NewReader(nil))
+		resp.ContentLength = -1
+		resp.Header.Set("Content-Type", "application/json")
+		return nil
+	}
+	body := []byte(`{"status":"unavailable"}`)
+	if resp.StatusCode >= http.StatusOK && resp.StatusCode < http.StatusMultipleChoices {
+		body = []byte(`{"status":"ok"}`)
+	}
+	resp.Body = io.NopCloser(bytes.NewReader(body))
+	resp.ContentLength = int64(len(body))
+	resp.Header.Set("Content-Type", "application/json")
+	resp.Header.Set("Content-Length", fmt.Sprintf("%d", len(body)))
+	return nil
+}
+
+// countTopLevelJSONKey counts a single top-level key, reusing the ONE streaming
+// duplicate-key parser in the package (modelbind.go's countTopLevelKeys). This
+// guard is security-relevant — Phoebe must never validate one duplicate while
+// Dynamo consumes another — so a second implementation would mean the tested
+// copy and the used copy can drift apart.
 func countTopLevelJSONKey(body []byte, key string) (int, error) {
-	dec := json.NewDecoder(bytes.NewReader(body))
-	tok, err := dec.Token()
+	counts, err := countTopLevelKeys(body, map[string]struct{}{key: {}})
 	if err != nil {
 		return 0, err
 	}
-	if delim, ok := tok.(json.Delim); !ok || delim != '{' {
-		return 0, fmt.Errorf("not a JSON object")
-	}
-	count := 0
-	for dec.More() {
-		name, err := dec.Token()
-		if err != nil {
-			return 0, err
-		}
-		if name == key {
-			count++
-		}
-		var value json.RawMessage
-		if err := dec.Decode(&value); err != nil {
-			return 0, err
-		}
-	}
-	_, err = dec.Token()
-	return count, err
+	return counts[key], nil
 }
