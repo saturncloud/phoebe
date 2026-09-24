@@ -20,9 +20,14 @@ import (
 type settlementKind int
 
 const (
+	// settlementUnset is the zero value: it names no settlement path, so an
+	// uninitialized kind lands in settleAdmissionLease's default branch and
+	// fails closed instead of silently inheriting a real settlement's lease
+	// calls. The real kinds start at 1.
+	settlementUnset settlementKind = iota
 	// settlementActual: the engine's usage block was captured — settle with the
 	// engine-authoritative token counts.
-	settlementActual settlementKind = iota
+	settlementActual
 	// settlementUnknown: the request was dispatched but its usage is
 	// indeterminate (engine 4xx/5xx with no usage block, client abort, mid-
 	// stream fault). Retain the conservative reservation — consumed engine
@@ -104,8 +109,8 @@ func settleAdmissionLease(ctx context.Context, lease *admission.Lease, kind sett
 	case settlementZeroPreWriteDial, settlementZeroNeverServed:
 		return lease.Complete(ctx, 0)
 	default:
-		// Unreachable while the enum stays closed; fail conservative rather
-		// than silently dropping a reservation.
+		// settlementUnset (the zero value) and anything outside the closed set
+		// fail conservative here rather than silently dropping a reservation.
 		return fmt.Errorf("unhandled settlement kind %d", int(kind))
 	}
 }

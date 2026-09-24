@@ -103,6 +103,35 @@ func TestClassifyCaptureSettlement(t *testing.T) {
 	}
 }
 
+// TestSettleAdmissionLeaseRejectsUnsetKind pins the enum guard: the zero-value
+// kind names no settlement path, so settleAdmissionLease must fail closed at
+// the switch's default branch rather than take a real settlement's lease
+// calls. Callers always classify first, so this is a guard against the most
+// common Go enum mistake (an uninitialized settlementKind), not a live path.
+func TestSettleAdmissionLeaseRejectsUnsetKind(t *testing.T) {
+	mr := miniredis.RunT(t)
+	cfg := proxyAdmissionConfig(1)
+	c := redis.NewClient(&redis.Options{Addr: mr.Addr()})
+	t.Cleanup(func() { _ = c.Close() })
+	lease, err := admission.New(c, cfg).Admit(context.Background(), admission.Request{
+		Graph: "graph", Organization: "org-a", Model: "m",
+		PromptBytes: 1, EstimatedInputTokens: 1, ReservedOutputTokens: 1,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	err = settleAdmissionLease(context.Background(), lease, settlementUnset, admission.Usage{})
+	if err == nil {
+		t.Fatal("settleAdmissionLease with the zero-value kind must error, not settle")
+	}
+	if !strings.Contains(err.Error(), "unhandled settlement kind") {
+		t.Fatalf("settleAdmissionLease error = %v, want the default branch's fail-closed message", err)
+	}
+	if err := lease.Complete(context.Background(), 0); err != nil {
+		t.Fatalf("lease left unsettled-but-invalid by the rejected zero kind: %v", err)
+	}
+}
+
 // TestWakeRoundTripperMarksColdFinal pins the plumbing: the round tripper flags
 // the response as final-cold exactly when it gives up and serves the engine's
 // cold response (wake budget exhausted OR waker failed), and never for a warm
