@@ -128,47 +128,44 @@ func extractRequestModel(body []byte) (string, bool) {
 // keys, e.g. inside an array element, are not counted). Returns an error if the
 // body is not a JSON object.
 func countTopLevelModelKeys(body []byte) (int, error) {
+	counts, err := countTopLevelKeys(body, map[string]struct{}{"model": {}})
+	return counts["model"], err
+}
+
+// countTopLevelKeys rejects ambiguity in fields whose interpretation affects
+// authorization or capacity. Downstream JSON stacks do not universally agree
+// on first-vs-last duplicate-key handling, so Phoebe must never validate or
+// reserve against one value while Dynamo/vLLM consumes another.
+func countTopLevelKeys(body []byte, wanted map[string]struct{}) (map[string]int, error) {
 	dec := json.NewDecoder(bytes.NewReader(body))
 	tok, err := dec.Token()
 	if err != nil {
-		return 0, err
+		return nil, err
 	}
 	if d, ok := tok.(json.Delim); !ok || d != '{' {
-		return 0, errNotObject
+		return nil, errNotObject
 	}
-	count := 0
-	depth := 0 // depth WITHIN the top-level object's values
-	for dec.More() || depth > 0 {
+	counts := make(map[string]int, len(wanted))
+	for dec.More() {
 		tok, err := dec.Token()
 		if err != nil {
-			return 0, err
+			return nil, err
 		}
-		switch t := tok.(type) {
-		case json.Delim:
-			switch t {
-			case '{', '[':
-				depth++
-			case '}', ']':
-				if depth == 0 {
-					// closing the top-level object
-					return count, nil
-				}
-				depth--
-			}
-		case string:
-			// A string token at depth 0 in the key position is a top-level key.
-			if depth == 0 {
-				if t == "model" {
-					count++
-				}
-				// consume this key's value (a token or a nested structure).
-				if err := skipValue(dec); err != nil {
-					return 0, err
-				}
-			}
+		key, ok := tok.(string)
+		if !ok {
+			return nil, errNotObject
+		}
+		if _, ok := wanted[key]; ok {
+			counts[key]++
+		}
+		if err := skipValue(dec); err != nil {
+			return nil, err
 		}
 	}
-	return count, nil
+	if _, err := dec.Token(); err != nil { // closing top-level object
+		return nil, err
+	}
+	return counts, nil
 }
 
 // skipValue consumes exactly one JSON value from the decoder (scalar, object, or

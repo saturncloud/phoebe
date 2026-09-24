@@ -12,6 +12,7 @@ import (
 	_ "github.com/jackc/pgx/v5/stdlib"
 	"github.com/redis/go-redis/v9"
 
+	"github.com/saturncloud/phoebe/internal/admission"
 	"github.com/saturncloud/phoebe/internal/config"
 	"github.com/saturncloud/phoebe/internal/emit"
 	"github.com/saturncloud/phoebe/internal/gateway"
@@ -44,13 +45,17 @@ func main() {
 	ioPolicy, ioSink, ioMaxBody, closeIOLog := buildIOLog(settings, log)
 
 	srv := proxy.NewWithIOLog(settings, log, emitter, ioPolicy, ioSink, ioMaxBody)
+	admitter, closeAdmission := buildAdmission(settings, log)
+	if admitter != nil {
+		srv = srv.WithAdmitter(admitter)
+	}
 	if gwResolver != nil {
 		srv = srv.WithGateway(gwResolver, settings.Gateway.Namespace, settings.Gateway.Port)
 	}
 	if w := buildWaker(settings, log); w != nil {
 		// Timeout 0 = the proxy default (300s — sized above vLLM's measured
-		// ~2.5min cold reload).
-		srv = srv.WithWaker(w, settings.Wake.Timeout)
+		// ~2.5min cold reload); tries 0 = the proxy default (3).
+		srv = srv.WithWaker(w, settings.Wake.Timeout, 0)
 	}
 	srvErr := srv.Run()
 
@@ -61,11 +66,28 @@ func main() {
 	closeIOLog()
 	closeEmitter()
 	closeGateway()
+	closeAdmission()
 
 	if srvErr != nil {
 		log.Error.Printf("server error: %v", srvErr)
 		os.Exit(1)
 	}
+}
+
+func buildAdmission(s *config.Settings, log *logging.Logger) (admission.Admitter, func()) {
+	if !s.Admission.Enabled {
+		return nil, func() {}
+	}
+	client := redis.NewClient(&redis.Options{Addr: s.Admission.ValkeyAddr})
+	// Startup reachability is checked, and every request operation still fails
+	// closed if state disappears later.
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if err := client.Ping(ctx).Err(); err != nil {
+		log.Error.Fatalf("admission: Valkey unavailable at %s: %v", s.Admission.ValkeyAddr, err)
+	}
+	log.Info.Printf("admission: enabled (valkey %s, lease ttl %s)", s.Admission.ValkeyAddr, s.Admission.LeaseTTL)
+	return admission.New(client, s.Admission), func() { _ = client.Close() }
 }
 
 // buildGateway constructs the TF gateway (org, model) resolver. DEFAULT: the
@@ -138,9 +160,9 @@ func buildLegacyPGGateway(s *config.Settings, log *logging.Logger) (gateway.Reso
 // in the MAIN phoebe container — no separate waker pod; see
 // deploy/rbac-waker.yaml for the RBAC it needs). Returns nil when wake is
 // disabled (the default) OR when the kubernetes config is unavailable: the
-// proxy then runs with wake off — requests forward directly — because a broken
-// wake path must degrade the cold-start UX, never crash or block the proxy
-// (which also serves warm traffic).
+// proxy then runs with wake off — cold responses pass through exactly as
+// before — because a broken wake path must degrade the cold-start UX, never
+// crash or block the proxy (which also serves warm traffic).
 func buildWaker(s *config.Settings, log *logging.Logger) proxy.Waker {
 	if !s.Wake.Enabled {
 		return nil
@@ -150,7 +172,7 @@ func buildWaker(s *config.Settings, log *logging.Logger) proxy.Waker {
 		Kubeconfig: s.Wake.Kubeconfig,
 	}, log)
 	if err != nil {
-		log.Error.Printf("wake: kubernetes client unavailable (%v); wake-from-zero DISABLED — requests forward directly", err)
+		log.Error.Printf("wake: kubernetes client unavailable (%v); wake-from-zero DISABLED — cold responses pass through", err)
 		return nil
 	}
 	log.Info.Printf("wake: enabled (DGDSA namespace=%s)", s.Gateway.Namespace)

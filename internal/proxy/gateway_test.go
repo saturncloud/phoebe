@@ -53,10 +53,10 @@ func newGatewayTestServer(t *testing.T, em *recordingEmitter, resolver gateway.R
 	return s
 }
 
-// gatewayRequest builds a gateway-marked request: the trusted middleware
-// markers (X-Saturn-Gateway, X-Saturn-Org-Id) plus the auth id every billed
-// request carries — and NONE of the per-resource routing headers, exactly as
-// the gateway route contract specifies.
+// gatewayRequest builds a gateway-marked request with the complete trusted
+// identity and admission-policy contract. Zero rate limits mean unlimited.
+// It carries none of the per-resource routing headers, exactly as the gateway
+// route contract specifies.
 func gatewayRequest(org, body string) *http.Request {
 	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(body))
 	req.Header.Set(identity.HeaderGateway, "true")
@@ -64,6 +64,11 @@ func gatewayRequest(org, body string) *http.Request {
 		req.Header.Set(identity.HeaderOrgID, org)
 	}
 	req.Header.Set(identity.HeaderAuthID, "auth-1")
+	req.Header.Set(identity.HeaderServiceTier, "default")
+	req.Header.Set(identity.HeaderRateLimitRequests, "0")
+	req.Header.Set(identity.HeaderRateLimitTotalPromptTokens, "0")
+	req.Header.Set(identity.HeaderRateLimitUncachedPromptTokens, "0")
+	req.Header.Set(identity.HeaderRateLimitGeneratedTokens, "0")
 	return req
 }
 
@@ -388,8 +393,13 @@ func TestGateway_UpstreamHostShape(t *testing.T) {
 // resolution succeeded IS the wakeability signal (ResourceID + ServedModel are
 // populated by resolveGateway) — so a cold (scaled-to-zero) upstream triggers
 // the waker and the request is served after warm-up rather than 404ing.
+//
+// The assertion that matters is the LAST one: the graph name resolved from
+// tf_model must reach the wake target VERBATIM, never re-derived by parsing the
+// upstream host the gateway itself composed from that same name. Re-deriving
+// would work by coincidence today and break the moment the host format changes.
 func TestGateway_WakeEligible(t *testing.T) {
-	backend := &inferenceBackend{}
+	backend := &coldToWarmBackend{}
 	be := httptest.NewServer(backend)
 	defer be.Close()
 	beURL, _ := url.Parse(be.URL)
@@ -402,12 +412,11 @@ func TestGateway_WakeEligible(t *testing.T) {
 			GraphK8sName: "graph-llama31",
 		},
 	}}
-	waker := &fakeWaker{wake: func(context.Context, WakeTarget) error {
-		backend.warm.Store(true)
-		return nil
-	}}
+	// warmsAt: 1 — the backend goes warm after the first wake, so serveWithWake's
+	// re-probe succeeds and the caller performs the real metered forward.
+	waker := &fakeWaker{backend: backend, warmsAt: 1}
 	em := &recordingEmitter{}
-	srv := newGatewayTestServer(t, em, resolver, beURL).WithWaker(waker, 5*time.Second)
+	srv := newGatewayTestServer(t, em, resolver, beURL).WithWaker(waker, 5*time.Second, 0)
 
 	rr := httptest.NewRecorder()
 	srv.Handler().ServeHTTP(rr, gatewayRequest("org-1", `{"model":"sleepy-bot"}`))
@@ -420,7 +429,7 @@ func TestGateway_WakeEligible(t *testing.T) {
 	}
 	// The RESOLVED graph name is threaded onto the wake target verbatim —
 	// never re-derived from the upstream host the gateway composed from it.
-	if tgt := waker.last(); tgt.GraphK8sName != "graph-llama31" || tgt.ResourceID != "tfm-cold-1" || tgt.ServedModel != "sleepy-bot" {
+	if tgt := waker.last(); tgt.GraphK8sName != "graph-llama31" || tgt.ResourceID != "tfm-cold-1" {
 		t.Fatalf("wake target = %+v, want the resolved graph/resource", tgt)
 	}
 }

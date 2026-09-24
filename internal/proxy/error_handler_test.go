@@ -67,7 +67,7 @@ func TestErrorHandlerClassifiesWrappedCancel(t *testing.T) {
 	// cancel must NOT 502 over the already-dead connection. (The abort's
 	// zero-token abort emit is covered by the
 	// dedicated TestPreHeaderAbort* tests, not re-asserted here.)
-	h := srv.errorHandler(upstream.String(), id, "req-1", "logical-1")
+	h := srv.errorHandler(upstream.String(), id, "req-1", "logical-1", nil)
 	rr := httptest.NewRecorder()
 	h(rr, httptest.NewRequest(http.MethodPost, "/v1/chat/completions", nil),
 		&url.Error{Op: "Post", URL: upstream.String(), Err: context.Canceled})
@@ -98,7 +98,7 @@ func TestErrorHandlerUpstreamFaultStill502(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			emTC := &recordingEmitter{}
 			srvTC := newTestServerE(t, upstream, emTC)
-			h := srvTC.errorHandler(upstream.String(), id, "req-1", "logical-1")
+			h := srvTC.errorHandler(upstream.String(), id, "req-1", "logical-1", nil)
 			rr := httptest.NewRecorder()
 			h(rr, httptest.NewRequest(http.MethodPost, "/v1/chat/completions", nil), tc.err)
 

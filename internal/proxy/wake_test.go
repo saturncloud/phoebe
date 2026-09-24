@@ -2,9 +2,9 @@ package proxy
 
 import (
 	"context"
-	"errors"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -15,6 +15,31 @@ import (
 	"github.com/saturncloud/phoebe/internal/identity"
 	"github.com/saturncloud/phoebe/internal/logging"
 )
+
+func TestIsColdWakeable(t *testing.T) {
+	cases := []struct {
+		name   string
+		status int
+		body   string
+		want   bool
+	}{
+		{"404 model not found -> cold", 404, `{"message":"Model not found"}`, true},
+		{"503 not-ready marker -> cold", 503, `Model X is not ready to serve requests yet. Retry.`, true},
+		{"503 generic overload -> NOT cold", 503, `{"error":"server overloaded"}`, false},
+		{"200 -> not cold", 200, `{"ok":true}`, false},
+		{"500 -> not cold", 500, `boom`, false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			b := newBufferingResponseWriter()
+			b.WriteHeader(tc.status)
+			_, _ = b.Write([]byte(tc.body))
+			if b.isColdWakeable() != tc.want {
+				t.Fatalf("isColdWakeable(status=%d)=%v want %v", tc.status, b.isColdWakeable(), tc.want)
+			}
+		})
+	}
+}
 
 // TestGraphFromUpstreamHost pins the header-routed graph derivation: first DNS
 // label, `-frontend` Service suffix stripped, port ignored; a label without
@@ -46,23 +71,27 @@ func TestIsWakeable(t *testing.T) {
 }
 
 type fakeWaker struct {
-	calls int32
-	err   error
-	wake  func(context.Context, WakeTarget) error
+	calls   int32
+	err     error
+	warmsAt int32 // after this many wake calls, the upstream goes warm
+	backend *coldToWarmBackend
 
 	mu         sync.Mutex
 	lastTarget WakeTarget
 }
 
-func (f *fakeWaker) Wake(ctx context.Context, target WakeTarget) error {
-	atomic.AddInt32(&f.calls, 1)
+func (f *fakeWaker) Wake(_ context.Context, target WakeTarget) error {
+	n := atomic.AddInt32(&f.calls, 1)
 	f.mu.Lock()
 	f.lastTarget = target
 	f.mu.Unlock()
-	if f.wake != nil {
-		return f.wake(ctx, target)
+	if f.err != nil {
+		return f.err
 	}
-	return f.err
+	if f.backend != nil && n >= f.warmsAt {
+		f.backend.warm.Store(true)
+	}
+	return nil
 }
 
 func (f *fakeWaker) last() WakeTarget {
@@ -71,237 +100,79 @@ func (f *fakeWaker) last() WakeTarget {
 	return f.lastTarget
 }
 
-// inferenceBackend counts only customer inference executions. Readiness is the
-// waker's responsibility and therefore never reaches this POST handler.
-type inferenceBackend struct {
-	calls int32
-	warm  atomic.Bool
-}
+// coldToWarmBackend serves cold (404) until warm is set, then 200.
+type coldToWarmBackend struct{ warm atomic.Bool }
 
-func (b *inferenceBackend) ServeHTTP(w http.ResponseWriter, r *http.Request) {
-	atomic.AddInt32(&b.calls, 1)
-	if r.Method != http.MethodPost {
-		http.Error(w, "unexpected method", http.StatusMethodNotAllowed)
+func (c *coldToWarmBackend) ServeHTTP(w http.ResponseWriter, _ *http.Request) {
+	if c.warm.Load() {
+		w.WriteHeader(200)
+		_, _ = w.Write([]byte(`{"served":true}`))
 		return
 	}
-	if !b.warm.Load() {
-		w.WriteHeader(http.StatusNotFound)
-		_, _ = w.Write([]byte(`{"message":"Model not found"}`))
-		return
-	}
-	_, _ = w.Write([]byte(`{"model":"m","choices":[{"finish_reason":"stop"}],"usage":{"prompt_tokens":7,"completion_tokens":3,"total_tokens":10}}`))
+	w.WriteHeader(404)
+	_, _ = w.Write([]byte(`{"message":"Model not found"}`))
 }
 
 // TestWithWakerDefaults pins the default wake budget: 300s — deliberately
-// above vLLM's measured ~2.5min cold reload.
+// ABOVE vLLM's measured ~2.5min cold reload (a smaller default made every real
+// wake time out and serve the cold response after holding the client anyway).
 func TestWithWakerDefaults(t *testing.T) {
-	s := New(&config.Settings{}, logging.New(logging.ERROR), nil).WithWaker(&fakeWaker{}, 0)
+	s := New(&config.Settings{}, logging.New(logging.ERROR), nil).WithWaker(&fakeWaker{}, 0, 0)
 	if s.wakeTimeout != 300*time.Second {
-		t.Fatalf("default wakeTimeout = %v, want 300s", s.wakeTimeout)
+		t.Fatalf("default wakeTimeout = %v, want 300s (must exceed the real cold start)", s.wakeTimeout)
+	}
+	if s.wakeMaxTries != 3 {
+		t.Fatalf("default wakeMaxTries = %d, want 3", s.wakeMaxTries)
 	}
 }
 
-func wakeableRequest(backend *httptest.Server) *http.Request {
-	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(`{"model":"m"}`))
-	req.Header.Set(identity.HeaderAuthID, "auth-1")
-	req.Header.Set(identity.HeaderResourceID, "r1")
-	req.Header.Set(identity.HeaderServedModel, "m")
-	req.Header.Set(identity.HeaderUpstream, strings.TrimPrefix(backend.URL, "http://"))
-	req.Header.Set(requestIDHeader, "client-request")
-	return req
+func testServerWithWaker(waker Waker) *Server {
+	s := New(&config.Settings{}, logging.New(logging.ERROR), nil)
+	return s.WithWaker(waker, 5*time.Second, 3)
 }
 
-func TestWakeThenSingleMeteredInference(t *testing.T) {
-	backendHandler := &inferenceBackend{}
-	backend := httptest.NewServer(backendHandler)
-	defer backend.Close()
-	em := &recordingEmitter{}
-	waker := &fakeWaker{wake: func(context.Context, WakeTarget) error {
-		backendHandler.warm.Store(true)
-		return nil
-	}}
-	s := New(&config.Settings{}, logging.New(logging.ERROR), em).WithWaker(waker, time.Second)
+func TestServeWithWake_ColdThenWarm(t *testing.T) {
+	backend := &coldToWarmBackend{}
+	be := httptest.NewServer(backend)
+	defer be.Close()
+	up, _ := url.Parse(be.URL)
 
-	rr := httptest.NewRecorder()
-	s.Handler().ServeHTTP(rr, wakeableRequest(backend))
+	waker := &fakeWaker{warmsAt: 1, backend: backend}
+	s := testServerWithWaker(waker)
 
-	if rr.Code != http.StatusOK {
-		t.Fatalf("status = %d, want 200 (body %q)", rr.Code, rr.Body.String())
-	}
-	if got := atomic.LoadInt32(&backendHandler.calls); got != 1 {
-		t.Fatalf("inference POST executions = %d, want exactly 1", got)
+	req := httptest.NewRequest("POST", "http://x/v1/chat/completions", strings.NewReader(`{"model":"m"}`))
+	id := identity.Identity{ResourceID: "r1", ServedModel: "m"}
+	rec := httptest.NewRecorder()
+
+	served := s.serveWithWake(rec, req, up, id, "req-1", nil)
+	// Cold-then-warm: serveWithWake wakes, sees warm on re-probe, returns false
+	// (caller does the real forward). Waker called exactly once.
+	if served {
+		t.Fatalf("expected served=false (warm -> caller forwards), got true")
 	}
 	if got := atomic.LoadInt32(&waker.calls); got != 1 {
-		t.Fatalf("waker calls = %d, want 1", got)
-	}
-	if target := waker.last(); target.ServedModel != "m" || target.ResourceID != "r1" {
-		t.Fatalf("wake target = %+v, want requested model and authorized resource", target)
-	}
-	events := em.waitForEvents(1, time.Second)
-	if len(events) != 1 || !events[0].UsageFound || events[0].PromptTokens != 7 {
-		t.Fatalf("events = %+v, want one usage-bearing event", events)
+		t.Fatalf("waker called %d times, want 1", got)
 	}
 }
 
-func TestWakeFailureFallsThroughToOneHonestMeteredResponse(t *testing.T) {
-	backendHandler := &inferenceBackend{} // remains cold
-	backend := httptest.NewServer(backendHandler)
-	defer backend.Close()
-	em := &recordingEmitter{}
-	waker := &fakeWaker{err: errors.New("cluster unavailable")}
-	s := New(&config.Settings{}, logging.New(logging.ERROR), em).WithWaker(waker, time.Second)
+func TestServeWithWake_WakeErrorReturnsCold(t *testing.T) {
+	backend := &coldToWarmBackend{} // stays cold
+	be := httptest.NewServer(backend)
+	defer be.Close()
+	up, _ := url.Parse(be.URL)
 
-	rr := httptest.NewRecorder()
-	s.Handler().ServeHTTP(rr, wakeableRequest(backend))
+	waker := &fakeWaker{err: context.DeadlineExceeded}
+	s := testServerWithWaker(waker)
 
-	if rr.Code != http.StatusNotFound || !strings.Contains(rr.Body.String(), "Model not found") {
-		t.Fatalf("response = %d %q, want honest upstream 404", rr.Code, rr.Body.String())
-	}
-	if got := atomic.LoadInt32(&backendHandler.calls); got != 1 {
-		t.Fatalf("inference POST executions = %d, want exactly 1", got)
-	}
-	events := em.waitForEvents(1, time.Second)
-	if len(events) != 1 || events[0].UsageFound || events[0].StatusCode != http.StatusNotFound {
-		t.Fatalf("events = %+v, want one zero-charge 404 attempt", events)
-	}
-}
+	req := httptest.NewRequest("POST", "http://x/v1/chat/completions", strings.NewReader(`{"model":"m"}`))
+	id := identity.Identity{ResourceID: "r1", ServedModel: "m"}
+	rec := httptest.NewRecorder()
 
-func TestClientDisconnectWhileWakingNeverExecutesInference(t *testing.T) {
-	backendHandler := &inferenceBackend{}
-	backend := httptest.NewServer(backendHandler)
-	defer backend.Close()
-	started := make(chan struct{})
-	waker := &fakeWaker{wake: func(ctx context.Context, _ WakeTarget) error {
-		close(started)
-		<-ctx.Done()
-		return ctx.Err()
-	}}
-	em := &recordingEmitter{}
-	s := New(&config.Settings{}, logging.New(logging.ERROR), em).WithWaker(waker, time.Second)
-	ctx, cancel := context.WithCancel(context.Background())
-	req := wakeableRequest(backend).WithContext(ctx)
-	done := make(chan struct{})
-	go func() {
-		s.Handler().ServeHTTP(httptest.NewRecorder(), req)
-		close(done)
-	}()
-	<-started
-	cancel()
-	select {
-	case <-done:
-	case <-time.After(time.Second):
-		t.Fatal("handler did not return after client cancellation")
+	served := s.serveWithWake(rec, req, up, id, "req-1", nil)
+	if !served {
+		t.Fatal("wake error should serve the cold response (served=true)")
 	}
-	if got := atomic.LoadInt32(&backendHandler.calls); got != 0 {
-		t.Fatalf("inference POST executions = %d, want 0 after disconnect", got)
-	}
-	events := em.waitForEvents(1, time.Second)
-	if len(events) != 1 || !events[0].Aborted || events[0].UsageFound {
-		t.Fatalf("events = %+v, want one aborted zero-charge attempt", events)
-	}
-}
-
-// TestWakeUsesSelectedModelNotAllowList pins the wake-readiness contract for a
-// MULTI-MODEL shared route. atlas injects the whole comma-separated allow-list
-// as X-Saturn-Served-Model, but readiness polls GET /v1/models for an EXACT
-// match — a CSV string can never equal any single served-model entry, so waking
-// on the raw header could never observe readiness and would burn the full wake
-// budget before every cold request. The waker must receive the singular model
-// the request body selected, which the binding check already proved authorized.
-func TestWakeUsesSelectedModelNotAllowList(t *testing.T) {
-	backendHandler := &inferenceBackend{}
-	backend := httptest.NewServer(backendHandler)
-	defer backend.Close()
-	em := &recordingEmitter{}
-	waker := &fakeWaker{wake: func(context.Context, WakeTarget) error {
-		backendHandler.warm.Store(true)
-		return nil
-	}}
-	s := New(&config.Settings{}, logging.New(logging.ERROR), em).WithWaker(waker, time.Second)
-
-	// Body selects model-b; the route authorizes both model-a and model-b.
-	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(`{"model":"model-b"}`))
-	req.Header.Set(identity.HeaderAuthID, "auth-1")
-	req.Header.Set(identity.HeaderResourceID, "r1")
-	req.Header.Set(identity.HeaderServedModel, "model-a,model-b")
-	req.Header.Set(identity.HeaderUpstream, strings.TrimPrefix(backend.URL, "http://"))
-	req.Header.Set(requestIDHeader, "client-request")
-
-	rr := httptest.NewRecorder()
-	s.Handler().ServeHTTP(rr, req)
-
-	if rr.Code != http.StatusOK {
-		t.Fatalf("status = %d, want 200 (body %q)", rr.Code, rr.Body.String())
-	}
-	if got := waker.last().ServedModel; got != "model-b" {
-		t.Fatalf("wake target ServedModel = %q, want the selected %q (never the allow-list)", got, "model-b")
-	}
-	if got := atomic.LoadInt32(&backendHandler.calls); got != 1 {
-		t.Fatalf("inference POST executions = %d, want exactly 1", got)
-	}
-}
-
-// TestWakeUsesSelectedModelFirstOfAllowList covers the other multi-model entry,
-// so a fix that accidentally hard-coded the last CSV element would still fail.
-func TestWakeUsesSelectedModelFirstOfAllowList(t *testing.T) {
-	backendHandler := &inferenceBackend{}
-	backend := httptest.NewServer(backendHandler)
-	defer backend.Close()
-	waker := &fakeWaker{wake: func(context.Context, WakeTarget) error {
-		backendHandler.warm.Store(true)
-		return nil
-	}}
-	s := New(&config.Settings{}, logging.New(logging.ERROR), &recordingEmitter{}).WithWaker(waker, time.Second)
-
-	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(`{"model":"model-a"}`))
-	req.Header.Set(identity.HeaderAuthID, "auth-1")
-	req.Header.Set(identity.HeaderResourceID, "r1")
-	req.Header.Set(identity.HeaderServedModel, "model-a,model-b")
-	req.Header.Set(identity.HeaderUpstream, strings.TrimPrefix(backend.URL, "http://"))
-	req.Header.Set(requestIDHeader, "client-request")
-
-	s.Handler().ServeHTTP(httptest.NewRecorder(), req)
-
-	if got := waker.last().ServedModel; got != "model-a" {
-		t.Fatalf("wake target ServedModel = %q, want the selected %q", got, "model-a")
-	}
-}
-
-// TestWakeSucceedsThenBackendColdReturnsHonestResponse pins the no-replay
-// contract for the race where readiness SUCCEEDS but the backend goes cold again
-// before the single inference POST (e.g. the graph scaled back to zero between
-// the /v1/models poll and the forward). The customer must receive that honest
-// cold response — never a retried or replayed inference — and it must be
-// metered exactly once as a zero-charge attempt.
-func TestWakeSucceedsThenBackendColdReturnsHonestResponse(t *testing.T) {
-	backendHandler := &inferenceBackend{} // stays cold: wake reports success anyway
-	backend := httptest.NewServer(backendHandler)
-	defer backend.Close()
-	em := &recordingEmitter{}
-	// Readiness succeeds (no error) but never warms the backend.
-	waker := &fakeWaker{}
-	s := New(&config.Settings{}, logging.New(logging.ERROR), em).WithWaker(waker, time.Second)
-
-	rr := httptest.NewRecorder()
-	s.Handler().ServeHTTP(rr, wakeableRequest(backend))
-
-	if got := atomic.LoadInt32(&waker.calls); got != 1 {
-		t.Fatalf("waker calls = %d, want 1 successful wake", got)
-	}
-	if rr.Code != http.StatusNotFound || !strings.Contains(rr.Body.String(), "Model not found") {
-		t.Fatalf("response = %d %q, want the honest cold upstream response", rr.Code, rr.Body.String())
-	}
-	if got := atomic.LoadInt32(&backendHandler.calls); got != 1 {
-		t.Fatalf("inference POST executions = %d, want exactly 1 (no replay)", got)
-	}
-	events := em.waitForEvents(1, time.Second)
-	if len(events) != 1 {
-		t.Fatalf("events = %d, want exactly 1 raw attempt", len(events))
-	}
-	if events[0].UsageFound || events[0].StatusCode != http.StatusNotFound {
-		t.Fatalf("event = %+v, want one zero-charge 404 attempt", events[0])
-	}
-	if events[0].PromptTokens != 0 || events[0].CompletionTokens != 0 {
-		t.Fatalf("event = %+v, want zero billable tokens", events[0])
+	if rec.Code != 404 {
+		t.Fatalf("expected the cold 404 flushed to client, got %d", rec.Code)
 	}
 }

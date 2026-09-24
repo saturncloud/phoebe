@@ -28,9 +28,11 @@ import (
 	"net/http"
 	"net/http/httputil"
 	"net/url"
+	"strconv"
 	"strings"
 	"time"
 
+	"github.com/saturncloud/phoebe/internal/admission"
 	"github.com/saturncloud/phoebe/internal/capture"
 	"github.com/saturncloud/phoebe/internal/config"
 	"github.com/saturncloud/phoebe/internal/identity"
@@ -91,17 +93,26 @@ type Server struct {
 	ioSink       iolog.Sink
 	ioMaxBodyLen int
 
-	// waker proactively prepares a shared base graph before the customer's one
-	// inference forward. nil (the default) = wake disabled. Set via WithWaker
-	// when shared serving is enabled.
-	waker       Waker
-	wakeTimeout time.Duration
+	// waker triggers a shared base graph's 0->1 scale-up on a cold response,
+	// for the shared serverless mode. nil (the default) = wake disabled: a cold
+	// response passes straight through to the client, exactly as before. Set via
+	// WithWaker when shared serving is enabled.
+	waker        Waker
+	wakeTimeout  time.Duration
+	wakeMaxTries int
 
 	// gateway wires the TF gateway resolution path ((org, body model=) →
 	// tf_model → identity + upstream). nil (the default) = gateway disabled:
 	// gateway-marked requests fail closed with 503. Set via WithGateway.
 	gateway *gatewayRoute
+
+	// admitter is the distributed shared-tier physical-capacity gate. nil means
+	// the feature is disabled. It runs only after trusted org/model resolution
+	// and model binding, and before any engine request.
+	admitter admission.Admitter
 }
+
+func (s *Server) WithAdmitter(a admission.Admitter) *Server { s.admitter = a; return s }
 
 // New constructs a Server from its dependencies. I/O logging is OFF: the policy
 // denies every request and the sink is a NopSink, so no bodies are buffered.
@@ -138,7 +149,7 @@ func NewWithIOLog(s *config.Settings, log *logging.Logger, emitter metering.Emit
 	return srv
 }
 
-// Default wake bound when a waker is wired without an explicit value.
+// Default wake bounds when a waker is wired without explicit values.
 const (
 	// defaultWakeTimeout is the per-wake ceiling the woken request is held for.
 	// 300s, sized to the MEASURED cold path: a vLLM worker's cold reload is
@@ -151,7 +162,8 @@ const (
 	// multi-minute holds, and the alternative (a budget shorter than the
 	// cold start) makes the wake feature a no-op. Still bounded; operators can
 	// tune per install via wake.timeout in the settings.
-	defaultWakeTimeout = 300 * time.Second
+	defaultWakeTimeout  = 300 * time.Second
+	defaultWakeMaxTries = 3 // probe -> wake -> re-probe attempts
 )
 
 // WithWaker enables shared-mode wake-from-zero. Before forwarding a wakeable
@@ -159,11 +171,15 @@ const (
 // appear in non-billable readiness discovery. It then forwards the customer's
 // inference request exactly once. A wake failure also falls through to that one
 // honest, metered forward. A timeout <= 0 uses the default.
-func (s *Server) WithWaker(waker Waker, timeout time.Duration) *Server {
+func (s *Server) WithWaker(waker Waker, timeout time.Duration, maxTries int) *Server {
 	s.waker = waker
 	s.wakeTimeout = timeout
 	if s.wakeTimeout <= 0 {
 		s.wakeTimeout = defaultWakeTimeout
+	}
+	s.wakeMaxTries = maxTries
+	if s.wakeMaxTries <= 0 {
+		s.wakeMaxTries = defaultWakeMaxTries
 	}
 	return s
 }
@@ -338,10 +354,11 @@ func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request) {
 	// THE ORG, so resolution IS the binding (id.ServedModel was set FROM the
 	// resolved request model; re-checking it against itself would be a
 	// tautology).
-	// selectedModel is the singular model this request actually asked for, as
-	// proven by the binding check. Wake readiness requires it: id.ServedModel
-	// may be a comma-separated allow-list, which no /v1/models entry can equal.
-	selectedModel := ""
+	// NOTE: the binding check's singular matched model is deliberately discarded.
+	// It existed so wake readiness could match /v1/models EXACTLY (id.ServedModel
+	// may be a comma-separated allow-list, which no /v1/models entry can equal).
+	// serveWithWake no longer polls /v1/models -- it probes for a cold response
+	// and retries -- so there is nothing left that needs the singular value.
 	if id.ServedModel != "" && !id.Gateway {
 		body, rerr := readAndRestoreBody(r)
 		if rerr != nil {
@@ -349,8 +366,9 @@ func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request) {
 			http.Error(w, "bad request body", http.StatusBadRequest)
 			return
 		}
-		result, bound := checkModelBinding(body, id.ServedModel)
-		selectedModel = bound
+		// The second return is the singular matched model; see the note above
+		// for why nothing consumes it any more.
+		result, _ := checkModelBinding(body, id.ServedModel)
 		switch result {
 		case bindingMismatch, bindingUnparseable:
 			// Fail closed: the request names a model this resource is not
@@ -362,6 +380,98 @@ func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request) {
 			http.Error(w, "requested model is not authorized for this endpoint", http.StatusForbidden)
 			return
 		case bindingOK:
+		}
+	}
+
+	// SHARED REQUEST POLICY + DISTRIBUTED ADMISSION. Trusted Dynamo hints and
+	// cache isolation are enforced for every shared request, even during an
+	// admission rollout with the distributed gate disabled; otherwise a client
+	// could self-promote precisely while the rollout switch is off. Dedicated
+	// endpoints own their engine and bypass both shared-pool mechanisms.
+	var admitted *admission.Lease
+	if id.ServingMode == "shared" {
+		rateLimits, rerr := parseTrustedRateLimits(id)
+		if rerr != nil {
+			s.log.Error.Printf("admission: invalid trusted rate-limit policy: %v", rerr)
+			http.Error(w, "shared inference policy unavailable", http.StatusServiceUnavailable)
+			return
+		}
+		body, rerr := readAndRestoreBody(r)
+		if rerr != nil {
+			http.Error(w, "bad request body", http.StatusBadRequest)
+			return
+		}
+		defaultOutput := s.settings.Admission.DefaultMaxOutputTokens
+		if defaultOutput <= 0 {
+			defaultOutput = 512
+		}
+		model, maxOutput, ok := admissionWork(body, defaultOutput)
+		if !ok {
+			http.Error(w, "invalid shared inference request", http.StatusBadRequest)
+			return
+		}
+		tierName := id.ServiceTier
+		if tierName == "" {
+			tierName = "default"
+		}
+		tier, ok := s.settings.Admission.Tiers[tierName]
+		if !ok {
+			tier = s.settings.Admission.Tiers["default"]
+		}
+		if tierName, mapped := s.settings.Admission.OrganizationTiers[id.OrgID]; mapped {
+			tier = s.settings.Admission.Tiers[tierName]
+		}
+		body, tenant, rerr := prepareSharedDynamoRequest(body, id.OrgID, maxOutput, tier)
+		if rerr != nil {
+			http.Error(w, "invalid shared inference request", http.StatusBadRequest)
+			return
+		}
+		replaceRequestBody(r, body)
+		// Replace a client-supplied tenant header. Dynamo gives this header
+		// precedence over every body salt, so it must come from trusted identity.
+		r.Header.Set("X-Tenant-ID", tenant)
+		r.Header.Set("X-Dynamo-Request-Priority", strconv.FormatInt(tier.DynamoPriority, 10))
+		r.Header.Set("X-Dynamo-Request-Strict-Priority", strconv.FormatInt(tier.DynamoStrictPriority, 10))
+		for _, header := range []string{
+			"X-Dynamo-Worker-Instance-ID", "X-Dynamo-Prefill-Instance-ID",
+			"X-Dynamo-DP-Rank", "X-Dynamo-Prefill-DP-Rank",
+			// Dynamo 1.4 retains these aliases for compatibility.
+			"X-Worker-Instance-ID", "X-Prefill-Instance-ID",
+			"X-DP-Rank", "X-Data-Parallel-Rank", "X-Prefill-DP-Rank",
+		} {
+			r.Header.Del(header)
+		}
+		if s.admitter != nil {
+			graph := id.GraphK8sName
+			if graph == "" {
+				graph = graphFromUpstreamHost(upstream.Host)
+			}
+			admitted, err = s.admitter.Admit(r.Context(), admission.Request{
+				Graph: graph, Organization: id.OrgID, Model: model,
+				PromptBytes: int64(len(body)), ReservedOutputTokens: maxOutput,
+				Adapter: id.Adapter != "", ServiceTier: id.ServiceTier, RateLimits: rateLimits,
+			})
+			if err != nil {
+				s.writeAdmissionError(w, err)
+				return
+			}
+			// Renewal failure means the distributed authority can no longer prove
+			// this request owns capacity. Cancel the upstream request rather than
+			// merely logging and allowing an unaccounted stream to continue.
+			proxyCtx, stopProxy := context.WithCancelCause(r.Context())
+			r = r.WithContext(proxyCtx)
+			defer stopProxy(nil)
+			go admitted.KeepAlive(proxyCtx, func(e error) {
+				s.log.Error.Printf("admission: lease renewal failed for request_id=%s: %v", requestID, e)
+				stopProxy(e)
+			})
+			// Safety net for every early return. Normal response completion wins the
+			// lease's idempotent Complete race and charges actual generated tokens.
+			defer func() {
+				if e := admitted.Complete(context.WithoutCancel(r.Context()), 0); e != nil {
+					s.log.Error.Printf("admission: release fallback failed: %v", e)
+				}
+			}()
 		}
 	}
 
@@ -378,39 +488,7 @@ func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request) {
 	// below forwards the customer's POST at most once and meters its honest
 	// response. No inference response is ever discarded and replayed.
 	if s.wakeEnabled(id) {
-		// Readiness matches /v1/models EXACTLY, so pass the singular model the
-		// binding check proved this request selected. id.ServedModel is only
-		// usable directly when it is not an allow-list: on the gateway path it
-		// was set FROM the resolved request model, and on a dedicated route it
-		// is the route's one served model.
-		wakeModel := selectedModel
-		if wakeModel == "" {
-			wakeModel = id.ServedModel
-		}
-		target := WakeTarget{
-			UpstreamHost: upstream.Host,
-			GraphK8sName: id.GraphK8sName,
-			ResourceID:   id.ResourceID,
-			ServedModel:  wakeModel,
-		}
-		wakeCtx := r.Context()
-		cancel := func() {}
-		if s.wakeTimeout > 0 {
-			wakeCtx, cancel = context.WithTimeout(wakeCtx, s.wakeTimeout)
-		}
-		wakeErr := s.waker.Wake(wakeCtx, target)
-		cancel()
-		if wakeErr != nil {
-			s.log.Warn.Printf("wake: could not prepare base for request_id=%s resource_id=%s: %v",
-				requestID, id.ResourceID, wakeErr)
-		}
-
-		// If the client left while it was waiting, do not execute inference. This
-		// pre-forward abort branch is mutually exclusive with ReverseProxy's
-		// completion/error branches, so it emits exactly one zero-charge attempt.
-		if r.Context().Err() != nil {
-			s.emit(context.WithoutCancel(r.Context()), id, requestID, clientRequestID,
-				499, capture.Result{Aborted: true, UsageFound: false})
+		if served := s.serveWithWake(w, r, upstream, id, requestID, admitted); served {
 			return
 		}
 	}
@@ -445,6 +523,15 @@ func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request) {
 			// be able to drop the emit OR the I/O-log record (a sink that
 			// honours ctx would otherwise lose every aborted request).
 			ctx := context.WithoutCancel(r.Context())
+			if admitted != nil {
+				if e := admitted.CompleteUsage(ctx, admission.Usage{
+					TotalPromptTokens:  int64(res.Usage.PromptTokens),
+					CachedPromptTokens: int64(res.Usage.CachedTokens()),
+					GeneratedTokens:    int64(res.Usage.CompletionTokens),
+				}); e != nil {
+					s.log.Error.Printf("admission: completion release failed: %v", e)
+				}
+			}
 			// Metering (durable) always fires.
 			s.emit(ctx, id, requestID, clientRequestID, statusCode, res)
 			// M5 I/O logging (best-effort) only when this request opted in.
@@ -479,6 +566,16 @@ func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request) {
 		// goroutine racing the body's Close(). On abort, ReverseProxy cancels
 		// this context, so by the time finish() runs ctx.Err() is non-nil.
 		cr = newCaptureReader(r.Context(), resp.Body, streamed, onDone)
+		if admitted != nil {
+			// The first response body byte is the observable prefill→decode
+			// boundary. Headers alone can arrive before an engine finishes prefill,
+			// so releasing there would under-protect prefill bursts.
+			cr.setOnFirstRead(func() {
+				if e := admitted.PrefillDone(context.WithoutCancel(r.Context())); e != nil {
+					s.log.Error.Printf("admission: prefill release failed: %v", e)
+				}
+			})
+		}
 		// Enable bounded response-body capture ONLY for opted-in requests (M5).
 		// For everything else logBuf stays nil and Read pays no extra cost.
 		if shouldLog {
@@ -488,7 +585,7 @@ func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request) {
 		return nil
 	}
 
-	rp.ErrorHandler = s.errorHandler(upstream.String(), id, requestID, clientRequestID)
+	rp.ErrorHandler = s.errorHandler(upstream.String(), id, requestID, clientRequestID, admitted)
 
 	rp.ServeHTTP(w, r)
 }
@@ -521,8 +618,23 @@ func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request) {
 // a bogus zero-token billing row. The context is decoupled from the cancelled
 // client ctx (WithoutCancel) — the abort is precisely WHY we are here, so a
 // cancelled ctx must not be able to drop the emit (mirrors onDone).
-func (s *Server) errorHandler(upstream string, id identity.Identity, requestID, clientRequestID string) func(http.ResponseWriter, *http.Request, error) {
+// errorHandler takes BOTH the untrusted client correlation id and the admission
+// lease, because the two branches that merged here each owned one of them:
+// clientRequestID must reach the pre-header abort's metering event (it is the
+// caller's only handle on a failed attempt), and the lease must be released on
+// every exit path or capacity leaks. Dropping either silently loses a guarantee
+// the other branch's tests do not cover.
+func (s *Server) errorHandler(upstream string, id identity.Identity, requestID, clientRequestID string, admitted *admission.Lease) func(http.ResponseWriter, *http.Request, error) {
 	return func(w http.ResponseWriter, r *http.Request, err error) {
+		if admitted != nil {
+			if e := admitted.Complete(context.WithoutCancel(r.Context()), 0); e != nil {
+				s.log.Error.Printf("admission: upstream-failure release failed: %v", e)
+			}
+		}
+		if cause := context.Cause(r.Context()); errors.Is(cause, admission.ErrUnavailable) {
+			s.writeAdmissionError(w, cause)
+			return
+		}
 		if isClientAbort(err) {
 			s.log.Debug.Printf("client disconnected for %s", upstream)
 			// Pre-header abort: ModifyResponse never ran, so onDone will not emit.

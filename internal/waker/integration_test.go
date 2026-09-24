@@ -34,7 +34,7 @@ func TestWake_DGDSAMissing_ServesColdResponse(t *testing.T) {
 	w, client := newFakeWaker(t)
 
 	srv := proxy.New(&config.Settings{ListenAddr: ":0"}, logging.New(logging.ERROR), &metering.LogEmitter{Log: logging.New(logging.ERROR)}).
-		WithWaker(w, time.Second)
+		WithWaker(w, time.Second, 0)
 
 	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(`{"model":"m"}`))
 	req.Header.Set(identity.HeaderAuthID, "auth-1")

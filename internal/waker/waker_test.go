@@ -64,18 +64,9 @@ func newFakeWaker(t *testing.T, objs ...runtime.Object) (*KubeWaker, *dynamicfak
 	w := NewWithClient(client, Config{Namespace: testNS, PollInterval: time.Millisecond}, logging.New(logging.ERROR))
 	// Atomic: concurrent-wake tests call readiness from several goroutines.
 	var probes int32
-	w.ready = func(context.Context, string, string) bool {
+	w.ready = func(context.Context, string) bool {
 		return atomic.AddInt32(&probes, 1) > 1
 	}
-	return w, client
-}
-
-// newWarmFakeWaker is the same fake with readiness stubbed ALWAYS-READY, i.e. a
-// graph that is already serving the requested model.
-func newWarmFakeWaker(t *testing.T, objs ...runtime.Object) (*KubeWaker, *dynamicfake.FakeDynamicClient) {
-	t.Helper()
-	w, client := newFakeWaker(t, objs...)
-	w.ready = func(context.Context, string, string) bool { return true }
 	return w, client
 }
 
@@ -84,7 +75,6 @@ func target(graph string) proxy.WakeTarget {
 		UpstreamHost: DGDSAName(graph) + "-frontend." + testNS + ".svc.cluster.local:8000",
 		GraphK8sName: graph,
 		ResourceID:   "tfm-1",
-		ServedModel:  "m",
 	}
 }
 
@@ -317,7 +307,7 @@ func TestWake_NeverScalesDown(t *testing.T) {
 func TestWake_HoldsUntilReadyOrDeadline(t *testing.T) {
 	// Never-ready: Wake must return the deadline error, not hang, not succeed.
 	w, _ := newFakeWaker(t, dgdsaObj("g1", 0))
-	w.ready = func(context.Context, string, string) bool { return false }
+	w.ready = func(context.Context, string) bool { return false }
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Millisecond)
 	defer cancel()
 	if err := w.Wake(ctx, target("g1")); err == nil || !strings.Contains(err.Error(), "not ready before deadline") {
@@ -327,7 +317,7 @@ func TestWake_HoldsUntilReadyOrDeadline(t *testing.T) {
 	// Ready-after-a-few-polls: Wake returns nil once the probe flips.
 	w2, _ := newFakeWaker(t, dgdsaObj("g2", 0))
 	var polls int32
-	w2.ready = func(context.Context, string, string) bool { return atomic.AddInt32(&polls, 1) >= 3 }
+	w2.ready = func(context.Context, string) bool { return atomic.AddInt32(&polls, 1) >= 3 }
 	if err := w2.Wake(context.Background(), target("g2")); err != nil {
 		t.Fatalf("eventually-ready Wake: %v", err)
 	}
@@ -340,7 +330,7 @@ func TestWake_HoldsUntilReadyOrDeadline(t *testing.T) {
 // programming error upstream — refuse rather than patch a guessed name.
 func TestWake_EmptyGraphNameErrors(t *testing.T) {
 	w, client := newFakeWaker(t, dgdsaObj("g1", 0))
-	if err := w.Wake(context.Background(), proxy.WakeTarget{UpstreamHost: "h:1", ResourceID: "r", ServedModel: "m"}); err == nil {
+	if err := w.Wake(context.Background(), proxy.WakeTarget{UpstreamHost: "h:1", ResourceID: "r"}); err == nil {
 		t.Fatal("Wake with empty GraphK8sName must error")
 	}
 	if patches := patchActions(client); len(patches) != 0 {
@@ -348,57 +338,53 @@ func TestWake_EmptyGraphNameErrors(t *testing.T) {
 	}
 }
 
-func TestWake_EmptyServedModelErrorsBeforeActuation(t *testing.T) {
-	w, client := newFakeWaker(t, dgdsaObj("g1", 0))
-	tgt := target("g1")
-	tgt.ServedModel = ""
-	if err := w.Wake(context.Background(), tgt); err == nil {
-		t.Fatal("Wake with empty ServedModel must error")
-	}
-	if patches := patchActions(client); len(patches) != 0 {
-		t.Fatalf("issued %d patches, want 0", len(patches))
-	}
-}
-
-func TestUpstreamServesModelsRequiresRequestedModel(t *testing.T) {
+// TestUpstreamServesModelsIsAnyModel pins the readiness signal: the frontend is
+// ready when it serves ANY model, not one specific id.
+//
+// It used to require the REQUESTED model, which mattered while Wake was the thing
+// that decided a request could proceed. serveWithWake now proves coldness by
+// probing with the real request and re-probes afterwards, so the waker only has to
+// answer "is this graph serving again". A per-model check would additionally FAIL
+// on a graph that came back up serving a different set — a false negative that
+// burns the whole wake budget.
+//
+// Why /v1/models at all: a scaled-to-zero frontend stays up (its /health is 200 —
+// useless as a wake signal) but DROPS every model from discovery, which is exactly
+// why the cold request fails. Models reappearing is the same discovery event that
+// ends the failure.
+func TestUpstreamServesModelsIsAnyModel(t *testing.T) {
+	var body atomic.Value
+	body.Store(`{"data":[]}`)
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodGet || r.URL.Path != "/v1/models" {
 			t.Fatalf("readiness request = %s %s, want GET /v1/models", r.Method, r.URL.Path)
 		}
-		_, _ = w.Write([]byte(`{"data":[{"id":"other-model"},{"id":"requested-model"}]}`))
+		_, _ = w.Write([]byte(body.Load().(string)))
 	}))
 	defer server.Close()
 	host := strings.TrimPrefix(server.URL, "http://")
 	w := &KubeWaker{}
-	if w.upstreamServesModels(context.Background(), host, "missing-model") {
-		t.Fatal("another registered model must not make the requested model ready")
+
+	// Empty discovery = still scaled to zero.
+	if w.upstreamServesModels(context.Background(), host) {
+		t.Fatal("empty /v1/models must not read as ready")
 	}
-	if !w.upstreamServesModels(context.Background(), host, "requested-model") {
-		t.Fatal("requested registered model should be ready")
+	// Any model back in discovery = the frontend is serving again, even if it is
+	// not the one this request asked for.
+	body.Store(`{"data":[{"id":"some-other-model"}]}`)
+	if !w.upstreamServesModels(context.Background(), host) {
+		t.Fatal("a served model must read as ready regardless of which model it is")
 	}
 }
 
-// TestWake_WarmGraphTouchesNoApiserver pins the warm short-circuit. Wake runs on
-// EVERY wakeable request, not only cold ones, so without the short-circuit a warm
-// shared graph pays a DGDSA GET — serialized behind the per-graph mutex — on every
-// inference request: head-of-line blocking for the whole graph's traffic behind one
-// apiserver round trip, plus one GET of apiserver load per request.
-func TestWake_WarmGraphTouchesNoApiserver(t *testing.T) {
-	w, client := newWarmFakeWaker(t, dgdsaObj("g1", 1), scaledObjectObj("g1", "false"))
-	client.ClearActions()
-
-	if err := w.Wake(context.Background(), target("g1")); err != nil {
-		t.Fatalf("Wake on a warm graph: %v", err)
-	}
-
-	if actions := client.Actions(); len(actions) != 0 {
-		verbs := make([]string, 0, len(actions))
-		for _, a := range actions {
-			verbs = append(verbs, a.GetVerb()+" "+a.GetResource().Resource)
-		}
-		t.Fatalf("warm wake issued %d apiserver call(s) %v, want none", len(actions), verbs)
-	}
-}
+// NOTE: the warm short-circuit test that lived here was REMOVED, not fixed.
+// It pinned Wake returning early for an already-warm graph, which mattered while
+// Wake ran on every wakeable request. serveWithWake now calls Wake ONLY after a
+// probe saw a genuinely cold response, so a warm graph never reaches the waker
+// and the short-circuit has moved up a layer (and got cheaper — the proxy was
+// going to make that request anyway). The equivalent coverage now lives in
+// internal/proxy's wake tests, which assert the waker is not called when the
+// first probe comes back warm.
 
 // TestWake_ColdGraphStillActuates is the other half: the short-circuit must not
 // suppress a real wake. A cold graph is still read, scaled and unpaused.

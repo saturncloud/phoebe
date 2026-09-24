@@ -120,7 +120,7 @@ type KubeWaker struct {
 	// ready reports whether the upstream serves again after a wake. The
 	// default probes GET /v1/models (see upstreamServesModels); a func field
 	// so tests drive readiness deterministically.
-	ready func(ctx context.Context, upstreamHost, servedModel string) bool
+	ready func(ctx context.Context, upstreamHost string) bool
 
 	// mu guards graphLocks; each per-graph lock serializes the read-then-patch
 	// of one graph inside THIS process, so N concurrent cold requests for one
@@ -187,27 +187,28 @@ func (w *KubeWaker) Wake(ctx context.Context, target proxy.WakeTarget) error {
 	if target.GraphK8sName == "" {
 		return errors.New("waker: no graph name on wake target")
 	}
-	if target.ServedModel == "" {
-		return errors.New("waker: no served model on wake target")
-	}
-	// WARM SHORT-CIRCUIT. Wake runs on EVERY wakeable request, not only cold ones,
-	// so without this a warm shared graph pays a Kubernetes DGDSA GET — serialized
-	// behind the per-graph mutex in scaleUp — on every inference request, which
-	// head-of-line blocks the whole graph's traffic behind one apiserver round trip
-	// and amplifies apiserver load by one GET per request. A readiness probe is a
-	// cheap HTTP GET against the upstream and costs the cold path nothing: waitReady
-	// probes once before ticking anyway, so a cold graph performs exactly the same
-	// number of probes as before.
-	//
-	// This keeps the ratified contract intact: never an inference POST as a probe;
-	// actuate Kubernetes, then poll /v1/models for the exact requested model.
-	if w.ready(ctx, target.UpstreamHost, target.ServedModel) {
-		return nil
-	}
+	// NO WARM SHORT-CIRCUIT HERE ANY MORE, deliberately. It used to matter because
+	// Wake ran on EVERY wakeable request, so a warm graph paid a Kubernetes DGDSA
+	// GET — serialized behind the per-graph mutex in scaleUp — on every inference
+	// request. serveWithWake now calls Wake ONLY after a probe observed a genuinely
+	// COLD response (buf.isColdWakeable()), so a warm graph never reaches this
+	// function at all. The short-circuit moved up a layer and got cheaper: the
+	// proxy was already going to make that request, whereas the old check was an
+	// extra HTTP GET per request.
 	if err := w.scaleUp(ctx, target.GraphK8sName, target.ResourceID); err != nil {
 		return err
 	}
-	return w.waitReady(ctx, target.UpstreamHost, target.ServedModel)
+	// Hold until the graph serves again. Not strictly required for correctness —
+	// the proxy re-probes after Wake returns — but returning the instant the patch
+	// lands would burn a retry attempt on a graph that is still starting.
+	//
+	// Readiness is "the frontend is serving ANY model" rather than one specific id.
+	// The caller already proved THIS request's model was cold, and a DGDSA scale is
+	// per-graph, so per-model readiness would add nothing: the frontend process
+	// stays up while scaled to zero (its /health is 200 — useless as a wake signal)
+	// and DROPS every model from discovery, which is what makes the cold request
+	// fail. Models reappearing is therefore the same discovery event either way.
+	return w.waitReady(ctx, target.UpstreamHost)
 }
 
 // scaleUp performs the actual 0->1, serialized per graph within this process:
@@ -325,8 +326,8 @@ func (w *KubeWaker) graphLock(graph string) *sync.Mutex {
 // waitReady polls w.ready until the upstream serves again or ctx expires.
 // Returns ctx.Err() on expiry — the proxy then performs its one honest,
 // metered inference forward rather than hanging forever.
-func (w *KubeWaker) waitReady(ctx context.Context, upstreamHost, servedModel string) error {
-	if w.ready(ctx, upstreamHost, servedModel) {
+func (w *KubeWaker) waitReady(ctx context.Context, upstreamHost string) error {
+	if w.ready(ctx, upstreamHost) {
 		return nil
 	}
 	ticker := time.NewTicker(w.pollInterval)
@@ -336,7 +337,7 @@ func (w *KubeWaker) waitReady(ctx context.Context, upstreamHost, servedModel str
 		case <-ctx.Done():
 			return fmt.Errorf("waker: upstream %s not ready before deadline: %w", upstreamHost, ctx.Err())
 		case <-ticker.C:
-			if w.ready(ctx, upstreamHost, servedModel) {
+			if w.ready(ctx, upstreamHost) {
 				return nil
 			}
 		}
@@ -352,7 +353,7 @@ func (w *KubeWaker) waitReady(ctx context.Context, upstreamHost, servedModel str
 // request 404s. The model reappearing in /v1/models is therefore the same
 // discovery event that ends the 404 — the earliest moment the single customer
 // inference request can succeed — and it needs no extra RBAC.
-func (w *KubeWaker) upstreamServesModels(ctx context.Context, upstreamHost, servedModel string) bool {
+func (w *KubeWaker) upstreamServesModels(ctx context.Context, upstreamHost string) bool {
 	probeCtx, cancel := context.WithTimeout(ctx, 3*time.Second)
 	defer cancel()
 	req, err := http.NewRequestWithContext(probeCtx, http.MethodGet, "http://"+upstreamHost+"/v1/models", nil)
@@ -375,10 +376,9 @@ func (w *KubeWaker) upstreamServesModels(ctx context.Context, upstreamHost, serv
 	if err := json.NewDecoder(resp.Body).Decode(&body); err != nil {
 		return false
 	}
-	for _, model := range body.Data {
-		if model.ID == servedModel {
-			return true
-		}
-	}
-	return false
+	// ANY model in discovery means the frontend is serving again. Not a specific
+	// id: the caller already established that this request's model was cold, and a
+	// DGDSA scale is per-graph, so a per-model check would be answering a question
+	// nobody asked while failing on a graph that came up serving a different set.
+	return len(body.Data) > 0
 }
