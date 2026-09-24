@@ -91,6 +91,22 @@ ALTER TABLE rated_usage ADD COLUMN owner_id   VARCHAR(32) NOT NULL DEFAULT '';
 -- precisely because it is not keyed, so a NULL cannot split or duplicate a rollup.
 ALTER TABLE rated_usage ADD COLUMN graph_k8s_name VARCHAR(253);
 
+-- serving_mode is a closed enum: '' (dedicated, the absence-of-prefix pricing
+-- contract) or 'shared'. Constrained for the SAME reason as owner_type below, and
+-- with more force: this column SELECTS THE PRICE SKU. An unconstrained value is not
+-- merely uninterpretable, it is a rollup priced from the wrong rate row, or -- for a
+-- near-miss like 'SHARED', 'shared ' or the spelled-out 'dedicated' -- a grain SPLIT
+-- that mints a second rated_usage_id for traffic that should have been one rollup.
+--
+-- 'dedicated' is the specific trap worth naming: the manager's own pricing module
+-- defines SERVING_MODE_DEDICATED = "dedicated" (pricing/lookup.py), so the spelled-out
+-- form already exists in the system as a legitimate value in a DIFFERENT vocabulary.
+-- Here it is illegal, because dedicated is the ABSENCE of a prefix. Without this CHECK
+-- the two vocabularies silently coexist in one column and the first breakdown view
+-- that groups on it reports dedicated spend split across two buckets.
+ALTER TABLE rated_usage
+    ADD CONSTRAINT rated_usage_serving_mode_ck CHECK (serving_mode IN ('', 'shared'));
+
 -- owner_type is a closed two-valued enum plus the empty sentinel. Anything else is a
 -- producer or rater bug; reject it at the money boundary rather than billing an
 -- uninterpretable owner.

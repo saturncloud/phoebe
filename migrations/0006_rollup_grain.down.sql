@@ -32,6 +32,7 @@ ALTER TABLE rated_usage
     UNIQUE (auth_id, resource_id, model_id, window_start);
 
 ALTER TABLE rated_usage
+    DROP CONSTRAINT IF EXISTS rated_usage_serving_mode_ck,
     DROP CONSTRAINT IF EXISTS rated_usage_owner_pair_ck,
     DROP CONSTRAINT IF EXISTS rated_usage_owner_type_ck,
     DROP COLUMN IF EXISTS graph_k8s_name,
