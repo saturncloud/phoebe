@@ -92,10 +92,14 @@ type Server struct {
 	// and model binding, and before any engine request.
 	admitter admission.Admitter
 
-	// admissionBypassLog and leaseRenewalLog aggregate the per-request error
-	// logs emitted when the distributed gate is unavailable, so a store
-	// outage cannot flood one ERROR per request (see sampledErrorLog).
-	admissionBypassLog, leaseRenewalLog sampledErrorLog
+	// These sampledErrorLog samplers aggregate the recurring per-request
+	// admission error logs — gate-unavailable bypasses, lease renewals, and
+	// the settlement/cold-hold release failures — so a store outage cannot
+	// flood one ERROR per request (see sampledErrorLog).
+	admissionBypassLog, leaseRenewalLog                        sampledErrorLog
+	admissionReleaseFallbackLog, admissionCompletionReleaseLog sampledErrorLog
+	admissionPrefillReleaseLog, admissionUpstreamReleaseLog    sampledErrorLog
+	admissionColdHoldBypassLog, admissionColdHoldReleaseLog    sampledErrorLog
 }
 
 func (s *Server) WithAdmitter(a admission.Admitter) *Server { s.admitter = a; return s }
@@ -508,7 +512,7 @@ func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request) {
 						return
 					}
 					if e := admitted.Complete(context.WithoutCancel(r.Context()), 0); e != nil {
-						s.log.Error.Printf("admission: release fallback failed: %v", e)
+						s.admissionReleaseFallbackLog.logf(s.log, "admission: release fallback failed: %v", e)
 					}
 				}()
 			}
@@ -568,7 +572,7 @@ func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request) {
 					e = admitted.CompleteUnknownUsage(ctx)
 				}
 				if e != nil {
-					s.log.Error.Printf("admission: completion release failed: %v", e)
+					s.admissionCompletionReleaseLog.logf(s.log, "admission: completion release failed: %v", e)
 				}
 			}
 			// Metering (durable) always fires.
@@ -618,7 +622,7 @@ func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request) {
 			cr.setOnFirstRead(func() {
 				go func() {
 					if e := admitted.PrefillDone(context.WithoutCancel(r.Context())); e != nil {
-						s.log.Error.Printf("admission: prefill release failed: %v", e)
+						s.admissionPrefillReleaseLog.logf(s.log, "admission: prefill release failed: %v", e)
 					}
 				}()
 			})
@@ -704,7 +708,7 @@ func (s *Server) errorHandler(upstream string, id identity.Identity, requestID s
 				settlementErr = admitted.Complete(ctx, 0)
 			}
 			if settlementErr != nil {
-				s.log.Error.Printf("admission: upstream-failure release failed: %v", settlementErr)
+				s.admissionUpstreamReleaseLog.logf(s.log, "admission: upstream-failure release failed: %v", settlementErr)
 			}
 		}
 		if clientAbort {

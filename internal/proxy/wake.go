@@ -128,7 +128,7 @@ func (t *wakeRoundTripper) RoundTrip(req *http.Request) (*http.Response, error) 
 		if t.lease != nil {
 			if aerr := t.lease.BeginColdHold(req.Context()); aerr != nil {
 				if errors.Is(aerr, admission.ErrUnavailable) {
-					t.server.log.Error.Printf("admission: cold-hold state unavailable; bypassing distributed gate for request_id=%s: %v", t.requestID, aerr)
+					t.server.admissionColdHoldBypassLog.logf(t.server.log, "admission: cold-hold state unavailable; bypassing distributed gate for request_id=%s: %v", t.requestID, aerr)
 				} else {
 					_ = resp.Body.Close()
 					return nil, &admissionRoundTripError{err: aerr}
@@ -145,7 +145,7 @@ func (t *wakeRoundTripper) RoundTrip(req *http.Request) (*http.Response, error) 
 		cancel()
 		if t.lease != nil {
 			if aerr := t.lease.EndColdHold(context.WithoutCancel(req.Context())); aerr != nil {
-				t.server.log.Error.Printf("admission: cold-hold release failed: %v", aerr)
+				t.server.admissionColdHoldReleaseLog.logf(t.server.log, "admission: cold-hold release failed: %v", aerr)
 			}
 		}
 		if werr != nil {

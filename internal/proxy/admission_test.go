@@ -1868,3 +1868,123 @@ func TestSampledErrorLog(t *testing.T) {
 		t.Fatalf("200th occurrence must report 99 suppressed: %q", lines[2])
 	}
 }
+
+// The settlement and cold-hold release failure sites route through their own
+// sampledErrorLog samplers on Server, with the same contract as the bypass
+// sampler: a store outage that fails every request's settlement still logs its
+// onset (1st + every 100th occurrence) instead of flooding one ERROR per request.
+func TestSampledErrorLogAdmissionReleaseSites(t *testing.T) {
+	var buf bytes.Buffer
+	logger := &logging.Logger{Error: log.New(&buf, "", 0)}
+	s := New(&config.Settings{}, logger, nil)
+	storeErr := errors.New("valkey: connection refused")
+	sites := []struct {
+		name string
+		logf func()
+	}{
+		{"release fallback", func() { s.admissionReleaseFallbackLog.logf(s.log, "admission: release fallback failed: %v", storeErr) }},
+		{"completion release", func() {
+			s.admissionCompletionReleaseLog.logf(s.log, "admission: completion release failed: %v", storeErr)
+		}},
+		{"prefill release", func() { s.admissionPrefillReleaseLog.logf(s.log, "admission: prefill release failed: %v", storeErr) }},
+		{"upstream-failure release", func() {
+			s.admissionUpstreamReleaseLog.logf(s.log, "admission: upstream-failure release failed: %v", storeErr)
+		}},
+		{"cold-hold state unavailable", func() {
+			s.admissionColdHoldBypassLog.logf(s.log, "admission: cold-hold state unavailable; bypassing distributed gate for request_id=req: %v", storeErr)
+		}},
+		{"cold-hold release", func() { s.admissionColdHoldReleaseLog.logf(s.log, "admission: cold-hold release failed: %v", storeErr) }},
+	}
+	for _, site := range sites {
+		t.Run(site.name, func(t *testing.T) {
+			buf.Reset()
+			for i := 0; i < 250; i++ {
+				site.logf()
+			}
+			lines := strings.Split(strings.TrimSpace(buf.String()), "\n")
+			if len(lines) != 3 {
+				t.Fatalf("logged %d lines for 250 occurrences, want 3 (1st + every 100th): %q", len(lines), lines)
+			}
+			if strings.Contains(lines[0], "suppressed") {
+				t.Fatalf("first occurrence must log plainly: %q", lines[0])
+			}
+			if !strings.Contains(lines[1], "+98 similar suppressed") || !strings.Contains(lines[2], "+99 similar suppressed") {
+				t.Fatalf("100th/200th occurrences must report the suppressed counts: %q %q", lines[1], lines[2])
+			}
+		})
+	}
+}
+
+// Real-path proof that the wake.go cold-hold sites emit through the Server
+// samplers: with the store dead after admission, every wake retry of every
+// request fails BeginColdHold (bypass site) and EndColdHold (release site).
+// 250 requests x 2 wake retries = 500 occurrences per site, so sampling must
+// yield exactly the 1st + every 100th line per site — not 500 ERROR lines.
+func TestWakeColdHoldStoreOutageLogsSampled(t *testing.T) {
+	mr := miniredis.RunT(t)
+	backend := &coldToWarmBackend{} // stays cold: every attempt re-fires both sites
+	be := httptest.NewServer(backend)
+	defer be.Close()
+	up, _ := url.Parse(be.URL)
+	cfg := proxyAdmissionConfig(1)
+	cfg.Platform.MaxColdHolds = 1
+	// MaxRetries=-1: against a dead store every op otherwise pays go-redis's
+	// retry backoff (~85ms), which would stretch this 1000-op test to minutes.
+	// The sampling behavior under test is unaffected.
+	c := redis.NewClient(&redis.Options{Addr: mr.Addr(), MaxRetries: -1})
+	t.Cleanup(func() { _ = c.Close() })
+	a := admission.New(c, cfg)
+
+	// Admit the lease while the store is up, then kill the store: every
+	// BeginColdHold/EndColdHold fails with ErrUnavailable while the request
+	// itself still completes (the bypass path).
+	lease, err := a.Admit(context.Background(), admission.Request{
+		Graph: "graph", Organization: "org-a", Model: "m",
+		PromptBytes: 1, EstimatedInputTokens: 1, ReservedOutputTokens: 1,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	mr.Close()
+
+	var buf bytes.Buffer
+	logger := &logging.Logger{Error: log.New(&buf, "", 0)}
+	s := New(&config.Settings{Admission: cfg}, logger, &recordingEmitter{}).
+		WithAdmitter(a).
+		WithWaker(&fakeWaker{}, time.Second, 3)
+
+	id := identity.Identity{ResourceID: "r1", ServedModel: "m"}
+	const requests = 250
+	for i := 0; i < requests; i++ {
+		req := httptest.NewRequest("POST", up.String(), strings.NewReader(`{"model":"m"}`))
+		replaceRequestBody(req, []byte(`{"model":"m"}`))
+		resp, rerr := s.newWakeRoundTripper(up.Host, "req", id, lease).RoundTrip(req)
+		if rerr != nil {
+			t.Fatalf("request %d: %v", i, rerr)
+		}
+		_, _ = io.Copy(io.Discard, resp.Body)
+		_ = resp.Body.Close()
+	}
+
+	lines := strings.Split(strings.TrimSpace(buf.String()), "\n")
+	// maxTries=3 fires each cold-hold site twice per request (attempts 0 and 1):
+	// 500 occurrences per site, logged at n=1,100,200,300,400,500.
+	if len(lines) != 12 {
+		t.Fatalf("logged %d lines for 2x%d cold-hold occurrences, want 12 (6 per site): %q", len(lines), requests, lines)
+	}
+	if got := strings.Count(buf.String(), "cold-hold state unavailable"); got != 6 {
+		t.Fatalf("cold-hold bypass site logged %d lines, want 6 (1st + every 100th of 500)", got)
+	}
+	if got := strings.Count(buf.String(), "cold-hold release failed"); got != 6 {
+		t.Fatalf("cold-hold release site logged %d lines, want 6 (1st + every 100th of 500)", got)
+	}
+	if !strings.Contains(lines[0], "cold-hold state unavailable") || strings.Contains(lines[0], "suppressed") {
+		t.Fatalf("first occurrence must log the bypass onset plainly: %q", lines[0])
+	}
+	if !strings.Contains(lines[1], "cold-hold release failed") || strings.Contains(lines[1], "suppressed") {
+		t.Fatalf("first occurrence must log the release onset plainly: %q", lines[1])
+	}
+	if got := strings.Count(buf.String(), "+98 similar suppressed"); got != 2 {
+		t.Fatalf("each site's 100th occurrence must report 98 suppressed, got %d such lines: %q", got, lines)
+	}
+}
