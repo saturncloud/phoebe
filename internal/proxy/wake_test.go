@@ -165,7 +165,7 @@ func TestWakeRoundTripper_ColdThenWarmExecutesOneSuccessfulInference(t *testing.
 	replaceRequestBody(req, []byte(`{"model":"m"}`))
 	id := identity.Identity{ResourceID: "r1", ServedModel: "m"}
 	req.URL = up
-	resp, err := s.newWakeRoundTripper(up.Host, "req-1", id, nil).RoundTrip(req)
+	resp, err := s.newWakeRoundTripper(up.Host, "req-1", id, nil, new(atomic.Bool)).RoundTrip(req)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -193,7 +193,7 @@ func TestWakeRoundTripper_WarmRequestExecutesExactlyOnce(t *testing.T) {
 	replaceRequestBody(req, []byte(`{"model":"m"}`))
 	id := identity.Identity{ResourceID: "r1", ServedModel: "m"}
 
-	resp, err := s.newWakeRoundTripper(up.Host, "req-1", id, nil).RoundTrip(req)
+	resp, err := s.newWakeRoundTripper(up.Host, "req-1", id, nil, new(atomic.Bool)).RoundTrip(req)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -220,7 +220,7 @@ func TestWakeRoundTripper_WakeErrorReturnsCold(t *testing.T) {
 	replaceRequestBody(req, []byte(`{"model":"m"}`))
 	id := identity.Identity{ResourceID: "r1", ServedModel: "m"}
 	req.URL = up
-	resp, err := s.newWakeRoundTripper(up.Host, "req-1", id, nil).RoundTrip(req)
+	resp, err := s.newWakeRoundTripper(up.Host, "req-1", id, nil, new(atomic.Bool)).RoundTrip(req)
 	if err != nil {
 		t.Fatal(err)
 	}

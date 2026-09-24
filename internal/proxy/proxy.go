@@ -527,8 +527,14 @@ func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request) {
 	}
 
 	rp := httputil.NewSingleHostReverseProxy(upstream)
+	// wakeColdFinal is set by the wake round tripper when the engine's cold
+	// response becomes the final response (wake budget exhausted or waker
+	// failed): the engine provably did no inference work, so a usage-less
+	// capture settles zero rather than conservative-unknown. It stays false for
+	// every other response, including engine 4xx/5xx after a real dispatch.
+	wakeColdFinal := new(atomic.Bool)
 	if s.wakeEnabled(id) {
-		rp.Transport = s.newWakeRoundTripper(upstream.Host, requestID, id, admitted)
+		rp.Transport = s.newWakeRoundTripper(upstream.Host, requestID, id, admitted, wakeColdFinal)
 	}
 
 	// FlushInterval=-1 flushes every write immediately — per-chunk SSE
@@ -561,16 +567,12 @@ func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request) {
 			// honours ctx would otherwise lose every aborted request).
 			ctx := context.WithoutCancel(r.Context())
 			if admitted != nil {
-				var e error
-				if res.UsageFound {
-					e = admitted.CompleteUsage(ctx, admission.Usage{
-						TotalPromptTokens:  int64(res.Usage.PromptTokens),
-						CachedPromptTokens: int64(res.Usage.CachedTokens()),
-						GeneratedTokens:    int64(res.Usage.CompletionTokens),
-					})
-				} else {
-					e = admitted.CompleteUnknownUsage(ctx)
-				}
+				kind := classifyCaptureSettlement(res, wakeColdFinal.Load())
+				e := settleAdmissionLease(ctx, admitted, kind, admission.Usage{
+					TotalPromptTokens:  int64(res.Usage.PromptTokens),
+					CachedPromptTokens: int64(res.Usage.CachedTokens()),
+					GeneratedTokens:    int64(res.Usage.CompletionTokens),
+				})
 				if e != nil {
 					s.admissionCompletionReleaseLog.logf(s.log, "admission: completion release failed: %v", e)
 				}
@@ -681,33 +683,32 @@ func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request) {
 // client abort. Unaffected non-admitted faults (dedicated traffic, gateway
 // resolution) never emit here.
 //
-// LEASE SETTLEMENT: an abort or an indeterminate non-abort failure settles with
-// CompleteUnknownUsage — the conservative token reservation is retained, because
-// consumed engine work must not vanish from the contract windows. Only a
-// verified pre-write dial failure (the request provably never left the process)
-// settles Complete(0). The context is decoupled from the cancelled client ctx
-// (WithoutCancel) — the abort is precisely WHY we are here, so a cancelled ctx
-// must not be able to drop the emit or the settlement (mirrors onDone).
+// LEASE SETTLEMENT: the RoundTrip error is classified once, at the point the
+// failure becomes known, into a closed settlementKind (see settlement.go):
+// aborts and indeterminate non-abort failures settle CompleteUnknownUsage —
+// the conservative token reservation is retained, because consumed engine work
+// must not vanish from the contract windows — while a verified pre-write dial
+// failure (the request provably never left the process) and the cold-hold
+// capacity rejection (the engine answered cold: determinate never-served,
+// whether it is rendered 503 or 429) settle Complete(0). Both kinds keep the
+// requests-window +1 charged at Admit time: that window measures demand, not
+// work. The context is decoupled from the cancelled client ctx (WithoutCancel)
+// — the abort is precisely WHY we are here, so a cancelled ctx must not be
+// able to drop the emit or the settlement (mirrors onDone).
 func (s *Server) errorHandler(upstream string, id identity.Identity, requestID string, admitted *admission.Lease, responseCaptureInstalled *atomic.Bool) func(http.ResponseWriter, *http.Request, error) {
 	return func(w http.ResponseWriter, r *http.Request, err error) {
 		clientAbort := isClientAbort(err)
 		indeterminate := false
 		if admitted != nil && (responseCaptureInstalled == nil || !responseCaptureInstalled.Load()) {
 			ctx := context.WithoutCancel(r.Context())
-			var settlementErr error
-			if clientAbort || !isPreWriteDialFailure(err) {
-				// Once dispatched, a client can cancel — or the upstream can read
-				// the full request and then reset before headers — even though the
-				// engine has already done work. With no usage block available,
-				// retain the conservative token reservation.
-				indeterminate = true
-				settlementErr = admitted.CompleteUnknownUsage(ctx)
-			} else {
-				// A dial failure proves the request never left the process, so no
-				// engine work could have been consumed: settle zero.
-				settlementErr = admitted.Complete(ctx, 0)
-			}
-			if settlementErr != nil {
+			// classifyRoundTripSettlement decides the settlement kind at the
+			// point the failure becomes known: conservative settlement is
+			// retained only for genuinely indeterminate failures (abort, mid-
+			// flight fault); the determinate never-served cold-hold rejection
+			// and the verified pre-write dial failure settle zero.
+			kind := classifyRoundTripSettlement(err)
+			indeterminate = kind == settlementUnknown
+			if settlementErr := settleAdmissionLease(ctx, admitted, kind, admission.Usage{}); settlementErr != nil {
 				s.admissionUpstreamReleaseLog.logf(s.log, "admission: upstream-failure release failed: %v", settlementErr)
 			}
 		}

@@ -2141,7 +2141,7 @@ func TestWakeColdHoldStoreOutageLogsSampled(t *testing.T) {
 	for i := 0; i < requests; i++ {
 		req := httptest.NewRequest("POST", up.String(), strings.NewReader(`{"model":"m"}`))
 		replaceRequestBody(req, []byte(`{"model":"m"}`))
-		resp, rerr := s.newWakeRoundTripper(up.Host, "req", id, lease).RoundTrip(req)
+		resp, rerr := s.newWakeRoundTripper(up.Host, "req", id, lease, new(atomic.Bool)).RoundTrip(req)
 		if rerr != nil {
 			t.Fatalf("request %d: %v", i, rerr)
 		}

@@ -9,6 +9,7 @@ import (
 	"net"
 	"net/http"
 	"strings"
+	"sync/atomic"
 
 	"github.com/saturncloud/phoebe/internal/admission"
 	"github.com/saturncloud/phoebe/internal/identity"
@@ -102,6 +103,14 @@ type wakeRoundTripper struct {
 	target    WakeTarget
 	requestID string
 	lease     *admission.Lease
+
+	// coldFinal receives true at each point where a positively identified cold
+	// response becomes the FINAL response (wake budget exhausted, or the waker
+	// failed): the engine refused every dispatch before any inference, so the
+	// admission lease must settle zero, not conservative-unknown. Written only
+	// from RoundTrip (before it returns the response), read by onDone after
+	// ModifyResponse — the RoundTrip return orders the two.
+	coldFinal *atomic.Bool
 }
 
 func (t *wakeRoundTripper) RoundTrip(req *http.Request) (*http.Response, error) {
@@ -122,6 +131,10 @@ func (t *wakeRoundTripper) RoundTrip(req *http.Request) (*http.Response, error) 
 			return resp, nil
 		}
 		if attempt == maxTries-1 {
+			// Wake budget exhausted: the engine's cold response is final. It is
+			// determinate never-served — every dispatch was refused before any
+			// inference — so the lease settles zero (see coldFinal).
+			t.coldFinal.Store(true)
 			return resp, nil
 		}
 
@@ -150,6 +163,10 @@ func (t *wakeRoundTripper) RoundTrip(req *http.Request) (*http.Response, error) 
 		}
 		if werr != nil {
 			t.server.log.Warn.Printf("wake: could not warm base for request_id=%s resource_id=%s: %v", t.requestID, t.target.ResourceID, werr)
+			// Same never-served axis as the exhausted-budget give-up: the engine
+			// answered cold and no inference ran, so the final cold response
+			// settles zero (see coldFinal).
+			t.coldFinal.Store(true)
 			return resp, nil
 		}
 
@@ -168,7 +185,7 @@ func (t *wakeRoundTripper) RoundTrip(req *http.Request) (*http.Response, error) 
 	panic("unreachable")
 }
 
-func (s *Server) newWakeRoundTripper(upstreamHost, requestID string, id identity.Identity, lease *admission.Lease) http.RoundTripper {
+func (s *Server) newWakeRoundTripper(upstreamHost, requestID string, id identity.Identity, lease *admission.Lease, coldFinal *atomic.Bool) http.RoundTripper {
 	graph := id.GraphK8sName
 	if graph == "" {
 		graph = graphFromUpstreamHost(upstreamHost)
@@ -183,5 +200,6 @@ func (s *Server) newWakeRoundTripper(upstreamHost, requestID string, id identity
 		},
 		requestID: requestID,
 		lease:     lease,
+		coldFinal: coldFinal,
 	}
 }
