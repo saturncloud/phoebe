@@ -1786,7 +1786,17 @@ func TestProxyForwardsOperatorAdmissionLaneDynamoHints(t *testing.T) {
 	req.Header.Set("X-Tenant-ID", "attacker")
 	req.Header.Set("X-Dynamo-Request-Priority", "2147483647")
 	req.Header.Set("X-Dynamo-Request-Strict-Priority", "4294967295")
-	req.Header.Set("X-Dynamo-Worker-Instance-ID", "99")
+	// Every client-controllable worker/rank selection header — direct
+	// routing bypasses load- and cache-aware scheduling.
+	for _, header := range []string{
+		"X-Dynamo-Worker-Instance-ID", "X-Dynamo-Prefill-Instance-ID",
+		"X-Dynamo-DP-Rank", "X-Dynamo-Prefill-DP-Rank",
+		// Dynamo 1.4 retains these aliases for compatibility.
+		"X-Worker-Instance-ID", "X-Prefill-Instance-ID",
+		"X-DP-Rank", "X-Data-Parallel-Rank", "X-Prefill-DP-Rank",
+	} {
+		req.Header.Set(header, "99")
+	}
 	req.Body = http.NoBody
 	req.Body = io.NopCloser(strings.NewReader(`{"model":"model-a","max_tokens":20,"nvext":{"cache_salt":"attacker","agent_hints":{"priority":999}}}`))
 	rr := httptest.NewRecorder()
@@ -1804,8 +1814,15 @@ func TestProxyForwardsOperatorAdmissionLaneDynamoHints(t *testing.T) {
 	if got := forwarded.Header.Get("X-Dynamo-Request-Strict-Priority"); got != "4" {
 		t.Fatalf("forwarded strict-priority header=%q", got)
 	}
-	if got := forwarded.Header.Get("X-Dynamo-Worker-Instance-ID"); got != "" {
-		t.Fatalf("forwarded direct-worker header=%q", got)
+	for _, header := range []string{
+		"X-Dynamo-Worker-Instance-ID", "X-Dynamo-Prefill-Instance-ID",
+		"X-Dynamo-DP-Rank", "X-Dynamo-Prefill-DP-Rank",
+		"X-Worker-Instance-ID", "X-Prefill-Instance-ID",
+		"X-DP-Rank", "X-Data-Parallel-Rank", "X-Prefill-DP-Rank",
+	} {
+		if got := forwarded.Header.Get(header); got != "" {
+			t.Fatalf("forwarded direct-worker header %s=%q, want it stripped", header, got)
+		}
 	}
 	var payload struct {
 		Nvext struct {
