@@ -34,6 +34,13 @@ func proxyAdmissionConfig(active int64) config.AdmissionSettings {
 			RequestsPerWindow: 100, GeneratedTokensPerWindow: 1000, Window: time.Minute}}
 }
 
+// fixedWindowBucket mirrors the admission store's fixed 1-minute window bucket
+// (floor(now_ms/window_ms), internal/admission/scripts.go) so a test can
+// detect a minute rollover between charging a window and probing it.
+func fixedWindowBucket() int64 {
+	return time.Now().UnixMilli() / time.Minute.Milliseconds()
+}
+
 func sharedRequest(upstream *url.URL) *http.Request {
 	r := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(`{"model":"model-a","max_tokens":20}`))
 	setUpstream(r, upstream)
@@ -961,52 +968,75 @@ func TestLegacyServiceTierNeverSelectsLane(t *testing.T) {
 	a := admission.New(c, cfg)
 	s := New(&config.Settings{Admission: cfg}, logging.New(logging.ERROR), &recordingEmitter{}).WithAdmitter(a)
 
-	req := sharedRequest(up)
-	// OwnerID belongs to the NEW envelope; a legacy-only request must not
-	// carry it, or the partial-new check fails before the legacy fallback.
-	req.Header.Del(identity.HeaderOwnerID)
-	for _, header := range []string{
-		identity.HeaderOrgRateLimitRequests,
-		identity.HeaderOrgRateLimitTotalPromptTokens,
-		identity.HeaderOrgRateLimitUncachedPromptTokens,
-		identity.HeaderOrgRateLimitGeneratedTokens,
-		identity.HeaderOwnerRateLimitRequests,
-		identity.HeaderOwnerRateLimitTotalPromptTokens,
-		identity.HeaderOwnerRateLimitUncachedPromptTokens,
-		identity.HeaderOwnerRateLimitGeneratedTokens,
-	} {
-		req.Header.Del(header)
-	}
-	req.Header.Set(identity.HeaderLegacyServiceTier, "gold")
-	req.Header.Set(identity.HeaderLegacyRateLimitRequests, "100")
-	req.Header.Set(identity.HeaderLegacyRateLimitTotalPromptTokens, "1000")
-	req.Header.Set(identity.HeaderLegacyRateLimitUncachedPromptTokens, "1000")
-	req.Header.Set(identity.HeaderLegacyRateLimitGeneratedTokens, "20")
-	rr := httptest.NewRecorder()
-	s.Handler().ServeHTTP(rr, req)
-	if rr.Code != http.StatusOK {
-		t.Fatalf("status=%d, want 200 for a complete legacy envelope", rr.Code)
-	}
-	forwarded := <-seen
-	if got := forwarded.Header.Get("X-Dynamo-Request-Priority"); got != "0" {
-		t.Fatalf("forwarded priority header=%q, want the default lane's 0 — the legacy tier must not self-select the gold lane (11)", got)
-	}
-	if got := forwarded.Header.Get("X-Dynamo-Request-Strict-Priority"); got != "0" {
-		t.Fatalf("forwarded strict-priority header=%q, want the default lane's 0", got)
-	}
-
 	// The legacy limits still bind: the engine-reported 3 generated tokens
 	// were charged to org-a's contract window (limit 20), so a probe reserving
 	// 18 more is rejected. Had the legacy envelope been ignored, the window
 	// would be empty and the probe would admit.
-	_, err := a.Admit(context.Background(), admission.Request{
-		Graph: "graph", Organization: "org-a", Owner: "other-owner", Model: "m",
-		PromptBytes: 1, EstimatedInputTokens: 1, ReservedOutputTokens: 18,
-		OrganizationLimits: admission.RateLimits{GeneratedTokens: 20},
-	})
-	var rejected *admission.Rejected
-	if !errors.As(err, &rejected) || rejected.Scope != "contract_organization" || rejected.Dimension != "generated_tokens" {
-		t.Fatalf("err=%v, want contract_organization generated_tokens rejection from the legacy limit", err)
+	//
+	// That window is a fixed 1-minute bucket (floor(now/60000)): a minute
+	// tick between the metered request's charge and the rejection probe
+	// empties the bucket and would spuriously ADMIT the probe. Capture the
+	// bucket around the request+probe section and, on roll, re-charge and
+	// retry the section once.
+	for attempt := 0; ; attempt++ {
+		bucketBefore := fixedWindowBucket()
+
+		req := sharedRequest(up)
+		// OwnerID belongs to the NEW envelope; a legacy-only request must not
+		// carry it, or the partial-new check fails before the legacy fallback.
+		req.Header.Del(identity.HeaderOwnerID)
+		for _, header := range []string{
+			identity.HeaderOrgRateLimitRequests,
+			identity.HeaderOrgRateLimitTotalPromptTokens,
+			identity.HeaderOrgRateLimitUncachedPromptTokens,
+			identity.HeaderOrgRateLimitGeneratedTokens,
+			identity.HeaderOwnerRateLimitRequests,
+			identity.HeaderOwnerRateLimitTotalPromptTokens,
+			identity.HeaderOwnerRateLimitUncachedPromptTokens,
+			identity.HeaderOwnerRateLimitGeneratedTokens,
+		} {
+			req.Header.Del(header)
+		}
+		req.Header.Set(identity.HeaderLegacyServiceTier, "gold")
+		req.Header.Set(identity.HeaderLegacyRateLimitRequests, "100")
+		req.Header.Set(identity.HeaderLegacyRateLimitTotalPromptTokens, "1000")
+		req.Header.Set(identity.HeaderLegacyRateLimitUncachedPromptTokens, "1000")
+		req.Header.Set(identity.HeaderLegacyRateLimitGeneratedTokens, "20")
+		rr := httptest.NewRecorder()
+		s.Handler().ServeHTTP(rr, req)
+		if rr.Code != http.StatusOK {
+			t.Fatalf("status=%d, want 200 for a complete legacy envelope", rr.Code)
+		}
+		forwarded := <-seen
+		if got := forwarded.Header.Get("X-Dynamo-Request-Priority"); got != "0" {
+			t.Fatalf("forwarded priority header=%q, want the default lane's 0 — the legacy tier must not self-select the gold lane (11)", got)
+		}
+		if got := forwarded.Header.Get("X-Dynamo-Request-Strict-Priority"); got != "0" {
+			t.Fatalf("forwarded strict-priority header=%q, want the default lane's 0", got)
+		}
+
+		_, err := a.Admit(context.Background(), admission.Request{
+			Graph: "graph", Organization: "org-a", Owner: "other-owner", Model: "m",
+			PromptBytes: 1, EstimatedInputTokens: 1, ReservedOutputTokens: 18,
+			OrganizationLimits: admission.RateLimits{GeneratedTokens: 20},
+		})
+		var rejected *admission.Rejected
+		rejectedOK := errors.As(err, &rejected) && rejected.Scope == "contract_organization" && rejected.Dimension == "generated_tokens"
+		if bucketBefore != fixedWindowBucket() {
+			// The window ticked between charge and probe: the probe's admit
+			// landed in the fresh bucket and charged it. Flush the store back
+			// to the exact post-rollover empty-window state, then re-charge
+			// and retry once.
+			if attempt == 0 {
+				mr.FlushAll()
+				continue
+			}
+			t.Skip("fixed 1-minute admission window rolled twice during the test; the probe cannot be made deterministic — retry")
+		}
+		if !rejectedOK {
+			t.Fatalf("err=%v, want contract_organization generated_tokens rejection from the legacy limit", err)
+		}
+		break
 	}
 }
 
@@ -1466,26 +1496,11 @@ func TestAdmissionDialFailureChargesOnlyRequestsWindow(t *testing.T) {
 	a := admission.New(c, cfg)
 	em := &recordingEmitter{}
 	s := New(&config.Settings{Admission: cfg}, logging.New(logging.ERROR), em).WithAdmitter(a)
-	req := sharedRequest(up)
-	req.Header.Set(identity.HeaderOrgRateLimitRequests, "1")
-	req.Header.Set(identity.HeaderOwnerRateLimitRequests, "1")
-	req.Header.Set(identity.HeaderOrgRateLimitGeneratedTokens, "20")
-	req.Header.Set(identity.HeaderOwnerRateLimitGeneratedTokens, "20")
-	rr := httptest.NewRecorder()
-	s.Handler().ServeHTTP(rr, req)
-	if rr.Code != http.StatusBadGateway {
-		t.Fatalf("status=%d, want 502", rr.Code)
-	}
-	// No engine work was possible, so nothing is metered either (the
-	// zero-token event is reserved for indeterminate failures).
-	if n := len(em.all()); n != 0 {
-		t.Fatalf("dial failure emitted %d events, want 0", n)
-	}
 
 	// The requests window was charged at admit time and never refunded: the
 	// dial-failed request's own org (resp. owner) is already at its
 	// requests-per-minute limit of 1.
-	for _, tc := range []struct {
+	probes := []struct {
 		name string
 		req  admission.Request
 		want string
@@ -1504,14 +1519,51 @@ func TestAdmissionDialFailureChargesOnlyRequestsWindow(t *testing.T) {
 				OwnerLimits: admission.RateLimits{Requests: 1}},
 			want: "contract_owner",
 		},
-	} {
-		t.Run(tc.name, func(t *testing.T) {
-			_, err := a.Admit(context.Background(), tc.req)
-			var rejected *admission.Rejected
-			if !errors.As(err, &rejected) || rejected.Scope != tc.want || rejected.Dimension != "requests" {
-				t.Fatalf("err=%v, want %s requests rejection", err, tc.want)
-			}
-		})
+	}
+	// The window is a fixed 1-minute bucket (floor(now/60000)): a minute tick
+	// between the dial-failed request's charge and the rejection probes empties
+	// the bucket and would spuriously ADMIT them. Capture the bucket around the
+	// charge+probe section and, on roll, re-charge and retry the section once.
+	chargeAndProbe := func() (bool, []error) {
+		bucketBefore := fixedWindowBucket()
+		req := sharedRequest(up)
+		req.Header.Set(identity.HeaderOrgRateLimitRequests, "1")
+		req.Header.Set(identity.HeaderOwnerRateLimitRequests, "1")
+		req.Header.Set(identity.HeaderOrgRateLimitGeneratedTokens, "20")
+		req.Header.Set(identity.HeaderOwnerRateLimitGeneratedTokens, "20")
+		rr := httptest.NewRecorder()
+		s.Handler().ServeHTTP(rr, req)
+		if rr.Code != http.StatusBadGateway {
+			t.Fatalf("status=%d, want 502", rr.Code)
+		}
+		// No engine work was possible, so nothing is metered either (the
+		// zero-token event is reserved for indeterminate failures).
+		if n := len(em.all()); n != 0 {
+			t.Fatalf("dial failure emitted %d events, want 0", n)
+		}
+		errs := make([]error, len(probes))
+		for i, tc := range probes {
+			_, errs[i] = a.Admit(context.Background(), tc.req)
+		}
+		return bucketBefore != fixedWindowBucket(), errs
+	}
+	rolled, errs := chargeAndProbe()
+	if rolled {
+		// The window ticked between charge and probes: the probes' admits
+		// landed in the fresh bucket and charged it themselves. Flush the
+		// store back to the exact post-rollover empty-window state, then
+		// re-charge and retry once.
+		mr.FlushAll()
+		rolled, errs = chargeAndProbe()
+		if rolled {
+			t.Skip("fixed 1-minute admission window rolled twice during the test; the probes cannot be made deterministic — retry")
+		}
+	}
+	for i, tc := range probes {
+		var rejected *admission.Rejected
+		if !errors.As(errs[i], &rejected) || rejected.Scope != tc.want || rejected.Dimension != "requests" {
+			t.Errorf("%s: err=%v, want %s requests rejection", tc.name, errs[i], tc.want)
+		}
 	}
 
 	// The generated and prompt windows were NOT charged: the same organization
