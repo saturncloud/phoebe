@@ -902,6 +902,110 @@ func TestMissingOrPartialTrustedRateLimitPolicyFailsClosed(t *testing.T) {
 	if err == nil {
 		t.Fatal("partial new envelope incorrectly fell back to the legacy policy")
 	}
+
+	// A partial legacy envelope fails closed too: the tier marker and all
+	// four legacy rate headers must arrive together.
+	for _, tc := range []struct {
+		name string
+		id   identity.Identity
+	}{
+		{
+			name: "legacy missing generated tokens",
+			id: identity.Identity{Gateway: true, LegacyServiceTier: "default",
+				LegacyRateLimitRequests: "7", LegacyRateLimitTotalPromptTokens: "100",
+				LegacyRateLimitUncachedPromptTokens: "25"},
+		},
+		{
+			name: "legacy rates without tier",
+			id: identity.Identity{Gateway: true,
+				LegacyRateLimitRequests: "7", LegacyRateLimitTotalPromptTokens: "100",
+				LegacyRateLimitUncachedPromptTokens: "25", LegacyRateLimitGeneratedTokens: "50"},
+		},
+		{
+			name: "legacy tier without rates",
+			id:   identity.Identity{Gateway: true, LegacyServiceTier: "default"},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if _, _, err := parseTrustedRateLimits(tc.id); err == nil {
+				t.Fatal("partial legacy envelope was accepted as a complete fallback")
+			}
+		})
+	}
+}
+
+// A complete legacy envelope is a limits fallback only: the service-tier value
+// is an envelope-version marker and must NOT self-select an admission lane on
+// new phoebe — lanes come from operator config (OrganizationLanes). A legacy
+// "gold" tier with no operator mapping stays on the default lane's Dynamo
+// hints, while its rate limits still bind the organization contract.
+func TestLegacyServiceTierNeverSelectsLane(t *testing.T) {
+	seen := make(chan *http.Request, 1)
+	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		seen <- r.Clone(r.Context())
+		_, _ = w.Write([]byte(`{"model":"model-a","usage":{"prompt_tokens":1,"completion_tokens":3}}`))
+	}))
+	defer backend.Close()
+	up, _ := url.Parse(backend.URL)
+	mr := miniredis.RunT(t)
+	cfg := proxyAdmissionConfig(2)
+	cfg.Lanes = map[string]config.AdmissionLane{
+		"default": {Weight: 1},
+		"gold":    {Weight: 1, DynamoPriority: 11, DynamoStrictPriority: 4},
+	}
+	// Deliberately NO OrganizationLanes mapping: nothing may select gold.
+	c := redis.NewClient(&redis.Options{Addr: mr.Addr()})
+	t.Cleanup(func() { _ = c.Close() })
+	a := admission.New(c, cfg)
+	s := New(&config.Settings{Admission: cfg}, logging.New(logging.ERROR), &recordingEmitter{}).WithAdmitter(a)
+
+	req := sharedRequest(up)
+	// OwnerID belongs to the NEW envelope; a legacy-only request must not
+	// carry it, or the partial-new check fails before the legacy fallback.
+	req.Header.Del(identity.HeaderOwnerID)
+	for _, header := range []string{
+		identity.HeaderOrgRateLimitRequests,
+		identity.HeaderOrgRateLimitTotalPromptTokens,
+		identity.HeaderOrgRateLimitUncachedPromptTokens,
+		identity.HeaderOrgRateLimitGeneratedTokens,
+		identity.HeaderOwnerRateLimitRequests,
+		identity.HeaderOwnerRateLimitTotalPromptTokens,
+		identity.HeaderOwnerRateLimitUncachedPromptTokens,
+		identity.HeaderOwnerRateLimitGeneratedTokens,
+	} {
+		req.Header.Del(header)
+	}
+	req.Header.Set(identity.HeaderLegacyServiceTier, "gold")
+	req.Header.Set(identity.HeaderLegacyRateLimitRequests, "100")
+	req.Header.Set(identity.HeaderLegacyRateLimitTotalPromptTokens, "1000")
+	req.Header.Set(identity.HeaderLegacyRateLimitUncachedPromptTokens, "1000")
+	req.Header.Set(identity.HeaderLegacyRateLimitGeneratedTokens, "20")
+	rr := httptest.NewRecorder()
+	s.Handler().ServeHTTP(rr, req)
+	if rr.Code != http.StatusOK {
+		t.Fatalf("status=%d, want 200 for a complete legacy envelope", rr.Code)
+	}
+	forwarded := <-seen
+	if got := forwarded.Header.Get("X-Dynamo-Request-Priority"); got != "0" {
+		t.Fatalf("forwarded priority header=%q, want the default lane's 0 — the legacy tier must not self-select the gold lane (11)", got)
+	}
+	if got := forwarded.Header.Get("X-Dynamo-Request-Strict-Priority"); got != "0" {
+		t.Fatalf("forwarded strict-priority header=%q, want the default lane's 0", got)
+	}
+
+	// The legacy limits still bind: the engine-reported 3 generated tokens
+	// were charged to org-a's contract window (limit 20), so a probe reserving
+	// 18 more is rejected. Had the legacy envelope been ignored, the window
+	// would be empty and the probe would admit.
+	_, err := a.Admit(context.Background(), admission.Request{
+		Graph: "graph", Organization: "org-a", Owner: "other-owner", Model: "m",
+		PromptBytes: 1, EstimatedInputTokens: 1, ReservedOutputTokens: 18,
+		OrganizationLimits: admission.RateLimits{GeneratedTokens: 20},
+	})
+	var rejected *admission.Rejected
+	if !errors.As(err, &rejected) || rejected.Scope != "contract_organization" || rejected.Dimension != "generated_tokens" {
+		t.Fatalf("err=%v, want contract_organization generated_tokens rejection from the legacy limit", err)
+	}
 }
 
 func TestAdmissionEnabledPerResourceRequestWithoutPolicyFailsClosed(t *testing.T) {
@@ -945,6 +1049,33 @@ func TestAdmissionEnabledPerResourceRequestWithoutPolicyFailsClosed(t *testing.T
 				req.Header.Set(identity.HeaderLegacyRateLimitTotalPromptTokens, "0")
 				req.Header.Set(identity.HeaderLegacyRateLimitUncachedPromptTokens, "0")
 				req.Header.Set(identity.HeaderLegacyRateLimitGeneratedTokens, "0")
+			},
+		},
+		{
+			name: "partial legacy envelope",
+			mutate: func(req *http.Request) {
+				// OwnerID is part of the NEW envelope's completeness check;
+				// removing it leaves the partial legacy envelope as the only
+				// policy present, so the legacy branch is what must fail.
+				req.Header.Del(identity.HeaderOwnerID)
+				for _, header := range []string{
+					identity.HeaderOrgRateLimitRequests,
+					identity.HeaderOrgRateLimitTotalPromptTokens,
+					identity.HeaderOrgRateLimitUncachedPromptTokens,
+					identity.HeaderOrgRateLimitGeneratedTokens,
+					identity.HeaderOwnerRateLimitRequests,
+					identity.HeaderOwnerRateLimitTotalPromptTokens,
+					identity.HeaderOwnerRateLimitUncachedPromptTokens,
+					identity.HeaderOwnerRateLimitGeneratedTokens,
+				} {
+					req.Header.Del(header)
+				}
+				req.Header.Set(identity.HeaderLegacyServiceTier, "default")
+				req.Header.Set(identity.HeaderLegacyRateLimitRequests, "0")
+				req.Header.Set(identity.HeaderLegacyRateLimitTotalPromptTokens, "0")
+				req.Header.Set(identity.HeaderLegacyRateLimitUncachedPromptTokens, "0")
+				// The generated-tokens header is deliberately absent: a subset
+				// of the legacy rate headers must fail closed.
 			},
 		},
 	} {
