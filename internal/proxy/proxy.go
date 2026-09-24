@@ -15,9 +15,10 @@
 //     Aborted=true without a separate watcher goroutine racing the body Close
 //   - capture the engine-reported model name from the response body as the
 //     stable price key (Event.Model), distinct from the routing resource id
-//   - apply BillPartialOnAbort policy in emit: if aborted and usage present,
-//     always bill; if aborted and no usage, bill only if BillPartialOnAbort;
-//     if not aborted and no usage, log for reconciliation only
+//   - apply BillPartialOnAbort policy in emit: if usage is present, always
+//     bill; if usage is absent after a client abort or an indeterminate
+//     upstream fault, bill only if BillPartialOnAbort (the fault classified
+//     distinctly, never as an abort); otherwise log for reconciliation only
 package proxy
 
 import (
@@ -663,11 +664,13 @@ func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request) {
 // NO double-emit: in phoebe ModifyResponse always returns nil, so ErrorHandler
 // fires ONLY on a RoundTrip error (pre-header) — mutually exclusive with the
 // onDone path (post-header), which needs ModifyResponse to have run. The abort
-// emit is gated on isClientAbort; an admitted request whose non-abort failure is
-// indeterminate (not a verifiable pre-write dial failure) emits the same
-// zero-token attributable event, because the engine may already have done work
-// and the request must not be invisible to billing. Unaffected non-admitted
-// faults (dedicated traffic, gateway resolution) never emit here.
+// emit is gated on isClientAbort and classified Aborted; an admitted request
+// whose non-abort failure is indeterminate (not a verifiable pre-write dial
+// failure) emits the same zero-token attributable event but classified
+// UpstreamFault — the engine may already have done work and the request must
+// not be invisible to billing, and the fault must not be misrecorded as a
+// client abort. Unaffected non-admitted faults (dedicated traffic, gateway
+// resolution) never emit here.
 //
 // LEASE SETTLEMENT: an abort or an indeterminate non-abort failure settles with
 // CompleteUnknownUsage — the conservative token reservation is retained, because
@@ -716,12 +719,14 @@ func (s *Server) errorHandler(upstream string, id identity.Identity, requestID s
 		s.log.Error.Printf("upstream %s error: %v", upstream, err)
 		if indeterminate {
 			// An admitted request whose usage is indeterminate (the upstream may
-			// have consumed engine work before failing) gets the same zero-token
-			// attributable event as the pre-header abort, under the same
-			// BillPartialOnAbort policy. Verifiable pre-write dial failures settle
-			// zero and emit nothing — no engine work was possible.
+			// have consumed engine work before failing) gets a zero-token
+			// attributable event under the same BillPartialOnAbort policy as the
+			// pre-header abort — but classified as an upstream fault, NOT an
+			// abort: the client did not disconnect, and billing_event.aborted
+			// must say so. Verifiable pre-write dial failures settle zero and
+			// emit nothing — no engine work was possible.
 			ctx := context.WithoutCancel(r.Context())
-			s.emit(ctx, id, requestID, capture.Result{Aborted: true, UsageFound: false})
+			s.emit(ctx, id, requestID, capture.Result{UpstreamFault: true, UsageFound: false})
 		}
 		http.Error(w, "upstream error", http.StatusBadGateway)
 	}
@@ -732,29 +737,29 @@ func (s *Server) errorHandler(upstream string, id identity.Identity, requestID s
 // for async/durable delivery.
 //
 // Policy (M3):
-//   - Aborted + usage captured:    always emit (we have real counts).
-//   - Aborted + no usage:          emit only if BillPartialOnAbort; otherwise
-//     log for reconciliation.
-//   - Not aborted + no usage:      log for reconciliation; never bill.
-//   - Not aborted + usage:         always emit (normal completion).
+//   - usage captured:                  always emit (we have real counts),
+//     whether aborted, faulted, or clean.
+//   - no usage, client abort or        emit only if BillPartialOnAbort;
+//     indeterminate upstream fault:    otherwise log for reconciliation.
+//   - no usage, neither:               log for reconciliation; never bill.
 func (s *Server) emit(ctx context.Context, id identity.Identity, requestID string, res capture.Result) {
-	if res.Aborted && !res.UsageFound {
+	if (res.Aborted || res.UpstreamFault) && !res.UsageFound {
 		if !s.settings.BillPartialOnAbort {
 			// Policy: don't bill partial aborts with no token data. Log for
 			// reconciliation so the event is not silently lost.
-			s.log.Warn.Printf("aborted, no usage, not billing (BillPartialOnAbort=false) resource=%s request_id=%s streamed=%t",
+			s.log.Warn.Printf("aborted or upstream-faulted, no usage, not billing (BillPartialOnAbort=false) resource=%s request_id=%s streamed=%t",
 				id.ResourceID, requestID, res.Streamed)
 			return
 		}
 		// BillPartialOnAbort=true: emit a partial event with zero counts so
 		// downstream knows we attempted to bill and can reconcile if needed.
-		s.log.Debug.Printf("aborted, no usage, emitting partial event resource=%s request_id=%s streamed=%t",
+		s.log.Debug.Printf("aborted or upstream-faulted, no usage, emitting partial event resource=%s request_id=%s streamed=%t",
 			id.ResourceID, requestID, res.Streamed)
 	}
 
-	if !res.UsageFound && !res.Aborted {
-		// No usage and not an abort: a non-OpenAI response or an upstream we
-		// can't meter. Log for reconciliation; emit nothing billable.
+	if !res.UsageFound && !res.Aborted && !res.UpstreamFault {
+		// No usage and not an abort or fault: a non-OpenAI response or an
+		// upstream we can't meter. Log for reconciliation; emit nothing billable.
 		s.log.Warn.Printf("no usage captured for resource=%s request_id=%s streamed=%t",
 			id.ResourceID, requestID, res.Streamed)
 		return

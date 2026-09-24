@@ -1198,8 +1198,9 @@ func TestAdmissionChargesUnknownUsageOnPreHeaderAbort(t *testing.T) {
 // An upstream that consumes the full request and then resets before writing
 // response headers fails RoundTrip with EOF — not a client cancel. The engine's
 // usage is indeterminate, so the conservative reservation must be retained in
-// the org/owner contract windows and the request must be metered exactly like
-// the pre-header abort path.
+// the org/owner contract windows and the request must be metered like the
+// pre-header abort path — a zero-token attributable event — but classified as
+// an upstream fault, never as a client abort.
 func TestAdmissionChargesUnknownUsageOnUpstreamReset(t *testing.T) {
 	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		_, _ = io.Copy(io.Discard, r.Body) // consume the full request, then vanish
@@ -1227,8 +1228,13 @@ func TestAdmissionChargesUnknownUsageOnUpstreamReset(t *testing.T) {
 	}
 
 	events := em.waitForEvents(1, time.Second)
-	if len(events) != 1 || !events[0].Aborted || events[0].PromptTokens != 0 || events[0].CompletionTokens != 0 {
+	if len(events) != 1 || events[0].PromptTokens != 0 || events[0].CompletionTokens != 0 {
 		t.Fatalf("metering events=%+v, want the same zero-token attributable event as the abort path", events)
+	}
+	// The reset is an upstream fault, not a client abort: the event must be
+	// attributable without billing_event.aborted misrecording it as one.
+	if events[0].Aborted {
+		t.Fatalf("upstream fault event must have Aborted=false: %+v", events[0])
 	}
 
 	for _, tc := range []struct {
