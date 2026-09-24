@@ -239,7 +239,7 @@ func TestProxySanitizesModelListTrailers(t *testing.T) {
 	defer front.Close()
 
 	for _, method := range []string{http.MethodGet, http.MethodHead} {
-		req, err := http.NewRequest(method, front.URL+"/v1/models", nil)
+		req, err := http.NewRequestWithContext(context.Background(), method, front.URL+"/v1/models", nil)
 		if err != nil {
 			t.Fatal(err)
 		}
