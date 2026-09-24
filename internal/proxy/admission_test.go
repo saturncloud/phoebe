@@ -1,11 +1,13 @@
 package proxy
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
+	"log"
 	"net"
 	"net/http"
 	"net/http/httptest"
@@ -1839,5 +1841,30 @@ func TestProxyForwardsOperatorAdmissionLaneDynamoHints(t *testing.T) {
 	}
 	if payload.Nvext.CacheSalt != forwarded.Header.Get("X-Tenant-ID") || payload.Nvext.Hints.Priority != 11 || payload.Nvext.Hints.StrictPriority != 4 || payload.Nvext.Hints.OSL != 20 {
 		t.Fatalf("forwarded trusted policy mismatch: %+v headers=%v", payload, forwarded.Header)
+	}
+}
+
+// The per-request admission error logs must aggregate, not flood: the first
+// occurrence logs at onset, then every 100th, each carrying the number of
+// suppressed occurrences since the previous line.
+func TestSampledErrorLog(t *testing.T) {
+	var buf bytes.Buffer
+	logger := &logging.Logger{Error: log.New(&buf, "", 0)}
+	var site sampledErrorLog
+	for i := 0; i < 250; i++ {
+		site.logf(logger, "admission: distributed gate unavailable; bypassing request_id=%d", i)
+	}
+	lines := strings.Split(strings.TrimSpace(buf.String()), "\n")
+	if len(lines) != 3 {
+		t.Fatalf("logged %d lines for 250 occurrences, want 3 (1st + every 100th): %q", len(lines), lines)
+	}
+	if !strings.Contains(lines[0], "request_id=0") || strings.Contains(lines[0], "suppressed") {
+		t.Fatalf("first occurrence must log plainly: %q", lines[0])
+	}
+	if !strings.Contains(lines[1], "+98 similar suppressed") {
+		t.Fatalf("100th occurrence must report 98 suppressed: %q", lines[1])
+	}
+	if !strings.Contains(lines[2], "+99 similar suppressed") {
+		t.Fatalf("200th occurrence must report 99 suppressed: %q", lines[2])
 	}
 }

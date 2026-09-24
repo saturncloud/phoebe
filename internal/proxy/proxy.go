@@ -91,6 +91,11 @@ type Server struct {
 	// the feature is disabled. It runs only after trusted org/model resolution
 	// and model binding, and before any engine request.
 	admitter admission.Admitter
+
+	// admissionBypassLog and leaseRenewalLog aggregate the per-request error
+	// logs emitted when the distributed gate is unavailable, so a store
+	// outage cannot flood one ERROR per request (see sampledErrorLog).
+	admissionBypassLog, leaseRenewalLog sampledErrorLog
 }
 
 func (s *Server) WithAdmitter(a admission.Admitter) *Server { s.admitter = a; return s }
@@ -481,7 +486,7 @@ func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request) {
 					return
 				}
 				if errors.Is(err, admission.ErrUnavailable) {
-					s.log.Error.Printf("admission: distributed gate unavailable; bypassing for otherwise valid request_id=%s: %v", requestID, err)
+					s.admissionBypassLog.logf(s.log, "admission: distributed gate unavailable; bypassing for otherwise valid request_id=%s: %v", requestID, err)
 					admitted = nil
 				} else {
 					s.writeAdmissionError(w, err)
@@ -492,7 +497,7 @@ func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request) {
 				// Losing the fairness store must not terminate otherwise authorized
 				// inference. Metering is independent and still records actual usage.
 				go admitted.KeepAlive(r.Context(), func(e error) {
-					s.log.Error.Printf("admission: lease renewal failed; bypassing distributed gate for running request_id=%s: %v", requestID, e)
+					s.leaseRenewalLog.logf(s.log, "admission: lease renewal failed; bypassing distributed gate for running request_id=%s: %v", requestID, e)
 				})
 				// Safety net only for exits before an upstream response is attached.
 				// Once ModifyResponse installs capture, its completion callback owns

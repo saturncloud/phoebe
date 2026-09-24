@@ -8,11 +8,40 @@ import (
 	"math"
 	"net/http"
 	"strconv"
+	"sync/atomic"
 
 	"github.com/saturncloud/phoebe/internal/admission"
 	"github.com/saturncloud/phoebe/internal/config"
 	"github.com/saturncloud/phoebe/internal/identity"
+	"github.com/saturncloud/phoebe/internal/logging"
 )
+
+// admissionErrorLogEvery throttles the per-request admission error logs: a
+// store outage would otherwise emit one ERROR per bypassed request and one
+// per in-flight stream whose renewal fails — flooding the log exactly when
+// the gate is down. The 1st and then every Nth occurrence is logged, with
+// the number of suppressed occurrences appended.
+const admissionErrorLogEvery = 100
+
+// sampledErrorLog aggregates one recurring per-request error log site so a
+// sustained failure is visible at onset without flooding every request.
+type sampledErrorLog struct {
+	n          atomic.Int64
+	suppressed atomic.Int64
+}
+
+func (l *sampledErrorLog) logf(log *logging.Logger, format string, args ...interface{}) {
+	n := l.n.Add(1)
+	if n > 1 && n%admissionErrorLogEvery != 0 {
+		l.suppressed.Add(1)
+		return
+	}
+	if dropped := l.suppressed.Swap(0); dropped > 0 {
+		log.Error.Printf(format+" (+%d similar suppressed)", append(args, dropped)...)
+		return
+	}
+	log.Error.Printf(format, args...)
+}
 
 type admissionEstimate struct {
 	Model        string
