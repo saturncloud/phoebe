@@ -2248,8 +2248,8 @@ func TestSampledErrorLogQuietGapConcurrentOnset(t *testing.T) {
 	// them together then makes the outcome scheduling-independent: without
 	// the gate each worker resets the counters and logs its own onset line
 	// (deterministic red); with it exactly one CAS winner resets and logs
-	// (deterministic green). The losers' increments may be wiped by the
-	// winner's reset (the acknowledged under-count); none of them may log.
+	// (deterministic green). The losers return without counting or logging
+	// (their dropped occurrence is the acknowledged under-count).
 	const workers = 16
 	var arrived sync.WaitGroup
 	arrived.Add(workers)
@@ -2266,7 +2266,18 @@ func TestSampledErrorLogQuietGapConcurrentOnset(t *testing.T) {
 			site.logf(logger, "incident-two occurrence %d", i)
 		}(i)
 	}
-	arrived.Wait()
+	// Fail fast if a regression keeps workers from reaching the hook, rather
+	// than blocking until the go test panic timeout.
+	arrivedDone := make(chan struct{})
+	go func() {
+		arrived.Wait()
+		close(arrivedDone)
+	}()
+	select {
+	case <-arrivedDone:
+	case <-time.After(5 * time.Second):
+		t.Fatal("workers did not reach the afterLoad hook within 5s")
+	}
 	close(release)
 	wg.Wait()
 

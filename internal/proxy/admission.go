@@ -72,13 +72,16 @@ func (l *sampledErrorLog) logf(log *logging.Logger, format string, args ...inter
 	if last != 0 && unixNano-last > l.quietGapNanos() {
 		// Only the goroutine that wins the timestamp update resets the
 		// counters: a concurrent burst at an incident's onset must not each
-		// reset and each log an onset line. Losers fall through with their
-		// increment possibly wiped by the winner's reset — the acknowledged
-		// benign under-count, never an extra flood.
-		if l.lastUnixNano.CompareAndSwap(last, unixNano) {
-			l.n.Store(0)
-			l.suppressed.Store(0)
+		// reset and each log an onset line. Losers return without counting
+		// or logging: a loser that fell through could observe n==1 after
+		// the winner's reset but before the winner's own increment, logging
+		// a duplicate onset. The dropped loser occurrence matches the
+		// under-count a wiped loser increment already caused.
+		if !l.lastUnixNano.CompareAndSwap(last, unixNano) {
+			return
 		}
+		l.n.Store(0)
+		l.suppressed.Store(0)
 	} else {
 		l.lastUnixNano.Store(unixNano)
 	}
