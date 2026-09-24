@@ -1407,6 +1407,49 @@ func TestAdmissionChargesUnknownUsageOnUpstreamReset(t *testing.T) {
 	_ = lease.Complete(context.Background(), 0)
 }
 
+// The emit-matrix cell the sibling test cannot see: the same upstream reset
+// (UpstreamFault, no usage) with BillPartialOnAbort=false must emit NOTHING —
+// the zero-token event is reserved for the partial-billing policy — and the
+// skip must leave the Warn reconciliation log, not silence.
+func TestAdmissionUpstreamResetNoEmitWithoutPartialBilling(t *testing.T) {
+	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = io.Copy(io.Discard, r.Body) // consume the full request, then vanish
+		conn, _, herr := w.(http.Hijacker).Hijack()
+		if herr != nil {
+			return
+		}
+		_ = conn.Close()
+	}))
+	defer backend.Close()
+	up, _ := url.Parse(backend.URL)
+	mr := miniredis.RunT(t)
+	cfg := proxyAdmissionConfig(1)
+	c := redis.NewClient(&redis.Options{Addr: mr.Addr()})
+	t.Cleanup(func() { _ = c.Close() })
+	a := admission.New(c, cfg)
+	em := &recordingEmitter{}
+	var warnBuf, errBuf bytes.Buffer
+	logger := &logging.Logger{
+		Warn:  log.New(&warnBuf, "", 0),
+		Error: log.New(&errBuf, "", 0),
+	}
+	s := New(&config.Settings{Admission: cfg, BillPartialOnAbort: false}, logger, em).WithAdmitter(a)
+	req := sharedRequest(up)
+	req.Header.Set(identity.HeaderOrgRateLimitGeneratedTokens, "20")
+	req.Header.Set(identity.HeaderOwnerRateLimitGeneratedTokens, "20")
+	rr := httptest.NewRecorder()
+	s.Handler().ServeHTTP(rr, req)
+	if rr.Code != http.StatusBadGateway {
+		t.Fatalf("status=%d, want 502", rr.Code)
+	}
+	if n := len(em.all()); n != 0 {
+		t.Fatalf("BillPartialOnAbort=false emitted %d events for an upstream fault with no usage, want 0", n)
+	}
+	if !strings.Contains(warnBuf.String(), "not billing (BillPartialOnAbort=false)") {
+		t.Fatalf("the skip must log the reconciliation Warn, got: %q", warnBuf.String())
+	}
+}
+
 // A verifiable pre-write dial failure (connection refused) proves the request
 // never left the process: the lease settles Complete(0) — physical capacity is
 // released and the generated/prompt contract windows are NOT charged. The
