@@ -602,11 +602,19 @@ func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request) {
 		if admitted != nil {
 			// The first response body byte is the observable prefill→decode
 			// boundary. Headers alone can arrive before an engine finishes prefill,
-			// so releasing there would under-protect prefill bursts.
+			// so releasing there would under-protect prefill bursts. The release
+			// itself is a Valkey round-trip, so it must not sit inline in the Read
+			// that forwards the first byte: hand it off a goroutine (the same
+			// pattern KeepAlive uses). Settlement ordering is unaffected — the
+			// transition is idempotent, a finish that beats it releases the
+			// prefill reservation itself (release_record), and a transition that
+			// lands after settlement is a no-op on the missing lease.
 			cr.setOnFirstRead(func() {
-				if e := admitted.PrefillDone(context.WithoutCancel(r.Context())); e != nil {
-					s.log.Error.Printf("admission: prefill release failed: %v", e)
-				}
+				go func() {
+					if e := admitted.PrefillDone(context.WithoutCancel(r.Context())); e != nil {
+						s.log.Error.Printf("admission: prefill release failed: %v", e)
+					}
+				}()
 			})
 		}
 		// Enable bounded response-body capture ONLY for opted-in requests (M5).

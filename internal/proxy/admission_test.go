@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"net"
 	"net/http"
@@ -449,6 +450,231 @@ func TestPrefillReservationReleasesAtFirstBodyByte(t *testing.T) {
 	if resp.StatusCode != http.StatusOK {
 		t.Fatalf("first request status=%d, want 200", resp.StatusCode)
 	}
+}
+
+// prefillTransitionHook intercepts the admission prefill transition — the
+// only Lua call whose ARGV carries the bare action string "prefill" — to
+// block or fail it, simulating a slow or dead Valkey at the prefill→decode
+// boundary. It matches both EVALSHA and EVAL (miniredis starts with no
+// scripts loaded, so every call falls back from the former to the latter).
+type prefillTransitionHook struct {
+	entered chan struct{}
+	release chan struct{}
+	fail    error
+	once    sync.Once
+}
+
+func (h *prefillTransitionHook) DialHook(next redis.DialHook) redis.DialHook { return next }
+func (h *prefillTransitionHook) ProcessPipelineHook(next redis.ProcessPipelineHook) redis.ProcessPipelineHook {
+	return next
+}
+func (h *prefillTransitionHook) ProcessHook(next redis.ProcessHook) redis.ProcessHook {
+	return func(ctx context.Context, cmd redis.Cmder) error {
+		if cmd.Name() != "evalsha" && cmd.Name() != "eval" {
+			return next(ctx, cmd)
+		}
+		// The prefill transition is the only script whose ARGV carries the
+		// bare action string "prefill" (finish carries "finish", renew and
+		// admit carry none). Exact-match per arg: admit's JSON body merely
+		// contains the substring "prefills".
+		prefill := false
+		for _, arg := range cmd.Args() {
+			if fmt.Sprint(arg) == "prefill" {
+				prefill = true
+				break
+			}
+		}
+		if !prefill {
+			return next(ctx, cmd)
+		}
+		h.once.Do(func() { close(h.entered) })
+		if h.fail != nil {
+			return h.fail
+		}
+		select {
+		case <-h.release:
+			return next(ctx, cmd)
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+	}
+}
+
+// The prefill release is a Valkey round-trip and must stay off the first-byte
+// Read path: with the store blocked or failing, the first byte still flows to
+// the client. Settlement is unchanged — once the store answers, the transition
+// records the release; if it never does, the lease's finish releases the
+// prefill reservation itself (release_record), so capacity cannot leak.
+func TestPrefillReleaseOffFirstBytePath(t *testing.T) {
+	newBackend := func(requests *atomic.Int32, writeFirstByte <-chan struct{}, firstByteWritten chan<- struct{}, finishFirst <-chan struct{}) *httptest.Server {
+		return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			if requests.Add(1) == 1 {
+				// First request: headers immediately, then withhold the body.
+				w.WriteHeader(http.StatusOK)
+				w.(http.Flusher).Flush()
+				<-writeFirstByte
+				_, _ = w.Write([]byte(`{"model"`))
+				w.(http.Flusher).Flush()
+				close(firstByteWritten)
+				<-finishFirst
+				_, _ = w.Write([]byte(`:"model-a","usage":{"prompt_tokens":1,"completion_tokens":1}}`))
+				return
+			}
+			_, _ = w.Write([]byte(`{"model":"model-a","usage":{"prompt_tokens":1,"completion_tokens":1}}`))
+		}))
+	}
+
+	t.Run("blocked store does not delay the first byte", func(t *testing.T) {
+		writeFirstByte := make(chan struct{})
+		firstByteWritten := make(chan struct{})
+		finishFirst := make(chan struct{})
+		var startOnce, finishOnce sync.Once
+		startBody := func() { startOnce.Do(func() { close(writeFirstByte) }) }
+		releaseFirst := func() { finishOnce.Do(func() { close(finishFirst) }) }
+		var requests atomic.Int32
+		backend := newBackend(&requests, writeFirstByte, firstByteWritten, finishFirst)
+		defer backend.Close()
+		up, _ := url.Parse(backend.URL)
+		mr := miniredis.RunT(t)
+		cfg := proxyAdmissionConfig(2)
+		cfg.Platform.MaxConcurrentPrefills = 1 // prefill is the only binding dimension
+		c := redis.NewClient(&redis.Options{Addr: mr.Addr()})
+		t.Cleanup(func() { _ = c.Close() })
+		hook := &prefillTransitionHook{entered: make(chan struct{}), release: make(chan struct{})}
+		c.AddHook(hook)
+		var releaseHookOnce sync.Once
+		releaseHook := func() { releaseHookOnce.Do(func() { close(hook.release) }) }
+		s := New(&config.Settings{Admission: cfg}, logging.New(logging.ERROR), &recordingEmitter{}).WithAdmitter(admission.New(c, cfg))
+		front := httptest.NewServer(s.Handler())
+		defer front.Close()
+		// Registered after the servers so it runs before their blocking Close():
+		// never leave the first backend handler stuck on a failure path.
+		defer func() { startBody(); releaseFirst(); releaseHook() }()
+
+		first, err := http.NewRequestWithContext(context.Background(), http.MethodPost, front.URL+"/v1/chat/completions",
+			strings.NewReader(`{"model":"model-a","max_tokens":20}`))
+		if err != nil {
+			t.Fatal(err)
+		}
+		for k, vs := range sharedRequest(up).Header {
+			first.Header[k] = vs
+		}
+		resp, err := front.Client().Do(first)
+		if err != nil {
+			t.Fatalf("first request: %v", err)
+		}
+		defer resp.Body.Close()
+
+		startBody()
+		select {
+		case <-firstByteWritten:
+		case <-time.After(2 * time.Second):
+			t.Fatal("backend never wrote the first body byte")
+		}
+		// The prefill transition is now in flight against the blocked store.
+		select {
+		case <-hook.entered:
+		case <-time.After(2 * time.Second):
+			t.Fatal("prefill transition never reached the store")
+		}
+		// The first byte must reach the client while that round-trip is still
+		// blocked; inline settlement would hold it until the store answered.
+		readDone := make(chan error, 1)
+		go func() {
+			one := make([]byte, 1)
+			_, rerr := resp.Body.Read(one)
+			readDone <- rerr
+		}()
+		select {
+		case err := <-readDone:
+			if err != nil {
+				t.Fatalf("first byte read: %v", err)
+			}
+		case <-time.After(2 * time.Second):
+			t.Fatal("first byte blocked on the in-flight prefill release")
+		}
+
+		// Unblock the store: the release lands and the prefill slot opens even
+		// though the first response is still streaming.
+		releaseHook()
+		deadline := time.Now().Add(2 * time.Second)
+		for {
+			rr := httptest.NewRecorder()
+			s.Handler().ServeHTTP(rr, sharedRequest(up))
+			if rr.Code == http.StatusOK {
+				break
+			}
+			if time.Now().After(deadline) {
+				t.Fatalf("prefill release never settled; last status=%d", rr.Code)
+			}
+			time.Sleep(5 * time.Millisecond)
+		}
+
+		releaseFirst()
+		if _, err := io.Copy(io.Discard, resp.Body); err != nil {
+			t.Fatalf("read first response body: %v", err)
+		}
+		if resp.StatusCode != http.StatusOK {
+			t.Fatalf("first request status=%d, want 200", resp.StatusCode)
+		}
+	})
+
+	t.Run("failing store defers the release to settlement", func(t *testing.T) {
+		writeFirstByte := make(chan struct{})
+		firstByteWritten := make(chan struct{})
+		finishFirst := make(chan struct{})
+		close(writeFirstByte)
+		close(finishFirst)
+		var requests atomic.Int32
+		backend := newBackend(&requests, writeFirstByte, firstByteWritten, finishFirst)
+		defer backend.Close()
+		up, _ := url.Parse(backend.URL)
+		mr := miniredis.RunT(t)
+		cfg := proxyAdmissionConfig(2)
+		cfg.Platform.MaxConcurrentPrefills = 1
+		c := redis.NewClient(&redis.Options{Addr: mr.Addr()})
+		t.Cleanup(func() { _ = c.Close() })
+		hook := &prefillTransitionHook{entered: make(chan struct{}), fail: errors.New("valkey unavailable")}
+		c.AddHook(hook)
+		s := New(&config.Settings{Admission: cfg}, logging.New(logging.ERROR), &recordingEmitter{}).WithAdmitter(admission.New(c, cfg))
+		front := httptest.NewServer(s.Handler())
+		defer front.Close()
+
+		first, err := http.NewRequestWithContext(context.Background(), http.MethodPost, front.URL+"/v1/chat/completions",
+			strings.NewReader(`{"model":"model-a","max_tokens":20}`))
+		if err != nil {
+			t.Fatal(err)
+		}
+		for k, vs := range sharedRequest(up).Header {
+			first.Header[k] = vs
+		}
+		resp, err := front.Client().Do(first)
+		if err != nil {
+			t.Fatalf("first request: %v", err)
+		}
+		defer resp.Body.Close()
+		if _, err := io.Copy(io.Discard, resp.Body); err != nil {
+			t.Fatalf("response body with a failing prefill release: %v", err)
+		}
+		if resp.StatusCode != http.StatusOK {
+			t.Fatalf("first request status=%d, want 200", resp.StatusCode)
+		}
+		select {
+		case <-hook.entered:
+		case <-time.After(2 * time.Second):
+			t.Fatal("prefill transition never reached the store")
+		}
+		// The failed transition left rec.prefill set, so the lease's finish
+		// releases the prefill reservation itself — capacity cannot leak.
+		lease, err := admission.New(c, cfg).Admit(context.Background(), admission.Request{
+			Graph: "graph", Organization: "org-b", Model: "m",
+			PromptBytes: 1, EstimatedInputTokens: 1, ReservedOutputTokens: 1,
+		})
+		if err != nil {
+			t.Fatalf("failed prefill release leaked the reservation past settlement: %v", err)
+		}
+		_ = lease.Complete(context.Background(), 0)
+	})
 }
 
 // When every wake attempt stays cold, the client receives the final cold
