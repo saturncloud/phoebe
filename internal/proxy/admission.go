@@ -44,6 +44,12 @@ type sampledErrorLog struct {
 	// zero values select the production defaults (time.Now, 1 minute).
 	now      func() time.Time
 	quietGap time.Duration
+
+	// afterLoad, when non-nil, runs in logf after the lastUnixNano load and
+	// before the quiet-gap check/CAS. It exists so a test can park every
+	// concurrent caller at that decision point, forcing all of them to act
+	// on the same pre-reset timestamp; nil in production.
+	afterLoad func()
 }
 
 func (l *sampledErrorLog) quietGapNanos() int64 {
@@ -59,7 +65,11 @@ func (l *sampledErrorLog) logf(log *logging.Logger, format string, args ...inter
 		now = l.now()
 	}
 	unixNano := now.UnixNano()
-	if last := l.lastUnixNano.Load(); last != 0 && unixNano-last > l.quietGapNanos() {
+	last := l.lastUnixNano.Load()
+	if l.afterLoad != nil {
+		l.afterLoad()
+	}
+	if last != 0 && unixNano-last > l.quietGapNanos() {
 		// Only the goroutine that wins the timestamp update resets the
 		// counters: a concurrent burst at an incident's onset must not each
 		// reset and each log an onset line. Losers fall through with their

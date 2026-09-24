@@ -2237,26 +2237,37 @@ func TestSampledErrorLogQuietGapConcurrentOnset(t *testing.T) {
 		site.logf(logger, "incident-one occurrence %d", i)
 	}
 
-	// Over a minute of silence, then a concurrent second incident: exactly
-	// one onset line, whichever goroutine wins the reset CAS. The losers'
-	// increments may be wiped by the winner's reset (the acknowledged
-	// under-count); none of them may log. The start barrier releases every
-	// goroutine into logf at once, so they all observe the pre-reset
-	// timestamp — without the CAS gate each would reset and log its own
-	// onset line.
+	// Over a minute of silence, then a concurrent second incident.
 	now = base.Add(2 * time.Minute)
+
+	// Park every worker inside logf between its lastUnixNano load and the
+	// gap check/CAS: the arrival barrier holds each worker at the hook until
+	// all of them have loaded the pre-reset timestamp (incident one's wall
+	// clock), so every worker enters the gap branch acting on the same
+	// stale last — the collision the CAS gate exists to break. Releasing
+	// them together then makes the outcome scheduling-independent: without
+	// the gate each worker resets the counters and logs its own onset line
+	// (deterministic red); with it exactly one CAS winner resets and logs
+	// (deterministic green). The losers' increments may be wiped by the
+	// winner's reset (the acknowledged under-count); none of them may log.
 	const workers = 16
-	start := make(chan struct{})
+	var arrived sync.WaitGroup
+	arrived.Add(workers)
+	release := make(chan struct{})
+	site.afterLoad = func() {
+		arrived.Done()
+		<-release
+	}
 	var wg sync.WaitGroup
 	for i := 0; i < workers; i++ {
 		wg.Add(1)
 		go func(i int) {
 			defer wg.Done()
-			<-start
 			site.logf(logger, "incident-two occurrence %d", i)
 		}(i)
 	}
-	close(start)
+	arrived.Wait()
+	close(release)
 	wg.Wait()
 
 	lines := strings.Split(strings.TrimSpace(buf.String()), "\n")
