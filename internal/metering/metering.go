@@ -44,7 +44,14 @@ func (u Usage) CachedTokens() int {
 // ResourceID, ResourceType are captured verbatim so no information the edge
 // gave us is lost.
 type Event struct {
+	// RequestID is the trusted, server-minted BILLABLE ATTEMPT id.  The JSON and
+	// database name are retained for wire compatibility; it is never copied from
+	// the client's X-Request-Id.
 	RequestID string `json:"request_id"`
+	// ClientRequestID is the untrusted correlation/idempotency value supplied by
+	// the caller.  It is forensic only: retries that reuse it still receive a new
+	// RequestID and therefore remain distinct billable execution attempts.
+	ClientRequestID string `json:"client_request_id,omitempty"`
 
 	// Identity, captured verbatim from atlas-auth headers.
 	AuthID       string `json:"auth_id,omitempty"`       // token / API-key id (JWT sub) — primary key
@@ -88,6 +95,19 @@ type Event struct {
 	// dedicated).
 	ServingMode string `json:"serving_mode,omitempty"`
 
+	// GraphK8sName is the DynamoGraphDeployment (DGD) that served this request —
+	// the COST CENTRE. It is carried so a rollup's cost stays attributable to the
+	// hardware that produced it, and it is the only way to do so in SHARED mode:
+	// there, MANY tf_model rows across MANY orgs ride ONE platform-owned base
+	// graph, and that graph has no row in any database (it is keyed by a
+	// deterministic name and reference-counted), so resource_id cannot identify it.
+	//
+	// Sourced from gateway resolution (tf_model.graph_k8s_name) on the gateway
+	// path, and derived from the upstream host on the header path. Empty is valid
+	// and never withholds money — it only means the cost is not pool-attributable.
+	// EVIDENCE ONLY: never part of the billing grain (see migrations/0006).
+	GraphK8sName string `json:"graph_k8s_name,omitempty"`
+
 	// Token counts (the engine's own usage block; never re-tokenized).
 	PromptTokens     int `json:"prompt_tokens"`
 	CachedTokens     int `json:"cached_tokens"`
@@ -96,6 +116,11 @@ type Event struct {
 	FinishReason string `json:"finish_reason,omitempty"`
 	GPUType      string `json:"gpu_type,omitempty"` // for margin; echoed by router/engine
 	Aborted      bool   `json:"aborted,omitempty"`
+	// UsageFound distinguishes a legitimate zero-token engine usage block from a
+	// failed/aborted attempt for which no authoritative counts were available.
+	UsageFound bool `json:"usage_found"`
+	StatusCode int  `json:"status_code,omitempty"`
+	Streamed   bool `json:"streamed,omitempty"`
 
 	// TimestampUnixMs is stamped by the emitter, not in the hot path here.
 	TimestampUnixMs int64 `json:"timestamp_unix_ms"`
@@ -115,7 +140,7 @@ type LogEmitter struct {
 }
 
 func (l *LogEmitter) Emit(_ context.Context, e Event) {
-	l.Log.Info.Printf("metering event: request_id=%s auth_id=%s org=%s group=%s user=%s resource=%s/%s model=%s prompt=%d cached=%d completion=%d finish=%s aborted=%t",
-		e.RequestID, e.AuthID, e.OrgID, e.GroupID, e.UserID, e.ResourceType, e.ResourceID, e.Model,
-		e.PromptTokens, e.CachedTokens, e.CompletionTokens, e.FinishReason, e.Aborted)
+	l.Log.Info.Printf("metering event: request_id=%s client_request_id=%s auth_id=%s org=%s group=%s user=%s resource=%s/%s model=%s prompt=%d cached=%d completion=%d finish=%s aborted=%t usage_found=%t status=%d streamed=%t",
+		e.RequestID, e.ClientRequestID, e.AuthID, e.OrgID, e.GroupID, e.UserID, e.ResourceType, e.ResourceID, e.Model,
+		e.PromptTokens, e.CachedTokens, e.CompletionTokens, e.FinishReason, e.Aborted, e.UsageFound, e.StatusCode, e.Streamed)
 }

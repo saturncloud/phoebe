@@ -2,7 +2,7 @@
 // proxy that sits behind Traefik and in front of the inference router/engine.
 //
 // M1 implemented the forward-then-inspect streaming tee. M3 (this milestone)
-// wires client-abort detection and applies the bill-partial-on-abort policy:
+// wires client-abort detection and its billing contract:
 //   - read trusted identity headers (does NOT authenticate)
 //   - forward to the Atlas-injected X-Saturn-Upstream backend (the routing
 //     authority; fail closed when absent/malformed — phoebe never guesses)
@@ -15,10 +15,8 @@
 //     Aborted=true without a separate watcher goroutine racing the body Close
 //   - capture the engine-reported model name from the response body as the
 //     stable price key (Event.Model), distinct from the routing resource id
-//   - apply BillPartialOnAbort policy in emit: if usage is present, always
-//     bill; if usage is absent after a client abort or an indeterminate
-//     upstream fault, bill only if BillPartialOnAbort (the fault classified
-//     distinctly, never as an abort); otherwise log for reconciliation only
+//   - always bill authoritative engine usage even when the client aborted;
+//     without usage, retain a zero-charge raw attempt for reconciliation
 package proxy
 
 import (
@@ -45,9 +43,32 @@ import (
 	"github.com/saturncloud/phoebe/internal/metering"
 )
 
-// requestIDHeader is the public request-correlation header. It is never trusted
-// as billing_event's idempotency key: clients can choose and replay it.
-const requestIDHeader = "X-Request-Id"
+const (
+	// requestIDHeader is the public request-correlation header. It is never trusted
+	// as billing_event's idempotency key: clients can choose and replay it.
+	requestIDHeader = "X-Request-Id"
+
+	// clientRequestIDLimit is an exclusive byte bound. The persisted column is
+	// VARCHAR(255), so rejecting 255-byte and larger caller values before any
+	// upstream work makes the storage constraint unreachable from untrusted input.
+	clientRequestIDLimit = 255
+)
+
+// validClientRequestID accepts the conventional HTTP identifier alphabet:
+// printable ASCII, strictly shorter than clientRequestIDLimit bytes. Empty is
+// valid because Phoebe generates the trusted attempt id when the caller omits
+// this optional correlation value.
+func validClientRequestID(value string) bool {
+	if len(value) >= clientRequestIDLimit {
+		return false
+	}
+	for i := 0; i < len(value); i++ {
+		if value[i] < 0x20 || value[i] > 0x7e {
+			return false
+		}
+	}
+	return true
+}
 
 // generateRequestID mints the internal billing-attempt id at Phoebe ingress.
 // It is called exactly once per inbound inference request; retries and durable
@@ -99,7 +120,7 @@ type Server struct {
 	admissionBypassLog, leaseRenewalLog                        sampledErrorLog
 	admissionReleaseFallbackLog, admissionCompletionReleaseLog sampledErrorLog
 	admissionPrefillReleaseLog, admissionUpstreamReleaseLog    sampledErrorLog
-	admissionColdHoldBypassLog, admissionColdHoldReleaseLog    sampledErrorLog
+	admissionColdHoldReleaseLog                                sampledErrorLog
 }
 
 func (s *Server) WithAdmitter(a admission.Admitter) *Server { s.admitter = a; return s }
@@ -156,10 +177,11 @@ const (
 	defaultWakeMaxTries = 3 // probe -> wake -> re-probe attempts
 )
 
-// WithWaker enables shared-mode wake-from-zero: on a cold response for a
-// wakeable route, the proxy triggers a 0->1 scale via the waker and holds the
-// request until warm. nil waker leaves wake disabled (cold responses pass
-// through). timeout/maxTries <= 0 use the defaults.
+// WithWaker enables shared-mode wake-from-zero. Before forwarding a wakeable
+// request, the proxy triggers a 0->1 scale and waits for the requested model to
+// appear in non-billable readiness discovery. It then forwards the customer's
+// inference request exactly once. A wake failure also falls through to that one
+// honest, metered forward. A timeout <= 0 uses the default.
 func (s *Server) WithWaker(waker Waker, timeout time.Duration, maxTries int) *Server {
 	s.waker = waker
 	s.wakeTimeout = timeout
@@ -205,6 +227,17 @@ func (s *Server) handleHealth(w http.ResponseWriter, _ *http.Request) {
 // onDone fires exactly once regardless of whether EOF or Close reaches it first.
 func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request) {
 	id := identity.FromRequest(r)
+	clientRequestID := r.Header.Get(requestIDHeader)
+	if !validClientRequestID(clientRequestID) {
+		// Do not log or echo the untrusted value: it can be large or contain
+		// terminal-confusing bytes. Most importantly, reject before gateway
+		// resolution, waking, or forwarding so an invalid correlation field can
+		// never produce served-but-unpersistable usage.
+		s.log.Warn.Printf("rejecting invalid %s (must be printable ASCII and fewer than %d bytes)",
+			requestIDHeader, clientRequestIDLimit)
+		http.Error(w, "invalid X-Request-Id", http.StatusBadRequest)
+		return
+	}
 	var sharedLane config.AdmissionLane
 	bodyBound := false
 
@@ -313,6 +346,16 @@ func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
+	// Resolve the serving graph ONCE, here, so every downstream consumer (the wake
+	// target and the metering event) reads one value rather than deriving its own.
+	// The gateway path already set it from tf_model.graph_k8s_name; the header path
+	// has no such header, so it is derived from the upstream host the middleware
+	// stamped (<graph>-frontend.<ns>.svc...). Best-effort: an underivable graph
+	// leaves this empty, which is valid and never affects billing.
+	if id.GraphK8sName == "" {
+		id.GraphK8sName = graphFromUpstreamHost(upstream.Host)
+	}
+
 	// M5 I/O-logging gate — computed ONCE. Everything that adds hot-path cost
 	// (capturing the request body, buffering the response) is guarded by this
 	// single boolean. When false (the default, and the common case), the proxy
@@ -367,6 +410,11 @@ func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request) {
 	// THE ORG, so resolution IS the binding (id.ServedModel was set FROM the
 	// resolved request model; re-checking it against itself would be a
 	// tautology).
+	// NOTE: the binding check's singular matched model is deliberately discarded.
+	// It existed so wake readiness could match /v1/models EXACTLY (id.ServedModel
+	// may be a comma-separated allow-list, which no /v1/models entry can equal).
+	// serveWithWake no longer polls /v1/models -- it probes for a cold response
+	// and retries -- so there is nothing left that needs the singular value.
 	if id.ServedModel != "" && !id.Gateway {
 		body, rerr := readAndRestoreBody(r)
 		if rerr != nil {
@@ -374,7 +422,10 @@ func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request) {
 			writeRequestBodyError(w, rerr)
 			return
 		}
-		switch checkModelBinding(body, id.ServedModel) {
+		// The second return is the singular matched model; see the note above
+		// for why nothing consumes it any more.
+		result, _ := checkModelBinding(body, id.ServedModel)
+		switch result {
 		case bindingMismatch, bindingUnparseable:
 			// Fail closed: the request names a model this resource is not
 			// authorized to serve (or one we cannot verify). Log with the
@@ -526,16 +577,18 @@ func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	rp := httputil.NewSingleHostReverseProxy(upstream)
-	// wakeColdFinal is set by the wake round tripper when the engine's cold
-	// response becomes the final response (wake budget exhausted or waker
-	// failed): the engine provably did no inference work, so a usage-less
-	// capture settles zero rather than conservative-unknown. It stays false for
-	// every other response, including engine 4xx/5xx after a real dispatch.
-	wakeColdFinal := new(atomic.Bool)
+	// WAKE-FROM-ZERO (shared serverless mode, the 0->1 leg). Prepare the graph
+	// with Kubernetes actuation and non-billable GET /v1/models readiness before
+	// the inference POST. Regardless of wake success or failure, the normal path
+	// below forwards the customer's POST at most once and meters its honest
+	// response. No inference response is ever discarded and replayed.
 	if s.wakeEnabled(id) {
-		rp.Transport = s.newWakeRoundTripper(upstream.Host, requestID, id, admitted, wakeColdFinal)
+		if served := s.serveWithWake(w, r, upstream, id, requestID, admitted); served {
+			return
+		}
 	}
+
+	rp := httputil.NewSingleHostReverseProxy(upstream)
 
 	// FlushInterval=-1 flushes every write immediately — per-chunk SSE
 	// delivery with no buffering. This is the streaming-correctness linchpin.
@@ -567,7 +620,7 @@ func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request) {
 			// honours ctx would otherwise lose every aborted request).
 			ctx := context.WithoutCancel(r.Context())
 			if admitted != nil {
-				kind := classifyCaptureSettlement(res, wakeColdFinal.Load())
+				kind := classifyCaptureSettlement(res)
 				e := settleAdmissionLease(ctx, admitted, kind, admission.Usage{
 					TotalPromptTokens:  int64(res.Usage.PromptTokens),
 					CachedPromptTokens: int64(res.Usage.CachedTokens()),
@@ -578,7 +631,7 @@ func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request) {
 				}
 			}
 			// Metering (durable) always fires.
-			s.emit(ctx, id, requestID, res)
+			s.emit(ctx, id, requestID, clientRequestID, statusCode, res)
 			// M5 I/O logging (best-effort) only when this request opted in.
 			if shouldLog {
 				respBody, truncated := cr.capturedBody()
@@ -639,7 +692,7 @@ func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request) {
 		return nil
 	}
 
-	rp.ErrorHandler = s.errorHandler(upstream.String(), id, requestID, admitted, &responseCaptureInstalled)
+	rp.ErrorHandler = s.errorHandler(upstream.String(), id, requestID, clientRequestID, admitted, &responseCaptureInstalled)
 
 	rp.ServeHTTP(w, r)
 	if responseCaptureInstalled.Load() {
@@ -666,7 +719,7 @@ func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request) {
 // completely invisible to billing/reconciliation. So on an abort we emit exactly
 // ONE zero-token, attributable event (Aborted=true, no usage) with the already-
 // resolved identity, via the SAME s.emit path the completion path uses — so the
-// pre-header abort obeys the SAME BillPartialOnAbort policy (no second policy).
+// pre-header abort uses the same always-record contract as every other abort.
 //
 // Invariant: every request past the billing-identity gate emits exactly one
 // attributable event — real usage on completion, or a zero-token Aborted event on
@@ -674,40 +727,46 @@ func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request) {
 //
 // NO double-emit: in phoebe ModifyResponse always returns nil, so ErrorHandler
 // fires ONLY on a RoundTrip error (pre-header) — mutually exclusive with the
+// NO double-emit: in phoebe ModifyResponse always returns nil, so ErrorHandler
+// fires ONLY on a RoundTrip error (pre-header) — mutually exclusive with the
 // onDone path (post-header), which needs ModifyResponse to have run. The abort
-// emit is gated on isClientAbort and classified Aborted; an admitted request
-// whose non-abort failure is indeterminate (not a verifiable pre-write dial
-// failure) emits the same zero-token attributable event but classified
-// UpstreamFault — the engine may already have done work and the request must
-// not be invisible to billing, and the fault must not be misrecorded as a
-// client abort. Unaffected non-admitted faults (dedicated traffic, gateway
-// resolution) never emit here.
+// emit is gated on isClientAbort and classified Aborted; every other transport
+// failure (including a wrapped DeadlineExceeded and a verified pre-write dial
+// failure) persists the same zero-token attributable row under the
+// always-record policy, with StatusCode 502 and the engine-attempt classified
+// UpstreamFault in the capture result — never Aborted, so
+// billing_event.aborted cannot misrecord a client disconnect.
 //
 // LEASE SETTLEMENT: the RoundTrip error is classified once, at the point the
 // failure becomes known, into a closed settlementKind (see settlement.go):
 // aborts and indeterminate non-abort failures settle CompleteUnknownUsage —
 // the conservative token reservation is retained, because consumed engine work
 // must not vanish from the contract windows — while a verified pre-write dial
-// failure (the request provably never left the process) and the cold-hold
-// capacity rejection (the engine answered cold: determinate never-served,
-// whether it is rendered 503 or 429) settle Complete(0). Both kinds keep the
-// requests-window +1 charged at Admit time: that window measures demand, not
-// work. The context is decoupled from the cancelled client ctx (WithoutCancel)
-// — the abort is precisely WHY we are here, so a cancelled ctx must not be
-// able to drop the emit or the settlement (mirrors onDone).
-func (s *Server) errorHandler(upstream string, id identity.Identity, requestID string, admitted *admission.Lease, responseCaptureInstalled *atomic.Bool) func(http.ResponseWriter, *http.Request, error) {
+// failure (the request provably never left the process) settles Complete(0).
+// Both kinds keep the requests-window +1 charged at Admit time: that window
+// measures demand, not work. The context is decoupled from the cancelled client
+// ctx (WithoutCancel) — the abort is precisely WHY we are here, so a cancelled
+// ctx must not be able to drop the emit or the settlement (mirrors onDone).
+//
+// errorHandler takes BOTH the untrusted client correlation id and the
+// responseCaptureInstalled guard, because the two branches that merged here
+// each owned one of them: clientRequestID must reach the pre-header abort's
+// metering event (it is the caller's only handle on a failed attempt), and
+// settlement must be skipped once ModifyResponse installed the capture reader
+// (its completion callback owns settlement; lease settlement is first-writer-
+// wins). Dropping either silently loses a guarantee the other branch's tests
+// do not cover.
+func (s *Server) errorHandler(upstream string, id identity.Identity, requestID, clientRequestID string, admitted *admission.Lease, responseCaptureInstalled *atomic.Bool) func(http.ResponseWriter, *http.Request, error) {
 	return func(w http.ResponseWriter, r *http.Request, err error) {
 		clientAbort := isClientAbort(err)
-		indeterminate := false
 		if admitted != nil && (responseCaptureInstalled == nil || !responseCaptureInstalled.Load()) {
 			ctx := context.WithoutCancel(r.Context())
 			// classifyRoundTripSettlement decides the settlement kind at the
 			// point the failure becomes known: conservative settlement is
-			// retained only for genuinely indeterminate failures (abort, mid-
-			// flight fault); the determinate never-served cold-hold rejection
-			// and the verified pre-write dial failure settle zero.
+			// retained for genuinely indeterminate failures (abort, mid-
+			// flight fault); a verified pre-write dial failure (the request
+			// provably never left the process) settles zero.
 			kind := classifyRoundTripSettlement(err)
-			indeterminate = kind == settlementUnknown
 			if settlementErr := settleAdmissionLease(ctx, admitted, kind, admission.Usage{}); settlementErr != nil {
 				s.admissionUpstreamReleaseLog.logf(s.log, "admission: upstream-failure release failed: %v", settlementErr)
 			}
@@ -718,26 +777,23 @@ func (s *Server) errorHandler(upstream string, id identity.Identity, requestID s
 			// Emit a zero-token attributable event so the request is not invisible
 			// to billing. Best-effort, non-blocking — like onDone's emit.
 			ctx := context.WithoutCancel(r.Context())
-			s.emit(ctx, id, requestID, capture.Result{Aborted: true, UsageFound: false})
-			return
-		}
-		var admissionErr *admissionRoundTripError
-		if errors.As(err, &admissionErr) {
-			s.writeAdmissionError(w, admissionErr.err)
+			s.emit(ctx, id, requestID, clientRequestID, 499, capture.Result{Aborted: true, UsageFound: false})
 			return
 		}
 		s.log.Error.Printf("upstream %s error: %v", upstream, err)
-		if indeterminate {
-			// An admitted request whose usage is indeterminate (the upstream may
-			// have consumed engine work before failing) gets a zero-token
-			// attributable event under the same BillPartialOnAbort policy as the
-			// pre-header abort — but classified as an upstream fault, NOT an
-			// abort: the client did not disconnect, and billing_event.aborted
-			// must say so. Verifiable pre-write dial failures settle zero and
-			// emit nothing — no engine work was possible.
-			ctx := context.WithoutCancel(r.Context())
-			s.emit(ctx, id, requestID, capture.Result{UpstreamFault: true, UsageFound: false})
-		}
+		// A transport failure is still a real execution attempt. Persist a zero-
+		// token raw row with UsageFound=false so reconciliation can distinguish it
+		// from a legitimate zero-token completion. Rating naturally charges $0.
+		// The row is classified UpstreamFault (never Aborted): the client did not
+		// disconnect, and billing_event.aborted must say so. Every transport
+		// failure emits — including a verified pre-write dial failure, whose row
+		// is reconciliation-visible under the always-record policy even though its
+		// settlement is zero (no engine work was possible; see settlement.go).
+		// Return the same trusted attempt id carried by the raw row so the client
+		// can correlate this terminal failure without relying on its untrusted id.
+		w.Header().Set("X-Request-Id", requestID)
+		s.emit(context.WithoutCancel(r.Context()), id, requestID, clientRequestID,
+			http.StatusBadGateway, capture.Result{UpstreamFault: true, UsageFound: false})
 		http.Error(w, "upstream error", http.StatusBadGateway)
 	}
 }
@@ -746,37 +802,28 @@ func (s *Server) errorHandler(upstream string, id identity.Identity, requestID s
 // emitter. It must not block the client response — the emitter is responsible
 // for async/durable delivery.
 //
-// Policy (M3):
-//   - usage captured:                  always emit (we have real counts),
-//     whether aborted, faulted, or clean.
-//   - no usage, client abort or        emit only if BillPartialOnAbort;
-//     indeterminate upstream fault:    otherwise log for reconciliation.
-//   - no usage, neither:               log for reconciliation; never bill.
-func (s *Server) emit(ctx context.Context, id identity.Identity, requestID string, res capture.Result) {
-	if (res.Aborted || res.UpstreamFault) && !res.UsageFound {
-		if !s.settings.BillPartialOnAbort {
-			// Policy: don't bill partial aborts with no token data. Log for
-			// reconciliation so the event is not silently lost.
-			s.log.Warn.Printf("aborted or upstream-faulted, no usage, not billing (BillPartialOnAbort=false) resource=%s request_id=%s streamed=%t",
-				id.ResourceID, requestID, res.Streamed)
-			return
-		}
-		// BillPartialOnAbort=true: emit a partial event with zero counts so
-		// downstream knows we attempted to bill and can reconcile if needed.
-		s.log.Debug.Printf("aborted or upstream-faulted, no usage, emitting partial event resource=%s request_id=%s streamed=%t",
+// Every forwarded execution attempt is emitted exactly once. Usage-bearing
+// attempts carry the engine counts; failed/aborted attempts without usage carry
+// explicit UsageFound=false and zero counts, so they are visible to reconciliation
+// without fabricating a charge.
+func (s *Server) emit(ctx context.Context, id identity.Identity, requestID, clientRequestID string, statusCode int, res capture.Result) {
+	if res.Aborted && !res.UsageFound {
+		// A missing usage block is never guessed or tokenized locally. The raw
+		// zero-token attempt is nevertheless durable for reconciliation.
+		s.log.Warn.Printf("aborted, no usage, recording unmetered attempt resource=%s request_id=%s streamed=%t",
 			id.ResourceID, requestID, res.Streamed)
 	}
 
-	if !res.UsageFound && !res.Aborted && !res.UpstreamFault {
-		// No usage and not an abort or fault: a non-OpenAI response or an
-		// upstream we can't meter. Log for reconciliation; emit nothing billable.
-		s.log.Warn.Printf("no usage captured for resource=%s request_id=%s streamed=%t",
+	if !res.UsageFound && !res.Aborted {
+		// Persist the attempt rather than making failed/non-conforming responses
+		// invisible. With zero authoritative counts it contributes no charge.
+		s.log.Warn.Printf("no usage captured; recording unmetered attempt resource=%s request_id=%s streamed=%t",
 			id.ResourceID, requestID, res.Streamed)
-		return
 	}
 
 	e := metering.Event{
-		RequestID: requestID,
+		RequestID:       requestID,
+		ClientRequestID: clientRequestID,
 		// Identity captured verbatim — attribution resolved downstream.
 		AuthID:       id.AuthID,
 		UserID:       id.UserID,
@@ -810,12 +857,21 @@ func (s *Server) emit(ctx context.Context, id identity.Identity, requestID strin
 		// the trusted middleware header. Empty = dedicated. Shared traffic prices
 		// from the distinct shared:<base> rate row.
 		ServingMode: id.ServingMode,
+		// GraphK8sName is the serving graph (the cost centre), resolved once on the
+		// request path: from tf_model on the gateway route, derived from the upstream
+		// host on a dedicated route. Evidence only — it never affects the charge, and
+		// empty is valid. Carried because in SHARED mode the graph is the only handle
+		// on the hardware: many orgs ride one platform graph that has no database row.
+		GraphK8sName: id.GraphK8sName,
 
 		PromptTokens:     res.Usage.PromptTokens,
 		CachedTokens:     res.Usage.CachedTokens(),
 		CompletionTokens: res.Usage.CompletionTokens,
 		FinishReason:     res.FinishReason,
 		Aborted:          res.Aborted,
+		UsageFound:       res.UsageFound,
+		StatusCode:       statusCode,
+		Streamed:         res.Streamed,
 	}
 	s.emitter.Emit(ctx, e)
 }

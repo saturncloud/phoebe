@@ -2,6 +2,7 @@ package rating
 
 import (
 	"errors"
+	"os"
 	"strings"
 	"testing"
 )
@@ -645,20 +646,18 @@ gpu_floor_rates:
 	}
 }
 
-// TestLoadPriceBook_MissingFileFailsClosed: a missing price file is an error — the
-// rater can't run without prices (never default to $0).
-func TestLoadPriceBook_MissingFileFailsClosed(t *testing.T) {
-	if _, err := LoadPriceBook("/no/such/prices.yaml"); err == nil {
-		t.Fatal("missing price file loaded cleanly; want a fail-closed error")
-	}
-}
-
-// TestLoadPriceBook_ExampleFileIsValid: the shipped example price file must parse and
-// validate — it is the operator-facing contract and a broken example is a footgun.
-func TestLoadPriceBook_ExampleFileIsValid(t *testing.T) {
-	pb, err := LoadPriceBook("../../config/prices.example.yaml")
+// TestParsePriceBook_ExampleFileIsValid: the shipped example price file must parse
+// and validate — it is the operator-facing wire-shape contract and a broken example
+// is a footgun. (There is no file loader any more: the rater's books come from the
+// manager as bytes, so the example is read here and run through the same parser.)
+func TestParsePriceBook_ExampleFileIsValid(t *testing.T) {
+	data, err := os.ReadFile("../../config/prices.example.yaml")
 	if err != nil {
-		t.Fatalf("example price file does not load: %v", err)
+		t.Fatalf("read example price file: %v", err)
+	}
+	pb, err := ParsePriceBook(data)
+	if err != nil {
+		t.Fatalf("example price file does not parse: %v", err)
 	}
 	// It should price at least one concrete base model end-to-end.
 	if _, err := pb.Resolve("meta-llama/Llama-3.1-8B-Instruct"); err != nil {

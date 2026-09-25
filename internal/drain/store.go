@@ -85,6 +85,7 @@ func (s *PostgresStore) Close() error {
 // per-row value binding. Keeping it in one place keeps the two in lockstep.
 var upsertColumns = []string{
 	"request_id",
+	"client_request_id",
 	"auth_id",
 	"user_id",
 	"group_id",
@@ -101,10 +102,14 @@ var upsertColumns = []string{
 	"finish_reason",
 	"gpu_type",
 	"aborted",
+	"usage_found",
+	"status_code",
+	"streamed",
+	"graph_k8s_name",
 	"event_ts",
 }
 
-const colsPerRow = 18 // len(upsertColumns); created_at is DB-defaulted.
+const colsPerRow = 23 // len(upsertColumns); created_at is DB-defaulted.
 
 // Upsert writes a batch of events in a single transaction with a multi-row
 // INSERT ... ON CONFLICT (request_id) DO NOTHING.
@@ -175,6 +180,7 @@ func eventArgs(e metering.Event) []any {
 	}
 	return []any{
 		e.RequestID,
+		nullStr(e.ClientRequestID),
 		nullStr(e.AuthID),
 		nullStr(e.UserID),
 		nullStr(e.GroupID),
@@ -209,6 +215,16 @@ func eventArgs(e metering.Event) []any {
 		nullStr(e.FinishReason),
 		nullStr(e.GPUType),
 		e.Aborted,
+		e.UsageFound,
+		nullInt(e.StatusCode),
+		e.Streamed,
+		// GraphK8sName is the serving graph (the cost centre) — evidence only, never
+		// part of the billing grain. nullStr so an unresolvable graph stores NULL
+		// rather than '': the rater's MAX(graph_k8s_name) ignores NULLs (so a rollup
+		// whose events partly predate graph propagation still resolves to the one
+		// known graph), whereas a stored '' would read as a DISTINCT second graph and
+		// falsely trip the ambiguous-graph count.
+		nullStr(e.GraphK8sName),
 		eventTS,
 	}
 }
@@ -219,4 +235,20 @@ func nullStr(s string) any {
 		return nil
 	}
 	return s
+}
+
+// nullInt returns a driver NULL for 0 and the int otherwise. This is the ingest
+// side of the status_code invariant: metering.Event.StatusCode is 0 only when no
+// HTTP status was ever produced for the attempt (the proxy never got a response
+// to record), and billing_event_status_code_ck admits NULL or 100..599 — so 0
+// binds NULL deliberately. NULL means "no response was produced", not "unknown":
+// pre-status_code rows are also NULL, but they predate the column, and 0 is never
+// a real status. Mirrors the rule stated in internal/recovery/recovery.go
+// ("Zero marshals as the omitted/NULL case"), which rejects any other
+// out-of-range value before it can reach this bind.
+func nullInt(v int) any {
+	if v == 0 {
+		return nil
+	}
+	return v
 }

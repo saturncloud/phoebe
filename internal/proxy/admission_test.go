@@ -185,7 +185,7 @@ func TestAdmissionAcrossProxyReplicasAndLifecycleRelease(t *testing.T) {
 	newReplica := func() *Server {
 		c := redis.NewClient(&redis.Options{Addr: mr.Addr()})
 		t.Cleanup(func() { _ = c.Close() })
-		s := &config.Settings{Admission: cfg, BillPartialOnAbort: true}
+		s := &config.Settings{Admission: cfg}
 		return New(s, logging.New(logging.ERROR), &recordingEmitter{}).WithAdmitter(admission.New(c, cfg))
 	}
 	one, two := newReplica(), newReplica()
@@ -283,7 +283,11 @@ func TestWakeEnabledWarmRequestExecutesMetersAndSettlesOnce(t *testing.T) {
 
 	rr := httptest.NewRecorder()
 	s.Handler().ServeHTTP(rr, sharedRequest(up))
-	if rr.Code != http.StatusOK || hits != 1 || waker.calls != 0 {
+	// serveWithWake costs one readiness probe on the wake path (the backend is
+	// warm, so the probe returns not-cold and the caller performs the real
+	// metered forward): two backend hits, one wake-eligible probe and one
+	// inference, zero wakes.
+	if rr.Code != http.StatusOK || hits != 2 || waker.calls != 0 {
 		t.Fatalf("status=%d backend hits=%d wake calls=%d", rr.Code, hits, waker.calls)
 	}
 	events := em.waitForEvents(1, time.Second)
@@ -710,8 +714,10 @@ func TestWakeExhaustedReturnsColdAndReleasesCapacity(t *testing.T) {
 	if rr.Code != http.StatusNotFound {
 		t.Fatalf("status=%d, want the final cold 404 after wake exhaustion", rr.Code)
 	}
-	if calls := atomic.LoadInt32(&waker.calls); calls != 1 {
-		t.Fatalf("waker calls=%d, want 1 for maxTries=2", calls)
+	// serveWithWake wakes once per cold attempt: maxTries=2 means two probes
+	// (both cold) with a wake between them, then the honest final cold forward.
+	if calls := atomic.LoadInt32(&waker.calls); calls != 2 {
+		t.Fatalf("waker calls=%d, want 2 for maxTries=2 (one wake per cold attempt)", calls)
 	}
 	lease, err := a.Admit(context.Background(), admission.Request{
 		Graph: "graph", Organization: "org-b", Model: "m",
@@ -723,9 +729,14 @@ func TestWakeExhaustedReturnsColdAndReleasesCapacity(t *testing.T) {
 	_ = lease.Complete(context.Background(), 0)
 }
 
-// A store outage at BeginColdHold degrades to a logged bypass: the wake flow
-// and the request complete normally instead of failing closed.
-func TestWakeColdHoldStoreOutageDegradesToBypass(t *testing.T) {
+// A store outage between Admit and the cold probe fails closed at the cold
+// hold: the request gets the admission-unavailable error (503), the waker is
+// never invoked, and the handler's deferred release fallback — not a cold-hold
+// bypass — owns the lease release. (The bypass lives at Admit time: when the
+// store is already down at Admit, ErrUnavailable bypasses the whole gate and
+// the wake completes normally; a mid-request outage is a broken contract, not
+// a soft limit, and fails closed.)
+func TestWakeColdHoldStoreOutageFailsClosed(t *testing.T) {
 	mr := miniredis.RunT(t)
 	var killOnce sync.Once
 	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
@@ -749,11 +760,11 @@ func TestWakeColdHoldStoreOutageDegradesToBypass(t *testing.T) {
 
 	rr := httptest.NewRecorder()
 	s.Handler().ServeHTTP(rr, sharedRequest(up))
-	if rr.Code != http.StatusNotFound {
-		t.Fatalf("status=%d, want the cold 404 — a cold-hold store outage must bypass, not reject", rr.Code)
+	if rr.Code != http.StatusServiceUnavailable {
+		t.Fatalf("status=%d, want 503 — a mid-request store outage must fail closed, not bypass", rr.Code)
 	}
-	if calls := atomic.LoadInt32(&waker.calls); calls != 1 {
-		t.Fatalf("waker calls=%d, want 1 (the bypass must not skip the wake)", calls)
+	if calls := atomic.LoadInt32(&waker.calls); calls != 0 {
+		t.Fatalf("waker calls=%d, want 0 (a failed cold hold must not invoke the waker)", calls)
 	}
 }
 
@@ -1240,7 +1251,27 @@ func TestAdmissionReleasesAbortedStream(t *testing.T) {
 	cfg := proxyAdmissionConfig(1)
 	c := redis.NewClient(&redis.Options{Addr: mr.Addr()})
 	a := admission.New(c, cfg)
-	s := New(&config.Settings{Admission: cfg, BillPartialOnAbort: true}, logging.New(logging.ERROR), &recordingEmitter{}).WithAdmitter(a)
+	s := New(&config.Settings{Admission: cfg}, logging.New(logging.ERROR), &recordingEmitter{}).WithAdmitter(a)
+
+	// Release half of this test (spliced at the merge): a plain aborted stream
+	// must start, return promptly once the client cancels, and release its
+	// lease. The probe half below then pins the conservative reservation the
+	// abort retains in the contract windows.
+	ctx, cancel := context.WithCancel(context.Background())
+	req := sharedRequest(up).WithContext(ctx)
+	done := make(chan struct{})
+	go func() { defer close(done); s.Handler().ServeHTTP(httptest.NewRecorder(), req) }()
+	select {
+	case <-started:
+	case <-time.After(time.Second):
+		t.Fatal("stream never started")
+	}
+	cancel()
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("aborted proxy did not return")
+	}
 
 	// The aborted stream's retained reservation was charged to the org/owner
 	// generated_tokens windows, so each probe reserving one more token must
@@ -1340,7 +1371,7 @@ func TestAdmissionChargesUnknownUsageOnPreHeaderAbort(t *testing.T) {
 	cfg := proxyAdmissionConfig(1)
 	c := redis.NewClient(&redis.Options{Addr: mr.Addr()})
 	a := admission.New(c, cfg)
-	s := New(&config.Settings{Admission: cfg, BillPartialOnAbort: true}, logging.New(logging.ERROR), &recordingEmitter{}).WithAdmitter(a)
+	s := New(&config.Settings{Admission: cfg}, logging.New(logging.ERROR), &recordingEmitter{}).WithAdmitter(a)
 
 	// The pre-header abort retained the conservative reservation in the
 	// org/owner generated_tokens windows, so each probe reserving one more
@@ -1437,7 +1468,7 @@ func TestAdmissionChargesUnknownUsageOnUpstreamReset(t *testing.T) {
 	c := redis.NewClient(&redis.Options{Addr: mr.Addr()})
 	a := admission.New(c, cfg)
 	em := &recordingEmitter{}
-	s := New(&config.Settings{Admission: cfg, BillPartialOnAbort: true}, logging.New(logging.ERROR), em).WithAdmitter(a)
+	s := New(&config.Settings{Admission: cfg}, logging.New(logging.ERROR), em).WithAdmitter(a)
 
 	// The reset retained the conservative reservation in the org/owner
 	// generated_tokens windows, so each probe reserving one more token must
@@ -1486,6 +1517,12 @@ func TestAdmissionChargesUnknownUsageOnUpstreamReset(t *testing.T) {
 		if len(mine) != 1 || mine[0].PromptTokens != 0 || mine[0].CompletionTokens != 0 {
 			t.Fatalf("metering events=%+v, want the same zero-token attributable event as the abort path", mine)
 		}
+		// The always-record policy persists the attempt: explicit UsageFound=false
+		// and the 502 status the client saw, so reconciliation can distinguish it
+		// from a legitimate zero-token completion.
+		if mine[0].UsageFound || mine[0].StatusCode != http.StatusBadGateway {
+			t.Fatalf("upstream fault event must be a usage-missing 502 attempt: %+v", mine[0])
+		}
 		// The reset is an upstream fault, not a client abort: the event must be
 		// attributable without billing_event.aborted misrecording it as one.
 		if mine[0].Aborted {
@@ -1525,11 +1562,13 @@ func TestAdmissionChargesUnknownUsageOnUpstreamReset(t *testing.T) {
 	_ = lease.Complete(context.Background(), 0)
 }
 
-// The emit-matrix cell the sibling test cannot see: the same upstream reset
-// (UpstreamFault, no usage) with BillPartialOnAbort=false must emit NOTHING —
-// the zero-token event is reserved for the partial-billing policy — and the
-// skip must leave the Warn reconciliation log, not silence.
-func TestAdmissionUpstreamResetNoEmitWithoutPartialBilling(t *testing.T) {
+// The emit-matrix cell the sibling test cannot see: under the always-record
+// policy (BillPartialOnAbort is gone) the same upstream reset (UpstreamFault,
+// no usage) MUST emit exactly one zero-token, usage-missing row — status
+// preserved at 502, Aborted=false — so reconciliation sees the attempt, and
+// the Warn reconciliation log must say the unmetered attempt was recorded,
+// not that it was skipped.
+func TestAdmissionUpstreamResetAlwaysEmitsZeroTokenRow(t *testing.T) {
 	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		_, _ = io.Copy(io.Discard, r.Body) // consume the full request, then vanish
 		conn, _, herr := w.(http.Hijacker).Hijack()
@@ -1551,7 +1590,7 @@ func TestAdmissionUpstreamResetNoEmitWithoutPartialBilling(t *testing.T) {
 		Warn:  log.New(&warnBuf, "", 0),
 		Error: log.New(&errBuf, "", 0),
 	}
-	s := New(&config.Settings{Admission: cfg, BillPartialOnAbort: false}, logger, em).WithAdmitter(a)
+	s := New(&config.Settings{Admission: cfg}, logger, em).WithAdmitter(a)
 	req := sharedRequest(up)
 	req.Header.Set(identity.HeaderOrgRateLimitGeneratedTokens, "20")
 	req.Header.Set(identity.HeaderOwnerRateLimitGeneratedTokens, "20")
@@ -1560,11 +1599,16 @@ func TestAdmissionUpstreamResetNoEmitWithoutPartialBilling(t *testing.T) {
 	if rr.Code != http.StatusBadGateway {
 		t.Fatalf("status=%d, want 502", rr.Code)
 	}
-	if n := len(em.all()); n != 0 {
-		t.Fatalf("BillPartialOnAbort=false emitted %d events for an upstream fault with no usage, want 0", n)
+	events := em.waitForEvents(1, time.Second)
+	if len(events) != 1 {
+		t.Fatalf("always-record policy emitted %d events for an upstream fault with no usage, want 1", len(events))
 	}
-	if !strings.Contains(warnBuf.String(), "not billing (BillPartialOnAbort=false)") {
-		t.Fatalf("the skip must log the reconciliation Warn, got: %q", warnBuf.String())
+	e := events[0]
+	if e.UsageFound || e.Aborted || e.StatusCode != http.StatusBadGateway || e.PromptTokens != 0 || e.CompletionTokens != 0 {
+		t.Fatalf("upstream fault event = %+v, want a zero-token usage-missing non-aborted 502 attempt", e)
+	}
+	if !strings.Contains(warnBuf.String(), "no usage captured; recording unmetered attempt") {
+		t.Fatalf("the emit must log the reconciliation Warn, got: %q", warnBuf.String())
 	}
 }
 
@@ -1614,6 +1658,10 @@ func TestAdmissionDialFailureChargesOnlyRequestsWindow(t *testing.T) {
 	// charge+probe section and, on roll, re-charge and retry the section once.
 	chargeAndProbe := func() (bool, []error) {
 		bucketBefore := fixedWindowBucket()
+		// The emitter accumulates across attempts (and this attempt's emit
+		// lands synchronously inside ServeHTTP), so snapshot the count BEFORE
+		// the request and assert on the events THIS attempt produced.
+		before := em.count()
 		req := sharedRequest(up)
 		req.Header.Set(identity.HeaderOrgRateLimitRequests, "1")
 		req.Header.Set(identity.HeaderOwnerRateLimitRequests, "1")
@@ -1624,14 +1672,19 @@ func TestAdmissionDialFailureChargesOnlyRequestsWindow(t *testing.T) {
 		if rr.Code != http.StatusBadGateway {
 			t.Fatalf("status=%d, want 502", rr.Code)
 		}
-		// No engine work was possible, so nothing is metered either (the
-		// zero-token event is reserved for indeterminate failures).
-		if n := len(em.all()); n != 0 {
-			t.Fatalf("dial failure emitted %d events, want 0", n)
-		}
 		errs := make([]error, len(probes))
 		for i, tc := range probes {
 			_, errs[i] = a.Admit(context.Background(), tc.req)
+		}
+		// No engine work was possible, so the lease settles zero — but the
+		// attempt itself is still persisted: the always-record policy emits a
+		// zero-token, usage-missing 502 row for every transport failure
+		// (including a verified pre-write dial failure), keeping it visible to
+		// reconciliation.
+		events := em.waitForEvents(before+1, time.Second)
+		mine := events[before:]
+		if len(mine) != 1 || mine[0].UsageFound || mine[0].Aborted || mine[0].StatusCode != http.StatusBadGateway {
+			t.Fatalf("dial failure events=%+v, want one zero-token usage-missing non-aborted 502 attempt", mine)
 		}
 		return bucketBefore != fixedWindowBucket(), errs
 	}
@@ -2073,9 +2126,6 @@ func TestSampledErrorLogAdmissionReleaseSites(t *testing.T) {
 		{"upstream-failure release", func() {
 			s.admissionUpstreamReleaseLog.logf(s.log, "admission: upstream-failure release failed: %v", storeErr)
 		}},
-		{"cold-hold state unavailable", func() {
-			s.admissionColdHoldBypassLog.logf(s.log, "admission: cold-hold state unavailable; bypassing distributed gate for request_id=req: %v", storeErr)
-		}},
 		{"cold-hold release", func() { s.admissionColdHoldReleaseLog.logf(s.log, "admission: cold-hold release failed: %v", storeErr) }},
 	}
 	for _, site := range sites {
@@ -2098,29 +2148,30 @@ func TestSampledErrorLogAdmissionReleaseSites(t *testing.T) {
 	}
 }
 
-// Real-path proof that the wake.go cold-hold sites emit through the Server
-// samplers: with the store dead after admission, every wake retry of every
-// request fails BeginColdHold (bypass site) and EndColdHold (release site).
-// 250 requests x 2 wake retries = 500 occurrences per site, so sampling must
-// yield exactly the 1st + every 100th line per site — not 500 ERROR lines.
+// Real-path proof that the admission bypass site emits through the Server
+// sampler under the merged serveWithWake architecture. With the store dead
+// from the start, every request's Admit fails with ErrUnavailable and the
+// request bypasses the whole gate (admitted == nil) — the wake path then runs
+// with no lease, so the cold-hold sites are never reached. 250 bypassed
+// requests = 250 occurrences at the bypass site, so sampling must yield
+// exactly the 1st + every 100th line — not 250 ERROR lines.
 func TestWakeColdHoldStoreOutageLogsSampled(t *testing.T) {
 	mr := miniredis.RunT(t)
-	backend := &coldToWarmBackend{} // stays cold: every attempt re-fires both sites
+	backend := &coldToWarmBackend{} // stays cold: the wake never warms it
 	be := httptest.NewServer(backend)
 	defer be.Close()
 	up, _ := url.Parse(be.URL)
 	cfg := proxyAdmissionConfig(1)
 	cfg.Platform.MaxColdHolds = 1
 	// MaxRetries=-1: against a dead store every op otherwise pays go-redis's
-	// retry backoff (~85ms), which would stretch this 1000-op test to minutes.
-	// The sampling behavior under test is unaffected.
+	// retry backoff (~85ms), which would stretch this 250-request test to
+	// minutes. The sampling behavior under test is unaffected.
 	c := redis.NewClient(&redis.Options{Addr: mr.Addr(), MaxRetries: -1})
 	t.Cleanup(func() { _ = c.Close() })
 	a := admission.New(c, cfg)
 
 	// Admit the lease while the store is up, then kill the store: every
-	// BeginColdHold/EndColdHold fails with ErrUnavailable while the request
-	// itself still completes (the bypass path).
+	// request's Admit fails with ErrUnavailable and bypasses the gate.
 	lease, err := a.Admit(context.Background(), admission.Request{
 		Graph: "graph", Organization: "org-a", Model: "m",
 		PromptBytes: 1, EstimatedInputTokens: 1, ReservedOutputTokens: 1,
@@ -2128,6 +2179,7 @@ func TestWakeColdHoldStoreOutageLogsSampled(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	_ = lease.Complete(context.Background(), 0)
 	mr.Close()
 
 	var buf bytes.Buffer
@@ -2136,39 +2188,28 @@ func TestWakeColdHoldStoreOutageLogsSampled(t *testing.T) {
 		WithAdmitter(a).
 		WithWaker(&fakeWaker{}, time.Second, 3)
 
-	id := identity.Identity{ResourceID: "r1", ServedModel: "m"}
 	const requests = 250
 	for i := 0; i < requests; i++ {
-		req := httptest.NewRequest("POST", up.String(), strings.NewReader(`{"model":"m"}`))
-		replaceRequestBody(req, []byte(`{"model":"m"}`))
-		resp, rerr := s.newWakeRoundTripper(up.Host, "req", id, lease, new(atomic.Bool)).RoundTrip(req)
-		if rerr != nil {
-			t.Fatalf("request %d: %v", i, rerr)
+		rr := httptest.NewRecorder()
+		s.Handler().ServeHTTP(rr, sharedRequest(up))
+		if i == 0 && rr.Code != http.StatusNotFound {
+			t.Fatalf("status=%d, want the cold 404 — a bypassed request must still complete the wake path", rr.Code)
 		}
-		_, _ = io.Copy(io.Discard, resp.Body)
-		_ = resp.Body.Close()
 	}
 
 	lines := strings.Split(strings.TrimSpace(buf.String()), "\n")
-	// maxTries=3 fires each cold-hold site twice per request (attempts 0 and 1):
-	// 500 occurrences per site, logged at n=1,100,200,300,400,500.
-	if len(lines) != 12 {
-		t.Fatalf("logged %d lines for 2x%d cold-hold occurrences, want 12 (6 per site): %q", len(lines), requests, lines)
+	// 250 occurrences at the bypass site, logged at n=1,100,200.
+	if len(lines) != 3 {
+		t.Fatalf("logged %d lines for %d bypass occurrences, want 3 (1st + every 100th): %q", len(lines), requests, lines)
 	}
-	if got := strings.Count(buf.String(), "cold-hold state unavailable"); got != 6 {
-		t.Fatalf("cold-hold bypass site logged %d lines, want 6 (1st + every 100th of 500)", got)
+	if got := strings.Count(buf.String(), "distributed gate unavailable; bypassing"); got != 3 {
+		t.Fatalf("bypass site logged %d lines, want 3 (1st + every 100th of %d)", got, requests)
 	}
-	if got := strings.Count(buf.String(), "cold-hold release failed"); got != 6 {
-		t.Fatalf("cold-hold release site logged %d lines, want 6 (1st + every 100th of 500)", got)
-	}
-	if !strings.Contains(lines[0], "cold-hold state unavailable") || strings.Contains(lines[0], "suppressed") {
+	if strings.Contains(lines[0], "suppressed") {
 		t.Fatalf("first occurrence must log the bypass onset plainly: %q", lines[0])
 	}
-	if !strings.Contains(lines[1], "cold-hold release failed") || strings.Contains(lines[1], "suppressed") {
-		t.Fatalf("first occurrence must log the release onset plainly: %q", lines[1])
-	}
-	if got := strings.Count(buf.String(), "+98 similar suppressed"); got != 2 {
-		t.Fatalf("each site's 100th occurrence must report 98 suppressed, got %d such lines: %q", got, lines)
+	if !strings.Contains(lines[1], "+98 similar suppressed") || !strings.Contains(lines[2], "+99 similar suppressed") {
+		t.Fatalf("100th/200th occurrences must report the suppressed counts: %q %q", lines[1], lines[2])
 	}
 }
 

@@ -148,6 +148,10 @@ func newHarness(t *testing.T, schema string) *harness {
 	// exact drift this harness exists to catch (a fresh staging DB without it
 	// poison-dropped every event with SQLSTATE 42703).
 	mustExec(t, db, readMigration(t, "0004_billing_event_serving_mode.up.sql"))
+	mustExec(t, db, readMigration(t, "0005_invoice_grade_attempts.up.sql"))
+	// 0006 adds billing_event.graph_k8s_name (in the drainer's INSERT) and widens
+	// the rated_usage grain the rater upserts on — same drift class as 0004.
+	mustExec(t, db, readMigration(t, "0006_rollup_grain.up.sql"))
 
 	mr, err := miniredis.Run()
 	if err != nil {
@@ -193,7 +197,7 @@ func newHarness(t *testing.T, schema string) *harness {
 // it per route), so this helper takes no upstream.
 func (h *harness) proxyServer(t *testing.T) *proxy.Server {
 	t.Helper()
-	settings := &config.Settings{ListenAddr: ":0", BillPartialOnAbort: true}
+	settings := &config.Settings{ListenAddr: ":0"}
 	return proxy.New(settings, h.log, h.emitter)
 }
 
@@ -380,8 +384,11 @@ func TestE2E_StreamedRequestBecomesMoney(t *testing.T) {
 	req.Header.Set(identity.HeaderAuthID, testAuthID)
 	req.Header.Set(identity.HeaderResourceID, testResourceID)
 	req.Header.Set(identity.HeaderResourceType, "deployment")
+	// A user XOR a group, never both (DESIGN §2: identity_auth joins org via
+	// user_id OR group_id). Setting both is a producer bug the rater now treats
+	// as an owner conflict and withholds from money, so the fixture carries the
+	// realistic user-owned identity.
 	req.Header.Set(identity.HeaderUserID, "user-e2e")
-	req.Header.Set(identity.HeaderGroupID, "group-e2e")
 	req.Header.Set(identity.HeaderOrgID, testOrgID)
 	req.Header.Set("X-Request-Id", "saturn-e2e-streamed-request")
 	srv.Handler().ServeHTTP(rr, req)
@@ -598,8 +605,11 @@ func TestE2E_FineTuneBillsAtBaseTimesPremium(t *testing.T) {
 	req.Header.Set(identity.HeaderAuthID, testAuthID)
 	req.Header.Set(identity.HeaderResourceID, testResourceID)
 	req.Header.Set(identity.HeaderResourceType, "deployment")
+	// A user XOR a group, never both (DESIGN §2: identity_auth joins org via
+	// user_id OR group_id). Setting both is a producer bug the rater now treats
+	// as an owner conflict and withholds from money, so the fixture carries the
+	// realistic user-owned identity.
 	req.Header.Set(identity.HeaderUserID, "user-e2e")
-	req.Header.Set(identity.HeaderGroupID, "group-e2e")
 	// The base_model header Atlas injects at deploy for a fine-tune endpoint.
 	req.Header.Set(identity.HeaderBaseModel, ftBaseModel)
 	srv.Handler().ServeHTTP(rr, req)
@@ -689,8 +699,11 @@ func TestE2E_FineTuneWithoutBaseModelHeaderIsUnpriced(t *testing.T) {
 	req.Header.Set(identity.HeaderAuthID, testAuthID)
 	req.Header.Set(identity.HeaderResourceID, testResourceID)
 	req.Header.Set(identity.HeaderResourceType, "deployment")
+	// A user XOR a group, never both (DESIGN §2: identity_auth joins org via
+	// user_id OR group_id). Setting both is a producer bug the rater now treats
+	// as an owner conflict and withholds from money, so the fixture carries the
+	// realistic user-owned identity.
 	req.Header.Set(identity.HeaderUserID, "user-e2e")
-	req.Header.Set(identity.HeaderGroupID, "group-e2e")
 	// DELIBERATELY no X-Saturn-Base-Model header — the propagation bug under test.
 	srv.Handler().ServeHTTP(rr, req)
 
@@ -732,23 +745,23 @@ func TestE2E_FineTuneWithoutBaseModelHeaderIsUnpriced(t *testing.T) {
 	}
 }
 
-// TestE2E_ModellessEventIsUnattributable pins the nullStr(model) contract end
-// to end: an event whose upstream never reported a model (e.g. an abort before
-// the first chunk) must reach Postgres with model = NULL and be counted by the
-// rater as UNATTRIBUTABLE — never UNPRICED. A stored ” would dodge the
-// `model_id IS NULL` predicate and misreport as unpriced, pointing operators
-// at the wrong runbook ("backfill prices" instead of "fix the capture gap").
-func TestE2E_ModellessEventIsUnattributable(t *testing.T) {
+// TestE2E_ModellessEventWithoutUsageIsMissingUsage pins the no-response contract
+// end to end: an attempt whose upstream never reported either a model or a usage
+// block (for example, an abort before the first chunk) reaches Postgres with model
+// = NULL and is counted once as MISSING-USAGE. It must be neither UNATTRIBUTABLE
+// nor UNPRICED, because those categories describe usage-bearing events whose
+// attribution or pricing failed.
+func TestE2E_ModellessEventWithoutUsageIsMissingUsage(t *testing.T) {
 	h := newHarness(t, "phoebe_e2e_modelless")
 
 	// Emit directly through the REAL emitter, exactly as the proxy does for a
-	// BillPartialOnAbort=true abort with no usage chunk: empty Model, zero
-	// counts, Aborted. (See proxy.Server.emit.)
+	// An abort with no usage chunk: empty Model, zero counts, Aborted. Phoebe
+	// always records the attempt but has no authoritative counts to charge.
 	h.emitter.Emit(context.Background(), metering.Event{
-		RequestID:    "phoebe-e2e-modelless-0001",
-		AuthID:       testAuthID,
-		UserID:       "user-e2e",
-		GroupID:      "group-e2e",
+		RequestID: "phoebe-e2e-modelless-0001",
+		AuthID:    testAuthID,
+		UserID:    "user-e2e", // a user XOR a group, never both
+
 		ResourceID:   testResourceID,
 		ResourceType: "deployment",
 		Model:        "", // upstream emitted no parseable model
@@ -773,19 +786,126 @@ func TestE2E_ModellessEventIsUnattributable(t *testing.T) {
 	// bucket logic itself is wrong, not a missing price.
 	res := h.rateEventHour(t, h.priceBook(t))
 
-	if res.UnattributableEvents != 1 {
-		t.Errorf("UnattributableEvents = %d, want 1 (the model-less event)", res.UnattributableEvents)
+	if res.MissingUsageEvents != 1 {
+		t.Errorf("MissingUsageEvents = %d, want 1 (the no-usage attempt)", res.MissingUsageEvents)
+	}
+	// Cause partition: this attempt was ABORTED, so it is routine — reported for
+	// reconciliation, never paged (ratified with Hugo 2026-09-21). Paging on the
+	// cause-blind total fired hourly on any install with traffic.
+	if res.ExpectedMissingUsageEvents != 1 {
+		t.Errorf("ExpectedMissingUsageEvents = %d, want 1 (an abort is a routine zero-usage cause)", res.ExpectedMissingUsageEvents)
+	}
+	if res.UnexplainedMissingUsageEvents != 0 {
+		t.Errorf("UnexplainedMissingUsageEvents = %d, want 0 (the attempt aborted; it did not report success)", res.UnexplainedMissingUsageEvents)
+	}
+	if res.UnattributableEvents != 0 {
+		t.Errorf("UnattributableEvents = %d, want 0 — a model-less attempt with no usage is MISSING-USAGE; that bucket is exclusive and more specific than UNATTRIBUTABLE", res.UnattributableEvents)
 	}
 	if res.UnpricedEvents != 0 {
-		t.Errorf("UnpricedEvents = %d, want 0 — a model-less event must land in UNATTRIBUTABLE, not UNPRICED (wrong runbook)", res.UnpricedEvents)
+		t.Errorf("UnpricedEvents = %d, want 0 — a model-less attempt with no usage is MISSING-USAGE, not UNPRICED; UNPRICED means a usage-bearing event whose price lookup failed (wrong runbook)", res.UnpricedEvents)
 	}
 	if res.EventsRated != 0 || res.RollupsWritten != 0 {
 		t.Errorf("rater billed a model-less event: %+v (must never be rated, let alone $0-billed)", res)
 	}
-	if !res.HasAnomaly() {
-		t.Error("Result.HasAnomaly() = false — the leak must drive the exit-nonzero path")
+	// An aborted attempt is correctly billed zero and is NOT a pageable anomaly:
+	// exit 2 is reserved for rare, wrong conditions. The attempt is still fully
+	// recorded (asserted above) and surfaces in billing_reconciliation_hourly.
+	if res.HasAnomaly() {
+		t.Error("Result.HasAnomaly() = true for a routine client abort — exit 2 must stay reserved for rare, wrong conditions")
 	}
 	h.assertNumericEqual(t, res.TotalCost, "0", "Result.TotalCost")
+}
+
+// TestE2E_SuccessWithoutUsagePages is the other half of the missing-usage cause
+// partition: an attempt the engine reported as SUCCESSFUL while supplying no usage
+// block means work may have been served that cannot be billed. That is the
+// unexplained case and it MUST drive the exit-nonzero path, end to end through the
+// emitter, stream, drainer and rater.
+func TestE2E_SuccessWithoutUsagePages(t *testing.T) {
+	h := newHarness(t, "phoebe_e2e_success_no_usage")
+
+	h.emitter.Emit(context.Background(), metering.Event{
+		RequestID: "phoebe-e2e-success-no-usage-0001",
+		AuthID:    testAuthID,
+		UserID:    "user-e2e", // a user XOR a group, never both
+
+		ResourceID:   testResourceID,
+		ResourceType: "deployment",
+		Model:        testModelName,
+		// Not aborted, HTTP 200, yet the engine reported no usage block.
+		Aborted:    false,
+		StatusCode: 200,
+		UsageFound: false,
+	})
+
+	h.waitForStreamLen(t, 1, 5*time.Second)
+	h.drainUntilRows(t, 1, 10*time.Second)
+
+	res := h.rateEventHour(t, h.priceBook(t))
+
+	if res.MissingUsageEvents != 1 {
+		t.Errorf("MissingUsageEvents = %d, want 1", res.MissingUsageEvents)
+	}
+	if res.UnexplainedMissingUsageEvents != 1 {
+		t.Errorf("UnexplainedMissingUsageEvents = %d, want 1 (success with no usage block)", res.UnexplainedMissingUsageEvents)
+	}
+	if res.ExpectedMissingUsageEvents != 0 {
+		t.Errorf("ExpectedMissingUsageEvents = %d, want 0 (neither aborted nor failed)", res.ExpectedMissingUsageEvents)
+	}
+	if res.EventsRated != 0 || res.RollupsWritten != 0 {
+		t.Errorf("rater billed an attempt with no authoritative usage: %+v", res)
+	}
+	if !res.HasAnomaly() {
+		t.Error("Result.HasAnomaly() = false — a success with no usage block must drive the exit-nonzero path")
+	}
+	h.assertNumericEqual(t, res.TotalCost, "0", "Result.TotalCost")
+}
+
+// TestE2E_InvalidEngineEvidenceIsRetainedButNeverRated proves an authoritative
+// malformed usage block survives emitter -> stream -> drainer -> Postgres. It
+// must be a loud reconciliation anomaly, never a poison drop and never money.
+func TestE2E_InvalidEngineEvidenceIsRetainedButNeverRated(t *testing.T) {
+	h := newHarness(t, "phoebe_e2e_invalid_usage")
+	h.emitter.Emit(context.Background(), metering.Event{
+		RequestID:        "phoebe-e2e-invalid-0001",
+		AuthID:           testAuthID,
+		ResourceID:       testResourceID,
+		ResourceType:     "deployment",
+		OrgID:            testOrgID,
+		Model:            testModelName,
+		PromptTokens:     10,
+		CachedTokens:     20, // impossible: cached input cannot exceed prompt input
+		CompletionTokens: 1,
+		UsageFound:       true,
+		StatusCode:       http.StatusOK,
+	})
+
+	h.waitForStreamLen(t, 1, 5*time.Second)
+	h.drainUntilRows(t, 1, 10*time.Second) // also asserts drainer Poisoned() == 0
+
+	res := h.rateEventHour(t, h.priceBook(t))
+	if res.InvalidUsageEvents != 1 || res.EventsRated != 0 || res.RollupsWritten != 0 {
+		t.Fatalf("invalid evidence result = invalid/rated/rollups %d/%d/%d, want 1/0/0",
+			res.InvalidUsageEvents, res.EventsRated, res.RollupsWritten)
+	}
+	if !res.HasAnomaly() {
+		t.Fatal("invalid engine evidence must drive the fail-loud anomaly path")
+	}
+
+	var rawRows, invalidAttempts, ratedRows int64
+	if err := h.db.QueryRow("SELECT COUNT(*) FROM billing_event WHERE request_id='phoebe-e2e-invalid-0001'").Scan(&rawRows); err != nil {
+		t.Fatalf("count raw invalid evidence: %v", err)
+	}
+	if err := h.db.QueryRow("SELECT COALESCE(SUM(invalid_usage_attempts),0) FROM billing_reconciliation_hourly").Scan(&invalidAttempts); err != nil {
+		t.Fatalf("read invalid reconciliation evidence: %v", err)
+	}
+	if err := h.db.QueryRow("SELECT COUNT(*) FROM rated_usage").Scan(&ratedRows); err != nil {
+		t.Fatalf("count rated rows: %v", err)
+	}
+	if rawRows != 1 || invalidAttempts != 1 || ratedRows != 0 {
+		t.Fatalf("invalid evidence persistence = raw/invalid/rated %d/%d/%d, want 1/1/0",
+			rawRows, invalidAttempts, ratedRows)
+	}
 }
 
 // epVllmStream is the vLLM SSE fixture for a C4 Token Factory deployment: the engine
@@ -847,8 +967,11 @@ func TestE2E_AdapterHeaderLandsInBillingEventAndTriggersPremium(t *testing.T) {
 	req.Header.Set(identity.HeaderAuthID, testAuthID)
 	req.Header.Set(identity.HeaderResourceID, testResourceID)
 	req.Header.Set(identity.HeaderResourceType, "deployment")
+	// A user XOR a group, never both (DESIGN §2: identity_auth joins org via
+	// user_id OR group_id). Setting both is a producer bug the rater now treats
+	// as an owner conflict and withholds from money, so the fixture carries the
+	// realistic user-owned identity.
 	req.Header.Set(identity.HeaderUserID, "user-e2e")
-	req.Header.Set(identity.HeaderGroupID, "group-e2e")
 	// The two per-deployment headers the Atlas middleware injects on a fine-tune
 	// checkpoint endpoint (C4).
 	req.Header.Set(identity.HeaderBaseModel, epBaseModel)

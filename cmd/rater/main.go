@@ -74,22 +74,26 @@
 // explicitly with --since/--until).
 //
 // Config, like the drainer: a YAML settings file (flag -f) for pool knobs and
-// rateTrailingHours, the DATABASE_URL env var (Atlas convention) for Postgres, and a
-// price-file path (settings `priceFile` or flag -prices) for the YAML price book. The
-// rater does NOT run migrations — it assumes billing_event/rated_usage exist (see
-// migrations/README.md). It FAILS CLOSED if the price file is missing or malformed:
-// it refuses to rate rather than bill at $0.
+// rateTrailingHours, the DATABASE_URL env var (Atlas convention) for Postgres, and
+// `managerURL` (settings, or flag -manager-url) plus the SATURN_TOKEN env var for
+// prices. managerURL is REQUIRED — the manager is the only price source, and the
+// rater exits fatal without it. The rater does NOT run migrations — it assumes
+// billing_event/rated_usage exist (see migrations/README.md). It FAILS CLOSED on an
+// unresolvable price (internal/rating/policy.go ErrNoPrice): it refuses to rate
+// rather than bill at $0.
 package main
 
 import (
 	"context"
 	"flag"
+	"fmt"
 	"os"
 	"time"
 
 	"gopkg.in/yaml.v2"
 
 	"github.com/saturncloud/phoebe/internal/logging"
+	"github.com/saturncloud/phoebe/internal/pricefetch"
 	"github.com/saturncloud/phoebe/internal/rating"
 )
 
@@ -105,16 +109,27 @@ type raterSettings struct {
 	// explicit 0 fails loud instead of silently meaning "default".
 	RateTrailingHours *int `yaml:"rateTrailingHours"`
 
-	// PriceFile is the path to the YAML price book (E1). Required (via settings or
-	// the -prices flag): the rater cannot price without it. A local path now; the
-	// S3-fetch is out of scope (fetch-to-local then point this at the local copy —
-	// the create-time price gate and the rater must read the same file/version).
-	PriceFile string `yaml:"priceFile"`
+	// ManagerURL is the base URL of the pricing service (saturn-aws-manager), which
+	// owns the effective-dated price series and is the ONLY source of prices. The
+	// rater asks it for the rates EFFECTIVE DURING EACH HOUR it rates, so
+	// re-rating an old window is idempotent: an hour always resolves to the rates
+	// that were in force during it, however many times prices have changed since.
+	//
+	// REQUIRED. An install that cannot egress to the central manager runs its own
+	// manager instance seeded with that deployment's prices — there is no local
+	// price file to fall back to. The customer auth token comes from SATURN_TOKEN,
+	// the same install->manager direction as the usage push.
+	ManagerURL string `yaml:"managerURL"`
 
 	MaxOpenConns    int    `yaml:"maxOpenConns"`
 	MaxIdleConns    int    `yaml:"maxIdleConns"`
 	ConnMaxLifetime string `yaml:"connMaxLifetime"`
 }
+
+// priceTokenEnv is the env var carrying the customer auth token used to call the
+// manager for prices. Same install->manager direction (customer token) as the usage
+// push; not a new auth surface.
+const priceTokenEnv = "SATURN_TOKEN"
 
 // defaultRateTrailingHours is the default N for the trailing window. 24 trades a
 // cheap re-rate of already-correct hours (the upsert is a no-op REPLACE) for a full
@@ -125,12 +140,20 @@ const defaultRateTrailingHours = 24
 const (
 	exitOK      = 0
 	exitFatal   = 1
-	exitAnomaly = 2 // window rated but something leaked: unpriced and/or unattributable
+	exitAnomaly = 2 // window rated but something leaked: pricing, attribution, or usage evidence
+	// exitIncomplete: the run SKIPPED one or more hours (prices unavailable, or
+	// rating that hour failed) and therefore did not cover its whole window. Each
+	// hour is independent and the upsert is idempotent, so a later run whose
+	// trailing window still covers the hour rates it — this is "check the pricing
+	// service and confirm the next run caught up", NOT "the billing data is wrong".
+	// Distinct from exitAnomaly so an operator can tell a flaky dependency from
+	// bad evidence, and so a transient blip does not look like a money problem.
+	exitIncomplete = 3
 )
 
 // exitCode maps a completed rating run to its process exit code, encoding the
 // reconcile-delete contract (see the package doc). A run that rated cleanly but
-// leaked an anomaly (unpriced / unattributable / ambiguous-base) ALWAYS exits
+// leaked an anomaly (unpriced / unattributable / missing-usage / invalid-usage / ambiguous) ALWAYS exits
 // exitAnomaly. A reconcile-delete (reconciledDeletions > 0) exits exitAnomaly TOO —
 // but ONLY when the window was the default trailing-hours window (windowExplicit ==
 // false): on a routine run a prior bill vanishing is alarming (data loss / upstream
@@ -138,12 +161,17 @@ const (
 // reconcile-deletes are intended convergence (a backfill) and do NOT raise the exit
 // code on their own. This is the single place the routine-vs-backfill decision is
 // made, because only cmd/rater knows whether the window was explicit.
-func exitCode(reconciledDeletions int64, windowExplicit, hasAnomaly bool) int {
+func exitCode(reconciledDeletions int64, windowExplicit, hasAnomaly, hasUnratedHours bool) int {
+	// An anomaly outranks an incomplete run: bad evidence is the more urgent
+	// signal, and a run can be both (an hour skipped AND another hour leaking).
 	if hasAnomaly {
 		return exitAnomaly
 	}
 	if reconciledDeletions > 0 && !windowExplicit {
 		return exitAnomaly
+	}
+	if hasUnratedHours {
+		return exitIncomplete
 	}
 	return exitOK
 }
@@ -156,7 +184,7 @@ func main() {
 // (os.Exit skips defers).
 func run() int {
 	settingsFile := flag.String("f", "/etc/saturn/config/rater.yaml", "Settings YAML file path")
-	pricesFlag := flag.String("prices", "", "Price YAML file path (overrides settings priceFile)")
+	managerFlag := flag.String("manager-url", "", "Manager base URL for per-hour prices (overrides settings managerURL)")
 	since := flag.String("since", "", "Window start, RFC3339 (default: floor(now) minus rateTrailingHours)")
 	until := flag.String("until", "", "Window end, RFC3339 (default: start of the current hour)")
 	flag.Parse()
@@ -172,21 +200,50 @@ func run() int {
 		log.SetLevel(logging.DEBUG)
 	}
 
-	// The -prices flag overrides the settings priceFile. The price file is REQUIRED:
-	// without it the rater cannot price (it must never default to $0). Load+validate
-	// up front so a bad file fails the job before any DB work — fail closed.
-	pricePath := opts.priceFile
-	if *pricesFlag != "" {
-		pricePath = *pricesFlag
+	// THE MANAGER IS THE ONLY PRICE SOURCE (Hugo, 2026-09-22). It owns the
+	// effective-dated price series, so each hour is rated against the prices in
+	// force DURING that hour — which is what makes re-rating an old window
+	// idempotent across a price change. phoebe keeps no price history and no local
+	// price file; an install that cannot egress to the central manager runs its own
+	// manager instance, seeded with that deployment's prices.
+	//
+	// No managerURL is FATAL: there is nothing else to price from, and the rater
+	// must never default to $0.
+	managerURL := opts.managerURL
+	if *managerFlag != "" {
+		managerURL = *managerFlag
 	}
-	if pricePath == "" {
-		log.Error.Printf("rater: no price file configured (set priceFile in the settings file or pass -prices); the rater cannot rate without prices")
+	if managerURL == "" {
+		log.Error.Printf("rater: no managerURL configured; the manager is the only price source (set managerURL in the settings file or pass -manager-url)")
 		return exitFatal
 	}
-	book, err := rating.LoadPriceBook(pricePath)
-	if err != nil {
-		log.Error.Printf("rater: load price file %q: %v (refusing to rate — never bill at $0)", pricePath, err)
+	token := os.Getenv(priceTokenEnv)
+	if token == "" {
+		log.Error.Printf("rater: %s is empty; the manager authenticates the customer by this token and will not serve prices without it", priceTokenEnv)
 		return exitFatal
+	}
+
+	client := pricefetch.Client{ManagerURL: managerURL, Token: token}
+	// Hours repeat across a run (a 24-hour window re-rated hourly) and prices
+	// rarely change, so cache per hour within ONE run. The cache never outlives the
+	// process, so a price change is picked up by the next run.
+	cache := map[time.Time]*rating.PriceBook{}
+	bookForHour := func(ctx context.Context, hourStart time.Time) (*rating.PriceBook, error) {
+		hourStart = hourStart.UTC()
+		if cached, ok := cache[hourStart]; ok {
+			return cached, nil
+		}
+		body, version, err := client.Fetch(ctx, hourStart)
+		if err != nil {
+			return nil, err
+		}
+		hourBook, err := rating.ParsePriceBook(body)
+		if err != nil {
+			return nil, fmt.Errorf("parse prices for %s (version %s): %w", hourStart.Format(time.RFC3339), version, err)
+		}
+		log.Debug.Printf("rater: hour %s priced from manager price-version %s", hourStart.Format(time.RFC3339), version)
+		cache[hourStart] = hourBook
+		return hourBook, nil
 	}
 
 	windowStart, windowEnd, windowExplicit, err := resolveWindow(*since, *until, opts.trailingHours, time.Now())
@@ -207,19 +264,19 @@ func run() int {
 	}
 	defer func() { _ = store.Close() }()
 
-	r := rating.New(store, book, log)
-	res, err := r.Run(ctx, windowStart, windowEnd, windowExplicit)
+	r := rating.New(store, nil, log).WithBookForHour(bookForHour)
+	res, err := r.RunWindow(ctx, windowStart, windowEnd, windowExplicit)
 	if err != nil {
 		log.Error.Printf("rater: run: %v", err)
 		return exitFatal
 	}
 
 	// Exit code encodes BOTH the leaked-anomaly signal (unpriced / unattributable /
-	// ambiguous-base — always nonzero) AND the reconcile-delete contract: a routine
+	// missing-usage / invalid-usage / ambiguous — always nonzero) AND the reconcile-delete contract: a routine
 	// run (default window) that rewrote a prior bill is alarming and exits nonzero,
 	// while an explicit backfill (--since/--until) that did so is intended and exits
 	// 0. See exitCode and the package doc.
-	return exitCode(res.ReconciledDeletions, windowExplicit, res.HasAnomaly())
+	return exitCode(res.ReconciledDeletions, windowExplicit, res.HasAnomaly(), res.HasUnratedHours())
 }
 
 // resolveWindow computes [start, end). Defaults (both flags empty) rate the
@@ -292,7 +349,7 @@ func resolveWindow(since, until string, trailingHours int, now time.Time) (time.
 type raterOptions struct {
 	debug         bool
 	trailingHours int    // validated >= 1, defaulted to defaultRateTrailingHours
-	priceFile     string // path to the YAML price book (may be overridden by -prices)
+	managerURL    string // when set, prices come from the manager PER HOUR rated
 }
 
 // loadConfig reads the YAML settings file, applies rating.DefaultConfig, then
@@ -334,7 +391,7 @@ func loadConfig(path string) (rating.Config, raterOptions, error) {
 	// DATABASE_URL (Atlas convention) is the authoritative Postgres source.
 	cfg.DatabaseURL = os.Getenv("DATABASE_URL")
 
-	opts.priceFile = s.PriceFile
+	opts.managerURL = s.ManagerURL
 	opts.debug = s.Debug
 	return cfg, opts, nil
 }

@@ -2,7 +2,6 @@ package proxy
 
 import (
 	"context"
-	"errors"
 	"fmt"
 
 	"github.com/saturncloud/phoebe/internal/admission"
@@ -46,36 +45,26 @@ const (
 )
 
 // classifyCaptureSettlement maps a COMPLETED response capture (the ModifyResponse
-// path) to its settlement kind. wakeColdFinal reports that the wake round
-// tripper gave up and served the engine's cold response as the final response:
-// the engine refused every dispatch before any inference, so a usage-less
-// capture is provably "never served", not "unknown". A captured usage block
-// always wins — even a final cold response that somehow carried one settles
-// actual.
-func classifyCaptureSettlement(res capture.Result, wakeColdFinal bool) settlementKind {
+// path) to its settlement kind. A captured usage block always settles actual;
+// without one the usage of a dispatched request is indeterminate (engine
+// 4xx/5xx, client abort, mid-stream fault) and settles conservative-unknown.
+// Determinate never-served outcomes (the cold-hold rejection, the final cold
+// response after the wake gave up) never reach this path: serveWithWake serves
+// them itself and settles them to zero directly.
+func classifyCaptureSettlement(res capture.Result) settlementKind {
 	if res.UsageFound {
 		return settlementActual
-	}
-	if wakeColdFinal {
-		return settlementZeroNeverServed
 	}
 	return settlementUnknown
 }
 
 // classifyRoundTripSettlement maps a RoundTrip error (the ErrorHandler path,
 // pre-response) to its settlement kind. The axis is whether the engine could
-// have done work, never the HTTP status the rejection later maps to: the
-// cold-hold capacity rejection settles zero whether writeAdmissionError renders
-// it 503 (non-contractual scope) or 429 (contractual scope).
+// have done work: a verified pre-write dial failure (the request provably never
+// left the process) settles zero, while client aborts and every other transport
+// fault are indeterminate (the upstream may have read the request and consumed
+// engine work before failing) and keep the conservative reservation.
 func classifyRoundTripSettlement(err error) settlementKind {
-	var admissionErr *admissionRoundTripError
-	if errors.As(err, &admissionErr) {
-		// The cold-hold gate refused to extend the lease for a wake: the engine
-		// answered cold (never served) and phoebe fails closed without
-		// dispatching any inference work. The BeginColdHold ErrUnavailable
-		// bypass never reaches this error — it continues the live lease.
-		return settlementZeroNeverServed
-	}
 	if isClientAbort(err) {
 		// The client disconnected; the engine may have consumed work before the
 		// cancel reached it — indeterminate.

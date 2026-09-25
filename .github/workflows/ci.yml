@@ -32,6 +32,10 @@ jobs:
         run: go vet ./...
       - name: Test
         run: make test
+      - name: Race (concurrency-sensitive billing paths)
+        # proxy/waker decide whether a billable attempt is emitted exactly once
+        # under concurrent aborts, so a data race there is a money bug.
+        run: make race-test
 
   integration-test:
     name: Integration (live Postgres conformance)

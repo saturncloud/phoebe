@@ -41,7 +41,13 @@ const (
 // single-model endpoint: one subdomain == one model, the engine can only serve
 // the one thing) → bindingOK, no parse, no cost. atlas DECIDES access; this only
 // guarantees the body can't escape the atlas-authorized resource.
-func checkModelBinding(body []byte, servedModelAllowList string) modelBindingResult {
+// The second return value is the SINGULAR model the request selected, set only
+// on bindingOK for an enforced route. Wake readiness polls /v1/models for an
+// exact match, so it must receive this value and never the comma-separated
+// allow-list, which can never equal any single served-model name. It is empty
+// when the binding is not enforced (no allow-list header), where the caller
+// falls back to the route's own single served model.
+func checkModelBinding(body []byte, servedModelAllowList string) (modelBindingResult, string) {
 	// An ABSENT header (empty string) = binding not enforced (dedicated
 	// single-model route). But a PRESENT header that parses to an EMPTY set
 	// (e.g. a whitespace-only served name, or all-empty CSV parts) must fail
@@ -49,24 +55,24 @@ func checkModelBinding(body []byte, servedModelAllowList string) modelBindingRes
 	// model= through, defeating the binding. The caller only reaches here when
 	// the header is non-empty, so "present but empty set" is the attack/bug case.
 	if servedModelAllowList == "" {
-		return bindingOK // truly absent (empty header) -> not a shared-binding route
+		return bindingOK, "" // truly absent (empty header) -> not a shared-binding route
 	}
 	allow := parseServedModelAllowList(servedModelAllowList)
 	if len(allow) == 0 {
 		// Present (non-empty header) but parsed to nothing — whitespace-only or
 		// all-empty CSV parts. Fail CLOSED: an empty allow-list on a route that
 		// DID inject the header would let any model= through.
-		return bindingMismatch
+		return bindingMismatch, ""
 	}
 	model, ok := extractRequestModel(body)
 	if !ok {
 		// Enforced but the model is unreadable — fail closed.
-		return bindingUnparseable
+		return bindingUnparseable, ""
 	}
 	if _, authorized := allow[model]; authorized {
-		return bindingOK
+		return bindingOK, model
 	}
-	return bindingMismatch
+	return bindingMismatch, ""
 }
 
 // parseServedModelAllowList splits the comma-separated header into a set,

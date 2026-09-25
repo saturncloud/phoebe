@@ -537,6 +537,11 @@ func TestGateway_UpstreamHostShape(t *testing.T) {
 // resolution succeeded IS the wakeability signal (ResourceID + ServedModel are
 // populated by resolveGateway) — so a cold (scaled-to-zero) upstream triggers
 // the waker and the request is served after warm-up rather than 404ing.
+//
+// The assertion that matters is the LAST one: the graph name resolved from
+// tf_model must reach the wake target VERBATIM, never re-derived by parsing the
+// upstream host the gateway itself composed from that same name. Re-deriving
+// would work by coincidence today and break the moment the host format changes.
 func TestGateway_WakeEligible(t *testing.T) {
 	backend := &coldToWarmBackend{warmBody: `{"model":"sleepy-bot","usage":{"prompt_tokens":7,"completion_tokens":3,"total_tokens":10,"prompt_tokens_details":{"cached_tokens":2}}}`}
 	be := httptest.NewServer(backend)
@@ -551,7 +556,9 @@ func TestGateway_WakeEligible(t *testing.T) {
 			GraphK8sName: "graph-llama31",
 		},
 	}}
-	waker := &fakeWaker{warmsAt: 1, backend: backend}
+	// warmsAt: 1 — the backend goes warm after the first wake, so serveWithWake's
+	// re-probe succeeds and the caller performs the real metered forward.
+	waker := &fakeWaker{backend: backend, warmsAt: 1}
 	em := &recordingEmitter{}
 	mr := miniredis.RunT(t)
 	cfg := proxyAdmissionConfig(1)
@@ -561,7 +568,7 @@ func TestGateway_WakeEligible(t *testing.T) {
 	a := admission.New(client, cfg)
 	srv := newGatewayTestServer(t, em, resolver, beURL)
 	srv.settings.Admission = cfg
-	srv.WithAdmitter(a).WithWaker(waker, 5*time.Second, 3)
+	srv.WithAdmitter(a).WithWaker(waker, 5*time.Second, 0)
 
 	rr := httptest.NewRecorder()
 	srv.Handler().ServeHTTP(rr, gatewayRequest("org-1", `{"model":"sleepy-bot","max_tokens":20}`))
@@ -572,8 +579,10 @@ func TestGateway_WakeEligible(t *testing.T) {
 	if got := atomic.LoadInt32(&waker.calls); got != 1 {
 		t.Fatalf("waker called %d times, want 1 (gateway route must be wakeable)", got)
 	}
-	if backend.requests.Load() != 2 || backend.successes.Load() != 1 {
-		t.Fatalf("backend requests=%d successes=%d, want one cold plus one successful inference", backend.requests.Load(), backend.successes.Load())
+	// serveWithWake costs one readiness probe on the wake path: one cold probe,
+	// one warm re-probe after the wake, then the caller's metered forward.
+	if backend.requests.Load() != 3 || backend.successes.Load() != 2 {
+		t.Fatalf("backend requests=%d successes=%d, want one cold probe, one warm re-probe, one successful inference", backend.requests.Load(), backend.successes.Load())
 	}
 	events := em.waitForEvents(1, time.Second)
 	if len(events) != 1 || events[0].PromptTokens != 7 || events[0].CachedTokens != 2 || events[0].CompletionTokens != 3 {

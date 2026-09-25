@@ -75,7 +75,7 @@ import (
 )
 
 // tokenEnv carries the install's customer auth token (a mounted secret), same as
-// price-fetch. Never a flag/config — it must not land in logs or a configmap.
+// cmd/rater. Never a flag/config — it must not land in logs or a configmap.
 const tokenEnv = "SATURN_TOKEN"
 
 // tokenUsagePath is the manager endpoint that ingests the hourly snapshot.
@@ -179,7 +179,7 @@ func runWith(argv []string) int {
 }
 
 // signalContext returns a context cancelled on SIGTERM/SIGINT so a CronJob pod
-// shutdown aborts an in-flight push cleanly. Mirrors cmd/rater and cmd/price-fetch.
+// shutdown aborts an in-flight push cleanly. Mirrors cmd/rater.
 func signalContext() (context.Context, context.CancelFunc) {
 	return signal.NotifyContext(context.Background(), syscall.SIGTERM, syscall.SIGINT)
 }

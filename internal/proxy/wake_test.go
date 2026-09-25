@@ -32,28 +32,19 @@ func TestIsColdWakeable(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			resp := &http.Response{
-				StatusCode: tc.status,
-				Body:       io.NopCloser(strings.NewReader(tc.body)),
-			}
-			got, err := isColdResponse(resp)
-			if err != nil {
-				t.Fatal(err)
-			}
-			if got != tc.want {
-				t.Fatalf("isColdResponse(status=%d)=%v want %v", tc.status, got, tc.want)
-			}
-			preserved, err := io.ReadAll(resp.Body)
-			if err != nil || string(preserved) != tc.body {
-				t.Fatalf("response body not preserved: %q, %v", preserved, err)
+			b := newBufferingResponseWriter()
+			b.WriteHeader(tc.status)
+			_, _ = b.Write([]byte(tc.body))
+			if b.isColdWakeable() != tc.want {
+				t.Fatalf("isColdWakeable(status=%d)=%v want %v", tc.status, b.isColdWakeable(), tc.want)
 			}
 		})
 	}
 }
 
 // TestGraphFromUpstreamHost pins the header-routed graph derivation: first DNS
-// label, `-frontend` Service suffix stripped, port ignored; a label without
-// the suffix is the k8s name itself.
+// label, `-frontend` Service suffix stripped, port ignored; a label without the
+// suffix is the k8s name itself.
 func TestGraphFromUpstreamHost(t *testing.T) {
 	cases := map[string]string{
 		"graph-llama31-frontend.tf-shared.svc.cluster.local:8000":     "graph-llama31",
@@ -152,7 +143,7 @@ func testServerWithWaker(waker Waker) *Server {
 	return s.WithWaker(waker, 5*time.Second, 3)
 }
 
-func TestWakeRoundTripper_ColdThenWarmExecutesOneSuccessfulInference(t *testing.T) {
+func TestServeWithWake_ColdThenWarm(t *testing.T) {
 	backend := &coldToWarmBackend{}
 	be := httptest.NewServer(backend)
 	defer be.Close()
@@ -162,52 +153,25 @@ func TestWakeRoundTripper_ColdThenWarmExecutesOneSuccessfulInference(t *testing.
 	s := testServerWithWaker(waker)
 
 	req := httptest.NewRequest("POST", "http://x/v1/chat/completions", strings.NewReader(`{"model":"m"}`))
-	replaceRequestBody(req, []byte(`{"model":"m"}`))
 	id := identity.Identity{ResourceID: "r1", ServedModel: "m"}
-	req.URL = up
-	resp, err := s.newWakeRoundTripper(up.Host, "req-1", id, nil, new(atomic.Bool)).RoundTrip(req)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer resp.Body.Close()
-	if resp.StatusCode != http.StatusOK {
-		t.Fatalf("status=%d, want 200", resp.StatusCode)
+	rec := httptest.NewRecorder()
+
+	served := s.serveWithWake(rec, req, up, id, "req-1", nil)
+	// Cold-then-warm: serveWithWake wakes, sees warm on re-probe, returns false
+	// (caller does the real forward). Waker called exactly once.
+	if served {
+		t.Fatalf("expected served=false (warm -> caller forwards), got true")
 	}
 	if got := atomic.LoadInt32(&waker.calls); got != 1 {
 		t.Fatalf("waker called %d times, want 1", got)
 	}
 	if backend.requests.Load() != 2 || backend.successes.Load() != 1 {
-		t.Fatalf("backend requests=%d successes=%d, want one cold + one successful inference", backend.requests.Load(), backend.successes.Load())
+		t.Fatalf("backend requests=%d successes=%d, want one cold probe plus one warm re-probe",
+			backend.requests.Load(), backend.successes.Load())
 	}
 }
 
-func TestWakeRoundTripper_WarmRequestExecutesExactlyOnce(t *testing.T) {
-	backend := &coldToWarmBackend{}
-	backend.warm.Store(true)
-	be := httptest.NewServer(backend)
-	defer be.Close()
-	up, _ := url.Parse(be.URL)
-	waker := &fakeWaker{}
-	s := testServerWithWaker(waker)
-	req := httptest.NewRequest("POST", up.String(), strings.NewReader(`{"model":"m"}`))
-	replaceRequestBody(req, []byte(`{"model":"m"}`))
-	id := identity.Identity{ResourceID: "r1", ServedModel: "m"}
-
-	resp, err := s.newWakeRoundTripper(up.Host, "req-1", id, nil, new(atomic.Bool)).RoundTrip(req)
-	if err != nil {
-		t.Fatal(err)
-	}
-	_, _ = io.Copy(io.Discard, resp.Body)
-	_ = resp.Body.Close()
-	if backend.requests.Load() != 1 || backend.successes.Load() != 1 {
-		t.Fatalf("backend requests=%d successes=%d, want exactly one inference", backend.requests.Load(), backend.successes.Load())
-	}
-	if waker.calls != 0 {
-		t.Fatalf("waker called %d times for warm request", waker.calls)
-	}
-}
-
-func TestWakeRoundTripper_WakeErrorReturnsCold(t *testing.T) {
+func TestServeWithWake_WakeErrorReturnsCold(t *testing.T) {
 	backend := &coldToWarmBackend{} // stays cold
 	be := httptest.NewServer(backend)
 	defer be.Close()
@@ -217,15 +181,46 @@ func TestWakeRoundTripper_WakeErrorReturnsCold(t *testing.T) {
 	s := testServerWithWaker(waker)
 
 	req := httptest.NewRequest("POST", "http://x/v1/chat/completions", strings.NewReader(`{"model":"m"}`))
-	replaceRequestBody(req, []byte(`{"model":"m"}`))
 	id := identity.Identity{ResourceID: "r1", ServedModel: "m"}
-	req.URL = up
-	resp, err := s.newWakeRoundTripper(up.Host, "req-1", id, nil, new(atomic.Bool)).RoundTrip(req)
-	if err != nil {
-		t.Fatal(err)
+	rec := httptest.NewRecorder()
+
+	served := s.serveWithWake(rec, req, up, id, "req-1", nil)
+	if !served {
+		t.Fatal("wake error should serve the cold response (served=true)")
 	}
-	defer resp.Body.Close()
-	if resp.StatusCode != http.StatusNotFound {
-		t.Fatalf("expected cold 404, got %d", resp.StatusCode)
+	if rec.Code != 404 {
+		t.Fatalf("expected the cold 404 flushed to client, got %d", rec.Code)
+	}
+}
+
+func TestServeWithWake_WarmRequestNotServed(t *testing.T) {
+	backend := &coldToWarmBackend{}
+	backend.warm.Store(true)
+	be := httptest.NewServer(backend)
+	defer be.Close()
+	up, _ := url.Parse(be.URL)
+
+	waker := &fakeWaker{}
+	s := testServerWithWaker(waker)
+
+	req := httptest.NewRequest("POST", "http://x/v1/chat/completions", strings.NewReader(`{"model":"m"}`))
+	id := identity.Identity{ResourceID: "r1", ServedModel: "m"}
+	rec := httptest.NewRecorder()
+
+	served := s.serveWithWake(rec, req, up, id, "req-1", nil)
+	if served {
+		t.Fatal("warm request must not be served by serveWithWake (caller forwards)")
+	}
+	if backend.requests.Load() != 1 || backend.successes.Load() != 1 {
+		t.Fatalf("backend requests=%d successes=%d, want exactly one probe", backend.requests.Load(), backend.successes.Load())
+	}
+	if waker.calls != 0 {
+		t.Fatalf("waker called %d times for warm request", waker.calls)
+	}
+	// The caller re-forwards the request, so the body must be restored: the
+	// probe consumed it, and serveWithWake returns with it readable.
+	body, err := io.ReadAll(req.Body)
+	if err != nil || string(body) != `{"model":"m"}` {
+		t.Fatalf("request body not restored for the metered forward: %q, %v", body, err)
 	}
 }

@@ -12,7 +12,6 @@ package proxy
 import (
 	"context"
 	"errors"
-	"fmt"
 	"io"
 	"net"
 	"net/http"
@@ -34,26 +33,12 @@ import (
 )
 
 func TestClassifyRoundTripSettlement(t *testing.T) {
-	coldHoldRejection := &admissionRoundTripError{err: &admission.Rejected{
-		Scope: "platform", Dimension: "cold_holds", RetryAfter: time.Second,
-	}}
-	coldHoldRejection429 := &admissionRoundTripError{err: &admission.Rejected{
-		Scope: "contract_organization", Dimension: "cold_holds", RetryAfter: time.Second, Contractual: true,
-	}}
 	dialFailure := &net.OpError{Op: "dial", Net: "tcp", Err: errors.New("connection refused")}
 	tests := []struct {
 		name string
 		err  error
 		want settlementKind
 	}{
-		// The cold-hold capacity rejection is determinate never-served: the
-		// engine answered cold and no inference ran. The settlement kind is the
-		// same whether writeAdmissionError renders the rejection 503
-		// (non-contractual scope) or 429 (contractual scope) — the axis is
-		// never-served, not the status code.
-		{"cold-hold rejection (503 rendering)", coldHoldRejection, settlementZeroNeverServed},
-		{"cold-hold rejection (429 rendering)", coldHoldRejection429, settlementZeroNeverServed},
-		{"wrapped cold-hold rejection", fmt.Errorf("roundtrip: %w", coldHoldRejection), settlementZeroNeverServed},
 		// Aborts and indeterminate faults keep the conservative estimate.
 		{"client abort", context.Canceled, settlementUnknown},
 		{"wrapped client abort", &url.Error{Op: "Post", URL: "http://up", Err: context.Canceled}, settlementUnknown},
@@ -80,24 +65,20 @@ func TestClassifyCaptureSettlement(t *testing.T) {
 	noUsage := capture.Result{UsageFound: false}
 	abortedNoUsage := capture.Result{UsageFound: false, Aborted: true}
 	tests := []struct {
-		name          string
-		res           capture.Result
-		wakeColdFinal bool
-		want          settlementKind
+		name string
+		res  capture.Result
+		want settlementKind
 	}{
-		{"usage found", withUsage, false, settlementActual},
-		// A captured usage block always wins, even on a final cold response.
-		{"usage found on final cold response", withUsage, true, settlementActual},
-		{"no usage, final cold response", noUsage, true, settlementZeroNeverServed},
-		{"no usage, ordinary response", noUsage, false, settlementUnknown},
+		{"usage found", withUsage, settlementActual},
+		{"no usage, ordinary response", noUsage, settlementUnknown},
 		// An aborted stream with no usage stays conservative: the engine may
 		// have done work before the disconnect.
-		{"aborted, no usage, ordinary response", abortedNoUsage, false, settlementUnknown},
+		{"aborted, no usage", abortedNoUsage, settlementUnknown},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
-			if got := classifyCaptureSettlement(tc.res, tc.wakeColdFinal); got != tc.want {
-				t.Fatalf("classifyCaptureSettlement(%+v, %t) = %d, want %d", tc.res, tc.wakeColdFinal, got, tc.want)
+			if got := classifyCaptureSettlement(tc.res); got != tc.want {
+				t.Fatalf("classifyCaptureSettlement(%+v) = %d, want %d", tc.res, got, tc.want)
 			}
 		})
 	}
@@ -130,73 +111,6 @@ func TestSettleAdmissionLeaseRejectsUnsetKind(t *testing.T) {
 	if err := lease.Complete(context.Background(), 0); err != nil {
 		t.Fatalf("lease left unsettled-but-invalid by the rejected zero kind: %v", err)
 	}
-}
-
-// TestWakeRoundTripperMarksColdFinal pins the plumbing: the round tripper flags
-// the response as final-cold exactly when it gives up and serves the engine's
-// cold response (wake budget exhausted OR waker failed), and never for a warm
-// or successfully re-warmed response.
-func TestWakeRoundTripperMarksColdFinal(t *testing.T) {
-	roundTrip := func(t *testing.T, backend *coldToWarmBackend, waker Waker, maxTries int) (*http.Response, *atomic.Bool) {
-		t.Helper()
-		be := httptest.NewServer(backend)
-		t.Cleanup(be.Close)
-		up, _ := url.Parse(be.URL)
-		s := New(&config.Settings{}, logging.New(logging.ERROR), nil).WithWaker(waker, 5*time.Second, maxTries)
-		req := httptest.NewRequest(http.MethodPost, "http://x/v1/chat/completions", strings.NewReader(`{"model":"m"}`))
-		replaceRequestBody(req, []byte(`{"model":"m"}`))
-		req.URL = up
-		id := identity.Identity{ResourceID: "r1", ServedModel: "m"}
-		coldFinal := new(atomic.Bool)
-		resp, err := s.newWakeRoundTripper(up.Host, "req-1", id, nil, coldFinal).RoundTrip(req)
-		if err != nil {
-			t.Fatal(err)
-		}
-		t.Cleanup(func() { _ = resp.Body.Close() })
-		return resp, coldFinal
-	}
-
-	t.Run("exhausted budget flags final cold", func(t *testing.T) {
-		backend := &coldToWarmBackend{}
-		resp, coldFinal := roundTrip(t, backend, &fakeWaker{warmsAt: 99, backend: backend}, 2)
-		if resp.StatusCode != http.StatusNotFound {
-			t.Fatalf("status=%d, want the cold 404", resp.StatusCode)
-		}
-		if !coldFinal.Load() {
-			t.Fatal("coldFinal not set after the wake budget was exhausted")
-		}
-	})
-	t.Run("waker failure flags final cold", func(t *testing.T) {
-		backend := &coldToWarmBackend{}
-		resp, coldFinal := roundTrip(t, backend, &fakeWaker{err: context.DeadlineExceeded}, 3)
-		if resp.StatusCode != http.StatusNotFound {
-			t.Fatalf("status=%d, want the cold 404", resp.StatusCode)
-		}
-		if !coldFinal.Load() {
-			t.Fatal("coldFinal not set after the waker failed")
-		}
-	})
-	t.Run("warm response does not flag", func(t *testing.T) {
-		backend := &coldToWarmBackend{}
-		backend.warm.Store(true)
-		resp, coldFinal := roundTrip(t, backend, &fakeWaker{}, 3)
-		if resp.StatusCode != http.StatusOK {
-			t.Fatalf("status=%d, want 200", resp.StatusCode)
-		}
-		if coldFinal.Load() {
-			t.Fatal("coldFinal set for a warm response")
-		}
-	})
-	t.Run("successful re-warm does not flag", func(t *testing.T) {
-		backend := &coldToWarmBackend{}
-		resp, coldFinal := roundTrip(t, backend, &fakeWaker{warmsAt: 1, backend: backend}, 3)
-		if resp.StatusCode != http.StatusOK {
-			t.Fatalf("status=%d, want the warm 200", resp.StatusCode)
-		}
-		if coldFinal.Load() {
-			t.Fatal("coldFinal set for a successfully re-warmed response")
-		}
-	})
 }
 
 // chargeThenProbeAdmit runs charge (the admission-affecting request section),
@@ -318,10 +232,12 @@ func zeroSettlementProbeSet(est admissionEstimate) []admission.Request {
 // holder, the wakeable request's BeginColdHold is rejected (503 + Retry-After,
 // waker never invoked — pinned by TestWakeColdHoldRejectionFailsClosedAndReleasesLease),
 // and the rejection settles ZERO: token windows uncharged, the requests-window
-// +1 kept, the physical platform reservation released. (The 429 contractual
-// rendering is pinned at the classifier level in TestClassifyRoundTripSettlement:
-// no current config produces a contractual cold-holds scope, so it cannot be
-// driven end to end.)
+// +1 kept, the physical platform reservation released. serveWithWake does not
+// settle this path itself; the handler's deferred release fallback owns the
+// lease release, and it lands on exactly the R1 never-served settlement:
+// Complete(0). (The 429 contractual rendering would take the same path through
+// the same fallback — no current config produces a contractual cold-holds
+// scope, so it cannot be driven end to end.)
 func TestWakeColdHoldRejectionSettlesZeroNeverServed(t *testing.T) {
 	backend := &coldToWarmBackend{} // stays cold: every response is the cold 404
 	be := httptest.NewServer(backend)
@@ -399,11 +315,11 @@ func TestWakeColdHoldRejectionSettlesZeroNeverServed(t *testing.T) {
 }
 
 // TestWakeExhaustedColdSettlesZeroNeverServed pins the wake-exhausted cold 404
-// (the round tripper's give-up at maxTries): the engine refused every dispatch
-// before any inference, so the final cold 404 settles ZERO — token windows
-// uncharged, the requests-window +1 kept, the physical reservation released —
-// rather than the conservative estimate a usage-less ordinary response would
-// retain.
+// (serveWithWake's give-up after maxTries cold attempts): the engine refused
+// every dispatch before any inference, so the final cold 404 settles ZERO —
+// token windows uncharged, the requests-window +1 kept, the physical
+// reservation released — rather than the conservative estimate a usage-less
+// ordinary response would retain.
 func TestWakeExhaustedColdSettlesZeroNeverServed(t *testing.T) {
 	backend := &coldToWarmBackend{} // never warms
 	be := httptest.NewServer(backend)
@@ -428,8 +344,11 @@ func TestWakeExhaustedColdSettlesZeroNeverServed(t *testing.T) {
 		if rr.Code != http.StatusNotFound {
 			t.Fatalf("status=%d, want the final cold 404 after wake exhaustion", rr.Code)
 		}
-		if got := atomic.LoadInt32(&waker.calls) - callsBefore; got != 1 {
-			t.Fatalf("waker delta=%d, want 1 for maxTries=2", got)
+		// serveWithWake wakes once per cold attempt: maxTries=2 means two wakes
+		// (each followed by a still-cold re-probe), then the honest final cold
+		// forward.
+		if got := atomic.LoadInt32(&waker.calls) - callsBefore; got != 2 {
+			t.Fatalf("waker delta=%d, want 2 for maxTries=2 (one wake per cold attempt)", got)
 		}
 	}
 

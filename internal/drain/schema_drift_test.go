@@ -44,8 +44,12 @@ func billingEventDDLColumns(t *testing.T) map[string]bool {
 	createRe := regexp.MustCompile(`(?is)CREATE TABLE billing_event\s*\((.*?)\);`)
 	// A column definition line: identifier then a type keyword. CONSTRAINT/
 	// comment lines don't match (their first token is uppercase or --).
-	colRe := regexp.MustCompile(`(?m)^\s*([a-z_]+)\s+(?:VARCHAR|CHAR|TEXT|INTEGER|BIGINT|SMALLINT|BOOLEAN|NUMERIC|TIMESTAMPTZ|TIMESTAMP|DATE|JSONB|TSVECTOR)`)
-	alterRe := regexp.MustCompile(`(?i)ALTER TABLE billing_event\s+ADD COLUMN\s+(?:IF NOT EXISTS\s+)?([a-z_]+)`)
+	// [a-z0-9_]+, NOT [a-z_]+: a DIGIT inside an identifier (graph_k8s_name) would
+	// otherwise truncate the capture at the digit ("graph_k"), so the real column
+	// reads as absent and a genuinely-present column fails the drift check. Every
+	// column predating graph_k8s_name was digit-free, which kept this latent.
+	colRe := regexp.MustCompile(`(?m)^\s*([a-z][a-z0-9_]*)\s+(?:VARCHAR|CHAR|TEXT|INTEGER|BIGINT|SMALLINT|BOOLEAN|NUMERIC|TIMESTAMPTZ|TIMESTAMP|DATE|JSONB|TSVECTOR)`)
+	alterRe := regexp.MustCompile(`(?i)ALTER TABLE billing_event\s+ADD COLUMN\s+(?:IF NOT EXISTS\s+)?([a-z][a-z0-9_]*)`)
 
 	for _, e := range entries {
 		if !strings.HasSuffix(e.Name(), ".up.sql") {
