@@ -819,6 +819,9 @@ func TestAdmissionRetryAfterCeilsRemainingFixedWindow(t *testing.T) {
 	if got := rr.Header().Get("Retry-After"); got != "2" {
 		t.Fatalf("Retry-After=%q, want ceil(1.5s)=2", got)
 	}
+	if got := rr.Header().Get("X-Request-Id"); got != "req-retry-after" {
+		t.Fatalf("X-Request-Id=%q, want the request id echoed on the rejection response", got)
+	}
 }
 
 func TestMalformedTrustedRateLimitFailsClosed(t *testing.T) {

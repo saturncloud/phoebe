@@ -154,9 +154,15 @@ func (b *bufferingResponseWriter) isColdWakeable() bool {
 }
 
 // flushTo writes the captured status, headers, and body to the real client.
+// The request-correlation header is never copied from the buffer: the caller
+// Sets the authoritative minted value on w before flushing (an upstream echo
+// must not duplicate it — same "Set, not Add" contract as ModifyResponse).
 func (b *bufferingResponseWriter) flushTo(w http.ResponseWriter) {
 	dst := w.Header()
 	for k, vs := range b.header {
+		if strings.EqualFold(k, requestIDHeader) {
+			continue
+		}
 		for _, v := range vs {
 			dst.Add(k, v)
 		}

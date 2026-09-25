@@ -344,6 +344,9 @@ func TestWakeExhaustedColdSettlesZeroNeverServed(t *testing.T) {
 		if rr.Code != http.StatusNotFound {
 			t.Fatalf("status=%d, want the final cold 404 after wake exhaustion", rr.Code)
 		}
+		if got := rr.Header().Get("X-Request-Id"); !strings.HasPrefix(got, "phoebe-") {
+			t.Fatalf("final cold 404 response missing the minted X-Request-Id echo, got %q", got)
+		}
 		// serveWithWake wakes once per cold attempt: maxTries=2 means two wakes
 		// (each followed by a still-cold re-probe), then the honest final cold
 		// forward.
@@ -398,6 +401,9 @@ func TestWakeErrorColdSettlesZeroNeverServed(t *testing.T) {
 		s.Handler().ServeHTTP(rr, withContractEnvelope(sharedRequest(up)))
 		if rr.Code != http.StatusNotFound {
 			t.Fatalf("status=%d, want the final cold 404 after the waker failed", rr.Code)
+		}
+		if got := rr.Header().Get("X-Request-Id"); !strings.HasPrefix(got, "phoebe-") {
+			t.Fatalf("waker-failure cold 404 response missing the minted X-Request-Id echo, got %q", got)
 		}
 		if got := atomic.LoadInt32(&waker.calls) - callsBefore; got != 1 {
 			t.Fatalf("waker delta=%d, want 1 (a failed wake must not retry)", got)
