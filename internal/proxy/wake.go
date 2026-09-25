@@ -187,11 +187,16 @@ func (s *Server) wakeEnabled(id identity.Identity) bool {
 // intact. Cost: one extra round-trip on the (rare) first-request-after-idle.
 //
 // SETTLEMENT (R1 ruling): when this function returns true with a FINAL cold
-// response (wake error, or tries exhausted), the engine provably did no
-// inference work — every dispatch was refused before any token ran — so the
-// admitted lease is settled to zero here (settlementZeroNeverServed), in
-// addition to the cold response being flushed to the client. The rejection
-// path (BeginColdHold error) does NOT settle: the engine answered cold but the
+// response (the wake-error give-up, or tries exhausted with the final probe
+// STILL cold), the engine provably did no inference work — every dispatch was
+// refused before any token ran — so the admitted lease is settled to zero here
+// (settlementZeroNeverServed), in addition to the cold response being flushed
+// to the client. A tries-exhausted final probe that is NOT cold (warm, or a
+// non-cold transport/overload error) returns false instead: the R1
+// never-served precondition does not hold for it, so the caller's metered
+// forward owns both the metering row and the settlement (actual usage, or
+// conservative-unknown for an indeterminate fault). The rejection path
+// (BeginColdHold error) does NOT settle: the engine answered cold but the
 // request is refused pre-dispatch, and the handler's deferred release fallback
 // owns that lease release. A successful wake returns false without settling:
 // the caller's metered forward owns settlement.
@@ -263,7 +268,7 @@ func (s *Server) serveWithWake(
 				// not a completed response: fail closed without usage-settling
 				// here; the handler's deferred release fallback owns the lease
 				// release on this exit path.
-				s.writeAdmissionError(w, aerr)
+				s.writeAdmissionError(w, requestID, aerr)
 				return true
 			}
 		}
@@ -288,21 +293,36 @@ func (s *Server) serveWithWake(
 			s.log.Warn.Printf("wake: could not warm base for request_id=%s resource_id=%s: %v",
 				requestID, id.ResourceID, werr)
 			s.settleFinalColdLease(r, lease)
+			w.Header().Set(requestIDHeader, requestID)
 			buf.flushTo(w)
 			return true
 		}
 		// Woken: loop and re-probe (the next attempt should be warm).
 	}
 
-	// Tries exhausted and still cold — serve the last cold response honestly.
-	// Same determinate never-served axis as the wake-error give-up: every
-	// dispatch was refused before any inference, so the lease settles zero
-	// before the flush.
+	// Tries exhausted — dispatch ONE more buffered probe and classify it.
+	// Still genuinely cold: same determinate never-served axis as the wake-error
+	// give-up — every dispatch was refused before any inference, so the lease
+	// settles zero before the flush.
+	//
+	// NOT cold (a warm response, or a non-cold error such as a transport
+	// 502/500): the R1 "engine provably did no work" precondition does NOT
+	// hold. Serving the buffer here would hand the client a real response
+	// settled Complete(0) and never metered (a billing hole), or an
+	// unclassified 502 settled never-served zero (indeterminate faults must
+	// keep the conservative reservation). Return false so the caller's normal
+	// metered streaming forward classifies the outcome — exactly the in-loop
+	// not-cold handling above.
 	restoreBody()
 	buf := newBufferingResponseWriter()
 	last := httputil.NewSingleHostReverseProxy(upstream)
 	last.ServeHTTP(buf, r)
+	if !buf.isColdWakeable() {
+		restoreBody()
+		return false
+	}
 	s.settleFinalColdLease(r, lease)
+	w.Header().Set(requestIDHeader, requestID)
 	buf.flushTo(w)
 	return true
 }

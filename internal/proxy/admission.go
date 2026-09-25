@@ -293,7 +293,11 @@ func prepareSharedDynamoRequest(body []byte, tenantIdentity string, maxOutput in
 	return out, tenant, nil
 }
 
-func (s *Server) writeAdmissionError(w http.ResponseWriter, err error) {
+func (s *Server) writeAdmissionError(w http.ResponseWriter, requestID string, err error) {
+	// Echo the authoritative attempt id on rejections too — the same handle the
+	// normal path stamps in ModifyResponse and the error handler stamps on 502s:
+	// a rejected client needs its billing-record correlation id just as much.
+	w.Header().Set(requestIDHeader, requestID)
 	var rejected *admission.Rejected
 	if errors.As(err, &rejected) {
 		retry := int64(math.Ceil(rejected.RetryAfter.Seconds()))

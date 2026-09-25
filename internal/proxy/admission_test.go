@@ -812,7 +812,7 @@ func TestContractRateLimitReturns429BeforeUpstream(t *testing.T) {
 func TestAdmissionRetryAfterCeilsRemainingFixedWindow(t *testing.T) {
 	s := New(&config.Settings{}, logging.New(logging.ERROR), &recordingEmitter{})
 	rr := httptest.NewRecorder()
-	s.writeAdmissionError(rr, &admission.Rejected{
+	s.writeAdmissionError(rr, "req-retry-after", &admission.Rejected{
 		Scope: "contract_organization", Dimension: "requests", Contractual: true,
 		RetryAfter: 1500 * time.Millisecond,
 	})

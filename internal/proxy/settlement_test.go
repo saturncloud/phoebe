@@ -423,6 +423,202 @@ func TestWakeErrorColdSettlesZeroNeverServed(t *testing.T) {
 	}
 }
 
+// TestWakeExhaustedWarmFinalSettlesActualUsage pins the tries-exhausted tail's
+// NON-cold final axis: the in-loop probes stay cold (each triggering a wake)
+// but the FINAL dispatch comes back warm — the engine DID real work. The tail
+// must NOT settle Complete(0) and flush the buffer: it returns false so the
+// caller's metered forward serves the response, emits exactly one usage-bearing
+// metering row, and settles the lease with the engine-authoritative usage.
+// Under the old unconditional-zero settlement the generated/prompt probes below
+// would be ADMITTED (nothing charged); with actual usage settled they must be
+// REJECTED.
+func TestWakeExhaustedWarmFinalSettlesActualUsage(t *testing.T) {
+	var requests atomic.Int32
+	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		if requests.Add(1) > 2 { // in-loop probes (2) stay cold; the final dispatch is warm
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write([]byte(`{"model":"model-a","usage":{"prompt_tokens":5,"completion_tokens":7}}`))
+			return
+		}
+		w.WriteHeader(http.StatusNotFound)
+		_, _ = w.Write([]byte(`{"message":"Model not found"}`))
+	}))
+	defer backend.Close()
+	up, _ := url.Parse(backend.URL)
+	mr := miniredis.RunT(t)
+	cfg := proxyAdmissionConfig(1)
+	cfg.Platform.MaxColdHolds = 1
+	c := redis.NewClient(&redis.Options{Addr: mr.Addr()})
+	t.Cleanup(func() { _ = c.Close() })
+	a := admission.New(c, cfg)
+	// The waker succeeds but never warms the backend: only the counting handler
+	// above decides which dispatch sees the warm body.
+	waker := &fakeWaker{}
+	em := &recordingEmitter{}
+	s := New(&config.Settings{Admission: cfg}, logging.New(logging.ERROR), em).
+		WithAdmitter(a).
+		WithWaker(waker, time.Second, 2)
+
+	charge := func() {
+		callsBefore := atomic.LoadInt32(&waker.calls)
+		rr := httptest.NewRecorder()
+		s.Handler().ServeHTTP(rr, withContractEnvelope(sharedRequest(up)))
+		if rr.Code != http.StatusOK {
+			t.Fatalf("status=%d, want the warm 200 served by the caller's metered forward", rr.Code)
+		}
+		if !strings.Contains(rr.Body.String(), `"completion_tokens":7`) {
+			t.Fatalf("body=%q, want the warm response body served to the client", rr.Body.String())
+		}
+		if got := atomic.LoadInt32(&waker.calls) - callsBefore; got != 2 {
+			t.Fatalf("waker delta=%d, want 2 for maxTries=2 (one wake per cold in-loop probe)", got)
+		}
+		// Two cold in-loop probes + the warm final probe + the caller's metered
+		// forward: four dispatches total, two warm.
+		if got := requests.Load(); got != 4 {
+			t.Fatalf("backend requests=%d, want 4 (2 cold probes + warm final probe + warm forward)", got)
+		}
+	}
+
+	req := sharedRequest(up)
+	est := sharedRequestEstimate(t, req)
+	errs := chargeThenProbeAdmit(t, a, mr.FlushAll, charge, zeroSettlementProbeSet(est))
+	if len(errs) != 3 {
+		t.Fatalf("got %d probe errors, want 3", len(errs))
+	}
+	// The requests-window +1 is kept under every settlement (demand, not work).
+	if scope, dimension, ok := rejectedScopeDimension(errs[0]); !ok || scope != "contract_organization" || dimension != "requests" {
+		t.Errorf("requests probe: err=%v, want contract_organization requests rejection", errs[0])
+	}
+	// The generated/prompt probes reserve exactly the conservative estimate
+	// against a limit equal to it. They must be REJECTED: the lease settled with
+	// ACTUAL usage (generated=7, prompt=5) still occupying the windows. A
+	// Complete(0) settlement would leave the windows empty and both probes
+	// would be ADMITTED — this is the billing-hole pin.
+	for i, wantDimension := range []string{"generated_tokens", "total_prompt_tokens"} {
+		if scope, dimension, ok := rejectedScopeDimension(errs[i+1]); !ok || scope != "contract_organization" || dimension != wantDimension {
+			t.Errorf("probe %d: err=%v, want contract_organization %s rejection (actual usage settled, not zero)", i+1, errs[i+1], wantDimension)
+		}
+	}
+
+	// Exactly one metering event, carrying the engine's usage block.
+	events := em.waitForEvents(1, 5*time.Second)
+	if len(events) != 1 {
+		t.Fatalf("emitted %d events, want exactly 1 (the caller's metered forward)", len(events))
+	}
+	e := events[0]
+	if !e.UsageFound || e.PromptTokens != 5 || e.CompletionTokens != 7 || e.StatusCode != http.StatusOK {
+		t.Fatalf("event=%+v, want one usage-bearing 200 event (prompt=5 completion=7)", e)
+	}
+
+	// Physical capacity is released by the usage settlement.
+	physical, err := a.Admit(context.Background(), admission.Request{
+		Graph: "graph", Organization: "org-c", Model: "m",
+		PromptBytes: 1, EstimatedInputTokens: 1, ReservedOutputTokens: 1,
+	})
+	if err != nil {
+		t.Fatalf("warm-final usage settlement leaked its platform reservation: %v", err)
+	}
+	_ = physical.Complete(context.Background(), 0)
+}
+
+// TestWakeExhaustedTransportErrorSettlesUnknownUsage pins the tries-exhausted
+// tail's indeterminate-fault axis: the in-loop probes stay cold, then the
+// engine dies before the final dispatch — the connection drops mid-retry. The
+// tail must NOT settle never-served zero and flush an unclassified 502: it
+// returns false so the caller's error handler classifies the fault — one
+// UsageFound=false 502 metering row and the conservative reservation retained
+// (CompleteUnknownUsage), exactly the R1 ruling for indeterminate faults.
+func TestWakeExhaustedTransportErrorSettlesUnknownUsage(t *testing.T) {
+	var requests atomic.Int32
+	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		if requests.Add(1) > 2 { // engine dies after the last in-loop probe
+			hj, ok := w.(http.Hijacker)
+			if !ok {
+				t.Error("backend ResponseWriter is not a Hijacker")
+				return
+			}
+			conn, _, err := hj.Hijack()
+			if err != nil {
+				t.Errorf("hijack: %v", err)
+				return
+			}
+			// Drop the connection without a byte: the dispatch fails at the
+			// transport layer, deterministically pre-response.
+			_ = conn.Close()
+			return
+		}
+		w.WriteHeader(http.StatusNotFound)
+		_, _ = w.Write([]byte(`{"message":"Model not found"}`))
+	}))
+	defer backend.Close()
+	up, _ := url.Parse(backend.URL)
+	mr := miniredis.RunT(t)
+	cfg := proxyAdmissionConfig(1)
+	cfg.Platform.MaxColdHolds = 1
+	c := redis.NewClient(&redis.Options{Addr: mr.Addr()})
+	t.Cleanup(func() { _ = c.Close() })
+	a := admission.New(c, cfg)
+	waker := &fakeWaker{} // succeeds; the backend dies on its own count
+	em := &recordingEmitter{}
+	s := New(&config.Settings{Admission: cfg}, logging.New(logging.ERROR), em).
+		WithAdmitter(a).
+		WithWaker(waker, time.Second, 2)
+
+	charge := func() {
+		callsBefore := atomic.LoadInt32(&waker.calls)
+		rr := httptest.NewRecorder()
+		s.Handler().ServeHTTP(rr, withContractEnvelope(sharedRequest(up)))
+		if rr.Code != http.StatusBadGateway {
+			t.Fatalf("status=%d, want the classified 502 from the caller's error handler", rr.Code)
+		}
+		if got := atomic.LoadInt32(&waker.calls) - callsBefore; got != 2 {
+			t.Fatalf("waker delta=%d, want 2 for maxTries=2 (one wake per cold in-loop probe)", got)
+		}
+		// Two cold in-loop probes + the failed final probe + the caller's failed
+		// forward: four dispatches, none warm.
+		if got := requests.Load(); got != 4 {
+			t.Fatalf("backend requests=%d, want 4 (2 cold probes + failed final probe + failed forward)", got)
+		}
+	}
+
+	req := sharedRequest(up)
+	est := sharedRequestEstimate(t, req)
+	errs := chargeThenProbeAdmit(t, a, mr.FlushAll, charge, zeroSettlementProbeSet(est))
+	if len(errs) != 3 {
+		t.Fatalf("got %d probe errors, want 3", len(errs))
+	}
+	// Indeterminate fault: the conservative reservation is RETAINED in every
+	// contract window (the requests-window +1 kept, and the generated/prompt
+	// probes reserving exactly the conservative estimate are REJECTED) — the
+	// same expectations as a dispatched engine error. A never-served-zero
+	// settlement would ADMIT both token probes.
+	for i, wantDimension := range []string{"requests", "generated_tokens", "total_prompt_tokens"} {
+		if scope, dimension, ok := rejectedScopeDimension(errs[i]); !ok || scope != "contract_organization" || dimension != wantDimension {
+			t.Errorf("probe %d: err=%v, want contract_organization %s rejection (conservative settlement retained)", i, errs[i], wantDimension)
+		}
+	}
+
+	// Exactly one metering row: the classified UpstreamFault 502, no usage.
+	events := em.waitForEvents(1, 5*time.Second)
+	if len(events) != 1 {
+		t.Fatalf("emitted %d events, want exactly 1 (the caller's error-handler row)", len(events))
+	}
+	e := events[0]
+	if e.UsageFound || e.StatusCode != http.StatusBadGateway || e.Aborted {
+		t.Fatalf("event=%+v, want one UsageFound=false 502 row (UpstreamFault, not an abort)", e)
+	}
+
+	// Physical capacity is released even though the conservative charges stand.
+	physical, err := a.Admit(context.Background(), admission.Request{
+		Graph: "graph", Organization: "org-c", Model: "m",
+		PromptBytes: 1, EstimatedInputTokens: 1, ReservedOutputTokens: 1,
+	})
+	if err != nil {
+		t.Fatalf("transport-error final leaked its platform reservation: %v", err)
+	}
+	_ = physical.Complete(context.Background(), 0)
+}
+
 // TestAdmissionEngineErrorResponseChargesUnknownUsage pins the conservative
 // side of the ruling: an engine 4xx/5xx AFTER A REAL DISPATCH, with no usage
 // block, cannot be distinguished from a prompt-processed-then-failed request,

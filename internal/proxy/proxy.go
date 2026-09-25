@@ -544,7 +544,7 @@ func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request) {
 					s.admissionBypassLog.logf(s.log, "admission: distributed gate unavailable; bypassing for otherwise valid request_id=%s: %v", requestID, err)
 					admitted = nil
 				} else {
-					s.writeAdmissionError(w, err)
+					s.writeAdmissionError(w, requestID, err)
 					return
 				}
 			}
@@ -577,11 +577,12 @@ func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// WAKE-FROM-ZERO (shared serverless mode, the 0->1 leg). Prepare the graph
-	// with Kubernetes actuation and non-billable GET /v1/models readiness before
-	// the inference POST. Regardless of wake success or failure, the normal path
-	// below forwards the customer's POST at most once and meters its honest
-	// response. No inference response is ever discarded and replayed.
+	// WAKE-FROM-ZERO (shared serverless mode, the 0->1 leg). Probe the upstream
+	// with a buffered dispatch of the customer's (already-rewritten) POST: a cold
+	// response triggers Kubernetes actuation via the configured waker, holding
+	// the request for bounded retries. Regardless of wake success or failure,
+	// the normal path below forwards the customer's POST at most once and meters
+	// its honest response. No inference response is ever discarded and replayed.
 	if s.wakeEnabled(id) {
 		if served := s.serveWithWake(w, r, upstream, id, requestID, admitted); served {
 			return
