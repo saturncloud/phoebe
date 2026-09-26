@@ -67,6 +67,11 @@ type captureReader struct {
 	result capture.Result
 	onDone func(capture.Result)
 	done   bool
+	// onFirstRead marks the prefill→decode boundary for admission. sync.Once
+	// protects unusual Readers that return both bytes and an error or are closed
+	// concurrently with the copy loop.
+	firstRead   sync.Once
+	onFirstRead func()
 
 	// logBuf, when non-nil, accumulates a COPY of the forwarded response bytes
 	// for M5 I/O logging — bounded by logCap. It is allocated ONLY when the
@@ -102,6 +107,8 @@ func (c *captureReader) enableBodyLog(capBytes int) {
 	c.logBuf = &bytes.Buffer{}
 	c.logCap = capBytes
 }
+
+func (c *captureReader) setOnFirstRead(fn func()) { c.onFirstRead = fn }
 
 // capturedBody returns the buffered response body and whether it was truncated
 // at the cap. Returns ("", false) if body logging was not enabled. Safe to call
@@ -139,6 +146,11 @@ func (c *captureReader) appendLog(p []byte) {
 func (c *captureReader) Read(p []byte) (int, error) {
 	n, err := c.src.Read(p)
 	if n > 0 {
+		c.firstRead.Do(func() {
+			if c.onFirstRead != nil {
+				c.onFirstRead()
+			}
+		})
 		// Inspect a COPY of exactly the bytes we forward. The bytes in p are
 		// returned to the client verbatim; we never mutate them.
 		c.scan.Write(p[:n])

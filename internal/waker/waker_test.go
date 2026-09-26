@@ -3,6 +3,8 @@ package waker
 import (
 	"context"
 	"encoding/json"
+	"net/http"
+	"net/http/httptest"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -47,8 +49,11 @@ func scaledObjectObj(graph string, paused string) *unstructured.Unstructured {
 }
 
 // newFakeWaker builds a KubeWaker over client-go's fake dynamic client seeded
-// with objs, with readiness stubbed to always-ready (readiness has its own
-// tests). Returns the waker and the fake for action assertions.
+// with objs, readiness stubbed COLD-THEN-READY: the first probe reports not-ready
+// (so the warm short-circuit in Wake does not fire and the actuation path runs —
+// which is what these tests assert), and every later probe reports ready (so
+// waitReady returns immediately instead of polling). Readiness itself has its own
+// tests. Returns the waker and the fake for action assertions.
 func newFakeWaker(t *testing.T, objs ...runtime.Object) (*KubeWaker, *dynamicfake.FakeDynamicClient) {
 	t.Helper()
 	scheme := runtime.NewScheme()
@@ -57,7 +62,11 @@ func newFakeWaker(t *testing.T, objs ...runtime.Object) (*KubeWaker, *dynamicfak
 		scaledObjectGVR: "ScaledObjectList",
 	}, objs...)
 	w := NewWithClient(client, Config{Namespace: testNS, PollInterval: time.Millisecond}, logging.New(logging.ERROR))
-	w.ready = func(context.Context, string) bool { return true }
+	// Atomic: concurrent-wake tests call readiness from several goroutines.
+	var probes int32
+	w.ready = func(context.Context, string) bool {
+		return atomic.AddInt32(&probes, 1) > 1
+	}
 	return w, client
 }
 
@@ -207,7 +216,7 @@ func TestWake_LegacyVllmWorkerFallback(t *testing.T) {
 // TestWake_BothDGDSANamesMissingErrors: neither the uniform nor the legacy
 // adapter exists — the wake errors (naming BOTH candidates for diagnosis) and
 // writes nothing; the proxy then serves the honest cold response (see the
-// serveWithWake integration test below).
+// proxy integration test).
 func TestWake_BothDGDSANamesMissingErrors(t *testing.T) {
 	w, client := newFakeWaker(t) // empty cluster
 
@@ -326,5 +335,66 @@ func TestWake_EmptyGraphNameErrors(t *testing.T) {
 	}
 	if patches := patchActions(client); len(patches) != 0 {
 		t.Fatalf("issued %d patches, want 0", len(patches))
+	}
+}
+
+// TestUpstreamServesModelsIsAnyModel pins the readiness signal: the frontend is
+// ready when it serves ANY model, not one specific id.
+//
+// It used to require the REQUESTED model, which mattered while Wake was the thing
+// that decided a request could proceed. serveWithWake now proves coldness by
+// probing with the real request and re-probes afterwards, so the waker only has to
+// answer "is this graph serving again". A per-model check would additionally FAIL
+// on a graph that came back up serving a different set — a false negative that
+// burns the whole wake budget.
+//
+// Why /v1/models at all: a scaled-to-zero frontend stays up (its /health is 200 —
+// useless as a wake signal) but DROPS every model from discovery, which is exactly
+// why the cold request fails. Models reappearing is the same discovery event that
+// ends the failure.
+func TestUpstreamServesModelsIsAnyModel(t *testing.T) {
+	var body atomic.Value
+	body.Store(`{"data":[]}`)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet || r.URL.Path != "/v1/models" {
+			t.Fatalf("readiness request = %s %s, want GET /v1/models", r.Method, r.URL.Path)
+		}
+		_, _ = w.Write([]byte(body.Load().(string)))
+	}))
+	defer server.Close()
+	host := strings.TrimPrefix(server.URL, "http://")
+	w := &KubeWaker{}
+
+	// Empty discovery = still scaled to zero.
+	if w.upstreamServesModels(context.Background(), host) {
+		t.Fatal("empty /v1/models must not read as ready")
+	}
+	// Any model back in discovery = the frontend is serving again, even if it is
+	// not the one this request asked for.
+	body.Store(`{"data":[{"id":"some-other-model"}]}`)
+	if !w.upstreamServesModels(context.Background(), host) {
+		t.Fatal("a served model must read as ready regardless of which model it is")
+	}
+}
+
+// NOTE: the warm short-circuit test that lived here was REMOVED, not fixed.
+// It pinned Wake returning early for an already-warm graph, which mattered while
+// Wake ran on every wakeable request. serveWithWake now calls Wake ONLY after a
+// probe saw a genuinely cold response, so a warm graph never reaches the waker
+// and the short-circuit has moved up a layer (and got cheaper — the proxy was
+// going to make that request anyway). The equivalent coverage now lives in
+// internal/proxy's wake tests, which assert the waker is not called when the
+// first probe comes back warm.
+
+// TestWake_ColdGraphStillActuates is the other half: the short-circuit must not
+// suppress a real wake. A cold graph is still read, scaled and unpaused.
+func TestWake_ColdGraphStillActuates(t *testing.T) {
+	w, client := newFakeWaker(t, dgdsaObj("g1", 0), scaledObjectObj("g1", "true"))
+
+	if err := w.Wake(context.Background(), target("g1")); err != nil {
+		t.Fatalf("Wake: %v", err)
+	}
+	if patches := patchActions(client); len(patches) != 2 {
+		t.Fatalf("cold wake issued %d patches, want 2 (scale, then unpause)", len(patches))
 	}
 }

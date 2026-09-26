@@ -28,9 +28,6 @@ func TestLoadDefaults(t *testing.T) {
 	if s.ListenAddr != ":8080" {
 		t.Fatalf("ListenAddr = %q, want :8080", s.ListenAddr)
 	}
-	if !s.BillPartialOnAbort {
-		t.Fatal("BillPartialOnAbort should default true")
-	}
 }
 
 // TestLoadIOLogOffByDefault verifies M5 I/O logging is OFF unless configured:
@@ -266,5 +263,61 @@ emit:
 	}
 	if s.Emit.ValkeyAddr != "valkey:6379" || s.Emit.StreamName != "custom:stream" {
 		t.Fatalf("emit settings wrong: %+v", s.Emit)
+	}
+}
+
+func TestLoadAdmissionFailClosedAndDefaults(t *testing.T) {
+	if _, err := Load(writeTemp(t, "admission:\n  enabled: true\n")); err == nil {
+		t.Fatal("enabled admission without Valkey must fail startup")
+	}
+	s, err := Load(writeTemp(t, `
+admission:
+  enabled: true
+  valkeyAddr: "valkey:6379"
+  platform:
+    maxActiveRequests: 10
+  tiers:
+    default:
+      weight: 1
+      limits:
+        maxActiveRequests: 4
+    protected:
+      weight: 2
+      dynamoPriority: 17
+      dynamoStrictPriority: 3
+      limits:
+        maxActiveRequests: 2
+        requestsPerWindow: 5
+        window: "30s"
+  organizationTiers:
+    org-a: protected
+`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if s.Admission.LeaseTTL != 15*time.Minute || s.Admission.DefaultMaxOutputTokens != 512 {
+		t.Fatalf("admission defaults wrong: %+v", s.Admission)
+	}
+	if got := s.Admission.Tiers["protected"].Limits.Window; got != 30*time.Second {
+		t.Fatalf("tier window=%s, want 30s", got)
+	}
+	if got := s.Admission.Tiers["protected"]; got.DynamoPriority != 17 || got.DynamoStrictPriority != 3 {
+		t.Fatalf("protected Dynamo hints wrong: %+v", got)
+	}
+}
+
+func TestLoadAdmissionRejectsInvalidPolicy(t *testing.T) {
+	tests := []string{
+		"admission:\n  enabled: true\n  valkeyAddr: v\n  platform:\n    maxActiveRequests: -1\n",
+		"admission:\n  enabled: true\n  valkeyAddr: v\n  tiers:\n    bad:\n      weight: 0\n",
+		"admission:\n  enabled: true\n  valkeyAddr: v\n  tiers:\n    default:\n      weight: 1\n      dynamoPriority: 2147483648\n",
+		"admission:\n  enabled: true\n  valkeyAddr: v\n  tiers:\n    default:\n      weight: 1\n      dynamoStrictPriority: -1\n",
+		"admission:\n  enabled: true\n  valkeyAddr: v\n  organizationTiers:\n    org-a: missing\n",
+		"admission:\n  enabled: true\n  valkeyAddr: v\n  platform:\n    totalPromptTokensPerWindow: 10\n    uncachedPromptTokensPerWindow: 11\n",
+	}
+	for _, body := range tests {
+		if _, err := Load(writeTemp(t, body)); err == nil {
+			t.Fatalf("expected invalid policy rejection for:\n%s", body)
+		}
 	}
 }

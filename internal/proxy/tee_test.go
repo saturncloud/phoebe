@@ -57,6 +57,26 @@ func drain(t *testing.T, body string, streamed bool) ([]byte, capture.Result) {
 	return forwarded, got
 }
 
+func TestCaptureReaderFirstReadFiresExactlyOnce(t *testing.T) {
+	var calls int
+	cr := newCaptureReader(context.Background(), io.NopCloser(strings.NewReader("abcdef")), false, func(capture.Result) {})
+	cr.setOnFirstRead(func() { calls++ })
+	buf := make([]byte, 2)
+	for {
+		_, err := cr.Read(buf)
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+	_ = cr.Close()
+	if calls != 1 {
+		t.Fatalf("first-read callbacks=%d, want 1", calls)
+	}
+}
+
 func TestTeeStreamingCapturesUsageAfterFinishReason(t *testing.T) {
 	forwarded, res := drain(t, vllmStream, true)
 

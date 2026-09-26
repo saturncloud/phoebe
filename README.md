@@ -4,6 +4,10 @@ Phoebe is the **token-metering interceptor** for Saturn Cloud's token factory.
 It is a thin, tenant-aware reverse proxy that sits behind Traefik and in front
 of the (optional) inference router / vLLM engine:
 
+Billing operators should use [the reconciliation and recovery runbook](docs/billing-reconciliation.md)
+for the request-to-invoice audit, alert conditions, replay procedure, and
+explicit external guarantees.
+
 ```
 Traefik → atlas-auth (ForwardAuth) → Phoebe → [vLLM prod router | llm-d] → vLLM / SGLang / TensorRT-LLM
 ```
@@ -27,6 +31,10 @@ trusts the identity headers atlas-auth injects.
 - **Streaming correctness.** Forward-then-inspect SSE: streams each chunk to
   the client immediately, captures the trailing usage chunk, handles client
   aborts. See `internal/proxy`.
+- **Shared-tier admission.** Optional fail-closed Valkey reservations protect
+  platform, serving-graph, organization, and organization×model capacity across
+  every proxy replica. See `internal/admission` and
+  `docs/shared-tier-admission.md`.
 
 It is **topology-independent**: it behaves identically whether the upstream is
 an engine directly (Shape A) or a router (Shape B), and acts as the stable

@@ -41,7 +41,13 @@ const (
 // single-model endpoint: one subdomain == one model, the engine can only serve
 // the one thing) → bindingOK, no parse, no cost. atlas DECIDES access; this only
 // guarantees the body can't escape the atlas-authorized resource.
-func checkModelBinding(body []byte, servedModelAllowList string) modelBindingResult {
+// The second return value is the SINGULAR model the request selected, set only
+// on bindingOK for an enforced route. Wake readiness polls /v1/models for an
+// exact match, so it must receive this value and never the comma-separated
+// allow-list, which can never equal any single served-model name. It is empty
+// when the binding is not enforced (no allow-list header), where the caller
+// falls back to the route's own single served model.
+func checkModelBinding(body []byte, servedModelAllowList string) (modelBindingResult, string) {
 	// An ABSENT header (empty string) = binding not enforced (dedicated
 	// single-model route). But a PRESENT header that parses to an EMPTY set
 	// (e.g. a whitespace-only served name, or all-empty CSV parts) must fail
@@ -49,24 +55,24 @@ func checkModelBinding(body []byte, servedModelAllowList string) modelBindingRes
 	// model= through, defeating the binding. The caller only reaches here when
 	// the header is non-empty, so "present but empty set" is the attack/bug case.
 	if servedModelAllowList == "" {
-		return bindingOK // truly absent (empty header) -> not a shared-binding route
+		return bindingOK, "" // truly absent (empty header) -> not a shared-binding route
 	}
 	allow := parseServedModelAllowList(servedModelAllowList)
 	if len(allow) == 0 {
 		// Present (non-empty header) but parsed to nothing — whitespace-only or
 		// all-empty CSV parts. Fail CLOSED: an empty allow-list on a route that
 		// DID inject the header would let any model= through.
-		return bindingMismatch
+		return bindingMismatch, ""
 	}
 	model, ok := extractRequestModel(body)
 	if !ok {
 		// Enforced but the model is unreadable — fail closed.
-		return bindingUnparseable
+		return bindingUnparseable, ""
 	}
 	if _, authorized := allow[model]; authorized {
-		return bindingOK
+		return bindingOK, model
 	}
-	return bindingMismatch
+	return bindingMismatch, ""
 }
 
 // parseServedModelAllowList splits the comma-separated header into a set,
@@ -122,47 +128,44 @@ func extractRequestModel(body []byte) (string, bool) {
 // keys, e.g. inside an array element, are not counted). Returns an error if the
 // body is not a JSON object.
 func countTopLevelModelKeys(body []byte) (int, error) {
+	counts, err := countTopLevelKeys(body, map[string]struct{}{"model": {}})
+	return counts["model"], err
+}
+
+// countTopLevelKeys rejects ambiguity in fields whose interpretation affects
+// authorization or capacity. Downstream JSON stacks do not universally agree
+// on first-vs-last duplicate-key handling, so Phoebe must never validate or
+// reserve against one value while Dynamo/vLLM consumes another.
+func countTopLevelKeys(body []byte, wanted map[string]struct{}) (map[string]int, error) {
 	dec := json.NewDecoder(bytes.NewReader(body))
 	tok, err := dec.Token()
 	if err != nil {
-		return 0, err
+		return nil, err
 	}
 	if d, ok := tok.(json.Delim); !ok || d != '{' {
-		return 0, errNotObject
+		return nil, errNotObject
 	}
-	count := 0
-	depth := 0 // depth WITHIN the top-level object's values
-	for dec.More() || depth > 0 {
+	counts := make(map[string]int, len(wanted))
+	for dec.More() {
 		tok, err := dec.Token()
 		if err != nil {
-			return 0, err
+			return nil, err
 		}
-		switch t := tok.(type) {
-		case json.Delim:
-			switch t {
-			case '{', '[':
-				depth++
-			case '}', ']':
-				if depth == 0 {
-					// closing the top-level object
-					return count, nil
-				}
-				depth--
-			}
-		case string:
-			// A string token at depth 0 in the key position is a top-level key.
-			if depth == 0 {
-				if t == "model" {
-					count++
-				}
-				// consume this key's value (a token or a nested structure).
-				if err := skipValue(dec); err != nil {
-					return 0, err
-				}
-			}
+		key, ok := tok.(string)
+		if !ok {
+			return nil, errNotObject
+		}
+		if _, ok := wanted[key]; ok {
+			counts[key]++
+		}
+		if err := skipValue(dec); err != nil {
+			return nil, err
 		}
 	}
-	return count, nil
+	if _, err := dec.Token(); err != nil { // closing top-level object
+		return nil, err
+	}
+	return counts, nil
 }
 
 // skipValue consumes exactly one JSON value from the decoder (scalar, object, or

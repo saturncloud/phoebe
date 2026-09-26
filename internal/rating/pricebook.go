@@ -2,7 +2,6 @@ package rating
 
 import (
 	"fmt"
-	"os"
 	"sort"
 	"strings"
 
@@ -33,9 +32,12 @@ const ftLikePattern = fineTunePrefix + "%"
 
 // --- THE PRICE FILE SCHEMA (the operator-facing contract) -------------------
 //
-// The price file is the SINGLE source of truth for what every model costs (E1).
-// An operator authors and version-controls it; the file's history IS the price
-// audit trail (no DB price table, no effective-dating, no audit table). The hourly
+// A price book is one effective snapshot of what every model costs (E1), served by
+// the pricing service which owns the effective-dated series.
+// In file mode an operator authors and version-controls it and the file's history
+// is the price audit trail. In manager mode the parsed book is ONE HOUR's effective
+// prices, fetched per hour from the service that owns the effective-dated series
+// (see internal/pricefetch); phoebe stores no price history either way. The hourly
 // rater loads the CURRENT file at run start and rates the last complete hour with
 // whatever rate the file carries — and freezes that rate onto the rated_usage row.
 //
@@ -137,25 +139,10 @@ type fineTuneEntry struct {
 	Rate        *rateYAML `yaml:"rate"` // optional own rate (escape hatch; bypasses premium)
 }
 
-// LoadPriceBook reads, parses, and validates the price file at path, returning an
-// immutable PriceBook. It FAILS CLOSED: a missing file, malformed YAML, an unknown
-// schema version, a non-decimal/negative rate, or an inconsistent premium policy is
-// an error — the rater refuses to run rather than rate at $0 or a wrong rate.
-//
-// SEAM FOR S3 (out of scope here): the file is loaded from a local path. To fetch
-// from S3, fetch-to-local then call LoadPriceBook(localPath) — the create-time price
-// gate (E4) and the rater MUST read the same file/version, so a single fetched copy
-// is the natural shared artifact.
-func LoadPriceBook(path string) (*PriceBook, error) {
-	data, err := os.ReadFile(path)
-	if err != nil {
-		return nil, fmt.Errorf("rating: read price file %q: %w", path, err)
-	}
-	return ParsePriceBook(data)
-}
-
-// ParsePriceBook parses+validates raw YAML bytes into a PriceBook. Split from
-// LoadPriceBook so tests can exercise the parser without touching the filesystem.
+// ParsePriceBook parses+validates raw YAML bytes into a PriceBook, FAILING CLOSED
+// on anything malformed. This is the only way a book is built: the rater obtains
+// each hour's book from the pricing service (internal/pricefetch) and parses the
+// bytes here — there is no local price file and no file loader.
 // UnmarshalStrict rejects unknown keys, so a typo'd field (e.g. `promt:`) fails the
 // load rather than silently pricing a token at $0.
 func ParsePriceBook(data []byte) (*PriceBook, error) {

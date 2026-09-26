@@ -122,6 +122,14 @@ const (
 	// take down the inference path. See internal/proxy missingBillingFields.
 	HeaderOrgID = "X-Saturn-Org-Id"
 
+	// Shared-tier policy resolved by Atlas from authenticated UsageLimits and
+	// stamped by gateway ForwardAuth. Clients never choose these values.
+	HeaderServiceTier                   = "X-Saturn-Service-Tier"
+	HeaderRateLimitRequests             = "X-Saturn-Rate-Limit-Requests"
+	HeaderRateLimitTotalPromptTokens    = "X-Saturn-Rate-Limit-Total-Prompt-Tokens"
+	HeaderRateLimitUncachedPromptTokens = "X-Saturn-Rate-Limit-Uncached-Prompt-Tokens"
+	HeaderRateLimitGeneratedTokens      = "X-Saturn-Rate-Limit-Generated-Tokens"
+
 	// HeaderUpstream carries the EXACT backend the request must be forwarded to —
 	// `host:port` (e.g. pd-abcde-mymodel-r123.main-namespace.svc.cluster.local:8000).
 	//
@@ -193,24 +201,34 @@ type Identity struct {
 	// upstream host the gateway just composed from this same name. Empty on
 	// header-routed requests (the proxy derives the graph from the upstream
 	// host instead).
-	GraphK8sName string
+	GraphK8sName                  string
+	ServiceTier                   string
+	RateLimitRequests             string
+	RateLimitTotalPromptTokens    string
+	RateLimitUncachedPromptTokens string
+	RateLimitGeneratedTokens      string
 }
 
 // FromRequest extracts the trusted identity headers. It performs no
 // validation beyond reading the values; authorization happened at the edge.
 func FromRequest(r *http.Request) Identity {
 	return Identity{
-		AuthID:       r.Header.Get(HeaderAuthID),
-		UserID:       r.Header.Get(HeaderUserID),
-		GroupID:      r.Header.Get(HeaderGroupID),
-		ResourceID:   r.Header.Get(HeaderResourceID),
-		ResourceType: r.Header.Get(HeaderResourceType),
-		OrgID:        r.Header.Get(HeaderOrgID),
-		BaseModel:    r.Header.Get(HeaderBaseModel),
-		Adapter:      r.Header.Get(HeaderAdapter),
-		ServingMode:  r.Header.Get(HeaderServingMode),
-		ServedModel:  r.Header.Get(HeaderServedModel),
-		Upstream:     r.Header.Get(HeaderUpstream),
-		Gateway:      r.Header.Get(HeaderGateway) == "true",
+		AuthID:                        r.Header.Get(HeaderAuthID),
+		UserID:                        r.Header.Get(HeaderUserID),
+		GroupID:                       r.Header.Get(HeaderGroupID),
+		ResourceID:                    r.Header.Get(HeaderResourceID),
+		ResourceType:                  r.Header.Get(HeaderResourceType),
+		OrgID:                         r.Header.Get(HeaderOrgID),
+		BaseModel:                     r.Header.Get(HeaderBaseModel),
+		Adapter:                       r.Header.Get(HeaderAdapter),
+		ServingMode:                   r.Header.Get(HeaderServingMode),
+		ServedModel:                   r.Header.Get(HeaderServedModel),
+		Upstream:                      r.Header.Get(HeaderUpstream),
+		Gateway:                       r.Header.Get(HeaderGateway) == "true",
+		ServiceTier:                   r.Header.Get(HeaderServiceTier),
+		RateLimitRequests:             r.Header.Get(HeaderRateLimitRequests),
+		RateLimitTotalPromptTokens:    r.Header.Get(HeaderRateLimitTotalPromptTokens),
+		RateLimitUncachedPromptTokens: r.Header.Get(HeaderRateLimitUncachedPromptTokens),
+		RateLimitGeneratedTokens:      r.Header.Get(HeaderRateLimitGeneratedTokens),
 	}
 }
