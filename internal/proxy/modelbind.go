@@ -68,6 +68,23 @@ func boundRequestAllowed(method, path, servedModelAllowList string) bool {
 	}
 }
 
+// unboundRequestAllowed is the surface for a deployment route with NO injected
+// allow-list (legacy/unconfigured). Escalation 4 (PR #50): such a route must
+// not forward Dynamo's graph-wide surfaces — the unfiltered /v1/models list,
+// graph-wide readiness, metrics, docs — so only the meterable inference POST
+// surface is reachable, plus OPTIONS on that same surface, which handleProxy
+// answers locally (never forwarded). Anything else 404s at this gate.
+//
+// The rationale that used to keep unbound routes fully open ("one subdomain ==
+// one model") was never an architectural guarantee — a dedicated graph can
+// host a base model plus sibling adapters — and graph-wide routes disclose
+// them. The inference POST surface stays open for backward compatibility;
+// Atlas's middleware injecting X-Saturn-Served-Model restores the full bound
+// surface (including the filtered model list and sanitized readiness).
+func unboundRequestAllowed(method, path string) bool {
+	return (method == "OPTIONS" || method == "POST") && inferenceRequestPathAllowed(path)
+}
+
 // canonicalRequestPath returns the path to authorize on, reporting ok=false
 // when the raw request target is not byte-identical to its decoded form.
 //
@@ -143,17 +160,14 @@ const (
 // without this check a caller authorized for model-A could send `model=B` and be
 // served B. This binds the two: request model ∈ allow-list, else fail closed.
 //
-// An ABSENT allow-list means Atlas did not mark this route as bound, and phoebe
-// then enforces NOTHING: not the body binding here, not the route gate
-// (proxy.go, also conditioned on ServedModel != ""), and not the /v1/models
-// filter — so such a route forwards Dynamo's full graph-wide model list. That
-// fail-open is safe ONLY because X-Saturn-Served-Model is injected and
-// anti-spoof overwritten server-side by the Atlas-rendered Traefik middleware
-// (identity.HeaderServedModel): a client cannot cause its absence. It is NOT
-// justified by "one subdomain == one model" — a dedicated Dynamo graph may host
-// a base model plus several attached adapters, which is exactly why dedicated
-// routes now carry a served-name allow-list too. An absent header on such a
-// graph would disable all three protections at once.
+// An ABSENT allow-list means Atlas did not mark this route as bound. Phoebe
+// then enforces no body binding here — but the ROUTE GATE still applies
+// (proxy.go): unbound routes get only the meterable inference POST surface
+// (unboundRequestAllowed), never Dynamo's graph-wide model list, readiness,
+// metrics or docs, and a shared route with no allow-list is refused outright.
+// The header is injected and anti-spoof overwritten server-side by the
+// Atlas-rendered Traefik middleware (identity.HeaderServedModel), so a client
+// cannot cause its absence; a real route always carries it.
 //
 // The binding check once also returned the SINGULAR model the request selected
 // (a comma-separated allow-list can never equal one /v1/models entry, so wake

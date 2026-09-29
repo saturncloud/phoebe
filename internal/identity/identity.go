@@ -62,10 +62,11 @@ const (
 	// (proxy.boundRequestAllowed) and for the /v1/models response filter
 	// (proxy.filterModelListResponse).
 	//
-	// ABSENT = none of those three is enforced, and the route forwards Dynamo's
-	// unfiltered graph-wide model list — the legacy/unconfigured case. That
-	// fail-open is tolerable only because this header is injected and anti-spoof
-	// overwritten server-side, so a client cannot strip it. PRESENT = enforce.
+	// ABSENT = no binding here, and the route gate degrades to the meterable
+	// inference POST surface only (proxy.unboundRequestAllowed): graph-wide
+	// surfaces (unfiltered model list, readiness, metrics, docs) are refused,
+	// and a SHARED route with no allow-list is refused outright. PRESENT =
+	// enforce the full bound surface.
 	HeaderServedModel = "X-Saturn-Served-Model"
 
 	// HeaderServingMode carries the serving mode of the deployment — "shared" or

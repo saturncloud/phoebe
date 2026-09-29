@@ -808,14 +808,17 @@ func TestProxyStreamingEndToEnd(t *testing.T) {
 	}
 }
 
-// Documents an INTENTIONAL fail-open: a non-gateway route that reaches phoebe
-// with X-Saturn-Served-Model ABSENT gets none of the three protections keyed on
-// that header — no route gate, no body binding, no /v1/models filter — so it
-// forwards Dynamo's graph-wide surface. That is tolerable only because the
-// header is injected and anti-spoof overwritten server-side by the
-// Atlas-rendered Traefik middleware, so a client cannot cause its absence.
-// Pinned by name so any future change to it is deliberate rather than silent.
-func TestProxyUnboundRouteSkipsAllServedModelGates(t *testing.T) {
+// Escalation 4 (PR #50) pin: a non-gateway route that reaches phoebe with
+// X-Saturn-Served-Model ABSENT must NOT forward Dynamo's graph-wide surfaces.
+// The inference POST surface stays reachable (backward compatibility; binding
+// is not enforced without the header), but the unfiltered model list,
+// graph-wide readiness, metrics and docs 404 at the route gate without ever
+// reaching Dynamo. OPTIONS on the inference surface is still answered locally.
+// A SHARED route in this state is refused outright — nothing binds model=.
+// The header is injected and anti-spoof overwritten server-side by the
+// Atlas-rendered Traefik middleware, so a client cannot cause its absence; a
+// real route always carries it.
+func TestProxyUnboundRouteForwardsNoGraphWideSurfaces(t *testing.T) {
 	var upstreamCalls int32
 	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		atomic.AddInt32(&upstreamCalls, 1)
@@ -825,34 +828,76 @@ func TestProxyUnboundRouteSkipsAllServedModelGates(t *testing.T) {
 	upstream, _ := url.Parse(backend.URL)
 	srv := newTestServer(t, upstream)
 
-	request := func(method, path, body string) *httptest.ResponseRecorder {
+	request := func(method, path, body string, extraHeaders map[string]string) *httptest.ResponseRecorder {
 		req := httptest.NewRequest(method, path, strings.NewReader(body))
 		setUpstream(req, upstream)
 		req.Header.Set(identity.HeaderAuthID, "auth-1")
 		req.Header.Set(identity.HeaderResourceID, "deployment-a")
 		// deliberately NO identity.HeaderServedModel
+		for k, v := range extraHeaders {
+			req.Header.Set(k, v)
+		}
 		rr := httptest.NewRecorder()
 		srv.Handler().ServeHTTP(rr, req)
 		return rr
 	}
 
-	if rr := request(http.MethodPost, "/v1/chat/completions", `{"model":"anything"}`); rr.Code != http.StatusOK {
-		t.Fatalf("unbound POST status = %d, want 200 (binding not enforced without the header)", rr.Code)
+	if rr := request(http.MethodPost, "/v1/chat/completions", `{"model":"anything"}`, nil); rr.Code != http.StatusOK {
+		t.Fatalf("unbound POST status = %d, want 200 (inference surface stays reachable without the header)", rr.Code)
 	}
-	if rr := request(http.MethodGet, "/metrics", ""); rr.Code == http.StatusNotFound {
-		t.Fatal("unbound GET /metrics is NOT route-gated today; update this test deliberately if that changes")
+	for _, path := range []string{"/v1/models", "/health", "/metrics", "/docs", "/v1/models/adapter-b"} {
+		if rr := request(http.MethodGet, path, "", nil); rr.Code != http.StatusNotFound {
+			t.Fatalf("unbound GET %s status = %d, want 404 (graph-wide surface must not forward)", path, rr.Code)
+		}
 	}
-	if atomic.LoadInt32(&upstreamCalls) != 2 {
-		t.Fatalf("unbound requests made %d upstream calls, want 2", atomic.LoadInt32(&upstreamCalls))
+	// OPTIONS on the inference surface is answered locally; anywhere else it
+	// 404s at the gate like every other method — never forwarded.
+	if rr := request(http.MethodOptions, "/v1/chat/completions", "", nil); rr.Code != http.StatusNoContent {
+		t.Fatalf("unbound OPTIONS inference status = %d, want 204 (answered locally)", rr.Code)
 	}
-	// OPTIONS is the one gate that is NOT keyed on the header: it must be
-	// answered locally even on an unbound route, so no Dynamo response data
-	// can reach the caller through preflight.
-	if rr := request(http.MethodOptions, "/metrics", ""); rr.Code != http.StatusNoContent {
-		t.Fatalf("unbound OPTIONS status = %d, want 204 (answered locally)", rr.Code)
+	if rr := request(http.MethodOptions, "/metrics", "", nil); rr.Code != http.StatusNotFound {
+		t.Fatalf("unbound OPTIONS /metrics status = %d, want 404 (outside the inference surface)", rr.Code)
 	}
-	if atomic.LoadInt32(&upstreamCalls) != 2 {
-		t.Fatalf("OPTIONS reached Dynamo: %d upstream calls", atomic.LoadInt32(&upstreamCalls))
+	// Only the POST ever reached Dynamo.
+	if got := atomic.LoadInt32(&upstreamCalls); got != 1 {
+		t.Fatalf("unbound requests made %d upstream calls, want 1 (POST only)", got)
+	}
+}
+
+// A SHARED route with no injected allow-list is refused outright: without the
+// allow-list there is nothing to bind the request-body model= against, so any
+// model on the shared graph would be reachable.
+func TestProxyUnboundSharedRouteFailsClosed(t *testing.T) {
+	var upstreamCalls int32
+	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		atomic.AddInt32(&upstreamCalls, 1)
+		_, _ = w.Write([]byte(`{"object":"list","data":[{"id":"adapter-b"}]}`))
+	}))
+	defer backend.Close()
+	upstream, _ := url.Parse(backend.URL)
+	srv := newTestServer(t, upstream)
+
+	for _, tc := range []struct {
+		method, path, body string
+	}{
+		{http.MethodPost, "/v1/chat/completions", `{"model":"anything"}`},
+		{http.MethodGet, "/v1/models", ""},
+		{http.MethodOptions, "/v1/chat/completions", ""},
+	} {
+		req := httptest.NewRequest(tc.method, tc.path, strings.NewReader(tc.body))
+		setUpstream(req, upstream)
+		req.Header.Set(identity.HeaderAuthID, "auth-1")
+		req.Header.Set(identity.HeaderResourceID, "model-shared")
+		req.Header.Set(identity.HeaderServingMode, "shared")
+		// deliberately NO identity.HeaderServedModel
+		rr := httptest.NewRecorder()
+		srv.Handler().ServeHTTP(rr, req)
+		if rr.Code != http.StatusNotFound {
+			t.Fatalf("unbound shared %s %s status = %d, want 404", tc.method, tc.path, rr.Code)
+		}
+	}
+	if got := atomic.LoadInt32(&upstreamCalls); got != 0 {
+		t.Fatalf("unbound shared route made %d upstream calls, want 0", got)
 	}
 }
 
@@ -964,12 +1009,15 @@ func TestGatewayPreflightEmitsNoCORSHeaders(t *testing.T) {
 	}
 }
 
-// The errorHandler's no-double-emit invariant: a ModifyResponse fault is NOT a
-// client abort, so it releases the admission lease but writes no bogus
-// zero-token billing row. Named for the invariant it guards, because the
-// comment that used to justify it ("ModifyResponse always returns nil") is no
-// longer true.
-func TestModelListFilterErrorEmitsNoBillingEvent(t *testing.T) {
+// Merged-contract pin (billing #48): a ModifyResponse fault is NOT a client
+// abort, so besides releasing the admission lease it emits exactly ONE raw
+// reconciliation row — Aborted=false, UsageFound=false, StatusCode=502 — the
+// same always-record contract as every other failed attempt. The row charges
+// $0 (no authoritative counts); it exists so the failed attempt is visible to
+// reconciliation. Exactly-once holds because every ModifyResponse error returns
+// BEFORE the captureReader installs onDone, so the completion emit was never
+// armed.
+func TestModelListFilterErrorEmitsReconciliationRow(t *testing.T) {
 	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		_, _ = w.Write([]byte(`{"data":[{"id":"sibling","id":"adapter-a"}]}`))
 	}))
@@ -988,7 +1036,14 @@ func TestModelListFilterErrorEmitsNoBillingEvent(t *testing.T) {
 	if rr.Code != http.StatusBadGateway {
 		t.Fatalf("status = %d, want 502", rr.Code)
 	}
-	if events := em.waitForEvents(1, 100*time.Millisecond); len(events) != 0 {
-		t.Fatalf("filter failure emitted %d billing events, want 0: %+v", len(events), events)
+	events := em.waitForEvents(1, 2*time.Second)
+	if len(events) != 1 {
+		t.Fatalf("filter failure emitted %d billing events, want exactly 1 reconciliation row: %+v",
+			len(events), events)
+	}
+	ev := events[0]
+	if ev.Aborted || ev.UsageFound || ev.StatusCode != http.StatusBadGateway {
+		t.Fatalf("filter-failure row = {Aborted:%v UsageFound:%v StatusCode:%d}, "+
+			"want {false false 502} (visible to reconciliation, charges $0)", ev.Aborted, ev.UsageFound, ev.StatusCode)
 	}
 }

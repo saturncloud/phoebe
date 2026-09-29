@@ -374,9 +374,13 @@ func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request) {
 	// is one the subdomain-authorized resource may serve, fail closed on mismatch.
 	// atlas-auth authorized the caller for this subdomain/resource; Dynamo routes
 	// on the body `model=` and both shared and dedicated graphs can front several
-	// served names behind one upstream. Only enforced when Atlas injected an
-	// allow-list (X-Saturn-Served-Model). Runs BEFORE
-	// forwarding so a bad model never reaches the engine. Reads the body once and
+	// served names behind one upstream. The route gate runs for EVERY
+	// header-routed request — an allow-listed route gets the full bound surface
+	// (boundRequestAllowed), a route with NO injected allow-list gets only the
+	// meterable inference POST surface (unboundRequestAllowed), and a shared
+	// route with no allow-list is refused outright (nothing binds model=, so any
+	// model on the shared graph would be reachable). Runs BEFORE
+	// forwarding so a bad route never reaches the engine. Reads the body once and
 	// restores it for forceIncludeUsage.
 	//
 	// GATEWAY requests skip this check — THE PATHS DIVERGE HERE: on the
@@ -386,12 +390,34 @@ func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request) {
 	// THE ORG, so resolution IS the binding (id.ServedModel was set FROM the
 	// resolved request model; re-checking it against itself would be a
 	// tautology).
-	if id.ServedModel != "" && !id.Gateway &&
-		(!pathCanonical || !boundRequestAllowed(r.Method, routePath, id.ServedModel)) {
-		s.log.Warn.Printf("model-binding: refused request_id=%s resource_id=%s raw_path=%q canonical=%v (route not authorized for resource)",
-			requestID, id.ResourceID, r.URL.RawPath, pathCanonical)
-		http.Error(w, "not found", http.StatusNotFound)
-		return
+	if !id.Gateway {
+		allowed := pathCanonical
+		switch {
+		case id.ServedModel != "":
+			allowed = allowed && boundRequestAllowed(r.Method, routePath, id.ServedModel)
+		case id.ServingMode == "shared":
+			// Shared route with no injected allow-list: there is nothing to
+			// bind the request-body model= against, so model= could select any
+			// tenant's model on the shared graph. A real shared route always
+			// carries the header (identity.HeaderServedModel) — absent means
+			// misconfiguration, and misconfiguration fails closed.
+			allowed = false
+		default:
+			// Dedicated route with no injected allow-list (legacy/unconfigured).
+			// Escalation 4 (PR #50): it must not forward Dynamo's graph-wide
+			// surfaces — the unfiltered model list, graph-wide readiness,
+			// metrics, docs — which is exactly the disclosure the bound-route
+			// machinery closes. Only the inference POST surface (and the local
+			// preflight that precedes it) stays reachable; Atlas's middleware
+			// injecting the header restores the full bound surface.
+			allowed = allowed && unboundRequestAllowed(r.Method, routePath)
+		}
+		if !allowed {
+			s.log.Warn.Printf("model-binding: refused request_id=%s resource_id=%s raw_path=%q canonical=%v serving_mode=%q (route not authorized for resource)",
+				requestID, id.ResourceID, r.URL.RawPath, pathCanonical, id.ServingMode)
+			http.Error(w, "not found", http.StatusNotFound)
+			return
+		}
 	}
 	// Bound-route preflight is answered LOCALLY, mirroring the gateway branch
 	// above: OPTIONS is never forwarded, so Dynamo's graph-wide admin surface
@@ -676,10 +702,11 @@ func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request) {
 // pre-header abort uses the same always-record contract as every other abort.
 //
 // Invariant: every request past the billing-identity gate emits exactly one
-// attributable event — real usage on completion, or a zero-token Aborted event on
-// disconnect (pre- OR post-header).
+// attributable event — real usage on completion, a zero-token Aborted event on
+// disconnect (pre- OR post-header), or a zero-token raw row (UsageFound=false)
+// on any other upstream/ModifyResponse failure.
 //
-// NO double-emit. ErrorHandler now fires on TWO paths, not one:
+// NO double-emit. ErrorHandler fires on TWO paths, not one:
 //
 //	(a) a RoundTrip error — pre-header, no response was ever received;
 //	(b) a ModifyResponse error — filterModelListResponse /
@@ -689,12 +716,14 @@ func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request) {
 // Neither can double-emit or double-release, for a structural reason: every
 // ModifyResponse error return happens BEFORE `resp.Body = cr` installs the
 // captureReader, so onDone is never registered on those paths and cannot fire.
-// And the emit below is gated on isClientAbort (context.Canceled), which a
-// ModifyResponse fault never satisfies — so a filter failure writes no bogus
-// zero-token billing row; it only releases the admission lease, exactly once.
-// httputil also calls ErrorHandler before any response header reaches the
-// client on both paths, so the w.Header().Set(requestIDHeader, ...) + http.Error
-// below is still a pre-header write.
+// Exactly one row is written on every path: the abort branch emits
+// Aborted=true, and any other fault (RoundTrip OR ModifyResponse) falls through
+// to the raw reconciliation row below (Aborted=false, UsageFound=false,
+// StatusCode=502) — the merged billing contract (#48): every forwarded attempt
+// is recorded exactly once, failures included, at $0. httputil also calls
+// ErrorHandler before any response header reaches the client on both paths, so
+// the w.Header().Set(requestIDHeader, ...) + http.Error below is still a
+// pre-header write.
 //
 // WARNING: any future ModifyResponse error return placed AFTER the captureReader
 // is installed would break this — onDone would then be armed and would emit a
