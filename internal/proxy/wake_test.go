@@ -161,7 +161,7 @@ func TestServeWithWake_ColdThenWarm(t *testing.T) {
 	id := identity.Identity{ResourceID: "r1", ServedModel: "m"}
 	rec := httptest.NewRecorder()
 
-	served := s.serveWithWake(rec, req, up, id, "req-1", nil)
+	served := s.serveWithWake(rec, req, up, id, "req-1", "client-req-1", nil)
 	// Cold-then-warm: serveWithWake wakes, sees warm on re-probe, returns false
 	// (caller does the real forward). Waker called exactly once.
 	if served {
@@ -185,7 +185,7 @@ func TestServeWithWake_WakeErrorReturnsCold(t *testing.T) {
 	id := identity.Identity{ResourceID: "r1", ServedModel: "m"}
 	rec := httptest.NewRecorder()
 
-	served := s.serveWithWake(rec, req, up, id, "req-1", nil)
+	served := s.serveWithWake(rec, req, up, id, "req-1", "client-req-1", nil)
 	if !served {
 		t.Fatal("wake error should serve the cold response (served=true)")
 	}
@@ -214,7 +214,7 @@ func TestWakeErrorColdEmitsReconciliationRow(t *testing.T) {
 	id := identity.Identity{ResourceID: "r1", ServedModel: "m"}
 	rec := httptest.NewRecorder()
 
-	served := s.serveWithWake(rec, req, up, id, "req-1", nil)
+	served := s.serveWithWake(rec, req, up, id, "req-1", "client-req-1", nil)
 	if !served {
 		t.Fatal("wake error should serve the cold response (served=true)")
 	}
@@ -259,7 +259,7 @@ func TestWakeExhaustedWarmFinalProbeEmitsReconciliationRow(t *testing.T) {
 	id := identity.Identity{ResourceID: "r1", ServedModel: "m"}
 	rec := httptest.NewRecorder()
 
-	served := s.serveWithWake(rec, req, up, id, "req-1", nil)
+	served := s.serveWithWake(rec, req, up, id, "req-1", "client-req-1", nil)
 	if !served {
 		t.Fatal("tries-exhausted should serve the final probe response (served=true)")
 	}

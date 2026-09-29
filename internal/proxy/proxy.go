@@ -572,8 +572,14 @@ func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request) {
 	// the inference POST. Regardless of wake success or failure, the normal path
 	// below forwards the customer's POST at most once and meters its honest
 	// response. No inference response is ever discarded and replayed.
-	if s.wakeEnabled(id) {
-		if served := s.serveWithWake(w, r, upstream, id, requestID, admitted); served {
+	//
+	// Wake is attempted ONLY for the model-bearing inference surface: a cold
+	// control probe (GET /health, /v1/models on a bound shared route) must not
+	// trigger a 0->1 scale — the probe gets the honest cold response and the
+	// sanitizers reduce it, while a monitoring loop could otherwise hold a
+	// bounded wake on every check.
+	if s.wakeEnabled(id) && inferenceRequestPathAllowed(routePath) {
+		if served := s.serveWithWake(w, r, upstream, id, requestID, clientRequestID, admitted); served {
 			return
 		}
 	}

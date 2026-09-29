@@ -226,13 +226,12 @@ func (r *statusRecorder) Write(p []byte) (int, error) {
 // as errorHandler's fall-through row, same WithoutCancel ctx (the emit must
 // survive a cancelled client ctx), and $0 by construction (no authoritative
 // counts). The fall-through (return false) path must NOT call this — the
-// caller's normal forward meters that attempt. clientRequestID is threaded
-// nowhere into serveWithWake and handleProxy has already replaced the header
-// with the minted attempt id, so that value is the only correlation handle
-// available on this exit; the column is forensic only.
-func (s *Server) emitWakeFailureRow(r *http.Request, id identity.Identity, requestID string, statusCode int) {
+// caller's normal forward meters that attempt. clientRequestID is captured by
+// handleProxy BEFORE it replaces the X-Request-Id header with the minted
+// attempt id, so it is threaded in explicitly; the column is forensic only.
+func (s *Server) emitWakeFailureRow(r *http.Request, id identity.Identity, requestID, clientRequestID string, statusCode int) {
 	s.emit(context.WithoutCancel(r.Context()), id, requestID,
-		r.Header.Get(requestIDHeader), statusCode, capture.Result{UsageFound: false})
+		clientRequestID, statusCode, capture.Result{UsageFound: false})
 }
 
 // serveWithWake probes the upstream and, on a cold (scaled-to-zero) response,
@@ -256,7 +255,7 @@ func (s *Server) serveWithWake(
 	r *http.Request,
 	upstream *url.URL,
 	id identity.Identity,
-	requestID string,
+	requestID, clientRequestID string,
 	lease *admission.Lease,
 ) (served bool) {
 	// Snapshot the (already include-usage-rewritten) request body so it can be
@@ -317,7 +316,7 @@ func (s *Server) serveWithWake(
 				// bypasses the normal metered forward, so record the attempt.
 				rec := &statusRecorder{ResponseWriter: w}
 				s.writeAdmissionError(rec, aerr)
-				s.emitWakeFailureRow(r, id, requestID, rec.status)
+				s.emitWakeFailureRow(r, id, requestID, clientRequestID, rec.status)
 				return true
 			}
 		}
@@ -342,7 +341,7 @@ func (s *Server) serveWithWake(
 			s.log.Warn.Printf("wake: could not warm base for request_id=%s resource_id=%s: %v",
 				requestID, id.ResourceID, werr)
 			buf.flushTo(w)
-			s.emitWakeFailureRow(r, id, requestID, buf.status)
+			s.emitWakeFailureRow(r, id, requestID, clientRequestID, buf.status)
 			return true
 		}
 		// Woken: loop and re-probe (the next attempt should be warm).
@@ -357,6 +356,6 @@ func (s *Server) serveWithWake(
 	last := httputil.NewSingleHostReverseProxy(upstream)
 	last.ServeHTTP(buf, r)
 	buf.flushTo(w)
-	s.emitWakeFailureRow(r, id, requestID, buf.status)
+	s.emitWakeFailureRow(r, id, requestID, clientRequestID, buf.status)
 	return true
 }
