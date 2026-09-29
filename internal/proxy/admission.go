@@ -50,6 +50,13 @@ type sampledErrorLog struct {
 	// concurrent caller at that decision point, forcing all of them to act
 	// on the same pre-reset timestamp; nil in production.
 	afterLoad func()
+
+	// afterReset, when non-nil, runs in logf only on the quiet-gap CAS
+	// winner, after the counters are zeroed and before the winner's first
+	// increment. It exists so a test can park the winner in the window a
+	// fall-through loser would land in, forcing the duplicate-onset
+	// interleaving deterministically; nil in production.
+	afterReset func()
 }
 
 func (l *sampledErrorLog) quietGapNanos() int64 {
@@ -82,6 +89,9 @@ func (l *sampledErrorLog) logf(log *logging.Logger, format string, args ...inter
 		}
 		l.n.Store(0)
 		l.suppressed.Store(0)
+		if l.afterReset != nil {
+			l.afterReset()
+		}
 	} else {
 		l.lastUnixNano.Store(unixNano)
 	}

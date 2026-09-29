@@ -2325,6 +2325,18 @@ func TestSampledErrorLogQuietGapConcurrentOnset(t *testing.T) {
 	close(release)
 	wg.Wait()
 
+	// Losers must neither count nor log: only the CAS winner's increment
+	// survives the reset. A refactor that lets a loser fall through to the
+	// increment shows up here as n > 1 with a phantom suppressed count,
+	// even when the log-line assertion below still passes (battery
+	// finding 928773741a12).
+	if got := site.n.Load(); got != 1 {
+		t.Fatalf("site.n = %d, want 1 (only the CAS winner counts after the reset)", got)
+	}
+	if got := site.suppressed.Load(); got != 0 {
+		t.Fatalf("site.suppressed = %d, want 0 (losers never reach the suppressed counter)", got)
+	}
+
 	lines := strings.Split(strings.TrimSpace(buf.String()), "\n")
 	if len(lines) != 2 {
 		t.Fatalf("logged %d lines, want 2 (incident-one onset + exactly one incident-two onset): %q", len(lines), lines)
@@ -2334,5 +2346,87 @@ func TestSampledErrorLogQuietGapConcurrentOnset(t *testing.T) {
 	}
 	if !strings.Contains(lines[1], "incident-two occurrence") {
 		t.Fatalf("line 1 must be the single incident-two onset: %q", lines[1])
+	}
+}
+
+// The afterLoad barrier alone cannot force the one interleaving that logs a
+// duplicate onset: a loser's increment landing between the winner's counter
+// reset and the winner's own increment. The winner must be parked in that
+// window while a loser falls through. afterReset exists for exactly that
+// park: the winner stops between the zeroing stores and its first increment,
+// every loser has by then already lost the CAS (a failed CAS implies the
+// winner's swap happened), so against the old fall-through the first loser
+// increment returns n==1 and logs its own onset line — deterministically,
+// not scheduling-dependently (battery finding 1987a183d457).
+func TestSampledErrorLogQuietGapWinnerPreemption(t *testing.T) {
+	var buf bytes.Buffer
+	logger := &logging.Logger{Error: log.New(&buf, "", 0)}
+	var site sampledErrorLog
+	base := time.Unix(1_700_000_000, 0)
+	now := base
+	site.now = func() time.Time { return now }
+	site.quietGap = time.Minute
+
+	// Incident one: 3 occurrences, only the onset logs.
+	for i := 0; i < 3; i++ {
+		site.logf(logger, "incident-one occurrence %d", i)
+	}
+
+	// Over a minute of silence, then a concurrent second incident.
+	now = base.Add(2 * time.Minute)
+
+	const workers = 16
+	var arrived sync.WaitGroup
+	arrived.Add(workers)
+	release := make(chan struct{})
+	site.afterLoad = func() {
+		arrived.Done()
+		<-release
+	}
+	resetParked := make(chan struct{})
+	resetRelease := make(chan struct{})
+	var resetOnce sync.Once
+	site.afterReset = func() {
+		resetOnce.Do(func() { close(resetParked) })
+		<-resetRelease
+	}
+	var wg sync.WaitGroup
+	for i := 0; i < workers; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			site.logf(logger, "incident-two occurrence %d", i)
+		}(i)
+	}
+	arrivedDone := make(chan struct{})
+	go func() {
+		arrived.Wait()
+		close(arrivedDone)
+	}()
+	select {
+	case <-arrivedDone:
+	case <-time.After(5 * time.Second):
+		t.Fatal("workers did not reach the afterLoad hook within 5s")
+	}
+	close(release)
+	select {
+	case <-resetParked:
+	case <-time.After(5 * time.Second):
+		t.Fatal("CAS winner did not reach the afterReset hook within 5s")
+	}
+	// The winner is parked in the fall-through window; with the loser
+	// early-return in place none of the 15 losers counts or logs.
+	close(resetRelease)
+	wg.Wait()
+
+	if got := site.n.Load(); got != 1 {
+		t.Fatalf("site.n = %d, want 1 (a fall-through loser increments after the reset)", got)
+	}
+	if got := site.suppressed.Load(); got != 0 {
+		t.Fatalf("site.suppressed = %d, want 0", got)
+	}
+	lines := strings.Split(strings.TrimSpace(buf.String()), "\n")
+	if len(lines) != 2 {
+		t.Fatalf("logged %d lines, want 2 (incident-one onset + exactly one incident-two onset): %q", len(lines), lines)
 	}
 }
