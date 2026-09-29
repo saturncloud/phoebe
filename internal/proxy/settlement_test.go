@@ -374,11 +374,13 @@ func TestWakeExhaustedColdSettlesZeroNeverServed(t *testing.T) {
 	}
 }
 
-// TestWakeErrorColdSettlesZeroNeverServed pins the waker-failure give-up: the
+// TestWakeErrorColdSettlementZeroNeverServed pins the waker-failure give-up: the
 // waker errored, the engine's cold response is final, and the same never-served
 // settlement applies — zero token-window charges, the requests-window +1 kept,
-// physical capacity released.
-func TestWakeErrorColdSettlesZeroNeverServed(t *testing.T) {
+// physical capacity released. The name carries "Settlement" so the battery's
+// mandated regression -run filter ('Settlement|ColdHold|WakeExhausted|...') can
+// never silently skip this ruling cell (finding d801883a2bd2).
+func TestWakeErrorColdSettlementZeroNeverServed(t *testing.T) {
 	backend := &coldToWarmBackend{} // never warms
 	be := httptest.NewServer(backend)
 	defer be.Close()
