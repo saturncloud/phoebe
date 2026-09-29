@@ -379,7 +379,11 @@ func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request) {
 	// (boundRequestAllowed), a route with NO injected allow-list gets only the
 	// meterable inference POST surface (unboundRequestAllowed), and a shared
 	// route with no allow-list is refused outright (nothing binds model=, so any
-	// model on the shared graph would be reachable). Runs BEFORE
+	// model on the shared graph would be reachable), and a route whose trusted
+	// serving-mode header is anything but "", "dedicated", or "shared" (a
+	// producer-side bug; the header is read verbatim, never normalized) is
+	// likewise refused outright — no branch below may guess what a malformed
+	// mode meant. Runs BEFORE
 	// forwarding so a bad route never reaches the engine. Reads the body once and
 	// restores it for forceIncludeUsage.
 	//
@@ -393,6 +397,16 @@ func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request) {
 	if !id.Gateway {
 		allowed := pathCanonical
 		switch {
+		case !validTrustedServingMode(id.ServingMode):
+			// Malformed serving mode (an Atlas producer bug — the header is read
+			// verbatim, never normalized). Refuse with the same generic 404 as
+			// every other unauthorized route: falling through to the dedicated
+			// branch would forward the inference POST surface to a possibly
+			// shared graph with no model binding, and with an allow-list present
+			// the shared policy below would still be skipped. Guessing the
+			// intended mode from a malformed value is exactly the fail-open this
+			// gate exists to prevent.
+			allowed = false
 		case id.ServedModel != "":
 			allowed = allowed && boundRequestAllowed(r.Method, routePath, id.ServedModel)
 		case id.ServingMode == "shared":
@@ -450,12 +464,18 @@ func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	// SHARED REQUEST POLICY + DISTRIBUTED ADMISSION. Trusted Dynamo hints and
-	// cache isolation are enforced for every shared request, even during an
-	// admission rollout with the distributed gate disabled; otherwise a client
-	// could self-promote precisely while the rollout switch is off. Dedicated
+	// cache isolation are enforced for every shared request ON THE MODEL-BEARING
+	// INFERENCE SURFACE — the block reserves output tokens against a body model=
+	// and rewrites the body, both meaningless for a GET/HEAD. Shared GET/HEAD
+	// control routes (/health, /live, /v1/models[/<id>], authorized by the route
+	// gate above) fall through to the normal forward, where the readiness
+	// sanitizer and model-list filters below apply. Scoping is fail-safe even
+	// during an admission rollout with the distributed gate disabled: a client
+	// could not self-promote precisely while the rollout switch is off, because
+	// every model-bearing shared route still passes through here. Dedicated
 	// endpoints own their engine and bypass both shared-pool mechanisms.
 	var admitted *admission.Lease
-	if id.ServingMode == "shared" {
+	if id.ServingMode == "shared" && inferenceRequestPathAllowed(routePath) {
 		rateLimits, rerr := parseTrustedRateLimits(id)
 		if rerr != nil {
 			s.log.Error.Printf("admission: invalid trusted rate-limit policy: %v", rerr)
@@ -570,14 +590,31 @@ func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request) {
 		// Dynamo's model-list endpoint is graph-wide. A dedicated subdomain is
 		// deployment-scoped, so expose only the served name Atlas authorized for
 		// this route; otherwise endpoint A could enumerate attached endpoint B.
-		if id.ServedModel != "" && !id.Gateway && routePath == "/v1/models" {
-			switch r.Method {
-			case http.MethodGet:
-				if err := filterModelListResponse(resp, id.ServedModel); err != nil {
-					return fmt.Errorf("filter model list: %w", err)
+		// The authorized /v1/models/<id> subtree gets the same treatment per
+		// object: the route gate already authorized <id> against the allow-list,
+		// and the response is rebuilt as that single model — a graph-wide list,
+		// a sibling object, or an ambiguous body fails the response closed
+		// (ErrorHandler's raw reconciliation row) rather than disclose siblings.
+		if id.ServedModel != "" && !id.Gateway {
+			switch {
+			case routePath == "/v1/models":
+				switch r.Method {
+				case http.MethodGet:
+					if err := filterModelListResponse(resp, id.ServedModel); err != nil {
+						return fmt.Errorf("filter model list: %w", err)
+					}
+				case http.MethodHead:
+					sanitizeModelListHeadResponse(resp)
 				}
-			case http.MethodHead:
-				sanitizeModelListHeadResponse(resp)
+			case strings.HasPrefix(routePath, "/v1/models/"):
+				switch r.Method {
+				case http.MethodGet:
+					if err := filterSingleModelResponse(resp, strings.TrimPrefix(routePath, "/v1/models/"), id.ServedModel); err != nil {
+						return fmt.Errorf("filter model metadata: %w", err)
+					}
+				case http.MethodHead:
+					sanitizeModelListHeadResponse(resp)
+				}
 			}
 		}
 
@@ -704,25 +741,29 @@ func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request) {
 // Invariant: every request past the billing-identity gate emits exactly one
 // attributable event — real usage on completion, a zero-token Aborted event on
 // disconnect (pre- OR post-header), or a zero-token raw row (UsageFound=false)
-// on any other upstream/ModifyResponse failure.
+// on any other failure: a RoundTrip/ModifyResponse fault (502) or a mid-flight
+// admission lease-renewal loss that cancelled the upstream attempt (503, the
+// admission-cause branch above).
 //
 // NO double-emit. ErrorHandler fires on TWO paths, not one:
 //
 //	(a) a RoundTrip error — pre-header, no response was ever received;
 //	(b) a ModifyResponse error — filterModelListResponse /
-//	    sanitizeReadinessResponse can fail on a malformed, oversized,
-//	    duplicate-id or unsupported-encoding upstream response.
+//	    filterSingleModelResponse / sanitizeReadinessResponse can fail on a
+//	    malformed, oversized, duplicate-id or unsupported-encoding upstream
+//	    response.
 //
 // Neither can double-emit or double-release, for a structural reason: every
 // ModifyResponse error return happens BEFORE `resp.Body = cr` installs the
 // captureReader, so onDone is never registered on those paths and cannot fire.
-// Exactly one row is written on every path: the abort branch emits
-// Aborted=true, and any other fault (RoundTrip OR ModifyResponse) falls through
-// to the raw reconciliation row below (Aborted=false, UsageFound=false,
-// StatusCode=502) — the merged billing contract (#48): every forwarded attempt
-// is recorded exactly once, failures included, at $0. httputil also calls
-// ErrorHandler before any response header reaches the client on both paths, so
-// the w.Header().Set(requestIDHeader, ...) + http.Error below is still a
+// Exactly one row is written on every exit: the abort branch emits
+// Aborted=true, the admission-cause branch emits the raw row at 503, and any
+// other fault (RoundTrip OR ModifyResponse) falls through to the raw
+// reconciliation row below (Aborted=false, UsageFound=false, StatusCode=502) —
+// the merged billing contract (#48): every forwarded attempt is recorded
+// exactly once, failures included, at $0. httputil also calls ErrorHandler
+// before any response header reaches the client on both paths, so the
+// w.Header().Set(requestIDHeader, ...) + http.Error below is still a
 // pre-header write.
 //
 // WARNING: any future ModifyResponse error return placed AFTER the captureReader
@@ -746,6 +787,18 @@ func (s *Server) errorHandler(upstream string, id identity.Identity, requestID, 
 			}
 		}
 		if cause := context.Cause(r.Context()); errors.Is(cause, admission.ErrUnavailable) {
+			// Mid-flight lease-renewal loss: the distributed authority can no
+			// longer prove this request owns capacity, so the proxy cancelled the
+			// in-flight upstream attempt. ModifyResponse never ran, so onDone was
+			// never armed — without an emit here this attempt would be the one
+			// ErrorHandler exit with NO metering row. Record exactly one raw
+			// reconciliation row (Aborted=false, UsageFound=false) at the actual
+			// terminal status (503 — the cause is always ErrUnavailable-flavoured
+			// here, never a contractual Rejected), matching the 502 branch below:
+			// every forwarded attempt is visible to billing exactly once.
+			w.Header().Set("X-Request-Id", requestID)
+			s.emit(context.WithoutCancel(r.Context()), id, requestID, clientRequestID,
+				http.StatusServiceUnavailable, capture.Result{UsageFound: false})
 			s.writeAdmissionError(w, cause)
 			return
 		}

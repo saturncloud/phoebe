@@ -236,3 +236,95 @@ func TestSanitizeReadinessResponseDropsGraphWideDetail(t *testing.T) {
 		t.Fatalf("HEAD readiness leaked upstream metadata: %v", resp.Header)
 	}
 }
+
+// The authorized /v1/models/<id> subtree filter: a conforming single-object
+// body is rebuilt through the minimal schema (documented limits survive,
+// extension fields and graph-wide headers/trailers do not), exactly like the
+// list filter — same duplicate-key guard, same carryHeaders reset.
+func TestFilterSingleModelResponse(t *testing.T) {
+	resp := modelListResponse(`{"id":"a","object":"model","created":123,"owned_by":"one","context_window":131072,"max_output_tokens":8192,"internal_graph":"secret","siblings":["b"]}`)
+	resp.Header.Set("X-Graph-Debug", "b")
+	resp.Header.Set("ETag", "graph-wide")
+	resp.Header.Set("Access-Control-Allow-Origin", "https://example.test")
+	resp.Header.Set("Vary", "Origin")
+	resp.Trailer = http.Header{"X-Graph-Trailer": []string{"b"}}
+	if err := filterSingleModelResponse(resp, "a", "a"); err != nil {
+		t.Fatal(err)
+	}
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := string(body)
+	if !strings.Contains(got, `"id":"a"`) || !strings.Contains(got, `"object":"model"`) ||
+		!strings.Contains(got, `"context_window":131072`) || !strings.Contains(got, `"max_output_tokens":8192`) {
+		t.Fatalf("model metadata lost the documented fields: %s", got)
+	}
+	if strings.Contains(got, "internal_graph") || strings.Contains(got, "siblings") || strings.Contains(got, "secret") {
+		t.Fatalf("model metadata preserved graph-wide extension fields: %s", got)
+	}
+	if resp.ContentLength != int64(len(body)) || resp.Header.Get("Content-Length") == "" {
+		t.Fatalf("response length metadata not updated: length=%d header=%q", resp.ContentLength, resp.Header.Get("Content-Length"))
+	}
+	if resp.Header.Get("X-Graph-Debug") != "" || resp.Header.Get("ETag") != "" || resp.Trailer != nil {
+		t.Fatalf("model metadata leaked upstream metadata: headers=%v trailer=%v", resp.Header, resp.Trailer)
+	}
+	if resp.Header.Get("Access-Control-Allow-Origin") != "https://example.test" || resp.Header.Get("Vary") != "Origin" {
+		t.Fatalf("model metadata dropped client-contract headers: %v", resp.Header)
+	}
+}
+
+func TestFilterSingleModelResponseSanitizesUpstreamErrors(t *testing.T) {
+	resp := modelListResponse(`{"error":"adapter-b on base-internal failed"}`)
+	resp.StatusCode = http.StatusServiceUnavailable
+	resp.Header.Set("X-Graph-Debug", "adapter-b")
+	resp.Header.Set("Retry-After", "30")
+	resp.Trailer = http.Header{"X-Graph-Trailer": []string{"adapter-b"}}
+	if err := filterSingleModelResponse(resp, "adapter-a", "adapter-a"); err != nil {
+		t.Fatal(err)
+	}
+	body, _ := io.ReadAll(resp.Body)
+	if resp.StatusCode != http.StatusServiceUnavailable {
+		t.Fatalf("status = %d, want 503 (liveness stays truthful)", resp.StatusCode)
+	}
+	if strings.Contains(string(body), "adapter-b") || strings.Contains(string(body), "base-internal") {
+		t.Fatalf("sanitized error leaked upstream names: %s", body)
+	}
+	if resp.Header.Get("X-Graph-Debug") != "" || resp.Trailer != nil {
+		t.Fatalf("sanitized error leaked upstream metadata: headers=%v trailer=%v", resp.Header, resp.Trailer)
+	}
+	if resp.Header.Get("Retry-After") != "30" {
+		t.Fatalf("sanitized error dropped Retry-After backoff guidance: %v", resp.Header)
+	}
+}
+
+func TestFilterSingleModelResponseFailsClosed(t *testing.T) {
+	for _, body := range []string{
+		`not json`,
+		// Graph-wide LIST shape for a per-model route — the exact body that
+		// used to pass through verbatim and disclose sibling names.
+		`{"object":"list","data":[{"id":"a"},{"id":"b"}]}`,
+		`[{"id":"a"}]`,
+		// Duplicate top-level "id" keys: ambiguous across JSON stacks, refused
+		// whole — the same guard the list filter applies per entry.
+		`{"id":"b","id":"a"}`,
+		// Sibling id — the requested id is "a".
+		`{"id":"b"}`,
+		`{}`,
+	} {
+		resp := modelListResponse(body)
+		if err := filterSingleModelResponse(resp, "a", "a"); err == nil {
+			t.Fatalf("body %q unexpectedly passed", body)
+		}
+	}
+	// Requested id outside the allow-list is refused even with a conforming
+	// body — the filter re-checks membership rather than trusting the caller.
+	if err := filterSingleModelResponse(modelListResponse(`{"id":"b"}`), "b", "a"); err == nil {
+		t.Fatal("requested id outside the allow-list accepted")
+	}
+	// The duplicate-id rejection must report through the count (no %!w(<nil>)).
+	err := filterSingleModelResponse(modelListResponse(`{"id":"b","id":"a"}`), "a", "a")
+	if err == nil || strings.Contains(err.Error(), "%!w") || !strings.Contains(err.Error(), "got 2") {
+		t.Fatalf("duplicate-id rejection error = %v, want a count-reporting message without a nil wrap", err)
+	}
+}

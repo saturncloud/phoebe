@@ -92,14 +92,22 @@ func TestHealthz(t *testing.T) {
 
 func TestProxyBindsDedicatedEndpointToServedModel(t *testing.T) {
 	var upstreamCalls int
-	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		upstreamCalls++
 		// Emit the graph-wide headers the sanitizers exist to strip. Without
 		// these the "no X-Graph-Debug / ETag leaked" assertions below are
 		// vacuous — they would pass whether or not the sanitizer ran.
 		w.Header().Set("X-Graph-Debug", "adapter-b")
 		w.Header().Set("ETag", "graph-wide")
-		_, _ = w.Write([]byte(`{"object":"list","data":[{"id":"adapter-a","object":"model"},{"id":"adapter-b","object":"model"},{"id":"base-internal","object":"model"}]}`))
+		switch r.URL.Path {
+		case "/v1/models/adapter-a":
+			// The authorized per-model metadata subtree: a conforming single
+			// object carrying graph-wide extension fields the subtree filter
+			// must rebuild away.
+			_, _ = w.Write([]byte(`{"id":"adapter-a","object":"model","owned_by":"org-a","internal_graph":"secret","context_window":131072}`))
+		default:
+			_, _ = w.Write([]byte(`{"object":"list","data":[{"id":"adapter-a","object":"model"},{"id":"adapter-b","object":"model"},{"id":"base-internal","object":"model"}]}`))
+		}
 	}))
 	defer backend.Close()
 	upstream, _ := url.Parse(backend.URL)
@@ -162,6 +170,15 @@ func TestProxyBindsDedicatedEndpointToServedModel(t *testing.T) {
 	}
 	if rr := request(http.MethodGet, "/v1/models/adapter-a", ""); rr.Code != http.StatusOK {
 		t.Fatalf("bound model metadata status = %d, want 200", rr.Code)
+	} else {
+		body := rr.Body.String()
+		if !strings.Contains(body, `"id":"adapter-a"`) {
+			t.Fatalf("model metadata omitted the authorized model: %s", body)
+		}
+		if strings.Contains(body, "adapter-b") || strings.Contains(body, "base-internal") ||
+			strings.Contains(body, "internal_graph") {
+			t.Fatalf("model metadata disclosed graph-wide data: %s", body)
+		}
 	}
 	if rr := request(http.MethodGet, "/v1/models/adapter-a/ready", ""); rr.Code != http.StatusNotFound {
 		t.Fatalf("ambiguous model readiness status = %d, want 404", rr.Code)
@@ -901,6 +918,70 @@ func TestProxyUnboundSharedRouteFailsClosed(t *testing.T) {
 	}
 }
 
+// A malformed trusted serving-mode value (an Atlas producer bug — identity
+// reads the header verbatim, never normalizes) must fail closed at the route
+// gate for EVERY route shape. With no allow-list it would otherwise inherit
+// the unbound inference surface: POST /v1/chat/completions forwarded to a
+// genuinely shared graph with no model binding (cross-model reachability).
+// With a valid allow-list it would pass boundRequestAllowed but skip the
+// shared policy: no X-Tenant-ID replacement, no admission. Both are refused
+// with the generic 404 body and log shape of every other route-gate refusal —
+// no oracle — and never reach Dynamo.
+func TestProxyMalformedServingModeFailsClosed(t *testing.T) {
+	for _, mode := range []string{"Shared", " shared"} {
+		for _, tc := range []struct {
+			name        string
+			servedModel string
+		}{
+			{"no allow-list", ""},
+			{"valid allow-list", "adapter-a"},
+		} {
+			t.Run(mode+"/"+tc.name, func(t *testing.T) {
+				var upstreamCalls int32
+				backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+					atomic.AddInt32(&upstreamCalls, 1)
+					_, _ = w.Write([]byte(`{"ok":true}`))
+				}))
+				defer backend.Close()
+				upstream, _ := url.Parse(backend.URL)
+				em := &recordingEmitter{}
+				srv := newTestServerE(t, upstream, em)
+
+				for _, route := range []struct {
+					method, path, body string
+				}{
+					{http.MethodPost, "/v1/chat/completions", `{"model":"adapter-a"}`},
+					{http.MethodGet, "/v1/models", ""},
+				} {
+					req := httptest.NewRequest(route.method, route.path, strings.NewReader(route.body))
+					setUpstream(req, upstream)
+					req.Header.Set(identity.HeaderAuthID, "auth-1")
+					req.Header.Set(identity.HeaderResourceID, "model-x")
+					req.Header.Set(identity.HeaderServingMode, mode)
+					if tc.servedModel != "" {
+						req.Header.Set(identity.HeaderServedModel, tc.servedModel)
+					}
+					rr := httptest.NewRecorder()
+					srv.Handler().ServeHTTP(rr, req)
+					if rr.Code != http.StatusNotFound {
+						t.Fatalf("serving_mode=%q %s %s status = %d, want 404", mode, route.method, route.path, rr.Code)
+					}
+					if rr.Body.String() != "not found\n" {
+						t.Fatalf("serving_mode=%q refusal body = %q, want the generic \"not found\" (no oracle)",
+							mode, rr.Body.String())
+					}
+				}
+				if got := atomic.LoadInt32(&upstreamCalls); got != 0 {
+					t.Fatalf("serving_mode=%q made %d upstream calls, want 0", mode, got)
+				}
+				if got := em.count(); got != 0 {
+					t.Fatalf("route-gate refusal emitted %d billing events, want 0", got)
+				}
+			})
+		}
+	}
+}
+
 // A PRESENT but empty-parsing allow-list authorizes no model at all and must
 // fail CLOSED at the route gate — before the request reaches Dynamo — not late
 // inside the response filter, which made the request hit the graph and surfaced
@@ -1045,5 +1126,255 @@ func TestModelListFilterErrorEmitsReconciliationRow(t *testing.T) {
 	if ev.Aborted || ev.UsageFound || ev.StatusCode != http.StatusBadGateway {
 		t.Fatalf("filter-failure row = {Aborted:%v UsageFound:%v StatusCode:%d}, "+
 			"want {false false 502} (visible to reconciliation, charges $0)", ev.Aborted, ev.UsageFound, ev.StatusCode)
+	}
+}
+
+// A BOUND shared route serves its control surfaces through the normal forward
+// plus the existing sanitizers/filters — NOT through the shared admission
+// block, which reserves output tokens against a body model= and is therefore
+// scoped to the model-bearing inference surface (a GET has no body to admit;
+// the old every-method condition 400'd every one of these routes on
+// admissionWork). This is the shared-mode half of the bound-route matrix: the
+// identical requests with ServingMode omitted are covered by
+// TestProxyBindsDedicatedEndpointToServedModel and
+// TestProxySanitizesBoundReadinessResponses. Assertions worth reading: the
+// POST still runs the FULL shared policy (trusted X-Tenant-ID replacement, not
+// the client-supplied value, and the cache-salt body rewrite) — scoping the
+// block to inference paths must not weaken the shared admission path itself.
+func TestProxyBoundSharedRouteServesSanitizedControlSurface(t *testing.T) {
+	var mu sync.Mutex
+	var postHeader http.Header
+	var postBody []byte
+	var upstreamCalls int32
+	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		atomic.AddInt32(&upstreamCalls, 1)
+		// Graph-wide headers every sanitizer/filter below must strip.
+		w.Header().Set("X-Graph-Debug", "adapter-b")
+		w.Header().Set("ETag", "graph-wide")
+		switch r.URL.Path {
+		case "/health", "/live":
+			_, _ = w.Write([]byte(`{"components":[{"model":"org/sibling","workers":2}],"instances":["base-internal"]}`))
+		case "/v1/models":
+			_, _ = w.Write([]byte(`{"object":"list","data":[{"id":"adapter-a","object":"model"},{"id":"adapter-b","object":"model"},{"id":"base-internal","object":"model"}]}`))
+		default:
+			if r.Method == http.MethodPost {
+				mu.Lock()
+				postHeader = r.Header.Clone()
+				postBody, _ = io.ReadAll(r.Body)
+				mu.Unlock()
+			}
+			_, _ = w.Write([]byte(`{"model":"adapter-a","usage":{"prompt_tokens":1,"completion_tokens":1}}`))
+		}
+	}))
+	defer backend.Close()
+	upstream, _ := url.Parse(backend.URL)
+	srv := newTestServer(t, upstream)
+
+	request := func(method, path, body string) *httptest.ResponseRecorder {
+		req := httptest.NewRequest(method, path, strings.NewReader(body))
+		setUpstream(req, upstream)
+		req.Header.Set(identity.HeaderAuthID, "auth-1")
+		req.Header.Set(identity.HeaderResourceID, "model-shared")
+		req.Header.Set(identity.HeaderOrgID, "org-1")
+		req.Header.Set(identity.HeaderServingMode, "shared")
+		req.Header.Set(identity.HeaderServedModel, "adapter-a")
+		// A client-supplied tenant header must be REPLACED by the shared policy
+		// on the POST, and must never survive onto the control-surface forward.
+		req.Header.Set("X-Tenant-ID", "attacker")
+		rr := httptest.NewRecorder()
+		srv.Handler().ServeHTTP(rr, req)
+		return rr
+	}
+
+	rr := request(http.MethodGet, "/health", "")
+	if rr.Code != http.StatusOK {
+		t.Fatalf("shared GET /health status = %d, want 200 (must not hit admission's body requirement)", rr.Code)
+	}
+	if body := rr.Body.String(); body != `{"status":"ok"}` {
+		t.Fatalf("shared GET /health body = %s, want status-only document", body)
+	}
+
+	rr = request(http.MethodGet, "/v1/models", "")
+	if rr.Code != http.StatusOK {
+		t.Fatalf("shared GET /v1/models status = %d, want 200", rr.Code)
+	}
+	if body := rr.Body.String(); !strings.Contains(body, `"id":"adapter-a"`) ||
+		strings.Contains(body, "adapter-b") || strings.Contains(body, "base-internal") {
+		t.Fatalf("shared model list not filtered to the allow-list: %s", body)
+	}
+
+	rr = request(http.MethodHead, "/live", "")
+	if rr.Code != http.StatusOK {
+		t.Fatalf("shared HEAD /live status = %d, want 200", rr.Code)
+	}
+	if rr.Body.Len() != 0 {
+		t.Fatalf("shared HEAD /live returned a body: %q", rr.Body.String())
+	}
+	if rr.Header().Get("X-Graph-Debug") != "" || rr.Header().Get("ETag") != "" {
+		t.Fatalf("shared HEAD /live leaked graph-wide headers: %v", rr.Header())
+	}
+
+	rr = request(http.MethodPost, "/v1/chat/completions", `{"model":"adapter-a","max_tokens":10}`)
+	if rr.Code != http.StatusOK {
+		t.Fatalf("shared POST status = %d, want 200", rr.Code)
+	}
+	mu.Lock()
+	hdr, body := postHeader, string(postBody)
+	mu.Unlock()
+	if hdr == nil {
+		t.Fatal("shared POST never reached the upstream")
+	}
+	if tenant := hdr.Get("X-Tenant-ID"); tenant == "" || tenant == "attacker" || !strings.HasPrefix(tenant, "saturn-") {
+		t.Fatalf("shared POST X-Tenant-ID = %q, want the trusted saturn- tenant hash (client value replaced)", tenant)
+	}
+	if !strings.Contains(body, `"cache_salt"`) {
+		t.Fatalf("shared POST body was not rewritten with the tenant cache salt: %s", body)
+	}
+	if got := atomic.LoadInt32(&upstreamCalls); got != 4 {
+		t.Fatalf("shared control-surface requests made %d upstream calls, want 4", got)
+	}
+}
+
+// The authorized /v1/models/<id> subtree is filtered to the single requested
+// model object. With a backend that answers the subtree with the graph-wide
+// LIST shape, the old ModifyResponse passthrough returned sibling names
+// verbatim; the subtree filter now fails that response closed: the body cannot
+// be a conforming single-object for <id>, so the client gets the generic 502
+// (no sibling names — the fail-closed error carries no upstream bytes) and
+// billing records exactly one raw reconciliation row (UsageFound=false,
+// Aborted=false) — the merged #48 contract for a ModifyResponse fault. HEAD on
+// the subtree keeps its 200 while the graph-wide representation headers are
+// stripped exactly like the model-list HEAD sanitizer.
+func TestProxyModelMetadataSubtreeFailsClosedOnGraphWideBody(t *testing.T) {
+	var upstreamCalls int32
+	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		atomic.AddInt32(&upstreamCalls, 1)
+		w.Header().Set("X-Graph-Debug", "adapter-b")
+		w.Header().Set("ETag", "graph-wide")
+		_, _ = w.Write([]byte(`{"object":"list","data":[{"id":"adapter-a","object":"model"},{"id":"adapter-b","object":"model"},{"id":"base-internal","object":"model"}]}`))
+	}))
+	defer backend.Close()
+	upstream, _ := url.Parse(backend.URL)
+	em := &recordingEmitter{}
+	srv := newTestServerE(t, upstream, em)
+
+	request := func(method, path string) *httptest.ResponseRecorder {
+		req := httptest.NewRequest(method, path, nil)
+		setUpstream(req, upstream)
+		req.Header.Set(identity.HeaderAuthID, "auth-1")
+		req.Header.Set(identity.HeaderResourceID, "deployment-a")
+		req.Header.Set(identity.HeaderServedModel, "adapter-a")
+		rr := httptest.NewRecorder()
+		srv.Handler().ServeHTTP(rr, req)
+		return rr
+	}
+
+	rr := request(http.MethodGet, "/v1/models/adapter-a")
+	if rr.Code != http.StatusBadGateway {
+		t.Fatalf("subtree GET with graph-wide body status = %d, want 502 (fail closed)", rr.Code)
+	}
+	if body := rr.Body.String(); strings.Contains(body, "adapter-b") || strings.Contains(body, "base-internal") {
+		t.Fatalf("subtree failure leaked graph-wide names: %s", body)
+	}
+	events := em.waitForEvents(1, 2*time.Second)
+	if len(events) != 1 {
+		t.Fatalf("subtree filter failure emitted %d billing events, want exactly 1 raw row: %+v", len(events), events)
+	}
+	ev := events[0]
+	if ev.Aborted || ev.UsageFound || ev.StatusCode != http.StatusBadGateway {
+		t.Fatalf("subtree filter-failure row = {Aborted:%v UsageFound:%v StatusCode:%d}, "+
+			"want {false false 502}", ev.Aborted, ev.UsageFound, ev.StatusCode)
+	}
+
+	rr = request(http.MethodHead, "/v1/models/adapter-a")
+	if rr.Code != http.StatusOK {
+		t.Fatalf("subtree HEAD status = %d, want 200 (HEAD carries no body to filter)", rr.Code)
+	}
+	if rr.Body.Len() != 0 {
+		t.Fatalf("subtree HEAD returned a body: %q", rr.Body.String())
+	}
+	if rr.Header().Get("X-Graph-Debug") != "" || rr.Header().Get("ETag") != "" ||
+		rr.Header().Get("Content-Length") != "" {
+		t.Fatalf("subtree HEAD leaked graph-wide representation headers: %v", rr.Header())
+	}
+	if got := atomic.LoadInt32(&upstreamCalls); got != 2 {
+		t.Fatalf("subtree requests made %d upstream calls, want 2", got)
+	}
+}
+
+// A malformed subtree body (not JSON) is the same fail-closed shape: 502 with
+// exactly one raw UsageFound=false row, and no upstream bytes in the error.
+func TestProxyModelMetadataSubtreeFailsClosedOnMalformedBody(t *testing.T) {
+	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("X-Graph-Debug", "adapter-b")
+		_, _ = w.Write([]byte(`not json`))
+	}))
+	defer backend.Close()
+	upstream, _ := url.Parse(backend.URL)
+	em := &recordingEmitter{}
+	srv := newTestServerE(t, upstream, em)
+
+	req := httptest.NewRequest(http.MethodGet, "/v1/models/adapter-a", nil)
+	setUpstream(req, upstream)
+	req.Header.Set(identity.HeaderAuthID, "auth-1")
+	req.Header.Set(identity.HeaderResourceID, "deployment-a")
+	req.Header.Set(identity.HeaderServedModel, "adapter-a")
+	rr := httptest.NewRecorder()
+	srv.Handler().ServeHTTP(rr, req)
+
+	if rr.Code != http.StatusBadGateway {
+		t.Fatalf("subtree GET with malformed body status = %d, want 502", rr.Code)
+	}
+	events := em.waitForEvents(1, 2*time.Second)
+	if len(events) != 1 {
+		t.Fatalf("malformed subtree body emitted %d billing events, want exactly 1 raw row: %+v", len(events), events)
+	}
+	if ev := events[0]; ev.Aborted || ev.UsageFound || ev.StatusCode != http.StatusBadGateway {
+		t.Fatalf("malformed-subtree row = {Aborted:%v UsageFound:%v StatusCode:%d}, want {false false 502}",
+			ev.Aborted, ev.UsageFound, ev.StatusCode)
+	}
+}
+
+// A conforming subtree body is rebuilt through the minimal schema: the
+// requested id and its documented limits survive, graph-wide extension fields
+// and headers do not.
+func TestProxyModelMetadataSubtreeRebuiltToSingleModel(t *testing.T) {
+	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("X-Graph-Debug", "adapter-b")
+		w.Header().Set("ETag", "graph-wide")
+		w.Header().Set("Access-Control-Allow-Origin", "https://example.test")
+		_, _ = w.Write([]byte(`{"id":"adapter-a","object":"model","owned_by":"org-a","internal_graph":"secret","context_window":131072,"max_output_tokens":8192,"siblings":["adapter-b"]}`))
+	}))
+	defer backend.Close()
+	upstream, _ := url.Parse(backend.URL)
+	srv := newTestServer(t, upstream)
+
+	req := httptest.NewRequest(http.MethodGet, "/v1/models/adapter-a", nil)
+	setUpstream(req, upstream)
+	req.Header.Set(identity.HeaderAuthID, "auth-1")
+	req.Header.Set(identity.HeaderResourceID, "deployment-a")
+	req.Header.Set(identity.HeaderServedModel, "adapter-a")
+	rr := httptest.NewRecorder()
+	srv.Handler().ServeHTTP(rr, req)
+
+	if rr.Code != http.StatusOK {
+		t.Fatalf("subtree GET status = %d, want 200", rr.Code)
+	}
+	body := rr.Body.String()
+	if !strings.Contains(body, `"id":"adapter-a"`) || !strings.Contains(body, `"context_window":131072`) {
+		t.Fatalf("subtree body lost the authorized model: %s", body)
+	}
+	if strings.Contains(body, "internal_graph") || strings.Contains(body, "siblings") ||
+		strings.Contains(body, "adapter-b") || strings.Contains(body, "secret") {
+		t.Fatalf("subtree body disclosed graph-wide data: %s", body)
+	}
+	if rr.Header().Get("X-Graph-Debug") != "" || rr.Header().Get("ETag") != "" {
+		t.Fatalf("subtree response leaked graph-wide headers: %v", rr.Header())
+	}
+	if rr.Header().Get("Access-Control-Allow-Origin") != "https://example.test" {
+		t.Fatalf("subtree response dropped the client-contract CORS header: %v", rr.Header())
+	}
+	if rr.Header().Get("Content-Length") == "" {
+		t.Fatalf("subtree response length metadata not rebuilt: %v", rr.Header())
 	}
 }
