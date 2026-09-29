@@ -150,10 +150,13 @@ func (s *Server) resolveGateway(w http.ResponseWriter, r *http.Request, id *iden
 	// because wake eligibility (isWakeable) keys on
 	// ServingMode+ResourceID+ServedModel. Resolution alone is NOT sufficient:
 	// a dedicated row resolves and is deliberately not wakeable (dedicated
-	// capacity never scales to zero through this path). The registry parser
-	// rejects a row whose serving_mode is blank or unrecognized
-	// (gateway.parseRegistryConfigMap), so ServingMode here is always exactly
-	// "shared" or "dedicated" and the shared case is never silently lost.
+	// capacity never scales to zero through this path). ServingMode here is
+	// always exactly "shared" or "dedicated" because BOTH resolver paths
+	// reject any other value: the registry parser fails closed on a row whose
+	// serving_mode is blank or unrecognized (gateway.parseRegistryConfigMap),
+	// and the legacy PG resolver validates the scanned serving_mode against
+	// the same contract (gateway.PGResolver.Resolve) — so the shared case is
+	// never silently lost.
 	id.ServedModel = model
 	// The graph name rides the identity to the wake target verbatim, so a wake
 	// on this route actuates exactly the resolved graph — never a re-parse of
