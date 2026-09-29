@@ -14,6 +14,10 @@ import (
 	"testing"
 	"time"
 
+	"github.com/alicebob/miniredis/v2"
+	"github.com/redis/go-redis/v9"
+
+	"github.com/saturncloud/phoebe/internal/admission"
 	"github.com/saturncloud/phoebe/internal/config"
 	"github.com/saturncloud/phoebe/internal/identity"
 	"github.com/saturncloud/phoebe/internal/logging"
@@ -235,6 +239,9 @@ func TestWakeErrorColdEmitsReconciliationRow(t *testing.T) {
 		t.Fatalf("wake-failure row attribution = {RequestID:%q ResourceID:%q}, want {req-1 r1}",
 			ev.RequestID, ev.ResourceID)
 	}
+	if got := rec.Header().Get(requestIDHeader); got != "req-1" {
+		t.Fatalf("wake-failure response X-Request-Id = %q, want the minted attempt id (client correlation handle)", got)
+	}
 }
 
 // TestWakeExhaustedWarmFinalProbeEmitsReconciliationRow (merged billing
@@ -275,6 +282,80 @@ func TestWakeExhaustedWarmFinalProbeEmitsReconciliationRow(t *testing.T) {
 	if ev.Aborted || ev.UsageFound || ev.StatusCode != http.StatusOK {
 		t.Fatalf("tries-exhausted row = {Aborted:%v UsageFound:%v StatusCode:%d}, "+
 			"want {false false 200} (visible to reconciliation, charges $0)", ev.Aborted, ev.UsageFound, ev.StatusCode)
+	}
+	if got := rec.Header().Get(requestIDHeader); got != "req-1" {
+		t.Fatalf("tries-exhausted response X-Request-Id = %q, want the minted attempt id (client correlation handle)", got)
+	}
+}
+
+// TestWakeColdHoldRejectionEmitsReconciliationRow (merged billing contract #48,
+// exactly-once): the BeginColdHold-failure exit is the third and last served=true
+// exit; nothing else pins it. With the platform cold-hold cap already consumed by
+// another lease, a cold probe's BeginColdHold is rejected, the client gets the
+// admission error, and exactly one raw reconciliation row is recorded at the
+// status actually written — the regression class these tests exist to catch on
+// a money path (wrong status, or a double-emit, would pass the suite without
+// this test).
+func TestWakeColdHoldRejectionEmitsReconciliationRow(t *testing.T) {
+	backend := &coldToWarmBackend{} // stays cold
+	be := httptest.NewServer(backend)
+	defer be.Close()
+	up, _ := url.Parse(be.URL)
+
+	mr := miniredis.RunT(t)
+	cfg := proxyAdmissionConfig(10)
+	cfg.Platform.MaxColdHolds = 1
+	c := redis.NewClient(&redis.Options{Addr: mr.Addr()})
+	t.Cleanup(func() { _ = c.Close() })
+	admitter := admission.New(c, cfg)
+
+	holdReq := admission.Request{Graph: "g1", Organization: "org-a", Model: "m", ReservedOutputTokens: 1}
+	holder, err := admitter.Admit(context.Background(), holdReq)
+	if err != nil {
+		t.Fatalf("holder admit: %v", err)
+	}
+	t.Cleanup(func() { _ = holder.Complete(context.Background(), 0) })
+	// Consume the single platform cold hold so the request under test is rejected.
+	if err := holder.BeginColdHold(context.Background()); err != nil {
+		t.Fatalf("holder begin cold hold: %v", err)
+	}
+	lease, err := admitter.Admit(context.Background(), holdReq)
+	if err != nil {
+		t.Fatalf("request admit: %v", err)
+	}
+	t.Cleanup(func() { _ = lease.Complete(context.Background(), 0) })
+
+	em := &recordingEmitter{}
+	s := New(&config.Settings{Admission: cfg}, logging.New(logging.ERROR), em).
+		WithWaker(&fakeWaker{}, 5*time.Second, 3)
+
+	req := httptest.NewRequest("POST", "http://x/v1/chat/completions", strings.NewReader(`{"model":"m"}`))
+	id := identity.Identity{ResourceID: "r1", ServedModel: "m", ServingMode: "shared"}
+	rec := httptest.NewRecorder()
+
+	served := s.serveWithWake(rec, req, up, id, "req-1", "client-req-1", lease)
+	if !served {
+		t.Fatal("cold-hold rejection should serve the admission error (served=true)")
+	}
+	if rec.Code != http.StatusServiceUnavailable {
+		t.Fatalf("client got %d, want the admission 503 (platform cold-hold cap is non-contractual)", rec.Code)
+	}
+	if got := rec.Header().Get(requestIDHeader); got != "req-1" {
+		t.Fatalf("cold-hold rejection response X-Request-Id = %q, want the minted attempt id", got)
+	}
+	events := em.waitForEvents(1, 2*time.Second)
+	if len(events) != 1 {
+		t.Fatalf("cold-hold rejection emitted %d billing events, want exactly 1 raw reconciliation row: %+v",
+			len(events), events)
+	}
+	ev := events[0]
+	if ev.Aborted || ev.UsageFound || ev.StatusCode != http.StatusServiceUnavailable {
+		t.Fatalf("cold-hold row = {Aborted:%v UsageFound:%v StatusCode:%d}, "+
+			"want {false false 503} (visible to reconciliation, charges $0)", ev.Aborted, ev.UsageFound, ev.StatusCode)
+	}
+	if ev.RequestID != "req-1" || ev.ResourceID != "r1" {
+		t.Fatalf("cold-hold row attribution = {RequestID:%q ResourceID:%q}, want {req-1 r1}",
+			ev.RequestID, ev.ResourceID)
 	}
 }
 

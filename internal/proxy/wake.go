@@ -156,9 +156,14 @@ func (b *bufferingResponseWriter) isColdWakeable() bool {
 }
 
 // flushTo writes the captured status, headers, and body to the real client.
+// The authoritative X-Request-Id is set by the caller (never replayed from
+// the probe): Add would duplicate it when the upstream echoed the header.
 func (b *bufferingResponseWriter) flushTo(w http.ResponseWriter) {
 	dst := w.Header()
 	for k, vs := range b.header {
+		if http.CanonicalHeaderKey(k) == requestIDHeader {
+			continue
+		}
 		for _, v := range vs {
 			dst.Add(k, v)
 		}
@@ -314,6 +319,9 @@ func (s *Server) serveWithWake(
 			if aerr := lease.BeginColdHold(r.Context()); aerr != nil {
 				// A probe was already forwarded above; this served=true exit
 				// bypasses the normal metered forward, so record the attempt.
+				// The minted id is the client's only correlation handle to the
+				// reconciliation row — same contract as every errorHandler exit.
+				w.Header().Set(requestIDHeader, requestID)
 				rec := &statusRecorder{ResponseWriter: w}
 				s.writeAdmissionError(rec, aerr)
 				s.emitWakeFailureRow(r, id, requestID, clientRequestID, rec.status)
@@ -340,6 +348,7 @@ func (s *Server) serveWithWake(
 			// metered forward, so record the attempt at the served status.
 			s.log.Warn.Printf("wake: could not warm base for request_id=%s resource_id=%s: %v",
 				requestID, id.ResourceID, werr)
+			w.Header().Set(requestIDHeader, requestID)
 			buf.flushTo(w)
 			s.emitWakeFailureRow(r, id, requestID, clientRequestID, buf.status)
 			return true
@@ -355,6 +364,7 @@ func (s *Server) serveWithWake(
 	buf := newBufferingResponseWriter()
 	last := httputil.NewSingleHostReverseProxy(upstream)
 	last.ServeHTTP(buf, r)
+	w.Header().Set(requestIDHeader, requestID)
 	buf.flushTo(w)
 	s.emitWakeFailureRow(r, id, requestID, clientRequestID, buf.status)
 	return true
