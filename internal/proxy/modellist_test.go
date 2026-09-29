@@ -6,6 +6,7 @@ import (
 	"errors"
 	"io"
 	"net/http"
+	"strconv"
 	"strings"
 	"testing"
 )
@@ -109,6 +110,49 @@ func TestFilterModelListResponseDecodesGzip(t *testing.T) {
 	body, _ := io.ReadAll(resp.Body)
 	if strings.Contains(string(body), `"id":"b"`) || resp.Header.Get("Content-Encoding") != "" {
 		t.Fatalf("gzip response was not filtered and normalized: headers=%v body=%s", resp.Header, body)
+	}
+}
+
+// TestFilterModelDiscoveryRejectsUnsupportedEncoding (fail-closed pin): any
+// Content-Encoding other than identity/gzip must fail the response, never be
+// treated as pass-through — a refactor that forwarded the upstream bytes
+// undecoded would disclose sibling model names on /v1/models with the suite
+// green. Both discovery filters share readModelDiscoveryBody, so each is
+// exercised here.
+func TestFilterModelDiscoveryRejectsUnsupportedEncoding(t *testing.T) {
+	for name, filter := range map[string]func(*http.Response) error{
+		"list":   func(r *http.Response) error { return filterModelListResponse(r, "a") },
+		"single": func(r *http.Response) error { return filterSingleModelResponse(r, "a", "a") },
+	} {
+		t.Run(name, func(t *testing.T) {
+			resp := &http.Response{
+				StatusCode: http.StatusOK,
+				Header:     http.Header{"Content-Encoding": []string{"deflate"}},
+				Body:       io.NopCloser(strings.NewReader(`{"data":[{"id":"a"},{"id":"sibling"}]}`)),
+			}
+			err := filter(resp)
+			if err == nil || !strings.Contains(err.Error(), "unsupported model-discovery content encoding") {
+				t.Fatalf("unsupported encoding error = %v, want the encoding refusal (never pass-through)", err)
+			}
+		})
+	}
+}
+
+// TestFilterModelDiscoveryRejectsOversizedBody (fail-closed pin): the
+// maxModelListBytes+1 read cap is the only bound on buffering a graph-wide
+// discovery response; breaking the check would let a misbehaving upstream make
+// phoebe buffer unbounded bytes or silently truncate-and-serve.
+func TestFilterModelDiscoveryRejectsOversizedBody(t *testing.T) {
+	oversized := make([]byte, maxModelListBytes+1)
+	copy(oversized, []byte(`{"data":[`)) // well-formed prefix: only the size bound can reject
+	resp := &http.Response{
+		StatusCode: http.StatusOK,
+		Header:     http.Header{},
+		Body:       io.NopCloser(bytes.NewReader(oversized)),
+	}
+	err := filterModelListResponse(resp, "a")
+	if err == nil || !strings.Contains(err.Error(), strconv.Itoa(maxModelListBytes)) {
+		t.Fatalf("oversized body error = %v, want the byte-bound refusal", err)
 	}
 }
 

@@ -282,6 +282,51 @@ func TestGateway_MissingOrg403(t *testing.T) {
 	}
 }
 
+// TestGateway_PreflightMissingOrg403: the preflight branch refuses an anonymous
+// preflight (403) BEFORE any resolution — the resolver must not be consulted,
+// and no 204 may answer it. Deleting the org check would 204 anonymous
+// preflights on the gateway route with no test failing.
+func TestGateway_PreflightMissingOrg403(t *testing.T) {
+	resolver := &mapResolver{}
+	srv := newGatewayTestServer(t, &recordingEmitter{}, resolver, nil)
+
+	req := httptest.NewRequest(http.MethodOptions, "/v1/chat/completions", nil)
+	req.Header.Set(identity.HeaderGateway, "true")
+	// deliberately no identity.HeaderOrgID
+	rr := httptest.NewRecorder()
+	srv.Handler().ServeHTTP(rr, req)
+
+	if rr.Code != http.StatusForbidden {
+		t.Fatalf("preflight without org: status = %d, want 403", rr.Code)
+	}
+	if atomic.LoadInt32(&resolver.calls) != 0 {
+		t.Fatal("resolver must not be consulted for an anonymous preflight")
+	}
+}
+
+// TestGateway_ResolverInvalidServingModeFailsClosed: Resolver is an exported
+// interface and WithGateway accepts any implementation, so the proxy
+// re-validates the resolved serving mode itself — a non-conforming resolver
+// returning a value outside the closed enum must fail closed (503), not
+// silently disable the shared-policy block and wake on a possibly-shared graph.
+func TestGateway_ResolverInvalidServingModeFailsClosed(t *testing.T) {
+	resolver := &mapResolver{m: map[[2]string]gateway.Resolution{
+		{"org-a", "m"}: {ResourceID: "resource-a", ServingMode: "Shared", GraphK8sName: "g1"},
+	}}
+	em := &recordingEmitter{}
+	srv := newGatewayTestServer(t, em, resolver, nil)
+
+	rr := httptest.NewRecorder()
+	srv.Handler().ServeHTTP(rr, gatewayRequest("org-a", `{"model":"m"}`))
+
+	if rr.Code != http.StatusServiceUnavailable {
+		t.Fatalf("status = %d, want 503 (invalid resolved serving mode fails closed)", rr.Code)
+	}
+	if events := em.waitForEvents(1, 100*time.Millisecond); len(events) != 0 {
+		t.Fatalf("refused resolution emitted %d billing events, want 0: %+v", len(events), events)
+	}
+}
+
 // TestGateway_HeaderAbsent_LegacyPathUnchanged: with the gateway CONFIGURED, a
 // request without the gateway marker takes today's header-routed path exactly
 // — forwarded via X-Saturn-Upstream without ever consulting the resolver, and
