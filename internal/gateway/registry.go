@@ -18,6 +18,7 @@ import (
 	"k8s.io/client-go/tools/cache"
 	"k8s.io/client-go/tools/clientcmd"
 
+	"github.com/saturncloud/phoebe/internal/identity"
 	"github.com/saturncloud/phoebe/internal/logging"
 )
 
@@ -54,7 +55,8 @@ func NewKubeClient(kubeconfig string) (kubernetes.Interface, error) {
 //	           base_model        — HF base id (the catalog price key)
 //	           adapter           — fine-tune checkpoint id; MAY BE EMPTY
 //	                               (base-model endpoint)
-//	           serving_mode      — "shared" | "dedicated" (SKU axis)
+//	           serving_mode      — REQUIRED, exactly "shared" | "dedicated"
+//	                               (SKU axis; "" is NOT a serving mode)
 //	           graph_k8s_name    — the serving DGD k8s name
 //	           port              — the graph's OpenAI-compatible serve port
 //
@@ -275,16 +277,24 @@ func (r *RegistryResolver) size() int {
 // above. org_id, served_model_name, resource_id, base_model, and
 // graph_k8s_name are REQUIRED (a row missing any of them cannot be routed
 // AND billed correctly — indexing it would serve unbillable or unroutable
-// traffic); adapter and serving_mode may be empty (base-model endpoint /
-// dedicated). An unparseable port is tolerated as 0 (the proxy falls back to
-// the configured gateway.port) — wrong-but-recoverable, unlike the identity
-// fields.
+// traffic). serving_mode is also REQUIRED and must be exactly "shared" or
+// "dedicated": per the 2026-09-29 ruling the empty string is not a serving
+// mode, and the proxy refuses every request carrying an invalid one, so a row
+// with any other value is rejected here at index time (logged, never served)
+// rather than indexed and then refused per request. Only adapter may be empty
+// (base-model endpoint). An unparseable port is tolerated as 0 (the proxy
+// falls back to the configured gateway.port) — wrong-but-recoverable, unlike
+// the identity fields.
 func parseRegistryConfigMap(cm *corev1.ConfigMap) (Resolution, cacheKey, error) {
 	d := cm.Data
 	for _, req := range []string{"org_id", "served_model_name", "resource_id", "base_model", "graph_k8s_name"} {
 		if d[req] == "" {
 			return Resolution{}, cacheKey{}, fmt.Errorf("missing required data key %q", req)
 		}
+	}
+	if !identity.ValidServingMode(d["serving_mode"]) {
+		return Resolution{}, cacheKey{}, fmt.Errorf("invalid serving_mode %q (must be %q or %q)",
+			d["serving_mode"], identity.ServingModeShared, identity.ServingModeDedicated)
 	}
 	res := Resolution{
 		ResourceID:   d["resource_id"],
