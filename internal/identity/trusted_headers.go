@@ -123,7 +123,7 @@ func LoadTrustedHeaders(log *logging.Logger) {
 	if len(names) == 0 {
 		fallback := newTrustedHeaderSet(pinnedTrustedHeaders)
 		activeTrustedHeaders.Store(&fallback)
-		log.Error.Printf("%s is unset, empty, or malformed — falling back to the pinned %d-header default set (%s). If the phoebe chart's ConfigMap is supposed to render this list, the rendering is broken; phoebe keeps serving with the built-in defaults",
+		log.Warn.Printf("%s is unset, empty, or malformed — falling back to the pinned %d-header default set (%s). If the phoebe chart's ConfigMap is supposed to render this list, the rendering is broken; phoebe keeps serving with the built-in defaults",
 			TrustedHeadersEnv, len(pinnedTrustedHeaders), strings.Join(pinnedTrustedHeaders, ", "))
 		return
 	}
