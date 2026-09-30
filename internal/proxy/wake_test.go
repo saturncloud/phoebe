@@ -457,3 +457,65 @@ func TestWakeEnabledWarnsOnBoundRouteMissingServingMode(t *testing.T) {
 		t.Fatalf("warn logged with wake unconfigured: %q", buf.String())
 	}
 }
+
+// TestWakeSkippedOnControlRoutes (wake-scoping negative pin): the wake path
+// runs ONLY for model-bearing inference requests. A bound shared GET or HEAD
+// on a cold control route (/health, /live, /v1/models) is served by the normal
+// forward — the readiness sanitizer and model-list filters reduce the cold
+// upstream response — and must never call the waker: a monitoring probe must
+// not trigger a 0->1 scale of a cold base. Without this test, deleting
+// inferenceRequestPathAllowed(routePath) from the wake condition leaves the
+// whole suite green while cold control probes scale the graph.
+func TestWakeSkippedOnControlRoutes(t *testing.T) {
+	backend := &coldToWarmBackend{} // stays cold
+	be := httptest.NewServer(backend)
+	defer be.Close()
+	up, _ := url.Parse(be.URL)
+
+	em := &recordingEmitter{}
+	waker := &fakeWaker{}
+	s := New(&config.Settings{}, logging.New(logging.ERROR), em).
+		WithWaker(waker, 5*time.Second, 3)
+
+	for _, tc := range []struct{ method, path string }{
+		{http.MethodGet, "/health"},
+		{http.MethodGet, "/live"},
+		{http.MethodGet, "/v1/models"},
+		{http.MethodHead, "/health"},
+	} {
+		t.Run(tc.method+" "+tc.path, func(t *testing.T) {
+			rr := httptest.NewRecorder()
+			req := httptest.NewRequest(tc.method, tc.path, nil)
+			setUpstream(req, up)
+			req.Header.Set(identity.HeaderAuthID, "auth-1")
+			req.Header.Set(identity.HeaderResourceID, "r1")
+			req.Header.Set(identity.HeaderServedModel, "m")
+			req.Header.Set(identity.HeaderServingMode, "shared")
+			s.Handler().ServeHTTP(rr, req)
+
+			if got := atomic.LoadInt32(&waker.calls); got != 0 {
+				t.Fatalf("control-route %s %s called the waker %d times, want 0 "+
+					"(monitoring probes must not scale a cold base)", tc.method, tc.path, got)
+			}
+			if rr.Code != http.StatusNotFound {
+				t.Fatalf("status = %d, want the upstream cold 404 served by the normal forward", rr.Code)
+			}
+		})
+	}
+
+	// Positive control: the identical bound shared route DOES wake on the
+	// inference POST — proves the waker is functional in this test and the
+	// negative assertions above are meaningful.
+	rr := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions",
+		strings.NewReader(`{"model":"m","messages":[]}`))
+	setUpstream(req, up)
+	req.Header.Set(identity.HeaderAuthID, "auth-1")
+	req.Header.Set(identity.HeaderResourceID, "r1")
+	req.Header.Set(identity.HeaderServedModel, "m")
+	req.Header.Set(identity.HeaderServingMode, "shared")
+	s.Handler().ServeHTTP(rr, req)
+	if got := atomic.LoadInt32(&waker.calls); got == 0 {
+		t.Fatal("inference POST on the same cold route did not call the waker — the positive control must wake")
+	}
+}
