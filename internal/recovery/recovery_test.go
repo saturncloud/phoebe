@@ -23,6 +23,7 @@ func testEvent(id string) metering.Event {
 		AuthID:          "auth-1",
 		PromptTokens:    -1, // Invalid engine counts remain recoverable raw evidence.
 		UsageFound:      true,
+		ServingMode:     "dedicated",
 		TimestampUnixMs: 1_750_000_000_000,
 	}
 }
@@ -313,6 +314,88 @@ func TestLoadAcceptsExplicitUsageFoundBothWays(t *testing.T) {
 		}
 		if len(evidence.Events) != 1 || evidence.Events[0].UsageFound != usageFound {
 			t.Fatalf("events = %+v, want one event with usage_found=%v", evidence.Events, usageFound)
+		}
+	}
+}
+
+func writeEvidence(t *testing.T, content string) string {
+	t.Helper()
+	path := filepath.Join(t.TempDir(), "evidence.jsonl")
+	if err := os.WriteFile(path, []byte(content), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	return path
+}
+
+// TestDecodeEvent_MissingServingModeRefused: a record predating the 2026-09-29
+// serving-mode cutover has no serving_mode key. Decoded, it becomes "", the
+// drainer stores NULL, and the rater withholds it from money forever. Refuse it at
+// import (same precedent as usage_found) so an operator asserts the mode instead.
+func TestDecodeEvent_MissingServingModeRefused(t *testing.T) {
+	legacy := `{"request_id":"req-legacy","auth_id":"auth-1","prompt_tokens":10,` +
+		`"completion_tokens":5,"usage_found":true,"timestamp_unix_ms":1750000000000}`
+	if _, err := decodeEvent([]byte(legacy)); err == nil || !strings.Contains(err.Error(), "serving_mode") {
+		t.Fatalf("decodeEvent must refuse a record with no serving_mode, naming the field; got %v", err)
+	}
+	if _, err := Load(writeEvidence(t, legacy)); err == nil || !strings.Contains(err.Error(), "serving_mode") {
+		t.Fatalf("Load must refuse a record with no serving_mode, naming the field; got %v", err)
+	}
+}
+
+// TestDecodeEvent_MissingServingModeRefusedFromWAL: the same refusal applies to
+// WAL evidence, not only JSONL.
+func TestDecodeEvent_MissingServingModeRefusedFromWAL(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), "wal")
+	log, err := tidwall.Open(dir, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	legacy := `{"request_id":"req-legacy","auth_id":"auth-1","usage_found":true,"timestamp_unix_ms":1750000000000}`
+	if err := log.Write(1, []byte(legacy)); err != nil {
+		t.Fatal(err)
+	}
+	if err := log.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := Load(dir); err == nil || !strings.Contains(err.Error(), "serving_mode") {
+		t.Fatalf("WAL record with no serving_mode must be refused, naming the field; got %v", err)
+	}
+}
+
+// TestDecodeEvent_EmptyServingModeRefused: a present-but-empty (or any other
+// non-shared/dedicated) serving_mode is withheld by the rater exactly like an
+// absent one, so it must not pass validation either.
+func TestDecodeEvent_EmptyServingModeRefused(t *testing.T) {
+	for _, mode := range []string{"", "Dedicated", "serverless"} {
+		ev := testEvent("req-bad-mode")
+		ev.ServingMode = mode
+		data, err := json.Marshal(ev)
+		if err != nil {
+			t.Fatal(err)
+		}
+		_, err = Load(writeEvidence(t, string(data)))
+		if err == nil || !strings.Contains(err.Error(), "serving_mode") {
+			t.Fatalf("serving_mode %q must be refused, naming the field; got %v", mode, err)
+		}
+	}
+}
+
+// TestDecodeEvent_ExplicitDedicatedAccepted: the refusal targets absent or invalid
+// modes only; both explicit modes replay and keep their value.
+func TestDecodeEvent_ExplicitDedicatedAccepted(t *testing.T) {
+	for _, mode := range []string{"dedicated", "shared"} {
+		ev := testEvent("req-" + mode)
+		ev.ServingMode = mode
+		data, err := json.Marshal(ev)
+		if err != nil {
+			t.Fatal(err)
+		}
+		evidence, err := Load(writeEvidence(t, string(data)))
+		if err != nil {
+			t.Fatalf("serving_mode %q must be accepted: %v", mode, err)
+		}
+		if len(evidence.Events) != 1 || evidence.Events[0].ServingMode != mode {
+			t.Fatalf("events = %+v, want one event with serving_mode=%q", evidence.Events, mode)
 		}
 	}
 }

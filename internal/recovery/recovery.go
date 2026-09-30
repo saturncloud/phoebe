@@ -225,11 +225,14 @@ func copyTree(source, destination string) error {
 
 func decodeEvent(data []byte) (metering.Event, error) {
 	var ev metering.Event
-	// usage_found decides whether an attempt can EVER become money, and Go decodes a
-	// missing bool to false — so a record predating that field would replay as
-	// "engine supplied no usage", be excluded from money permanently, and report
-	// nothing. Refuse it instead: an operator can assert the right value and
-	// re-import, but they cannot recover revenue that was silently zeroed.
+	// usage_found and serving_mode each decide whether an attempt can EVER become
+	// money, and Go decodes a missing field to its zero value. A record predating
+	// usage_found would replay as "engine supplied no usage"; a record predating
+	// the 2026-09-29 serving-mode cutover would replay with serving_mode "", which
+	// the drainer stores as NULL and the rater withholds as an invalid serving
+	// mode. Either way the attempt is excluded from money permanently with no
+	// error at import time. Refuse both instead: an operator can assert the right
+	// value and re-import, but they cannot recover revenue that was silently zeroed.
 	var probe map[string]json.RawMessage
 	if err := json.Unmarshal(data, &probe); err != nil {
 		return ev, fmt.Errorf("decode event JSON: %w", err)
@@ -237,6 +240,10 @@ func decodeEvent(data []byte) (metering.Event, error) {
 	if _, ok := probe["usage_found"]; !ok {
 		return ev, fmt.Errorf("event has no usage_found field (pre-hardening evidence); " +
 			"refusing to replay it as unmetered — assert the correct value and re-import")
+	}
+	if _, ok := probe["serving_mode"]; !ok {
+		return ev, fmt.Errorf("event has no explicit serving_mode (pre-2026-09-29 evidence); " +
+			"refusing to replay it as unbillable — assert shared|dedicated and re-import")
 	}
 	dec := json.NewDecoder(bytes.NewReader(data))
 	if err := dec.Decode(&ev); err != nil {
@@ -302,6 +309,13 @@ func validate(ev metering.Event) error {
 		if count := utf8.RuneCountInString(field.value); count > field.max {
 			return fmt.Errorf("%s is %d characters; database maximum is %d", field.name, count, field.max)
 		}
+	}
+	// A present-but-invalid serving_mode (including "") is withheld from money by
+	// the rater exactly like an absent one, so it is refused here for the same
+	// reason decodeEvent refuses the absent key.
+	if ev.ServingMode != "shared" && ev.ServingMode != "dedicated" {
+		return fmt.Errorf("serving_mode %q is not shared or dedicated; "+
+			"refusing to replay it as unbillable — assert shared|dedicated and re-import", ev.ServingMode)
 	}
 	if ev.TimestampUnixMs <= 0 {
 		return fmt.Errorf("timestamp_unix_ms must be positive")
