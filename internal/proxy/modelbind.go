@@ -4,8 +4,147 @@ import (
 	"bytes"
 	"encoding/json"
 	"errors"
+	"github.com/saturncloud/phoebe/internal/identity"
+	"net/url"
 	"strings"
 )
+
+// authorizedModelDiscoveryPath validates Dynamo's graph-wide per-model GET
+// subtree against the endpoint's served-model allow-list. The wildcard model id
+// may contain slashes. Bound routes authorize exact model ids only: Dynamo gives
+// an exact sibling named <allowed>/ready precedence over the readiness
+// subresource, so suffix-based authorization would be ambiguous and fail open.
+func authorizedModelDiscoveryPath(path, servedModelAllowList string) (discovery, authorized bool) {
+	const prefix = "/v1/models/"
+	if !strings.HasPrefix(path, prefix) {
+		return false, false
+	}
+	requested := strings.TrimPrefix(path, prefix)
+	allow := parseServedModelAllowList(servedModelAllowList)
+	if _, ok := allow[requested]; ok {
+		return true, true
+	}
+	return true, false
+}
+
+// validTrustedServingMode reports whether a trusted serving-mode value is one
+// the route machinery understands: exactly "shared" or "dedicated" (the
+// 2026-09-29 serving-mode ruling; the empty string is not a serving mode).
+// identity.FromRequest resolves an ABSENT header to "dedicated" (a dedicated
+// route carries no header) and otherwise reads the value VERBATIM, so an Atlas
+// producer bug ("Shared", " shared", "SHARED") would otherwise fall into the
+// dedicated/unbound branch: a genuinely shared graph would get the unbound
+// inference surface with no model binding, and the shared policy (tenant
+// isolation + admission) would be skipped even when an allow-list is present.
+// Values outside the set are refused at the route gate (fail closed, generic
+// 404 — no oracle), exactly like every other unauthorized route.
+func validTrustedServingMode(mode string) bool {
+	return identity.ValidServingMode(mode)
+}
+
+// boundRequestAllowed is the complete public surface for a deployment-scoped
+// endpoint. Dynamo's frontend also exposes graph-wide admin, metrics,
+// documentation, batch storage, and future extension routes; those must not
+// become customer APIs merely because the reverse proxy can reach them.
+//
+// OPTIONS is scoped to the inference POST surface — the only surface a browser
+// preflights — and is answered LOCALLY by phoebe (handleProxy writes 204), never
+// forwarded. An unconditional OPTIONS allowance would have let `OPTIONS /metrics`
+// reach the Dynamo frontend, whose framework answers preflight with an Allow
+// header enumerating a graph-wide admin route's methods: the exact disclosure
+// the GET/HEAD gates below close, re-opened by one method.
+func boundRequestAllowed(method, path, servedModelAllowList string) bool {
+	if method == "OPTIONS" {
+		return inferenceRequestPathAllowed(path)
+	}
+	if method == "POST" {
+		return inferenceRequestPathAllowed(path)
+	}
+	if method != "GET" && method != "HEAD" {
+		return false
+	}
+	switch path {
+	case "/health", "/live":
+		// Routable unconditionally — they carry no per-model data ONCE
+		// sanitized. proxy.go rewrites their body to a status-only document
+		// (sanitizeReadinessResponse), because Dynamo's readiness is
+		// graph-wide and would otherwise enumerate sibling adapters.
+		return true
+	case "/v1/models":
+		// Requires a non-empty PARSED allow-list. A present-but-empty header
+		// (whitespace, ",,") authorizes no model at all, so listing must fail
+		// CLOSED here — at the route gate, before the request reaches Dynamo —
+		// matching checkModelBinding's decision for the same input. Allowing it
+		// through only to have filterModelListResponse error made the request
+		// hit the graph and surfaced as an opaque 502.
+		return len(parseServedModelAllowList(servedModelAllowList)) > 0
+	default:
+		discovery, authorized := authorizedModelDiscoveryPath(path, servedModelAllowList)
+		return discovery && authorized
+	}
+}
+
+// unboundRequestAllowed is the surface for a deployment route with NO injected
+// allow-list (legacy/unconfigured). Escalation 4 (PR #50): such a route must
+// not forward Dynamo's graph-wide surfaces — the unfiltered /v1/models list,
+// graph-wide readiness, metrics, docs — so only the meterable inference POST
+// surface is reachable, plus OPTIONS on that same surface, which handleProxy
+// answers locally (never forwarded). Anything else 404s at this gate.
+//
+// The rationale that used to keep unbound routes fully open ("one subdomain ==
+// one model") was never an architectural guarantee — a dedicated graph can
+// host a base model plus sibling adapters — and graph-wide routes disclose
+// them. The inference POST surface stays open for backward compatibility;
+// Atlas's middleware injecting X-Saturn-Served-Model restores the full bound
+// surface (including the filtered model list and sanitized readiness).
+func unboundRequestAllowed(method, path string) bool {
+	return (method == "OPTIONS" || method == "POST") && inferenceRequestPathAllowed(path)
+}
+
+// canonicalRequestPath returns the path to authorize on, reporting ok=false
+// when the raw request target is not byte-identical to its decoded form.
+//
+// The authorization gates decide on the percent-DECODED r.URL.Path, but the
+// reverse proxy forwards the RAW target: `GET /v1/models/%6dine` decodes to
+// "/v1/models/mine" (authorized when "mine" is the served name) while the
+// forwarded RequestURI stays "/v1/models/%6dine", and `POST
+// /v1%2Fchat/completions` decodes to an allowlisted path while forwarding one
+// that is not. Any upstream router that normalizes percent-encoding differently
+// from net/url then resolves a path the allow-list never approved. Go populates
+// URL.RawPath only when the escaped form differs from the decoded form, so
+// RawPath != "" is exactly the "encoded path" signal; phoebe refuses those
+// rather than guessing which form the upstream will honour.
+func canonicalRequestPath(u *url.URL) (string, bool) {
+	if u.RawPath != "" && u.RawPath != u.Path {
+		return "", false
+	}
+	return u.Path, true
+}
+
+// inferenceRequestPathAllowed lists the model-bearing APIs whose response
+// usage schema Phoebe can meter. Responses API uses different token field names
+// and remains closed until its billing parser is implemented.
+func inferenceRequestPathAllowed(path string) bool {
+	switch path {
+	case "/v1/chat/completions", "/v1/completions", "/v1/embeddings":
+		return true
+	default:
+		return false
+	}
+}
+
+// gatewayRequestAllowed is narrower than the bound-resource surface because a
+// shared gateway URL does not identify one model for health or discovery. The
+// request body supplies that identity only on model-bearing POST requests.
+//
+// OPTIONS is scoped to the same inference surface as POST. handleProxy already
+// answers gateway preflight locally with a 204 before any forward, so this is
+// defense in depth rather than a behaviour change — but it keeps the two route
+// gates saying the same thing, so a future refactor that drops the
+// short-circuit cannot silently open every path to OPTIONS.
+func gatewayRequestAllowed(method, path string) bool {
+	return (method == "OPTIONS" || method == "POST") && inferenceRequestPathAllowed(path)
+}
 
 var errNotObject = errors.New("request body is not a JSON object")
 
@@ -37,42 +176,49 @@ const (
 // without this check a caller authorized for model-A could send `model=B` and be
 // served B. This binds the two: request model ∈ allow-list, else fail closed.
 //
-// The allow-list is empty for routes that don't enforce binding (a dedicated
-// single-model endpoint: one subdomain == one model, the engine can only serve
-// the one thing) → bindingOK, no parse, no cost. atlas DECIDES access; this only
-// guarantees the body can't escape the atlas-authorized resource.
-// The second return value is the SINGULAR model the request selected, set only
-// on bindingOK for an enforced route. Wake readiness polls /v1/models for an
-// exact match, so it must receive this value and never the comma-separated
-// allow-list, which can never equal any single served-model name. It is empty
-// when the binding is not enforced (no allow-list header), where the caller
-// falls back to the route's own single served model.
-func checkModelBinding(body []byte, servedModelAllowList string) (modelBindingResult, string) {
-	// An ABSENT header (empty string) = binding not enforced (dedicated
-	// single-model route). But a PRESENT header that parses to an EMPTY set
+// An ABSENT allow-list means Atlas did not mark this route as bound. Phoebe
+// then enforces no body binding here — but the ROUTE GATE still applies
+// (proxy.go): unbound routes get only the meterable inference POST surface
+// (unboundRequestAllowed), never Dynamo's graph-wide model list, readiness,
+// metrics or docs, and a shared route with no allow-list is refused outright.
+// The header is injected and anti-spoof overwritten server-side by the
+// Atlas-rendered Traefik middleware (identity.HeaderServedModel), so a client
+// cannot cause its absence; a real route always carries it.
+//
+// The binding check once also returned the SINGULAR model the request selected
+// (a comma-separated allow-list can never equal one /v1/models entry, so wake
+// readiness needed the resolved value). The wake reconciliation (72f7ec1)
+// removed that consumer — serveWithWake probes for a cold response and retries
+// instead of polling /v1/models — so the value is gone with it.
+//
+// Atlas decides access; this only guarantees the body can't escape the
+// Atlas-authorized resource.
+func checkModelBinding(body []byte, servedModelAllowList string) modelBindingResult {
+	// An ABSENT header (empty string) = binding not enforced. But a PRESENT
+	// header that parses to an EMPTY set
 	// (e.g. a whitespace-only served name, or all-empty CSV parts) must fail
 	// CLOSED, not open: an empty allow-list on a shared route would let ANY
 	// model= through, defeating the binding. The caller only reaches here when
 	// the header is non-empty, so "present but empty set" is the attack/bug case.
 	if servedModelAllowList == "" {
-		return bindingOK, "" // truly absent (empty header) -> not a shared-binding route
+		return bindingOK // truly absent (empty header) -> not a shared-binding route
 	}
 	allow := parseServedModelAllowList(servedModelAllowList)
 	if len(allow) == 0 {
 		// Present (non-empty header) but parsed to nothing — whitespace-only or
 		// all-empty CSV parts. Fail CLOSED: an empty allow-list on a route that
 		// DID inject the header would let any model= through.
-		return bindingMismatch, ""
+		return bindingMismatch
 	}
 	model, ok := extractRequestModel(body)
 	if !ok {
 		// Enforced but the model is unreadable — fail closed.
-		return bindingUnparseable, ""
+		return bindingUnparseable
 	}
 	if _, authorized := allow[model]; authorized {
-		return bindingOK, model
+		return bindingOK
 	}
-	return bindingMismatch, ""
+	return bindingMismatch
 }
 
 // parseServedModelAllowList splits the comma-separated header into a set,

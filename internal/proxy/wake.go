@@ -11,6 +11,7 @@ import (
 	"strings"
 
 	"github.com/saturncloud/phoebe/internal/admission"
+	"github.com/saturncloud/phoebe/internal/capture"
 	"github.com/saturncloud/phoebe/internal/identity"
 )
 
@@ -73,10 +74,11 @@ const dynamoNotReadyBodyMarker = "is not ready to serve requests yet"
 // a shared-mode route (a served-model allow-list was injected by Atlas) AND carry
 // a valid atlas-authorized resource id. This is what disambiguates "cold parked
 // base, wake it" from "model genuinely doesn't exist" — the latter has no such
-// authorized resource. Dedicated routes (no allow-list) are never woken here
-// (they don't scale to zero via this path).
+// authorized resource. Dedicated routes also carry a served-model binding now,
+// so ServingMode is the authoritative discriminator; dedicated capacity never
+// scales to zero through this path.
 func isWakeable(id identity.Identity) bool {
-	return id.ResourceID != "" && id.ServedModel != ""
+	return id.ServingMode == "shared" && id.ResourceID != "" && id.ServedModel != ""
 }
 
 // graphFromUpstreamHost derives the Dynamo graph (DGD) k8s name from a
@@ -154,9 +156,14 @@ func (b *bufferingResponseWriter) isColdWakeable() bool {
 }
 
 // flushTo writes the captured status, headers, and body to the real client.
+// The authoritative X-Request-Id is set by the caller (never replayed from
+// the probe): Add would duplicate it when the upstream echoed the header.
 func (b *bufferingResponseWriter) flushTo(w http.ResponseWriter) {
 	dst := w.Header()
 	for k, vs := range b.header {
+		if http.CanonicalHeaderKey(k) == requestIDHeader {
+			continue
+		}
 		for _, v := range vs {
 			dst.Add(k, v)
 		}
@@ -174,12 +181,57 @@ func (s *Server) wakeEnabled(id identity.Identity) bool {
 	return s.waker != nil && isWakeable(id)
 }
 
+// statusRecorder wraps the client ResponseWriter to capture the status code a
+// helper actually writes, so a served response that bypassed the normal
+// metered forward can be recorded at the status the client really received.
+type statusRecorder struct {
+	http.ResponseWriter
+	status int
+}
+
+func (r *statusRecorder) WriteHeader(code int) {
+	if r.status == 0 {
+		r.status = code
+	}
+	r.ResponseWriter.WriteHeader(code)
+}
+
+func (r *statusRecorder) Write(p []byte) (int, error) {
+	if r.status == 0 {
+		r.status = http.StatusOK
+	}
+	return r.ResponseWriter.Write(p)
+}
+
+// emitWakeFailureRow records a forwarded-but-unmetered wake attempt. Every
+// exit path below that returns served=true has already forwarded at least one
+// real probe of the customer's request to the upstream (probe.ServeHTTP /
+// last.ServeHTTP) and then serves the response directly, so the normal metered
+// forward — and errorHandler with it — never runs. The merged billing
+// contract (#48) requires exactly one row per forwarded attempt: Aborted=false,
+// UsageFound=false, at the status actually written to the client. Same shape
+// as errorHandler's fall-through row, same WithoutCancel ctx (the emit must
+// survive a cancelled client ctx), and $0 by construction (no authoritative
+// counts). The fall-through (return false) path must NOT call this — the
+// caller's normal forward meters that attempt. clientRequestID is captured by
+// handleProxy BEFORE it replaces the X-Request-Id header with the minted
+// attempt id, so it is threaded in explicitly; the column is forensic only.
+func (s *Server) emitWakeFailureRow(r *http.Request, id identity.Identity, requestID, clientRequestID string, statusCode int) {
+	s.emit(context.WithoutCancel(r.Context()), id, requestID,
+		clientRequestID, statusCode, capture.Result{UsageFound: false})
+}
+
 // serveWithWake probes the upstream and, on a cold (scaled-to-zero) response,
 // triggers a 0->1 wake and retries. Returns true if it produced the client's
 // FINAL response here (a genuine error, or the wake deadline was exceeded and
 // the cold response was returned) — the caller then returns. Returns false when
 // the base is warm and the caller should perform the normal metered streaming
 // forward (the request body has been restored for that attempt).
+//
+// Every served=true exit below has already forwarded at least one real probe,
+// so each emits exactly one raw reconciliation row (Aborted=false,
+// UsageFound=false) at the status the client received — see emitWakeFailureRow.
+// The return-false path emits nothing here; the caller's forward meters it.
 //
 // Only the cold-probe attempts are buffered here (a cold body is tiny). The
 // moment a NON-cold response is seen we DON'T serve it from the buffer — we
@@ -190,7 +242,7 @@ func (s *Server) serveWithWake(
 	r *http.Request,
 	upstream *url.URL,
 	id identity.Identity,
-	requestID string,
+	requestID, clientRequestID string,
 	lease *admission.Lease,
 ) (served bool) {
 	// Snapshot the (already include-usage-rewritten) request body so it can be
@@ -247,7 +299,14 @@ func (s *Server) serveWithWake(
 		// Cold. Trigger the wake and block until ready (bounded), then retry.
 		if lease != nil {
 			if aerr := lease.BeginColdHold(r.Context()); aerr != nil {
-				s.writeAdmissionError(w, aerr)
+				// A probe was already forwarded above; this served=true exit
+				// bypasses the normal metered forward, so record the attempt.
+				// The minted id is the client's only correlation handle to the
+				// reconciliation row — same contract as every errorHandler exit.
+				w.Header().Set(requestIDHeader, requestID)
+				rec := &statusRecorder{ResponseWriter: w}
+				s.writeAdmissionError(rec, aerr)
+				s.emitWakeFailureRow(r, id, requestID, clientRequestID, rec.status)
 				return true
 			}
 		}
@@ -266,20 +325,29 @@ func (s *Server) serveWithWake(
 		if werr != nil {
 			// Wake couldn't complete (deadline/scale error): return the cold
 			// response to the client rather than hang. It's a real, honest 503/404
-			// for a base we couldn't bring up in time.
+			// for a base we couldn't bring up in time. The probe above was a real
+			// forwarded attempt and this served=true exit bypasses the normal
+			// metered forward, so record the attempt at the served status.
 			s.log.Warn.Printf("wake: could not warm base for request_id=%s resource_id=%s: %v",
 				requestID, id.ResourceID, werr)
+			w.Header().Set(requestIDHeader, requestID)
 			buf.flushTo(w)
+			s.emitWakeFailureRow(r, id, requestID, clientRequestID, buf.status)
 			return true
 		}
 		// Woken: loop and re-probe (the next attempt should be warm).
 	}
 
 	// Tries exhausted and still cold — serve the last cold response honestly.
+	// The probes above were real forwarded attempts and this served=true exit
+	// bypasses the normal metered forward, so record the attempt at the served
+	// status.
 	restoreBody()
 	buf := newBufferingResponseWriter()
 	last := httputil.NewSingleHostReverseProxy(upstream)
 	last.ServeHTTP(buf, r)
+	w.Header().Set(requestIDHeader, requestID)
 	buf.flushTo(w)
+	s.emitWakeFailureRow(r, id, requestID, clientRequestID, buf.status)
 	return true
 }

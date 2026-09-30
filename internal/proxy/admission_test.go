@@ -447,3 +447,74 @@ func TestProxyForwardsAtlasServiceTierDynamoHints(t *testing.T) {
 		t.Fatalf("forwarded trusted policy mismatch: %+v headers=%v", payload, forwarded.Header)
 	}
 }
+
+// Billing-contract pin for the admission-cause ErrorHandler branch: when a
+// mid-flight lease renewal failure cancels the in-flight upstream request,
+// errorHandler writes the 503 AND records exactly one raw reconciliation row
+// (Aborted=false, UsageFound=false, StatusCode=503) via the same s.emit path
+// as every other failure. Before the fix this branch was the one ErrorHandler
+// exit with no metering row — the request passed the billing-identity gate,
+// consumed shared capacity, and was invisible to billing. Exactly-once holds
+// for the same structural reason as the 502 path: ModifyResponse never ran, so
+// the completion emit was never armed.
+func TestAdmissionRenewalFailureEmitsReconciliationRow(t *testing.T) {
+	started := make(chan struct{})
+	releaseBackend := make(chan struct{})
+	backend := httptest.NewServer(http.HandlerFunc(func(_ http.ResponseWriter, r *http.Request) {
+		close(started)
+		select {
+		case <-r.Context().Done():
+		case <-releaseBackend:
+		}
+	}))
+	defer backend.Close()
+	defer close(releaseBackend)
+	up, _ := url.Parse(backend.URL)
+	mr := miniredis.RunT(t)
+	cfg := proxyAdmissionConfig(1)
+	cfg.LeaseTTL = 30 * time.Millisecond
+	client := redis.NewClient(&redis.Options{
+		Addr: mr.Addr(), DialTimeout: 20 * time.Millisecond, ReadTimeout: 20 * time.Millisecond,
+		WriteTimeout: 20 * time.Millisecond, MaxRetries: 0,
+	})
+	defer client.Close()
+	em := &recordingEmitter{}
+	s := New(&config.Settings{Admission: cfg}, logging.New(logging.ERROR), em).
+		WithAdmitter(admission.New(client, cfg))
+	rr := httptest.NewRecorder()
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		s.Handler().ServeHTTP(rr, sharedRequest(up))
+	}()
+	select {
+	case <-started:
+	case <-time.After(time.Second):
+		t.Fatal("request never reached upstream")
+	}
+	mr.Close()
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("proxy did not cancel upstream after lease renewal failed")
+	}
+	if rr.Code != http.StatusServiceUnavailable {
+		t.Fatalf("status=%d, want 503 after admission authority loss", rr.Code)
+	}
+	if got := rr.Header().Get(requestIDHeader); !strings.HasPrefix(got, "phoebe-") {
+		t.Fatalf("503 response X-Request-Id = %q, want the generated billing attempt id", got)
+	}
+	events := em.waitForEvents(1, 2*time.Second)
+	if len(events) != 1 {
+		t.Fatalf("renewal failure emitted %d billing events, want exactly 1 raw row: %+v", len(events), events)
+	}
+	ev := events[0]
+	if ev.Aborted || ev.UsageFound || ev.StatusCode != http.StatusServiceUnavailable {
+		t.Fatalf("renewal-failure row = {Aborted:%v UsageFound:%v StatusCode:%d}, "+
+			"want {false false 503} (visible to reconciliation, charges $0)", ev.Aborted, ev.UsageFound, ev.StatusCode)
+	}
+	if ev.RequestID != rr.Header().Get(requestIDHeader) {
+		t.Fatalf("renewal-failure row request id = %q, want the response's attempt id %q",
+			ev.RequestID, rr.Header().Get(requestIDHeader))
+	}
+}
