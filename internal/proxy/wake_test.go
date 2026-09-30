@@ -1,8 +1,10 @@
 package proxy
 
 import (
+	"bytes"
 	"context"
 	"io"
+	"log"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -12,6 +14,10 @@ import (
 	"testing"
 	"time"
 
+	"github.com/alicebob/miniredis/v2"
+	"github.com/redis/go-redis/v9"
+
+	"github.com/saturncloud/phoebe/internal/admission"
 	"github.com/saturncloud/phoebe/internal/config"
 	"github.com/saturncloud/phoebe/internal/identity"
 	"github.com/saturncloud/phoebe/internal/logging"
@@ -60,14 +66,26 @@ func TestGraphFromUpstreamHost(t *testing.T) {
 }
 
 func TestIsWakeable(t *testing.T) {
-	if !isWakeable(identity.Identity{ResourceID: "r1", ServedModel: "m"}) {
+	if !isWakeable(identity.Identity{ResourceID: "r1", ServedModel: "m", ServingMode: "shared"}) {
 		t.Fatal("shared route with resource id should be wakeable")
 	}
-	if isWakeable(identity.Identity{ResourceID: "r1"}) {
-		t.Fatal("no served-model allow-list (dedicated) must NOT be wakeable")
+	if isWakeable(identity.Identity{ResourceID: "r1", ServedModel: "m"}) {
+		t.Fatal("dedicated route must NOT be wakeable even with a model binding")
 	}
-	if isWakeable(identity.Identity{ServedModel: "m"}) {
+	if isWakeable(identity.Identity{ServedModel: "m", ServingMode: "shared"}) {
 		t.Fatal("no resource id (unauthorized) must NOT be wakeable")
+	}
+	// An EMPTY ServingMode is dedicated by the absence-of-prefix contract
+	// (identity.ServingMode: "Empty = dedicated"), so it is NOT wakeable even
+	// on a fully-resolved gateway route. The gateway registry parser
+	// (gateway.parseRegistryConfigMap) rejects rows with a blank serving_mode
+	// precisely so a shared row can never arrive here with "" and silently
+	// lose wake-from-zero.
+	if isWakeable(identity.Identity{ResourceID: "r1", ServedModel: "m", ServingMode: ""}) {
+		t.Fatal("empty serving mode is dedicated by contract and must NOT be wakeable")
+	}
+	if isWakeable(identity.Identity{ResourceID: "r1", ServedModel: "m", ServingMode: "dedicated"}) {
+		t.Fatal("dedicated route must NOT be wakeable")
 	}
 }
 
@@ -139,7 +157,9 @@ func TestWithWakerDefaults(t *testing.T) {
 }
 
 func testServerWithWaker(waker Waker) *Server {
-	s := New(&config.Settings{}, logging.New(logging.ERROR), nil)
+	// A non-nil emitter is required: the served=true wake exits record a raw
+	// reconciliation row, and these legacy tests exercise exactly those exits.
+	s := New(&config.Settings{}, logging.New(logging.ERROR), &recordingEmitter{})
 	return s.WithWaker(waker, 5*time.Second, 3)
 }
 
@@ -156,7 +176,7 @@ func TestServeWithWake_ColdThenWarm(t *testing.T) {
 	id := identity.Identity{ResourceID: "r1", ServedModel: "m"}
 	rec := httptest.NewRecorder()
 
-	served := s.serveWithWake(rec, req, up, id, "req-1", nil)
+	served := s.serveWithWake(rec, req, up, id, "req-1", "client-req-1", nil)
 	// Cold-then-warm: serveWithWake wakes, sees warm on re-probe, returns false
 	// (caller does the real forward). Waker called exactly once.
 	if served {
@@ -184,7 +204,7 @@ func TestServeWithWake_WakeErrorReturnsCold(t *testing.T) {
 	id := identity.Identity{ResourceID: "r1", ServedModel: "m"}
 	rec := httptest.NewRecorder()
 
-	served := s.serveWithWake(rec, req, up, id, "req-1", nil)
+	served := s.serveWithWake(rec, req, up, id, "req-1", "client-req-1", nil)
 	if !served {
 		t.Fatal("wake error should serve the cold response (served=true)")
 	}
@@ -207,7 +227,7 @@ func TestServeWithWake_WarmRequestNotServed(t *testing.T) {
 	id := identity.Identity{ResourceID: "r1", ServedModel: "m"}
 	rec := httptest.NewRecorder()
 
-	served := s.serveWithWake(rec, req, up, id, "req-1", nil)
+	served := s.serveWithWake(rec, req, up, id, "req-1", "client-req-1", nil)
 	if served {
 		t.Fatal("warm request must not be served by serveWithWake (caller forwards)")
 	}
@@ -222,5 +242,282 @@ func TestServeWithWake_WarmRequestNotServed(t *testing.T) {
 	body, err := io.ReadAll(req.Body)
 	if err != nil || string(body) != `{"model":"m"}` {
 		t.Fatalf("request body not restored for the metered forward: %q, %v", body, err)
+	}
+}
+
+func TestWakeErrorColdEmitsReconciliationRow(t *testing.T) {
+	backend := &coldToWarmBackend{} // stays cold
+	be := httptest.NewServer(backend)
+	defer be.Close()
+	up, _ := url.Parse(be.URL)
+
+	em := &recordingEmitter{}
+	s := New(&config.Settings{}, logging.New(logging.ERROR), em).
+		WithWaker(&fakeWaker{err: context.DeadlineExceeded}, 5*time.Second, 3)
+
+	req := httptest.NewRequest("POST", "http://x/v1/chat/completions", strings.NewReader(`{"model":"m"}`))
+	id := identity.Identity{ResourceID: "r1", ServedModel: "m"}
+	rec := httptest.NewRecorder()
+
+	served := s.serveWithWake(rec, req, up, id, "req-1", "client-req-1", nil)
+	if !served {
+		t.Fatal("wake error should serve the cold response (served=true)")
+	}
+	if rec.Code != http.StatusNotFound {
+		t.Fatalf("client got %d, want the cold 404", rec.Code)
+	}
+	events := em.waitForEvents(1, 2*time.Second)
+	if len(events) != 1 {
+		t.Fatalf("wake failure emitted %d billing events, want exactly 1 raw reconciliation row: %+v",
+			len(events), events)
+	}
+	ev := events[0]
+	if ev.Aborted || ev.UsageFound || ev.StatusCode != http.StatusNotFound {
+		t.Fatalf("wake-failure row = {Aborted:%v UsageFound:%v StatusCode:%d}, "+
+			"want {false false 404} (visible to reconciliation, charges $0)", ev.Aborted, ev.UsageFound, ev.StatusCode)
+	}
+	if ev.RequestID != "req-1" || ev.ResourceID != "r1" {
+		t.Fatalf("wake-failure row attribution = {RequestID:%q ResourceID:%q}, want {req-1 r1}",
+			ev.RequestID, ev.ResourceID)
+	}
+	if got := rec.Header().Get(requestIDHeader); got != "req-1" {
+		t.Fatalf("wake-failure response X-Request-Id = %q, want the minted attempt id (client correlation handle)", got)
+	}
+}
+
+func TestWakeExhaustedWarmFinalProbeEmitsReconciliationRow(t *testing.T) {
+	backend := &coldToWarmBackend{}
+	be := httptest.NewServer(backend)
+	defer be.Close()
+	up, _ := url.Parse(be.URL)
+
+	// warmsAt=1: the single in-loop wake succeeds and flips the backend warm;
+	// maxTries=1 ends the loop there, so the post-loop final probe sees the 200.
+	em := &recordingEmitter{}
+	s := New(&config.Settings{}, logging.New(logging.ERROR), em).
+		WithWaker(&fakeWaker{warmsAt: 1, backend: backend}, 5*time.Second, 1)
+
+	req := httptest.NewRequest("POST", "http://x/v1/chat/completions", strings.NewReader(`{"model":"m"}`))
+	id := identity.Identity{ResourceID: "r1", ServedModel: "m"}
+	rec := httptest.NewRecorder()
+
+	// Merged #50×#51 contract (decc49b): a tries-exhausted final probe that is
+	// NOT cold must NOT be served from the buffer. Serving it here would hand
+	// the client a real response that the wake path never meters (a billing
+	// hole) — or, for a non-cold error, an unclassified 502 settled
+	// never-served zero. serveWithWake returns false so the caller's normal
+	// metered forward owns the response, the metering row, and the settlement.
+	served := s.serveWithWake(rec, req, up, id, "req-1", "client-req-1", nil)
+	if served {
+		t.Fatal("warm final probe must not be served by serveWithWake (caller forwards and meters)")
+	}
+	if n := len(em.all()); n != 0 {
+		t.Fatalf("warm final probe emitted %d rows from the wake path, want 0 — the caller's metered forward owns the row", n)
+	}
+	body, err := io.ReadAll(req.Body)
+	if err != nil || string(body) != `{"model":"m"}` {
+		t.Fatalf("request body not restored for the metered forward: %q, %v", body, err)
+	}
+}
+func TestWakeColdHoldRejectionEmitsReconciliationRow(t *testing.T) {
+	backend := &coldToWarmBackend{} // stays cold
+	be := httptest.NewServer(backend)
+	defer be.Close()
+	up, _ := url.Parse(be.URL)
+
+	mr := miniredis.RunT(t)
+	cfg := proxyAdmissionConfig(10)
+	cfg.Platform.MaxColdHolds = 1
+	c := redis.NewClient(&redis.Options{Addr: mr.Addr()})
+	t.Cleanup(func() { _ = c.Close() })
+	admitter := admission.New(c, cfg)
+
+	// Positive work estimate: #51's admission API validates the request's work
+	// estimate against the configured floors.
+	holdReq := admission.Request{Graph: "g1", Organization: "org-a", Model: "m", PromptBytes: 1, EstimatedInputTokens: 1, ReservedOutputTokens: 1}
+	holder, err := admitter.Admit(context.Background(), holdReq)
+	if err != nil {
+		t.Fatalf("holder admit: %v", err)
+	}
+	t.Cleanup(func() { _ = holder.Complete(context.Background(), 0) })
+	// Consume the single platform cold hold so the request under test is rejected.
+	if err := holder.BeginColdHold(context.Background()); err != nil {
+		t.Fatalf("holder begin cold hold: %v", err)
+	}
+	lease, err := admitter.Admit(context.Background(), holdReq)
+	if err != nil {
+		t.Fatalf("request admit: %v", err)
+	}
+	t.Cleanup(func() { _ = lease.Complete(context.Background(), 0) })
+
+	em := &recordingEmitter{}
+	s := New(&config.Settings{Admission: cfg}, logging.New(logging.ERROR), em).
+		WithWaker(&fakeWaker{}, 5*time.Second, 3)
+
+	req := httptest.NewRequest("POST", "http://x/v1/chat/completions", strings.NewReader(`{"model":"m"}`))
+	id := identity.Identity{ResourceID: "r1", ServedModel: "m", ServingMode: "shared"}
+	rec := httptest.NewRecorder()
+
+	served := s.serveWithWake(rec, req, up, id, "req-1", "client-req-1", lease)
+	if !served {
+		t.Fatal("cold-hold rejection should serve the admission error (served=true)")
+	}
+	if rec.Code != http.StatusServiceUnavailable {
+		t.Fatalf("client got %d, want the admission 503 (platform cold-hold cap is non-contractual)", rec.Code)
+	}
+	if got := rec.Header().Get(requestIDHeader); got != "req-1" {
+		t.Fatalf("cold-hold rejection response X-Request-Id = %q, want the minted attempt id", got)
+	}
+	events := em.waitForEvents(1, 2*time.Second)
+	if len(events) != 1 {
+		t.Fatalf("cold-hold rejection emitted %d billing events, want exactly 1 raw reconciliation row: %+v",
+			len(events), events)
+	}
+	ev := events[0]
+	if ev.Aborted || ev.UsageFound || ev.StatusCode != http.StatusServiceUnavailable {
+		t.Fatalf("cold-hold row = {Aborted:%v UsageFound:%v StatusCode:%d}, "+
+			"want {false false 503} (visible to reconciliation, charges $0)", ev.Aborted, ev.UsageFound, ev.StatusCode)
+	}
+	if ev.RequestID != "req-1" || ev.ResourceID != "r1" {
+		t.Fatalf("cold-hold row attribution = {RequestID:%q ResourceID:%q}, want {req-1 r1}",
+			ev.RequestID, ev.ResourceID)
+	}
+}
+func TestWakeWarmFallThroughMetersNormalRowOnly(t *testing.T) {
+	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = w.Write([]byte(`{"model":"m","choices":[{"finish_reason":"stop"}],"usage":{"prompt_tokens":1,"completion_tokens":1}}`))
+	}))
+	defer backend.Close()
+	up, _ := url.Parse(backend.URL)
+
+	em := &recordingEmitter{}
+	s := New(&config.Settings{}, logging.New(logging.ERROR), em).
+		WithWaker(&fakeWaker{}, 5*time.Second, 3)
+
+	rr := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions",
+		strings.NewReader(`{"model":"m","messages":[]}`))
+	setUpstream(req, up)
+	req.Header.Set(identity.HeaderAuthID, "auth-1")
+	req.Header.Set(identity.HeaderResourceID, "r1")
+	req.Header.Set(identity.HeaderServedModel, "m")
+	req.Header.Set(identity.HeaderServingMode, "shared")
+	s.Handler().ServeHTTP(rr, req)
+
+	if rr.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200", rr.Code)
+	}
+	events := em.waitForEvents(1, 2*time.Second)
+	if len(events) != 1 {
+		t.Fatalf("warm fall-through emitted %d billing events, want exactly 1: %+v", len(events), events)
+	}
+	ev := events[0]
+	if !ev.UsageFound || ev.Aborted {
+		t.Fatalf("warm fall-through row = {UsageFound:%v Aborted:%v}, want the usage-bearing row {true false}",
+			ev.UsageFound, ev.Aborted)
+	}
+	if ev.StatusCode != http.StatusOK || ev.PromptTokens != 1 || ev.CompletionTokens != 1 {
+		t.Fatalf("warm fall-through row = {StatusCode:%d Prompt:%d Completion:%d}, want {200 1 1}",
+			ev.StatusCode, ev.PromptTokens, ev.CompletionTokens)
+	}
+}
+func TestWakeEnabledWarnsOnBoundRouteMissingServingMode(t *testing.T) {
+	newServer := func() (*Server, *bytes.Buffer) {
+		var buf bytes.Buffer
+		logger := &logging.Logger{
+			Debug: log.New(io.Discard, "", 0),
+			Info:  log.New(io.Discard, "", 0),
+			Warn:  log.New(&buf, "", 0),
+			Error: log.New(io.Discard, "", 0),
+		}
+		return New(&config.Settings{}, logger, nil).WithWaker(&fakeWaker{}, time.Second, 1), &buf
+	}
+
+	cases := []struct {
+		name     string
+		id       identity.Identity
+		wantWake bool
+		wantLog  bool
+	}{
+		{"bound shape without serving mode warns", identity.Identity{ResourceID: "r1", ServedModel: "m"}, false, true},
+		{"shared mode wakes and does not warn", identity.Identity{ResourceID: "r1", ServedModel: "m", ServingMode: "shared"}, true, false},
+		{"explicit dedicated does not warn", identity.Identity{ResourceID: "r1", ServedModel: "m", ServingMode: "dedicated"}, false, false},
+		{"unbound route does not warn", identity.Identity{ResourceID: "r1"}, false, false},
+		{"no resource id does not warn", identity.Identity{ServedModel: "m"}, false, false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			s, buf := newServer()
+			if got := s.wakeEnabled(tc.id); got != tc.wantWake {
+				t.Fatalf("wakeEnabled = %v, want %v", got, tc.wantWake)
+			}
+			if got := strings.Contains(buf.String(), "edge contract not fully rolled out"); got != tc.wantLog {
+				t.Fatalf("warn present = %v, want %v (log: %q)", got, tc.wantLog, buf.String())
+			}
+		})
+	}
+
+	// Wake unconfigured: the predicate short-circuits before the diagnostic, so
+	// no WARN either (a dedicated install has no wake rollout to diagnose).
+	s, buf := newServer()
+	s.waker = nil
+	if s.wakeEnabled(identity.Identity{ResourceID: "r1", ServedModel: "m"}) {
+		t.Fatal("wakeEnabled = true with nil waker, want false")
+	}
+	if buf.Len() != 0 {
+		t.Fatalf("warn logged with wake unconfigured: %q", buf.String())
+	}
+}
+func TestWakeSkippedOnControlRoutes(t *testing.T) {
+	backend := &coldToWarmBackend{} // stays cold
+	be := httptest.NewServer(backend)
+	defer be.Close()
+	up, _ := url.Parse(be.URL)
+
+	em := &recordingEmitter{}
+	waker := &fakeWaker{}
+	s := New(&config.Settings{}, logging.New(logging.ERROR), em).
+		WithWaker(waker, 5*time.Second, 3)
+
+	for _, tc := range []struct{ method, path string }{
+		{http.MethodGet, "/health"},
+		{http.MethodGet, "/live"},
+		{http.MethodGet, "/v1/models"},
+		{http.MethodHead, "/health"},
+	} {
+		t.Run(tc.method+" "+tc.path, func(t *testing.T) {
+			rr := httptest.NewRecorder()
+			req := httptest.NewRequest(tc.method, tc.path, nil)
+			setUpstream(req, up)
+			req.Header.Set(identity.HeaderAuthID, "auth-1")
+			req.Header.Set(identity.HeaderResourceID, "r1")
+			req.Header.Set(identity.HeaderServedModel, "m")
+			req.Header.Set(identity.HeaderServingMode, "shared")
+			s.Handler().ServeHTTP(rr, req)
+
+			if got := atomic.LoadInt32(&waker.calls); got != 0 {
+				t.Fatalf("control-route %s %s called the waker %d times, want 0 "+
+					"(monitoring probes must not scale a cold base)", tc.method, tc.path, got)
+			}
+			if rr.Code != http.StatusNotFound {
+				t.Fatalf("status = %d, want the upstream cold 404 served by the normal forward", rr.Code)
+			}
+		})
+	}
+
+	// Positive control: the identical bound shared route DOES wake on the
+	// inference POST — proves the waker is functional in this test and the
+	// negative assertions above are meaningful.
+	rr := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions",
+		strings.NewReader(`{"model":"m","messages":[]}`))
+	setUpstream(req, up)
+	req.Header.Set(identity.HeaderAuthID, "auth-1")
+	req.Header.Set(identity.HeaderResourceID, "r1")
+	req.Header.Set(identity.HeaderServedModel, "m")
+	req.Header.Set(identity.HeaderServingMode, "shared")
+	s.Handler().ServeHTTP(rr, req)
+	if got := atomic.LoadInt32(&waker.calls); got == 0 {
+		t.Fatal("inference POST on the same cold route did not call the waker — the positive control must wake")
 	}
 }

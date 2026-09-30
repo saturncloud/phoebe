@@ -308,9 +308,18 @@ func TestWakeColdHoldRejectionSettlesZeroNeverServed(t *testing.T) {
 	}
 	_ = physical.Complete(context.Background(), 0)
 
-	// Determinate never-served: nothing is metered either.
-	if n := len(em.all()); n != 0 {
-		t.Fatalf("cold-hold rejection emitted %d events, want 0", n)
+	// Determinate never-served: the contract windows settle zero (asserted
+	// above), and under the merged always-record billing contract (#48, the
+	// 5929d03 resolution) the one forwarded probe still leaves exactly one
+	// $0 raw reconciliation row — never-served changes the SETTLEMENT, not
+	// the metering visibility.
+	rows := em.all()
+	if len(rows) != 1 {
+		t.Fatalf("cold-hold rejection emitted %d events, want exactly 1 raw row: %+v", len(rows), rows)
+	}
+	if rows[0].Aborted || rows[0].UsageFound || rows[0].StatusCode != http.StatusServiceUnavailable {
+		t.Fatalf("cold-hold row = {Aborted:%v UsageFound:%v StatusCode:%d}, want {false false 503}",
+			rows[0].Aborted, rows[0].UsageFound, rows[0].StatusCode)
 	}
 }
 
@@ -369,8 +378,16 @@ func TestWakeExhaustedColdSettlesZeroNeverServed(t *testing.T) {
 	}
 	_ = physical.Complete(context.Background(), 0)
 
-	if n := len(em.all()); n != 0 {
-		t.Fatalf("exhausted cold response emitted %d events, want 0", n)
+	// Always-record billing contract: the refused probes leave exactly one
+	// $0 raw row; the zero SETTLEMENT in the contract windows is asserted
+	// above and is unaffected.
+	rows := em.all()
+	if len(rows) != 1 {
+		t.Fatalf("exhausted cold response emitted %d events, want exactly 1 raw row: %+v", len(rows), rows)
+	}
+	if rows[0].Aborted || rows[0].UsageFound || rows[0].StatusCode != http.StatusNotFound {
+		t.Fatalf("exhausted-cold row = {Aborted:%v UsageFound:%v StatusCode:%d}, want {false false 404}",
+			rows[0].Aborted, rows[0].UsageFound, rows[0].StatusCode)
 	}
 }
 
@@ -426,8 +443,16 @@ func TestWakeErrorColdSettlementZeroNeverServed(t *testing.T) {
 	}
 	_ = physical.Complete(context.Background(), 0)
 
-	if n := len(em.all()); n != 0 {
-		t.Fatalf("waker-failure cold response emitted %d events, want 0", n)
+	// Always-record billing contract: the refused probes leave exactly one
+	// $0 raw row; the zero SETTLEMENT in the contract windows is asserted
+	// above and is unaffected.
+	rows := em.all()
+	if len(rows) != 1 {
+		t.Fatalf("waker-failure cold response emitted %d events, want exactly 1 raw row: %+v", len(rows), rows)
+	}
+	if rows[0].Aborted || rows[0].UsageFound || rows[0].StatusCode != http.StatusNotFound {
+		t.Fatalf("waker-failure row = {Aborted:%v UsageFound:%v StatusCode:%d}, want {false false 404}",
+			rows[0].Aborted, rows[0].UsageFound, rows[0].StatusCode)
 	}
 }
 

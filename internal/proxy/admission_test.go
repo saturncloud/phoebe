@@ -1857,28 +1857,37 @@ func TestDedicatedTrafficBypassesSharedAdmission(t *testing.T) {
 	}
 }
 
+// TestPerResourceServingIdentityFailsClosedWhenInconsistent — merged #50×#51
+// contract. phoebe#51's standalone coherence gate used to 503 every
+// serving-metadata combination it considered inconsistent. phoebe#50 made the
+// served-model allow-list a legitimate DEDICATED-route shape (bound
+// endpoints), and its model-binding route gate is now the single checker: it
+// validates the mode, binds the request body to the injected allow-list, and
+// fails malformed modes and allow-list-less shared routes closed with the
+// generic 404 — before admission and before upstream. Those two shapes are
+// legitimate now and must forward normally.
 func TestPerResourceServingIdentityFailsClosedWhenInconsistent(t *testing.T) {
-	var upstreamHits int
-	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
-		upstreamHits++
-		w.WriteHeader(http.StatusOK)
-	}))
-	defer backend.Close()
-	up, _ := url.Parse(backend.URL)
-
 	tests := []struct {
 		name        string
 		servingMode string
 		servedModel string
+		wantStatus  int
 	}{
-		{name: "model with absent mode", servedModel: "model-a"},
-		{name: "model with dedicated mode", servingMode: "dedicated", servedModel: "model-a"},
-		{name: "model with unknown mode", servingMode: "shraed", servedModel: "model-a"},
-		{name: "shared mode without model", servingMode: "shared"},
-		{name: "unknown mode without model", servingMode: "shraed"},
+		{name: "model with absent mode", servedModel: "model-a", wantStatus: http.StatusOK},
+		{name: "model with dedicated mode", servingMode: "dedicated", servedModel: "model-a", wantStatus: http.StatusOK},
+		{name: "model with unknown mode", servingMode: "shraed", servedModel: "model-a", wantStatus: http.StatusNotFound},
+		{name: "shared mode without model", servingMode: "shared", wantStatus: http.StatusNotFound},
+		{name: "unknown mode without model", servingMode: "shraed", wantStatus: http.StatusNotFound},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
+			var upstreamHits int
+			backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				upstreamHits++
+				w.WriteHeader(http.StatusOK)
+			}))
+			defer backend.Close()
+			up, _ := url.Parse(backend.URL)
 			a := &countingAdmitter{}
 			s := New(&config.Settings{}, logging.New(logging.ERROR), &recordingEmitter{}).WithAdmitter(a)
 			req := sharedRequest(up)
@@ -1894,14 +1903,14 @@ func TestPerResourceServingIdentityFailsClosedWhenInconsistent(t *testing.T) {
 			}
 			rr := httptest.NewRecorder()
 			s.Handler().ServeHTTP(rr, req)
-			if rr.Code != http.StatusServiceUnavailable {
-				t.Fatalf("status=%d, want 503", rr.Code)
+			if rr.Code != tc.wantStatus {
+				t.Fatalf("status=%d, want %d", rr.Code, tc.wantStatus)
 			}
 			if a.calls != 0 {
-				t.Fatalf("admission calls=%d, want 0", a.calls)
+				t.Fatalf("admission calls=%d, want 0 — no shape here reaches admission", a.calls)
 			}
-			if upstreamHits != 0 {
-				t.Fatalf("upstream hits=%d, want 0", upstreamHits)
+			if tc.wantStatus != http.StatusOK && upstreamHits != 0 {
+				t.Fatalf("upstream hits=%d, want 0 for refused shapes", upstreamHits)
 			}
 		})
 	}
@@ -2186,7 +2195,9 @@ func TestWakeColdHoldStoreOutageLogsSampled(t *testing.T) {
 	mr.Close()
 
 	var buf bytes.Buffer
-	logger := &logging.Logger{Error: log.New(&buf, "", 0)}
+	// Warn must be sinked too: the merged emit() logs unmetered-attempt rows
+	// at Warn, and the cold-hold rejection path now records a reconciliation row.
+	logger := &logging.Logger{Error: log.New(&buf, "", 0), Warn: log.New(io.Discard, "", 0)}
 	s := New(&config.Settings{Admission: cfg}, logger, &recordingEmitter{}).
 		WithAdmitter(a).
 		WithWaker(&fakeWaker{}, time.Second, 3)
@@ -2428,5 +2439,87 @@ func TestSampledErrorLogQuietGapWinnerPreemption(t *testing.T) {
 	lines := strings.Split(strings.TrimSpace(buf.String()), "\n")
 	if len(lines) != 2 {
 		t.Fatalf("logged %d lines, want 2 (incident-one onset + exactly one incident-two onset): %q", len(lines), lines)
+	}
+}
+
+// Billing-contract pin for the admission-cause ErrorHandler branch: when a
+// mid-flight lease renewal failure cancels the in-flight upstream request,
+// errorHandler writes the 503 AND records exactly one raw reconciliation row
+// (Aborted=false, UsageFound=false, StatusCode=503) via the same s.emit path
+// as every other failure. Before the fix this branch was the one ErrorHandler
+// exit with no metering row — the request passed the billing-identity gate,
+// consumed shared capacity, and was invisible to billing. Exactly-once holds
+// for the same structural reason as the 502 path: ModifyResponse never ran, so
+// the completion emit was never armed.
+// TestAdmissionRenewalFailureEmitsReconciliationRow — merged #50×#51 contract.
+// phoebe#50 cancelled the in-flight upstream on mid-stream lease-renewal loss
+// and recorded a raw 503 reconciliation row. phoebe#51's fail-open posture
+// (the R2 ruling is pending Hugo) instead treats renewal failure as a bypass:
+// the sampled log records it, and the already-admitted stream runs to
+// completion — metering is independent of the fairness store, and the
+// engine's real usage is what billing needs. This test now pins the merged
+// behavior: no cancellation, the engine response reaches the client, and the
+// normal completion path records exactly one usage-bearing row. The
+// errorHandler's 503 admission-cause branch stays as a fail-safe for any
+// future cancellation-with-cause, but nothing in the current tree cancels the
+// proxy on renewal loss.
+func TestAdmissionRenewalFailureEmitsReconciliationRow(t *testing.T) {
+	started := make(chan struct{})
+	var startedOnce, releaseOnce sync.Once
+	releaseBackend := make(chan struct{})
+	defer func() { releaseOnce.Do(func() { close(releaseBackend) }) }()
+	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		startedOnce.Do(func() { close(started) })
+		select {
+		case <-r.Context().Done():
+		case <-releaseBackend:
+		}
+		_, _ = w.Write([]byte(`{"model":"model-a","usage":{"prompt_tokens":2,"completion_tokens":3}}`))
+	}))
+	defer backend.Close()
+	up, _ := url.Parse(backend.URL)
+	mr := miniredis.RunT(t)
+	cfg := proxyAdmissionConfig(1)
+	cfg.LeaseTTL = 30 * time.Millisecond
+	client := redis.NewClient(&redis.Options{
+		Addr: mr.Addr(), DialTimeout: 20 * time.Millisecond, ReadTimeout: 20 * time.Millisecond,
+		WriteTimeout: 20 * time.Millisecond, MaxRetries: 0,
+	})
+	defer client.Close()
+	em := &recordingEmitter{}
+	s := New(&config.Settings{Admission: cfg}, logging.New(logging.ERROR), em).
+		WithAdmitter(admission.New(client, cfg))
+	rr := httptest.NewRecorder()
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		s.Handler().ServeHTTP(rr, sharedRequest(up))
+	}()
+	select {
+	case <-started:
+	case <-time.After(time.Second):
+		t.Fatal("request never reached upstream")
+	}
+	mr.Close() // mid-stream store loss: lease renewal fails from here on
+	releaseOnce.Do(func() { close(releaseBackend) })
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("admitted stream did not complete after renewal failure (bypass posture)")
+	}
+	if rr.Code != http.StatusOK {
+		t.Fatalf("status=%d, want 200 — renewal failure must not cancel the admitted stream", rr.Code)
+	}
+	if got := rr.Header().Get(requestIDHeader); !strings.HasPrefix(got, "phoebe-") {
+		t.Fatalf("response X-Request-Id = %q, want the generated billing attempt id", got)
+	}
+	events := em.waitForEvents(1, 2*time.Second)
+	if len(events) != 1 {
+		t.Fatalf("completion emitted %d billing events, want exactly 1 usage-bearing row: %+v", len(events), events)
+	}
+	ev := events[0]
+	if ev.Aborted || !ev.UsageFound || ev.StatusCode != http.StatusOK {
+		t.Fatalf("completion row = {Aborted:%v UsageFound:%v StatusCode:%d}, "+
+			"want {false true 200} (the engine's real usage, recorded by the normal path)", ev.Aborted, ev.UsageFound, ev.StatusCode)
 	}
 }

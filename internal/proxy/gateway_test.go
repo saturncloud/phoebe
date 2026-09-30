@@ -61,7 +61,11 @@ func newGatewayTestServer(t *testing.T, em *recordingEmitter, resolver gateway.R
 // It carries none of the per-resource routing headers, exactly as the gateway
 // route contract specifies.
 func gatewayRequest(org, body string) *http.Request {
-	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(body))
+	return gatewayRequestFor(http.MethodPost, "/v1/chat/completions", org, body)
+}
+
+func gatewayRequestFor(method, path, org, body string) *http.Request {
+	req := httptest.NewRequest(method, path, strings.NewReader(body))
 	req.Header.Set(identity.HeaderGateway, "true")
 	if org != "" {
 		req.Header.Set(identity.HeaderOrgID, org)
@@ -216,6 +220,61 @@ func TestGatewayPolicyEnvelopeCanRollOutBeforeAdmissionIsEnabled(t *testing.T) {
 	}
 }
 
+func TestGateway_RejectsRoutesBeforeResolution(t *testing.T) {
+	resolver := &mapResolver{}
+	srv := newGatewayTestServer(t, &recordingEmitter{}, resolver, nil)
+	for _, tc := range []struct{ method, path string }{
+		{http.MethodPost, "/future-admin"},
+		{http.MethodPost, "/v1/models"},
+		{http.MethodPost, "/v1/responses"},
+		{http.MethodGet, "/health"},
+		{http.MethodPut, "/v1/chat/completions"},
+	} {
+		rr := httptest.NewRecorder()
+		srv.Handler().ServeHTTP(rr, gatewayRequestFor(tc.method, tc.path, "org-1", `{"model":"m"}`))
+		if rr.Code != http.StatusNotFound {
+			t.Fatalf("%s %s status = %d, want 404", tc.method, tc.path, rr.Code)
+		}
+	}
+	if atomic.LoadInt32(&resolver.calls) != 0 {
+		t.Fatalf("blocked gateway routes invoked resolver %d times", resolver.calls)
+	}
+}
+
+func TestGateway_PreflightDoesNotRequireModelResolution(t *testing.T) {
+	resolver := &mapResolver{}
+	srv := newGatewayTestServer(t, &recordingEmitter{}, resolver, nil)
+	rr := httptest.NewRecorder()
+	srv.Handler().ServeHTTP(rr, gatewayRequestFor(http.MethodOptions, "/v1/chat/completions", "org-1", ""))
+	if rr.Code != http.StatusNoContent {
+		t.Fatalf("preflight status = %d, want 204", rr.Code)
+	}
+	if atomic.LoadInt32(&resolver.calls) != 0 {
+		t.Fatal("preflight must not invoke model resolution")
+	}
+}
+
+func TestGateway_AllBillableInferencePathsResolveAndForward(t *testing.T) {
+	be, beURL := usageBackend(t)
+	defer be.Close()
+	resolver := &mapResolver{m: map[[2]string]gateway.Resolution{
+		{"org-1", "served-m"}: {
+			ResourceID: "tfm-1", BaseModel: "base", ServingMode: "shared", GraphK8sName: "graph",
+		},
+	}}
+	srv := newGatewayTestServer(t, &recordingEmitter{}, resolver, beURL)
+	for _, path := range []string{"/v1/chat/completions", "/v1/completions", "/v1/embeddings"} {
+		rr := httptest.NewRecorder()
+		srv.Handler().ServeHTTP(rr, gatewayRequestFor(http.MethodPost, path, "org-1", `{"model":"served-m"}`))
+		if rr.Code != http.StatusOK {
+			t.Fatalf("POST %s status = %d, want 200 (body %q)", path, rr.Code, rr.Body.String())
+		}
+	}
+	if calls := atomic.LoadInt32(&resolver.calls); calls != 3 {
+		t.Fatalf("resolver calls = %d, want 3", calls)
+	}
+}
+
 // usageBackend returns an httptest server answering like a vLLM engine (model
 // name + usage block), so the full metering path runs.
 func usageBackend(t *testing.T) (*httptest.Server, *url.URL) {
@@ -364,6 +423,51 @@ func TestGateway_MissingOrg403(t *testing.T) {
 	}
 	if atomic.LoadInt32(&resolver.calls) != 0 {
 		t.Fatal("resolver must not be consulted without an org")
+	}
+}
+
+// TestGateway_PreflightMissingOrg403: the preflight branch refuses an anonymous
+// preflight (403) BEFORE any resolution — the resolver must not be consulted,
+// and no 204 may answer it. Deleting the org check would 204 anonymous
+// preflights on the gateway route with no test failing.
+func TestGateway_PreflightMissingOrg403(t *testing.T) {
+	resolver := &mapResolver{}
+	srv := newGatewayTestServer(t, &recordingEmitter{}, resolver, nil)
+
+	req := httptest.NewRequest(http.MethodOptions, "/v1/chat/completions", nil)
+	req.Header.Set(identity.HeaderGateway, "true")
+	// deliberately no identity.HeaderOrgID
+	rr := httptest.NewRecorder()
+	srv.Handler().ServeHTTP(rr, req)
+
+	if rr.Code != http.StatusForbidden {
+		t.Fatalf("preflight without org: status = %d, want 403", rr.Code)
+	}
+	if atomic.LoadInt32(&resolver.calls) != 0 {
+		t.Fatal("resolver must not be consulted for an anonymous preflight")
+	}
+}
+
+// TestGateway_ResolverInvalidServingModeFailsClosed: Resolver is an exported
+// interface and WithGateway accepts any implementation, so the proxy
+// re-validates the resolved serving mode itself — a non-conforming resolver
+// returning a value outside the closed enum must fail closed (503), not
+// silently disable the shared-policy block and wake on a possibly-shared graph.
+func TestGateway_ResolverInvalidServingModeFailsClosed(t *testing.T) {
+	resolver := &mapResolver{m: map[[2]string]gateway.Resolution{
+		{"org-a", "m"}: {ResourceID: "resource-a", ServingMode: "Shared", GraphK8sName: "g1"},
+	}}
+	em := &recordingEmitter{}
+	srv := newGatewayTestServer(t, em, resolver, nil)
+
+	rr := httptest.NewRecorder()
+	srv.Handler().ServeHTTP(rr, gatewayRequest("org-a", `{"model":"m"}`))
+
+	if rr.Code != http.StatusServiceUnavailable {
+		t.Fatalf("status = %d, want 503 (invalid resolved serving mode fails closed)", rr.Code)
+	}
+	if events := em.waitForEvents(1, 100*time.Millisecond); len(events) != 0 {
+		t.Fatalf("refused resolution emitted %d billing events, want 0: %+v", len(events), events)
 	}
 }
 
