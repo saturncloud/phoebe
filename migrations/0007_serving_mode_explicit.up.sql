@@ -32,6 +32,11 @@
 -- serving_mode. The rater now withholds such events (invalid_serving_mode_events),
 -- so a re-rate of a pre-cutover window deletes the rows rewritten here through the
 -- normal reconcile path. That is intended: there is nothing in production to keep.
+-- The routine trailing-window rater hits this on its own for up to
+-- rateTrailingHours after the deploy (exit 2 each run, dedicated rows deleted and
+-- then removed from saturn-aws-manager by token-push). See "Serving-mode cutover
+-- (migration 0007)" in docs/billing-reconciliation.md for what to expect and the
+-- optional explicit backfill.
 
 DELETE FROM rated_usage ru
 WHERE ru.serving_mode = ''

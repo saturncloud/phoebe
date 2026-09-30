@@ -109,7 +109,8 @@ that was NOT aborted and did NOT fail — a response the engine reported as
 SUCCESSFUL while supplying no usage block, meaning work may have been served that
 cannot be billed. The rater exits non-zero only on that unexplained subset, so
 exit 2 stays reserved for rare, wrong conditions (unpriced, unattributable,
-invalid-usage, ambiguous base/org) rather than firing every hour.
+invalid-usage, ambiguous base/org, invalid serving mode, owner conflict) rather
+than firing every hour.
 
 Page on an unexplained missing-usage attempt, rater anomaly/non-zero exit, reconcile
 deletion during a routine run, drainer poison row, `METERING_FLOOR`, WAL corruption,
@@ -123,15 +124,25 @@ NULL and one real org therefore reconciles to one rated row without false token
 deltas, while conflicting non-NULL orgs remain explicit.
 
 **`rated_attempts = 0` with a non-zero `raw_attempts` is NOT by itself lost
-rating.** It has two very different causes and the view alone cannot tell them
+rating.** It has three very different causes and the view alone cannot tell them
 apart, so never treat the row as a drainer/rating incident before ruling out the
-first: either (a) the rater deliberately WITHHELD the rollup at an ambiguity gate
+first two: (a) the rater deliberately WITHHELD the rollup at an ambiguity gate
 — check `distinct_org_ids > 1` on the row for org-ambiguity, and the same run's
 `ambiguous_base_events` count for base-ambiguity, which the view does not surface
 at all (the base gate keys on `rating_price`/`rating_derived` join outcomes that
-exist only inside the rater, not on `billing_event`) — or (b) the rater has not
-yet run for that hour. Check the rater's run report for the window before
-escalating.
+exist only inside the rater, not on `billing_event`); (b) the rater deliberately
+WITHHELD the events because their serving mode is invalid — the run's
+`invalid_serving_mode_events` count. These are events whose
+`billing_event.serving_mode` is NULL, `''` or anything other than `'shared'` or
+`'dedicated'`. Dedicated events stored before migration 0007 look exactly like
+this, so inside a re-rate window that covers pre-cutover hours they are withheld
+on purpose (see "Serving-mode cutover (migration 0007)" below). The view has no
+column for this cause; check it directly for the hour and key with
+`SELECT COUNT(*) FROM billing_event WHERE (serving_mode IS NULL OR serving_mode
+NOT IN ('shared','dedicated')) AND auth_id = … AND resource_id = … AND model = …
+AND event_ts >= <hour> AND event_ts < <hour> + interval '1 hour'`; or (c) the
+rater has not yet run for that hour. Check the rater's run report for the window
+before escalating.
 
 For the invoice boundary, export `rated_usage.id`, `window_start`, `org_id`, and
 `cost` for the same interval and compare it to the central manager's received-rollup
@@ -219,6 +230,43 @@ The raw ledger deliberately accepts invalid engine counts so evidence is never
 discarded merely because it cannot become money. The rater excludes those rows
 and reports `invalid_usage_attempts`; repair or explicitly quarantine them before
 settling the invoice window.
+
+### Serving-mode cutover (migration 0007)
+
+Migration 0007 makes `'shared'` and `'dedicated'` the only legal serving modes.
+It renames every existing `rated_usage` row stored with the old empty serving mode
+to `'dedicated'` and recomputes its id. It does NOT rewrite `billing_event`: raw
+evidence is never edited, so dedicated events recorded before the cutover still
+carry a NULL (or `''`) serving mode.
+
+The rater now counts such events as `invalid_serving_mode_events` and withholds
+them from money. Expect the following after you deploy 0007 and the new rater at
+hour H:
+
+- Every default (trailing-window) rater run whose window still contains hours
+  before H exits 2. That is up to `rateTrailingHours` runs (default 24), one per
+  hour, until the window slides past the deploy hour. Two conditions drive the
+  exit: the invalid-serving-mode anomaly, and, on the first run that covers each
+  pre-cutover hour, a reconcile deletion during a routine run.
+- The `'dedicated'` `rated_usage` rows that 0007 renamed inside that window are
+  reconcile-deleted, because their evidence no longer rates. token-push then
+  pushes snapshots without those rows, and saturn-aws-manager removes those
+  charges by absence.
+- Dedicated traffic served in hour H before the deploy is never billed, even
+  though `billing_event` still holds it.
+
+This is expected and harmless in the pre-production window, where there is no
+real customer billing to preserve (ratified in the 2026-09-24 and 2026-09-29
+serving-mode rulings). Do not treat these pages as a data-loss incident. They
+stop once the trailing window no longer contains any hour before H. On an install
+that is already billing real customers, stop and get a ruling before deploying
+0007; this runbook does not cover that case.
+
+Optionally, right after the deploy, run one explicit backfill over the trailing
+window, for example `rater --since <H minus 24h> --until <H>`. The reconcile
+deletions then happen once, under a window the operator named, and that run does
+not page for them. The invalid-serving-mode anomaly still exits 2 on that run by
+design, and later routine runs keep exiting 2 on it until the window slides past H.
 
 ### Upgrading an install that already carries billing traffic
 
