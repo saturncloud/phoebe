@@ -97,8 +97,11 @@ NULL, so it must not run against schema 0007. Roll out in this order:
    resume the rater.
 3. Once every interceptor pod runs the new image, re-run 0007's idempotent
    `billing_event` backfill (`UPDATE billing_event SET serving_mode = 'dedicated'
-   WHERE serving_mode IS NULL OR serving_mode = ''`) to cover dedicated events the
-   old pods metered during the rollout. See "Serving-mode cutover (migration 0007)"
+   WHERE serving_mode IS NULL OR serving_mode = ''`) to cover dedicated events an
+   old drainer stored as NULL during the rollout. The new drainer stores an empty
+   serving mode (an event an old pod metered, including one replayed later from an
+   on-disk spool or the drain queue) as `'dedicated'`, so events it inserts need no
+   backfill. See "Serving-mode cutover (migration 0007)"
    in `docs/billing-reconciliation.md`.
 4. Deploy saturn-aws-manager #310 in the same window. Until both sides run the
    new code, pushes are rejected with 400 in whichever direction is mismatched,

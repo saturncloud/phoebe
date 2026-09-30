@@ -46,11 +46,11 @@ func TestPostgresStore_UpsertSQL(t *testing.T) {
 		"INSERT INTO billing_event (request_id, client_request_id, auth_id, user_id, group_id, resource_id, resource_type, org_id, model, base_model, adapter, serving_mode, prompt_tokens, cached_tokens, completion_tokens, finish_reason, gpu_type, aborted, usage_found, status_code, streamed, graph_k8s_name, event_ts) VALUES",
 	)).
 		WithArgs(
-			// row 1 (org_id + base_model + serving_mode NULL: a pre-cutover-shaped event with
-			// no org header and no derived_from; the drainer stores what it was given)
-			"req-1", "logical-1", "auth-1", nil, nil, nil, nil, nil, "m1", nil, nil, nil, 5, 0, 7, nil, nil, false, false, nil, false, nil, time.UnixMilli(ts).UTC(),
+			// row 1 (org_id + base_model NULL: a pre-cutover-shaped event with no org
+			// header and no derived_from; its empty serving_mode stores as "dedicated")
+			"req-1", "logical-1", "auth-1", nil, nil, nil, nil, nil, "m1", nil, nil, "dedicated", 5, 0, 7, nil, nil, false, false, nil, false, nil, time.UnixMilli(ts).UTC(),
 			// row 2 (no identity, no timestamp → event_ts NULL)
-			"req-2", nil, nil, nil, nil, nil, nil, nil, "m2", nil, nil, nil, 0, 0, 0, nil, nil, false, false, nil, false, nil, nil,
+			"req-2", nil, nil, nil, nil, nil, nil, nil, "m2", nil, nil, "dedicated", 0, 0, 0, nil, nil, false, false, nil, false, nil, nil,
 		).
 		WillReturnResult(sqlmock.NewResult(0, 2))
 	mock.ExpectCommit()
@@ -123,11 +123,11 @@ func TestPostgresStore_EmptyModelStoredAsNull(t *testing.T) {
 	mock.ExpectExec("INSERT INTO billing_event").
 		WithArgs(
 			"req-no-model", nil, "auth-1", nil, nil, nil, nil,
-			nil, // org_id: "" must bind NULL
-			nil, // model: "" must bind NULL
-			nil, // base_model: "" must bind NULL
-			nil, // adapter: "" must bind NULL
-			nil, // serving_mode: "" must bind NULL (missing evidence; the rater withholds it)
+			nil,         // org_id: "" must bind NULL
+			nil,         // model: "" must bind NULL
+			nil,         // base_model: "" must bind NULL
+			nil,         // adapter: "" must bind NULL
+			"dedicated", // serving_mode: "" is a pre-cutover event, which was dedicated
 			1, 0, 2, nil, nil, false, false, nil, false,
 			nil, // graph_k8s_name: "" must bind NULL
 			nil,
@@ -191,11 +191,6 @@ func TestEventArgs_NullsEmptyIdentities(t *testing.T) {
 	if args[9] != nil {
 		t.Fatalf("base_model arg = %v, want nil for empty BaseModel", args[9])
 	}
-	// serving_mode is index 10 (model=7, base_model=8, adapter=9, serving_mode=10) —
-	// nil for empty (only possible on pre-cutover events; the rater withholds NULL).
-	if args[11] != nil {
-		t.Fatalf("serving_mode arg = %v, want nil for empty ServingMode", args[11])
-	}
 	// prompt_tokens is index 11 (…base_model=8, adapter=9, serving_mode=10) — int, not nil.
 	if args[12] != 3 {
 		t.Fatalf("prompt_tokens arg = %v, want 3", args[12])
@@ -211,5 +206,30 @@ func TestEventArgs_NullsEmptyIdentities(t *testing.T) {
 	withOrg := eventArgs(metering.Event{RequestID: "r", Model: "m", OrgID: "org-xyz"})
 	if withOrg[7] != "org-xyz" {
 		t.Fatalf("org_id arg = %v, want \"org-xyz\" (a non-empty OrgID must bind through)", withOrg[7])
+	}
+}
+
+// TestEventArgs_PreCutoverEmptyServingModeStoredAsDedicated pins the replay
+// rule for spooled or queued pre-cutover events: an empty serving_mode binds as
+// "dedicated" (all pre-cutover traffic was dedicated, the same rule as
+// migration 0007 and recovery), a known mode binds verbatim, and an unknown
+// value is stored as captured so the rater still withholds it.
+func TestEventArgs_PreCutoverEmptyServingModeStoredAsDedicated(t *testing.T) {
+	const servingModeIdx = 11 // request_id..adapter is 11 columns; serving_mode is next.
+
+	cases := []struct {
+		in   string
+		want any
+	}{
+		{"", "dedicated"},
+		{"dedicated", "dedicated"},
+		{"shared", "shared"},
+		{"bogus", "bogus"},
+	}
+	for _, tc := range cases {
+		args := eventArgs(metering.Event{RequestID: "r", Model: "m", ServingMode: tc.in})
+		if args[servingModeIdx] != tc.want {
+			t.Fatalf("serving_mode arg for %q = %v, want %v", tc.in, args[servingModeIdx], tc.want)
+		}
 	}
 }

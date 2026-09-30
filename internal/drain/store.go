@@ -13,6 +13,7 @@ import (
 	// database/sql API.
 	_ "github.com/jackc/pgx/v5/stdlib"
 
+	"github.com/saturncloud/phoebe/internal/identity"
 	"github.com/saturncloud/phoebe/internal/metering"
 )
 
@@ -205,11 +206,15 @@ func eventArgs(e metering.Event) []any {
 		nullStr(e.BaseModel),
 		nullStr(e.Adapter),
 		// ServingMode is "dedicated" or "shared" (the proxy refuses anything else).
-		// nullStr keeps an empty value — only possible on an event metered before
-		// the serving-mode cutover — as NULL, which the rater withholds from money
-		// and counts as an invalid serving mode. billing_event is the evidence
-		// ledger, so it has no CHECK here: the value is stored as captured.
-		nullStr(e.ServingMode),
+		// An empty value can only come from an event metered before the
+		// serving-mode cutover (the field was omitempty and dedicated was the
+		// empty value) and replayed later from an on-disk spool or the drain
+		// queue. All pre-cutover traffic was dedicated (ledger item 6; the same
+		// rule migration 0007 and recovery.go apply), so it is stored as
+		// "dedicated" rather than NULL. Any other value is stored as captured:
+		// billing_event is the evidence ledger with no CHECK here, and the rater
+		// still withholds an unknown value as an invalid serving mode.
+		servingModeArg(e.ServingMode),
 		e.PromptTokens,
 		e.CachedTokens,
 		e.CompletionTokens,
@@ -228,6 +233,17 @@ func eventArgs(e metering.Event) []any {
 		nullStr(e.GraphK8sName),
 		eventTS,
 	}
+}
+
+// servingModeArg maps the empty serving mode of a pre-cutover event to
+// "dedicated" (all pre-cutover traffic was dedicated) and passes every other
+// value through unchanged, so an unknown value still reaches the rater's
+// invalid-serving-mode withholding.
+func servingModeArg(mode string) any {
+	if mode == "" {
+		return identity.ServingModeDedicated
+	}
+	return mode
 }
 
 // nullStr returns a driver NULL for "" and the string otherwise.
