@@ -238,7 +238,39 @@ func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request) {
 	// (403/400/404/503, generic bodies) and has then already written the
 	// response. Non-gateway requests skip this entirely — today's header-routed
 	// behavior, byte for byte.
+	// Authorize on a CANONICAL path only. The gates below decide on the decoded
+	// path while the reverse proxy forwards the raw target, so a request whose
+	// raw target is not byte-identical to its decoded form is refused outright
+	// rather than authorized as one string and forwarded as another (see
+	// canonicalRequestPath).
+	routePath, pathCanonical := canonicalRequestPath(r.URL)
+
 	if id.Gateway {
+		if !pathCanonical || !gatewayRequestAllowed(r.Method, routePath) {
+			s.log.Warn.Printf("gateway: refusing route outside public inference surface method=%s raw_path=%q canonical=%v org_id=%q",
+				r.Method, r.URL.RawPath, pathCanonical, id.OrgID)
+			http.Error(w, "not found", http.StatusNotFound)
+			return
+		}
+		// Preflight is answered LOCALLY: phoebe writes 204 and no OPTIONS is
+		// ever forwarded, so no Dynamo response data (Allow enumeration, body,
+		// extension headers) can reach the caller through this method.
+		//
+		// Phoebe deliberately emits NO Access-Control-* headers here. Browser-
+		// origin clients are NOT a supported gateway client — Atlas proxies
+		// them server-side (pdc/managers/token_factory.py proxy_inference_chat)
+		// — so the 204 exists only so a preflight does not 404. Emitting a
+		// permissive allow-origin would be a security-posture change and is
+		// deliberately not made here. TestGatewayPreflightEmitsNoCORSHeaders
+		// pins the non-support so it stays a decision rather than an accident.
+		if r.Method == http.MethodOptions {
+			if id.OrgID == "" {
+				http.Error(w, "forbidden", http.StatusForbidden)
+				return
+			}
+			w.WriteHeader(http.StatusNoContent)
+			return
+		}
 		if !s.resolveGateway(w, r, &id) {
 			return
 		}
@@ -337,15 +369,23 @@ func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	// SHARED-MODE MODEL BINDING (security crux): assert the request-body `model=`
+	// SUBDOMAIN ROUTE AND MODEL BINDING: first restrict the resource URL to the
+	// explicit public inference surface, then assert the request-body `model=`
 	// is one the subdomain-authorized resource may serve, fail closed on mismatch.
 	// atlas-auth authorized the caller for this subdomain/resource; Dynamo routes
-	// on the body `model=` and a shared graph fronts many tenants behind one
-	// upstream — so bind the two or a caller could send `model=<someone-else's>`
-	// and be served it. Only enforced when Atlas injected an allow-list
-	// (X-Saturn-Served-Model); dedicated single-model routes carry none and skip
-	// this at zero cost. Runs BEFORE forwarding so a bad model never reaches the
-	// engine. Reads the body once and restores it for forceIncludeUsage.
+	// on the body `model=` and both shared and dedicated graphs can front several
+	// served names behind one upstream. The route gate runs for EVERY
+	// header-routed request — an allow-listed route gets the full bound surface
+	// (boundRequestAllowed), a route with NO injected allow-list gets only the
+	// meterable inference POST surface (unboundRequestAllowed), and a shared
+	// route with no allow-list is refused outright (nothing binds model=, so any
+	// model on the shared graph would be reachable), and a route whose trusted
+	// serving-mode header is anything but "", "dedicated", or "shared" (a
+	// producer-side bug; the header is read verbatim, never normalized) is
+	// likewise refused outright — no branch below may guess what a malformed
+	// mode meant. Runs BEFORE
+	// forwarding so a bad route never reaches the engine. Reads the body once and
+	// restores it for forceIncludeUsage.
 	//
 	// GATEWAY requests skip this check — THE PATHS DIVERGE HERE: on the
 	// subdomain path Atlas authorizes a resource and injects its allow-list,
@@ -354,22 +394,63 @@ func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request) {
 	// THE ORG, so resolution IS the binding (id.ServedModel was set FROM the
 	// resolved request model; re-checking it against itself would be a
 	// tautology).
-	// NOTE: the binding check's singular matched model is deliberately discarded.
-	// It existed so wake readiness could match /v1/models EXACTLY (id.ServedModel
-	// may be a comma-separated allow-list, which no /v1/models entry can equal).
-	// serveWithWake no longer polls /v1/models -- it probes for a cold response
-	// and retries -- so there is nothing left that needs the singular value.
-	if id.ServedModel != "" && !id.Gateway {
+	if !id.Gateway {
+		allowed := pathCanonical
+		switch {
+		case !validTrustedServingMode(id.ServingMode):
+			// Malformed serving mode (an Atlas producer bug — the header is read
+			// verbatim, never normalized). Refuse with the same generic 404 as
+			// every other unauthorized route: falling through to the dedicated
+			// branch would forward the inference POST surface to a possibly
+			// shared graph with no model binding, and with an allow-list present
+			// the shared policy below would still be skipped. Guessing the
+			// intended mode from a malformed value is exactly the fail-open this
+			// gate exists to prevent.
+			allowed = false
+		case id.ServedModel != "":
+			allowed = allowed && boundRequestAllowed(r.Method, routePath, id.ServedModel)
+		case id.ServingMode == "shared":
+			// Shared route with no injected allow-list: there is nothing to
+			// bind the request-body model= against, so model= could select any
+			// tenant's model on the shared graph. A real shared route always
+			// carries the header (identity.HeaderServedModel) — absent means
+			// misconfiguration, and misconfiguration fails closed.
+			allowed = false
+		default:
+			// Dedicated route with no injected allow-list (legacy/unconfigured).
+			// Escalation 4 (PR #50): it must not forward Dynamo's graph-wide
+			// surfaces — the unfiltered model list, graph-wide readiness,
+			// metrics, docs — which is exactly the disclosure the bound-route
+			// machinery closes. Only the inference POST surface (and the local
+			// preflight that precedes it) stays reachable; Atlas's middleware
+			// injecting the header restores the full bound surface.
+			allowed = allowed && unboundRequestAllowed(r.Method, routePath)
+		}
+		if !allowed {
+			s.log.Warn.Printf("model-binding: refused request_id=%s resource_id=%s raw_path=%q canonical=%v serving_mode=%q (route not authorized for resource)",
+				requestID, id.ResourceID, r.URL.RawPath, pathCanonical, id.ServingMode)
+			http.Error(w, "not found", http.StatusNotFound)
+			return
+		}
+	}
+	// Bound-route preflight is answered LOCALLY, mirroring the gateway branch
+	// above: OPTIONS is never forwarded, so Dynamo's graph-wide admin surface
+	// cannot answer a preflight with an Allow enumeration or a body. This sits
+	// AFTER the route gate, so an unauthorized path still 404s rather than
+	// getting a 204. It is NOT gated on ServedModel != "" — a route with no
+	// injected allow-list must not forward OPTIONS either.
+	if !id.Gateway && r.Method == http.MethodOptions {
+		w.WriteHeader(http.StatusNoContent)
+		return
+	}
+	if id.ServedModel != "" && !id.Gateway && r.Method == "POST" {
 		body, rerr := readAndRestoreBody(r)
 		if rerr != nil {
 			s.log.Error.Printf("model-binding: read request body: %v", rerr)
 			http.Error(w, "bad request body", http.StatusBadRequest)
 			return
 		}
-		// The second return is the singular matched model; see the note above
-		// for why nothing consumes it any more.
-		result, _ := checkModelBinding(body, id.ServedModel)
-		switch result {
+		switch checkModelBinding(body, id.ServedModel) {
 		case bindingMismatch, bindingUnparseable:
 			// Fail closed: the request names a model this resource is not
 			// authorized to serve (or one we cannot verify). Log with the
@@ -382,14 +463,19 @@ func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request) {
 		case bindingOK:
 		}
 	}
-
 	// SHARED REQUEST POLICY + DISTRIBUTED ADMISSION. Trusted Dynamo hints and
-	// cache isolation are enforced for every shared request, even during an
-	// admission rollout with the distributed gate disabled; otherwise a client
-	// could self-promote precisely while the rollout switch is off. Dedicated
+	// cache isolation are enforced for every shared request ON THE MODEL-BEARING
+	// INFERENCE SURFACE — the block reserves output tokens against a body model=
+	// and rewrites the body, both meaningless for a GET/HEAD. Shared GET/HEAD
+	// control routes (/health, /live, /v1/models[/<id>], authorized by the route
+	// gate above) fall through to the normal forward, where the readiness
+	// sanitizer and model-list filters below apply. Scoping is fail-safe even
+	// during an admission rollout with the distributed gate disabled: a client
+	// could not self-promote precisely while the rollout switch is off, because
+	// every model-bearing shared route still passes through here. Dedicated
 	// endpoints own their engine and bypass both shared-pool mechanisms.
 	var admitted *admission.Lease
-	if id.ServingMode == "shared" {
+	if id.ServingMode == "shared" && inferenceRequestPathAllowed(routePath) {
 		rateLimits, rerr := parseTrustedRateLimits(id)
 		if rerr != nil {
 			s.log.Error.Printf("admission: invalid trusted rate-limit policy: %v", rerr)
@@ -474,7 +560,6 @@ func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request) {
 			}()
 		}
 	}
-
 	// Force streaming usage so we never under-bill a streamed response.
 	if err := forceIncludeUsage(r); err != nil {
 		s.log.Error.Printf("rewrite request body: %v", err)
@@ -487,8 +572,14 @@ func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request) {
 	// the inference POST. Regardless of wake success or failure, the normal path
 	// below forwards the customer's POST at most once and meters its honest
 	// response. No inference response is ever discarded and replayed.
-	if s.wakeEnabled(id) {
-		if served := s.serveWithWake(w, r, upstream, id, requestID, admitted); served {
+	//
+	// Wake is attempted ONLY for the model-bearing inference surface: a cold
+	// control probe (GET /health, /v1/models on a bound shared route) must not
+	// trigger a 0->1 scale — the probe gets the honest cold response and the
+	// sanitizers reduce it, while a monitoring loop could otherwise hold a
+	// bounded wake on every check.
+	if s.wakeEnabled(id) && inferenceRequestPathAllowed(routePath) {
+		if served := s.serveWithWake(w, r, upstream, id, requestID, clientRequestID, admitted); served {
 			return
 		}
 	}
@@ -502,6 +593,52 @@ func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request) {
 	rp.FlushInterval = -1
 
 	rp.ModifyResponse = func(resp *http.Response) error {
+		// Dynamo's model-list endpoint is graph-wide. A dedicated subdomain is
+		// deployment-scoped, so expose only the served name Atlas authorized for
+		// this route; otherwise endpoint A could enumerate attached endpoint B.
+		// The authorized /v1/models/<id> subtree gets the same treatment per
+		// object: the route gate already authorized <id> against the allow-list,
+		// and the response is rebuilt as that single model — a graph-wide list,
+		// a sibling object, or an ambiguous body fails the response closed
+		// (ErrorHandler's raw reconciliation row) rather than disclose siblings.
+		if id.ServedModel != "" && !id.Gateway {
+			switch {
+			case routePath == "/v1/models":
+				switch r.Method {
+				case http.MethodGet:
+					if err := filterModelListResponse(resp, id.ServedModel); err != nil {
+						return fmt.Errorf("filter model list: %w", err)
+					}
+				case http.MethodHead:
+					sanitizeModelListHeadResponse(resp)
+				}
+			case strings.HasPrefix(routePath, "/v1/models/"):
+				switch r.Method {
+				case http.MethodGet:
+					if err := filterSingleModelResponse(resp, strings.TrimPrefix(routePath, "/v1/models/"), id.ServedModel); err != nil {
+						return fmt.Errorf("filter model metadata: %w", err)
+					}
+				case http.MethodHead:
+					sanitizeModelListHeadResponse(resp)
+				}
+			}
+		}
+
+		// Dynamo's readiness endpoints are graph-wide too: they enumerate the
+		// component/worker/model instances of the WHOLE graph, i.e. sibling
+		// tenants' attached adapters. Allowlisting /health and /live for a
+		// deployment-scoped subdomain would re-open through readiness exactly
+		// the enumeration the model-list filter above closes, so their payload
+		// is replaced with a status-only document. The status CODE is preserved,
+		// so liveness stays truthful.
+		if id.ServedModel != "" && !id.Gateway &&
+			(routePath == "/health" || routePath == "/live") &&
+			(r.Method == http.MethodGet || r.Method == http.MethodHead) {
+			if err := sanitizeReadinessResponse(resp, r.Method == http.MethodHead); err != nil {
+				return fmt.Errorf("sanitize readiness: %w", err)
+			}
+		}
+
 		// Echo the request id to the client (Set, not Add, so an upstream echo
 		// can't duplicate it) — with a generated id this is the client's only
 		// handle for correlating a support question to its billing record.
@@ -608,14 +745,38 @@ func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request) {
 // pre-header abort uses the same always-record contract as every other abort.
 //
 // Invariant: every request past the billing-identity gate emits exactly one
-// attributable event — real usage on completion, or a zero-token Aborted event on
-// disconnect (pre- OR post-header).
+// attributable event — real usage on completion, a zero-token Aborted event on
+// disconnect (pre- OR post-header), or a zero-token raw row (UsageFound=false)
+// on any other failure: a RoundTrip/ModifyResponse fault (502) or a mid-flight
+// admission lease-renewal loss that cancelled the upstream attempt (503, the
+// admission-cause branch above).
 //
-// NO double-emit: in phoebe ModifyResponse always returns nil, so ErrorHandler
-// fires ONLY on a RoundTrip error (pre-header) — mutually exclusive with the
-// onDone path (post-header), which needs ModifyResponse to have run. The emit is
-// gated on isClientAbort, so a genuine upstream/ModifyResponse fault never writes
-// a bogus zero-token billing row. The context is decoupled from the cancelled
+// NO double-emit. ErrorHandler fires on TWO paths, not one:
+//
+//	(a) a RoundTrip error — pre-header, no response was ever received;
+//	(b) a ModifyResponse error — filterModelListResponse /
+//	    filterSingleModelResponse / sanitizeReadinessResponse can fail on a
+//	    malformed, oversized, duplicate-id or unsupported-encoding upstream
+//	    response.
+//
+// Neither can double-emit or double-release, for a structural reason: every
+// ModifyResponse error return happens BEFORE `resp.Body = cr` installs the
+// captureReader, so onDone is never registered on those paths and cannot fire.
+// Exactly one row is written on every exit: the abort branch emits
+// Aborted=true, the admission-cause branch emits the raw row at 503, and any
+// other fault (RoundTrip OR ModifyResponse) falls through to the raw
+// reconciliation row below (Aborted=false, UsageFound=false, StatusCode=502) —
+// the merged billing contract (#48): every forwarded attempt is recorded
+// exactly once, failures included, at $0. httputil also calls ErrorHandler
+// before any response header reaches the client on both paths, so the
+// w.Header().Set(requestIDHeader, ...) + http.Error below is still a
+// pre-header write.
+//
+// WARNING: any future ModifyResponse error return placed AFTER the captureReader
+// is installed would break this — onDone would then be armed and would emit a
+// second event. Such a change must disarm onDone first.
+//
+// The context is decoupled from the cancelled
 // client ctx (WithoutCancel) — the abort is precisely WHY we are here, so a
 // cancelled ctx must not be able to drop the emit (mirrors onDone).
 // errorHandler takes BOTH the untrusted client correlation id and the admission
@@ -632,6 +793,18 @@ func (s *Server) errorHandler(upstream string, id identity.Identity, requestID, 
 			}
 		}
 		if cause := context.Cause(r.Context()); errors.Is(cause, admission.ErrUnavailable) {
+			// Mid-flight lease-renewal loss: the distributed authority can no
+			// longer prove this request owns capacity, so the proxy cancelled the
+			// in-flight upstream attempt. ModifyResponse never ran, so onDone was
+			// never armed — without an emit here this attempt would be the one
+			// ErrorHandler exit with NO metering row. Record exactly one raw
+			// reconciliation row (Aborted=false, UsageFound=false) at the actual
+			// terminal status (503 — the cause is always ErrUnavailable-flavoured
+			// here, never a contractual Rejected), matching the 502 branch below:
+			// every forwarded attempt is visible to billing exactly once.
+			w.Header().Set("X-Request-Id", requestID)
+			s.emit(context.WithoutCancel(r.Context()), id, requestID, clientRequestID,
+				http.StatusServiceUnavailable, capture.Result{UsageFound: false})
 			s.writeAdmissionError(w, cause)
 			return
 		}
@@ -644,7 +817,7 @@ func (s *Server) errorHandler(upstream string, id identity.Identity, requestID, 
 			s.emit(ctx, id, requestID, clientRequestID, 499, capture.Result{Aborted: true, UsageFound: false})
 			return
 		}
-		s.log.Error.Printf("upstream %s error: %v", upstream, err)
+		s.log.Error.Printf("upstream %s error: %v (request_id=%s)", upstream, err, requestID)
 		// A transport failure is still a real execution attempt. Persist a zero-
 		// token raw row with UsageFound=false so reconciliation can distinguish it
 		// from a legitimate zero-token completion. Rating naturally charges $0.

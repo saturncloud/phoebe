@@ -285,3 +285,46 @@ func TestRegistry_InvalidRowsSkippedNeverServed(t *testing.T) {
 		t.Fatal("row broken by update must be de-indexed")
 	}
 }
+
+// serving_mode is REQUIRED and load-bearing: phoebe derives the SKU price row,
+// the shared admission gate, and wake-from-zero eligibility
+// (proxy.isWakeable, which requires ServingMode=="shared") from it. A blank or
+// unrecognized value must never enter the index — it would silently price as
+// dedicated and silently lose wake-from-zero. Reject the ConfigMap instead.
+func TestParseRegistryConfigMap_ServingModeRequired(t *testing.T) {
+	for _, tc := range []struct {
+		name        string
+		servingMode string
+		wantErr     bool
+	}{
+		{"shared accepted", "shared", false},
+		{"dedicated accepted", "dedicated", false},
+		{"empty rejected", "", true},
+		{"bogus rejected", "bogus", true},
+		{"case sensitive", "Shared", true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			cm := registryCM("tf-model-mode", nil)
+			cm.Data["serving_mode"] = tc.servingMode
+			_, _, err := parseRegistryConfigMap(cm)
+			if tc.wantErr && err == nil {
+				t.Fatalf("serving_mode %q must be rejected", tc.servingMode)
+			}
+			if !tc.wantErr && err != nil {
+				t.Fatalf("serving_mode %q must be accepted: %v", tc.servingMode, err)
+			}
+		})
+	}
+}
+
+// A live row whose serving_mode is blanked by an update must be de-indexed, so
+// a mode-less row can never be resolved and served.
+func TestRegistry_BlankServingModeRowNeverServed(t *testing.T) {
+	cm := registryCM("tf-model-modeless", nil)
+	cm.Data["serving_mode"] = ""
+	r, _, _ := startedRegistry(t, cm)
+
+	if _, err := r.Resolve(context.Background(), "org-1", "support-bot"); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("blank serving_mode row err = %v, want ErrNotFound (never indexed)", err)
+	}
+}
