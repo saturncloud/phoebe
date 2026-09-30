@@ -538,15 +538,16 @@ func TestGateway_WakeEligible(t *testing.T) {
 	}
 }
 
-// TestGateway_ResolutionWithEmptyServingModeRefusedAtGate proves the proxy's
+// TestGateway_ResolutionWithoutLegalServingModeRefusedAtGate proves the proxy's
 // serving-mode gate refuses a resolved identity that carries no legal serving
 // mode. A resolver hands back a Resolution whose ServingMode is empty or not
-// "shared"/"dedicated"; the request must get 400 before anything else runs:
+// "shared"/"dedicated"; the request must get 503 (a resolver-side fault, per
+// phoebe#50) before anything else runs:
 // the upstream is never reached, the waker is never called, and nothing is
 // metered. The gateway path gets no absent-means-dedicated default. (Rejecting
 // such rows when the registry ConfigMap is indexed is covered separately by
 // TestRegistry_InvalidServingModeRejectedAtIndex.)
-func TestGateway_ResolutionWithEmptyServingModeRefusedAtGate(t *testing.T) {
+func TestGateway_ResolutionWithoutLegalServingModeRefusedAtGate(t *testing.T) {
 	for _, tc := range []struct {
 		name string
 		mode string

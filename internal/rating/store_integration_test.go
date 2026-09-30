@@ -2534,7 +2534,7 @@ func TestIntegration_MigrationsCreateOrgGrainViewWithoutReplacement(t *testing.T
 // REACHABILITY: serving_mode is a deploy-time property (a tf_model column, or the
 // anti-spoof X-Saturn-Serving-Mode header), so it cannot vary per request. But it CAN
 // change across an hour: Atlas flipping a deployment's mode, or the header rollout
-// landing mid-hour — an ABSENT header reads as dedicated, so pre-rollout events on an
+// landing mid-hour — an ABSENT header (header-routed path only) reads as dedicated, so pre-rollout events on an
 // already-shared deployment price as dedicated. That is the scenario seeded below.
 //
 // WHAT THIS PINS: one resource, one model, one hour, both modes → TWO rollups, each
