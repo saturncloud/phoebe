@@ -328,23 +328,43 @@ func writeEvidence(t *testing.T, content string) string {
 }
 
 // TestDecodeEvent_PreCutoverEvidenceReplaysAsDedicated: a record predating the
-// 2026-09-29 serving-mode cutover has no serving_mode key (or an empty one). All
-// pre-cutover traffic was dedicated (Hugo, 2026-09-30), so it replays as
+// 2026-09-29 serving-mode cutover has no serving_mode key (the field was
+// omitempty, so the pre-cutover producer never wrote it for dedicated traffic).
+// All pre-cutover traffic was dedicated (Hugo, 2026-09-30), so it replays as
 // "dedicated" — the same rule migration 0007 applied to billing_event — instead of
 // being stored NULL and withheld by the rater.
 func TestDecodeEvent_PreCutoverEvidenceReplaysAsDedicated(t *testing.T) {
-	absent := `{"request_id":"req-legacy","auth_id":"auth-1","prompt_tokens":10,` +
+	rec := `{"request_id":"req-legacy","auth_id":"auth-1","prompt_tokens":10,` +
 		`"completion_tokens":5,"usage_found":true,"timestamp_unix_ms":1750000000000}`
-	empty := `{"request_id":"req-legacy-2","auth_id":"auth-1","prompt_tokens":10,` +
-		`"completion_tokens":5,"usage_found":true,"serving_mode":"","timestamp_unix_ms":1750000000000}`
-	for _, rec := range []string{absent, empty} {
+	ev, err := decodeEvent([]byte(rec))
+	if err != nil || ev.ServingMode != "dedicated" {
+		t.Fatalf("decodeEvent(%s) = (%q, %v), want serving_mode dedicated", rec, ev.ServingMode, err)
+	}
+	evidence, err := Load(writeEvidence(t, rec))
+	if err != nil || len(evidence.Events) != 1 || evidence.Events[0].ServingMode != "dedicated" {
+		t.Fatalf("Load(%s) = (%+v, %v), want one dedicated event", rec, evidence, err)
+	}
+}
+
+// TestDecodeEvent_ExplicitEmptyOrNullServingModeRefused: only an ABSENT key is
+// pre-cutover evidence. An explicit "" or null can only come from a post-cutover
+// producer bug (the pre-cutover field was omitempty), so it must not be silently
+// replayed and billed as dedicated; validate() refuses it, naming the field.
+func TestDecodeEvent_ExplicitEmptyOrNullServingModeRefused(t *testing.T) {
+	for _, mode := range []string{`""`, `null`} {
+		rec := `{"request_id":"req-empty-mode","auth_id":"auth-1","prompt_tokens":10,` +
+			`"completion_tokens":5,"usage_found":true,"serving_mode":` + mode +
+			`,"timestamp_unix_ms":1750000000000}`
 		ev, err := decodeEvent([]byte(rec))
-		if err != nil || ev.ServingMode != "dedicated" {
-			t.Fatalf("decodeEvent(%s) = (%q, %v), want serving_mode dedicated", rec, ev.ServingMode, err)
+		if err != nil {
+			t.Fatalf("decodeEvent(%s) unexpected decode error: %v", rec, err)
 		}
-		evidence, err := Load(writeEvidence(t, rec))
-		if err != nil || len(evidence.Events) != 1 || evidence.Events[0].ServingMode != "dedicated" {
-			t.Fatalf("Load(%s) = (%+v, %v), want one dedicated event", rec, evidence, err)
+		if ev.ServingMode != "" {
+			t.Fatalf("decodeEvent(%s) serving_mode = %q, want it left empty (not defaulted)", rec, ev.ServingMode)
+		}
+		_, err = Load(writeEvidence(t, rec))
+		if err == nil || !strings.Contains(err.Error(), "serving_mode") {
+			t.Fatalf("serving_mode %s must be refused, naming the field; got %v", mode, err)
 		}
 	}
 }
@@ -388,9 +408,10 @@ func TestDecodeEvent_InvalidServingModeRefused(t *testing.T) {
 	}
 }
 
-// TestDecodeEvent_ExplicitDedicatedAccepted: the refusal targets absent or invalid
-// modes only; both explicit modes replay and keep their value.
-func TestDecodeEvent_ExplicitDedicatedAccepted(t *testing.T) {
+// TestDecodeEvent_ExplicitSharedAndDedicatedKeepTheirValue: an explicit valid mode
+// (shared or dedicated) replays unchanged. Only an absent key maps to dedicated;
+// an explicit empty, null or otherwise invalid value is refused.
+func TestDecodeEvent_ExplicitSharedAndDedicatedKeepTheirValue(t *testing.T) {
 	for _, mode := range []string{"dedicated", "shared"} {
 		ev := testEvent("req-" + mode)
 		ev.ServingMode = mode

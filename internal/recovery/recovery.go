@@ -254,10 +254,13 @@ func decodeEvent(data []byte) (metering.Event, error) {
 	// serving_mode (the field was omitempty and dedicated was the empty value).
 	// All of that traffic was dedicated (Hugo, 2026-09-30: "assume it's all
 	// dedicated (which is true)"), the same rule migration 0007 applied to
-	// billing_event, so it replays as "dedicated". Post-cutover evidence always
-	// carries an explicit value, and validate() still refuses anything that is
-	// not shared or dedicated.
-	if _, ok := probe["serving_mode"]; !ok || ev.ServingMode == "" {
+	// billing_event, so it replays as "dedicated". Only an ABSENT key gets this
+	// mapping: the pre-cutover producer never wrote the key when the mode was
+	// empty, and post-cutover evidence always carries an explicit value. An
+	// explicit "" or null (which decodes to "") is therefore a producer bug, not
+	// pre-cutover evidence, and validate() refuses it like any other value that
+	// is not shared or dedicated.
+	if _, ok := probe["serving_mode"]; !ok {
 		ev.ServingMode = identity.ServingModeDedicated
 	}
 	return ev, nil
@@ -316,7 +319,8 @@ func validate(ev metering.Event) error {
 	}
 	// Any serving_mode other than shared or dedicated would be withheld from money
 	// by the rater, so it is refused here rather than replayed as unbillable.
-	// (decodeEvent has already mapped absent/"" pre-cutover evidence to dedicated.)
+	// (decodeEvent has already mapped an absent key, i.e. pre-cutover evidence, to
+	// dedicated; an explicit "" or null reaches this check and is refused.)
 	if !identity.ValidServingMode(ev.ServingMode) {
 		return fmt.Errorf("serving_mode %q is not shared or dedicated; "+
 			"refusing to replay it as unbillable — assert shared|dedicated and re-import", ev.ServingMode)
