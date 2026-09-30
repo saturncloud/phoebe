@@ -2,10 +2,13 @@ package rating
 
 import (
 	"context"
+	"fmt"
 	"strings"
 	"testing"
 
 	"github.com/DATA-DOG/go-sqlmock"
+
+	"github.com/saturncloud/phoebe/internal/identity"
 )
 
 // TestPostgresStore_RateWindowSQL asserts the rate-and-sum flow: it projects the
@@ -218,8 +221,12 @@ func TestRateWindowSQL_Shape(t *testing.T) {
 		// SERVING MODE (2026-09-29 ruling): only 'shared'/'dedicated' reach money. The
 		// validity flag is computed once, the per-event drop sits in grouped's WHERE
 		// right before GROUP BY, the grain key is carried verbatim (no COALESCE to ''),
-		// and the withheld events are counted in their own exclusive bucket.
-		"COALESCE(serving_mode IN ('shared', 'dedicated'), false) AS valid_serving_mode",
+		// and the withheld events are counted in their own exclusive bucket. The SQL
+		// literals are built from identity's constants — the ONE definition of the
+		// serving-mode vocabulary the proxy gate and the Go oracle also use — so a
+		// vocabulary change that misses the SQL fails here.
+		fmt.Sprintf("COALESCE(serving_mode IN ('%s', '%s'), false) AS valid_serving_mode", identity.ServingModeShared, identity.ServingModeDedicated),
+		fmt.Sprintf("CASE WHEN serving_mode = '%s' THEN '%s' || base_model ELSE base_model END", identity.ServingModeShared, sharedPrefix),
 		"      AND valid_serving_mode\n    GROUP BY auth_id, owner_type, owner_id, resource_id, model_id, serving_mode,",
 		"        ev.serving_mode,\n        ev.valid_serving_mode,",
 		"WHERE NOT valid_serving_mode\n        AND usage_found\n        AND valid_usage\n        AND auth_id     IS NOT NULL\n        AND resource_id IS NOT NULL\n        AND model_id    IS NOT NULL)                        AS invalid_serving_mode_events",

@@ -7,6 +7,8 @@ import (
 	"strings"
 
 	"gopkg.in/yaml.v2"
+
+	"github.com/saturncloud/phoebe/internal/identity"
 )
 
 // fineTunePrefix is the reserved prefix that marks a model_id as a fine-tune
@@ -17,15 +19,14 @@ const fineTunePrefix = "ft:"
 
 // Serving-mode SKU pricing axis (design D1, "Option A" — an OUTER prefix on the
 // price key). A shared base is priced from a `shared:<base>` row; dedicated is
-// the bare `<base>`. servingModeShared and servingModeDedicated are the event's
-// only legal serving_mode values (the 2026-09-29 serving-mode ruling retired the
-// empty string as a spelling of dedicated); sharedPrefix is the key prefix. The
-// price-key grammar itself is unchanged: dedicated rows have no prefix.
-const (
-	servingModeShared    = "shared"
-	servingModeDedicated = "dedicated"
-	sharedPrefix         = "shared:"
-)
+// the bare `<base>`. The event's only legal serving_mode values are defined ONCE,
+// in package identity (identity.ServingModeShared / identity.ServingModeDedicated,
+// checked by identity.ValidServingMode), and are shared with the proxy's billing
+// gate so the oracle and the proxy cannot drift (the 2026-09-29 serving-mode
+// ruling retired the empty string as a spelling of dedicated). sharedPrefix is the
+// key prefix. The price-key grammar itself is unchanged: dedicated rows have no
+// prefix.
+const sharedPrefix = "shared:"
 
 // ErrInvalidServingMode is the fail-closed sentinel for an event whose serving
 // mode is neither "shared" nor "dedicated" (including the pre-cutover empty
@@ -575,7 +576,7 @@ func (pb *PriceBook) ResolveEvent(modelID, baseModel, adapter, servingMode strin
 	// has a direct price: the SQL rater drops such an event per event before
 	// grouping (the serving mode is a grain key, so there is no rollup it could
 	// legally join), and the oracle must agree with it.
-	if servingMode != servingModeShared && servingMode != servingModeDedicated {
+	if !identity.ValidServingMode(servingMode) {
 		return Rate3{}, ErrInvalidServingMode
 	}
 	skuBase := servingModeKey(servingMode, baseModel)
@@ -622,7 +623,7 @@ func (pb *PriceBook) ResolveEvent(modelID, baseModel, adapter, servingMode strin
 // Callers validate the serving mode first (ResolveEvent refuses anything that is
 // not "shared" or "dedicated").
 func servingModeKey(servingMode, base string) string {
-	if servingMode == servingModeShared {
+	if servingMode == identity.ServingModeShared {
 		return sharedPrefix + base
 	}
 	return base
