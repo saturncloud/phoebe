@@ -278,7 +278,7 @@ func (r *Rater) Run(ctx context.Context, windowStart, windowEnd time.Time, windo
 			windowStart.Format(time.RFC3339), windowEnd.Format(time.RFC3339), res.OwnerConflictEvents)
 	}
 	if res.HasInvalidServingMode() {
-		r.log.Error.Printf("rating: window [%s,%s) has %d INVALID-SERVING-MODE events (serving_mode is neither \"shared\" nor \"dedicated\"; NULL is how dedicated was stored before the 2026-09-29 serving-mode cutover) — the serving mode selects the price SKU, so these events are NOT billed. The raw events are retained in billing_event. If the window predates the cutover this is expected staging evidence; otherwise the proxy's serving-mode gate or the served-model registry is broken",
+		r.log.Error.Printf("rating: window [%s,%s) has %d INVALID-SERVING-MODE events (serving_mode is neither \"shared\" nor \"dedicated\"; NULL is how dedicated was stored before the 2026-09-29 serving-mode cutover) — the serving mode selects the price SKU, so these events are NOT billed. The raw events are retained in billing_event. If the window predates the cutover this is expected staging evidence; otherwise the proxy's serving-mode gate or the served-model registry is broken. Per hour and key, billing_reconciliation_hourly.invalid_serving_mode_attempts shows how many attempts this withheld",
 			windowStart.Format(time.RFC3339), windowEnd.Format(time.RFC3339), res.InvalidServingModeEvents)
 	}
 	if res.HasAmbiguousGraph() {

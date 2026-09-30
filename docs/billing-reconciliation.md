@@ -59,6 +59,7 @@ WHERE window_start >= :start AND window_start < :end
   AND (
       missing_usage_attempts <> 0
       OR invalid_usage_attempts <> 0
+      OR invalid_serving_mode_attempts <> 0
       OR missing_org_attempts <> 0
       OR distinct_org_ids > 1
       OR attempt_delta <> missing_usage_attempts
@@ -136,11 +137,9 @@ WITHHELD the events because their serving mode is invalid — the run's
 `billing_event.serving_mode` is NULL, `''` or anything other than `'shared'` or
 `'dedicated'`. Dedicated events stored before migration 0007 look exactly like
 this, so inside a re-rate window that covers pre-cutover hours they are withheld
-on purpose (see "Serving-mode cutover (migration 0007)" below). The view has no
-column for this cause; check it directly for the hour and key with
-`SELECT COUNT(*) FROM billing_event WHERE (serving_mode IS NULL OR serving_mode
-NOT IN ('shared','dedicated')) AND auth_id = … AND resource_id = … AND model = …
-AND event_ts >= <hour> AND event_ts < <hour> + interval '1 hour'`; or (c) the
+on purpose (see "Serving-mode cutover (migration 0007)" below). The view's
+`invalid_serving_mode_attempts` column (added by migration 0007) counts these
+attempts for the hour and key, with the same predicate the rater uses; or (c) the
 rater has not yet run for that hour. Check the rater's run report for the window
 before escalating.
 

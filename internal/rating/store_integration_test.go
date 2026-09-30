@@ -3049,6 +3049,68 @@ func TestIntegration_InvalidServingModeWithheldAndCounted(t *testing.T) {
 	}
 }
 
+// TestIntegration_ReconciliationViewExplainsInvalidServingModeDelta guards the
+// invariant that every attempt the rater withholds for an invalid serving mode is
+// explained by a column of billing_reconciliation_hourly. One NULL-serving-mode
+// attempt (how dedicated was stored before the 2026-09-29 cutover) and one
+// 'dedicated' attempt share an hour and key. The rater bills only the dedicated
+// one, so attempt_delta is 1, and invalid_serving_mode_attempts must be 1 so the
+// operator can see the delta is a deliberate withholding, not lost revenue.
+func TestIntegration_ReconciliationViewExplainsInvalidServingModeDelta(t *testing.T) {
+	dsn := os.Getenv("PHOEBE_TEST_DATABASE_URL")
+	if dsn == "" {
+		t.Skip("PHOEBE_TEST_DATABASE_URL not set; skipping live-Postgres conformance")
+	}
+	ctx := context.Background()
+	db, err := sql.Open("pgx", dsn)
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	defer db.Close()
+	db.SetMaxOpenConns(1)
+
+	const sch = "phoebe_rating_invalid_mode_view_it"
+	exec(t, db, "DROP SCHEMA IF EXISTS "+sch+" CASCADE")
+	exec(t, db, "CREATE SCHEMA "+sch)
+	exec(t, db, "SET search_path TO "+sch)
+	defer func() { exec(t, db, "DROP SCHEMA IF EXISTS "+sch+" CASCADE") }()
+	exec(t, db, ratingSchemaDDL(t))
+
+	hour := mustTime("2026-06-08T10:00:00Z")
+	book := newTestBook(map[string]Rate3{"m": rate3("0.000010", "0", "0")}, nil, PolicyIdentity, Dec{}, Dec{})
+	if _, err := db.ExecContext(ctx,
+		`INSERT INTO billing_event (request_id, auth_id, resource_id, org_id, model, serving_mode, prompt_tokens, completion_tokens, event_ts)
+		 VALUES ('nul', 'a', 'res', 'org-1', 'm', NULL,        100, 0, $1),
+		        ('ded', 'a', 'res', 'org-1', 'm', 'dedicated', 100, 0, $1)`,
+		hour.Add(5*time.Minute)); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+
+	res, err := NewPostgresStore(db).RateWindow(ctx, book, hour, hour.Add(time.Hour))
+	if err != nil {
+		t.Fatalf("RateWindow: %v", err)
+	}
+	if res.EventsRated != 1 || res.InvalidServingModeEvents != 1 {
+		t.Fatalf("rated/invalid-serving-mode = %d/%d, want 1/1", res.EventsRated, res.InvalidServingModeEvents)
+	}
+
+	var invalidMode, delta, missingUsage, invalidUsage, failed int64
+	if err := db.QueryRowContext(ctx, `
+		SELECT invalid_serving_mode_attempts, attempt_delta,
+		       missing_usage_attempts, invalid_usage_attempts, failed_attempts
+		FROM billing_reconciliation_hourly
+		WHERE window_start=$1 AND auth_id='a' AND resource_id='res' AND model_id='m'`, hour).
+		Scan(&invalidMode, &delta, &missingUsage, &invalidUsage, &failed); err != nil {
+		t.Fatalf("read view: %v", err)
+	}
+	if invalidMode != 1 || delta != 1 {
+		t.Fatalf("invalid_serving_mode_attempts/attempt_delta = %d/%d, want 1/1 — the withheld attempt must be explained by the view", invalidMode, delta)
+	}
+	if missingUsage != 0 || invalidUsage != 0 || failed != 0 {
+		t.Fatalf("missing_usage/invalid_usage/failed = %d/%d/%d, want 0/0/0 (only the serving-mode column explains this delta)", missingUsage, invalidUsage, failed)
+	}
+}
+
 // TestIntegration_Migration0007ServingModeExplicit applies the real 0001–0006 DDL,
 // seeds rated_usage the way the pre-0007 rater wrote it, then runs 0007 up and down.
 //
@@ -3179,6 +3241,16 @@ func TestIntegration_Migration0007ServingModeExplicit(t *testing.T) {
 	}
 	if downMode != "" || downID != wantID {
 		t.Fatalf("after down: mode=%q id=%s, want '' with the pre-0007 id %s", downMode, downID, wantID)
+	}
+	// Down restores the 0005 view shape: the 0007 column is gone.
+	var viewCols int64
+	if err := db.QueryRowContext(ctx, `SELECT COUNT(*) FROM information_schema.columns
+		WHERE table_schema=$1 AND table_name='billing_reconciliation_hourly'
+		  AND column_name='invalid_serving_mode_attempts'`, sch).Scan(&viewCols); err != nil {
+		t.Fatalf("inspect view after down: %v", err)
+	}
+	if viewCols != 0 {
+		t.Fatalf("billing_reconciliation_hourly still has invalid_serving_mode_attempts after 0007 down")
 	}
 	// '' is legal again after down.
 	exec(t, db, `INSERT INTO rated_usage
