@@ -249,10 +249,14 @@ saturn-aws-manager replaces the old `''` records for those windows by absence.
 
 **One follow-up step after the rollout.** The migration Job runs before the new
 proxy pods replace the old ones. An old pod still serving during the rollout
-meters dedicated traffic with an empty serving mode. The new drainer stores an
-empty serving mode as `'dedicated'` (all pre-cutover traffic was dedicated), and
-this includes events replayed later from an on-disk spool or the drain queue. An
-old drainer still running during the rollout stores it as NULL, which the new
+meters dedicated traffic with no `serving_mode` key in the event JSON. The new
+drainer stores an event whose `serving_mode` key is ABSENT as `'dedicated'` (all
+pre-cutover traffic was dedicated), and this includes events replayed later from
+an on-disk spool or the drain queue: the new spool reader applies the same rule
+before it re-sends an event. Only an absent key gets this default. A new pod
+always writes the key, so an explicit `"serving_mode":""` or `null` is a producer
+bug; the drainer stores it as `''` and the rater withholds it as
+`invalid_serving_mode_events` instead of billing it as dedicated. An old drainer still running during the rollout stores it as NULL, which the new
 rater withholds as `invalid_serving_mode_events`. Once every interceptor and
 drainer pod runs the new image, run the same idempotent statement again against
 phoebe's database:

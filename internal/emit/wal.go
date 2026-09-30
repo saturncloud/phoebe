@@ -242,8 +242,10 @@ func readLegacyJSONL(path string) ([]metering.Event, error) {
 		// ReadBytes returns whatever it read even on error — a torn final line
 		// (no trailing newline) arrives here alongside io.EOF.
 		if trimmed := bytes.TrimSpace(line); len(trimmed) > 0 {
-			var ev metering.Event
-			if jerr := json.Unmarshal(trimmed, &ev); jerr == nil {
+			// UnmarshalEvent: the event is re-marshaled when shipped, so a
+			// pre-cutover event's absent serving_mode must become "dedicated"
+			// here, before it gains an explicit "".
+			if ev, jerr := metering.UnmarshalEvent(trimmed); jerr == nil {
 				events = append(events, ev)
 			}
 			// Undecodable line (torn or corrupt): skip; don't lose the rest.
@@ -407,8 +409,10 @@ func (w *wal) pending(limit int) (events []metering.Event, through uint64, skipp
 			w.recoverIfCorruptLocked(rerr)
 			return nil, 0, skipped, fmt.Errorf("wal read index %d: %w", i, rerr)
 		}
-		var ev metering.Event
-		if jerr := json.Unmarshal(data, &ev); jerr != nil {
+		// UnmarshalEvent: see readLegacyJSONL. A spool written by a pre-cutover
+		// pod and shipped by a post-cutover pod must keep the dedicated default.
+		ev, jerr := metering.UnmarshalEvent(data)
+		if jerr != nil {
 			skipped++
 			continue
 		}

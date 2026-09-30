@@ -13,7 +13,6 @@ import (
 	// database/sql API.
 	_ "github.com/jackc/pgx/v5/stdlib"
 
-	"github.com/saturncloud/phoebe/internal/identity"
 	"github.com/saturncloud/phoebe/internal/metering"
 )
 
@@ -205,16 +204,15 @@ func eventArgs(e metering.Event) []any {
 		// -braces for a clean column either way.
 		nullStr(e.BaseModel),
 		nullStr(e.Adapter),
-		// ServingMode is "dedicated" or "shared" (the proxy refuses anything else).
-		// An empty value can only come from an event metered before the
-		// serving-mode cutover (the field was omitempty and dedicated was the
-		// empty value) and replayed later from an on-disk spool or the drain
-		// queue. All pre-cutover traffic was dedicated (ledger item 6; the same
-		// rule migration 0007 and recovery.go apply), so it is stored as
-		// "dedicated" rather than NULL. Any other value is stored as captured:
-		// billing_event is the evidence ledger with no CHECK here, and the rater
-		// still withholds an unknown value as an invalid serving mode.
-		servingModeArg(e.ServingMode),
+		// ServingMode is stored exactly as decoded. The pre-cutover default is
+		// applied at decode time, not here: metering.UnmarshalEvent (used by the
+		// drain queue and the on-disk spool) maps only an ABSENT serving_mode key
+		// to "dedicated" (ledger item 6; the same rule as migration 0007 and
+		// recovery.go). An explicit "" from a post-cutover producer is a bug, so
+		// it is stored as '' (not NULL, not 'dedicated') and the rater withholds
+		// it as an invalid serving mode. billing_event is the evidence ledger
+		// with no CHECK here, so any other value is also stored as captured.
+		e.ServingMode,
 		e.PromptTokens,
 		e.CachedTokens,
 		e.CompletionTokens,
@@ -233,17 +231,6 @@ func eventArgs(e metering.Event) []any {
 		nullStr(e.GraphK8sName),
 		eventTS,
 	}
-}
-
-// servingModeArg maps the empty serving mode of a pre-cutover event to
-// "dedicated" (all pre-cutover traffic was dedicated) and passes every other
-// value through unchanged, so an unknown value still reaches the rater's
-// invalid-serving-mode withholding.
-func servingModeArg(mode string) any {
-	if mode == "" {
-		return identity.ServingModeDedicated
-	}
-	return mode
 }
 
 // nullStr returns a driver NULL for "" and the string otherwise.

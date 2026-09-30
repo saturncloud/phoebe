@@ -5,7 +5,9 @@ package metering
 
 import (
 	"context"
+	"encoding/json"
 
+	"github.com/saturncloud/phoebe/internal/identity"
 	"github.com/saturncloud/phoebe/internal/logging"
 )
 
@@ -92,7 +94,9 @@ type Event struct {
 	// axis. The proxy's serving-mode gate guarantees one of the two explicit
 	// values; "shared" prices from the distinct shared:<base> rate row. An empty
 	// value only appears on events metered before the 2026-09-29 serving-mode
-	// cutover (when empty meant dedicated); the rater withholds those from money.
+	// cutover (when empty meant dedicated and the key was omitted). Decode stored
+	// or queued event JSON with UnmarshalEvent, which maps only an ABSENT key to
+	// "dedicated"; an explicit "" or null stays "" and the rater withholds it.
 	ServingMode string `json:"serving_mode"`
 
 	// GraphK8sName is the DynamoGraphDeployment (DGD) that served this request —
@@ -143,4 +147,35 @@ func (l *LogEmitter) Emit(_ context.Context, e Event) {
 	l.Log.Info.Printf("metering event: request_id=%s client_request_id=%s auth_id=%s org=%s group=%s user=%s resource=%s/%s model=%s prompt=%d cached=%d completion=%d finish=%s aborted=%t usage_found=%t status=%d streamed=%t",
 		e.RequestID, e.ClientRequestID, e.AuthID, e.OrgID, e.GroupID, e.UserID, e.ResourceType, e.ResourceID, e.Model,
 		e.PromptTokens, e.CachedTokens, e.CompletionTokens, e.FinishReason, e.Aborted, e.UsageFound, e.StatusCode, e.Streamed)
+}
+
+// UnmarshalEvent decodes one event's JSON, the shape written by the emitter to
+// the drain queue and the on-disk spool. Evidence written before the
+// 2026-09-29 serving-mode cutover carries no serving_mode key (the field was
+// omitempty and dedicated was the empty value). All of that traffic was
+// dedicated (ratified ledger item 6), so an ABSENT key decodes as "dedicated",
+// the same rule internal/recovery applies. A post-cutover producer always
+// writes the key, so an explicit "" or null is a producer bug, not pre-cutover
+// evidence: it decodes as "" and the rater withholds it as an invalid serving
+// mode instead of billing it as dedicated.
+//
+// Every reader that later re-marshals the event (the spool replay re-sends it
+// to the queue, and ServingMode is no longer omitempty) must decode through
+// this function, or a pre-cutover event would acquire an explicit "" on the
+// way and be withheld instead of billed as dedicated.
+func UnmarshalEvent(data []byte) (Event, error) {
+	var ev Event
+	if err := json.Unmarshal(data, &ev); err != nil {
+		return ev, err
+	}
+	// A map probe, not a pointer field: json.Unmarshal sets a pointer to nil for
+	// an explicit null, which would be indistinguishable from an absent key.
+	var probe map[string]json.RawMessage
+	if err := json.Unmarshal(data, &probe); err != nil {
+		return ev, err
+	}
+	if _, ok := probe["serving_mode"]; !ok {
+		ev.ServingMode = identity.ServingModeDedicated
+	}
+	return ev, nil
 }

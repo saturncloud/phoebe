@@ -32,12 +32,14 @@ func TestPostgresStore_UpsertSQL(t *testing.T) {
 			Model:            "m1",
 			PromptTokens:     5,
 			CompletionTokens: 7,
+			ServingMode:      "dedicated",
 			TimestampUnixMs:  ts,
 		},
 		{
 			RequestID: "req-2",
 			// No identity fields set → must bind NULL, not "".
-			Model: "m2",
+			Model:       "m2",
+			ServingMode: "shared",
 		},
 	}
 
@@ -47,10 +49,10 @@ func TestPostgresStore_UpsertSQL(t *testing.T) {
 	)).
 		WithArgs(
 			// row 1 (org_id + base_model NULL: a pre-cutover-shaped event with no org
-			// header and no derived_from; its empty serving_mode stores as "dedicated")
+			// header and no derived_from)
 			"req-1", "logical-1", "auth-1", nil, nil, nil, nil, nil, "m1", nil, nil, "dedicated", 5, 0, 7, nil, nil, false, false, nil, false, nil, time.UnixMilli(ts).UTC(),
 			// row 2 (no identity, no timestamp → event_ts NULL)
-			"req-2", nil, nil, nil, nil, nil, nil, nil, "m2", nil, nil, "dedicated", 0, 0, 0, nil, nil, false, false, nil, false, nil, nil,
+			"req-2", nil, nil, nil, nil, nil, nil, nil, "m2", nil, nil, "shared", 0, 0, 0, nil, nil, false, false, nil, false, nil, nil,
 		).
 		WillReturnResult(sqlmock.NewResult(0, 2))
 	mock.ExpectCommit()
@@ -127,7 +129,7 @@ func TestPostgresStore_EmptyModelStoredAsNull(t *testing.T) {
 			nil,         // model: "" must bind NULL
 			nil,         // base_model: "" must bind NULL
 			nil,         // adapter: "" must bind NULL
-			"dedicated", // serving_mode: "" is a pre-cutover event, which was dedicated
+			"dedicated", // serving_mode: bound as decoded
 			1, 0, 2, nil, nil, false, false, nil, false,
 			nil, // graph_k8s_name: "" must bind NULL
 			nil,
@@ -139,6 +141,7 @@ func TestPostgresStore_EmptyModelStoredAsNull(t *testing.T) {
 		RequestID:        "req-no-model",
 		AuthID:           "auth-1",
 		Model:            "", // upstream never reported a model
+		ServingMode:      "dedicated",
 		PromptTokens:     1,
 		CompletionTokens: 2,
 	}})
@@ -209,19 +212,19 @@ func TestEventArgs_NullsEmptyIdentities(t *testing.T) {
 	}
 }
 
-// TestEventArgs_PreCutoverEmptyServingModeStoredAsDedicated pins the replay
-// rule for spooled or queued pre-cutover events: an empty serving_mode binds as
-// "dedicated" (all pre-cutover traffic was dedicated, the same rule as
-// migration 0007 and recovery), a known mode binds verbatim, and an unknown
-// value is stored as captured so the rater still withholds it.
-func TestEventArgs_PreCutoverEmptyServingModeStoredAsDedicated(t *testing.T) {
+// TestEventArgs_ServingModeStoredAsDecoded pins that the store applies no
+// serving-mode default of its own: the pre-cutover default happens at decode
+// time for an absent key only (metering.UnmarshalEvent). An explicit "" binds
+// as ” (not NULL, not 'dedicated') so the rater withholds it as an invalid
+// serving mode, and every other value binds verbatim.
+func TestEventArgs_ServingModeStoredAsDecoded(t *testing.T) {
 	const servingModeIdx = 11 // request_id..adapter is 11 columns; serving_mode is next.
 
 	cases := []struct {
 		in   string
 		want any
 	}{
-		{"", "dedicated"},
+		{"", ""},
 		{"dedicated", "dedicated"},
 		{"shared", "shared"},
 		{"bogus", "bogus"},
