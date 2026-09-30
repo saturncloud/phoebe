@@ -3,6 +3,7 @@ package recovery
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -426,5 +427,66 @@ func TestDecodeEvent_ExplicitSharedAndDedicatedKeepTheirValue(t *testing.T) {
 		if len(evidence.Events) != 1 || evidence.Events[0].ServingMode != mode {
 			t.Fatalf("events = %+v, want one event with serving_mode=%q", evidence.Events, mode)
 		}
+	}
+}
+
+// TestDecodeEvent_DifferentlyCasedServingModeKeepsItsValue: encoding/json matches
+// keys to struct fields case-insensitively, so "Serving_Mode":"shared" decodes as
+// shared. The absent-key check must use the same matching, or it would treat the
+// key as missing and overwrite the decoded value with "dedicated", billing a
+// shared event at the dedicated price.
+func TestDecodeEvent_DifferentlyCasedServingModeKeepsItsValue(t *testing.T) {
+	for _, key := range []string{"Serving_Mode", "SERVING_MODE"} {
+		rec := `{"request_id":"req-cased","auth_id":"auth-1","prompt_tokens":10,` +
+			`"completion_tokens":5,"usage_found":true,"` + key + `":"shared",` +
+			`"timestamp_unix_ms":1750000000000}`
+		ev, err := decodeEvent([]byte(rec))
+		if err != nil || ev.ServingMode != "shared" {
+			t.Fatalf("decodeEvent(%s) = (%q, %v), want serving_mode shared", rec, ev.ServingMode, err)
+		}
+		evidence, err := Load(writeEvidence(t, rec))
+		if err != nil || len(evidence.Events) != 1 || evidence.Events[0].ServingMode != "shared" {
+			t.Fatalf("Load(%s) = (%+v, %v), want one shared event", rec, evidence, err)
+		}
+	}
+}
+
+// TestDecodeEvent_DifferentlyCasedUsageFoundCountsAsPresent: the usage_found
+// presence check must match keys the way encoding/json does. A differently-cased
+// key is decoded into UsageFound, so it is present and its value is kept.
+func TestDecodeEvent_DifferentlyCasedUsageFoundCountsAsPresent(t *testing.T) {
+	for _, key := range []string{"Usage_Found", "USAGE_FOUND"} {
+		for _, value := range []bool{true, false} {
+			rec := fmt.Sprintf(`{"request_id":"req-cased","auth_id":"auth-1","prompt_tokens":10,`+
+				`"completion_tokens":5,%q:%t,"serving_mode":"shared","timestamp_unix_ms":1750000000000}`,
+				key, value)
+			ev, err := decodeEvent([]byte(rec))
+			if err != nil || ev.UsageFound != value {
+				t.Fatalf("decodeEvent(%s) = (usage_found=%v, %v), want usage_found=%v", rec, ev.UsageFound, err, value)
+			}
+		}
+	}
+}
+
+// TestDigestPreCutoverAbsentModeEqualsExplicitDedicated: decodeEvent maps an
+// absent serving_mode key to "dedicated" before hashing, so a pre-cutover record
+// and the same record with an explicit "serving_mode":"dedicated" must produce
+// the same digest within one binary.
+func TestDigestPreCutoverAbsentModeEqualsExplicitDedicated(t *testing.T) {
+	const prefix = `{"request_id":"req-legacy","auth_id":"auth-1","prompt_tokens":10,` +
+		`"completion_tokens":5,"usage_found":true,`
+	absent, err := Load(writeEvidence(t, prefix+`"timestamp_unix_ms":1750000000000}`))
+	if err != nil {
+		t.Fatalf("Load(absent serving_mode): %v", err)
+	}
+	explicit, err := Load(writeEvidence(t, prefix+`"serving_mode":"dedicated","timestamp_unix_ms":1750000000000}`))
+	if err != nil {
+		t.Fatalf("Load(explicit dedicated): %v", err)
+	}
+	if absent.Digest() == "" {
+		t.Fatal("digest must be computable for a valid pre-cutover record")
+	}
+	if absent.Digest() != explicit.Digest() {
+		t.Fatalf("absent serving_mode digest %s != explicit dedicated digest %s", absent.Digest(), explicit.Digest())
 	}
 }

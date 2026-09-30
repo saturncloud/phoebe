@@ -45,12 +45,20 @@ type Evidence struct {
 // sorted by the trusted request id, which validateAndDedupe has already proven
 // unique. Framing each record with its length keeps concatenation unambiguous.
 //
+// The digest is computed over the DECODED events, so decodeEvent's defaults are
+// part of it: decodeEvent maps an absent serving_mode key to "dedicated" before
+// hashing, so a pre-cutover record and the same record with an explicit
+// "serving_mode":"dedicated" produce the same digest within one binary.
+//
 // The digest is therefore only comparable between a dry-run and an -apply run
-// made with the same binary: changing metering.Event's fields or JSON tags (for
-// example, dropping omitempty from serving_mode in the serving-mode cutover, so
-// an empty serving_mode is now emitted as "serving_mode":"") changes the digest
-// of the same evidence, and an operator who upgrades between dry-run and apply
-// must redo the dry-run with the new binary.
+// made with the same binary. Two kinds of change alter the digest of the same
+// evidence: changing metering.Event's fields or JSON tags (for example,
+// dropping omitempty from serving_mode in the serving-mode cutover, so the
+// field is now always emitted), and changing decodeEvent's mapping of absent
+// keys (the pre-cutover evidence digested as "serving_mode":"dedicated" by this
+// binary hashed with no serving_mode at all under the previous one). An
+// operator who upgrades between dry-run and apply must redo the dry-run with
+// the new binary.
 func (e Evidence) Digest() string {
 	encoded := make([][]byte, 0, len(e.Events))
 	for i := range e.Events {
@@ -235,7 +243,7 @@ func decodeEvent(data []byte) (metering.Event, error) {
 	if err := json.Unmarshal(data, &probe); err != nil {
 		return ev, fmt.Errorf("decode event JSON: %w", err)
 	}
-	if _, ok := probe["usage_found"]; !ok {
+	if !hasKeyFold(probe, "usage_found") {
 		return ev, fmt.Errorf("event has no usage_found field (pre-hardening evidence); " +
 			"refusing to replay it as unmetered — assert the correct value and re-import")
 	}
@@ -260,10 +268,24 @@ func decodeEvent(data []byte) (metering.Event, error) {
 	// explicit "" or null (which decodes to "") is therefore a producer bug, not
 	// pre-cutover evidence, and validate() refuses it like any other value that
 	// is not shared or dedicated.
-	if _, ok := probe["serving_mode"]; !ok {
+	if !hasKeyFold(probe, "serving_mode") {
 		ev.ServingMode = identity.ServingModeDedicated
 	}
 	return ev, nil
+}
+
+// hasKeyFold reports whether probe holds name under any casing. encoding/json
+// matches object keys to struct fields case-insensitively, so a record with
+// "Serving_Mode":"shared" decodes ServingMode as "shared"; an exact-case
+// presence check would miss that key, treat the field as absent, and overwrite
+// the decoded value with a default (billing a shared event as dedicated).
+func hasKeyFold(probe map[string]json.RawMessage, name string) bool {
+	for k := range probe {
+		if strings.EqualFold(k, name) {
+			return true
+		}
+	}
+	return false
 }
 
 func validateAndDedupe(events []metering.Event) (Evidence, error) {
