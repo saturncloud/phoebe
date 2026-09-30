@@ -84,6 +84,24 @@ If any installation has legacy rows or buffered events, stop: that installation
 does not satisfy this migration's preconditions and needs a separate expand /
 contract migration before upgrading.
 
+### Rollout order for migration 0007
+
+Migration 0007 adds the CHECK constraint `rated_usage_serving_mode_ck`
+(`serving_mode IN ('shared','dedicated')`). A pre-0007 rater still writes
+`serving_mode = ''` for dedicated events and for events whose serving mode is
+NULL, so it must not run against schema 0007. Roll out in this order:
+
+1. Before applying 0007, suspend the rater CronJob (and the token-push CronJob if
+   you want the push paused too), or let any in-flight rater run finish.
+2. Run `cmd/migrate up`, deploy the new rater, proxy and token-push images, then
+   resume the rater.
+
+If an old rater does run against schema 0007, it writes `serving_mode = ''` for
+dedicated or NULL events. The CHECK constraint rejects that write, and the whole
+`RateWindow` transaction rolls back, shared rollups included. Nothing is written
+for that window, and the next run of the new rater re-rates it. The failure is
+closed and heals itself; the order above only avoids the delayed windows.
+
 ## Local dev
 
 ```
