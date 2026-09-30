@@ -24,7 +24,9 @@ import (
 	"testing"
 	"time"
 
-	_ "github.com/jackc/pgx/v5/stdlib"
+	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
+	"github.com/jackc/pgx/v5/stdlib"
 
 	"github.com/saturncloud/phoebe/internal/logging"
 )
@@ -3314,6 +3316,98 @@ func TestIntegration_Migration0007ServingModeExplicit(t *testing.T) {
 		(id, auth_id, resource_id, model_id, window_start, window_end,
 		 prompt_tokens, cached_tokens, completion_tokens, billable_prompt_tokens, cost, event_count)
 		VALUES ('x3', 'z', 'res', 'm', '2026-06-08T10:00:00Z', '2026-06-08T11:00:00Z', 0, 0, 0, 0, 0, 0)`)
+}
+
+// TestIntegration_Migration0007NoticesEveryRatedRowItDeletes pins the audit trail
+// for the two rated_usage clean-ups in 0007 up: before deleting a ” row that has a
+// 'dedicated' twin, or a row with an unknown serving_mode, the migration must RAISE
+// NOTICE with the row count, SUM(cost) and SUM(event_count) of exactly the rows it
+// deletes. A clean database (nothing to delete) must produce no such NOTICE.
+func TestIntegration_Migration0007NoticesEveryRatedRowItDeletes(t *testing.T) {
+	dsn := os.Getenv("PHOEBE_TEST_DATABASE_URL")
+	if dsn == "" {
+		t.Skip("PHOEBE_TEST_DATABASE_URL not set; skipping live-Postgres conformance")
+	}
+	ctx := context.Background()
+	cfg, err := pgx.ParseConfig(dsn)
+	if err != nil {
+		t.Fatalf("parse dsn: %v", err)
+	}
+	var notices []string
+	cfg.OnNotice = func(_ *pgconn.PgConn, n *pgconn.Notice) {
+		if strings.HasPrefix(n.Message, "0007:") {
+			notices = append(notices, n.Message)
+		}
+	}
+	db := stdlib.OpenDB(*cfg)
+	defer db.Close()
+	// One pooled connection so SET search_path sticks and every NOTICE reaches
+	// the callback above.
+	db.SetMaxOpenConns(1)
+
+	setup := func(sch string) {
+		t.Helper()
+		exec(t, db, "DROP SCHEMA IF EXISTS "+sch+" CASCADE")
+		exec(t, db, "CREATE SCHEMA "+sch)
+		exec(t, db, "SET search_path TO "+sch)
+		for _, f := range []string{"0001_billing_event", "0002_rating", "0004_billing_event_serving_mode",
+			"0005_invoice_grade_attempts", "0006_rollup_grain"} {
+			exec(t, db, readMigration(t, f+".up.sql"))
+		}
+	}
+	hour := mustTime("2026-06-08T10:00:00Z")
+	seed := func(auth, mode, cost string, events int) {
+		t.Helper()
+		if _, err := db.ExecContext(ctx, `INSERT INTO rated_usage
+			(id, auth_id, resource_id, org_id, model_id, serving_mode, window_start, window_end,
+			 prompt_tokens, cached_tokens, completion_tokens, billable_prompt_tokens,
+			 cost, applied_prompt_rate, applied_cached_rate, applied_completion_rate, event_count)
+			VALUES (md5($1 || $2), $1, 'res', 'org-1', 'm', $2, $3::timestamptz, $3::timestamptz + interval '1 hour',
+			        100, 0, 0, 100, $4::numeric, 0.00001, 0, 0, $5)`, auth, mode, hour, cost, events); err != nil {
+			t.Fatalf("seed rated_usage (%s, %q): %v", auth, mode, err)
+		}
+	}
+
+	const sch = "phoebe_migration_0007_notice_it"
+	setup(sch)
+	defer func() { exec(t, db, "DROP SCHEMA IF EXISTS "+sch+" CASCADE") }()
+	seed("a-ded", "", "0.500000000", 7)       // renamed, not deleted: no NOTICE
+	seed("a-shr", "shared", "0.250000000", 3) // untouched
+	seed("a-twin", "", "1.250000000", 4)      // deleted: 'dedicated' twin exists
+	seed("a-twin2", "", "0.750000000", 6)     // deleted: 'dedicated' twin exists
+	seed("a-twin", "dedicated", "9.000000000", 9)
+	seed("a-twin2", "dedicated", "9.000000000", 9)
+	seed("a-bogus", "bogus", "2.000000000", 5)   // deleted: unknown value
+	seed("a-bogus2", "Shared", "0.125000000", 1) // deleted: unknown value (case matters)
+
+	exec(t, db, readMigration(t, "0007_serving_mode_explicit.up.sql"))
+
+	want := []string{
+		"0007: deleting 2 rated_usage rows with serving_mode '' that have a 'dedicated' twin (sum cost 2.000000000, sum event_count 10)",
+		"0007: deleting 2 rated_usage rows with an unknown serving_mode (sum cost 2.125000000, sum event_count 6)",
+	}
+	if strings.Join(notices, "\n") != strings.Join(want, "\n") {
+		t.Fatalf("0007 notices =\n%s\nwant\n%s", strings.Join(notices, "\n"), strings.Join(want, "\n"))
+	}
+	var left int64
+	if err := db.QueryRowContext(ctx, `SELECT COUNT(*) FROM rated_usage`).Scan(&left); err != nil {
+		t.Fatalf("count after up: %v", err)
+	}
+	if left != 4 {
+		t.Fatalf("rated_usage rows after up = %d, want 4 (a-ded, a-shr and the two 'dedicated' twins)", left)
+	}
+
+	// Nothing to delete: no audit NOTICE at all.
+	notices = nil
+	const clean = "phoebe_migration_0007_notice_clean_it"
+	setup(clean)
+	defer func() { exec(t, db, "DROP SCHEMA IF EXISTS "+clean+" CASCADE") }()
+	seed("a-ded", "", "0.500000000", 7)
+	seed("a-shr", "shared", "0.250000000", 3)
+	exec(t, db, readMigration(t, "0007_serving_mode_explicit.up.sql"))
+	if len(notices) != 0 {
+		t.Fatalf("0007 on a database with nothing to delete raised %v, want no NOTICE", notices)
+	}
 }
 
 // TestIntegration_Migration0007BackfillMakesPreCutoverReRateANoOp pins Hugo's

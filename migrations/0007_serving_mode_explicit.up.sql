@@ -27,6 +27,10 @@
 --  2. A row with any other value (neither '', 'shared' nor 'dedicated') has no
 --     legal meaning and is deleted.
 -- The raw evidence for both remains in billing_event.
+-- Before deleting, the migration prints a RAISE NOTICE with the row count, SUM(cost)
+-- and SUM(event_count) for each clean-up that finds rows; that NOTICE output is the
+-- audit trail for the deleted rows, and the trailing re-rate rebuilds them from
+-- billing_event.
 --
 -- PRE-CUTOVER EVIDENCE IS DEDICATED (Hugo, 2026-09-30: "assume it's all dedicated
 -- (which is true)"). Before this migration the proxy stored dedicated traffic with a
@@ -52,6 +56,42 @@
 UPDATE billing_event
 SET serving_mode = 'dedicated'
 WHERE serving_mode IS NULL OR serving_mode = '';
+
+DO $$
+DECLARE
+    n      bigint;
+    cost_s numeric;
+    evts_s bigint;
+BEGIN
+    SELECT COUNT(*), COALESCE(SUM(ru.cost), 0), COALESCE(SUM(ru.event_count), 0)
+      INTO n, cost_s, evts_s
+      FROM rated_usage ru
+     WHERE ru.serving_mode = ''
+       AND EXISTS (
+           SELECT 1 FROM rated_usage d
+           WHERE d.serving_mode = 'dedicated'
+             AND d.auth_id      = ru.auth_id
+             AND d.owner_type   = ru.owner_type
+             AND d.owner_id     = ru.owner_id
+             AND d.resource_id  = ru.resource_id
+             AND d.model_id     = ru.model_id
+             AND d.window_start = ru.window_start
+       );
+    IF n > 0 THEN
+        RAISE NOTICE '0007: deleting % rated_usage rows with serving_mode '''' that have a ''dedicated'' twin (sum cost %, sum event_count %)',
+            n, cost_s, evts_s;
+    END IF;
+
+    SELECT COUNT(*), COALESCE(SUM(cost), 0), COALESCE(SUM(event_count), 0)
+      INTO n, cost_s, evts_s
+      FROM rated_usage
+     WHERE serving_mode NOT IN ('', 'shared', 'dedicated');
+    IF n > 0 THEN
+        RAISE NOTICE '0007: deleting % rated_usage rows with an unknown serving_mode (sum cost %, sum event_count %)',
+            n, cost_s, evts_s;
+    END IF;
+END
+$$;
 
 DELETE FROM rated_usage ru
 WHERE ru.serving_mode = ''
