@@ -156,12 +156,13 @@ func (b *bufferingResponseWriter) isColdWakeable() bool {
 }
 
 // flushTo writes the captured status, headers, and body to the real client.
-// The authoritative X-Request-Id is set by the caller (never replayed from
-// the probe): Add would duplicate it when the upstream echoed the header.
+// The request-correlation header is never copied from the buffer: the caller
+// Sets the authoritative minted value on w before flushing (an upstream echo
+// must not duplicate it — same "Set, not Add" contract as ModifyResponse).
 func (b *bufferingResponseWriter) flushTo(w http.ResponseWriter) {
 	dst := w.Header()
 	for k, vs := range b.header {
-		if http.CanonicalHeaderKey(k) == requestIDHeader {
+		if strings.EqualFold(k, requestIDHeader) {
 			continue
 		}
 		for _, v := range vs {
@@ -255,6 +256,21 @@ func (s *Server) emitWakeFailureRow(r *http.Request, id identity.Identity, reque
 // moment a NON-cold response is seen we DON'T serve it from the buffer — we
 // return false so the caller re-forwards it with full streaming + metering
 // intact. Cost: one extra round-trip on the (rare) first-request-after-idle.
+//
+// SETTLEMENT (R1 ruling): when this function returns true with a FINAL cold
+// response (the wake-error give-up, or tries exhausted with the final probe
+// STILL cold), the engine provably did no inference work — every dispatch was
+// refused before any token ran — so the admitted lease is settled to zero here
+// (settlementZeroNeverServed), in addition to the cold response being flushed
+// to the client. A tries-exhausted final probe that is NOT cold (warm, or a
+// non-cold transport/overload error) returns false instead: the R1
+// never-served precondition does not hold for it, so the caller's metered
+// forward owns both the metering row and the settlement (actual usage, or
+// conservative-unknown for an indeterminate fault). The rejection path
+// (BeginColdHold error) does NOT settle: the engine answered cold but the
+// request is refused pre-dispatch, and the handler's deferred release fallback
+// owns that lease release. A successful wake returns false without settling:
+// the caller's metered forward owns settlement.
 func (s *Server) serveWithWake(
 	w http.ResponseWriter,
 	r *http.Request,
@@ -320,10 +336,17 @@ func (s *Server) serveWithWake(
 				// A probe was already forwarded above; this served=true exit
 				// bypasses the normal metered forward, so record the attempt.
 				// The minted id is the client's only correlation handle to the
-				// reconciliation row — same contract as every errorHandler exit.
-				w.Header().Set(requestIDHeader, requestID)
+				// reconciliation row — same contract as every errorHandler exit
+				// (writeAdmissionError stamps it on the response).
+				//
+				// The cold-hold gate refused to extend the lease for a wake
+				// (capacity rejection or unavailable store). The engine
+				// answered cold — no inference ran — but this is a rejection,
+				// not a completed response: fail closed without usage-settling
+				// here; the handler's deferred release fallback owns the lease
+				// release on this exit path.
 				rec := &statusRecorder{ResponseWriter: w}
-				s.writeAdmissionError(rec, aerr)
+				s.writeAdmissionError(rec, requestID, aerr)
 				s.emitWakeFailureRow(r, id, requestID, clientRequestID, rec.status)
 				return true
 			}
@@ -337,17 +360,20 @@ func (s *Server) serveWithWake(
 		werr := s.waker.Wake(ctx, target)
 		if lease != nil {
 			if aerr := lease.EndColdHold(context.WithoutCancel(r.Context())); aerr != nil {
-				s.log.Error.Printf("admission: cold-hold release failed: %v", aerr)
+				s.admissionColdHoldReleaseLog.logf(s.log, "admission: cold-hold release failed: %v", aerr)
 			}
 		}
 		if werr != nil {
 			// Wake couldn't complete (deadline/scale error): return the cold
 			// response to the client rather than hang. It's a real, honest 503/404
-			// for a base we couldn't bring up in time. The probe above was a real
-			// forwarded attempt and this served=true exit bypasses the normal
-			// metered forward, so record the attempt at the served status.
+			// for a base we couldn't bring up in time — and determinate
+			// never-served (no inference ran), so the lease settles zero before
+			// the flush. The probe above was a real forwarded attempt and this
+			// served=true exit bypasses the normal metered forward, so the
+			// attempt is recorded at the served status below.
 			s.log.Warn.Printf("wake: could not warm base for request_id=%s resource_id=%s: %v",
 				requestID, id.ResourceID, werr)
+			s.settleFinalColdLease(r, lease)
 			w.Header().Set(requestIDHeader, requestID)
 			buf.flushTo(w)
 			s.emitWakeFailureRow(r, id, requestID, clientRequestID, buf.status)
@@ -356,16 +382,46 @@ func (s *Server) serveWithWake(
 		// Woken: loop and re-probe (the next attempt should be warm).
 	}
 
-	// Tries exhausted and still cold — serve the last cold response honestly.
-	// The probes above were real forwarded attempts and this served=true exit
-	// bypasses the normal metered forward, so record the attempt at the served
-	// status.
+	// Tries exhausted — dispatch ONE more buffered probe and classify it.
+	// Still genuinely cold: same determinate never-served axis as the wake-error
+	// give-up — every dispatch was refused before any inference, so the lease
+	// settles zero before the flush.
+	//
+	// NOT cold (a warm response, or a non-cold error such as a transport
+	// 502/500): the R1 "engine provably did no work" precondition does NOT
+	// hold. Serving the buffer here would hand the client a real response
+	// settled Complete(0) and never metered (a billing hole), or an
+	// unclassified 502 settled never-served zero (indeterminate faults must
+	// keep the conservative reservation). Return false so the caller's normal
+	// metered streaming forward classifies the outcome — exactly the in-loop
+	// not-cold handling above.
 	restoreBody()
 	buf := newBufferingResponseWriter()
 	last := httputil.NewSingleHostReverseProxy(upstream)
 	last.ServeHTTP(buf, r)
+	if !buf.isColdWakeable() {
+		restoreBody()
+		return false
+	}
+	s.settleFinalColdLease(r, lease)
 	w.Header().Set(requestIDHeader, requestID)
 	buf.flushTo(w)
 	s.emitWakeFailureRow(r, id, requestID, clientRequestID, buf.status)
 	return true
+}
+
+// settleFinalColdLease settles an admitted lease to zero for a final cold
+// response (the engine provably did no work). Settlement is first-writer-wins:
+// the handler's deferred release fallback becomes a no-op once this lands, and
+// vice versa. The context is decoupled from the client request: the settlement
+// must survive a client disconnect racing the cold flush (mirrors the error
+// handler and onDone).
+func (s *Server) settleFinalColdLease(r *http.Request, lease *admission.Lease) {
+	if lease == nil {
+		return
+	}
+	ctx := context.WithoutCancel(r.Context())
+	if err := settleAdmissionLease(ctx, lease, settlementZeroNeverServed, admission.Usage{}); err != nil {
+		s.admissionReleaseFallbackLog.logf(s.log, "admission: release fallback failed: %v", err)
+	}
 }

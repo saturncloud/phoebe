@@ -49,8 +49,8 @@ func TestIsColdWakeable(t *testing.T) {
 }
 
 // TestGraphFromUpstreamHost pins the header-routed graph derivation: first DNS
-// label, `-frontend` Service suffix stripped, port ignored; a label without
-// the suffix is the k8s name itself.
+// label, `-frontend` Service suffix stripped, port ignored; a label without the
+// suffix is the k8s name itself.
 func TestGraphFromUpstreamHost(t *testing.T) {
 	cases := map[string]string{
 		"graph-llama31-frontend.tf-shared.svc.cluster.local:8000":     "graph-llama31",
@@ -120,12 +120,23 @@ func (f *fakeWaker) last() WakeTarget {
 }
 
 // coldToWarmBackend serves cold (404) until warm is set, then 200.
-type coldToWarmBackend struct{ warm atomic.Bool }
+type coldToWarmBackend struct {
+	warm      atomic.Bool
+	requests  atomic.Int32
+	successes atomic.Int32
+	warmBody  string
+}
 
 func (c *coldToWarmBackend) ServeHTTP(w http.ResponseWriter, _ *http.Request) {
+	c.requests.Add(1)
 	if c.warm.Load() {
+		c.successes.Add(1)
 		w.WriteHeader(200)
-		_, _ = w.Write([]byte(`{"served":true}`))
+		body := c.warmBody
+		if body == "" {
+			body = `{"served":true}`
+		}
+		_, _ = w.Write([]byte(body))
 		return
 	}
 	w.WriteHeader(404)
@@ -174,6 +185,10 @@ func TestServeWithWake_ColdThenWarm(t *testing.T) {
 	if got := atomic.LoadInt32(&waker.calls); got != 1 {
 		t.Fatalf("waker called %d times, want 1", got)
 	}
+	if backend.requests.Load() != 2 || backend.successes.Load() != 1 {
+		t.Fatalf("backend requests=%d successes=%d, want one cold probe plus one warm re-probe",
+			backend.requests.Load(), backend.successes.Load())
+	}
 }
 
 func TestServeWithWake_WakeErrorReturnsCold(t *testing.T) {
@@ -198,12 +213,38 @@ func TestServeWithWake_WakeErrorReturnsCold(t *testing.T) {
 	}
 }
 
-// TestWakeErrorColdEmitsReconciliationRow (merged billing contract #48): the
-// waker failed (deadline), so serveWithWake serves the buffered cold response
-// and returns served=true — but the probe above WAS a real forwarded attempt of
-// the customer's request, and the normal metered forward never runs. Exactly
-// one raw reconciliation row must be recorded: Aborted=false, UsageFound=false,
-// at the status actually written to the client (the cold 404), charging $0.
+func TestServeWithWake_WarmRequestNotServed(t *testing.T) {
+	backend := &coldToWarmBackend{}
+	backend.warm.Store(true)
+	be := httptest.NewServer(backend)
+	defer be.Close()
+	up, _ := url.Parse(be.URL)
+
+	waker := &fakeWaker{}
+	s := testServerWithWaker(waker)
+
+	req := httptest.NewRequest("POST", "http://x/v1/chat/completions", strings.NewReader(`{"model":"m"}`))
+	id := identity.Identity{ResourceID: "r1", ServedModel: "m"}
+	rec := httptest.NewRecorder()
+
+	served := s.serveWithWake(rec, req, up, id, "req-1", "client-req-1", nil)
+	if served {
+		t.Fatal("warm request must not be served by serveWithWake (caller forwards)")
+	}
+	if backend.requests.Load() != 1 || backend.successes.Load() != 1 {
+		t.Fatalf("backend requests=%d successes=%d, want exactly one probe", backend.requests.Load(), backend.successes.Load())
+	}
+	if waker.calls != 0 {
+		t.Fatalf("waker called %d times for warm request", waker.calls)
+	}
+	// The caller re-forwards the request, so the body must be restored: the
+	// probe consumed it, and serveWithWake returns with it readable.
+	body, err := io.ReadAll(req.Body)
+	if err != nil || string(body) != `{"model":"m"}` {
+		t.Fatalf("request body not restored for the metered forward: %q, %v", body, err)
+	}
+}
+
 func TestWakeErrorColdEmitsReconciliationRow(t *testing.T) {
 	backend := &coldToWarmBackend{} // stays cold
 	be := httptest.NewServer(backend)
@@ -244,12 +285,6 @@ func TestWakeErrorColdEmitsReconciliationRow(t *testing.T) {
 	}
 }
 
-// TestWakeExhaustedWarmFinalProbeEmitsReconciliationRow (merged billing
-// contract #48): tries are exhausted but the post-loop final probe is WARM, so
-// the client is served the real 200 inference body from serveWithWake
-// (served=true) and the normal metered forward never runs. Exactly one raw
-// reconciliation row at the status actually written to the client (200) — NOT
-// zero, and NOT an extra row beyond it.
 func TestWakeExhaustedWarmFinalProbeEmitsReconciliationRow(t *testing.T) {
 	backend := &coldToWarmBackend{}
 	be := httptest.NewServer(backend)
@@ -266,36 +301,24 @@ func TestWakeExhaustedWarmFinalProbeEmitsReconciliationRow(t *testing.T) {
 	id := identity.Identity{ResourceID: "r1", ServedModel: "m"}
 	rec := httptest.NewRecorder()
 
+	// Merged #50×#51 contract (decc49b): a tries-exhausted final probe that is
+	// NOT cold must NOT be served from the buffer. Serving it here would hand
+	// the client a real response that the wake path never meters (a billing
+	// hole) — or, for a non-cold error, an unclassified 502 settled
+	// never-served zero. serveWithWake returns false so the caller's normal
+	// metered forward owns the response, the metering row, and the settlement.
 	served := s.serveWithWake(rec, req, up, id, "req-1", "client-req-1", nil)
-	if !served {
-		t.Fatal("tries-exhausted should serve the final probe response (served=true)")
+	if served {
+		t.Fatal("warm final probe must not be served by serveWithWake (caller forwards and meters)")
 	}
-	if rec.Code != http.StatusOK || !strings.Contains(rec.Body.String(), `"served":true`) {
-		t.Fatalf("client got %d body %q, want the warm 200 inference body", rec.Code, rec.Body.String())
+	if n := len(em.all()); n != 0 {
+		t.Fatalf("warm final probe emitted %d rows from the wake path, want 0 — the caller's metered forward owns the row", n)
 	}
-	events := em.waitForEvents(1, 2*time.Second)
-	if len(events) != 1 {
-		t.Fatalf("tries-exhausted emitted %d billing events, want exactly 1 raw reconciliation row: %+v",
-			len(events), events)
-	}
-	ev := events[0]
-	if ev.Aborted || ev.UsageFound || ev.StatusCode != http.StatusOK {
-		t.Fatalf("tries-exhausted row = {Aborted:%v UsageFound:%v StatusCode:%d}, "+
-			"want {false false 200} (visible to reconciliation, charges $0)", ev.Aborted, ev.UsageFound, ev.StatusCode)
-	}
-	if got := rec.Header().Get(requestIDHeader); got != "req-1" {
-		t.Fatalf("tries-exhausted response X-Request-Id = %q, want the minted attempt id (client correlation handle)", got)
+	body, err := io.ReadAll(req.Body)
+	if err != nil || string(body) != `{"model":"m"}` {
+		t.Fatalf("request body not restored for the metered forward: %q, %v", body, err)
 	}
 }
-
-// TestWakeColdHoldRejectionEmitsReconciliationRow (merged billing contract #48,
-// exactly-once): the BeginColdHold-failure exit is the third and last served=true
-// exit; nothing else pins it. With the platform cold-hold cap already consumed by
-// another lease, a cold probe's BeginColdHold is rejected, the client gets the
-// admission error, and exactly one raw reconciliation row is recorded at the
-// status actually written — the regression class these tests exist to catch on
-// a money path (wrong status, or a double-emit, would pass the suite without
-// this test).
 func TestWakeColdHoldRejectionEmitsReconciliationRow(t *testing.T) {
 	backend := &coldToWarmBackend{} // stays cold
 	be := httptest.NewServer(backend)
@@ -309,7 +332,9 @@ func TestWakeColdHoldRejectionEmitsReconciliationRow(t *testing.T) {
 	t.Cleanup(func() { _ = c.Close() })
 	admitter := admission.New(c, cfg)
 
-	holdReq := admission.Request{Graph: "g1", Organization: "org-a", Model: "m", ReservedOutputTokens: 1}
+	// Positive work estimate: #51's admission API validates the request's work
+	// estimate against the configured floors.
+	holdReq := admission.Request{Graph: "g1", Organization: "org-a", Model: "m", PromptBytes: 1, EstimatedInputTokens: 1, ReservedOutputTokens: 1}
 	holder, err := admitter.Admit(context.Background(), holdReq)
 	if err != nil {
 		t.Fatalf("holder admit: %v", err)
@@ -358,12 +383,6 @@ func TestWakeColdHoldRejectionEmitsReconciliationRow(t *testing.T) {
 			ev.RequestID, ev.ResourceID)
 	}
 }
-
-// TestWakeWarmFallThroughMetersNormalRowOnly (merged billing contract #48,
-// exactly-once): a warm first probe returns false and the caller's normal
-// metered forward runs, emitting the usual single usage-bearing completion row.
-// serveWithWake must NOT add a raw row of its own — the attempt is metered
-// exactly once, by the forward.
 func TestWakeWarmFallThroughMetersNormalRowOnly(t *testing.T) {
 	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		_, _ = w.Write([]byte(`{"model":"m","choices":[{"finish_reason":"stop"}],"usage":{"prompt_tokens":1,"completion_tokens":1}}`))
@@ -402,14 +421,6 @@ func TestWakeWarmFallThroughMetersNormalRowOnly(t *testing.T) {
 			ev.StatusCode, ev.PromptTokens, ev.CompletionTokens)
 	}
 }
-
-// TestWakeEnabledWarnsOnBoundRouteMissingServingMode pins the diagnosability
-// fix for the producer-rollout ordering window: the middleware injects
-// X-Saturn-Served-Model but not yet X-Saturn-Serving-Mode, so a bound route
-// silently loses wake-from-zero (empty serving mode is dedicated by the
-// absence-of-prefix contract — the behavior is intentional and unchanged). The
-// only addition is this WARN, fired when wake is configured and the route has
-// the bound shape without a serving mode.
 func TestWakeEnabledWarnsOnBoundRouteMissingServingMode(t *testing.T) {
 	newServer := func() (*Server, *bytes.Buffer) {
 		var buf bytes.Buffer
@@ -457,15 +468,6 @@ func TestWakeEnabledWarnsOnBoundRouteMissingServingMode(t *testing.T) {
 		t.Fatalf("warn logged with wake unconfigured: %q", buf.String())
 	}
 }
-
-// TestWakeSkippedOnControlRoutes (wake-scoping negative pin): the wake path
-// runs ONLY for model-bearing inference requests. A bound shared GET or HEAD
-// on a cold control route (/health, /live, /v1/models) is served by the normal
-// forward — the readiness sanitizer and model-list filters reduce the cold
-// upstream response — and must never call the waker: a monitoring probe must
-// not trigger a 0->1 scale of a cold base. Without this test, deleting
-// inferenceRequestPathAllowed(routePath) from the wake condition leaves the
-// whole suite green while cold control probes scale the graph.
 func TestWakeSkippedOnControlRoutes(t *testing.T) {
 	backend := &coldToWarmBackend{} // stays cold
 	be := httptest.NewServer(backend)
