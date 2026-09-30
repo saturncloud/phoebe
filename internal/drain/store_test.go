@@ -46,8 +46,8 @@ func TestPostgresStore_UpsertSQL(t *testing.T) {
 		"INSERT INTO billing_event (request_id, client_request_id, auth_id, user_id, group_id, resource_id, resource_type, org_id, model, base_model, adapter, serving_mode, prompt_tokens, cached_tokens, completion_tokens, finish_reason, gpu_type, aborted, usage_found, status_code, streamed, graph_k8s_name, event_ts) VALUES",
 	)).
 		WithArgs(
-			// row 1 (org_id + base_model + serving_mode NULL: a dedicated base-model event, no
-			// org header, no derived_from)
+			// row 1 (org_id + base_model + serving_mode NULL: a pre-cutover-shaped event with
+			// no org header and no derived_from; the drainer stores what it was given)
 			"req-1", "logical-1", "auth-1", nil, nil, nil, nil, nil, "m1", nil, nil, nil, 5, 0, 7, nil, nil, false, false, nil, false, nil, time.UnixMilli(ts).UTC(),
 			// row 2 (no identity, no timestamp → event_ts NULL)
 			"req-2", nil, nil, nil, nil, nil, nil, nil, "m2", nil, nil, nil, 0, 0, 0, nil, nil, false, false, nil, false, nil, nil,
@@ -127,7 +127,7 @@ func TestPostgresStore_EmptyModelStoredAsNull(t *testing.T) {
 			nil, // model: "" must bind NULL
 			nil, // base_model: "" must bind NULL
 			nil, // adapter: "" must bind NULL
-			nil, // serving_mode: "" must bind NULL (dedicated)
+			nil, // serving_mode: "" must bind NULL (missing evidence; the rater withholds it)
 			1, 0, 2, nil, nil, false, false, nil, false,
 			nil, // graph_k8s_name: "" must bind NULL
 			nil,
@@ -192,7 +192,7 @@ func TestEventArgs_NullsEmptyIdentities(t *testing.T) {
 		t.Fatalf("base_model arg = %v, want nil for empty BaseModel", args[9])
 	}
 	// serving_mode is index 10 (model=7, base_model=8, adapter=9, serving_mode=10) —
-	// nil for empty (dedicated).
+	// nil for empty (only possible on pre-cutover events; the rater withholds NULL).
 	if args[11] != nil {
 		t.Fatalf("serving_mode arg = %v, want nil for empty ServingMode", args[11])
 	}

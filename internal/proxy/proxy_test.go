@@ -8,6 +8,7 @@ import (
 	"net/url"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -569,5 +570,69 @@ func TestProxyStreamingEndToEnd(t *testing.T) {
 	}
 	if e.FinishReason != "stop" {
 		t.Fatalf("event finish_reason = %q, want stop", e.FinishReason)
+	}
+}
+
+// TestProxyServingMode_DedicatedRouteMetersExplicitDedicated: a header-routed
+// request with no X-Saturn-Serving-Mode (what a dedicated route looks like — Atlas
+// stamps nothing and Traefik strips client values) is metered as "dedicated",
+// never as the empty string the 2026-09-29 ruling retired.
+func TestProxyServingMode_DedicatedRouteMetersExplicitDedicated(t *testing.T) {
+	be, beURL := usageBackend(t)
+	defer be.Close()
+	em := &recordingEmitter{}
+	srv := newTestServerE(t, beURL, em)
+
+	rr := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", nil)
+	setUpstream(req, beURL)
+	req.Header.Set(identity.HeaderAuthID, "auth-key-7")
+	req.Header.Set(identity.HeaderResourceID, "dep-1")
+	srv.Handler().ServeHTTP(rr, req)
+
+	if rr.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200 (body %q)", rr.Code, rr.Body.String())
+	}
+	events := em.waitForEvents(1, 2*time.Second)
+	if len(events) != 1 {
+		t.Fatalf("emitted %d events, want 1", len(events))
+	}
+	if events[0].ServingMode != identity.ServingModeDedicated {
+		t.Fatalf("event.ServingMode = %q, want %q", events[0].ServingMode, identity.ServingModeDedicated)
+	}
+}
+
+// TestProxyServingMode_InvalidValueRefused: a trusted header carrying anything
+// other than "shared"/"dedicated" is a broken edge contract. The request is
+// refused with 400 before it reaches the engine, and nothing is metered.
+func TestProxyServingMode_InvalidValueRefused(t *testing.T) {
+	var hits int32
+	be := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		atomic.AddInt32(&hits, 1)
+		_, _ = w.Write([]byte(`{}`))
+	}))
+	defer be.Close()
+	beURL, _ := url.Parse(be.URL)
+
+	for _, bad := range []string{"Shared", "DEDICATED", "serverless", " shared"} {
+		em := &recordingEmitter{}
+		srv := newTestServerE(t, beURL, em)
+		rr := httptest.NewRecorder()
+		req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", nil)
+		setUpstream(req, beURL)
+		req.Header.Set(identity.HeaderAuthID, "auth-key-7")
+		req.Header.Set(identity.HeaderResourceID, "dep-1")
+		req.Header.Set(identity.HeaderServingMode, bad)
+		srv.Handler().ServeHTTP(rr, req)
+
+		if rr.Code != http.StatusBadRequest {
+			t.Fatalf("serving mode %q: status = %d, want 400", bad, rr.Code)
+		}
+		if em.count() != 0 {
+			t.Fatalf("serving mode %q: %d events metered, want 0", bad, em.count())
+		}
+	}
+	if n := atomic.LoadInt32(&hits); n != 0 {
+		t.Fatalf("upstream reached %d times, want 0 (refused before forwarding)", n)
 	}
 }

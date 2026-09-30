@@ -433,3 +433,28 @@ func TestGateway_WakeEligible(t *testing.T) {
 		t.Fatalf("wake target = %+v, want the resolved graph/resource", tgt)
 	}
 }
+
+// TestGateway_RegistryEntryWithEmptyServingModeRefused: a served-model registry
+// entry must carry "shared" or "dedicated". An entry with an empty serving mode
+// (a malformed ConfigMap) is refused at the serving-mode gate with 400 and never
+// metered — the gateway path gets no absent-means-dedicated default.
+func TestGateway_RegistryEntryWithEmptyServingModeRefused(t *testing.T) {
+	be, beURL := usageBackend(t)
+	defer be.Close()
+
+	resolver := &mapResolver{m: map[[2]string]gateway.Resolution{
+		{"org-1", "m"}: {ResourceID: "tfm-1", BaseModel: "b", ServingMode: "", GraphK8sName: "g"},
+	}}
+	em := &recordingEmitter{}
+	srv := newGatewayTestServer(t, em, resolver, beURL)
+
+	rr := httptest.NewRecorder()
+	srv.Handler().ServeHTTP(rr, gatewayRequest("org-1", `{"model":"m"}`))
+
+	if rr.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400 (body %q)", rr.Code, rr.Body.String())
+	}
+	if em.count() != 0 {
+		t.Fatalf("%d events metered, want 0", em.count())
+	}
+}

@@ -63,11 +63,13 @@ const (
 	// products independently (design D1). Like HeaderBaseModel/HeaderAdapter it
 	// is a deploy-time resource property injected server-side by the
 	// Atlas-rendered Traefik middleware, anti-spoof overwritten, never trusted
-	// from clients. ABSENT = dedicated (the OUTER-prefix pricing contract: a bare
-	// base id is dedicated, so every event shipped before shared serving prices
-	// as dedicated with no rewrite). PRESENT with "shared" marks shared traffic,
-	// which the rater prices from the distinct shared:<base> price row. Phoebe
-	// reads it defensively: absent = "" = dedicated.
+	// from clients. Atlas stamps it only on shared routes; on a dedicated route it
+	// stamps nothing, and Traefik removes any client-supplied value. So on a
+	// header-routed request an ABSENT header means the route belongs to a
+	// dedicated deployment, and FromRequest resolves it to ServingModeDedicated
+	// right here. From this point on phoebe only ever carries the explicit
+	// spellings "shared" and "dedicated" (the 2026-09-29 serving-mode ruling: the
+	// empty string is not a serving mode anywhere).
 	HeaderServingMode = "X-Saturn-Serving-Mode"
 
 	// HeaderGateway marks a request that arrived on the TF shared-inference
@@ -174,10 +176,10 @@ type Identity struct {
 	// checkpoint deployments. Its presence triggers the fine-tune premium at rating
 	// (C4); its value is forensic. Empty for a base-model endpoint.
 	Adapter string
-	// ServingMode is the serving mode ("shared" | "dedicated"), the SKU pricing
-	// axis. Empty = dedicated (the absence-of-prefix contract). Carried to the
-	// metering event so the rater prices shared traffic from the distinct
-	// shared:<base> row. See HeaderServingMode.
+	// ServingMode is the serving mode (ServingModeShared | ServingModeDedicated),
+	// the SKU pricing axis. Never empty after FromRequest. Carried to the metering
+	// event so the rater prices shared traffic from the distinct shared:<base>
+	// row. See HeaderServingMode.
 	ServingMode string
 	// ServedModel is the comma-separated allow-list of served-model names the
 	// subdomain-authorized resource may serve. Empty = binding not enforced for
@@ -209,8 +211,36 @@ type Identity struct {
 	RateLimitGeneratedTokens      string
 }
 
+// The two serving modes, spelled exactly as they are stored in billing_event and
+// rated_usage and sent on the billing push. There is no third value: an empty or
+// unknown serving mode is an edge-contract bug, refused at the proxy's billing
+// gate and withheld from money by the rater.
+const (
+	ServingModeShared    = "shared"
+	ServingModeDedicated = "dedicated"
+)
+
+// ValidServingMode reports whether s is one of the two serving modes.
+func ValidServingMode(s string) bool {
+	return s == ServingModeShared || s == ServingModeDedicated
+}
+
+// servingModeFromHeader resolves the X-Saturn-Serving-Mode header value. Absent
+// means a dedicated route (see HeaderServingMode); a present value is returned
+// verbatim so an unexpected spelling reaches the billing gate and is refused
+// there rather than being silently reinterpreted.
+func servingModeFromHeader(v string) string {
+	if v == "" {
+		return ServingModeDedicated
+	}
+	return v
+}
+
 // FromRequest extracts the trusted identity headers. It performs no
-// validation beyond reading the values; authorization happened at the edge.
+// validation beyond reading the values; authorization happened at the edge. The
+// one value it resolves rather than copies is the serving mode (see
+// HeaderServingMode). A gateway request's serving mode is overwritten later by
+// gateway resolution from the served-model registry.
 func FromRequest(r *http.Request) Identity {
 	return Identity{
 		AuthID:                        r.Header.Get(HeaderAuthID),
@@ -221,7 +251,7 @@ func FromRequest(r *http.Request) Identity {
 		OrgID:                         r.Header.Get(HeaderOrgID),
 		BaseModel:                     r.Header.Get(HeaderBaseModel),
 		Adapter:                       r.Header.Get(HeaderAdapter),
-		ServingMode:                   r.Header.Get(HeaderServingMode),
+		ServingMode:                   servingModeFromHeader(r.Header.Get(HeaderServingMode)),
 		ServedModel:                   r.Header.Get(HeaderServedModel),
 		Upstream:                      r.Header.Get(HeaderUpstream),
 		Gateway:                       r.Header.Get(HeaderGateway) == "true",

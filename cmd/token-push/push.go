@@ -40,9 +40,11 @@ type rollup struct {
 	ModelID      string `json:"model_id"`
 	// ServingMode, OwnerType and OwnerID are GRAIN columns (migration 0006): they
 	// are part of what identifies a rollup, so the manager needs them to present
-	// charges per serving tier and per person/team, not only per API key. "" is a
-	// meaningful value -- dedicated, and "no owner supplied" respectively -- so
-	// these are NOT omitempty: a missing key and an empty key must not be
+	// charges per serving tier and per person/team, not only per API key.
+	// ServingMode is "shared" or "dedicated" (rated_usage CHECK; the empty string
+	// stopped meaning dedicated on 2026-09-29, and the manager rejects it). For
+	// the owner pair "" is a meaningful value ("no owner supplied"). None of the
+	// three is omitempty: a missing key and an empty key must not be
 	// indistinguishable on a billing wire.
 	ServingMode string `json:"serving_mode"`
 	OwnerType   string `json:"owner_type"`

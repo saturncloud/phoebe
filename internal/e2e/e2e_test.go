@@ -152,6 +152,9 @@ func newHarness(t *testing.T, schema string) *harness {
 	// 0006 adds billing_event.graph_k8s_name (in the drainer's INSERT) and widens
 	// the rated_usage grain the rater upserts on — same drift class as 0004.
 	mustExec(t, db, readMigration(t, "0006_rollup_grain.up.sql"))
+	// 0007 makes rated_usage.serving_mode 'shared'/'dedicated' only (CHECK, no
+	// default); the rater's upsert must satisfy it.
+	mustExec(t, db, readMigration(t, "0007_serving_mode_explicit.up.sql"))
 
 	mr, err := miniredis.Run()
 	if err != nil {
@@ -521,6 +524,20 @@ func TestE2E_StreamedRequestBecomesMoney(t *testing.T) {
 	// resource_name join). This is the composed-path assertion for the header→rollup carry.
 	if !ruOrgID.Valid || ruOrgID.String != testOrgID {
 		t.Errorf("rated_usage.org_id = %v, want %q (the X-Saturn-Org-Id header value, carried meter→rate)", ruOrgID, testOrgID)
+	}
+	// SERVING MODE, end to end (2026-09-29 ruling): this request is header-routed
+	// with NO X-Saturn-Serving-Mode, which is what a dedicated route looks like. It
+	// must be stored as the explicit 'dedicated' in billing_event AND rated_usage —
+	// never NULL or the retired ''.
+	var beMode, ruMode sql.NullString
+	if err := h.db.QueryRow(`SELECT serving_mode FROM billing_event`).Scan(&beMode); err != nil {
+		t.Fatalf("read billing_event.serving_mode: %v", err)
+	}
+	if err := h.db.QueryRow(`SELECT serving_mode FROM rated_usage`).Scan(&ruMode); err != nil {
+		t.Fatalf("read rated_usage.serving_mode: %v", err)
+	}
+	if !beMode.Valid || beMode.String != "dedicated" || !ruMode.Valid || ruMode.String != "dedicated" {
+		t.Errorf("serving_mode billing_event=%v rated_usage=%v, want 'dedicated' in both", beMode, ruMode)
 	}
 	// THE deployment-id-bug guard, at the far end of the pipe: the money is
 	// keyed on the engine name the upstream reported, not the id we routed on.

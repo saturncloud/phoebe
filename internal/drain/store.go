@@ -204,10 +204,11 @@ func eventArgs(e metering.Event) []any {
 		// -braces for a clean column either way.
 		nullStr(e.BaseModel),
 		nullStr(e.Adapter),
-		// ServingMode is "" for dedicated (the common case, incl. every pre-shared
-		// event) and "shared" for shared traffic. nullStr so dedicated stores NULL,
-		// not '' — the rater treats NULL/'' identically as dedicated (the bare price
-		// key), and a clean NULL keeps the column faithful to "absence = dedicated".
+		// ServingMode is "dedicated" or "shared" (the proxy refuses anything else).
+		// nullStr keeps an empty value — only possible on an event metered before
+		// the serving-mode cutover — as NULL, which the rater withholds from money
+		// and counts as an invalid serving mode. billing_event is the evidence
+		// ledger, so it has no CHECK here: the value is stored as captured.
 		nullStr(e.ServingMode),
 		e.PromptTokens,
 		e.CachedTokens,

@@ -257,6 +257,20 @@ func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Serving-mode gate: the serving mode selects the price SKU and is part of the
+	// rollup grain, so a request whose mode is neither "shared" nor "dedicated" is
+	// refused rather than metered under a value the rater would have to withhold.
+	// A header-routed dedicated request already resolved to "dedicated" in
+	// identity.FromRequest; reaching here with anything else means the trusted
+	// middleware stamped an unexpected value or a served-model registry entry
+	// carries one — an edge-contract bug, same class as a missing billing header.
+	if !identity.ValidServingMode(id.ServingMode) {
+		s.log.Warn.Printf("rejecting request with invalid serving mode %q (gateway=%t, request_id=%s)",
+			id.ServingMode, id.Gateway, r.Header.Get(requestIDHeader))
+		http.Error(w, "invalid serving mode", http.StatusBadRequest)
+		return
+	}
+
 	// Never use the public X-Request-Id as billing_event's primary key: clients
 	// can replay it. Mint a fresh attempt id after the billing identity gate and
 	// before any forwarding. The one value is then captured by all retries and
@@ -389,7 +403,7 @@ func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request) {
 	// could self-promote precisely while the rollout switch is off. Dedicated
 	// endpoints own their engine and bypass both shared-pool mechanisms.
 	var admitted *admission.Lease
-	if id.ServingMode == "shared" {
+	if id.ServingMode == identity.ServingModeShared {
 		rateLimits, rerr := parseTrustedRateLimits(id)
 		if rerr != nil {
 			s.log.Error.Printf("admission: invalid trusted rate-limit policy: %v", rerr)
@@ -712,9 +726,9 @@ func (s *Server) emit(ctx context.Context, id identity.Identity, requestID, clie
 		// Its presence triggers the fine-tune premium at rating; its value is
 		// forensic. Empty for a base-model endpoint.
 		Adapter: id.Adapter,
-		// ServingMode is the serving-mode SKU axis ("shared" | "dedicated"), from
-		// the trusted middleware header. Empty = dedicated. Shared traffic prices
-		// from the distinct shared:<base> rate row.
+		// ServingMode is the serving-mode SKU axis ("shared" | "dedicated"),
+		// validated by the serving-mode gate above, so it is never empty here.
+		// Shared traffic prices from the distinct shared:<base> rate row.
 		ServingMode: id.ServingMode,
 		// GraphK8sName is the serving graph (the cost centre), resolved once on the
 		// request path: from tf_model on the gateway route, derived from the upstream

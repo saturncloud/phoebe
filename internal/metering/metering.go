@@ -89,11 +89,11 @@ type Event struct {
 	BaseModel string `json:"base_model,omitempty"`
 
 	// ServingMode is the serving mode ("shared" | "dedicated"), the SKU pricing
-	// axis (X-Saturn-Serving-Mode). Empty = dedicated (the absence-of-prefix
-	// contract, so every pre-shared event is unaffected). "shared" prices from the
-	// distinct shared:<base> rate row. Captured verbatim; empty is valid (=
-	// dedicated).
-	ServingMode string `json:"serving_mode,omitempty"`
+	// axis. The proxy's serving-mode gate guarantees one of the two explicit
+	// values; "shared" prices from the distinct shared:<base> rate row. An empty
+	// value only appears on events metered before the 2026-09-29 serving-mode
+	// cutover (when empty meant dedicated); the rater withholds those from money.
+	ServingMode string `json:"serving_mode"`
 
 	// GraphK8sName is the DynamoGraphDeployment (DGD) that served this request —
 	// the COST CENTRE. It is carried so a rollup's cost stays attributable to the

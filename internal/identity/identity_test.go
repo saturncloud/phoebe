@@ -86,3 +86,38 @@ func TestFromRequestGatewayMarkerIsStrict(t *testing.T) {
 		}
 	}
 }
+
+// TestFromRequestServingMode pins the 2026-09-29 serving-mode rule at its origin.
+// Atlas stamps X-Saturn-Serving-Mode only on shared routes and Traefik strips any
+// client-supplied value, so an absent header on a header-routed request means a
+// dedicated route and resolves to the explicit "dedicated". A present value is
+// carried verbatim, so an unexpected spelling reaches the proxy's serving-mode
+// gate and is refused there instead of being reinterpreted here.
+func TestFromRequestServingMode(t *testing.T) {
+	cases := []struct {
+		header, want string
+		valid        bool
+	}{
+		{"", ServingModeDedicated, true},
+		{"dedicated", ServingModeDedicated, true},
+		{"shared", ServingModeShared, true},
+		{"Shared", "Shared", false},
+		{"bogus", "bogus", false},
+	}
+	for _, c := range cases {
+		r := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", nil)
+		if c.header != "" {
+			r.Header.Set(HeaderServingMode, c.header)
+		}
+		id := FromRequest(r)
+		if id.ServingMode != c.want {
+			t.Errorf("header %q: ServingMode = %q, want %q", c.header, id.ServingMode, c.want)
+		}
+		if ValidServingMode(id.ServingMode) != c.valid {
+			t.Errorf("header %q: ValidServingMode(%q) = %t, want %t", c.header, id.ServingMode, !c.valid, c.valid)
+		}
+	}
+	if ValidServingMode("") {
+		t.Error(`ValidServingMode("") = true; the empty string is not a serving mode`)
+	}
+}
