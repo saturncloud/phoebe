@@ -75,6 +75,8 @@ WHERE serving_mode = '';
 -- either spelling would hide a writer that forgot it.
 ALTER TABLE rated_usage ALTER COLUMN serving_mode DROP DEFAULT;
 
+-- A pre-0007 rater writes '' and is rejected here; see "Rollout order for
+-- migration 0007" in migrations/README.md.
 ALTER TABLE rated_usage
     ADD CONSTRAINT rated_usage_serving_mode_ck CHECK (serving_mode IN ('shared', 'dedicated'));
 
@@ -109,9 +111,19 @@ WITH raw AS (
                               OR completion_tokens < 0 OR cached_tokens > prompt_tokens)::bigint
             AS invalid_usage_attempts,
         COUNT(*) FILTER (WHERE aborted)::bigint AS aborted_attempts,
-        -- Same predicate as the rater's valid_serving_mode gate: these attempts
-        -- are withheld from money (the run report's invalid_serving_mode_events).
-        COUNT(*) FILTER (WHERE serving_mode IS NULL OR serving_mode NOT IN ('shared','dedicated'))::bigint
+        -- Same predicate as the rater's invalid_serving_mode_events bucket: an
+        -- invalid serving mode on an authoritative (usage_found), valid-usage,
+        -- attributable event. A missing-usage or invalid-usage attempt is already
+        -- explained by its own column above, and an unattributable one (NULL
+        -- auth/resource/model) by the rater's unattributable bucket, so counting
+        -- it here as well would explain the same delta twice.
+        COUNT(*) FILTER (WHERE (serving_mode IS NULL OR serving_mode NOT IN ('shared','dedicated'))
+                              AND usage_found
+                              AND prompt_tokens >= 0 AND cached_tokens >= 0
+                              AND completion_tokens >= 0 AND cached_tokens <= prompt_tokens
+                              AND auth_id IS NOT NULL
+                              AND resource_id IS NOT NULL
+                              AND model IS NOT NULL)::bigint
             AS invalid_serving_mode_attempts,
         -- "FAILED" is status_code >= 400, the SAME threshold the rater uses to
         -- decide whether a zero-usage attempt is routine (expected) or alarming

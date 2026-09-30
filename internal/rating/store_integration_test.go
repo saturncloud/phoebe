@@ -3111,6 +3111,63 @@ func TestIntegration_ReconciliationViewExplainsInvalidServingModeDelta(t *testin
 	}
 }
 
+// TestIntegration_ReconciliationViewInvalidServingModeDoesNotDoubleCountMissingUsage
+// guards the invariant that billing_reconciliation_hourly explains each withheld
+// attempt with exactly one cause column, using the rater's precedence. A
+// NULL-serving-mode attempt that ALSO has no usage block is withheld by the rater
+// as missing usage (the invalid_serving_mode_events bucket only counts
+// authoritative, valid-usage, attributable events), so the view must count it in
+// missing_usage_attempts and NOT in invalid_serving_mode_attempts.
+func TestIntegration_ReconciliationViewInvalidServingModeDoesNotDoubleCountMissingUsage(t *testing.T) {
+	dsn := os.Getenv("PHOEBE_TEST_DATABASE_URL")
+	if dsn == "" {
+		t.Skip("PHOEBE_TEST_DATABASE_URL not set; skipping live-Postgres conformance")
+	}
+	ctx := context.Background()
+	db, err := sql.Open("pgx", dsn)
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	defer db.Close()
+	db.SetMaxOpenConns(1)
+
+	const sch = "phoebe_rating_invalid_mode_missing_usage_it"
+	exec(t, db, "DROP SCHEMA IF EXISTS "+sch+" CASCADE")
+	exec(t, db, "CREATE SCHEMA "+sch)
+	exec(t, db, "SET search_path TO "+sch)
+	defer func() { exec(t, db, "DROP SCHEMA IF EXISTS "+sch+" CASCADE") }()
+	exec(t, db, ratingSchemaDDL(t))
+
+	hour := mustTime("2026-06-08T10:00:00Z")
+	book := newTestBook(map[string]Rate3{"m": rate3("0.000010", "0", "0")}, nil, PolicyIdentity, Dec{}, Dec{})
+	if _, err := db.ExecContext(ctx,
+		`INSERT INTO billing_event (request_id, auth_id, resource_id, org_id, model, serving_mode, usage_found, prompt_tokens, completion_tokens, event_ts)
+		 VALUES ('nul-nousage', 'a', 'res', 'org-1', 'm', NULL, false, 0, 0, $1)`,
+		hour.Add(5*time.Minute)); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+
+	res, err := NewPostgresStore(db).RateWindow(ctx, book, hour, hour.Add(time.Hour))
+	if err != nil {
+		t.Fatalf("RateWindow: %v", err)
+	}
+	if res.MissingUsageEvents != 1 || res.InvalidServingModeEvents != 0 {
+		t.Fatalf("rater missing-usage/invalid-serving-mode = %d/%d, want 1/0", res.MissingUsageEvents, res.InvalidServingModeEvents)
+	}
+
+	var invalidMode, missingUsage, delta int64
+	if err := db.QueryRowContext(ctx, `
+		SELECT invalid_serving_mode_attempts, missing_usage_attempts, attempt_delta
+		FROM billing_reconciliation_hourly
+		WHERE window_start=$1 AND auth_id='a' AND resource_id='res' AND model_id='m'`, hour).
+		Scan(&invalidMode, &missingUsage, &delta); err != nil {
+		t.Fatalf("read view: %v", err)
+	}
+	if delta != 1 || missingUsage != 1 || invalidMode != 0 {
+		t.Fatalf("attempt_delta/missing_usage/invalid_serving_mode = %d/%d/%d, want 1/1/0 — the view must explain the delta once, with the rater's precedence", delta, missingUsage, invalidMode)
+	}
+}
+
 // TestIntegration_Migration0007ServingModeExplicit applies the real 0001–0006 DDL,
 // seeds rated_usage the way the pre-0007 rater wrote it, then runs 0007 up and down.
 //
