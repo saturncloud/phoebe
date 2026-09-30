@@ -86,9 +86,11 @@ type Result struct {
 	// raw events stay in billing_event as evidence.
 	OwnerConflictEvents int64
 	// InvalidServingModeEvents counts events whose serving_mode is neither "shared"
-	// nor "dedicated" — NULL/"" is how dedicated was stored before the 2026-09-29
-	// serving-mode cutover. The serving mode selects the price SKU, so such an event
-	// is NOT billed; the raw event stays in billing_event as evidence.
+	// nor "dedicated". Pre-cutover NULL/"" rows are backfilled to "dedicated" by
+	// migration 0007 (ledger item 6), so a remaining NULL/"" means the backfill
+	// was missed or a producer sent an explicit empty value. The serving mode
+	// selects the price SKU, so such an event is NOT billed; the raw event stays
+	// in billing_event as evidence.
 	InvalidServingModeEvents int64
 	// AmbiguousGraphRollups counts ROLLUPS whose traffic spanned more than one serving
 	// graph. NOT a withholding signal and NOT in event units: these rollups ARE billed
@@ -172,9 +174,11 @@ func (r Result) HasOwnerConflict() bool { return r.OwnerConflictEvents > 0 }
 // mode other than "shared" or "dedicated". The serving mode selects the price SKU
 // and is part of the rollup grain, so such an event cannot be billed without
 // guessing; it is withheld and screams. Loud, exit-nonzero, like the other
-// anomalies. Right after the serving-mode cutover this also fires for dedicated
-// evidence metered before the cutover (stored as NULL) that is still inside the
-// re-rate window.
+// anomalies. Dedicated evidence metered before the 2026-09-29 cutover (stored as
+// NULL or "") should already have been rewritten to "dedicated" by migration
+// 0007's backfill (ledger item 6). If this fires for such rows, the backfill was
+// missed (for example, old proxy pods kept writing NULL after the migration ran)
+// and must be re-run; otherwise the proxy's serving-mode gate is broken.
 func (r Result) HasInvalidServingMode() bool { return r.InvalidServingModeEvents > 0 }
 
 // HasAmbiguousGraph reports whether any BILLED rollup drew traffic from more than one
@@ -278,7 +282,7 @@ func (r *Rater) Run(ctx context.Context, windowStart, windowEnd time.Time, windo
 			windowStart.Format(time.RFC3339), windowEnd.Format(time.RFC3339), res.OwnerConflictEvents)
 	}
 	if res.HasInvalidServingMode() {
-		r.log.Error.Printf("rating: window [%s,%s) has %d INVALID-SERVING-MODE events (serving_mode is neither \"shared\" nor \"dedicated\"; NULL is how dedicated was stored before the 2026-09-29 serving-mode cutover) — the serving mode selects the price SKU, so these events are NOT billed. The raw events are retained in billing_event. If the window predates the cutover this is expected staging evidence; otherwise the proxy's serving-mode gate or the served-model registry is broken. Per hour and key, billing_reconciliation_hourly.invalid_serving_mode_attempts shows how many attempts this withheld",
+		r.log.Error.Printf("rating: window [%s,%s) has %d INVALID-SERVING-MODE events (serving_mode is neither \"shared\" nor \"dedicated\") — the serving mode selects the price SKU, so these events are NOT billed. The raw events are retained in billing_event. NULL or empty rows should already have been backfilled to 'dedicated' by migration 0007 (ledger item 6); any that remain mean the backfill was missed (re-run it, see docs/billing-reconciliation.md) or the proxy's serving-mode gate is broken. Per hour and key, billing_reconciliation_hourly.invalid_serving_mode_attempts shows how many attempts this withheld",
 			windowStart.Format(time.RFC3339), windowEnd.Format(time.RFC3339), res.InvalidServingModeEvents)
 	}
 	if res.HasAmbiguousGraph() {

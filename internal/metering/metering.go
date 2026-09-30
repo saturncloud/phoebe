@@ -94,9 +94,13 @@ type Event struct {
 	// axis. The proxy's serving-mode gate guarantees one of the two explicit
 	// values; "shared" prices from the distinct shared:<base> rate row. An empty
 	// value only appears on events metered before the 2026-09-29 serving-mode
-	// cutover (when empty meant dedicated and the key was omitted). Decode stored
-	// or queued event JSON with UnmarshalEvent, which maps only an ABSENT key to
-	// "dedicated"; an explicit "" or null stays "" and the rater withholds it.
+	// cutover, when the key was omitted and its absence meant dedicated. That
+	// evidence is billed as dedicated (ratified ledger item 6): UnmarshalEvent
+	// (used by the drainer and the spool replay), recovery and migration 0007
+	// all map it to "dedicated" at ingest and replay. Decode stored or queued
+	// event JSON with UnmarshalEvent, which maps only an ABSENT key; an explicit
+	// "" or null from a post-cutover producer is a bug, stays "", and the rater
+	// withholds it.
 	ServingMode string `json:"serving_mode"`
 
 	// GraphK8sName is the DynamoGraphDeployment (DGD) that served this request —
