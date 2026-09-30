@@ -244,6 +244,12 @@ type Identity struct {
 
 // FromRequest extracts the trusted identity headers. It performs no
 // validation beyond reading the values; authorization happened at the edge.
+//
+// The R3 envelope reads (gateway mark, org, owner, serving mode, served
+// model, and every rate-limit policy header — the pinned 18) resolve through
+// the trusted-header registry: a header outside the active set is treated
+// as ABSENT, never read for a trust decision. The remaining identity headers
+// are read directly (ratified edge contract, outside the R3 gate).
 func FromRequest(r *http.Request) Identity {
 	return Identity{
 		AuthID:                              r.Header.Get(HeaderAuthID),
@@ -251,26 +257,26 @@ func FromRequest(r *http.Request) Identity {
 		GroupID:                             r.Header.Get(HeaderGroupID),
 		ResourceID:                          r.Header.Get(HeaderResourceID),
 		ResourceType:                        r.Header.Get(HeaderResourceType),
-		OrgID:                               r.Header.Get(HeaderOrgID),
+		OrgID:                               trustedHeaderValue(r, HeaderOrgID),
 		BaseModel:                           r.Header.Get(HeaderBaseModel),
 		Adapter:                             r.Header.Get(HeaderAdapter),
-		ServingMode:                         r.Header.Get(HeaderServingMode),
-		ServedModel:                         r.Header.Get(HeaderServedModel),
+		ServingMode:                         trustedHeaderValue(r, HeaderServingMode),
+		ServedModel:                         trustedHeaderValue(r, HeaderServedModel),
 		Upstream:                            r.Header.Get(HeaderUpstream),
-		Gateway:                             r.Header.Get(HeaderGateway) == "true",
-		OwnerID:                             r.Header.Get(HeaderOwnerID),
-		OrgRateLimitRequests:                r.Header.Get(HeaderOrgRateLimitRequests),
-		OrgRateLimitTotalPromptTokens:       r.Header.Get(HeaderOrgRateLimitTotalPromptTokens),
-		OrgRateLimitUncachedPromptTokens:    r.Header.Get(HeaderOrgRateLimitUncachedPromptTokens),
-		OrgRateLimitGeneratedTokens:         r.Header.Get(HeaderOrgRateLimitGeneratedTokens),
-		OwnerRateLimitRequests:              r.Header.Get(HeaderOwnerRateLimitRequests),
-		OwnerRateLimitTotalPromptTokens:     r.Header.Get(HeaderOwnerRateLimitTotalPromptTokens),
-		OwnerRateLimitUncachedPromptTokens:  r.Header.Get(HeaderOwnerRateLimitUncachedPromptTokens),
-		OwnerRateLimitGeneratedTokens:       r.Header.Get(HeaderOwnerRateLimitGeneratedTokens),
-		LegacyServiceTier:                   r.Header.Get(HeaderLegacyServiceTier),
-		LegacyRateLimitRequests:             r.Header.Get(HeaderLegacyRateLimitRequests),
-		LegacyRateLimitTotalPromptTokens:    r.Header.Get(HeaderLegacyRateLimitTotalPromptTokens),
-		LegacyRateLimitUncachedPromptTokens: r.Header.Get(HeaderLegacyRateLimitUncachedPromptTokens),
-		LegacyRateLimitGeneratedTokens:      r.Header.Get(HeaderLegacyRateLimitGeneratedTokens),
+		Gateway:                             trustedHeaderValue(r, HeaderGateway) == "true",
+		OwnerID:                             trustedHeaderValue(r, HeaderOwnerID),
+		OrgRateLimitRequests:                trustedHeaderValue(r, HeaderOrgRateLimitRequests),
+		OrgRateLimitTotalPromptTokens:       trustedHeaderValue(r, HeaderOrgRateLimitTotalPromptTokens),
+		OrgRateLimitUncachedPromptTokens:    trustedHeaderValue(r, HeaderOrgRateLimitUncachedPromptTokens),
+		OrgRateLimitGeneratedTokens:         trustedHeaderValue(r, HeaderOrgRateLimitGeneratedTokens),
+		OwnerRateLimitRequests:              trustedHeaderValue(r, HeaderOwnerRateLimitRequests),
+		OwnerRateLimitTotalPromptTokens:     trustedHeaderValue(r, HeaderOwnerRateLimitTotalPromptTokens),
+		OwnerRateLimitUncachedPromptTokens:  trustedHeaderValue(r, HeaderOwnerRateLimitUncachedPromptTokens),
+		OwnerRateLimitGeneratedTokens:       trustedHeaderValue(r, HeaderOwnerRateLimitGeneratedTokens),
+		LegacyServiceTier:                   trustedHeaderValue(r, HeaderLegacyServiceTier),
+		LegacyRateLimitRequests:             trustedHeaderValue(r, HeaderLegacyRateLimitRequests),
+		LegacyRateLimitTotalPromptTokens:    trustedHeaderValue(r, HeaderLegacyRateLimitTotalPromptTokens),
+		LegacyRateLimitUncachedPromptTokens: trustedHeaderValue(r, HeaderLegacyRateLimitUncachedPromptTokens),
+		LegacyRateLimitGeneratedTokens:      trustedHeaderValue(r, HeaderLegacyRateLimitGeneratedTokens),
 	}
 }
