@@ -4,9 +4,10 @@ import (
 	"bytes"
 	"encoding/json"
 	"errors"
-	"github.com/saturncloud/phoebe/internal/identity"
 	"net/url"
 	"strings"
+
+	"github.com/saturncloud/phoebe/internal/identity"
 )
 
 // authorizedModelDiscoveryPath validates Dynamo's graph-wide per-model GET
