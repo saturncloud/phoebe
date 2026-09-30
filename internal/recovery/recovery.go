@@ -43,6 +43,13 @@ type Evidence struct {
 // declaration order, so a given build produces one byte sequence per event) and
 // sorted by the trusted request id, which validateAndDedupe has already proven
 // unique. Framing each record with its length keeps concatenation unambiguous.
+//
+// The digest is therefore only comparable between a dry-run and an -apply run
+// made with the same binary: changing metering.Event's fields or JSON tags (for
+// example, dropping omitempty from serving_mode in the serving-mode cutover, so
+// an empty serving_mode is now emitted as "serving_mode":"") changes the digest
+// of the same evidence, and an operator who upgrades between dry-run and apply
+// must redo the dry-run with the new binary.
 func (e Evidence) Digest() string {
 	encoded := make([][]byte, 0, len(e.Events))
 	for i := range e.Events {
