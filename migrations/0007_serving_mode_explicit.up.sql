@@ -28,21 +28,30 @@
 --     legal meaning and is deleted.
 -- The raw evidence for both remains in billing_event.
 --
--- NOTE ON RE-RATING: pre-cutover dedicated evidence in billing_event has a NULL
--- serving_mode. The rater now withholds such events (invalid_serving_mode_events),
--- so a re-rate of a pre-cutover window deletes the rows rewritten here through the
--- normal reconcile path. That is intended: there is nothing in production to keep.
--- The routine trailing-window rater hits this on its own for up to
--- rateTrailingHours after the deploy (exit 2 each run, dedicated rows deleted and
--- then removed from saturn-aws-manager by token-push). See "Serving-mode cutover
--- (migration 0007)" in docs/billing-reconciliation.md for what to expect and the
--- optional explicit backfill.
+-- PRE-CUTOVER EVIDENCE IS DEDICATED (Hugo, 2026-09-30: "assume it's all dedicated
+-- (which is true)"). Before this migration the proxy stored dedicated traffic with a
+-- NULL serving_mode (the header is absent on dedicated routes), and '' is the other
+-- historical spelling. Every such billing_event row IS dedicated traffic, so the
+-- first statement below rewrites it to 'dedicated'. This is a deliberate, one-time,
+-- ratified exception to "billing_event is never edited": it records what the row
+-- always meant in the vocabulary the rater now reads. Without it the rater would
+-- withhold that evidence, the trailing re-rate would reconcile-delete the rows
+-- renamed below, and the rater would page for a day.
 --
--- ROLLBACK LIMIT: the down migration cannot be reversed exactly for windows
--- metered after the cutover. The pre-0007 rater keeps billing_event's explicit
--- 'dedicated', so re-rating such a window after a rollback writes 'dedicated'
--- rollups next to the '' rows the down migration restores. See the header of
--- 0007_serving_mode_explicit.down.sql.
+-- With the backfill, a re-rate of any pre-cutover window reproduces exactly the
+-- rows this migration renames: same serving_mode, same id, no reconcile deletion.
+--
+-- The UPDATE is idempotent. Events metered by old proxy pods between this
+-- migration and the end of the rollout also carry NULL; re-running the same
+-- statement once the rollout finishes covers them (see "Serving-mode cutover
+-- (migration 0007)" in docs/billing-reconciliation.md).
+
+-- ROLLBACK: the down migration maps 'dedicated' back to the pre-0007 spellings in
+-- both tables (NULL in billing_event, '' in rated_usage). See its header.
+
+UPDATE billing_event
+SET serving_mode = 'dedicated'
+WHERE serving_mode IS NULL OR serving_mode = '';
 
 DELETE FROM rated_usage ru
 WHERE ru.serving_mode = ''
@@ -83,10 +92,10 @@ ALTER TABLE rated_usage
 COMMENT ON COLUMN rated_usage.serving_mode IS
     'Serving-mode SKU axis: ''shared'' or ''dedicated'' (CHECK-enforced; the empty string was retired on 2026-09-29). KEY COLUMN: the two price from different SKUs and must never merge into one rollup.';
 
--- billing_event is the evidence ledger and deliberately has no CHECK. Only its
+-- billing_event is the evidence ledger and deliberately has no CHECK. Its
 -- description changes: NULL no longer means dedicated.
 COMMENT ON COLUMN billing_event.serving_mode IS
-    'Serving mode captured at meter time: ''shared'' or ''dedicated''. NULL or empty only on events metered before the 2026-09-29 serving-mode cutover (when it meant dedicated); the rater withholds those from money and counts them as invalid_serving_mode_events.';
+    'Serving mode captured at meter time: ''shared'' or ''dedicated''. Rows metered before migration 0007 were backfilled to ''dedicated'' (all pre-cutover traffic was dedicated). Any other value, including NULL, is withheld by the rater as invalid_serving_mode_events.';
 
 -- Reconciliation view: add invalid_serving_mode_attempts. Before this migration
 -- every dedicated event was rated; from here on the rater withholds any event

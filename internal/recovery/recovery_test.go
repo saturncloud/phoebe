@@ -327,24 +327,31 @@ func writeEvidence(t *testing.T, content string) string {
 	return path
 }
 
-// TestDecodeEvent_MissingServingModeRefused: a record predating the 2026-09-29
-// serving-mode cutover has no serving_mode key. Decoded, it becomes "", the
-// drainer stores NULL, and the rater withholds it from money forever. Refuse it at
-// import (same precedent as usage_found) so an operator asserts the mode instead.
-func TestDecodeEvent_MissingServingModeRefused(t *testing.T) {
-	legacy := `{"request_id":"req-legacy","auth_id":"auth-1","prompt_tokens":10,` +
+// TestDecodeEvent_PreCutoverEvidenceReplaysAsDedicated: a record predating the
+// 2026-09-29 serving-mode cutover has no serving_mode key (or an empty one). All
+// pre-cutover traffic was dedicated (Hugo, 2026-09-30), so it replays as
+// "dedicated" — the same rule migration 0007 applied to billing_event — instead of
+// being stored NULL and withheld by the rater.
+func TestDecodeEvent_PreCutoverEvidenceReplaysAsDedicated(t *testing.T) {
+	absent := `{"request_id":"req-legacy","auth_id":"auth-1","prompt_tokens":10,` +
 		`"completion_tokens":5,"usage_found":true,"timestamp_unix_ms":1750000000000}`
-	if _, err := decodeEvent([]byte(legacy)); err == nil || !strings.Contains(err.Error(), "serving_mode") {
-		t.Fatalf("decodeEvent must refuse a record with no serving_mode, naming the field; got %v", err)
-	}
-	if _, err := Load(writeEvidence(t, legacy)); err == nil || !strings.Contains(err.Error(), "serving_mode") {
-		t.Fatalf("Load must refuse a record with no serving_mode, naming the field; got %v", err)
+	empty := `{"request_id":"req-legacy-2","auth_id":"auth-1","prompt_tokens":10,` +
+		`"completion_tokens":5,"usage_found":true,"serving_mode":"","timestamp_unix_ms":1750000000000}`
+	for _, rec := range []string{absent, empty} {
+		ev, err := decodeEvent([]byte(rec))
+		if err != nil || ev.ServingMode != "dedicated" {
+			t.Fatalf("decodeEvent(%s) = (%q, %v), want serving_mode dedicated", rec, ev.ServingMode, err)
+		}
+		evidence, err := Load(writeEvidence(t, rec))
+		if err != nil || len(evidence.Events) != 1 || evidence.Events[0].ServingMode != "dedicated" {
+			t.Fatalf("Load(%s) = (%+v, %v), want one dedicated event", rec, evidence, err)
+		}
 	}
 }
 
-// TestDecodeEvent_MissingServingModeRefusedFromWAL: the same refusal applies to
+// TestDecodeEvent_PreCutoverWALEvidenceReplaysAsDedicated: the same rule applies to
 // WAL evidence, not only JSONL.
-func TestDecodeEvent_MissingServingModeRefusedFromWAL(t *testing.T) {
+func TestDecodeEvent_PreCutoverWALEvidenceReplaysAsDedicated(t *testing.T) {
 	dir := filepath.Join(t.TempDir(), "wal")
 	log, err := tidwall.Open(dir, nil)
 	if err != nil {
@@ -357,16 +364,17 @@ func TestDecodeEvent_MissingServingModeRefusedFromWAL(t *testing.T) {
 	if err := log.Close(); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := Load(dir); err == nil || !strings.Contains(err.Error(), "serving_mode") {
-		t.Fatalf("WAL record with no serving_mode must be refused, naming the field; got %v", err)
+	evidence, err := Load(dir)
+	if err != nil || len(evidence.Events) != 1 || evidence.Events[0].ServingMode != "dedicated" {
+		t.Fatalf("WAL pre-cutover record = (%+v, %v), want one dedicated event", evidence, err)
 	}
 }
 
-// TestDecodeEvent_EmptyServingModeRefused: a present-but-empty (or any other
-// non-shared/dedicated) serving_mode is withheld by the rater exactly like an
-// absent one, so it must not pass validation either.
-func TestDecodeEvent_EmptyServingModeRefused(t *testing.T) {
-	for _, mode := range []string{"", "Dedicated", "serverless"} {
+// TestDecodeEvent_InvalidServingModeRefused: a present value that is neither
+// shared nor dedicated would be withheld by the rater, so it must not pass
+// validation.
+func TestDecodeEvent_InvalidServingModeRefused(t *testing.T) {
+	for _, mode := range []string{"Dedicated", "serverless", " shared"} {
 		ev := testEvent("req-bad-mode")
 		ev.ServingMode = mode
 		data, err := json.Marshal(ev)

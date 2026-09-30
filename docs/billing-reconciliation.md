@@ -233,39 +233,37 @@ settling the invoice window.
 ### Serving-mode cutover (migration 0007)
 
 Migration 0007 makes `'shared'` and `'dedicated'` the only legal serving modes.
-It renames every existing `rated_usage` row stored with the old empty serving mode
-to `'dedicated'` and recomputes its id. It does NOT rewrite `billing_event`: raw
-evidence is never edited, so dedicated events recorded before the cutover still
-carry a NULL (or `''`) serving mode.
+Before it, dedicated traffic was stored with a NULL (or `''`) serving mode. All of
+that traffic was dedicated (Hugo, 2026-09-30: "assume it's all dedicated (which is
+true)"), so 0007:
 
-The rater now counts such events as `invalid_serving_mode_events` and withholds
-them from money. Expect the following after you deploy 0007 and the new rater at
-hour H:
+- rewrites `billing_event.serving_mode` NULL and `''` to `'dedicated'` (a one-time,
+  ratified exception to "raw evidence is never edited");
+- renames the matching `rated_usage` rows from `''` to `'dedicated'` and recomputes
+  their ids with the rater's formula.
 
-- Every default (trailing-window) rater run whose window still contains hours
-  before H exits 2. That is up to `rateTrailingHours` runs (default 24), one per
-  hour, until the window slides past the deploy hour. Two conditions drive the
-  exit: the invalid-serving-mode anomaly, and, on the first run that covers each
-  pre-cutover hour, a reconcile deletion during a routine run.
-- The `'dedicated'` `rated_usage` rows that 0007 renamed inside that window are
-  reconcile-deleted, because their evidence no longer rates. token-push then
-  pushes snapshots without those rows, and saturn-aws-manager removes those
-  charges by absence.
-- Dedicated traffic served in hour H before the deploy is never billed, even
-  though `billing_event` still holds it.
+After the deploy, the trailing-window rater re-rates the pre-cutover hours and
+reproduces exactly those rows: same serving mode, same ids, no reconcile deletions
+and no invalid-serving-mode anomaly. token-push sends the new ids once, and
+saturn-aws-manager replaces the old `''` records for those windows by absence.
 
-This is expected and harmless in the pre-production window, where there is no
-real customer billing to preserve (ratified in the 2026-09-24 and 2026-09-29
-serving-mode rulings). Do not treat these pages as a data-loss incident. They
-stop once the trailing window no longer contains any hour before H. On an install
-that is already billing real customers, stop and get a ruling before deploying
-0007; this runbook does not cover that case.
+**One follow-up step after the rollout.** The migration Job runs before the new
+proxy pods replace the old ones. An old pod still serving during the rollout
+meters dedicated traffic with a NULL serving mode, which the new rater withholds
+as `invalid_serving_mode_events`. Once every interceptor pod runs the new image,
+run the same idempotent statement again against phoebe's database:
 
-Optionally, right after the deploy, run one explicit backfill over the trailing
-window, for example `rater --since <H minus 24h> --until <H>`. The reconcile
-deletions then happen once, under a window the operator named, and that run does
-not page for them. The invalid-serving-mode anomaly still exits 2 on that run by
-design, and later routine runs keep exiting 2 on it until the window slides past H.
+```sql
+UPDATE billing_event SET serving_mode = 'dedicated'
+WHERE serving_mode IS NULL OR serving_mode = '';
+```
+
+The next routine rater run (or an explicit `rater --since <deploy hour> --until
+<now>`) then rates those events. If the rater paged with `invalid_serving_mode_events`
+for hours inside the rollout, this step is the fix. Outside the cutover, a nonzero
+`invalid_serving_mode_events` means the proxy's serving-mode gate or the
+served-model registry is broken, and the statement above must NOT be used to hide
+it.
 
 ### Upgrading an install that already carries billing traffic
 

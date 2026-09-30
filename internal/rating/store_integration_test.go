@@ -3316,6 +3316,140 @@ func TestIntegration_Migration0007ServingModeExplicit(t *testing.T) {
 		VALUES ('x3', 'z', 'res', 'm', '2026-06-08T10:00:00Z', '2026-06-08T11:00:00Z', 0, 0, 0, 0, 0, 0)`)
 }
 
+// TestIntegration_Migration0007BackfillMakesPreCutoverReRateANoOp pins Hugo's
+// 2026-09-30 ruling ("assume it's all dedicated (which is true)"): 0007 backfills
+// pre-cutover billing_event rows (NULL and ”) to 'dedicated', so the trailing
+// re-rate after the deploy REPRODUCES the rated_usage rows 0007 renamed — same
+// ids, zero reconcile deletions, zero invalid-serving-mode events — instead of
+// withholding the evidence and deleting the rows. It also pins the rollout
+// follow-up: a NULL event metered by an old pod after the migration is withheld
+// until the same idempotent backfill statement is re-run, and then rates. Down
+// maps billing_event 'dedicated' back to NULL (the pre-0007 dedicated spelling).
+func TestIntegration_Migration0007BackfillMakesPreCutoverReRateANoOp(t *testing.T) {
+	dsn := os.Getenv("PHOEBE_TEST_DATABASE_URL")
+	if dsn == "" {
+		t.Skip("PHOEBE_TEST_DATABASE_URL not set; skipping live-Postgres conformance")
+	}
+	ctx := context.Background()
+	db, err := sql.Open("pgx", dsn)
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	defer db.Close()
+	db.SetMaxOpenConns(1)
+
+	const sch = "phoebe_migration_0007_backfill_it"
+	exec(t, db, "DROP SCHEMA IF EXISTS "+sch+" CASCADE")
+	exec(t, db, "CREATE SCHEMA "+sch)
+	exec(t, db, "SET search_path TO "+sch)
+	defer func() { exec(t, db, "DROP SCHEMA IF EXISTS "+sch+" CASCADE") }()
+	for _, f := range []string{"0001_billing_event", "0002_rating", "0004_billing_event_serving_mode",
+		"0005_invoice_grade_attempts", "0006_rollup_grain"} {
+		exec(t, db, readMigration(t, f+".up.sql"))
+	}
+	exec(t, db, "ALTER TABLE billing_event ALTER COLUMN usage_found SET DEFAULT TRUE")
+
+	hour := mustTime("2026-06-08T10:00:00Z")
+	// Pre-cutover evidence exactly as the pre-0007 proxy/drainer stored it:
+	// dedicated as NULL (and the other historical spelling ''), shared as 'shared'.
+	if _, err := db.ExecContext(ctx,
+		`INSERT INTO billing_event (request_id, auth_id, resource_id, org_id, model, base_model, serving_mode, prompt_tokens, event_ts)
+		 VALUES ('d-null', 'a', 'res', 'org-1', 'm', 'b', NULL,     100, $1),
+		        ('d-empty','a', 'res', 'org-1', 'm', 'b', '',       100, $1),
+		        ('s1',     'a', 'res', 'org-1', 'm', 'b', 'shared', 100, $1)`, hour.Add(time.Minute)); err != nil {
+		t.Fatalf("seed billing_event: %v", err)
+	}
+	// The rollups the pre-0007 rater wrote for that evidence: dedicated as '' with
+	// its old-formula id, shared as 'shared'.
+	book := newTestBook(map[string]Rate3{
+		"b":        rate3("0.000010", "0", "0"),
+		"shared:b": rate3("0.000001", "0", "0"),
+	}, nil, PolicyIdentity, Dec{}, Dec{})
+	for _, row := range []struct {
+		mode, cost string
+		events     int
+	}{{"", "0.002000000", 2}, {"shared", "0.000100000", 1}} {
+		if _, err := db.ExecContext(ctx, `INSERT INTO rated_usage
+			(id, auth_id, owner_type, owner_id, resource_id, org_id, model_id, serving_mode,
+			 window_start, window_end, prompt_tokens, cached_tokens, completion_tokens,
+			 billable_prompt_tokens, cost, applied_prompt_rate, applied_cached_rate,
+			 applied_completion_rate, event_count)
+			VALUES (md5(length('a')::text || ':' || 'a' || '|0:|0:|' || length('res')::text || ':' || 'res'
+			            || '|' || length('m')::text || ':' || 'm'
+			            || '|' || length($1::text)::text || ':' || $1::text
+			            || '|' || extract(epoch FROM $2::timestamptz)::bigint::text),
+			        'a', '', '', 'res', 'org-1', 'm', $1::text, $2::timestamptz,
+			        $2::timestamptz + interval '1 hour', $3, 0, 0, $3, $4::numeric, 0, 0, 0, $5)`,
+			row.mode, hour, 100*row.events, row.cost, row.events); err != nil {
+			t.Fatalf("seed rated_usage %q: %v", row.mode, err)
+		}
+	}
+
+	exec(t, db, readMigration(t, "0007_serving_mode_explicit.up.sql"))
+
+	var leftover int
+	if err := db.QueryRowContext(ctx,
+		`SELECT COUNT(*) FROM billing_event WHERE serving_mode IS NULL OR serving_mode NOT IN ('shared','dedicated')`).
+		Scan(&leftover); err != nil {
+		t.Fatalf("count leftover: %v", err)
+	}
+	if leftover != 0 {
+		t.Fatalf("%d billing_event rows still lack an explicit serving mode after 0007, want 0", leftover)
+	}
+	idsBefore := readRatedUsageIDs(t, db)
+
+	// The routine re-rate of the pre-cutover hour must be a no-op on identity.
+	store := NewPostgresStore(db)
+	res, err := store.RateWindow(ctx, book, hour, hour.Add(time.Hour))
+	if err != nil {
+		t.Fatalf("RateWindow: %v", err)
+	}
+	if res.ReconciledDeletions != 0 || res.InvalidServingModeEvents != 0 || res.EventsRated != 3 || res.RollupsWritten != 2 {
+		t.Fatalf("re-rate after 0007: deletions=%d invalid=%d rated=%d rollups=%d, want 0/0/3/2",
+			res.ReconciledDeletions, res.InvalidServingModeEvents, res.EventsRated, res.RollupsWritten)
+	}
+	idsAfter := readRatedUsageIDs(t, db)
+	if len(idsAfter) != 2 {
+		t.Fatalf("rated_usage after re-rate = %v, want 2 rows", idsAfter)
+	}
+	for k, id := range idsBefore {
+		if idsAfter[k] != id {
+			t.Fatalf("rollup %s: id %s after re-rate, %s after migration — the re-rate re-cut an id", k, idsAfter[k], id)
+		}
+	}
+
+	// Rollout follow-up: an old pod metering after the migration writes NULL. The
+	// rater withholds it until the idempotent backfill is re-run.
+	if _, err := db.ExecContext(ctx,
+		`INSERT INTO billing_event (request_id, auth_id, resource_id, org_id, model, base_model, serving_mode, prompt_tokens, event_ts)
+		 VALUES ('d-rollout', 'a', 'res', 'org-1', 'm', 'b', NULL, 100, $1)`, hour.Add(2*time.Minute)); err != nil {
+		t.Fatalf("seed rollout event: %v", err)
+	}
+	if res, err = store.RateWindow(ctx, book, hour, hour.Add(time.Hour)); err != nil || res.InvalidServingModeEvents != 1 {
+		t.Fatalf("before re-running the backfill: invalid=%d err=%v, want 1", res.InvalidServingModeEvents, err)
+	}
+	exec(t, db, `UPDATE billing_event SET serving_mode = 'dedicated' WHERE serving_mode IS NULL OR serving_mode = ''`)
+	if res, err = store.RateWindow(ctx, book, hour, hour.Add(time.Hour)); err != nil ||
+		res.InvalidServingModeEvents != 0 || res.EventsRated != 4 || res.ReconciledDeletions != 0 {
+		t.Fatalf("after re-running the backfill: invalid=%d rated=%d deletions=%d err=%v, want 0/4/0",
+			res.InvalidServingModeEvents, res.EventsRated, res.ReconciledDeletions, err)
+	}
+
+	// Down: billing_event goes back to the pre-0007 dedicated spelling (NULL).
+	exec(t, db, readMigration(t, "0007_serving_mode_explicit.down.sql"))
+	var nulls, shared, explicitDedicated int
+	if err := db.QueryRowContext(ctx, `SELECT
+		COUNT(*) FILTER (WHERE serving_mode IS NULL),
+		COUNT(*) FILTER (WHERE serving_mode = 'shared'),
+		COUNT(*) FILTER (WHERE serving_mode = 'dedicated') FROM billing_event`).
+		Scan(&nulls, &shared, &explicitDedicated); err != nil {
+		t.Fatalf("read billing_event after down: %v", err)
+	}
+	if nulls != 3 || shared != 1 || explicitDedicated != 0 {
+		t.Fatalf("billing_event after down: NULL=%d shared=%d dedicated=%d, want 3/1/0", nulls, shared, explicitDedicated)
+	}
+}
+
 // readMigration returns the text of one real migration file.
 func readMigration(t *testing.T, name string) string {
 	t.Helper()

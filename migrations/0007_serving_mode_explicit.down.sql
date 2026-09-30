@@ -1,28 +1,22 @@
--- Reverse of 0007: every 'dedicated' row in rated_usage goes back to being
--- spelled '', with the id recomputed by the pre-0007 formula (the same md5
--- expression hashing the empty string). The rename cannot collide with the
--- unique key: while the CHECK held, no '' row could exist.
+-- Reverse of 0007: 'dedicated' goes back to the pre-0007 spellings — '' in
+-- rated_usage (with the id recomputed by the pre-0007 formula, the same md5
+-- expression hashing the empty string) and NULL in billing_event (what the pre-0007
+-- proxy stored for dedicated traffic). The rated_usage rename cannot collide with
+-- the unique key: while the CHECK held, no '' row could exist.
 --
--- WHAT THIS DOES AND DOES NOT RESTORE. The rewrite is lossless for the rated_usage
--- rows that exist at rollback time. The rewritten rows match what the pre-0007
--- rater would write only for windows whose billing_event evidence predates the
--- cutover (billing_event.serving_mode NULL or ''). Events metered after the
--- cutover were stamped serving_mode = 'dedicated' by the proxy, and the pre-0007
--- rater keeps that value, because its COALESCE(ev.serving_mode, '') maps only
--- NULL to ''. So after a rollback, the next re-rate of any window that holds
--- post-cutover evidence writes a 'dedicated' rollup with a different id and
--- deletes, through the normal reconcile path, the '' row this migration restored.
--- Expect reconcile-deletion counts and new ids pushed to saturn-aws-manager for
--- those windows. An hour that also holds events from the rolled-back proxy splits
--- into a '' rollup and a 'dedicated' rollup, so a rolled-back install holds both
--- spellings of dedicated and a rolled-back manager receives both for one grain.
+-- billing_event: the pre-0007 rater reads NULL as dedicated and keeps any explicit
+-- value verbatim, so an explicit 'dedicated' would make it write a second, separate
+-- 'dedicated' rollup next to the '' one for the same grain. Mapping every
+-- 'dedicated' event back to NULL keeps a rolled-back install on one spelling. This
+-- mirrors the up migration's ratified backfill (Hugo, 2026-09-30: all pre-cutover
+-- traffic was dedicated); after a rollback, NULL means dedicated again.
 --
--- This migration deliberately does NOT rewrite billing_event to hide that: it is
--- the append-only evidence ledger (contracts/billing-event-ledger.md) and is never
--- edited. The limitation is accepted only because rated_usage rows are disposable
--- in the pre-production window (no production rows; the 2026-09-24 ruling, ledger
--- item 2), where they can be thrown away and rebuilt from billing_event. Once
--- production rows exist, do not roll 0007 back.
+-- Pre-production only (no production rows; 2026-09-24 ruling). Once production
+-- rows exist, do not roll 0007 back without a fresh ruling.
+UPDATE billing_event
+SET serving_mode = NULL
+WHERE serving_mode = 'dedicated';
+
 ALTER TABLE rated_usage DROP CONSTRAINT IF EXISTS rated_usage_serving_mode_ck;
 
 UPDATE rated_usage
