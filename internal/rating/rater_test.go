@@ -86,13 +86,18 @@ func TestResult_InvalidServingModeDrivesAnomaly(t *testing.T) {
 // oracle store, an event carrying the retired empty serving mode (or any other
 // non-"shared"/"dedicated" value) is withheld and counted as an invalid serving
 // mode — not billed as dedicated and not misreported as unpriced — while its
-// dedicated neighbour in the same hour still bills.
+// dedicated neighbour in the same hour still bills. The "unpriced-model" rows have
+// NO price in bookM() and no base, so they would ALSO be unpriced if the serving
+// mode were valid: they are what makes the "not unpriced" half of the claim able
+// to fail (an invalid mode is counted ONLY as invalid, never also as unpriced).
 func TestRater_InvalidServingModeWithheldNotUnpriced(t *testing.T) {
 	at := mustTime("2026-06-08T10:05:00Z")
 	events := []RatedEvent{
 		{ServingMode: "dedicated", AuthID: "k", ResourceID: "d", ModelID: "m", PromptTokens: 100, At: at},
 		{ServingMode: "", AuthID: "k", ResourceID: "d", ModelID: "m", PromptTokens: 100, At: at},
 		{ServingMode: "bogus", AuthID: "k", ResourceID: "d", ModelID: "m", PromptTokens: 100, At: at},
+		{ServingMode: "", AuthID: "k", ResourceID: "d", ModelID: "unpriced-model", PromptTokens: 100, At: at},
+		{ServingMode: "bogus", AuthID: "k", ResourceID: "d", ModelID: "unpriced-model", PromptTokens: 100, At: at},
 	}
 	store := newOracleStore(bookM(), events)
 	r := New(store, bookM(), testLogger())
@@ -100,9 +105,16 @@ func TestRater_InvalidServingModeWithheldNotUnpriced(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Run: %v", err)
 	}
-	if res.EventsRated != 1 || res.InvalidServingModeEvents != 2 || res.UnpricedEvents != 0 {
-		t.Fatalf("rated/invalid-mode/unpriced = %d/%d/%d, want 1/2/0",
+	if res.EventsRated != 1 || res.InvalidServingModeEvents != 4 || res.UnpricedEvents != 0 {
+		t.Fatalf("rated/invalid-mode/unpriced = %d/%d/%d, want 1/4/0",
 			res.EventsRated, res.InvalidServingModeEvents, res.UnpricedEvents)
+	}
+	// Partition identity: every in-window event lands in exactly one bucket.
+	sum := res.EventsRated + res.UnpricedEvents + res.UnattributableEvents +
+		res.MissingUsageEvents + res.InvalidUsageEvents + res.AmbiguousBaseEvents +
+		res.AmbiguousOrgEvents + res.OwnerConflictEvents + res.InvalidServingModeEvents
+	if sum != int64(len(events)) {
+		t.Fatalf("bucket sum = %d, want %d (one bucket per event)", sum, len(events))
 	}
 	if !res.HasAnomaly() {
 		t.Fatal("withheld invalid-serving-mode events must drive the fail-loud exit")

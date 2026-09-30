@@ -2968,6 +2968,10 @@ func TestIntegration_OwnerConflictDoesNotPoisonItsBucket(t *testing.T) {
 //     ONLY as invalid_serving_mode_events (not as unpriced, even though 'unp'
 //     below shows an unpriced model is reported separately);
 //   - 'both' is invalid AND owner-conflicted: counted once, as invalid serving mode;
+//   - 'nulunp' (NULL) and 'empunp' (”) are invalid AND unpriced (neither model
+//     'm3' nor base 'nobase' has a price row): counted ONLY as invalid serving
+//     mode, never also as unpriced. They are what lets the "not unpriced" claim
+//     fail if the valid_serving_mode filter is dropped from the unpriced count;
 //   - 'unp' is a valid dedicated event for an unpriced model: counted as unpriced.
 //
 // The partition identity must hold, the one rollup written must carry
@@ -3001,6 +3005,8 @@ func TestIntegration_InvalidServingModeWithheldAndCounted(t *testing.T) {
 		        ('emp', 'a', NULL,  NULL,  'res','org-1','m',  'b',        '',         100,0,$1),
 		        ('bad', 'a', NULL,  NULL,  'res','org-1','m',  'b',        'Dedicated',100,0,$1),
 		        ('both','a', 'u-1', 'g-1', 'res','org-1','m',  'b',        NULL,       100,0,$1),
+		        ('nulunp','a', NULL, NULL, 'res','org-1','m3', 'nobase',   NULL,       100,0,$1),
+		        ('empunp','a', NULL, NULL, 'res','org-1','m3', 'nobase',   '',         100,0,$1),
 		        ('unp', 'a', NULL,  NULL,  'res','org-1','m2', 'unpriced', 'dedicated',100,0,$1)`,
 		hour.Add(5*time.Minute)); err != nil {
 		t.Fatalf("seed: %v", err)
@@ -3013,17 +3019,17 @@ func TestIntegration_InvalidServingModeWithheldAndCounted(t *testing.T) {
 	if res.EventsRated != 1 || res.RollupsWritten != 1 {
 		t.Fatalf("rated/rollups = %d/%d, want 1/1 (only 'ded' bills)", res.EventsRated, res.RollupsWritten)
 	}
-	if res.InvalidServingModeEvents != 4 {
-		t.Fatalf("InvalidServingModeEvents = %d, want 4 (nul, emp, bad, both)", res.InvalidServingModeEvents)
+	if res.InvalidServingModeEvents != 6 {
+		t.Fatalf("InvalidServingModeEvents = %d, want 6 (nul, emp, bad, both, nulunp, empunp)", res.InvalidServingModeEvents)
 	}
 	if res.UnpricedEvents != 1 || res.OwnerConflictEvents != 0 {
-		t.Fatalf("unpriced/owner-conflict = %d/%d, want 1/0 (each event in exactly one bucket)",
+		t.Fatalf("unpriced/owner-conflict = %d/%d, want 1/0 (only 'unp' is unpriced; nulunp/empunp are invalid only)",
 			res.UnpricedEvents, res.OwnerConflictEvents)
 	}
 	if got := res.EventsRated + res.MissingUsageEvents + res.InvalidUsageEvents + res.UnpricedEvents +
 		res.UnattributableEvents + res.InvalidServingModeEvents + res.AmbiguousBaseEvents +
-		res.AmbiguousOrgEvents + res.OwnerConflictEvents; got != 6 {
-		t.Fatalf("partition sums to %d, want 6 (every event in exactly one bucket)", got)
+		res.AmbiguousOrgEvents + res.OwnerConflictEvents; got != 8 {
+		t.Fatalf("partition sums to %d, want 8 (every event in exactly one bucket)", got)
 	}
 
 	var mode string
@@ -3038,8 +3044,8 @@ func TestIntegration_InvalidServingModeWithheldAndCounted(t *testing.T) {
 	if err := db.QueryRowContext(ctx, `SELECT COUNT(*) FROM billing_event`).Scan(&raw); err != nil {
 		t.Fatalf("count billing_event: %v", err)
 	}
-	if raw != 6 {
-		t.Fatalf("billing_event rows = %d, want 6 (withheld evidence is retained)", raw)
+	if raw != 8 {
+		t.Fatalf("billing_event rows = %d, want 8 (withheld evidence is retained)", raw)
 	}
 }
 
