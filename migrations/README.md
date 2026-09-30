@@ -55,6 +55,13 @@ migrate down       # roll back one step
 migrate version    # print the current applied version
 ```
 
+Rolling back 0007 is not exact for windows metered after its cutover: the
+pre-0007 rater keeps the explicit `'dedicated'` recorded in `billing_event`, so
+re-rating those windows after a rollback produces `'dedicated'` rollups beside the
+`''` rows the down migration restored. That is acceptable only while
+`rated_usage` rows are disposable (pre-production). See the header of
+`0007_serving_mode_explicit.down.sql`.
+
 It adapts `DATABASE_URL`'s `postgres://` scheme to golang-migrate's `pgx5://`
 driver scheme internally, so one `DATABASE_URL` serves every phoebe component.
 

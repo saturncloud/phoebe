@@ -37,6 +37,12 @@
 -- then removed from saturn-aws-manager by token-push). See "Serving-mode cutover
 -- (migration 0007)" in docs/billing-reconciliation.md for what to expect and the
 -- optional explicit backfill.
+--
+-- ROLLBACK LIMIT: the down migration cannot be reversed exactly for windows
+-- metered after the cutover. The pre-0007 rater keeps billing_event's explicit
+-- 'dedicated', so re-rating such a window after a rollback writes 'dedicated'
+-- rollups next to the '' rows the down migration restores. See the header of
+-- 0007_serving_mode_explicit.down.sql.
 
 DELETE FROM rated_usage ru
 WHERE ru.serving_mode = ''
