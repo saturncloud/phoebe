@@ -185,17 +185,26 @@ func (s *Server) wakeEnabled(id identity.Identity) bool {
 	if isWakeable(id) {
 		return true
 	}
-	// Wake is configured, and the route has the BOUND shape (authorized
-	// resource id + served-model allow-list) but no serving mode: the edge
-	// middleware injects X-Saturn-Served-Model but not yet
-	// X-Saturn-Serving-Mode (contract not fully rolled out), so the route is
-	// treated as dedicated-for-wake — and a cold shared base on it would NEVER
-	// wake, giving customers raw cold 404/503s with no signal anywhere. Empty
-	// serving mode is dedicated by the absence-of-prefix contract, so
-	// eligibility is unchanged; this log is the only addition.
+	// The route has the BOUND shape (authorized resource id + served-model
+	// allow-list) but no serving mode: an absent serving-mode header on a
+	// bound route IS the dedicated-route shape (the ratified contract), not a
+	// rollout gap — dedicated capacity never scales to zero, so treating it as
+	// dedicated-for-wake loses nothing. This is the normal state for every
+	// bound dedicated route, so the diagnostic is per-request Debug, never a
+	// per-request Warn.
 	if id.ResourceID != "" && id.ServedModel != "" && id.ServingMode == "" {
-		s.log.Warn.Printf("wake: route looks bound (resource_id=%s) but %s is absent: treating as dedicated-for-wake, shared cold bases will not wake (edge contract not fully rolled out)",
+		s.log.Debug.Printf("wake: bound route (resource_id=%s) has no %s header: dedicated by the absent-mode contract, shared cold bases will not wake on it",
 			id.ResourceID, identity.HeaderServingMode)
+		return false
+	}
+	// A route explicitly marked shared that is missing half of the bound shape
+	// (no authorized resource id or no served-model allow-list) can never
+	// wake: a cold shared base on it serves raw 404/503s with no wake signal
+	// anywhere. That is a genuine contract breakage, not the normal dedicated
+	// state — keep it loud.
+	if id.ServingMode == "shared" && (id.ResourceID == "" || id.ServedModel == "") {
+		s.log.Warn.Printf("wake: route marked shared (resource_id=%q served_model=%q) can never wake: cold shared bases will serve raw 404/503s",
+			id.ResourceID, id.ServedModel)
 	}
 	return false
 }
