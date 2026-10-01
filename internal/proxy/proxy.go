@@ -549,7 +549,8 @@ func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request) {
 		originalPromptBytes := int64(len(body))
 		defaultOutput := s.settings.Admission.DefaultMaxOutputTokens
 		if defaultOutput <= 0 {
-			defaultOutput = 512
+			// R10: the ratified default (Baseten-aligned) is 4096.
+			defaultOutput = 4096
 		}
 		estimate, ok := admissionWork(body, defaultOutput)
 		if !ok {

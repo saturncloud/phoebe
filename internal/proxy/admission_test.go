@@ -27,11 +27,13 @@ import (
 	"github.com/saturncloud/phoebe/internal/logging"
 )
 
+func ptr64(v int64) *int64 { return &v }
+
 func proxyAdmissionConfig(active int64) config.AdmissionSettings {
 	return config.AdmissionSettings{Enabled: true, KeyPrefix: "proxy-test", LeaseTTL: time.Minute,
-		DefaultMaxOutputTokens: 20, Platform: config.AdmissionLimits{MaxActiveRequests: active,
-			MaxConcurrentPrefills: active, MaxReservedDecodeSlots: active, MaxPromptBytes: 1024, MaxReservedOutputTokens: 100,
-			RequestsPerWindow: 100, GeneratedTokensPerWindow: 1000, Window: time.Minute}}
+		DefaultMaxOutputTokens: 20, Platform: config.AdmissionLimits{MaxActiveRequests: ptr64(active),
+			MaxConcurrentPrefills: ptr64(active), MaxReservedDecodeSlots: ptr64(active), MaxPromptBytes: ptr64(1024), MaxReservedOutputTokens: ptr64(100),
+			RequestsPerWindow: ptr64(100), GeneratedTokensPerWindow: ptr64(1000), Window: time.Minute}}
 }
 
 // fixedWindowBucket mirrors the admission store's fixed 1-minute window bucket
@@ -52,7 +54,11 @@ func sharedRequest(upstream *url.URL) *http.Request {
 	r.Header.Set(identity.HeaderServedModel, "model-a")
 	// Admission-enabled shared requests require the complete authenticated
 	// policy envelope regardless of whether they use the single-host gateway or
-	// a transitional per-resource route. Explicit zero means unlimited.
+	// a transitional per-resource route. R4 sentinel semantics: an absent
+	// header would be unlimited, but the envelope must be complete, and an
+	// explicit "0" is a zero cap that blocks every request — so this base
+	// helper stamps large, non-binding caps and tests that need a binding or
+	// zero-capped dimension override it explicitly.
 	for _, header := range []string{
 		identity.HeaderOrgRateLimitRequests,
 		identity.HeaderOrgRateLimitTotalPromptTokens,
@@ -63,7 +69,7 @@ func sharedRequest(upstream *url.URL) *http.Request {
 		identity.HeaderOwnerRateLimitUncachedPromptTokens,
 		identity.HeaderOwnerRateLimitGeneratedTokens,
 	} {
-		r.Header.Set(header, "0")
+		r.Header.Set(header, "1000000")
 	}
 	return r
 }
@@ -100,7 +106,7 @@ func TestSharedRequestBodyBoundariesBeforeAdmission(t *testing.T) {
 
 	newServer := func(a *countingAdmitter) *Server {
 		cfg := proxyAdmissionConfig(2)
-		cfg.Platform.MaxPromptBytes = limit
+		cfg.Platform.MaxPromptBytes = ptr64(limit)
 		return New(&config.Settings{Admission: cfg}, logging.New(logging.ERROR), &recordingEmitter{}).
 			WithAdmitter(a)
 	}
@@ -151,7 +157,7 @@ func TestSharedRequestAtExactBodyLimitAdmitsWithRedisAdmitter(t *testing.T) {
 	up, _ := url.Parse(backend.URL)
 	mr := miniredis.RunT(t)
 	cfg := proxyAdmissionConfig(2)
-	cfg.Platform.MaxPromptBytes = limit
+	cfg.Platform.MaxPromptBytes = ptr64(limit)
 	client := redis.NewClient(&redis.Options{Addr: mr.Addr()})
 	t.Cleanup(func() { _ = client.Close() })
 	s := New(&config.Settings{Admission: cfg}, logging.New(logging.ERROR), &recordingEmitter{}).
@@ -314,7 +320,7 @@ func TestWakeColdHoldRejectionFailsClosedAndReleasesLease(t *testing.T) {
 	up, _ := url.Parse(be.URL)
 	mr := miniredis.RunT(t)
 	cfg := proxyAdmissionConfig(2)
-	cfg.Platform.MaxColdHolds = 1
+	cfg.Platform.MaxColdHolds = ptr64(1)
 	c := redis.NewClient(&redis.Options{Addr: mr.Addr()})
 	t.Cleanup(func() { _ = c.Close() })
 	a := admission.New(c, cfg)
@@ -400,7 +406,7 @@ func TestPrefillReservationReleasesAtFirstBodyByte(t *testing.T) {
 	up, _ := url.Parse(backend.URL)
 	mr := miniredis.RunT(t)
 	cfg := proxyAdmissionConfig(2)
-	cfg.Platform.MaxConcurrentPrefills = 1 // prefill is the only binding dimension
+	cfg.Platform.MaxConcurrentPrefills = ptr64(1) // prefill is the only binding dimension
 	c := redis.NewClient(&redis.Options{Addr: mr.Addr()})
 	t.Cleanup(func() { _ = c.Close() })
 	s := New(&config.Settings{Admission: cfg}, logging.New(logging.ERROR), &recordingEmitter{}).WithAdmitter(admission.New(c, cfg))
@@ -550,7 +556,7 @@ func TestPrefillReleaseOffFirstBytePath(t *testing.T) {
 		up, _ := url.Parse(backend.URL)
 		mr := miniredis.RunT(t)
 		cfg := proxyAdmissionConfig(2)
-		cfg.Platform.MaxConcurrentPrefills = 1 // prefill is the only binding dimension
+		cfg.Platform.MaxConcurrentPrefills = ptr64(1) // prefill is the only binding dimension
 		c := redis.NewClient(&redis.Options{Addr: mr.Addr()})
 		t.Cleanup(func() { _ = c.Close() })
 		hook := &prefillTransitionHook{entered: make(chan struct{}), release: make(chan struct{})}
@@ -644,7 +650,7 @@ func TestPrefillReleaseOffFirstBytePath(t *testing.T) {
 		up, _ := url.Parse(backend.URL)
 		mr := miniredis.RunT(t)
 		cfg := proxyAdmissionConfig(2)
-		cfg.Platform.MaxConcurrentPrefills = 1
+		cfg.Platform.MaxConcurrentPrefills = ptr64(1)
 		c := redis.NewClient(&redis.Options{Addr: mr.Addr()})
 		t.Cleanup(func() { _ = c.Close() })
 		hook := &prefillTransitionHook{entered: make(chan struct{}), fail: errors.New("valkey unavailable")}
@@ -700,7 +706,7 @@ func TestWakeExhaustedReturnsColdAndReleasesCapacity(t *testing.T) {
 	up, _ := url.Parse(be.URL)
 	mr := miniredis.RunT(t)
 	cfg := proxyAdmissionConfig(1)
-	cfg.Platform.MaxColdHolds = 1
+	cfg.Platform.MaxColdHolds = ptr64(1)
 	c := redis.NewClient(&redis.Options{Addr: mr.Addr()})
 	t.Cleanup(func() { _ = c.Close() })
 	a := admission.New(c, cfg)
@@ -749,7 +755,7 @@ func TestWakeColdHoldStoreOutageFailsClosed(t *testing.T) {
 	defer backend.Close()
 	up, _ := url.Parse(backend.URL)
 	cfg := proxyAdmissionConfig(1)
-	cfg.Platform.MaxColdHolds = 1
+	cfg.Platform.MaxColdHolds = ptr64(1)
 	c := redis.NewClient(&redis.Options{Addr: mr.Addr()})
 	t.Cleanup(func() { _ = c.Close() })
 	a := admission.New(c, cfg)
@@ -775,7 +781,7 @@ func TestAdmissionImpossibleOutputRejectedBeforeUpstream(t *testing.T) {
 	up, _ := url.Parse(backend.URL)
 	mr := miniredis.RunT(t)
 	cfg := proxyAdmissionConfig(2)
-	cfg.Platform.MaxReservedOutputTokens = 10
+	cfg.Platform.MaxReservedOutputTokens = ptr64(10)
 	c := redis.NewClient(&redis.Options{Addr: mr.Addr()})
 	s := New(&config.Settings{Admission: cfg}, logging.New(logging.ERROR), &recordingEmitter{}).WithAdmitter(admission.New(c, cfg))
 	rr := httptest.NewRecorder()
@@ -806,6 +812,79 @@ func TestContractRateLimitReturns429BeforeUpstream(t *testing.T) {
 	}
 	if hits != 0 {
 		t.Fatal("contractually over-limit request reached upstream")
+	}
+}
+
+// R4 sentinel semantics end to end: an explicit "0" in the trusted envelope is
+// a zero cap — every request is blocked with the contractual 429 before
+// upstream — and a forged all-zeros envelope parses as zero-quota and is
+// blocked the same way instead of minting unlimited traffic. Table-driven;
+// run under -race.
+func TestExplicitZeroRateLimitCapsBlockBeforeUpstream(t *testing.T) {
+	zeroHeaders := []string{
+		identity.HeaderOrgRateLimitRequests,
+		identity.HeaderOrgRateLimitTotalPromptTokens,
+		identity.HeaderOrgRateLimitUncachedPromptTokens,
+		identity.HeaderOrgRateLimitGeneratedTokens,
+		identity.HeaderOwnerRateLimitRequests,
+		identity.HeaderOwnerRateLimitTotalPromptTokens,
+		identity.HeaderOwnerRateLimitUncachedPromptTokens,
+		identity.HeaderOwnerRateLimitGeneratedTokens,
+	}
+	for _, tc := range []struct {
+		name   string
+		mutate func(*http.Request)
+	}{
+		{
+			name: "zero organization requests cap",
+			mutate: func(req *http.Request) {
+				req.Header.Set(identity.HeaderOrgRateLimitRequests, "0")
+			},
+		},
+		{
+			name: "zero organization generated-tokens cap",
+			mutate: func(req *http.Request) {
+				req.Header.Set(identity.HeaderOrgRateLimitGeneratedTokens, "0")
+			},
+		},
+		{
+			name: "zero owner requests cap",
+			mutate: func(req *http.Request) {
+				req.Header.Set(identity.HeaderOwnerRateLimitRequests, "0")
+			},
+		},
+		{
+			// The forged-zeros hazard: a complete envelope of all zeros used to
+			// parse as unlimited; it must now block (fail-closed).
+			name: "forged all-zeros envelope",
+			mutate: func(req *http.Request) {
+				for _, header := range zeroHeaders {
+					req.Header.Set(header, "0")
+				}
+			},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var hits int
+			backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) { hits++; w.WriteHeader(200) }))
+			defer backend.Close()
+			up, _ := url.Parse(backend.URL)
+			mr := miniredis.RunT(t)
+			cfg := proxyAdmissionConfig(2)
+			c := redis.NewClient(&redis.Options{Addr: mr.Addr()})
+			t.Cleanup(func() { _ = c.Close() })
+			s := New(&config.Settings{Admission: cfg}, logging.New(logging.ERROR), &recordingEmitter{}).WithAdmitter(admission.New(c, cfg))
+			req := sharedRequest(up)
+			tc.mutate(req)
+			rr := httptest.NewRecorder()
+			s.Handler().ServeHTTP(rr, req)
+			if rr.Code != http.StatusTooManyRequests {
+				t.Fatalf("status=%d, want the contractual 429 at the zero cap", rr.Code)
+			}
+			if hits != 0 {
+				t.Fatal("zero-capped request reached upstream")
+			}
+		})
 	}
 }
 
@@ -889,7 +968,29 @@ func TestTrustedRateLimitParserBoundaries(t *testing.T) {
 	}
 }
 
-func TestMissingOrPartialTrustedRateLimitPolicyFailsClosed(t *testing.T) {
+// rateLimitsEqual compares two parsed quota envelopes field-by-field: a nil
+// field (absent header = unlimited) equals only nil, and an explicit zero cap
+// equals an explicit zero cap. (RateLimits holds *int64, so != would compare
+// pointer identity and never match.)
+func rateLimitsEqual(a, b admission.RateLimits) bool {
+	equal := func(x, y *int64) bool {
+		if x == nil || y == nil {
+			return x == y
+		}
+		return *x == *y
+	}
+	return equal(a.Requests, b.Requests) && equal(a.TotalPromptTokens, b.TotalPromptTokens) &&
+		equal(a.UncachedPromptTokens, b.UncachedPromptTokens) && equal(a.GeneratedTokens, b.GeneratedTokens)
+}
+
+// R4 sentinel semantics for the trusted quota envelope, pinned at the parser:
+// a missing envelope fails closed (503) — absent is unlimited only per-field
+// inside a complete envelope, never as a stand-in for the envelope itself; an
+// all-zeros envelope is a complete envelope of EXPLICIT ZERO CAPS, which
+// parses as zero-quota (nil error) and is then blocked by admission
+// (fail-closed) — a forged all-zeros envelope can no longer mint unlimited
+// traffic; a present-but-partial envelope fails closed exactly as before.
+func TestTrustedRateLimitPolicyParsing(t *testing.T) {
 	_, _, err := parseTrustedRateLimits(identity.Identity{Gateway: true})
 	if err == nil {
 		t.Fatal("gateway request without Atlas policy was accepted as unlimited")
@@ -905,16 +1006,22 @@ func TestMissingOrPartialTrustedRateLimitPolicyFailsClosed(t *testing.T) {
 		OwnerRateLimitRequests: "0", OwnerRateLimitTotalPromptTokens: "0",
 		OwnerRateLimitUncachedPromptTokens: "0", OwnerRateLimitGeneratedTokens: "0",
 	})
-	if err != nil || organization != (admission.RateLimits{}) || owner != (admission.RateLimits{}) {
-		t.Fatalf("explicit unlimited gateway policy = org=%+v owner=%+v, %v", organization, owner, err)
+	// FLIPPED by R4: the all-zeros envelope used to parse as "explicit
+	// unlimited" (every field 0); it now parses as zero-quota — every field an
+	// explicit zero cap — so admission blocks it.
+	zeroCap := admission.RateLimits{Requests: ptr64(0), TotalPromptTokens: ptr64(0),
+		UncachedPromptTokens: ptr64(0), GeneratedTokens: ptr64(0)}
+	if err != nil || !rateLimitsEqual(organization, zeroCap) || !rateLimitsEqual(owner, zeroCap) {
+		t.Fatalf("all-zeros envelope must parse as zero-quota: org=%+v owner=%+v, %v", organization, owner, err)
 	}
 	legacyOrg, legacyOwner, err := parseTrustedRateLimits(identity.Identity{
 		Gateway: true, LegacyServiceTier: "default", LegacyRateLimitRequests: "7",
 		LegacyRateLimitTotalPromptTokens: "100", LegacyRateLimitUncachedPromptTokens: "25",
 		LegacyRateLimitGeneratedTokens: "50",
 	})
-	if err != nil || legacyOrg != (admission.RateLimits{Requests: 7, TotalPromptTokens: 100, UncachedPromptTokens: 25, GeneratedTokens: 50}) ||
-		legacyOwner != (admission.RateLimits{}) {
+	if err != nil ||
+		!rateLimitsEqual(legacyOrg, admission.RateLimits{Requests: ptr64(7), TotalPromptTokens: ptr64(100), UncachedPromptTokens: ptr64(25), GeneratedTokens: ptr64(50)}) ||
+		!rateLimitsEqual(legacyOwner, admission.RateLimits{}) {
 		t.Fatalf("legacy gateway policy = org=%+v owner=%+v, %v", legacyOrg, legacyOwner, err)
 	}
 	_, _, err = parseTrustedRateLimits(identity.Identity{
@@ -1032,7 +1139,7 @@ func TestLegacyServiceTierNeverSelectsLane(t *testing.T) {
 		_, err := a.Admit(context.Background(), admission.Request{
 			Graph: "graph", Organization: "org-a", Owner: "other-owner", Model: "m",
 			PromptBytes: 1, EstimatedInputTokens: 1, ReservedOutputTokens: 18,
-			OrganizationLimits: admission.RateLimits{GeneratedTokens: 20},
+			OrganizationLimits: admission.RateLimits{GeneratedTokens: ptr64(20)},
 		})
 		var rejected *admission.Rejected
 		rejectedOK := errors.As(err, &rejected) && rejected.Scope == "contract_organization" && rejected.Dimension == "generated_tokens"
@@ -1260,8 +1367,16 @@ func TestAdmissionReleasesAbortedStream(t *testing.T) {
 	// must start, return promptly once the client cancels, and release its
 	// lease. The probe half below then pins the conservative reservation the
 	// abort retains in the contract windows.
+	//
+	// R4: the base envelope now stamps large (non-binding) caps instead of
+	// zeros, so a complete envelope always creates contract scopes and this
+	// abort's conservative charge would land in org-a/owner-a's windows and
+	// pollute the probes below. The release half pins PHYSICAL lease release
+	// only, so give its request a disjoint org/owner identity.
 	ctx, cancel := context.WithCancel(context.Background())
 	req := sharedRequest(up).WithContext(ctx)
+	req.Header.Set(identity.HeaderOrgID, "org-release-check")
+	req.Header.Set(identity.HeaderOwnerID, "owner-release-check")
 	done := make(chan struct{})
 	go func() { defer close(done); s.Handler().ServeHTTP(httptest.NewRecorder(), req) }()
 	select {
@@ -1292,14 +1407,14 @@ func TestAdmissionReleasesAbortedStream(t *testing.T) {
 			name: "organization contract",
 			req: admission.Request{Graph: "graph", Organization: "org-a", Owner: "other-owner", Model: "m",
 				PromptBytes: 1, EstimatedInputTokens: 1, ReservedOutputTokens: 1,
-				OrganizationLimits: admission.RateLimits{GeneratedTokens: 20}},
+				OrganizationLimits: admission.RateLimits{GeneratedTokens: ptr64(20)}},
 			want: "contract_organization",
 		},
 		{
 			name: "owner contract",
 			req: admission.Request{Graph: "graph", Organization: "other-org", Owner: "owner-a", Model: "m",
 				PromptBytes: 1, EstimatedInputTokens: 1, ReservedOutputTokens: 1,
-				OwnerLimits: admission.RateLimits{GeneratedTokens: 20}},
+				OwnerLimits: admission.RateLimits{GeneratedTokens: ptr64(20)}},
 			want: "contract_owner",
 		},
 	}
@@ -1392,14 +1507,14 @@ func TestAdmissionChargesUnknownUsageOnPreHeaderAbort(t *testing.T) {
 			name: "organization contract",
 			req: admission.Request{Graph: "graph", Organization: "org-a", Owner: "other-owner", Model: "m",
 				PromptBytes: 1, EstimatedInputTokens: 1, ReservedOutputTokens: 1,
-				OrganizationLimits: admission.RateLimits{GeneratedTokens: 20}},
+				OrganizationLimits: admission.RateLimits{GeneratedTokens: ptr64(20)}},
 			want: "contract_organization",
 		},
 		{
 			name: "owner contract",
 			req: admission.Request{Graph: "graph", Organization: "other-org", Owner: "owner-a", Model: "m",
 				PromptBytes: 1, EstimatedInputTokens: 1, ReservedOutputTokens: 1,
-				OwnerLimits: admission.RateLimits{GeneratedTokens: 20}},
+				OwnerLimits: admission.RateLimits{GeneratedTokens: ptr64(20)}},
 			want: "contract_owner",
 		},
 	}
@@ -1489,14 +1604,14 @@ func TestAdmissionChargesUnknownUsageOnUpstreamReset(t *testing.T) {
 			name: "organization contract",
 			req: admission.Request{Graph: "graph", Organization: "org-a", Owner: "other-owner", Model: "m",
 				PromptBytes: 1, EstimatedInputTokens: 1, ReservedOutputTokens: 1,
-				OrganizationLimits: admission.RateLimits{GeneratedTokens: 20}},
+				OrganizationLimits: admission.RateLimits{GeneratedTokens: ptr64(20)}},
 			want: "contract_organization",
 		},
 		{
 			name: "owner contract",
 			req: admission.Request{Graph: "graph", Organization: "other-org", Owner: "owner-a", Model: "m",
 				PromptBytes: 1, EstimatedInputTokens: 1, ReservedOutputTokens: 1,
-				OwnerLimits: admission.RateLimits{GeneratedTokens: 20}},
+				OwnerLimits: admission.RateLimits{GeneratedTokens: ptr64(20)}},
 			want: "contract_owner",
 		},
 	}
@@ -1644,14 +1759,14 @@ func TestAdmissionDialFailureChargesOnlyRequestsWindow(t *testing.T) {
 			name: "organization requests window",
 			req: admission.Request{Graph: "graph", Organization: "org-a", Owner: "other-owner", Model: "m",
 				PromptBytes: 1, EstimatedInputTokens: 1, ReservedOutputTokens: 1,
-				OrganizationLimits: admission.RateLimits{Requests: 1}},
+				OrganizationLimits: admission.RateLimits{Requests: ptr64(1)}},
 			want: "contract_organization",
 		},
 		{
 			name: "owner requests window",
 			req: admission.Request{Graph: "graph", Organization: "other-org", Owner: "owner-a", Model: "m",
 				PromptBytes: 1, EstimatedInputTokens: 1, ReservedOutputTokens: 1,
-				OwnerLimits: admission.RateLimits{Requests: 1}},
+				OwnerLimits: admission.RateLimits{Requests: ptr64(1)}},
 			want: "contract_owner",
 		},
 	}
@@ -1717,7 +1832,7 @@ func TestAdmissionDialFailureChargesOnlyRequestsWindow(t *testing.T) {
 	// rejected this probe.
 	lease, err := a.Admit(context.Background(), admission.Request{Graph: "graph", Organization: "org-a", Owner: "other-owner", Model: "m",
 		PromptBytes: 1, EstimatedInputTokens: 7, ReservedOutputTokens: 20,
-		OrganizationLimits: admission.RateLimits{GeneratedTokens: 20, TotalPromptTokens: 7, UncachedPromptTokens: 7}})
+		OrganizationLimits: admission.RateLimits{GeneratedTokens: ptr64(20), TotalPromptTokens: ptr64(7), UncachedPromptTokens: ptr64(7)}})
 	if err != nil {
 		t.Fatalf("dial failure left a phantom prompt/generated charge: %v", err)
 	}
@@ -2174,7 +2289,7 @@ func TestWakeColdHoldStoreOutageLogsSampled(t *testing.T) {
 	defer be.Close()
 	up, _ := url.Parse(be.URL)
 	cfg := proxyAdmissionConfig(1)
-	cfg.Platform.MaxColdHolds = 1
+	cfg.Platform.MaxColdHolds = ptr64(1)
 	// MaxRetries=-1: against a dead store every op otherwise pays go-redis's
 	// retry backoff (~85ms), which would stretch this 250-request test to
 	// minutes. The sampling behavior under test is unaffected.

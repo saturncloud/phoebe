@@ -128,30 +128,36 @@ func admissionLaneForIdentity(settings config.AdmissionSettings, id identity.Ide
 }
 
 // sharedRequestBodyLimit returns the tightest individual body size that could
-// possibly fit every applicable aggregate prompt-byte scope. Even when every
-// scope is configured as unlimited, retain a process-safety ceiling so an
+// possibly fit every applicable aggregate prompt-byte scope. R4 sentinel
+// semantics: a nil (unset) dimension is unlimited and does not tighten the
+// bound; neither does an explicit zero cap — no body can fit a zero-capped
+// scope, and admission rejects the request there. Even when every scope is
+// configured as unlimited, retain a process-safety ceiling so an
 // authenticated request cannot force an unbounded io.ReadAll allocation.
 func sharedRequestBodyLimit(settings config.AdmissionSettings, lane config.AdmissionLane) int64 {
 	limit := int64(0)
-	add := func(candidate int64) {
-		if candidate > 0 && (limit == 0 || candidate < limit) {
-			limit = candidate
+	add := func(candidate *int64) {
+		if candidate == nil || *candidate <= 0 {
+			return
+		}
+		if limit == 0 || *candidate < limit {
+			limit = *candidate
 		}
 	}
 	add(settings.Platform.MaxPromptBytes)
 	add(settings.Graph.MaxPromptBytes)
 	add(settings.Organization.MaxPromptBytes)
 	add(settings.OrganizationModel.MaxPromptBytes)
-	laneBytes := lane.Limits.MaxPromptBytes
-	if laneBytes > 0 {
+	if laneBytes := lane.Limits.MaxPromptBytes; laneBytes != nil && *laneBytes > 0 {
+		weighted := *laneBytes
 		weight := lane.Weight
 		if weight < 1 {
 			weight = 1
 		}
-		if laneBytes <= math.MaxInt64/weight {
-			laneBytes *= weight
+		if weighted <= math.MaxInt64/weight {
+			weighted *= weight
 		}
-		add(laneBytes)
+		add(&weighted)
 	}
 	if limit == 0 {
 		return defaultSharedRequestBodyLimit
@@ -329,16 +335,23 @@ func (s *Server) writeAdmissionError(w http.ResponseWriter, requestID string, er
 	s.log.Error.Printf("admission: unexpected error: %v", err)
 }
 
+// parseTrustedRateLimits parses the trusted quota envelope. R4 sentinel
+// semantics (the Saturn UsageLimit pattern): an absent header parses to nil =
+// unlimited for that dimension; an explicit "0" parses to a zero cap that
+// blocks every request (fail-closed) — a forged all-zeros envelope therefore
+// mints zero quota, never unlimited. There is no 0-sentinel for unlimited.
+// The envelope-level completeness rule is unchanged: a present-but-partial
+// envelope still fails closed.
 func parseTrustedRateLimits(id identity.Identity) (admission.RateLimits, admission.RateLimits, error) {
-	parse := func(name, value string) (int64, error) {
+	parse := func(name, value string) (*int64, error) {
 		if value == "" {
-			return 0, nil
+			return nil, nil
 		}
 		limit, err := strconv.ParseInt(value, 10, 64)
 		if err != nil || limit < 0 {
-			return 0, fmt.Errorf("invalid trusted %s header", name)
+			return nil, fmt.Errorf("invalid trusted %s header", name)
 		}
-		return limit, nil
+		return &limit, nil
 	}
 	parseScope := func(names, values [4]string) (admission.RateLimits, error) {
 		var out admission.RateLimits
@@ -355,7 +368,8 @@ func parseTrustedRateLimits(id identity.Identity) (admission.RateLimits, admissi
 		if out.GeneratedTokens, err = parse(names[3], values[3]); err != nil {
 			return out, err
 		}
-		if out.TotalPromptTokens > 0 && out.UncachedPromptTokens > out.TotalPromptTokens {
+		if out.TotalPromptTokens != nil && out.UncachedPromptTokens != nil &&
+			*out.UncachedPromptTokens > *out.TotalPromptTokens {
 			return out, fmt.Errorf("trusted uncached prompt limit exceeds total prompt limit")
 		}
 		return out, nil
