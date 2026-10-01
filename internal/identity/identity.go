@@ -74,13 +74,12 @@ const (
 	// products independently (design D1). Like HeaderBaseModel/HeaderAdapter it
 	// is a deploy-time resource property injected server-side by the
 	// Atlas-rendered Traefik middleware, anti-spoof overwritten, never trusted
-	// from clients. Atlas stamps it only on shared routes; on a dedicated route it
-	// stamps nothing, and Traefik removes any client-supplied value. So on a
-	// header-routed request an ABSENT header means the route belongs to a
-	// dedicated deployment, and FromRequest resolves it to ServingModeDedicated
-	// right here. From this point on phoebe only ever carries the explicit
-	// spellings "shared" and "dedicated" (the 2026-09-29 serving-mode ruling: the
-	// empty string is not a serving mode anywhere).
+	// from clients. Atlas stamps it explicitly on EVERY Token Factory inference
+	// route, dedicated included (Hugo's 2026-10-01 ruling #19), so an ABSENT or
+	// malformed value on a header-routed request is an edge-contract bug: the
+	// route gate refuses it (generic 404) and nothing is metered. FromRequest
+	// copies the value verbatim; there is no default. The empty string is not a
+	// serving mode anywhere (the 2026-09-29 serving-mode ruling).
 	HeaderServingMode = "X-Saturn-Serving-Mode"
 
 	// HeaderGateway marks a request that arrived on the TF shared-inference
@@ -236,22 +235,10 @@ func ValidServingMode(s string) bool {
 	return s == ServingModeShared || s == ServingModeDedicated
 }
 
-// servingModeFromHeader resolves the X-Saturn-Serving-Mode header value. Absent
-// means a dedicated route (see HeaderServingMode); a present value is returned
-// verbatim so an unexpected spelling reaches the billing gate and is refused
-// there rather than being silently reinterpreted.
-func servingModeFromHeader(v string) string {
-	if v == "" {
-		return ServingModeDedicated
-	}
-	return v
-}
-
 // FromRequest extracts the trusted identity headers. It performs no
-// validation beyond reading the values; authorization happened at the edge. The
-// one value it resolves rather than copies is the serving mode (see
-// HeaderServingMode). A gateway request's serving mode is overwritten later by
-// gateway resolution from the served-model registry.
+// validation beyond reading the values; authorization happened at the edge. A
+// gateway request's serving mode is overwritten later by gateway resolution
+// from the served-model registry.
 func FromRequest(r *http.Request) Identity {
 	return Identity{
 		AuthID:                        r.Header.Get(HeaderAuthID),
@@ -262,7 +249,7 @@ func FromRequest(r *http.Request) Identity {
 		OrgID:                         r.Header.Get(HeaderOrgID),
 		BaseModel:                     r.Header.Get(HeaderBaseModel),
 		Adapter:                       r.Header.Get(HeaderAdapter),
-		ServingMode:                   servingModeFromHeader(r.Header.Get(HeaderServingMode)),
+		ServingMode:                   r.Header.Get(HeaderServingMode),
 		ServedModel:                   r.Header.Get(HeaderServedModel),
 		Upstream:                      r.Header.Get(HeaderUpstream),
 		Gateway:                       r.Header.Get(HeaderGateway) == "true",

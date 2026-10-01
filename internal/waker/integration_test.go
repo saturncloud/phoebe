@@ -42,6 +42,9 @@ func TestWake_DGDSAMissing_ServesColdResponse(t *testing.T) {
 	req.Header.Set(identity.HeaderServedModel, "m") // wakeable route
 	req.Header.Set(identity.HeaderServingMode, "shared")
 	req.Header.Set(identity.HeaderUpstream, strings.TrimPrefix(backend.URL, "http://"))
+	if req.Header.Get(identity.HeaderServingMode) == "" { // Atlas stamps it on every TF route (ruling #19)
+		req.Header.Set(identity.HeaderServingMode, identity.ServingModeDedicated)
+	}
 	rr := httptest.NewRecorder()
 	srv.Handler().ServeHTTP(rr, req)
 

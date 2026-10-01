@@ -384,6 +384,9 @@ func TestE2E_StreamedRequestBecomesMoney(t *testing.T) {
 	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions",
 		strings.NewReader(`{"model":"whatever-the-client-said","stream":true,"messages":[]}`))
 	req.Header.Set(identity.HeaderUpstream, backend.URL)
+	if req.Header.Get(identity.HeaderServingMode) == "" { // Atlas stamps it on every TF route (ruling #19)
+		req.Header.Set(identity.HeaderServingMode, identity.ServingModeDedicated)
+	}
 	req.Header.Set(identity.HeaderAuthID, testAuthID)
 	req.Header.Set(identity.HeaderResourceID, testResourceID)
 	req.Header.Set(identity.HeaderResourceType, "deployment")
@@ -525,10 +528,10 @@ func TestE2E_StreamedRequestBecomesMoney(t *testing.T) {
 	if !ruOrgID.Valid || ruOrgID.String != testOrgID {
 		t.Errorf("rated_usage.org_id = %v, want %q (the X-Saturn-Org-Id header value, carried meter→rate)", ruOrgID, testOrgID)
 	}
-	// SERVING MODE, end to end (2026-09-29 ruling): this request is header-routed
-	// with NO X-Saturn-Serving-Mode, which is what a dedicated route looks like. It
-	// must be stored as the explicit 'dedicated' in billing_event AND rated_usage —
-	// never NULL or the retired ''.
+	// SERVING MODE, end to end (2026-09-29 ruling): this request models a dedicated
+	// route, which carries X-Saturn-Serving-Mode: dedicated (Atlas stamps it
+	// explicitly, ruling #19). It must be stored as the explicit 'dedicated' in
+	// billing_event AND rated_usage — never NULL or the retired ''.
 	var beMode, ruMode sql.NullString
 	if err := h.db.QueryRow(`SELECT serving_mode FROM billing_event`).Scan(&beMode); err != nil {
 		t.Fatalf("read billing_event.serving_mode: %v", err)
@@ -619,6 +622,9 @@ func TestE2E_FineTuneBillsAtBaseTimesPremium(t *testing.T) {
 	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions",
 		strings.NewReader(`{"model":"my-finetune","stream":true,"messages":[]}`))
 	req.Header.Set(identity.HeaderUpstream, backend.URL)
+	if req.Header.Get(identity.HeaderServingMode) == "" { // Atlas stamps it on every TF route (ruling #19)
+		req.Header.Set(identity.HeaderServingMode, identity.ServingModeDedicated)
+	}
 	req.Header.Set(identity.HeaderAuthID, testAuthID)
 	req.Header.Set(identity.HeaderResourceID, testResourceID)
 	req.Header.Set(identity.HeaderResourceType, "deployment")
@@ -713,6 +719,9 @@ func TestE2E_FineTuneWithoutBaseModelHeaderIsUnpriced(t *testing.T) {
 	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions",
 		strings.NewReader(`{"model":"my-finetune","stream":true,"messages":[]}`))
 	req.Header.Set(identity.HeaderUpstream, backend.URL)
+	if req.Header.Get(identity.HeaderServingMode) == "" { // Atlas stamps it on every TF route (ruling #19)
+		req.Header.Set(identity.HeaderServingMode, identity.ServingModeDedicated)
+	}
 	req.Header.Set(identity.HeaderAuthID, testAuthID)
 	req.Header.Set(identity.HeaderResourceID, testResourceID)
 	req.Header.Set(identity.HeaderResourceType, "deployment")
@@ -981,6 +990,9 @@ func TestE2E_AdapterHeaderLandsInBillingEventAndTriggersPremium(t *testing.T) {
 	// The forward target rides on the request (X-Saturn-Upstream, as Atlas
 	// injects per deployment); phoebe has no resolver.
 	req.Header.Set(identity.HeaderUpstream, backend.URL)
+	if req.Header.Get(identity.HeaderServingMode) == "" { // Atlas stamps it on every TF route (ruling #19)
+		req.Header.Set(identity.HeaderServingMode, identity.ServingModeDedicated)
+	}
 	req.Header.Set(identity.HeaderAuthID, testAuthID)
 	req.Header.Set(identity.HeaderResourceID, testResourceID)
 	req.Header.Set(identity.HeaderResourceType, "deployment")

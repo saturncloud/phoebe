@@ -75,8 +75,19 @@ func newTestServerE(t *testing.T, _ *url.URL, em metering.Emitter) *Server {
 // exactly as Atlas's per-route injection does in production. Routing now comes
 // solely from this header (phoebe resolves no upstream of its own), so every
 // request a test expects to be FORWARDED must carry it.
+// stampDedicatedServingMode adds X-Saturn-Serving-Mode: dedicated unless the test
+// already set a serving mode. Atlas stamps the serving mode on every Token
+// Factory inference route (ruling #19), so a header-routed test request that
+// models a real dedicated route carries it too.
+func stampDedicatedServingMode(req *http.Request) {
+	if req.Header.Get(identity.HeaderServingMode) == "" {
+		req.Header.Set(identity.HeaderServingMode, identity.ServingModeDedicated)
+	}
+}
+
 func setUpstream(req *http.Request, upstream *url.URL) {
 	req.Header.Set(identity.HeaderUpstream, upstream.Host)
+	stampDedicatedServingMode(req)
 	req.Header.Set("X-Request-Id", "saturn-test-request-id")
 }
 
@@ -261,6 +272,7 @@ func TestProxySanitizesModelListTrailers(t *testing.T) {
 			t.Fatal(err)
 		}
 		req.Header.Set(identity.HeaderUpstream, upstream.Host)
+		stampDedicatedServingMode(req)
 		req.Header.Set(identity.HeaderAuthID, "auth-1")
 		req.Header.Set(identity.HeaderResourceID, "deployment-a")
 		req.Header.Set(identity.HeaderServedModel, "adapter-a")
@@ -594,6 +606,7 @@ func TestProxyUpstreamHeaderMalformedFailsClosed(t *testing.T) {
 			req.Header.Set(identity.HeaderAuthID, "auth-1")
 			req.Header.Set(identity.HeaderResourceID, "r")
 			req.Header.Set(identity.HeaderUpstream, bad)
+			stampDedicatedServingMode(req)
 			srv.Handler().ServeHTTP(rr, req)
 			if rr.Code != http.StatusBadGateway {
 				t.Fatalf("upstream %q: got %d, want 502 (non-bare-host:port must fail closed)", bad, rr.Code)
@@ -825,10 +838,9 @@ func TestProxyStreamingEndToEnd(t *testing.T) {
 	}
 }
 
-// TestProxyServingMode_DedicatedRouteMetersExplicitDedicated: a header-routed
-// request with no X-Saturn-Serving-Mode (what a dedicated route looks like — Atlas
-// stamps nothing and Traefik strips client values) is metered as "dedicated",
-// never as the empty string the 2026-09-29 ruling retired.
+// TestProxyServingMode_DedicatedRouteMetersExplicitDedicated: a dedicated route
+// carries X-Saturn-Serving-Mode: dedicated (Atlas stamps it explicitly, ruling
+// #19) and is metered as "dedicated", never as the retired empty string.
 func TestProxyServingMode_DedicatedRouteMetersExplicitDedicated(t *testing.T) {
 	be, beURL := usageBackend(t)
 	defer be.Close()
@@ -851,6 +863,42 @@ func TestProxyServingMode_DedicatedRouteMetersExplicitDedicated(t *testing.T) {
 	}
 	if events[0].ServingMode != identity.ServingModeDedicated {
 		t.Fatalf("event.ServingMode = %q, want %q", events[0].ServingMode, identity.ServingModeDedicated)
+	}
+}
+
+// TestProxyServingMode_AbsentHeaderRefused: ruling #19 makes the serving mode
+// an explicit part of every Token Factory route's trusted header set. A
+// header-routed request with NO X-Saturn-Serving-Mode is an edge-contract bug:
+// the route gate refuses it with the generic 404 "not found" before it reaches
+// the engine, and nothing is metered. There is no absent-means-dedicated
+// default any more.
+func TestProxyServingMode_AbsentHeaderRefused(t *testing.T) {
+	var hits int32
+	be := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		atomic.AddInt32(&hits, 1)
+		_, _ = w.Write([]byte(`{}`))
+	}))
+	defer be.Close()
+	beURL, _ := url.Parse(be.URL)
+	em := &recordingEmitter{}
+	srv := newTestServerE(t, beURL, em)
+
+	rr := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", nil)
+	// The upstream header only: no serving mode (not via setUpstream, which stamps one).
+	req.Header.Set(identity.HeaderUpstream, beURL.Host)
+	req.Header.Set(identity.HeaderAuthID, "auth-key-7")
+	req.Header.Set(identity.HeaderResourceID, "dep-1")
+	srv.Handler().ServeHTTP(rr, req)
+
+	if rr.Code != http.StatusNotFound || rr.Body.String() != "not found\n" {
+		t.Fatalf("status = %d body %q, want 404 \"not found\"", rr.Code, rr.Body.String())
+	}
+	if em.count() != 0 {
+		t.Fatalf("%d events metered, want 0", em.count())
+	}
+	if n := atomic.LoadInt32(&hits); n != 0 {
+		t.Fatalf("upstream reached %d times, want 0", n)
 	}
 }
 

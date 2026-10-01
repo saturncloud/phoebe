@@ -87,18 +87,16 @@ func TestFromRequestGatewayMarkerIsStrict(t *testing.T) {
 	}
 }
 
-// TestFromRequestServingMode pins the 2026-09-29 serving-mode rule at its origin.
-// Atlas stamps X-Saturn-Serving-Mode only on shared routes and Traefik strips any
-// client-supplied value, so an absent header on a header-routed request means a
-// dedicated route and resolves to the explicit "dedicated". A present value is
-// carried verbatim, so an unexpected spelling reaches the proxy's serving-mode
-// gate and is refused there instead of being reinterpreted here.
+// TestFromRequestServingMode pins ruling #19 (2026-10-01): Atlas stamps the
+// serving mode explicitly on every Token Factory route, dedicated included, so
+// FromRequest copies the header verbatim with no default. An absent header
+// stays empty and fails ValidServingMode; the proxy's route gate refuses it.
 func TestFromRequestServingMode(t *testing.T) {
 	cases := []struct {
 		header, want string
 		valid        bool
 	}{
-		{"", ServingModeDedicated, true},
+		{"", "", false},
 		{"dedicated", ServingModeDedicated, true},
 		{"shared", ServingModeShared, true},
 		{"Shared", "Shared", false},
@@ -116,8 +114,5 @@ func TestFromRequestServingMode(t *testing.T) {
 		if ValidServingMode(id.ServingMode) != c.valid {
 			t.Errorf("header %q: ValidServingMode(%q) = %t, want %t", c.header, id.ServingMode, !c.valid, c.valid)
 		}
-	}
-	if ValidServingMode("") {
-		t.Error(`ValidServingMode("") = true; the empty string is not a serving mode`)
 	}
 }

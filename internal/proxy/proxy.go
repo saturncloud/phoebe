@@ -380,10 +380,10 @@ func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request) {
 	// meterable inference POST surface (unboundRequestAllowed), and a shared
 	// route with no allow-list is refused outright (nothing binds model=, so any
 	// model on the shared graph would be reachable), and a route whose trusted
-	// serving mode is anything but "dedicated" or "shared" (a producer-side bug;
-	// identity.FromRequest resolves only an ABSENT header, to "dedicated", and
-	// otherwise reads the value verbatim) is
-	// likewise refused outright — no branch below may guess what a malformed
+	// serving mode is absent or anything but "dedicated" or "shared" (a
+	// producer-side bug; Atlas stamps it on every Token Factory route, ruling
+	// #19, and identity.FromRequest reads it verbatim) is likewise refused
+	// outright — no branch below may guess what a malformed
 	// mode meant. Runs BEFORE
 	// forwarding so a bad route never reaches the engine. Reads the body once and
 	// restores it for forceIncludeUsage.

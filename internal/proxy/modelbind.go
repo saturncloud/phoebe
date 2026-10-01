@@ -31,8 +31,8 @@ func authorizedModelDiscoveryPath(path, servedModelAllowList string) (discovery,
 // validTrustedServingMode reports whether a trusted serving-mode value is one
 // the route machinery understands: exactly "shared" or "dedicated" (the
 // 2026-09-29 serving-mode ruling; the empty string is not a serving mode).
-// identity.FromRequest resolves an ABSENT header to "dedicated" (a dedicated
-// route carries no header) and otherwise reads the value VERBATIM, so an Atlas
+// identity.FromRequest reads the header VERBATIM with no default (Atlas stamps
+// it on every Token Factory route, ruling #19), so an absent header or an Atlas
 // producer bug ("Shared", " shared", "SHARED") would otherwise fall into the
 // dedicated/unbound branch: a genuinely shared graph would get the unbound
 // inference surface with no model binding, and the shared policy (tenant

@@ -72,10 +72,10 @@ func TestIsWakeable(t *testing.T) {
 	if isWakeable(identity.Identity{ServedModel: "m", ServingMode: "shared"}) {
 		t.Fatal("no resource id (unauthorized) must NOT be wakeable")
 	}
-	// An empty ServingMode is not a valid serving mode. identity.FromRequest
-	// never produces it: an absent header resolves to ServingModeDedicated, and
-	// the gateway registry parser (gateway.parseRegistryConfigMap) rejects rows
-	// with a blank serving_mode. If one ever arrives here it must not be
+	// An empty ServingMode is not a valid serving mode. The route gate refuses a
+	// header-routed request without one (ruling #19), and the gateway registry
+	// parser (gateway.parseRegistryConfigMap) rejects rows with a blank
+	// serving_mode. If one ever arrives here it must not be
 	// wakeable, because only the exact value "shared" is (fail closed).
 	if isWakeable(identity.Identity{ResourceID: "r1", ServedModel: "m", ServingMode: ""}) {
 		t.Fatal("empty serving mode is invalid and must NOT be wakeable")
