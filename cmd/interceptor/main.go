@@ -16,6 +16,7 @@ import (
 	"github.com/saturncloud/phoebe/internal/config"
 	"github.com/saturncloud/phoebe/internal/emit"
 	"github.com/saturncloud/phoebe/internal/gateway"
+	"github.com/saturncloud/phoebe/internal/identity"
 	"github.com/saturncloud/phoebe/internal/iolog"
 	"github.com/saturncloud/phoebe/internal/logging"
 	"github.com/saturncloud/phoebe/internal/metering"
@@ -36,6 +37,13 @@ func main() {
 	if settings.Debug {
 		log.SetLevel(logging.DEBUG)
 	}
+
+	// R3 trusted-header registry: parse PHOEBE_TRUSTED_HEADERS (rendered
+	// from the phoebe chart's ConfigMap) into the active set the parser's
+	// envelope reads resolve through. The pinned 18 already govern from
+	// package init; this engages the runtime config once, at startup, and
+	// warns loudly if the chart render was empty/malformed.
+	identity.LoadTrustedHeaders(log)
 
 	// Gateway wiring FIRST: buildGateway may Fatalf on a fail-closed
 	// misconfiguration, and at this point nothing needs cleanup yet.
