@@ -336,12 +336,19 @@ func (s *Server) writeAdmissionError(w http.ResponseWriter, requestID string, er
 }
 
 // parseTrustedRateLimits parses the trusted quota envelope. R4 sentinel
-// semantics (the Saturn UsageLimit pattern): an absent header parses to nil =
-// unlimited for that dimension; an explicit "0" parses to a zero cap that
+// semantics (the Saturn UsageLimit pattern): an absent limit header parses to
+// nil = unlimited for that field; an explicit "0" parses to a zero cap that
 // blocks every request (fail-closed) — a forged all-zeros envelope therefore
 // mints zero quota, never unlimited. There is no 0-sentinel for unlimited.
-// The envelope-level completeness rule is unchanged: a present-but-partial
-// envelope still fails closed.
+//
+// R4 x R7 reconciliation: the completeness gate covers the IDENTITY anchor
+// only — X-Saturn-Owner-Id for the scoped envelope, the legacy service-tier
+// marker for the legacy envelope. The 12 rate-limit headers (8 scoped + 4
+// legacy) are per-field: Atlas omits headers for unset UsageLimits, and that
+// absence is the R4 unlimited encoding, not an R7 violation. What still fails
+// closed (503): limit headers present WITHOUT their anchor, a present-but-
+// malformed value (non-numeric/negative), an uncached-above-total relation,
+// and an entirely absent policy.
 func parseTrustedRateLimits(id identity.Identity) (admission.RateLimits, admission.RateLimits, error) {
 	parse := func(name, value string) (*int64, error) {
 		if value == "" {
@@ -374,51 +381,56 @@ func parseTrustedRateLimits(id identity.Identity) (admission.RateLimits, admissi
 		}
 		return out, nil
 	}
-	newValues := [9]string{
-		id.OwnerID,
+	scopedValues := [8]string{
 		id.OrgRateLimitRequests, id.OrgRateLimitTotalPromptTokens,
 		id.OrgRateLimitUncachedPromptTokens, id.OrgRateLimitGeneratedTokens,
 		id.OwnerRateLimitRequests, id.OwnerRateLimitTotalPromptTokens,
 		id.OwnerRateLimitUncachedPromptTokens, id.OwnerRateLimitGeneratedTokens,
 	}
-	legacyValues := [5]string{
-		id.LegacyServiceTier, id.LegacyRateLimitRequests,
-		id.LegacyRateLimitTotalPromptTokens, id.LegacyRateLimitUncachedPromptTokens,
-		id.LegacyRateLimitGeneratedTokens,
-	}
-	completeness := func(values []string) (present, complete bool) {
-		complete = true
+	anyPresent := func(values []string) bool {
 		for _, value := range values {
-			present = present || value != ""
-			complete = complete && value != ""
+			if value != "" {
+				return true
+			}
 		}
-		return present, complete
+		return false
 	}
-	newAny, newComplete := completeness(newValues[:])
-	legacyAny, legacyComplete := completeness(legacyValues[:])
-	if newAny && !newComplete {
-		return admission.RateLimits{}, admission.RateLimits{}, fmt.Errorf("incomplete trusted shared-inference rate-limit policy")
-	}
-	if !newAny {
-		if !legacyAny || !legacyComplete {
-			return admission.RateLimits{}, admission.RateLimits{}, fmt.Errorf("incomplete trusted shared-inference rate-limit policy")
+
+	switch {
+	case id.OwnerID != "":
+		// Scoped envelope: the owner id is the structural anchor (R7). The 8
+		// scoped headers are per-field R4 — absent is unlimited. A legacy
+		// envelope arriving alongside is superseded: the new anchor wins, as
+		// it did when both envelopes were complete.
+		organization, err := parseScope(
+			[4]string{identity.HeaderOrgRateLimitRequests, identity.HeaderOrgRateLimitTotalPromptTokens, identity.HeaderOrgRateLimitUncachedPromptTokens, identity.HeaderOrgRateLimitGeneratedTokens},
+			[4]string{id.OrgRateLimitRequests, id.OrgRateLimitTotalPromptTokens, id.OrgRateLimitUncachedPromptTokens, id.OrgRateLimitGeneratedTokens},
+		)
+		if err != nil {
+			return organization, admission.RateLimits{}, err
+		}
+		owner, err := parseScope(
+			[4]string{identity.HeaderOwnerRateLimitRequests, identity.HeaderOwnerRateLimitTotalPromptTokens, identity.HeaderOwnerRateLimitUncachedPromptTokens, identity.HeaderOwnerRateLimitGeneratedTokens},
+			[4]string{id.OwnerRateLimitRequests, id.OwnerRateLimitTotalPromptTokens, id.OwnerRateLimitUncachedPromptTokens, id.OwnerRateLimitGeneratedTokens},
+		)
+		return organization, owner, err
+	case id.LegacyServiceTier != "":
+		// Legacy envelope: the tier marker is the structural anchor; the 4
+		// legacy rate headers are per-field R4, same absence semantics.
+		// Scoped headers without the owner-id anchor are a structural
+		// violation (R7), not unlimited fields.
+		if anyPresent(scopedValues[:]) {
+			return admission.RateLimits{}, admission.RateLimits{}, fmt.Errorf("incomplete trusted shared-inference rate-limit policy: scoped headers without %s", identity.HeaderOwnerID)
 		}
 		legacy, err := parseScope(
 			[4]string{identity.HeaderLegacyRateLimitRequests, identity.HeaderLegacyRateLimitTotalPromptTokens, identity.HeaderLegacyRateLimitUncachedPromptTokens, identity.HeaderLegacyRateLimitGeneratedTokens},
 			[4]string{id.LegacyRateLimitRequests, id.LegacyRateLimitTotalPromptTokens, id.LegacyRateLimitUncachedPromptTokens, id.LegacyRateLimitGeneratedTokens},
 		)
 		return legacy, admission.RateLimits{}, err
+	default:
+		// No identity anchor: limit headers without the identity they belong
+		// to, or no policy at all — both are structural violations (R7) and
+		// fail closed.
+		return admission.RateLimits{}, admission.RateLimits{}, fmt.Errorf("incomplete trusted shared-inference rate-limit policy")
 	}
-	organization, err := parseScope(
-		[4]string{identity.HeaderOrgRateLimitRequests, identity.HeaderOrgRateLimitTotalPromptTokens, identity.HeaderOrgRateLimitUncachedPromptTokens, identity.HeaderOrgRateLimitGeneratedTokens},
-		[4]string{id.OrgRateLimitRequests, id.OrgRateLimitTotalPromptTokens, id.OrgRateLimitUncachedPromptTokens, id.OrgRateLimitGeneratedTokens},
-	)
-	if err != nil {
-		return organization, admission.RateLimits{}, err
-	}
-	owner, err := parseScope(
-		[4]string{identity.HeaderOwnerRateLimitRequests, identity.HeaderOwnerRateLimitTotalPromptTokens, identity.HeaderOwnerRateLimitUncachedPromptTokens, identity.HeaderOwnerRateLimitGeneratedTokens},
-		[4]string{id.OwnerRateLimitRequests, id.OwnerRateLimitTotalPromptTokens, id.OwnerRateLimitUncachedPromptTokens, id.OwnerRateLimitGeneratedTokens},
-	)
-	return organization, owner, err
 }

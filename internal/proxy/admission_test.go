@@ -52,13 +52,13 @@ func sharedRequest(upstream *url.URL) *http.Request {
 	r.Header.Set(identity.HeaderOrgID, "org-a")
 	r.Header.Set(identity.HeaderServingMode, "shared")
 	r.Header.Set(identity.HeaderServedModel, "model-a")
-	// Admission-enabled shared requests require the complete authenticated
-	// policy envelope regardless of whether they use the single-host gateway or
-	// a transitional per-resource route. R4 sentinel semantics: an absent
-	// header would be unlimited, but the envelope must be complete, and an
-	// explicit "0" is a zero cap that blocks every request — so this base
-	// helper stamps large, non-binding caps and tests that need a binding or
-	// zero-capped dimension override it explicitly.
+	// Admission-enabled shared requests require the authenticated identity
+	// anchor (X-Saturn-Owner-Id) regardless of whether they use the
+	// single-host gateway or a transitional per-resource route; the limit
+	// headers themselves are per-field — absent is unlimited, explicit "0" is
+	// a zero cap. This base helper stamps large, non-binding caps and tests
+	// that need an absent, binding, or zero-capped dimension override the
+	// headers explicitly.
 	for _, header := range []string{
 		identity.HeaderOrgRateLimitRequests,
 		identity.HeaderOrgRateLimitTotalPromptTokens,
@@ -983,37 +983,87 @@ func rateLimitsEqual(a, b admission.RateLimits) bool {
 		equal(a.UncachedPromptTokens, b.UncachedPromptTokens) && equal(a.GeneratedTokens, b.GeneratedTokens)
 }
 
-// R4 sentinel semantics for the trusted quota envelope, pinned at the parser:
-// a missing envelope fails closed (503) — absent is unlimited only per-field
-// inside a complete envelope, never as a stand-in for the envelope itself; an
-// all-zeros envelope is a complete envelope of EXPLICIT ZERO CAPS, which
-// parses as zero-quota (nil error) and is then blocked by admission
-// (fail-closed) — a forged all-zeros envelope can no longer mint unlimited
-// traffic; a present-but-partial envelope fails closed exactly as before.
+// R4 x R7 reconciliation for the trusted quota envelope, pinned at the
+// parser. R4: every limit header is per-field — absent parses as nil =
+// unlimited, explicit "0" parses as a zero cap (an all-zeros envelope is a
+// forged zero-quota envelope, blocked fail-closed by admission, never
+// unlimited). R7: the completeness gate covers the IDENTITY anchor only —
+// X-Saturn-Owner-Id for the scoped envelope, the legacy service-tier marker
+// for the legacy envelope; limit headers without their anchor, a malformed
+// present value, and an absent policy all fail closed.
 func TestTrustedRateLimitPolicyParsing(t *testing.T) {
-	_, _, err := parseTrustedRateLimits(identity.Identity{Gateway: true})
-	if err == nil {
-		t.Fatal("gateway request without Atlas policy was accepted as unlimited")
+	// R7 structural pins — fail closed.
+	for _, tc := range []struct {
+		name string
+		id   identity.Identity
+	}{
+		{
+			name: "no anchor and no headers",
+			id:   identity.Identity{Gateway: true},
+		},
+		{
+			name: "scoped headers without owner id",
+			id: identity.Identity{Gateway: true,
+				OrgRateLimitRequests: "5", OrgRateLimitTotalPromptTokens: "100",
+				OrgRateLimitUncachedPromptTokens: "100", OrgRateLimitGeneratedTokens: "20",
+				OwnerRateLimitRequests: "5", OwnerRateLimitTotalPromptTokens: "100",
+				OwnerRateLimitUncachedPromptTokens: "100", OwnerRateLimitGeneratedTokens: "20"},
+		},
+		{
+			name: "legacy rates without tier",
+			id: identity.Identity{Gateway: true,
+				LegacyRateLimitRequests: "7", LegacyRateLimitTotalPromptTokens: "100",
+				LegacyRateLimitUncachedPromptTokens: "25", LegacyRateLimitGeneratedTokens: "50"},
+		},
+		{
+			name: "legacy tier plus scoped headers without owner id",
+			id: identity.Identity{Gateway: true, LegacyServiceTier: "default",
+				OrgRateLimitRequests: "5"},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if _, _, err := parseTrustedRateLimits(tc.id); err == nil {
+				t.Fatal("structurally incomplete envelope was accepted")
+			}
+		})
 	}
-	_, _, err = parseTrustedRateLimits(identity.Identity{OwnerID: "owner-1"})
-	if err == nil {
-		t.Fatal("per-resource shared request without policy was accepted as unlimited")
+
+	// R4 per-field pins — the identity anchor present, limit headers absent
+	// where unset: each absent header parses to nil (unlimited)
+	// independently. An owner id with NO headers is the all-unset org.
+	organization, owner, err := parseTrustedRateLimits(identity.Identity{OwnerID: "owner-1"})
+	if err != nil || !rateLimitsEqual(organization, admission.RateLimits{}) || !rateLimitsEqual(owner, admission.RateLimits{}) {
+		t.Fatalf("owner identity with all limits unset = org=%+v owner=%+v, %v; absent headers must parse as unlimited", organization, owner, err)
 	}
-	organization, owner, err := parseTrustedRateLimits(identity.Identity{
+	organization, owner, err = parseTrustedRateLimits(identity.Identity{
+		OwnerID:              "owner-1",
+		OrgRateLimitRequests: "5", OwnerRateLimitGeneratedTokens: "7",
+	})
+	if err != nil ||
+		!rateLimitsEqual(organization, admission.RateLimits{Requests: ptr64(5)}) ||
+		!rateLimitsEqual(owner, admission.RateLimits{GeneratedTokens: ptr64(7)}) {
+		t.Fatalf("per-field parse = org=%+v owner=%+v, %v; absent fields must be nil (unlimited)", organization, owner, err)
+	}
+
+	// FLIPPED by R4: the all-zeros envelope used to parse as "explicit
+	// unlimited" (every field 0); it now parses as zero-quota — every field an
+	// explicit zero cap — so admission blocks it.
+	organization, owner, err = parseTrustedRateLimits(identity.Identity{
 		Gateway: true, OwnerID: "owner-1",
 		OrgRateLimitRequests: "0", OrgRateLimitTotalPromptTokens: "0",
 		OrgRateLimitUncachedPromptTokens: "0", OrgRateLimitGeneratedTokens: "0",
 		OwnerRateLimitRequests: "0", OwnerRateLimitTotalPromptTokens: "0",
 		OwnerRateLimitUncachedPromptTokens: "0", OwnerRateLimitGeneratedTokens: "0",
 	})
-	// FLIPPED by R4: the all-zeros envelope used to parse as "explicit
-	// unlimited" (every field 0); it now parses as zero-quota — every field an
-	// explicit zero cap — so admission blocks it.
 	zeroCap := admission.RateLimits{Requests: ptr64(0), TotalPromptTokens: ptr64(0),
 		UncachedPromptTokens: ptr64(0), GeneratedTokens: ptr64(0)}
 	if err != nil || !rateLimitsEqual(organization, zeroCap) || !rateLimitsEqual(owner, zeroCap) {
 		t.Fatalf("all-zeros envelope must parse as zero-quota: org=%+v owner=%+v, %v", organization, owner, err)
 	}
+
+	// Legacy envelope: tier anchor + per-field headers. A partial legacy
+	// envelope (Atlas omits unset legacy headers too) admits with the absent
+	// fields unlimited.
 	legacyOrg, legacyOwner, err := parseTrustedRateLimits(identity.Identity{
 		Gateway: true, LegacyServiceTier: "default", LegacyRateLimitRequests: "7",
 		LegacyRateLimitTotalPromptTokens: "100", LegacyRateLimitUncachedPromptTokens: "25",
@@ -1024,41 +1074,54 @@ func TestTrustedRateLimitPolicyParsing(t *testing.T) {
 		!rateLimitsEqual(legacyOwner, admission.RateLimits{}) {
 		t.Fatalf("legacy gateway policy = org=%+v owner=%+v, %v", legacyOrg, legacyOwner, err)
 	}
-	_, _, err = parseTrustedRateLimits(identity.Identity{
-		Gateway: true, OwnerID: "partial-new", LegacyServiceTier: "default",
+	legacyOrg, legacyOwner, err = parseTrustedRateLimits(identity.Identity{
+		Gateway: true, LegacyServiceTier: "default", LegacyRateLimitRequests: "7",
+		LegacyRateLimitTotalPromptTokens: "100", LegacyRateLimitUncachedPromptTokens: "25",
+	})
+	if err != nil ||
+		!rateLimitsEqual(legacyOrg, admission.RateLimits{Requests: ptr64(7), TotalPromptTokens: ptr64(100), UncachedPromptTokens: ptr64(25)}) ||
+		!rateLimitsEqual(legacyOwner, admission.RateLimits{}) {
+		t.Fatalf("partial legacy envelope = org=%+v owner=%+v, %v; absent generated header must be nil (unlimited)", legacyOrg, legacyOwner, err)
+	}
+
+	// A legacy envelope arriving alongside a present owner-id anchor is
+	// superseded: the new anchor wins (as it did when both were complete), so
+	// absent scoped headers parse as unlimited rather than falling back.
+	organization, owner, err = parseTrustedRateLimits(identity.Identity{
+		Gateway: true, OwnerID: "owner-1", LegacyServiceTier: "default",
 		LegacyRateLimitRequests: "0", LegacyRateLimitTotalPromptTokens: "0",
 		LegacyRateLimitUncachedPromptTokens: "0", LegacyRateLimitGeneratedTokens: "0",
 	})
-	if err == nil {
-		t.Fatal("partial new envelope incorrectly fell back to the legacy policy")
+	if err != nil || !rateLimitsEqual(organization, admission.RateLimits{}) || !rateLimitsEqual(owner, admission.RateLimits{}) {
+		t.Fatalf("owner anchor with legacy envelope alongside = org=%+v owner=%+v, %v; the new anchor must win with absent scoped headers unlimited",
+			organization, owner, err)
 	}
 
-	// A partial legacy envelope fails closed too: the tier marker and all
-	// four legacy rate headers must arrive together.
+	// Malformed PRESENT values fail closed in both envelope families (R7's
+	// malformed clause); the per-field rule governs absence, not garbage.
 	for _, tc := range []struct {
 		name string
 		id   identity.Identity
 	}{
 		{
-			name: "legacy missing generated tokens",
+			name: "non-numeric scoped header",
+			id: identity.Identity{Gateway: true, OwnerID: "owner-1",
+				OrgRateLimitRequests: "not-a-number"},
+		},
+		{
+			name: "negative scoped header",
+			id: identity.Identity{Gateway: true, OwnerID: "owner-1",
+				OrgRateLimitRequests: "-1"},
+		},
+		{
+			name: "non-numeric legacy header",
 			id: identity.Identity{Gateway: true, LegacyServiceTier: "default",
-				LegacyRateLimitRequests: "7", LegacyRateLimitTotalPromptTokens: "100",
-				LegacyRateLimitUncachedPromptTokens: "25"},
-		},
-		{
-			name: "legacy rates without tier",
-			id: identity.Identity{Gateway: true,
-				LegacyRateLimitRequests: "7", LegacyRateLimitTotalPromptTokens: "100",
-				LegacyRateLimitUncachedPromptTokens: "25", LegacyRateLimitGeneratedTokens: "50"},
-		},
-		{
-			name: "legacy tier without rates",
-			id:   identity.Identity{Gateway: true, LegacyServiceTier: "default"},
+				LegacyRateLimitRequests: "not-a-number"},
 		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			if _, _, err := parseTrustedRateLimits(tc.id); err == nil {
-				t.Fatal("partial legacy envelope was accepted as a complete fallback")
+				t.Fatal("malformed present limit value was accepted")
 			}
 		})
 	}
@@ -1161,7 +1224,11 @@ func TestLegacyServiceTierNeverSelectsLane(t *testing.T) {
 	}
 }
 
-func TestAdmissionEnabledPerResourceRequestWithoutPolicyFailsClosed(t *testing.T) {
+// R7 structural pin, end to end: the completeness gate covers the identity
+// anchor, so limit headers without their anchor are refused (503) before
+// admission. Absent limit headers with the anchor present are NOT a violation
+// — they parse as unlimited (see TestPartialRateLimitHeadersAdmitAsUnlimited).
+func TestTrustedRateLimitPolicyWithoutIdentityAnchorFailsClosed(t *testing.T) {
 	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		w.WriteHeader(http.StatusOK)
 	}))
@@ -1177,39 +1244,8 @@ func TestAdmissionEnabledPerResourceRequestWithoutPolicyFailsClosed(t *testing.T
 		mutate func(*http.Request)
 	}{
 		{
-			name: "missing",
+			name: "no anchor and no headers",
 			mutate: func(req *http.Request) {
-				for _, header := range []string{
-					identity.HeaderOrgRateLimitRequests,
-					identity.HeaderOrgRateLimitTotalPromptTokens,
-					identity.HeaderOrgRateLimitUncachedPromptTokens,
-					identity.HeaderOrgRateLimitGeneratedTokens,
-					identity.HeaderOwnerRateLimitRequests,
-					identity.HeaderOwnerRateLimitTotalPromptTokens,
-					identity.HeaderOwnerRateLimitUncachedPromptTokens,
-					identity.HeaderOwnerRateLimitGeneratedTokens,
-				} {
-					req.Header.Del(header)
-				}
-			},
-		},
-		{
-			name: "partial new plus complete legacy",
-			mutate: func(req *http.Request) {
-				req.Header.Del(identity.HeaderOwnerRateLimitGeneratedTokens)
-				req.Header.Set(identity.HeaderLegacyServiceTier, "default")
-				req.Header.Set(identity.HeaderLegacyRateLimitRequests, "0")
-				req.Header.Set(identity.HeaderLegacyRateLimitTotalPromptTokens, "0")
-				req.Header.Set(identity.HeaderLegacyRateLimitUncachedPromptTokens, "0")
-				req.Header.Set(identity.HeaderLegacyRateLimitGeneratedTokens, "0")
-			},
-		},
-		{
-			name: "partial legacy envelope",
-			mutate: func(req *http.Request) {
-				// OwnerID is part of the NEW envelope's completeness check;
-				// removing it leaves the partial legacy envelope as the only
-				// policy present, so the legacy branch is what must fail.
 				req.Header.Del(identity.HeaderOwnerID)
 				for _, header := range []string{
 					identity.HeaderOrgRateLimitRequests,
@@ -1223,12 +1259,34 @@ func TestAdmissionEnabledPerResourceRequestWithoutPolicyFailsClosed(t *testing.T
 				} {
 					req.Header.Del(header)
 				}
-				req.Header.Set(identity.HeaderLegacyServiceTier, "default")
-				req.Header.Set(identity.HeaderLegacyRateLimitRequests, "0")
-				req.Header.Set(identity.HeaderLegacyRateLimitTotalPromptTokens, "0")
-				req.Header.Set(identity.HeaderLegacyRateLimitUncachedPromptTokens, "0")
-				// The generated-tokens header is deliberately absent: a subset
-				// of the legacy rate headers must fail closed.
+			},
+		},
+		{
+			name: "scoped headers without owner id",
+			mutate: func(req *http.Request) {
+				req.Header.Del(identity.HeaderOwnerID)
+			},
+		},
+		{
+			name: "legacy rates without tier",
+			mutate: func(req *http.Request) {
+				req.Header.Del(identity.HeaderOwnerID)
+				for _, header := range []string{
+					identity.HeaderOrgRateLimitRequests,
+					identity.HeaderOrgRateLimitTotalPromptTokens,
+					identity.HeaderOrgRateLimitUncachedPromptTokens,
+					identity.HeaderOrgRateLimitGeneratedTokens,
+					identity.HeaderOwnerRateLimitRequests,
+					identity.HeaderOwnerRateLimitTotalPromptTokens,
+					identity.HeaderOwnerRateLimitUncachedPromptTokens,
+					identity.HeaderOwnerRateLimitGeneratedTokens,
+				} {
+					req.Header.Del(header)
+				}
+				req.Header.Set(identity.HeaderLegacyRateLimitRequests, "7")
+				req.Header.Set(identity.HeaderLegacyRateLimitTotalPromptTokens, "100")
+				req.Header.Set(identity.HeaderLegacyRateLimitUncachedPromptTokens, "25")
+				req.Header.Set(identity.HeaderLegacyRateLimitGeneratedTokens, "50")
 			},
 		},
 	} {
@@ -1239,6 +1297,95 @@ func TestAdmissionEnabledPerResourceRequestWithoutPolicyFailsClosed(t *testing.T
 			s.Handler().ServeHTTP(rr, req)
 			if rr.Code != http.StatusServiceUnavailable {
 				t.Fatalf("status=%d, want 503", rr.Code)
+			}
+		})
+	}
+}
+
+// R4 x R7 reconciliation, end to end: with the identity anchor present, Atlas
+// may omit any limit header whose UsageLimit is unset — the absent fields
+// parse as unlimited and the request is admitted and forwarded. This is the
+// shape the sister Atlas branch (hugo/r4-atlas-omit-unset) produces; under an
+// all-or-nothing gate every shared request of such an org 503'd.
+func TestPartialRateLimitHeadersAdmitAsUnlimited(t *testing.T) {
+	scopedHeaders := []string{
+		identity.HeaderOrgRateLimitRequests,
+		identity.HeaderOrgRateLimitTotalPromptTokens,
+		identity.HeaderOrgRateLimitUncachedPromptTokens,
+		identity.HeaderOrgRateLimitGeneratedTokens,
+		identity.HeaderOwnerRateLimitRequests,
+		identity.HeaderOwnerRateLimitTotalPromptTokens,
+		identity.HeaderOwnerRateLimitUncachedPromptTokens,
+		identity.HeaderOwnerRateLimitGeneratedTokens,
+	}
+	for _, tc := range []struct {
+		name   string
+		mutate func(*http.Request)
+	}{
+		{
+			name: "owner id only, every limit unset",
+			mutate: func(req *http.Request) {
+				for _, header := range scopedHeaders {
+					req.Header.Del(header)
+				}
+			},
+		},
+		{
+			name: "single org header present",
+			mutate: func(req *http.Request) {
+				for _, header := range scopedHeaders {
+					req.Header.Del(header)
+				}
+				req.Header.Set(identity.HeaderOrgRateLimitRequests, "1000000")
+			},
+		},
+		{
+			name: "org and owner subsets",
+			mutate: func(req *http.Request) {
+				for _, header := range scopedHeaders {
+					req.Header.Del(header)
+				}
+				req.Header.Set(identity.HeaderOrgRateLimitRequests, "1000000")
+				req.Header.Set(identity.HeaderOrgRateLimitGeneratedTokens, "1000000")
+				req.Header.Set(identity.HeaderOwnerRateLimitRequests, "1000000")
+			},
+		},
+		{
+			name: "legacy tier with partial legacy rates",
+			mutate: func(req *http.Request) {
+				req.Header.Del(identity.HeaderOwnerID)
+				for _, header := range scopedHeaders {
+					req.Header.Del(header)
+				}
+				req.Header.Set(identity.HeaderLegacyServiceTier, "default")
+				req.Header.Set(identity.HeaderLegacyRateLimitRequests, "7")
+				req.Header.Set(identity.HeaderLegacyRateLimitTotalPromptTokens, "100")
+			},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var hits int
+			backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				hits++
+				_, _ = w.Write([]byte(`{"model":"model-a","usage":{"prompt_tokens":1,"completion_tokens":1}}`))
+			}))
+			defer backend.Close()
+			up, _ := url.Parse(backend.URL)
+			mr := miniredis.RunT(t)
+			cfg := proxyAdmissionConfig(1)
+			c := redis.NewClient(&redis.Options{Addr: mr.Addr()})
+			t.Cleanup(func() { _ = c.Close() })
+			s := New(&config.Settings{Admission: cfg}, logging.New(logging.ERROR), &recordingEmitter{}).WithAdmitter(admission.New(c, cfg))
+
+			req := sharedRequest(up)
+			tc.mutate(req)
+			rr := httptest.NewRecorder()
+			s.Handler().ServeHTTP(rr, req)
+			if rr.Code != http.StatusOK {
+				t.Fatalf("status=%d, want 200 — absent limit headers must admit as unlimited", rr.Code)
+			}
+			if hits != 1 {
+				t.Fatalf("upstream hits=%d, want 1", hits)
 			}
 		})
 	}
@@ -1873,8 +2020,11 @@ func TestStoreDownStillFailsClosedOnBrokenIdentityAndPolicy(t *testing.T) {
 			mutate: func(req *http.Request) { req.Header.Set(identity.HeaderOrgRateLimitRequests, "not-a-number") },
 		},
 		{
-			name:   "partial policy envelope",
-			mutate: func(req *http.Request) { req.Header.Del(identity.HeaderOwnerRateLimitGeneratedTokens) },
+			// R4 x R7: a single ABSENT limit header is unlimited, not a
+			// violation — the structural 503 shape is headers without their
+			// identity anchor.
+			name:   "headers without identity anchor",
+			mutate: func(req *http.Request) { req.Header.Del(identity.HeaderOwnerID) },
 		},
 		{
 			name:   "degenerate upstream graph",

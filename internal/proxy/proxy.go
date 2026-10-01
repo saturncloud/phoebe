@@ -581,7 +581,9 @@ func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request) {
 			// The trusted quota envelope is part of enabled admission, not of
 			// request routing. Keeping this check behind the feature gate lets
 			// operators deploy Phoebe before Saturn begins stamping the envelope;
-			// once admission is enabled, absent or partial policy still fails closed.
+			// once admission is enabled, a structurally broken policy — headers
+			// without their identity anchor, a malformed present value — fails
+			// closed, while absent limit headers parse as unlimited (R4).
 			organizationLimits, ownerLimits, policyErr := parseTrustedRateLimits(id)
 			if policyErr != nil {
 				s.log.Error.Printf("admission: invalid trusted rate-limit policy: %v", policyErr)
