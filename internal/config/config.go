@@ -66,24 +66,26 @@ type Settings struct {
 	configDir string
 }
 
-// AdmissionLimits is one independently-enforced scope budget. Zero means that
-// dimension is unlimited. Window applies to RequestsPerWindow, the three
-// token-throughput windows, and WakesPerWindow. Total prompt includes cached
-// and uncached prompt tokens; uncached prompt is the subset that required
-// prefill compute.
+// AdmissionLimits is one independently-enforced scope budget. R4 sentinel
+// semantics (the Saturn UsageLimit pattern): nil — a YAML null or an absent
+// key — means that dimension is unlimited; an explicit 0 is a zero cap that
+// blocks every request at that dimension. There is no 0-sentinel for
+// unlimited. Window applies to RequestsPerWindow, the three token-throughput
+// windows, and WakesPerWindow. Total prompt includes cached and uncached
+// prompt tokens; uncached prompt is the subset that required prefill compute.
 type AdmissionLimits struct {
-	MaxActiveRequests             int64         `yaml:"maxActiveRequests"`
-	MaxConcurrentPrefills         int64         `yaml:"maxConcurrentPrefills"`
-	MaxReservedDecodeSlots        int64         `yaml:"maxReservedDecodeSlots"`
-	MaxPromptBytes                int64         `yaml:"maxPromptBytes"`
-	MaxReservedOutputTokens       int64         `yaml:"maxReservedOutputTokens"`
-	MaxActiveAdapters             int64         `yaml:"maxActiveAdapters"`
-	RequestsPerWindow             int64         `yaml:"requestsPerWindow"`
-	TotalPromptTokensPerWindow    int64         `yaml:"totalPromptTokensPerWindow"`
-	UncachedPromptTokensPerWindow int64         `yaml:"uncachedPromptTokensPerWindow"`
-	GeneratedTokensPerWindow      int64         `yaml:"generatedTokensPerWindow"`
-	MaxColdHolds                  int64         `yaml:"maxColdHolds"`
-	WakesPerWindow                int64         `yaml:"wakesPerWindow"`
+	MaxActiveRequests             *int64        `yaml:"maxActiveRequests"`
+	MaxConcurrentPrefills         *int64        `yaml:"maxConcurrentPrefills"`
+	MaxReservedDecodeSlots        *int64        `yaml:"maxReservedDecodeSlots"`
+	MaxPromptBytes                *int64        `yaml:"maxPromptBytes"`
+	MaxReservedOutputTokens       *int64        `yaml:"maxReservedOutputTokens"`
+	MaxActiveAdapters             *int64        `yaml:"maxActiveAdapters"`
+	RequestsPerWindow             *int64        `yaml:"requestsPerWindow"`
+	TotalPromptTokensPerWindow    *int64        `yaml:"totalPromptTokensPerWindow"`
+	UncachedPromptTokensPerWindow *int64        `yaml:"uncachedPromptTokensPerWindow"`
+	GeneratedTokensPerWindow      *int64        `yaml:"generatedTokensPerWindow"`
+	MaxColdHolds                  *int64        `yaml:"maxColdHolds"`
+	WakesPerWindow                *int64        `yaml:"wakesPerWindow"`
 	WindowStr                     string        `yaml:"window"`
 	Window                        time.Duration `yaml:"-"`
 }
@@ -348,7 +350,7 @@ func (a *AdmissionSettings) parse() error {
 		return fmt.Errorf("invalid admission.leaseTtl %q", a.LeaseTTLStr)
 	}
 	if a.DefaultMaxOutputTokens <= 0 {
-		a.DefaultMaxOutputTokens = 512
+		a.DefaultMaxOutputTokens = 4096
 	}
 	limits := []struct {
 		name  string
@@ -379,8 +381,8 @@ func (a *AdmissionSettings) parse() error {
 	return nil
 }
 
-func limitValues(l AdmissionLimits) []int64 {
-	return []int64{l.MaxActiveRequests, l.MaxConcurrentPrefills, l.MaxReservedDecodeSlots, l.MaxPromptBytes,
+func limitValues(l AdmissionLimits) []*int64 {
+	return []*int64{l.MaxActiveRequests, l.MaxConcurrentPrefills, l.MaxReservedDecodeSlots, l.MaxPromptBytes,
 		l.MaxReservedOutputTokens, l.MaxActiveAdapters, l.RequestsPerWindow,
 		l.TotalPromptTokensPerWindow, l.UncachedPromptTokensPerWindow,
 		l.GeneratedTokensPerWindow, l.MaxColdHolds, l.WakesPerWindow}
@@ -395,13 +397,17 @@ func (a *AdmissionSettings) validateLaneShares() error {
 	sums := make([]int64, len(platform))
 	for laneName, lane := range a.Lanes {
 		for i, v := range limitValues(lane.Limits) {
-			if platform[i] > 0 && v == 0 {
+			if platform[i] != nil && *platform[i] > 0 && v == nil {
 				return fmt.Errorf("admission.lanes.%s.%s must be set when the platform limit is set", laneName, names[i])
 			}
-			if v > 0 && lane.Weight > (1<<63-1)/v {
+			if v == nil {
+				continue
+			}
+			value := *v
+			if value > 0 && lane.Weight > (1<<63-1)/value {
 				return fmt.Errorf("admission.lanes.%s.%s overflows after weight", laneName, names[i])
 			}
-			weighted := v * lane.Weight
+			weighted := value * lane.Weight
 			if weighted > 0 && sums[i] > (1<<63-1)-weighted {
 				return fmt.Errorf("weighted admission lane shares for %s overflow", names[i])
 			}
@@ -409,29 +415,30 @@ func (a *AdmissionSettings) validateLaneShares() error {
 		}
 	}
 	for i, max := range platform {
-		if max > 0 && sums[i] > max {
-			return fmt.Errorf("weighted admission lane shares for %s total %d above platform limit %d", names[i], sums[i], max)
+		if max != nil && *max > 0 && sums[i] > *max {
+			return fmt.Errorf("weighted admission lane shares for %s total %d above platform limit %d", names[i], sums[i], *max)
 		}
 	}
 	return nil
 }
 
 func (l *AdmissionLimits) parse(name string) error {
-	values := []int64{l.MaxActiveRequests, l.MaxConcurrentPrefills, l.MaxReservedDecodeSlots, l.MaxPromptBytes, l.MaxReservedOutputTokens, l.MaxActiveAdapters,
+	values := []*int64{l.MaxActiveRequests, l.MaxConcurrentPrefills, l.MaxReservedDecodeSlots, l.MaxPromptBytes, l.MaxReservedOutputTokens, l.MaxActiveAdapters,
 		l.RequestsPerWindow, l.TotalPromptTokensPerWindow, l.UncachedPromptTokensPerWindow,
 		l.GeneratedTokensPerWindow, l.MaxColdHolds, l.WakesPerWindow}
 	for _, value := range values {
-		if value < 0 {
+		if value != nil && *value < 0 {
 			return fmt.Errorf("%s limits cannot be negative", name)
 		}
 	}
-	if l.TotalPromptTokensPerWindow > 0 && l.UncachedPromptTokensPerWindow > l.TotalPromptTokensPerWindow {
+	if l.TotalPromptTokensPerWindow != nil && l.UncachedPromptTokensPerWindow != nil &&
+		*l.UncachedPromptTokensPerWindow > *l.TotalPromptTokensPerWindow {
 		return fmt.Errorf("%s.uncachedPromptTokensPerWindow cannot exceed totalPromptTokensPerWindow", name)
 	}
-	if l.MaxActiveRequests > 0 && l.MaxConcurrentPrefills > l.MaxActiveRequests {
+	if l.MaxActiveRequests != nil && l.MaxConcurrentPrefills != nil && *l.MaxConcurrentPrefills > *l.MaxActiveRequests {
 		return fmt.Errorf("%s.maxConcurrentPrefills cannot exceed maxActiveRequests", name)
 	}
-	if l.MaxActiveRequests > 0 && l.MaxReservedDecodeSlots > l.MaxActiveRequests {
+	if l.MaxActiveRequests != nil && l.MaxReservedDecodeSlots != nil && *l.MaxReservedDecodeSlots > *l.MaxActiveRequests {
 		return fmt.Errorf("%s.maxReservedDecodeSlots cannot exceed maxActiveRequests", name)
 	}
 	if l.WindowStr == "" {

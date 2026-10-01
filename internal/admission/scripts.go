@@ -7,6 +7,11 @@ import "github.com/redis/go-redis/v9"
 // fixed-window reaping occurs before every mutation, so replica death cannot
 // leak reservations past leaseTtl and retired dynamic scopes cannot grow the
 // counters hash forever.
+//
+// Scope limit fields use the R4 wire sentinel: 0 means unlimited (a nil
+// config value), -1 means an explicit zero cap, and a positive value is the
+// cap. Every limit check is `limit ~= 0 and usage > limit`: -1 rejects any
+// usage because usage is never negative, while 0 skips the check.
 const luaHelpers = `
 local function get(field) return tonumber(redis.call('HGET', KEYS[1], field) or '0') end
 local function current_time_ms()
@@ -83,18 +88,18 @@ if redis.call('HEXISTS',KEYS[2],q.id) == 1 then return {1} end
 for _,s in ipairs(q.scopes) do
   local contract=s.contractual and 1 or 0
   local checks={{'active',s.active,1},{'prefills',s.prefills,1},{'reserved_decode_slots',s.reserved_decode_slots,1},{'prompt',s.prompt,q.prompt},{'output',s.output,q.output},{'adapters',s.adapters,q.adapter}}
-  for _,c in ipairs(checks) do if c[2] > 0 and get(field(s,c[1])) + c[3] > c[2] then return {0,s.name,c[1],contract} end end
-  if s.requests > 0 and window_get(s,'requests',q.now)+1 > s.requests then return {0,s.name,'requests',contract,window_retry_ms(s,q.now)} end
-  if s.total_prompt > 0 and window_get(s,'total_prompt',q.now)+get(field(s,'total_prompt_reserved'))+q.estimated_input > s.total_prompt then return {0,s.name,'total_prompt_tokens',contract,window_retry_ms(s,q.now)} end
-  if s.uncached_prompt > 0 and window_get(s,'uncached_prompt',q.now)+get(field(s,'uncached_prompt_reserved'))+q.estimated_input > s.uncached_prompt then return {0,s.name,'uncached_prompt_tokens',contract,window_retry_ms(s,q.now)} end
-  if s.generated > 0 and window_get(s,'generated',q.now)+get(field(s,'genreserved'))+q.output > s.generated then return {0,s.name,'generated_tokens',contract,window_retry_ms(s,q.now)} end
+  for _,c in ipairs(checks) do if c[2] ~= 0 and get(field(s,c[1])) + c[3] > c[2] then return {0,s.name,c[1],contract} end end
+  if s.requests ~= 0 and window_get(s,'requests',q.now)+1 > s.requests then return {0,s.name,'requests',contract,window_retry_ms(s,q.now)} end
+  if s.total_prompt ~= 0 and window_get(s,'total_prompt',q.now)+get(field(s,'total_prompt_reserved'))+q.estimated_input > s.total_prompt then return {0,s.name,'total_prompt_tokens',contract,window_retry_ms(s,q.now)} end
+  if s.uncached_prompt ~= 0 and window_get(s,'uncached_prompt',q.now)+get(field(s,'uncached_prompt_reserved'))+q.estimated_input > s.uncached_prompt then return {0,s.name,'uncached_prompt_tokens',contract,window_retry_ms(s,q.now)} end
+  if s.generated ~= 0 and window_get(s,'generated',q.now)+get(field(s,'genreserved'))+q.output > s.generated then return {0,s.name,'generated_tokens',contract,window_retry_ms(s,q.now)} end
 end
 local rec={scopes=q.scopes,prompt=q.prompt,estimated_input=q.estimated_input,output=q.output,adapter=q.adapter,prefill=true,cold=false,admitted_at=q.now}
 for _,s in ipairs(q.scopes) do
   add(field(s,'active'),1); add(field(s,'prefills'),1); add(field(s,'reserved_decode_slots'),1); add(field(s,'prompt'),q.prompt); add(field(s,'output'),q.output); add(field(s,'genreserved'),q.output)
   add(field(s,'total_prompt_reserved'),q.estimated_input); add(field(s,'uncached_prompt_reserved'),q.estimated_input)
   if q.adapter == 1 then add(field(s,'adapters'),1) end
-  if s.requests > 0 then window_add(s,'requests',q.now,1) end
+  if s.requests ~= 0 then window_add(s,'requests',q.now,1) end
 end
 redis.call('HSET',KEYS[2],q.id,cjson.encode(rec)); redis.call('ZADD',KEYS[3],q.now+q.lease_ms,q.id)
 return {1}
@@ -111,7 +116,7 @@ local rec=cjson.decode(raw); release_record(rec)
 -- The request never reached the engine, so undo its RPM charge when cleanup
 -- occurs in the same fixed window. Never subtract from a newer bucket.
 for _,s in ipairs(rec.scopes) do
-  if s.requests > 0 and rec.admitted_at and bucket(s,rec.admitted_at) == bucket(s,now) then
+  if s.requests ~= 0 and rec.admitted_at and bucket(s,rec.admitted_at) == bucket(s,now) then
     window_add(s,'requests',now,-1)
   end
 end
@@ -134,10 +139,10 @@ local rec=cjson.decode(raw)
 if ARGV[2] == 'begin' and not rec.cold then
   for _,s in ipairs(rec.scopes) do
     local contract=s.contractual and 1 or 0
-    if s.cold > 0 and get(field(s,'cold'))+1 > s.cold then return {0,s.name,'cold_holds',contract} end
-    if s.wakes > 0 and window_get(s,'wakes',now)+1 > s.wakes then return {0,s.name,'wakes',contract,window_retry_ms(s,now)} end
+    if s.cold ~= 0 and get(field(s,'cold'))+1 > s.cold then return {0,s.name,'cold_holds',contract} end
+    if s.wakes ~= 0 and window_get(s,'wakes',now)+1 > s.wakes then return {0,s.name,'wakes',contract,window_retry_ms(s,now)} end
   end
-  for _,s in ipairs(rec.scopes) do add(field(s,'cold'),1); if s.wakes > 0 then window_add(s,'wakes',now,1) end end
+  for _,s in ipairs(rec.scopes) do add(field(s,'cold'),1); if s.wakes ~= 0 then window_add(s,'wakes',now,1) end end
   rec.cold=true; redis.call('HSET',KEYS[2],ARGV[1],cjson.encode(rec))
 elseif ARGV[2] == 'end' and rec.cold then
   for _,s in ipairs(rec.scopes) do add(field(s,'cold'),-1) end

@@ -57,7 +57,9 @@ func newGatewayTestServer(t *testing.T, em *recordingEmitter, resolver gateway.R
 }
 
 // gatewayRequest builds a gateway-marked request with the complete trusted
-// identity and admission-policy contract. Zero rate limits mean unlimited.
+// identity and admission-policy contract. R4: the base envelope stamps
+// large non-binding caps; explicit 0 is a zero cap and absent headers are
+// unlimited only per-field inside a complete envelope.
 // It carries none of the per-resource routing headers, exactly as the gateway
 // route contract specifies.
 func gatewayRequest(org, body string) *http.Request {
@@ -82,7 +84,7 @@ func gatewayRequestFor(method, path, org, body string) *http.Request {
 		identity.HeaderOwnerRateLimitUncachedPromptTokens,
 		identity.HeaderOwnerRateLimitGeneratedTokens,
 	} {
-		req.Header.Set(header, "0")
+		req.Header.Set(header, "1000000")
 	}
 	return req
 }
@@ -113,7 +115,7 @@ func TestGatewayRequestBodyBoundedBeforeResolution(t *testing.T) {
 		},
 	}}
 	s := newGatewayTestServer(t, &recordingEmitter{}, resolver, up)
-	s.settings.Admission.Platform.MaxPromptBytes = limit
+	s.settings.Admission.Platform.MaxPromptBytes = ptr64(limit)
 
 	rr := httptest.NewRecorder()
 	s.Handler().ServeHTTP(rr, gatewayRequestBodyOfSize(t, "org-1", limit))
@@ -666,7 +668,7 @@ func TestGateway_WakeEligible(t *testing.T) {
 	em := &recordingEmitter{}
 	mr := miniredis.RunT(t)
 	cfg := proxyAdmissionConfig(1)
-	cfg.Platform.MaxColdHolds = 1
+	cfg.Platform.MaxColdHolds = ptr64(1)
 	client := redis.NewClient(&redis.Options{Addr: mr.Addr()})
 	t.Cleanup(func() { _ = client.Close() })
 	a := admission.New(client, cfg)

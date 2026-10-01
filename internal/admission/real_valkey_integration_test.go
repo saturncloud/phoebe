@@ -98,9 +98,9 @@ func TestRealValkeyLeaseLifecycleTransitions(t *testing.T) {
 	}
 
 	l := limits(2)
-	l.MaxConcurrentPrefills = 1
-	l.MaxColdHolds = 1
-	l.WakesPerWindow = 10
+	l.MaxConcurrentPrefills = ptr64(1)
+	l.MaxColdHolds = ptr64(1)
+	l.WakesPerWindow = ptr64(10)
 	cfg := config.AdmissionSettings{
 		KeyPrefix: fmt.Sprintf("phoebe-admission-lifecycle-%d", time.Now().UnixNano()),
 		LeaseTTL:  300 * time.Millisecond,
@@ -274,10 +274,10 @@ func TestRealValkeySettlesIndependentContractsExactly(t *testing.T) {
 		r.EstimatedInputTokens = input
 		r.ReservedOutputTokens = output
 		r.OrganizationLimits = RateLimits{
-			TotalPromptTokens: 12, UncachedPromptTokens: 8, GeneratedTokens: 7,
+			TotalPromptTokens: ptr64(12), UncachedPromptTokens: ptr64(8), GeneratedTokens: ptr64(7),
 		}
 		r.OwnerLimits = RateLimits{
-			TotalPromptTokens: 9, UncachedPromptTokens: 5, GeneratedTokens: 6,
+			TotalPromptTokens: ptr64(9), UncachedPromptTokens: ptr64(5), GeneratedTokens: ptr64(6),
 		}
 		return r
 	}

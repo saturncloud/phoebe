@@ -295,7 +295,7 @@ admission:
 	if err != nil {
 		t.Fatal(err)
 	}
-	if s.Admission.LeaseTTL != 15*time.Minute || s.Admission.DefaultMaxOutputTokens != 512 {
+	if s.Admission.LeaseTTL != 15*time.Minute || s.Admission.DefaultMaxOutputTokens != 4096 {
 		t.Fatalf("admission defaults wrong: %+v", s.Admission)
 	}
 	if got := s.Admission.Lanes["protected"].Limits.Window; got != 30*time.Second {
@@ -304,6 +304,83 @@ admission:
 	if got := s.Admission.Lanes["protected"]; got.DynamoPriority != 17 || got.DynamoStrictPriority != 3 {
 		t.Fatalf("protected Dynamo hints wrong: %+v", got)
 	}
+}
+
+// R4 sentinel semantics: YAML null or an absent key decodes to nil = unlimited;
+// an explicit 0 decodes to a zero cap that blocks every request. Without the
+// pointer conversion a chart-side null would decode to 0 = zero cap and block
+// everything. Table-driven over each shape.
+func TestLoadAdmissionLimitsNullableSentinel(t *testing.T) {
+	tests := []struct {
+		name string
+		yaml string
+		want map[string]*int64
+	}{
+		{
+			name: "absent keys are nil",
+			yaml: "admission:\n  enabled: true\n  valkeyAddr: v\n  platform:\n    maxPromptBytes: 1024\n",
+			want: map[string]*int64{"MaxActiveRequests": nil, "MaxPromptBytes": int64ptr(1024)},
+		},
+		{
+			name: "explicit null is nil",
+			yaml: "admission:\n  enabled: true\n  valkeyAddr: v\n  platform:\n    maxActiveRequests: null\n    maxPromptBytes: 1024\n",
+			want: map[string]*int64{"MaxActiveRequests": nil, "MaxPromptBytes": int64ptr(1024)},
+		},
+		{
+			name: "explicit zero is a zero cap",
+			yaml: "admission:\n  enabled: true\n  valkeyAddr: v\n  platform:\n    maxActiveRequests: 0\n    maxPromptBytes: 0\n",
+			want: map[string]*int64{"MaxActiveRequests": int64ptr(0), "MaxPromptBytes": int64ptr(0)},
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			s, err := Load(writeTemp(t, tc.yaml))
+			if err != nil {
+				t.Fatal(err)
+			}
+			for field, want := range tc.want {
+				got := fieldValue(s.Admission.Platform, field)
+				if (got == nil) != (want == nil) || (got != nil && *got != *want) {
+					t.Fatalf("platform.%s = %v, want %v", field, got, want)
+				}
+			}
+		})
+	}
+
+	// A zero cap on one scope must not constrain the others, and a zero-capped
+	// scope must still load: zero caps are enforced at admission, not at parse.
+	t.Run("zero cap round-trips per scope", func(t *testing.T) {
+		s, err := Load(writeTemp(t, `
+admission:
+  enabled: true
+  valkeyAddr: v
+  platform:
+    maxActiveRequests: 0
+  organization:
+    maxActiveRequests: 7
+`))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got := s.Admission.Platform.MaxActiveRequests; got == nil || *got != 0 {
+			t.Fatalf("platform.maxActiveRequests = %v, want explicit zero cap", got)
+		}
+		if got := s.Admission.Organization.MaxActiveRequests; got == nil || *got != 7 {
+			t.Fatalf("organization.maxActiveRequests = %v, want 7", got)
+		}
+	})
+}
+
+func int64ptr(v int64) *int64 { return &v }
+
+func fieldValue(l AdmissionLimits, name string) *int64 {
+	switch name {
+	case "MaxActiveRequests":
+		return l.MaxActiveRequests
+	case "MaxPromptBytes":
+		return l.MaxPromptBytes
+	}
+	return nil
 }
 
 func TestLoadAdmissionRejectsInvalidPolicy(t *testing.T) {
