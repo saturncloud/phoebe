@@ -1,6 +1,7 @@
 package proxy
 
 import (
+	"bytes"
 	"context"
 	"io"
 	"net/http"
@@ -71,10 +72,6 @@ func newTestServerE(t *testing.T, _ *url.URL, em metering.Emitter) *Server {
 	return New(s, log, em)
 }
 
-// setUpstream stamps the X-Saturn-Upstream routing header onto a test request,
-// exactly as Atlas's per-route injection does in production. Routing now comes
-// solely from this header (phoebe resolves no upstream of its own), so every
-// request a test expects to be FORWARDED must carry it.
 // stampDedicatedServingMode adds X-Saturn-Serving-Mode: dedicated unless the test
 // already set a serving mode. Atlas stamps the serving mode on every Token
 // Factory inference route (ruling #19), so a header-routed test request that
@@ -85,6 +82,14 @@ func stampDedicatedServingMode(req *http.Request) {
 	}
 }
 
+// setUpstream stamps the X-Saturn-Upstream routing header onto a test request,
+// exactly as Atlas's per-route injection does in production. Routing now comes
+// solely from this header (phoebe resolves no upstream of its own), so every
+// request a test expects to be FORWARDED must carry it.
+// It also stamps X-Saturn-Serving-Mode: dedicated (via stampDedicatedServingMode)
+// unless the test already set a serving mode, so a test that needs the
+// serving-mode header absent must set X-Saturn-Upstream directly and not call
+// setUpstream.
 func setUpstream(req *http.Request, upstream *url.URL) {
 	req.Header.Set(identity.HeaderUpstream, upstream.Host)
 	stampDedicatedServingMode(req)
@@ -1489,5 +1494,62 @@ func TestProxyModelMetadataSubtreeRebuiltToSingleModel(t *testing.T) {
 	}
 	if rr.Header().Get("Content-Length") == "" {
 		t.Fatalf("subtree response length metadata not rebuilt: %v", rr.Header())
+	}
+}
+
+// TestProxyServingMode_RefusalLogsDistinctError: the route gate's serving-mode
+// refusal is the most likely Token Factory cutover failure (a route the
+// restamp script missed, or PHOEBE_TRUSTED_HEADERS rendered without
+// X-Saturn-Serving-Mode). It must log its own ERROR that tells an absent header
+// apart from a malformed one, instead of the generic "route not authorized"
+// WARN, while the client still gets the generic 404 and the upstream is never
+// reached.
+func TestProxyServingMode_RefusalLogsDistinctError(t *testing.T) {
+	var hits int32
+	be := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		atomic.AddInt32(&hits, 1)
+		_, _ = w.Write([]byte(`{}`))
+	}))
+	defer be.Close()
+	beURL, _ := url.Parse(be.URL)
+
+	cases := []struct {
+		name, mode, wantLog string
+	}{
+		{"absent", "", "absent or untrusted"},
+		{"malformed", "Shared", "malformed"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			var errBuf, warnBuf bytes.Buffer
+			log := logging.New(logging.WARN)
+			log.Error.SetOutput(&errBuf)
+			log.Warn.SetOutput(&warnBuf)
+			srv := New(&config.Settings{ListenAddr: ":0"}, log, &recordingEmitter{})
+
+			rr := httptest.NewRecorder()
+			req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", nil)
+			// Not setUpstream: it would stamp a serving mode.
+			req.Header.Set(identity.HeaderUpstream, beURL.Host)
+			req.Header.Set(identity.HeaderAuthID, "auth-key-7")
+			req.Header.Set(identity.HeaderResourceID, "dep-1")
+			if tc.mode != "" {
+				req.Header.Set(identity.HeaderServingMode, tc.mode)
+			}
+			srv.Handler().ServeHTTP(rr, req)
+
+			if rr.Code != http.StatusNotFound || rr.Body.String() != "not found\n" {
+				t.Fatalf("status = %d body %q, want 404 \"not found\"", rr.Code, rr.Body.String())
+			}
+			if n := atomic.LoadInt32(&hits); n != 0 {
+				t.Fatalf("upstream reached %d times, want 0", n)
+			}
+			if out := errBuf.String(); !strings.Contains(out, tc.wantLog) || !strings.Contains(out, "dep-1") {
+				t.Fatalf("error log %q, want it to contain %q and the resource id", out, tc.wantLog)
+			}
+			if strings.Contains(warnBuf.String(), "route not authorized for resource") {
+				t.Fatalf("generic refusal WARN also fired (double log): %q", warnBuf.String())
+			}
+		})
 	}
 }

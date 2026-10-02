@@ -442,7 +442,7 @@ func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request) {
 	if !id.Gateway {
 		allowed := pathCanonical
 		switch {
-		case !validTrustedServingMode(id.ServingMode):
+		case !identity.ValidServingMode(id.ServingMode):
 			// Malformed serving mode (an Atlas producer bug — a present header is
 			// read verbatim, never normalized). Refuse with the same generic 404 as
 			// every other unauthorized route: falling through to the dedicated
@@ -450,8 +450,24 @@ func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request) {
 			// shared graph with no model binding, and with an allow-list present
 			// the shared policy below would still be skipped. Guessing the
 			// intended mode from a malformed value is exactly the fail-open this
-			// gate exists to prevent.
-			allowed = false
+			// gate exists to prevent. An absent header is also refused, because
+			// identity.FromRequest applies no default (ruling #19) and the empty
+			// string is not a serving mode.
+			//
+			// This branch logs its own ERROR (not the generic WARN below) so the
+			// most likely cutover failure — a route Atlas never stamped, or a
+			// PHOEBE_TRUSTED_HEADERS rendering that omits the header — is visible
+			// as itself rather than as an ordinary unauthorized path. The client
+			// still gets the same generic 404.
+			if id.ServingMode == "" {
+				s.log.Error.Printf("model-binding: refused request_id=%s resource_id=%s: %s absent or untrusted (ruling #19: Atlas must stamp it on every route; check the restamp_dedicated_serving_mode script run and that PHOEBE_TRUSTED_HEADERS includes it)",
+					requestID, id.ResourceID, identity.HeaderServingMode)
+			} else {
+				s.log.Error.Printf("model-binding: refused request_id=%s resource_id=%s: malformed %s=%q (Atlas producer bug)",
+					requestID, id.ResourceID, identity.HeaderServingMode, id.ServingMode)
+			}
+			http.Error(w, "not found", http.StatusNotFound)
+			return
 		case id.ServedModel != "":
 			allowed = allowed && boundRequestAllowed(r.Method, routePath, id.ServedModel)
 		case id.ServingMode == "shared":

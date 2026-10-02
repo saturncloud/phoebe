@@ -6,8 +6,6 @@ import (
 	"errors"
 	"net/url"
 	"strings"
-
-	"github.com/saturncloud/phoebe/internal/identity"
 )
 
 // authorizedModelDiscoveryPath validates Dynamo's graph-wide per-model GET
@@ -26,21 +24,6 @@ func authorizedModelDiscoveryPath(path, servedModelAllowList string) (discovery,
 		return true, true
 	}
 	return true, false
-}
-
-// validTrustedServingMode reports whether a trusted serving-mode value is one
-// the route machinery understands: exactly "shared" or "dedicated" (the
-// 2026-09-29 serving-mode ruling; the empty string is not a serving mode).
-// identity.FromRequest reads the header VERBATIM with no default (Atlas stamps
-// it on every Token Factory route, ruling #19), so an absent header or an Atlas
-// producer bug ("Shared", " shared", "SHARED") would otherwise fall into the
-// dedicated/unbound branch: a genuinely shared graph would get the unbound
-// inference surface with no model binding, and the shared policy (tenant
-// isolation + admission) would be skipped even when an allow-list is present.
-// Values outside the set are refused at the route gate (fail closed, generic
-// 404 — no oracle), exactly like every other unauthorized route.
-func validTrustedServingMode(mode string) bool {
-	return identity.ValidServingMode(mode)
 }
 
 // boundRequestAllowed is the complete public surface for a deployment-scoped
