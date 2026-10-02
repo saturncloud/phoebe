@@ -3524,7 +3524,7 @@ func TestIntegration_Migration0007BackfillMakesPreCutoverReRateANoOp(t *testing.
 	if res, err = store.RateWindow(ctx, book, hour, hour.Add(time.Hour)); err != nil || res.InvalidServingModeEvents != 1 {
 		t.Fatalf("before re-running the backfill: invalid=%d err=%v, want 1", res.InvalidServingModeEvents, err)
 	}
-	exec(t, db, `UPDATE billing_event SET serving_mode = 'dedicated' WHERE serving_mode IS NULL OR serving_mode = ''`)
+	exec(t, db, rolloutReRunBackfill)
 	if res, err = store.RateWindow(ctx, book, hour, hour.Add(time.Hour)); err != nil ||
 		res.InvalidServingModeEvents != 0 || res.EventsRated != 4 || res.ReconciledDeletions != 0 {
 		t.Fatalf("after re-running the backfill: invalid=%d rated=%d deletions=%d err=%v, want 0/4/0",
@@ -3543,6 +3543,78 @@ func TestIntegration_Migration0007BackfillMakesPreCutoverReRateANoOp(t *testing.
 	}
 	if nulls != 3 || shared != 1 || explicitDedicated != 0 {
 		t.Fatalf("billing_event after down: NULL=%d shared=%d dedicated=%d, want 3/1/0", nulls, shared, explicitDedicated)
+	}
+}
+
+// rolloutReRunBackfill is the statement the 0007 runbook (docs/billing-reconciliation.md
+// and migrations/README.md step 3) tells operators to re-run after the rollout. It
+// covers only NULL, which only an old drainer writes; it must not touch the empty string.
+const rolloutReRunBackfill = `UPDATE billing_event SET serving_mode = 'dedicated' WHERE serving_mode IS NULL`
+
+// TestIntegration_RolloutReRunBackfillLeavesExplicitEmptyServingModeWithheld pins
+// the drainer/metering contract against the runbook's post-rollout re-run. After
+// the cutover the new drainer stores an explicit "serving_mode":"" as the empty string because it
+// is a producer bug, and the rater withholds it as invalid_serving_mode_events.
+// The re-run must backfill only the NULL rows an old drainer wrote during the
+// rollout, and leave the empty-string row withheld so it still pages and is investigated
+// instead of being billed at the dedicated price.
+func TestIntegration_RolloutReRunBackfillLeavesExplicitEmptyServingModeWithheld(t *testing.T) {
+	dsn := os.Getenv("PHOEBE_TEST_DATABASE_URL")
+	if dsn == "" {
+		t.Skip("PHOEBE_TEST_DATABASE_URL not set; skipping live-Postgres conformance")
+	}
+	ctx := context.Background()
+	db, err := sql.Open("pgx", dsn)
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	defer db.Close()
+	db.SetMaxOpenConns(1)
+
+	const sch = "phoebe_rollout_rerun_backfill_it"
+	exec(t, db, "DROP SCHEMA IF EXISTS "+sch+" CASCADE")
+	exec(t, db, "CREATE SCHEMA "+sch)
+	exec(t, db, "SET search_path TO "+sch)
+	defer func() { exec(t, db, "DROP SCHEMA IF EXISTS "+sch+" CASCADE") }()
+	for _, f := range []string{"0001_billing_event", "0002_rating", "0004_billing_event_serving_mode",
+		"0005_invoice_grade_attempts", "0006_rollup_grain", "0007_serving_mode_explicit"} {
+		exec(t, db, readMigration(t, f+".up.sql"))
+	}
+	exec(t, db, "ALTER TABLE billing_event ALTER COLUMN usage_found SET DEFAULT TRUE")
+
+	hour := mustTime("2026-06-08T10:00:00Z")
+	// After 0007: an old drainer still running during the rollout stores NULL; the
+	// new drainer stores an explicit "" from a post-cutover producer bug as ''.
+	if _, err := db.ExecContext(ctx,
+		`INSERT INTO billing_event (request_id, auth_id, resource_id, org_id, model, base_model, serving_mode, prompt_tokens, event_ts)
+		 VALUES ('old-drainer-null', 'a', 'res', 'org-1', 'm', 'b', NULL, 100, $1),
+		        ('producer-bug',     'a', 'res', 'org-1', 'm', 'b', '',   100, $1)`, hour.Add(time.Minute)); err != nil {
+		t.Fatalf("seed billing_event: %v", err)
+	}
+	book := newTestBook(map[string]Rate3{
+		"b":        rate3("0.000010", "0", "0"),
+		"shared:b": rate3("0.000001", "0", "0"),
+	}, nil, PolicyIdentity, Dec{}, Dec{})
+	store := NewPostgresStore(db)
+
+	res, err := store.RateWindow(ctx, book, hour, hour.Add(time.Hour))
+	if err != nil || res.InvalidServingModeEvents != 2 || res.EventsRated != 0 {
+		t.Fatalf("before the re-run: invalid=%d rated=%d err=%v, want 2/0", res.InvalidServingModeEvents, res.EventsRated, err)
+	}
+
+	exec(t, db, rolloutReRunBackfill)
+
+	var empty int
+	if err := db.QueryRowContext(ctx, `SELECT COUNT(*) FROM billing_event WHERE serving_mode = ''`).Scan(&empty); err != nil {
+		t.Fatalf("count '' rows: %v", err)
+	}
+	if empty != 1 {
+		t.Fatalf("'' rows after the re-run = %d, want 1 (the producer-bug row must not be backfilled)", empty)
+	}
+	res, err = store.RateWindow(ctx, book, hour, hour.Add(time.Hour))
+	if err != nil || res.InvalidServingModeEvents != 1 || res.EventsRated != 1 {
+		t.Fatalf("after the re-run: invalid=%d rated=%d err=%v, want 1/1 (NULL rated, '' still withheld)",
+			res.InvalidServingModeEvents, res.EventsRated, err)
 	}
 }
 

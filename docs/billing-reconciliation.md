@@ -282,13 +282,20 @@ bug; the drainer stores it as `''` and the rater withholds it as
 `invalid_serving_mode_events` instead of billing it as dedicated. An old drainer still running during the rollout stores it as NULL, which the new
 rater withholds as `invalid_serving_mode_events`. Once every interceptor and
 drainer pod runs the new image, and no old drainer pod is left draining the
-queue, run the same idempotent statement again against
-phoebe's database:
+queue, run this statement against phoebe's database. It is idempotent, but it is
+NOT the same statement as 0007's one-time backfill, because it leaves `''` rows
+alone:
 
 ```sql
 UPDATE billing_event SET serving_mode = 'dedicated'
-WHERE serving_mode IS NULL OR serving_mode = '';
+WHERE serving_mode IS NULL;
 ```
+
+Only an old drainer writes NULL during the rollout. The new drainer writes `''`
+only for an explicit `"serving_mode":""` from a post-cutover producer, which is a
+bug; those rows must stay withheld and be investigated, not backfilled. To keep
+the statement to the rollout, you can also bound it by `created_at` (when the
+drainer wrote the row) to the rollout window.
 
 The next routine rater run (or an explicit `rater --since <deploy hour> --until
 <now>`) then rates those events. If the rater paged with `invalid_serving_mode_events`

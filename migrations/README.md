@@ -107,21 +107,22 @@ NULL, so it must not run against schema 0007. Roll out in this order:
 2. Run `cmd/migrate up`, deploy the new rater, proxy and token-push images, then
    resume the rater.
 3. Once every interceptor and drainer pod runs the new image, and no old drainer
-   pod is left draining the queue, re-run 0007's idempotent `billing_event`
-   backfill (`UPDATE billing_event SET serving_mode = 'dedicated' WHERE
-   serving_mode IS NULL OR serving_mode = ''`) to cover dedicated events an old
-   drainer stored as NULL during the rollout. If an old drainer pod might have
-   stored events after the backfill ran, run the UPDATE again; it is idempotent.
+   pod is left draining the queue, run `UPDATE billing_event SET serving_mode =
+   'dedicated' WHERE serving_mode IS NULL` to cover dedicated events an old
+   drainer stored as NULL during the rollout. Unlike 0007's one-time backfill,
+   this statement does not touch `''` rows: after the cutover a `''` row is a
+   producer bug and must not be rewritten. You can bound the statement by
+   `created_at` (when the drainer wrote the row) to the rollout window. If an
+   old drainer pod might have stored events after the statement ran, run it
+   again; it is idempotent.
    The new drainer stores an event whose `serving_mode` key is ABSENT (only an
    old pod emits one, including one replayed later from an on-disk spool or the
    drain queue) as `'dedicated'`, so those events need no backfill. Only an
    absent key gets this default. An explicit `"serving_mode":""` or `null` comes
    from a producer bug after the cutover. The new drainer stores it as `''`, and
    the rater withholds it as an invalid serving mode
-   (`invalid_serving_mode_events`). Do not assume every `''` row is left over
-   from the rollout. Run this backfill only right after the rollout. Do not run
-   it over `''` rows written after every pod runs the new image; investigate
-   those rows instead, as described in `docs/billing-reconciliation.md`.
+   (`invalid_serving_mode_events`). Investigate those rows instead of
+   backfilling them, as described in `docs/billing-reconciliation.md`.
    See "Serving-mode cutover (migration 0007)"
    in `docs/billing-reconciliation.md`.
 4. Re-rate the hours whose `''` rollup 0007 deleted. Atlas #6709 ships first and
