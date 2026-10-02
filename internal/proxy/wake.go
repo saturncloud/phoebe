@@ -78,7 +78,7 @@ const dynamoNotReadyBodyMarker = "is not ready to serve requests yet"
 // so ServingMode is the authoritative discriminator; dedicated capacity never
 // scales to zero through this path.
 func isWakeable(id identity.Identity) bool {
-	return id.ServingMode == "shared" && id.ResourceID != "" && id.ServedModel != ""
+	return id.ServingMode == identity.ServingModeShared && id.ResourceID != "" && id.ServedModel != ""
 }
 
 // graphFromUpstreamHost derives the Dynamo graph (DGD) k8s name from a

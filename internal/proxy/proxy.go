@@ -357,7 +357,7 @@ func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if id.ServingMode == "shared" {
+	if id.ServingMode == identity.ServingModeShared {
 		if !bodyBound {
 			sharedLane = admissionLaneForIdentity(s.settings.Admission, id)
 			if !boundSharedRequestBody(w, r, sharedRequestBodyLimit(s.settings.Admission, sharedLane)) {
@@ -470,7 +470,7 @@ func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request) {
 			return
 		case id.ServedModel != "":
 			allowed = allowed && boundRequestAllowed(r.Method, routePath, id.ServedModel)
-		case id.ServingMode == "shared":
+		case id.ServingMode == identity.ServingModeShared:
 			// Shared route with no injected allow-list: there is nothing to
 			// bind the request-body model= against, so model= could select any
 			// tenant's model on the shared graph. A real shared route always

@@ -32,6 +32,8 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+
+	"github.com/saturncloud/phoebe/internal/identity"
 )
 
 // ErrNotFound reports that no tf_model row matches (org, served model name) —
@@ -158,8 +160,9 @@ func (p *PGResolver) Resolve(ctx context.Context, orgID, model string) (Resoluti
 	// model. Folding it into ErrNotFound would hide a data-integrity bug as
 	// an ordinary miss; defaulting it would mis-price and mis-gate the
 	// request.
-	if r.ServingMode != "shared" && r.ServingMode != "dedicated" {
-		return Resolution{}, fmt.Errorf("gateway: tf_model row for org %s model %q has invalid serving_mode %q (want \"shared\" or \"dedicated\")", orgID, model, r.ServingMode)
+	if !identity.ValidServingMode(r.ServingMode) {
+		return Resolution{}, fmt.Errorf("gateway: tf_model row for org %s model %q has invalid serving_mode %q (want %q or %q)",
+			orgID, model, r.ServingMode, identity.ServingModeShared, identity.ServingModeDedicated)
 	}
 	if r.GraphK8sName == "" {
 		// Exists but not addressable (no serving graph). Folded into ErrNotFound
