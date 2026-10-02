@@ -19,18 +19,28 @@
 -- dedicated ids is allowed; saturn-aws-manager sees the new id on its next push
 -- of the window and replaces the old record by delete-by-absence.
 --
--- TWO CLEAN-UPS HAPPEN FIRST, both on staging data only:
---  1. A '' row whose natural-key twin already exists as 'dedicated' (possible if
---     a trusted header ever stamped the explicit spelling before the cutover)
---     cannot be renamed without violating the unique key. The '' row is deleted;
---     the 'dedicated' twin stays.
+-- TWO CLEAN-UPS HAPPEN FIRST:
+--  1. A '' row whose natural-key twin already exists as 'dedicated' cannot be
+--     renamed without violating the unique key. The '' row is deleted; the
+--     'dedicated' twin stays. Twins are EXPECTED, not hypothetical: the ratified
+--     deploy order ships Atlas #6709 first, and Atlas then stamps
+--     X-Saturn-Serving-Mode: dedicated while the old phoebe is still running. The
+--     old rater groups the NULL (pre-stamp) events as '' and the stamped events as
+--     'dedicated', so every hour that straddles the Atlas rollout, and every hour
+--     after it until this migration runs, can hold both rows. The surviving
+--     'dedicated' row covers only PART of its hour until that hour is re-rated:
+--     the deleted '' row's events (backfilled to 'dedicated' below) are counted
+--     again only by a re-rate of that hour.
 --  2. A row with any other value (neither '', 'shared' nor 'dedicated') has no
 --     legal meaning and is deleted.
 -- The raw evidence for both remains in billing_event.
--- Before deleting, the migration prints a RAISE NOTICE with the row count, SUM(cost)
--- and SUM(event_count) for each clean-up that finds rows; that NOTICE output is the
--- audit trail for the deleted rows, and the trailing re-rate rebuilds them from
--- billing_event.
+-- Before deleting, the migration prints a RAISE NOTICE with the row count, SUM(cost),
+-- SUM(event_count) and the earliest window_start for each clean-up that finds rows;
+-- that NOTICE output is the audit trail for the deleted rows. The routine rater
+-- rebuilds them only for hours inside its trailing window (24h by default). Hours
+-- older than that MUST be re-rated explicitly with `rater --since <earliest
+-- window_start> --until <now>`, then pushed with token-push over the same window
+-- (see "Rollout order for migration 0007" in migrations/README.md).
 --
 -- PRE-CUTOVER EVIDENCE IS DEDICATED (Hugo, 2026-09-30: "assume it's all dedicated
 -- (which is true)"). Before this migration the proxy stored dedicated traffic with a
@@ -59,12 +69,14 @@ WHERE serving_mode IS NULL OR serving_mode = '';
 
 DO $$
 DECLARE
-    n      bigint;
-    cost_s numeric;
-    evts_s bigint;
+    n       bigint;
+    cost_s  numeric;
+    evts_s  bigint;
+    first_w timestamptz;
 BEGIN
-    SELECT COUNT(*), COALESCE(SUM(ru.cost), 0), COALESCE(SUM(ru.event_count), 0)
-      INTO n, cost_s, evts_s
+    SELECT COUNT(*), COALESCE(SUM(ru.cost), 0), COALESCE(SUM(ru.event_count), 0),
+           MIN(ru.window_start)
+      INTO n, cost_s, evts_s, first_w
       FROM rated_usage ru
      WHERE ru.serving_mode = ''
        AND EXISTS (
@@ -78,17 +90,18 @@ BEGIN
              AND d.window_start = ru.window_start
        );
     IF n > 0 THEN
-        RAISE NOTICE '0007: deleting % rated_usage rows with serving_mode '''' that have a ''dedicated'' twin (sum cost %, sum event_count %)',
-            n, cost_s, evts_s;
+        RAISE NOTICE '0007: deleting % rated_usage rows with serving_mode '''' that have a ''dedicated'' twin (sum cost %, sum event_count %, earliest window_start %); the ''dedicated'' twins are partial until re-rated, so every affected hour MUST be re-rated: rater --since <earliest window_start> --until <now>, then token-push over the same window',
+            n, cost_s, evts_s, to_char(first_w AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS"Z"');
     END IF;
 
-    SELECT COUNT(*), COALESCE(SUM(cost), 0), COALESCE(SUM(event_count), 0)
-      INTO n, cost_s, evts_s
+    SELECT COUNT(*), COALESCE(SUM(cost), 0), COALESCE(SUM(event_count), 0),
+           MIN(window_start)
+      INTO n, cost_s, evts_s, first_w
       FROM rated_usage
      WHERE serving_mode NOT IN ('', 'shared', 'dedicated');
     IF n > 0 THEN
-        RAISE NOTICE '0007: deleting % rated_usage rows with an unknown serving_mode (sum cost %, sum event_count %)',
-            n, cost_s, evts_s;
+        RAISE NOTICE '0007: deleting % rated_usage rows with an unknown serving_mode (sum cost %, sum event_count %, earliest window_start %)',
+            n, cost_s, evts_s, to_char(first_w AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS"Z"');
     END IF;
 END
 $$;
@@ -142,9 +155,11 @@ COMMENT ON COLUMN billing_event.serving_mode IS
 -- whose serving_mode is not 'shared' or 'dedicated' (invalid_serving_mode_events).
 -- Without a column for that cause, those withheld attempts would show up as an
 -- unexplained attempt_delta and token deltas. The predicate matches the rater's.
--- Everything else is the 0005 definition unchanged; the new column is appended
--- last because CREATE OR REPLACE VIEW can only add columns at the end. The down
--- migration drops and recreates the 0005 view.
+-- The `rated` CTE now aggregates rated_usage to the view's grain (see the CTE's
+-- comment); every output column keeps its 0005 name and type. Everything else is
+-- the 0005 definition unchanged; the new column is appended last because CREATE
+-- OR REPLACE VIEW can only add columns at the end. The down migration drops and
+-- recreates the 0005 column set with the same aggregated `rated` CTE.
 CREATE OR REPLACE VIEW billing_reconciliation_hourly AS
 WITH raw AS (
     SELECT
@@ -187,15 +202,21 @@ WITH raw AS (
     FROM billing_event
     GROUP BY 1, auth_id, resource_id, model
 ), rated AS (
+    -- Since 0006, rated_usage holds one row per (serving_mode, owner) inside the
+    -- view's grain. Aggregate to exactly one row per (window, auth, resource,
+    -- model) so the LEFT JOIN below cannot repeat a raw row (and its
+    -- raw_attempts / invalid_serving_mode_attempts) once per rated row.
     SELECT
-        window_start, auth_id, resource_id, org_id, model_id,
-        event_count AS rated_attempts,
-        prompt_tokens AS rated_prompt_tokens,
-        billable_prompt_tokens AS rated_fresh_input_tokens,
-        cached_tokens AS rated_cached_tokens,
-        completion_tokens AS rated_completion_tokens,
-        cost
+        window_start, auth_id, resource_id, model_id,
+        MAX(org_id) AS org_id,
+        SUM(event_count)::bigint AS rated_attempts,
+        SUM(prompt_tokens)::bigint AS rated_prompt_tokens,
+        SUM(billable_prompt_tokens)::bigint AS rated_fresh_input_tokens,
+        SUM(cached_tokens)::bigint AS rated_cached_tokens,
+        SUM(completion_tokens)::bigint AS rated_completion_tokens,
+        SUM(cost) AS cost
     FROM rated_usage
+    GROUP BY window_start, auth_id, resource_id, model_id
 ), reconciliation_keys AS (
     -- UNION uses PostgreSQL set semantics (NULLs compare equal) to produce one
     -- row per null-safe natural key without relying on FULL JOIN conditions that

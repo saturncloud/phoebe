@@ -103,7 +103,21 @@ NULL, so it must not run against schema 0007. Roll out in this order:
    on-disk spool or the drain queue) as `'dedicated'`, so events it inserts need no
    backfill. See "Serving-mode cutover (migration 0007)"
    in `docs/billing-reconciliation.md`.
-4. Deploy saturn-aws-manager #310 in the same window. Until both sides run the
+4. Re-rate the hours whose `''` rollup 0007 deleted. Atlas #6709 ships first and
+   stamps `X-Saturn-Serving-Mode: dedicated` while the old phoebe is still
+   running, so the old rater writes two rollups for each hour that has both
+   pre-stamp (NULL) and stamped events: `''` and `'dedicated'`. 0007 deletes the
+   `''` row of each such pair and prints a NOTICE with the earliest affected
+   `window_start`. The surviving `'dedicated'` row covers only part of its hour
+   until that hour is re-rated, and the routine rater re-rates only its trailing
+   window (24h by default). Whenever the hour the Atlas #6709 rollout started (or
+   the earliest `window_start` in the 0007 twin NOTICE, whichever is earlier) is
+   older than that window, run
+   `rater --since <that hour> --until <start of the current hour>` and then
+   `token-push --since <that hour> --until <start of the current hour>`, so
+   saturn-aws-manager replaces the partial rows. Without this, those hours stay
+   under-counted in `rated_usage` and are pushed under-billed.
+5. Deploy saturn-aws-manager #310 in the same window. Until both sides run the
    new code, pushes are rejected with 400 in whichever direction is mismatched,
    nothing is written, and token-push retries the window on its next run.
 

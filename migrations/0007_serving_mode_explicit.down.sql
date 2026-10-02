@@ -37,8 +37,10 @@ COMMENT ON COLUMN rated_usage.serving_mode IS
 
 COMMENT ON COLUMN billing_event.serving_mode IS NULL;
 
--- Restore the 0005 reconciliation view. CREATE OR REPLACE cannot remove the
--- invalid_serving_mode_attempts column 0007 added, so drop and recreate.
+-- Restore the 0005 reconciliation view's columns. CREATE OR REPLACE cannot remove
+-- the invalid_serving_mode_attempts column 0007 added, so drop and recreate. The
+-- `rated` CTE keeps 0007's aggregation to the view's grain, so a downgrade does not
+-- bring back the one-raw-row-per-rated-row fan-out that 0006's wider grain caused.
 DROP VIEW billing_reconciliation_hourly;
 
 -- Operator-facing raw -> rated reconciliation.  This deliberately stops at
@@ -78,15 +80,21 @@ WITH raw AS (
     FROM billing_event
     GROUP BY 1, auth_id, resource_id, model
 ), rated AS (
+    -- Since 0006, rated_usage holds one row per (serving_mode, owner) inside the
+    -- view's grain. Aggregate to exactly one row per (window, auth, resource,
+    -- model) so the LEFT JOIN below cannot repeat a raw row (and its
+    -- raw_attempts) once per rated row.
     SELECT
-        window_start, auth_id, resource_id, org_id, model_id,
-        event_count AS rated_attempts,
-        prompt_tokens AS rated_prompt_tokens,
-        billable_prompt_tokens AS rated_fresh_input_tokens,
-        cached_tokens AS rated_cached_tokens,
-        completion_tokens AS rated_completion_tokens,
-        cost
+        window_start, auth_id, resource_id, model_id,
+        MAX(org_id) AS org_id,
+        SUM(event_count)::bigint AS rated_attempts,
+        SUM(prompt_tokens)::bigint AS rated_prompt_tokens,
+        SUM(billable_prompt_tokens)::bigint AS rated_fresh_input_tokens,
+        SUM(cached_tokens)::bigint AS rated_cached_tokens,
+        SUM(completion_tokens)::bigint AS rated_completion_tokens,
+        SUM(cost) AS cost
     FROM rated_usage
+    GROUP BY window_start, auth_id, resource_id, model_id
 ), reconciliation_keys AS (
     -- UNION uses PostgreSQL set semantics (NULLs compare equal) to produce one
     -- row per null-safe natural key without relying on FULL JOIN conditions that

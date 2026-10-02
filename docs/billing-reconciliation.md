@@ -247,6 +247,29 @@ reproduces exactly those rows: same serving mode, same ids, no reconcile deletio
 and no invalid-serving-mode anomaly. token-push sends the new ids once, and
 saturn-aws-manager replaces the old `''` records for those windows by absence.
 
+**Re-rate the hours where 0007 deleted a `''` twin.** Atlas #6709 is deployed
+before this phoebe release, and from then on it stamps `X-Saturn-Serving-Mode:
+dedicated` while the old phoebe is still running. The old rater stores the
+pre-stamp (NULL) events of an hour as `''` and the stamped events as
+`'dedicated'`, so those hours hold two rollups for one key. 0007 cannot rename
+the `''` row onto its twin without breaking the unique key, so it deletes it and
+prints a NOTICE with the count, cost, event count and earliest `window_start` of
+the deleted rows. The surviving `'dedicated'` row covers only part of its hour. A
+`''` row deleted by 0007 is rebuilt only by a re-rate of its hour, because its
+events are still in `billing_event` (now backfilled to `'dedicated'`). The
+routine rater re-rates only its trailing window (24h by default). If the hour the
+Atlas #6709 rollout started, or the earliest `window_start` in the twin NOTICE,
+is older than that window, run:
+
+```
+rater --since <that hour> --until <start of the current hour>
+token-push --since <that hour> --until <start of the current hour>
+```
+
+The push makes saturn-aws-manager replace the partial `'dedicated'` rows for
+those windows. Skipping this leaves those hours under-counted in `rated_usage`
+and pushed under-billed.
+
 **One follow-up step after the rollout.** The migration Job runs before the new
 proxy pods replace the old ones. An old pod still serving during the rollout
 meters dedicated traffic with no `serving_mode` key in the event JSON. The new

@@ -3321,8 +3321,9 @@ func TestIntegration_Migration0007ServingModeExplicit(t *testing.T) {
 // TestIntegration_Migration0007NoticesEveryRatedRowItDeletes pins the audit trail
 // for the two rated_usage clean-ups in 0007 up: before deleting a ” row that has a
 // 'dedicated' twin, or a row with an unknown serving_mode, the migration must RAISE
-// NOTICE with the row count, SUM(cost) and SUM(event_count) of exactly the rows it
-// deletes. A clean database (nothing to delete) must produce no such NOTICE.
+// NOTICE with the row count, SUM(cost), SUM(event_count) and earliest window_start
+// of exactly the rows it deletes; the twin NOTICE must also say the hours MUST be
+// re-rated. A clean database (nothing to delete) must produce no such NOTICE.
 func TestIntegration_Migration0007NoticesEveryRatedRowItDeletes(t *testing.T) {
 	dsn := os.Getenv("PHOEBE_TEST_DATABASE_URL")
 	if dsn == "" {
@@ -3383,8 +3384,9 @@ func TestIntegration_Migration0007NoticesEveryRatedRowItDeletes(t *testing.T) {
 	exec(t, db, readMigration(t, "0007_serving_mode_explicit.up.sql"))
 
 	want := []string{
-		"0007: deleting 2 rated_usage rows with serving_mode '' that have a 'dedicated' twin (sum cost 2.000000000, sum event_count 10)",
-		"0007: deleting 2 rated_usage rows with an unknown serving_mode (sum cost 2.125000000, sum event_count 6)",
+		"0007: deleting 2 rated_usage rows with serving_mode '' that have a 'dedicated' twin (sum cost 2.000000000, sum event_count 10, earliest window_start 2026-06-08T10:00:00Z); " +
+			"the 'dedicated' twins are partial until re-rated, so every affected hour MUST be re-rated: rater --since <earliest window_start> --until <now>, then token-push over the same window",
+		"0007: deleting 2 rated_usage rows with an unknown serving_mode (sum cost 2.125000000, sum event_count 6, earliest window_start 2026-06-08T10:00:00Z)",
 	}
 	if strings.Join(notices, "\n") != strings.Join(want, "\n") {
 		t.Fatalf("0007 notices =\n%s\nwant\n%s", strings.Join(notices, "\n"), strings.Join(want, "\n"))
@@ -3542,6 +3544,201 @@ func TestIntegration_Migration0007BackfillMakesPreCutoverReRateANoOp(t *testing.
 	if nulls != 3 || shared != 1 || explicitDedicated != 0 {
 		t.Fatalf("billing_event after down: NULL=%d shared=%d dedicated=%d, want 3/1/0", nulls, shared, explicitDedicated)
 	}
+}
+
+// TestIntegration_Migration0007TwinHourIsWholeAfterExplicitReRate pins the rollout
+// step for the ” / 'dedicated' twins 0007 deletes. Atlas #6709 ships first and
+// stamps 'dedicated' while the old phoebe runs, so the old rater writes two rollups
+// for one hour: ” for the NULL (pre-stamp) events and 'dedicated' for the stamped
+// ones. 0007 deletes the ” row, which leaves the 'dedicated' row covering only
+// part of the hour. An explicit re-rate of that hour (`rater --since <hour>`) must
+// leave exactly one row whose event_count is every event of the hour.
+func TestIntegration_Migration0007TwinHourIsWholeAfterExplicitReRate(t *testing.T) {
+	dsn := os.Getenv("PHOEBE_TEST_DATABASE_URL")
+	if dsn == "" {
+		t.Skip("PHOEBE_TEST_DATABASE_URL not set; skipping live-Postgres conformance")
+	}
+	ctx := context.Background()
+	db, err := sql.Open("pgx", dsn)
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	defer db.Close()
+	db.SetMaxOpenConns(1)
+
+	const sch = "phoebe_migration_0007_twin_rerate_it"
+	exec(t, db, "DROP SCHEMA IF EXISTS "+sch+" CASCADE")
+	exec(t, db, "CREATE SCHEMA "+sch)
+	exec(t, db, "SET search_path TO "+sch)
+	defer func() { exec(t, db, "DROP SCHEMA IF EXISTS "+sch+" CASCADE") }()
+	for _, f := range []string{"0001_billing_event", "0002_rating", "0004_billing_event_serving_mode",
+		"0005_invoice_grade_attempts", "0006_rollup_grain"} {
+		exec(t, db, readMigration(t, f+".up.sql"))
+	}
+	exec(t, db, "ALTER TABLE billing_event ALTER COLUMN usage_found SET DEFAULT TRUE")
+
+	// An hour older than the rater's trailing window: the routine run never
+	// revisits it, so only the explicit re-rate can repair it.
+	hour := mustTime("2026-06-08T10:00:00Z")
+	// Two NULL events before Atlas started stamping, three stamped 'dedicated' after.
+	if _, err := db.ExecContext(ctx,
+		`INSERT INTO billing_event (request_id, auth_id, resource_id, org_id, model, serving_mode, prompt_tokens, event_ts)
+		 VALUES ('n1', 'a', 'res', 'org-1', 'm', NULL,        100, $1),
+		        ('n2', 'a', 'res', 'org-1', 'm', NULL,        100, $1),
+		        ('d1', 'a', 'res', 'org-1', 'm', 'dedicated', 100, $2),
+		        ('d2', 'a', 'res', 'org-1', 'm', 'dedicated', 100, $2),
+		        ('d3', 'a', 'res', 'org-1', 'm', 'dedicated', 100, $2)`,
+		hour.Add(5*time.Minute), hour.Add(40*time.Minute)); err != nil {
+		t.Fatalf("seed billing_event: %v", err)
+	}
+	// The two rollups the old rater wrote for that hour.
+	for _, row := range []struct {
+		mode   string
+		events int
+	}{{"", 2}, {"dedicated", 3}} {
+		if _, err := db.ExecContext(ctx, `INSERT INTO rated_usage
+			(id, auth_id, resource_id, org_id, model_id, serving_mode, window_start, window_end,
+			 prompt_tokens, cached_tokens, completion_tokens, billable_prompt_tokens,
+			 cost, applied_prompt_rate, applied_cached_rate, applied_completion_rate, event_count)
+			VALUES (md5('a' || $1::text), 'a', 'res', 'org-1', 'm', $1::text, $2::timestamptz,
+			        $2::timestamptz + interval '1 hour', $3, 0, 0, $3, 0.001, 0.00001, 0, 0, $4)`,
+			row.mode, hour, 100*row.events, row.events); err != nil {
+			t.Fatalf("seed rated_usage %q: %v", row.mode, err)
+		}
+	}
+
+	exec(t, db, readMigration(t, "0007_serving_mode_explicit.up.sql"))
+
+	var partial int64
+	if err := db.QueryRowContext(ctx, `SELECT SUM(event_count) FROM rated_usage WHERE window_start = $1`, hour).
+		Scan(&partial); err != nil {
+		t.Fatalf("read after up: %v", err)
+	}
+	if partial != 3 {
+		t.Fatalf("event_count after 0007 = %d, want 3 (the surviving 'dedicated' twin is partial until re-rated)", partial)
+	}
+
+	// The runbook step: rater --since <hour> --until <hour+1h>.
+	book := newTestBook(map[string]Rate3{"m": rate3("0.000010", "0", "0")}, nil, PolicyIdentity, Dec{}, Dec{})
+	if _, err := NewPostgresStore(db).RateWindow(ctx, book, hour, hour.Add(time.Hour)); err != nil {
+		t.Fatalf("RateWindow: %v", err)
+	}
+	var rows, events int64
+	var mode string
+	if err := db.QueryRowContext(ctx,
+		`SELECT COUNT(*), COALESCE(SUM(event_count), 0), MAX(serving_mode) FROM rated_usage WHERE window_start = $1`, hour).
+		Scan(&rows, &events, &mode); err != nil {
+		t.Fatalf("read after re-rate: %v", err)
+	}
+	if rows != 1 || events != 5 || mode != "dedicated" {
+		t.Fatalf("after re-rate: rows=%d event_count=%d mode=%q, want 1 row, 5 events, 'dedicated'", rows, events, mode)
+	}
+}
+
+// TestIntegration_ReconciliationViewOneRowPerGrainAcrossServingModes guards the
+// invariant that billing_reconciliation_hourly returns exactly one row per
+// (window, auth, resource, model) even though rated_usage (since 0006) can hold
+// several rows inside that grain, one per serving_mode and owner. Without the
+// aggregation in the view's `rated` CTE, the LEFT JOIN repeats the raw row once per
+// rated row, double-counting raw_attempts and invalid_serving_mode_attempts. The
+// invariant must hold after 0007 up and after 0007 down.
+func TestIntegration_ReconciliationViewOneRowPerGrainAcrossServingModes(t *testing.T) {
+	dsn := os.Getenv("PHOEBE_TEST_DATABASE_URL")
+	if dsn == "" {
+		t.Skip("PHOEBE_TEST_DATABASE_URL not set; skipping live-Postgres conformance")
+	}
+	ctx := context.Background()
+	db, err := sql.Open("pgx", dsn)
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	defer db.Close()
+	db.SetMaxOpenConns(1)
+
+	const sch = "phoebe_reconciliation_view_grain_it"
+	exec(t, db, "DROP SCHEMA IF EXISTS "+sch+" CASCADE")
+	exec(t, db, "CREATE SCHEMA "+sch)
+	exec(t, db, "SET search_path TO "+sch)
+	defer func() { exec(t, db, "DROP SCHEMA IF EXISTS "+sch+" CASCADE") }()
+	for _, f := range []string{"0001_billing_event", "0002_rating", "0004_billing_event_serving_mode",
+		"0005_invoice_grade_attempts", "0006_rollup_grain"} {
+		exec(t, db, readMigration(t, f+".up.sql"))
+	}
+	// The 0005 view's column types: 0007 up (CREATE OR REPLACE) must keep them,
+	// and 0007 down must restore them.
+	colTypes := func() string {
+		t.Helper()
+		r, err := db.QueryContext(ctx, `SELECT a.attname, format_type(a.atttypid, a.atttypmod)
+			FROM pg_attribute a WHERE a.attrelid = 'billing_reconciliation_hourly'::regclass
+			  AND a.attnum > 0 AND NOT a.attisdropped
+			  AND a.attname <> 'invalid_serving_mode_attempts'
+			ORDER BY a.attnum`)
+		if err != nil {
+			t.Fatalf("read view columns: %v", err)
+		}
+		defer r.Close()
+		var b strings.Builder
+		for r.Next() {
+			var n, ty string
+			if err := r.Scan(&n, &ty); err != nil {
+				t.Fatalf("scan: %v", err)
+			}
+			b.WriteString(n + " " + ty + "\n")
+		}
+		return b.String()
+	}
+	types0005 := colTypes()
+
+	exec(t, db, readMigration(t, "0007_serving_mode_explicit.up.sql"))
+	if got := colTypes(); got != types0005 {
+		t.Fatalf("view columns after 0007 up =\n%s\nwant the 0005 shape\n%s", got, types0005)
+	}
+
+	hour := mustTime("2026-06-08T10:00:00Z")
+	if _, err := db.ExecContext(ctx,
+		`INSERT INTO billing_event (request_id, auth_id, resource_id, org_id, model, serving_mode, usage_found, prompt_tokens, event_ts)
+		 VALUES ('e1', 'a', 'res', 'org-1', 'm', 'dedicated', TRUE, 100, $1)`, hour.Add(time.Minute)); err != nil {
+		t.Fatalf("seed billing_event: %v", err)
+	}
+	for _, row := range []struct {
+		mode   string
+		events int
+	}{{"shared", 2}, {"dedicated", 3}} {
+		if _, err := db.ExecContext(ctx, `INSERT INTO rated_usage
+			(id, auth_id, resource_id, org_id, model_id, serving_mode, window_start, window_end,
+			 prompt_tokens, cached_tokens, completion_tokens, billable_prompt_tokens,
+			 cost, applied_prompt_rate, applied_cached_rate, applied_completion_rate, event_count)
+			VALUES (md5('a' || $1::text), 'a', 'res', 'org-1', 'm', $1::text, $2::timestamptz,
+			        $2::timestamptz + interval '1 hour', $3, 0, 0, $3, 0.001, 0.00001, 0, 0, $4)`,
+			row.mode, hour, 100*row.events, row.events); err != nil {
+			t.Fatalf("seed rated_usage %q: %v", row.mode, err)
+		}
+	}
+
+	check := func(stage string) {
+		t.Helper()
+		var rows, raw, rated, delta int64
+		var cost string
+		if err := db.QueryRowContext(ctx, `SELECT COUNT(*), SUM(raw_attempts), SUM(rated_attempts),
+			SUM(attempt_delta), SUM(rated_cost)::text
+			FROM billing_reconciliation_hourly
+			WHERE window_start=$1 AND auth_id='a' AND resource_id='res' AND model_id='m'`, hour).
+			Scan(&rows, &raw, &rated, &delta, &cost); err != nil {
+			t.Fatalf("%s: read view: %v", stage, err)
+		}
+		if rows != 1 || raw != 1 || rated != 5 || delta != -4 || cost != "0.002000000" {
+			t.Fatalf("%s: rows=%d raw_attempts=%d rated_attempts=%d attempt_delta=%d rated_cost=%s, want 1/1/5/-4/0.002000000",
+				stage, rows, raw, rated, delta, cost)
+		}
+	}
+	check("after 0007 up")
+
+	exec(t, db, readMigration(t, "0007_serving_mode_explicit.down.sql"))
+	if got := colTypes(); got != types0005 {
+		t.Fatalf("view columns after 0007 down =\n%s\nwant the 0005 shape\n%s", got, types0005)
+	}
+	// Down renames 'dedicated' to '': still two rated rows inside the grain.
+	check("after 0007 down")
 }
 
 // readMigration returns the text of one real migration file.
