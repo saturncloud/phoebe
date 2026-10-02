@@ -299,7 +299,29 @@ drainer wrote the row) to the rollout window.
 
 The next routine rater run (or an explicit `rater --since <deploy hour> --until
 <now>`) then rates those events. If the rater paged with `invalid_serving_mode_events`
-for hours inside the rollout, this step is the fix. Outside the cutover, a nonzero
+for hours inside the rollout, this step is the fix.
+
+Until this backfill runs, an hour that contains NULL events from an old drainer
+is rated and pushed WITHOUT those events. The rater withholds the NULL events one
+by one rather than withholding the whole rollup, and token-push sends the
+smaller rollup. So for that hour saturn-aws-manager briefly holds a dedicated
+amount that is too low. This is expected; the backfill and the re-rate correct
+it.
+
+Run the backfill within the rater's trailing window (24h by default) of the
+deploy. Then the routine rater and token-push runs fix the amounts with no manual
+step. If the deploy hour is older than token-push's `pushTrailingHours` (24h by
+default) by the time the backfill and re-rate are done, also run:
+
+```
+token-push --since <deploy hour> --until <now>
+```
+
+The routine token-push only re-sends its trailing window, so without this run
+the corrected hours older than that window never reach saturn-aws-manager, and
+they stay under-billed.
+
+Outside the cutover, a nonzero
 `invalid_serving_mode_events` means the proxy's serving-mode gate or the
 served-model registry is broken, and the statement above must NOT be used to hide
 it.
