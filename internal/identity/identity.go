@@ -74,11 +74,12 @@ const (
 	// products independently (design D1). Like HeaderBaseModel/HeaderAdapter it
 	// is a deploy-time resource property injected server-side by the
 	// Atlas-rendered Traefik middleware, anti-spoof overwritten, never trusted
-	// from clients. ABSENT = dedicated (the OUTER-prefix pricing contract: a bare
-	// base id is dedicated, so every event shipped before shared serving prices
-	// as dedicated with no rewrite). PRESENT with "shared" marks shared traffic,
-	// which the rater prices from the distinct shared:<base> price row. Phoebe
-	// reads it defensively: absent = "" = dedicated.
+	// from clients. Atlas stamps it explicitly on EVERY Token Factory inference
+	// route, dedicated included (Hugo's 2026-10-01 ruling #19), so an ABSENT or
+	// malformed value on a header-routed request is an edge-contract bug: the
+	// route gate refuses it (generic 404) and nothing is metered. FromRequest
+	// copies the value verbatim; there is no default. The empty string is not a
+	// serving mode anywhere (the 2026-09-29 serving-mode ruling).
 	HeaderServingMode = "X-Saturn-Serving-Mode"
 
 	// HeaderGateway marks a request that arrived on the TF shared-inference
@@ -198,10 +199,10 @@ type Identity struct {
 	// checkpoint deployments. Its presence triggers the fine-tune premium at rating
 	// (C4); its value is forensic. Empty for a base-model endpoint.
 	Adapter string
-	// ServingMode is the serving mode ("shared" | "dedicated"), the SKU pricing
-	// axis. Empty = dedicated (the absence-of-prefix contract). Carried to the
-	// metering event so the rater prices shared traffic from the distinct
-	// shared:<base> row. See HeaderServingMode.
+	// ServingMode is the serving mode (ServingModeShared | ServingModeDedicated),
+	// the SKU pricing axis. Never empty after FromRequest. Carried to the metering
+	// event so the rater prices shared traffic from the distinct shared:<base>
+	// row. See HeaderServingMode.
 	ServingMode string
 	// ServedModel is the comma-separated allow-list of served-model names the
 	// subdomain-authorized resource may serve. Empty = binding not enforced for
@@ -242,6 +243,20 @@ type Identity struct {
 	LegacyRateLimitGeneratedTokens      string
 }
 
+// The two serving modes, spelled exactly as they are stored in billing_event and
+// rated_usage and sent on the billing push. There is no third value: an empty or
+// unknown serving mode is an edge-contract bug, refused at the proxy's billing
+// gate and withheld from money by the rater.
+const (
+	ServingModeShared    = "shared"
+	ServingModeDedicated = "dedicated"
+)
+
+// ValidServingMode reports whether s is one of the two serving modes.
+func ValidServingMode(s string) bool {
+	return s == ServingModeShared || s == ServingModeDedicated
+}
+
 // FromRequest extracts the trusted identity headers. It performs no
 // validation beyond reading the values; authorization happened at the edge.
 //
@@ -250,6 +265,12 @@ type Identity struct {
 // the trusted-header registry: a header outside the active set is treated
 // as ABSENT, never read for a trust decision. The remaining identity headers
 // are read directly (ratified edge contract, outside the R3 gate).
+//
+// The serving mode is copied verbatim and NO default is applied (ruling #19):
+// an absent, untrusted, or malformed X-Saturn-Serving-Mode leaves a value that
+// fails ValidServingMode, and the proxy route gate refuses it. A gateway
+// request's serving mode is overwritten later by gateway resolution from the
+// served-model registry.
 func FromRequest(r *http.Request) Identity {
 	return Identity{
 		AuthID:                              r.Header.Get(HeaderAuthID),

@@ -140,7 +140,7 @@ func (s *Server) resolveGateway(w http.ResponseWriter, r *http.Request, id *iden
 		http.Error(w, "service unavailable", http.StatusServiceUnavailable)
 		return false
 	}
-	if res.ServingMode != "shared" {
+	if res.ServingMode != identity.ServingModeShared {
 		// The gateway is exclusively the shared-inference entry point. Treat a
 		// non-shared registry row as a broken trusted contract; otherwise the
 		// request would skip tenant isolation, scheduler sanitization, and quota
@@ -164,7 +164,7 @@ func (s *Server) resolveGateway(w http.ResponseWriter, r *http.Request, id *iden
 	// PGResolver.Resolve) already reject such rows; this makes the proxy fail
 	// closed even for a non-conforming in-process impl, and rejects "" too: a
 	// resolved row must name its mode explicitly.
-	if res.ServingMode != "shared" && res.ServingMode != "dedicated" {
+	if !identity.ValidServingMode(res.ServingMode) {
 		s.log.Error.Printf("gateway: resolver returned invalid serving_mode %q org_id=%s request_id=%q",
 			res.ServingMode, id.OrgID, requestID)
 		http.Error(w, "service unavailable", http.StatusServiceUnavailable)

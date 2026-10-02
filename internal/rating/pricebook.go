@@ -1,11 +1,14 @@
 package rating
 
 import (
+	"errors"
 	"fmt"
 	"sort"
 	"strings"
 
 	"gopkg.in/yaml.v2"
+
+	"github.com/saturncloud/phoebe/internal/identity"
 )
 
 // fineTunePrefix is the reserved prefix that marks a model_id as a fine-tune
@@ -16,13 +19,20 @@ const fineTunePrefix = "ft:"
 
 // Serving-mode SKU pricing axis (design D1, "Option A" — an OUTER prefix on the
 // price key). A shared base is priced from a `shared:<base>` row; dedicated is
-// the bare `<base>`. servingModeShared is the event's serving_mode value;
-// sharedPrefix is the key prefix. Absence of a serving mode = dedicated = the
-// bare key.
-const (
-	servingModeShared = "shared"
-	sharedPrefix      = "shared:"
-)
+// the bare `<base>`. The event's only legal serving_mode values are defined ONCE,
+// in package identity (identity.ServingModeShared / identity.ServingModeDedicated,
+// checked by identity.ValidServingMode), and are shared with the proxy's billing
+// gate so the oracle and the proxy cannot drift (the 2026-09-29 serving-mode
+// ruling retired the empty string as a spelling of dedicated). sharedPrefix is the
+// key prefix. The price-key grammar itself is unchanged: dedicated rows have no
+// prefix.
+const sharedPrefix = "shared:"
+
+// ErrInvalidServingMode is the fail-closed sentinel for an event whose serving
+// mode is neither "shared" nor "dedicated" (including the pre-cutover empty
+// value). Such an event is never priced: the SQL rater withholds it and counts
+// it as InvalidServingModeEvents, and the Go oracle refuses it the same way.
+var ErrInvalidServingMode = errors.New("rating: serving mode is neither \"shared\" nor \"dedicated\"")
 
 // ftLikePattern is the SQL LIKE pattern that matches a fine-tune model_id, derived
 // from fineTunePrefix so the rater's SQL (store.go) and the Go resolution share ONE
@@ -557,11 +567,18 @@ func (pb *PriceBook) ResolveEvent(modelID, baseModel, adapter, servingMode strin
 	// SERVING-MODE AXIS (design D1): shared and dedicated are distinct SKUs priced
 	// from distinct rows. The serving mode is an OUTER prefix on the price key — a
 	// shared base is stored as `shared:<base>`, dedicated as the bare `<base>`.
-	// Absence of a serving mode (or "dedicated") = the bare key, so every
-	// pre-shared event is unaffected. We resolve the base against its SKU key: for
+	// "dedicated" = the bare key. We resolve the base against its SKU key: for
 	// shared traffic the ladder below keys on `shared:<base>` instead of `<base>`.
 	// (model_id direct hits at (a) are unaffected — an explicit priced model_id
 	// wins regardless of serving mode, the per-endpoint override seam.)
+	//
+	// Any other serving mode is refused BEFORE the ladder, even when the model_id
+	// has a direct price: the SQL rater drops such an event per event before
+	// grouping (the serving mode is a grain key, so there is no rollup it could
+	// legally join), and the oracle must agree with it.
+	if !identity.ValidServingMode(servingMode) {
+		return Rate3{}, ErrInvalidServingMode
+	}
 	skuBase := servingModeKey(servingMode, baseModel)
 
 	// (a) Direct model_id hit: the existing model_id-keyed resolution.
@@ -601,14 +618,12 @@ func (pb *PriceBook) ResolveEvent(modelID, baseModel, adapter, servingMode strin
 }
 
 // servingModeKey composes the OUTER mode-prefixed price key for a base model id
-// (design D1, "Option A"): shared traffic keys on `shared:<base>`; dedicated
-// (empty serving mode, or the literal "dedicated") keys on the bare `<base>`, so
-// every price key and event shipped before shared serving stays valid and prices
-// exactly as before. An unknown serving-mode value is treated as dedicated (the
-// bare key) — a mis-stamped serving mode can never silently reprice to a shared
-// row that doesn't exist; it falls through to the normal dedicated resolution.
+// (design D1, "Option A"): shared traffic keys on `shared:<base>`; dedicated keys
+// on the bare `<base>`, so every dedicated price key stays valid unchanged.
+// Callers validate the serving mode first (ResolveEvent refuses anything that is
+// not "shared" or "dedicated").
 func servingModeKey(servingMode, base string) string {
-	if servingMode == servingModeShared {
+	if servingMode == identity.ServingModeShared {
 		return sharedPrefix + base
 	}
 	return base

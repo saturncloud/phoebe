@@ -1,10 +1,8 @@
 package proxy
 
 import (
-	"bytes"
 	"context"
 	"io"
-	"log"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -75,14 +73,13 @@ func TestIsWakeable(t *testing.T) {
 	if isWakeable(identity.Identity{ServedModel: "m", ServingMode: "shared"}) {
 		t.Fatal("no resource id (unauthorized) must NOT be wakeable")
 	}
-	// An EMPTY ServingMode is dedicated by the absence-of-prefix contract
-	// (identity.ServingMode: "Empty = dedicated"), so it is NOT wakeable even
-	// on a fully-resolved gateway route. The gateway registry parser
-	// (gateway.parseRegistryConfigMap) rejects rows with a blank serving_mode
-	// precisely so a shared row can never arrive here with "" and silently
-	// lose wake-from-zero.
+	// An empty ServingMode is not a valid serving mode. The route gate refuses a
+	// header-routed request without one (ruling #19), and the gateway registry
+	// parser (gateway.parseRegistryConfigMap) rejects rows with a blank
+	// serving_mode. If one ever arrives here it must not be
+	// wakeable, because only the exact value "shared" is (fail closed).
 	if isWakeable(identity.Identity{ResourceID: "r1", ServedModel: "m", ServingMode: ""}) {
-		t.Fatal("empty serving mode is dedicated by contract and must NOT be wakeable")
+		t.Fatal("empty serving mode is invalid and must NOT be wakeable")
 	}
 	if isWakeable(identity.Identity{ResourceID: "r1", ServedModel: "m", ServingMode: "dedicated"}) {
 		t.Fatal("dedicated route must NOT be wakeable")
@@ -421,53 +418,15 @@ func TestWakeWarmFallThroughMetersNormalRowOnly(t *testing.T) {
 			ev.StatusCode, ev.PromptTokens, ev.CompletionTokens)
 	}
 }
-func TestWakeEnabledWarnsOnBoundRouteMissingServingMode(t *testing.T) {
-	newServer := func() (*Server, *bytes.Buffer) {
-		var buf bytes.Buffer
-		logger := &logging.Logger{
-			Debug: log.New(io.Discard, "", 0),
-			Info:  log.New(io.Discard, "", 0),
-			Warn:  log.New(&buf, "", 0),
-			Error: log.New(io.Discard, "", 0),
-		}
-		return New(&config.Settings{}, logger, nil).WithWaker(&fakeWaker{}, time.Second, 1), &buf
-	}
 
-	cases := []struct {
-		name     string
-		id       identity.Identity
-		wantWake bool
-		wantLog  bool
-	}{
-		{"bound shape without serving mode warns", identity.Identity{ResourceID: "r1", ServedModel: "m"}, false, true},
-		{"shared mode wakes and does not warn", identity.Identity{ResourceID: "r1", ServedModel: "m", ServingMode: "shared"}, true, false},
-		{"explicit dedicated does not warn", identity.Identity{ResourceID: "r1", ServedModel: "m", ServingMode: "dedicated"}, false, false},
-		{"unbound route does not warn", identity.Identity{ResourceID: "r1"}, false, false},
-		{"no resource id does not warn", identity.Identity{ServedModel: "m"}, false, false},
-	}
-	for _, tc := range cases {
-		t.Run(tc.name, func(t *testing.T) {
-			s, buf := newServer()
-			if got := s.wakeEnabled(tc.id); got != tc.wantWake {
-				t.Fatalf("wakeEnabled = %v, want %v", got, tc.wantWake)
-			}
-			if got := strings.Contains(buf.String(), "edge contract not fully rolled out"); got != tc.wantLog {
-				t.Fatalf("warn present = %v, want %v (log: %q)", got, tc.wantLog, buf.String())
-			}
-		})
-	}
-
-	// Wake unconfigured: the predicate short-circuits before the diagnostic, so
-	// no WARN either (a dedicated install has no wake rollout to diagnose).
-	s, buf := newServer()
-	s.waker = nil
-	if s.wakeEnabled(identity.Identity{ResourceID: "r1", ServedModel: "m"}) {
-		t.Fatal("wakeEnabled = true with nil waker, want false")
-	}
-	if buf.Len() != 0 {
-		t.Fatalf("warn logged with wake unconfigured: %q", buf.String())
-	}
-}
+// TestWakeSkippedOnControlRoutes (wake-scoping negative pin): the wake path
+// runs ONLY for model-bearing inference requests. A bound shared GET or HEAD
+// on a cold control route (/health, /live, /v1/models) is served by the normal
+// forward — the readiness sanitizer and model-list filters reduce the cold
+// upstream response — and must never call the waker: a monitoring probe must
+// not trigger a 0->1 scale of a cold base. Without this test, deleting
+// inferenceRequestPathAllowed(routePath) from the wake condition leaves the
+// whole suite green while cold control probes scale the graph.
 func TestWakeSkippedOnControlRoutes(t *testing.T) {
 	backend := &coldToWarmBackend{} // stays cold
 	be := httptest.NewServer(backend)

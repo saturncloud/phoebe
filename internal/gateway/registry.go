@@ -18,6 +18,7 @@ import (
 	"k8s.io/client-go/tools/cache"
 	"k8s.io/client-go/tools/clientcmd"
 
+	"github.com/saturncloud/phoebe/internal/identity"
 	"github.com/saturncloud/phoebe/internal/logging"
 )
 
@@ -297,8 +298,9 @@ func parseRegistryConfigMap(cm *corev1.ConfigMap) (Resolution, cacheKey, error) 
 			return Resolution{}, cacheKey{}, fmt.Errorf("missing required data key %q", req)
 		}
 	}
-	if m := d["serving_mode"]; m != "shared" && m != "dedicated" {
-		return Resolution{}, cacheKey{}, fmt.Errorf("invalid serving_mode %q (want \"shared\" or \"dedicated\")", m)
+	if !identity.ValidServingMode(d["serving_mode"]) {
+		return Resolution{}, cacheKey{}, fmt.Errorf("invalid serving_mode %q (must be %q or %q)",
+			d["serving_mode"], identity.ServingModeShared, identity.ServingModeDedicated)
 	}
 	res := Resolution{
 		ResourceID:   d["resource_id"],

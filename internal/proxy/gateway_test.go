@@ -719,3 +719,58 @@ func TestGateway_WakeEligible(t *testing.T) {
 		t.Fatal(err)
 	}
 }
+
+// TestGateway_ResolutionWithoutLegalServingModeRefusedAtGate proves the proxy's
+// serving-mode gate refuses a resolved identity that carries no legal serving
+// mode. A resolver hands back a Resolution whose ServingMode is empty or not
+// "shared"/"dedicated"; the request must get 503 (a resolver-side fault, per
+// phoebe#50) before anything else runs:
+// the upstream is never reached, the waker is never called, and nothing is
+// metered. The gateway path gets no absent-means-dedicated default. (Rejecting
+// such rows when the registry ConfigMap is indexed is covered separately by
+// TestRegistry_InvalidServingModeRejectedAtIndex.)
+func TestGateway_ResolutionWithoutLegalServingModeRefusedAtGate(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		mode string
+	}{
+		{"empty", ""},
+		{"bogus", "bogus"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var hits int32
+			be := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				atomic.AddInt32(&hits, 1)
+				_, _ = w.Write([]byte(`{"model":"served-m","choices":[{"finish_reason":"stop"}],"usage":{"prompt_tokens":7,"completion_tokens":3,"total_tokens":10}}`))
+			}))
+			defer be.Close()
+			beURL, _ := url.Parse(be.URL)
+
+			resolver := &mapResolver{m: map[[2]string]gateway.Resolution{
+				{"org-1", "m"}: {ResourceID: "tfm-1", BaseModel: "b", ServingMode: tc.mode, GraphK8sName: "g"},
+			}}
+			em := &recordingEmitter{}
+			waker := &fakeWaker{}
+			srv := newGatewayTestServer(t, em, resolver, beURL).WithWaker(waker, 5*time.Second, 0)
+
+			rr := httptest.NewRecorder()
+			srv.Handler().ServeHTTP(rr, gatewayRequest("org-1", `{"model":"m"}`))
+
+			// resolveGateway refuses a resolution without a legal serving mode
+			// with 503 (phoebe#50's contract: a resolver-side fault, not the
+			// caller's), before any forward or wake.
+			if rr.Code != http.StatusServiceUnavailable {
+				t.Fatalf("status = %d, want 503 (body %q)", rr.Code, rr.Body.String())
+			}
+			if got := atomic.LoadInt32(&hits); got != 0 {
+				t.Fatalf("upstream reached %d times; the gate must refuse before forwarding", got)
+			}
+			if got := atomic.LoadInt32(&waker.calls); got != 0 {
+				t.Fatalf("waker called %d times; the gate must refuse before any wake", got)
+			}
+			if em.count() != 0 {
+				t.Fatalf("%d events metered, want 0", em.count())
+			}
+		})
+	}
+}

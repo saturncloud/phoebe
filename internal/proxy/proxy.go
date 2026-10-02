@@ -357,7 +357,7 @@ func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if id.ServingMode == "shared" {
+	if id.ServingMode == identity.ServingModeShared {
 		if !bodyBound {
 			sharedLane = admissionLaneForIdentity(s.settings.Admission, id)
 			if !boundSharedRequestBody(w, r, sharedRequestBodyLimit(s.settings.Admission, sharedLane)) {
@@ -424,9 +424,10 @@ func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request) {
 	// meterable inference POST surface (unboundRequestAllowed), and a shared
 	// route with no allow-list is refused outright (nothing binds model=, so any
 	// model on the shared graph would be reachable), and a route whose trusted
-	// serving-mode header is anything but "", "dedicated", or "shared" (a
-	// producer-side bug; the header is read verbatim, never normalized) is
-	// likewise refused outright — no branch below may guess what a malformed
+	// serving mode is absent or anything but "dedicated" or "shared" (a
+	// producer-side bug; Atlas stamps it on every Token Factory route, ruling
+	// #19, and identity.FromRequest reads it verbatim) is likewise refused
+	// outright — no branch below may guess what a malformed
 	// mode meant. Runs BEFORE
 	// forwarding so a bad route never reaches the engine. Reads the body once and
 	// restores it for forceIncludeUsage.
@@ -441,19 +442,35 @@ func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request) {
 	if !id.Gateway {
 		allowed := pathCanonical
 		switch {
-		case !validTrustedServingMode(id.ServingMode):
-			// Malformed serving mode (an Atlas producer bug — the header is read
-			// verbatim, never normalized). Refuse with the same generic 404 as
+		case !identity.ValidServingMode(id.ServingMode):
+			// Malformed serving mode (an Atlas producer bug — a present header is
+			// read verbatim, never normalized). Refuse with the same generic 404 as
 			// every other unauthorized route: falling through to the dedicated
 			// branch would forward the inference POST surface to a possibly
 			// shared graph with no model binding, and with an allow-list present
 			// the shared policy below would still be skipped. Guessing the
 			// intended mode from a malformed value is exactly the fail-open this
-			// gate exists to prevent.
-			allowed = false
+			// gate exists to prevent. An absent header is also refused, because
+			// identity.FromRequest applies no default (ruling #19) and the empty
+			// string is not a serving mode.
+			//
+			// This branch logs its own ERROR (not the generic WARN below) so the
+			// most likely cutover failure — a route Atlas never stamped, or a
+			// PHOEBE_TRUSTED_HEADERS rendering that omits the header — is visible
+			// as itself rather than as an ordinary unauthorized path. The client
+			// still gets the same generic 404.
+			if id.ServingMode == "" {
+				s.log.Error.Printf("model-binding: refused request_id=%s resource_id=%s: %s absent or untrusted (ruling #19: Atlas must stamp it on every route; check the restamp_dedicated_serving_mode script run and that PHOEBE_TRUSTED_HEADERS includes it)",
+					requestID, id.ResourceID, identity.HeaderServingMode)
+			} else {
+				s.log.Error.Printf("model-binding: refused request_id=%s resource_id=%s: malformed %s=%q (Atlas producer bug)",
+					requestID, id.ResourceID, identity.HeaderServingMode, id.ServingMode)
+			}
+			http.Error(w, "not found", http.StatusNotFound)
+			return
 		case id.ServedModel != "":
 			allowed = allowed && boundRequestAllowed(r.Method, routePath, id.ServedModel)
-		case id.ServingMode == "shared":
+		case id.ServingMode == identity.ServingModeShared:
 			// Shared route with no injected allow-list: there is nothing to
 			// bind the request-body model= against, so model= could select any
 			// tenant's model on the shared graph. A real shared route always
@@ -521,7 +538,7 @@ func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request) {
 	var admitted *admission.Lease
 	var responseCaptureInstalled atomic.Bool
 	responseCaptureDone := make(chan struct{})
-	if id.ServingMode == "shared" && inferenceRequestPathAllowed(routePath) {
+	if id.ServingMode == identity.ServingModeShared && inferenceRequestPathAllowed(routePath) {
 		tenantIdentity := id.OrgID
 		if tenantIdentity == "" {
 			if s.admitter != nil {
@@ -1011,9 +1028,10 @@ func (s *Server) emit(ctx context.Context, id identity.Identity, requestID, clie
 		// Its presence triggers the fine-tune premium at rating; its value is
 		// forensic. Empty for a base-model endpoint.
 		Adapter: id.Adapter,
-		// ServingMode is the serving-mode SKU axis ("shared" | "dedicated"), from
-		// the trusted middleware header. Empty = dedicated. Shared traffic prices
-		// from the distinct shared:<base> rate row.
+		// ServingMode is the serving-mode SKU axis ("shared" | "dedicated"),
+		// validated by the route gate (header path) or resolveGateway (gateway
+		// path) above, so it is never empty or malformed here.
+		// Shared traffic prices from the distinct shared:<base> rate row.
 		ServingMode: id.ServingMode,
 		// GraphK8sName is the serving graph (the cost centre), resolved once on the
 		// request path: from tf_model on the gateway route, derived from the upstream

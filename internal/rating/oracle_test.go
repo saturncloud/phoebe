@@ -51,8 +51,9 @@ type RatedEvent struct {
 	// premium trigger (C4) — mirroring the SQL.
 	Adapter string
 	// ServingMode is the serving-mode SKU axis from billing_event.serving_mode
-	// ("shared" | "dedicated"; empty = dedicated). Shared traffic prices from the
-	// distinct shared:<base> row — mirroring the SQL.
+	// ("shared" | "dedicated"; anything else is withheld as an invalid serving
+	// mode). Shared traffic prices from the distinct shared:<base> row — mirroring
+	// the SQL.
 	ServingMode      string
 	PromptTokens     int64 // TOTAL prompt tokens (cached + non-cached), per vLLM
 	CachedTokens     int64 // SUBSET of PromptTokens that was a cache hit

@@ -59,6 +59,7 @@ WHERE window_start >= :start AND window_start < :end
   AND (
       missing_usage_attempts <> 0
       OR invalid_usage_attempts <> 0
+      OR invalid_serving_mode_attempts <> 0
       OR missing_org_attempts <> 0
       OR distinct_org_ids > 1
       OR attempt_delta <> missing_usage_attempts
@@ -109,7 +110,8 @@ that was NOT aborted and did NOT fail — a response the engine reported as
 SUCCESSFUL while supplying no usage block, meaning work may have been served that
 cannot be billed. The rater exits non-zero only on that unexplained subset, so
 exit 2 stays reserved for rare, wrong conditions (unpriced, unattributable,
-invalid-usage, ambiguous base/org) rather than firing every hour.
+invalid-usage, ambiguous base/org, invalid serving mode, owner conflict) rather
+than firing every hour.
 
 Page on an unexplained missing-usage attempt, rater anomaly/non-zero exit, reconcile
 deletion during a routine run, drainer poison row, `METERING_FLOOR`, WAL corruption,
@@ -123,15 +125,23 @@ NULL and one real org therefore reconciles to one rated row without false token
 deltas, while conflicting non-NULL orgs remain explicit.
 
 **`rated_attempts = 0` with a non-zero `raw_attempts` is NOT by itself lost
-rating.** It has two very different causes and the view alone cannot tell them
+rating.** It has three very different causes and the view alone cannot tell them
 apart, so never treat the row as a drainer/rating incident before ruling out the
-first: either (a) the rater deliberately WITHHELD the rollup at an ambiguity gate
+first two: (a) the rater deliberately WITHHELD the rollup at an ambiguity gate
 — check `distinct_org_ids > 1` on the row for org-ambiguity, and the same run's
 `ambiguous_base_events` count for base-ambiguity, which the view does not surface
 at all (the base gate keys on `rating_price`/`rating_derived` join outcomes that
-exist only inside the rater, not on `billing_event`) — or (b) the rater has not
-yet run for that hour. Check the rater's run report for the window before
-escalating.
+exist only inside the rater, not on `billing_event`); (b) the rater deliberately
+WITHHELD the events because their serving mode is invalid — the run's
+`invalid_serving_mode_events` count. These are events whose
+`billing_event.serving_mode` is NULL, `''` or anything other than `'shared'` or
+`'dedicated'`. Dedicated events stored before migration 0007 look exactly like
+this, so inside a re-rate window that covers pre-cutover hours they are withheld
+on purpose (see "Serving-mode cutover (migration 0007)" below). The view's
+`invalid_serving_mode_attempts` column (added by migration 0007) counts these
+attempts for the hour and key, with the same predicate the rater uses; or (c) the
+rater has not yet run for that hour. Check the rater's run report for the window
+before escalating.
 
 For the invoice boundary, export `rated_usage.id`, `window_start`, `org_id`, and
 `cost` for the same interval and compare it to the central manager's received-rollup
@@ -219,6 +229,102 @@ The raw ledger deliberately accepts invalid engine counts so evidence is never
 discarded merely because it cannot become money. The rater excludes those rows
 and reports `invalid_usage_attempts`; repair or explicitly quarantine them before
 settling the invoice window.
+
+### Serving-mode cutover (migration 0007)
+
+Migration 0007 makes `'shared'` and `'dedicated'` the only legal serving modes.
+Before it, dedicated traffic was stored with a NULL (or `''`) serving mode. All of
+that traffic was dedicated (Hugo, 2026-09-30: "assume it's all dedicated (which is
+true)"), so 0007:
+
+- rewrites `billing_event.serving_mode` NULL and `''` to `'dedicated'` (a one-time,
+  ratified exception to "raw evidence is never edited");
+- renames the matching `rated_usage` rows from `''` to `'dedicated'` and recomputes
+  their ids with the rater's formula.
+
+After the deploy, the trailing-window rater re-rates the pre-cutover hours and
+reproduces exactly those rows: same serving mode, same ids, no reconcile deletions
+and no invalid-serving-mode anomaly. token-push sends the new ids once, and
+saturn-aws-manager replaces the old `''` records for those windows by absence.
+
+**Re-rate the hours where 0007 deleted a `''` twin.** Atlas #6709 is deployed
+before this phoebe release, and from then on it stamps `X-Saturn-Serving-Mode:
+dedicated` while the old phoebe is still running. The old rater stores the
+pre-stamp (NULL) events of an hour as `''` and the stamped events as
+`'dedicated'`, so those hours hold two rollups for one key. 0007 cannot rename
+the `''` row onto its twin without breaking the unique key, so it deletes it and
+prints a NOTICE with the count, cost, event count and earliest `window_start` of
+the deleted rows. The surviving `'dedicated'` row covers only part of its hour. A
+`''` row deleted by 0007 is rebuilt only by a re-rate of its hour, because its
+events are still in `billing_event` (now backfilled to `'dedicated'`). The
+routine rater re-rates only its trailing window (24h by default). If the hour the
+Atlas #6709 rollout started, or the earliest `window_start` in the twin NOTICE,
+is older than that window, run:
+
+```
+rater --since <that hour> --until <start of the current hour>
+token-push --since <that hour> --until <start of the current hour>
+```
+
+The push makes saturn-aws-manager replace the partial `'dedicated'` rows for
+those windows. Skipping this leaves those hours under-counted in `rated_usage`
+and pushed under-billed.
+
+**One follow-up step after the rollout.** The migration Job runs before the new
+proxy pods replace the old ones. An old pod still serving during the rollout
+meters dedicated traffic with no `serving_mode` key in the event JSON. The new
+drainer stores an event whose `serving_mode` key is ABSENT as `'dedicated'` (all
+pre-cutover traffic was dedicated), and this includes events replayed later from
+an on-disk spool or the drain queue: the new spool reader applies the same rule
+before it re-sends an event. Only an absent key gets this default. A new pod
+always writes the key, so an explicit `"serving_mode":""` or `null` is a producer
+bug; the drainer stores it as `''` and the rater withholds it as
+`invalid_serving_mode_events` instead of billing it as dedicated. An old drainer still running during the rollout stores it as NULL, which the new
+rater withholds as `invalid_serving_mode_events`. Once every interceptor and
+drainer pod runs the new image, and no old drainer pod is left draining the
+queue, run this statement against phoebe's database. It is idempotent, but it is
+NOT the same statement as 0007's one-time backfill, because it leaves `''` rows
+alone:
+
+```sql
+UPDATE billing_event SET serving_mode = 'dedicated'
+WHERE serving_mode IS NULL;
+```
+
+Only an old drainer writes NULL during the rollout. The new drainer writes `''`
+only for an explicit `"serving_mode":""` from a post-cutover producer, which is a
+bug; those rows must stay withheld and be investigated, not backfilled. To keep
+the statement to the rollout, you can also bound it by `created_at` (when the
+drainer wrote the row) to the rollout window.
+
+The next routine rater run (or an explicit `rater --since <deploy hour> --until
+<now>`) then rates those events. If the rater paged with `invalid_serving_mode_events`
+for hours inside the rollout, this step is the fix.
+
+Until this backfill runs, an hour that contains NULL events from an old drainer
+is rated and pushed WITHOUT those events. The rater withholds the NULL events one
+by one rather than withholding the whole rollup, and token-push sends the
+smaller rollup. So for that hour saturn-aws-manager briefly holds a dedicated
+amount that is too low. This is expected; the backfill and the re-rate correct
+it.
+
+Run the backfill within the rater's trailing window (24h by default) of the
+deploy. Then the routine rater and token-push runs fix the amounts with no manual
+step. If the deploy hour is older than token-push's `pushTrailingHours` (24h by
+default) by the time the backfill and re-rate are done, also run:
+
+```
+token-push --since <deploy hour> --until <now>
+```
+
+The routine token-push only re-sends its trailing window, so without this run
+the corrected hours older than that window never reach saturn-aws-manager, and
+they stay under-billed.
+
+Outside the cutover, a nonzero
+`invalid_serving_mode_events` means the proxy's serving-mode gate or the
+served-model registry is broken, and the statement above must NOT be used to hide
+it.
 
 ### Upgrading an install that already carries billing traffic
 

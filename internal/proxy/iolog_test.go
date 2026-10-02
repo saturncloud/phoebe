@@ -67,6 +67,7 @@ func newIOLogServer(t *testing.T, _ *url.URL, policy iolog.Policy, sink iolog.Si
 func iologRequest(upstream *url.URL, method, body string) *http.Request {
 	req := httptest.NewRequest(method, "/v1/chat/completions", strings.NewReader(body))
 	req.Header.Set(identity.HeaderUpstream, upstream.Host)
+	stampDedicatedServingMode(req)
 	req.Header.Set(identity.HeaderAuthID, "auth-key-7")
 	req.Header.Set(identity.HeaderResourceID, "model-abc")
 	req.Header.Set(identity.HeaderResourceType, "deployment")

@@ -5,7 +5,10 @@ package metering
 
 import (
 	"context"
+	"encoding/json"
+	"strings"
 
+	"github.com/saturncloud/phoebe/internal/identity"
 	"github.com/saturncloud/phoebe/internal/logging"
 )
 
@@ -89,11 +92,17 @@ type Event struct {
 	BaseModel string `json:"base_model,omitempty"`
 
 	// ServingMode is the serving mode ("shared" | "dedicated"), the SKU pricing
-	// axis (X-Saturn-Serving-Mode). Empty = dedicated (the absence-of-prefix
-	// contract, so every pre-shared event is unaffected). "shared" prices from the
-	// distinct shared:<base> rate row. Captured verbatim; empty is valid (=
-	// dedicated).
-	ServingMode string `json:"serving_mode,omitempty"`
+	// axis. The proxy's serving-mode gate guarantees one of the two explicit
+	// values; "shared" prices from the distinct shared:<base> rate row. An empty
+	// value only appears on events metered before the 2026-09-29 serving-mode
+	// cutover, when the key was omitted and its absence meant dedicated. That
+	// evidence is billed as dedicated (ratified ledger item 6): UnmarshalEvent
+	// (used by the drainer and the spool replay), recovery and migration 0007
+	// all map it to "dedicated" at ingest and replay. Decode stored or queued
+	// event JSON with UnmarshalEvent, which maps only an ABSENT key; an explicit
+	// "" or null from a post-cutover producer is a bug, stays "", and the rater
+	// withholds it.
+	ServingMode string `json:"serving_mode"`
 
 	// GraphK8sName is the DynamoGraphDeployment (DGD) that served this request —
 	// the COST CENTRE. It is carried so a rollup's cost stays attributable to the
@@ -143,4 +152,65 @@ func (l *LogEmitter) Emit(_ context.Context, e Event) {
 	l.Log.Info.Printf("metering event: request_id=%s client_request_id=%s auth_id=%s org=%s group=%s user=%s resource=%s/%s model=%s prompt=%d cached=%d completion=%d finish=%s aborted=%t usage_found=%t status=%d streamed=%t",
 		e.RequestID, e.ClientRequestID, e.AuthID, e.OrgID, e.GroupID, e.UserID, e.ResourceType, e.ResourceID, e.Model,
 		e.PromptTokens, e.CachedTokens, e.CompletionTokens, e.FinishReason, e.Aborted, e.UsageFound, e.StatusCode, e.Streamed)
+}
+
+// UnmarshalEvent decodes one event's JSON, the shape written by the emitter to
+// the drain queue and the on-disk spool. Evidence written before the
+// 2026-09-29 serving-mode cutover carries no serving_mode key (the field was
+// omitempty and dedicated was the empty value). All of that traffic was
+// dedicated (ratified ledger item 6), so an ABSENT key decodes as "dedicated"
+// (see ApplyAbsentServingModeDefault, which internal/recovery also calls). A post-cutover producer always
+// writes the key, so an explicit "" or null is a producer bug, not pre-cutover
+// evidence: it decodes as "" and the rater withholds it as an invalid serving
+// mode instead of billing it as dedicated.
+//
+// Every reader that later re-marshals the event (the spool replay re-sends it
+// to the queue, and ServingMode is no longer omitempty) must decode through
+// this function, or a pre-cutover event would acquire an explicit "" on the
+// way and be withheld instead of billed as dedicated.
+func UnmarshalEvent(data []byte) (Event, error) {
+	var ev Event
+	if err := json.Unmarshal(data, &ev); err != nil {
+		return ev, err
+	}
+	// A map probe, not a pointer field: json.Unmarshal sets a pointer to nil for
+	// an explicit null, which would be indistinguishable from an absent key.
+	var probe map[string]json.RawMessage
+	if err := json.Unmarshal(data, &probe); err != nil {
+		return ev, err
+	}
+	ApplyAbsentServingModeDefault(&ev, probe)
+	return ev, nil
+}
+
+// ApplyAbsentServingModeDefault is the single implementation of the
+// pre-cutover serving-mode rule for event JSON: when probe (the record decoded
+// as a map of raw values) has no serving_mode key in any casing, ev was written
+// before the 2026-09-29 cutover and its ServingMode is set to "dedicated"
+// (ratified ledger item 6). A present key, including an explicit "" or null,
+// leaves ev untouched, so a post-cutover producer bug stays "" and the rater
+// withholds it. The presence check is case-insensitive because encoding/json
+// fills ServingMode from any key casing; an exact-case lookup would overwrite
+// a decoded "Serving_Mode":"shared" with "dedicated". Every decoder of Event
+// JSON (UnmarshalEvent, internal/recovery) calls this rather than restating
+// the rule.
+func ApplyAbsentServingModeDefault(ev *Event, probe map[string]json.RawMessage) {
+	if !HasKeyFold(probe, "serving_mode") {
+		ev.ServingMode = identity.ServingModeDedicated
+	}
+}
+
+// HasKeyFold reports whether probe holds name under any casing. encoding/json
+// matches object keys to struct fields case-insensitively, so a record with
+// "Serving_Mode":"shared" decodes ServingMode as "shared"; an exact-case
+// presence check would miss that key, treat the field as absent, and overwrite
+// the decoded value with a default (billing a shared event as dedicated).
+// Every decoder that applies an absent-key rule to Event JSON must use this.
+func HasKeyFold(probe map[string]json.RawMessage, name string) bool {
+	for k := range probe {
+		if strings.EqualFold(k, name) {
+			return true
+		}
+	}
+	return false
 }

@@ -78,7 +78,7 @@ const dynamoNotReadyBodyMarker = "is not ready to serve requests yet"
 // so ServingMode is the authoritative discriminator; dedicated capacity never
 // scales to zero through this path.
 func isWakeable(id identity.Identity) bool {
-	return id.ServingMode == "shared" && id.ResourceID != "" && id.ServedModel != ""
+	return id.ServingMode == identity.ServingModeShared && id.ResourceID != "" && id.ServedModel != ""
 }
 
 // graphFromUpstreamHost derives the Dynamo graph (DGD) k8s name from a
@@ -179,25 +179,7 @@ func (b *bufferingResponseWriter) flushTo(w http.ResponseWriter) {
 // waker is configured AND the route is wakeable (shared-mode + authorized
 // resource id). Everything else streams directly with zero wake overhead.
 func (s *Server) wakeEnabled(id identity.Identity) bool {
-	if s.waker == nil {
-		return false
-	}
-	if isWakeable(id) {
-		return true
-	}
-	// Wake is configured, and the route has the BOUND shape (authorized
-	// resource id + served-model allow-list) but no serving mode: the edge
-	// middleware injects X-Saturn-Served-Model but not yet
-	// X-Saturn-Serving-Mode (contract not fully rolled out), so the route is
-	// treated as dedicated-for-wake — and a cold shared base on it would NEVER
-	// wake, giving customers raw cold 404/503s with no signal anywhere. Empty
-	// serving mode is dedicated by the absence-of-prefix contract, so
-	// eligibility is unchanged; this log is the only addition.
-	if id.ResourceID != "" && id.ServedModel != "" && id.ServingMode == "" {
-		s.log.Warn.Printf("wake: route looks bound (resource_id=%s) but %s is absent: treating as dedicated-for-wake, shared cold bases will not wake (edge contract not fully rolled out)",
-			id.ResourceID, identity.HeaderServingMode)
-	}
-	return false
+	return s.waker != nil && isWakeable(id)
 }
 
 // statusRecorder wraps the client ResponseWriter to capture the status code a
