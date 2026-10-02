@@ -344,8 +344,9 @@ func TestWAL_LegacyUnreadable(t *testing.T) {
 // pre-cutover pod (no serving_mode key) keeps the dedicated default when a
 // post-cutover pod replays it. The replay re-marshals the event, and
 // ServingMode is no longer omitempty, so decoding without the absent-key rule
-// would ship an explicit "" that the drain stores as ” and the rater
-// withholds. An explicit "" in the spool stays "" so it is still withheld.
+// would ship an explicit "" that the drain stores as the empty string and the
+// rater withholds. An explicit "" in the spool stays "" so it is still
+// withheld.
 func TestWAL_PreCutoverSpoolReplaysAsDedicated(t *testing.T) {
 	path := tmpWALPath(t)
 

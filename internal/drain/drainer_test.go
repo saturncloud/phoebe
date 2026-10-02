@@ -612,8 +612,8 @@ func TestEnsureGroup_Idempotent(t *testing.T) {
 // TestDecodeEvent_OnlyAbsentServingModeStoredAsDedicated pins the drain
 // queue's serving-mode rule end to end through eventArgs: an event without a
 // serving_mode key (metered by a pre-cutover pod) is stored as 'dedicated', an
-// explicit "" (a post-cutover producer bug) is stored as ” so the rater
-// withholds it, and "shared" and "dedicated" are stored as sent.
+// explicit "" (a post-cutover producer bug) is stored as the empty string so
+// the rater withholds it, and "shared" and "dedicated" are stored as sent.
 func TestDecodeEvent_OnlyAbsentServingModeStoredAsDedicated(t *testing.T) {
 	const servingModeIdx = 11
 	cases := []struct {
