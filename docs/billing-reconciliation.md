@@ -281,7 +281,8 @@ always writes the key, so an explicit `"serving_mode":""` or `null` is a produce
 bug; the drainer stores it as `''` and the rater withholds it as
 `invalid_serving_mode_events` instead of billing it as dedicated. An old drainer still running during the rollout stores it as NULL, which the new
 rater withholds as `invalid_serving_mode_events`. Once every interceptor and
-drainer pod runs the new image, run the same idempotent statement again against
+drainer pod runs the new image, and no old drainer pod is left draining the
+queue, run the same idempotent statement again against
 phoebe's database:
 
 ```sql

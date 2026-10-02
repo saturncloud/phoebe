@@ -55,11 +55,22 @@ migrate down       # roll back one step
 migrate version    # print the current applied version
 ```
 
-Rolling back 0007 is not exact for windows metered after its cutover: the
-pre-0007 rater keeps the explicit `'dedicated'` recorded in `billing_event`, so
-re-rating those windows after a rollback produces `'dedicated'` rollups beside the
-`''` rows the down migration restored. That is acceptable only while
-`rated_usage` rows are disposable (pre-production). See the header of
+Rolling back 0007 is not exact. The 0007 down migration maps every
+`billing_event.serving_mode = 'dedicated'` back to NULL. It also renames the
+`rated_usage` `'dedicated'` rows back to `''` and recomputes their ids, so a
+rolled-back install stays on one spelling, and re-rating produces `''` rollups
+that match the restored rows. The rollback is lossy: afterwards, dedicated events
+written after the cutover can no longer be told apart from NULL events written
+before the cutover. Ledger item 6 ratifies this loss; after a rollback, NULL means
+dedicated.
+
+Roll the code back before the schema. Stop the post-0007 interceptors and
+drainers before running `migrate down`. Any event they write as `'dedicated'`
+after the down migration would make the pre-0007 rater produce a separate
+`'dedicated'` rollup next to the `''` rollup for the same grain.
+
+A rollback is acceptable only while there are no production rows (while
+`rated_usage` rows are disposable). See the header of
 `0007_serving_mode_explicit.down.sql`.
 
 It adapts `DATABASE_URL`'s `postgres://` scheme to golang-migrate's `pgx5://`
@@ -95,13 +106,23 @@ NULL, so it must not run against schema 0007. Roll out in this order:
    you want the push paused too), or let any in-flight rater run finish.
 2. Run `cmd/migrate up`, deploy the new rater, proxy and token-push images, then
    resume the rater.
-3. Once every interceptor pod runs the new image, re-run 0007's idempotent
-   `billing_event` backfill (`UPDATE billing_event SET serving_mode = 'dedicated'
-   WHERE serving_mode IS NULL OR serving_mode = ''`) to cover dedicated events an
-   old drainer stored as NULL during the rollout. The new drainer stores an empty
-   serving mode (an event an old pod metered, including one replayed later from an
-   on-disk spool or the drain queue) as `'dedicated'`, so events it inserts need no
-   backfill. See "Serving-mode cutover (migration 0007)"
+3. Once every interceptor and drainer pod runs the new image, and no old drainer
+   pod is left draining the queue, re-run 0007's idempotent `billing_event`
+   backfill (`UPDATE billing_event SET serving_mode = 'dedicated' WHERE
+   serving_mode IS NULL OR serving_mode = ''`) to cover dedicated events an old
+   drainer stored as NULL during the rollout. If an old drainer pod might have
+   stored events after the backfill ran, run the UPDATE again; it is idempotent.
+   The new drainer stores an event whose `serving_mode` key is ABSENT (only an
+   old pod emits one, including one replayed later from an on-disk spool or the
+   drain queue) as `'dedicated'`, so those events need no backfill. Only an
+   absent key gets this default. An explicit `"serving_mode":""` or `null` comes
+   from a producer bug after the cutover. The new drainer stores it as `''`, and
+   the rater withholds it as an invalid serving mode
+   (`invalid_serving_mode_events`). Do not assume every `''` row is left over
+   from the rollout. Run this backfill only right after the rollout. Do not run
+   it over `''` rows written after every pod runs the new image; investigate
+   those rows instead, as described in `docs/billing-reconciliation.md`.
+   See "Serving-mode cutover (migration 0007)"
    in `docs/billing-reconciliation.md`.
 4. Re-rate the hours whose `''` rollup 0007 deleted. Atlas #6709 ships first and
    stamps `X-Saturn-Serving-Mode: dedicated` while the old phoebe is still
