@@ -259,18 +259,10 @@ func decodeEvent(data []byte) (metering.Event, error) {
 		return ev, fmt.Errorf("event JSON has trailing data: %w", err)
 	}
 	// Evidence written before the 2026-09-29 serving-mode cutover carries no
-	// serving_mode (the field was omitempty and dedicated was the empty value).
-	// All of that traffic was dedicated (Hugo, 2026-09-30: "assume it's all
-	// dedicated (which is true)"), the same rule migration 0007 applied to
-	// billing_event, so it replays as "dedicated". Only an ABSENT key gets this
-	// mapping: the pre-cutover producer never wrote the key when the mode was
-	// empty, and post-cutover evidence always carries an explicit value. An
-	// explicit "" or null (which decodes to "") is therefore a producer bug, not
-	// pre-cutover evidence, and validate() refuses it like any other value that
-	// is not shared or dedicated.
-	if !metering.HasKeyFold(probe, "serving_mode") {
-		ev.ServingMode = identity.ServingModeDedicated
-	}
+	// serving_mode key and replays as "dedicated"; an explicit "" or null is a
+	// producer bug that validate() refuses. The rule lives in one place:
+	// metering.ApplyAbsentServingModeDefault.
+	metering.ApplyAbsentServingModeDefault(&ev, probe)
 	return ev, nil
 }
 

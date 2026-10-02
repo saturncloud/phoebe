@@ -1,6 +1,9 @@
 package metering
 
-import "testing"
+import (
+	"encoding/json"
+	"testing"
+)
 
 // TestUnmarshalEvent_OnlyAbsentServingModeDefaultsToDedicated pins the one
 // pre-cutover default for stored and queued event JSON: an ABSENT serving_mode
@@ -66,6 +69,42 @@ func TestUnmarshalEvent_DifferentlyCasedServingModeKeepsItsValue(t *testing.T) {
 			if err != nil {
 				t.Fatalf("UnmarshalEvent: %v", err)
 			}
+			if ev.ServingMode != tc.want {
+				t.Fatalf("serving_mode = %q, want %q", ev.ServingMode, tc.want)
+			}
+		})
+	}
+}
+
+// TestApplyAbsentServingModeDefault_OnlyAbsentKeyInAnyCasingBecomesDedicated
+// pins the single shared implementation of the pre-cutover rule that both
+// UnmarshalEvent and internal/recovery's decodeEvent call: only a serving_mode
+// key that is absent under every casing sets "dedicated". An explicit "" or
+// null keeps the decoded "" (withheld), and a differently cased key keeps its
+// decoded value instead of being overwritten.
+func TestApplyAbsentServingModeDefault_OnlyAbsentKeyInAnyCasingBecomesDedicated(t *testing.T) {
+	cases := []struct {
+		name string
+		json string
+		want string
+	}{
+		{"absent key is pre-cutover dedicated", `{"request_id":"r"}`, "dedicated"},
+		{"explicit empty is withheld", `{"request_id":"r","serving_mode":""}`, ""},
+		{"explicit null is withheld", `{"request_id":"r","serving_mode":null}`, ""},
+		{"mixed-case shared kept", `{"request_id":"r","Serving_Mode":"shared"}`, "shared"},
+		{"upper-case dedicated kept", `{"request_id":"r","SERVING_MODE":"dedicated"}`, "dedicated"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			var ev Event
+			if err := json.Unmarshal([]byte(tc.json), &ev); err != nil {
+				t.Fatalf("decode event: %v", err)
+			}
+			var probe map[string]json.RawMessage
+			if err := json.Unmarshal([]byte(tc.json), &probe); err != nil {
+				t.Fatalf("decode probe: %v", err)
+			}
+			ApplyAbsentServingModeDefault(&ev, probe)
 			if ev.ServingMode != tc.want {
 				t.Fatalf("serving_mode = %q, want %q", ev.ServingMode, tc.want)
 			}

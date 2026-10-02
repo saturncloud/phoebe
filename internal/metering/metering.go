@@ -158,8 +158,8 @@ func (l *LogEmitter) Emit(_ context.Context, e Event) {
 // the drain queue and the on-disk spool. Evidence written before the
 // 2026-09-29 serving-mode cutover carries no serving_mode key (the field was
 // omitempty and dedicated was the empty value). All of that traffic was
-// dedicated (ratified ledger item 6), so an ABSENT key decodes as "dedicated",
-// the same rule internal/recovery applies. A post-cutover producer always
+// dedicated (ratified ledger item 6), so an ABSENT key decodes as "dedicated"
+// (see ApplyAbsentServingModeDefault, which internal/recovery also calls). A post-cutover producer always
 // writes the key, so an explicit "" or null is a producer bug, not pre-cutover
 // evidence: it decodes as "" and the rater withholds it as an invalid serving
 // mode instead of billing it as dedicated.
@@ -179,12 +179,25 @@ func UnmarshalEvent(data []byte) (Event, error) {
 	if err := json.Unmarshal(data, &probe); err != nil {
 		return ev, err
 	}
-	// Case-insensitive: json.Unmarshal above matched the key under any casing,
-	// so an exact-case lookup would overwrite a decoded "Serving_Mode" value.
+	ApplyAbsentServingModeDefault(&ev, probe)
+	return ev, nil
+}
+
+// ApplyAbsentServingModeDefault is the single implementation of the
+// pre-cutover serving-mode rule for event JSON: when probe (the record decoded
+// as a map of raw values) has no serving_mode key in any casing, ev was written
+// before the 2026-09-29 cutover and its ServingMode is set to "dedicated"
+// (ratified ledger item 6). A present key, including an explicit "" or null,
+// leaves ev untouched, so a post-cutover producer bug stays "" and the rater
+// withholds it. The presence check is case-insensitive because encoding/json
+// fills ServingMode from any key casing; an exact-case lookup would overwrite
+// a decoded "Serving_Mode":"shared" with "dedicated". Every decoder of Event
+// JSON (UnmarshalEvent, internal/recovery) calls this rather than restating
+// the rule.
+func ApplyAbsentServingModeDefault(ev *Event, probe map[string]json.RawMessage) {
 	if !HasKeyFold(probe, "serving_mode") {
 		ev.ServingMode = identity.ServingModeDedicated
 	}
-	return ev, nil
 }
 
 // HasKeyFold reports whether probe holds name under any casing. encoding/json
