@@ -60,6 +60,23 @@ var pinnedTrustedHeaders = []string{
 	HeaderOwnerRateLimitGeneratedTokens,
 }
 
+// requiredTrustedHeaders are the envelope headers request handling cannot work
+// without, each with the consequence of leaving it out of a configured
+// PHOEBE_TRUSTED_HEADERS list. A configured list that omits one is still
+// installed as written (the missing header is NOT added: the edge strip
+// middleware is rendered from the same list, so a header missing from it is
+// not stripped, and trusting it would let a client set its own value), and
+// phoebe does not exit (the never-a-startup-failure policy). Instead
+// LoadTrustedHeaders logs one ERROR line per missing header at startup, so
+// the config gap is visible before the first refused request.
+var requiredTrustedHeaders = []struct {
+	name        string
+	consequence string
+}{
+	{HeaderGateway, "gateway requests will not be recognized"},
+	{HeaderServingMode, "every header-routed (non-gateway) inference request will be refused with 404 because the serving mode reads as absent (ruling #19)"},
+}
+
 // trustedHeaderSet is the active trusted-header set. Keys are canonical
 // header names (http.CanonicalHeaderKey), so membership is case-insensitive
 // per HTTP convention.
@@ -110,6 +127,9 @@ func trustedHeaderValue(r *http.Request, name string) string {
 //     misrendered chart. Fallback, never a startup failure: phoebe must keep
 //     serving with the pinned set rather than crash-loop behind a broken
 //     ConfigMap render.
+//   - a configured list that omits a header in requiredTrustedHeaders is
+//     still installed as written, with one ERROR log line per missing
+//     header naming it and the consequence.
 func LoadTrustedHeaders(log *logging.Logger) {
 	raw, set := os.LookupEnv(TrustedHeadersEnv)
 	var names []string
@@ -128,6 +148,12 @@ func LoadTrustedHeaders(log *logging.Logger) {
 		return
 	}
 	loaded := newTrustedHeaderSet(names)
+	for _, req := range requiredTrustedHeaders {
+		if _, ok := loaded[http.CanonicalHeaderKey(req.name)]; !ok {
+			log.Error.Printf("%s omits %s; %s. Add %s to the phoebe chart's trustedHeaders list, or unset %s to use the pinned default set",
+				TrustedHeadersEnv, req.name, req.consequence, req.name, TrustedHeadersEnv)
+		}
+	}
 	activeTrustedHeaders.Store(&loaded)
 	log.Info.Printf("trusted headers: parser trusts %d header(s) from %s: %s",
 		len(names), TrustedHeadersEnv, strings.Join(names, ", "))
