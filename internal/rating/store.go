@@ -103,8 +103,10 @@ type RateResult struct {
 	// units too would break the anomaly partition.
 	AmbiguousGraphRollups int64
 	// InvalidServingModeEvents counts attributable, valid-usage events whose
-	// serving_mode is not 'shared' or 'dedicated' (NULL/'' is the pre-cutover
-	// spelling of dedicated). Withheld from money per event, retained in
+	// serving_mode is not 'shared' or 'dedicated'. Migration 0007 rewrote
+	// pre-cutover NULL/'' to 'dedicated' and the drainer maps an absent key to
+	// 'dedicated', so a NULL, '' or other value here is a missed backfill or a
+	// post-cutover producer bug. Withheld from money per event, retained in
 	// billing_event, and screamed about.
 	InvalidServingModeEvents int64
 }
@@ -313,10 +315,12 @@ WITH ev AS (
         -- 2026-09-29 serving-mode ruling those are the ONLY legal values; the proxy
         -- refuses anything else before metering.
         serving_mode,
-        -- valid_serving_mode: false for NULL, '' or any other spelling. NULL/'' is
-        -- what phoebe stored for dedicated before the cutover, so such evidence is
-        -- no longer interpretable as a price SKU. The event is withheld from money
-        -- per event (see grouped's WHERE) and counted as invalid_serving_mode_events.
+        -- valid_serving_mode: false for NULL, '' or any other spelling. Migration
+        -- 0007 rewrote pre-cutover NULL/'' to 'dedicated', and the drainer maps an
+        -- absent key to 'dedicated', so a NULL, '' or other value that reaches
+        -- this point is a missed backfill or a post-cutover producer bug. The
+        -- event is withheld from money per event (see grouped's WHERE) and
+        -- counted as invalid_serving_mode_events.
         -- billing_event keeps the raw row; nothing here rewrites evidence.
         COALESCE(serving_mode IN ('shared', 'dedicated'), false) AS valid_serving_mode,
         -- sku_base: the MODE-PREFIXED base price key (design D1, mirrors the Go

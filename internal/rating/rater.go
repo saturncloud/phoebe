@@ -177,7 +177,8 @@ func (r Result) HasOwnerConflict() bool { return r.OwnerConflictEvents > 0 }
 // anomalies. Dedicated evidence metered before the 2026-09-29 cutover (stored as
 // NULL or "") should already have been rewritten to "dedicated" by migration
 // 0007's backfill (ledger item 6). If this fires for such rows, the backfill was
-// missed (for example, old proxy pods kept writing NULL after the migration ran)
+// missed (for example, drainer pods on the pre-0007 image kept writing NULL
+// after the migration ran)
 // and must be re-run; otherwise the proxy's serving-mode gate is broken.
 func (r Result) HasInvalidServingMode() bool { return r.InvalidServingModeEvents > 0 }
 
@@ -282,7 +283,7 @@ func (r *Rater) Run(ctx context.Context, windowStart, windowEnd time.Time, windo
 			windowStart.Format(time.RFC3339), windowEnd.Format(time.RFC3339), res.OwnerConflictEvents)
 	}
 	if res.HasInvalidServingMode() {
-		r.log.Error.Printf("rating: window [%s,%s) has %d INVALID-SERVING-MODE events (serving_mode is neither \"shared\" nor \"dedicated\") — the serving mode selects the price SKU, so these events are NOT billed. The raw events are retained in billing_event. NULL or empty rows should already have been backfilled to 'dedicated' by migration 0007 (ledger item 6); any that remain mean the backfill was missed (re-run it, see docs/billing-reconciliation.md) or the proxy's serving-mode gate is broken. Per hour and key, billing_reconciliation_hourly.invalid_serving_mode_attempts shows how many attempts this withheld",
+		r.log.Error.Printf("rating: window [%s,%s) has %d INVALID-SERVING-MODE events (serving_mode is neither \"shared\" nor \"dedicated\") — the serving mode selects the price SKU, so these events are NOT billed. The raw events are retained in billing_event. NULL or empty rows should already have been backfilled to 'dedicated' by migration 0007 (ledger item 6); any that remain mean the backfill was missed (for example, drainer pods on the pre-0007 image kept writing NULL after the migration ran; re-run the NULL-only backfill once no old drainer pod is left, see docs/billing-reconciliation.md) or the proxy's serving-mode gate is broken. Per hour and key, billing_reconciliation_hourly.invalid_serving_mode_attempts shows how many attempts this withheld",
 			windowStart.Format(time.RFC3339), windowEnd.Format(time.RFC3339), res.InvalidServingModeEvents)
 	}
 	if res.HasAmbiguousGraph() {
