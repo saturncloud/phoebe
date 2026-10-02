@@ -6,6 +6,7 @@ package metering
 import (
 	"context"
 	"encoding/json"
+	"strings"
 
 	"github.com/saturncloud/phoebe/internal/identity"
 	"github.com/saturncloud/phoebe/internal/logging"
@@ -178,8 +179,25 @@ func UnmarshalEvent(data []byte) (Event, error) {
 	if err := json.Unmarshal(data, &probe); err != nil {
 		return ev, err
 	}
-	if _, ok := probe["serving_mode"]; !ok {
+	// Case-insensitive: json.Unmarshal above matched the key under any casing,
+	// so an exact-case lookup would overwrite a decoded "Serving_Mode" value.
+	if !HasKeyFold(probe, "serving_mode") {
 		ev.ServingMode = identity.ServingModeDedicated
 	}
 	return ev, nil
+}
+
+// HasKeyFold reports whether probe holds name under any casing. encoding/json
+// matches object keys to struct fields case-insensitively, so a record with
+// "Serving_Mode":"shared" decodes ServingMode as "shared"; an exact-case
+// presence check would miss that key, treat the field as absent, and overwrite
+// the decoded value with a default (billing a shared event as dedicated).
+// Every decoder that applies an absent-key rule to Event JSON must use this.
+func HasKeyFold(probe map[string]json.RawMessage, name string) bool {
+	for k := range probe {
+		if strings.EqualFold(k, name) {
+			return true
+		}
+	}
+	return false
 }

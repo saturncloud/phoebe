@@ -42,3 +42,33 @@ func TestUnmarshalEvent_RejectsInvalidJSON(t *testing.T) {
 		t.Fatal("UnmarshalEvent accepted truncated JSON")
 	}
 }
+
+// TestUnmarshalEvent_DifferentlyCasedServingModeKeepsItsValue pins that the
+// absent-key default checks presence case-insensitively, the same rule
+// internal/recovery applies. encoding/json fills ServingMode from any key
+// casing, so an exact-case presence check would overwrite a decoded
+// "Serving_Mode":"shared" with "dedicated" and bill shared traffic at the
+// dedicated SKU.
+func TestUnmarshalEvent_DifferentlyCasedServingModeKeepsItsValue(t *testing.T) {
+	cases := []struct {
+		name string
+		json string
+		want string
+	}{
+		{"mixed-case shared kept", `{"request_id":"r","Serving_Mode":"shared","usage_found":true}`, "shared"},
+		{"upper-case shared kept", `{"request_id":"r","SERVING_MODE":"shared"}`, "shared"},
+		{"mixed-case explicit empty is withheld", `{"request_id":"r","Serving_Mode":""}`, ""},
+		{"no key in any casing is dedicated", `{"request_id":"r","usage_found":true}`, "dedicated"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			ev, err := UnmarshalEvent([]byte(tc.json))
+			if err != nil {
+				t.Fatalf("UnmarshalEvent: %v", err)
+			}
+			if ev.ServingMode != tc.want {
+				t.Fatalf("serving_mode = %q, want %q", ev.ServingMode, tc.want)
+			}
+		})
+	}
+}

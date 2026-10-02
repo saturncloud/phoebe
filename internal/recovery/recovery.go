@@ -243,7 +243,7 @@ func decodeEvent(data []byte) (metering.Event, error) {
 	if err := json.Unmarshal(data, &probe); err != nil {
 		return ev, fmt.Errorf("decode event JSON: %w", err)
 	}
-	if !hasKeyFold(probe, "usage_found") {
+	if !metering.HasKeyFold(probe, "usage_found") {
 		return ev, fmt.Errorf("event has no usage_found field (pre-hardening evidence); " +
 			"refusing to replay it as unmetered — assert the correct value and re-import")
 	}
@@ -268,24 +268,10 @@ func decodeEvent(data []byte) (metering.Event, error) {
 	// explicit "" or null (which decodes to "") is therefore a producer bug, not
 	// pre-cutover evidence, and validate() refuses it like any other value that
 	// is not shared or dedicated.
-	if !hasKeyFold(probe, "serving_mode") {
+	if !metering.HasKeyFold(probe, "serving_mode") {
 		ev.ServingMode = identity.ServingModeDedicated
 	}
 	return ev, nil
-}
-
-// hasKeyFold reports whether probe holds name under any casing. encoding/json
-// matches object keys to struct fields case-insensitively, so a record with
-// "Serving_Mode":"shared" decodes ServingMode as "shared"; an exact-case
-// presence check would miss that key, treat the field as absent, and overwrite
-// the decoded value with a default (billing a shared event as dedicated).
-func hasKeyFold(probe map[string]json.RawMessage, name string) bool {
-	for k := range probe {
-		if strings.EqualFold(k, name) {
-			return true
-		}
-	}
-	return false
 }
 
 func validateAndDedupe(events []metering.Event) (Evidence, error) {
