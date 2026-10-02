@@ -134,13 +134,26 @@ const (
 	// take down the inference path. See internal/proxy missingBillingFields.
 	HeaderOrgID = "X-Saturn-Org-Id"
 
-	// Shared-tier policy resolved by Atlas from authenticated UsageLimits and
-	// stamped by gateway ForwardAuth. Clients never choose these values.
-	HeaderServiceTier                   = "X-Saturn-Service-Tier"
-	HeaderRateLimitRequests             = "X-Saturn-Rate-Limit-Requests"
-	HeaderRateLimitTotalPromptTokens    = "X-Saturn-Rate-Limit-Total-Prompt-Tokens"
-	HeaderRateLimitUncachedPromptTokens = "X-Saturn-Rate-Limit-Uncached-Prompt-Tokens"
-	HeaderRateLimitGeneratedTokens      = "X-Saturn-Rate-Limit-Generated-Tokens"
+	// Shared-inference policy resolved by Saturn from authenticated UsageLimits and
+	// stamped by gateway ForwardAuth. OwnerID is stable across all API keys for
+	// a user/group; AuthID remains the per-key audit and revocation identity.
+	HeaderOwnerID                            = "X-Saturn-Owner-Id"
+	HeaderOrgRateLimitRequests               = "X-Saturn-Org-Rate-Limit-Requests"
+	HeaderOrgRateLimitTotalPromptTokens      = "X-Saturn-Org-Rate-Limit-Total-Prompt-Tokens"
+	HeaderOrgRateLimitUncachedPromptTokens   = "X-Saturn-Org-Rate-Limit-Uncached-Prompt-Tokens"
+	HeaderOrgRateLimitGeneratedTokens        = "X-Saturn-Org-Rate-Limit-Generated-Tokens"
+	HeaderOwnerRateLimitRequests             = "X-Saturn-Owner-Rate-Limit-Requests"
+	HeaderOwnerRateLimitTotalPromptTokens    = "X-Saturn-Owner-Rate-Limit-Total-Prompt-Tokens"
+	HeaderOwnerRateLimitUncachedPromptTokens = "X-Saturn-Owner-Rate-Limit-Uncached-Prompt-Tokens"
+	HeaderOwnerRateLimitGeneratedTokens      = "X-Saturn-Owner-Rate-Limit-Generated-Tokens"
+	// LegacyPolicy headers are accepted only as a complete fallback during the
+	// rolling upgrade to independent organization and owner contracts. The
+	// service-tier value is an envelope-version marker; it never selects a lane.
+	HeaderLegacyServiceTier                   = "X-Saturn-Service-Tier"
+	HeaderLegacyRateLimitRequests             = "X-Saturn-Rate-Limit-Requests"
+	HeaderLegacyRateLimitTotalPromptTokens    = "X-Saturn-Rate-Limit-Total-Prompt-Tokens"
+	HeaderLegacyRateLimitUncachedPromptTokens = "X-Saturn-Rate-Limit-Uncached-Prompt-Tokens"
+	HeaderLegacyRateLimitGeneratedTokens      = "X-Saturn-Rate-Limit-Generated-Tokens"
 
 	// HeaderUpstream carries the EXACT backend the request must be forwarded to —
 	// `host:port` (e.g. pd-abcde-mymodel-r123.main-namespace.svc.cluster.local:8000).
@@ -213,12 +226,21 @@ type Identity struct {
 	// upstream host the gateway just composed from this same name. Empty on
 	// header-routed requests (the proxy derives the graph from the upstream
 	// host instead).
-	GraphK8sName                  string
-	ServiceTier                   string
-	RateLimitRequests             string
-	RateLimitTotalPromptTokens    string
-	RateLimitUncachedPromptTokens string
-	RateLimitGeneratedTokens      string
+	GraphK8sName                        string
+	OwnerID                             string
+	OrgRateLimitRequests                string
+	OrgRateLimitTotalPromptTokens       string
+	OrgRateLimitUncachedPromptTokens    string
+	OrgRateLimitGeneratedTokens         string
+	OwnerRateLimitRequests              string
+	OwnerRateLimitTotalPromptTokens     string
+	OwnerRateLimitUncachedPromptTokens  string
+	OwnerRateLimitGeneratedTokens       string
+	LegacyServiceTier                   string
+	LegacyRateLimitRequests             string
+	LegacyRateLimitTotalPromptTokens    string
+	LegacyRateLimitUncachedPromptTokens string
+	LegacyRateLimitGeneratedTokens      string
 }
 
 // The two serving modes, spelled exactly as they are stored in billing_event and
@@ -236,27 +258,46 @@ func ValidServingMode(s string) bool {
 }
 
 // FromRequest extracts the trusted identity headers. It performs no
-// validation beyond reading the values; authorization happened at the edge. A
-// gateway request's serving mode is overwritten later by gateway resolution
-// from the served-model registry.
+// validation beyond reading the values; authorization happened at the edge.
+//
+// The R3 envelope reads (gateway mark, org, owner, serving mode, served
+// model, and every rate-limit policy header — the pinned 18) resolve through
+// the trusted-header registry: a header outside the active set is treated
+// as ABSENT, never read for a trust decision. The remaining identity headers
+// are read directly (ratified edge contract, outside the R3 gate).
+//
+// The serving mode is copied verbatim and NO default is applied (ruling #19):
+// an absent, untrusted, or malformed X-Saturn-Serving-Mode leaves a value that
+// fails ValidServingMode, and the proxy route gate refuses it. A gateway
+// request's serving mode is overwritten later by gateway resolution from the
+// served-model registry.
 func FromRequest(r *http.Request) Identity {
 	return Identity{
-		AuthID:                        r.Header.Get(HeaderAuthID),
-		UserID:                        r.Header.Get(HeaderUserID),
-		GroupID:                       r.Header.Get(HeaderGroupID),
-		ResourceID:                    r.Header.Get(HeaderResourceID),
-		ResourceType:                  r.Header.Get(HeaderResourceType),
-		OrgID:                         r.Header.Get(HeaderOrgID),
-		BaseModel:                     r.Header.Get(HeaderBaseModel),
-		Adapter:                       r.Header.Get(HeaderAdapter),
-		ServingMode:                   r.Header.Get(HeaderServingMode),
-		ServedModel:                   r.Header.Get(HeaderServedModel),
-		Upstream:                      r.Header.Get(HeaderUpstream),
-		Gateway:                       r.Header.Get(HeaderGateway) == "true",
-		ServiceTier:                   r.Header.Get(HeaderServiceTier),
-		RateLimitRequests:             r.Header.Get(HeaderRateLimitRequests),
-		RateLimitTotalPromptTokens:    r.Header.Get(HeaderRateLimitTotalPromptTokens),
-		RateLimitUncachedPromptTokens: r.Header.Get(HeaderRateLimitUncachedPromptTokens),
-		RateLimitGeneratedTokens:      r.Header.Get(HeaderRateLimitGeneratedTokens),
+		AuthID:                              r.Header.Get(HeaderAuthID),
+		UserID:                              r.Header.Get(HeaderUserID),
+		GroupID:                             r.Header.Get(HeaderGroupID),
+		ResourceID:                          r.Header.Get(HeaderResourceID),
+		ResourceType:                        r.Header.Get(HeaderResourceType),
+		OrgID:                               trustedHeaderValue(r, HeaderOrgID),
+		BaseModel:                           r.Header.Get(HeaderBaseModel),
+		Adapter:                             r.Header.Get(HeaderAdapter),
+		ServingMode:                         trustedHeaderValue(r, HeaderServingMode),
+		ServedModel:                         trustedHeaderValue(r, HeaderServedModel),
+		Upstream:                            r.Header.Get(HeaderUpstream),
+		Gateway:                             trustedHeaderValue(r, HeaderGateway) == "true",
+		OwnerID:                             trustedHeaderValue(r, HeaderOwnerID),
+		OrgRateLimitRequests:                trustedHeaderValue(r, HeaderOrgRateLimitRequests),
+		OrgRateLimitTotalPromptTokens:       trustedHeaderValue(r, HeaderOrgRateLimitTotalPromptTokens),
+		OrgRateLimitUncachedPromptTokens:    trustedHeaderValue(r, HeaderOrgRateLimitUncachedPromptTokens),
+		OrgRateLimitGeneratedTokens:         trustedHeaderValue(r, HeaderOrgRateLimitGeneratedTokens),
+		OwnerRateLimitRequests:              trustedHeaderValue(r, HeaderOwnerRateLimitRequests),
+		OwnerRateLimitTotalPromptTokens:     trustedHeaderValue(r, HeaderOwnerRateLimitTotalPromptTokens),
+		OwnerRateLimitUncachedPromptTokens:  trustedHeaderValue(r, HeaderOwnerRateLimitUncachedPromptTokens),
+		OwnerRateLimitGeneratedTokens:       trustedHeaderValue(r, HeaderOwnerRateLimitGeneratedTokens),
+		LegacyServiceTier:                   trustedHeaderValue(r, HeaderLegacyServiceTier),
+		LegacyRateLimitRequests:             trustedHeaderValue(r, HeaderLegacyRateLimitRequests),
+		LegacyRateLimitTotalPromptTokens:    trustedHeaderValue(r, HeaderLegacyRateLimitTotalPromptTokens),
+		LegacyRateLimitUncachedPromptTokens: trustedHeaderValue(r, HeaderLegacyRateLimitUncachedPromptTokens),
+		LegacyRateLimitGeneratedTokens:      trustedHeaderValue(r, HeaderLegacyRateLimitGeneratedTokens),
 	}
 }

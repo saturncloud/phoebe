@@ -16,6 +16,7 @@ import (
 	"github.com/saturncloud/phoebe/internal/config"
 	"github.com/saturncloud/phoebe/internal/emit"
 	"github.com/saturncloud/phoebe/internal/gateway"
+	"github.com/saturncloud/phoebe/internal/identity"
 	"github.com/saturncloud/phoebe/internal/iolog"
 	"github.com/saturncloud/phoebe/internal/logging"
 	"github.com/saturncloud/phoebe/internal/metering"
@@ -36,6 +37,13 @@ func main() {
 	if settings.Debug {
 		log.SetLevel(logging.DEBUG)
 	}
+
+	// R3 trusted-header registry: parse PHOEBE_TRUSTED_HEADERS (rendered
+	// from the phoebe chart's ConfigMap) into the active set the parser's
+	// envelope reads resolve through. The pinned 18 already govern from
+	// package init; this engages the runtime config once, at startup, and
+	// warns loudly if the chart render was empty/malformed.
+	identity.LoadTrustedHeaders(log)
 
 	// Gateway wiring FIRST: buildGateway may Fatalf on a fail-closed
 	// misconfiguration, and at this point nothing needs cleanup yet.
@@ -78,15 +86,17 @@ func buildAdmission(s *config.Settings, log *logging.Logger) (admission.Admitter
 	if !s.Admission.Enabled {
 		return nil, func() {}
 	}
-	client := redis.NewClient(&redis.Options{Addr: s.Admission.ValkeyAddr})
-	// Startup reachability is checked, and every request operation still fails
-	// closed if state disappears later.
+	client := admission.NewValkeyClient(s.Admission.ValkeyAddr)
+	// Admission is a fairness/capacity gate, not an authorization or billing
+	// authority. Start serving when Valkey is unavailable and bypass only this
+	// gate until it recovers; metering has its own durable path.
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	if err := client.Ping(ctx).Err(); err != nil {
-		log.Error.Fatalf("admission: Valkey unavailable at %s: %v", s.Admission.ValkeyAddr, err)
+		log.Error.Printf("admission: Valkey unavailable at %s; starting with distributed gate bypassed until recovery: %v", s.Admission.ValkeyAddr, err)
+	} else {
+		log.Info.Printf("admission: enabled (valkey %s, lease ttl %s)", s.Admission.ValkeyAddr, s.Admission.LeaseTTL)
 	}
-	log.Info.Printf("admission: enabled (valkey %s, lease ttl %s)", s.Admission.ValkeyAddr, s.Admission.LeaseTTL)
 	return admission.New(client, s.Admission), func() { _ = client.Close() }
 }
 
