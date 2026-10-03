@@ -2138,7 +2138,9 @@ func TestPerResourceServingIdentityFailsClosedWhenInconsistent(t *testing.T) {
 		servedModel string
 		wantStatus  int
 	}{
-		{name: "model with absent mode", servedModel: "model-a", wantStatus: http.StatusOK},
+		// Ruling #19: an absent serving mode is an edge-contract bug, not
+		// dedicated — refused at the route gate like a malformed one.
+		{name: "model with absent mode", servedModel: "model-a", wantStatus: http.StatusNotFound},
 		{name: "model with dedicated mode", servingMode: "dedicated", servedModel: "model-a", wantStatus: http.StatusOK},
 		{name: "model with unknown mode", servingMode: "shraed", servedModel: "model-a", wantStatus: http.StatusNotFound},
 		{name: "shared mode without model", servingMode: "shared", wantStatus: http.StatusNotFound},

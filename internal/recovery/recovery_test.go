@@ -3,6 +3,7 @@ package recovery
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -23,6 +24,7 @@ func testEvent(id string) metering.Event {
 		AuthID:          "auth-1",
 		PromptTokens:    -1, // Invalid engine counts remain recoverable raw evidence.
 		UsageFound:      true,
+		ServingMode:     "dedicated",
 		TimestampUnixMs: 1_750_000_000_000,
 	}
 }
@@ -314,5 +316,177 @@ func TestLoadAcceptsExplicitUsageFoundBothWays(t *testing.T) {
 		if len(evidence.Events) != 1 || evidence.Events[0].UsageFound != usageFound {
 			t.Fatalf("events = %+v, want one event with usage_found=%v", evidence.Events, usageFound)
 		}
+	}
+}
+
+func writeEvidence(t *testing.T, content string) string {
+	t.Helper()
+	path := filepath.Join(t.TempDir(), "evidence.jsonl")
+	if err := os.WriteFile(path, []byte(content), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	return path
+}
+
+// TestDecodeEvent_PreCutoverEvidenceReplaysAsDedicated: a record predating the
+// 2026-09-29 serving-mode cutover has no serving_mode key (the field was
+// omitempty, so the pre-cutover producer never wrote it for dedicated traffic).
+// All pre-cutover traffic was dedicated (Hugo, 2026-09-30), so it replays as
+// "dedicated" — the same rule migration 0007 applied to billing_event — instead of
+// being stored NULL and withheld by the rater.
+func TestDecodeEvent_PreCutoverEvidenceReplaysAsDedicated(t *testing.T) {
+	rec := `{"request_id":"req-legacy","auth_id":"auth-1","prompt_tokens":10,` +
+		`"completion_tokens":5,"usage_found":true,"timestamp_unix_ms":1750000000000}`
+	ev, err := decodeEvent([]byte(rec))
+	if err != nil || ev.ServingMode != "dedicated" {
+		t.Fatalf("decodeEvent(%s) = (%q, %v), want serving_mode dedicated", rec, ev.ServingMode, err)
+	}
+	evidence, err := Load(writeEvidence(t, rec))
+	if err != nil || len(evidence.Events) != 1 || evidence.Events[0].ServingMode != "dedicated" {
+		t.Fatalf("Load(%s) = (%+v, %v), want one dedicated event", rec, evidence, err)
+	}
+}
+
+// TestDecodeEvent_ExplicitEmptyOrNullServingModeRefused: only an ABSENT key is
+// pre-cutover evidence. An explicit "" or null can only come from a post-cutover
+// producer bug (the pre-cutover field was omitempty), so it must not be silently
+// replayed and billed as dedicated; validate() refuses it, naming the field.
+func TestDecodeEvent_ExplicitEmptyOrNullServingModeRefused(t *testing.T) {
+	for _, mode := range []string{`""`, `null`} {
+		rec := `{"request_id":"req-empty-mode","auth_id":"auth-1","prompt_tokens":10,` +
+			`"completion_tokens":5,"usage_found":true,"serving_mode":` + mode +
+			`,"timestamp_unix_ms":1750000000000}`
+		ev, err := decodeEvent([]byte(rec))
+		if err != nil {
+			t.Fatalf("decodeEvent(%s) unexpected decode error: %v", rec, err)
+		}
+		if ev.ServingMode != "" {
+			t.Fatalf("decodeEvent(%s) serving_mode = %q, want it left empty (not defaulted)", rec, ev.ServingMode)
+		}
+		_, err = Load(writeEvidence(t, rec))
+		if err == nil || !strings.Contains(err.Error(), "serving_mode") {
+			t.Fatalf("serving_mode %s must be refused, naming the field; got %v", mode, err)
+		}
+	}
+}
+
+// TestDecodeEvent_PreCutoverWALEvidenceReplaysAsDedicated: the same rule applies to
+// WAL evidence, not only JSONL.
+func TestDecodeEvent_PreCutoverWALEvidenceReplaysAsDedicated(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), "wal")
+	log, err := tidwall.Open(dir, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	legacy := `{"request_id":"req-legacy","auth_id":"auth-1","usage_found":true,"timestamp_unix_ms":1750000000000}`
+	if err := log.Write(1, []byte(legacy)); err != nil {
+		t.Fatal(err)
+	}
+	if err := log.Close(); err != nil {
+		t.Fatal(err)
+	}
+	evidence, err := Load(dir)
+	if err != nil || len(evidence.Events) != 1 || evidence.Events[0].ServingMode != "dedicated" {
+		t.Fatalf("WAL pre-cutover record = (%+v, %v), want one dedicated event", evidence, err)
+	}
+}
+
+// TestDecodeEvent_InvalidServingModeRefused: a present value that is neither
+// shared nor dedicated would be withheld by the rater, so it must not pass
+// validation.
+func TestDecodeEvent_InvalidServingModeRefused(t *testing.T) {
+	for _, mode := range []string{"Dedicated", "serverless", " shared"} {
+		ev := testEvent("req-bad-mode")
+		ev.ServingMode = mode
+		data, err := json.Marshal(ev)
+		if err != nil {
+			t.Fatal(err)
+		}
+		_, err = Load(writeEvidence(t, string(data)))
+		if err == nil || !strings.Contains(err.Error(), "serving_mode") {
+			t.Fatalf("serving_mode %q must be refused, naming the field; got %v", mode, err)
+		}
+	}
+}
+
+// TestDecodeEvent_ExplicitSharedAndDedicatedKeepTheirValue: an explicit valid mode
+// (shared or dedicated) replays unchanged. Only an absent key maps to dedicated;
+// an explicit empty, null or otherwise invalid value is refused.
+func TestDecodeEvent_ExplicitSharedAndDedicatedKeepTheirValue(t *testing.T) {
+	for _, mode := range []string{"dedicated", "shared"} {
+		ev := testEvent("req-" + mode)
+		ev.ServingMode = mode
+		data, err := json.Marshal(ev)
+		if err != nil {
+			t.Fatal(err)
+		}
+		evidence, err := Load(writeEvidence(t, string(data)))
+		if err != nil {
+			t.Fatalf("serving_mode %q must be accepted: %v", mode, err)
+		}
+		if len(evidence.Events) != 1 || evidence.Events[0].ServingMode != mode {
+			t.Fatalf("events = %+v, want one event with serving_mode=%q", evidence.Events, mode)
+		}
+	}
+}
+
+// TestDecodeEvent_DifferentlyCasedServingModeKeepsItsValue: encoding/json matches
+// keys to struct fields case-insensitively, so "Serving_Mode":"shared" decodes as
+// shared. The absent-key check must use the same matching, or it would treat the
+// key as missing and overwrite the decoded value with "dedicated", billing a
+// shared event at the dedicated price.
+func TestDecodeEvent_DifferentlyCasedServingModeKeepsItsValue(t *testing.T) {
+	for _, key := range []string{"Serving_Mode", "SERVING_MODE"} {
+		rec := `{"request_id":"req-cased","auth_id":"auth-1","prompt_tokens":10,` +
+			`"completion_tokens":5,"usage_found":true,"` + key + `":"shared",` +
+			`"timestamp_unix_ms":1750000000000}`
+		ev, err := decodeEvent([]byte(rec))
+		if err != nil || ev.ServingMode != "shared" {
+			t.Fatalf("decodeEvent(%s) = (%q, %v), want serving_mode shared", rec, ev.ServingMode, err)
+		}
+		evidence, err := Load(writeEvidence(t, rec))
+		if err != nil || len(evidence.Events) != 1 || evidence.Events[0].ServingMode != "shared" {
+			t.Fatalf("Load(%s) = (%+v, %v), want one shared event", rec, evidence, err)
+		}
+	}
+}
+
+// TestDecodeEvent_DifferentlyCasedUsageFoundCountsAsPresent: the usage_found
+// presence check must match keys the way encoding/json does. A differently-cased
+// key is decoded into UsageFound, so it is present and its value is kept.
+func TestDecodeEvent_DifferentlyCasedUsageFoundCountsAsPresent(t *testing.T) {
+	for _, key := range []string{"Usage_Found", "USAGE_FOUND"} {
+		for _, value := range []bool{true, false} {
+			rec := fmt.Sprintf(`{"request_id":"req-cased","auth_id":"auth-1","prompt_tokens":10,`+
+				`"completion_tokens":5,%q:%t,"serving_mode":"shared","timestamp_unix_ms":1750000000000}`,
+				key, value)
+			ev, err := decodeEvent([]byte(rec))
+			if err != nil || ev.UsageFound != value {
+				t.Fatalf("decodeEvent(%s) = (usage_found=%v, %v), want usage_found=%v", rec, ev.UsageFound, err, value)
+			}
+		}
+	}
+}
+
+// TestDigestPreCutoverAbsentModeEqualsExplicitDedicated: decodeEvent maps an
+// absent serving_mode key to "dedicated" before hashing, so a pre-cutover record
+// and the same record with an explicit "serving_mode":"dedicated" must produce
+// the same digest within one binary.
+func TestDigestPreCutoverAbsentModeEqualsExplicitDedicated(t *testing.T) {
+	const prefix = `{"request_id":"req-legacy","auth_id":"auth-1","prompt_tokens":10,` +
+		`"completion_tokens":5,"usage_found":true,`
+	absent, err := Load(writeEvidence(t, prefix+`"timestamp_unix_ms":1750000000000}`))
+	if err != nil {
+		t.Fatalf("Load(absent serving_mode): %v", err)
+	}
+	explicit, err := Load(writeEvidence(t, prefix+`"serving_mode":"dedicated","timestamp_unix_ms":1750000000000}`))
+	if err != nil {
+		t.Fatalf("Load(explicit dedicated): %v", err)
+	}
+	if absent.Digest() == "" {
+		t.Fatal("digest must be computable for a valid pre-cutover record")
+	}
+	if absent.Digest() != explicit.Digest() {
+		t.Fatalf("absent serving_mode digest %s != explicit dedicated digest %s", absent.Digest(), explicit.Digest())
 	}
 }

@@ -26,19 +26,6 @@ func authorizedModelDiscoveryPath(path, servedModelAllowList string) (discovery,
 	return true, false
 }
 
-// validTrustedServingMode reports whether a trusted serving-mode header value
-// is one the route machinery understands. identity.FromRequest reads the header
-// VERBATIM, so an Atlas producer bug ("Shared", " shared", "SHARED") would
-// otherwise fall into the dedicated/unbound branch: a genuinely shared graph
-// would get the unbound inference surface with no model binding, and the shared
-// policy (tenant isolation + admission) would be skipped even when an
-// allow-list is present. Values outside the known set are refused at the route
-// gate (fail closed, generic 404 — no oracle), exactly like every other
-// unauthorized route.
-func validTrustedServingMode(mode string) bool {
-	return mode == "" || mode == "dedicated" || mode == "shared"
-}
-
 // boundRequestAllowed is the complete public surface for a deployment-scoped
 // endpoint. Dynamo's frontend also exposes graph-wide admin, metrics,
 // documentation, batch storage, and future extension routes; those must not

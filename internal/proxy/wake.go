@@ -78,7 +78,7 @@ const dynamoNotReadyBodyMarker = "is not ready to serve requests yet"
 // so ServingMode is the authoritative discriminator; dedicated capacity never
 // scales to zero through this path.
 func isWakeable(id identity.Identity) bool {
-	return id.ServingMode == "shared" && id.ResourceID != "" && id.ServedModel != ""
+	return id.ServingMode == identity.ServingModeShared && id.ResourceID != "" && id.ServedModel != ""
 }
 
 // graphFromUpstreamHost derives the Dynamo graph (DGD) k8s name from a
@@ -179,34 +179,7 @@ func (b *bufferingResponseWriter) flushTo(w http.ResponseWriter) {
 // waker is configured AND the route is wakeable (shared-mode + authorized
 // resource id). Everything else streams directly with zero wake overhead.
 func (s *Server) wakeEnabled(id identity.Identity) bool {
-	if s.waker == nil {
-		return false
-	}
-	if isWakeable(id) {
-		return true
-	}
-	// The route has the BOUND shape (authorized resource id + served-model
-	// allow-list) but no serving mode: an absent serving-mode header on a
-	// bound route IS the dedicated-route shape (the ratified contract), not a
-	// rollout gap — dedicated capacity never scales to zero, so treating it as
-	// dedicated-for-wake loses nothing. This is the normal state for every
-	// bound dedicated route, so the diagnostic is per-request Debug, never a
-	// per-request Warn.
-	if id.ResourceID != "" && id.ServedModel != "" && id.ServingMode == "" {
-		s.log.Debug.Printf("wake: bound route (resource_id=%s) has no %s header: dedicated by the absent-mode contract, shared cold bases will not wake on it",
-			id.ResourceID, identity.HeaderServingMode)
-		return false
-	}
-	// A route explicitly marked shared that is missing half of the bound shape
-	// (no authorized resource id or no served-model allow-list) can never
-	// wake: a cold shared base on it serves raw 404/503s with no wake signal
-	// anywhere. That is a genuine contract breakage, not the normal dedicated
-	// state — keep it loud.
-	if id.ServingMode == "shared" && (id.ResourceID == "" || id.ServedModel == "") {
-		s.log.Warn.Printf("wake: route marked shared (resource_id=%q served_model=%q) can never wake: cold shared bases will serve raw 404/503s",
-			id.ResourceID, id.ServedModel)
-	}
-	return false
+	return s.waker != nil && isWakeable(id)
 }
 
 // statusRecorder wraps the client ResponseWriter to capture the status code a

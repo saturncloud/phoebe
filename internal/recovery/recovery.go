@@ -22,6 +22,7 @@ import (
 	"github.com/redis/go-redis/v9"
 	tidwall "github.com/tidwall/wal"
 
+	"github.com/saturncloud/phoebe/internal/identity"
 	"github.com/saturncloud/phoebe/internal/metering"
 )
 
@@ -43,6 +44,21 @@ type Evidence struct {
 // declaration order, so a given build produces one byte sequence per event) and
 // sorted by the trusted request id, which validateAndDedupe has already proven
 // unique. Framing each record with its length keeps concatenation unambiguous.
+//
+// The digest is computed over the DECODED events, so decodeEvent's defaults are
+// part of it: decodeEvent maps an absent serving_mode key to "dedicated" before
+// hashing, so a pre-cutover record and the same record with an explicit
+// "serving_mode":"dedicated" produce the same digest within one binary.
+//
+// The digest is therefore only comparable between a dry-run and an -apply run
+// made with the same binary. Two kinds of change alter the digest of the same
+// evidence: changing metering.Event's fields or JSON tags (for example,
+// dropping omitempty from serving_mode in the serving-mode cutover, so the
+// field is now always emitted), and changing decodeEvent's mapping of absent
+// keys (the pre-cutover evidence digested as "serving_mode":"dedicated" by this
+// binary hashed with no serving_mode at all under the previous one). An
+// operator who upgrades between dry-run and apply must redo the dry-run with
+// the new binary.
 func (e Evidence) Digest() string {
 	encoded := make([][]byte, 0, len(e.Events))
 	for i := range e.Events {
@@ -218,16 +234,16 @@ func copyTree(source, destination string) error {
 
 func decodeEvent(data []byte) (metering.Event, error) {
 	var ev metering.Event
-	// usage_found decides whether an attempt can EVER become money, and Go decodes a
-	// missing bool to false — so a record predating that field would replay as
-	// "engine supplied no usage", be excluded from money permanently, and report
-	// nothing. Refuse it instead: an operator can assert the right value and
-	// re-import, but they cannot recover revenue that was silently zeroed.
+	// usage_found decides whether an attempt can EVER become money, and Go decodes
+	// a missing field to its zero value: a record predating usage_found would
+	// replay as "engine supplied no usage" and be excluded from money permanently
+	// with no error at import time. Refuse it instead: an operator can assert the
+	// right value and re-import, but cannot recover revenue silently zeroed.
 	var probe map[string]json.RawMessage
 	if err := json.Unmarshal(data, &probe); err != nil {
 		return ev, fmt.Errorf("decode event JSON: %w", err)
 	}
-	if _, ok := probe["usage_found"]; !ok {
+	if !metering.HasKeyFold(probe, "usage_found") {
 		return ev, fmt.Errorf("event has no usage_found field (pre-hardening evidence); " +
 			"refusing to replay it as unmetered — assert the correct value and re-import")
 	}
@@ -242,6 +258,11 @@ func decodeEvent(data []byte) (metering.Event, error) {
 		}
 		return ev, fmt.Errorf("event JSON has trailing data: %w", err)
 	}
+	// Evidence written before the 2026-09-29 serving-mode cutover carries no
+	// serving_mode key and replays as "dedicated"; an explicit "" or null is a
+	// producer bug that validate() refuses. The rule lives in one place:
+	// metering.ApplyAbsentServingModeDefault.
+	metering.ApplyAbsentServingModeDefault(&ev, probe)
 	return ev, nil
 }
 
@@ -295,6 +316,14 @@ func validate(ev metering.Event) error {
 		if count := utf8.RuneCountInString(field.value); count > field.max {
 			return fmt.Errorf("%s is %d characters; database maximum is %d", field.name, count, field.max)
 		}
+	}
+	// Any serving_mode other than shared or dedicated would be withheld from money
+	// by the rater, so it is refused here rather than replayed as unbillable.
+	// (decodeEvent has already mapped an absent key, i.e. pre-cutover evidence, to
+	// dedicated; an explicit "" or null reaches this check and is refused.)
+	if !identity.ValidServingMode(ev.ServingMode) {
+		return fmt.Errorf("serving_mode %q is not shared or dedicated; "+
+			"refusing to replay it as unbillable — assert shared|dedicated and re-import", ev.ServingMode)
 	}
 	if ev.TimestampUnixMs <= 0 {
 		return fmt.Errorf("timestamp_unix_ms must be positive")

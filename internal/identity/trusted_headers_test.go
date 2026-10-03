@@ -1,6 +1,7 @@
 package identity
 
 import (
+	"bytes"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -227,5 +228,59 @@ func TestFromRequestEnvelopeHeadersAreCaseInsensitiveOnRead(t *testing.T) {
 	r.Header.Set(HeaderOrgID, "org-9")
 	if got := FromRequest(r).OrgID; got != "org-9" {
 		t.Errorf("OrgID = %q, want org-9 (configured entry %q must match case-insensitively)", got, strings.ToLower(HeaderOrgID))
+	}
+}
+
+// loadTrustedHeadersCapturingErrors sets PHOEBE_TRUSTED_HEADERS to value,
+// loads the registry with a logger whose ERROR output goes to a buffer, and
+// returns what was logged at ERROR. withTrustedHeadersEnv restores the
+// previous env and reloads the pinned set on cleanup.
+func loadTrustedHeadersCapturingErrors(t *testing.T, value string) string {
+	t.Helper()
+	withTrustedHeadersEnv(t, value, true)
+	var buf bytes.Buffer
+	log := logging.New(logging.INFO)
+	log.Error.SetOutput(&buf)
+	LoadTrustedHeaders(log)
+	return buf.String()
+}
+
+// TestLoadTrustedHeadersErrorsWhenServingModeMissing: a configured list that
+// omits X-Saturn-Serving-Mode is installed as written (the header is NOT
+// trusted, so a client cannot set its own serving mode) and an ERROR line at
+// load time names the header, the env var, and the 404 consequence.
+func TestLoadTrustedHeadersErrorsWhenServingModeMissing(t *testing.T) {
+	out := loadTrustedHeadersCapturingErrors(t, "X-Saturn-Gateway,X-Saturn-Org-Id")
+	if _, ok := ActiveTrustedHeaders()[HeaderServingMode]; ok {
+		t.Fatalf("active set trusts %s although the configured list omits it", HeaderServingMode)
+	}
+	for _, want := range []string{HeaderServingMode, TrustedHeadersEnv, "404"} {
+		if !strings.Contains(out, want) {
+			t.Fatalf("error log %q does not mention %q", out, want)
+		}
+	}
+	if strings.Contains(out, "omits "+HeaderGateway) {
+		t.Fatalf("error log %q flags %s although the list includes it", out, HeaderGateway)
+	}
+}
+
+// TestLoadTrustedHeadersErrorsWhenGatewayMissing: a configured list that
+// omits X-Saturn-Gateway logs an ERROR naming it.
+func TestLoadTrustedHeadersErrorsWhenGatewayMissing(t *testing.T) {
+	out := loadTrustedHeadersCapturingErrors(t, "X-Saturn-Serving-Mode,X-Saturn-Org-Id")
+	if !strings.Contains(out, "omits "+HeaderGateway) || !strings.Contains(out, "gateway requests will not be recognized") {
+		t.Fatalf("error log %q does not flag the missing %s", out, HeaderGateway)
+	}
+	if strings.Contains(out, "omits "+HeaderServingMode) {
+		t.Fatalf("error log %q flags %s although the list includes it", out, HeaderServingMode)
+	}
+}
+
+// TestLoadTrustedHeadersNoErrorWhenRequiredHeadersPresent: a configured list
+// containing every required header (in any case) logs nothing at ERROR.
+func TestLoadTrustedHeadersNoErrorWhenRequiredHeadersPresent(t *testing.T) {
+	out := loadTrustedHeadersCapturingErrors(t, "x-saturn-gateway, X-SATURN-SERVING-MODE, X-Saturn-Org-Id")
+	if out != "" {
+		t.Fatalf("unexpected error log for a list with every required header: %q", out)
 	}
 }

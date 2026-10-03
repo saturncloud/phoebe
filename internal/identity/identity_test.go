@@ -101,3 +101,33 @@ func TestFromRequestGatewayMarkerIsStrict(t *testing.T) {
 		}
 	}
 }
+
+// TestFromRequestServingMode pins ruling #19 (2026-10-01): Atlas stamps the
+// serving mode explicitly on every Token Factory route, dedicated included, so
+// FromRequest copies the header verbatim with no default. An absent header
+// stays empty and fails ValidServingMode; the proxy's route gate refuses it.
+func TestFromRequestServingMode(t *testing.T) {
+	cases := []struct {
+		header, want string
+		valid        bool
+	}{
+		{"", "", false},
+		{"dedicated", ServingModeDedicated, true},
+		{"shared", ServingModeShared, true},
+		{"Shared", "Shared", false},
+		{"bogus", "bogus", false},
+	}
+	for _, c := range cases {
+		r := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", nil)
+		if c.header != "" {
+			r.Header.Set(HeaderServingMode, c.header)
+		}
+		id := FromRequest(r)
+		if id.ServingMode != c.want {
+			t.Errorf("header %q: ServingMode = %q, want %q", c.header, id.ServingMode, c.want)
+		}
+		if ValidServingMode(id.ServingMode) != c.valid {
+			t.Errorf("header %q: ValidServingMode(%q) = %t, want %t", c.header, id.ServingMode, !c.valid, c.valid)
+		}
+	}
+}

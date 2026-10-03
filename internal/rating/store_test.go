@@ -2,10 +2,13 @@ package rating
 
 import (
 	"context"
+	"fmt"
 	"strings"
 	"testing"
 
 	"github.com/DATA-DOG/go-sqlmock"
+
+	"github.com/saturncloud/phoebe/internal/identity"
 )
 
 // TestPostgresStore_RateWindowSQL asserts the rate-and-sum flow: it projects the
@@ -43,8 +46,8 @@ func TestPostgresStore_RateWindowSQL(t *testing.T) {
 	// missing_usage_events is the TOTAL; expected + unexplained partition it
 	// (6 = 4 routine aborts/failures + 2 successes with no usage block), so the
 	// fixture cannot pass while the SQL's partition is wrong.
-	rows := sqlmock.NewRows([]string{"rollups_written", "events_rated", "total_cost", "reconciled_deletions", "unpriced_events", "unattributable_events", "missing_usage_events", "expected_missing_usage_events", "unexplained_missing_usage_events", "invalid_usage_events", "ambiguous_base_events", "ambiguous_org_events", "owner_conflict_events", "ambiguous_graph_rollups"}).
-		AddRow(2, 5, "0.001234500", 0, 3, 1, 6, 4, 2, 7, 4, 2, 3, 1)
+	rows := sqlmock.NewRows([]string{"rollups_written", "events_rated", "total_cost", "reconciled_deletions", "unpriced_events", "unattributable_events", "missing_usage_events", "expected_missing_usage_events", "unexplained_missing_usage_events", "invalid_usage_events", "ambiguous_base_events", "ambiguous_org_events", "owner_conflict_events", "ambiguous_graph_rollups", "invalid_serving_mode_events"}).
+		AddRow(2, 5, "0.001234500", 0, 3, 1, 6, 4, 2, 7, 4, 2, 3, 1, 5)
 	// The statement binds $3 = the ft: LIKE pattern (single-sourced from fineTunePrefix).
 	mock.ExpectQuery(`INSERT INTO rated_usage`).
 		WithArgs(start.UTC(), end.UTC(), ftLikePattern).
@@ -82,6 +85,9 @@ func TestPostgresStore_RateWindowSQL(t *testing.T) {
 	}
 	if res.AmbiguousGraphRollups != 1 {
 		t.Fatalf("ambiguous-graph rollups = %d, want 1 (must ride the same statement)", res.AmbiguousGraphRollups)
+	}
+	if res.InvalidServingModeEvents != 5 {
+		t.Fatalf("invalid-serving-mode events = %d, want 5 (must ride the same statement)", res.InvalidServingModeEvents)
 	}
 	if res.ReconciledDeletions != 0 {
 		t.Fatalf("reconciled deletions = %d, want 0 (the projected count must scan into the result)", res.ReconciledDeletions)
@@ -178,7 +184,7 @@ func TestRateWindowSQL_Shape(t *testing.T) {
 		// collapses into the same '' / '' owner bucket as genuine no-owner traffic.
 		// See TestIntegration_OwnerConflictDoesNotPoisonItsBucket.
 		"AND resource_id IS NOT NULL\n      -- OWNER CONFLICT is excluded PER EVENT",
-		"AND NOT owner_conflict\n    GROUP BY auth_id, owner_type, owner_id, resource_id, model_id, serving_mode,",
+		"AND NOT owner_conflict\n      -- INVALID SERVING MODE",
 		// session-TZ-independent hour bucket
 		"date_trunc('hour', ev_ts AT TIME ZONE 'UTC') AT TIME ZONE 'UTC'",
 		// deterministic natural-key surrogate id (re-runs regenerate the same id),
@@ -211,7 +217,19 @@ func TestRateWindowSQL_Shape(t *testing.T) {
 		// contiguous WHERE so the resource_id guard is anchored to THIS count clause — a
 		// bare "AND resource_id IS NOT NULL" would also match the grouped/priced filter and
 		// wouldn't catch the guard being dropped from the unpriced count.
-		"WHERE usage_found\n        AND valid_usage\n        AND prompt_price  IS NULL\n        AND auth_id     IS NOT NULL\n        AND resource_id IS NOT NULL\n        AND model_id    IS NOT NULL)",
+		"WHERE usage_found\n        AND valid_usage\n        AND valid_serving_mode\n        AND prompt_price  IS NULL\n        AND auth_id     IS NOT NULL\n        AND resource_id IS NOT NULL\n        AND model_id    IS NOT NULL)",
+		// SERVING MODE (2026-09-29 ruling): only 'shared'/'dedicated' reach money. The
+		// validity flag is computed once, the per-event drop sits in grouped's WHERE
+		// right before GROUP BY, the grain key is carried verbatim (no COALESCE to ''),
+		// and the withheld events are counted in their own exclusive bucket. The SQL
+		// literals are built from identity's constants — the ONE definition of the
+		// serving-mode vocabulary the proxy gate and the Go oracle also use — so a
+		// vocabulary change that misses the SQL fails here.
+		fmt.Sprintf("COALESCE(serving_mode IN ('%s', '%s'), false) AS valid_serving_mode", identity.ServingModeShared, identity.ServingModeDedicated),
+		fmt.Sprintf("CASE WHEN serving_mode = '%s' THEN '%s' || base_model ELSE base_model END", identity.ServingModeShared, sharedPrefix),
+		"      AND valid_serving_mode\n    GROUP BY auth_id, owner_type, owner_id, resource_id, model_id, serving_mode,",
+		"        ev.serving_mode,\n        ev.valid_serving_mode,",
+		"WHERE NOT valid_serving_mode\n        AND usage_found\n        AND valid_usage\n        AND auth_id     IS NOT NULL\n        AND resource_id IS NOT NULL\n        AND model_id    IS NOT NULL)                        AS invalid_serving_mode_events",
 		"AS unpriced_events",
 		"AND (auth_id IS NULL OR resource_id IS NULL OR model_id IS NULL)) AS unattributable_events",
 		// the SINGLE-RATE gate: a rollup whose base_model-priced rows span >1 base
@@ -250,6 +268,11 @@ func TestRateWindowSQL_Shape(t *testing.T) {
 		if strings.Contains(rateWindowSQL, gone) {
 			t.Errorf("rateWindowSQL still references removed price-table machinery: %q", gone)
 		}
+	}
+	// The pre-2026-09-29 rule that a missing serving mode means dedicated ('') must
+	// not come back: an event without a legal serving mode is withheld, not defaulted.
+	if strings.Contains(rateWindowSQL, "COALESCE(ev.serving_mode, '')") {
+		t.Error("rateWindowSQL defaults a missing serving mode to '' (the retired dedicated spelling)")
 	}
 	// The session-TZ-DEPENDENT bucket must be gone everywhere.
 	if strings.Contains(rateWindowSQL, "date_trunc('hour', ev_ts)") {

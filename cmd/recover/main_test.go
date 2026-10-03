@@ -13,7 +13,7 @@ import (
 )
 
 func TestRunDryRunAndApplyGuard(t *testing.T) {
-	ev := metering.Event{RequestID: "phoebe-recovery-test", TimestampUnixMs: 1}
+	ev := metering.Event{RequestID: "phoebe-recovery-test", ServingMode: "dedicated", TimestampUnixMs: 1}
 	data, _ := json.Marshal(ev)
 	path := filepath.Join(t.TempDir(), "evidence.jsonl")
 	if err := os.WriteFile(path, data, 0o600); err != nil {
@@ -86,8 +86,8 @@ func TestApplyRequiresDigestBindingCompleteEventSet(t *testing.T) {
 	}
 
 	reviewed := write(t,
-		metering.Event{RequestID: "req-a", OrgID: "org-1", PromptTokens: 10, TimestampUnixMs: 1},
-		metering.Event{RequestID: "req-b", OrgID: "org-1", PromptTokens: 20, TimestampUnixMs: 2},
+		metering.Event{RequestID: "req-a", ServingMode: "dedicated", OrgID: "org-1", PromptTokens: 10, TimestampUnixMs: 1},
+		metering.Event{RequestID: "req-b", ServingMode: "dedicated", OrgID: "org-1", PromptTokens: 20, TimestampUnixMs: 2},
 	)
 	reviewedDigest := digestOf(t, reviewed)
 
@@ -101,8 +101,8 @@ func TestApplyRequiresDigestBindingCompleteEventSet(t *testing.T) {
 
 	t.Run("same count different request ids is refused", func(t *testing.T) {
 		other := write(t,
-			metering.Event{RequestID: "req-c", OrgID: "org-1", PromptTokens: 10, TimestampUnixMs: 1},
-			metering.Event{RequestID: "req-d", OrgID: "org-1", PromptTokens: 20, TimestampUnixMs: 2},
+			metering.Event{RequestID: "req-c", ServingMode: "dedicated", OrgID: "org-1", PromptTokens: 10, TimestampUnixMs: 1},
+			metering.Event{RequestID: "req-d", ServingMode: "dedicated", OrgID: "org-1", PromptTokens: 20, TimestampUnixMs: 2},
 		)
 		if got := digestOf(t, other); got == reviewedDigest {
 			t.Fatal("different request ids must not share the reviewed digest")
@@ -120,8 +120,8 @@ func TestApplyRequiresDigestBindingCompleteEventSet(t *testing.T) {
 		// Identical ids and count; token counts and org differ. This is exactly
 		// what a request-id-only digest could not detect.
 		tampered := write(t,
-			metering.Event{RequestID: "req-a", OrgID: "org-2", PromptTokens: 9999, TimestampUnixMs: 1},
-			metering.Event{RequestID: "req-b", OrgID: "org-1", PromptTokens: 20, TimestampUnixMs: 2},
+			metering.Event{RequestID: "req-a", ServingMode: "dedicated", OrgID: "org-2", PromptTokens: 9999, TimestampUnixMs: 1},
+			metering.Event{RequestID: "req-b", ServingMode: "dedicated", OrgID: "org-1", PromptTokens: 20, TimestampUnixMs: 2},
 		)
 		if got := digestOf(t, tampered); got == reviewedDigest {
 			t.Fatal("altered token counts/org must not share the reviewed digest")
@@ -137,8 +137,8 @@ func TestApplyRequiresDigestBindingCompleteEventSet(t *testing.T) {
 
 	t.Run("digest is stable across input record order", func(t *testing.T) {
 		reordered := write(t,
-			metering.Event{RequestID: "req-b", OrgID: "org-1", PromptTokens: 20, TimestampUnixMs: 2},
-			metering.Event{RequestID: "req-a", OrgID: "org-1", PromptTokens: 10, TimestampUnixMs: 1},
+			metering.Event{RequestID: "req-b", ServingMode: "dedicated", OrgID: "org-1", PromptTokens: 20, TimestampUnixMs: 2},
+			metering.Event{RequestID: "req-a", ServingMode: "dedicated", OrgID: "org-1", PromptTokens: 10, TimestampUnixMs: 1},
 		)
 		if got := digestOf(t, reordered); got != reviewedDigest {
 			t.Fatalf("digest = %s, want %s — ordering must not change the binding", got, reviewedDigest)

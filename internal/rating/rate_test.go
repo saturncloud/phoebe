@@ -23,47 +23,47 @@ func TestRate(t *testing.T) {
 		{
 			name: "cached-subset-no-double-count",
 			rule: "billable_prompt=(prompt-cached) at prompt rate + cached at cached rate; cached charged ONCE",
-			ev:   RatedEvent{PromptTokens: 100, CachedTokens: 30, CompletionTokens: 0},
+			ev:   RatedEvent{ServingMode: "dedicated", PromptTokens: 100, CachedTokens: 30, CompletionTokens: 0},
 			// (100-30)*0.000003 + 30*0.0000003 = 0.000210 + 0.000009 = 0.000219
 			want: "0.000219000",
 		},
 		{
 			name: "cached-subset-with-completion",
 			rule: "all three token classes summed with their own rates",
-			ev:   RatedEvent{PromptTokens: 100, CachedTokens: 30, CompletionTokens: 50},
+			ev:   RatedEvent{ServingMode: "dedicated", PromptTokens: 100, CachedTokens: 30, CompletionTokens: 50},
 			// 0.000219 + 50*0.00001 = 0.000219 + 0.0005 = 0.000719
 			want: "0.000719000",
 		},
 		{
 			name: "no-cache-hits-all-prompt-at-prompt-rate",
 			rule: "cached=0 → entire prompt billed at prompt rate, none at cached",
-			ev:   RatedEvent{PromptTokens: 100, CachedTokens: 0, CompletionTokens: 0},
+			ev:   RatedEvent{ServingMode: "dedicated", PromptTokens: 100, CachedTokens: 0, CompletionTokens: 0},
 			// 100*0.000003 = 0.0003
 			want: "0.000300000",
 		},
 		{
 			name: "all-prompt-cached",
 			rule: "cached==prompt → billable_prompt=0, whole prompt at cached rate",
-			ev:   RatedEvent{PromptTokens: 100, CachedTokens: 100, CompletionTokens: 0},
+			ev:   RatedEvent{ServingMode: "dedicated", PromptTokens: 100, CachedTokens: 100, CompletionTokens: 0},
 			// 0 + 100*0.0000003 = 0.00003
 			want: "0.000030000",
 		},
 		{
 			name: "zero-token",
 			rule: "zero tokens → zero cost (legitimate; the model HAD a price)",
-			ev:   RatedEvent{PromptTokens: 0, CachedTokens: 0, CompletionTokens: 0},
+			ev:   RatedEvent{ServingMode: "dedicated", PromptTokens: 0, CachedTokens: 0, CompletionTokens: 0},
 			want: "0.000000000",
 		},
 		{
 			name: "aborted-event-rated-normally",
 			rule: "aborted streams served real tokens; rate them — do NOT zero-rate on abort",
-			ev:   RatedEvent{PromptTokens: 100, CachedTokens: 30, CompletionTokens: 50, Aborted: true},
+			ev:   RatedEvent{ServingMode: "dedicated", PromptTokens: 100, CachedTokens: 30, CompletionTokens: 50, Aborted: true},
 			want: "0.000719000", // identical to cached-subset-with-completion
 		},
 		{
 			name: "malformed-cached-gt-prompt-clamps-no-credit",
 			rule: "cached>prompt (malformed) clamps billable_prompt to 0; never credit phantom tokens",
-			ev:   RatedEvent{PromptTokens: 10, CachedTokens: 40, CompletionTokens: 0},
+			ev:   RatedEvent{ServingMode: "dedicated", PromptTokens: 10, CachedTokens: 40, CompletionTokens: 0},
 			// billable_prompt clamped 0; charge reported cached at cached rate: 40*0.0000003 = 0.000012
 			want: "0.000012000",
 		},
@@ -86,7 +86,7 @@ func TestRate_NumericExactnessNoFloat(t *testing.T) {
 	// $0.15 / 1,000,000 tokens = 0.000000150 USD/token. In float64 this is not
 	// exactly representable; in NUMERIC/big.Rat it is exact.
 	r := rate3("0.00000015", "0", "0.0000006") // gpt-4o-mini-ish prompt/cached/completion
-	got := Rate(RatedEvent{PromptTokens: 1_000_000, CompletionTokens: 1_000_000}, r).String()
+	got := Rate(RatedEvent{ServingMode: "dedicated", PromptTokens: 1_000_000, CompletionTokens: 1_000_000}, r).String()
 	// 1e6 * 0.00000015 + 1e6 * 0.0000006 = 0.15 + 0.60 = 0.75 exactly.
 	if got != "0.750000000" {
 		t.Fatalf("cost = %s, want 0.750000000 (exact NUMERIC, no float drift)", got)
