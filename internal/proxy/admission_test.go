@@ -988,9 +988,9 @@ func rateLimitsEqual(a, b admission.RateLimits) bool {
 // unlimited, explicit "0" parses as a zero cap (an all-zeros envelope is a
 // forged zero-quota envelope, blocked fail-closed by admission, never
 // unlimited). R7: the completeness gate covers the IDENTITY anchor only —
-// X-Saturn-Owner-Id for the scoped envelope, the legacy service-tier marker
-// for the legacy envelope; limit headers without their anchor, a malformed
-// present value, and an absent policy all fail closed.
+// X-Saturn-Owner-Id; limit headers without that anchor, a malformed present
+// value, and an absent policy all fail closed. R8: there is no legacy
+// envelope (see TestLegacyOnlyQuotaHeadersFailClosed).
 func TestTrustedRateLimitPolicyParsing(t *testing.T) {
 	// R7 structural pins — fail closed.
 	for _, tc := range []struct {
@@ -1008,17 +1008,6 @@ func TestTrustedRateLimitPolicyParsing(t *testing.T) {
 				OrgRateLimitUncachedPromptTokens: "100", OrgRateLimitGeneratedTokens: "20",
 				OwnerRateLimitRequests: "5", OwnerRateLimitTotalPromptTokens: "100",
 				OwnerRateLimitUncachedPromptTokens: "100", OwnerRateLimitGeneratedTokens: "20"},
-		},
-		{
-			name: "legacy rates without tier",
-			id: identity.Identity{Gateway: true,
-				LegacyRateLimitRequests: "7", LegacyRateLimitTotalPromptTokens: "100",
-				LegacyRateLimitUncachedPromptTokens: "25", LegacyRateLimitGeneratedTokens: "50"},
-		},
-		{
-			name: "legacy tier plus scoped headers without owner id",
-			id: identity.Identity{Gateway: true, LegacyServiceTier: "default",
-				OrgRateLimitRequests: "5"},
 		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
@@ -1061,44 +1050,7 @@ func TestTrustedRateLimitPolicyParsing(t *testing.T) {
 		t.Fatalf("all-zeros envelope must parse as zero-quota: org=%+v owner=%+v, %v", organization, owner, err)
 	}
 
-	// Legacy envelope: tier anchor + per-field headers. A partial legacy
-	// envelope (Atlas omits unset legacy headers too) admits with the absent
-	// fields unlimited.
-	legacyOrg, legacyOwner, err := parseTrustedRateLimits(identity.Identity{
-		Gateway: true, LegacyServiceTier: "default", LegacyRateLimitRequests: "7",
-		LegacyRateLimitTotalPromptTokens: "100", LegacyRateLimitUncachedPromptTokens: "25",
-		LegacyRateLimitGeneratedTokens: "50",
-	})
-	if err != nil ||
-		!rateLimitsEqual(legacyOrg, admission.RateLimits{Requests: ptr64(7), TotalPromptTokens: ptr64(100), UncachedPromptTokens: ptr64(25), GeneratedTokens: ptr64(50)}) ||
-		!rateLimitsEqual(legacyOwner, admission.RateLimits{}) {
-		t.Fatalf("legacy gateway policy = org=%+v owner=%+v, %v", legacyOrg, legacyOwner, err)
-	}
-	legacyOrg, legacyOwner, err = parseTrustedRateLimits(identity.Identity{
-		Gateway: true, LegacyServiceTier: "default", LegacyRateLimitRequests: "7",
-		LegacyRateLimitTotalPromptTokens: "100", LegacyRateLimitUncachedPromptTokens: "25",
-	})
-	if err != nil ||
-		!rateLimitsEqual(legacyOrg, admission.RateLimits{Requests: ptr64(7), TotalPromptTokens: ptr64(100), UncachedPromptTokens: ptr64(25)}) ||
-		!rateLimitsEqual(legacyOwner, admission.RateLimits{}) {
-		t.Fatalf("partial legacy envelope = org=%+v owner=%+v, %v; absent generated header must be nil (unlimited)", legacyOrg, legacyOwner, err)
-	}
-
-	// A legacy envelope arriving alongside a present owner-id anchor is
-	// superseded: the new anchor wins (as it did when both were complete), so
-	// absent scoped headers parse as unlimited rather than falling back.
-	organization, owner, err = parseTrustedRateLimits(identity.Identity{
-		Gateway: true, OwnerID: "owner-1", LegacyServiceTier: "default",
-		LegacyRateLimitRequests: "0", LegacyRateLimitTotalPromptTokens: "0",
-		LegacyRateLimitUncachedPromptTokens: "0", LegacyRateLimitGeneratedTokens: "0",
-	})
-	if err != nil || !rateLimitsEqual(organization, admission.RateLimits{}) || !rateLimitsEqual(owner, admission.RateLimits{}) {
-		t.Fatalf("owner anchor with legacy envelope alongside = org=%+v owner=%+v, %v; the new anchor must win with absent scoped headers unlimited",
-			organization, owner, err)
-	}
-
-	// Malformed PRESENT values fail closed in both envelope families (R7's
-	// malformed clause); the per-field rule governs absence, not garbage.
+	// Malformed PRESENT values fail closed (R7's malformed clause); the per-field rule governs absence, not garbage.
 	for _, tc := range []struct {
 		name string
 		id   identity.Identity
@@ -1113,114 +1065,12 @@ func TestTrustedRateLimitPolicyParsing(t *testing.T) {
 			id: identity.Identity{Gateway: true, OwnerID: "owner-1",
 				OrgRateLimitRequests: "-1"},
 		},
-		{
-			name: "non-numeric legacy header",
-			id: identity.Identity{Gateway: true, LegacyServiceTier: "default",
-				LegacyRateLimitRequests: "not-a-number"},
-		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			if _, _, err := parseTrustedRateLimits(tc.id); err == nil {
 				t.Fatal("malformed present limit value was accepted")
 			}
 		})
-	}
-}
-
-// A complete legacy envelope is a limits fallback only: the service-tier value
-// is an envelope-version marker and must NOT self-select an admission lane on
-// new phoebe — lanes come from operator config (OrganizationLanes). A legacy
-// "gold" tier with no operator mapping stays on the default lane's Dynamo
-// hints, while its rate limits still bind the organization contract.
-func TestLegacyServiceTierNeverSelectsLane(t *testing.T) {
-	seen := make(chan *http.Request, 1)
-	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		seen <- r.Clone(r.Context())
-		_, _ = w.Write([]byte(`{"model":"model-a","usage":{"prompt_tokens":1,"completion_tokens":3}}`))
-	}))
-	defer backend.Close()
-	up, _ := url.Parse(backend.URL)
-	mr := miniredis.RunT(t)
-	cfg := proxyAdmissionConfig(2)
-	cfg.Lanes = map[string]config.AdmissionLane{
-		"default": {Weight: 1},
-		"gold":    {Weight: 1, DynamoPriority: 11, DynamoStrictPriority: 4},
-	}
-	// Deliberately NO OrganizationLanes mapping: nothing may select gold.
-	c := redis.NewClient(&redis.Options{Addr: mr.Addr()})
-	t.Cleanup(func() { _ = c.Close() })
-	a := admission.New(c, cfg)
-	s := New(&config.Settings{Admission: cfg}, logging.New(logging.ERROR), &recordingEmitter{}).WithAdmitter(a)
-
-	// The legacy limits still bind: the engine-reported 3 generated tokens
-	// were charged to org-a's contract window (limit 20), so a probe reserving
-	// 18 more is rejected. Had the legacy envelope been ignored, the window
-	// would be empty and the probe would admit.
-	//
-	// That window is a fixed 1-minute bucket (floor(now/60000)): a minute
-	// tick between the metered request's charge and the rejection probe
-	// empties the bucket and would spuriously ADMIT the probe. Capture the
-	// bucket around the request+probe section and, on roll, re-charge and
-	// retry the section once.
-	for attempt := 0; ; attempt++ {
-		bucketBefore := fixedWindowBucket()
-
-		req := sharedRequest(up)
-		// OwnerID belongs to the NEW envelope; a legacy-only request must not
-		// carry it, or the partial-new check fails before the legacy fallback.
-		req.Header.Del(identity.HeaderOwnerID)
-		for _, header := range []string{
-			identity.HeaderOrgRateLimitRequests,
-			identity.HeaderOrgRateLimitTotalPromptTokens,
-			identity.HeaderOrgRateLimitUncachedPromptTokens,
-			identity.HeaderOrgRateLimitGeneratedTokens,
-			identity.HeaderOwnerRateLimitRequests,
-			identity.HeaderOwnerRateLimitTotalPromptTokens,
-			identity.HeaderOwnerRateLimitUncachedPromptTokens,
-			identity.HeaderOwnerRateLimitGeneratedTokens,
-		} {
-			req.Header.Del(header)
-		}
-		req.Header.Set(identity.HeaderLegacyServiceTier, "gold")
-		req.Header.Set(identity.HeaderLegacyRateLimitRequests, "100")
-		req.Header.Set(identity.HeaderLegacyRateLimitTotalPromptTokens, "1000")
-		req.Header.Set(identity.HeaderLegacyRateLimitUncachedPromptTokens, "1000")
-		req.Header.Set(identity.HeaderLegacyRateLimitGeneratedTokens, "20")
-		rr := httptest.NewRecorder()
-		s.Handler().ServeHTTP(rr, req)
-		if rr.Code != http.StatusOK {
-			t.Fatalf("status=%d, want 200 for a complete legacy envelope", rr.Code)
-		}
-		forwarded := <-seen
-		if got := forwarded.Header.Get("X-Dynamo-Request-Priority"); got != "0" {
-			t.Fatalf("forwarded priority header=%q, want the default lane's 0 — the legacy tier must not self-select the gold lane (11)", got)
-		}
-		if got := forwarded.Header.Get("X-Dynamo-Request-Strict-Priority"); got != "0" {
-			t.Fatalf("forwarded strict-priority header=%q, want the default lane's 0", got)
-		}
-
-		_, err := a.Admit(context.Background(), admission.Request{
-			Graph: "graph", Organization: "org-a", Owner: "other-owner", Model: "m",
-			PromptBytes: 1, EstimatedInputTokens: 1, ReservedOutputTokens: 18,
-			OrganizationLimits: admission.RateLimits{GeneratedTokens: ptr64(20)},
-		})
-		var rejected *admission.Rejected
-		rejectedOK := errors.As(err, &rejected) && rejected.Scope == "contract_organization" && rejected.Dimension == "generated_tokens"
-		if bucketBefore != fixedWindowBucket() {
-			// The window ticked between charge and probe: the probe's admit
-			// landed in the fresh bucket and charged it. Flush the store back
-			// to the exact post-rollover empty-window state, then re-charge
-			// and retry once.
-			if attempt == 0 {
-				mr.FlushAll()
-				continue
-			}
-			t.Skip("fixed 1-minute admission window rolled twice during the test; the probe cannot be made deterministic — retry")
-		}
-		if !rejectedOK {
-			t.Fatalf("err=%v, want contract_organization generated_tokens rejection from the legacy limit", err)
-		}
-		break
 	}
 }
 
@@ -1267,28 +1117,6 @@ func TestTrustedRateLimitPolicyWithoutIdentityAnchorFailsClosed(t *testing.T) {
 				req.Header.Del(identity.HeaderOwnerID)
 			},
 		},
-		{
-			name: "legacy rates without tier",
-			mutate: func(req *http.Request) {
-				req.Header.Del(identity.HeaderOwnerID)
-				for _, header := range []string{
-					identity.HeaderOrgRateLimitRequests,
-					identity.HeaderOrgRateLimitTotalPromptTokens,
-					identity.HeaderOrgRateLimitUncachedPromptTokens,
-					identity.HeaderOrgRateLimitGeneratedTokens,
-					identity.HeaderOwnerRateLimitRequests,
-					identity.HeaderOwnerRateLimitTotalPromptTokens,
-					identity.HeaderOwnerRateLimitUncachedPromptTokens,
-					identity.HeaderOwnerRateLimitGeneratedTokens,
-				} {
-					req.Header.Del(header)
-				}
-				req.Header.Set(identity.HeaderLegacyRateLimitRequests, "7")
-				req.Header.Set(identity.HeaderLegacyRateLimitTotalPromptTokens, "100")
-				req.Header.Set(identity.HeaderLegacyRateLimitUncachedPromptTokens, "25")
-				req.Header.Set(identity.HeaderLegacyRateLimitGeneratedTokens, "50")
-			},
-		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			req := sharedRequest(up)
@@ -1299,6 +1127,62 @@ func TestTrustedRateLimitPolicyWithoutIdentityAnchorFailsClosed(t *testing.T) {
 				t.Fatalf("status=%d, want 503", rr.Code)
 			}
 		})
+	}
+}
+
+// R8 hard cut, end to end: the five legacy single-scope quota headers
+// (X-Saturn-Service-Tier and X-Saturn-Rate-Limit-*) are no longer an
+// envelope. A shared request under enabled admission that carries ONLY those
+// five, with no X-Saturn-Owner-Id and no scoped header, has no trusted policy
+// and fails closed (503) before reaching the upstream — the legacy values
+// neither admit it nor bind any limit. The header names are spelled out
+// literally because phoebe no longer defines constants for them.
+func TestLegacyOnlyQuotaHeadersFailClosed(t *testing.T) {
+	var hits int
+	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		hits++
+		_, _ = w.Write([]byte(`{"model":"model-a","usage":{"prompt_tokens":1,"completion_tokens":1}}`))
+	}))
+	defer backend.Close()
+	up, _ := url.Parse(backend.URL)
+	cfg := proxyAdmissionConfig(1)
+	mr := miniredis.RunT(t)
+	c := redis.NewClient(&redis.Options{Addr: mr.Addr()})
+	t.Cleanup(func() { _ = c.Close() })
+	s := New(&config.Settings{Admission: cfg}, logging.New(logging.ERROR), &recordingEmitter{}).WithAdmitter(admission.New(c, cfg))
+
+	req := sharedRequest(up)
+	req.Header.Del(identity.HeaderOwnerID)
+	for _, header := range []string{
+		identity.HeaderOrgRateLimitRequests,
+		identity.HeaderOrgRateLimitTotalPromptTokens,
+		identity.HeaderOrgRateLimitUncachedPromptTokens,
+		identity.HeaderOrgRateLimitGeneratedTokens,
+		identity.HeaderOwnerRateLimitRequests,
+		identity.HeaderOwnerRateLimitTotalPromptTokens,
+		identity.HeaderOwnerRateLimitUncachedPromptTokens,
+		identity.HeaderOwnerRateLimitGeneratedTokens,
+	} {
+		req.Header.Del(header)
+	}
+	req.Header.Set("X-Saturn-Service-Tier", "default")
+	req.Header.Set("X-Saturn-Rate-Limit-Requests", "1000000")
+	req.Header.Set("X-Saturn-Rate-Limit-Total-Prompt-Tokens", "1000000")
+	req.Header.Set("X-Saturn-Rate-Limit-Uncached-Prompt-Tokens", "1000000")
+	req.Header.Set("X-Saturn-Rate-Limit-Generated-Tokens", "1000000")
+
+	rr := httptest.NewRecorder()
+	s.Handler().ServeHTTP(rr, req)
+	if rr.Code != http.StatusServiceUnavailable {
+		t.Fatalf("status=%d, want 503 — legacy-only quota headers must not satisfy the policy gate", rr.Code)
+	}
+	if hits != 0 {
+		t.Fatalf("legacy-only request reached upstream %d times, want 0", hits)
+	}
+	// The parser must also see no policy at all: the legacy values are not
+	// part of the identity it reads.
+	if _, _, err := parseTrustedRateLimits(identity.FromRequest(req)); err == nil {
+		t.Fatal("parseTrustedRateLimits accepted a request carrying only the legacy headers")
 	}
 }
 
@@ -1348,18 +1232,6 @@ func TestPartialRateLimitHeadersAdmitAsUnlimited(t *testing.T) {
 				req.Header.Set(identity.HeaderOrgRateLimitRequests, "1000000")
 				req.Header.Set(identity.HeaderOrgRateLimitGeneratedTokens, "1000000")
 				req.Header.Set(identity.HeaderOwnerRateLimitRequests, "1000000")
-			},
-		},
-		{
-			name: "legacy tier with partial legacy rates",
-			mutate: func(req *http.Request) {
-				req.Header.Del(identity.HeaderOwnerID)
-				for _, header := range scopedHeaders {
-					req.Header.Del(header)
-				}
-				req.Header.Set(identity.HeaderLegacyServiceTier, "default")
-				req.Header.Set(identity.HeaderLegacyRateLimitRequests, "7")
-				req.Header.Set(identity.HeaderLegacyRateLimitTotalPromptTokens, "100")
 			},
 		},
 	} {

@@ -53,10 +53,10 @@ identity or ceilings are overwritten before Phoebe. Phoebe enforces the
 organization contract at an aggregate organization scope and the owner contract
 at a stable user/group-owner scope. API-key rotation cannot reset an owner budget,
 and another owner cannot bypass the aggregate organization budget.
-Zero means no contractual ceiling within that scope, while independent operator
-capacity limits still apply. Saturn must stamp every field; a missing field is a
-broken trusted contract and fails closed, while the explicit string `0`
-represents unlimited.
+An absent limit header means no contractual ceiling for that field (R4), while
+independent operator capacity limits still apply. An explicit `0` is a zero
+ceiling that blocks the scope. The owner id is the required anchor: limit
+headers without it, or a malformed value, fail closed.
 An exhausted contract returns 429 with Retry-After, and physical pool
 saturation returns 503. Admission-store unavailability bypasses only these
 soft limits and is logged; it does not bypass trusted-policy validation.
@@ -117,16 +117,28 @@ downstream JSON stack cannot select different values and under-reserve work.
 
 ## Rollout and rollback
 
-Component deployment order is independent while admission remains disabled.
-Saturn emits both the new independent
-eleven-header envelope and a conservative five-header legacy projection. Traefik
-allowlists both during the rolling upgrade. New Phoebe prefers the complete new
-envelope, rejects a partial one, and accepts the complete legacy envelope only
-when every new field is absent. While admission is disabled, Phoebe does not
-require a policy envelope, allowing Saturn's producer headers to roll out after
-the proxy. Once admission is enabled, missing or partial policy fails closed.
-The legacy service-tier marker is constant and never selects an admission lane. Remove the five compatibility headers after all
-Saturn, Traefik, and Phoebe replicas use the new contract.
+The quota envelope is the scoped contract only: `X-Saturn-Owner-Id` plus
+the four `X-Saturn-Org-Rate-Limit-*` and four `X-Saturn-Owner-Rate-Limit-*`
+headers, stamped by the gateway ForwardAuth. The owner id is the required
+anchor; each absent limit header means unlimited for that field (R4).
+
+The five legacy single-scope quota headers (`X-Saturn-Service-Tier`,
+`X-Saturn-Rate-Limit-Requests`, `X-Saturn-Rate-Limit-Total-Prompt-Tokens`,
+`X-Saturn-Rate-Limit-Uncached-Prompt-Tokens`,
+`X-Saturn-Rate-Limit-Generated-Tokens`) were removed in one cutover release
+(ruling R8, a hard cut). In that release Saturn stops stamping them, Traefik
+stops allowlisting them, the phoebe chart drops them from `trustedHeaders`
+(so they leave the trust set and the strip middleware together), and Phoebe
+stops reading them. There is no dual-contract window after the cutover and no
+fallback: a request that carries only the legacy headers and no
+`X-Saturn-Owner-Id` has no policy and, with admission enabled, fails closed
+with 503. The four components of that release can roll in any order, because
+the scoped envelope was already stamped on every route where admission runs
+before the cutover, and every Phoebe that still read the legacy headers
+preferred the scoped envelope whenever the owner id was present.
+
+While admission is disabled, Phoebe does not require a policy envelope. Once
+admission is enabled, a missing or structurally broken policy fails closed.
 
 Keep `admission.enabled: false` until Saturn, Traefik, and all Phoebe replicas
 have the new envelope contract; enabling earlier is unsupported because an old

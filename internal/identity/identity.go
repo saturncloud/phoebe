@@ -145,14 +145,6 @@ const (
 	HeaderOwnerRateLimitTotalPromptTokens    = "X-Saturn-Owner-Rate-Limit-Total-Prompt-Tokens"
 	HeaderOwnerRateLimitUncachedPromptTokens = "X-Saturn-Owner-Rate-Limit-Uncached-Prompt-Tokens"
 	HeaderOwnerRateLimitGeneratedTokens      = "X-Saturn-Owner-Rate-Limit-Generated-Tokens"
-	// LegacyPolicy headers are accepted only as a complete fallback during the
-	// rolling upgrade to independent organization and owner contracts. The
-	// service-tier value is an envelope-version marker; it never selects a lane.
-	HeaderLegacyServiceTier                   = "X-Saturn-Service-Tier"
-	HeaderLegacyRateLimitRequests             = "X-Saturn-Rate-Limit-Requests"
-	HeaderLegacyRateLimitTotalPromptTokens    = "X-Saturn-Rate-Limit-Total-Prompt-Tokens"
-	HeaderLegacyRateLimitUncachedPromptTokens = "X-Saturn-Rate-Limit-Uncached-Prompt-Tokens"
-	HeaderLegacyRateLimitGeneratedTokens      = "X-Saturn-Rate-Limit-Generated-Tokens"
 
 	// HeaderUpstream carries the EXACT backend the request must be forwarded to —
 	// `host:port` (e.g. pd-abcde-mymodel-r123.main-namespace.svc.cluster.local:8000).
@@ -225,58 +217,48 @@ type Identity struct {
 	// upstream host the gateway just composed from this same name. Empty on
 	// header-routed requests (the proxy derives the graph from the upstream
 	// host instead).
-	GraphK8sName                        string
-	OwnerID                             string
-	OrgRateLimitRequests                string
-	OrgRateLimitTotalPromptTokens       string
-	OrgRateLimitUncachedPromptTokens    string
-	OrgRateLimitGeneratedTokens         string
-	OwnerRateLimitRequests              string
-	OwnerRateLimitTotalPromptTokens     string
-	OwnerRateLimitUncachedPromptTokens  string
-	OwnerRateLimitGeneratedTokens       string
-	LegacyServiceTier                   string
-	LegacyRateLimitRequests             string
-	LegacyRateLimitTotalPromptTokens    string
-	LegacyRateLimitUncachedPromptTokens string
-	LegacyRateLimitGeneratedTokens      string
+	GraphK8sName                       string
+	OwnerID                            string
+	OrgRateLimitRequests               string
+	OrgRateLimitTotalPromptTokens      string
+	OrgRateLimitUncachedPromptTokens   string
+	OrgRateLimitGeneratedTokens        string
+	OwnerRateLimitRequests             string
+	OwnerRateLimitTotalPromptTokens    string
+	OwnerRateLimitUncachedPromptTokens string
+	OwnerRateLimitGeneratedTokens      string
 }
 
 // FromRequest extracts the trusted identity headers. It performs no
 // validation beyond reading the values; authorization happened at the edge.
 //
 // The R3 envelope reads (gateway mark, org, owner, serving mode, served
-// model, and every rate-limit policy header — the pinned 18) resolve through
+// model, and every rate-limit policy header — the pinned 13) resolve through
 // the trusted-header registry: a header outside the active set is treated
 // as ABSENT, never read for a trust decision. The remaining identity headers
 // are read directly (ratified edge contract, outside the R3 gate).
 func FromRequest(r *http.Request) Identity {
 	return Identity{
-		AuthID:                              r.Header.Get(HeaderAuthID),
-		UserID:                              r.Header.Get(HeaderUserID),
-		GroupID:                             r.Header.Get(HeaderGroupID),
-		ResourceID:                          r.Header.Get(HeaderResourceID),
-		ResourceType:                        r.Header.Get(HeaderResourceType),
-		OrgID:                               trustedHeaderValue(r, HeaderOrgID),
-		BaseModel:                           r.Header.Get(HeaderBaseModel),
-		Adapter:                             r.Header.Get(HeaderAdapter),
-		ServingMode:                         trustedHeaderValue(r, HeaderServingMode),
-		ServedModel:                         trustedHeaderValue(r, HeaderServedModel),
-		Upstream:                            r.Header.Get(HeaderUpstream),
-		Gateway:                             trustedHeaderValue(r, HeaderGateway) == "true",
-		OwnerID:                             trustedHeaderValue(r, HeaderOwnerID),
-		OrgRateLimitRequests:                trustedHeaderValue(r, HeaderOrgRateLimitRequests),
-		OrgRateLimitTotalPromptTokens:       trustedHeaderValue(r, HeaderOrgRateLimitTotalPromptTokens),
-		OrgRateLimitUncachedPromptTokens:    trustedHeaderValue(r, HeaderOrgRateLimitUncachedPromptTokens),
-		OrgRateLimitGeneratedTokens:         trustedHeaderValue(r, HeaderOrgRateLimitGeneratedTokens),
-		OwnerRateLimitRequests:              trustedHeaderValue(r, HeaderOwnerRateLimitRequests),
-		OwnerRateLimitTotalPromptTokens:     trustedHeaderValue(r, HeaderOwnerRateLimitTotalPromptTokens),
-		OwnerRateLimitUncachedPromptTokens:  trustedHeaderValue(r, HeaderOwnerRateLimitUncachedPromptTokens),
-		OwnerRateLimitGeneratedTokens:       trustedHeaderValue(r, HeaderOwnerRateLimitGeneratedTokens),
-		LegacyServiceTier:                   trustedHeaderValue(r, HeaderLegacyServiceTier),
-		LegacyRateLimitRequests:             trustedHeaderValue(r, HeaderLegacyRateLimitRequests),
-		LegacyRateLimitTotalPromptTokens:    trustedHeaderValue(r, HeaderLegacyRateLimitTotalPromptTokens),
-		LegacyRateLimitUncachedPromptTokens: trustedHeaderValue(r, HeaderLegacyRateLimitUncachedPromptTokens),
-		LegacyRateLimitGeneratedTokens:      trustedHeaderValue(r, HeaderLegacyRateLimitGeneratedTokens),
+		AuthID:                             r.Header.Get(HeaderAuthID),
+		UserID:                             r.Header.Get(HeaderUserID),
+		GroupID:                            r.Header.Get(HeaderGroupID),
+		ResourceID:                         r.Header.Get(HeaderResourceID),
+		ResourceType:                       r.Header.Get(HeaderResourceType),
+		OrgID:                              trustedHeaderValue(r, HeaderOrgID),
+		BaseModel:                          r.Header.Get(HeaderBaseModel),
+		Adapter:                            r.Header.Get(HeaderAdapter),
+		ServingMode:                        trustedHeaderValue(r, HeaderServingMode),
+		ServedModel:                        trustedHeaderValue(r, HeaderServedModel),
+		Upstream:                           r.Header.Get(HeaderUpstream),
+		Gateway:                            trustedHeaderValue(r, HeaderGateway) == "true",
+		OwnerID:                            trustedHeaderValue(r, HeaderOwnerID),
+		OrgRateLimitRequests:               trustedHeaderValue(r, HeaderOrgRateLimitRequests),
+		OrgRateLimitTotalPromptTokens:      trustedHeaderValue(r, HeaderOrgRateLimitTotalPromptTokens),
+		OrgRateLimitUncachedPromptTokens:   trustedHeaderValue(r, HeaderOrgRateLimitUncachedPromptTokens),
+		OrgRateLimitGeneratedTokens:        trustedHeaderValue(r, HeaderOrgRateLimitGeneratedTokens),
+		OwnerRateLimitRequests:             trustedHeaderValue(r, HeaderOwnerRateLimitRequests),
+		OwnerRateLimitTotalPromptTokens:    trustedHeaderValue(r, HeaderOwnerRateLimitTotalPromptTokens),
+		OwnerRateLimitUncachedPromptTokens: trustedHeaderValue(r, HeaderOwnerRateLimitUncachedPromptTokens),
+		OwnerRateLimitGeneratedTokens:      trustedHeaderValue(r, HeaderOwnerRateLimitGeneratedTokens),
 	}
 }

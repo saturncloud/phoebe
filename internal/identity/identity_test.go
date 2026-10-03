@@ -26,11 +26,6 @@ func TestFromRequestCapturesAllHeaders(t *testing.T) {
 	r.Header.Set(HeaderOwnerRateLimitTotalPromptTokens, "160000")
 	r.Header.Set(HeaderOwnerRateLimitUncachedPromptTokens, "40000")
 	r.Header.Set(HeaderOwnerRateLimitGeneratedTokens, "20000")
-	r.Header.Set(HeaderLegacyServiceTier, "default")
-	r.Header.Set(HeaderLegacyRateLimitRequests, "70")
-	r.Header.Set(HeaderLegacyRateLimitTotalPromptTokens, "160000")
-	r.Header.Set(HeaderLegacyRateLimitUncachedPromptTokens, "40000")
-	r.Header.Set(HeaderLegacyRateLimitGeneratedTokens, "20000")
 
 	id := FromRequest(r)
 
@@ -64,10 +59,7 @@ func TestFromRequestCapturesAllHeaders(t *testing.T) {
 		id.OrgRateLimitGeneratedTokens != "200000" ||
 		id.OwnerRateLimitRequests != "70" || id.OwnerRateLimitTotalPromptTokens != "160000" ||
 		id.OwnerRateLimitUncachedPromptTokens != "40000" ||
-		id.OwnerRateLimitGeneratedTokens != "20000" || id.LegacyServiceTier != "default" ||
-		id.LegacyRateLimitRequests != "70" || id.LegacyRateLimitTotalPromptTokens != "160000" ||
-		id.LegacyRateLimitUncachedPromptTokens != "40000" ||
-		id.LegacyRateLimitGeneratedTokens != "20000" {
+		id.OwnerRateLimitGeneratedTokens != "20000" {
 		t.Errorf("rate-limit identity fields = %+v", id)
 	}
 	if id.Upstream != "pd-x.main-namespace.svc.cluster.local:8000" {
