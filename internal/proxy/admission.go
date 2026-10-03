@@ -128,30 +128,36 @@ func admissionLaneForIdentity(settings config.AdmissionSettings, id identity.Ide
 }
 
 // sharedRequestBodyLimit returns the tightest individual body size that could
-// possibly fit every applicable aggregate prompt-byte scope. Even when every
-// scope is configured as unlimited, retain a process-safety ceiling so an
+// possibly fit every applicable aggregate prompt-byte scope. R4 sentinel
+// semantics: a nil (unset) dimension is unlimited and does not tighten the
+// bound; neither does an explicit zero cap — no body can fit a zero-capped
+// scope, and admission rejects the request there. Even when every scope is
+// configured as unlimited, retain a process-safety ceiling so an
 // authenticated request cannot force an unbounded io.ReadAll allocation.
 func sharedRequestBodyLimit(settings config.AdmissionSettings, lane config.AdmissionLane) int64 {
 	limit := int64(0)
-	add := func(candidate int64) {
-		if candidate > 0 && (limit == 0 || candidate < limit) {
-			limit = candidate
+	add := func(candidate *int64) {
+		if candidate == nil || *candidate <= 0 {
+			return
+		}
+		if limit == 0 || *candidate < limit {
+			limit = *candidate
 		}
 	}
 	add(settings.Platform.MaxPromptBytes)
 	add(settings.Graph.MaxPromptBytes)
 	add(settings.Organization.MaxPromptBytes)
 	add(settings.OrganizationModel.MaxPromptBytes)
-	laneBytes := lane.Limits.MaxPromptBytes
-	if laneBytes > 0 {
+	if laneBytes := lane.Limits.MaxPromptBytes; laneBytes != nil && *laneBytes > 0 {
+		weighted := *laneBytes
 		weight := lane.Weight
 		if weight < 1 {
 			weight = 1
 		}
-		if laneBytes <= math.MaxInt64/weight {
-			laneBytes *= weight
+		if weighted <= math.MaxInt64/weight {
+			weighted *= weight
 		}
-		add(laneBytes)
+		add(&weighted)
 	}
 	if limit == 0 {
 		return defaultSharedRequestBodyLimit
@@ -329,16 +335,30 @@ func (s *Server) writeAdmissionError(w http.ResponseWriter, requestID string, er
 	s.log.Error.Printf("admission: unexpected error: %v", err)
 }
 
+// parseTrustedRateLimits parses the trusted quota envelope. R4 sentinel
+// semantics (the Saturn UsageLimit pattern): an absent limit header parses to
+// nil = unlimited for that field; an explicit "0" parses to a zero cap that
+// blocks every request (fail-closed) — a forged all-zeros envelope therefore
+// mints zero quota, never unlimited. There is no 0-sentinel for unlimited.
+//
+// R4 x R7 reconciliation: the completeness gate covers the IDENTITY anchor
+// only — X-Saturn-Owner-Id for the scoped envelope, the legacy service-tier
+// marker for the legacy envelope. The 12 rate-limit headers (8 scoped + 4
+// legacy) are per-field: Atlas omits headers for unset UsageLimits, and that
+// absence is the R4 unlimited encoding, not an R7 violation. What still fails
+// closed (503): limit headers present WITHOUT their anchor, a present-but-
+// malformed value (non-numeric/negative), an uncached-above-total relation,
+// and an entirely absent policy.
 func parseTrustedRateLimits(id identity.Identity) (admission.RateLimits, admission.RateLimits, error) {
-	parse := func(name, value string) (int64, error) {
+	parse := func(name, value string) (*int64, error) {
 		if value == "" {
-			return 0, nil
+			return nil, nil
 		}
 		limit, err := strconv.ParseInt(value, 10, 64)
 		if err != nil || limit < 0 {
-			return 0, fmt.Errorf("invalid trusted %s header", name)
+			return nil, fmt.Errorf("invalid trusted %s header", name)
 		}
-		return limit, nil
+		return &limit, nil
 	}
 	parseScope := func(names, values [4]string) (admission.RateLimits, error) {
 		var out admission.RateLimits
@@ -355,56 +375,62 @@ func parseTrustedRateLimits(id identity.Identity) (admission.RateLimits, admissi
 		if out.GeneratedTokens, err = parse(names[3], values[3]); err != nil {
 			return out, err
 		}
-		if out.TotalPromptTokens > 0 && out.UncachedPromptTokens > out.TotalPromptTokens {
+		if out.TotalPromptTokens != nil && out.UncachedPromptTokens != nil &&
+			*out.UncachedPromptTokens > *out.TotalPromptTokens {
 			return out, fmt.Errorf("trusted uncached prompt limit exceeds total prompt limit")
 		}
 		return out, nil
 	}
-	newValues := [9]string{
-		id.OwnerID,
+	scopedValues := [8]string{
 		id.OrgRateLimitRequests, id.OrgRateLimitTotalPromptTokens,
 		id.OrgRateLimitUncachedPromptTokens, id.OrgRateLimitGeneratedTokens,
 		id.OwnerRateLimitRequests, id.OwnerRateLimitTotalPromptTokens,
 		id.OwnerRateLimitUncachedPromptTokens, id.OwnerRateLimitGeneratedTokens,
 	}
-	legacyValues := [5]string{
-		id.LegacyServiceTier, id.LegacyRateLimitRequests,
-		id.LegacyRateLimitTotalPromptTokens, id.LegacyRateLimitUncachedPromptTokens,
-		id.LegacyRateLimitGeneratedTokens,
-	}
-	completeness := func(values []string) (present, complete bool) {
-		complete = true
+	anyPresent := func(values []string) bool {
 		for _, value := range values {
-			present = present || value != ""
-			complete = complete && value != ""
+			if value != "" {
+				return true
+			}
 		}
-		return present, complete
+		return false
 	}
-	newAny, newComplete := completeness(newValues[:])
-	legacyAny, legacyComplete := completeness(legacyValues[:])
-	if newAny && !newComplete {
-		return admission.RateLimits{}, admission.RateLimits{}, fmt.Errorf("incomplete trusted shared-inference rate-limit policy")
-	}
-	if !newAny {
-		if !legacyAny || !legacyComplete {
-			return admission.RateLimits{}, admission.RateLimits{}, fmt.Errorf("incomplete trusted shared-inference rate-limit policy")
+
+	switch {
+	case id.OwnerID != "":
+		// Scoped envelope: the owner id is the structural anchor (R7). The 8
+		// scoped headers are per-field R4 — absent is unlimited. A legacy
+		// envelope arriving alongside is superseded: the new anchor wins, as
+		// it did when both envelopes were complete.
+		organization, err := parseScope(
+			[4]string{identity.HeaderOrgRateLimitRequests, identity.HeaderOrgRateLimitTotalPromptTokens, identity.HeaderOrgRateLimitUncachedPromptTokens, identity.HeaderOrgRateLimitGeneratedTokens},
+			[4]string{id.OrgRateLimitRequests, id.OrgRateLimitTotalPromptTokens, id.OrgRateLimitUncachedPromptTokens, id.OrgRateLimitGeneratedTokens},
+		)
+		if err != nil {
+			return organization, admission.RateLimits{}, err
+		}
+		owner, err := parseScope(
+			[4]string{identity.HeaderOwnerRateLimitRequests, identity.HeaderOwnerRateLimitTotalPromptTokens, identity.HeaderOwnerRateLimitUncachedPromptTokens, identity.HeaderOwnerRateLimitGeneratedTokens},
+			[4]string{id.OwnerRateLimitRequests, id.OwnerRateLimitTotalPromptTokens, id.OwnerRateLimitUncachedPromptTokens, id.OwnerRateLimitGeneratedTokens},
+		)
+		return organization, owner, err
+	case id.LegacyServiceTier != "":
+		// Legacy envelope: the tier marker is the structural anchor; the 4
+		// legacy rate headers are per-field R4, same absence semantics.
+		// Scoped headers without the owner-id anchor are a structural
+		// violation (R7), not unlimited fields.
+		if anyPresent(scopedValues[:]) {
+			return admission.RateLimits{}, admission.RateLimits{}, fmt.Errorf("incomplete trusted shared-inference rate-limit policy: scoped headers without %s", identity.HeaderOwnerID)
 		}
 		legacy, err := parseScope(
 			[4]string{identity.HeaderLegacyRateLimitRequests, identity.HeaderLegacyRateLimitTotalPromptTokens, identity.HeaderLegacyRateLimitUncachedPromptTokens, identity.HeaderLegacyRateLimitGeneratedTokens},
 			[4]string{id.LegacyRateLimitRequests, id.LegacyRateLimitTotalPromptTokens, id.LegacyRateLimitUncachedPromptTokens, id.LegacyRateLimitGeneratedTokens},
 		)
 		return legacy, admission.RateLimits{}, err
+	default:
+		// No identity anchor: limit headers without the identity they belong
+		// to, or no policy at all — both are structural violations (R7) and
+		// fail closed.
+		return admission.RateLimits{}, admission.RateLimits{}, fmt.Errorf("incomplete trusted shared-inference rate-limit policy")
 	}
-	organization, err := parseScope(
-		[4]string{identity.HeaderOrgRateLimitRequests, identity.HeaderOrgRateLimitTotalPromptTokens, identity.HeaderOrgRateLimitUncachedPromptTokens, identity.HeaderOrgRateLimitGeneratedTokens},
-		[4]string{id.OrgRateLimitRequests, id.OrgRateLimitTotalPromptTokens, id.OrgRateLimitUncachedPromptTokens, id.OrgRateLimitGeneratedTokens},
-	)
-	if err != nil {
-		return organization, admission.RateLimits{}, err
-	}
-	owner, err := parseScope(
-		[4]string{identity.HeaderOwnerRateLimitRequests, identity.HeaderOwnerRateLimitTotalPromptTokens, identity.HeaderOwnerRateLimitUncachedPromptTokens, identity.HeaderOwnerRateLimitGeneratedTokens},
-		[4]string{id.OwnerRateLimitRequests, id.OwnerRateLimitTotalPromptTokens, id.OwnerRateLimitUncachedPromptTokens, id.OwnerRateLimitGeneratedTokens},
-	)
-	return organization, owner, err
 }

@@ -324,7 +324,7 @@ func TestWakeColdHoldRejectionEmitsReconciliationRow(t *testing.T) {
 
 	mr := miniredis.RunT(t)
 	cfg := proxyAdmissionConfig(10)
-	cfg.Platform.MaxColdHolds = 1
+	cfg.Platform.MaxColdHolds = ptr64(1)
 	c := redis.NewClient(&redis.Options{Addr: mr.Addr()})
 	t.Cleanup(func() { _ = c.Close() })
 	admitter := admission.New(c, cfg)
