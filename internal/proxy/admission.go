@@ -342,13 +342,16 @@ func (s *Server) writeAdmissionError(w http.ResponseWriter, requestID string, er
 // mints zero quota, never unlimited. There is no 0-sentinel for unlimited.
 //
 // R4 x R7 reconciliation: the completeness gate covers the IDENTITY anchor
-// only — X-Saturn-Owner-Id for the scoped envelope, the legacy service-tier
-// marker for the legacy envelope. The 12 rate-limit headers (8 scoped + 4
-// legacy) are per-field: Atlas omits headers for unset UsageLimits, and that
-// absence is the R4 unlimited encoding, not an R7 violation. What still fails
-// closed (503): limit headers present WITHOUT their anchor, a present-but-
-// malformed value (non-numeric/negative), an uncached-above-total relation,
-// and an entirely absent policy.
+// only — X-Saturn-Owner-Id. The 8 scoped rate-limit headers are per-field:
+// Atlas omits headers for unset UsageLimits, and that absence is the R4
+// unlimited encoding, not an R7 violation. What still fails closed (503):
+// limit headers present WITHOUT the owner-id anchor, a present-but-malformed
+// value (non-numeric/negative), an uncached-above-total relation, and an
+// entirely absent policy.
+//
+// R8: there is no legacy single-scope envelope. The five legacy headers
+// (X-Saturn-Service-Tier, X-Saturn-Rate-Limit-*) are not read at all, so a
+// request carrying only those and no owner id has no policy and fails closed.
 func parseTrustedRateLimits(id identity.Identity) (admission.RateLimits, admission.RateLimits, error) {
 	parse := func(name, value string) (*int64, error) {
 		if value == "" {
@@ -399,9 +402,7 @@ func parseTrustedRateLimits(id identity.Identity) (admission.RateLimits, admissi
 	switch {
 	case id.OwnerID != "":
 		// Scoped envelope: the owner id is the structural anchor (R7). The 8
-		// scoped headers are per-field R4 — absent is unlimited. A legacy
-		// envelope arriving alongside is superseded: the new anchor wins, as
-		// it did when both envelopes were complete.
+		// scoped headers are per-field R4 — absent is unlimited.
 		organization, err := parseScope(
 			[4]string{identity.HeaderOrgRateLimitRequests, identity.HeaderOrgRateLimitTotalPromptTokens, identity.HeaderOrgRateLimitUncachedPromptTokens, identity.HeaderOrgRateLimitGeneratedTokens},
 			[4]string{id.OrgRateLimitRequests, id.OrgRateLimitTotalPromptTokens, id.OrgRateLimitUncachedPromptTokens, id.OrgRateLimitGeneratedTokens},
@@ -414,23 +415,13 @@ func parseTrustedRateLimits(id identity.Identity) (admission.RateLimits, admissi
 			[4]string{id.OwnerRateLimitRequests, id.OwnerRateLimitTotalPromptTokens, id.OwnerRateLimitUncachedPromptTokens, id.OwnerRateLimitGeneratedTokens},
 		)
 		return organization, owner, err
-	case id.LegacyServiceTier != "":
-		// Legacy envelope: the tier marker is the structural anchor; the 4
-		// legacy rate headers are per-field R4, same absence semantics.
-		// Scoped headers without the owner-id anchor are a structural
+	case anyPresent(scopedValues[:]):
+		// Scoped limit headers without the owner-id anchor are a structural
 		// violation (R7), not unlimited fields.
-		if anyPresent(scopedValues[:]) {
-			return admission.RateLimits{}, admission.RateLimits{}, fmt.Errorf("incomplete trusted shared-inference rate-limit policy: scoped headers without %s", identity.HeaderOwnerID)
-		}
-		legacy, err := parseScope(
-			[4]string{identity.HeaderLegacyRateLimitRequests, identity.HeaderLegacyRateLimitTotalPromptTokens, identity.HeaderLegacyRateLimitUncachedPromptTokens, identity.HeaderLegacyRateLimitGeneratedTokens},
-			[4]string{id.LegacyRateLimitRequests, id.LegacyRateLimitTotalPromptTokens, id.LegacyRateLimitUncachedPromptTokens, id.LegacyRateLimitGeneratedTokens},
-		)
-		return legacy, admission.RateLimits{}, err
+		return admission.RateLimits{}, admission.RateLimits{}, fmt.Errorf("incomplete trusted shared-inference rate-limit policy: scoped headers without %s", identity.HeaderOwnerID)
 	default:
-		// No identity anchor: limit headers without the identity they belong
-		// to, or no policy at all — both are structural violations (R7) and
-		// fail closed.
+		// No identity anchor and no policy at all: a structural violation
+		// (R7) that fails closed.
 		return admission.RateLimits{}, admission.RateLimits{}, fmt.Errorf("incomplete trusted shared-inference rate-limit policy")
 	}
 }

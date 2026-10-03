@@ -43,21 +43,18 @@ func pinnedSet() map[string]struct{} {
 	return set
 }
 
-// TestPinnedFallbackIsExactlyTheRuling18 pins the fallback to the exact
+// TestPinnedFallbackIsExactlyThe13 pins the fallback to the exact
 // pinned names, in the exact pinned order — the set the chart's ConfigMap
-// is supposed to render.
-func TestPinnedFallbackIsExactlyTheRuling18(t *testing.T) {
+// is supposed to render. Ruling R8 removed the five legacy single-scope
+// quota headers (X-Saturn-Service-Tier, X-Saturn-Rate-Limit-*), taking the
+// R3 set from 18 to 13.
+func TestPinnedFallbackIsExactlyThe13(t *testing.T) {
 	want := []string{
 		"X-Saturn-Gateway",
 		"X-Saturn-Org-Id",
 		"X-Saturn-Owner-Id",
 		"X-Saturn-Serving-Mode",
 		"X-Saturn-Served-Model",
-		"X-Saturn-Service-Tier",
-		"X-Saturn-Rate-Limit-Requests",
-		"X-Saturn-Rate-Limit-Total-Prompt-Tokens",
-		"X-Saturn-Rate-Limit-Uncached-Prompt-Tokens",
-		"X-Saturn-Rate-Limit-Generated-Tokens",
 		"X-Saturn-Org-Rate-Limit-Requests",
 		"X-Saturn-Org-Rate-Limit-Total-Prompt-Tokens",
 		"X-Saturn-Org-Rate-Limit-Uncached-Prompt-Tokens",
@@ -68,12 +65,12 @@ func TestPinnedFallbackIsExactlyTheRuling18(t *testing.T) {
 		"X-Saturn-Owner-Rate-Limit-Generated-Tokens",
 	}
 	if !reflect.DeepEqual(pinnedTrustedHeaders, want) {
-		t.Fatalf("pinnedTrustedHeaders = %v, want the ruling's 18 in order %v", pinnedTrustedHeaders, want)
+		t.Fatalf("pinnedTrustedHeaders = %v, want the pinned 13 in order %v", pinnedTrustedHeaders, want)
 	}
 }
 
 // TestLoadTrustedHeadersFallback: unset, empty, whitespace-only, or
-// all-empty-after-split config engages the pinned 18 — never an empty set.
+// all-empty-after-split config engages the pinned 13 — never an empty set.
 func TestLoadTrustedHeadersFallback(t *testing.T) {
 	cases := []struct {
 		name  string
@@ -90,7 +87,7 @@ func TestLoadTrustedHeadersFallback(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			withTrustedHeadersEnv(t, tc.value, tc.set)
 			if got := ActiveTrustedHeaders(); !reflect.DeepEqual(got, pinnedSet()) {
-				t.Fatalf("active set = %v, want the pinned 18 %v", got, pinnedSet())
+				t.Fatalf("active set = %v, want the pinned 13 %v", got, pinnedSet())
 			}
 		})
 	}
@@ -121,8 +118,8 @@ func TestLoadTrustedHeadersConfigured(t *testing.T) {
 		},
 		{
 			"trims spaces and drops empties",
-			"  X-Saturn-Owner-Id ,, X-Saturn-Service-Tier , ",
-			map[string]struct{}{"X-Saturn-Owner-Id": {}, "X-Saturn-Service-Tier": {}},
+			"  X-Saturn-Owner-Id ,, X-Saturn-Serving-Mode , ",
+			map[string]struct{}{"X-Saturn-Owner-Id": {}, "X-Saturn-Serving-Mode": {}},
 		},
 	}
 	for _, tc := range cases {
@@ -162,16 +159,13 @@ func TestFromRequestIgnoresHeadersOutsideActiveSet(t *testing.T) {
 		id.OrgRateLimitRequests != "" || id.OrgRateLimitTotalPromptTokens != "" ||
 		id.OrgRateLimitUncachedPromptTokens != "" || id.OrgRateLimitGeneratedTokens != "" ||
 		id.OwnerRateLimitRequests != "" || id.OwnerRateLimitTotalPromptTokens != "" ||
-		id.OwnerRateLimitUncachedPromptTokens != "" || id.OwnerRateLimitGeneratedTokens != "" ||
-		id.LegacyServiceTier != "" || id.LegacyRateLimitRequests != "" ||
-		id.LegacyRateLimitTotalPromptTokens != "" || id.LegacyRateLimitUncachedPromptTokens != "" ||
-		id.LegacyRateLimitGeneratedTokens != "" {
+		id.OwnerRateLimitUncachedPromptTokens != "" || id.OwnerRateLimitGeneratedTokens != "" {
 		t.Errorf("envelope fields outside the active set must read absent, got %+v", id)
 	}
 }
 
 // TestFromRequestFallbackTrustsPinnedHeaders is the no-regression pin: with
-// the fallback engaged (unset env), all 18 remain trusted on the real parse
+// the fallback engaged (unset env), all 13 remain trusted on the real parse
 // path — request handling is unchanged from before the gate existed.
 func TestFromRequestFallbackTrustsPinnedHeaders(t *testing.T) {
 	withTrustedHeadersEnv(t, "", false)
@@ -193,23 +187,18 @@ func TestFromRequestFallbackTrustsPinnedHeaders(t *testing.T) {
 		got  string
 		name string
 	}{
-		"OrgId":          {id.OrgID, "X-Saturn-Org-Id"},
-		"OwnerId":        {id.OwnerID, "X-Saturn-Owner-Id"},
-		"ServingMode":    {id.ServingMode, "X-Saturn-Serving-Mode"},
-		"ServedModel":    {id.ServedModel, "X-Saturn-Served-Model"},
-		"LegacyTier":     {id.LegacyServiceTier, "X-Saturn-Service-Tier"},
-		"LegacyReq":      {id.LegacyRateLimitRequests, "X-Saturn-Rate-Limit-Requests"},
-		"LegacyTotal":    {id.LegacyRateLimitTotalPromptTokens, "X-Saturn-Rate-Limit-Total-Prompt-Tokens"},
-		"LegacyUncached": {id.LegacyRateLimitUncachedPromptTokens, "X-Saturn-Rate-Limit-Uncached-Prompt-Tokens"},
-		"LegacyGen":      {id.LegacyRateLimitGeneratedTokens, "X-Saturn-Rate-Limit-Generated-Tokens"},
-		"OrgReq":         {id.OrgRateLimitRequests, "X-Saturn-Org-Rate-Limit-Requests"},
-		"OrgTotal":       {id.OrgRateLimitTotalPromptTokens, "X-Saturn-Org-Rate-Limit-Total-Prompt-Tokens"},
-		"OrgUncached":    {id.OrgRateLimitUncachedPromptTokens, "X-Saturn-Org-Rate-Limit-Uncached-Prompt-Tokens"},
-		"OrgGen":         {id.OrgRateLimitGeneratedTokens, "X-Saturn-Org-Rate-Limit-Generated-Tokens"},
-		"OwnerReq":       {id.OwnerRateLimitRequests, "X-Saturn-Owner-Rate-Limit-Requests"},
-		"OwnerTotal":     {id.OwnerRateLimitTotalPromptTokens, "X-Saturn-Owner-Rate-Limit-Total-Prompt-Tokens"},
-		"OwnerUncached":  {id.OwnerRateLimitUncachedPromptTokens, "X-Saturn-Owner-Rate-Limit-Uncached-Prompt-Tokens"},
-		"OwnerGen":       {id.OwnerRateLimitGeneratedTokens, "X-Saturn-Owner-Rate-Limit-Generated-Tokens"},
+		"OrgId":         {id.OrgID, "X-Saturn-Org-Id"},
+		"OwnerId":       {id.OwnerID, "X-Saturn-Owner-Id"},
+		"ServingMode":   {id.ServingMode, "X-Saturn-Serving-Mode"},
+		"ServedModel":   {id.ServedModel, "X-Saturn-Served-Model"},
+		"OrgReq":        {id.OrgRateLimitRequests, "X-Saturn-Org-Rate-Limit-Requests"},
+		"OrgTotal":      {id.OrgRateLimitTotalPromptTokens, "X-Saturn-Org-Rate-Limit-Total-Prompt-Tokens"},
+		"OrgUncached":   {id.OrgRateLimitUncachedPromptTokens, "X-Saturn-Org-Rate-Limit-Uncached-Prompt-Tokens"},
+		"OrgGen":        {id.OrgRateLimitGeneratedTokens, "X-Saturn-Org-Rate-Limit-Generated-Tokens"},
+		"OwnerReq":      {id.OwnerRateLimitRequests, "X-Saturn-Owner-Rate-Limit-Requests"},
+		"OwnerTotal":    {id.OwnerRateLimitTotalPromptTokens, "X-Saturn-Owner-Rate-Limit-Total-Prompt-Tokens"},
+		"OwnerUncached": {id.OwnerRateLimitUncachedPromptTokens, "X-Saturn-Owner-Rate-Limit-Uncached-Prompt-Tokens"},
+		"OwnerGen":      {id.OwnerRateLimitGeneratedTokens, "X-Saturn-Owner-Rate-Limit-Generated-Tokens"},
 	}
 	for field, check := range checks {
 		if want := "v:" + check.name; check.got != want {

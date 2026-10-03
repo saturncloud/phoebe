@@ -2,17 +2,17 @@ package identity
 
 // Trusted-header registry (R3 header trust). The shared-inference parser —
 // the gateway mark (HeaderGateway) plus the envelope fields (org, owner,
-// serving mode, served-model allow-list, and the org/owner/legacy rate-limit
+// serving mode, served-model allow-list, and the org/owner rate-limit
 // policy) — resolves those headers ONLY through the active set in this
 // registry. A header not in the active set is treated as ABSENT: never read
 // for a trust decision. The set arrives as runtime config (env
 // PHOEBE_TRUSTED_HEADERS, comma-separated, rendered from the saturn-k8s
 // phoebe chart's ConfigMap); when the config is empty, unset, or malformed
 // (nothing left after trimming and dropping empties), a hard-coded fallback
-// equal to the pinned 18 engages so phoebe fails closed, and a loud warning
+// equal to the pinned 13 engages so phoebe fails closed, and a loud warning
 // flags the misrendered chart for the operator.
 //
-// The set covers exactly the R3 envelope headers listed in the pinned 18.
+// The set covers exactly the R3 envelope headers listed in the pinned 13.
 // The remaining identity headers (AuthID / UserID / GroupID / ResourceID /
 // ResourceType / BaseModel / Adapter / Upstream) are read under the ratified
 // edge contract (ForwardAuth authResponseHeaders allowlist + Atlas
@@ -39,17 +39,16 @@ const TrustedHeadersEnv = "PHOEBE_TRUSTED_HEADERS"
 // policy headers the proxy's admission/lane inputs and gateway resolution
 // consume. An empty or misrendered PHOEBE_TRUSTED_HEADERS engages this set
 // (with a loud warning), never an empty trust set.
+//
+// The five legacy single-scope quota headers (X-Saturn-Service-Tier and
+// X-Saturn-Rate-Limit-*) were removed by ruling R8 (hard cut, no fallback):
+// phoebe no longer reads them, so they are not trusted either.
 var pinnedTrustedHeaders = []string{
 	HeaderGateway,
 	HeaderOrgID,
 	HeaderOwnerID,
 	HeaderServingMode,
 	HeaderServedModel,
-	HeaderLegacyServiceTier,
-	HeaderLegacyRateLimitRequests,
-	HeaderLegacyRateLimitTotalPromptTokens,
-	HeaderLegacyRateLimitUncachedPromptTokens,
-	HeaderLegacyRateLimitGeneratedTokens,
 	HeaderOrgRateLimitRequests,
 	HeaderOrgRateLimitTotalPromptTokens,
 	HeaderOrgRateLimitUncachedPromptTokens,
@@ -85,7 +84,7 @@ type trustedHeaderSet map[string]struct{}
 var activeTrustedHeaders atomic.Pointer[trustedHeaderSet]
 
 func init() {
-	// Before config load the pinned 18 are active: phoebe never reads an
+	// Before config load the pinned 13 are active: phoebe never reads an
 	// envelope header outside the list, before OR after the runtime config
 	// is loaded, and the pre-load default must preserve request handling.
 	fallback := newTrustedHeaderSet(pinnedTrustedHeaders)
@@ -123,7 +122,7 @@ func trustedHeaderValue(r *http.Request, name string) string {
 //     active (entries are canonicalized; case is ignored per HTTP
 //     convention);
 //   - unset, empty/whitespace-only, or nothing left after splitting and
-//     trimming -> the pinned 18 engage AND a loud warning flags the
+//     trimming -> the pinned 13 engage AND a loud warning flags the
 //     misrendered chart. Fallback, never a startup failure: phoebe must keep
 //     serving with the pinned set rather than crash-loop behind a broken
 //     ConfigMap render.
