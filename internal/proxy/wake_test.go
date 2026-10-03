@@ -327,7 +327,7 @@ func TestWakeColdHoldRejectionEmitsReconciliationRow(t *testing.T) {
 
 	mr := miniredis.RunT(t)
 	cfg := proxyAdmissionConfig(10)
-	cfg.Platform.MaxColdHolds = 1
+	cfg.Platform.MaxColdHolds = ptr64(1)
 	c := redis.NewClient(&redis.Options{Addr: mr.Addr()})
 	t.Cleanup(func() { _ = c.Close() })
 	admitter := admission.New(c, cfg)
@@ -422,50 +422,61 @@ func TestWakeWarmFallThroughMetersNormalRowOnly(t *testing.T) {
 	}
 }
 func TestWakeEnabledWarnsOnBoundRouteMissingServingMode(t *testing.T) {
-	newServer := func() (*Server, *bytes.Buffer) {
-		var buf bytes.Buffer
+	newServer := func() (*Server, *bytes.Buffer, *bytes.Buffer) {
+		var warnBuf, debugBuf bytes.Buffer
 		logger := &logging.Logger{
-			Debug: log.New(io.Discard, "", 0),
+			Debug: log.New(&debugBuf, "", 0),
 			Info:  log.New(io.Discard, "", 0),
-			Warn:  log.New(&buf, "", 0),
+			Warn:  log.New(&warnBuf, "", 0),
 			Error: log.New(io.Discard, "", 0),
 		}
-		return New(&config.Settings{}, logger, nil).WithWaker(&fakeWaker{}, time.Second, 1), &buf
+		return New(&config.Settings{}, logger, nil).WithWaker(&fakeWaker{}, time.Second, 1), &warnBuf, &debugBuf
 	}
 
 	cases := []struct {
 		name     string
 		id       identity.Identity
 		wantWake bool
-		wantLog  bool
+		// The bound-dedicated shape (absent serving mode is the ratified
+		// dedicated contract) is normal: Debug only, never Warn.
+		wantDedicatedDebug bool
+		// A route explicitly marked shared that cannot wake is a genuine
+		// contract breakage: it stays loud at Warn.
+		wantSharedWarn bool
 	}{
-		{"bound shape without serving mode warns", identity.Identity{ResourceID: "r1", ServedModel: "m"}, false, true},
-		{"shared mode wakes and does not warn", identity.Identity{ResourceID: "r1", ServedModel: "m", ServingMode: "shared"}, true, false},
-		{"explicit dedicated does not warn", identity.Identity{ResourceID: "r1", ServedModel: "m", ServingMode: "dedicated"}, false, false},
-		{"unbound route does not warn", identity.Identity{ResourceID: "r1"}, false, false},
-		{"no resource id does not warn", identity.Identity{ServedModel: "m"}, false, false},
+		{"bound shape without serving mode logs debug only", identity.Identity{ResourceID: "r1", ServedModel: "m"}, false, true, false},
+		{"shared mode wakes and logs nothing", identity.Identity{ResourceID: "r1", ServedModel: "m", ServingMode: "shared"}, true, false, false},
+		{"explicit dedicated does not log", identity.Identity{ResourceID: "r1", ServedModel: "m", ServingMode: "dedicated"}, false, false, false},
+		{"shared without resource id warns", identity.Identity{ServedModel: "m", ServingMode: "shared"}, false, false, true},
+		{"shared without served model warns", identity.Identity{ResourceID: "r1", ServingMode: "shared"}, false, false, true},
+		{"unbound route does not log", identity.Identity{ResourceID: "r1"}, false, false, false},
+		{"no resource id does not log", identity.Identity{ServedModel: "m"}, false, false, false},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			s, buf := newServer()
+			s, warnBuf, debugBuf := newServer()
 			if got := s.wakeEnabled(tc.id); got != tc.wantWake {
 				t.Fatalf("wakeEnabled = %v, want %v", got, tc.wantWake)
 			}
-			if got := strings.Contains(buf.String(), "edge contract not fully rolled out"); got != tc.wantLog {
-				t.Fatalf("warn present = %v, want %v (log: %q)", got, tc.wantLog, buf.String())
+			if got := strings.Contains(warnBuf.String(), "can never wake"); got != tc.wantSharedWarn {
+				t.Fatalf("shared-route warn present = %v, want %v (warn log: %q)", got, tc.wantSharedWarn, warnBuf.String())
+			}
+			if got := strings.Contains(debugBuf.String(), "dedicated by the absent-mode contract"); got != tc.wantDedicatedDebug {
+				t.Fatalf("dedicated-route debug present = %v, want %v (debug log: %q)", got, tc.wantDedicatedDebug, debugBuf.String())
 			}
 		})
 	}
 
 	// Wake unconfigured: the predicate short-circuits before the diagnostic, so
-	// no WARN either (a dedicated install has no wake rollout to diagnose).
-	s, buf := newServer()
+	// no Warn or Debug either (a dedicated install has no wake rollout to
+	// diagnose).
+	s, warnBuf, debugBuf := newServer()
 	s.waker = nil
 	if s.wakeEnabled(identity.Identity{ResourceID: "r1", ServedModel: "m"}) {
 		t.Fatal("wakeEnabled = true with nil waker, want false")
 	}
-	if buf.Len() != 0 {
-		t.Fatalf("warn logged with wake unconfigured: %q", buf.String())
+	if warnBuf.Len() != 0 || debugBuf.Len() != 0 {
+		t.Fatalf("logged with wake unconfigured: warn=%q debug=%q", warnBuf.String(), debugBuf.String())
 	}
 }
 func TestWakeSkippedOnControlRoutes(t *testing.T) {

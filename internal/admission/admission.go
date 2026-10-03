@@ -61,13 +61,16 @@ type Request struct {
 	OwnerLimits          RateLimits
 }
 
-// RateLimits is the authenticated customer contract. Zero means unlimited.
-// Every value is per minute; total prompt contains the uncached subset.
+// RateLimits is the authenticated customer contract. R4 sentinel semantics
+// (the Saturn UsageLimit pattern): a nil field is unlimited; an explicit 0 is
+// a zero cap that blocks every request (fail-closed). There is no 0-sentinel
+// for unlimited. Every value is per minute; total prompt contains the
+// uncached subset.
 type RateLimits struct {
-	Requests             int64
-	TotalPromptTokens    int64
-	UncachedPromptTokens int64
-	GeneratedTokens      int64
+	Requests             *int64
+	TotalPromptTokens    *int64
+	UncachedPromptTokens *int64
+	GeneratedTokens      *int64
 }
 
 type scope struct {
@@ -247,11 +250,12 @@ func scaled(l config.AdmissionLimits, weight int64) config.AdmissionLimits {
 	if weight <= 1 {
 		return l
 	}
-	mul := func(v int64) int64 {
-		if v == 0 || v > math.MaxInt64/weight {
+	mul := func(v *int64) *int64 {
+		if v == nil || *v == 0 || *v > math.MaxInt64/weight {
 			return v
 		}
-		return v * weight
+		m := *v * weight
+		return &m
 	}
 	l.MaxActiveRequests = mul(l.MaxActiveRequests)
 	l.MaxConcurrentPrefills = mul(l.MaxConcurrentPrefills)
@@ -268,32 +272,46 @@ func scaled(l config.AdmissionLimits, weight int64) config.AdmissionLimits {
 	return l
 }
 
+// wireLimit maps a nullable limit onto the Lua wire sentinel: nil (unlimited)
+// is 0, an explicit zero cap is -1, and a positive cap passes through. Every
+// Lua limit check is `limit ~= 0 and usage > limit`, so -1 rejects any usage
+// (usage is never negative) while 0 skips the check entirely.
+func wireLimit(v *int64) int64 {
+	if v == nil {
+		return 0
+	}
+	if *v == 0 {
+		return -1
+	}
+	return *v
+}
+
 func makeScope(name, id string, l config.AdmissionLimits) scope {
 	windowMs := l.Window.Milliseconds()
 	if windowMs <= 0 {
 		windowMs = time.Minute.Milliseconds()
 	}
 	digest := sha256.Sum256([]byte(id))
-	return scope{ID: name + ":" + hex.EncodeToString(digest[:]), Name: name, Active: l.MaxActiveRequests, Prefills: l.MaxConcurrentPrefills,
-		ReservedDecodeSlots: l.MaxReservedDecodeSlots,
-		Prompt:              l.MaxPromptBytes, Output: l.MaxReservedOutputTokens, Adapters: l.MaxActiveAdapters,
-		Requests: l.RequestsPerWindow, TotalPrompt: l.TotalPromptTokensPerWindow,
-		UncachedPrompt: l.UncachedPromptTokensPerWindow, Generated: l.GeneratedTokensPerWindow, Cold: l.MaxColdHolds,
-		Wakes: l.WakesPerWindow, WindowMs: windowMs}
+	return scope{ID: name + ":" + hex.EncodeToString(digest[:]), Name: name, Active: wireLimit(l.MaxActiveRequests), Prefills: wireLimit(l.MaxConcurrentPrefills),
+		ReservedDecodeSlots: wireLimit(l.MaxReservedDecodeSlots),
+		Prompt:              wireLimit(l.MaxPromptBytes), Output: wireLimit(l.MaxReservedOutputTokens), Adapters: wireLimit(l.MaxActiveAdapters),
+		Requests: wireLimit(l.RequestsPerWindow), TotalPrompt: wireLimit(l.TotalPromptTokensPerWindow),
+		UncachedPrompt: wireLimit(l.UncachedPromptTokensPerWindow), Generated: wireLimit(l.GeneratedTokensPerWindow), Cold: wireLimit(l.MaxColdHolds),
+		Wakes: wireLimit(l.WakesPerWindow), WindowMs: windowMs}
 }
 
 func makeContractScope(name, id string, limits RateLimits) scope {
 	digest := sha256.Sum256([]byte(id))
 	return scope{
 		ID: name + ":" + hex.EncodeToString(digest[:]), Name: name,
-		Requests: limits.Requests, TotalPrompt: limits.TotalPromptTokens,
-		UncachedPrompt: limits.UncachedPromptTokens, Generated: limits.GeneratedTokens,
+		Requests: wireLimit(limits.Requests), TotalPrompt: wireLimit(limits.TotalPromptTokens),
+		UncachedPrompt: wireLimit(limits.UncachedPromptTokens), Generated: wireLimit(limits.GeneratedTokens),
 		WindowMs: time.Minute.Milliseconds(), Contractual: true,
 	}
 }
 
 func (l RateLimits) any() bool {
-	return l.Requests > 0 || l.TotalPromptTokens > 0 || l.UncachedPromptTokens > 0 || l.GeneratedTokens > 0
+	return l.Requests != nil || l.TotalPromptTokens != nil || l.UncachedPromptTokens != nil || l.GeneratedTokens != nil
 }
 
 func (a *RedisAdmitter) scopes(r Request) []scope {
