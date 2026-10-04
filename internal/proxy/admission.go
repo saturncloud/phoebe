@@ -384,16 +384,16 @@ func parseTrustedRateLimits(id identity.Identity) (admission.RateLimits, admissi
 		}
 		return out, nil
 	}
-	scopedValues := [8]string{
-		id.OrgRateLimitRequests, id.OrgRateLimitTotalPromptTokens,
-		id.OrgRateLimitUncachedPromptTokens, id.OrgRateLimitGeneratedTokens,
-		id.OwnerRateLimitRequests, id.OwnerRateLimitTotalPromptTokens,
-		id.OwnerRateLimitUncachedPromptTokens, id.OwnerRateLimitGeneratedTokens,
-	}
-	anyPresent := func(values []string) bool {
-		for _, value := range values {
-			if value != "" {
-				return true
+	orgNames := [4]string{identity.HeaderOrgRateLimitRequests, identity.HeaderOrgRateLimitTotalPromptTokens, identity.HeaderOrgRateLimitUncachedPromptTokens, identity.HeaderOrgRateLimitGeneratedTokens}
+	orgValues := [4]string{id.OrgRateLimitRequests, id.OrgRateLimitTotalPromptTokens, id.OrgRateLimitUncachedPromptTokens, id.OrgRateLimitGeneratedTokens}
+	ownerNames := [4]string{identity.HeaderOwnerRateLimitRequests, identity.HeaderOwnerRateLimitTotalPromptTokens, identity.HeaderOwnerRateLimitUncachedPromptTokens, identity.HeaderOwnerRateLimitGeneratedTokens}
+	ownerValues := [4]string{id.OwnerRateLimitRequests, id.OwnerRateLimitTotalPromptTokens, id.OwnerRateLimitUncachedPromptTokens, id.OwnerRateLimitGeneratedTokens}
+	anyScopedPresent := func() bool {
+		for _, values := range [][4]string{orgValues, ownerValues} {
+			for _, value := range values {
+				if value != "" {
+					return true
+				}
 			}
 		}
 		return false
@@ -403,25 +403,48 @@ func parseTrustedRateLimits(id identity.Identity) (admission.RateLimits, admissi
 	case id.OwnerID != "":
 		// Scoped envelope: the owner id is the structural anchor (R7). The 8
 		// scoped headers are per-field R4 — absent is unlimited.
-		organization, err := parseScope(
-			[4]string{identity.HeaderOrgRateLimitRequests, identity.HeaderOrgRateLimitTotalPromptTokens, identity.HeaderOrgRateLimitUncachedPromptTokens, identity.HeaderOrgRateLimitGeneratedTokens},
-			[4]string{id.OrgRateLimitRequests, id.OrgRateLimitTotalPromptTokens, id.OrgRateLimitUncachedPromptTokens, id.OrgRateLimitGeneratedTokens},
-		)
+		organization, err := parseScope(orgNames, orgValues)
 		if err != nil {
 			return organization, admission.RateLimits{}, err
 		}
-		owner, err := parseScope(
-			[4]string{identity.HeaderOwnerRateLimitRequests, identity.HeaderOwnerRateLimitTotalPromptTokens, identity.HeaderOwnerRateLimitUncachedPromptTokens, identity.HeaderOwnerRateLimitGeneratedTokens},
-			[4]string{id.OwnerRateLimitRequests, id.OwnerRateLimitTotalPromptTokens, id.OwnerRateLimitUncachedPromptTokens, id.OwnerRateLimitGeneratedTokens},
-		)
+		owner, err := parseScope(ownerNames, ownerValues)
 		return organization, owner, err
-	case anyPresent(scopedValues[:]):
+	case anyScopedPresent():
 		// Scoped limit headers without the owner-id anchor are a structural
 		// violation (R7), not unlimited fields.
 		return admission.RateLimits{}, admission.RateLimits{}, fmt.Errorf("incomplete trusted shared-inference rate-limit policy: scoped headers without %s", identity.HeaderOwnerID)
 	default:
 		// No identity anchor and no policy at all: a structural violation
 		// (R7) that fails closed.
-		return admission.RateLimits{}, admission.RateLimits{}, fmt.Errorf("incomplete trusted shared-inference rate-limit policy")
+		return admission.RateLimits{}, admission.RateLimits{}, errNoTrustedRateLimitPolicy
 	}
+}
+
+// errNoTrustedRateLimitPolicy is the parser's "no anchor and no scoped policy
+// at all" result. The proxy call site matches it to add a log-only diagnostic
+// for pre-R8 producers (see legacyQuotaHeadersPresent).
+var errNoTrustedRateLimitPolicy = errors.New("incomplete trusted shared-inference rate-limit policy")
+
+// legacyQuotaHeaderNames are the five single-scope quota headers that R8
+// removed from the trusted envelope. Phoebe never reads them for a trust or
+// limit decision; they are listed here ONLY so the proxy can log that a
+// not-yet-upgraded producer (Atlas or Traefik) is still stamping them. Remove
+// this diagnostic one release after the R8 cutover.
+var legacyQuotaHeaderNames = []string{
+	"X-Saturn-Service-Tier",
+	"X-Saturn-Rate-Limit-Requests",
+	"X-Saturn-Rate-Limit-Total-Prompt-Tokens",
+	"X-Saturn-Rate-Limit-Uncached-Prompt-Tokens",
+	"X-Saturn-Rate-Limit-Generated-Tokens",
+}
+
+// legacyQuotaHeadersPresent reports whether the raw request carries any of the
+// removed legacy quota headers. It is a logging diagnostic only.
+func legacyQuotaHeadersPresent(h http.Header) bool {
+	for _, name := range legacyQuotaHeaderNames {
+		if h.Get(name) != "" {
+			return true
+		}
+	}
+	return false
 }
