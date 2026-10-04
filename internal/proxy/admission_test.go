@@ -990,7 +990,7 @@ func rateLimitsEqual(a, b admission.RateLimits) bool {
 // unlimited). R7: the completeness gate covers the IDENTITY anchor only —
 // X-Saturn-Owner-Id; limit headers without that anchor, a malformed present
 // value, and an absent policy all fail closed. R8: there is no legacy
-// envelope (see TestLegacyOnlyQuotaHeadersFailClosed).
+// envelope (see TestLegacyQuotaHeadersAreIgnored).
 func TestTrustedRateLimitPolicyParsing(t *testing.T) {
 	// R7 structural pins — fail closed.
 	for _, tc := range []struct {
@@ -1130,29 +1130,18 @@ func TestTrustedRateLimitPolicyWithoutIdentityAnchorFailsClosed(t *testing.T) {
 	}
 }
 
-// R8 hard cut, end to end: the five legacy single-scope quota headers
-// (X-Saturn-Service-Tier and X-Saturn-Rate-Limit-*) are no longer an
-// envelope. A shared request under enabled admission that carries ONLY those
-// five, with no X-Saturn-Owner-Id and no scoped header, has no trusted policy
-// and fails closed (503) before reaching the upstream — the legacy values
-// neither admit it nor bind any limit. The header names are spelled out
-// literally because phoebe no longer defines constants for them.
-func TestLegacyOnlyQuotaHeadersFailClosed(t *testing.T) {
-	var hits int
-	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
-		hits++
-		_, _ = w.Write([]byte(`{"model":"model-a","usage":{"prompt_tokens":1,"completion_tokens":1}}`))
-	}))
-	defer backend.Close()
-	up, _ := url.Parse(backend.URL)
-	cfg := proxyAdmissionConfig(1)
-	mr := miniredis.RunT(t)
-	c := redis.NewClient(&redis.Options{Addr: mr.Addr()})
-	t.Cleanup(func() { _ = c.Close() })
-	s := New(&config.Settings{Admission: cfg}, logging.New(logging.ERROR), &recordingEmitter{}).WithAdmitter(admission.New(c, cfg))
+// legacyQuotaTestHeaders are the five single-scope quota headers R8 removed.
+// They are spelled out literally because phoebe defines no trusted-header
+// constants for them.
+var legacyQuotaTestHeaders = []string{
+	"X-Saturn-Service-Tier",
+	"X-Saturn-Rate-Limit-Requests",
+	"X-Saturn-Rate-Limit-Total-Prompt-Tokens",
+	"X-Saturn-Rate-Limit-Uncached-Prompt-Tokens",
+	"X-Saturn-Rate-Limit-Generated-Tokens",
+}
 
-	req := sharedRequest(up)
-	req.Header.Del(identity.HeaderOwnerID)
+func deleteScopedRateLimitHeaders(req *http.Request) {
 	for _, header := range []string{
 		identity.HeaderOrgRateLimitRequests,
 		identity.HeaderOrgRateLimitTotalPromptTokens,
@@ -1165,24 +1154,169 @@ func TestLegacyOnlyQuotaHeadersFailClosed(t *testing.T) {
 	} {
 		req.Header.Del(header)
 	}
-	req.Header.Set("X-Saturn-Service-Tier", "default")
-	req.Header.Set("X-Saturn-Rate-Limit-Requests", "1000000")
-	req.Header.Set("X-Saturn-Rate-Limit-Total-Prompt-Tokens", "1000000")
-	req.Header.Set("X-Saturn-Rate-Limit-Uncached-Prompt-Tokens", "1000000")
-	req.Header.Set("X-Saturn-Rate-Limit-Generated-Tokens", "1000000")
+}
 
-	rr := httptest.NewRecorder()
-	s.Handler().ServeHTTP(rr, req)
-	if rr.Code != http.StatusServiceUnavailable {
-		t.Fatalf("status=%d, want 503 — legacy-only quota headers must not satisfy the policy gate", rr.Code)
+// R8 hard cut, end to end: the five legacy single-scope quota headers
+// (X-Saturn-Service-Tier and X-Saturn-Rate-Limit-*) are not an envelope.
+// Legacy headers neither admit a request nor bind or break its limits:
+//   - legacy-only (no X-Saturn-Owner-Id, no scoped header) has no trusted
+//     policy and fails closed (503) before reaching the upstream;
+//   - with the owner-id anchor and no scoped limits, legacy zero caps are
+//     ignored and the request is unlimited and forwarded;
+//   - with the owner-id anchor and scoped limits, legacy zero or malformed
+//     values neither refuse the request nor change the parsed scoped limits.
+//
+// The last two cases are the ones that would fail if phoebe read the legacy
+// headers; the first only shows that a missing anchor fails closed.
+func TestLegacyQuotaHeadersAreIgnored(t *testing.T) {
+	newServer := func(t *testing.T) (*Server, *url.URL, *int) {
+		t.Helper()
+		hits := new(int)
+		backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			*hits++
+			_, _ = w.Write([]byte(`{"model":"model-a","usage":{"prompt_tokens":1,"completion_tokens":1}}`))
+		}))
+		t.Cleanup(backend.Close)
+		up, _ := url.Parse(backend.URL)
+		cfg := proxyAdmissionConfig(1)
+		mr := miniredis.RunT(t)
+		c := redis.NewClient(&redis.Options{Addr: mr.Addr()})
+		t.Cleanup(func() { _ = c.Close() })
+		s := New(&config.Settings{Admission: cfg}, logging.New(logging.ERROR), &recordingEmitter{}).WithAdmitter(admission.New(c, cfg))
+		return s, up, hits
 	}
-	if hits != 0 {
-		t.Fatalf("legacy-only request reached upstream %d times, want 0", hits)
-	}
-	// The parser must also see no policy at all: the legacy values are not
-	// part of the identity it reads.
-	if _, _, err := parseTrustedRateLimits(identity.FromRequest(req)); err == nil {
-		t.Fatal("parseTrustedRateLimits accepted a request carrying only the legacy headers")
+
+	t.Run("legacy only without owner anchor fails closed", func(t *testing.T) {
+		s, up, hits := newServer(t)
+		req := sharedRequest(up)
+		req.Header.Del(identity.HeaderOwnerID)
+		deleteScopedRateLimitHeaders(req)
+		req.Header.Set("X-Saturn-Service-Tier", "default")
+		for _, header := range legacyQuotaTestHeaders[1:] {
+			req.Header.Set(header, "1000000")
+		}
+		rr := httptest.NewRecorder()
+		s.Handler().ServeHTTP(rr, req)
+		if rr.Code != http.StatusServiceUnavailable {
+			t.Fatalf("status=%d, want 503 — legacy-only quota headers must not satisfy the policy gate", rr.Code)
+		}
+		if *hits != 0 {
+			t.Fatalf("legacy-only request reached upstream %d times, want 0", *hits)
+		}
+	})
+
+	t.Run("owner anchor without scoped limits ignores legacy zero caps", func(t *testing.T) {
+		s, up, hits := newServer(t)
+		req := sharedRequest(up)
+		deleteScopedRateLimitHeaders(req)
+		req.Header.Set("X-Saturn-Service-Tier", "default")
+		for _, header := range legacyQuotaTestHeaders[1:] {
+			req.Header.Set(header, "0")
+		}
+		organization, owner, err := parseTrustedRateLimits(identity.FromRequest(req))
+		if err != nil {
+			t.Fatalf("parseTrustedRateLimits: %v — legacy headers must not affect an anchored request", err)
+		}
+		for name, limits := range map[string]admission.RateLimits{"organization": organization, "owner": owner} {
+			if limits.Requests != nil || limits.TotalPromptTokens != nil || limits.UncachedPromptTokens != nil || limits.GeneratedTokens != nil {
+				t.Fatalf("%s limits=%+v, want all unlimited (nil) — legacy zero caps were read", name, limits)
+			}
+		}
+		rr := httptest.NewRecorder()
+		s.Handler().ServeHTTP(rr, req)
+		if rr.Code != http.StatusOK {
+			t.Fatalf("status=%d, want 200 — legacy zero caps must not block the request", rr.Code)
+		}
+		if *hits != 1 {
+			t.Fatalf("upstream hits=%d, want 1", *hits)
+		}
+	})
+
+	t.Run("owner anchor with scoped limits ignores legacy zero and malformed values", func(t *testing.T) {
+		s, up, hits := newServer(t)
+		req := sharedRequest(up)
+		req.Header.Set("X-Saturn-Service-Tier", "gold")
+		req.Header.Set("X-Saturn-Rate-Limit-Requests", "0")
+		req.Header.Set("X-Saturn-Rate-Limit-Total-Prompt-Tokens", "0")
+		req.Header.Set("X-Saturn-Rate-Limit-Uncached-Prompt-Tokens", "-1")
+		req.Header.Set("X-Saturn-Rate-Limit-Generated-Tokens", "not-a-number")
+		organization, owner, err := parseTrustedRateLimits(identity.FromRequest(req))
+		if err != nil {
+			t.Fatalf("parseTrustedRateLimits: %v — malformed legacy headers must not break an anchored request", err)
+		}
+		for name, limits := range map[string]admission.RateLimits{"organization": organization, "owner": owner} {
+			for field, got := range map[string]*int64{
+				"Requests": limits.Requests, "TotalPromptTokens": limits.TotalPromptTokens,
+				"UncachedPromptTokens": limits.UncachedPromptTokens, "GeneratedTokens": limits.GeneratedTokens,
+			} {
+				if got == nil || *got != 1000000 {
+					t.Fatalf("%s %s=%v, want the scoped 1000000 — legacy values leaked into the parsed limits", name, field, got)
+				}
+			}
+		}
+		rr := httptest.NewRecorder()
+		s.Handler().ServeHTTP(rr, req)
+		if rr.Code != http.StatusOK {
+			t.Fatalf("status=%d, want 200 — legacy zero/malformed values must not refuse the request", rr.Code)
+		}
+		if *hits != 1 {
+			t.Fatalf("upstream hits=%d, want 1", *hits)
+		}
+	})
+}
+
+// R8 cutover diagnostic: a legacy-only request still gets the unchanged,
+// opaque 503, but the log names the likely root cause (a producer that still
+// stamps only the removed legacy headers). A request with no policy and no
+// legacy headers must not carry the marker. The legacy headers only ever
+// reach a log line, never a trust or limit decision.
+func TestLegacyOnlyQuotaHeadersLogPreR8ProducerMarker(t *testing.T) {
+	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = w.Write([]byte(`{"model":"model-a","usage":{"prompt_tokens":1,"completion_tokens":1}}`))
+	}))
+	defer backend.Close()
+	up, _ := url.Parse(backend.URL)
+	cfg := proxyAdmissionConfig(1)
+	mr := miniredis.RunT(t)
+	c := redis.NewClient(&redis.Options{Addr: mr.Addr()})
+	t.Cleanup(func() { _ = c.Close() })
+
+	for _, tc := range []struct {
+		name       string
+		legacy     bool
+		wantMarker bool
+	}{
+		{name: "legacy headers present", legacy: true, wantMarker: true},
+		{name: "no policy at all", legacy: false, wantMarker: false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var warnBuf, errBuf bytes.Buffer
+			logger := &logging.Logger{Warn: log.New(&warnBuf, "", 0), Error: log.New(&errBuf, "", 0)}
+			s := New(&config.Settings{Admission: cfg}, logger, &recordingEmitter{}).WithAdmitter(admission.New(c, cfg))
+			req := sharedRequest(up)
+			req.Header.Del(identity.HeaderOwnerID)
+			deleteScopedRateLimitHeaders(req)
+			if tc.legacy {
+				req.Header.Set("X-Saturn-Service-Tier", "default")
+				for _, header := range legacyQuotaTestHeaders[1:] {
+					req.Header.Set(header, "1000000")
+				}
+			}
+			rr := httptest.NewRecorder()
+			s.Handler().ServeHTTP(rr, req)
+			if rr.Code != http.StatusServiceUnavailable {
+				t.Fatalf("status=%d, want 503", rr.Code)
+			}
+			if body := strings.TrimSpace(rr.Body.String()); body != "shared inference policy unavailable" {
+				t.Fatalf("response body=%q, want the unchanged opaque body", body)
+			}
+			if !strings.Contains(errBuf.String(), "incomplete trusted shared-inference rate-limit policy") {
+				t.Fatalf("error log=%q, want the policy error", errBuf.String())
+			}
+			if got := strings.Contains(warnBuf.String(), "legacy_envelope_present=true"); got != tc.wantMarker {
+				t.Fatalf("legacy marker in warn log=%v, want %v; warn log=%q", got, tc.wantMarker, warnBuf.String())
+			}
+		})
 	}
 }
 
@@ -2228,6 +2362,44 @@ func TestProxyForwardsOperatorAdmissionLaneDynamoHints(t *testing.T) {
 	}
 	if payload.Nvext.CacheSalt != forwarded.Header.Get("X-Tenant-ID") || payload.Nvext.Hints.Priority != 11 || payload.Nvext.Hints.StrictPriority != 4 || payload.Nvext.Hints.OSL != 20 {
 		t.Fatalf("forwarded trusted policy mismatch: %+v headers=%v", payload, forwarded.Header)
+	}
+}
+
+// Only operator config selects a lane: an org with no OrganizationLanes entry
+// stays on the default lane even when a higher-priority lane is configured,
+// another org is mapped to it, and the client asks for that priority.
+func TestUnmappedOrgStaysOnDefaultLaneDynamoHints(t *testing.T) {
+	seen := make(chan *http.Request, 1)
+	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		seen <- r.Clone(r.Context())
+		_, _ = w.Write([]byte(`{"model":"model-a","usage":{"prompt_tokens":1,"completion_tokens":1}}`))
+	}))
+	defer backend.Close()
+	up, _ := url.Parse(backend.URL)
+	mr := miniredis.RunT(t)
+	cfg := proxyAdmissionConfig(2)
+	cfg.Lanes = map[string]config.AdmissionLane{
+		"default": {Weight: 1},
+		"gold":    {Weight: 1, DynamoPriority: 11, DynamoStrictPriority: 4},
+	}
+	cfg.OrganizationLanes = map[string]string{"org-z": "gold"}
+	c := redis.NewClient(&redis.Options{Addr: mr.Addr()})
+	t.Cleanup(func() { _ = c.Close() })
+	s := New(&config.Settings{Admission: cfg}, logging.New(logging.ERROR), &recordingEmitter{}).WithAdmitter(admission.New(c, cfg))
+	req := sharedRequest(up) // org-a, full scoped envelope
+	req.Header.Set("X-Dynamo-Request-Priority", "11")
+	req.Header.Set("X-Dynamo-Request-Strict-Priority", "4")
+	rr := httptest.NewRecorder()
+	s.Handler().ServeHTTP(rr, req)
+	if rr.Code != http.StatusOK {
+		t.Fatalf("status=%d", rr.Code)
+	}
+	forwarded := <-seen
+	if got := forwarded.Header.Get("X-Dynamo-Request-Priority"); got != "0" {
+		t.Fatalf("forwarded priority header=%q, want 0 — an unmapped org must not get the gold lane's 11", got)
+	}
+	if got := forwarded.Header.Get("X-Dynamo-Request-Strict-Priority"); got != "0" {
+		t.Fatalf("forwarded strict-priority header=%q, want 0 — an unmapped org must not get the gold lane's 4", got)
 	}
 }
 
