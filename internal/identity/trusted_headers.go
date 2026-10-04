@@ -78,6 +78,8 @@ var requiredTrustedHeaders = []struct {
 }{
 	{HeaderGateway, "gateway requests will not be recognized"},
 	{HeaderServingMode, "every header-routed (non-gateway) inference request will be refused with 404 because the serving mode reads as absent (ruling #19)"},
+	{HeaderOwnerID, "with admission enabled, every shared gateway inference request will be refused with 503 because the quota policy has no owner-id anchor (R7/R8: the legacy service-tier envelope is no longer read)"},
+	{HeaderOrgID, "with admission enabled, every shared gateway inference request will be refused with 503 because the trusted organization identity reads as absent"},
 }
 
 // trustedHeaderSet is the active trusted-header set. Keys are canonical

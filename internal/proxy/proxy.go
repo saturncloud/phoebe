@@ -623,6 +623,11 @@ func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request) {
 			organizationLimits, ownerLimits, policyErr := parseTrustedRateLimits(id)
 			if policyErr != nil {
 				s.log.Error.Printf("admission: invalid trusted rate-limit policy: %v", policyErr)
+				if errors.Is(policyErr, errNoTrustedRateLimitPolicy) && legacyQuotaHeadersPresent(r.Header) {
+					// Log-only diagnostic for the R8 cutover: the legacy headers
+					// decide nothing, but their presence names the root cause.
+					s.log.Warn.Printf("admission: legacy single-scope quota headers present without %s (removed by R8); legacy_envelope_present=true (pre-R8 producer; upgrade Atlas/Traefik) request_id=%s", identity.HeaderOwnerID, requestID)
+				}
 				http.Error(w, "shared inference policy unavailable", http.StatusServiceUnavailable)
 				return
 			}

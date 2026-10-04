@@ -127,15 +127,43 @@ The five legacy single-scope quota headers (`X-Saturn-Service-Tier`,
 `X-Saturn-Rate-Limit-Uncached-Prompt-Tokens`,
 `X-Saturn-Rate-Limit-Generated-Tokens`) were removed in one cutover release
 (ruling R8, a hard cut). In that release Saturn stops stamping them, Traefik
-stops allowlisting them, the phoebe chart drops them from `trustedHeaders`
-(so they leave the trust set and the strip middleware together), and Phoebe
-stops reading them. There is no dual-contract window after the cutover and no
+stops allowlisting them, the phoebe chart drops them from `trustedHeaders`,
+and Phoebe stops reading them. The strip outlives the trust: the edge keeps
+blanking client-supplied copies of the five names until every Phoebe replica
+runs the R8 image (see below). There is no dual-contract window after the cutover and no
 fallback: a request that carries only the legacy headers and no
 `X-Saturn-Owner-Id` has no policy and, with admission enabled, fails closed
-with 503. The four components of that release can roll in any order, because
-the scoped envelope was already stamped on every route where admission runs
-before the cutover, and every Phoebe that still read the legacy headers
-preferred the scoped envelope whenever the owner id was present.
+with 503.
+
+The four components of that release are safe to roll in any order only
+because admission stays disabled (`admission.enabled: false`, ruling R12) for the
+whole cutover, so no replica enforces a policy envelope during the rollout.
+No current or pre-cutover Phoebe reads the legacy headers on dedicated
+routes. The scoped envelope is stamped only by the gateway ForwardAuth, on
+gateway routes; every Phoebe that still read the legacy headers preferred the
+scoped envelope whenever the owner id was present. Historical per-resource
+shared routes never carried the policy contract, and R8 does not change that:
+they must be drained or removed before admission is enabled (see the
+requirement later in this section).
+
+The five legacy names leave the trust set but must not leave the edge strip
+lists in the same release. A Phoebe replica older than the R8 image still
+parses the legacy envelope, and during a mixed rollout it would accept a
+client-forged `X-Saturn-Service-Tier` / `X-Saturn-Rate-Limit-*` set on any
+admission-enabled request that has no `X-Saturn-Owner-Id`. The edge strip has
+always prevented that, and the R8 image cannot protect older replicas by
+stripping in its own code. So the names stay stripped at the edge, without
+being trusted: the traefik chart's `tf-gateway-headers` middleware blanks
+them on the gateway route, and the phoebe chart's
+`phoebe-inference-headers` middleware must blank them on the standard route
+through a strip-only list that is not rendered into `PHOEBE_TRUSTED_HEADERS`.
+On the standard route this breaks the usual equality of the strip set and the
+trusted set (ruling R3) on purpose: the strip set is the trusted set plus the
+five legacy names. Remove the strip-only names only in a later release, after
+every Phoebe replica runs the R8 image. The recommended order is phoebe #55
+first (or in the same window), then Atlas #6715, with saturn-k8s #1073
+alongside either. Nothing reads these headers after the cutover, so dropping
+the strip once no pre-R8 replica remains is harmless.
 
 While admission is disabled, Phoebe does not require a policy envelope. Once
 admission is enabled, a missing or structurally broken policy fails closed.
