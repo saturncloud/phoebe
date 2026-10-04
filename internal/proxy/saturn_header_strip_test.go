@@ -1,11 +1,13 @@
 package proxy
 
 import (
+	"bufio"
+	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
-	"os"
 	"strings"
 	"sync"
 	"testing"
@@ -246,17 +248,14 @@ func TestConfiguredTrustedHeadersOmissionIsStripped(t *testing.T) {
 			keep = append(keep, name)
 		}
 	}
-	old, hadOld := os.LookupEnv(identity.TrustedHeadersEnv)
+	// t.Setenv restores the variable itself, but the active trusted set is
+	// package-global, so the registry must be reloaded after the variable is
+	// restored. Cleanups run last-in first-out: registering the reload before
+	// t.Setenv makes it run after t.Setenv's restore, so it reloads from the
+	// original value.
+	t.Cleanup(func() { identity.LoadTrustedHeaders(logging.New(logging.ERROR)) })
 	t.Setenv(identity.TrustedHeadersEnv, strings.Join(keep, ","))
 	identity.LoadTrustedHeaders(logging.New(logging.ERROR))
-	t.Cleanup(func() {
-		if hadOld {
-			os.Setenv(identity.TrustedHeadersEnv, old)
-		} else {
-			os.Unsetenv(identity.TrustedHeadersEnv)
-		}
-		identity.LoadTrustedHeaders(logging.New(logging.ERROR))
-	})
 
 	rec := &headerRecorder{next: usageHandler()}
 	be := httptest.NewServer(rec)
@@ -285,41 +284,150 @@ func TestConfiguredTrustedHeadersOmissionIsStripped(t *testing.T) {
 	assertUpstreamSaturnHeaders(t, rec.all(), sent, []string{retired}, forwardable)
 }
 
-// TestUntrustedSaturnTrailersStripped: ReverseProxy forwards request trailers,
-// so an X-Saturn-* trailer outside the trusted set is stripped too. A harmless
-// trailer must still arrive, proving the trailer channel is live in this test.
-func TestUntrustedSaturnTrailersStripped(t *testing.T) {
-	var mu sync.Mutex
-	var trailer http.Header
-	be := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		_, _ = io.Copy(io.Discard, r.Body)
-		mu.Lock()
-		trailer = r.Trailer.Clone()
-		mu.Unlock()
-		_, _ = w.Write([]byte(`{"model":"model-a","usage":{"prompt_tokens":3,"completion_tokens":2,"total_tokens":5}}`))
-	}))
-	defer be.Close()
-	u, _ := url.Parse(be.URL)
+// trailerRecorder is a backend that reads each request body to the end and
+// then records the request's trailers. The server fills in r.Trailer only once
+// the body reaches EOF, so the copy must be taken after the drain.
+type trailerRecorder struct {
+	mu       sync.Mutex
+	trailers []http.Header
+}
 
-	// An empty chunked body on an unbound dedicated route is forwarded without
-	// any body rewrite, so the request stays chunked and its trailers travel.
-	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(""))
-	req.ContentLength = -1
-	setUpstream(req, u)
-	req.Header.Set(identity.HeaderAuthID, "auth-a")
-	req.Header.Set(identity.HeaderResourceID, "resource-a")
-	req.Trailer = http.Header{"X-Saturn-Service-Tier": {"premium"}, "X-Other-Trailer": {"ok"}}
-	rr := httptest.NewRecorder()
-	newTestServer(t, u).Handler().ServeHTTP(rr, req)
-	if rr.Code != http.StatusOK {
-		t.Fatalf("status = %d, want 200", rr.Code)
+func (rec *trailerRecorder) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	_, _ = io.Copy(io.Discard, r.Body)
+	rec.mu.Lock()
+	rec.trailers = append(rec.trailers, r.Trailer.Clone())
+	rec.mu.Unlock()
+	_, _ = w.Write([]byte(`{"model":"model-a","usage":{"prompt_tokens":3,"completion_tokens":2,"total_tokens":5}}`))
+}
+
+func (rec *trailerRecorder) all() []http.Header {
+	rec.mu.Lock()
+	defer rec.mu.Unlock()
+	return append([]http.Header(nil), rec.trailers...)
+}
+
+// rawChunkedPost writes a chunked HTTP/1.1 POST byte for byte to addr, with
+// the given trailer lines after the terminating zero-length chunk, and returns
+// the response status. Writing raw bytes is what makes the server parse the
+// trailers off the wire and merge them into r.Trailer at body EOF, which an
+// in-process httptest.NewRequest fixture never does.
+func rawChunkedPost(t *testing.T, addr string, header http.Header, declared, body string, trailerLines []string) int {
+	t.Helper()
+	conn, err := net.Dial("tcp", addr)
+	if err != nil {
+		t.Fatalf("dial: %v", err)
 	}
-	mu.Lock()
-	defer mu.Unlock()
-	if trailer.Get("X-Other-Trailer") != "ok" {
-		t.Fatalf("control trailer did not arrive (%v); the test cannot observe trailers", trailer)
+	defer conn.Close()
+	_ = conn.SetDeadline(time.Now().Add(10 * time.Second))
+
+	var b strings.Builder
+	b.WriteString("POST /v1/chat/completions HTTP/1.1\r\nHost: phoebe.test\r\n")
+	for name, values := range header {
+		for _, v := range values {
+			fmt.Fprintf(&b, "%s: %s\r\n", name, v)
+		}
 	}
-	if v := trailer.Get("X-Saturn-Service-Tier"); v != "" {
-		t.Fatalf("upstream received untrusted X-Saturn-* trailer %q", v)
+	b.WriteString("Content-Type: application/json\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n")
+	if declared != "" {
+		fmt.Fprintf(&b, "Trailer: %s\r\n", declared)
+	}
+	b.WriteString("\r\n")
+	if body != "" {
+		fmt.Fprintf(&b, "%x\r\n%s\r\n", len(body), body)
+	}
+	b.WriteString("0\r\n")
+	for _, line := range trailerLines {
+		b.WriteString(line + "\r\n")
+	}
+	b.WriteString("\r\n")
+	if _, err := conn.Write([]byte(b.String())); err != nil {
+		t.Fatalf("write request: %v", err)
+	}
+	resp, err := http.ReadResponse(bufio.NewReader(conn), nil)
+	if err != nil {
+		t.Fatalf("read response: %v", err)
+	}
+	_, _ = io.Copy(io.Discard, resp.Body)
+	_ = resp.Body.Close()
+	return resp.StatusCode
+}
+
+// TestUntrustedSaturnTrailersStrippedOverWire: a client's X-Saturn-* request
+// trailer outside the forwardable set never reaches the upstream, on a real
+// connection where the server fills in trailer values only after the body has
+// been read (ruling Q-R8STRIP option b covers headers and trailers). Covered:
+// a declared and an undeclared trailer name (the server merges both), a
+// non-empty and an empty body, and the dedicated and gateway routes. A
+// harmless trailer must still arrive, proving the trailer channel is live.
+func TestUntrustedSaturnTrailersStrippedOverWire(t *testing.T) {
+	const allTrailers = "X-Saturn-Service-Tier, X-Saturn-Foo, X-Other-Trailer"
+	trailerLines := []string{"X-Saturn-Service-Tier: premium", "X-Saturn-Foo: bar", "X-Other-Trailer: ok"}
+
+	dedicatedHeader := func(u *url.URL) http.Header {
+		h := http.Header{}
+		h.Set(identity.HeaderAuthID, "auth-a")
+		h.Set(identity.HeaderResourceID, "resource-a")
+		h.Set(identity.HeaderUpstream, u.Host)
+		h.Set(identity.HeaderServingMode, identity.ServingModeDedicated)
+		h.Set("X-Request-Id", "saturn-test-request-id")
+		return h
+	}
+	gatewayHeader := func(*url.URL) http.Header {
+		return gatewayRequest("org-1", "").Header
+	}
+	dedicatedServer := func(t *testing.T, u *url.URL) *Server { return newTestServer(t, u) }
+	gatewayServer := func(t *testing.T, u *url.URL) *Server {
+		resolver := &mapResolver{m: map[[2]string]gateway.Resolution{
+			{"org-1", "model-a"}: {ResourceID: "tfm-1", BaseModel: "base/model", ServingMode: "shared", GraphK8sName: "graph-a"},
+		}}
+		return newGatewayTestServer(t, &recordingEmitter{}, resolver, u)
+	}
+
+	for _, tc := range []struct {
+		name     string
+		server   func(*testing.T, *url.URL) *Server
+		header   func(*url.URL) http.Header
+		declared string
+		body     string
+		// noControl: an empty body is forwarded with no body at all
+		// (ReverseProxy drops a zero-length body), so no trailer, not even
+		// the harmless one, can travel. The case still proves the empty
+		// chunked request is served (200, not 502) and leaks nothing.
+		noControl bool
+	}{
+		{"dedicated/declared", dedicatedServer, dedicatedHeader, allTrailers, `{"model":"model-a","stream":true,"max_tokens":5}`, false},
+		{"dedicated/undeclared", dedicatedServer, dedicatedHeader, "X-Other-Trailer", `{"model":"model-a","max_tokens":5}`, false},
+		{"dedicated/empty-body", dedicatedServer, dedicatedHeader, allTrailers, "", true},
+		{"gateway/declared", gatewayServer, gatewayHeader, allTrailers, `{"model":"model-a","stream":true,"max_tokens":5}`, false},
+		{"gateway/undeclared", gatewayServer, gatewayHeader, "X-Other-Trailer", `{"model":"model-a","max_tokens":5}`, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			rec := &trailerRecorder{}
+			be := httptest.NewServer(rec)
+			defer be.Close()
+			u, _ := url.Parse(be.URL)
+			front := httptest.NewServer(tc.server(t, u).Handler())
+			defer front.Close()
+
+			status := rawChunkedPost(t, front.Listener.Addr().String(), tc.header(u), tc.declared, tc.body, trailerLines)
+			if status != http.StatusOK {
+				t.Fatalf("status = %d, want 200", status)
+			}
+			seen := rec.all()
+			if len(seen) == 0 {
+				t.Fatal("upstream saw no request")
+			}
+			for _, tr := range seen {
+				if !tc.noControl && tr.Get("X-Other-Trailer") != "ok" {
+					t.Fatalf("control trailer did not arrive (%v); the test cannot observe trailers", tr)
+				}
+				for name := range tr {
+					canon := http.CanonicalHeaderKey(name)
+					if strings.HasPrefix(canon, "X-Saturn-") && !forwardableSaturn[canon] {
+						t.Fatalf("upstream received untrusted X-Saturn-* trailer %s=%v", name, tr[name])
+					}
+				}
+			}
+		})
 	}
 }

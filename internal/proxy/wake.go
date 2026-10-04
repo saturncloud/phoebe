@@ -6,7 +6,6 @@ import (
 	"io"
 	"net"
 	"net/http"
-	"net/http/httputil"
 	"net/url"
 	"strings"
 
@@ -296,7 +295,7 @@ func (s *Server) serveWithWake(
 	for attempt := 0; attempt < maxTries; attempt++ {
 		restoreBody()
 		buf := newBufferingResponseWriter()
-		probe := httputil.NewSingleHostReverseProxy(upstream)
+		probe := newUpstreamProxy(upstream)
 		// A probe failure (upstream unreachable) is not a cold signal — surface
 		// it as a bad gateway, same as the normal error handler would.
 		probe.ErrorHandler = func(pw http.ResponseWriter, _ *http.Request, e error) {
@@ -379,7 +378,7 @@ func (s *Server) serveWithWake(
 	// not-cold handling above.
 	restoreBody()
 	buf := newBufferingResponseWriter()
-	last := httputil.NewSingleHostReverseProxy(upstream)
+	last := newUpstreamProxy(upstream)
 	last.ServeHTTP(buf, r)
 	if !buf.isColdWakeable() {
 		restoreBody()
