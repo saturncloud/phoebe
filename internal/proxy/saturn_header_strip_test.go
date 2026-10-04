@@ -357,19 +357,35 @@ func TestSaturnHeadersStrippedWithConfiguredTrustedSet(t *testing.T) {
 }
 
 // trailerRecorder is a backend that reads each request body to the end and
-// then records the request's trailers. The server fills in r.Trailer only once
-// the body reaches EOF, so the copy must be taken after the drain.
+// then records the request's trailers and body length. The server fills in
+// r.Trailer only once the body reaches EOF, so the copy must be taken after
+// the drain. With cold set, the response comes from cold (a wake test's
+// cold-then-warm backend); otherwise it is a usage-bearing 200.
 type trailerRecorder struct {
+	cold *coldToWarmBackend
+
 	mu       sync.Mutex
 	trailers []http.Header
+	bodyLens []int64
 }
 
 func (rec *trailerRecorder) ServeHTTP(w http.ResponseWriter, r *http.Request) {
-	_, _ = io.Copy(io.Discard, r.Body)
+	n, _ := io.Copy(io.Discard, r.Body)
 	rec.mu.Lock()
 	rec.trailers = append(rec.trailers, r.Trailer.Clone())
+	rec.bodyLens = append(rec.bodyLens, n)
 	rec.mu.Unlock()
+	if rec.cold != nil {
+		rec.cold.ServeHTTP(w, r)
+		return
+	}
 	_, _ = w.Write([]byte(`{"model":"model-a","usage":{"prompt_tokens":3,"completion_tokens":2,"total_tokens":5}}`))
+}
+
+func (rec *trailerRecorder) bodyLengths() []int64 {
+	rec.mu.Lock()
+	defer rec.mu.Unlock()
+	return append([]int64(nil), rec.bodyLens...)
 }
 
 func (rec *trailerRecorder) all() []http.Header {
@@ -428,10 +444,17 @@ func rawChunkedPost(t *testing.T, addr string, header http.Header, declared, bod
 // reaches the upstream (ruling Q-R8STRIP2 covers headers and trailers), on a
 // real connection where the server fills in trailer values only after the body
 // has been read. The trailers include trusted and edge-contract names, a
-// mixed-case name, and look-alikes that must survive. Covered:
-// a declared and an undeclared trailer name (the server merges both), a
-// non-empty and an empty body, and the dedicated and gateway routes. A
-// harmless trailer must still arrive, proving the trailer channel is live.
+// mixed-case name, and look-alikes that must survive. Covered: a declared and
+// an undeclared trailer name (the server merges both), on the dedicated
+// header-routed, shared header-routed and gateway routes, and on the shared
+// wake path, where the cold probe, the re-probe after the wake and the metered
+// forward each reach the upstream. A harmless trailer must arrive on every
+// upstream request that carries a body, proving the trailer channel is live.
+//
+// The "empty-body-served-not-502" case cannot observe trailer stripping:
+// ReverseProxy forwards a zero-length body with no body at all, so no trailer,
+// forged or harmless, can travel. It checks only that an empty chunked request
+// is served (200, not 502).
 func TestNoSaturnTrailersReachUpstreamOverWire(t *testing.T) {
 	const allTrailers = "X-Saturn-Service-Tier, X-Saturn-Foo, X-Saturn-Upstream, X-Saturn-Org-Id, x-SATURN-mixed, X-Saturnine, X-Other-Trailer"
 	trailerLines := []string{
@@ -449,41 +472,55 @@ func TestNoSaturnTrailersReachUpstreamOverWire(t *testing.T) {
 		h.Set("X-Request-Id", "saturn-test-request-id")
 		return h
 	}
+	sharedHeader := func(u *url.URL) http.Header { return sharedRequest(u).Header }
 	gatewayHeader := func(*url.URL) http.Header {
 		return gatewayRequest("org-1", "").Header
 	}
-	dedicatedServer := func(t *testing.T, u *url.URL) *Server { return newTestServer(t, u) }
-	gatewayServer := func(t *testing.T, u *url.URL) *Server {
+	plainServer := func(t *testing.T, u *url.URL, _ *trailerRecorder) *Server { return newTestServer(t, u) }
+	gatewayServer := func(t *testing.T, u *url.URL, _ *trailerRecorder) *Server {
 		resolver := &mapResolver{m: map[[2]string]gateway.Resolution{
 			{"org-1", "model-a"}: {ResourceID: "tfm-1", BaseModel: "base/model", ServingMode: "shared", GraphK8sName: "graph-a"},
 		}}
 		return newGatewayTestServer(t, &recordingEmitter{}, resolver, u)
 	}
+	// wakeServer makes the upstream cold until the first wake, so the request
+	// takes the wake path: cold probe, re-probe after the wake, then the
+	// metered forward.
+	wakeServer := func(t *testing.T, u *url.URL, rec *trailerRecorder) *Server {
+		rec.cold = &coldToWarmBackend{warmBody: `{"model":"model-a","usage":{"prompt_tokens":3,"completion_tokens":2,"total_tokens":5}}`}
+		waker := &fakeWaker{warmsAt: 1, backend: rec.cold}
+		return newTestServer(t, u).WithWaker(waker, 5*time.Second, 3)
+	}
+	const body = `{"model":"model-a","max_tokens":5}`
+	const streamBody = `{"model":"model-a","stream":true,"max_tokens":5}`
 
 	for _, tc := range []struct {
 		name     string
-		server   func(*testing.T, *url.URL) *Server
+		server   func(*testing.T, *url.URL, *trailerRecorder) *Server
 		header   func(*url.URL) http.Header
 		declared string
 		body     string
-		// noControl: an empty body is forwarded with no body at all
-		// (ReverseProxy drops a zero-length body), so no trailer, not even
-		// the harmless one, can travel. The case still proves the empty
-		// chunked request is served (200, not 502) and leaks nothing.
-		noControl bool
+		requests int // upstream requests expected
+		// servedOnly: the case cannot observe trailers (empty body), so it
+		// checks only that the request is served.
+		servedOnly bool
 	}{
-		{"dedicated/declared", dedicatedServer, dedicatedHeader, allTrailers, `{"model":"model-a","stream":true,"max_tokens":5}`, false},
-		{"dedicated/undeclared", dedicatedServer, dedicatedHeader, "X-Other-Trailer", `{"model":"model-a","max_tokens":5}`, false},
-		{"dedicated/empty-body", dedicatedServer, dedicatedHeader, allTrailers, "", true},
-		{"gateway/declared", gatewayServer, gatewayHeader, allTrailers, `{"model":"model-a","stream":true,"max_tokens":5}`, false},
-		{"gateway/undeclared", gatewayServer, gatewayHeader, "X-Other-Trailer", `{"model":"model-a","max_tokens":5}`, false},
+		{"dedicated/declared", plainServer, dedicatedHeader, allTrailers, streamBody, 1, false},
+		{"dedicated/undeclared", plainServer, dedicatedHeader, "X-Other-Trailer", body, 1, false},
+		{"dedicated/empty-body-served-not-502", plainServer, dedicatedHeader, allTrailers, "", 1, true},
+		{"shared/declared", plainServer, sharedHeader, allTrailers, streamBody, 1, false},
+		{"shared/undeclared", plainServer, sharedHeader, "X-Other-Trailer", body, 1, false},
+		{"gateway/declared", gatewayServer, gatewayHeader, allTrailers, streamBody, 1, false},
+		{"gateway/undeclared", gatewayServer, gatewayHeader, "X-Other-Trailer", body, 1, false},
+		{"shared-wake/declared", wakeServer, sharedHeader, allTrailers, body, 3, false},
+		{"shared-wake/undeclared", wakeServer, sharedHeader, "X-Other-Trailer", body, 3, false},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			rec := &trailerRecorder{}
 			be := httptest.NewServer(rec)
 			defer be.Close()
 			u, _ := url.Parse(be.URL)
-			front := httptest.NewServer(tc.server(t, u).Handler())
+			front := httptest.NewServer(tc.server(t, u, rec).Handler())
 			defer front.Close()
 
 			status := rawChunkedPost(t, front.Listener.Addr().String(), tc.header(u), tc.declared, tc.body, trailerLines)
@@ -491,18 +528,30 @@ func TestNoSaturnTrailersReachUpstreamOverWire(t *testing.T) {
 				t.Fatalf("status = %d, want 200", status)
 			}
 			seen := rec.all()
-			if len(seen) == 0 {
-				t.Fatal("upstream saw no request")
+			if len(seen) != tc.requests {
+				t.Fatalf("upstream saw %d requests, want %d", len(seen), tc.requests)
 			}
-			for _, tr := range seen {
-				if !tc.noControl && (tr.Get("X-Other-Trailer") != "ok" || tr.Get("X-Saturnine") != "ok") {
-					t.Fatalf("control trailers did not arrive (%v); the test cannot observe trailers", tr)
-				}
+			if tc.servedOnly {
+				return
+			}
+			lens := rec.bodyLengths()
+			withBody := 0
+			for i, tr := range seen {
 				for name := range tr {
 					if isSaturnName(name) {
-						t.Fatalf("upstream received X-Saturn-* trailer %s=%v", name, tr[name])
+						t.Fatalf("upstream request %d received X-Saturn-* trailer %s=%v", i, name, tr[name])
 					}
 				}
+				if lens[i] == 0 {
+					continue
+				}
+				withBody++
+				if tr.Get("X-Other-Trailer") != "ok" || tr.Get("X-Saturnine") != "ok" {
+					t.Fatalf("upstream request %d: control trailers did not arrive (%v); the test cannot observe trailers", i, tr)
+				}
+			}
+			if withBody == 0 {
+				t.Fatal("no upstream request carried a body, so no trailer could be observed")
 			}
 		})
 	}
