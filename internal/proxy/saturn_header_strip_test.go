@@ -40,6 +40,7 @@ var keptLookalikes = map[string]string{
 	"X-SaturnX":        "kept-2",
 	"X-Saturn":         "kept-3",
 	"X-Saturnalia-Foo": "kept-4",
+	"X_Saturnine":      "kept-6",
 	"X-Client-Custom":  "kept-5",
 }
 
@@ -56,6 +57,11 @@ func addClientSaturnHeaders(req *http.Request) {
 	req.Header["X-SATURN-SERVICE-TIER-SHOUT"] = []string{"client-forged"}
 	req.Header.Add("X-Saturn-Repeated", "one")
 	req.Header.Add("X-Saturn-Repeated", "two")
+	// Underscore spellings: Go keeps '_' in header names, and a WSGI/CGI-style
+	// upstream would fold them into X-Saturn-* names.
+	req.Header["X_Saturn_Owner_Id"] = []string{"client-forged"}
+	req.Header["x_saturn_upstream"] = []string{"client-forged"}
+	req.Header["X-Saturn_Org_Id"] = []string{"client-forged"}
 	for name, value := range keptLookalikes {
 		req.Header[name] = []string{value}
 	}
@@ -88,8 +94,10 @@ func usageHandler() http.Handler {
 	})
 }
 
+// isSaturnName reports an X-Saturn-* name in any case, with '_' folded to
+// '-' the way a WSGI/CGI-style upstream would read it.
 func isSaturnName(name string) bool {
-	return strings.HasPrefix(strings.ToLower(name), "x-saturn-")
+	return strings.HasPrefix(strings.ReplaceAll(strings.ToLower(name), "_", "-"), "x-saturn-")
 }
 
 // assertNoUpstreamSaturnHeaders checks every request the upstream saw: it

@@ -21,8 +21,8 @@ package identity
 //
 // This registry governs only what phoebe READS. What phoebe FORWARDS is a
 // separate, simpler rule: after FromRequest has parsed the identity,
-// StripSaturnHeaders removes every X-Saturn-* header, trusted or not, from the
-// forwarded request (ruling Q-R8STRIP2), so no X-Saturn-* header reaches the
+// StripSaturnHeaders removes every X-Saturn-* header (dash or underscore
+// spelling), trusted or not, from the forwarded request (ruling Q-R8STRIP2), so no X-Saturn-* header reaches the
 // upstream.
 
 import (
@@ -182,16 +182,39 @@ const saturnHeaderPrefix = "X-Saturn-"
 // isSaturnHeader reports whether name is in the X-Saturn-* namespace,
 // case-insensitively. It does not rely on name being canonical, so a key put
 // into an http.Header map directly (bypassing Set/Add canonicalization) is
-// still recognized. Only the full prefix with its trailing dash matches:
-// look-alikes such as "X-Saturnine" or "X-SaturnX" are not Saturn headers.
+// still recognized. Underscore spellings such as "X_Saturn_User_Id" or
+// "X-Saturn_Org_Id" also match: Go's HTTP parser accepts '_' in header names
+// and keeps it, and some upstreams (WSGI/CGI-style servers) fold '_' and '-'
+// together, so such a name would read upstream as a real X-Saturn-* header.
+// Only the full prefix with its trailing separator matches: look-alikes such
+// as "X-Saturnine", "X-SaturnX" or "X_Saturnine" are not Saturn headers.
 func isSaturnHeader(name string) bool {
-	return len(name) >= len(saturnHeaderPrefix) &&
-		strings.EqualFold(name[:len(saturnHeaderPrefix)], saturnHeaderPrefix)
+	if len(name) < len(saturnHeaderPrefix) {
+		return false
+	}
+	for i := 0; i < len(saturnHeaderPrefix); i++ {
+		c := name[i]
+		if c == '_' {
+			c = '-'
+		}
+		if lowerASCII(c) != lowerASCII(saturnHeaderPrefix[i]) {
+			return false
+		}
+	}
+	return true
+}
+
+func lowerASCII(c byte) byte {
+	if 'A' <= c && c <= 'Z' {
+		return c + ('a' - 'A')
+	}
+	return c
 }
 
 // StripSaturnHeaders deletes EVERY X-Saturn-* header from h and returns how
 // many header names it removed. All values of a repeated header are removed
-// with its key, and matching is case-insensitive. Trusted envelope headers,
+// with its key, matching is case-insensitive, and '_' counts as '-' in the
+// prefix (so "X_Saturn_Owner_Id" is removed too; see isSaturnHeader). Trusted envelope headers,
 // edge-contract identity headers (X-Saturn-Upstream, X-Saturn-Resource-Id,
 // ...), retired names, and names no registry lists are all removed alike.
 //

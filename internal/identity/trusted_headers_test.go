@@ -318,7 +318,9 @@ func TestLoadTrustedHeadersNoErrorForPinnedList(t *testing.T) {
 }
 
 // TestStripSaturnHeaders (ruling Q-R8STRIP2): every X-Saturn-* header is
-// removed, in any case spelling and with all of its values, whether it is in
+// removed, in any case spelling, with '_' in place of any '-' in the prefix
+// (X_Saturn_Owner_Id, which a WSGI/CGI-style upstream folds into
+// X-Saturn-Owner-Id), and with all of its values, whether it is in
 // the trusted set, an edge-contract identity header, retired, or unknown.
 // Non-Saturn headers and look-alike names outside the "X-Saturn-" namespace
 // are untouched.
@@ -342,12 +344,22 @@ func TestStripSaturnHeaders(t *testing.T) {
 		{"edge contract auth", HeaderAuthID, false},
 		{"edge contract upstream", HeaderUpstream, false},
 		{"edge contract lowercase", "x-saturn-resource-id", false},
+		{"underscore owner", "X_Saturn_Owner_Id", false},
+		{"underscore lowercase user", "x_saturn_user_id", false},
+		{"underscore resource", "X_Saturn_Resource_Id", false},
+		{"underscore upstream lowercase", "x_saturn_upstream", false},
+		{"mixed dash and underscore", "X-Saturn_Mixed", false},
+		{"mixed underscore and dash", "X_Saturn-Org-Id", false},
 		{"non-saturn", "X-Request-Id", true},
 		{"non-saturn tenant", "X-Tenant-ID", true},
 		{"prefix only, no namespace dash", "X-Saturn", true},
 		{"look-alike X-Saturnine", "X-Saturnine", true},
 		{"look-alike X-SaturnX", "X-SaturnX", true},
 		{"look-alike namespace", "X-Saturnalia-Foo", true},
+		{"underscore look-alike X_Saturnine", "X_Saturnine", true},
+		{"underscore look-alike X_SaturnX", "X_SaturnX", true},
+		{"underscore too short", "X_Sat", true},
+		{"underscore prefix only", "X_Saturn", true},
 		{"saturn not at the start", "X-Not-Saturn-Foo", true},
 	}
 	h := http.Header{}
@@ -510,5 +522,55 @@ func TestStripSaturnHeadersRemovesEveryPackageHeader(t *testing.T) {
 	}
 	if empty := FromRequest(httptest.NewRequest(http.MethodGet, "/", nil)); !reflect.DeepEqual(FromRequest(req), empty) {
 		t.Fatalf("a re-parse after the strip still sees X-Saturn-* values: %+v", FromRequest(req))
+	}
+}
+
+// TestEveryHeaderConstantIsInTheSaturnNamespace: every Header* constant the
+// identity package declares (the names FromRequest reads) lives in the
+// X-Saturn-* namespace, so StripSaturnHeaders removes it before forwarding. A
+// new Header* constant with a name outside the namespace would be read by
+// FromRequest yet forwarded to the upstream; this test fails loudly on it.
+func TestEveryHeaderConstantIsInTheSaturnNamespace(t *testing.T) {
+	fset := token.NewFileSet()
+	pkgs, err := parser.ParseDir(fset, ".", func(fi fs.FileInfo) bool {
+		return !strings.HasSuffix(fi.Name(), "_test.go")
+	}, 0)
+	if err != nil {
+		t.Fatalf("parse package: %v", err)
+	}
+	found := 0
+	for _, pkg := range pkgs {
+		for _, f := range pkg.Files {
+			for _, decl := range f.Decls {
+				gd, ok := decl.(*ast.GenDecl)
+				if !ok || gd.Tok != token.CONST {
+					continue
+				}
+				for _, spec := range gd.Specs {
+					vs := spec.(*ast.ValueSpec)
+					for i, ident := range vs.Names {
+						if !strings.HasPrefix(ident.Name, "Header") || i >= len(vs.Values) {
+							continue
+						}
+						lit, ok := vs.Values[i].(*ast.BasicLit)
+						if !ok || lit.Kind != token.STRING {
+							t.Errorf("Header constant %s is not a string literal; check it by hand", ident.Name)
+							continue
+						}
+						value, err := strconv.Unquote(lit.Value)
+						if err != nil {
+							t.Fatalf("unquote %s: %v", ident.Name, err)
+						}
+						found++
+						if !isSaturnHeader(value) || len(value) <= len(saturnHeaderPrefix) {
+							t.Errorf("Header constant %s = %q is outside the X-Saturn-* namespace; StripSaturnHeaders would forward it upstream", ident.Name, value)
+						}
+					}
+				}
+			}
+		}
+	}
+	if found != len(candidateSaturnHeaders) {
+		t.Fatalf("found %d Header* constants, candidateSaturnHeaders lists %d; keep them in step", found, len(candidateSaturnHeaders))
 	}
 }
