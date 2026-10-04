@@ -132,10 +132,32 @@ stops allowlisting them, the phoebe chart drops them from `trustedHeaders`
 stops reading them. There is no dual-contract window after the cutover and no
 fallback: a request that carries only the legacy headers and no
 `X-Saturn-Owner-Id` has no policy and, with admission enabled, fails closed
-with 503. The four components of that release can roll in any order, because
-the scoped envelope was already stamped on every route where admission runs
-before the cutover, and every Phoebe that still read the legacy headers
-preferred the scoped envelope whenever the owner id was present.
+with 503.
+
+The four components of that release are safe to roll in any order only
+because admission stays disabled (`admission.enabled: false`, ruling R12) for the
+whole cutover, so no replica enforces a policy envelope during the rollout.
+No current or pre-cutover Phoebe reads the legacy headers on dedicated
+routes. The scoped envelope is stamped only by the gateway ForwardAuth, on
+gateway routes; every Phoebe that still read the legacy headers preferred the
+scoped envelope whenever the owner id was present. Historical per-resource
+shared routes never carried the policy contract, and R8 does not change that:
+they must be drained or removed before admission is enabled (see the
+requirement later in this section).
+
+There is one ordering constraint if admission is not kept disabled for the
+whole cutover: every Phoebe replica must run the R8 image, which no longer
+reads the legacy headers, before the phoebe chart that drops them from
+`trustedHeaders` is applied. The chart change also removes them from the strip
+middleware, because the strip set is intentionally equal to the trusted set
+(ruling R3). Once the chart drops the legacy names, client-supplied
+`X-Saturn-Service-Tier` and `X-Saturn-Rate-Limit-*` headers are no longer
+stripped at the edge, and a pre-R8 replica would accept a forged complete
+legacy envelope on any request that has no `X-Saturn-Owner-Id`. The
+recommended order is phoebe #55 first (or in the same window), then Atlas
+#6715, with saturn-k8s #1073 alongside either. After the cutover these legacy
+headers pass through unstripped to the upstream; this is harmless because no
+component reads them.
 
 While admission is disabled, Phoebe does not require a policy envelope. Once
 admission is enabled, a missing or structurally broken policy fails closed.
