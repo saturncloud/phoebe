@@ -211,6 +211,46 @@ func lowerASCII(c byte) byte {
 	return c
 }
 
+// edgeContractHeaders are the X-Saturn-* identity headers FromRequest reads
+// directly under the ratified edge contract (the ForwardAuth
+// authResponseHeaders allowlist plus Atlas's per-deployment injection),
+// outside the R3 trusted-header set. They decide nothing about forwarding:
+// StripSaturnHeaders removes them like every other X-Saturn-* header. They are
+// listed only so CountUnexpectedSaturnHeaders can tell an expected edge header
+// from one the edge strip should have removed.
+var edgeContractHeaders = map[string]struct{}{
+	HeaderAuthID:       {},
+	HeaderUserID:       {},
+	HeaderGroupID:      {},
+	HeaderResourceID:   {},
+	HeaderResourceType: {},
+	HeaderBaseModel:    {},
+	HeaderAdapter:      {},
+	HeaderUpstream:     {},
+}
+
+// CountUnexpectedSaturnHeaders returns how many X-Saturn-* header names in h
+// are neither in the active trusted-header set nor edge-contract identity
+// headers. It does not modify h. The edge (Traefik) should already have
+// removed every such name, so a non-zero count is an operator signal that the
+// edge strip may be incomplete. It is a diagnostic only: phoebe strips every
+// X-Saturn-* header regardless (StripSaturnHeaders). Membership is
+// case-insensitive; an underscore spelling (X_Saturn_Owner_Id) is in neither
+// set, so it always counts.
+func CountUnexpectedSaturnHeaders(h http.Header) int {
+	n := 0
+	for name := range h {
+		if !isSaturnHeader(name) || isTrustedHeader(name) {
+			continue
+		}
+		if _, ok := edgeContractHeaders[http.CanonicalHeaderKey(name)]; ok {
+			continue
+		}
+		n++
+	}
+	return n
+}
+
 // StripSaturnHeaders deletes EVERY X-Saturn-* header from h and returns how
 // many header names it removed. All values of a repeated header are removed
 // with its key, matching is case-insensitive, and '_' counts as '-' in the

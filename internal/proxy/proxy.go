@@ -226,9 +226,11 @@ func (s *Server) handleHealth(w http.ResponseWriter, _ *http.Request) {
 // onDone fires exactly once regardless of whether EOF or Close reaches it first.
 func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request) {
 	id := identity.FromRequest(r)
-	// The legacy quota headers feed only a log diagnostic (R8 cutover); record
-	// their presence now, because the strip below removes them.
-	legacyEnvelope := legacyQuotaHeadersPresent(r.Header)
+	// The legacy quota headers feed only a log diagnostic on the admission path
+	// (R8 cutover); record their presence now, because the strip below removes
+	// them. Without an admitter the diagnostic can never fire, so skip the
+	// lookups.
+	legacyEnvelope := s.admitter != nil && legacyQuotaHeadersPresent(r.Header)
 	// X-SATURN-* STRIP (ruling Q-R8STRIP2): no X-Saturn-* header reaches the
 	// upstream. Identity is parsed above; below this point the handler decides
 	// only on that parsed identity, never on a raw X-Saturn-* header. The strip
@@ -244,6 +246,14 @@ func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request) {
 	// wrapTrailerStrip makes the body reader strip r.Trailer at EOF, and every
 	// upstream proxy strips the outbound request's Trailer map again before it
 	// is sent (newUpstreamProxy).
+	//
+	// Before the strip, count the X-Saturn-* names that are neither trusted
+	// nor edge-contract identity headers. The edge should already have removed
+	// them, so a non-zero count means its strip may be incomplete. Only the
+	// count is logged; client-chosen names and values are not.
+	if n := identity.CountUnexpectedSaturnHeaders(r.Header); n > 0 {
+		s.log.Debug.Printf("%d untrusted X-Saturn-* header name(s) present at proxy entry (edge strip may be incomplete)", n)
+	}
 	identity.StripSaturnHeaders(r.Header)
 	wrapTrailerStrip(r)
 	clientRequestID := r.Header.Get(requestIDHeader)

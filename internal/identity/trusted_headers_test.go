@@ -574,3 +574,32 @@ func TestEveryHeaderConstantIsInTheSaturnNamespace(t *testing.T) {
 		t.Fatalf("found %d Header* constants, candidateSaturnHeaders lists %d; keep them in step", found, len(candidateSaturnHeaders))
 	}
 }
+
+// TestCountUnexpectedSaturnHeadersCountsOnlyNamesTheEdgeShouldHaveStripped:
+// every X-Saturn-* header the identity package declares is either trusted or
+// an edge-contract identity header, so a request carrying all of them counts
+// zero. Retired, unknown, and underscore-spelled names each count once, and
+// look-alikes outside the namespace do not count. The count never modifies the
+// headers.
+func TestCountUnexpectedSaturnHeadersCountsOnlyNamesTheEdgeShouldHaveStripped(t *testing.T) {
+	withTrustedHeadersEnv(t, "", false)
+	h := http.Header{}
+	for _, name := range candidateSaturnHeaders {
+		h.Set(name, "v")
+	}
+	h["x-saturn-upstream"] = []string{"v"} // non-canonical spelling of an edge header
+	h.Set("X-Saturnine", "v")
+	if got := CountUnexpectedSaturnHeaders(h); got != 0 {
+		t.Fatalf("count = %d for trusted and edge-contract headers only, want 0", got)
+	}
+	h.Set("X-Saturn-Service-Tier", "v")
+	h.Set("X-Saturn-Foo", "v")
+	h["X_Saturn_Owner_Id"] = []string{"v"}
+	before := len(h)
+	if got := CountUnexpectedSaturnHeaders(h); got != 3 {
+		t.Fatalf("count = %d, want 3 (retired, unknown, underscore spelling)", got)
+	}
+	if len(h) != before {
+		t.Fatalf("CountUnexpectedSaturnHeaders modified the headers: %d names, want %d", len(h), before)
+	}
+}

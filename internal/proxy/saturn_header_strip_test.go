@@ -2,8 +2,10 @@ package proxy
 
 import (
 	"bufio"
+	"bytes"
 	"fmt"
 	"io"
+	"log"
 	"net"
 	"net/http"
 	"net/http/httptest"
@@ -13,6 +15,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/saturncloud/phoebe/internal/config"
 	"github.com/saturncloud/phoebe/internal/gateway"
 	"github.com/saturncloud/phoebe/internal/identity"
 	"github.com/saturncloud/phoebe/internal/logging"
@@ -96,6 +99,13 @@ func usageHandler() http.Handler {
 
 // isSaturnName reports an X-Saturn-* name in any case, with '_' folded to
 // '-' the way a WSGI/CGI-style upstream would read it.
+//
+// This is the test oracle, and it is written independently of the production
+// rule (identity.isSaturnHeader) on purpose: it lowercases the whole name,
+// folds every '_' to '-', and checks the prefix with the standard library.
+// Do not replace it with, or export, the production function. If the two
+// rules drift apart, the end-to-end assertions that the upstream sees no
+// X-Saturn-* header should fail rather than agree with a production bug.
 func isSaturnName(name string) bool {
 	return strings.HasPrefix(strings.ReplaceAll(strings.ToLower(name), "_", "-"), "x-saturn-")
 }
@@ -493,6 +503,64 @@ func TestNoSaturnTrailersReachUpstreamOverWire(t *testing.T) {
 						t.Fatalf("upstream received X-Saturn-* trailer %s=%v", name, tr[name])
 					}
 				}
+			}
+		})
+	}
+}
+
+// TestUnexpectedSaturnHeaderAtEntryLogsDebugCount: an X-Saturn-* header that is
+// neither trusted nor an edge-contract identity header should have been
+// removed by the edge strip, so phoebe logs at Debug how many such names it
+// saw before stripping them. Only the count is logged, never a name or value.
+// A request carrying only trusted and edge-contract headers logs nothing.
+func TestUnexpectedSaturnHeaderAtEntryLogsDebugCount(t *testing.T) {
+	be := httptest.NewServer(usageHandler())
+	defer be.Close()
+	u, _ := url.Parse(be.URL)
+
+	for _, tc := range []struct {
+		name    string
+		forge   bool
+		wantLog string
+	}{
+		{"only trusted and edge-contract headers", false, ""},
+		{"one unexpected header", true, "1 untrusted X-Saturn-* header name(s) present at proxy entry"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var debugBuf bytes.Buffer
+			logger := &logging.Logger{
+				Debug: log.New(&debugBuf, "", 0),
+				Info:  log.New(io.Discard, "", 0),
+				Warn:  log.New(io.Discard, "", 0),
+				Error: log.New(io.Discard, "", 0),
+			}
+			srv := New(&config.Settings{ListenAddr: ":0"}, logger, &recordingEmitter{})
+			req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(`{"model":"model-a"}`))
+			setUpstream(req, u)
+			req.Header.Set(identity.HeaderAuthID, "auth-a")
+			req.Header.Set(identity.HeaderResourceID, "resource-a")
+			req.Header.Set(identity.HeaderOrgID, "org-a")
+			req.Header.Set(identity.HeaderServedModel, "model-a")
+			if tc.forge {
+				req.Header.Set("X-Saturn-Foo", "secret-value")
+			}
+			rr := httptest.NewRecorder()
+			srv.Handler().ServeHTTP(rr, req)
+			if rr.Code != http.StatusOK {
+				t.Fatalf("status = %d, want 200", rr.Code)
+			}
+			got := debugBuf.String()
+			if tc.wantLog == "" {
+				if strings.Contains(got, "untrusted X-Saturn-*") {
+					t.Fatalf("debug log reports unexpected headers for a clean request: %q", got)
+				}
+				return
+			}
+			if !strings.Contains(got, tc.wantLog) {
+				t.Fatalf("debug log = %q, want it to contain %q", got, tc.wantLog)
+			}
+			if strings.Contains(got, "Foo") || strings.Contains(got, "secret-value") {
+				t.Fatalf("debug log leaks the client header name or value: %q", got)
 			}
 		})
 	}
