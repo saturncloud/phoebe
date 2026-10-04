@@ -6,6 +6,7 @@ import (
 	"net/http/httptest"
 	"net/url"
 	"strings"
+	"sync"
 	"testing"
 )
 
@@ -82,6 +83,51 @@ func TestTrailerStripBodyStripsTrailersMergedOnClose(t *testing.T) {
 	_ = req.Body.Close()
 	if name := saturnTrailerLeft(req.Trailer); name != "" {
 		t.Fatalf("X-Saturn-* trailer %s survived Close: %v", name, req.Trailer)
+	}
+}
+
+// eofBody returns io.EOF on every Read and does nothing on Close. It touches
+// no trailer map itself, so any concurrent map access in the test below comes
+// from trailerStripBody.
+type eofBody struct{}
+
+func (eofBody) Read([]byte) (int, error) { return 0, io.EOF }
+func (eofBody) Close() error             { return nil }
+
+// TestTrailerStripBodyConcurrentReadAndCloseDoNotRace: the http.Transport may
+// Close the body on one goroutine while another reads it to EOF, and both
+// strip r.Trailer. The strips must be serialized, because concurrent map
+// writes are a fatal error that recover() cannot catch and would kill the
+// proxy process. Run under -race to detect an unsynchronized strip.
+func TestTrailerStripBodyConcurrentReadAndCloseDoNotRace(t *testing.T) {
+	for i := 0; i < 200; i++ {
+		req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", nil)
+		req.Body = eofBody{}
+		req.Trailer = http.Header{
+			"X-Saturn-Foo": {"bar"}, "X-Saturn-Upstream": {"decoy.invalid:80"},
+			"x-saturn-org-ID": {"org-forged"}, "X-Other-Trailer": {"ok"},
+		}
+		wrapTrailerStrip(req)
+		body := req.Body
+		var wg sync.WaitGroup
+		for g := 0; g < 4; g++ {
+			wg.Add(2)
+			go func() {
+				defer wg.Done()
+				_, _ = body.Read(make([]byte, 8))
+			}()
+			go func() {
+				defer wg.Done()
+				_ = body.Close()
+			}()
+		}
+		wg.Wait()
+		if name := saturnTrailerLeft(req.Trailer); name != "" {
+			t.Fatalf("X-Saturn-* trailer %s survived concurrent Read/Close: %v", name, req.Trailer)
+		}
+		if req.Trailer.Get("X-Other-Trailer") != "ok" {
+			t.Fatalf("harmless trailer was dropped: %v", req.Trailer)
+		}
 	}
 }
 
