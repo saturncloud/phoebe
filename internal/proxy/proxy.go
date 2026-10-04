@@ -27,7 +27,6 @@ import (
 	"fmt"
 	"net"
 	"net/http"
-	"net/http/httputil"
 	"net/url"
 	"strconv"
 	"strings"
@@ -227,6 +226,26 @@ func (s *Server) handleHealth(w http.ResponseWriter, _ *http.Request) {
 // onDone fires exactly once regardless of whether EOF or Close reaches it first.
 func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request) {
 	id := identity.FromRequest(r)
+	// UNTRUSTED X-SATURN-* STRIP (ruling Q-R8STRIP, option b). Below this
+	// point the handler decides on the parsed identity above, not on raw
+	// X-Saturn-* headers. The strip removes every X-Saturn-* request header
+	// outside the active trusted set that is present at handler entry, on the
+	// request every forward is cloned from (the gateway route, the
+	// header-routed shared and dedicated routes, the wake probes, and the final
+	// metered forward). A header retired from PHOEBE_TRUSTED_HEADERS, which the
+	// edge no longer strips, therefore never reaches the upstream.
+	//
+	// Trailers need a different mechanism. The net/http server fills in
+	// r.Trailer only when the body is read to EOF, which happens after this
+	// point, so an entry-time strip of r.Trailer would be undone.
+	// wrapTrailerStrip makes the body reader strip r.Trailer at EOF, and every
+	// upstream proxy strips the outbound request's Trailer map again before it
+	// is sent (newUpstreamProxy). Only a count of stripped headers is logged;
+	// client-chosen names and values are not.
+	if n := identity.StripUntrustedSaturnHeaders(r.Header); n > 0 {
+		s.log.Debug.Printf("stripped %d untrusted X-Saturn-* header name(s) before forwarding", n)
+	}
+	wrapTrailerStrip(r)
 	clientRequestID := r.Header.Get(requestIDHeader)
 	if !validClientRequestID(clientRequestID) {
 		// Do not log or echo the untrusted value: it can be large or contain
@@ -688,7 +707,7 @@ func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	rp := httputil.NewSingleHostReverseProxy(upstream)
+	rp := newUpstreamProxy(upstream)
 
 	// FlushInterval=-1 flushes every write immediately — per-chunk SSE
 	// delivery with no buffering. This is the streaming-correctness linchpin.

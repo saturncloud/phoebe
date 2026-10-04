@@ -2,10 +2,16 @@ package identity
 
 import (
 	"bytes"
+	"go/ast"
+	"go/parser"
+	"go/token"
+	"io/fs"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"reflect"
+	"sort"
+	"strconv"
 	"strings"
 	"testing"
 
@@ -272,4 +278,236 @@ func TestLoadTrustedHeadersNoErrorWhenRequiredHeadersPresent(t *testing.T) {
 	if out != "" {
 		t.Fatalf("unexpected error log for a list with every required header: %q", out)
 	}
+}
+
+// TestStripUntrustedSaturnHeaders (ruling Q-R8STRIP option b): with the pinned
+// set active, every X-Saturn-* header outside the trusted set and the
+// edge-contract identity headers is removed, in any case spelling and with all
+// of its values; trusted, edge-contract, and non-Saturn headers are untouched.
+func TestStripUntrustedSaturnHeaders(t *testing.T) {
+	withTrustedHeadersEnv(t, "", false)
+	cases := []struct {
+		name string
+		key  string // written raw into the map, bypassing canonicalization
+		keep bool
+	}{
+		{"retired legacy service tier", "X-Saturn-Service-Tier", false},
+		{"retired legacy requests", "X-Saturn-Rate-Limit-Requests", false},
+		{"retired legacy total prompt", "X-Saturn-Rate-Limit-Total-Prompt-Tokens", false},
+		{"retired legacy uncached prompt", "X-Saturn-Rate-Limit-Uncached-Prompt-Tokens", false},
+		{"retired legacy generated", "X-Saturn-Rate-Limit-Generated-Tokens", false},
+		{"unknown", "X-Saturn-Foo", false},
+		{"unknown lowercase", "x-saturn-foo-lower", false},
+		{"retired legacy uppercase", "X-SATURN-SERVICE-TIER", false},
+		{"trusted gateway", HeaderGateway, true},
+		{"trusted owner limit", HeaderOwnerRateLimitGeneratedTokens, true},
+		{"trusted lowercase", "x-saturn-serving-mode", true},
+		{"edge contract auth", HeaderAuthID, true},
+		{"edge contract upstream", HeaderUpstream, true},
+		{"edge contract lowercase", "x-saturn-resource-id", true},
+		{"non-saturn", "X-Request-Id", true},
+		{"prefix only, no namespace dash", "X-Saturn", true},
+		{"saturn-like but different namespace", "X-Saturnalia-Foo", true},
+	}
+	h := http.Header{}
+	for _, tc := range cases {
+		h[tc.key] = []string{"v1", "v2"}
+	}
+	wantRemoved := 0
+	for _, tc := range cases {
+		if !tc.keep {
+			wantRemoved++
+		}
+	}
+	if got := StripUntrustedSaturnHeaders(h); got != wantRemoved {
+		t.Fatalf("removed %d header names, want %d", got, wantRemoved)
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			_, present := h[tc.key]
+			if present != tc.keep {
+				t.Fatalf("%q present=%v after strip, want %v", tc.key, present, tc.keep)
+			}
+			if tc.keep && len(h[tc.key]) != 2 {
+				t.Fatalf("%q kept %d values, want both", tc.key, len(h[tc.key]))
+			}
+		})
+	}
+	if StripUntrustedSaturnHeaders(nil) != 0 {
+		t.Fatal("nil header map must strip nothing")
+	}
+}
+
+// TestStripUntrustedSaturnHeadersFollowsConfiguredSet: a name omitted from a
+// configured PHOEBE_TRUSTED_HEADERS (a future retirement) is stripped, with no
+// code change; the configured names are kept.
+func TestStripUntrustedSaturnHeadersFollowsConfiguredSet(t *testing.T) {
+	withTrustedHeadersEnv(t, HeaderGateway+","+HeaderServingMode, true)
+	h := http.Header{}
+	h.Set(HeaderGateway, "true")
+	h.Set(HeaderServingMode, "shared")
+	h.Set(HeaderOrgID, "org-1")
+	h.Set(HeaderOwnerRateLimitRequests, "5")
+	h.Set(HeaderAuthID, "auth-1")
+	if got := StripUntrustedSaturnHeaders(h); got != 2 {
+		t.Fatalf("removed %d, want 2 (org id and owner limit are no longer trusted)", got)
+	}
+	for _, name := range []string{HeaderGateway, HeaderServingMode, HeaderAuthID} {
+		if h.Get(name) == "" {
+			t.Errorf("%s stripped, want kept", name)
+		}
+	}
+	for _, name := range []string{HeaderOrgID, HeaderOwnerRateLimitRequests} {
+		if h.Get(name) != "" {
+			t.Errorf("%s kept, want stripped", name)
+		}
+	}
+}
+
+// candidateSaturnHeaders is every exported X-Saturn-* Header* constant the
+// identity package declares. TestCandidateSaturnHeadersCoverPackageConstants
+// fails if a constant is added to the package without being listed here.
+var candidateSaturnHeaders = []string{
+	HeaderAuthID,
+	HeaderUserID,
+	HeaderGroupID,
+	HeaderResourceID,
+	HeaderResourceType,
+	HeaderOrgID,
+	HeaderBaseModel,
+	HeaderAdapter,
+	HeaderServingMode,
+	HeaderServedModel,
+	HeaderUpstream,
+	HeaderGateway,
+	HeaderOwnerID,
+	HeaderOrgRateLimitRequests,
+	HeaderOrgRateLimitTotalPromptTokens,
+	HeaderOrgRateLimitUncachedPromptTokens,
+	HeaderOrgRateLimitGeneratedTokens,
+	HeaderOwnerRateLimitRequests,
+	HeaderOwnerRateLimitTotalPromptTokens,
+	HeaderOwnerRateLimitUncachedPromptTokens,
+	HeaderOwnerRateLimitGeneratedTokens,
+}
+
+// packageSaturnHeaderConstants parses the package's non-test Go files and
+// returns the value of every const whose string literal starts with
+// "X-Saturn-" and names a full header (not the bare prefix).
+func packageSaturnHeaderConstants(t *testing.T) []string {
+	t.Helper()
+	fset := token.NewFileSet()
+	pkgs, err := parser.ParseDir(fset, ".", func(fi fs.FileInfo) bool {
+		return !strings.HasSuffix(fi.Name(), "_test.go")
+	}, 0)
+	if err != nil {
+		t.Fatalf("parse package: %v", err)
+	}
+	var out []string
+	for _, pkg := range pkgs {
+		for _, f := range pkg.Files {
+			for _, decl := range f.Decls {
+				gd, ok := decl.(*ast.GenDecl)
+				if !ok || gd.Tok != token.CONST {
+					continue
+				}
+				for _, spec := range gd.Specs {
+					vs := spec.(*ast.ValueSpec)
+					for _, v := range vs.Values {
+						lit, ok := v.(*ast.BasicLit)
+						if !ok || lit.Kind != token.STRING {
+							continue
+						}
+						s, err := strconv.Unquote(lit.Value)
+						if err != nil {
+							continue
+						}
+						if strings.HasPrefix(s, saturnHeaderPrefix) && len(s) > len(saturnHeaderPrefix) {
+							out = append(out, s)
+						}
+					}
+				}
+			}
+		}
+	}
+	return out
+}
+
+func TestCandidateSaturnHeadersCoverPackageConstants(t *testing.T) {
+	listed := make(map[string]bool, len(candidateSaturnHeaders))
+	for _, name := range candidateSaturnHeaders {
+		listed[name] = true
+	}
+	consts := packageSaturnHeaderConstants(t)
+	if len(consts) == 0 {
+		t.Fatal("found no X-Saturn-* constants; the parse is broken")
+	}
+	for _, name := range consts {
+		if !listed[name] {
+			t.Errorf("X-Saturn-* constant %q is not in candidateSaturnHeaders; add it", name)
+		}
+	}
+}
+
+// headersFromRequestReads returns the canonical names of the candidate headers
+// FromRequest actually consumes under the active set: setting the header alone
+// changes the parsed Identity.
+func headersFromRequestReads(t *testing.T) map[string]struct{} {
+	t.Helper()
+	empty := FromRequest(httptest.NewRequest(http.MethodGet, "/", nil))
+	read := make(map[string]struct{})
+	for i, name := range candidateSaturnHeaders {
+		req := httptest.NewRequest(http.MethodGet, "/", nil)
+		value := "probe-value-" + strconv.Itoa(i)
+		if name == HeaderGateway {
+			value = "true"
+		}
+		req.Header.Set(name, value)
+		if !reflect.DeepEqual(FromRequest(req), empty) {
+			read[http.CanonicalHeaderKey(name)] = struct{}{}
+		}
+	}
+	return read
+}
+
+// Invariant: every header FromRequest reads survives the forward strip, so the
+// upstream still receives every identity header the edge contract gives it.
+func TestEveryHeaderFromRequestReadsIsForwardable(t *testing.T) {
+	withTrustedHeadersEnv(t, "", false)
+	read := headersFromRequestReads(t)
+	if len(read) == 0 {
+		t.Fatal("FromRequest read no candidate header; the probe is broken")
+	}
+	for name := range read {
+		if !forwardableSaturnHeader(name) {
+			t.Errorf("FromRequest reads %s but forwardableSaturnHeader(%q) = false", name, name)
+		}
+		h := http.Header{}
+		h.Set(name, "v")
+		StripUntrustedSaturnHeaders(h)
+		if h.Get(name) != "v" {
+			t.Errorf("StripUntrustedSaturnHeaders removed %s, which FromRequest reads", name)
+		}
+	}
+}
+
+// Invariant: the forwardable set (active trusted set plus edgeContractHeaders)
+// is exactly the set of headers FromRequest reads — no read header is
+// stripped, and no stale entry is forwarded without being read.
+func TestEdgeContractHeadersMatchFromRequestReads(t *testing.T) {
+	withTrustedHeadersEnv(t, "", false)
+	read := headersFromRequestReads(t)
+	forwardable := ForwardableSaturnHeaders()
+	if !reflect.DeepEqual(read, forwardable) {
+		t.Fatalf("FromRequest reads %v\nbut forwardable set is %v", sortedNames(read), sortedNames(forwardable))
+	}
+}
+
+func sortedNames(set map[string]struct{}) []string {
+	out := make([]string, 0, len(set))
+	for name := range set {
+		out = append(out, name)
+	}
+	sort.Strings(out)
+	return out
 }
