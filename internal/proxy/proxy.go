@@ -226,25 +226,25 @@ func (s *Server) handleHealth(w http.ResponseWriter, _ *http.Request) {
 // onDone fires exactly once regardless of whether EOF or Close reaches it first.
 func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request) {
 	id := identity.FromRequest(r)
-	// UNTRUSTED X-SATURN-* STRIP (ruling Q-R8STRIP, option b). Below this
-	// point the handler decides on the parsed identity above, not on raw
-	// X-Saturn-* headers. The strip removes every X-Saturn-* request header
-	// outside the active trusted set that is present at handler entry, on the
-	// request every forward is cloned from (the gateway route, the
-	// header-routed shared and dedicated routes, the wake probes, and the final
-	// metered forward). A header retired from PHOEBE_TRUSTED_HEADERS, which the
-	// edge no longer strips, therefore never reaches the upstream.
+	// The legacy quota headers feed only a log diagnostic (R8 cutover); record
+	// their presence now, because the strip below removes them.
+	legacyEnvelope := legacyQuotaHeadersPresent(r.Header)
+	// X-SATURN-* STRIP (ruling Q-R8STRIP2): no X-Saturn-* header reaches the
+	// upstream. Identity is parsed above; below this point the handler decides
+	// only on that parsed identity, never on a raw X-Saturn-* header. The strip
+	// removes every X-Saturn-* request header (trusted, edge-contract, retired
+	// or unknown) from the request every forward is cloned from: the gateway
+	// route, the header-routed shared and dedicated routes, the wake probes,
+	// and the final metered forward. Traefik strips the same namespace first
+	// (an enumerated list rendered by saturn-k8s); this is phoebe's backstop.
 	//
 	// Trailers need a different mechanism. The net/http server fills in
 	// r.Trailer only when the body is read to EOF, which happens after this
 	// point, so an entry-time strip of r.Trailer would be undone.
 	// wrapTrailerStrip makes the body reader strip r.Trailer at EOF, and every
 	// upstream proxy strips the outbound request's Trailer map again before it
-	// is sent (newUpstreamProxy). Only a count of stripped headers is logged;
-	// client-chosen names and values are not.
-	if n := identity.StripUntrustedSaturnHeaders(r.Header); n > 0 {
-		s.log.Debug.Printf("stripped %d untrusted X-Saturn-* header name(s) before forwarding", n)
-	}
+	// is sent (newUpstreamProxy).
+	identity.StripSaturnHeaders(r.Header)
 	wrapTrailerStrip(r)
 	clientRequestID := r.Header.Get(requestIDHeader)
 	if !validClientRequestID(clientRequestID) {
@@ -623,7 +623,7 @@ func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request) {
 			organizationLimits, ownerLimits, policyErr := parseTrustedRateLimits(id)
 			if policyErr != nil {
 				s.log.Error.Printf("admission: invalid trusted rate-limit policy: %v", policyErr)
-				if errors.Is(policyErr, errNoTrustedRateLimitPolicy) && legacyQuotaHeadersPresent(r.Header) {
+				if errors.Is(policyErr, errNoTrustedRateLimitPolicy) && legacyEnvelope {
 					// Log-only diagnostic for the R8 cutover: the legacy headers
 					// decide nothing, but their presence names the root cause.
 					s.log.Warn.Printf("admission: legacy single-scope quota headers present without %s (removed by R8); legacy_envelope_present=true (pre-R8 producer; upgrade Atlas/Traefik) request_id=%s", identity.HeaderOwnerID, requestID)

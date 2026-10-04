@@ -9,8 +9,9 @@ import (
 	"github.com/saturncloud/phoebe/internal/identity"
 )
 
-// trailerStripBody strips untrusted X-Saturn-* names from the request's
-// trailers once the body has been read to the end (ruling Q-R8STRIP, option b).
+// trailerStripBody strips every X-Saturn-* name from the request's trailers
+// once the body has been read to the end (ruling Q-R8STRIP2: no X-Saturn-*
+// header or trailer reaches the upstream).
 //
 // The strip cannot run only at handler entry: the net/http server fills in
 // r.Trailer while the body is being read, when the reader reaches EOF
@@ -27,14 +28,14 @@ type trailerStripBody struct {
 func (b *trailerStripBody) Read(p []byte) (int, error) {
 	n, err := b.ReadCloser.Read(p)
 	if err == io.EOF {
-		identity.StripUntrustedSaturnHeaders(b.req.Trailer)
+		identity.StripSaturnHeaders(b.req.Trailer)
 	}
 	return n, err
 }
 
 func (b *trailerStripBody) Close() error {
 	err := b.ReadCloser.Close()
-	identity.StripUntrustedSaturnHeaders(b.req.Trailer)
+	identity.StripSaturnHeaders(b.req.Trailer)
 	return err
 }
 
@@ -50,7 +51,7 @@ func wrapTrailerStrip(r *http.Request) {
 
 // newUpstreamProxy builds the single-host reverse proxy for every forward to
 // the upstream (the metered forward and the wake probes). Its Director strips
-// untrusted X-Saturn-* names from the outbound request's own Trailer map, the
+// every X-Saturn-* name from the outbound request's own Trailer map, the
 // one the transport sends. Request.Clone deep-copies Trailer, so this second
 // strip covers a clone made from a trailer map that was not yet clean.
 func newUpstreamProxy(upstream *url.URL) *httputil.ReverseProxy {
@@ -58,7 +59,7 @@ func newUpstreamProxy(upstream *url.URL) *httputil.ReverseProxy {
 	director := rp.Director
 	rp.Director = func(out *http.Request) {
 		director(out)
-		identity.StripUntrustedSaturnHeaders(out.Trailer)
+		identity.StripSaturnHeaders(out.Trailer)
 	}
 	return rp
 }

@@ -251,10 +251,10 @@ func ValidServingMode(s string) bool {
 // model, and every rate-limit policy header — the pinned 13) resolve through
 // the trusted-header registry: a header outside the active set is treated
 // as ABSENT, never read for a trust decision. The remaining identity headers
-// are read directly (ratified edge contract, outside the R3 gate). Every
-// header read directly here must also be listed in edgeContractHeaders
-// (trusted_headers.go), or StripUntrustedSaturnHeaders removes it from the
-// forwarded request.
+// are read directly (ratified edge contract, outside the R3 gate). The proxy
+// calls FromRequest BEFORE StripSaturnHeaders removes every X-Saturn-* header
+// from the forwarded request (ruling Q-R8STRIP2), so the returned Identity is
+// the only form in which these values survive past the strip.
 //
 // The serving mode is copied verbatim and NO default is applied (ruling #19):
 // an absent, untrusted, or malformed X-Saturn-Serving-Mode leaves a value that
