@@ -33,18 +33,16 @@ var retiredLegacyHeaders = []string{
 
 // forwardableSaturn is every X-Saturn-* name phoebe may forward with the
 // pinned trusted set active: the pinned 13 plus the edge-contract identity
-// headers.
-var forwardableSaturn = map[string]bool{
-	identity.HeaderGateway: true, identity.HeaderOrgID: true, identity.HeaderOwnerID: true,
-	identity.HeaderServingMode: true, identity.HeaderServedModel: true,
-	identity.HeaderOrgRateLimitRequests: true, identity.HeaderOrgRateLimitTotalPromptTokens: true,
-	identity.HeaderOrgRateLimitUncachedPromptTokens: true, identity.HeaderOrgRateLimitGeneratedTokens: true,
-	identity.HeaderOwnerRateLimitRequests: true, identity.HeaderOwnerRateLimitTotalPromptTokens: true,
-	identity.HeaderOwnerRateLimitUncachedPromptTokens: true, identity.HeaderOwnerRateLimitGeneratedTokens: true,
-	identity.HeaderAuthID: true, identity.HeaderUserID: true, identity.HeaderGroupID: true,
-	identity.HeaderResourceID: true, identity.HeaderResourceType: true, identity.HeaderBaseModel: true,
-	identity.HeaderAdapter: true, identity.HeaderUpstream: true,
-}
+// headers. It is taken from identity.ForwardableSaturnHeaders at package init
+// (the pinned set is active then), the one list the identity package tests tie
+// to the headers FromRequest reads.
+var forwardableSaturn = func() map[string]bool {
+	out := make(map[string]bool)
+	for name := range identity.ForwardableSaturnHeaders() {
+		out[name] = true
+	}
+	return out
+}()
 
 // addUntrustedSaturnHeaders stamps the client-sent junk every route case must
 // strip, and returns the names (as the client spelled them) that must not
