@@ -227,6 +227,19 @@ func (s *Server) handleHealth(w http.ResponseWriter, _ *http.Request) {
 // onDone fires exactly once regardless of whether EOF or Close reaches it first.
 func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request) {
 	id := identity.FromRequest(r)
+	// UNTRUSTED X-SATURN-* STRIP (ruling Q-R8STRIP, option b). FromRequest is
+	// the only reader of X-Saturn-* request headers: everything below decides
+	// on the parsed identity, never on the raw headers. So the strip runs here,
+	// once, on the request every forward is built from — the gateway route,
+	// header-routed shared and dedicated routes, the wake probes, and the final
+	// metered forward all clone r. A header outside the active trusted set
+	// (for example one retired from PHOEBE_TRUSTED_HEADERS, which the edge no
+	// longer strips) never reaches the upstream. Trailers are covered too,
+	// because ReverseProxy forwards request trailers. Only a count is logged;
+	// client-chosen names and values are not.
+	if n := identity.StripUntrustedSaturnHeaders(r.Header) + identity.StripUntrustedSaturnHeaders(r.Trailer); n > 0 {
+		s.log.Debug.Printf("stripped %d untrusted X-Saturn-* header name(s) before forwarding", n)
+	}
 	clientRequestID := r.Header.Get(requestIDHeader)
 	if !validClientRequestID(clientRequestID) {
 		// Do not log or echo the untrusted value: it can be large or contain

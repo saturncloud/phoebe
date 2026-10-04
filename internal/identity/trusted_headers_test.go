@@ -273,3 +273,87 @@ func TestLoadTrustedHeadersNoErrorWhenRequiredHeadersPresent(t *testing.T) {
 		t.Fatalf("unexpected error log for a list with every required header: %q", out)
 	}
 }
+
+// TestStripUntrustedSaturnHeaders (ruling Q-R8STRIP option b): with the pinned
+// set active, every X-Saturn-* header outside the trusted set and the
+// edge-contract identity headers is removed, in any case spelling and with all
+// of its values; trusted, edge-contract, and non-Saturn headers are untouched.
+func TestStripUntrustedSaturnHeaders(t *testing.T) {
+	withTrustedHeadersEnv(t, "", false)
+	cases := []struct {
+		name string
+		key  string // written raw into the map, bypassing canonicalization
+		keep bool
+	}{
+		{"retired legacy service tier", "X-Saturn-Service-Tier", false},
+		{"retired legacy requests", "X-Saturn-Rate-Limit-Requests", false},
+		{"retired legacy total prompt", "X-Saturn-Rate-Limit-Total-Prompt-Tokens", false},
+		{"retired legacy uncached prompt", "X-Saturn-Rate-Limit-Uncached-Prompt-Tokens", false},
+		{"retired legacy generated", "X-Saturn-Rate-Limit-Generated-Tokens", false},
+		{"unknown", "X-Saturn-Foo", false},
+		{"unknown lowercase", "x-saturn-foo-lower", false},
+		{"retired legacy uppercase", "X-SATURN-SERVICE-TIER", false},
+		{"trusted gateway", HeaderGateway, true},
+		{"trusted owner limit", HeaderOwnerRateLimitGeneratedTokens, true},
+		{"trusted lowercase", "x-saturn-serving-mode", true},
+		{"edge contract auth", HeaderAuthID, true},
+		{"edge contract upstream", HeaderUpstream, true},
+		{"edge contract lowercase", "x-saturn-resource-id", true},
+		{"non-saturn", "X-Request-Id", true},
+		{"prefix only, no namespace dash", "X-Saturn", true},
+		{"saturn-like but different namespace", "X-Saturnalia-Foo", true},
+	}
+	h := http.Header{}
+	for _, tc := range cases {
+		h[tc.key] = []string{"v1", "v2"}
+	}
+	wantRemoved := 0
+	for _, tc := range cases {
+		if !tc.keep {
+			wantRemoved++
+		}
+	}
+	if got := StripUntrustedSaturnHeaders(h); got != wantRemoved {
+		t.Fatalf("removed %d header names, want %d", got, wantRemoved)
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			_, present := h[tc.key]
+			if present != tc.keep {
+				t.Fatalf("%q present=%v after strip, want %v", tc.key, present, tc.keep)
+			}
+			if tc.keep && len(h[tc.key]) != 2 {
+				t.Fatalf("%q kept %d values, want both", tc.key, len(h[tc.key]))
+			}
+		})
+	}
+	if StripUntrustedSaturnHeaders(nil) != 0 {
+		t.Fatal("nil header map must strip nothing")
+	}
+}
+
+// TestStripUntrustedSaturnHeadersFollowsConfiguredSet: a name omitted from a
+// configured PHOEBE_TRUSTED_HEADERS (a future retirement) is stripped, with no
+// code change; the configured names are kept.
+func TestStripUntrustedSaturnHeadersFollowsConfiguredSet(t *testing.T) {
+	withTrustedHeadersEnv(t, HeaderGateway+","+HeaderServingMode, true)
+	h := http.Header{}
+	h.Set(HeaderGateway, "true")
+	h.Set(HeaderServingMode, "shared")
+	h.Set(HeaderOrgID, "org-1")
+	h.Set(HeaderOwnerRateLimitRequests, "5")
+	h.Set(HeaderAuthID, "auth-1")
+	if got := StripUntrustedSaturnHeaders(h); got != 2 {
+		t.Fatalf("removed %d, want 2 (org id and owner limit are no longer trusted)", got)
+	}
+	for _, name := range []string{HeaderGateway, HeaderServingMode, HeaderAuthID} {
+		if h.Get(name) == "" {
+			t.Errorf("%s stripped, want kept", name)
+		}
+	}
+	for _, name := range []string{HeaderOrgID, HeaderOwnerRateLimitRequests} {
+		if h.Get(name) != "" {
+			t.Errorf("%s kept, want stripped", name)
+		}
+	}
+}
