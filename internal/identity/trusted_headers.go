@@ -17,8 +17,12 @@ package identity
 // ResourceType / BaseModel / Adapter / Upstream) are read under the ratified
 // edge contract (ForwardAuth authResponseHeaders allowlist + Atlas
 // anti-spoof per-deployment injection), which is outside the R3 gate — so
-// with the fallback set engaged, request handling is byte-for-byte
-// unchanged (a pure hardening).
+// with the fallback set engaged, phoebe's own trust decisions are unchanged.
+// Separately, StripUntrustedSaturnHeaders (ruling Q-R8STRIP) removes from the
+// forwarded request every X-Saturn-* header that is neither in the active set
+// nor an edge-contract identity header. So with the fallback engaged, a
+// client-sent retired header (e.g. X-Saturn-Service-Tier) or an unknown
+// X-Saturn-* name no longer reaches the upstream.
 
 import (
 	"net/http"
@@ -169,4 +173,94 @@ func ActiveTrustedHeaders() map[string]struct{} {
 		out[name] = struct{}{}
 	}
 	return out
+}
+
+// saturnHeaderPrefix is the namespace every Saturn edge header lives in.
+const saturnHeaderPrefix = "X-Saturn-"
+
+// edgeContractHeaders are the X-Saturn-* identity headers phoebe reads
+// directly under the ratified edge contract (the ForwardAuth
+// authResponseHeaders allowlist plus Atlas's per-deployment injection), outside
+// the R3 trusted-header set. StripUntrustedSaturnHeaders leaves them on the
+// forwarded request.
+//
+// The edge does NOT overwrite every one of them on every route:
+//   - On per-resource (header-routed) routes the Atlas middleware overwrites
+//     X-Saturn-Upstream, -Resource-Id, -Resource-Type, -Base-Model and
+//     -Adapter with the real values.
+//   - On the gateway route the edge sets none of those five, so a client's
+//     copy of them is forwarded to the upstream unchanged. Phoebe never makes
+//     a decision on these raw headers: it reads only the identity that
+//     FromRequest parsed, which gateway resolution then overwrites from the
+//     served-model registry.
+//   - auth-server does not yet inject X-Saturn-Auth-Id, so a client's copy of
+//     that header is also forwarded on every route.
+//
+// Every header FromRequest reads directly with r.Header.Get must be listed
+// here, or the strip removes it from the forwarded request;
+// TestEveryHeaderFromRequestReadsIsForwardable and
+// TestEdgeContractHeadersMatchFromRequestReads enforce that.
+var edgeContractHeaders = map[string]struct{}{
+	HeaderAuthID:       {},
+	HeaderUserID:       {},
+	HeaderGroupID:      {},
+	HeaderResourceID:   {},
+	HeaderResourceType: {},
+	HeaderBaseModel:    {},
+	HeaderAdapter:      {},
+	HeaderUpstream:     {},
+}
+
+// ForwardableSaturnHeaders returns a copy of every X-Saturn-* header name
+// (canonical) that StripUntrustedSaturnHeaders currently leaves on a forwarded
+// request: the active trusted-header set plus the edge-contract identity
+// headers. It is the single source tests compare forwarding behaviour against.
+func ForwardableSaturnHeaders() map[string]struct{} {
+	out := ActiveTrustedHeaders()
+	for name := range edgeContractHeaders {
+		out[name] = struct{}{}
+	}
+	return out
+}
+
+// isSaturnHeader reports whether name is in the X-Saturn-* namespace,
+// case-insensitively. It does not rely on name being canonical, so a key put
+// into an http.Header map directly (bypassing Set/Add canonicalization) is
+// still recognized.
+func isSaturnHeader(name string) bool {
+	return len(name) >= len(saturnHeaderPrefix) &&
+		strings.EqualFold(name[:len(saturnHeaderPrefix)], saturnHeaderPrefix)
+}
+
+// forwardableSaturnHeader reports whether an X-Saturn-* header may be
+// forwarded upstream: it is in the active trusted-header set, or it is one of
+// the edge-contract identity headers.
+func forwardableSaturnHeader(name string) bool {
+	if isTrustedHeader(name) {
+		return true
+	}
+	_, ok := edgeContractHeaders[http.CanonicalHeaderKey(name)]
+	return ok
+}
+
+// StripUntrustedSaturnHeaders deletes from h every X-Saturn-* header that is
+// neither in the active trusted-header set nor an edge-contract identity
+// header, and returns how many header names it removed. All values of a
+// repeated header are removed with its key. Matching is case-insensitive.
+//
+// Ruling Q-R8STRIP (option b): the edge strip middleware is rendered from the
+// same trusted list as PHOEBE_TRUSTED_HEADERS, so a header retired from that
+// list is no longer stripped at the edge and a client's copy would otherwise
+// reach the upstream unchanged. Phoebe already treats such a header as absent
+// for its own decisions; this removes it from the forwarded request as well,
+// so every future retirement fails closed without a chart change.
+func StripUntrustedSaturnHeaders(h http.Header) int {
+	removed := 0
+	for name := range h {
+		if isSaturnHeader(name) && !forwardableSaturnHeader(name) {
+			delete(h, name)
+			removed++
+		}
+	}
+	return removed
 }

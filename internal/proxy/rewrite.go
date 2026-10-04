@@ -95,6 +95,10 @@ func forceIncludeUsage(r *http.Request) error {
 		return err
 	}
 	if len(body) == 0 {
+		// The original body is closed: install the (empty) buffered body so
+		// the forward never reads the closed one ("invalid Read on closed
+		// Body", a 502 for every empty chunked request).
+		replaceRequestBody(r, body)
 		return nil
 	}
 
