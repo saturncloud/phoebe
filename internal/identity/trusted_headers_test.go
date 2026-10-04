@@ -164,9 +164,14 @@ func TestFromRequestIgnoresHeadersOutsideActiveSet(t *testing.T) {
 	}
 }
 
-// TestFromRequestFallbackTrustsPinnedHeaders is the no-regression pin: with
-// the fallback engaged (unset env), all 13 remain trusted on the real parse
-// path — request handling is unchanged from before the gate existed.
+// TestFromRequestFallbackTrustsPinnedHeaders is the no-regression pin for the
+// gate: with the fallback engaged (unset env), all 13 pinned envelope headers
+// are trusted on the real parse path, so a missing or misrendered ConfigMap
+// does not change request handling relative to the chart's intended set, and
+// the gate's fallback reads exactly what the ungated parser reads. Note:
+// ruling R8 removed the five legacy single-scope quota headers
+// (X-Saturn-Service-Tier, X-Saturn-Rate-Limit-*) from the parser entirely,
+// so pre-R8 phoebe read 18 headers; see TestPinnedFallbackIsExactlyThe13.
 func TestFromRequestFallbackTrustsPinnedHeaders(t *testing.T) {
 	withTrustedHeadersEnv(t, "", false)
 
@@ -268,8 +273,41 @@ func TestLoadTrustedHeadersErrorsWhenGatewayMissing(t *testing.T) {
 // TestLoadTrustedHeadersNoErrorWhenRequiredHeadersPresent: a configured list
 // containing every required header (in any case) logs nothing at ERROR.
 func TestLoadTrustedHeadersNoErrorWhenRequiredHeadersPresent(t *testing.T) {
-	out := loadTrustedHeadersCapturingErrors(t, "x-saturn-gateway, X-SATURN-SERVING-MODE, X-Saturn-Org-Id")
+	out := loadTrustedHeadersCapturingErrors(t, "x-saturn-gateway, X-SATURN-SERVING-MODE, X-Saturn-Org-Id, x-saturn-owner-id")
 	if out != "" {
 		t.Fatalf("unexpected error log for a list with every required header: %q", out)
+	}
+}
+
+// TestLoadTrustedHeadersErrorsWhenOwnerOrOrgAnchorMissing: after R8,
+// X-Saturn-Owner-Id is the only anchor for the quota policy and admission
+// also requires X-Saturn-Org-Id, so a configured list that omits either
+// would 503 every admitted shared request. Each omission logs an ERROR line
+// naming the header and the 503 consequence, and the list is still installed
+// exactly as written (neither header becomes trusted).
+func TestLoadTrustedHeadersErrorsWhenOwnerOrOrgAnchorMissing(t *testing.T) {
+	out := loadTrustedHeadersCapturingErrors(t, "X-Saturn-Gateway,X-Saturn-Serving-Mode")
+	for _, missing := range []string{HeaderOwnerID, HeaderOrgID} {
+		if !strings.Contains(out, "omits "+missing) {
+			t.Fatalf("error log %q does not flag the missing %s", out, missing)
+		}
+		if _, ok := ActiveTrustedHeaders()[missing]; ok {
+			t.Fatalf("active set trusts %s although the configured list omits it", missing)
+		}
+	}
+	if !strings.Contains(out, "503") || !strings.Contains(out, "owner-id anchor") {
+		t.Fatalf("error log %q does not state the 503 owner-anchor consequence", out)
+	}
+	if got := len(ActiveTrustedHeaders()); got != 2 {
+		t.Fatalf("active set has %d headers, want exactly the 2 configured", got)
+	}
+}
+
+// TestLoadTrustedHeadersNoErrorForPinnedList: the full pinned 13, configured
+// explicitly, satisfies every required header and logs nothing at ERROR.
+func TestLoadTrustedHeadersNoErrorForPinnedList(t *testing.T) {
+	out := loadTrustedHeadersCapturingErrors(t, strings.Join(pinnedTrustedHeaders, ","))
+	if out != "" {
+		t.Fatalf("unexpected error log for the pinned list: %q", out)
 	}
 }
