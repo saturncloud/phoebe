@@ -307,7 +307,11 @@ func decodeEvent(m redis.XMessage) (metering.Event, error) {
 	if !ok {
 		return ev, fmt.Errorf("entry %s 'event' field is %T, want string", m.ID, raw)
 	}
-	if err := json.Unmarshal([]byte(s), &ev); err != nil {
+	// UnmarshalEvent maps only an absent serving_mode key (pre-cutover
+	// evidence) to "dedicated"; an explicit "" or null is kept as "" so the
+	// rater withholds it.
+	ev, err := metering.UnmarshalEvent([]byte(s))
+	if err != nil {
 		return ev, fmt.Errorf("entry %s unmarshal: %w", m.ID, err)
 	}
 	if ev.RequestID == "" {

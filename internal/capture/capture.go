@@ -46,6 +46,15 @@ type Result struct {
 	// or partial; bill-partial policy lives in the emitter, not here.
 	Aborted bool
 
+	// UpstreamFault is true when the request failed on a non-client-abort
+	// upstream/transport fault before a response could be metered (the
+	// reverse-proxy error path, e.g. an upstream reset mid-request). The
+	// engine may already have done work, so usage is indeterminate — but the
+	// client did NOT disconnect, and billing_event.aborted must not claim it
+	// did. The emitter bills these under the same partial policy as aborts
+	// so the attempt is not invisible to billing.
+	UpstreamFault bool
+
 	// Streamed reports whether the response was SSE (true) or a single JSON
 	// body (false). Useful for diagnostics and reconciliation.
 	Streamed bool

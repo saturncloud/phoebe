@@ -53,9 +53,20 @@ const (
 	// a caller authorized for model-A's subdomain could put `model=B` in the body
 	// and reach B. Phoebe ASSERTS the request `model=` is in this allow-list and
 	// fails closed (403) on mismatch — atlas DECIDES access, phoebe only guarantees
-	// the body can't escape the atlas-authorized resource. Absent = the binding is
-	// not enforced for this route (dedicated single-model endpoints, where one
-	// subdomain == one model, need no binding); present = enforce.
+	// the body can't escape the atlas-authorized resource.
+	//
+	// It is present on BOTH shared and dedicated routes: a dedicated Dynamo graph
+	// can host a base model plus several attached adapters, so "one subdomain ==
+	// one model" is NOT an architectural guarantee. On a dedicated route the
+	// allow-list is additionally the authorization input for the route gate
+	// (proxy.boundRequestAllowed) and for the /v1/models response filter
+	// (proxy.filterModelListResponse).
+	//
+	// ABSENT = no binding here, and the route gate degrades to the meterable
+	// inference POST surface only (proxy.unboundRequestAllowed): graph-wide
+	// surfaces (unfiltered model list, readiness, metrics, docs) are refused,
+	// and a SHARED route with no allow-list is refused outright. PRESENT =
+	// enforce the full bound surface.
 	HeaderServedModel = "X-Saturn-Served-Model"
 
 	// HeaderServingMode carries the serving mode of the deployment — "shared" or
@@ -63,11 +74,12 @@ const (
 	// products independently (design D1). Like HeaderBaseModel/HeaderAdapter it
 	// is a deploy-time resource property injected server-side by the
 	// Atlas-rendered Traefik middleware, anti-spoof overwritten, never trusted
-	// from clients. ABSENT = dedicated (the OUTER-prefix pricing contract: a bare
-	// base id is dedicated, so every event shipped before shared serving prices
-	// as dedicated with no rewrite). PRESENT with "shared" marks shared traffic,
-	// which the rater prices from the distinct shared:<base> price row. Phoebe
-	// reads it defensively: absent = "" = dedicated.
+	// from clients. Atlas stamps it explicitly on EVERY Token Factory inference
+	// route, dedicated included (Hugo's 2026-10-01 ruling #19), so an ABSENT or
+	// malformed value on a header-routed request is an edge-contract bug: the
+	// route gate refuses it (generic 404) and nothing is metered. FromRequest
+	// copies the value verbatim; there is no default. The empty string is not a
+	// serving mode anywhere (the 2026-09-29 serving-mode ruling).
 	HeaderServingMode = "X-Saturn-Serving-Mode"
 
 	// HeaderGateway marks a request that arrived on the TF shared-inference
@@ -122,13 +134,18 @@ const (
 	// take down the inference path. See internal/proxy missingBillingFields.
 	HeaderOrgID = "X-Saturn-Org-Id"
 
-	// Shared-tier policy resolved by Atlas from authenticated UsageLimits and
-	// stamped by gateway ForwardAuth. Clients never choose these values.
-	HeaderServiceTier                   = "X-Saturn-Service-Tier"
-	HeaderRateLimitRequests             = "X-Saturn-Rate-Limit-Requests"
-	HeaderRateLimitTotalPromptTokens    = "X-Saturn-Rate-Limit-Total-Prompt-Tokens"
-	HeaderRateLimitUncachedPromptTokens = "X-Saturn-Rate-Limit-Uncached-Prompt-Tokens"
-	HeaderRateLimitGeneratedTokens      = "X-Saturn-Rate-Limit-Generated-Tokens"
+	// Shared-inference policy resolved by Saturn from authenticated UsageLimits and
+	// stamped by gateway ForwardAuth. OwnerID is stable across all API keys for
+	// a user/group; AuthID remains the per-key audit and revocation identity.
+	HeaderOwnerID                            = "X-Saturn-Owner-Id"
+	HeaderOrgRateLimitRequests               = "X-Saturn-Org-Rate-Limit-Requests"
+	HeaderOrgRateLimitTotalPromptTokens      = "X-Saturn-Org-Rate-Limit-Total-Prompt-Tokens"
+	HeaderOrgRateLimitUncachedPromptTokens   = "X-Saturn-Org-Rate-Limit-Uncached-Prompt-Tokens"
+	HeaderOrgRateLimitGeneratedTokens        = "X-Saturn-Org-Rate-Limit-Generated-Tokens"
+	HeaderOwnerRateLimitRequests             = "X-Saturn-Owner-Rate-Limit-Requests"
+	HeaderOwnerRateLimitTotalPromptTokens    = "X-Saturn-Owner-Rate-Limit-Total-Prompt-Tokens"
+	HeaderOwnerRateLimitUncachedPromptTokens = "X-Saturn-Owner-Rate-Limit-Uncached-Prompt-Tokens"
+	HeaderOwnerRateLimitGeneratedTokens      = "X-Saturn-Owner-Rate-Limit-Generated-Tokens"
 
 	// HeaderUpstream carries the EXACT backend the request must be forwarded to —
 	// `host:port` (e.g. pd-abcde-mymodel-r123.main-namespace.svc.cluster.local:8000).
@@ -174,10 +191,10 @@ type Identity struct {
 	// checkpoint deployments. Its presence triggers the fine-tune premium at rating
 	// (C4); its value is forensic. Empty for a base-model endpoint.
 	Adapter string
-	// ServingMode is the serving mode ("shared" | "dedicated"), the SKU pricing
-	// axis. Empty = dedicated (the absence-of-prefix contract). Carried to the
-	// metering event so the rater prices shared traffic from the distinct
-	// shared:<base> row. See HeaderServingMode.
+	// ServingMode is the serving mode (ServingModeShared | ServingModeDedicated),
+	// the SKU pricing axis. Never empty after FromRequest. Carried to the metering
+	// event so the rater prices shared traffic from the distinct shared:<base>
+	// row. See HeaderServingMode.
 	ServingMode string
 	// ServedModel is the comma-separated allow-list of served-model names the
 	// subdomain-authorized resource may serve. Empty = binding not enforced for
@@ -201,34 +218,71 @@ type Identity struct {
 	// upstream host the gateway just composed from this same name. Empty on
 	// header-routed requests (the proxy derives the graph from the upstream
 	// host instead).
-	GraphK8sName                  string
-	ServiceTier                   string
-	RateLimitRequests             string
-	RateLimitTotalPromptTokens    string
-	RateLimitUncachedPromptTokens string
-	RateLimitGeneratedTokens      string
+	GraphK8sName                       string
+	OwnerID                            string
+	OrgRateLimitRequests               string
+	OrgRateLimitTotalPromptTokens      string
+	OrgRateLimitUncachedPromptTokens   string
+	OrgRateLimitGeneratedTokens        string
+	OwnerRateLimitRequests             string
+	OwnerRateLimitTotalPromptTokens    string
+	OwnerRateLimitUncachedPromptTokens string
+	OwnerRateLimitGeneratedTokens      string
+}
+
+// The two serving modes, spelled exactly as they are stored in billing_event and
+// rated_usage and sent on the billing push. There is no third value: an empty or
+// unknown serving mode is an edge-contract bug, refused at the proxy's billing
+// gate and withheld from money by the rater.
+const (
+	ServingModeShared    = "shared"
+	ServingModeDedicated = "dedicated"
+)
+
+// ValidServingMode reports whether s is one of the two serving modes.
+func ValidServingMode(s string) bool {
+	return s == ServingModeShared || s == ServingModeDedicated
 }
 
 // FromRequest extracts the trusted identity headers. It performs no
 // validation beyond reading the values; authorization happened at the edge.
+//
+// The R3 envelope reads (gateway mark, org, owner, serving mode, served
+// model, and every rate-limit policy header — the pinned 13) resolve through
+// the trusted-header registry: a header outside the active set is treated
+// as ABSENT, never read for a trust decision. The remaining identity headers
+// are read directly (ratified edge contract, outside the R3 gate). The proxy
+// calls FromRequest BEFORE StripSaturnHeaders removes every X-Saturn-* header
+// from the forwarded request (ruling Q-R8STRIP2), so the returned Identity is
+// the only form in which these values survive past the strip.
+//
+// The serving mode is copied verbatim and NO default is applied (ruling #19):
+// an absent, untrusted, or malformed X-Saturn-Serving-Mode leaves a value that
+// fails ValidServingMode, and the proxy route gate refuses it. A gateway
+// request's serving mode is overwritten later by gateway resolution from the
+// served-model registry.
 func FromRequest(r *http.Request) Identity {
 	return Identity{
-		AuthID:                        r.Header.Get(HeaderAuthID),
-		UserID:                        r.Header.Get(HeaderUserID),
-		GroupID:                       r.Header.Get(HeaderGroupID),
-		ResourceID:                    r.Header.Get(HeaderResourceID),
-		ResourceType:                  r.Header.Get(HeaderResourceType),
-		OrgID:                         r.Header.Get(HeaderOrgID),
-		BaseModel:                     r.Header.Get(HeaderBaseModel),
-		Adapter:                       r.Header.Get(HeaderAdapter),
-		ServingMode:                   r.Header.Get(HeaderServingMode),
-		ServedModel:                   r.Header.Get(HeaderServedModel),
-		Upstream:                      r.Header.Get(HeaderUpstream),
-		Gateway:                       r.Header.Get(HeaderGateway) == "true",
-		ServiceTier:                   r.Header.Get(HeaderServiceTier),
-		RateLimitRequests:             r.Header.Get(HeaderRateLimitRequests),
-		RateLimitTotalPromptTokens:    r.Header.Get(HeaderRateLimitTotalPromptTokens),
-		RateLimitUncachedPromptTokens: r.Header.Get(HeaderRateLimitUncachedPromptTokens),
-		RateLimitGeneratedTokens:      r.Header.Get(HeaderRateLimitGeneratedTokens),
+		AuthID:                             r.Header.Get(HeaderAuthID),
+		UserID:                             r.Header.Get(HeaderUserID),
+		GroupID:                            r.Header.Get(HeaderGroupID),
+		ResourceID:                         r.Header.Get(HeaderResourceID),
+		ResourceType:                       r.Header.Get(HeaderResourceType),
+		OrgID:                              trustedHeaderValue(r, HeaderOrgID),
+		BaseModel:                          r.Header.Get(HeaderBaseModel),
+		Adapter:                            r.Header.Get(HeaderAdapter),
+		ServingMode:                        trustedHeaderValue(r, HeaderServingMode),
+		ServedModel:                        trustedHeaderValue(r, HeaderServedModel),
+		Upstream:                           r.Header.Get(HeaderUpstream),
+		Gateway:                            trustedHeaderValue(r, HeaderGateway) == "true",
+		OwnerID:                            trustedHeaderValue(r, HeaderOwnerID),
+		OrgRateLimitRequests:               trustedHeaderValue(r, HeaderOrgRateLimitRequests),
+		OrgRateLimitTotalPromptTokens:      trustedHeaderValue(r, HeaderOrgRateLimitTotalPromptTokens),
+		OrgRateLimitUncachedPromptTokens:   trustedHeaderValue(r, HeaderOrgRateLimitUncachedPromptTokens),
+		OrgRateLimitGeneratedTokens:        trustedHeaderValue(r, HeaderOrgRateLimitGeneratedTokens),
+		OwnerRateLimitRequests:             trustedHeaderValue(r, HeaderOwnerRateLimitRequests),
+		OwnerRateLimitTotalPromptTokens:    trustedHeaderValue(r, HeaderOwnerRateLimitTotalPromptTokens),
+		OwnerRateLimitUncachedPromptTokens: trustedHeaderValue(r, HeaderOwnerRateLimitUncachedPromptTokens),
+		OwnerRateLimitGeneratedTokens:      trustedHeaderValue(r, HeaderOwnerRateLimitGeneratedTokens),
 	}
 }

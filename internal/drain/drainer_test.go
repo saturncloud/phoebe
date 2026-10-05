@@ -608,3 +608,34 @@ func TestEnsureGroup_Idempotent(t *testing.T) {
 		t.Fatalf("second ensureGroup (BUSYGROUP) should be nil, got: %v", err)
 	}
 }
+
+// TestDecodeEvent_OnlyAbsentServingModeStoredAsDedicated pins the drain
+// queue's serving-mode rule end to end through eventArgs: an event without a
+// serving_mode key (metered by a pre-cutover pod) is stored as 'dedicated', an
+// explicit "" (a post-cutover producer bug) is stored as the empty string so
+// the rater withholds it, and "shared" and "dedicated" are stored as sent.
+func TestDecodeEvent_OnlyAbsentServingModeStoredAsDedicated(t *testing.T) {
+	const servingModeIdx = 11
+	cases := []struct {
+		name string
+		json string
+		want any
+	}{
+		{"absent key", `{"request_id":"r","model":"m"}`, "dedicated"},
+		{"explicit empty", `{"request_id":"r","model":"m","serving_mode":""}`, ""},
+		{"explicit null", `{"request_id":"r","model":"m","serving_mode":null}`, ""},
+		{"shared", `{"request_id":"r","model":"m","serving_mode":"shared"}`, "shared"},
+		{"dedicated", `{"request_id":"r","model":"m","serving_mode":"dedicated"}`, "dedicated"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			ev, err := decodeEvent(redis.XMessage{ID: "1-0", Values: map[string]interface{}{"event": tc.json}})
+			if err != nil {
+				t.Fatalf("decodeEvent: %v", err)
+			}
+			if got := eventArgs(ev)[servingModeIdx]; got != tc.want {
+				t.Fatalf("stored serving_mode = %v, want %v", got, tc.want)
+			}
+		})
+	}
+}

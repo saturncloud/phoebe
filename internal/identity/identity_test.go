@@ -17,11 +17,15 @@ func TestFromRequestCapturesAllHeaders(t *testing.T) {
 	r.Header.Set(HeaderBaseModel, "meta-llama/Llama-3.1-8B-Instruct")
 	r.Header.Set(HeaderAdapter, "ckpt-artifact-42")
 	r.Header.Set(HeaderUpstream, "pd-x.main-namespace.svc.cluster.local:8000")
-	r.Header.Set(HeaderServiceTier, "pro")
-	r.Header.Set(HeaderRateLimitRequests, "700")
-	r.Header.Set(HeaderRateLimitTotalPromptTokens, "1600000")
-	r.Header.Set(HeaderRateLimitUncachedPromptTokens, "400000")
-	r.Header.Set(HeaderRateLimitGeneratedTokens, "200000")
+	r.Header.Set(HeaderOwnerID, "owner-3")
+	r.Header.Set(HeaderOrgRateLimitRequests, "700")
+	r.Header.Set(HeaderOrgRateLimitTotalPromptTokens, "1600000")
+	r.Header.Set(HeaderOrgRateLimitUncachedPromptTokens, "400000")
+	r.Header.Set(HeaderOrgRateLimitGeneratedTokens, "200000")
+	r.Header.Set(HeaderOwnerRateLimitRequests, "70")
+	r.Header.Set(HeaderOwnerRateLimitTotalPromptTokens, "160000")
+	r.Header.Set(HeaderOwnerRateLimitUncachedPromptTokens, "40000")
+	r.Header.Set(HeaderOwnerRateLimitGeneratedTokens, "20000")
 
 	id := FromRequest(r)
 
@@ -49,10 +53,13 @@ func TestFromRequestCapturesAllHeaders(t *testing.T) {
 	if id.Adapter != "ckpt-artifact-42" {
 		t.Errorf("Adapter = %q, want ckpt-artifact-42", id.Adapter)
 	}
-	if id.ServiceTier != "pro" || id.RateLimitRequests != "700" ||
-		id.RateLimitTotalPromptTokens != "1600000" ||
-		id.RateLimitUncachedPromptTokens != "400000" ||
-		id.RateLimitGeneratedTokens != "200000" {
+	if id.OwnerID != "owner-3" || id.OrgRateLimitRequests != "700" ||
+		id.OrgRateLimitTotalPromptTokens != "1600000" ||
+		id.OrgRateLimitUncachedPromptTokens != "400000" ||
+		id.OrgRateLimitGeneratedTokens != "200000" ||
+		id.OwnerRateLimitRequests != "70" || id.OwnerRateLimitTotalPromptTokens != "160000" ||
+		id.OwnerRateLimitUncachedPromptTokens != "40000" ||
+		id.OwnerRateLimitGeneratedTokens != "20000" {
 		t.Errorf("rate-limit identity fields = %+v", id)
 	}
 	if id.Upstream != "pd-x.main-namespace.svc.cluster.local:8000" {
@@ -83,6 +90,36 @@ func TestFromRequestGatewayMarkerIsStrict(t *testing.T) {
 		}
 		if got := FromRequest(r).Gateway; got != want {
 			t.Errorf("Gateway for header %q = %v, want %v", v, got, want)
+		}
+	}
+}
+
+// TestFromRequestServingMode pins ruling #19 (2026-10-01): Atlas stamps the
+// serving mode explicitly on every Token Factory route, dedicated included, so
+// FromRequest copies the header verbatim with no default. An absent header
+// stays empty and fails ValidServingMode; the proxy's route gate refuses it.
+func TestFromRequestServingMode(t *testing.T) {
+	cases := []struct {
+		header, want string
+		valid        bool
+	}{
+		{"", "", false},
+		{"dedicated", ServingModeDedicated, true},
+		{"shared", ServingModeShared, true},
+		{"Shared", "Shared", false},
+		{"bogus", "bogus", false},
+	}
+	for _, c := range cases {
+		r := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", nil)
+		if c.header != "" {
+			r.Header.Set(HeaderServingMode, c.header)
+		}
+		id := FromRequest(r)
+		if id.ServingMode != c.want {
+			t.Errorf("header %q: ServingMode = %q, want %q", c.header, id.ServingMode, c.want)
+		}
+		if ValidServingMode(id.ServingMode) != c.valid {
+			t.Errorf("header %q: ValidServingMode(%q) = %t, want %t", c.header, id.ServingMode, !c.valid, c.valid)
 		}
 	}
 }

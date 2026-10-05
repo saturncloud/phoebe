@@ -204,11 +204,15 @@ func eventArgs(e metering.Event) []any {
 		// -braces for a clean column either way.
 		nullStr(e.BaseModel),
 		nullStr(e.Adapter),
-		// ServingMode is "" for dedicated (the common case, incl. every pre-shared
-		// event) and "shared" for shared traffic. nullStr so dedicated stores NULL,
-		// not '' — the rater treats NULL/'' identically as dedicated (the bare price
-		// key), and a clean NULL keeps the column faithful to "absence = dedicated".
-		nullStr(e.ServingMode),
+		// ServingMode is stored exactly as decoded. The pre-cutover default is
+		// applied at decode time, not here: metering.UnmarshalEvent (used by the
+		// drain queue and the on-disk spool) maps only an ABSENT serving_mode key
+		// to "dedicated" (ledger item 6; the same rule as migration 0007 and
+		// recovery.go). An explicit "" from a post-cutover producer is a bug, so
+		// it is stored as '' (not NULL, not 'dedicated') and the rater withholds
+		// it as an invalid serving mode. billing_event is the evidence ledger
+		// with no CHECK here, so any other value is also stored as captured.
+		e.ServingMode,
 		e.PromptTokens,
 		e.CachedTokens,
 		e.CompletionTokens,

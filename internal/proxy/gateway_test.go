@@ -11,8 +11,11 @@ import (
 	"testing"
 	"time"
 
+	"github.com/alicebob/miniredis/v2"
+	"github.com/redis/go-redis/v9"
 	k8sfake "k8s.io/client-go/kubernetes/fake"
 
+	"github.com/saturncloud/phoebe/internal/admission"
 	"github.com/saturncloud/phoebe/internal/config"
 	"github.com/saturncloud/phoebe/internal/gateway"
 	"github.com/saturncloud/phoebe/internal/identity"
@@ -54,22 +57,224 @@ func newGatewayTestServer(t *testing.T, em *recordingEmitter, resolver gateway.R
 }
 
 // gatewayRequest builds a gateway-marked request with the complete trusted
-// identity and admission-policy contract. Zero rate limits mean unlimited.
+// identity and admission-policy contract. R4: the base envelope stamps
+// large non-binding caps; explicit 0 is a zero cap and absent headers are
+// unlimited only per-field inside a complete envelope.
 // It carries none of the per-resource routing headers, exactly as the gateway
 // route contract specifies.
 func gatewayRequest(org, body string) *http.Request {
-	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(body))
+	return gatewayRequestFor(http.MethodPost, "/v1/chat/completions", org, body)
+}
+
+func gatewayRequestFor(method, path, org, body string) *http.Request {
+	req := httptest.NewRequest(method, path, strings.NewReader(body))
 	req.Header.Set(identity.HeaderGateway, "true")
 	if org != "" {
 		req.Header.Set(identity.HeaderOrgID, org)
 	}
 	req.Header.Set(identity.HeaderAuthID, "auth-1")
-	req.Header.Set(identity.HeaderServiceTier, "default")
-	req.Header.Set(identity.HeaderRateLimitRequests, "0")
-	req.Header.Set(identity.HeaderRateLimitTotalPromptTokens, "0")
-	req.Header.Set(identity.HeaderRateLimitUncachedPromptTokens, "0")
-	req.Header.Set(identity.HeaderRateLimitGeneratedTokens, "0")
+	req.Header.Set(identity.HeaderOwnerID, "owner-1")
+	for _, header := range []string{
+		identity.HeaderOrgRateLimitRequests,
+		identity.HeaderOrgRateLimitTotalPromptTokens,
+		identity.HeaderOrgRateLimitUncachedPromptTokens,
+		identity.HeaderOrgRateLimitGeneratedTokens,
+		identity.HeaderOwnerRateLimitRequests,
+		identity.HeaderOwnerRateLimitTotalPromptTokens,
+		identity.HeaderOwnerRateLimitUncachedPromptTokens,
+		identity.HeaderOwnerRateLimitGeneratedTokens,
+	} {
+		req.Header.Set(header, "1000000")
+	}
 	return req
+}
+
+func gatewayRequestBodyOfSize(t *testing.T, org string, size int) *http.Request {
+	t.Helper()
+	prefix := `{"model":"model-a","max_tokens":20,"padding":"`
+	suffix := `"}`
+	if size < len(prefix)+len(suffix) {
+		t.Fatalf("body size %d too small", size)
+	}
+	return gatewayRequest(org, prefix+strings.Repeat("x", size-len(prefix)-len(suffix))+suffix)
+}
+
+func TestGatewayRequestBodyBoundedBeforeResolution(t *testing.T) {
+	const limit = 128
+	var upstreamHits int
+	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		upstreamHits++
+		_, _ = w.Write([]byte(`{"model":"model-a","usage":{"prompt_tokens":1,"completion_tokens":1}}`))
+	}))
+	defer backend.Close()
+	up, _ := url.Parse(backend.URL)
+	resolver := &mapResolver{m: map[[2]string]gateway.Resolution{
+		{"org-1", "model-a"}: {
+			ResourceID: "resource-a", BaseModel: "model-a", ServingMode: "shared",
+			GraphK8sName: "graph-a",
+		},
+	}}
+	s := newGatewayTestServer(t, &recordingEmitter{}, resolver, up)
+	s.settings.Admission.Platform.MaxPromptBytes = ptr64(limit)
+
+	rr := httptest.NewRecorder()
+	s.Handler().ServeHTTP(rr, gatewayRequestBodyOfSize(t, "org-1", limit))
+	if rr.Code != http.StatusOK || atomic.LoadInt32(&resolver.calls) != 1 || upstreamHits != 1 {
+		t.Fatalf("exact limit status=%d resolver=%d upstream=%d", rr.Code, resolver.calls, upstreamHits)
+	}
+
+	for _, tc := range []struct {
+		name    string
+		chunked bool
+	}{
+		{name: "known content length plus one"},
+		{name: "chunked plus one", chunked: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			req := gatewayRequestBodyOfSize(t, "org-1", limit+1)
+			if tc.chunked {
+				req.ContentLength = -1
+				req.Header.Del("Content-Length")
+			}
+			rr := httptest.NewRecorder()
+			s.Handler().ServeHTTP(rr, req)
+			if rr.Code != http.StatusRequestEntityTooLarge {
+				t.Fatalf("status=%d, want 413", rr.Code)
+			}
+			if got := atomic.LoadInt32(&resolver.calls); got != 1 || upstreamHits != 1 {
+				t.Fatalf("oversized gateway reached resolver=%d or upstream=%d", got, upstreamHits)
+			}
+		})
+	}
+}
+
+func TestGatewayRejectsNonSharedRegistryResolution(t *testing.T) {
+	for _, mode := range []string{"", "dedicated"} {
+		t.Run("serving_mode="+mode, func(t *testing.T) {
+			var upstreamHits int
+			backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				upstreamHits++
+				w.WriteHeader(http.StatusOK)
+			}))
+			defer backend.Close()
+			up, _ := url.Parse(backend.URL)
+			resolver := &mapResolver{m: map[[2]string]gateway.Resolution{
+				{"org-1", "model-a"}: {
+					ResourceID: "resource-a", BaseModel: "model-a", ServingMode: mode,
+					GraphK8sName: "graph-a",
+				},
+			}}
+			s := newGatewayTestServer(t, &recordingEmitter{}, resolver, up)
+			rr := httptest.NewRecorder()
+			s.Handler().ServeHTTP(rr, gatewayRequest("org-1", `{"model":"model-a","max_tokens":20}`))
+			if rr.Code != http.StatusServiceUnavailable {
+				t.Fatalf("status=%d, want 503", rr.Code)
+			}
+			if upstreamHits != 0 {
+				t.Fatalf("non-shared gateway resolution reached upstream %d times", upstreamHits)
+			}
+		})
+	}
+}
+
+func TestGatewayPolicyEnvelopeCanRollOutBeforeAdmissionIsEnabled(t *testing.T) {
+	backend, backendURL := usageBackend(t)
+	defer backend.Close()
+	resolver := &mapResolver{m: map[[2]string]gateway.Resolution{
+		{"org-1", "model-a"}: {
+			ResourceID: "resource-a", BaseModel: "model-a", ServingMode: "shared",
+			GraphK8sName: "graph-a",
+		},
+	}}
+	s := newGatewayTestServer(t, &recordingEmitter{}, resolver, backendURL)
+	missingPolicyRequest := func() *http.Request {
+		req := gatewayRequest("org-1", `{"model":"model-a","max_tokens":20}`)
+		for _, header := range []string{
+			identity.HeaderOwnerID,
+			identity.HeaderOrgRateLimitRequests,
+			identity.HeaderOrgRateLimitTotalPromptTokens,
+			identity.HeaderOrgRateLimitUncachedPromptTokens,
+			identity.HeaderOrgRateLimitGeneratedTokens,
+			identity.HeaderOwnerRateLimitRequests,
+			identity.HeaderOwnerRateLimitTotalPromptTokens,
+			identity.HeaderOwnerRateLimitUncachedPromptTokens,
+			identity.HeaderOwnerRateLimitGeneratedTokens,
+		} {
+			req.Header.Del(header)
+		}
+		return req
+	}
+	rr := httptest.NewRecorder()
+	s.Handler().ServeHTTP(rr, missingPolicyRequest())
+	if rr.Code != http.StatusOK {
+		t.Fatalf("disabled-admission rollout status=%d, want 200 (body %q)", rr.Code, rr.Body.String())
+	}
+
+	cfg := proxyAdmissionConfig(2)
+	s.settings.Admission = cfg
+	mr := miniredis.RunT(t)
+	client := redis.NewClient(&redis.Options{Addr: mr.Addr()})
+	s.WithAdmitter(admission.New(client, cfg))
+	rr = httptest.NewRecorder()
+	s.Handler().ServeHTTP(rr, missingPolicyRequest())
+	if rr.Code != http.StatusServiceUnavailable {
+		t.Fatalf("enabled-admission missing-policy status=%d, want 503", rr.Code)
+	}
+}
+
+func TestGateway_RejectsRoutesBeforeResolution(t *testing.T) {
+	resolver := &mapResolver{}
+	srv := newGatewayTestServer(t, &recordingEmitter{}, resolver, nil)
+	for _, tc := range []struct{ method, path string }{
+		{http.MethodPost, "/future-admin"},
+		{http.MethodPost, "/v1/models"},
+		{http.MethodPost, "/v1/responses"},
+		{http.MethodGet, "/health"},
+		{http.MethodPut, "/v1/chat/completions"},
+	} {
+		rr := httptest.NewRecorder()
+		srv.Handler().ServeHTTP(rr, gatewayRequestFor(tc.method, tc.path, "org-1", `{"model":"m"}`))
+		if rr.Code != http.StatusNotFound {
+			t.Fatalf("%s %s status = %d, want 404", tc.method, tc.path, rr.Code)
+		}
+	}
+	if atomic.LoadInt32(&resolver.calls) != 0 {
+		t.Fatalf("blocked gateway routes invoked resolver %d times", resolver.calls)
+	}
+}
+
+func TestGateway_PreflightDoesNotRequireModelResolution(t *testing.T) {
+	resolver := &mapResolver{}
+	srv := newGatewayTestServer(t, &recordingEmitter{}, resolver, nil)
+	rr := httptest.NewRecorder()
+	srv.Handler().ServeHTTP(rr, gatewayRequestFor(http.MethodOptions, "/v1/chat/completions", "org-1", ""))
+	if rr.Code != http.StatusNoContent {
+		t.Fatalf("preflight status = %d, want 204", rr.Code)
+	}
+	if atomic.LoadInt32(&resolver.calls) != 0 {
+		t.Fatal("preflight must not invoke model resolution")
+	}
+}
+
+func TestGateway_AllBillableInferencePathsResolveAndForward(t *testing.T) {
+	be, beURL := usageBackend(t)
+	defer be.Close()
+	resolver := &mapResolver{m: map[[2]string]gateway.Resolution{
+		{"org-1", "served-m"}: {
+			ResourceID: "tfm-1", BaseModel: "base", ServingMode: "shared", GraphK8sName: "graph",
+		},
+	}}
+	srv := newGatewayTestServer(t, &recordingEmitter{}, resolver, beURL)
+	for _, path := range []string{"/v1/chat/completions", "/v1/completions", "/v1/embeddings"} {
+		rr := httptest.NewRecorder()
+		srv.Handler().ServeHTTP(rr, gatewayRequestFor(http.MethodPost, path, "org-1", `{"model":"served-m"}`))
+		if rr.Code != http.StatusOK {
+			t.Fatalf("POST %s status = %d, want 200 (body %q)", path, rr.Code, rr.Body.String())
+		}
+	}
+	if calls := atomic.LoadInt32(&resolver.calls); calls != 3 {
+		t.Fatalf("resolver calls = %d, want 3", calls)
+	}
 }
 
 // usageBackend returns an httptest server answering like a vLLM engine (model
@@ -220,6 +425,51 @@ func TestGateway_MissingOrg403(t *testing.T) {
 	}
 	if atomic.LoadInt32(&resolver.calls) != 0 {
 		t.Fatal("resolver must not be consulted without an org")
+	}
+}
+
+// TestGateway_PreflightMissingOrg403: the preflight branch refuses an anonymous
+// preflight (403) BEFORE any resolution — the resolver must not be consulted,
+// and no 204 may answer it. Deleting the org check would 204 anonymous
+// preflights on the gateway route with no test failing.
+func TestGateway_PreflightMissingOrg403(t *testing.T) {
+	resolver := &mapResolver{}
+	srv := newGatewayTestServer(t, &recordingEmitter{}, resolver, nil)
+
+	req := httptest.NewRequest(http.MethodOptions, "/v1/chat/completions", nil)
+	req.Header.Set(identity.HeaderGateway, "true")
+	// deliberately no identity.HeaderOrgID
+	rr := httptest.NewRecorder()
+	srv.Handler().ServeHTTP(rr, req)
+
+	if rr.Code != http.StatusForbidden {
+		t.Fatalf("preflight without org: status = %d, want 403", rr.Code)
+	}
+	if atomic.LoadInt32(&resolver.calls) != 0 {
+		t.Fatal("resolver must not be consulted for an anonymous preflight")
+	}
+}
+
+// TestGateway_ResolverInvalidServingModeFailsClosed: Resolver is an exported
+// interface and WithGateway accepts any implementation, so the proxy
+// re-validates the resolved serving mode itself — a non-conforming resolver
+// returning a value outside the closed enum must fail closed (503), not
+// silently disable the shared-policy block and wake on a possibly-shared graph.
+func TestGateway_ResolverInvalidServingModeFailsClosed(t *testing.T) {
+	resolver := &mapResolver{m: map[[2]string]gateway.Resolution{
+		{"org-a", "m"}: {ResourceID: "resource-a", ServingMode: "Shared", GraphK8sName: "g1"},
+	}}
+	em := &recordingEmitter{}
+	srv := newGatewayTestServer(t, em, resolver, nil)
+
+	rr := httptest.NewRecorder()
+	srv.Handler().ServeHTTP(rr, gatewayRequest("org-a", `{"model":"m"}`))
+
+	if rr.Code != http.StatusServiceUnavailable {
+		t.Fatalf("status = %d, want 503 (invalid resolved serving mode fails closed)", rr.Code)
+	}
+	if events := em.waitForEvents(1, 100*time.Millisecond); len(events) != 0 {
+		t.Fatalf("refused resolution emitted %d billing events, want 0: %+v", len(events), events)
 	}
 }
 
@@ -399,7 +649,7 @@ func TestGateway_UpstreamHostShape(t *testing.T) {
 // upstream host the gateway itself composed from that same name. Re-deriving
 // would work by coincidence today and break the moment the host format changes.
 func TestGateway_WakeEligible(t *testing.T) {
-	backend := &coldToWarmBackend{}
+	backend := &coldToWarmBackend{warmBody: `{"model":"sleepy-bot","usage":{"prompt_tokens":7,"completion_tokens":3,"total_tokens":10,"prompt_tokens_details":{"cached_tokens":2}}}`}
 	be := httptest.NewServer(backend)
 	defer be.Close()
 	beURL, _ := url.Parse(be.URL)
@@ -416,10 +666,18 @@ func TestGateway_WakeEligible(t *testing.T) {
 	// re-probe succeeds and the caller performs the real metered forward.
 	waker := &fakeWaker{backend: backend, warmsAt: 1}
 	em := &recordingEmitter{}
-	srv := newGatewayTestServer(t, em, resolver, beURL).WithWaker(waker, 5*time.Second, 0)
+	mr := miniredis.RunT(t)
+	cfg := proxyAdmissionConfig(1)
+	cfg.Platform.MaxColdHolds = ptr64(1)
+	client := redis.NewClient(&redis.Options{Addr: mr.Addr()})
+	t.Cleanup(func() { _ = client.Close() })
+	a := admission.New(client, cfg)
+	srv := newGatewayTestServer(t, em, resolver, beURL)
+	srv.settings.Admission = cfg
+	srv.WithAdmitter(a).WithWaker(waker, 5*time.Second, 0)
 
 	rr := httptest.NewRecorder()
-	srv.Handler().ServeHTTP(rr, gatewayRequest("org-1", `{"model":"sleepy-bot"}`))
+	srv.Handler().ServeHTTP(rr, gatewayRequest("org-1", `{"model":"sleepy-bot","max_tokens":20}`))
 
 	if rr.Code != http.StatusOK {
 		t.Fatalf("status = %d, want 200 after wake (body %q)", rr.Code, rr.Body.String())
@@ -427,9 +685,94 @@ func TestGateway_WakeEligible(t *testing.T) {
 	if got := atomic.LoadInt32(&waker.calls); got != 1 {
 		t.Fatalf("waker called %d times, want 1 (gateway route must be wakeable)", got)
 	}
+	// serveWithWake costs one readiness probe on the wake path: one cold probe,
+	// one warm re-probe after the wake, then the caller's metered forward.
+	if backend.requests.Load() != 3 || backend.successes.Load() != 2 {
+		t.Fatalf("backend requests=%d successes=%d, want one cold probe, one warm re-probe, one successful inference", backend.requests.Load(), backend.successes.Load())
+	}
+	events := em.waitForEvents(1, time.Second)
+	if len(events) != 1 || events[0].PromptTokens != 7 || events[0].CachedTokens != 2 || events[0].CompletionTokens != 3 {
+		t.Fatalf("metering events=%+v, want exactly one authoritative 7/2/3 event", events)
+	}
 	// The RESOLVED graph name is threaded onto the wake target verbatim —
 	// never re-derived from the upstream host the gateway composed from it.
 	if tgt := waker.last(); tgt.GraphK8sName != "graph-llama31" || tgt.ResourceID != "tfm-cold-1" {
 		t.Fatalf("wake target = %+v, want the resolved graph/resource", tgt)
+	}
+
+	// With active, prefill, and decode each capped at one, admitting another
+	// request at the same graph/org/model scopes proves the completed inference
+	// released all three reservations. Beginning a cold hold on that lease
+	// separately proves the wake path released its one allowed cold hold as well.
+	next, err := a.Admit(context.Background(), admission.Request{
+		Graph: "graph-llama31", Organization: "org-1", Model: "sleepy-bot",
+		PromptBytes: 1, EstimatedInputTokens: 1, ReservedOutputTokens: 1,
+	})
+	if err != nil {
+		t.Fatalf("cold-to-warm request did not release admission reservations: %v", err)
+	}
+	if err := next.BeginColdHold(context.Background()); err != nil {
+		t.Fatalf("cold-to-warm request did not release its cold hold: %v", err)
+	}
+	if err := next.EndColdHold(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if err := next.Complete(context.Background(), 0); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// TestGateway_ResolutionWithoutLegalServingModeRefusedAtGate proves the proxy's
+// serving-mode gate refuses a resolved identity that carries no legal serving
+// mode. A resolver hands back a Resolution whose ServingMode is empty or not
+// "shared"/"dedicated"; the request must get 503 (a resolver-side fault, per
+// phoebe#50) before anything else runs:
+// the upstream is never reached, the waker is never called, and nothing is
+// metered. The gateway path gets no absent-means-dedicated default. (Rejecting
+// such rows when the registry ConfigMap is indexed is covered separately by
+// TestRegistry_InvalidServingModeRejectedAtIndex.)
+func TestGateway_ResolutionWithoutLegalServingModeRefusedAtGate(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		mode string
+	}{
+		{"empty", ""},
+		{"bogus", "bogus"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var hits int32
+			be := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				atomic.AddInt32(&hits, 1)
+				_, _ = w.Write([]byte(`{"model":"served-m","choices":[{"finish_reason":"stop"}],"usage":{"prompt_tokens":7,"completion_tokens":3,"total_tokens":10}}`))
+			}))
+			defer be.Close()
+			beURL, _ := url.Parse(be.URL)
+
+			resolver := &mapResolver{m: map[[2]string]gateway.Resolution{
+				{"org-1", "m"}: {ResourceID: "tfm-1", BaseModel: "b", ServingMode: tc.mode, GraphK8sName: "g"},
+			}}
+			em := &recordingEmitter{}
+			waker := &fakeWaker{}
+			srv := newGatewayTestServer(t, em, resolver, beURL).WithWaker(waker, 5*time.Second, 0)
+
+			rr := httptest.NewRecorder()
+			srv.Handler().ServeHTTP(rr, gatewayRequest("org-1", `{"model":"m"}`))
+
+			// resolveGateway refuses a resolution without a legal serving mode
+			// with 503 (phoebe#50's contract: a resolver-side fault, not the
+			// caller's), before any forward or wake.
+			if rr.Code != http.StatusServiceUnavailable {
+				t.Fatalf("status = %d, want 503 (body %q)", rr.Code, rr.Body.String())
+			}
+			if got := atomic.LoadInt32(&hits); got != 0 {
+				t.Fatalf("upstream reached %d times; the gate must refuse before forwarding", got)
+			}
+			if got := atomic.LoadInt32(&waker.calls); got != 0 {
+				t.Fatalf("waker called %d times; the gate must refuse before any wake", got)
+			}
+			if em.count() != 0 {
+				t.Fatalf("%d events metered, want 0", em.count())
+			}
+		})
 	}
 }

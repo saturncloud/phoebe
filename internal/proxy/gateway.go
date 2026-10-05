@@ -107,7 +107,7 @@ func (s *Server) resolveGateway(w http.ResponseWriter, r *http.Request, id *iden
 	body, err := readAndRestoreBody(r)
 	if err != nil {
 		s.log.Error.Printf("gateway: read request body: %v (request_id=%q)", err, requestID)
-		http.Error(w, "bad request body", http.StatusBadRequest)
+		writeRequestBodyError(w, err)
 		return false
 	}
 	model, ok := extractRequestModel(body)
@@ -140,15 +140,46 @@ func (s *Server) resolveGateway(w http.ResponseWriter, r *http.Request, id *iden
 		http.Error(w, "service unavailable", http.StatusServiceUnavailable)
 		return false
 	}
+	if res.ServingMode != identity.ServingModeShared {
+		// The gateway is exclusively the shared-inference entry point. Treat a
+		// non-shared registry row as a broken trusted contract; otherwise the
+		// request would skip tenant isolation, scheduler sanitization, and quota
+		// admission after resolving onto a shared graph.
+		s.log.Error.Printf("gateway: resolved non-shared model org_id=%s model=%q serving_mode=%q request_id=%q",
+			id.OrgID, model, res.ServingMode, requestID)
+		http.Error(w, "service unavailable", http.StatusServiceUnavailable)
+		return false
+	}
 
 	id.ResourceID = res.ResourceID
 	id.BaseModel = res.BaseModel
 	id.Adapter = res.Adapter
 	id.ServingMode = res.ServingMode
+	// Defense in depth at the seam: Resolver is an exported interface and
+	// WithGateway accepts any implementation, so the mode is validated HERE in
+	// code, not only asserted below. A resolver returning a value outside the
+	// closed enum would otherwise silently disable the shared-policy block and
+	// wake on what may be a genuinely shared graph — the same fail-open the
+	// header-routed gate refuses. Both shipped resolvers (parseRegistryConfigMap,
+	// PGResolver.Resolve) already reject such rows; this makes the proxy fail
+	// closed even for a non-conforming in-process impl, and rejects "" too: a
+	// resolved row must name its mode explicitly.
+	if !identity.ValidServingMode(res.ServingMode) {
+		s.log.Error.Printf("gateway: resolver returned invalid serving_mode %q org_id=%s request_id=%q",
+			res.ServingMode, id.OrgID, requestID)
+		http.Error(w, "service unavailable", http.StatusServiceUnavailable)
+		return false
+	}
 	// The resolved model is definitionally the single model this request is
 	// bound to — recorded on the identity both as documentation-of-binding and
-	// because wake eligibility (isWakeable) keys on ResourceID+ServedModel:
-	// "resolution succeeded" is exactly what makes a gateway route wakeable.
+	// because wake eligibility (isWakeable) keys on
+	// ServingMode+ResourceID+ServedModel. Resolution alone is NOT sufficient:
+	// a dedicated row resolves and is deliberately not wakeable (dedicated
+	// capacity never scales to zero through this path). The serving-mode
+	// check above enforces the closed enum (shipped resolvers reject bad rows
+	// themselves — the registry parser and PGResolver.Resolve — the proxy
+	// check covers a non-conforming Resolver impl), so the shared case is
+	// never silently lost.
 	id.ServedModel = model
 	// The graph name rides the identity to the wake target verbatim, so a wake
 	// on this route actuates exactly the resolved graph — never a re-parse of

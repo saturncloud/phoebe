@@ -102,6 +102,13 @@ type RateResult struct {
 	// because these events are already inside EventsRated — counting them in event
 	// units too would break the anomaly partition.
 	AmbiguousGraphRollups int64
+	// InvalidServingModeEvents counts attributable, valid-usage events whose
+	// serving_mode is not 'shared' or 'dedicated'. Migration 0007 rewrote
+	// pre-cutover NULL/'' to 'dedicated' and the drainer maps an absent key to
+	// 'dedicated', so a NULL, '' or other value here is a missed backfill or a
+	// post-cutover producer bug. Withheld from money per event, retained in
+	// billing_event, and screamed about.
+	InvalidServingModeEvents int64
 }
 
 // Anomalies are the fail-loud counts for a window: events that could not be priced
@@ -116,6 +123,7 @@ type Anomalies struct {
 	InvalidUsageEvents            int64
 	AmbiguousBaseEvents           int64
 	AmbiguousOrgEvents            int64
+	InvalidServingModeEvents      int64
 }
 
 // PostgresStore reads billing_event and writes rated_usage in the shared Atlas
@@ -303,15 +311,26 @@ WITH ev AS (
         -- on every Token Factory deployment. Prices both a base-model endpoint
         -- (plain base rate) and a fine-tune (base x premium).
         base_model,
-        -- serving_mode: the serving-mode SKU axis (X-Saturn-Serving-Mode). NULL/''
-        -- = dedicated; 'shared' = shared traffic, priced from the SKU base key below.
+        -- serving_mode: the serving-mode SKU axis, 'shared' or 'dedicated'. Since the
+        -- 2026-09-29 serving-mode ruling those are the ONLY legal values; the proxy
+        -- refuses anything else before metering.
         serving_mode,
+        -- valid_serving_mode: false for NULL, '' or any other spelling. Migration
+        -- 0007 rewrote pre-cutover NULL/'' to 'dedicated', and the drainer maps an
+        -- absent key to 'dedicated', so a NULL, '' or other value that reaches
+        -- this point is a missed backfill or a post-cutover producer bug. The
+        -- event is withheld from money per event (see grouped's WHERE) and
+        -- counted as invalid_serving_mode_events.
+        -- billing_event keeps the raw row; nothing here rewrites evidence.
+        COALESCE(serving_mode IN ('shared', 'dedicated'), false) AS valid_serving_mode,
         -- sku_base: the MODE-PREFIXED base price key (design D1, mirrors the Go
         -- servingModeKey). Shared traffic (serving_mode = 'shared') prices from a
-        -- DISTINCT 'shared:'||base_model row; dedicated (NULL/''/anything else = the
-        -- absence-of-prefix contract) keys on the bare base_model. The (b) derived
-        -- and (c) plain-base joins below key on THIS, so shared and dedicated of the
-        -- same base resolve to independent rate rows.
+        -- DISTINCT 'shared:'||base_model row; dedicated keys on the bare base_model
+        -- (the price-key grammar is unchanged: dedicated rows carry no prefix). An
+        -- invalid serving mode also lands on the bare key here, but it never reaches
+        -- money: grouped drops it first. The (b) derived and (c) plain-base joins
+        -- below key on THIS, so shared and dedicated of the same base resolve to
+        -- independent rate rows.
         CASE WHEN serving_mode = 'shared' THEN 'shared:' || base_model ELSE base_model END
             AS sku_base,
         -- adapter: the fine-tune checkpoint artifact id, non-NULL ONLY on fine-tune
@@ -371,10 +390,13 @@ resolved AS (
         ev.model_id,
         ev.base_model,
         -- serving_mode: a GRAIN key column from here on (see the grouped GROUP BY).
-        -- Normalized to '' for dedicated so the key column is never NULL -- UNIQUE
-        -- treats NULLs as distinct, so a NULL key column would let one logical rollup
-        -- be written twice and double-bill.
-        COALESCE(ev.serving_mode, '') AS serving_mode,
+        -- Carried verbatim, not defaulted: an event without a valid serving mode is
+        -- dropped in grouped's WHERE, so every row that reaches a rollup carries
+        -- 'shared' or 'dedicated' and the key column is never NULL (UNIQUE treats
+        -- NULLs as distinct, so a NULL key column would let one logical rollup be
+        -- written twice and double-bill; the rated_usage CHECK also forbids it).
+        ev.serving_mode,
+        ev.valid_serving_mode,
         ev.owner_type,
         ev.owner_id,
         ev.owner_conflict,
@@ -468,7 +490,7 @@ grouped AS (
         model_id,
         -- GRAIN KEY: shared and dedicated price from different SKUs, so they must never
         -- merge into one rollup (a merge would let MIN() below apply the cheaper rate
-        -- to both). Already normalized to '' for dedicated in resolved.
+        -- to both). Always 'shared' or 'dedicated' here (see the WHERE below).
         serving_mode,
         -- GRAIN KEYS: the owner pair, so charges are presentable per person/team as
         -- well as per API key. '' / '' means the producer supplied no owner.
@@ -563,6 +585,11 @@ grouped AS (
       -- Dropping the row here keeps the damage to exactly the offending event, and the
       -- count below is taken from ev so it reports that one event, not its neighbours.
       AND NOT owner_conflict
+      -- INVALID SERVING MODE is excluded PER EVENT for the same reason as
+      -- owner_conflict: the serving mode is a grain key and selects the price SKU,
+      -- so an event without a legal one has no rollup it can correctly join, and a
+      -- group-level gate would withhold innocent neighbours. Counted below.
+      AND valid_serving_mode
     GROUP BY auth_id, owner_type, owner_id, resource_id, model_id, serving_mode,
              date_trunc('hour', ev_ts AT TIME ZONE 'UTC') AT TIME ZONE 'UTC'
 ),
@@ -624,9 +651,15 @@ upserted AS (
         -- serving_mode, window_start); epoch (a bounded integer, no separator hazard)
         -- keeps the hash input session-TZ-independent.
         --
-        -- owner_type, owner_id and serving_mode are NOT NULL (defaulted to '' upstream),
+        -- owner_type and owner_id are NOT NULL (defaulted to '' upstream) and
+        -- serving_mode is 'shared' or 'dedicated' (invalid events never reach priced),
         -- so length() is never NULL here -- a NULL anywhere in this expression would
         -- make the whole md5 NULL and violate the PK.
+        --
+        -- THE SERVING-MODE CUTOVER RE-CUT DEDICATED IDS. Dedicated rows used to hash
+        -- serving_mode = '' and now hash 'dedicated', so every dedicated id changed.
+        -- Migration 0007 rewrote the stored rows with the same formula; there were no
+        -- production rows (2026-09-29 ruling), so no id continuity was owed.
         --
         -- WIDENING THIS KEY CHANGES EVERY ID. Migration 0006 widened it from 4 fields to
         -- 7; ids minted before that are not reproducible and were discarded with the
@@ -714,14 +747,19 @@ SELECT
     -- counted ONLY as unattributable (the more specific signal), never also as
     -- unpriced; likewise an ambiguous_org rollup that is ALSO ambiguous_base is counted
     -- ONLY as ambiguous_base. So the counts strictly PARTITION the in-window rows:
-    --   events_rated + missing_usage + invalid_usage + unpriced + unattributable + ambiguous_base + ambiguous_org
+    --   events_rated + missing_usage + invalid_usage + unpriced + unattributable
+    --     + invalid_serving_mode + ambiguous_base + ambiguous_org + owner_conflict
     --     == total in-window events.
     -- The unpriced count requires FULL attribution (auth_id, resource_id, model_id all
     -- NON-NULL) for exactly this exclusivity: a NULL-resource_id row that is also
     -- unpriced must be counted ONLY as unattributable, never double-counted here.
+    -- An event with an invalid serving mode is counted ONLY as
+    -- invalid_serving_mode (its SKU key is meaningless, so "unpriced" would be the
+    -- wrong diagnosis), hence the valid_serving_mode filter.
     (SELECT COUNT(*)::bigint FROM resolved
       WHERE usage_found
         AND valid_usage
+        AND valid_serving_mode
         AND prompt_price  IS NULL
         AND auth_id     IS NOT NULL
         AND resource_id IS NOT NULL
@@ -798,10 +836,13 @@ SELECT
     -- The attribution filters mirror the unattributable/unpriced buckets so the
     -- partition stays strict: a conflicted row that ALSO lacks auth/resource/model is
     -- counted once, as unattributable (the more specific upstream failure).
+    -- An event that is BOTH owner-conflicted and invalid-serving-mode is counted
+    -- once, as invalid_serving_mode (see that bucket), hence valid_serving_mode.
     (SELECT COUNT(*)::bigint FROM ev
       WHERE owner_conflict
         AND usage_found
         AND valid_usage
+        AND valid_serving_mode
         AND auth_id     IS NOT NULL
         AND resource_id IS NOT NULL
         AND model_id    IS NOT NULL)                        AS owner_conflict_events,
@@ -812,7 +853,24 @@ SELECT
     -- already inside events_rated, and counting them again in event units would break
     -- the partition identity. Surfaced so lost cost attribution is observable.
     (SELECT COUNT(*)::bigint FROM priced
-      WHERE ambiguous_graph)                                AS ambiguous_graph_rollups`
+      WHERE ambiguous_graph)                                AS ambiguous_graph_rollups,
+    -- INVALID-SERVING-MODE events: fully attributable, authoritative, valid-usage
+    -- events whose serving_mode is NULL, '' or any spelling other than 'shared' /
+    -- 'dedicated'. NULL/'' is how dedicated was stored before the 2026-09-29
+    -- serving-mode cutover, so after it this bucket means either pre-cutover
+    -- evidence still inside a re-rate window, or a producer bug. Excluded from
+    -- money per event, retained in billing_event, and it drives the fail-loud exit.
+    -- Precedence: after unattributable (a row missing auth/resource/model is counted
+    -- there), before unpriced and owner_conflict (both of which filter
+    -- valid_serving_mode), so the partition above stays strict. Per EVENT from ev,
+    -- because a dropped event has no rollup to be summed under.
+    (SELECT COUNT(*)::bigint FROM ev
+      WHERE NOT valid_serving_mode
+        AND usage_found
+        AND valid_usage
+        AND auth_id     IS NOT NULL
+        AND resource_id IS NOT NULL
+        AND model_id    IS NOT NULL)                        AS invalid_serving_mode_events`
 
 // RateWindow runs the price-projection + the single resolve→sum→upsert→count
 // statement for [start, end) in ONE transaction, and reports the rollups written,
@@ -861,7 +919,7 @@ func (s *PostgresStore) RateWindow(ctx context.Context, book *PriceBook, start, 
 			&res.ExpectedMissingUsageEvents, &res.UnexplainedMissingUsageEvents,
 			&res.InvalidUsageEvents, &res.AmbiguousBaseEvents,
 			&res.AmbiguousOrgEvents, &res.OwnerConflictEvents,
-			&res.AmbiguousGraphRollups)
+			&res.AmbiguousGraphRollups, &res.InvalidServingModeEvents)
 	if err != nil {
 		return RateResult{}, fmt.Errorf("rating: rate window [%s,%s): %w",
 			start.UTC().Format(time.RFC3339), end.UTC().Format(time.RFC3339), err)

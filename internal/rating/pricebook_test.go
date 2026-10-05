@@ -417,18 +417,18 @@ fine_tune_premium:
 
 	// The own-rate fine-tune itself still prices DIRECTLY by its own model_id (one hop
 	// is about being a derivation SOURCE, not about pricing itself).
-	if r, err := pb.ResolveEvent("ft:ownrate", "", "", ""); err != nil || r.Prompt.String() != "0.000010000" {
+	if r, err := pb.ResolveEvent("ft:ownrate", "", "", "dedicated"); err != nil || r.Prompt.String() != "0.000010000" {
 		t.Fatalf("own-rate ft direct resolve = %s, %v; want 0.000010000 / nil", r.Prompt, err)
 	}
 
 	// THE INVARIANT: a different ft: event whose base_model is the OWN-RATE fine-tune
 	// must NOT derive from it (that would be ft-of-ft, a second hop). Fail loud.
-	if _, err := pb.ResolveEvent("ft:9f8e7d6c5b4a", "ft:ownrate", "", ""); !errors.Is(err, ErrNoPrice) {
+	if _, err := pb.ResolveEvent("ft:9f8e7d6c5b4a", "ft:ownrate", "", "dedicated"); !errors.Is(err, ErrNoPrice) {
 		t.Fatalf("ft deriving from an own-rate ft: err = %v, want ErrNoPrice (one hop only — no fine-tune-of-fine-tune)", err)
 	}
 
 	// Sanity: deriving from the TRUE base still works (the one legitimate hop).
-	if r, err := pb.ResolveEvent("ft:9f8e7d6c5b4a", "meta-llama/Llama-3.1-8B-Instruct", "", ""); err != nil || r.Prompt.String() != "0.000006000" {
+	if r, err := pb.ResolveEvent("ft:9f8e7d6c5b4a", "meta-llama/Llama-3.1-8B-Instruct", "", "dedicated"); err != nil || r.Prompt.String() != "0.000006000" {
 		t.Fatalf("ft deriving from the true base = %s, %v; want 0.000006000 / nil", r.Prompt, err)
 	}
 
@@ -463,7 +463,7 @@ fine_tune_premium:
 	}
 
 	// ft: id NOT in the file, base_model IS → base × 1.5.
-	r, err := pb.ResolveEvent("ft:deadbeef", "meta-llama/Llama-3.1-8B-Instruct", "", "")
+	r, err := pb.ResolveEvent("ft:deadbeef", "meta-llama/Llama-3.1-8B-Instruct", "", "dedicated")
 	if err != nil {
 		t.Fatalf("resolve ft via base_model: %v", err)
 	}
@@ -472,17 +472,17 @@ fine_tune_premium:
 	}
 
 	// A base model id resolves DIRECTLY regardless of base_model (here empty).
-	if r, err := pb.ResolveEvent("meta-llama/Llama-3.1-8B-Instruct", "", "", ""); err != nil || r.Prompt.String() != "0.000004000" {
+	if r, err := pb.ResolveEvent("meta-llama/Llama-3.1-8B-Instruct", "", "", "dedicated"); err != nil || r.Prompt.String() != "0.000004000" {
 		t.Fatalf("base model direct resolve = %s, %v; want 0.000004000 / nil", r.Prompt, err)
 	}
 
 	// FAIL LOUD: an ft: id with an EMPTY base_model is a propagation bug, not $0.
-	if _, err := pb.ResolveEvent("ft:deadbeef", "", "", ""); !errors.Is(err, ErrNoPrice) {
+	if _, err := pb.ResolveEvent("ft:deadbeef", "", "", "dedicated"); !errors.Is(err, ErrNoPrice) {
 		t.Fatalf("ft: with empty base_model: err = %v, want ErrNoPrice (never silently mis-price)", err)
 	}
 
 	// FAIL LOUD: an ft: id whose base_model is NOT a priced base → ErrNoPrice.
-	if _, err := pb.ResolveEvent("ft:deadbeef", "some/unpriced-base", "", ""); !errors.Is(err, ErrNoPrice) {
+	if _, err := pb.ResolveEvent("ft:deadbeef", "some/unpriced-base", "", "dedicated"); !errors.Is(err, ErrNoPrice) {
 		t.Fatalf("ft: with unknown base_model: err = %v, want ErrNoPrice", err)
 	}
 }
@@ -728,7 +728,7 @@ fine_tune_premium:
 // PLAIN base rate, with NO premium applied. Ladder step (c).
 func TestResolveEvent_BaseEndpointPricesAtPlainBaseRate(t *testing.T) {
 	pb := c4Book(t)
-	r, err := pb.ResolveEvent("tf-ep-my-llama", "meta-llama/Llama-3.1-8B-Instruct", "", "")
+	r, err := pb.ResolveEvent("tf-ep-my-llama", "meta-llama/Llama-3.1-8B-Instruct", "", "dedicated")
 	if err != nil {
 		t.Fatalf("resolve base endpoint via base_model: %v", err)
 	}
@@ -745,7 +745,7 @@ func TestResolveEvent_BaseEndpointPricesAtPlainBaseRate(t *testing.T) {
 // for the rate. Ladder step (b).
 func TestResolveEvent_AdapterTriggersPremium(t *testing.T) {
 	pb := c4Book(t)
-	r, err := pb.ResolveEvent("tf-ep-my-finetune", "meta-llama/Llama-3.1-8B-Instruct", "ckpt-artifact-42", "")
+	r, err := pb.ResolveEvent("tf-ep-my-finetune", "meta-llama/Llama-3.1-8B-Instruct", "ckpt-artifact-42", "dedicated")
 	if err != nil {
 		t.Fatalf("resolve adapter endpoint: %v", err)
 	}
@@ -761,7 +761,7 @@ func TestResolveEvent_AdapterTriggersPremium(t *testing.T) {
 func TestResolveEvent_FtPrefixStillPremium(t *testing.T) {
 	pb := c4Book(t)
 	for _, adapter := range []string{"", "ckpt-artifact-42"} {
-		r, err := pb.ResolveEvent("ft:9f8e7d6c5b4a", "meta-llama/Llama-3.1-8B-Instruct", adapter, "")
+		r, err := pb.ResolveEvent("ft:9f8e7d6c5b4a", "meta-llama/Llama-3.1-8B-Instruct", adapter, "dedicated")
 		if err != nil {
 			t.Fatalf("resolve ft: id (adapter=%q): %v", adapter, err)
 		}
@@ -778,7 +778,7 @@ func TestResolveEvent_FtPrefixStillPremium(t *testing.T) {
 func TestResolveEvent_DirectEntryWinsOverDerivation(t *testing.T) {
 	pb := c4Book(t)
 	for _, adapter := range []string{"", "ckpt-artifact-42"} {
-		r, err := pb.ResolveEvent("tf-ep-override", "meta-llama/Llama-3.1-8B-Instruct", adapter, "")
+		r, err := pb.ResolveEvent("tf-ep-override", "meta-llama/Llama-3.1-8B-Instruct", adapter, "dedicated")
 		if err != nil {
 			t.Fatalf("resolve override entry (adapter=%q): %v", adapter, err)
 		}
@@ -797,10 +797,10 @@ func TestResolveEvent_DirectEntryWinsOverDerivation(t *testing.T) {
 // rate either. Ladder step (d), fail closed.
 func TestResolveEvent_AdapterWithEmptyBaseModelUnpriced(t *testing.T) {
 	pb := c4Book(t)
-	if _, err := pb.ResolveEvent("tf-ep-my-finetune", "", "ckpt-artifact-42", ""); !errors.Is(err, ErrNoPrice) {
+	if _, err := pb.ResolveEvent("tf-ep-my-finetune", "", "ckpt-artifact-42", "dedicated"); !errors.Is(err, ErrNoPrice) {
 		t.Fatalf("adapter + empty base_model: err = %v, want ErrNoPrice (propagation bug must scream, never $0)", err)
 	}
-	if _, err := pb.ResolveEvent("tf-ep-my-finetune", "some/unpriced-base", "ckpt-artifact-42", ""); !errors.Is(err, ErrNoPrice) {
+	if _, err := pb.ResolveEvent("tf-ep-my-finetune", "some/unpriced-base", "ckpt-artifact-42", "dedicated"); !errors.Is(err, ErrNoPrice) {
 		t.Fatalf("adapter + unpriced base_model: err = %v, want ErrNoPrice", err)
 	}
 }
@@ -810,11 +810,11 @@ func TestResolveEvent_AdapterWithEmptyBaseModelUnpriced(t *testing.T) {
 // ErrNoPrice, never $0. Unchanged by C4. Ladder step (d).
 func TestResolveEvent_PlainUnknownModelUnpriced(t *testing.T) {
 	pb := c4Book(t)
-	if _, err := pb.ResolveEvent("tf-ep-unknown", "", "", ""); !errors.Is(err, ErrNoPrice) {
+	if _, err := pb.ResolveEvent("tf-ep-unknown", "", "", "dedicated"); !errors.Is(err, ErrNoPrice) {
 		t.Fatalf("unknown endpoint name with no base_model: err = %v, want ErrNoPrice", err)
 	}
 	// An unknown base_model on a base endpoint also fails loud (nothing resolves).
-	if _, err := pb.ResolveEvent("tf-ep-unknown", "some/unpriced-base", "", ""); !errors.Is(err, ErrNoPrice) {
+	if _, err := pb.ResolveEvent("tf-ep-unknown", "some/unpriced-base", "", "dedicated"); !errors.Is(err, ErrNoPrice) {
 		t.Fatalf("unknown endpoint name with unpriced base_model: err = %v, want ErrNoPrice", err)
 	}
 }
@@ -849,17 +849,15 @@ fine_tune_premium:
 
 // The serving-mode SKU axis (D1): shared and dedicated of the SAME base price
 // from distinct rows; the serving mode is an OUTER prefix on the price key.
-// Absence of a serving mode = dedicated = the bare key (back-compat).
+// Since the 2026-09-29 serving-mode ruling the serving mode is spelled "shared" or
+// "dedicated" and nothing else: the empty string (the old dedicated spelling) and
+// any other value are refused with ErrInvalidServingMode, even when the model_id
+// has a direct price, mirroring the SQL rater which drops them per event.
 func TestResolveEvent_ServingModeAxis(t *testing.T) {
 	pb := servingModeBook(t)
 	const base = "meta-llama/Llama-3.1-8B-Instruct"
 
-	// Dedicated (empty serving mode) base-model endpoint -> the bare row ($4/1M).
-	if r, err := pb.ResolveEvent("tf-ep-ded", base, "", ""); err != nil ||
-		r.Prompt.String() != "0.000004000" {
-		t.Fatalf("dedicated base: r=%v err=%v, want 0.000004000", r, err)
-	}
-	// "dedicated" spelled explicitly -> same bare row.
+	// Dedicated base-model endpoint -> the bare row ($4/1M).
 	if r, err := pb.ResolveEvent("tf-ep-ded", base, "", "dedicated"); err != nil ||
 		r.Prompt.String() != "0.000004000" {
 		t.Fatalf("explicit dedicated: r=%v err=%v, want 0.000004000", r, err)
@@ -876,14 +874,20 @@ func TestResolveEvent_ServingModeAxis(t *testing.T) {
 		t.Fatalf("shared fine-tune: r=%v err=%v, want 0.000001500 (shared base x 1.5)", r, err)
 	}
 	// Dedicated fine-tune -> dedicated base row x premium: 0.000004 x 1.5 = 0.000006.
-	if r, err := pb.ResolveEvent("tf-ep-ded-ft", base, "ckpt-1", ""); err != nil ||
+	if r, err := pb.ResolveEvent("tf-ep-ded-ft", base, "ckpt-1", "dedicated"); err != nil ||
 		r.Prompt.String() != "0.000006000" {
 		t.Fatalf("dedicated fine-tune: r=%v err=%v, want 0.000006000", r, err)
 	}
-	// A mis-stamped/unknown serving mode falls back to dedicated (never silently
-	// reprices to a nonexistent shared row): "bogus" -> the bare row.
-	if r, err := pb.ResolveEvent("tf-ep-x", base, "", "bogus"); err != nil ||
-		r.Prompt.String() != "0.000004000" {
-		t.Fatalf("unknown serving mode -> dedicated: r=%v err=%v, want 0.000004000", r, err)
+	// The retired empty spelling and any unknown value are refused, never priced
+	// as dedicated.
+	for _, bad := range []string{"", "bogus", "Shared", "DEDICATED", " shared"} {
+		if _, err := pb.ResolveEvent("tf-ep-x", base, "", bad); !errors.Is(err, ErrInvalidServingMode) {
+			t.Fatalf("serving mode %q: err=%v, want ErrInvalidServingMode", bad, err)
+		}
+	}
+	// Refused even when the model_id has its own direct price: the serving mode is
+	// a grain key, so an event without a legal one cannot join any rollup.
+	if _, err := pb.ResolveEvent(base, "", "", ""); !errors.Is(err, ErrInvalidServingMode) {
+		t.Fatalf("direct-priced model with empty serving mode: err=%v, want ErrInvalidServingMode", err)
 	}
 }

@@ -29,7 +29,7 @@ func registryCM(name string, data map[string]string) *corev1.ConfigMap {
 		"port":              "8000",
 	}
 	for k, v := range data {
-		if v == "" && k != "adapter" && k != "serving_mode" && k != "port" {
+		if v == "" && k != "adapter" && k != "port" {
 			delete(base, k)
 			continue
 		}
@@ -283,5 +283,101 @@ func TestRegistry_InvalidRowsSkippedNeverServed(t *testing.T) {
 	}
 	if !waitNotFound(t, r, "org-1", "support-bot") {
 		t.Fatal("row broken by update must be de-indexed")
+	}
+}
+
+// TestRegistry_InvalidServingModeRejectedAtIndex pins that serving_mode is a
+// REQUIRED registry key that must be exactly "shared" or "dedicated" (the
+// 2026-09-29 ruling: "" is not a serving mode). A row that is missing it,
+// has it empty, mis-cased, or unknown is rejected by the parser and never
+// indexed — it fails closed at load time like a missing required key, rather
+// than resolving and then being refused with a 400 on every request.
+func TestRegistry_InvalidServingModeRejectedAtIndex(t *testing.T) {
+	missing := registryCM("tf-model-sm-missing", map[string]string{"served_model_name": "m-missing", "serving_mode": ""}) // deletes the key
+	empty := registryCM("tf-model-sm-empty", map[string]string{"served_model_name": "m-empty"})
+	empty.Data["serving_mode"] = ""
+	cased := registryCM("tf-model-sm-cased", map[string]string{"served_model_name": "m-cased", "serving_mode": "Shared"})
+	bogus := registryCM("tf-model-sm-bogus", map[string]string{"served_model_name": "m-bogus", "serving_mode": "bogus"})
+	shared := registryCM("tf-model-sm-shared", map[string]string{"served_model_name": "m-shared", "serving_mode": "shared"})
+	dedicated := registryCM("tf-model-sm-dedicated", map[string]string{"served_model_name": "m-dedicated", "serving_mode": "dedicated"})
+
+	if _, ok := missing.Data["serving_mode"]; ok {
+		t.Fatal("fixture: serving_mode override \"\" must delete the key")
+	}
+	for _, cm := range []*corev1.ConfigMap{missing, empty, cased, bogus} {
+		if _, _, err := parseRegistryConfigMap(cm); err == nil {
+			t.Errorf("parseRegistryConfigMap(%s, serving_mode=%q) = nil error, want rejection", cm.Name, cm.Data["serving_mode"])
+		}
+	}
+	for _, cm := range []*corev1.ConfigMap{shared, dedicated} {
+		res, _, err := parseRegistryConfigMap(cm)
+		if err != nil || res.ServingMode != cm.Data["serving_mode"] {
+			t.Errorf("parseRegistryConfigMap(%s) = %+v, %v; want accepted with ServingMode %q", cm.Name, res, err, cm.Data["serving_mode"])
+		}
+	}
+
+	r, client, _ := startedRegistry(t, missing, empty, cased, bogus, shared, dedicated)
+	for _, model := range []string{"m-missing", "m-empty", "m-cased", "m-bogus"} {
+		if _, err := r.Resolve(context.Background(), "org-1", model); !errors.Is(err, ErrNotFound) {
+			t.Errorf("Resolve(%s) err = %v, want ErrNotFound (invalid serving_mode never indexed)", model, err)
+		}
+	}
+	for model, mode := range map[string]string{"m-shared": "shared", "m-dedicated": "dedicated"} {
+		res, ok := waitResolve(t, r, "org-1", model)
+		if !ok || res.ServingMode != mode {
+			t.Errorf("Resolve(%s) = %+v ok=%v, want ServingMode %q", model, res, ok, mode)
+		}
+	}
+
+	// A valid row updated to an invalid serving_mode must be de-indexed.
+	broken := registryCM("tf-model-sm-dedicated", map[string]string{"served_model_name": "m-dedicated", "serving_mode": "Dedicated"})
+	if _, err := client.CoreV1().ConfigMaps(registryNS).Update(context.Background(), broken, metav1.UpdateOptions{}); err != nil {
+		t.Fatalf("update to invalid serving_mode: %v", err)
+	}
+	if !waitNotFound(t, r, "org-1", "m-dedicated") {
+		t.Fatal("row whose serving_mode was broken by an update must be de-indexed")
+	}
+}
+
+// serving_mode is REQUIRED and load-bearing: phoebe derives the SKU price row,
+// the shared admission gate, and wake-from-zero eligibility
+// (proxy.isWakeable, which requires ServingMode=="shared") from it. A blank or
+// unrecognized value must never enter the index — it would silently price as
+// dedicated and silently lose wake-from-zero. Reject the ConfigMap instead.
+func TestParseRegistryConfigMap_ServingModeRequired(t *testing.T) {
+	for _, tc := range []struct {
+		name        string
+		servingMode string
+		wantErr     bool
+	}{
+		{"shared accepted", "shared", false},
+		{"dedicated accepted", "dedicated", false},
+		{"empty rejected", "", true},
+		{"bogus rejected", "bogus", true},
+		{"case sensitive", "Shared", true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			cm := registryCM("tf-model-mode", nil)
+			cm.Data["serving_mode"] = tc.servingMode
+			_, _, err := parseRegistryConfigMap(cm)
+			if tc.wantErr && err == nil {
+				t.Fatalf("serving_mode %q must be rejected", tc.servingMode)
+			}
+			if !tc.wantErr && err != nil {
+				t.Fatalf("serving_mode %q must be accepted: %v", tc.servingMode, err)
+			}
+		})
+	}
+}
+
+// A live row whose serving_mode is blanked by an update must be de-indexed, so
+// a mode-less row can never be resolved and served.
+func TestRegistry_BlankServingModeRowNeverServed(t *testing.T) {
+	cm := registryCM("tf-model-modeless", nil)
+	cm.Data["serving_mode"] = ""
+	r, _, _ := startedRegistry(t, cm)
+
+	if _, err := r.Resolve(context.Background(), "org-1", "support-bot"); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("blank serving_mode row err = %v, want ErrNotFound (never indexed)", err)
 	}
 }

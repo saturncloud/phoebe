@@ -82,6 +82,7 @@ func doAbortRequest(t *testing.T, srv *Server, upstream *url.URL, delayBeforeCan
 		t.Fatalf("new request: %v", err)
 	}
 	req.Header.Set(identity.HeaderUpstream, upstream.Host)
+	stampDedicatedServingMode(req)
 	req.Header.Set(identity.HeaderAuthID, "auth-1")
 	req.Header.Set(identity.HeaderResourceID, "model-abc")
 	req.Header.Set(identity.HeaderGroupID, "org-1")
@@ -229,6 +230,7 @@ func TestNormalCompletionNotAffectedByAbortWatcher(t *testing.T) {
 	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions",
 		strings.NewReader(`{"model":"m","stream":true,"messages":[]}`))
 	req.Header.Set(identity.HeaderUpstream, upstream.Host)
+	stampDedicatedServingMode(req)
 	req.Header.Set(identity.HeaderAuthID, "auth-1")
 	req.Header.Set(identity.HeaderResourceID, "model-abc")
 	req.Header.Set(identity.HeaderGroupID, "org-1")
@@ -296,6 +298,7 @@ func TestAbortRaceStress(t *testing.T) {
 			req, _ := http.NewRequestWithContext(ctx, http.MethodPost, "/v1/chat/completions",
 				strings.NewReader(`{"model":"m","stream":true,"messages":[]}`))
 			req.Header.Set(identity.HeaderUpstream, upstream.Host)
+			stampDedicatedServingMode(req)
 			req.Header.Set(identity.HeaderAuthID, "auth-1")
 			req.Header.Set(identity.HeaderResourceID, "model-abc")
 			req.Header.Set(identity.HeaderGroupID, "org-1")
@@ -397,6 +400,7 @@ func TestLongStreamNoDeadlineSever(t *testing.T) {
 	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions",
 		strings.NewReader(`{"model":"m","stream":true,"messages":[]}`))
 	req.Header.Set(identity.HeaderUpstream, upstream.Host)
+	stampDedicatedServingMode(req)
 	req.Header.Set(identity.HeaderAuthID, "auth-1")
 	req.Header.Set(identity.HeaderResourceID, "model-abc")
 	req.Header.Set(identity.HeaderGroupID, "org-1")

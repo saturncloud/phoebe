@@ -276,7 +276,7 @@ admission:
   valkeyAddr: "valkey:6379"
   platform:
     maxActiveRequests: 10
-  tiers:
+  lanes:
     default:
       weight: 1
       limits:
@@ -289,35 +289,153 @@ admission:
         maxActiveRequests: 2
         requestsPerWindow: 5
         window: "30s"
-  organizationTiers:
+  organizationLanes:
     org-a: protected
 `))
 	if err != nil {
 		t.Fatal(err)
 	}
-	if s.Admission.LeaseTTL != 15*time.Minute || s.Admission.DefaultMaxOutputTokens != 512 {
+	if s.Admission.LeaseTTL != 15*time.Minute || s.Admission.DefaultMaxOutputTokens != 4096 {
 		t.Fatalf("admission defaults wrong: %+v", s.Admission)
 	}
-	if got := s.Admission.Tiers["protected"].Limits.Window; got != 30*time.Second {
-		t.Fatalf("tier window=%s, want 30s", got)
+	if got := s.Admission.Lanes["protected"].Limits.Window; got != 30*time.Second {
+		t.Fatalf("lane window=%s, want 30s", got)
 	}
-	if got := s.Admission.Tiers["protected"]; got.DynamoPriority != 17 || got.DynamoStrictPriority != 3 {
+	if got := s.Admission.Lanes["protected"]; got.DynamoPriority != 17 || got.DynamoStrictPriority != 3 {
 		t.Fatalf("protected Dynamo hints wrong: %+v", got)
 	}
 }
 
+// R4 sentinel semantics: YAML null or an absent key decodes to nil = unlimited;
+// an explicit 0 decodes to a zero cap that blocks every request. Without the
+// pointer conversion a chart-side null would decode to 0 = zero cap and block
+// everything. Table-driven over each shape.
+func TestLoadAdmissionLimitsNullableSentinel(t *testing.T) {
+	tests := []struct {
+		name string
+		yaml string
+		want map[string]*int64
+	}{
+		{
+			name: "absent keys are nil",
+			yaml: "admission:\n  enabled: true\n  valkeyAddr: v\n  platform:\n    maxPromptBytes: 1024\n",
+			want: map[string]*int64{"MaxActiveRequests": nil, "MaxPromptBytes": int64ptr(1024)},
+		},
+		{
+			name: "explicit null is nil",
+			yaml: "admission:\n  enabled: true\n  valkeyAddr: v\n  platform:\n    maxActiveRequests: null\n    maxPromptBytes: 1024\n",
+			want: map[string]*int64{"MaxActiveRequests": nil, "MaxPromptBytes": int64ptr(1024)},
+		},
+		{
+			name: "explicit zero is a zero cap",
+			yaml: "admission:\n  enabled: true\n  valkeyAddr: v\n  platform:\n    maxActiveRequests: 0\n    maxPromptBytes: 0\n",
+			want: map[string]*int64{"MaxActiveRequests": int64ptr(0), "MaxPromptBytes": int64ptr(0)},
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			s, err := Load(writeTemp(t, tc.yaml))
+			if err != nil {
+				t.Fatal(err)
+			}
+			for field, want := range tc.want {
+				got := fieldValue(s.Admission.Platform, field)
+				if (got == nil) != (want == nil) || (got != nil && *got != *want) {
+					t.Fatalf("platform.%s = %v, want %v", field, got, want)
+				}
+			}
+		})
+	}
+
+	// A zero cap on one scope must not constrain the others, and a zero-capped
+	// scope must still load: zero caps are enforced at admission, not at parse.
+	t.Run("zero cap round-trips per scope", func(t *testing.T) {
+		s, err := Load(writeTemp(t, `
+admission:
+  enabled: true
+  valkeyAddr: v
+  platform:
+    maxActiveRequests: 0
+  organization:
+    maxActiveRequests: 7
+`))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got := s.Admission.Platform.MaxActiveRequests; got == nil || *got != 0 {
+			t.Fatalf("platform.maxActiveRequests = %v, want explicit zero cap", got)
+		}
+		if got := s.Admission.Organization.MaxActiveRequests; got == nil || *got != 7 {
+			t.Fatalf("organization.maxActiveRequests = %v, want 7", got)
+		}
+	})
+}
+
+func int64ptr(v int64) *int64 { return &v }
+
+func fieldValue(l AdmissionLimits, name string) *int64 {
+	switch name {
+	case "MaxActiveRequests":
+		return l.MaxActiveRequests
+	case "MaxPromptBytes":
+		return l.MaxPromptBytes
+	}
+	return nil
+}
+
 func TestLoadAdmissionRejectsInvalidPolicy(t *testing.T) {
 	tests := []string{
+		"admission:\n  enabled: true\n  valkeyAddr: v\n  leaseTtl: 999ms\n",
 		"admission:\n  enabled: true\n  valkeyAddr: v\n  platform:\n    maxActiveRequests: -1\n",
-		"admission:\n  enabled: true\n  valkeyAddr: v\n  tiers:\n    bad:\n      weight: 0\n",
-		"admission:\n  enabled: true\n  valkeyAddr: v\n  tiers:\n    default:\n      weight: 1\n      dynamoPriority: 2147483648\n",
-		"admission:\n  enabled: true\n  valkeyAddr: v\n  tiers:\n    default:\n      weight: 1\n      dynamoStrictPriority: -1\n",
-		"admission:\n  enabled: true\n  valkeyAddr: v\n  organizationTiers:\n    org-a: missing\n",
+		"admission:\n  enabled: true\n  valkeyAddr: v\n  lanes:\n    bad:\n      weight: 0\n",
+		"admission:\n  enabled: true\n  valkeyAddr: v\n  lanes:\n    default:\n      weight: 1\n      dynamoPriority: 2147483648\n",
+		"admission:\n  enabled: true\n  valkeyAddr: v\n  lanes:\n    default:\n      weight: 1\n      dynamoStrictPriority: -1\n",
+		"admission:\n  enabled: true\n  valkeyAddr: v\n  organizationLanes:\n    org-a: missing\n",
 		"admission:\n  enabled: true\n  valkeyAddr: v\n  platform:\n    totalPromptTokensPerWindow: 10\n    uncachedPromptTokensPerWindow: 11\n",
+		"admission:\n  enabled: true\n  valkeyAddr: v\n  platform:\n    maxActiveRequests: 10\n    maxConcurrentPrefills: 11\n",
+		"admission:\n  enabled: true\n  valkeyAddr: v\n  platform:\n    maxActiveRequests: 10\n    maxReservedDecodeSlots: 11\n",
+		// Lane hints are stamped on shared requests even while admission is
+		// disabled, so hint ranges and lane-map integrity validate regardless.
+		"admission:\n  enabled: false\n  lanes:\n    default:\n      weight: 1\n      dynamoStrictPriority: -1\n",
+		"admission:\n  enabled: false\n  lanes:\n    default:\n      weight: 1\n      dynamoPriority: 2147483648\n",
+		"admission:\n  enabled: false\n  organizationLanes:\n    org-a: missing\n",
+		"admission:\n  enabled: false\n  lanes:\n    gold:\n      weight: 1\n",
+		// Weighted lane shares above the platform limit.
+		"admission:\n  enabled: true\n  valkeyAddr: v\n  platform:\n    maxActiveRequests: 2\n  lanes:\n    default:\n      weight: 1\n      limits:\n        maxActiveRequests: 2\n    gold:\n      weight: 1\n      limits:\n        maxActiveRequests: 1\n",
+		// weight*value int64 overflow.
+		"admission:\n  enabled: true\n  valkeyAddr: v\n  lanes:\n    default:\n      weight: 9223372036854775807\n      limits:\n        maxActiveRequests: 2\n",
+		// The platform sets a dimension the lane omits.
+		"admission:\n  enabled: true\n  valkeyAddr: v\n  platform:\n    maxActiveRequests: 10\n  lanes:\n    default:\n      weight: 1\n      limits:\n        maxPromptBytes: 1024\n",
+		// Individually valid weighted shares whose sum overflows int64.
+		"admission:\n  enabled: true\n  valkeyAddr: v\n  lanes:\n    default:\n      weight: 4611686018427387904\n      limits:\n        maxActiveRequests: 1\n    gold:\n      weight: 4611686018427387904\n      limits:\n        maxActiveRequests: 1\n",
 	}
 	for _, body := range tests {
 		if _, err := Load(writeTemp(t, body)); err == nil {
 			t.Fatalf("expected invalid policy rejection for:\n%s", body)
 		}
+	}
+}
+
+// The leaseTtl floor is inclusive: 999ms is rejected above, but exactly one
+// second (the minimum) must load.
+func TestLoadAdmissionLeaseTTLInclusiveFloor(t *testing.T) {
+	s, err := Load(writeTemp(t, "admission:\n  enabled: true\n  valkeyAddr: v\n  leaseTtl: 1s\n"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if s.Admission.LeaseTTL != time.Second {
+		t.Fatalf("LeaseTTL=%s, want 1s", s.Admission.LeaseTTL)
+	}
+}
+
+// While admission is disabled, valid lanes must still load (weight, lane-share,
+// leaseTtl, and valkeyAddr validation stay behind the Enabled gate).
+func TestLoadAdmissionDisabledWithValidLanes(t *testing.T) {
+	s, err := Load(writeTemp(t, "admission:\n  enabled: false\n  lanes:\n    default:\n      weight: 0\n      dynamoPriority: 5\n      dynamoStrictPriority: 2\n  organizationLanes:\n    org-a: default\n"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := s.Admission.Lanes["default"]; got.DynamoPriority != 5 || got.DynamoStrictPriority != 2 {
+		t.Fatalf("disabled-admission lane hints wrong: %+v", got)
 	}
 }

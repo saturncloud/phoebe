@@ -14,6 +14,7 @@ import (
 	tidwall "github.com/tidwall/wal"
 
 	"github.com/saturncloud/phoebe/internal/logging"
+	"github.com/saturncloud/phoebe/internal/metering"
 )
 
 // ---- helpers ----------------------------------------------------------------
@@ -335,6 +336,66 @@ func TestWAL_LegacyUnreadable(t *testing.T) {
 	for _, suffix := range []string{".importing", ".imported"} {
 		if _, err := os.Stat(path + suffix); !os.IsNotExist(err) {
 			t.Errorf("unreadable legacy file was renamed to %s (err=%v)", suffix, err)
+		}
+	}
+}
+
+// TestWAL_PreCutoverSpoolReplaysAsDedicated pins that a spool written by a
+// pre-cutover pod (no serving_mode key) keeps the dedicated default when a
+// post-cutover pod replays it. The replay re-marshals the event, and
+// ServingMode is no longer omitempty, so decoding without the absent-key rule
+// would ship an explicit "" that the drain stores as the empty string and the
+// rater withholds. An explicit "" in the spool stays "" so it is still
+// withheld.
+func TestWAL_PreCutoverSpoolReplaysAsDedicated(t *testing.T) {
+	path := tmpWALPath(t)
+
+	// Legacy JSONL file (the file-to-directory import path).
+	legacy := `{"request_id":"pre-cutover"}` + "\n" + `{"request_id":"explicit-empty","serving_mode":""}` + "\n"
+	if err := os.WriteFile(path, []byte(legacy), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	w := openTestWAL(t, path) // imports the legacy file into the tidwall log
+	if err := w.close(); err != nil {
+		t.Fatal(err)
+	}
+	// Tidwall log entry written raw by a pre-cutover pod.
+	l, err := tidwall.Open(path, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	last, err := l.LastIndex()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := l.Write(last+1, []byte(`{"request_id":"pre-cutover-log"}`)); err != nil {
+		t.Fatal(err)
+	}
+	if err := l.Close(); err != nil {
+		t.Fatal(err)
+	}
+	w = openTestWAL(t, path)
+	defer w.close() //nolint:errcheck
+	got := unshipped(t, w)
+
+	want := map[string]string{"pre-cutover": "dedicated", "explicit-empty": "", "pre-cutover-log": "dedicated"}
+	if len(got) != len(want) {
+		t.Fatalf("replayed %d events, want %d", len(got), len(want))
+	}
+	for _, ev := range got {
+		if ev.ServingMode != want[ev.RequestID] {
+			t.Errorf("request %s serving_mode = %q, want %q", ev.RequestID, ev.ServingMode, want[ev.RequestID])
+		}
+		raw, err := json.Marshal(ev)
+		if err != nil {
+			t.Fatal(err)
+		}
+		shipped, err := metering.UnmarshalEvent(raw)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if shipped.ServingMode != want[ev.RequestID] {
+			t.Errorf("request %s serving_mode after re-marshal = %q, want %q", ev.RequestID, shipped.ServingMode, want[ev.RequestID])
 		}
 	}
 }

@@ -32,6 +32,8 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+
+	"github.com/saturncloud/phoebe/internal/identity"
 )
 
 // ErrNotFound reports that no tf_model row matches (org, served model name) —
@@ -133,7 +135,10 @@ func NewPGResolver(db *sql.DB) *PGResolver {
 
 // Resolve implements Resolver against tf_model. sql.ErrNoRows and a
 // graph-less row both map to ErrNotFound (see resolveQuery); any other error
-// is returned wrapped for the caller's fail-closed 503.
+// is returned wrapped for the caller's fail-closed 503. A row whose
+// serving_mode is not exactly "shared" or "dedicated" is rejected with a
+// plain error (the caller's 503, not ErrNotFound's 404): the same contract
+// the registry parser enforces (parseRegistryConfigMap).
 func (p *PGResolver) Resolve(ctx context.Context, orgID, model string) (Resolution, error) {
 	var r Resolution
 	err := p.db.QueryRowContext(ctx, resolveQuery, orgID, model).Scan(
@@ -144,6 +149,20 @@ func (p *PGResolver) Resolve(ctx context.Context, orgID, model string) (Resoluti
 		return Resolution{}, ErrNotFound
 	case err != nil:
 		return Resolution{}, fmt.Errorf("gateway: resolve model for org %s: %w", orgID, err)
+	}
+	// serving_mode is load-bearing at request time — it selects the SKU price
+	// row, the shared admission gate, and wake-from-zero eligibility
+	// (proxy.isWakeable) — so it is validated against the same contract the
+	// registry parser enforces: exactly "shared" or "dedicated". A row with
+	// any other value (empty, wrong case, garbage) exists but cannot be
+	// attributed to an SKU, so resolution fails closed with a plain error:
+	// the proxy 503s and its resolver-failure log names the bad value and the
+	// model. Folding it into ErrNotFound would hide a data-integrity bug as
+	// an ordinary miss; defaulting it would mis-price and mis-gate the
+	// request.
+	if !identity.ValidServingMode(r.ServingMode) {
+		return Resolution{}, fmt.Errorf("gateway: tf_model row for org %s model %q has invalid serving_mode %q (want %q or %q)",
+			orgID, model, r.ServingMode, identity.ServingModeShared, identity.ServingModeDedicated)
 	}
 	if r.GraphK8sName == "" {
 		// Exists but not addressable (no serving graph). Folded into ErrNotFound

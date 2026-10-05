@@ -18,6 +18,7 @@ import (
 	"k8s.io/client-go/tools/cache"
 	"k8s.io/client-go/tools/clientcmd"
 
+	"github.com/saturncloud/phoebe/internal/identity"
 	"github.com/saturncloud/phoebe/internal/logging"
 )
 
@@ -54,7 +55,13 @@ func NewKubeClient(kubeconfig string) (kubernetes.Interface, error) {
 //	           base_model        — HF base id (the catalog price key)
 //	           adapter           — fine-tune checkpoint id; MAY BE EMPTY
 //	                               (base-model endpoint)
-//	           serving_mode      — "shared" | "dedicated" (SKU axis)
+//	           serving_mode      — REQUIRED, exactly "shared" | "dedicated"
+//	                               (SKU axis). It is load-bearing at request
+//	                               time — it selects the shared price row, the
+//	                               shared admission gate, and wake-from-zero
+//	                               eligibility (proxy.isWakeable) — so an
+//	                               empty or unrecognized value is REJECTED,
+//	                               never defaulted.
 //	           graph_k8s_name    — the serving DGD k8s name
 //	           port              — the graph's OpenAI-compatible serve port
 //
@@ -275,8 +282,13 @@ func (r *RegistryResolver) size() int {
 // above. org_id, served_model_name, resource_id, base_model, and
 // graph_k8s_name are REQUIRED (a row missing any of them cannot be routed
 // AND billed correctly — indexing it would serve unbillable or unroutable
-// traffic); adapter and serving_mode may be empty (base-model endpoint /
-// dedicated). An unparseable port is tolerated as 0 (the proxy falls back to
+// traffic); serving_mode is REQUIRED and must be exactly "shared" or
+// "dedicated", because phoebe derives the SKU price row, the shared admission
+// gate, and wake-from-zero eligibility (proxy.isWakeable) from it — a row
+// phoebe cannot attribute to an SKU must not serve traffic, so the fail-closed
+// choice is to reject the ConfigMap (upsert logs it and de-indexes the row)
+// rather than to silently default. Only adapter may be empty (a base-model
+// endpoint). An unparseable port is tolerated as 0 (the proxy falls back to
 // the configured gateway.port) — wrong-but-recoverable, unlike the identity
 // fields.
 func parseRegistryConfigMap(cm *corev1.ConfigMap) (Resolution, cacheKey, error) {
@@ -285,6 +297,10 @@ func parseRegistryConfigMap(cm *corev1.ConfigMap) (Resolution, cacheKey, error) 
 		if d[req] == "" {
 			return Resolution{}, cacheKey{}, fmt.Errorf("missing required data key %q", req)
 		}
+	}
+	if !identity.ValidServingMode(d["serving_mode"]) {
+		return Resolution{}, cacheKey{}, fmt.Errorf("invalid serving_mode %q (must be %q or %q)",
+			d["serving_mode"], identity.ServingModeShared, identity.ServingModeDedicated)
 	}
 	res := Resolution{
 		ResourceID:   d["resource_id"],
