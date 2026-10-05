@@ -12,6 +12,12 @@ with the Atlas schema; they live in phoebe's own database.
 
 - **`billing_event`** — system-of-record for raw metering records. Written by the
   Postgres drainer (`cmd/drainer`) as it consumes the Valkey metering stream.
+  **Retention is finite, by ruled policy (2026-09-30):** `cmd/prune` deletes rows
+  older than 30 days on `created_at` (configurable per install, hard floor 7 days
+  — inside the floor a later rater re-rate could reconcile-delete billed money).
+  ONE horizon for every row class, withheld/invalid rows included; the durable
+  records are the manager's money rollup (stored upstream) and the rater's hourly
+  anomaly counts/logs, not the raw rows. `rated_usage` below is never pruned.
 - **`rated_usage`** — the rating (E1) revenue rollup: per-(auth_id, resource_id,
   model_id, hour) cost, carrying the applied per-token rates frozen onto each row.
   `org_id` is carried from `billing_event` so `cmd/token-push` reads org straight
@@ -19,6 +25,9 @@ with the Atlas schema; they live in phoebe's own database.
   money math happens in SQL, not Go.**
 - **`io_log`** — optional, sampled, short-retention request/response body capture
   (M5 I/O logging). Written by the interceptor's iolog sink; OFF by default.
+  `cmd/prune` enforces the short retention: rows older than 7 days on `created_at`
+  are deleted (its OWN period, independent of billing_event's 30 days) — the
+  retention job this table's 0003 migration index always promised.
 
 **The price catalog is not a DB table here (E1).** There is no `model_price` table
 and no local price history. The manager owns the effective-dated price series; the
