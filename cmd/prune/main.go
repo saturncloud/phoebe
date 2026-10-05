@@ -39,6 +39,7 @@ package main
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"flag"
 	"os"
 	"time"
@@ -149,7 +150,10 @@ func run(configPath string, env func(string) string) int {
 		}
 		db.SetConnMaxLifetime(d)
 	}
-	if err := db.Ping(); err != nil {
+	pingCtx, pingCancel := context.WithTimeout(context.Background(), 10*time.Second)
+	err = db.PingContext(pingCtx)
+	pingCancel()
+	if err != nil {
 		log.Error.Printf("prune: ping database: %v", err)
 		return exitFatal
 	}
@@ -171,10 +175,14 @@ func run(configPath string, env func(string) string) int {
 	} {
 		ctx, cancel := context.WithTimeout(context.Background(), perTableTimeout)
 		res, err := store.Prune(ctx, job.table, job.retentionDays, cfg.BatchSize)
+		// Capture the context error BEFORE cancel(): cancel always makes
+		// ctx.Err() non-nil, so checking after cancel would misattribute every
+		// failure as a timeout.
+		ctxErr := ctx.Err()
 		cancel()
 		if err != nil {
-			if ctx.Err() != nil {
-				log.Error.Printf("prune: %s: interrupted by the %s per-table timeout: %v", job.table.Name(), perTableTimeout, err)
+			if errors.Is(err, context.DeadlineExceeded) || ctxErr == context.DeadlineExceeded {
+				log.Error.Printf("prune: %s: %v (interrupted by the %s per-table timeout)", job.table.Name(), err, perTableTimeout)
 			} else {
 				log.Error.Printf("prune: %s: %v", job.table.Name(), err)
 			}

@@ -103,15 +103,34 @@ func (c Config) WithDefaults() Config {
 	return c
 }
 
+// MaxBillingEventRetentionDays bounds the billing_event horizon at 100 years:
+// time.Duration(retentionDays)*24h overflows int64 nanoseconds past ~106752
+// days and wraps the cutoff into the FUTURE, making created_at < cutoff match
+// the WHOLE table — one run would wipe billing_event silently at exit 0. The
+// bound sits far below the overflow point and past any real retention ask.
+const MaxBillingEventRetentionDays = 36500
+
+// MaxIoLogRetentionDays bounds the io_log horizon at 10 years, same overflow
+// rationale as MaxBillingEventRetentionDays.
+const MaxIoLogRetentionDays = 3650
+
 // Validate enforces the ruled floors. A horizon below the floor is a config
 // error, not a silently clamped value: silently pruning LESS than asked would
-// leave an operator believing evidence is gone when it is not.
+// leave an operator believing evidence is gone when it is not. The upper
+// bounds are a hard-stop guard against the duration overflow that turns a
+// typo'd horizon into a full-table wipe.
 func (c Config) Validate() error {
 	if c.BillingEventRetentionDays < MinBillingEventRetentionDays {
 		return fmt.Errorf("billingEvent retention %dd below the hard floor %dd: pruning inside the rater's re-rate reach can reconcile-delete billed money", c.BillingEventRetentionDays, MinBillingEventRetentionDays)
 	}
+	if c.BillingEventRetentionDays > MaxBillingEventRetentionDays {
+		return fmt.Errorf("billingEvent retention %dd above the maximum %dd: the horizon would overflow the cutoff computation and wipe the table", c.BillingEventRetentionDays, MaxBillingEventRetentionDays)
+	}
 	if c.IoLogRetentionDays < MinIoLogRetentionDays {
 		return fmt.Errorf("ioLog retention %dd below the floor %dd", c.IoLogRetentionDays, MinIoLogRetentionDays)
+	}
+	if c.IoLogRetentionDays > MaxIoLogRetentionDays {
+		return fmt.Errorf("ioLog retention %dd above the maximum %dd: the horizon would overflow the cutoff computation and wipe the table", c.IoLogRetentionDays, MaxIoLogRetentionDays)
 	}
 	if c.BatchSize < 1 {
 		return fmt.Errorf("batchSize must be >= 1, got %d", c.BatchSize)

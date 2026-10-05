@@ -16,16 +16,25 @@ import (
 	"github.com/saturncloud/phoebe/migrations"
 )
 
-// newPruneHarness creates an isolated schema and applies the REAL migrations
-// (all of them, like the e2e harness — the pruner must run against the true
-// table shapes, not an inline copy), then returns a pool pinned to the schema
-// via search_path in the DSN.
-func newPruneHarness(t *testing.T, schema string) *sql.DB {
+// btreeGistAdvisoryLock serializes CREATE EXTENSION IF NOT EXISTS btree_gist
+// between parallel test binaries: IF NOT EXISTS is not atomic (two concurrent
+// runs both see "absent" and one fails on pg_extension_name_index with 23505 —
+// reproduced against a fresh database). 727301 is a phoebe-test-specific
+// constant, session-held on this harness's own admin connection.
+const btreeGistAdvisoryLock = 727301
+
+// newPruneHarness creates an isolated schema — named per test PROCESS so
+// concurrent runs against a shared database stop stomping each other — and
+// applies the REAL migrations (all of them, like the e2e harness — the pruner
+// must run against the true table shapes, not an inline copy), then returns a
+// pool pinned to the schema via search_path in the DSN.
+func newPruneHarness(t *testing.T) *sql.DB {
 	t.Helper()
 	dsn := os.Getenv("PHOEBE_TEST_DATABASE_URL")
 	if dsn == "" {
 		t.Skip("PHOEBE_TEST_DATABASE_URL not set; skipping prune integration test")
 	}
+	schema := fmt.Sprintf("phoebe_prune_it_%d", os.Getpid())
 
 	admin, err := sql.Open("pgx", dsn)
 	if err != nil {
@@ -35,7 +44,12 @@ func newPruneHarness(t *testing.T, schema string) *sql.DB {
 		_, _ = admin.Exec("DROP SCHEMA IF EXISTS " + schema + " CASCADE")
 		_ = admin.Close()
 	})
+	mustExec(t, admin, fmt.Sprintf("SELECT pg_advisory_lock(%d)", btreeGistAdvisoryLock))
+	t.Cleanup(func() {
+		_, _ = admin.Exec(fmt.Sprintf("SELECT pg_advisory_unlock(%d)", btreeGistAdvisoryLock))
+	})
 	mustExec(t, admin, "CREATE EXTENSION IF NOT EXISTS btree_gist")
+	mustExec(t, admin, fmt.Sprintf("SELECT pg_advisory_unlock(%d)", btreeGistAdvisoryLock))
 	mustExec(t, admin, "DROP SCHEMA IF EXISTS "+schema+" CASCADE")
 	mustExec(t, admin, "CREATE SCHEMA "+schema)
 
@@ -131,7 +145,7 @@ func countWhere(t *testing.T, db *sql.DB, table, where string) int {
 }
 
 func TestIntegration_PrunesOnlyOlderThanCutoff(t *testing.T) {
-	db := newPruneHarness(t, "phoebe_prune_it")
+	db := newPruneHarness(t)
 	s := NewStore(db)
 
 	// 40 days old: prunable at the 30-day default. Includes the
@@ -156,7 +170,7 @@ func TestIntegration_PrunesOnlyOlderThanCutoff(t *testing.T) {
 }
 
 func TestIntegration_BatchLoopDrainsBacklog(t *testing.T) {
-	db := newPruneHarness(t, "phoebe_prune_it")
+	db := newPruneHarness(t)
 	s := NewStore(db)
 
 	const total = 12
@@ -176,7 +190,7 @@ func TestIntegration_BatchLoopDrainsBacklog(t *testing.T) {
 }
 
 func TestIntegration_HardFloorRefusesBelowReRateReach(t *testing.T) {
-	db := newPruneHarness(t, "phoebe_prune_it")
+	db := newPruneHarness(t)
 	s := NewStore(db)
 	insertBillingEvent(t, db, "old", -40, true, 200)
 
@@ -190,7 +204,7 @@ func TestIntegration_HardFloorRefusesBelowReRateReach(t *testing.T) {
 }
 
 func TestIntegration_RerunIsANoOp(t *testing.T) {
-	db := newPruneHarness(t, "phoebe_prune_it")
+	db := newPruneHarness(t)
 	s := NewStore(db)
 	insertBillingEvent(t, db, "old", -40, true, 200)
 
@@ -211,7 +225,7 @@ func TestIntegration_RerunIsANoOp(t *testing.T) {
 }
 
 func TestIntegration_IoLogPrunedAtOwnPeriod(t *testing.T) {
-	db := newPruneHarness(t, "phoebe_prune_it")
+	db := newPruneHarness(t)
 	s := NewStore(db)
 
 	insertIoLog(t, db, "iol-old", -40)
@@ -241,7 +255,7 @@ func TestIntegration_IoLogPrunedAtOwnPeriod(t *testing.T) {
 // predicate an exact-cutoff row lands on), so the ±2s margin pins the
 // strictly-older semantics deterministically.
 func TestIntegration_BoundaryCutoffIsStrictlyOlder(t *testing.T) {
-	db := newPruneHarness(t, "phoebe_prune_it")
+	db := newPruneHarness(t)
 	s := NewStore(db)
 
 	cutoff := time.Now().Add(-time.Duration(DefaultBillingEventRetentionDays) * 24 * time.Hour).Truncate(time.Second)
@@ -275,7 +289,7 @@ func TestIntegration_BoundaryCutoffIsStrictlyOlder(t *testing.T) {
 // the overlap window so the inserts genuinely interleave with the loop; the
 // assertions hold whichever way the scheduler interleaves them.
 func TestIntegration_ConcurrentInsertsAreNeverDeleted(t *testing.T) {
-	db := newPruneHarness(t, "phoebe_prune_it")
+	db := newPruneHarness(t)
 	s := NewStore(db)
 
 	const oldRows = 2000
@@ -331,7 +345,7 @@ func TestIntegration_ConcurrentInsertsAreNeverDeleted(t *testing.T) {
 // nothing. The EXPLAIN runs the EXACT deleteBatch statement (same pruneQuery
 // switch), not a hand-copied approximation that could drift from the real one.
 func TestIntegration_PredicateUsesTheCreatedAtIndex(t *testing.T) {
-	db := newPruneHarness(t, "phoebe_prune_it")
+	db := newPruneHarness(t)
 	cutoff := time.Now().Add(-30 * 24 * time.Hour).Truncate(time.Second)
 
 	for _, table := range []Table{BillingEvent, IoLog} {

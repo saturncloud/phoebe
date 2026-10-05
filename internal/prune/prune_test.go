@@ -71,6 +71,27 @@ func TestValidateFloors(t *testing.T) {
 	if err := ok.Validate(); err != nil {
 		t.Fatalf("floor values must be valid: %v", err)
 	}
+
+	// Upper bounds: exactly at the bound is valid, bound+1 is refused — for
+	// both tables. The bounds stop a horizon typo from overflowing
+	// time.Duration(retentionDays)*24h into a future cutoff that matches the
+	// whole table.
+	ok = Config{BillingEventRetentionDays: MaxBillingEventRetentionDays, IoLogRetentionDays: 7, BatchSize: 100}
+	if err := ok.Validate(); err != nil {
+		t.Fatalf("billingEvent at the %dd bound must be valid: %v", MaxBillingEventRetentionDays, err)
+	}
+	ok = Config{BillingEventRetentionDays: 30, IoLogRetentionDays: MaxIoLogRetentionDays, BatchSize: 100}
+	if err := ok.Validate(); err != nil {
+		t.Fatalf("ioLog at the %dd bound must be valid: %v", MaxIoLogRetentionDays, err)
+	}
+	bad = Config{BillingEventRetentionDays: MaxBillingEventRetentionDays + 1, IoLogRetentionDays: 7, BatchSize: 100}
+	if err := bad.Validate(); err == nil || !strings.Contains(err.Error(), "maximum") {
+		t.Fatalf("expected billingEvent bound refusal at %d, got %v", MaxBillingEventRetentionDays+1, err)
+	}
+	bad = Config{BillingEventRetentionDays: 30, IoLogRetentionDays: MaxIoLogRetentionDays + 1, BatchSize: 100}
+	if err := bad.Validate(); err == nil || !strings.Contains(err.Error(), "maximum") {
+		t.Fatalf("expected ioLog bound refusal at %d, got %v", MaxIoLogRetentionDays+1, err)
+	}
 }
 
 func TestTableNameIsClosed(t *testing.T) {
