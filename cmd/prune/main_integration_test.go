@@ -3,7 +3,9 @@
 package main
 
 import (
+	"context"
 	"database/sql"
+	"errors"
 	"fmt"
 	"os"
 	"sort"
@@ -13,15 +15,9 @@ import (
 
 	_ "github.com/jackc/pgx/v5/stdlib"
 
+	"github.com/saturncloud/phoebe/internal/prune"
 	"github.com/saturncloud/phoebe/migrations"
 )
-
-// btreeGistAdvisoryLock serializes CREATE EXTENSION IF NOT EXISTS btree_gist
-// between parallel test binaries: IF NOT EXISTS is not atomic (two concurrent
-// runs both see "absent" and one fails on pg_extension_name_index with 23505 —
-// reproduced against a fresh database). 727301 is a phoebe-test-specific
-// constant, session-held on this harness's own admin connection.
-const btreeGistAdvisoryLock = 727301
 
 // newCmdPruneHarness creates an isolated schema — named per test PROCESS so
 // concurrent runs against a shared database stop stomping each other — with
@@ -29,6 +25,10 @@ const btreeGistAdvisoryLock = 727301
 // ordered by filename; a hand-maintained list could go stale while green), and
 // returns a pool pinned to it plus the schema-pinned DSN for handing to run()
 // as DATABASE_URL.
+//
+// No migration requires btree_gist (verified: all 7 apply on a database
+// without it); internal/e2e creates it for the rating tests' GiST constraints.
+// The prune harnesses stay out of the catalog race by not creating it.
 func newCmdPruneHarness(t *testing.T) (*sql.DB, string) {
 	t.Helper()
 	dsn := os.Getenv("PHOEBE_TEST_DATABASE_URL")
@@ -45,12 +45,6 @@ func newCmdPruneHarness(t *testing.T) (*sql.DB, string) {
 		_, _ = admin.Exec("DROP SCHEMA IF EXISTS " + schema + " CASCADE")
 		_ = admin.Close()
 	})
-	mustExecCmd(t, admin, fmt.Sprintf("SELECT pg_advisory_lock(%d)", btreeGistAdvisoryLock))
-	t.Cleanup(func() {
-		_, _ = admin.Exec(fmt.Sprintf("SELECT pg_advisory_unlock(%d)", btreeGistAdvisoryLock))
-	})
-	mustExecCmd(t, admin, "CREATE EXTENSION IF NOT EXISTS btree_gist")
-	mustExecCmd(t, admin, fmt.Sprintf("SELECT pg_advisory_unlock(%d)", btreeGistAdvisoryLock))
 	mustExecCmd(t, admin, "DROP SCHEMA IF EXISTS "+schema+" CASCADE")
 	mustExecCmd(t, admin, "CREATE SCHEMA "+schema)
 
@@ -142,5 +136,28 @@ func TestIntegration_CmdPrune_ContinuesPastFailedTable(t *testing.T) {
 	}
 	if strings.Contains(out, "per-table timeout") {
 		t.Fatalf("a missing table is a plain failure, not a timeout:\n%s", out)
+	}
+}
+
+// TestIntegration_StorePruneWithExpiredContextWrapsDeadline proves the
+// positive half of the timeout attribution: against live Postgres, a Prune
+// whose context has already hit its deadline fails with an error that
+// errors.Is(context.DeadlineExceeded) matches through the store's %w wrap —
+// exactly the signal timeoutForm keys on. (Driving run()'s whole loop to a
+// real 30-minute deadline is not testable in a suite, so the log branch is
+// pinned by the timeoutForm unit test and this pins the store half.)
+func TestIntegration_StorePruneWithExpiredContextWrapsDeadline(t *testing.T) {
+	db, _ := newCmdPruneHarness(t)
+	mustExecCmd(t, db, `INSERT INTO io_log (request_id, model, created_at) VALUES ('deadline-old', 'model', $1)`,
+		time.Now().Add(-40*24*time.Hour))
+
+	ctx, cancel := context.WithDeadline(context.Background(), time.Now().Add(-time.Second))
+	defer cancel()
+	_, err := prune.NewStore(db).Prune(ctx, prune.IoLog, prune.DefaultIoLogRetentionDays, 100)
+	if err == nil {
+		t.Fatal("expected an error pruning with an expired context, got nil")
+	}
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("expired-context prune error = %v, want it to wrap context.DeadlineExceeded", err)
 	}
 }

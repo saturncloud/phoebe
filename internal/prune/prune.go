@@ -61,6 +61,20 @@ func (t Table) minRetentionDays() int {
 	return 1
 }
 
+// maxRetentionDays mirrors the Config.Validate ceilings per table (the unknown
+// table falls back to the most conservative bound, io_log's) so a caller that
+// bypasses Config (Store.Prune is also called directly) cannot overflow
+// time.Duration(retentionDays)*24h into a future cutoff that wipes the table.
+func (t Table) maxRetentionDays() int {
+	switch t {
+	case BillingEvent:
+		return MaxBillingEventRetentionDays
+	case IoLog:
+		return MaxIoLogRetentionDays
+	}
+	return MaxIoLogRetentionDays
+}
+
 const (
 	// DefaultBillingEventRetentionDays is the ruled default horizon for
 	// billing_event: 30 days, configurable per install.
@@ -203,6 +217,9 @@ func (s *Store) Prune(ctx context.Context, table Table, retentionDays int, batch
 	}
 	if retentionDays < table.minRetentionDays() {
 		return Result{}, fmt.Errorf("%s retention %dd below floor %dd", table.Name(), retentionDays, table.minRetentionDays())
+	}
+	if retentionDays > table.maxRetentionDays() {
+		return Result{}, fmt.Errorf("%s retention %dd above maximum %dd", table.Name(), retentionDays, table.maxRetentionDays())
 	}
 	cutoff := time.Now().Add(-time.Duration(retentionDays) * 24 * time.Hour).Truncate(time.Second)
 	total := int64(0)

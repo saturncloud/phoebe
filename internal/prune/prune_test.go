@@ -231,3 +231,46 @@ func TestStore_PruneBatchSizeGuardPrecedesFloor(t *testing.T) {
 		t.Fatalf("expected the batchSize guard first, got %v", err)
 	}
 }
+
+// TestStore_PruneRejectsAboveMaximumBeforeTouchingDB pins the ceiling mirror
+// in Prune: bound+1 is refused before any query — NewStore(nil) would panic on
+// any DB access, so reaching one proves the guard fired first.
+func TestStore_PruneRejectsAboveMaximumBeforeTouchingDB(t *testing.T) {
+	s := NewStore(nil)
+	if _, err := s.Prune(context.Background(), BillingEvent, MaxBillingEventRetentionDays+1, 100); err == nil || !strings.Contains(err.Error(), "above maximum") {
+		t.Fatalf("expected billingEvent ceiling refusal at %d, got %v", MaxBillingEventRetentionDays+1, err)
+	}
+	if _, err := s.Prune(context.Background(), IoLog, MaxIoLogRetentionDays+1, 100); err == nil || !strings.Contains(err.Error(), "above maximum") {
+		t.Fatalf("expected ioLog ceiling refusal at %d, got %v", MaxIoLogRetentionDays+1, err)
+	}
+}
+
+// TestStore_PruneAtBoundsPassesGuards proves a horizon at exactly the bound
+// clears all the guards and reaches the query (a nil *sql.DB would panic
+// there, so this uses sqlmock: the issued Exec IS the proof of passage).
+func TestStore_PruneAtBoundsPassesGuards(t *testing.T) {
+	for _, tc := range []struct {
+		table Table
+		days  int
+	}{
+		{BillingEvent, MaxBillingEventRetentionDays},
+		{IoLog, MaxIoLogRetentionDays},
+	} {
+		db, mock, err := sqlmock.New()
+		if err != nil {
+			t.Fatalf("sqlmock: %v", err)
+		}
+		mock.ExpectExec(regexp.QuoteMeta(pruneQuery(tc.table))).
+			WithArgs(sqlmock.AnyArg(), 100).
+			WillReturnResult(sqlmock.NewResult(0, 0))
+
+		_, err = NewStore(db).Prune(context.Background(), tc.table, tc.days, 100)
+		if err != nil {
+			t.Fatalf("Prune at the %dd bound: %v", tc.days, err)
+		}
+		if err := mock.ExpectationsWereMet(); err != nil {
+			t.Fatalf("bound horizon must reach the query: %v", err)
+		}
+		_ = db.Close()
+	}
+}

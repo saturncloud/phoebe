@@ -1,6 +1,9 @@
 package main
 
 import (
+	"context"
+	"errors"
+	"fmt"
 	"io"
 	"os"
 	"path/filepath"
@@ -81,5 +84,27 @@ func TestCmdPrune_BelowFloorConfigRefusedBeforeDB(t *testing.T) {
 	}
 	if !strings.Contains(out, "hard floor") {
 		t.Fatalf("expected the hard-floor refusal in the log, got:\n%s", out)
+	}
+}
+
+// TestTimeoutForm pins both branches of the failure-logging decision: only a
+// deadline (surfaced through the store's %w wrap, or recorded on the table
+// context before cancel) logs the timeout form; plain failures and plain
+// cancellations take the plain form.
+func TestTimeoutForm(t *testing.T) {
+	if !timeoutForm(context.DeadlineExceeded, nil) {
+		t.Fatal("a raw deadline error is a timeout")
+	}
+	if !timeoutForm(fmt.Errorf("prune billing_event batch: %w", context.DeadlineExceeded), nil) {
+		t.Fatal("a deadline wrapped by the store is a timeout")
+	}
+	if !timeoutForm(errors.New("connection reset"), context.DeadlineExceeded) {
+		t.Fatal("a ctxErr deadline captured before cancel is a timeout")
+	}
+	if timeoutForm(errors.New(`relation "billing_event" does not exist`), nil) {
+		t.Fatal("a missing table is a plain failure, not a timeout")
+	}
+	if timeoutForm(errors.New("connection reset"), context.Canceled) {
+		t.Fatal("cancellation is not the deadline timeout form")
 	}
 }

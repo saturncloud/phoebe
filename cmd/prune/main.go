@@ -181,7 +181,7 @@ func run(configPath string, env func(string) string) int {
 		ctxErr := ctx.Err()
 		cancel()
 		if err != nil {
-			if errors.Is(err, context.DeadlineExceeded) || ctxErr == context.DeadlineExceeded {
+			if timeoutForm(err, ctxErr) {
 				log.Error.Printf("prune: %s: %v (interrupted by the %s per-table timeout)", job.table.Name(), err, perTableTimeout)
 			} else {
 				log.Error.Printf("prune: %s: %v", job.table.Name(), err)
@@ -196,4 +196,13 @@ func run(configPath string, env func(string) string) int {
 		return exitFatal
 	}
 	return exitOK
+}
+
+// timeoutForm reports whether a failed table prune should be logged as a
+// timeout interruption: either the store's error wraps context.DeadlineExceeded
+// (the driver surfaced the deadline through the store's %w wrap) or the table
+// context itself hit the deadline before cancel. A plain failure —
+// relation missing, connection lost, cancellation — is NOT a timeout.
+func timeoutForm(err, ctxErr error) bool {
+	return errors.Is(err, context.DeadlineExceeded) || ctxErr == context.DeadlineExceeded
 }

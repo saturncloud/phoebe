@@ -16,18 +16,15 @@ import (
 	"github.com/saturncloud/phoebe/migrations"
 )
 
-// btreeGistAdvisoryLock serializes CREATE EXTENSION IF NOT EXISTS btree_gist
-// between parallel test binaries: IF NOT EXISTS is not atomic (two concurrent
-// runs both see "absent" and one fails on pg_extension_name_index with 23505 —
-// reproduced against a fresh database). 727301 is a phoebe-test-specific
-// constant, session-held on this harness's own admin connection.
-const btreeGistAdvisoryLock = 727301
-
 // newPruneHarness creates an isolated schema — named per test PROCESS so
 // concurrent runs against a shared database stop stomping each other — and
 // applies the REAL migrations (all of them, like the e2e harness — the pruner
 // must run against the true table shapes, not an inline copy), then returns a
 // pool pinned to the schema via search_path in the DSN.
+//
+// No migration requires btree_gist (verified: all 7 apply on a database
+// without it); internal/e2e creates it for the rating tests' GiST constraints.
+// The prune harnesses stay out of the catalog race by not creating it.
 func newPruneHarness(t *testing.T) *sql.DB {
 	t.Helper()
 	dsn := os.Getenv("PHOEBE_TEST_DATABASE_URL")
@@ -44,12 +41,6 @@ func newPruneHarness(t *testing.T) *sql.DB {
 		_, _ = admin.Exec("DROP SCHEMA IF EXISTS " + schema + " CASCADE")
 		_ = admin.Close()
 	})
-	mustExec(t, admin, fmt.Sprintf("SELECT pg_advisory_lock(%d)", btreeGistAdvisoryLock))
-	t.Cleanup(func() {
-		_, _ = admin.Exec(fmt.Sprintf("SELECT pg_advisory_unlock(%d)", btreeGistAdvisoryLock))
-	})
-	mustExec(t, admin, "CREATE EXTENSION IF NOT EXISTS btree_gist")
-	mustExec(t, admin, fmt.Sprintf("SELECT pg_advisory_unlock(%d)", btreeGistAdvisoryLock))
 	mustExec(t, admin, "DROP SCHEMA IF EXISTS "+schema+" CASCADE")
 	mustExec(t, admin, "CREATE SCHEMA "+schema)
 
