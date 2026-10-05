@@ -141,17 +141,25 @@ func NewStore(db *sql.DB) *Store {
 // migration created its index explicitly for this job); ORDER BY + LIMIT walk
 // the index in order so each DELETE touches a compact set of heap pages.
 // ctid targeting avoids taking row locks on rows outside the batch. The query
-// text is per-table at the call site (switch), never interpolated.
-func deleteBatch(ctx context.Context, db *sql.DB, table Table, cutoff time.Time, batchSize int) (int64, error) {
-	var query string
+// text is per-table at the call site (switch), never interpolated. It is a
+// package-level function (not inline in deleteBatch) so the integration test
+// can EXPLAIN the EXACT statement the store runs — a hand-copied query in a
+// test could drift from the real one and green-light a regression.
+func pruneQuery(table Table) string {
 	switch table {
 	case BillingEvent:
-		query = `DELETE FROM billing_event WHERE ctid = ANY(ARRAY(
+		return `DELETE FROM billing_event WHERE ctid = ANY(ARRAY(
 			SELECT ctid FROM billing_event WHERE created_at < $1 ORDER BY created_at LIMIT $2))`
 	case IoLog:
-		query = `DELETE FROM io_log WHERE ctid = ANY(ARRAY(
+		return `DELETE FROM io_log WHERE ctid = ANY(ARRAY(
 			SELECT ctid FROM io_log WHERE created_at < $1 ORDER BY created_at LIMIT $2))`
-	default:
+	}
+	return ""
+}
+
+func deleteBatch(ctx context.Context, db *sql.DB, table Table, cutoff time.Time, batchSize int) (int64, error) {
+	query := pruneQuery(table)
+	if query == "" {
 		return 0, fmt.Errorf("unknown table %d", int(table))
 	}
 	res, err := db.ExecContext(ctx, query, cutoff, batchSize)
@@ -166,7 +174,14 @@ func deleteBatch(ctx context.Context, db *sql.DB, table Table, cutoff time.Time,
 // returns the total deleted. It loops in batches until a batch deletes
 // nothing, so a large backlog is drained in bounded statements. It only ever
 // DELETEs; it never touches rated_usage or any other table.
+//
+// retentionDays is explicit at this seam: zero or negative is an error here;
+// prune.Config.WithDefaults is the layer that maps an unset (zero) config
+// value to the ruled default.
 func (s *Store) Prune(ctx context.Context, table Table, retentionDays int, batchSize int) (Result, error) {
+	if batchSize < 1 {
+		return Result{}, fmt.Errorf("batchSize must be >= 1, got %d", batchSize)
+	}
 	if retentionDays < table.minRetentionDays() {
 		return Result{}, fmt.Errorf("%s retention %dd below floor %dd", table.Name(), retentionDays, table.minRetentionDays())
 	}

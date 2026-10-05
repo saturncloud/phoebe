@@ -73,21 +73,38 @@ const (
 	exitFatal = 1
 )
 
+// perTableTimeout bounds ONE table's prune loop: a runaway backlog or a lock
+// pile-up must not let one CronJob tick hold past the next one. A timed-out
+// table fails that table (exit 1) but leaves the other table pruned.
+const perTableTimeout = 30 * time.Minute
+
 func main() {
 	configPath := flag.String("f", "/etc/saturn/config/prune.yaml", "path to the prune YAML settings file")
 	flag.Parse()
+	os.Exit(run(*configPath, os.Getenv))
+}
 
+// run is main's body returning an exit code, so deferred Close runs before
+// exit (os.Exit skips defers). env is injectable so tests can supply
+// DATABASE_URL without mutating the process environment.
+func run(configPath string, env func(string) string) int {
 	log := logging.New(logging.INFO)
 
-	raw, err := os.ReadFile(*configPath)
-	if err != nil {
-		log.Error.Printf("prune: read config: %v", err)
-		os.Exit(exitFatal)
-	}
+	// A missing settings file is tolerated (house idiom, same as cmd/rater):
+	// zero pruneSettings + WithDefaults below supply the ruled policy, so the
+	// CronJob can run env-only. Any OTHER read error, and any YAML parse
+	// error, stays fatal.
 	var settings pruneSettings
-	if err := yaml.Unmarshal(raw, &settings); err != nil {
-		log.Error.Printf("prune: parse config: %v", err)
-		os.Exit(exitFatal)
+	if raw, err := os.ReadFile(configPath); err == nil {
+		if err := yaml.Unmarshal(raw, &settings); err != nil {
+			log.Error.Printf("prune: parse config: %v", err)
+			return exitFatal
+		}
+	} else if !os.IsNotExist(err) {
+		log.Error.Printf("prune: read config: %v", err)
+		return exitFatal
+	} else {
+		log.Info.Printf("no config file at %s; using ruled defaults", configPath)
 	}
 	if settings.Debug {
 		log = logging.New(logging.DEBUG)
@@ -100,18 +117,18 @@ func main() {
 	}.WithDefaults()
 	if err := cfg.Validate(); err != nil {
 		log.Error.Printf("prune: invalid config: %v", err)
-		os.Exit(exitFatal)
+		return exitFatal
 	}
 
-	dsn := os.Getenv("DATABASE_URL")
+	dsn := env("DATABASE_URL")
 	if dsn == "" {
 		log.Error.Printf("prune: DATABASE_URL is required")
-		os.Exit(exitFatal)
+		return exitFatal
 	}
 	db, err := sql.Open("pgx", dsn)
 	if err != nil {
 		log.Error.Printf("prune: open database: %v", err)
-		os.Exit(exitFatal)
+		return exitFatal
 	}
 	defer db.Close()
 	// One connection is plenty for a batch DELETE loop; default small so the
@@ -128,21 +145,22 @@ func main() {
 		d, err := time.ParseDuration(settings.ConnMaxLifetime)
 		if err != nil {
 			log.Error.Printf("prune: connMaxLifetime: %v", err)
-			os.Exit(exitFatal)
+			return exitFatal
 		}
 		db.SetConnMaxLifetime(d)
 	}
 	if err := db.Ping(); err != nil {
 		log.Error.Printf("prune: ping database: %v", err)
-		os.Exit(exitFatal)
+		return exitFatal
 	}
 
 	store := prune.NewStore(db)
-	ctx := context.Background()
 
 	// billing_event first: it is the unbounded-growth table (the finding).
 	// io_log second. Each failure is fatal-on-exit but leaves the other
-	// table's completed work standing (idempotent re-run catches up).
+	// table's completed work standing (idempotent re-run catches up). Each
+	// table gets its own timeout so one stuck table cannot hold the job past
+	// the next CronJob tick.
 	failed := false
 	for _, job := range []struct {
 		table         prune.Table
@@ -151,9 +169,15 @@ func main() {
 		{prune.BillingEvent, cfg.BillingEventRetentionDays},
 		{prune.IoLog, cfg.IoLogRetentionDays},
 	} {
+		ctx, cancel := context.WithTimeout(context.Background(), perTableTimeout)
 		res, err := store.Prune(ctx, job.table, job.retentionDays, cfg.BatchSize)
+		cancel()
 		if err != nil {
-			log.Error.Printf("prune: %s: %v", job.table.Name(), err)
+			if ctx.Err() != nil {
+				log.Error.Printf("prune: %s: interrupted by the %s per-table timeout: %v", job.table.Name(), perTableTimeout, err)
+			} else {
+				log.Error.Printf("prune: %s: %v", job.table.Name(), err)
+			}
 			failed = true
 			continue
 		}
@@ -161,7 +185,7 @@ func main() {
 			res.Table.Name(), res.RowsDeleted, res.Cutoff.UTC().Format(time.RFC3339), job.retentionDays)
 	}
 	if failed {
-		os.Exit(exitFatal)
+		return exitFatal
 	}
-	os.Exit(exitOK)
+	return exitOK
 }
