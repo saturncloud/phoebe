@@ -1291,7 +1291,7 @@ func TestLegacyOnlyQuotaHeadersLogPreR8ProducerMarker(t *testing.T) {
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			var warnBuf, errBuf bytes.Buffer
-			logger := &logging.Logger{Warn: log.New(&warnBuf, "", 0), Error: log.New(&errBuf, "", 0)}
+			logger := &logging.Logger{Debug: log.New(io.Discard, "", 0), Warn: log.New(&warnBuf, "", 0), Error: log.New(&errBuf, "", 0)}
 			s := New(&config.Settings{Admission: cfg}, logger, &recordingEmitter{}).WithAdmitter(admission.New(c, cfg))
 			req := sharedRequest(up)
 			req.Header.Del(identity.HeaderOwnerID)

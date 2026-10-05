@@ -439,7 +439,8 @@ var legacyQuotaHeaderNames = []string{
 }
 
 // legacyQuotaHeadersPresent reports whether the raw request carries any of the
-// removed legacy quota headers. It is a logging diagnostic only.
+// removed legacy quota headers. It is a logging diagnostic only, and must be
+// called before StripSaturnHeaders removes them.
 func legacyQuotaHeadersPresent(h http.Header) bool {
 	for _, name := range legacyQuotaHeaderNames {
 		if h.Get(name) != "" {
