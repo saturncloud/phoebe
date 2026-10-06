@@ -3,6 +3,7 @@ package config
 import (
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 )
@@ -295,7 +296,7 @@ admission:
 	if err != nil {
 		t.Fatal(err)
 	}
-	if s.Admission.LeaseTTL != 15*time.Minute || s.Admission.DefaultMaxOutputTokens != 4096 {
+	if s.Admission.LeaseTTL != 15*time.Minute || s.Admission.DefaultMaxOutputTokens != DefaultMaxOutputTokens {
 		t.Fatalf("admission defaults wrong: %+v", s.Admission)
 	}
 	if got := s.Admission.Lanes["protected"].Limits.Window; got != 30*time.Second {
@@ -429,7 +430,8 @@ func TestLoadAdmissionLeaseTTLInclusiveFloor(t *testing.T) {
 }
 
 // While admission is disabled, valid lanes must still load (weight, lane-share,
-// leaseTtl, and valkeyAddr validation stay behind the Enabled gate).
+// leaseTtl only when no admission store resolves, and valkeyAddr validation
+// stay behind the Enabled gate).
 func TestLoadAdmissionDisabledWithValidLanes(t *testing.T) {
 	s, err := Load(writeTemp(t, "admission:\n  enabled: false\n  lanes:\n    default:\n      weight: 0\n      dynamoPriority: 5\n      dynamoStrictPriority: 2\n  organizationLanes:\n    org-a: default\n"))
 	if err != nil {
@@ -437,5 +439,114 @@ func TestLoadAdmissionDisabledWithValidLanes(t *testing.T) {
 	}
 	if got := s.Admission.Lanes["default"]; got.DynamoPriority != 5 || got.DynamoStrictPriority != 2 {
 		t.Fatalf("disabled-admission lane hints wrong: %+v", got)
+	}
+}
+
+// Contract limits have no enablement gate (ruling R12 clarification,
+// 2026-10-06): the admission store resolves from admission.valkeyAddr, else
+// from the install Valkey metering uses, whether or not admission.enabled is
+// set. admission.enabled=false clears only the operator capacity tiers.
+func TestEffectiveAdmissionStoreAndTiers(t *testing.T) {
+	t.Run("disabled, store from emit.valkeyAddr, operator tiers cleared", func(t *testing.T) {
+		s, err := Load(writeTemp(t, `
+emit:
+  valkeyAddr: "valkey:6379"
+admission:
+  enabled: false
+  organization:
+    requestsPerWindow: 30
+  lanes:
+    default:
+      weight: 1
+      dynamoPriority: 5
+  organizationLanes:
+    org-a: default
+`))
+		if err != nil {
+			t.Fatal(err)
+		}
+		cfg, ok := s.EffectiveAdmission()
+		if !ok || cfg.ValkeyAddr != "valkey:6379" {
+			t.Fatalf("store=(%q, %v), want the metering Valkey", cfg.ValkeyAddr, ok)
+		}
+		if cfg.Organization.RequestsPerWindow != nil || cfg.Lanes != nil || cfg.OrganizationLanes != nil {
+			t.Fatalf("operator tiers survived admission.enabled=false: %+v", cfg)
+		}
+		if cfg.KeyPrefix != "phoebe:admission" || cfg.LeaseTTL != 15*time.Minute || cfg.DefaultMaxOutputTokens != DefaultMaxOutputTokens || DefaultMaxOutputTokens != 4096 {
+			t.Fatalf("store defaults not applied with admission disabled: %+v", cfg)
+		}
+		// The raw settings keep the lanes: they still supply trusted Dynamo hints.
+		if s.Admission.Lanes["default"].DynamoPriority != 5 {
+			t.Fatalf("clearing the effective tiers mutated the loaded lanes: %+v", s.Admission.Lanes)
+		}
+	})
+	t.Run("explicit admission.valkeyAddr wins", func(t *testing.T) {
+		s, err := Load(writeTemp(t, "emit:\n  valkeyAddr: metering:6379\nadmission:\n  valkeyAddr: admission:6379\n"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if cfg, ok := s.EffectiveAdmission(); !ok || cfg.ValkeyAddr != "admission:6379" {
+			t.Fatalf("store=(%q, %v), want admission:6379", cfg.ValkeyAddr, ok)
+		}
+	})
+	t.Run("enabled keeps operator tiers", func(t *testing.T) {
+		s, err := Load(writeTemp(t, "admission:\n  enabled: true\n  valkeyAddr: v\n  organization:\n    requestsPerWindow: 30\n"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		cfg, ok := s.EffectiveAdmission()
+		if !ok || cfg.Organization.RequestsPerWindow == nil || *cfg.Organization.RequestsPerWindow != 30 {
+			t.Fatalf("operator tier lost with admission enabled: %+v", cfg.Organization)
+		}
+	})
+	t.Run("no Valkey at all means no store", func(t *testing.T) {
+		s, err := Load(writeTemp(t, "debug: false\n"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, ok := s.EffectiveAdmission(); ok {
+			t.Fatal("reported an admission store with no Valkey configured")
+		}
+	})
+}
+
+// admission.leaseTtl is validated only when it is used: when an admission
+// store resolves (admission.valkeyAddr, else emit.valkeyAddr) or admission is
+// enabled. A leftover invalid value on an install with no store and admission
+// disabled was ignored before contract limits became store-gated, and must
+// still load instead of crash-looping the interceptor.
+func TestAdmissionLeaseTTLValidatedOnlyWhenStoreConfigured(t *testing.T) {
+	loads := []struct{ name, body string }{
+		{"disabled, no store, 0s", "admission:\n  enabled: false\n  leaseTtl: 0s\n"},
+		{"disabled, no store, 500ms", "admission:\n  enabled: false\n  leaseTtl: 500ms\n"},
+		{"disabled, no store, unparsable", "admission:\n  enabled: false\n  leaseTtl: \"15 m\"\n"},
+	}
+	for _, tc := range loads {
+		t.Run(tc.name+" loads", func(t *testing.T) {
+			s, err := Load(writeTemp(t, tc.body))
+			if err != nil {
+				t.Fatalf("unused leaseTtl stopped startup: %v", err)
+			}
+			if s.Admission.LeaseTTL != 15*time.Minute {
+				t.Fatalf("LeaseTTL=%s, want the 15m default when no store is configured", s.Admission.LeaseTTL)
+			}
+			if _, ok := s.EffectiveAdmission(); ok {
+				t.Fatal("reported an admission store with no Valkey configured")
+			}
+		})
+	}
+	fails := []struct{ name, body string }{
+		{"disabled, emit.valkeyAddr store, 0s", "emit:\n  valkeyAddr: metering:6379\nadmission:\n  enabled: false\n  leaseTtl: 0s\n"},
+		{"disabled, emit.valkeyAddr store, 500ms", "emit:\n  valkeyAddr: metering:6379\nadmission:\n  enabled: false\n  leaseTtl: 500ms\n"},
+		{"disabled, admission.valkeyAddr store, unitless 15", "admission:\n  enabled: false\n  valkeyAddr: admission:6379\n  leaseTtl: \"15\"\n"},
+		{"enabled, 500ms", "admission:\n  enabled: true\n  valkeyAddr: v\n  leaseTtl: 500ms\n"},
+	}
+	for _, tc := range fails {
+		t.Run(tc.name+" fails", func(t *testing.T) {
+			_, err := Load(writeTemp(t, tc.body))
+			if err == nil || !strings.Contains(err.Error(), "invalid admission.leaseTtl") {
+				t.Fatalf("err=%v, want invalid admission.leaseTtl", err)
+			}
+		})
 	}
 }

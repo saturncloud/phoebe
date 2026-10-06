@@ -83,21 +83,38 @@ func main() {
 }
 
 func buildAdmission(s *config.Settings, log *logging.Logger) (admission.Admitter, func()) {
-	if !s.Admission.Enabled {
+	admitter, client, ok := admission.FromSettings(s)
+	if !ok {
+		// No Valkey at all (admission.valkeyAddr and emit.valkeyAddr both
+		// empty). Contract rate limits on the trusted envelope cannot be
+		// enforced without the distributed store; say so loudly rather than
+		// letting a stamped limit pass silently.
+		log.Error.Printf("admission: no admission store configured (admission.valkeyAddr and emit.valkeyAddr are empty); contract rate limits (Atlas UsageLimits) are NOT enforced")
 		return nil, func() {}
 	}
-	client := admission.NewValkeyClient(s.Admission.ValkeyAddr)
+	cfg := admitter.Settings()
+	if s.Admission.ValkeyAddr == "" {
+		// The store fell back to the metering Valkey. Admission then shares
+		// memory and the noeviction cap with the durable metering stream, so
+		// a metering backlog can make admission fail with OOM (see
+		// docs/shared-tier-admission.md).
+		log.Info.Printf("admission: admission.valkeyAddr is empty; using the metering Valkey from emit.valkeyAddr (%s) as the admission store", cfg.ValkeyAddr)
+	}
+	mode := "contract limits only (admission.enabled=false: operator capacity tiers off, envelope-less shared routes allowed)"
+	if cfg.Enabled {
+		mode = "contract limits + operator capacity tiers (admission.enabled=true: every shared request must carry the trusted envelope)"
+	}
 	// Admission is a fairness/capacity gate, not an authorization or billing
 	// authority. Start serving when Valkey is unavailable and bypass only this
 	// gate until it recovers; metering has its own durable path.
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	if err := client.Ping(ctx).Err(); err != nil {
-		log.Error.Printf("admission: Valkey unavailable at %s; starting with distributed gate bypassed until recovery: %v", s.Admission.ValkeyAddr, err)
+		log.Error.Printf("admission: Valkey unavailable at %s; starting with distributed gate bypassed until recovery: %v", cfg.ValkeyAddr, err)
 	} else {
-		log.Info.Printf("admission: enabled (valkey %s, lease ttl %s)", s.Admission.ValkeyAddr, s.Admission.LeaseTTL)
+		log.Info.Printf("admission: enforcing %s (valkey %s, lease ttl %s)", mode, cfg.ValkeyAddr, cfg.LeaseTTL)
 	}
-	return admission.New(client, s.Admission), func() { _ = client.Close() }
+	return admitter, func() { _ = client.Close() }
 }
 
 // buildGateway constructs the TF gateway (org, model) resolver. DEFAULT: the

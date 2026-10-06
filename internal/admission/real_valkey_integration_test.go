@@ -333,3 +333,84 @@ func TestRealValkeySettlesIndependentContractsExactly(t *testing.T) {
 	_ = ownerB.CompleteUsage(ctx, Usage{})
 	_ = ownerC.CompleteUsage(ctx, Usage{})
 }
+
+// TestRealValkeyContractOnlyBurst is the QA reproduction against real Valkey:
+// no operator tier configured at all (the admission.enabled=false effective
+// configuration), an organization contract of 30 requests per minute. The
+// 31st request in the window is a contractual rejection with a Retry-After
+// inside the window. The owner contract behaves the same way independently.
+func TestRealValkeyContractOnlyBurst(t *testing.T) {
+	addr := os.Getenv("PHOEBE_TEST_ADMISSION_VALKEY_ADDR")
+	if addr == "" {
+		t.Fatal("PHOEBE_TEST_ADMISSION_VALKEY_ADDR is required")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	client := redis.NewClient(&redis.Options{Addr: addr})
+	cfg := config.AdmissionSettings{
+		KeyPrefix: fmt.Sprintf("phoebe-admission-contract-only-%d", time.Now().UnixNano()),
+		LeaseTTL:  time.Minute,
+	}
+	a := New(client, cfg)
+	t.Cleanup(func() {
+		_ = client.Del(context.Background(), a.counters, a.leases, a.expiries, a.windowExpiries).Err()
+		_ = client.Close()
+	})
+	for _, tc := range []struct {
+		scope string
+		mk    func() Request
+	}{
+		{scope: "contract_organization", mk: func() Request {
+			r := request("org-contract", "model")
+			r.OrganizationLimits = RateLimits{Requests: ptr64(30)}
+			return r
+		}},
+		{scope: "contract_owner", mk: func() Request {
+			r := request("org-owner", "model")
+			r.Owner = "owner-1"
+			r.OwnerLimits = RateLimits{Requests: ptr64(30)}
+			return r
+		}},
+	} {
+		t.Run(tc.scope, func(t *testing.T) {
+			// A window rollover mid-burst would reset the counter; retry once
+			// in the next window if the minute ticked over.
+			for attempt := 0; attempt < 2; attempt++ {
+				bucket := time.Now().UnixMilli() / time.Minute.Milliseconds()
+				admitted := 0
+				var rejected *Rejected
+				for i := 0; i < 35; i++ {
+					lease, err := a.Admit(ctx, tc.mk())
+					if err == nil {
+						admitted++
+						if err := lease.Complete(ctx, 1); err != nil {
+							t.Fatalf("complete: %v", err)
+						}
+						continue
+					}
+					r, ok := err.(*Rejected)
+					if !ok {
+						t.Fatalf("unexpected admission error: %v", err)
+					}
+					if rejected == nil {
+						rejected = r
+					}
+				}
+				if time.Now().UnixMilli()/time.Minute.Milliseconds() != bucket {
+					continue
+				}
+				if admitted != 30 || rejected == nil {
+					t.Fatalf("admitted=%d rejected=%v, want 30 admitted then rejections", admitted, rejected)
+				}
+				if !rejected.Contractual || rejected.Scope != tc.scope || rejected.Dimension != "requests" {
+					t.Fatalf("rejection=%+v, want contractual %s/requests", rejected, tc.scope)
+				}
+				if rejected.RetryAfter <= 0 || rejected.RetryAfter > time.Minute {
+					t.Fatalf("RetryAfter=%s, want within the 1-minute window", rejected.RetryAfter)
+				}
+				return
+			}
+			t.Fatal("burst straddled a window boundary twice")
+		})
+	}
+}

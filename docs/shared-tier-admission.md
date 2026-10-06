@@ -61,6 +61,62 @@ An exhausted contract returns 429 with Retry-After, and physical pool
 saturation returns 503. Admission-store unavailability bypasses only these
 soft limits and is logged; it does not bypass trusted-policy validation.
 
+Contract limits have no enablement switch (ruling R12 clarification,
+2026-10-06). They are Atlas database settings that can be changed at any time,
+and Phoebe enforces whatever the trusted envelope carries whenever an admission
+store is configured. The store is `admission.valkeyAddr` when set and otherwise
+the install Valkey that metering uses (`emit.valkeyAddr`); admission keys live
+under their own prefix.
+
+The store settings `admission.keyPrefix`, `admission.leaseTtl`, and
+`admission.defaultMaxOutputTokens` therefore apply when `admission.enabled` is
+false too, whenever a store resolves. They are defaulted (`phoebe:admission`,
+`15m`, 4096) and `leaseTtl` is validated (it must parse and be at least 1s,
+otherwise startup fails). With no store at all and `admission.enabled=false`,
+`leaseTtl` is not used and not validated. Keep these keys the same when you
+flip `admission.enabled`: changing `keyPrefix` resets every contract window
+counter and strands in-flight leases under the old prefix.
+
+Sharing the metering Valkey couples admission to metering. The shared install
+Valkey runs with `noeviction` and a 128mb memory cap. If the metering drainer
+is down long enough for the stream backlog to fill that cap, the admission
+scripts fail with an `OOM` error from Valkey. Admission treats that as an
+unavailable store, so contract limits are bypassed until the backlog drains.
+Each bypass is logged, and an OOM is logged with its own message
+("admission store out of memory") so it can be told apart from a network
+outage. Phoebe logs at startup when the admission store comes from
+`emit.valkeyAddr`. Operators who need contract limits isolated from metering
+backlogs should set `admission.valkeyAddr` to a dedicated Valkey, which must
+also run with `noeviction` (an evicting policy can drop admission hashes and
+silently reset contract counters).
+
+`admission.enabled` controls only the operator side:
+
+| `admission.enabled` | Contract scopes (envelope limits) | Operator capacity tiers | Shared request with no envelope |
+| --- | --- | --- | --- |
+| `false` (chart default) | Enforced: 429 + Retry-After | Off (not configured) | Served without admission (historical per-resource routes) |
+| `true` | Enforced: 429 + Retry-After | Enforced: 503 + Retry-After | Fails closed with 503 |
+
+In both modes a request that carries any part of the envelope (the owner-id
+anchor or any limit header) goes through admission's identity and policy
+checks, so a partial or malformed envelope, a missing organization identity,
+or an underivable graph scope fails closed with 503. With
+`admission.enabled=false`, a request whose envelope carries no limit header is
+unlimited in every scope and does not touch the store: no Admit, no lease, no
+completion. Every operator scope, the lane included, is checked before the
+contract scopes inside the one atomic transaction, so when both are exhausted
+at the same request the answer is 503.
+
+A request that alone reserves more than a contract scope's whole per-window
+limit can never be admitted, so it gets 400 without Retry-After instead of a
+429 that would repeat forever: a `max_tokens` above the generated-token limit,
+or an estimated prompt above a prompt-token limit. A request that declares no
+`max_tokens` reserves the configured default (4096) clamped to the smallest
+positive contract generated-token limit, and `/v1/embeddings` reserves one
+output token, since embeddings generate none.
+Only a Phoebe with no Valkey at all (no `admission.valkeyAddr` and no
+`emit.valkeyAddr`) cannot enforce contract limits; it logs that at startup.
+
 Phoebe can reserve generated capacity strictly before dispatch because the
 request declares a maximum output. It cannot derive exact rendered prompt or
 cache-hit counts from raw OpenAI JSON without duplicating Dynamo's model chat
@@ -135,9 +191,12 @@ fallback: a request that carries only the legacy headers and no
 `X-Saturn-Owner-Id` has no policy and, with admission enabled, fails closed
 with 503.
 
-The four components of that release are safe to roll in any order only
-because admission stays disabled (`admission.enabled: false`, ruling R12) for the
-whole cutover, so no replica enforces a policy envelope during the rollout.
+The four components of that release were safe to roll in any order only
+because no replica enforced a policy envelope during the rollout: admission was
+disabled (`admission.enabled: false`) and Phoebe at the time did not admit
+without it. Phoebe now enforces the scoped envelope whenever it is present,
+which relies on the edge strip of every `X-Saturn-*` header that the R8
+releases already ship.
 No current or pre-cutover Phoebe reads the legacy headers on dedicated
 routes. The scoped envelope is stamped only by the gateway ForwardAuth, on
 gateway routes; every Phoebe that still read the legacy headers preferred the
@@ -165,27 +224,43 @@ first (or in the same window), then Atlas #6715, with saturn-k8s #1073
 alongside either. Nothing reads these headers after the cutover, so dropping
 the strip once no pre-R8 replica remains is harmless.
 
-While admission is disabled, Phoebe does not require a policy envelope. Once
-admission is enabled, a missing or structurally broken policy fails closed.
+While `admission.enabled` is false, Phoebe does not require a policy envelope
+on every shared request, but it enforces any envelope that is present. Once
+`admission.enabled` is true, a missing or structurally broken policy fails
+closed.
 
-Keep `admission.enabled: false` until Saturn, Traefik, and all Phoebe replicas
-have the new envelope contract; enabling earlier is unsupported because an old
-edge does not authenticate the new headers. Then configure one shared Valkey
-and conservative measured limits and enable admission. Watch
-429 contract rejections, 503 capacity rejections by scope/dimension, and logged
-Valkey bypass/latency errors. Roll back by disabling the feature; existing leases expire without affecting billing or Dynamo. Do not
-point replicas at different Valkey instances during a rolling update.
+Set `admission.enabled: true` only after Saturn, Traefik, and all Phoebe
+replicas have the scoped envelope contract and historical per-resource shared
+routes are drained (see below). Then configure conservative measured operator
+limits. Watch 429 contract rejections, 503 capacity rejections by
+scope/dimension, and logged Valkey bypass/latency errors. Turning
+`admission.enabled` off again removes the operator tiers and the
+every-request envelope requirement; it does not stop contract enforcement,
+which is changed in Atlas UsageLimits. Existing leases expire without affecting
+billing or Dynamo. Do not point replicas at different Valkey instances during a
+rolling update.
+
+Phoebe replicas older than the release that enforces contract limits without
+`admission.enabled` (phoebe #60) do not admit requests while
+`admission.enabled` is false. During a mixed rollout, only requests served by
+updated replicas are counted and limited. A contract limit set in Atlas
+UsageLimits is therefore under-enforced, roughly in proportion to the share of
+old replicas, until every replica runs the new image. The effect is
+transient and only weakens the soft fairness limit (consistent with ruling R2).
+It never bypasses trusted-policy validation. Operators who need exact limits
+from the first minute should set or lower UsageLimits only after
+`kubectl rollout status` reports that the rollout is complete.
 
 The envelope requirement applies to every shared-inference request, not only
 gateway-marked requests. The historical per-resource auth path does not stamp
 this policy contract, so drain or remove those shared routes before enabling
-admission; once enabled, a missing or partial envelope on such a route fails
-closed with 503 instead of silently granting unlimited quota.
+`admission.enabled`; once it is on, a missing or partial envelope on such a
+route fails closed with 503 instead of silently granting unlimited quota.
 Per-resource routing metadata must also be internally coherent: shared mode
 requires a non-empty served-model allow-list, dedicated or legacy-empty mode
 requires that allow-list to be absent, and unknown modes fail closed. This keeps
 model authorization and the shared isolation/admission boundary inseparable.
-During the admission-disabled migration window, a historical shared route that
+While `admission.enabled` is false, a historical shared route that
 lacks organization identity remains isolated by its trusted resource ID rather
 than sharing the empty-organization cache namespace. Enabling admission also
 requires a non-empty trusted organization ID and rejects a broken identity

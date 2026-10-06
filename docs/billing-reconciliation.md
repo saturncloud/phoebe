@@ -152,7 +152,13 @@ balance while two customers are mis-attributed.
 ## Repair and replay
 
 1. Quiesce the affected invoice window in the central manager. Do not delete local
-   raw events or edit rated money manually.
+   raw events by hand or edit rated money manually. Note raw events are deleted
+   AUTOMATICALLY once older than the retention horizon by `cmd/prune` (ruled
+   policy: 30 days on `created_at`, hard floor 7; `rated_usage` is never pruned
+   and the money rollup lives upstream in the manager) — so if the window you
+   need to repair has aged past the horizon, the raw evidence is gone by design
+   and the repair path is the manager's rollup plus any retained WAL evidence,
+   not the billing_event table.
 2. Copy the recovery artifact away from any live writer, then validate it without
    making changes.
 
