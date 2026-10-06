@@ -240,6 +240,17 @@ which is changed in Atlas UsageLimits. Existing leases expire without affecting
 billing or Dynamo. Do not point replicas at different Valkey instances during a
 rolling update.
 
+Phoebe replicas older than the release that enforces contract limits without
+`admission.enabled` (phoebe #60) do not admit requests while
+`admission.enabled` is false. During a mixed rollout, only requests served by
+updated replicas are counted and limited. A contract limit set in Atlas
+UsageLimits is therefore under-enforced, roughly in proportion to the share of
+old replicas, until every replica runs the new image. The effect is
+transient and only weakens the soft fairness limit (consistent with ruling R2).
+It never bypasses trusted-policy validation. Operators who need exact limits
+from the first minute should set or lower UsageLimits only after
+`kubectl rollout status` reports that the rollout is complete.
+
 The envelope requirement applies to every shared-inference request, not only
 gateway-marked requests. The historical per-resource auth path does not stamp
 this policy contract, so drain or remove those shared routes before enabling
