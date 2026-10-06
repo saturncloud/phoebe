@@ -420,6 +420,26 @@ func parseTrustedRateLimits(id identity.Identity) (admission.RateLimits, admissi
 	}
 }
 
+// trustedPolicyEnvelopePresent reports whether the trusted quota envelope —
+// the owner-id anchor or any scoped limit header — reached this request. Any
+// part of it engages admission even under admission.enabled=false, so a
+// contract Atlas stamped is always enforced and a partial envelope still fails
+// closed in parseTrustedRateLimits.
+func trustedPolicyEnvelopePresent(id identity.Identity) bool {
+	for _, value := range []string{
+		id.OwnerID,
+		id.OrgRateLimitRequests, id.OrgRateLimitTotalPromptTokens,
+		id.OrgRateLimitUncachedPromptTokens, id.OrgRateLimitGeneratedTokens,
+		id.OwnerRateLimitRequests, id.OwnerRateLimitTotalPromptTokens,
+		id.OwnerRateLimitUncachedPromptTokens, id.OwnerRateLimitGeneratedTokens,
+	} {
+		if value != "" {
+			return true
+		}
+	}
+	return false
+}
+
 // errNoTrustedRateLimitPolicy is the parser's "no anchor and no scoped policy
 // at all" result. The proxy call site matches it to add a log-only diagnostic
 // for pre-R8 producers (see legacyQuotaHeadersPresent).

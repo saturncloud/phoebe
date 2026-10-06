@@ -107,7 +107,14 @@ type AdmissionLane struct {
 
 // AdmissionSettings is the YAML shape for Saturn-owned HTTP admission.
 type AdmissionSettings struct {
-	Enabled                bool                     `yaml:"enabled"`
+	// Enabled turns on the OPERATOR side of admission: the capacity tiers
+	// below and the requirement that every shared request carry the trusted
+	// envelope (a request without it fails closed with 503). It is not a gate
+	// on contract limits: those are enforced whenever an admission store is
+	// configured (see Settings.EffectiveAdmission).
+	Enabled bool `yaml:"enabled"`
+	// ValkeyAddr is the admission store. Empty falls back to emit.valkeyAddr
+	// (see Settings.AdmissionStoreAddr); Enabled requires it set explicitly.
 	ValkeyAddr             string                   `yaml:"valkeyAddr"`
 	KeyPrefix              string                   `yaml:"keyPrefix"`
 	LeaseTTLStr            string                   `yaml:"leaseTtl"`
@@ -333,12 +340,12 @@ func (a *AdmissionSettings) parse() error {
 			return fmt.Errorf("admission.organizationLanes.%s names unknown lane %q", org, lane)
 		}
 	}
-	if !a.Enabled {
-		return nil
-	}
-	if a.ValkeyAddr == "" {
-		return fmt.Errorf("admission.enabled=true requires admission.valkeyAddr")
-	}
+	// The store settings are parsed whether or not admission.enabled is set:
+	// contract scopes (the Atlas UsageLimits carried on the trusted envelope)
+	// are enforced whenever an admission store is configured, so the key
+	// prefix, lease TTL, and output reservation are always in use (ruling R12
+	// clarification, 2026-10-06: there is no enablement gate for contract
+	// limits).
 	if a.KeyPrefix == "" {
 		a.KeyPrefix = "phoebe:admission"
 	}
@@ -351,6 +358,12 @@ func (a *AdmissionSettings) parse() error {
 	}
 	if a.DefaultMaxOutputTokens <= 0 {
 		a.DefaultMaxOutputTokens = 4096
+	}
+	if !a.Enabled {
+		return nil
+	}
+	if a.ValkeyAddr == "" {
+		return fmt.Errorf("admission.enabled=true requires admission.valkeyAddr")
 	}
 	limits := []struct {
 		name  string
@@ -379,6 +392,47 @@ func (a *AdmissionSettings) parse() error {
 		}
 	}
 	return nil
+}
+
+// AdmissionStoreAddr is the Valkey address of the distributed admission
+// store: admission.valkeyAddr when set, otherwise the install Valkey that
+// metering already uses (emit.valkeyAddr). Admission keys live under their own
+// prefix, so sharing the metering Valkey is the documented deployment. Empty
+// means no store is configured and no limit — contract or operator — can be
+// enforced.
+func (s *Settings) AdmissionStoreAddr() string {
+	if s.Admission.ValkeyAddr != "" {
+		return s.Admission.ValkeyAddr
+	}
+	return s.Emit.ValkeyAddr
+}
+
+// EffectiveAdmission returns the settings the distributed admitter runs with,
+// and false when no admission store is configured.
+//
+// Contract scopes — the organization and owner rate limits Atlas stamps on
+// the trusted envelope — are enforced whenever a store exists, independent of
+// admission.enabled. admission.enabled governs only two operator-side things:
+// the operator capacity tiers (platform, graph, organization,
+// organizationModel, lanes) and the requirement that EVERY shared request
+// carry the trusted envelope. With it false the operator tiers are cleared
+// here, so the admitter enforces the contract scopes alone; the lane
+// configuration in s.Admission still supplies trusted Dynamo hints.
+func (s *Settings) EffectiveAdmission() (AdmissionSettings, bool) {
+	cfg := s.Admission
+	cfg.ValkeyAddr = s.AdmissionStoreAddr()
+	if cfg.ValkeyAddr == "" {
+		return cfg, false
+	}
+	if !cfg.Enabled {
+		cfg.Platform = AdmissionLimits{}
+		cfg.Graph = AdmissionLimits{}
+		cfg.Organization = AdmissionLimits{}
+		cfg.OrganizationModel = AdmissionLimits{}
+		cfg.Lanes = nil
+		cfg.OrganizationLanes = nil
+	}
+	return cfg, true
 }
 
 func limitValues(l AdmissionLimits) []*int64 {
