@@ -9,6 +9,9 @@
 #                             migrations to phoebe's own Postgres (a one-shot Job /
 #                             init-container before the drainer)
 #   /app/phoebe-recover     — guarded manual replay of WAL/log-floor evidence
+#   /app/phoebe-prune       — evidence-retention batch job: prunes billing_event
+#                             (30d default, 7d floor) and io_log (7d default) on
+#                             created_at (a CronJob, ships suspended)
 FROM golang:1.23-alpine AS builder
 
 WORKDIR /app
@@ -29,7 +32,8 @@ RUN go build -o /phoebe ./cmd/interceptor && \
     go build -o /phoebe-rater ./cmd/rater && \
     go build -o /phoebe-token-push ./cmd/token-push && \
     go build -o /phoebe-migrate ./cmd/migrate && \
-    go build -o /phoebe-recover ./cmd/recover
+    go build -o /phoebe-recover ./cmd/recover && \
+    go build -o /phoebe-prune ./cmd/prune
 
 FROM alpine:latest
 
@@ -42,6 +46,7 @@ COPY --from=builder /phoebe-rater /app/phoebe-rater
 COPY --from=builder /phoebe-token-push /app/phoebe-token-push
 COPY --from=builder /phoebe-migrate /app/phoebe-migrate
 COPY --from=builder /phoebe-recover /app/phoebe-recover
+COPY --from=builder /phoebe-prune /app/phoebe-prune
 
 # Default to the interceptor; the drainer/rater workloads override the command.
 ENTRYPOINT ["/app/phoebe"]
