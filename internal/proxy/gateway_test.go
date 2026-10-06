@@ -74,16 +74,7 @@ func gatewayRequestFor(method, path, org, body string) *http.Request {
 	}
 	req.Header.Set(identity.HeaderAuthID, "auth-1")
 	req.Header.Set(identity.HeaderOwnerID, "owner-1")
-	for _, header := range []string{
-		identity.HeaderOrgRateLimitRequests,
-		identity.HeaderOrgRateLimitTotalPromptTokens,
-		identity.HeaderOrgRateLimitUncachedPromptTokens,
-		identity.HeaderOrgRateLimitGeneratedTokens,
-		identity.HeaderOwnerRateLimitRequests,
-		identity.HeaderOwnerRateLimitTotalPromptTokens,
-		identity.HeaderOwnerRateLimitUncachedPromptTokens,
-		identity.HeaderOwnerRateLimitGeneratedTokens,
-	} {
+	for _, header := range identity.ScopedRateLimitHeaders {
 		req.Header.Set(header, "1000000")
 	}
 	return req

@@ -105,6 +105,11 @@ type AdmissionLane struct {
 	Limits               AdmissionLimits `yaml:"limits"`
 }
 
+// DefaultMaxOutputTokens is the output-token reservation for a shared request
+// that declares neither max_tokens nor max_completion_tokens. R10: the
+// ratified default (Baseten-aligned).
+const DefaultMaxOutputTokens int64 = 4096
+
 // AdmissionSettings is the YAML shape for Saturn-owned HTTP admission.
 type AdmissionSettings struct {
 	// Enabled turns on the OPERATOR side of admission: the capacity tiers
@@ -129,6 +134,10 @@ type AdmissionSettings struct {
 }
 
 const minimumAdmissionLeaseTTL = time.Second
+
+// defaultAdmissionLeaseTTL is the lease TTL used when admission.leaseTtl is
+// unset, or when no admission store is configured (the value is then unused).
+const defaultAdmissionLeaseTTL = 15 * time.Minute
 
 // EmitSettings is the YAML shape for the durable emitter. Mirrors emit.Config
 // without importing it.
@@ -311,13 +320,19 @@ func (s *Settings) parse() error {
 			return fmt.Errorf("wake.timeout %q must be positive", s.Wake.TimeoutStr)
 		}
 	}
-	if err := s.Admission.parse(); err != nil {
+	// Emit is already decoded, so AdmissionStoreAddr sees the metering
+	// Valkey fallback here.
+	if err := s.Admission.parse(s.AdmissionStoreAddr() != ""); err != nil {
 		return err
 	}
 	return nil
 }
 
-func (a *AdmissionSettings) parse() error {
+// parse validates the admission settings. storeConfigured reports whether an
+// admission store resolves (admission.valkeyAddr or emit.valkeyAddr): the
+// store settings are only in use when it does, so their validation is fatal
+// only then.
+func (a *AdmissionSettings) parse(storeConfigured bool) error {
 	// Trusted lane hints are stamped onto every shared request even while
 	// admission is disabled (the proxy overwrites client-supplied Dynamo
 	// priority headers from the lane), so hint ranges and the lane map's
@@ -340,24 +355,32 @@ func (a *AdmissionSettings) parse() error {
 			return fmt.Errorf("admission.organizationLanes.%s names unknown lane %q", org, lane)
 		}
 	}
-	// The store settings are parsed whether or not admission.enabled is set:
-	// contract scopes (the Atlas UsageLimits carried on the trusted envelope)
-	// are enforced whenever an admission store is configured, so the key
-	// prefix, lease TTL, and output reservation are always in use (ruling R12
-	// clarification, 2026-10-06: there is no enablement gate for contract
-	// limits).
+	// The store settings are defaulted whether or not admission.enabled is
+	// set: contract scopes (the Atlas UsageLimits carried on the trusted
+	// envelope) are enforced whenever an admission store is configured, so
+	// the key prefix, lease TTL, and output reservation are in use then too
+	// (ruling R12 clarification, 2026-10-06: there is no enablement gate for
+	// contract limits).
 	if a.KeyPrefix == "" {
 		a.KeyPrefix = "phoebe:admission"
 	}
 	if a.LeaseTTLStr == "" {
 		a.LeaseTTLStr = "15m"
 	}
-	var err error
-	if a.LeaseTTL, err = time.ParseDuration(a.LeaseTTLStr); err != nil || a.LeaseTTL < minimumAdmissionLeaseTTL {
-		return fmt.Errorf("invalid admission.leaseTtl %q", a.LeaseTTLStr)
+	if storeConfigured || a.Enabled {
+		var err error
+		if a.LeaseTTL, err = time.ParseDuration(a.LeaseTTLStr); err != nil || a.LeaseTTL < minimumAdmissionLeaseTTL {
+			return fmt.Errorf("invalid admission.leaseTtl %q", a.LeaseTTLStr)
+		}
+	} else {
+		// No store resolves and admission is disabled, so the lease TTL is
+		// never used. A leftover value that was ignored before contract
+		// limits became store-gated must not stop startup; keep the field
+		// non-zero with the default.
+		a.LeaseTTL = defaultAdmissionLeaseTTL
 	}
 	if a.DefaultMaxOutputTokens <= 0 {
-		a.DefaultMaxOutputTokens = 4096
+		a.DefaultMaxOutputTokens = DefaultMaxOutputTokens
 	}
 	if !a.Enabled {
 		return nil

@@ -117,6 +117,7 @@ type Server struct {
 	// the settlement/cold-hold release failures — so a store outage cannot
 	// flood one ERROR per request (see sampledErrorLog).
 	admissionBypassLog, leaseRenewalLog                        sampledErrorLog
+	admissionOOMBypassLog                                      sampledErrorLog
 	admissionReleaseFallbackLog, admissionCompletionReleaseLog sampledErrorLog
 	admissionPrefillReleaseLog, admissionUpstreamReleaseLog    sampledErrorLog
 	admissionColdHoldReleaseLog                                sampledErrorLog
@@ -568,14 +569,18 @@ func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request) {
 	var responseCaptureInstalled atomic.Bool
 	responseCaptureDone := make(chan struct{})
 	if id.ServingMode == identity.ServingModeShared && inferenceRequestPathAllowed(routePath) {
-		// Admission runs whenever an admitter exists (an admission store is
-		// configured) and either admission.enabled requires the envelope on
-		// every shared request, or this request carries the trusted envelope.
-		// Contract limits therefore engage whenever Atlas stamped them, with
-		// or without operator tiers (ruling R12 clarification). Only a shared
-		// request with NO envelope at all, under admission.enabled=false,
-		// skips admission: the historical per-resource routes that never
-		// carried the policy contract.
+		// Admission's fail-closed checks run whenever an admitter exists (an
+		// admission store is configured) and either admission.enabled requires
+		// the envelope on every shared request, or this request carries any
+		// part of the trusted envelope (the owner-id anchor or a limit header).
+		// Contract limits therefore engage whenever Atlas stamped them, with or
+		// without operator tiers (ruling R12 clarification). Under
+		// admission.enabled=false the store itself is consulted only when a
+		// contract limit header is present (the Admit call below); a limit
+		// header without the owner-id anchor still fails closed in
+		// parseTrustedRateLimits. Only a shared request with NO envelope at all,
+		// under admission.enabled=false, skips admission entirely: the
+		// historical per-resource routes that never carried the policy contract.
 		enforceAdmission := s.admitter != nil && (s.settings.Admission.Enabled || trustedPolicyEnvelopePresent(id))
 		tenantIdentity := id.OrgID
 		if tenantIdentity == "" {
@@ -591,7 +596,45 @@ func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request) {
 			// per-resource routes may not yet stamp OrgID. Preserve availability
 			// without putting every such route in one empty-org cache namespace:
 			// ResourceID is trusted, mandatory, and unique to the authorized route.
+			// This fallback applies only when admission is not enforced: either
+			// admission.enabled=false and no part of the trusted envelope is
+			// present, or no admission store is configured. A request carrying
+			// any part of the envelope without an OrgID is refused above (503).
 			tenantIdentity = "resource:" + id.ResourceID
+		}
+		var organizationLimits, ownerLimits admission.RateLimits
+		var graph string
+		if enforceAdmission {
+			// A structurally broken policy — limit headers without their
+			// identity anchor, a malformed present value — fails closed, while
+			// absent limit headers parse as unlimited (R4). Under
+			// admission.enabled=true a request with no envelope at all also
+			// fails closed here (errNoTrustedRateLimitPolicy).
+			var policyErr error
+			organizationLimits, ownerLimits, policyErr = parseTrustedRateLimits(id)
+			if policyErr != nil {
+				s.log.Error.Printf("admission: invalid trusted rate-limit policy: %v", policyErr)
+				if errors.Is(policyErr, errNoTrustedRateLimitPolicy) && legacyEnvelope {
+					// Log-only diagnostic for the R8 cutover: the legacy headers
+					// decide nothing, but their presence names the root cause.
+					s.log.Warn.Printf("admission: legacy single-scope quota headers present without %s (removed by R8); legacy_envelope_present=true (pre-R8 producer; upgrade Atlas/Traefik) request_id=%s", identity.HeaderOwnerID, requestID)
+				}
+				http.Error(w, "shared inference policy unavailable", http.StatusServiceUnavailable)
+				return
+			}
+			graph = id.GraphK8sName
+			if graph == "" {
+				graph = graphFromUpstreamHost(upstream.Host)
+			}
+			if graph == "" {
+				// A degenerate upstream host (e.g. ":8000") cannot be bound to a
+				// graph scope. Like a missing organization, this is a broken
+				// trusted identity contract, not a Valkey outage: reject before
+				// Admit so it can never enter the fail-open bypass below.
+				s.log.Error.Printf("admission: cannot derive graph scope from upstream host %q request_id=%s", upstream.Host, requestID)
+				http.Error(w, "shared inference identity unavailable", http.StatusServiceUnavailable)
+				return
+			}
 		}
 		body, rerr := readAndRestoreBody(r)
 		if rerr != nil {
@@ -602,10 +645,23 @@ func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request) {
 		// OpenAI JSON. Phoebe's cache-isolation and scheduler metadata is internal
 		// forwarding overhead, not tenant prompt work.
 		originalPromptBytes := int64(len(body))
+		// config.parse sets the R10 default (config.DefaultMaxOutputTokens);
+		// this guard covers only hand-built Settings.
 		defaultOutput := s.settings.Admission.DefaultMaxOutputTokens
 		if defaultOutput <= 0 {
-			// R10: the ratified default (Baseten-aligned) is 4096.
-			defaultOutput = 4096
+			defaultOutput = config.DefaultMaxOutputTokens
+		}
+		if routePath == "/v1/embeddings" {
+			// Embeddings generate no tokens, so they reserve none beyond the
+			// minimum of one that admission requires.
+			defaultOutput = 1
+		} else {
+			// An undeclared max_tokens reserves no more than the tightest
+			// contract generated-token limit, so it is never rejected for a
+			// default the client did not choose. The reservation is clamped
+			// before prepareSharedDynamoRequest so the Dynamo output hint
+			// still equals the reservation.
+			defaultOutput = undeclaredOutputReservation(defaultOutput, organizationLimits, ownerLimits)
 		}
 		estimate, ok := admissionWork(body, defaultOutput)
 		if !ok {
@@ -632,36 +688,11 @@ func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request) {
 		} {
 			r.Header.Del(header)
 		}
-		if enforceAdmission {
-			// A structurally broken policy — limit headers without their
-			// identity anchor, a malformed present value — fails closed, while
-			// absent limit headers parse as unlimited (R4). Under
-			// admission.enabled=true a request with no envelope at all also
-			// fails closed here (errNoTrustedRateLimitPolicy).
-			organizationLimits, ownerLimits, policyErr := parseTrustedRateLimits(id)
-			if policyErr != nil {
-				s.log.Error.Printf("admission: invalid trusted rate-limit policy: %v", policyErr)
-				if errors.Is(policyErr, errNoTrustedRateLimitPolicy) && legacyEnvelope {
-					// Log-only diagnostic for the R8 cutover: the legacy headers
-					// decide nothing, but their presence names the root cause.
-					s.log.Warn.Printf("admission: legacy single-scope quota headers present without %s (removed by R8); legacy_envelope_present=true (pre-R8 producer; upgrade Atlas/Traefik) request_id=%s", identity.HeaderOwnerID, requestID)
-				}
-				http.Error(w, "shared inference policy unavailable", http.StatusServiceUnavailable)
-				return
-			}
-			graph := id.GraphK8sName
-			if graph == "" {
-				graph = graphFromUpstreamHost(upstream.Host)
-			}
-			if graph == "" {
-				// A degenerate upstream host (e.g. ":8000") cannot be bound to a
-				// graph scope. Like a missing organization, this is a broken
-				// trusted identity contract, not a Valkey outage: reject before
-				// Admit so it can never enter the fail-open bypass below.
-				s.log.Error.Printf("admission: cannot derive graph scope from upstream host %q request_id=%s", upstream.Host, requestID)
-				http.Error(w, "shared inference identity unavailable", http.StatusServiceUnavailable)
-				return
-			}
+		// Under admission.enabled=false a request whose envelope carries no
+		// limit is unlimited in every scope, so it does not touch the store: no
+		// Admit, no lease renewal, no completion. Every fail-closed check above
+		// has already run.
+		if enforceAdmission && (s.settings.Admission.Enabled || organizationLimits.Any() || ownerLimits.Any()) {
 			admitted, err = s.admitter.Admit(r.Context(), admission.Request{
 				Graph: graph, Organization: id.OrgID, Owner: id.OwnerID, Model: estimate.Model,
 				PromptBytes: originalPromptBytes, EstimatedInputTokens: estimate.InputTokens,
@@ -677,7 +708,14 @@ func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request) {
 					return
 				}
 				if errors.Is(err, admission.ErrUnavailable) {
-					s.admissionBypassLog.logf(s.log, "admission: distributed gate unavailable; bypassing for otherwise valid request_id=%s: %v", requestID, err)
+					if admission.IsStoreOutOfMemory(err) {
+						// Labelled apart from network unavailability: a full
+						// shared Valkey (metering backlog) is a capacity
+						// problem an operator fixes differently.
+						s.admissionOOMBypassLog.logf(s.log, "admission: admission store out of memory (Valkey OOM); bypassing distributed gate for otherwise valid request_id=%s: %v", requestID, err)
+					} else {
+						s.admissionBypassLog.logf(s.log, "admission: distributed gate unavailable; bypassing for otherwise valid request_id=%s: %v", requestID, err)
+					}
 					admitted = nil
 				} else {
 					s.writeAdmissionError(w, requestID, err)

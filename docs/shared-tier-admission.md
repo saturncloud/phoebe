@@ -66,17 +66,54 @@ Contract limits have no enablement switch (ruling R12 clarification,
 and Phoebe enforces whatever the trusted envelope carries whenever an admission
 store is configured. The store is `admission.valkeyAddr` when set and otherwise
 the install Valkey that metering uses (`emit.valkeyAddr`); admission keys live
-under their own prefix. `admission.enabled` controls only the operator side:
+under their own prefix.
+
+The store settings `admission.keyPrefix`, `admission.leaseTtl`, and
+`admission.defaultMaxOutputTokens` therefore apply when `admission.enabled` is
+false too, whenever a store resolves. They are defaulted (`phoebe:admission`,
+`15m`, 4096) and `leaseTtl` is validated (it must parse and be at least 1s,
+otherwise startup fails). With no store at all and `admission.enabled=false`,
+`leaseTtl` is not used and not validated. Keep these keys the same when you
+flip `admission.enabled`: changing `keyPrefix` resets every contract window
+counter and strands in-flight leases under the old prefix.
+
+Sharing the metering Valkey couples admission to metering. The shared install
+Valkey runs with `noeviction` and a 128mb memory cap. If the metering drainer
+is down long enough for the stream backlog to fill that cap, the admission
+scripts fail with an `OOM` error from Valkey. Admission treats that as an
+unavailable store, so contract limits are bypassed until the backlog drains.
+Each bypass is logged, and an OOM is logged with its own message
+("admission store out of memory") so it can be told apart from a network
+outage. Phoebe logs at startup when the admission store comes from
+`emit.valkeyAddr`. Operators who need contract limits isolated from metering
+backlogs should set `admission.valkeyAddr` to a dedicated Valkey, which must
+also run with `noeviction` (an evicting policy can drop admission hashes and
+silently reset contract counters).
+
+`admission.enabled` controls only the operator side:
 
 | `admission.enabled` | Contract scopes (envelope limits) | Operator capacity tiers | Shared request with no envelope |
 | --- | --- | --- | --- |
 | `false` (chart default) | Enforced: 429 + Retry-After | Off (not configured) | Served without admission (historical per-resource routes) |
 | `true` | Enforced: 429 + Retry-After | Enforced: 503 + Retry-After | Fails closed with 503 |
 
-In both modes a request that carries any part of the envelope is admitted
-through the store, so a partial or malformed envelope fails closed with 503.
-Operator scopes are checked before contract scopes inside the one atomic
-transaction, so when both are exhausted at the same request the answer is 503.
+In both modes a request that carries any part of the envelope (the owner-id
+anchor or any limit header) goes through admission's identity and policy
+checks, so a partial or malformed envelope, a missing organization identity,
+or an underivable graph scope fails closed with 503. With
+`admission.enabled=false`, a request whose envelope carries no limit header is
+unlimited in every scope and does not touch the store: no Admit, no lease, no
+completion. Every operator scope, the lane included, is checked before the
+contract scopes inside the one atomic transaction, so when both are exhausted
+at the same request the answer is 503.
+
+A request that alone reserves more than a contract scope's whole per-window
+limit can never be admitted, so it gets 400 without Retry-After instead of a
+429 that would repeat forever: a `max_tokens` above the generated-token limit,
+or an estimated prompt above a prompt-token limit. A request that declares no
+`max_tokens` reserves the configured default (4096) clamped to the smallest
+positive contract generated-token limit, and `/v1/embeddings` reserves one
+output token, since embeddings generate none.
 Only a Phoebe with no Valkey at all (no `admission.valkeyAddr` and no
 `emit.valkeyAddr`) cannot enforce contract limits; it logs that at startup.
 
@@ -202,6 +239,17 @@ every-request envelope requirement; it does not stop contract enforcement,
 which is changed in Atlas UsageLimits. Existing leases expire without affecting
 billing or Dynamo. Do not point replicas at different Valkey instances during a
 rolling update.
+
+Phoebe replicas older than the release that enforces contract limits without
+`admission.enabled` (phoebe #60) do not admit requests while
+`admission.enabled` is false. During a mixed rollout, only requests served by
+updated replicas are counted and limited. A contract limit set in Atlas
+UsageLimits is therefore under-enforced, roughly in proportion to the share of
+old replicas, until every replica runs the new image. The effect is
+transient and only weakens the soft fairness limit (consistent with ruling R2).
+It never bypasses trusted-policy validation. Operators who need exact limits
+from the first minute should set or lower UsageLimits only after
+`kubectl rollout status` reports that the rollout is complete.
 
 The envelope requirement applies to every shared-inference request, not only
 gateway-marked requests. The historical per-resource auth path does not stamp

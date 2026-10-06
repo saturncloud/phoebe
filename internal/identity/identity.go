@@ -286,3 +286,31 @@ func FromRequest(r *http.Request) Identity {
 		OwnerRateLimitGeneratedTokens:      trustedHeaderValue(r, HeaderOwnerRateLimitGeneratedTokens),
 	}
 }
+
+// OrgScopedRateLimitHeaders and OwnerScopedRateLimitHeaders are the scoped
+// contract rate-limit headers in one fixed order (requests, total prompt
+// tokens, uncached prompt tokens, generated tokens). They and
+// ScopedRateLimitValues are the single list of scoped limit fields: every
+// reader of the envelope ranges over them, so adding a limit header changes
+// one place.
+var (
+	OrgScopedRateLimitHeaders = [4]string{
+		HeaderOrgRateLimitRequests, HeaderOrgRateLimitTotalPromptTokens,
+		HeaderOrgRateLimitUncachedPromptTokens, HeaderOrgRateLimitGeneratedTokens,
+	}
+	OwnerScopedRateLimitHeaders = [4]string{
+		HeaderOwnerRateLimitRequests, HeaderOwnerRateLimitTotalPromptTokens,
+		HeaderOwnerRateLimitUncachedPromptTokens, HeaderOwnerRateLimitGeneratedTokens,
+	}
+	// ScopedRateLimitHeaders is every scoped limit header, organization scope
+	// first, then owner scope.
+	ScopedRateLimitHeaders = append(append([]string{}, OrgScopedRateLimitHeaders[:]...), OwnerScopedRateLimitHeaders[:]...)
+)
+
+// ScopedRateLimitValues returns the trusted scoped limit values in the order
+// of OrgScopedRateLimitHeaders and OwnerScopedRateLimitHeaders.
+func (id Identity) ScopedRateLimitValues() (org, owner [4]string) {
+	org = [4]string{id.OrgRateLimitRequests, id.OrgRateLimitTotalPromptTokens, id.OrgRateLimitUncachedPromptTokens, id.OrgRateLimitGeneratedTokens}
+	owner = [4]string{id.OwnerRateLimitRequests, id.OwnerRateLimitTotalPromptTokens, id.OwnerRateLimitUncachedPromptTokens, id.OwnerRateLimitGeneratedTokens}
+	return org, owner
+}

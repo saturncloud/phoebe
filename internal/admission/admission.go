@@ -12,6 +12,7 @@ import (
 	"errors"
 	"fmt"
 	"math"
+	"strings"
 	"sync"
 	"time"
 
@@ -21,6 +22,23 @@ import (
 )
 
 var ErrUnavailable = errors.New("distributed admission state unavailable")
+
+// valkeyOOMPrefix starts the error Valkey returns for a write refused past
+// maxmemory under noeviction ("OOM command not allowed when used memory >
+// 'maxmemory'.").
+const valkeyOOMPrefix = "OOM "
+
+// IsStoreOutOfMemory reports whether an admission error was caused by the
+// store refusing writes because it is at its memory cap. The store error is
+// carried as text inside ErrUnavailable, so this checks for the Valkey OOM
+// reply at the start of the error or of any wrapped segment.
+func IsStoreOutOfMemory(err error) bool {
+	if err == nil {
+		return false
+	}
+	msg := err.Error()
+	return strings.HasPrefix(msg, valkeyOOMPrefix) || strings.Contains(msg, ": "+valkeyOOMPrefix)
+}
 
 // ErrInvalidIdentity marks a broken trusted identity contract (a missing
 // organization, model, graph, or required owner). It is deliberately distinct
@@ -42,6 +60,11 @@ type Rejected struct {
 	Dimension   string
 	RetryAfter  time.Duration
 	Contractual bool
+	// Unsatisfiable marks a contract rejection that no amount of waiting can
+	// clear: the single request alone reserves more than the scope's whole
+	// per-window limit (for example max_tokens above the generated-token
+	// limit). RetryAfter is zero; the proxy answers 400 without Retry-After.
+	Unsatisfiable bool
 }
 
 func (r *Rejected) Error() string {
@@ -140,6 +163,23 @@ func NewValkeyClient(addr string) *redis.Client {
 	})
 }
 
+// FromSettings builds the distributed admitter the interceptor runs with: the
+// settings from Settings.EffectiveAdmission (operator tiers cleared under
+// admission.enabled=false) against the admission store (admission.valkeyAddr,
+// else emit.valkeyAddr). It returns false, and a nil admitter and client,
+// when no store is configured. The caller owns the client and closes it.
+func FromSettings(s *config.Settings) (*RedisAdmitter, *redis.Client, bool) {
+	cfg, ok := s.EffectiveAdmission()
+	if !ok {
+		return nil, nil, false
+	}
+	client := NewValkeyClient(cfg.ValkeyAddr)
+	return New(client, cfg), client, true
+}
+
+// Settings returns the admission settings this admitter enforces.
+func (a *RedisAdmitter) Settings() config.AdmissionSettings { return a.cfg }
+
 func (a *RedisAdmitter) keys() []string {
 	return []string{a.counters, a.leases, a.expiries, a.windowExpiries}
 }
@@ -156,7 +196,7 @@ func (a *RedisAdmitter) Admit(ctx context.Context, req Request) (*Lease, error) 
 	if req.Organization == "" || req.Model == "" || req.Graph == "" {
 		return nil, fmt.Errorf("%w: missing trusted organization/model/graph identity", ErrInvalidIdentity)
 	}
-	if req.OwnerLimits.any() && req.Owner == "" {
+	if req.OwnerLimits.Any() && req.Owner == "" {
 		return nil, fmt.Errorf("%w: missing trusted owner identity", ErrInvalidIdentity)
 	}
 	if req.PromptBytes < 0 || req.EstimatedInputTokens <= 0 || req.ReservedOutputTokens <= 0 {
@@ -194,6 +234,9 @@ func (a *RedisAdmitter) Admit(ctx context.Context, req Request) (*Lease, error) 
 				dimension = fmt.Sprint(parts[2])
 			}
 			contractual := len(parts) > 3 && number(parts[3]) == 1
+			if strings.HasSuffix(dimension, unsatisfiableSuffix) {
+				return nil, &Rejected{Scope: scopeName, Dimension: dimension, Contractual: contractual, Unsatisfiable: true}
+			}
 			retryAfter := a.retryAfter(w.Scopes)
 			if len(parts) > 4 && number(parts[4]) > 0 {
 				retryAfter = time.Duration(number(parts[4])) * time.Millisecond
@@ -310,19 +353,22 @@ func makeContractScope(name, id string, limits RateLimits) scope {
 	}
 }
 
-func (l RateLimits) any() bool {
+// unsatisfiableSuffix ends the dimension name admitScript returns when one
+// request alone exceeds a contract scope's whole per-window limit.
+const unsatisfiableSuffix = "_exceeds_limit"
+
+// Any reports whether the contract carries at least one limit. A contract with
+// no limit is unlimited in every dimension and admits nothing to check.
+func (l RateLimits) Any() bool {
 	return l.Requests != nil || l.TotalPromptTokens != nil || l.UncachedPromptTokens != nil || l.GeneratedTokens != nil
 }
 
 func (a *RedisAdmitter) scopes(r Request) []scope {
 	out := []scope{makeScope("platform", "all", a.cfg.Platform), makeScope("graph", r.Graph, a.cfg.Graph),
 		makeScope("organization", r.Organization, a.cfg.Organization), makeScope("organization_model", r.Organization+"\x1f"+r.Model, a.cfg.OrganizationModel)}
-	if r.OrganizationLimits.any() {
-		out = append(out, makeContractScope("contract_organization", r.Organization, r.OrganizationLimits))
-	}
-	if r.OwnerLimits.any() {
-		out = append(out, makeContractScope("contract_owner", r.Owner, r.OwnerLimits))
-	}
+	// Every operator scope, the lane included, precedes the contract scopes:
+	// admitScript checks scopes in order, so at an exact tie the operator scope
+	// answers (503) before the contract scope (429).
 	laneName := a.cfg.OrganizationLanes[r.Organization]
 	if laneName == "" {
 		laneName = "default"
@@ -332,6 +378,12 @@ func (a *RedisAdmitter) scopes(r Request) []scope {
 	}
 	if t, ok := a.cfg.Lanes[laneName]; ok {
 		out = append(out, makeScope("lane", laneName, scaled(t.Limits, t.Weight)))
+	}
+	if r.OrganizationLimits.Any() {
+		out = append(out, makeContractScope("contract_organization", r.Organization, r.OrganizationLimits))
+	}
+	if r.OwnerLimits.Any() {
+		out = append(out, makeContractScope("contract_owner", r.Owner, r.OwnerLimits))
 	}
 	return out
 }

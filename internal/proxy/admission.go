@@ -315,6 +315,20 @@ func (s *Server) writeAdmissionError(w http.ResponseWriter, requestID string, er
 	// a rejected client needs its billing-record correlation id just as much.
 	w.Header().Set(requestIDHeader, requestID)
 	var rejected *admission.Rejected
+	if errors.As(err, &rejected) && rejected.Unsatisfiable {
+		// One request alone exceeds a contract's whole per-window limit, so
+		// waiting can never admit it: no Retry-After.
+		message := "shared inference request exceeds the per-window contract limit"
+		switch rejected.Dimension {
+		case "generated_tokens_exceeds_limit":
+			message = "max_tokens exceeds the per-window generated-token limit"
+		case "total_prompt_tokens_exceeds_limit", "uncached_prompt_tokens_exceeds_limit":
+			message = "estimated prompt tokens exceed the per-window prompt-token limit"
+		}
+		http.Error(w, message, http.StatusBadRequest)
+		s.log.Warn.Printf("admission: unsatisfiable request scope=%s dimension=%s", rejected.Scope, rejected.Dimension)
+		return
+	}
 	if errors.As(err, &rejected) {
 		retry := int64(math.Ceil(rejected.RetryAfter.Seconds()))
 		if retry < 1 {
@@ -384,32 +398,19 @@ func parseTrustedRateLimits(id identity.Identity) (admission.RateLimits, admissi
 		}
 		return out, nil
 	}
-	orgNames := [4]string{identity.HeaderOrgRateLimitRequests, identity.HeaderOrgRateLimitTotalPromptTokens, identity.HeaderOrgRateLimitUncachedPromptTokens, identity.HeaderOrgRateLimitGeneratedTokens}
-	orgValues := [4]string{id.OrgRateLimitRequests, id.OrgRateLimitTotalPromptTokens, id.OrgRateLimitUncachedPromptTokens, id.OrgRateLimitGeneratedTokens}
-	ownerNames := [4]string{identity.HeaderOwnerRateLimitRequests, identity.HeaderOwnerRateLimitTotalPromptTokens, identity.HeaderOwnerRateLimitUncachedPromptTokens, identity.HeaderOwnerRateLimitGeneratedTokens}
-	ownerValues := [4]string{id.OwnerRateLimitRequests, id.OwnerRateLimitTotalPromptTokens, id.OwnerRateLimitUncachedPromptTokens, id.OwnerRateLimitGeneratedTokens}
-	anyScopedPresent := func() bool {
-		for _, values := range [][4]string{orgValues, ownerValues} {
-			for _, value := range values {
-				if value != "" {
-					return true
-				}
-			}
-		}
-		return false
-	}
+	orgValues, ownerValues := id.ScopedRateLimitValues()
 
 	switch {
 	case id.OwnerID != "":
 		// Scoped envelope: the owner id is the structural anchor (R7). The 8
 		// scoped headers are per-field R4 — absent is unlimited.
-		organization, err := parseScope(orgNames, orgValues)
+		organization, err := parseScope(identity.OrgScopedRateLimitHeaders, orgValues)
 		if err != nil {
 			return organization, admission.RateLimits{}, err
 		}
-		owner, err := parseScope(ownerNames, ownerValues)
+		owner, err := parseScope(identity.OwnerScopedRateLimitHeaders, ownerValues)
 		return organization, owner, err
-	case anyScopedPresent():
+	case anyScopedLimitPresent(id):
 		// Scoped limit headers without the owner-id anchor are a structural
 		// violation (R7), not unlimited fields.
 		return admission.RateLimits{}, admission.RateLimits{}, fmt.Errorf("incomplete trusted shared-inference rate-limit policy: scoped headers without %s", identity.HeaderOwnerID)
@@ -420,24 +421,45 @@ func parseTrustedRateLimits(id identity.Identity) (admission.RateLimits, admissi
 	}
 }
 
-// trustedPolicyEnvelopePresent reports whether the trusted quota envelope —
-// the owner-id anchor or any scoped limit header — reached this request. Any
-// part of it engages admission even under admission.enabled=false, so a
-// contract Atlas stamped is always enforced and a partial envelope still fails
-// closed in parseTrustedRateLimits.
-func trustedPolicyEnvelopePresent(id identity.Identity) bool {
-	for _, value := range []string{
-		id.OwnerID,
-		id.OrgRateLimitRequests, id.OrgRateLimitTotalPromptTokens,
-		id.OrgRateLimitUncachedPromptTokens, id.OrgRateLimitGeneratedTokens,
-		id.OwnerRateLimitRequests, id.OwnerRateLimitTotalPromptTokens,
-		id.OwnerRateLimitUncachedPromptTokens, id.OwnerRateLimitGeneratedTokens,
-	} {
-		if value != "" {
-			return true
+// anyScopedLimitPresent reports whether any scoped contract limit header
+// reached this request.
+func anyScopedLimitPresent(id identity.Identity) bool {
+	org, owner := id.ScopedRateLimitValues()
+	for _, values := range [][4]string{org, owner} {
+		for _, value := range values {
+			if value != "" {
+				return true
+			}
 		}
 	}
 	return false
+}
+
+// trustedPolicyEnvelopePresent reports whether any part of the trusted quota
+// envelope — the owner-id anchor or any scoped limit header — reached this
+// request. Any part of it engages admission's fail-closed checks even under
+// admission.enabled=false: a missing organization identity, a malformed or
+// partial envelope (a limit header without the owner-id anchor fails closed
+// in parseTrustedRateLimits), and an underivable graph scope all answer 503.
+// Under admission.enabled=false the admission store itself is only consulted
+// when a contract limit header is present (see the Admit call in proxy.go).
+func trustedPolicyEnvelopePresent(id identity.Identity) bool {
+	return id.OwnerID != "" || anyScopedLimitPresent(id)
+}
+
+// undeclaredOutputReservation is the output-token reservation for a request
+// that declares neither max_tokens nor max_completion_tokens: the configured
+// default, clamped to the smallest positive contract generated-token limit so
+// that an undeclared request always fits an otherwise empty window. An
+// explicit zero cap does not clamp; that scope rejects in admission.
+func undeclaredOutputReservation(defaultOutput int64, scopes ...admission.RateLimits) int64 {
+	out := defaultOutput
+	for _, limits := range scopes {
+		if g := limits.GeneratedTokens; g != nil && *g > 0 && *g < out {
+			out = *g
+		}
+	}
+	return out
 }
 
 // errNoTrustedRateLimitPolicy is the parser's "no anchor and no scoped policy
