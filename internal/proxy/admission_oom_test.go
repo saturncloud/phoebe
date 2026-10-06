@@ -31,7 +31,7 @@ func (oomStoreHook) ProcessPipelineHook(next redis.ProcessPipelineHook) redis.Pr
 func (oomStoreHook) ProcessHook(next redis.ProcessHook) redis.ProcessHook {
 	return func(ctx context.Context, cmd redis.Cmder) error {
 		if name := cmd.Name(); name == "evalsha" || name == "eval" {
-			err := errors.New("OOM command not allowed when used memory > 'maxmemory'.")
+			err := errors.New("OOM command not allowed when used memory > 'maxmemory'.") //nolint:revive // verbatim Redis/Valkey OOM reply the code under test matches
 			cmd.SetErr(err)
 			return err
 		}

@@ -563,12 +563,12 @@ func TestUndeclaredMaxTokensReservationClampedToContractGeneratedLimit(t *testin
 	// End to end against the store: undeclared requests are admitted.
 	mr := frozenMiniredis(t)
 	up, hits := countingBackend(t)
-	real := contractTestServer(t, loadSettings(t, "emit:\n  valkeyAddr: "+mr.Addr()+"\n"), up)
+	srv := contractTestServer(t, loadSettings(t, "emit:\n  valkeyAddr: "+mr.Addr()+"\n"), up)
 	req = contractGatewayRequest(map[string]string{identity.HeaderOrgRateLimitGeneratedTokens: "2000"})
 	req.Body = io.NopCloser(strings.NewReader(`{"model":"model-a"}`))
 	req.ContentLength = -1
 	rr = httptest.NewRecorder()
-	real.Handler().ServeHTTP(rr, req)
+	srv.Handler().ServeHTTP(rr, req)
 	if rr.Code != http.StatusOK || hits.Load() != 1 {
 		t.Fatalf("status=%d body=%q hits=%d, want the undeclared request admitted", rr.Code, rr.Body.String(), hits.Load())
 	}
