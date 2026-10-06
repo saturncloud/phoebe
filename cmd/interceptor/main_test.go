@@ -1,9 +1,13 @@
 package main
 
 import (
+	"bytes"
 	"context"
+	"io"
+	"log"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/alicebob/miniredis/v2"
@@ -63,5 +67,27 @@ func TestBuildAdmissionEnabledFalseDropsOperatorTiers(t *testing.T) {
 		if err != nil {
 			t.Fatalf("request %d: %v, want admitted (operator tiers are off under admission.enabled=false)", i+1, err)
 		}
+	}
+}
+
+// When admission.valkeyAddr is empty the admission store falls back to the
+// metering Valkey, which couples admission to the metering stream's memory
+// cap. Startup must say so, naming both settings.
+func TestBuildAdmissionLogsMeteringStoreFallback(t *testing.T) {
+	mr := miniredis.RunT(t)
+	logs := func(yaml string) string {
+		var buf bytes.Buffer
+		logger := &logging.Logger{Debug: log.New(io.Discard, "", 0), Info: log.New(&buf, "", 0), Warn: log.New(&buf, "", 0), Error: log.New(&buf, "", 0)}
+		_, closeAdmission := buildAdmission(loadTestSettings(t, yaml), logger)
+		closeAdmission()
+		return buf.String()
+	}
+	fallback := logs("emit:\n  valkeyAddr: " + mr.Addr() + "\n")
+	if !strings.Contains(fallback, "admission.valkeyAddr is empty") || !strings.Contains(fallback, "emit.valkeyAddr ("+mr.Addr()+")") {
+		t.Fatalf("metering-store fallback not logged with both settings named: %q", fallback)
+	}
+	explicit := logs("emit:\n  valkeyAddr: " + mr.Addr() + "\nadmission:\n  valkeyAddr: " + mr.Addr() + "\n")
+	if strings.Contains(explicit, "admission.valkeyAddr is empty") {
+		t.Fatalf("fallback logged although admission.valkeyAddr is set: %q", explicit)
 	}
 }

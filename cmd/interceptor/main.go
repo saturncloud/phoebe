@@ -93,6 +93,13 @@ func buildAdmission(s *config.Settings, log *logging.Logger) (admission.Admitter
 		return nil, func() {}
 	}
 	cfg := admitter.Settings()
+	if s.Admission.ValkeyAddr == "" {
+		// The store fell back to the metering Valkey. Admission then shares
+		// memory and the noeviction cap with the durable metering stream, so
+		// a metering backlog can make admission fail with OOM (see
+		// docs/shared-tier-admission.md).
+		log.Info.Printf("admission: admission.valkeyAddr is empty; using the metering Valkey from emit.valkeyAddr (%s) as the admission store", cfg.ValkeyAddr)
+	}
 	mode := "contract limits only (admission.enabled=false: operator capacity tiers off, envelope-less shared routes allowed)"
 	if cfg.Enabled {
 		mode = "contract limits + operator capacity tiers (admission.enabled=true: every shared request must carry the trusted envelope)"

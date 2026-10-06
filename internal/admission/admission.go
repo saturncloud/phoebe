@@ -23,6 +23,23 @@ import (
 
 var ErrUnavailable = errors.New("distributed admission state unavailable")
 
+// valkeyOOMPrefix starts the error Valkey returns for a write refused past
+// maxmemory under noeviction ("OOM command not allowed when used memory >
+// 'maxmemory'.").
+const valkeyOOMPrefix = "OOM "
+
+// IsStoreOutOfMemory reports whether an admission error was caused by the
+// store refusing writes because it is at its memory cap. The store error is
+// carried as text inside ErrUnavailable, so this checks for the Valkey OOM
+// reply at the start of the error or of any wrapped segment.
+func IsStoreOutOfMemory(err error) bool {
+	if err == nil {
+		return false
+	}
+	msg := err.Error()
+	return strings.HasPrefix(msg, valkeyOOMPrefix) || strings.Contains(msg, ": "+valkeyOOMPrefix)
+}
+
 // ErrInvalidIdentity marks a broken trusted identity contract (a missing
 // organization, model, graph, or required owner). It is deliberately distinct
 // from ErrUnavailable: an unavailable fairness store bypasses soft limits for

@@ -117,6 +117,7 @@ type Server struct {
 	// the settlement/cold-hold release failures — so a store outage cannot
 	// flood one ERROR per request (see sampledErrorLog).
 	admissionBypassLog, leaseRenewalLog                        sampledErrorLog
+	admissionOOMBypassLog                                      sampledErrorLog
 	admissionReleaseFallbackLog, admissionCompletionReleaseLog sampledErrorLog
 	admissionPrefillReleaseLog, admissionUpstreamReleaseLog    sampledErrorLog
 	admissionColdHoldReleaseLog                                sampledErrorLog
@@ -707,7 +708,14 @@ func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request) {
 					return
 				}
 				if errors.Is(err, admission.ErrUnavailable) {
-					s.admissionBypassLog.logf(s.log, "admission: distributed gate unavailable; bypassing for otherwise valid request_id=%s: %v", requestID, err)
+					if admission.IsStoreOutOfMemory(err) {
+						// Labelled apart from network unavailability: a full
+						// shared Valkey (metering backlog) is a capacity
+						// problem an operator fixes differently.
+						s.admissionOOMBypassLog.logf(s.log, "admission: admission store out of memory (Valkey OOM); bypassing distributed gate for otherwise valid request_id=%s: %v", requestID, err)
+					} else {
+						s.admissionBypassLog.logf(s.log, "admission: distributed gate unavailable; bypassing for otherwise valid request_id=%s: %v", requestID, err)
+					}
 					admitted = nil
 				} else {
 					s.writeAdmissionError(w, requestID, err)
