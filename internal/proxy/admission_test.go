@@ -59,16 +59,7 @@ func sharedRequest(upstream *url.URL) *http.Request {
 	// a zero cap. This base helper stamps large, non-binding caps and tests
 	// that need an absent, binding, or zero-capped dimension override the
 	// headers explicitly.
-	for _, header := range []string{
-		identity.HeaderOrgRateLimitRequests,
-		identity.HeaderOrgRateLimitTotalPromptTokens,
-		identity.HeaderOrgRateLimitUncachedPromptTokens,
-		identity.HeaderOrgRateLimitGeneratedTokens,
-		identity.HeaderOwnerRateLimitRequests,
-		identity.HeaderOwnerRateLimitTotalPromptTokens,
-		identity.HeaderOwnerRateLimitUncachedPromptTokens,
-		identity.HeaderOwnerRateLimitGeneratedTokens,
-	} {
+	for _, header := range identity.ScopedRateLimitHeaders {
 		r.Header.Set(header, "1000000")
 	}
 	return r
@@ -803,15 +794,25 @@ func TestContractRateLimitReturns429BeforeUpstream(t *testing.T) {
 	cfg := proxyAdmissionConfig(2)
 	c := redis.NewClient(&redis.Options{Addr: mr.Addr()})
 	s := New(&config.Settings{Admission: cfg}, logging.New(logging.ERROR), &recordingEmitter{}).WithAdmitter(admission.New(c, cfg))
-	req := sharedRequest(up)
-	req.Header.Set(identity.HeaderOwnerRateLimitGeneratedTokens, "10")
-	rr := httptest.NewRecorder()
-	s.Handler().ServeHTTP(rr, req)
-	if rr.Code != http.StatusTooManyRequests {
+	// Each request reserves max_tokens=20 against a generated-token limit of
+	// 30: the first fits, the second exhausts the window and is answered 429
+	// before upstream. (A single request above the whole limit is a 400; see
+	// TestMaxTokensAboveGeneratedLimitIsUnsatisfiable400.)
+	send := func() *httptest.ResponseRecorder {
+		req := sharedRequest(up)
+		req.Header.Set(identity.HeaderOwnerRateLimitGeneratedTokens, "30")
+		rr := httptest.NewRecorder()
+		s.Handler().ServeHTTP(rr, req)
+		return rr
+	}
+	if rr := send(); rr.Code != http.StatusOK {
+		t.Fatalf("first request status=%d, want 200", rr.Code)
+	}
+	if rr := send(); rr.Code != http.StatusTooManyRequests {
 		t.Fatalf("status=%d, want 429", rr.Code)
 	}
-	if hits != 0 {
-		t.Fatal("contractually over-limit request reached upstream")
+	if hits != 1 {
+		t.Fatalf("hits=%d: contractually over-limit request reached upstream", hits)
 	}
 }
 
@@ -1064,6 +1065,11 @@ func TestTrustedRateLimitPolicyParsing(t *testing.T) {
 			name: "negative scoped header",
 			id: identity.Identity{Gateway: true, OwnerID: "owner-1",
 				OrgRateLimitRequests: "-1"},
+		},
+		{
+			name: "uncached prompt limit above total prompt limit",
+			id: identity.Identity{Gateway: true, OwnerID: "owner-1",
+				OwnerRateLimitUncachedPromptTokens: "50", OwnerRateLimitTotalPromptTokens: "10"},
 		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {

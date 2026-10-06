@@ -105,6 +105,11 @@ type AdmissionLane struct {
 	Limits               AdmissionLimits `yaml:"limits"`
 }
 
+// DefaultMaxOutputTokens is the output-token reservation for a shared request
+// that declares neither max_tokens nor max_completion_tokens. R10: the
+// ratified default (Baseten-aligned).
+const DefaultMaxOutputTokens int64 = 4096
+
 // AdmissionSettings is the YAML shape for Saturn-owned HTTP admission.
 type AdmissionSettings struct {
 	// Enabled turns on the OPERATOR side of admission: the capacity tiers
@@ -357,7 +362,7 @@ func (a *AdmissionSettings) parse() error {
 		return fmt.Errorf("invalid admission.leaseTtl %q", a.LeaseTTLStr)
 	}
 	if a.DefaultMaxOutputTokens <= 0 {
-		a.DefaultMaxOutputTokens = 4096
+		a.DefaultMaxOutputTokens = DefaultMaxOutputTokens
 	}
 	if !a.Enabled {
 		return nil

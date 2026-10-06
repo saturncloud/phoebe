@@ -89,6 +89,15 @@ for _,s in ipairs(q.scopes) do
   local contract=s.contractual and 1 or 0
   local checks={{'active',s.active,1},{'prefills',s.prefills,1},{'reserved_decode_slots',s.reserved_decode_slots,1},{'prompt',s.prompt,q.prompt},{'output',s.output,q.output},{'adapters',s.adapters,q.adapter}}
   for _,c in ipairs(checks) do if c[2] ~= 0 and get(field(s,c[1])) + c[3] > c[2] then return {0,s.name,c[1],contract} end end
+  -- A contract request that alone reserves more than the scope's whole
+  -- positive per-window limit can never be admitted, however long it waits:
+  -- answer that without a retry hint instead of a 429 that repeats forever.
+  -- An explicit zero cap (-1) is excluded; it keeps its retryable answer.
+  if s.contractual then
+    if s.total_prompt > 0 and q.estimated_input > s.total_prompt then return {0,s.name,'total_prompt_tokens_exceeds_limit',contract} end
+    if s.uncached_prompt > 0 and q.estimated_input > s.uncached_prompt then return {0,s.name,'uncached_prompt_tokens_exceeds_limit',contract} end
+    if s.generated > 0 and q.output > s.generated then return {0,s.name,'generated_tokens_exceeds_limit',contract} end
+  end
   if s.requests ~= 0 and window_get(s,'requests',q.now)+1 > s.requests then return {0,s.name,'requests',contract,window_retry_ms(s,q.now)} end
   if s.total_prompt ~= 0 and window_get(s,'total_prompt',q.now)+get(field(s,'total_prompt_reserved'))+q.estimated_input > s.total_prompt then return {0,s.name,'total_prompt_tokens',contract,window_retry_ms(s,q.now)} end
   if s.uncached_prompt ~= 0 and window_get(s,'uncached_prompt',q.now)+get(field(s,'uncached_prompt_reserved'))+q.estimated_input > s.uncached_prompt then return {0,s.name,'uncached_prompt_tokens',contract,window_retry_ms(s,q.now)} end

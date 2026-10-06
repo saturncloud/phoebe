@@ -295,7 +295,7 @@ admission:
 	if err != nil {
 		t.Fatal(err)
 	}
-	if s.Admission.LeaseTTL != 15*time.Minute || s.Admission.DefaultMaxOutputTokens != 4096 {
+	if s.Admission.LeaseTTL != 15*time.Minute || s.Admission.DefaultMaxOutputTokens != DefaultMaxOutputTokens {
 		t.Fatalf("admission defaults wrong: %+v", s.Admission)
 	}
 	if got := s.Admission.Lanes["protected"].Limits.Window; got != 30*time.Second {
@@ -470,7 +470,7 @@ admission:
 		if cfg.Organization.RequestsPerWindow != nil || cfg.Lanes != nil || cfg.OrganizationLanes != nil {
 			t.Fatalf("operator tiers survived admission.enabled=false: %+v", cfg)
 		}
-		if cfg.KeyPrefix != "phoebe:admission" || cfg.LeaseTTL != 15*time.Minute || cfg.DefaultMaxOutputTokens != 4096 {
+		if cfg.KeyPrefix != "phoebe:admission" || cfg.LeaseTTL != 15*time.Minute || cfg.DefaultMaxOutputTokens != DefaultMaxOutputTokens || DefaultMaxOutputTokens != 4096 {
 			t.Fatalf("store defaults not applied with admission disabled: %+v", cfg)
 		}
 		// The raw settings keep the lanes: they still supply trusted Dynamo hints.

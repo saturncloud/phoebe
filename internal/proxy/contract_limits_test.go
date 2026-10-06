@@ -1,6 +1,8 @@
 package proxy
 
 import (
+	"context"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -27,21 +29,10 @@ import (
 // window and answer the 31st with 429 + Retry-After, whatever the operator
 // capacity tiers are — absent, an empty `organization: {}`, or admission.enabled
 // false (ruling R12 clarification: there is no enablement gate for contract
-// limits). The admitter is built exactly as cmd/interceptor does, from the
-// loaded settings through Settings.EffectiveAdmission.
+// limits). The admitter is built by admission.FromSettings, the constructor
+// cmd/interceptor uses.
 
 const contractBurst = 35
-
-var allScopedLimitHeaders = []string{
-	identity.HeaderOrgRateLimitRequests,
-	identity.HeaderOrgRateLimitTotalPromptTokens,
-	identity.HeaderOrgRateLimitUncachedPromptTokens,
-	identity.HeaderOrgRateLimitGeneratedTokens,
-	identity.HeaderOwnerRateLimitRequests,
-	identity.HeaderOwnerRateLimitTotalPromptTokens,
-	identity.HeaderOwnerRateLimitUncachedPromptTokens,
-	identity.HeaderOwnerRateLimitGeneratedTokens,
-}
 
 // frozenMiniredis returns a store whose TIME is pinned mid-minute, so a burst
 // can never straddle a fixed-window boundary and flake.
@@ -67,17 +58,26 @@ func loadSettings(t *testing.T, yaml string) *config.Settings {
 	return s
 }
 
-// contractTestServer wires a gateway Server the way cmd/interceptor does:
-// the admitter exists iff Settings.EffectiveAdmission reports a store.
+// contractTestServer wires a gateway Server with the admitter built by
+// admission.FromSettings, the same constructor cmd/interceptor's
+// buildAdmission calls (its wiring is checked in
+// internal/admission/from_settings_test.go and cmd/interceptor/main_test.go).
 func contractTestServer(t *testing.T, settings *config.Settings, backend *url.URL) *Server {
 	t.Helper()
+	s := gatewayContractServer(settings, backend)
+	if admitter, client, ok := admission.FromSettings(settings); ok {
+		t.Cleanup(func() { _ = client.Close() })
+		s = s.WithAdmitter(admitter)
+	}
+	return s
+}
+
+// gatewayContractServer is the gateway Server with no admitter attached.
+func gatewayContractServer(settings *config.Settings, backend *url.URL) *Server {
 	s := New(settings, logging.New(logging.ERROR), &recordingEmitter{}).WithGateway(&mapResolver{m: map[[2]string]gateway.Resolution{
 		{"org-1", "model-a"}: {ResourceID: "resource-a", BaseModel: "model-a", ServingMode: "shared", GraphK8sName: "graph-a"},
 	}}, "tf-shared", 8000)
 	s.gateway.upstreamFor = func(string, int) string { return backend.Host }
-	if cfg, ok := settings.EffectiveAdmission(); ok {
-		s = s.WithAdmitter(admission.New(admission.NewValkeyClient(cfg.ValkeyAddr), cfg))
-	}
 	return s
 }
 
@@ -99,7 +99,7 @@ func countingBackend(t *testing.T) (*url.URL, *atomic.Int64) {
 // header is ABSENT (R4: unlimited).
 func contractGatewayRequest(limits map[string]string) *http.Request {
 	req := gatewayRequest("org-1", `{"model":"model-a","max_tokens":20}`)
-	for _, header := range allScopedLimitHeaders {
+	for _, header := range identity.ScopedRateLimitHeaders {
 		req.Header.Del(header)
 	}
 	for header, value := range limits {
@@ -167,6 +167,17 @@ func TestContractOrgLimitEnforcedRegardlessOfOperatorTiers(t *testing.T) {
 			yaml: func(addr string) string { return "emit:\n  valkeyAddr: " + addr + "\n" },
 		},
 		{
+			// admission.enabled=false clears every operator tier, even one
+			// that would bind first: the 11th request must not get the
+			// operator 503, and the contract of 30 decides.
+			name: "admission disabled, binding operator organization tier ignored",
+			yaml: func(addr string) string {
+				return "emit:\n  valkeyAddr: " + addr + "\nadmission:\n  enabled: false\n" +
+					"  organization:\n    requestsPerWindow: 10\n    window: 1m\n" +
+					"  platform:\n    requestsPerWindow: 5\n    window: 1m\n"
+			},
+		},
+		{
 			// QA case (b): admission enabled with every operator tier absent.
 			name: "admission enabled, all operator tiers absent",
 			yaml: func(addr string) string {
@@ -215,6 +226,9 @@ func TestContractOwnerLimitEnforcedRegardlessOfOperatorTiers(t *testing.T) {
 			yaml := "emit:\n  valkeyAddr: " + mr.Addr() + "\n"
 			if enabled {
 				yaml += "admission:\n  enabled: true\n  valkeyAddr: " + mr.Addr() + "\n"
+			} else {
+				// A binding operator tier that admission.enabled=false must clear.
+				yaml += "admission:\n  enabled: false\n  organization:\n    requestsPerWindow: 10\n    window: 1m\n"
 			}
 			s := contractTestServer(t, loadSettings(t, yaml), up)
 			got := runBurst(s, contractBurst, func() *http.Request {
@@ -255,27 +269,35 @@ func TestOperatorCapacityLimitStillAnswers503(t *testing.T) {
 	assertCutoff(t, got, 30, http.StatusServiceUnavailable, capacityRejectBody)
 }
 
-// Operator scopes and contract scopes are checked in ONE transaction, operator
-// scopes first (platform, graph, organization, organizationModel, then
-// contract_organization, contract_owner, then the lane). Whichever limit is
+// Operator scopes and contract scopes are checked in ONE transaction, every
+// operator scope first (platform, graph, organization, organizationModel, the
+// lane, then contract_organization and contract_owner). Whichever limit is
 // reached first decides the answer; at an exact tie the operator scope is
 // checked first and the answer is 503.
 func TestContractAndOperatorLimitPrecedence(t *testing.T) {
+	organizationTier := func(limit string) string {
+		return "  organization:\n    requestsPerWindow: " + limit + "\n    window: 1m\n"
+	}
+	laneTier := func(limit string) string {
+		return "  lanes:\n    default:\n      weight: 1\n    gold:\n      weight: 1\n      limits:\n        requestsPerWindow: " + limit +
+			"\n        window: 1m\n  organizationLanes:\n    org-1: gold\n"
+	}
 	for _, tc := range []struct {
-		name               string
-		operator, contract string
-		admitted, status   int
-		body               string
+		name             string
+		operatorTier     string
+		contract         string
+		admitted, status int
+		body             string
 	}{
-		{name: "contract tighter", operator: "30", contract: "20", admitted: 20, status: http.StatusTooManyRequests, body: contractRejectBody},
-		{name: "operator tighter", operator: "20", contract: "30", admitted: 20, status: http.StatusServiceUnavailable, body: capacityRejectBody},
-		{name: "tie answers operator 503", operator: "25", contract: "25", admitted: 25, status: http.StatusServiceUnavailable, body: capacityRejectBody},
+		{name: "contract tighter", operatorTier: organizationTier("30"), contract: "20", admitted: 20, status: http.StatusTooManyRequests, body: contractRejectBody},
+		{name: "operator tighter", operatorTier: organizationTier("20"), contract: "30", admitted: 20, status: http.StatusServiceUnavailable, body: capacityRejectBody},
+		{name: "tie answers operator 503", operatorTier: organizationTier("25"), contract: "25", admitted: 25, status: http.StatusServiceUnavailable, body: capacityRejectBody},
+		{name: "lane tie answers operator 503", operatorTier: laneTier("25"), contract: "25", admitted: 25, status: http.StatusServiceUnavailable, body: capacityRejectBody},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			mr := frozenMiniredis(t)
 			up, _ := countingBackend(t)
-			s := contractTestServer(t, loadSettings(t, "admission:\n  enabled: true\n  valkeyAddr: "+mr.Addr()+
-				"\n  organization:\n    requestsPerWindow: "+tc.operator+"\n    window: 1m\n"), up)
+			s := contractTestServer(t, loadSettings(t, "admission:\n  enabled: true\n  valkeyAddr: "+mr.Addr()+"\n"+tc.operatorTier), up)
 			got := runBurst(s, contractBurst, func() *http.Request {
 				return contractGatewayRequest(map[string]string{identity.HeaderOrgRateLimitRequests: tc.contract})
 			})
@@ -341,7 +363,7 @@ func TestEnvelopeLessSharedRequestFollowsAdmissionFlag(t *testing.T) {
 			s := contractTestServer(t, loadSettings(t, yaml), up)
 			req := sharedRequest(up)
 			req.Header.Del(identity.HeaderOwnerID)
-			for _, header := range allScopedLimitHeaders {
+			for _, header := range identity.ScopedRateLimitHeaders {
 				req.Header.Del(header)
 			}
 			rr := httptest.NewRecorder()
@@ -353,17 +375,228 @@ func TestEnvelopeLessSharedRequestFollowsAdmissionFlag(t *testing.T) {
 	}
 }
 
-// A partial envelope (a limit header without its owner-id anchor) fails
-// closed even with admission.enabled=false: a stamped limit is never dropped.
-func TestPartialEnvelopeFailsClosedWithAdmissionFlagOff(t *testing.T) {
+// flagOffServer is a server with admission.enabled=false and the store set
+// through emit.valkeyAddr only: contract limits on, operator tiers off.
+func flagOffServer(t *testing.T) (*Server, *url.URL, *atomic.Int64) {
+	t.Helper()
 	mr := frozenMiniredis(t)
 	up, hits := countingBackend(t)
-	s := contractTestServer(t, loadSettings(t, "emit:\n  valkeyAddr: "+mr.Addr()+"\n"), up)
-	req := contractGatewayRequest(map[string]string{identity.HeaderOrgRateLimitRequests: "30"})
-	req.Header.Del(identity.HeaderOwnerID)
+	return contractTestServer(t, loadSettings(t, "emit:\n  valkeyAddr: "+mr.Addr()+"\n"), up), up, hits
+}
+
+func assertRefusedBeforeUpstream(t *testing.T, s *Server, req *http.Request, hits *atomic.Int64, wantBody string) {
+	t.Helper()
 	rr := httptest.NewRecorder()
 	s.Handler().ServeHTTP(rr, req)
 	if rr.Code != http.StatusServiceUnavailable || hits.Load() != 0 {
-		t.Fatalf("status=%d hits=%d, want 503 before upstream", rr.Code, hits.Load())
+		t.Fatalf("status=%d body=%q hits=%d, want 503 before upstream", rr.Code, rr.Body.String(), hits.Load())
+	}
+	if wantBody != "" && strings.TrimSpace(rr.Body.String()) != wantBody {
+		t.Fatalf("body=%q, want %q", rr.Body.String(), wantBody)
+	}
+}
+
+// A partial envelope — any one limit header without its owner-id anchor —
+// fails closed even with admission.enabled=false: a stamped limit is never
+// dropped. Every scoped limit header is checked, so a header added to the
+// envelope without engaging admission is caught here.
+func TestPartialEnvelopeFailsClosedWithAdmissionFlagOff(t *testing.T) {
+	for _, header := range identity.ScopedRateLimitHeaders {
+		t.Run(header, func(t *testing.T) {
+			s, _, hits := flagOffServer(t)
+			req := contractGatewayRequest(map[string]string{header: "30"})
+			req.Header.Del(identity.HeaderOwnerID)
+			assertRefusedBeforeUpstream(t, s, req, hits, "shared inference policy unavailable")
+		})
+	}
+}
+
+// With admission.enabled=false, every broken-envelope case that the flag-on
+// path refuses is refused too, before upstream.
+func TestBrokenEnvelopeFailsClosedWithAdmissionFlagOff(t *testing.T) {
+	const identityUnavailable = "shared inference identity unavailable"
+	const policyUnavailable = "shared inference policy unavailable"
+	for _, tc := range []struct {
+		name   string
+		limits map[string]string
+		mutate func(*http.Request)
+		body   string
+	}{
+		{
+			name:   "envelope present without organization identity",
+			limits: map[string]string{identity.HeaderOrgRateLimitRequests: "30"},
+			mutate: func(r *http.Request) { r.Header.Del(identity.HeaderOrgID) },
+			body:   identityUnavailable,
+		},
+		{
+			name:   "owner anchor alone without organization identity",
+			mutate: func(r *http.Request) { r.Header.Del(identity.HeaderOrgID) },
+			body:   identityUnavailable,
+		},
+		{
+			name:   "envelope present with an underivable graph scope",
+			limits: map[string]string{identity.HeaderOrgRateLimitRequests: "30"},
+			mutate: func(r *http.Request) { r.Header.Set(identity.HeaderUpstream, ":8000") },
+			body:   identityUnavailable,
+		},
+		{name: "non-numeric organization limit", limits: map[string]string{identity.HeaderOrgRateLimitRequests: "abc"}, body: policyUnavailable},
+		{name: "negative owner limit", limits: map[string]string{identity.HeaderOwnerRateLimitRequests: "-1"}, body: policyUnavailable},
+		{
+			name: "organization uncached prompt limit above total prompt limit",
+			limits: map[string]string{
+				identity.HeaderOrgRateLimitUncachedPromptTokens: "50",
+				identity.HeaderOrgRateLimitTotalPromptTokens:    "10",
+			},
+			body: policyUnavailable,
+		},
+		{
+			name: "owner uncached prompt limit above total prompt limit",
+			limits: map[string]string{
+				identity.HeaderOwnerRateLimitUncachedPromptTokens: "50",
+				identity.HeaderOwnerRateLimitTotalPromptTokens:    "10",
+			},
+			body: policyUnavailable,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			s, up, hits := flagOffServer(t)
+			// The header-routed shared path: a gateway request without an
+			// organization never resolves, and only this path carries a
+			// trusted upstream to degrade.
+			req := sharedRequest(up)
+			for _, header := range identity.ScopedRateLimitHeaders {
+				req.Header.Del(header)
+			}
+			for header, value := range tc.limits {
+				req.Header.Set(header, value)
+			}
+			if tc.mutate != nil {
+				tc.mutate(req)
+			}
+			assertRefusedBeforeUpstream(t, s, req, hits, tc.body)
+		})
+	}
+}
+
+// recordingAdmitter counts Admit calls and records the last request; it admits
+// with no lease, as an unavailable store would.
+type recordingAdmitter struct {
+	calls int
+	last  admission.Request
+}
+
+func (a *recordingAdmitter) Admit(_ context.Context, req admission.Request) (*admission.Lease, error) {
+	a.calls++
+	a.last = req
+	return nil, nil
+}
+
+func fakeAdmitterServer(t *testing.T, yaml string) (*Server, *recordingAdmitter, *atomic.Int64) {
+	t.Helper()
+	up, hits := countingBackend(t)
+	fake := &recordingAdmitter{}
+	return gatewayContractServer(loadSettings(t, yaml), up).WithAdmitter(fake), fake, hits
+}
+
+// Under admission.enabled=false an envelope that carries no limit (Atlas
+// stamps the owner-id anchor on every gateway request; an org with no
+// UsageLimits sends no limit header) is unlimited, so the request never
+// touches the admission store: no Admit, no lease, no added latency or
+// failure mode.
+func TestEnvelopeWithoutLimitsDoesNotTouchAdmissionStoreWithAdmissionFlagOff(t *testing.T) {
+	s, fake, hits := fakeAdmitterServer(t, "emit:\n  valkeyAddr: unused:6379\n")
+	rr := httptest.NewRecorder()
+	s.Handler().ServeHTTP(rr, contractGatewayRequest(nil))
+	if rr.Code != http.StatusOK || hits.Load() != 1 {
+		t.Fatalf("status=%d hits=%d, want 200 served", rr.Code, hits.Load())
+	}
+	if fake.calls != 0 {
+		t.Fatalf("Admit called %d times for an envelope with no limits under admission.enabled=false, want 0", fake.calls)
+	}
+}
+
+func TestContractLimitHeaderEngagesAdmitWithAdmissionFlagOff(t *testing.T) {
+	for _, header := range identity.ScopedRateLimitHeaders {
+		t.Run(header, func(t *testing.T) {
+			s, fake, _ := fakeAdmitterServer(t, "emit:\n  valkeyAddr: unused:6379\n")
+			rr := httptest.NewRecorder()
+			s.Handler().ServeHTTP(rr, contractGatewayRequest(map[string]string{header: "1000000"}))
+			if rr.Code != http.StatusOK || fake.calls != 1 {
+				t.Fatalf("status=%d Admit calls=%d, want 200 and exactly one Admit", rr.Code, fake.calls)
+			}
+		})
+	}
+}
+
+func TestAdmissionFlagOnAdmitsEnvelopeWithoutLimits(t *testing.T) {
+	s, fake, _ := fakeAdmitterServer(t, "admission:\n  enabled: true\n  valkeyAddr: unused:6379\n")
+	rr := httptest.NewRecorder()
+	s.Handler().ServeHTTP(rr, contractGatewayRequest(nil))
+	if rr.Code != http.StatusOK || fake.calls != 1 {
+		t.Fatalf("status=%d Admit calls=%d, want 200 and exactly one Admit (operator tiers apply)", rr.Code, fake.calls)
+	}
+}
+
+// A request with no max_tokens reserves the configured default clamped to the
+// tightest positive contract generated-token limit, so a generated limit below
+// the 4096 default does not reject every undeclared request forever.
+func TestUndeclaredMaxTokensReservationClampedToContractGeneratedLimit(t *testing.T) {
+	s, fake, _ := fakeAdmitterServer(t, "emit:\n  valkeyAddr: unused:6379\n")
+	req := contractGatewayRequest(map[string]string{
+		identity.HeaderOrgRateLimitGeneratedTokens:   "2000",
+		identity.HeaderOwnerRateLimitGeneratedTokens: "3000",
+	})
+	req.Body = io.NopCloser(strings.NewReader(`{"model":"model-a"}`))
+	req.ContentLength = -1
+	rr := httptest.NewRecorder()
+	s.Handler().ServeHTTP(rr, req)
+	if rr.Code != http.StatusOK || fake.last.ReservedOutputTokens != 2000 {
+		t.Fatalf("status=%d reserved=%d, want 200 with a 2000-token reservation", rr.Code, fake.last.ReservedOutputTokens)
+	}
+
+	// End to end against the store: undeclared requests are admitted.
+	mr := frozenMiniredis(t)
+	up, hits := countingBackend(t)
+	real := contractTestServer(t, loadSettings(t, "emit:\n  valkeyAddr: "+mr.Addr()+"\n"), up)
+	req = contractGatewayRequest(map[string]string{identity.HeaderOrgRateLimitGeneratedTokens: "2000"})
+	req.Body = io.NopCloser(strings.NewReader(`{"model":"model-a"}`))
+	req.ContentLength = -1
+	rr = httptest.NewRecorder()
+	real.Handler().ServeHTTP(rr, req)
+	if rr.Code != http.StatusOK || hits.Load() != 1 {
+		t.Fatalf("status=%d body=%q hits=%d, want the undeclared request admitted", rr.Code, rr.Body.String(), hits.Load())
+	}
+}
+
+// Embeddings generate no tokens, so they must not reserve the 4096-token
+// output default against a generated-token limit.
+func TestEmbeddingsReserveNoGeneratedTokens(t *testing.T) {
+	s, fake, _ := fakeAdmitterServer(t, "emit:\n  valkeyAddr: unused:6379\n")
+	req := gatewayRequestFor(http.MethodPost, "/v1/embeddings", "org-1", `{"model":"model-a","input":"hello"}`)
+	for _, header := range identity.ScopedRateLimitHeaders {
+		req.Header.Del(header)
+	}
+	req.Header.Set(identity.HeaderOrgRateLimitGeneratedTokens, "2000")
+	rr := httptest.NewRecorder()
+	s.Handler().ServeHTTP(rr, req)
+	if rr.Code != http.StatusOK || fake.calls != 1 || fake.last.ReservedOutputTokens != 1 {
+		t.Fatalf("status=%d calls=%d reserved=%d, want 200 with a 1-token reservation", rr.Code, fake.calls, fake.last.ReservedOutputTokens)
+	}
+}
+
+// A declared max_tokens above the whole per-window generated-token limit can
+// never be admitted: 400 with no Retry-After, not a 429 that repeats forever.
+func TestMaxTokensAboveGeneratedLimitIsUnsatisfiable400(t *testing.T) {
+	s, _, hits := flagOffServer(t)
+	req := contractGatewayRequest(map[string]string{identity.HeaderOrgRateLimitGeneratedTokens: "2000"})
+	req.Body = io.NopCloser(strings.NewReader(`{"model":"model-a","max_tokens":3000}`))
+	req.ContentLength = -1
+	rr := httptest.NewRecorder()
+	s.Handler().ServeHTTP(rr, req)
+	if rr.Code != http.StatusBadRequest || rr.Header().Get("Retry-After") != "" || hits.Load() != 0 {
+		t.Fatalf("status=%d Retry-After=%q hits=%d, want 400 without Retry-After before upstream", rr.Code, rr.Header().Get("Retry-After"), hits.Load())
+	}
+	if got := strings.TrimSpace(rr.Body.String()); got != "max_tokens exceeds the per-window generated-token limit" {
+		t.Fatalf("body=%q", got)
 	}
 }

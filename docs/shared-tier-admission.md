@@ -73,10 +73,23 @@ under their own prefix. `admission.enabled` controls only the operator side:
 | `false` (chart default) | Enforced: 429 + Retry-After | Off (not configured) | Served without admission (historical per-resource routes) |
 | `true` | Enforced: 429 + Retry-After | Enforced: 503 + Retry-After | Fails closed with 503 |
 
-In both modes a request that carries any part of the envelope is admitted
-through the store, so a partial or malformed envelope fails closed with 503.
-Operator scopes are checked before contract scopes inside the one atomic
-transaction, so when both are exhausted at the same request the answer is 503.
+In both modes a request that carries any part of the envelope (the owner-id
+anchor or any limit header) goes through admission's identity and policy
+checks, so a partial or malformed envelope, a missing organization identity,
+or an underivable graph scope fails closed with 503. With
+`admission.enabled=false`, a request whose envelope carries no limit header is
+unlimited in every scope and does not touch the store: no Admit, no lease, no
+completion. Every operator scope, the lane included, is checked before the
+contract scopes inside the one atomic transaction, so when both are exhausted
+at the same request the answer is 503.
+
+A request that alone reserves more than a contract scope's whole per-window
+limit can never be admitted, so it gets 400 without Retry-After instead of a
+429 that would repeat forever: a `max_tokens` above the generated-token limit,
+or an estimated prompt above a prompt-token limit. A request that declares no
+`max_tokens` reserves the configured default (4096) clamped to the smallest
+positive contract generated-token limit, and `/v1/embeddings` reserves one
+output token, since embeddings generate none.
 Only a Phoebe with no Valkey at all (no `admission.valkeyAddr` and no
 `emit.valkeyAddr`) cannot enforce contract limits; it logs that at startup.
 
