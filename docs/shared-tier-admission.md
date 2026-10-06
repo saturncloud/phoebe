@@ -61,6 +61,25 @@ An exhausted contract returns 429 with Retry-After, and physical pool
 saturation returns 503. Admission-store unavailability bypasses only these
 soft limits and is logged; it does not bypass trusted-policy validation.
 
+Contract limits have no enablement switch (ruling R12 clarification,
+2026-10-06). They are Atlas database settings that can be changed at any time,
+and Phoebe enforces whatever the trusted envelope carries whenever an admission
+store is configured. The store is `admission.valkeyAddr` when set and otherwise
+the install Valkey that metering uses (`emit.valkeyAddr`); admission keys live
+under their own prefix. `admission.enabled` controls only the operator side:
+
+| `admission.enabled` | Contract scopes (envelope limits) | Operator capacity tiers | Shared request with no envelope |
+| --- | --- | --- | --- |
+| `false` (chart default) | Enforced: 429 + Retry-After | Off (not configured) | Served without admission (historical per-resource routes) |
+| `true` | Enforced: 429 + Retry-After | Enforced: 503 + Retry-After | Fails closed with 503 |
+
+In both modes a request that carries any part of the envelope is admitted
+through the store, so a partial or malformed envelope fails closed with 503.
+Operator scopes are checked before contract scopes inside the one atomic
+transaction, so when both are exhausted at the same request the answer is 503.
+Only a Phoebe with no Valkey at all (no `admission.valkeyAddr` and no
+`emit.valkeyAddr`) cannot enforce contract limits; it logs that at startup.
+
 Phoebe can reserve generated capacity strictly before dispatch because the
 request declares a maximum output. It cannot derive exact rendered prompt or
 cache-hit counts from raw OpenAI JSON without duplicating Dynamo's model chat
@@ -135,9 +154,12 @@ fallback: a request that carries only the legacy headers and no
 `X-Saturn-Owner-Id` has no policy and, with admission enabled, fails closed
 with 503.
 
-The four components of that release are safe to roll in any order only
-because admission stays disabled (`admission.enabled: false`, ruling R12) for the
-whole cutover, so no replica enforces a policy envelope during the rollout.
+The four components of that release were safe to roll in any order only
+because no replica enforced a policy envelope during the rollout: admission was
+disabled (`admission.enabled: false`) and Phoebe at the time did not admit
+without it. Phoebe now enforces the scoped envelope whenever it is present,
+which relies on the edge strip of every `X-Saturn-*` header that the R8
+releases already ship.
 No current or pre-cutover Phoebe reads the legacy headers on dedicated
 routes. The scoped envelope is stamped only by the gateway ForwardAuth, on
 gateway routes; every Phoebe that still read the legacy headers preferred the
@@ -165,27 +187,32 @@ first (or in the same window), then Atlas #6715, with saturn-k8s #1073
 alongside either. Nothing reads these headers after the cutover, so dropping
 the strip once no pre-R8 replica remains is harmless.
 
-While admission is disabled, Phoebe does not require a policy envelope. Once
-admission is enabled, a missing or structurally broken policy fails closed.
+While `admission.enabled` is false, Phoebe does not require a policy envelope
+on every shared request, but it enforces any envelope that is present. Once
+`admission.enabled` is true, a missing or structurally broken policy fails
+closed.
 
-Keep `admission.enabled: false` until Saturn, Traefik, and all Phoebe replicas
-have the new envelope contract; enabling earlier is unsupported because an old
-edge does not authenticate the new headers. Then configure one shared Valkey
-and conservative measured limits and enable admission. Watch
-429 contract rejections, 503 capacity rejections by scope/dimension, and logged
-Valkey bypass/latency errors. Roll back by disabling the feature; existing leases expire without affecting billing or Dynamo. Do not
-point replicas at different Valkey instances during a rolling update.
+Set `admission.enabled: true` only after Saturn, Traefik, and all Phoebe
+replicas have the scoped envelope contract and historical per-resource shared
+routes are drained (see below). Then configure conservative measured operator
+limits. Watch 429 contract rejections, 503 capacity rejections by
+scope/dimension, and logged Valkey bypass/latency errors. Turning
+`admission.enabled` off again removes the operator tiers and the
+every-request envelope requirement; it does not stop contract enforcement,
+which is changed in Atlas UsageLimits. Existing leases expire without affecting
+billing or Dynamo. Do not point replicas at different Valkey instances during a
+rolling update.
 
 The envelope requirement applies to every shared-inference request, not only
 gateway-marked requests. The historical per-resource auth path does not stamp
 this policy contract, so drain or remove those shared routes before enabling
-admission; once enabled, a missing or partial envelope on such a route fails
-closed with 503 instead of silently granting unlimited quota.
+`admission.enabled`; once it is on, a missing or partial envelope on such a
+route fails closed with 503 instead of silently granting unlimited quota.
 Per-resource routing metadata must also be internally coherent: shared mode
 requires a non-empty served-model allow-list, dedicated or legacy-empty mode
 requires that allow-list to be absent, and unknown modes fail closed. This keeps
 model authorization and the shared isolation/admission boundary inseparable.
-During the admission-disabled migration window, a historical shared route that
+While `admission.enabled` is false, a historical shared route that
 lacks organization identity remains isolated by its trusted resource ID rather
 than sharing the empty-organization cache namespace. Enabling admission also
 requires a non-empty trusted organization ID and rejects a broken identity

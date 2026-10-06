@@ -568,9 +568,18 @@ func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request) {
 	var responseCaptureInstalled atomic.Bool
 	responseCaptureDone := make(chan struct{})
 	if id.ServingMode == identity.ServingModeShared && inferenceRequestPathAllowed(routePath) {
+		// Admission runs whenever an admitter exists (an admission store is
+		// configured) and either admission.enabled requires the envelope on
+		// every shared request, or this request carries the trusted envelope.
+		// Contract limits therefore engage whenever Atlas stamped them, with
+		// or without operator tiers (ruling R12 clarification). Only a shared
+		// request with NO envelope at all, under admission.enabled=false,
+		// skips admission: the historical per-resource routes that never
+		// carried the policy contract.
+		enforceAdmission := s.admitter != nil && (s.settings.Admission.Enabled || trustedPolicyEnvelopePresent(id))
 		tenantIdentity := id.OrgID
 		if tenantIdentity == "" {
-			if s.admitter != nil {
+			if enforceAdmission {
 				// A missing organization is a broken trusted identity contract, not
 				// a Valkey outage. Reject before deriving cache/scheduler tenancy so
 				// it can never enter the admission fail-open path.
@@ -623,13 +632,12 @@ func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request) {
 		} {
 			r.Header.Del(header)
 		}
-		if s.admitter != nil {
-			// The trusted quota envelope is part of enabled admission, not of
-			// request routing. Keeping this check behind the feature gate lets
-			// operators deploy Phoebe before Saturn begins stamping the envelope;
-			// once admission is enabled, a structurally broken policy — headers
-			// without their identity anchor, a malformed present value — fails
-			// closed, while absent limit headers parse as unlimited (R4).
+		if enforceAdmission {
+			// A structurally broken policy — limit headers without their
+			// identity anchor, a malformed present value — fails closed, while
+			// absent limit headers parse as unlimited (R4). Under
+			// admission.enabled=true a request with no envelope at all also
+			// fails closed here (errNoTrustedRateLimitPolicy).
 			organizationLimits, ownerLimits, policyErr := parseTrustedRateLimits(id)
 			if policyErr != nil {
 				s.log.Error.Printf("admission: invalid trusted rate-limit policy: %v", policyErr)

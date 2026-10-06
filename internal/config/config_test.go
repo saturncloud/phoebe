@@ -439,3 +439,76 @@ func TestLoadAdmissionDisabledWithValidLanes(t *testing.T) {
 		t.Fatalf("disabled-admission lane hints wrong: %+v", got)
 	}
 }
+
+// Contract limits have no enablement gate (ruling R12 clarification,
+// 2026-10-06): the admission store resolves from admission.valkeyAddr, else
+// from the install Valkey metering uses, whether or not admission.enabled is
+// set. admission.enabled=false clears only the operator capacity tiers.
+func TestEffectiveAdmissionStoreAndTiers(t *testing.T) {
+	t.Run("disabled, store from emit.valkeyAddr, operator tiers cleared", func(t *testing.T) {
+		s, err := Load(writeTemp(t, `
+emit:
+  valkeyAddr: "valkey:6379"
+admission:
+  enabled: false
+  organization:
+    requestsPerWindow: 30
+  lanes:
+    default:
+      weight: 1
+      dynamoPriority: 5
+  organizationLanes:
+    org-a: default
+`))
+		if err != nil {
+			t.Fatal(err)
+		}
+		cfg, ok := s.EffectiveAdmission()
+		if !ok || cfg.ValkeyAddr != "valkey:6379" {
+			t.Fatalf("store=(%q, %v), want the metering Valkey", cfg.ValkeyAddr, ok)
+		}
+		if cfg.Organization.RequestsPerWindow != nil || cfg.Lanes != nil || cfg.OrganizationLanes != nil {
+			t.Fatalf("operator tiers survived admission.enabled=false: %+v", cfg)
+		}
+		if cfg.KeyPrefix != "phoebe:admission" || cfg.LeaseTTL != 15*time.Minute || cfg.DefaultMaxOutputTokens != 4096 {
+			t.Fatalf("store defaults not applied with admission disabled: %+v", cfg)
+		}
+		// The raw settings keep the lanes: they still supply trusted Dynamo hints.
+		if s.Admission.Lanes["default"].DynamoPriority != 5 {
+			t.Fatalf("clearing the effective tiers mutated the loaded lanes: %+v", s.Admission.Lanes)
+		}
+	})
+	t.Run("explicit admission.valkeyAddr wins", func(t *testing.T) {
+		s, err := Load(writeTemp(t, "emit:\n  valkeyAddr: metering:6379\nadmission:\n  valkeyAddr: admission:6379\n"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if cfg, ok := s.EffectiveAdmission(); !ok || cfg.ValkeyAddr != "admission:6379" {
+			t.Fatalf("store=(%q, %v), want admission:6379", cfg.ValkeyAddr, ok)
+		}
+	})
+	t.Run("enabled keeps operator tiers", func(t *testing.T) {
+		s, err := Load(writeTemp(t, "admission:\n  enabled: true\n  valkeyAddr: v\n  organization:\n    requestsPerWindow: 30\n"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		cfg, ok := s.EffectiveAdmission()
+		if !ok || cfg.Organization.RequestsPerWindow == nil || *cfg.Organization.RequestsPerWindow != 30 {
+			t.Fatalf("operator tier lost with admission enabled: %+v", cfg.Organization)
+		}
+	})
+	t.Run("no Valkey at all means no store", func(t *testing.T) {
+		s, err := Load(writeTemp(t, "debug: false\n"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, ok := s.EffectiveAdmission(); ok {
+			t.Fatal("reported an admission store with no Valkey configured")
+		}
+	})
+	t.Run("disabled still rejects an invalid leaseTtl, now that it is used", func(t *testing.T) {
+		if _, err := Load(writeTemp(t, "admission:\n  enabled: false\n  leaseTtl: 10ms\n")); err == nil {
+			t.Fatal("invalid leaseTtl accepted with admission disabled")
+		}
+	})
+}
