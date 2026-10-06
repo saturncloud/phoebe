@@ -282,6 +282,11 @@ func TestContractAndOperatorLimitPrecedence(t *testing.T) {
 		return "  lanes:\n    default:\n      weight: 1\n    gold:\n      weight: 1\n      limits:\n        requestsPerWindow: " + limit +
 			"\n        window: 1m\n  organizationLanes:\n    org-1: gold\n"
 	}
+	// The unmapped organization falls back to the default lane, the path most
+	// installs take.
+	defaultLaneTier := func(limit string) string {
+		return "  lanes:\n    default:\n      weight: 1\n      limits:\n        requestsPerWindow: " + limit + "\n        window: 1m\n"
+	}
 	for _, tc := range []struct {
 		name             string
 		operatorTier     string
@@ -293,6 +298,7 @@ func TestContractAndOperatorLimitPrecedence(t *testing.T) {
 		{name: "operator tighter", operatorTier: organizationTier("20"), contract: "30", admitted: 20, status: http.StatusServiceUnavailable, body: capacityRejectBody},
 		{name: "tie answers operator 503", operatorTier: organizationTier("25"), contract: "25", admitted: 25, status: http.StatusServiceUnavailable, body: capacityRejectBody},
 		{name: "lane tie answers operator 503", operatorTier: laneTier("25"), contract: "25", admitted: 25, status: http.StatusServiceUnavailable, body: capacityRejectBody},
+		{name: "default lane tie answers operator 503", operatorTier: defaultLaneTier("25"), contract: "25", admitted: 25, status: http.StatusServiceUnavailable, body: capacityRejectBody},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			mr := frozenMiniredis(t)
