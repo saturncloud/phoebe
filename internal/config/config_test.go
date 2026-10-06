@@ -3,6 +3,7 @@ package config
 import (
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 )
@@ -429,7 +430,8 @@ func TestLoadAdmissionLeaseTTLInclusiveFloor(t *testing.T) {
 }
 
 // While admission is disabled, valid lanes must still load (weight, lane-share,
-// leaseTtl, and valkeyAddr validation stay behind the Enabled gate).
+// leaseTtl only when no admission store resolves, and valkeyAddr validation
+// stay behind the Enabled gate).
 func TestLoadAdmissionDisabledWithValidLanes(t *testing.T) {
 	s, err := Load(writeTemp(t, "admission:\n  enabled: false\n  lanes:\n    default:\n      weight: 0\n      dynamoPriority: 5\n      dynamoStrictPriority: 2\n  organizationLanes:\n    org-a: default\n"))
 	if err != nil {
@@ -506,9 +508,45 @@ admission:
 			t.Fatal("reported an admission store with no Valkey configured")
 		}
 	})
-	t.Run("disabled still rejects an invalid leaseTtl, now that it is used", func(t *testing.T) {
-		if _, err := Load(writeTemp(t, "admission:\n  enabled: false\n  leaseTtl: 10ms\n")); err == nil {
-			t.Fatal("invalid leaseTtl accepted with admission disabled")
-		}
-	})
+}
+
+// admission.leaseTtl is validated only when it is used: when an admission
+// store resolves (admission.valkeyAddr, else emit.valkeyAddr) or admission is
+// enabled. A leftover invalid value on an install with no store and admission
+// disabled was ignored before contract limits became store-gated, and must
+// still load instead of crash-looping the interceptor.
+func TestAdmissionLeaseTTLValidatedOnlyWhenStoreConfigured(t *testing.T) {
+	loads := []struct{ name, body string }{
+		{"disabled, no store, 0s", "admission:\n  enabled: false\n  leaseTtl: 0s\n"},
+		{"disabled, no store, 500ms", "admission:\n  enabled: false\n  leaseTtl: 500ms\n"},
+		{"disabled, no store, unparsable", "admission:\n  enabled: false\n  leaseTtl: \"15 m\"\n"},
+	}
+	for _, tc := range loads {
+		t.Run(tc.name+" loads", func(t *testing.T) {
+			s, err := Load(writeTemp(t, tc.body))
+			if err != nil {
+				t.Fatalf("unused leaseTtl stopped startup: %v", err)
+			}
+			if s.Admission.LeaseTTL != 15*time.Minute {
+				t.Fatalf("LeaseTTL=%s, want the 15m default when no store is configured", s.Admission.LeaseTTL)
+			}
+			if _, ok := s.EffectiveAdmission(); ok {
+				t.Fatal("reported an admission store with no Valkey configured")
+			}
+		})
+	}
+	fails := []struct{ name, body string }{
+		{"disabled, emit.valkeyAddr store, 0s", "emit:\n  valkeyAddr: metering:6379\nadmission:\n  enabled: false\n  leaseTtl: 0s\n"},
+		{"disabled, emit.valkeyAddr store, 500ms", "emit:\n  valkeyAddr: metering:6379\nadmission:\n  enabled: false\n  leaseTtl: 500ms\n"},
+		{"disabled, admission.valkeyAddr store, unitless 15", "admission:\n  enabled: false\n  valkeyAddr: admission:6379\n  leaseTtl: \"15\"\n"},
+		{"enabled, 500ms", "admission:\n  enabled: true\n  valkeyAddr: v\n  leaseTtl: 500ms\n"},
+	}
+	for _, tc := range fails {
+		t.Run(tc.name+" fails", func(t *testing.T) {
+			_, err := Load(writeTemp(t, tc.body))
+			if err == nil || !strings.Contains(err.Error(), "invalid admission.leaseTtl") {
+				t.Fatalf("err=%v, want invalid admission.leaseTtl", err)
+			}
+		})
+	}
 }

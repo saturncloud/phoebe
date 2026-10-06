@@ -95,6 +95,11 @@ emit:
 #   valkeyAddr: "valkey.saturn.svc.cluster.local:6379"
 #   keyPrefix: "phoebe:admission"
 #   leaseTtl: "15m" # minimum 1s; must exceed admission Valkey I/O latency
+#   # keyPrefix, leaseTtl and defaultMaxOutputTokens are used whenever an
+#   # admission store resolves (admission.valkeyAddr, else emit.valkeyAddr),
+#   # including with enabled: false, because contract limits are enforced then.
+#   # In that case an unparsable leaseTtl or one under 1s fails startup.
+#   # With no store at all and enabled: false, leaseTtl is not validated.
 #   defaultMaxOutputTokens: 4096
 #   platform:
 #     maxActiveRequests: 256
