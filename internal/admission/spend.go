@@ -35,6 +35,13 @@ const groupSpendNegativeCacheTTL = 10 * time.Second
 // inside admitOperationBudget so the reservation keeps its own time.
 const groupSpendQueryBudget = 250 * time.Millisecond
 
+// groupSpendStarvedFloor is the remaining shared budget below which a read
+// that times out is treated as starved by the earlier reads in the same
+// request rather than as a slow store. A read that starts with this little
+// time cannot finish against a healthy Postgres either, so its timeout says
+// nothing about the store and is neither logged nor negative-cached.
+const groupSpendStarvedFloor = 25 * time.Millisecond
+
 // groupSpendConnectTimeout bounds establishing one pool connection, so a
 // Postgres that drops packets cannot pin a dial (and with it one of the four
 // pool slots) forever.
@@ -263,6 +270,10 @@ func (l *spendFailureLog) logf(log *logging.Logger, format string, args ...inter
 type spendFlight struct {
 	mu sync.Mutex
 	in map[string]*spendFlightCall
+	// joined, when set, is called each time a caller joins an in-flight read
+	// as a waiter. It exists so a test can release the read only after a
+	// waiter has joined it; nil in production.
+	joined func(key string)
 }
 
 type spendFlightCall struct {
@@ -289,7 +300,11 @@ func newSpendFlight() *spendFlight {
 func (f *spendFlight) do(ctx context.Context, key string, fn func() (bool, error)) (spendFlightResult, bool) {
 	f.mu.Lock()
 	if call, ok := f.in[key]; ok {
+		joined := f.joined
 		f.mu.Unlock()
+		if joined != nil {
+			joined(key)
+		}
 		select {
 		case <-call.done:
 			return call.result, false

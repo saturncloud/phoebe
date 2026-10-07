@@ -49,7 +49,8 @@ CREATE TABLE group_usage (
     group_id               TEXT NOT NULL,
     -- The UTC hour bucket, same bucketing expression the rater uses for
     -- rated_usage.window_start, so a group's monthly spend sum reads
-    -- window_start >= date_trunc('month', now()) over aligned hours.
+    -- window_start >= date_trunc('month', now() AT TIME ZONE 'UTC') AT TIME ZONE 'UTC'
+    -- over aligned hours.
     window_start           TIMESTAMPTZ NOT NULL,
     prompt_tokens          BIGINT NOT NULL DEFAULT 0,
     cached_tokens          BIGINT NOT NULL DEFAULT 0,

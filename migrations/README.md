@@ -78,6 +78,12 @@ failure modes are asymmetric, so the order matters:
   rollup (zero group spend) until the new rater covers those hours.
 - A post-0008 rater fails against the old schema (SQLSTATE 42703): its rating
   statement references `member_group_ids` and `group_usage`.
+- A post-0008 drainer fails against the old schema the same way (SQLSTATE
+  42703): its INSERT names `member_group_ids`, which does not exist there yet,
+  so EVERY insert fails and every event takes the poison path — logged, ACK'd,
+  and dropped, served but never billed. `cmd/migrate up` must come first,
+  before BOTH the drainer and the rater deploy; the drainer is not safe in
+  either order.
 
 So roll code and schema together, in the migration-0007 order: run
 `cmd/migrate up`, then deploy the new drainer and rater (the drainer's INSERT

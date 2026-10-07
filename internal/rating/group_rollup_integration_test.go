@@ -232,7 +232,11 @@ func TestIntegration_GroupUsageAttribution(t *testing.T) {
 //     the rollup level, so neither clean event may attribute to gC at all;
 //   - identical pair: two genuinely different but identical-looking billable
 //     events in one rollup must BOTH attribute to gD — the DISTINCT ON
-//     (request_id, gid) dedupe must not collapse them into one.
+//     (request_id, gid) dedupe must not collapse them into one;
+//   - missing-usage twin: one event has usage_found=false, so only the
+//     usage_found gate keeps it out of the gE row;
+//   - invalid-usage twin: one event reports more cached than prompt tokens,
+//     so only the valid_usage gate keeps it out of the gF row.
 //
 // For each withheld case the group's group_usage row must carry exactly its
 // priced event(s), and the money rollup must be what a baseline WITHOUT the
@@ -268,16 +272,20 @@ func TestIntegration_GroupUsageWithheldGatesSharedGrain(t *testing.T) {
 	billed := rate.Quantized()
 
 	const (
-		gA = "a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a"
-		gB = "b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b"
-		gC = "c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c"
-		gD = "d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d"
+		gA = "a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0"
+		gB = "b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1"
+		gC = "c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2"
+		gD = "d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3"
+		gE = "e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4"
+		gF = "f5f5f5f5f5f5f5f5f5f5f5f5f5f5f5f5"
+		// gConf is the owner-conflicted event's own group (its group_id).
+		gConf = "9a9a9a9a9a9a9a9a9a9a9a9a9a9a9a9a"
 	)
 
-	// Every event is dedicated with authoritative usage; each withheld event is
-	// kept out of money by exactly ONE classification (its price, its owner
-	// conflict, or its rollup's two orgs) and shares its money grain with the
-	// priced event that must still attribute.
+	// Every event is dedicated; each withheld event is kept out of money by
+	// exactly ONE classification (its price, its owner conflict, its rollup's
+	// two orgs, its missing usage, or its invalid usage) and shares its money
+	// grain with the priced event that must still attribute.
 	type gateEvent struct {
 		req      string
 		auth     string
@@ -289,6 +297,8 @@ func TestIntegration_GroupUsageWithheldGatesSharedGrain(t *testing.T) {
 		model    string
 		base     string // billing_event.base_model ('' writes NULL)
 		prompt   int
+		cached   int
+		noUsage  bool // writes usage_found=false (the zero value is authoritative usage)
 	}
 	events := []gateEvent{
 		// (a) the unpriced twin: 'ga-ok' prices model 'm-unp' through base 'b'
@@ -301,7 +311,7 @@ func TestIntegration_GroupUsageWithheldGatesSharedGrain(t *testing.T) {
 		// drops it from money per event. Its memberships and its own group must
 		// not reach group_usage.
 		{req: "gb-ok", auth: "a-conf", members: []string{gB}, resource: "r-conf", model: "b", prompt: 25},
-		{req: "gb-bad", auth: "a-conf", user: "u-x", group: "g-conflicted", members: []string{gB}, resource: "r-conf", model: "b", prompt: 777},
+		{req: "gb-bad", auth: "a-conf", user: "u-x", group: gConf, members: []string{gB}, resource: "r-conf", model: "b", prompt: 777},
 		// (c) ambiguous_org: one resource, two distinct orgs — the rollup is
 		// withheld as a whole, so neither clean event may attribute to gC.
 		{req: "gc-1", auth: "a-org", members: []string{gC}, resource: "r-org", org: "org-x", model: "b", prompt: 50},
@@ -311,14 +321,22 @@ func TestIntegration_GroupUsageWithheldGatesSharedGrain(t *testing.T) {
 		// key would collapse them into one.
 		{req: "gd-1", auth: "a-twin", members: []string{gD}, resource: "r-twin", model: "b", prompt: 60},
 		{req: "gd-2", auth: "a-twin", members: []string{gD}, resource: "r-twin", model: "b", prompt: 60},
+		// (e) the missing-usage twin: 'ge-bad' has no authoritative usage, so
+		// it is withheld as missing usage and must not reach gE.
+		{req: "ge-ok", auth: "a-miss", members: []string{gE}, resource: "r-miss", model: "b", prompt: 30},
+		{req: "ge-bad", auth: "a-miss", members: []string{gE}, resource: "r-miss", model: "b", prompt: 888, noUsage: true},
+		// (f) the invalid-usage twin: 'gf-bad' reports more cached than prompt
+		// tokens, so it is withheld as invalid usage and must not reach gF.
+		{req: "gf-ok", auth: "a-inv", members: []string{gF}, resource: "r-inv", model: "b", prompt: 35},
+		{req: "gf-bad", auth: "a-inv", members: []string{gF}, resource: "r-inv", model: "b", prompt: 10, cached: 20},
 	}
 	for i, e := range events {
 		_, err := db.ExecContext(ctx,
 			`INSERT INTO billing_event (request_id, auth_id, user_id, group_id, member_group_ids, resource_id, org_id, model, base_model, serving_mode, usage_found, prompt_tokens, cached_tokens, completion_tokens, event_ts)
-			 VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,'dedicated',true,$10,0,0,$11)`,
+			 VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,'dedicated',$10,$11,$12,0,$13)`,
 			e.req, nullableStr(e.auth), nullableStr(e.user), nullableStr(e.group), groupIDsOrNil(e.members),
 			nullableStr(e.resource), nullableStr(e.org), nullableStr(e.model), nullableStr(e.base),
-			e.prompt, hour.Add(time.Duration(i)*time.Minute))
+			!e.noUsage, e.prompt, e.cached, hour.Add(time.Duration(i)*time.Minute))
 		if err != nil {
 			t.Fatalf("seed event %d (%s): %v", i, e.req, err)
 		}
@@ -326,12 +344,14 @@ func TestIntegration_GroupUsageWithheldGatesSharedGrain(t *testing.T) {
 
 	// Oracle for the money baseline WITHOUT the withheld events: 'ga-ok' prices
 	// at the base 'b' rate through C4 rung (c), the others price model 'b'
-	// directly — all four resolve to the same quantized rate.
+	// directly — all six resolve to the same quantized rate.
 	moneyEvents := []RatedEvent{
 		{AuthID: "a-unp", ResourceID: "r-unp", ModelID: "m-unp", BaseModel: "b", ServingMode: "dedicated", PromptTokens: 40},
 		{AuthID: "a-conf", ResourceID: "r-conf", ModelID: "b", ServingMode: "dedicated", PromptTokens: 25},
 		{AuthID: "a-twin", ResourceID: "r-twin", ModelID: "b", ServingMode: "dedicated", PromptTokens: 60},
 		{AuthID: "a-twin", ResourceID: "r-twin", ModelID: "b", ServingMode: "dedicated", PromptTokens: 60},
+		{AuthID: "a-miss", ResourceID: "r-miss", ModelID: "b", ServingMode: "dedicated", PromptTokens: 30},
+		{AuthID: "a-inv", ResourceID: "r-inv", ModelID: "b", ServingMode: "dedicated", PromptTokens: 35},
 	}
 	costs := make([]Dec, len(moneyEvents))
 	for i, e := range moneyEvents {
@@ -344,30 +364,36 @@ func TestIntegration_GroupUsageWithheldGatesSharedGrain(t *testing.T) {
 		t.Fatalf("RateWindow: %v", err)
 	}
 
-	// Money is exactly the priced baseline: the three priced rollups (one per
-	// grain), four rated events, and a total equal to the sum of the four
+	// Money is exactly the priced baseline: the five priced rollups (one per
+	// grain), six rated events, and a total equal to the sum of the six
 	// oracle costs. The withheld events changed nothing.
-	if res.RollupsWritten != 3 || res.EventsRated != 4 {
-		t.Fatalf("rollups/events = %d/%d, want 3/4 (the priced baseline only)", res.RollupsWritten, res.EventsRated)
+	if res.RollupsWritten != 5 || res.EventsRated != 6 {
+		t.Fatalf("rollups/events = %d/%d, want 5/6 (the priced baseline only)", res.RollupsWritten, res.EventsRated)
 	}
-	wantTotal := costs[0].Add(costs[1]).Add(costs[2]).Add(costs[3]).String()
+	wantTotalDec := costs[0]
+	for _, c := range costs[1:] {
+		wantTotalDec = wantTotalDec.Add(c)
+	}
+	wantTotal := wantTotalDec.String()
 	if MustDec(res.TotalCost).String() != wantTotal {
 		t.Fatalf("total cost = %s, want %s (the priced baseline only)", res.TotalCost, wantTotal)
 	}
 	// The withheld events are classified, not silently dropped: the anomaly
-	// partition accounts for all 8 seeded events exactly once.
-	if res.UnpricedEvents != 1 || res.OwnerConflictEvents != 1 || res.AmbiguousOrgEvents != 2 {
-		t.Fatalf("unpriced/conflict/ambig-org = %d/%d/%d, want 1/1/2",
-			res.UnpricedEvents, res.OwnerConflictEvents, res.AmbiguousOrgEvents)
+	// partition accounts for all 12 seeded events exactly once.
+	if res.UnpricedEvents != 1 || res.OwnerConflictEvents != 1 || res.AmbiguousOrgEvents != 2 ||
+		res.MissingUsageEvents != 1 || res.InvalidUsageEvents != 1 {
+		t.Fatalf("unpriced/conflict/ambig-org/missing/invalid = %d/%d/%d/%d/%d, want 1/1/2/1/1",
+			res.UnpricedEvents, res.OwnerConflictEvents, res.AmbiguousOrgEvents,
+			res.MissingUsageEvents, res.InvalidUsageEvents)
 	}
 	if got := res.EventsRated + res.MissingUsageEvents + res.InvalidUsageEvents +
 		res.UnpricedEvents + res.UnattributableEvents + res.InvalidServingModeEvents +
-		res.AmbiguousBaseEvents + res.AmbiguousOrgEvents + res.OwnerConflictEvents; got != 8 {
-		t.Fatalf("anomaly partition = %d, want 8 (all seeded events accounted exactly once)", got)
+		res.AmbiguousBaseEvents + res.AmbiguousOrgEvents + res.OwnerConflictEvents; got != 12 {
+		t.Fatalf("anomaly partition = %d, want 12 (all seeded events accounted exactly once)", got)
 	}
-	if res.GroupRollupsWritten != 3 {
-		t.Fatalf("group rollups = %d, want 3 (groups %s, %s, %s)",
-			res.GroupRollupsWritten, gA[:8], gB[:8], gD[:8])
+	if res.GroupRollupsWritten != 5 {
+		t.Fatalf("group rollups = %d, want 5 (groups %s, %s, %s, %s, %s)",
+			res.GroupRollupsWritten, gA[:8], gB[:8], gD[:8], gE[:8], gF[:8])
 	}
 
 	type groupRow struct {
@@ -409,7 +435,7 @@ func TestIntegration_GroupUsageWithheldGatesSharedGrain(t *testing.T) {
 	if rB.count != 1 || rB.prompt != 25 || MustDec(rB.cost).String() != costs[1].String() {
 		t.Fatalf("group %s row = %+v, want count 1 / prompt 25 / cost %s (the clean twin only)", gB, rB, costs[1])
 	}
-	if _, ok := readRow("g-conflicted"); ok {
+	if _, ok := readRow(gConf); ok {
 		t.Fatalf("the conflicted event's own group reached group_usage; the owner_conflict twin must attribute nowhere")
 	}
 
@@ -435,6 +461,28 @@ func TestIntegration_GroupUsageWithheldGatesSharedGrain(t *testing.T) {
 	if rD.count != 2 || rD.prompt != 120 || MustDec(rD.cost).String() != twinCost {
 		t.Fatalf("group %s row = %+v, want count 2 / prompt 120 / cost %s (both events attribute)",
 			gD, rD, twinCost)
+	}
+
+	// (e) gE carries 'ge-ok' alone: dropping the usage_found gate would add
+	// 'ge-bad' (count 2, prompt 918).
+	rE, ok := readRow(gE)
+	if !ok {
+		t.Fatalf("no group_usage row for %s", gE)
+	}
+	if rE.count != 1 || rE.prompt != 30 || rE.billable != 30 || MustDec(rE.cost).String() != costs[4].String() {
+		t.Fatalf("group %s row = %+v, want count 1 / prompt 30 / billable 30 / cost %s (the priced twin only)",
+			gE, rE, costs[4])
+	}
+
+	// (f) gF carries 'gf-ok' alone: dropping the valid_usage gate would add
+	// 'gf-bad' (count 2, prompt 45).
+	rF, ok := readRow(gF)
+	if !ok {
+		t.Fatalf("no group_usage row for %s", gF)
+	}
+	if rF.count != 1 || rF.prompt != 35 || rF.billable != 35 || MustDec(rF.cost).String() != costs[5].String() {
+		t.Fatalf("group %s row = %+v, want count 1 / prompt 35 / billable 35 / cost %s (the priced twin only)",
+			gF, rF, costs[5])
 	}
 }
 

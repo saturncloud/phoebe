@@ -194,20 +194,37 @@ func TestParseTrustedGroupScopes(t *testing.T) {
 		}
 	})
 
-	t.Run("over the size bound", func(t *testing.T) {
-		// 16 maximal entries (32-hex gid + ":,,,,") plus the v1; prefix stays
-		// under 4 KiB, so pad one entry's (unused) spend field to cross it.
+	t.Run("maximal valid envelope stays under the size bound", func(t *testing.T) {
+		// K4B: a >4 KiB fixture built only from grammatically valid entries
+		// does not exist. The 16-entry cap bounds the count and every field
+		// is length-bounded by its own grammar, so the largest envelope the
+		// grammar admits is the one below — 16 entries, every rate at the 18
+		// nines that stay inside int64, every spend cap at spendCapRe's
+		// 11+9 digits, about 2 KiB, half the 4 KiB bound. Any header long
+		// enough to reach 4 KiB is malformed in at least one other way (an
+		// over-long spend field fails spendCapRe first), so the parser's
+		// size check is defense-in-depth ordering, not a bound a valid
+		// producer can ever hit — no valid-but-oversize fixture can pin it.
+		// The transport-level ceiling on any single header is the HTTP
+		// server's MaxHeaderBytes-style limit (net/http's default header
+		// block, which server.go does not override). The bounds the grammar
+		// actually enforces are pinned here and in the siblings above: this
+		// maximal envelope parses, and the shapes that could approach 4 KiB
+		// fail on the 16-entry cap (the "over the entry bound" case) or the
+		// per-entry grammar (the malformed table) — remove either check and
+		// this test's siblings fail.
+		maxRate := strings.Repeat("9", 18)  // largest rate that still fits int64
+		maxSpend := "99999999999.999999999" // largest spend spendCapRe admits
 		entries := make([]string, 0, maxGroupScopeEntries)
 		for i := 0; i < maxGroupScopeEntries; i++ {
-			entries = append(entries, groupIDFor(i)+":,,,,")
+			entries = append(entries, groupIDFor(i)+":"+maxRate+","+maxRate+","+maxRate+","+maxRate+","+maxSpend)
 		}
 		in := "v1;" + strings.Join(entries, ";")
-		in += strings.Repeat("0", maxGroupScopeBytes-len(in))
-		if len(in) != maxGroupScopeBytes {
-			t.Fatalf("fixture size = %d, want exactly the %d-byte bound", len(in), maxGroupScopeBytes)
+		if len(in) >= maxGroupScopeBytes {
+			t.Fatalf("maximal valid envelope = %d bytes, want under the %d-byte bound — the fixture must stay the largest the grammar admits", len(in), maxGroupScopeBytes)
 		}
-		if _, err := parseTrustedGroupScopes(identity.Identity{GroupScopes: in}); err == nil {
-			t.Fatalf("parse of a %d-byte header succeeded, want the size bound enforced", len(in))
+		if _, err := parseTrustedGroupScopes(identity.Identity{GroupScopes: in}); err != nil {
+			t.Fatalf("parse of the maximal valid envelope (%d bytes) failed: %v", len(in), err)
 		}
 	})
 }
@@ -528,5 +545,60 @@ func TestSharedGroupScopesEnforcedWithAdmissionFlagOff(t *testing.T) {
 	// ran: skipping the store for an unlimited envelope never drops it.
 	if got := evs[0].MemberGroupIDs; len(got) != 1 || got[0] != testGroupA {
 		t.Fatalf("MemberGroupIDs = %v, want [%s]", got, testGroupA)
+	}
+}
+
+// TestSharedGroupScopesOnlyEnvelopeFailsClosedWithAdmissionFlagOff closes the
+// trigger hole in the enabled=false test above: that one builds on
+// sharedRequest, which always stamps X-Saturn-Owner-Id, so its owner-id
+// anchor alone makes trustedPolicyEnvelopePresent true — a regression
+// dropping id.GroupScopes != "" from that function would leave every case
+// above green. This test sends the group envelope with NO other trusted
+// policy header: the owner-id anchor and every scoped rate-limit header are
+// deleted, so only the group clause of trustedPolicyEnvelopePresent can
+// engage admission.
+//
+// What the proxy actually answers for that shape, and why it is not 429 or
+// 200: parseTrustedRateLimits runs first inside the admission block and
+// fails closed on the missing contract anchor (errNoTrustedRateLimitPolicy),
+// so the request is refused 503 before the group scopes are even parsed — a
+// group zero cap can never be the rejecting reason here, and a within-limits
+// envelope is never admitted either. Group enforcement under
+// admission.enabled=false is only reachable WITH the owner-id anchor (the
+// tests above); this shape pins the trigger, not the enforcement.
+//
+// The pin: with the group envelope as the only trusted header, both a zero
+// cap and a within-limits envelope answer 503 and never reach the upstream.
+// Drop id.GroupScopes != "" from trustedPolicyEnvelopePresent and both are
+// forwarded (200), failing this test.
+func TestSharedGroupScopesOnlyEnvelopeFailsClosedWithAdmissionFlagOff(t *testing.T) {
+	up, hits := sharedGroupBackend(t)
+	s, _ := proxyWithGroupScopesEnabled(t, false, nil)
+
+	// Only the group envelope: the owner-id anchor and every scoped
+	// rate-limit header deleted.
+	groupOnly := func(envelope string) *http.Request {
+		req := groupScopesRequest(t, up, envelope)
+		req.Header.Del(identity.HeaderOwnerID)
+		for _, header := range identity.ScopedRateLimitHeaders {
+			req.Header.Del(header)
+		}
+		return req
+	}
+
+	rr := httptest.NewRecorder()
+	s.Handler().ServeHTTP(rr, groupOnly(groupScopesValue(testGroupA, "0,,,", "")))
+	if rr.Code != http.StatusServiceUnavailable {
+		t.Fatalf("group-only zero-cap status=%d, want 503 (the contract-anchor parse fails closed before group scopes)", rr.Code)
+	}
+
+	rr = httptest.NewRecorder()
+	s.Handler().ServeHTTP(rr, groupOnly(groupScopesValue(testGroupA, "30,,,", "")))
+	if rr.Code != http.StatusServiceUnavailable {
+		t.Fatalf("group-only within-limits status=%d, want 503", rr.Code)
+	}
+
+	if *hits != 0 {
+		t.Fatalf("upstream hits=%d, want 0 — a group-only request never forwards; with the group clause dropped from trustedPolicyEnvelopePresent both requests are admitted and this fails", *hits)
 	}
 }

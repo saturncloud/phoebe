@@ -351,8 +351,10 @@ func TestGroupSpendHungStoreFailsOpenWithinBudget(t *testing.T) {
 		t.Fatalf("hung-store admit: %v, want fail-open admission", err)
 	}
 	_ = lease.Complete(context.Background(), 0)
-	if elapsed > admitOperationBudget {
-		t.Fatalf("hung-store admit took %v, want it bounded by the spend query budget (%v)", elapsed, groupSpendQueryBudget)
+	// Bounded by the spend budget, not the wider admit budget — and it did
+	// wait for that budget, so an instant answer cannot pass this test.
+	if elapsed >= 2*groupSpendQueryBudget || elapsed < groupSpendQueryBudget/2 {
+		t.Fatalf("hung-store admit took %v, want about one spend query budget (%v)", elapsed, groupSpendQueryBudget)
 	}
 	out := buf.String()
 	if !strings.Contains(out, "monthly spend cap NOT enforced (fail open)") || !strings.Contains(out, context.DeadlineExceeded.Error()) {
@@ -469,6 +471,9 @@ func TestGroupSpendLeaderCancelDoesNotCancelCoalescedQuery(t *testing.T) {
 	store := &releasedSpendStore{entered: make(chan struct{}), release: make(chan struct{})}
 	a.WithGroupSpend(store, logging.New(logging.ERROR))
 
+	joined := make(chan struct{}, 1)
+	a.spendFlight.joined = func(string) { joined <- struct{}{} }
+
 	leaderCtx, cancelLeader := context.WithCancel(context.Background())
 	leaderDone := make(chan struct{})
 	go func() {
@@ -490,8 +495,8 @@ func TestGroupSpendLeaderCancelDoesNotCancelCoalescedQuery(t *testing.T) {
 		}
 		waiterErr <- err
 	}()
-	// Let the waiter join the in-flight read, then let the read answer.
-	time.Sleep(20 * time.Millisecond)
+	// Let the read answer only once the waiter has joined it.
+	<-joined
 	close(store.release)
 
 	err := <-waiterErr
@@ -505,6 +510,86 @@ func TestGroupSpendLeaderCancelDoesNotCancelCoalescedQuery(t *testing.T) {
 	store.mu.Unlock()
 	if calls != 1 {
 		t.Fatalf("store calls = %d, want 1 (the waiter shares the leader's read)", calls)
+	}
+}
+
+// slowSpendStore models a healthy but slow Postgres: it answers below-cap
+// after its latency, and counts reads per group. So that the test does not
+// depend on scheduler timing, a read that has enough time left answers with
+// room to spare (it never takes more than half the time remaining), and a
+// read that starts under groupSpendStarvedFloor runs out its deadline — the
+// starved case the check must not report as an outage.
+type slowSpendStore struct {
+	latency time.Duration
+	mu      sync.Mutex
+	calls   map[string]int
+}
+
+func (s *slowSpendStore) GroupSpendExhausted(ctx context.Context, groupID, _ string) (bool, error) {
+	s.mu.Lock()
+	s.calls[groupID]++
+	s.mu.Unlock()
+	wait := s.latency
+	if deadline, ok := ctx.Deadline(); ok {
+		left := time.Until(deadline)
+		if left < groupSpendStarvedFloor {
+			<-ctx.Done()
+			return false, ctx.Err()
+		}
+		wait = min(wait, left/2)
+	}
+	select {
+	case <-time.After(wait):
+		return false, nil
+	case <-ctx.Done():
+		return false, ctx.Err()
+	}
+}
+
+func (s *slowSpendStore) Calls(groupID string) int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.calls[groupID]
+}
+
+// TestGroupSpendBudgetExhaustionNotLoggedAsOutage: six uncached capped groups
+// against a store that answers in ~60ms cannot all fit in one shared 250ms
+// budget. The later groups run out of budget because of their siblings, not
+// because the store is down: the request admits (fail open) without the
+// outage ERROR line, and no negative cache entry is recorded, so the next
+// request for a starved group queries the store again.
+func TestGroupSpendBudgetExhaustionNotLoggedAsOutage(t *testing.T) {
+	a, _ := testAdmitter(t, config.AdmissionSettings{})
+	log := logging.New(logging.ERROR)
+	var buf bytes.Buffer
+	log.Error.SetOutput(&buf)
+	store := &slowSpendStore{latency: 60 * time.Millisecond, calls: map[string]int{}}
+	a.WithGroupSpend(store, log)
+
+	scopes := make([]GroupScope, 6)
+	for i := range scopes {
+		scopes[i] = groupScope(fmt.Sprintf("%032x", i+1), nil, "100")
+	}
+	lease, err := a.Admit(context.Background(), groupRequest("org-be", "m", scopes...))
+	if err != nil {
+		t.Fatalf("6-group slow-store admit: %v, want fail-open admission", err)
+	}
+	_ = lease.Complete(context.Background(), 0)
+	if out := buf.String(); strings.Contains(out, "monthly spend cap NOT enforced") {
+		t.Fatalf("budget-starved groups logged as an outage: %q, want no bypass ERROR", out)
+	}
+
+	// The last group can never fit (6 x 60ms > 250ms). With a fresh budget
+	// its own request reads the store instead of hitting a negative entry.
+	last := scopes[len(scopes)-1]
+	before := store.Calls(last.GroupID)
+	lease, err = a.Admit(context.Background(), groupRequest("org-be", "m", last))
+	if err != nil {
+		t.Fatalf("starved-group admit: %v, want admission (below cap)", err)
+	}
+	_ = lease.Complete(context.Background(), 0)
+	if got := store.Calls(last.GroupID); got != before+1 {
+		t.Fatalf("starved group store calls = %d, want %d (no negative cache entry after starvation)", got, before+1)
 	}
 }
 

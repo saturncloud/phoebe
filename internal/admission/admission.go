@@ -509,6 +509,9 @@ func (a *RedisAdmitter) checkGroupSpend(ctx context.Context, scopes []GroupScope
 			defer cancelBudget()
 		}
 		deadline, _ := budgetCtx.Deadline()
+		// startBudget is what was left of the shared budget when this read
+		// began. Only the leader runs the read, so only the leader sets it.
+		var startBudget time.Duration
 		// Collapse concurrent misses on one (group, cap) into a single store
 		// read: waiters take the leader's result (verdict, or fail-open on
 		// error) instead of each running their own query against a slow store.
@@ -519,6 +522,7 @@ func (a *RedisAdmitter) checkGroupSpend(ctx context.Context, scopes []GroupScope
 			// this read, and one client disconnecting must not end it and
 			// hand every waiter a free admit. The shared deadline still
 			// bounds it.
+			startBudget = time.Until(deadline)
 			queryCtx, cancel := context.WithDeadline(context.WithoutCancel(ctx), deadline)
 			defer cancel()
 			return a.spendStore.GroupSpendExhausted(queryCtx, gs.GroupID, gs.SpendCap)
@@ -530,7 +534,15 @@ func (a *RedisAdmitter) checkGroupSpend(ctx context.Context, scopes []GroupScope
 			// guards the same race at renew time). The 250ms deadline
 			// expiring with a live client IS logged: the store is too slow.
 			// Only the leader records and logs — waiters share its outcome.
-			if leader && ctx.Err() == nil {
+			//
+			// A read that began with almost none of the shared budget left
+			// and then ran out of time was starved by the reads of earlier
+			// groups in this request; that is not evidence of an outage. It
+			// fails open without the ERROR line and without a negative cache
+			// entry, so the group's next request queries the store again
+			// instead of skipping its cap for groupSpendNegativeCacheTTL.
+			starved := errors.Is(result.err, context.DeadlineExceeded) && startBudget < groupSpendStarvedFloor
+			if leader && ctx.Err() == nil && !starved {
 				a.spendCache.storeFailure(gs.GroupID, gs.SpendCap)
 				a.spendBypass(gs.GroupID, result.err)
 			}
