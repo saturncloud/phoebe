@@ -98,6 +98,11 @@ type Result struct {
 	// than a guessed one. Reported so lost attribution is visible.
 	AmbiguousGraphRollups int64
 	RollupsWritten        int64 // distinct grain rows upserted (see rated_usage_grain_uq)
+	GroupRollupsWritten   int64 // group_usage attribution rows upserted (NOT money — see RateResult.GroupRollupsWritten)
+	// GroupReconciledDeletions is stale in-window group_usage rows this run
+	// deleted (same reconcile contract as ReconciledDeletions, at the
+	// attribution grain). 0 on a first run or a clean identical re-run.
+	GroupReconciledDeletions int64
 	// UnratedHours counts hours in the window that were SKIPPED — prices could not
 	// be obtained, or rating them failed. Each hour is independent and the upsert is
 	// idempotent, so a skipped hour is rated by a later run whose trailing window
@@ -256,6 +261,8 @@ func (r *Rater) Run(ctx context.Context, windowStart, windowEnd time.Time, windo
 	}
 	res.EventsRated = rr.EventsRated
 	res.RollupsWritten = rr.RollupsWritten
+	res.GroupRollupsWritten = rr.GroupRollupsWritten
+	res.GroupReconciledDeletions = rr.GroupReconciledDeletions
 	res.ReconciledDeletions = rr.ReconciledDeletions
 	res.TotalCost = rr.TotalCost
 	res.UnpricedEvents = rr.UnpricedEvents
@@ -347,6 +354,11 @@ func (r *Rater) Run(ctx context.Context, windowStart, windowEnd time.Time, windo
 		r.log.Info.Printf("rating: window [%s,%s) rated %d events into %d rollups, total=%s USD",
 			windowStart.Format(time.RFC3339), windowEnd.Format(time.RFC3339),
 			res.EventsRated, res.RollupsWritten, res.TotalCost)
+	}
+	if res.GroupRollupsWritten > 0 || res.GroupReconciledDeletions > 0 {
+		r.log.Info.Printf("rating: window [%s,%s) attributed usage to %d group_usage rollup(s) (membership-aware group quotas — attribution, NOT money; the same event cost legitimately appears under every group it belongs to); %d stale group rollup(s) reconcile-deleted",
+			windowStart.Format(time.RFC3339), windowEnd.Format(time.RFC3339),
+			res.GroupRollupsWritten, res.GroupReconciledDeletions)
 	}
 	return res, nil
 }
@@ -474,6 +486,8 @@ func (r *Rater) RunWindow(ctx context.Context, windowStart, windowEnd time.Time,
 func (r *Result) accumulate(hour Result) {
 	r.EventsRated += hour.EventsRated
 	r.RollupsWritten += hour.RollupsWritten
+	r.GroupRollupsWritten += hour.GroupRollupsWritten
+	r.GroupReconciledDeletions += hour.GroupReconciledDeletions
 	r.ReconciledDeletions += hour.ReconciledDeletions
 	r.UnpricedEvents += hour.UnpricedEvents
 	r.UnattributableEvents += hour.UnattributableEvents

@@ -41,7 +41,18 @@ type RateResult struct {
 	// wide window can exceed 2^31. Widened with the ::bigint SQL casts to avoid a
 	// silent 32-bit overflow.
 	RollupsWritten int64
-	EventsRated    int64
+	// GroupRollupsWritten is how many group_usage attribution rows this run
+	// upserted (membership-aware group quotas, ruled 2026-10-07). ATTRIBUTION,
+	// not money: the same event cost legitimately appears under every group it
+	// is attributed to, so this count (and the group cost sums) must never be
+	// read as billing volume. rated_usage's money write count is unchanged.
+	GroupRollupsWritten int64
+	// GroupReconciledDeletions is how many in-window group_usage rows this run
+	// DELETED as stale — the same "what the latest run says is what bills"
+	// reconcile rated_usage performs, at the attribution grain. 0 on a first
+	// run or a clean identical re-run.
+	GroupReconciledDeletions int64
+	EventsRated              int64
 	// ReconciledDeletions is how many stale rated_usage rows this run DELETED because
 	// they billed in a prior run but fell out of the current priced set (re-rate
 	// convergence — "what the latest run says is what bills"). 0 on a first run or a
@@ -214,7 +225,12 @@ CREATE TEMP TABLE rating_derived (
 ) ON COMMIT DROP`
 
 // rateWindowSQL resolves, sums, upserts, and counts in ONE statement over the
-// transient rating_price table (populated from the YAML PriceBook for this run).
+// transient rating_price table (populated from the YAML PriceBook for this
+// run). It writes TWO rollups from the same snapshot: the money rollup
+// (rated_usage — written exactly once per window, schema and grain unchanged)
+// and the group attribution rollup (group_usage, migration 0008 — the same
+// events attributed to each group that counts against them; attribution, not
+// money).
 //
 // RESOLUTION (the C4 ladder, precedence a > b > c > d; the Go mirror is
 // PriceBook.ResolveEvent): vLLM serves Token Factory endpoints under the ENDPOINT
@@ -360,6 +376,18 @@ WITH ev AS (
         -- owner_conflict: both a user AND a group on one event. Carried so the grouped
         -- gate below can withhold the whole rollup rather than bill a guessed owner.
         (COALESCE(user_id, '') <> '' AND COALESCE(group_id, '') <> '') AS owner_conflict,
+        -- GROUP ATTRIBUTION (membership-aware group quotas, ruled 2026-10-07):
+        -- the token's own group (group-token case) plus the caller's memberships
+        -- (X-Saturn-Group-Scopes). Both feed the group_usage rollup below;
+        -- neither enters the money grain — rated_usage is unchanged.
+        group_id,
+        member_group_ids,
+        -- request_id: the event id, carried ONLY so the attribution dedupe can
+        -- key on it (DISTINCT ON (request_id, gid): one event whose own group
+        -- also appears in member_group_ids must attribute once, and without a
+        -- unique event key two genuinely different events with identical
+        -- counts and cost would collapse into one).
+        request_id,
         -- graph_k8s_name: the DynamoGraphDeployment that served the request -- the cost
         -- centre. Carried as EVIDENCE onto the rollup, never a grain key: a shared graph
         -- serves many orgs and has no database row, so without it shared-mode cost is
@@ -400,6 +428,9 @@ resolved AS (
         ev.owner_type,
         ev.owner_id,
         ev.owner_conflict,
+        ev.group_id,
+        ev.member_group_ids,
+        ev.request_id,
         ev.graph_k8s_name,
         ev.ev_ts,
         ev.usage_found,
@@ -688,8 +719,7 @@ upserted AS (
     -- the cross-rater hazard is unreachable and no delete-lock-ordering machinery is
     -- added here. See cmd/rater's package doc for the single-flight contract.
     ORDER BY auth_id, owner_type, owner_id, resource_id, model_id, serving_mode, window_start
-    ON CONFLICT (auth_id, owner_type, owner_id, resource_id, model_id, serving_mode, window_start) DO UPDATE SET
-        -- Refresh org_id on re-rate, but NEVER erase a known org: COALESCE prefers the
+    ON CONFLICT (auth_id, owner_type, owner_id, resource_id, model_id, serving_mode, window_start) DO UPDATE SET        -- Refresh org_id on re-rate, but NEVER erase a known org: COALESCE prefers the
         -- new snapshot's org and FALLS BACK to the existing row's org when the new one is
         -- NULL. So a rollup first written with a NULL org (header not yet wired) picks up
         -- the real org on a later re-rate (NULL -> real, convergence), but a re-rate over
@@ -734,10 +764,124 @@ upserted AS (
         event_count             = EXCLUDED.event_count,
         rated_at                = now()
     RETURNING event_count, cost
+),
+-- ---------------------------------------------------------------------------
+-- GROUP ATTRIBUTION (group_usage; membership-aware group quotas, ruled
+-- 2026-10-07): while the same statement writes the window's money into
+-- rated_usage, it ALSO upserts the per-(group, hour) attribution rollup the
+-- admission group spend check reads. Attribution, not money: an event
+-- attributed to N groups contributes to N group rows (the same event cost
+-- appears under each), and WITHHELD (non-money) events contribute nothing —
+-- an event reaches attributed only if it also entered a priced rollup, so the
+-- rollup's rows and the money always agree on what was served. rated_usage's
+-- schema, grain, and write count are untouched: money is still written
+-- exactly once.
+-- ---------------------------------------------------------------------------
+attributed AS (
+    -- Per (event, group) rows for the events that entered money. priced
+    -- already excludes the rollup-level ambiguity gates, so joining resolved
+    -- back onto priced on the FULL grain re-attaches exactly the events of
+    -- money rollups. The per-event money gates are re-applied on the resolved
+    -- side: a failing event of the same grain (an unpriced/invalid twin in an
+    -- otherwise priced rollup) must not sneak in with its rollup. DISTINCT ON
+    -- (request_id, gid) dedupes the one legitimate duplication — an event
+    -- whose own group ALSO appears in member_group_ids — while the event id
+    -- keeps two genuinely different but identical-looking events distinct.
+    SELECT DISTINCT ON (pe.request_id, g.gid)
+        g.gid                                              AS group_id,
+        p.window_start                                     AS window_start,
+        pe.prompt_tokens                                   AS prompt_tokens,
+        pe.cached_tokens                                   AS cached_tokens,
+        pe.completion_tokens                               AS completion_tokens,
+        pe.billable_prompt                                 AS billable_prompt_tokens,
+        (pe.billable_prompt   * pe.prompt_price
+       + pe.cached_tokens     * pe.cached_price
+       + pe.completion_tokens * pe.completion_price)     AS event_cost
+    FROM priced p
+    JOIN resolved pe
+      ON pe.auth_id      = p.auth_id
+     AND pe.owner_type   = p.owner_type
+     AND pe.owner_id     = p.owner_id
+     AND pe.resource_id  = p.resource_id
+     AND pe.model_id     = p.model_id
+     AND pe.serving_mode = p.serving_mode
+     AND date_trunc('hour', pe.ev_ts AT TIME ZONE 'UTC') AT TIME ZONE 'UTC' = p.window_start
+    CROSS JOIN LATERAL (
+        -- The token's own group (group-token case) PLUS each membership gid.
+        -- COALESCE both operands: NULL || anything is NULL in Postgres, and an
+        -- event with neither source simply attributes to no group. The empty-
+        -- string guard is belt-and-braces: the envelope parser never emits one.
+        SELECT gid
+        FROM unnest(COALESCE(pe.member_group_ids, '{}'::text[])
+                 || COALESCE(ARRAY[pe.group_id],    '{}'::text[])) AS u(gid)
+        WHERE gid IS NOT NULL AND gid <> ''
+    ) g
+    WHERE pe.usage_found
+      AND pe.valid_usage
+      AND pe.prompt_price IS NOT NULL
+      AND pe.auth_id      IS NOT NULL
+      AND pe.resource_id  IS NOT NULL
+      AND pe.model_id     IS NOT NULL
+      AND NOT pe.owner_conflict
+      AND pe.valid_serving_mode
+),
+group_rollup AS (
+    SELECT
+        group_id,
+        window_start,
+        SUM(prompt_tokens)::bigint     AS prompt_tokens,
+        SUM(cached_tokens)::bigint     AS cached_tokens,
+        SUM(completion_tokens)::bigint AS completion_tokens,
+        SUM(billable_prompt_tokens)::bigint AS billable_prompt_tokens,
+        SUM(event_cost)                AS cost,
+        COUNT(*)::bigint               AS event_count
+    FROM attributed
+    GROUP BY group_id, window_start
+),
+group_deleted AS (
+    -- Reconcile, the SAME contract as rated_usage's deleted CTE: an in-window
+    -- group_usage row this run does NOT reproduce is stale (its events became
+    -- withheld, or the window re-rated under different attribution), and a
+    -- clean re-run reproduces every row so nothing matches. Single-flight and
+    -- hour-aligned windows (cmd/rater's contract) make the delete safe.
+    DELETE FROM group_usage gu
+    WHERE gu.window_start >= $1
+      AND gu.window_start <  $2
+      AND NOT EXISTS (
+          SELECT 1 FROM group_rollup gr
+          WHERE gr.group_id     = gu.group_id
+            AND gr.window_start = gu.window_start
+      )
+    RETURNING gu.group_id
+),
+group_upserted AS (
+    INSERT INTO group_usage (
+        group_id, window_start, prompt_tokens, cached_tokens, completion_tokens,
+        billable_prompt_tokens, cost, event_count
+    )
+    SELECT
+        group_id, window_start, prompt_tokens, cached_tokens, completion_tokens,
+        billable_prompt_tokens, cost, event_count
+    FROM group_rollup
+    -- Same deterministic-order discipline as the rated_usage upsert.
+    ORDER BY group_id, window_start
+    ON CONFLICT (group_id, window_start) DO UPDATE SET
+        prompt_tokens          = EXCLUDED.prompt_tokens,
+        cached_tokens          = EXCLUDED.cached_tokens,
+        completion_tokens      = EXCLUDED.completion_tokens,
+        billable_prompt_tokens = EXCLUDED.billable_prompt_tokens,
+        cost                   = EXCLUDED.cost,
+        event_count            = EXCLUDED.event_count
+    RETURNING group_id
 )
 SELECT
     (SELECT COUNT(*)::bigint                      FROM upserted) AS rollups_written,
     (SELECT COALESCE(SUM(event_count), 0)::bigint FROM upserted) AS events_rated,
+    -- Group attribution rollup (group_usage), from the same snapshot: rows
+    -- upserted, and stale in-window rows the reconcile deleted. Attribution,
+    -- not money — group_rollups_total is NOT added to total_cost.
+    (SELECT COUNT(*)::bigint FROM group_upserted)                AS group_rollups_written,
+    (SELECT COUNT(*)::bigint FROM group_deleted)                 AS group_reconciled_deletions,
     (SELECT COALESCE(SUM(cost), 0)::numeric       FROM upserted) AS total_cost,
     -- Stale rollups DELETED by the reconcile (re-rate convergence). Rows that billed
     -- in a prior run but fell out of priced this run; surfaced so a re-rate that
@@ -914,7 +1058,7 @@ func (s *PostgresStore) RateWindow(ctx context.Context, book *PriceBook, start, 
 	var res RateResult
 	var total string
 	err = tx.QueryRowContext(ctx, rateWindowSQL, start.UTC(), end.UTC(), ftLikePattern).
-		Scan(&res.RollupsWritten, &res.EventsRated, &total, &res.ReconciledDeletions,
+		Scan(&res.RollupsWritten, &res.EventsRated, &res.GroupRollupsWritten, &res.GroupReconciledDeletions, &total, &res.ReconciledDeletions,
 			&res.UnpricedEvents, &res.UnattributableEvents, &res.MissingUsageEvents,
 			&res.ExpectedMissingUsageEvents, &res.UnexplainedMissingUsageEvents,
 			&res.InvalidUsageEvents, &res.AmbiguousBaseEvents,

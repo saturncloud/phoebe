@@ -155,6 +155,9 @@ func newHarness(t *testing.T, schema string) *harness {
 	// 0007 makes rated_usage.serving_mode 'shared'/'dedicated' only (CHECK, no
 	// default); the rater's upsert must satisfy it.
 	mustExec(t, db, readMigration(t, "0007_serving_mode_explicit.up.sql"))
+	// 0008 adds billing_event.member_group_ids (in the drainer's INSERT and the
+	// rater's group attribution) and the group_usage table the rater upserts.
+	mustExec(t, db, readMigration(t, "0008_group_scopes.up.sql"))
 
 	mr, err := miniredis.Run()
 	if err != nil {
