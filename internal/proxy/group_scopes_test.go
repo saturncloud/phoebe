@@ -3,6 +3,7 @@ package proxy
 import (
 	"context"
 	"errors"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -600,5 +601,104 @@ func TestSharedGroupScopesOnlyEnvelopeFailsClosedWithAdmissionFlagOff(t *testing
 
 	if *hits != 0 {
 		t.Fatalf("upstream hits=%d, want 0 — a group-only request never forwards; with the group clause dropped from trustedPolicyEnvelopePresent both requests are admitted and this fails", *hits)
+	}
+}
+
+// TestSharedGroupGeneratedCapClampsUndeclaredMaxTokensReservation: the
+// undeclared-max_tokens output reservation is clamped to the tightest
+// positive generated-token limit across EVERY scope class on the request —
+// organization, owner, and each stamped group scope. A group whose generated
+// cap sits below the configured default reserves the cap, not the default, so
+// its undeclared requests admit instead of reserving the default and hitting
+// the unsatisfiable 400 of
+// TestMaxTokensAboveGeneratedLimitIsUnsatisfiable400. Dropping the group
+// limits from the undeclaredOutputReservation call at proxy.go leaves every
+// case here green only if it also breaks the group cap below the default —
+// the end-to-end half fails: the unclamped 20-token default reservation over
+// a 10-token group cap is rejected before upstream.
+func TestSharedGroupGeneratedCapClampsUndeclaredMaxTokensReservation(t *testing.T) {
+	up, _ := sharedGroupBackend(t)
+	cfg := proxyAdmissionConfig(10) // DefaultMaxOutputTokens: 20
+
+	// noMaxTokens swaps the shared body ({"model":"model-a","max_tokens":20})
+	// for an undeclared-output one, the shape the reservation clamp exists
+	// for.
+	noMaxTokens := func(req *http.Request) {
+		req.Body = io.NopCloser(strings.NewReader(`{"model":"model-a"}`))
+		req.ContentLength = -1
+	}
+	noMaxTokensReq := func(req *http.Request) *http.Request {
+		noMaxTokens(req)
+		return req
+	}
+	send := func(recording *recordingAdmitter, envelope string, mutate func(*http.Request)) *httptest.ResponseRecorder {
+		s := New(&config.Settings{Admission: cfg}, logging.New(logging.ERROR), &recordingEmitter{}).WithAdmitter(recording)
+		req := groupScopesRequest(t, up, envelope)
+		if mutate != nil {
+			mutate(req)
+		}
+		rr := httptest.NewRecorder()
+		s.Handler().ServeHTTP(rr, req)
+		return rr
+	}
+
+	// The group generated cap below the default drives the reservation: 10,
+	// not the 20-token default.
+	recording := &recordingAdmitter{}
+	rr := send(recording, groupScopesValue(testGroupA, ",,,10", ""), noMaxTokens)
+	if rr.Code != http.StatusOK || recording.last.ReservedOutputTokens != 10 {
+		t.Fatalf("group cap 10: status=%d reserved=%d, want 200 with a 10-token reservation (the group cap, not the 20-token default)", rr.Code, recording.last.ReservedOutputTokens)
+	}
+
+	// A group cap above the default changes nothing: the default stands.
+	recording = &recordingAdmitter{}
+	rr = send(recording, groupScopesValue(testGroupA, ",,,30", ""), noMaxTokens)
+	if rr.Code != http.StatusOK || recording.last.ReservedOutputTokens != 20 {
+		t.Fatalf("group cap 30: status=%d reserved=%d, want 200 with the 20-token default (a cap above the default does not raise the reservation)", rr.Code, recording.last.ReservedOutputTokens)
+	}
+
+	// Every scope class feeds the same clamp and the tightest wins: org 5,
+	// owner 8, group 10 → 5.
+	recording = &recordingAdmitter{}
+	rr = send(recording, groupScopesValue(testGroupA, ",,,10", ""), func(req *http.Request) {
+		req.Header.Set(identity.HeaderOrgRateLimitGeneratedTokens, "5")
+		req.Header.Set(identity.HeaderOwnerRateLimitGeneratedTokens, "8")
+		noMaxTokens(req)
+	})
+	if rr.Code != http.StatusOK || recording.last.ReservedOutputTokens != 5 {
+		t.Fatalf("org 5 / owner 8 / group 10: status=%d reserved=%d, want 200 with the tightest (5)", rr.Code, recording.last.ReservedOutputTokens)
+	}
+
+	// End to end against the real store: the undeclared request from a
+	// group capped below the default is ADMITTED. Without the group limits in
+	// the clamp the reservation stays 20 over the 10-token cap and this is
+	// the unsatisfiable 400 — this half fails on that mutation.
+	s, _ := proxyWithGroupScopes(t, nil)
+	rr = httptest.NewRecorder()
+	s.Handler().ServeHTTP(rr, noMaxTokensReq(groupScopesRequest(t, up, groupScopesValue(testGroupA, ",,,10", ""))))
+	if rr.Code != http.StatusOK {
+		t.Fatalf("undeclared request, group cap 10: status=%d body=%q, want 200 admitted (the reservation clamped to the cap)", rr.Code, strings.TrimSpace(rr.Body.String()))
+	}
+
+	// The declared path is unchanged: max_tokens above the group cap can
+	// never be admitted — 400 without Retry-After, the group-scope twin of
+	// TestMaxTokensAboveGeneratedLimitIsUnsatisfiable400.
+	hits := 0
+	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		hits++
+		_, _ = w.Write([]byte(`{"model":"model-a","usage":{"prompt_tokens":2,"completion_tokens":3}}`))
+	}))
+	t.Cleanup(backend.Close)
+	declUp, err := url.Parse(backend.URL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	rr = httptest.NewRecorder()
+	s.Handler().ServeHTTP(rr, groupScopesRequest(t, declUp, groupScopesValue(testGroupA, ",,,10", "")))
+	if rr.Code != http.StatusBadRequest || rr.Header().Get("Retry-After") != "" || hits != 0 {
+		t.Fatalf("declared max_tokens 20 over group cap 10: status=%d Retry-After=%q hits=%d, want 400 without Retry-After before upstream", rr.Code, rr.Header().Get("Retry-After"), hits)
+	}
+	if got := strings.TrimSpace(rr.Body.String()); got != "max_tokens exceeds the per-window generated-token limit" {
+		t.Fatalf("body=%q", got)
 	}
 }
