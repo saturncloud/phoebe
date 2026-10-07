@@ -59,6 +59,44 @@ func TestGroupRateLimitsEnforcedLikeContractScope(t *testing.T) {
 	}
 }
 
+// TestGroupTotalPromptTokensWindowEnforced: a group scope may cap only the
+// total-prompt window, leaving the other rate fields nil (unlimited). Unlike
+// the request-count window, token windows charge actual usage at settlement,
+// so each request settles its 10-token input estimate: two requests fill a
+// 20-token cap and the next reservation is a contractual rejection naming
+// the group scope.
+func TestGroupTotalPromptTokensWindowEnforced(t *testing.T) {
+	a, _ := testAdmitter(t, config.AdmissionSettings{})
+	promptCap := int64(20)
+	r := groupRequest("org-p", "m", GroupScope{GroupID: testGID,
+		Limits: RateLimits{TotalPromptTokens: &promptCap}})
+
+	for i := 0; i < 2; i++ {
+		lease, err := a.Admit(context.Background(), r)
+		if err != nil {
+			t.Fatalf("admit %d: %v, want admitted", i+1, err)
+		}
+		if err := lease.CompleteUsage(context.Background(), Usage{TotalPromptTokens: 10}); err != nil {
+			t.Fatalf("CompleteUsage %d: %v", i+1, err)
+		}
+	}
+
+	_, err := a.Admit(context.Background(), r)
+	var rejected *Rejected
+	if !errors.As(err, &rejected) {
+		t.Fatalf("third admit: %v, want a contract rejection", err)
+	}
+	if !rejected.Contractual || rejected.RetryAfter <= 0 {
+		t.Fatalf("rejection = %+v, want Contractual with a Retry-After (429 mapping)", rejected)
+	}
+	if rejected.Scope != "group:"+testGID {
+		t.Fatalf("rejection scope = %q, want the group id named", rejected.Scope)
+	}
+	if rejected.Dimension != "total_prompt_tokens" {
+		t.Fatalf("rejection dimension = %q, want the total-prompt window", rejected.Dimension)
+	}
+}
+
 // TestGroupRateZeroCapBlocksEveryRequest: an explicit 0 is a zero cap, not
 // unlimited — the same R4 sentinel as every other contract scope.
 func TestGroupRateZeroCapBlocksEveryRequest(t *testing.T) {
