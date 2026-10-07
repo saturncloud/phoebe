@@ -161,10 +161,11 @@ type RedisAdmitter struct {
 	// (serving-only spokes): group RATE limits still enforce from the Valkey
 	// store, spend caps are then unchecked — logged loudly at startup by
 	// cmd/interceptor, never silently assumed.
-	spendStore GroupSpendStore
-	spendCache *spendVerdictCache
-	spendLog   *logging.Logger
-	spendFails *spendFailureLog
+	spendStore  GroupSpendStore
+	spendCache  *spendVerdictCache
+	spendFlight *spendFlight
+	spendLog    *logging.Logger
+	spendFails  *spendFailureLog
 }
 
 // WithGroupSpend enables the monthly spend cap check against a GroupSpendStore
@@ -176,6 +177,7 @@ func (a *RedisAdmitter) WithGroupSpend(store GroupSpendStore, log *logging.Logge
 	a.spendStore = store
 	a.spendLog = log
 	a.spendCache = newSpendVerdictCache()
+	a.spendFlight = newSpendFlight()
 	a.spendFails = &spendFailureLog{}
 	return a
 }
@@ -483,23 +485,45 @@ func (a *RedisAdmitter) checkGroupSpend(ctx context.Context, scopes []GroupScope
 		if gs.SpendCap == "" {
 			continue
 		}
-		if exhausted, ok := a.spendCache.lookup(gs.GroupID, gs.SpendCap); ok {
-			if exhausted {
+		if verdict, ok := a.spendCache.lookup(gs.GroupID, gs.SpendCap); ok {
+			if verdict.failed {
+				// A recent store error already logged its bypass once
+				// (throttled): admit without re-querying and without waiting
+				// on the store.
+				continue
+			}
+			if verdict.exhausted {
 				return &Rejected{Scope: "group:" + gs.GroupID, Dimension: "monthly_spend", RetryAfter: groupSpendCacheTTL, Contractual: true}
 			}
 			continue
 		}
-		// Bounded: a hung store read fails open (deadline exceeded is just
-		// another store error) instead of holding the request.
-		queryCtx, cancel := context.WithTimeout(ctx, groupSpendQueryBudget)
-		exhausted, err := a.spendStore.GroupSpendExhausted(queryCtx, gs.GroupID, gs.SpendCap)
-		cancel()
-		if err != nil {
-			a.spendBypass(gs.GroupID, err)
+		// Collapse concurrent misses on one (group, cap) into a single store
+		// read: waiters take the leader's result (verdict, or fail-open on
+		// error) instead of each running their own query against a slow store.
+		result, leader := a.spendFlight.do(gs.GroupID+"\x00"+gs.SpendCap, func() (bool, error) {
+			// Bounded: a hung store read fails open (deadline exceeded is just
+			// another store error) instead of holding the request.
+			queryCtx, cancel := context.WithTimeout(ctx, groupSpendQueryBudget)
+			defer cancel()
+			return a.spendStore.GroupSpendExhausted(queryCtx, gs.GroupID, gs.SpendCap)
+		})
+		if result.err != nil {
+			// A canceled request context (client gone) makes the check moot:
+			// it is not evidence the store is down and must not consume the
+			// throttled bypass slot that a genuine outage needs (KeepAlive
+			// guards the same race at renew time). The 250ms deadline
+			// expiring with a live client IS logged: the store is too slow.
+			// Only the leader records and logs — waiters share its outcome.
+			if leader && ctx.Err() == nil {
+				a.spendCache.storeFailure(gs.GroupID, gs.SpendCap)
+				a.spendBypass(gs.GroupID, result.err)
+			}
 			continue
 		}
-		a.spendCache.store(gs.GroupID, gs.SpendCap, exhausted)
-		if exhausted {
+		if leader {
+			a.spendCache.store(gs.GroupID, gs.SpendCap, result.exhausted)
+		}
+		if result.exhausted {
 			return &Rejected{Scope: "group:" + gs.GroupID, Dimension: "monthly_spend", RetryAfter: groupSpendCacheTTL, Contractual: true}
 		}
 	}

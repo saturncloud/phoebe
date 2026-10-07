@@ -21,6 +21,13 @@ import (
 // rating cadence doesn't already bound.
 const groupSpendCacheTTL = time.Minute
 
+// groupSpendNegativeCacheTTL is how long a fail-open verdict recorded after a
+// store error is reused before re-reading Postgres. Short on purpose: the
+// negative entry only absorbs the re-query storm while the store is down —
+// past it the check re-probes, so recovery is seen within seconds rather than
+// after a full verdict TTL.
+const groupSpendNegativeCacheTTL = 10 * time.Second
+
 // groupSpendQueryBudget bounds one spend-check read on the request path. The
 // check runs synchronously before the Valkey reservation, so a slow or
 // blackholed Postgres must not hold the request: past this budget the read is
@@ -136,7 +143,14 @@ type spendVerdictCache struct {
 
 type spendVerdictEntry struct {
 	exhausted bool
-	at        time.Time
+	// failed marks a fail-open entry recorded after a store error: it admits
+	// without querying and without waiting, its bypass already logged once
+	// (throttled) by the request that took the error. It expires after the
+	// short groupSpendNegativeCacheTTL and is not subject to the UTC month
+	// rollover — a fail-open verdict never denies, so letting it lapse a few
+	// seconds into a new month is harmless.
+	failed bool
+	at     time.Time
 }
 
 func newSpendVerdictCache() *spendVerdictCache {
@@ -147,22 +161,28 @@ func newSpendVerdictCache() *spendVerdictCache {
 // fresh enough to trust. An entry expires at the earlier of its TTL and the
 // next UTC month boundary after its capture: the cap counts calendar-month
 // spend, so a verdict taken in the old month says nothing about the new one.
-func (c *spendVerdictCache) lookup(groupID, cap string) (bool, bool) {
+// The negative (store-error) entries use the shorter groupSpendNegativeCacheTTL
+// and skip the month check — see spendVerdictEntry.failed.
+func (c *spendVerdictCache) lookup(groupID, cap string) (spendVerdictEntry, bool) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	e, ok := c.entries[groupID+"\x00"+cap]
 	if !ok {
-		return false, false
+		return spendVerdictEntry{}, false
 	}
 	now := time.Now
 	if c.now != nil {
 		now = c.now
 	}
 	t := now()
-	if t.Sub(e.at) >= groupSpendCacheTTL || !t.Before(nextUTCMonth(e.at)) {
-		return false, false
+	ttl := groupSpendCacheTTL
+	if e.failed {
+		ttl = groupSpendNegativeCacheTTL
 	}
-	return e.exhausted, true
+	if t.Sub(e.at) >= ttl || (!e.failed && !t.Before(nextUTCMonth(e.at))) {
+		return spendVerdictEntry{}, false
+	}
+	return e, true
 }
 
 // store records a fresh verdict for (groupID, cap).
@@ -174,6 +194,19 @@ func (c *spendVerdictCache) store(groupID, cap string, exhausted bool) {
 		now = c.now
 	}
 	c.entries[groupID+"\x00"+cap] = spendVerdictEntry{exhausted: exhausted, at: now()}
+}
+
+// storeFailure records a fail-open entry for (groupID, cap) after a store
+// error: for groupSpendNegativeCacheTTL the check admits without querying and
+// without waiting, then re-probes the store.
+func (c *spendVerdictCache) storeFailure(groupID, cap string) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	now := time.Now
+	if c.now != nil {
+		now = c.now
+	}
+	c.entries[groupID+"\x00"+cap] = spendVerdictEntry{failed: true, at: now()}
 }
 
 // nextUTCMonth returns the first instant of the UTC calendar month after t's.
@@ -212,4 +245,55 @@ func (l *spendFailureLog) logf(log *logging.Logger, format string, args ...inter
 		return
 	}
 	log.Error.Printf("%s", msg)
+}
+
+// spendFlight collapses concurrent in-flight spend-check reads per (group,
+// cap): while one request reads Postgres for a key, every other request on
+// the same key waits for that single read instead of issuing its own, so a
+// blackholed store with N concurrent capped requests makes one query, not N.
+// golang.org/x/sync is only an indirect dependency here, so this is a small
+// hand-rolled in-flight map (a mutex and one call struct per key).
+type spendFlight struct {
+	mu sync.Mutex
+	in map[string]*spendFlightCall
+}
+
+type spendFlightCall struct {
+	done   chan struct{}
+	result spendFlightResult
+}
+
+type spendFlightResult struct {
+	exhausted bool
+	err       error
+}
+
+func newSpendFlight() *spendFlight {
+	return &spendFlight{in: map[string]*spendFlightCall{}}
+}
+
+// do runs fn once per key while any caller is in flight and returns its
+// result to every caller: concurrent waiters take the leader's verdict, or
+// its error (the fail-open path), without re-running the query. The leader
+// reports leader=true so exactly one caller records and logs the outcome.
+func (f *spendFlight) do(key string, fn func() (bool, error)) (spendFlightResult, bool) {
+	f.mu.Lock()
+	if call, ok := f.in[key]; ok {
+		f.mu.Unlock()
+		// The leader's query is bounded by groupSpendQueryBudget, so this
+		// wait cannot hold the request past one query budget either.
+		<-call.done
+		return call.result, false
+	}
+	call := &spendFlightCall{done: make(chan struct{})}
+	f.in[key] = call
+	f.mu.Unlock()
+
+	call.result.exhausted, call.result.err = fn()
+	close(call.done)
+
+	f.mu.Lock()
+	delete(f.in, key)
+	f.mu.Unlock()
+	return call.result, true
 }

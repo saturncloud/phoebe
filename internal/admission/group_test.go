@@ -6,6 +6,7 @@ import (
 	"errors"
 	"regexp"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -19,6 +20,7 @@ import (
 // are scripted per call so a test can observe exactly how often Postgres would
 // be read (the cache-behavior tests pin the once-per-TTL contract).
 type fakeGroupSpendStore struct {
+	mu        sync.Mutex
 	exhausted bool
 	err       error
 	calls     int
@@ -27,6 +29,8 @@ type fakeGroupSpendStore struct {
 }
 
 func (f *fakeGroupSpendStore) GroupSpendExhausted(_ context.Context, groupID, cap string) (bool, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
 	f.calls++
 	f.gotGID = append(f.gotGID, groupID)
 	f.gotCap = append(f.gotCap, cap)
@@ -234,9 +238,13 @@ func TestGroupSpendCacheExpiry(t *testing.T) {
 
 // TestGroupSpendStoreErrorFailsOpen: a Postgres/store error must never deny —
 // the check fails open with a loud log (the 2026-09-24 posture: quotas are
-// permissible; they never take inference down).
+// permissible; they never take inference down). The error is negative-cached
+// briefly so an outage is not re-queried per request, and the check re-probes
+// once the short TTL lapses, so recovery is seen quickly.
 func TestGroupSpendStoreErrorFailsOpen(t *testing.T) {
 	a, store := spendTestAdmitter(t)
+	now := time.Now()
+	a.spendCache.now = func() time.Time { return now }
 	store.err = errors.New("postgres unreachable")
 
 	lease, err := a.Admit(context.Background(), groupRequest("org-f", "m",
@@ -246,17 +254,61 @@ func TestGroupSpendStoreErrorFailsOpen(t *testing.T) {
 	}
 	_ = lease.Complete(context.Background(), 0)
 
-	// A second request hits the failing store again: errors are NOT cached —
-	// caching a fail-open verdict would silently extend the bypass past
-	// recovery, and caching nothing keeps the check self-healing.
+	// Inside the negative TTL the second request admits without re-querying.
 	lease2, err := a.Admit(context.Background(), groupRequest("org-f", "m",
 		groupScope(testGID, nil, "100")))
 	if err != nil {
 		t.Fatalf("second store-error admit: %v, want fail-open admission", err)
 	}
 	_ = lease2.Complete(context.Background(), 0)
+	if store.calls != 1 {
+		t.Fatalf("store calls = %d, want 1 (the error is negative-cached)", store.calls)
+	}
+
+	// Past the negative TTL the check re-probes the store — and still admits
+	// while the error persists.
+	now = now.Add(groupSpendNegativeCacheTTL + time.Second)
+	lease3, err := a.Admit(context.Background(), groupRequest("org-f", "m",
+		groupScope(testGID, nil, "100")))
+	if err != nil {
+		t.Fatalf("post-negative-TTL admit: %v, want fail-open admission", err)
+	}
+	_ = lease3.Complete(context.Background(), 0)
 	if store.calls != 2 {
-		t.Fatalf("store calls = %d, want 2 (errors never cache)", store.calls)
+		t.Fatalf("store calls = %d, want 2 (recovery re-probes after the negative TTL)", store.calls)
+	}
+}
+
+// TestGroupSpendStoreErrorNegativeCache: after one failing Admit, a second
+// Admit within the negative-cache TTL makes no store call, does not wait on
+// the store, and admits.
+func TestGroupSpendStoreErrorNegativeCache(t *testing.T) {
+	a, store := spendTestAdmitter(t)
+	store.err = errors.New("postgres unreachable")
+	scope := groupScope(testGID, nil, "100")
+	ctx := context.Background()
+
+	lease, err := a.Admit(ctx, groupRequest("org-nc", "m", scope))
+	if err != nil {
+		t.Fatalf("first admit: %v", err)
+	}
+	_ = lease.Complete(ctx, 0)
+	if store.calls != 1 {
+		t.Fatalf("store calls = %d, want 1", store.calls)
+	}
+
+	start := time.Now()
+	lease2, err := a.Admit(ctx, groupRequest("org-nc", "m", scope))
+	elapsed := time.Since(start)
+	if err != nil {
+		t.Fatalf("negative-cached admit: %v, want fail-open admission", err)
+	}
+	_ = lease2.Complete(ctx, 0)
+	if store.calls != 1 {
+		t.Fatalf("store calls = %d, want 1 (no re-query inside the negative TTL)", store.calls)
+	}
+	if elapsed >= groupSpendQueryBudget {
+		t.Fatalf("negative-cached admit took %v, want no wait on the store (budget %v)", elapsed, groupSpendQueryBudget)
 	}
 }
 
@@ -293,6 +345,82 @@ func TestGroupSpendHungStoreFailsOpenWithinBudget(t *testing.T) {
 	out := buf.String()
 	if !strings.Contains(out, "monthly spend cap NOT enforced (fail open)") || !strings.Contains(out, context.DeadlineExceeded.Error()) {
 		t.Fatalf("bypass log = %q, want a fail-open ERROR naming the deadline", out)
+	}
+}
+
+// countedBlockingSpendStore models a blackholed Postgres that concurrent
+// requests pile onto: the read never answers until its context is done, and
+// every read is counted.
+type countedBlockingSpendStore struct {
+	mu    sync.Mutex
+	calls int
+}
+
+func (s *countedBlockingSpendStore) GroupSpendExhausted(ctx context.Context, _, _ string) (bool, error) {
+	s.mu.Lock()
+	s.calls++
+	s.mu.Unlock()
+	<-ctx.Done()
+	return false, ctx.Err()
+}
+
+func (s *countedBlockingSpendStore) Calls() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.calls
+}
+
+// TestGroupSpendConcurrentMissSingleflight: N concurrent Admits on one capped
+// group with a blocking store collapse to a single store call — concurrent
+// cache misses share one in-flight read — and every request still admits.
+func TestGroupSpendConcurrentMissSingleflight(t *testing.T) {
+	a, _ := testAdmitter(t, config.AdmissionSettings{})
+	store := &countedBlockingSpendStore{}
+	a.WithGroupSpend(store, logging.New(logging.ERROR))
+
+	const n = 20
+	start := make(chan struct{})
+	errs := make(chan error, n)
+	for i := 0; i < n; i++ {
+		go func() {
+			<-start
+			lease, err := a.Admit(context.Background(), groupRequest("org-sf", "m",
+				groupScope(testGID, nil, "100")))
+			if err == nil {
+				err = lease.Complete(context.Background(), 0)
+			}
+			errs <- err
+		}()
+	}
+	close(start)
+	for i := 0; i < n; i++ {
+		if err := <-errs; err != nil {
+			t.Fatalf("concurrent admit %d: %v, want fail-open admission", i, err)
+		}
+	}
+	if calls := store.Calls(); calls != 1 {
+		t.Fatalf("store calls = %d, want 1 (concurrent misses share one in-flight read)", calls)
+	}
+}
+
+// TestGroupSpendParentCancelNotLoggedAsBypass: a canceled request context
+// (client gone) makes the spend check moot — it must NOT log the throttled
+// 'monthly spend cap NOT enforced' ERROR, which a genuine outage needs.
+func TestGroupSpendParentCancelNotLoggedAsBypass(t *testing.T) {
+	a, _ := testAdmitter(t, config.AdmissionSettings{})
+	log := logging.New(logging.ERROR)
+	var buf bytes.Buffer
+	log.Error.SetOutput(&buf)
+	a.WithGroupSpend(blockingGroupSpendStore{}, log)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	// The Admit itself fails on the canceled context (the Valkey reservation
+	// cannot run); only the absence of the bypass line is asserted.
+	_, _ = a.Admit(ctx, groupRequest("org-pc", "m",
+		groupScope(testGID, nil, "100")))
+	if out := buf.String(); strings.Contains(out, "monthly spend cap NOT enforced") {
+		t.Fatalf("canceled-request bypass logged: %q, want no bypass ERROR (the check is moot)", out)
 	}
 }
 
