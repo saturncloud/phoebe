@@ -76,8 +76,8 @@ func TestGroupRateLimitsEnforcedLikeContractScope(t *testing.T) {
 	// Only the requests window is capped, so the request's own estimates
 	// (the helper's 10-in/20-out shape) can never trip the unsatisfiable
 	// check: the third request is rejected by the window counter itself.
-	cap := int64(2)
-	scope := GroupScope{GroupID: testGID, Limits: RateLimits{Requests: &cap}}
+	spendCap := int64(2)
+	scope := GroupScope{GroupID: testGID, Limits: RateLimits{Requests: &spendCap}}
 
 	for i := 0; i < 2; i++ {
 		lease, err := a.Admit(context.Background(), groupRequest("org-g", "m", scope))
@@ -693,9 +693,9 @@ func TestGroupSpendNoStoreFailsOpen(t *testing.T) {
 // distinct from the store-outage bypass.
 func TestGroupScopeMissingGroupIDFailsClosed(t *testing.T) {
 	a, _ := spendTestAdmitter(t)
-	cap := int64(10)
+	spendCap := int64(10)
 	_, err := a.Admit(context.Background(), groupRequest("org-i", "m",
-		GroupScope{Limits: RateLimits{Requests: &cap}}))
+		GroupScope{Limits: RateLimits{Requests: &spendCap}}))
 	if !errors.Is(err, ErrInvalidIdentity) {
 		t.Fatalf("anonymous group scope: %v, want ErrInvalidIdentity (fail closed)", err)
 	}
@@ -715,9 +715,9 @@ func TestGroupScopeMissingGroupIDFailsClosed(t *testing.T) {
 // reservation that would push the window past 50 is rejected.
 func TestGroupScopesSettleThroughCompleteUsage(t *testing.T) {
 	a, _ := spendTestAdmitter(t)
-	cap := int64(50)
+	spendCap := int64(50)
 	r := groupRequest("org-l", "m", GroupScope{GroupID: testGID,
-		Limits: RateLimits{GeneratedTokens: &cap}})
+		Limits: RateLimits{GeneratedTokens: &spendCap}})
 
 	lease, err := a.Admit(context.Background(), r)
 	if err != nil {
@@ -750,9 +750,9 @@ func TestGroupScopesSettleThroughCompleteUsage(t *testing.T) {
 // reservation — without settlement the third would be rejected at 60/50.
 func TestGroupScopesSettleZeroUsageRefundsReservation(t *testing.T) {
 	a, _ := spendTestAdmitter(t)
-	cap := int64(50)
+	spendCap := int64(50)
 	r := groupRequest("org-z0", "m", GroupScope{GroupID: testGID,
-		Limits: RateLimits{GeneratedTokens: &cap}})
+		Limits: RateLimits{GeneratedTokens: &spendCap}})
 
 	for i := 0; i < 5; i++ {
 		lease, err := a.Admit(context.Background(), r)
@@ -771,9 +771,9 @@ func TestGroupScopesSettleZeroUsageRefundsReservation(t *testing.T) {
 // would have fit it at 40/50.
 func TestGroupScopesSettleChargesActualUsage(t *testing.T) {
 	a, _ := spendTestAdmitter(t)
-	cap := int64(50)
+	spendCap := int64(50)
 	r := groupRequest("org-l45", "m", GroupScope{GroupID: testGID,
-		Limits: RateLimits{GeneratedTokens: &cap}})
+		Limits: RateLimits{GeneratedTokens: &spendCap}})
 
 	lease, err := a.Admit(context.Background(), r)
 	if err != nil {
