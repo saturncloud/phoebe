@@ -274,7 +274,16 @@ func validateAndDedupe(events []metering.Event) (Evidence, error) {
 			return Evidence{}, fmt.Errorf("record %d: %w", i+1, err)
 		}
 		if prior, ok := seen[ev.RequestID]; ok {
-			if prior != ev {
+			// Two records with one request_id must be identical evidence; a
+			// differing field (including a differing membership list) is a
+			// conflict. Compare canonical JSON, not ==: Event carries a slice
+			// (MemberGroupIDs) and is no longer comparable with the equality
+			// operator, and the marshaled form also normalizes a nil vs an
+			// empty membership list (both omit under omitempty — "no
+			// memberships" either way).
+			priorJSON, _ := json.Marshal(prior)
+			evJSON, _ := json.Marshal(ev)
+			if !bytes.Equal(priorJSON, evJSON) {
 				return Evidence{}, fmt.Errorf("record %d: conflicting duplicate request_id %q", i+1, ev.RequestID)
 			}
 			result.Duplicates++

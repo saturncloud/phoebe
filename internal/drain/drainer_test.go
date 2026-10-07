@@ -615,7 +615,7 @@ func TestEnsureGroup_Idempotent(t *testing.T) {
 // explicit "" (a post-cutover producer bug) is stored as the empty string so
 // the rater withholds it, and "shared" and "dedicated" are stored as sent.
 func TestDecodeEvent_OnlyAbsentServingModeStoredAsDedicated(t *testing.T) {
-	const servingModeIdx = 11
+	const servingModeIdx = 12
 	cases := []struct {
 		name string
 		json string

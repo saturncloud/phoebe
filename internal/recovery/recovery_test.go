@@ -1,6 +1,7 @@
 package recovery
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -175,8 +176,10 @@ func TestReplayUsesEmitterStreamShapeAndPreservesIDs(t *testing.T) {
 		if err := json.Unmarshal([]byte(raw), &got); err != nil {
 			t.Fatal(err)
 		}
-		if got != events[i] {
-			t.Fatalf("row %d mismatch: got %+v want %+v", i, got, events[i])
+		gotJSON, _ := json.Marshal(got)
+		wantJSON, _ := json.Marshal(events[i])
+		if !bytes.Equal(gotJSON, wantJSON) {
+			t.Fatalf("row %d mismatch: got %s want %s", i, gotJSON, wantJSON)
 		}
 	}
 }

@@ -91,6 +91,7 @@ var upsertColumns = []string{
 	"group_id",
 	"resource_id",
 	"resource_type",
+	"member_group_ids",
 	"org_id",
 	"model",
 	"base_model",
@@ -109,7 +110,7 @@ var upsertColumns = []string{
 	"event_ts",
 }
 
-const colsPerRow = 23 // len(upsertColumns); created_at is DB-defaulted.
+const colsPerRow = 24 // len(upsertColumns); created_at is DB-defaulted.
 
 // Upsert writes a batch of events in a single transaction with a multi-row
 // INSERT ... ON CONFLICT (request_id) DO NOTHING.
@@ -186,6 +187,10 @@ func eventArgs(e metering.Event) []any {
 		nullStr(e.GroupID),
 		nullStr(e.ResourceID),
 		nullStr(e.ResourceType),
+		// MemberGroupIDs is the caller's group list (X-Saturn-Group-Scopes
+		// membership). nil for len==0 so the column stores NULL, not an empty
+		// array — like every other identity column, absent must read as absent.
+		nullGroupIDs(e.MemberGroupIDs),
 		// OrgID is "" when Atlas isn't injecting X-Saturn-Org-Id yet (producer-rollout
 		// gap). nullStr so it stores NULL, not '' — the rater/push fail-closed predicate
 		// is `org_id IS NULL` (held + screamed at push), and a stored '' would dodge it
@@ -231,6 +236,16 @@ func eventArgs(e metering.Event) []any {
 		nullStr(e.GraphK8sName),
 		eventTS,
 	}
+}
+
+// nullGroupIDs returns a driver NULL for an empty slice and the []string
+// otherwise (pgx encodes it as a text[] bind). Mirror of nullStr for the
+// membership list: no memberships is NULL, not an empty array.
+func nullGroupIDs(ids []string) any {
+	if len(ids) == 0 {
+		return nil
+	}
+	return ids
 }
 
 // nullStr returns a driver NULL for "" and the string otherwise.
