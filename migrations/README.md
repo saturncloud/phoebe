@@ -50,7 +50,6 @@ golang-migrate up/down pairs, applied in version order:
 | 0005 | `0005_invoice_grade_attempts.{up,down}.sql` | trusted/client request identity, attempt outcome and usage evidence, invalid-usage reconciliation, and the hourly reconciliation view at the rated natural key (exposing missing/conflicting org evidence) |
 | 0006 | `0006_rollup_grain.{up,down}.sql` | widens the `rated_usage` grain with `serving_mode`, the owner pair and `graph_k8s_name` evidence |
 | 0007 | `0007_serving_mode_explicit.{up,down}.sql` | `rated_usage.serving_mode` becomes `'shared'`/`'dedicated'` only (CHECK, no default; dedicated rows renamed from `''` with their ids recomputed) |
-| 0008 | `0008_group_scopes.{up,down}.sql` | `billing_event.member_group_ids` (membership evidence) + `group_usage`, the group attribution rollup the admission group spend check reads |
 
 `embed.go` embeds these into the `migrations` package; `cmd/migrate` applies them.
 
@@ -64,38 +63,6 @@ migrate            # or "migrate up" — apply all pending migrations (default)
 migrate down       # roll back one step
 migrate version    # print the current applied version
 ```
-
-### Rollout order for migration 0008
-
-Migration 0008 adds `billing_event.member_group_ids` and the `group_usage`
-table, both of which the rater's single rating statement reads/writes. The
-failure modes are asymmetric, so the order matters:
-
-- A pre-0008 rater still runs cleanly against the 0008 schema: 0008 only adds
-  a nullable column and a new table, neither of which the old rating
-  statement references. The old rater rates and writes money as before, but
-  writes no `group_usage`, so the admission group spend check reads an empty
-  rollup (zero group spend) until the new rater covers those hours.
-- A post-0008 rater fails against the old schema (SQLSTATE 42703): its rating
-  statement references `member_group_ids` and `group_usage`.
-- A post-0008 drainer fails against the old schema the same way (SQLSTATE
-  42703): its INSERT names `member_group_ids`, which does not exist there yet,
-  so EVERY insert fails and every event takes the poison path — logged, ACK'd,
-  and dropped, served but never billed. `cmd/migrate up` must come first,
-  before BOTH the drainer and the rater deploy; the drainer is not safe in
-  either order.
-
-So roll code and schema together, in the migration-0007 order: run
-`cmd/migrate up`, then deploy the new drainer and rater (the drainer's INSERT
-gains the column; an old drainer against schema 0008 simply writes NULL
-membership). The interceptor's group scope enforcement is envelope-driven, so
-it is safe across the cutover: no stamped envelope, no group check.
-
-`group_usage` rows for already-rated hours exist only after a re-rate (the
-rollup is written by the rater, not backfilled). Until a window is re-rated,
-the admission spend check sums an empty rollup for that group's hours — group
-rate limits still enforce from the envelope; spend caps enforce once rating
-has covered the month.
 
 Rolling back 0007 is not exact. The 0007 down migration maps every
 `billing_event.serving_mode = 'dedicated'` back to NULL. It also renames the
