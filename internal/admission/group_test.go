@@ -656,3 +656,116 @@ func TestGroupScopesSettleThroughCompleteUsage(t *testing.T) {
 		t.Fatalf("third admit (window at 50/50): %v, want a contractual rejection", err)
 	}
 }
+
+// TestGroupScopesSettleZeroUsageRefundsReservation: the settlement test above
+// cannot tell settlement from a reservation left charged (each request
+// reserves 20 output tokens, so an unsettled window would also read 20, 40,
+// 60). Here every request completes with zero generated tokens: against a cap
+// of 50, five requests admit only if each settlement refunds its 20-token
+// reservation — without settlement the third would be rejected at 60/50.
+func TestGroupScopesSettleZeroUsageRefundsReservation(t *testing.T) {
+	a, _ := spendTestAdmitter(t)
+	cap := int64(50)
+	r := groupRequest("org-z0", "m", GroupScope{GroupID: testGID,
+		Limits: RateLimits{GeneratedTokens: &cap}})
+
+	for i := 0; i < 5; i++ {
+		lease, err := a.Admit(context.Background(), r)
+		if err != nil {
+			t.Fatalf("admit %d: %v, want admitted (each zero-usage Complete refunds the reservation)", i+1, err)
+		}
+		if err := lease.Complete(context.Background(), 0); err != nil {
+			t.Fatalf("Complete %d: %v", i+1, err)
+		}
+	}
+}
+
+// TestGroupScopesSettleChargesActualUsage: settling 45 generated tokens leaves
+// the window at 45/50, so the next 20-token reservation is rejected — even
+// though an unsettled window (holding only the first 20-token reservation)
+// would have fit it at 40/50.
+func TestGroupScopesSettleChargesActualUsage(t *testing.T) {
+	a, _ := spendTestAdmitter(t)
+	cap := int64(50)
+	r := groupRequest("org-l45", "m", GroupScope{GroupID: testGID,
+		Limits: RateLimits{GeneratedTokens: &cap}})
+
+	lease, err := a.Admit(context.Background(), r)
+	if err != nil {
+		t.Fatalf("first admit: %v", err)
+	}
+	if err := lease.Complete(context.Background(), 45); err != nil {
+		t.Fatalf("Complete: %v", err)
+	}
+
+	_, err = a.Admit(context.Background(), r)
+	var rejected *Rejected
+	if !errors.As(err, &rejected) || !rejected.Contractual || rejected.Scope != "group:"+testGID {
+		t.Fatalf("admit after settling 45/50: %v, want a contractual group rejection", err)
+	}
+}
+
+// TestSpendFailureLogThrottle: the first fail-open line of an incident writes
+// immediately; repeats inside spendFailureLogInterval are counted and silent;
+// the first call after the interval writes and carries the suppressed count.
+func TestSpendFailureLogThrottle(t *testing.T) {
+	log := logging.New(logging.ERROR)
+	var buf bytes.Buffer
+	log.Error.SetOutput(&buf)
+	now := time.Now()
+	l := &spendFailureLog{now: func() time.Time { return now }}
+
+	l.logf(log, "bypass %d", 1)
+	if got := strings.Count(buf.String(), "bypass"); got != 1 {
+		t.Fatalf("lines after first logf = %d (%q), want 1", got, buf.String())
+	}
+	if strings.Contains(buf.String(), "suppressed") {
+		t.Fatalf("first line = %q, want no suppressed count", buf.String())
+	}
+
+	for i := 0; i < 3; i++ {
+		now = now.Add(spendFailureLogInterval / 4)
+		l.logf(log, "bypass %d", i+2)
+	}
+	if got := strings.Count(buf.String(), "bypass"); got != 1 {
+		t.Fatalf("lines inside the interval = %d (%q), want still 1 (repeats are silent)", got, buf.String())
+	}
+
+	now = now.Add(spendFailureLogInterval)
+	l.logf(log, "bypass %d", 5)
+	out := buf.String()
+	if got := strings.Count(out, "bypass"); got != 2 {
+		t.Fatalf("lines after the interval = %d (%q), want 2", got, out)
+	}
+	if !strings.Contains(out, "bypass 5 (+3 similar suppressed)") {
+		t.Fatalf("post-interval line = %q, want it to carry the 3 suppressed repeats", out)
+	}
+}
+
+// TestGroupSpendStoreErrorLogsOnce: a plain (non-timeout) store error writes
+// exactly one fail-open ERROR line for the incident; the negative-cached
+// repeats do not add more.
+func TestGroupSpendStoreErrorLogsOnce(t *testing.T) {
+	a, store := spendTestAdmitter(t)
+	log := logging.New(logging.ERROR)
+	var buf bytes.Buffer
+	log.Error.SetOutput(&buf)
+	a.WithGroupSpend(store, log)
+	store.err = errors.New("postgres unreachable")
+
+	for i := 0; i < 3; i++ {
+		lease, err := a.Admit(context.Background(), groupRequest("org-lo", "m",
+			groupScope(testGID, nil, "100")))
+		if err != nil {
+			t.Fatalf("store-error admit %d: %v, want fail-open admission", i+1, err)
+		}
+		_ = lease.Complete(context.Background(), 0)
+	}
+	out := buf.String()
+	if got := strings.Count(out, "monthly spend cap NOT enforced (fail open)"); got != 1 {
+		t.Fatalf("fail-open ERROR lines = %d (%q), want exactly 1", got, out)
+	}
+	if !strings.Contains(out, "postgres unreachable") {
+		t.Fatalf("fail-open line = %q, want it to name the store error", out)
+	}
+}

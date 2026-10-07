@@ -17,10 +17,15 @@
 --     under every group it belongs to, and withheld (non-money) events
 --     contribute nothing.
 --
--- ROLLOUT: the rater's statement references member_group_ids and group_usage,
--- so a pre-0008 rater cannot run against this schema and a post-0008 rater
--- cannot run against the old one (SQLSTATE 42703) — roll code and schema
--- together, in the order used for migration 0007 (migrate up, then deploy).
+-- ROLLOUT: the failure is asymmetric, so the order is migration first, then
+-- code. A post-0008 rater cannot run against the pre-0008 schema (SQLSTATE
+-- 42703: its statements reference member_group_ids and group_usage, which do
+-- not exist there yet). A pre-0008 rater, by contrast, runs cleanly against
+-- the 0008 schema — 0008 only adds a nullable column and a new table, so the
+-- old statements still execute. The old rater writes no group_usage rows, so
+-- group spend caps read an empty rollup (zero spend) until the new rater
+-- deploys. Safe order: apply migration 0008 first, then deploy the new rater,
+-- which then starts writing group_usage.
 
 -- ---------------------------------------------------------------------------
 -- billing_event: membership evidence

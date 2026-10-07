@@ -207,6 +207,237 @@ func TestIntegration_GroupUsageAttribution(t *testing.T) {
 	}
 }
 
+// TestIntegration_GroupUsageWithheldGatesSharedGrain pins the per-event gates
+// the attributed CTE re-applies on the resolved side (store.go:819-826) against
+// real Postgres. The sibling test above withholds only a usage_found event, and
+// every seeded event has its own auth_id, so every event sits in its own money
+// grain. That leaves the other gates unexercised: the attributed CTE joins
+// priced rollups back onto resolved events on the full grain, and with no
+// withheld event sharing a priced rollup's grain, dropping any one of those
+// gates would change nothing — the test stays green while a withheld event
+// rides its priced twin's rollup into group_usage and inflates the group spend
+// the admission check reads.
+//
+// So every withheld event below SHARES its (auth, resource, model,
+// serving_mode, hour) money grain with a priced event:
+//
+//   - unpriced twin: model 'm-unp' prices through base_model 'b' for one event
+//     (C4 rung (c)); its twin names an unknown base, so its prompt_price is
+//     NULL and only the prompt_price gate keeps it out of the gA row;
+//   - owner-conflict twin: one event carries user_id AND group_id, collapses
+//     to the same user/group owner bucket as its clean twin, and is dropped per
+//     event — only the owner_conflict gate keeps its memberships (and its own
+//     group_id) out of group_usage;
+//   - ambiguous_org: one resource carrying two distinct orgs is withheld at
+//     the rollup level, so neither clean event may attribute to gC at all;
+//   - identical pair: two genuinely different but identical-looking billable
+//     events in one rollup must BOTH attribute to gD — the DISTINCT ON
+//     (request_id, gid) dedupe must not collapse them into one.
+//
+// For each withheld case the group's group_usage row must carry exactly its
+// priced event(s), and the money rollup must be what a baseline WITHOUT the
+// withheld events would write: same rollups, same events rated, same total.
+func TestIntegration_GroupUsageWithheldGatesSharedGrain(t *testing.T) {
+	dsn := os.Getenv("PHOEBE_TEST_DATABASE_URL")
+	if dsn == "" {
+		t.Skip("PHOEBE_TEST_DATABASE_URL not set; skipping live-Postgres conformance")
+	}
+	ctx := context.Background()
+	db, err := sql.Open("pgx", dsn)
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	defer db.Close()
+
+	const sch = "phoebe_rating_group_gates_it"
+	exec(t, db, "DROP SCHEMA IF EXISTS "+sch+" CASCADE")
+	exec(t, db, "CREATE SCHEMA "+sch)
+	exec(t, db, "SET search_path TO "+sch)
+	defer func() { exec(t, db, "DROP SCHEMA IF EXISTS "+sch+" CASCADE") }()
+	exec(t, db, ratingSchemaDDL(t))
+
+	hour := mustTime("2026-06-08T10:00:00Z")
+	book := newTestBook(
+		map[string]Rate3{"b": rate3("0.000005", "0.0000005", "0.00002")},
+		nil, PolicyIdentity, Dec{}, Dec{},
+	)
+	rate, err := book.Resolve("b")
+	if err != nil {
+		t.Fatalf("resolve: %v", err)
+	}
+	billed := rate.Quantized()
+
+	const (
+		gA = "a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a"
+		gB = "b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b"
+		gC = "c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c"
+		gD = "d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d"
+	)
+
+	// Every event is dedicated with authoritative usage; each withheld event is
+	// kept out of money by exactly ONE classification (its price, its owner
+	// conflict, or its rollup's two orgs) and shares its money grain with the
+	// priced event that must still attribute.
+	type gateEvent struct {
+		req      string
+		auth     string
+		user     string   // billing_event.user_id ('' writes NULL)
+		group    string   // billing_event.group_id (the token's own group)
+		members  []string // billing_event.member_group_ids
+		resource string
+		org      string // billing_event.org_id ('' writes NULL)
+		model    string
+		base     string // billing_event.base_model ('' writes NULL)
+		prompt   int
+	}
+	events := []gateEvent{
+		// (a) the unpriced twin: 'ga-ok' prices model 'm-unp' through base 'b'
+		// (C4 rung (c)); 'ga-bad' names base 'zz-unpriced-base', which has no
+		// price row, so its prompt_price is NULL and it is withheld as unpriced.
+		{req: "ga-ok", auth: "a-unp", members: []string{gA}, resource: "r-unp", model: "m-unp", base: "b", prompt: 40},
+		{req: "ga-bad", auth: "a-unp", members: []string{gA}, resource: "r-unp", model: "m-unp", base: "zz-unpriced-base", prompt: 999},
+		// (b) the owner-conflict twin: 'gb-bad' carries user_id AND group_id,
+		// which collapses its owner to ''/'' — the same bucket as 'gb-ok' — and
+		// drops it from money per event. Its memberships and its own group must
+		// not reach group_usage.
+		{req: "gb-ok", auth: "a-conf", members: []string{gB}, resource: "r-conf", model: "b", prompt: 25},
+		{req: "gb-bad", auth: "a-conf", user: "u-x", group: "g-conflicted", members: []string{gB}, resource: "r-conf", model: "b", prompt: 777},
+		// (c) ambiguous_org: one resource, two distinct orgs — the rollup is
+		// withheld as a whole, so neither clean event may attribute to gC.
+		{req: "gc-1", auth: "a-org", members: []string{gC}, resource: "r-org", org: "org-x", model: "b", prompt: 50},
+		{req: "gc-2", auth: "a-org", members: []string{gC}, resource: "r-org", org: "org-y", model: "b", prompt: 50},
+		// (d) the identical pair: same grain, same counts, same group — both
+		// events must attribute to gD; dropping request_id from the DISTINCT ON
+		// key would collapse them into one.
+		{req: "gd-1", auth: "a-twin", members: []string{gD}, resource: "r-twin", model: "b", prompt: 60},
+		{req: "gd-2", auth: "a-twin", members: []string{gD}, resource: "r-twin", model: "b", prompt: 60},
+	}
+	for i, e := range events {
+		_, err := db.ExecContext(ctx,
+			`INSERT INTO billing_event (request_id, auth_id, user_id, group_id, member_group_ids, resource_id, org_id, model, base_model, serving_mode, usage_found, prompt_tokens, cached_tokens, completion_tokens, event_ts)
+			 VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,'dedicated',true,$10,0,0,$11)`,
+			e.req, nullableStr(e.auth), nullableStr(e.user), nullableStr(e.group), groupIDsOrNil(e.members),
+			nullableStr(e.resource), nullableStr(e.org), nullableStr(e.model), nullableStr(e.base),
+			e.prompt, hour.Add(time.Duration(i)*time.Minute))
+		if err != nil {
+			t.Fatalf("seed event %d (%s): %v", i, e.req, err)
+		}
+	}
+
+	// Oracle for the money baseline WITHOUT the withheld events: 'ga-ok' prices
+	// at the base 'b' rate through C4 rung (c), the others price model 'b'
+	// directly — all four resolve to the same quantized rate.
+	moneyEvents := []RatedEvent{
+		{AuthID: "a-unp", ResourceID: "r-unp", ModelID: "m-unp", BaseModel: "b", ServingMode: "dedicated", PromptTokens: 40},
+		{AuthID: "a-conf", ResourceID: "r-conf", ModelID: "b", ServingMode: "dedicated", PromptTokens: 25},
+		{AuthID: "a-twin", ResourceID: "r-twin", ModelID: "b", ServingMode: "dedicated", PromptTokens: 60},
+		{AuthID: "a-twin", ResourceID: "r-twin", ModelID: "b", ServingMode: "dedicated", PromptTokens: 60},
+	}
+	costs := make([]Dec, len(moneyEvents))
+	for i, e := range moneyEvents {
+		costs[i] = Rate(e, billed)
+	}
+
+	store := NewPostgresStore(db)
+	res, err := store.RateWindow(ctx, book, hour, hour.Add(time.Hour))
+	if err != nil {
+		t.Fatalf("RateWindow: %v", err)
+	}
+
+	// Money is exactly the priced baseline: the three priced rollups (one per
+	// grain), four rated events, and a total equal to the sum of the four
+	// oracle costs. The withheld events changed nothing.
+	if res.RollupsWritten != 3 || res.EventsRated != 4 {
+		t.Fatalf("rollups/events = %d/%d, want 3/4 (the priced baseline only)", res.RollupsWritten, res.EventsRated)
+	}
+	wantTotal := costs[0].Add(costs[1]).Add(costs[2]).Add(costs[3]).String()
+	if MustDec(res.TotalCost).String() != wantTotal {
+		t.Fatalf("total cost = %s, want %s (the priced baseline only)", res.TotalCost, wantTotal)
+	}
+	// The withheld events are classified, not silently dropped: the anomaly
+	// partition accounts for all 8 seeded events exactly once.
+	if res.UnpricedEvents != 1 || res.OwnerConflictEvents != 1 || res.AmbiguousOrgEvents != 2 {
+		t.Fatalf("unpriced/conflict/ambig-org = %d/%d/%d, want 1/1/2",
+			res.UnpricedEvents, res.OwnerConflictEvents, res.AmbiguousOrgEvents)
+	}
+	if got := res.EventsRated + res.MissingUsageEvents + res.InvalidUsageEvents +
+		res.UnpricedEvents + res.UnattributableEvents + res.InvalidServingModeEvents +
+		res.AmbiguousBaseEvents + res.AmbiguousOrgEvents + res.OwnerConflictEvents; got != 8 {
+		t.Fatalf("anomaly partition = %d, want 8 (all seeded events accounted exactly once)", got)
+	}
+	if res.GroupRollupsWritten != 3 {
+		t.Fatalf("group rollups = %d, want 3 (groups %s, %s, %s)",
+			res.GroupRollupsWritten, gA[:8], gB[:8], gD[:8])
+	}
+
+	type groupRow struct {
+		prompt, billable, count int64
+		cost                    string
+	}
+	readRow := func(gid string) (groupRow, bool) {
+		var r groupRow
+		err := db.QueryRowContext(ctx,
+			`SELECT prompt_tokens, billable_prompt_tokens, event_count, cost::text
+			   FROM group_usage WHERE group_id=$1 AND window_start=$2`, gid, hour).
+			Scan(&r.prompt, &r.billable, &r.count, &r.cost)
+		if errors.Is(err, sql.ErrNoRows) {
+			return groupRow{}, false
+		}
+		if err != nil {
+			t.Fatalf("read group_usage %s: %v", gid, err)
+		}
+		return r, true
+	}
+
+	// (a) gA carries 'ga-ok' alone: dropping the prompt_price gate would let
+	// 'ga-bad' ride its twin's rollup in (count 2, prompt 1039).
+	rA, ok := readRow(gA)
+	if !ok {
+		t.Fatalf("no group_usage row for %s", gA)
+	}
+	if rA.count != 1 || rA.prompt != 40 || rA.billable != 40 || MustDec(rA.cost).String() != costs[0].String() {
+		t.Fatalf("group %s row = %+v, want count 1 / prompt 40 / billable 40 / cost %s (the priced twin only)",
+			gA, rA, costs[0])
+	}
+
+	// (b) gB carries 'gb-ok' alone: dropping the owner_conflict gate would add
+	// 'gb-bad' (count 2, prompt 802) and create a row for its own group.
+	rB, ok := readRow(gB)
+	if !ok {
+		t.Fatalf("no group_usage row for %s", gB)
+	}
+	if rB.count != 1 || rB.prompt != 25 || MustDec(rB.cost).String() != costs[1].String() {
+		t.Fatalf("group %s row = %+v, want count 1 / prompt 25 / cost %s (the clean twin only)", gB, rB, costs[1])
+	}
+	if _, ok := readRow("g-conflicted"); ok {
+		t.Fatalf("the conflicted event's own group reached group_usage; the owner_conflict twin must attribute nowhere")
+	}
+
+	// (c) the ambiguous-org rollup has no money row and no attribution row.
+	if _, ok := readRow(gC); ok {
+		t.Fatalf("group %s row exists, want none (its rollup is ambiguous-org withheld)", gC)
+	}
+	var nOrgRollups int
+	if err := db.QueryRowContext(ctx,
+		`SELECT COUNT(*) FROM rated_usage WHERE resource_id='r-org'`).Scan(&nOrgRollups); err != nil {
+		t.Fatalf("count r-org rollups: %v", err)
+	}
+	if nOrgRollups != 0 {
+		t.Fatalf("rated_usage has %d rows for r-org, want 0 (ambiguous-org withheld)", nOrgRollups)
+	}
+
+	// (d) gD carries BOTH identical events: per-event dedupe would show count 1.
+	rD, ok := readRow(gD)
+	if !ok {
+		t.Fatalf("no group_usage row for %s", gD)
+	}
+	twinCost := costs[2].Add(costs[3]).String()
+	if rD.count != 2 || rD.prompt != 120 || MustDec(rD.cost).String() != twinCost {
+		t.Fatalf("group %s row = %+v, want count 2 / prompt 120 / cost %s (both events attribute)",
+			gD, rD, twinCost)
+	}
+}
+
 // groupIDsOrNil binds a membership list as a driver value (nil for none —
 // mirrors the drainer's nullGroupIDs so the fixture writes what production
 // writes).

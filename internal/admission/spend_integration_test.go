@@ -63,7 +63,15 @@ func spendSchemaDDL(t *testing.T) string {
 //   - month spend exactly equal to the cap is exhausted (the >= boundary);
 //   - month spend below the cap is not exhausted;
 //   - a row in the PRIOR UTC month is excluded from the sum, even when it is
-//     the last hour before the boundary.
+//     the last hour before the boundary;
+//   - a row in the FIRST hour of the current UTC month is counted.
+//
+// The session runs with TimeZone set to UTC+14 (Pacific/Kiritimati), so a
+// month boundary taken in the session's time zone instead of UTC lands 14
+// hours away from the UTC boundary: it either pulls the prior month's last
+// hour into the sum or, during the last 14 hours of a UTC month, pushes the
+// first hour of the current month out of it. Postgres in CI runs with
+// TimeZone=UTC, where the two boundaries coincide and neither mistake shows.
 func TestIntegration_GroupSpendExhausted(t *testing.T) {
 	dsn := os.Getenv("PHOEBE_TEST_DATABASE_URL")
 	if dsn == "" {
@@ -84,6 +92,9 @@ func TestIntegration_GroupSpendExhausted(t *testing.T) {
 	exec(t, db, "DROP SCHEMA IF EXISTS "+sch+" CASCADE")
 	exec(t, db, "CREATE SCHEMA "+sch)
 	exec(t, db, "SET search_path TO "+sch)
+	// Like search_path, TimeZone is per connection, so it holds for every
+	// query below on the single pinned connection.
+	exec(t, db, "SET TIME ZONE 'Pacific/Kiritimati'")
 	defer func() { exec(t, db, "DROP SCHEMA IF EXISTS "+sch+" CASCADE") }()
 	exec(t, db, spendSchemaDDL(t))
 
@@ -99,6 +110,7 @@ func TestIntegration_GroupSpendExhausted(t *testing.T) {
 		gEmpty = "00000000000000000000000000000000"
 		gSpend = "a1b2c3d4e5f60718293a4b5c6d7e8f90"
 		gOther = "00112233445566778899aabbccddeeff"
+		gStart = "ffeeddccbbaa99887766554433221100"
 	)
 	seed := func(group string, windowStart time.Time, cost string) {
 		t.Helper()
@@ -122,6 +134,8 @@ func TestIntegration_GroupSpendExhausted(t *testing.T) {
 	}
 	seed(gSpend, priorMonthLastHour, "1000")
 	seed(gOther, monthStart, "1000")
+	// gStart has a single row, in the first hour of the current UTC month.
+	seed(gStart, monthStart, "2.5")
 
 	store := NewPostgresSpendStore(db)
 	for _, tc := range []struct {
@@ -143,6 +157,10 @@ func TestIntegration_GroupSpendExhausted(t *testing.T) {
 		// 4. The prior-month row (1000) is excluded: were it counted, spend
 		// would be 1001.500000001 and this cap would be exhausted.
 		{"prior month excluded", gSpend, "1001", false},
+		// 5. The first hour of the current UTC month is counted: spend equal
+		// to the cap is exhausted. A boundary taken in the session's UTC+14
+		// time zone would drop this row late in the month and admit.
+		{"current month first hour counted", gStart, "2.5", true},
 	} {
 		got, err := store.GroupSpendExhausted(ctx, tc.group, tc.cap)
 		if err != nil {

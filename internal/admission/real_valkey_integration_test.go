@@ -414,3 +414,78 @@ func TestRealValkeyContractOnlyBurst(t *testing.T) {
 		})
 	}
 }
+
+// TestRealValkeyGroupScopes runs the group fan-out through real Valkey's Lua:
+// one request carrying 16 rate-limited group scopes (the envelope maximum)
+// admits and settles, each group's window is charged the settled usage rather
+// than the reservation, and a zero-capped group is a contractual rejection.
+func TestRealValkeyGroupScopes(t *testing.T) {
+	addr := os.Getenv("PHOEBE_TEST_ADMISSION_VALKEY_ADDR")
+	if addr == "" {
+		t.Skip("PHOEBE_TEST_ADMISSION_VALKEY_ADDR not set; skipping real-Valkey group scopes")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 75*time.Second)
+	defer cancel()
+	client := redis.NewClient(&redis.Options{Addr: addr})
+	if err := client.Ping(ctx).Err(); err != nil {
+		t.Fatalf("ping real Valkey: %v", err)
+	}
+	cfg := config.AdmissionSettings{
+		KeyPrefix: fmt.Sprintf("phoebe-admission-groups-%d", time.Now().UnixNano()),
+		LeaseTTL:  time.Second,
+		Platform:  limits(64),
+	}
+	a := New(client, cfg)
+	t.Cleanup(func() {
+		_ = client.Del(context.Background(), a.counters, a.leases, a.expiries, a.windowExpiries).Err()
+		_ = client.Close()
+	})
+
+	// The windows are fixed per minute; start clear of a boundary so the
+	// settle and the per-group checks below land in the same window.
+	if s := time.Now().Second(); s >= 50 {
+		time.Sleep(time.Duration(61-s) * time.Second)
+	}
+
+	cap := int64(50)
+	scopes := make([]GroupScope, 16)
+	for i := range scopes {
+		scopes[i] = GroupScope{GroupID: fmt.Sprintf("%032x", i+1),
+			Limits: RateLimits{GeneratedTokens: &cap}}
+	}
+	r := request("org-g", "model")
+	r.GroupScopes = scopes
+
+	lease, err := a.Admit(ctx, r)
+	if err != nil {
+		t.Fatalf("admit 16-group request: %v", err)
+	}
+	// Settle 45 generated tokens: every group window now reads 45/50. A window
+	// left holding only the 20-token reservation would read 20/50 instead.
+	if err := lease.Complete(ctx, 45); err != nil {
+		t.Fatalf("settle 16-group request: %v", err)
+	}
+
+	// Each group alone: a 6-token reservation fits an unsettled 20/50 window
+	// but not a settled 45/50 one, so a rejection naming that group proves its
+	// own window settled.
+	for _, gs := range scopes {
+		probe := request("org-g", "model")
+		probe.ReservedOutputTokens = 6
+		probe.GroupScopes = []GroupScope{gs}
+		_, err := a.Admit(ctx, probe)
+		rejected, ok := err.(*Rejected)
+		if !ok || !rejected.Contractual || rejected.Scope != "group:"+gs.GroupID {
+			t.Fatalf("probe for group %s after settling 45/50 = %T %v, want a contractual rejection naming the group", gs.GroupID, err, err)
+		}
+	}
+
+	zero := int64(0)
+	zr := request("org-g", "model")
+	zr.GroupScopes = []GroupScope{{GroupID: fmt.Sprintf("%032x", 99),
+		Limits: RateLimits{Requests: &zero}}}
+	_, err = a.Admit(ctx, zr)
+	if rejected, ok := err.(*Rejected); !ok || !rejected.Contractual {
+		t.Fatalf("zero-capped group admit = %T %v, want a contractual rejection", err, err)
+	}
+}

@@ -227,12 +227,19 @@ type spendFailureLog struct {
 	mu         sync.Mutex
 	last       time.Time
 	suppressed int
+	// now is the clock; nil means time.Now. Tests inject a fixed clock to
+	// step across spendFailureLogInterval without sleeping.
+	now func() time.Time
 }
 
 func (l *spendFailureLog) logf(log *logging.Logger, format string, args ...interface{}) {
 	l.mu.Lock()
 	defer l.mu.Unlock()
-	now := time.Now()
+	clock := time.Now
+	if l.now != nil {
+		clock = l.now
+	}
+	now := clock()
 	if now.Sub(l.last) < spendFailureLogInterval {
 		l.suppressed++
 		return

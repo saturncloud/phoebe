@@ -68,14 +68,22 @@ migrate version    # print the current applied version
 ### Rollout order for migration 0008
 
 Migration 0008 adds `billing_event.member_group_ids` and the `group_usage`
-table, both of which the rater's single rating statement reads/writes. A
-pre-0008 rater fails against this schema and a post-0008 rater fails against
-the old one (SQLSTATE 42703), so roll code and schema together, in the
-migration-0007 order: run `cmd/migrate up`, then deploy the new drainer and
-rater (the drainer's INSERT gains the column; an old drainer against schema
-0008 simply writes NULL membership). The interceptor's group scope enforcement
-is envelope-driven, so it is safe across the cutover: no stamped envelope, no
-group check.
+table, both of which the rater's single rating statement reads/writes. The
+failure modes are asymmetric, so the order matters:
+
+- A pre-0008 rater still runs cleanly against the 0008 schema: 0008 only adds
+  a nullable column and a new table, neither of which the old rating
+  statement references. The old rater rates and writes money as before, but
+  writes no `group_usage`, so the admission group spend check reads an empty
+  rollup (zero group spend) until the new rater covers those hours.
+- A post-0008 rater fails against the old schema (SQLSTATE 42703): its rating
+  statement references `member_group_ids` and `group_usage`.
+
+So roll code and schema together, in the migration-0007 order: run
+`cmd/migrate up`, then deploy the new drainer and rater (the drainer's INSERT
+gains the column; an old drainer against schema 0008 simply writes NULL
+membership). The interceptor's group scope enforcement is envelope-driven, so
+it is safe across the cutover: no stamped envelope, no group check.
 
 `group_usage` rows for already-rated hours exist only after a re-rate (the
 rollup is written by the rater, not backfilled). Until a window is re-rated,
