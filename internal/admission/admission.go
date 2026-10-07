@@ -19,6 +19,7 @@ import (
 	"github.com/redis/go-redis/v9"
 
 	"github.com/saturncloud/phoebe/internal/config"
+	"github.com/saturncloud/phoebe/internal/logging"
 )
 
 var ErrUnavailable = errors.New("distributed admission state unavailable")
@@ -82,6 +83,26 @@ type Request struct {
 	Adapter              bool
 	OrganizationLimits   RateLimits
 	OwnerLimits          RateLimits
+	// GroupScopes is the parsed membership-aware group quota envelope
+	// (X-Saturn-Group-Scopes, ruled 2026-10-07): one entry per group the
+	// caller belongs to that carries limits. Each entry's Limits enforce the
+	// four per-minute rate windows as a contract scope (the same Lua/counter
+	// machinery as the contract_owner scope, settling through the same
+	// lease/CompleteUsage path); SpendCap, when set, enforces the group's
+	// monthly spend cap against the rater's group_usage rollup. Empty when the
+	// envelope carried no group (the common case).
+	GroupScopes []GroupScope
+}
+
+// GroupScope is one group's quota contract within a Request: the group's id,
+// its four per-minute rate limits (R4 sentinels: nil unlimited, 0 zero cap),
+// and its monthly spend cap as a plain decimal NUMERIC(20,9) string straight
+// from the trusted envelope ("" = no cap). The cap is compared in Postgres,
+// never as a Go number.
+type GroupScope struct {
+	GroupID  string
+	Limits   RateLimits
+	SpendCap string
 }
 
 // RateLimits is the authenticated customer contract. R4 sentinel semantics
@@ -135,6 +156,28 @@ type RedisAdmitter struct {
 	cfg                        config.AdmissionSettings
 	counters, leases, expiries string
 	windowExpiries             string
+	// Group scope enforcement (membership-aware group quotas, ruled
+	// 2026-10-07). spendStore is nil on installs without a Postgres handle
+	// (serving-only spokes): group RATE limits still enforce from the Valkey
+	// store, spend caps are then unchecked — logged loudly at startup by
+	// cmd/interceptor, never silently assumed.
+	spendStore GroupSpendStore
+	spendCache *spendVerdictCache
+	spendLog   *logging.Logger
+	spendFails *spendFailureLog
+}
+
+// WithGroupSpend enables the monthly spend cap check against a GroupSpendStore
+// and returns the admitter for chaining. log carries the loud-failure lines:
+// the spend check FAILS OPEN (a quota may never take inference down), so a
+// store error is always an ERROR line, throttled by spendFailureLog so a
+// Postgres outage cannot emit one line per admitted request.
+func (a *RedisAdmitter) WithGroupSpend(store GroupSpendStore, log *logging.Logger) *RedisAdmitter {
+	a.spendStore = store
+	a.spendLog = log
+	a.spendCache = newSpendVerdictCache()
+	a.spendFails = &spendFailureLog{}
+	return a
 }
 
 func New(client redis.Cmdable, cfg config.AdmissionSettings) *RedisAdmitter {
@@ -199,8 +242,24 @@ func (a *RedisAdmitter) Admit(ctx context.Context, req Request) (*Lease, error) 
 	if req.OwnerLimits.Any() && req.Owner == "" {
 		return nil, fmt.Errorf("%w: missing trusted owner identity", ErrInvalidIdentity)
 	}
+	for _, gs := range req.GroupScopes {
+		// A group scope carrying any limit or spend cap must name its group:
+		// an anonymous quota is not a quota, it is a broken envelope (fail
+		// closed, like every other structural violation).
+		if gs.GroupID == "" && (gs.Limits.Any() || gs.SpendCap != "") {
+			return nil, fmt.Errorf("%w: group scope carries limits without a group id", ErrInvalidIdentity)
+		}
+	}
 	if req.PromptBytes < 0 || req.EstimatedInputTokens <= 0 || req.ReservedOutputTokens <= 0 {
 		return nil, &Rejected{Scope: "request", Dimension: "work estimate", RetryAfter: time.Second}
+	}
+	// The monthly spend cap is a Go-side pre-check against Postgres (cached
+	// per (group, cap), compared in SQL), ahead of the Lua reservation: a group
+	// at its cap is rejected without reserving anything. It fails OPEN — a
+	// store error logs loud and admits, the 2026-09-24 posture (quotas are
+	// permissible; they never take inference down).
+	if err := a.checkGroupSpend(ctx, req.GroupScopes); err != nil {
+		return nil, err
 	}
 	id, err := randomID()
 	if err != nil {
@@ -385,7 +444,74 @@ func (a *RedisAdmitter) scopes(r Request) []scope {
 	if r.OwnerLimits.Any() {
 		out = append(out, makeContractScope("contract_owner", r.Owner, r.OwnerLimits))
 	}
+	// Group rate scopes: one contract scope per group that carries any rate
+	// limit, same Lua/counter machinery and wireLimit sentinels as the org/
+	// owner contract scopes, settling through the same lease/CompleteUsage
+	// path (the lease record holds this scope like any other, and finishScript
+	// charges its windows). The scope NAME carries the group id so a rejection
+	// names the team; the scope id digests it, so groups never collide.
+	for _, gs := range r.GroupScopes {
+		if gs.Limits.Any() {
+			out = append(out, makeContractScope("group:"+gs.GroupID, gs.GroupID, gs.Limits))
+		}
+	}
 	return out
+}
+
+// checkGroupSpend enforces the monthly spend cap for every group scope that
+// carries one: reject when the group's month-to-date attribution spend (the
+// rater's group_usage rollup) has reached the cap. Reaching is the boundary —
+// spend >= cap rejects, so a cap of 0 rejects all paid work for the group.
+// A 429+Retry-After denial (Contractual); the retry hint is one minute, the
+// cache TTL: the verdict can refresh no sooner anyway, and spend only relaxes
+// when the month turns or a re-rate supersedes the rollup.
+//
+// FAIL OPEN, LOUD: a missing store (install without Postgres) or a store
+// error admits the request and logs. Quotas are permissible; they never take
+// inference down, and they are never silently enforced either — every bypass
+// is an ERROR line (throttled so an outage cannot flood).
+func (a *RedisAdmitter) checkGroupSpend(ctx context.Context, scopes []GroupScope) error {
+	if a.spendStore == nil {
+		for _, gs := range scopes {
+			if gs.SpendCap != "" {
+				a.spendBypass(gs.GroupID, errors.New("no spend store configured (group_usage is unreachable — is DATABASE_URL set?)"))
+			}
+		}
+		return nil
+	}
+	for _, gs := range scopes {
+		if gs.SpendCap == "" {
+			continue
+		}
+		if exhausted, ok := a.spendCache.lookup(gs.GroupID, gs.SpendCap); ok {
+			if exhausted {
+				return &Rejected{Scope: "group:" + gs.GroupID, Dimension: "monthly_spend", RetryAfter: groupSpendCacheTTL, Contractual: true}
+			}
+			continue
+		}
+		exhausted, err := a.spendStore.GroupSpendExhausted(ctx, gs.GroupID, gs.SpendCap)
+		if err != nil {
+			a.spendBypass(gs.GroupID, err)
+			continue
+		}
+		a.spendCache.store(gs.GroupID, gs.SpendCap, exhausted)
+		if exhausted {
+			return &Rejected{Scope: "group:" + gs.GroupID, Dimension: "monthly_spend", RetryAfter: groupSpendCacheTTL, Contractual: true}
+		}
+	}
+	return nil
+}
+
+// spendBypass logs a fail-open spend-check bypass at ERROR, throttled through
+// spendFailureLog so a sustained store outage stays visible at its onset
+// without one line per admitted request. Nil-safe for admitters built without
+// WithGroupSpend (a spendStore-less admitter can still see spend caps if a
+// caller hands it group scopes directly).
+func (a *RedisAdmitter) spendBypass(groupID string, err error) {
+	if a.spendLog == nil || a.spendFails == nil {
+		return
+	}
+	a.spendFails.logf(a.spendLog, "admission: group %s: monthly spend cap NOT enforced (fail open): %v", groupID, err)
 }
 
 // Lease owns all reservations for one accepted request. Its transition methods
