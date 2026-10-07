@@ -174,6 +174,24 @@ func TestParseTrustedGroupScopes(t *testing.T) {
 		}
 	})
 
+	t.Run("over the size bound", func(t *testing.T) {
+		// The size check fires before any grammar validation, so one entry
+		// whose requests rate is a long digit string — overlong for the rate
+		// grammar, which never gets a say — is a valid fixture: the parse
+		// must fail on the byte bound alone, and the error must name it.
+		in := groupScopesValue(testGroupA, strings.Repeat("9", maxGroupScopeBytes), "")
+		if len(in) < maxGroupScopeBytes {
+			t.Fatalf("fixture = %d bytes, want at least the %d-byte bound", len(in), maxGroupScopeBytes)
+		}
+		_, err := parseTrustedGroupScopes(identity.Identity{GroupScopes: in})
+		if err == nil {
+			t.Fatalf("parse of a %d-byte header succeeded, want the %d-byte envelope bound enforced", len(in), maxGroupScopeBytes)
+		}
+		if !strings.Contains(err.Error(), "4096-byte envelope bound") {
+			t.Fatalf("parse error = %q, want it to name the 4096-byte envelope bound", err)
+		}
+	})
+
 	t.Run("maximal valid envelope stays under the size bound", func(t *testing.T) {
 		// K4B: a >4 KiB fixture built only from grammatically valid entries
 		// does not exist. The 16-entry cap bounds the count and every field
@@ -192,7 +210,12 @@ func TestParseTrustedGroupScopes(t *testing.T) {
 		// maximal envelope parses, and the shapes that could approach 4 KiB
 		// fail on the 16-entry cap (the "over the entry bound" case) or the
 		// per-entry grammar (the malformed table) — remove either check and
-		// this test's siblings fail.
+		// this test's siblings fail. The size check is pinned by the "over
+		// the size bound" case above: its fixture is over 4 KiB and the rate
+		// grammar would also reject its overlong field, so that case asserts
+		// the error names the byte bound — delete the size check and the
+		// parse fails on the rate grammar instead, the assertion misses, and
+		// the case goes red.
 		maxRate := strings.Repeat("9", 18) // largest rate that still fits int64
 		entries := make([]string, 0, maxGroupScopeEntries)
 		for i := 0; i < maxGroupScopeEntries; i++ {
