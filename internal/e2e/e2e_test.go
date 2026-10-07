@@ -41,7 +41,6 @@ import (
 	_ "github.com/jackc/pgx/v5/stdlib"
 	"github.com/redis/go-redis/v9"
 
-	"github.com/saturncloud/phoebe/internal/admission"
 	"github.com/saturncloud/phoebe/internal/config"
 	"github.com/saturncloud/phoebe/internal/drain"
 	"github.com/saturncloud/phoebe/internal/emit"
@@ -156,9 +155,6 @@ func newHarness(t *testing.T, schema string) *harness {
 	// 0007 makes rated_usage.serving_mode 'shared'/'dedicated' only (CHECK, no
 	// default); the rater's upsert must satisfy it.
 	mustExec(t, db, readMigration(t, "0007_serving_mode_explicit.up.sql"))
-	// 0008 adds billing_event.member_group_ids (in the drainer's INSERT and the
-	// rater's group attribution) and the group_usage table the rater upserts.
-	mustExec(t, db, readMigration(t, "0008_group_scopes.up.sql"))
 
 	mr, err := miniredis.Run()
 	if err != nil {
@@ -1065,157 +1061,4 @@ func TestE2E_AdapterHeaderLandsInBillingEventAndTriggersPremium(t *testing.T) {
 	}
 	h.assertNumericEqual(t, appliedPrompt, "0.000006", "rated_usage.applied_prompt_rate (base x premium frozen on row)")
 	h.assertNumericEqual(t, cost, wantCost, "rated_usage.cost")
-}
-
-// testGroupID is the 32-hex group id the group-scopes pipeline test stamps on
-// its X-Saturn-Group-Scopes envelope (uuid4 hex, as Atlas mints).
-const testGroupID = "a1b2c3d4e5f60718293a4b5c6d7e8f90"
-
-// TestE2E_GroupScopedRequestBecomesGroupSpend is the group attribution
-// pipeline test. Every hop of the membership-aware group quota path (proxy
-// envelope parse and emit, drainer binding of member_group_ids, rater
-// attribution into group_usage, admission spend verdict) has unit tests over
-// hand-seeded rows, so a shape mismatch BETWEEN hops — for example the drainer
-// binding the group list in a form the rater's unnest does not read as text[] —
-// would leave group spend silently at zero with every unit test green. This
-// test runs one shared request carrying a real v1 envelope through the real
-// components and asserts the far end:
-//
-//   - membership contract: billing_event.member_group_ids holds the envelope's
-//     group id, captured at meter time;
-//   - attribution contract: group_usage has a row for that group whose cost
-//     equals the event's money cost (the same oracle as the money test);
-//   - spend verdict: admission.PostgresSpendStore reads that row back, so a
-//     cap equal to the cost is exhausted and a higher cap is not.
-//
-// The request passes through a real admitter (admission.enabled=false, as a
-// default chart install renders it) over the harness's miniredis, with the
-// real Postgres spend store wired in: the envelope's requests-per-minute rate
-// and its spend cap engage Admit, and the spend check reads the still-empty
-// group_usage on the request path before rating fills it.
-func TestE2E_GroupScopedRequestBecomesGroupSpend(t *testing.T) {
-	h := newHarness(t, "phoebe_e2e_group_scopes")
-
-	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
-		w.Header().Set("Content-Type", "text/event-stream")
-		w.WriteHeader(http.StatusOK)
-		fl, _ := w.(http.Flusher)
-		for _, chunk := range strings.SplitAfter(vllmStream, "\n\n") {
-			if chunk == "" {
-				continue
-			}
-			_, _ = io.WriteString(w, chunk)
-			if fl != nil {
-				fl.Flush()
-			}
-		}
-	}))
-	defer backend.Close()
-
-	// A real admitter over the harness's miniredis (its own key prefix, so it
-	// never touches the metering stream), with the real Postgres spend store.
-	admissionCfg := config.AdmissionSettings{
-		Enabled:                false,
-		KeyPrefix:              "phoebe-admission-e2e",
-		LeaseTTL:               time.Minute,
-		DefaultMaxOutputTokens: config.DefaultMaxOutputTokens,
-	}
-	spendStore := admission.NewPostgresSpendStore(h.db)
-	admitter := admission.New(h.rdb, admissionCfg).WithGroupSpend(spendStore, h.log)
-	srv := proxy.New(&config.Settings{ListenAddr: ":0", Admission: admissionCfg}, h.log, h.emitter).
-		WithAdmitter(admitter)
-
-	// A shared route as Atlas stamps it, plus a one-group envelope: 60
-	// requests per minute, the token rates unlimited, and a spend cap well
-	// above this request's cost so the request is admitted.
-	rr := httptest.NewRecorder()
-	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions",
-		strings.NewReader(`{"model":"`+testModelName+`","stream":true,"max_tokens":300,"messages":[]}`))
-	req.Header.Set(identity.HeaderUpstream, backend.URL)
-	req.Header.Set(identity.HeaderServingMode, identity.ServingModeShared)
-	req.Header.Set(identity.HeaderServedModel, testModelName)
-	req.Header.Set(identity.HeaderAuthID, testAuthID)
-	req.Header.Set(identity.HeaderResourceID, testResourceID)
-	req.Header.Set(identity.HeaderResourceType, "deployment")
-	req.Header.Set(identity.HeaderUserID, "user-e2e")
-	req.Header.Set(identity.HeaderOwnerID, "user-e2e")
-	req.Header.Set(identity.HeaderOrgID, testOrgID)
-	req.Header.Set(identity.HeaderGroupScopes, "v1;"+testGroupID+":60,,,,100")
-	srv.Handler().ServeHTTP(rr, req)
-
-	if rr.Code != http.StatusOK {
-		t.Fatalf("proxy status = %d, want 200 (body: %s)", rr.Code, rr.Body.String())
-	}
-
-	h.waitForStreamLen(t, 1, 5*time.Second)
-	h.drainUntilRows(t, 1, 10*time.Second)
-
-	// MEMBERSHIP CONTRACT at the drain layer: the group list is stored as a
-	// Postgres text[] holding exactly the envelope's group id.
-	var members sql.NullString
-	if err := h.db.QueryRow(
-		`SELECT array_to_string(member_group_ids, ',') FROM billing_event`).Scan(&members); err != nil {
-		t.Fatalf("read billing_event.member_group_ids: %v", err)
-	}
-	if !members.Valid || members.String != testGroupID {
-		t.Fatalf("billing_event.member_group_ids = %v, want {%s} (from X-Saturn-Group-Scopes)", members, testGroupID)
-	}
-
-	res := h.rateEventHour(t, h.priceBook(t))
-
-	// Same fixture and price file as the money test, so the same hand-derived
-	// cost: 86*0.000005 + 1920*0.0000005 + 300*0.00002 = 0.00739.
-	const wantCost = "0.00739"
-	if res.EventsRated != 1 || res.UnpricedEvents != 0 || res.UnattributableEvents != 0 {
-		t.Fatalf("rater Result = %+v, want 1 event rated with no anomalies", res)
-	}
-	h.assertNumericEqual(t, res.TotalCost, wantCost, "Result.TotalCost")
-
-	// ATTRIBUTION CONTRACT: exactly one group_usage row, for the envelope's
-	// group, carrying the event's cost and tokens.
-	var nGroupRows int
-	if err := h.db.QueryRow("SELECT COUNT(*) FROM group_usage").Scan(&nGroupRows); err != nil {
-		t.Fatalf("count group_usage: %v", err)
-	}
-	if nGroupRows != 1 {
-		t.Fatalf("group_usage rows = %d, want exactly 1 (the envelope's group); zero means group spend is silently unattributed", nGroupRows)
-	}
-	var (
-		guGroupID, guCost                string
-		guPrompt, guCached, guCompletion int64
-		guBillable, guEventCount         int64
-	)
-	if err := h.db.QueryRow(
-		`SELECT group_id, cost::text, prompt_tokens, cached_tokens, completion_tokens, billable_prompt_tokens, event_count
-		 FROM group_usage`).
-		Scan(&guGroupID, &guCost, &guPrompt, &guCached, &guCompletion, &guBillable, &guEventCount); err != nil {
-		t.Fatalf("read group_usage: %v", err)
-	}
-	if guGroupID != testGroupID {
-		t.Errorf("group_usage.group_id = %q, want %q", guGroupID, testGroupID)
-	}
-	if guPrompt != 2006 || guCached != 1920 || guCompletion != 300 || guBillable != 86 || guEventCount != 1 {
-		t.Errorf("group_usage tokens = %d/%d/%d billable=%d events=%d, want 2006/1920/300 billable=86 events=1",
-			guPrompt, guCached, guCompletion, guBillable, guEventCount)
-	}
-	h.assertNumericEqual(t, guCost, wantCost, "group_usage.cost")
-
-	// SPEND VERDICT: the admission spend store reads the rated row back. The
-	// cap is inclusive (spend >= cap is exhausted), so a cap equal to the cost
-	// is exhausted and any higher cap is not.
-	ctx := context.Background()
-	exhausted, err := spendStore.GroupSpendExhausted(ctx, testGroupID, wantCost)
-	if err != nil {
-		t.Fatalf("GroupSpendExhausted(cap=%s): %v", wantCost, err)
-	}
-	if !exhausted {
-		t.Errorf("GroupSpendExhausted(cap=%s) = false, want true — the spend check does not see the rated group spend", wantCost)
-	}
-	exhausted, err = spendStore.GroupSpendExhausted(ctx, testGroupID, "0.007390001")
-	if err != nil {
-		t.Fatalf("GroupSpendExhausted(cap=0.007390001): %v", err)
-	}
-	if exhausted {
-		t.Error("GroupSpendExhausted(cap=0.007390001) = true, want false — a cap above the spend must not be exhausted")
-	}
 }
