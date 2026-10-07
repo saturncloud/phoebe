@@ -82,6 +82,24 @@ type Request struct {
 	Adapter              bool
 	OrganizationLimits   RateLimits
 	OwnerLimits          RateLimits
+	// GroupScopes is the parsed membership-aware group quota envelope
+	// (X-Saturn-Group-Scopes, ruled 2026-10-07): one entry per group the
+	// caller belongs to that carries limits. Each entry's Limits enforce the
+	// four per-minute rate windows as a contract scope (the same Lua/counter
+	// machinery as the contract_owner scope, settling through the same
+	// lease/CompleteUsage path). Empty when the envelope carried no group
+	// (the common case).
+	GroupScopes []GroupScope
+}
+
+// GroupScope is one group's quota contract within a Request: the group's id
+// and its four per-minute rate limits (R4 sentinels: nil unlimited, 0 zero
+// cap). The envelope's fifth field is reserved for the deferred monthly spend
+// cap; the proxy rejects any envelope that carries a non-empty value there,
+// so a GroupScope never holds one in this build.
+type GroupScope struct {
+	GroupID string
+	Limits  RateLimits
 }
 
 // RateLimits is the authenticated customer contract. R4 sentinel semantics
@@ -198,6 +216,14 @@ func (a *RedisAdmitter) Admit(ctx context.Context, req Request) (*Lease, error) 
 	}
 	if req.OwnerLimits.Any() && req.Owner == "" {
 		return nil, fmt.Errorf("%w: missing trusted owner identity", ErrInvalidIdentity)
+	}
+	for _, gs := range req.GroupScopes {
+		// A group scope carrying any limit must name its group: an anonymous
+		// quota is not a quota, it is a broken envelope (fail closed, like
+		// every other structural violation).
+		if gs.GroupID == "" && gs.Limits.Any() {
+			return nil, fmt.Errorf("%w: group scope carries limits without a group id", ErrInvalidIdentity)
+		}
 	}
 	if req.PromptBytes < 0 || req.EstimatedInputTokens <= 0 || req.ReservedOutputTokens <= 0 {
 		return nil, &Rejected{Scope: "request", Dimension: "work estimate", RetryAfter: time.Second}
@@ -384,6 +410,17 @@ func (a *RedisAdmitter) scopes(r Request) []scope {
 	}
 	if r.OwnerLimits.Any() {
 		out = append(out, makeContractScope("contract_owner", r.Owner, r.OwnerLimits))
+	}
+	// Group rate scopes: one contract scope per group that carries any rate
+	// limit, same Lua/counter machinery and wireLimit sentinels as the org/
+	// owner contract scopes, settling through the same lease/CompleteUsage
+	// path (the lease record holds this scope like any other, and finishScript
+	// charges its windows). The scope NAME carries the group id so a rejection
+	// names the team; the scope id digests it, so groups never collide.
+	for _, gs := range r.GroupScopes {
+		if gs.Limits.Any() {
+			out = append(out, makeContractScope("group:"+gs.GroupID, gs.GroupID, gs.Limits))
+		}
 	}
 	return out
 }

@@ -576,7 +576,9 @@ func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request) {
 		// Contract limits therefore engage whenever Atlas stamped them, with or
 		// without operator tiers (ruling R12 clarification). Under
 		// admission.enabled=false the store itself is consulted only when a
-		// contract limit header is present (the Admit call below); a limit
+		// contract limit header is present (the Admit call below; a group
+		// envelope engages it only when a group scope carries a rate limit);
+		// a limit
 		// header without the owner-id anchor still fails closed in
 		// parseTrustedRateLimits. Only a shared request with NO envelope at all,
 		// under admission.enabled=false, skips admission entirely: the
@@ -603,6 +605,7 @@ func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request) {
 			tenantIdentity = "resource:" + id.ResourceID
 		}
 		var organizationLimits, ownerLimits admission.RateLimits
+		var groupScopes []admission.GroupScope
 		var graph string
 		if enforceAdmission {
 			// A structurally broken policy — limit headers without their
@@ -619,6 +622,17 @@ func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request) {
 					// decide nothing, but their presence names the root cause.
 					s.log.Warn.Printf("admission: legacy single-scope quota headers present without %s (removed by R8); legacy_envelope_present=true (pre-R8 producer; upgrade Atlas/Traefik) request_id=%s", identity.HeaderOwnerID, requestID)
 				}
+				http.Error(w, "shared inference policy unavailable", http.StatusServiceUnavailable)
+				return
+			}
+			// The group quota envelope is a separate fail-closed parse:
+			// malformed, oversized, or over-count is a 503 with a loud log —
+			// the fail-visible default (the system never silently drops one
+			// group of a multi-group caller). Absent header → nil scopes.
+			var groupErr error
+			groupScopes, groupErr = parseTrustedGroupScopes(id)
+			if groupErr != nil {
+				s.log.Error.Printf("admission: invalid trusted group scope policy: %v request_id=%s", groupErr, requestID)
 				http.Error(w, "shared inference policy unavailable", http.StatusServiceUnavailable)
 				return
 			}
@@ -661,7 +675,11 @@ func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request) {
 			// default the client did not choose. The reservation is clamped
 			// before prepareSharedDynamoRequest so the Dynamo output hint
 			// still equals the reservation.
-			defaultOutput = undeclaredOutputReservation(defaultOutput, organizationLimits, ownerLimits)
+			groupLimits := make([]admission.RateLimits, len(groupScopes))
+			for i, gs := range groupScopes {
+				groupLimits[i] = gs.Limits
+			}
+			defaultOutput = undeclaredOutputReservation(defaultOutput, append([]admission.RateLimits{organizationLimits, ownerLimits}, groupLimits...)...)
 		}
 		estimate, ok := admissionWork(body, defaultOutput)
 		if !ok {
@@ -690,14 +708,17 @@ func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request) {
 		}
 		// Under admission.enabled=false a request whose envelope carries no
 		// limit is unlimited in every scope, so it does not touch the store: no
-		// Admit, no lease renewal, no completion. Every fail-closed check above
-		// has already run.
-		if enforceAdmission && (s.settings.Admission.Enabled || organizationLimits.Any() || ownerLimits.Any()) {
+		// Admit, no lease renewal, no completion. A group envelope engages the
+		// store only when at least one group scope carries a rate limit; an
+		// all-unlimited envelope enforces
+		// nothing. Every fail-closed check above has already run.
+		if enforceAdmission && (s.settings.Admission.Enabled || organizationLimits.Any() || ownerLimits.Any() || anyGroupScopeEnforced(groupScopes)) {
 			admitted, err = s.admitter.Admit(r.Context(), admission.Request{
 				Graph: graph, Organization: id.OrgID, Owner: id.OwnerID, Model: estimate.Model,
 				PromptBytes: originalPromptBytes, EstimatedInputTokens: estimate.InputTokens,
 				ReservedOutputTokens: estimate.OutputTokens,
 				Adapter:              id.Adapter != "", OrganizationLimits: organizationLimits, OwnerLimits: ownerLimits,
+				GroupScopes: groupScopes,
 			})
 			if err != nil {
 				if errors.Is(err, admission.ErrInvalidIdentity) {

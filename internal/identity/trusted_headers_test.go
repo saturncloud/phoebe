@@ -48,12 +48,13 @@ func pinnedSet() map[string]struct{} {
 	return set
 }
 
-// TestPinnedFallbackIsExactlyThe13 pins the fallback to the exact
+// TestPinnedFallbackIsExactlyThe14 pins the fallback to the exact
 // pinned names, in the exact pinned order — the set the chart's ConfigMap
 // is supposed to render. Ruling R8 removed the five legacy single-scope
 // quota headers (X-Saturn-Service-Tier, X-Saturn-Rate-Limit-*), taking the
-// R3 set from 18 to 13.
-func TestPinnedFallbackIsExactlyThe13(t *testing.T) {
+// R3 set from 18 to 13; the membership-aware group scope envelope
+// (X-Saturn-Group-Scopes, ruled 2026-10-07) takes it from 13 to 14.
+func TestPinnedFallbackIsExactlyThe14(t *testing.T) {
 	want := []string{
 		"X-Saturn-Gateway",
 		"X-Saturn-Org-Id",
@@ -68,14 +69,15 @@ func TestPinnedFallbackIsExactlyThe13(t *testing.T) {
 		"X-Saturn-Owner-Rate-Limit-Total-Prompt-Tokens",
 		"X-Saturn-Owner-Rate-Limit-Uncached-Prompt-Tokens",
 		"X-Saturn-Owner-Rate-Limit-Generated-Tokens",
+		"X-Saturn-Group-Scopes",
 	}
 	if !reflect.DeepEqual(pinnedTrustedHeaders, want) {
-		t.Fatalf("pinnedTrustedHeaders = %v, want the pinned 13 in order %v", pinnedTrustedHeaders, want)
+		t.Fatalf("pinnedTrustedHeaders = %v, want the pinned 14 in order %v", pinnedTrustedHeaders, want)
 	}
 }
 
 // TestLoadTrustedHeadersFallback: unset, empty, whitespace-only, or
-// all-empty-after-split config engages the pinned 13 — never an empty set.
+// all-empty-after-split config engages the pinned 14 — never an empty set.
 func TestLoadTrustedHeadersFallback(t *testing.T) {
 	cases := []struct {
 		name  string
@@ -92,7 +94,7 @@ func TestLoadTrustedHeadersFallback(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			withTrustedHeadersEnv(t, tc.value, tc.set)
 			if got := ActiveTrustedHeaders(); !reflect.DeepEqual(got, pinnedSet()) {
-				t.Fatalf("active set = %v, want the pinned 13 %v", got, pinnedSet())
+				t.Fatalf("active set = %v, want the pinned 14 %v", got, pinnedSet())
 			}
 		})
 	}
@@ -308,7 +310,7 @@ func TestLoadTrustedHeadersErrorsWhenOwnerOrOrgAnchorMissing(t *testing.T) {
 	}
 }
 
-// TestLoadTrustedHeadersNoErrorForPinnedList: the full pinned 13, configured
+// TestLoadTrustedHeadersNoErrorForPinnedList: the full pinned 14, configured
 // explicitly, satisfies every required header and logs nothing at ERROR.
 func TestLoadTrustedHeadersNoErrorForPinnedList(t *testing.T) {
 	out := loadTrustedHeadersCapturingErrors(t, strings.Join(pinnedTrustedHeaders, ","))
@@ -434,6 +436,7 @@ var candidateSaturnHeaders = []string{
 	HeaderOwnerRateLimitTotalPromptTokens,
 	HeaderOwnerRateLimitUncachedPromptTokens,
 	HeaderOwnerRateLimitGeneratedTokens,
+	HeaderGroupScopes,
 }
 
 // packageSaturnHeaderConstants parses the package's non-test Go files and
