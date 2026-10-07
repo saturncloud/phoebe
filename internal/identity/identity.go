@@ -147,6 +147,25 @@ const (
 	HeaderOwnerRateLimitUncachedPromptTokens = "X-Saturn-Owner-Rate-Limit-Uncached-Prompt-Tokens"
 	HeaderOwnerRateLimitGeneratedTokens      = "X-Saturn-Owner-Rate-Limit-Generated-Tokens"
 
+	// HeaderGroupScopes carries the membership-aware GROUP quota envelope
+	// (ruled 2026-10-07, Q-T1(b)+Q-T2(b)): the whole group scope set rides ONE
+	// allowlisted header because Traefik's authResponseHeaders allowlist is a
+	// fixed name list and a member can belong to several groups. Grammar
+	// (frozen envelope, parsed strictly at the proxy/admission layer):
+	//
+	//	v1;<gid>:<req>,<tot>,<unc>,<gen>,<spend>;<gid>:...
+	//
+	// <gid> is the 32-hex group id; each rate field is empty (unlimited), 0
+	// (zero cap), or a positive per-minute value (R4 sentinels). The <spend>
+	// field is RESERVED for the deferred monthly spend cap: it must be EMPTY
+	// in this build — a non-empty value is malformed and fails closed (503)
+	// at the proxy (the parked-activation boundary; parseTrustedGroupScopes).
+	// At most 16 entries, under 4 KiB. Like every scoped limit header it
+	// resolves through the R3 trusted-header registry: outside the active set
+	// it reads as ABSENT, so no group quota is ever read from a client-
+	// supplied value.
+	HeaderGroupScopes = "X-Saturn-Group-Scopes"
+
 	// HeaderUpstream carries the EXACT backend the request must be forwarded to —
 	// `host:port` (e.g. pd-abcde-mymodel-r123.main-namespace.svc.cluster.local:8000).
 	//
@@ -228,6 +247,13 @@ type Identity struct {
 	OwnerRateLimitTotalPromptTokens    string
 	OwnerRateLimitUncachedPromptTokens string
 	OwnerRateLimitGeneratedTokens      string
+	// GroupScopes is the raw, trusted X-Saturn-Group-Scopes envelope value
+	// (see HeaderGroupScopes), read through the R3 trusted-header registry.
+	// Empty when the header is absent or untrusted. The strict parse — per-group
+	// rate limits, bounds — happens at the proxy/admission layer
+	// (parseTrustedGroupScopes); Identity carries the envelope verbatim,
+	// exactly like the eight scoped rate-limit fields above.
+	GroupScopes string
 }
 
 // The two serving modes, spelled exactly as they are stored in billing_event and
@@ -248,8 +274,9 @@ func ValidServingMode(s string) bool {
 // validation beyond reading the values; authorization happened at the edge.
 //
 // The R3 envelope reads (gateway mark, org, owner, serving mode, served
-// model, and every rate-limit policy header — the pinned 13) resolve through
-// the trusted-header registry: a header outside the active set is treated
+// model, every rate-limit policy header, and the group scope envelope —
+// the pinned 14) resolve through the trusted-header registry: a header
+// outside the active set is treated
 // as ABSENT, never read for a trust decision. The remaining identity headers
 // are read directly (ratified edge contract, outside the R3 gate). The proxy
 // calls FromRequest BEFORE StripSaturnHeaders removes every X-Saturn-* header
@@ -284,6 +311,7 @@ func FromRequest(r *http.Request) Identity {
 		OwnerRateLimitTotalPromptTokens:    trustedHeaderValue(r, HeaderOwnerRateLimitTotalPromptTokens),
 		OwnerRateLimitUncachedPromptTokens: trustedHeaderValue(r, HeaderOwnerRateLimitUncachedPromptTokens),
 		OwnerRateLimitGeneratedTokens:      trustedHeaderValue(r, HeaderOwnerRateLimitGeneratedTokens),
+		GroupScopes:                        trustedHeaderValue(r, HeaderGroupScopes),
 	}
 }
 

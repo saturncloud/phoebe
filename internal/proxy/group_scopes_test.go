@@ -1,0 +1,644 @@
+package proxy
+
+import (
+	"bytes"
+	"io"
+	"log"
+	"net/http"
+	"net/http/httptest"
+	"net/url"
+	"strconv"
+	"strings"
+	"testing"
+	"time"
+
+	"github.com/redis/go-redis/v9"
+
+	"github.com/saturncloud/phoebe/internal/admission"
+	"github.com/saturncloud/phoebe/internal/config"
+	"github.com/saturncloud/phoebe/internal/identity"
+	"github.com/saturncloud/phoebe/internal/logging"
+)
+
+// These tests cover the membership-aware group quota envelope
+// (X-Saturn-Group-Scopes, ruled 2026-10-07) at the proxy layer: the strict
+// parse (fail-visible: malformed/oversize → 503) and the end-to-end
+// enforcement of the per-minute group rate limits (429 + Retry-After on
+// denial). The envelope's fifth field is reserved for the deferred monthly
+// spend cap: non-empty is malformed → 503 (the parked-activation boundary).
+
+const (
+	testGroupA = "a1b2c3d4e5f60718293a4b5c6d7e8f90"
+	testGroupB = "00112233445566778899aabbccddeeff"
+
+	// groupScopesHeader is a fully-unlimited two-group envelope: every rate
+	// empty (unlimited).
+	groupScopesHeader = "v1;" + testGroupA + ":,,,," + ";" + testGroupB + ":,,,,"
+)
+
+// groupScopesValue builds an envelope for one group with the given rate field
+// string (verbatim between the colons) and spend field (always "" in valid
+// envelopes; non-empty builds the malformed spend cases).
+func groupScopesValue(gid, rates, spend string) string {
+	return "v1;" + gid + ":" + rates + "," + spend
+}
+
+// TestParseTrustedGroupScopes exercises the frozen envelope grammar:
+// v1;<gid>:<req>,<tot>,<unc>,<gen>,<spend>;<gid>:...
+func TestParseTrustedGroupScopes(t *testing.T) {
+	valid := []struct {
+		name string
+		in   string
+		want []admission.GroupScope
+	}{
+		{
+			"absent header",
+			"",
+			nil,
+		},
+		{
+			"v1 alone is zero groups",
+			"v1",
+			nil,
+		},
+		{
+			"single group all unlimited",
+			groupScopesValue(testGroupA, ",,,", ""),
+			[]admission.GroupScope{{GroupID: testGroupA}},
+		},
+		{
+			"all four rates set",
+			groupScopesValue(testGroupA, "30,1000,500,2000", ""),
+			[]admission.GroupScope{{
+				GroupID: testGroupA,
+				Limits: admission.RateLimits{
+					Requests: ptr64(30), TotalPromptTokens: ptr64(1000),
+					UncachedPromptTokens: ptr64(500), GeneratedTokens: ptr64(2000),
+				},
+			}},
+		},
+		{
+			"rate zero is a zero cap",
+			groupScopesValue(testGroupA, "0,,,", ""),
+			[]admission.GroupScope{{
+				GroupID: testGroupA,
+				Limits:  admission.RateLimits{Requests: ptr64(0)},
+			}},
+		},
+		{
+			"multi group in envelope order",
+			"v1;" + testGroupA + ":1,,,," + ";" + testGroupB + ":,2,,,",
+			[]admission.GroupScope{
+				{GroupID: testGroupA, Limits: admission.RateLimits{Requests: ptr64(1)}},
+				{GroupID: testGroupB, Limits: admission.RateLimits{TotalPromptTokens: ptr64(2)}},
+			},
+		},
+	}
+	for _, tc := range valid {
+		t.Run(tc.name, func(t *testing.T) {
+			scopes, err := parseTrustedGroupScopes(identity.Identity{GroupScopes: tc.in})
+			if err != nil {
+				t.Fatalf("parse(%q): %v, want success", tc.in, err)
+			}
+			if len(scopes) != len(tc.want) {
+				t.Fatalf("parse(%q) = %d scopes, want %d (%+v)", tc.in, len(scopes), len(tc.want), scopes)
+			}
+			for i, want := range tc.want {
+				got := scopes[i]
+				if got.GroupID != want.GroupID {
+					t.Fatalf("scope %d = %+v, want %+v", i, got, want)
+				}
+				if (got.Limits.Requests == nil) != (want.Limits.Requests == nil) ||
+					(got.Limits.Requests != nil && *got.Limits.Requests != *want.Limits.Requests) {
+					t.Fatalf("scope %d requests = %v, want %v", i, got.Limits.Requests, want.Limits.Requests)
+				}
+				if (got.Limits.TotalPromptTokens == nil) != (want.Limits.TotalPromptTokens == nil) ||
+					(got.Limits.TotalPromptTokens != nil && *got.Limits.TotalPromptTokens != *want.Limits.TotalPromptTokens) {
+					t.Fatalf("scope %d total = %v, want %v", i, got.Limits.TotalPromptTokens, want.Limits.TotalPromptTokens)
+				}
+				if (got.Limits.UncachedPromptTokens == nil) != (want.Limits.UncachedPromptTokens == nil) ||
+					(got.Limits.UncachedPromptTokens != nil && *got.Limits.UncachedPromptTokens != *want.Limits.UncachedPromptTokens) {
+					t.Fatalf("scope %d uncached = %v, want %v", i, got.Limits.UncachedPromptTokens, want.Limits.UncachedPromptTokens)
+				}
+				if (got.Limits.GeneratedTokens == nil) != (want.Limits.GeneratedTokens == nil) ||
+					(got.Limits.GeneratedTokens != nil && *got.Limits.GeneratedTokens != *want.Limits.GeneratedTokens) {
+					t.Fatalf("scope %d generated = %v, want %v", i, got.Limits.GeneratedTokens, want.Limits.GeneratedTokens)
+				}
+			}
+		})
+	}
+
+	malformed := []struct {
+		name string
+		in   string
+	}{
+		{"missing v1 prefix", testGroupA + ":,,,,"},
+		{"wrong prefix version", "v2;" + testGroupA + ":,,,,"},
+		{"empty entry from trailing semicolon", "v1;" + testGroupA + ":,,,,;"},
+		{"empty entry in the middle", "v1;;" + testGroupA + ":,,,,"},
+		{"gid uppercase hex", "v1;A1B2C3D4E5F60718293A4B5C6D7E8F90:,,,,"},
+		{"gid too short", "v1;a1b2:,,,,"},
+		{"gid not hex", "v1;g1b2c3d4e5f60718293a4b5c6d7e8f90:,,,,"},
+		{"missing colon", "v1;" + testGroupA + ",,,,"},
+		{"too few rate fields", groupScopesValue(testGroupA, ",,", "")},
+		{"too many rate fields", "v1;" + testGroupA + ":1,2,3,4,5,6"},
+		{"negative rate", groupScopesValue(testGroupA, "-1,,,", "")},
+		{"non-numeric rate", groupScopesValue(testGroupA, "x,,,", "")},
+		{"signed requests rate", groupScopesValue(testGroupA, "+5,,,", "")},
+		{"negative zero total rate", groupScopesValue(testGroupA, ",-0,,", "")},
+		{"zero-padded uncached rate", groupScopesValue(testGroupA, ",,05,", "")},
+		{"signed generated rate", groupScopesValue(testGroupA, ",,,+30", "")},
+		{"zero-padded requests rate", groupScopesValue(testGroupA, "0030,,,", "")},
+		{"non-empty spend field", groupScopesValue(testGroupA, ",,,", "100")},
+		{"non-empty spend field, decimal shape", groupScopesValue(testGroupA, ",,,", "100.000000000")},
+		{"non-empty spend field, zero", groupScopesValue(testGroupA, ",,,", "0")},
+		{"non-empty spend field, exponent shape", groupScopesValue(testGroupA, ",,,", "1e3")},
+		{"uncached above total", groupScopesValue(testGroupA, ",100,101,", "")},
+		{"duplicate gid", "v1;" + testGroupA + ":,,,," + ";" + testGroupA + ":1,,,"},
+	}
+	for _, tc := range malformed {
+		t.Run(tc.name, func(t *testing.T) {
+			if _, err := parseTrustedGroupScopes(identity.Identity{GroupScopes: tc.in}); err == nil {
+				t.Fatalf("parse(%q) succeeded, want a fail-closed error", tc.in)
+			}
+		})
+	}
+
+	t.Run("over the entry bound", func(t *testing.T) {
+		entries := make([]string, 0, maxGroupScopeEntries+1)
+		for i := 0; i <= maxGroupScopeEntries; i++ {
+			entries = append(entries, groupIDFor(i)+":,,,,")
+		}
+		if _, err := parseTrustedGroupScopes(identity.Identity{GroupScopes: "v1;" + strings.Join(entries, ";")}); err == nil {
+			t.Fatalf("parse of %d entries succeeded, want the %d-entry bound enforced", len(entries), maxGroupScopeEntries)
+		}
+	})
+
+	t.Run("over the size bound", func(t *testing.T) {
+		// The size check fires before any grammar validation, so one entry
+		// whose requests rate is a long digit string — overlong for the rate
+		// grammar, which never gets a say — is a valid fixture: the parse
+		// must fail on the byte bound alone, and the error must name it.
+		in := groupScopesValue(testGroupA, strings.Repeat("9", maxGroupScopeBytes), "")
+		if len(in) < maxGroupScopeBytes {
+			t.Fatalf("fixture = %d bytes, want at least the %d-byte bound", len(in), maxGroupScopeBytes)
+		}
+		_, err := parseTrustedGroupScopes(identity.Identity{GroupScopes: in})
+		if err == nil {
+			t.Fatalf("parse of a %d-byte header succeeded, want the %d-byte envelope bound enforced", len(in), maxGroupScopeBytes)
+		}
+		if !strings.Contains(err.Error(), "4096-byte envelope bound") {
+			t.Fatalf("parse error = %q, want it to name the 4096-byte envelope bound", err)
+		}
+	})
+
+	t.Run("maximal valid envelope stays under the size bound", func(t *testing.T) {
+		// K4B: a >4 KiB fixture built only from grammatically valid entries
+		// does not exist. The 16-entry cap bounds the count and every field
+		// is length-bounded by its own grammar — the spend field reserved-
+		// empty in this build — so the largest envelope the grammar admits is
+		// the one below: 16 entries, every rate at the 18 nines that stay
+		// inside int64, about 1.3 KiB, well under the 4 KiB bound. Any header
+		// long enough to reach 4 KiB is malformed in at least one other way
+		// (an over-long rate field fails groupRateRe first), so the parser's
+		// size check is defense-in-depth ordering, not a bound a valid
+		// producer can ever hit — no valid-but-oversize fixture can pin it.
+		// The transport-level ceiling on any single header is the HTTP
+		// server's MaxHeaderBytes-style limit (net/http's default header
+		// block, which server.go does not override). The bounds the grammar
+		// actually enforces are pinned here and in the siblings above: this
+		// maximal envelope parses, and the shapes that could approach 4 KiB
+		// fail on the 16-entry cap (the "over the entry bound" case) or the
+		// per-entry grammar (the malformed table) — remove either check and
+		// this test's siblings fail. The size check is pinned by the "over
+		// the size bound" case above: its fixture is over 4 KiB and the rate
+		// grammar would also reject its overlong field, so that case asserts
+		// the error names the byte bound — delete the size check and the
+		// parse fails on the rate grammar instead, the assertion misses, and
+		// the case goes red.
+		maxRate := strings.Repeat("9", 18) // largest rate that still fits int64
+		entries := make([]string, 0, maxGroupScopeEntries)
+		for i := 0; i < maxGroupScopeEntries; i++ {
+			entries = append(entries, groupIDFor(i)+":"+maxRate+","+maxRate+","+maxRate+","+maxRate+",")
+		}
+		in := "v1;" + strings.Join(entries, ";")
+		if len(in) >= maxGroupScopeBytes {
+			t.Fatalf("maximal valid envelope = %d bytes, want under the %d-byte bound — the fixture must stay the largest the grammar admits", len(in), maxGroupScopeBytes)
+		}
+		if _, err := parseTrustedGroupScopes(identity.Identity{GroupScopes: in}); err != nil {
+			t.Fatalf("parse of the maximal valid envelope (%d bytes) failed: %v", len(in), err)
+		}
+	})
+}
+
+// groupIDFor returns a distinct valid 32-hex group id for i.
+func groupIDFor(i int) string {
+	s := strconv.FormatInt(int64(i), 16)
+	return strings.Repeat("0", 32-len(s)) + s
+}
+
+// groupScopesRequest is a shared request carrying the group quota envelope.
+func groupScopesRequest(t *testing.T, upstream *url.URL, envelope string) *http.Request {
+	t.Helper()
+	r := sharedRequest(upstream)
+	if envelope != "" {
+		r.Header.Set(identity.HeaderGroupScopes, envelope)
+	}
+	return r
+}
+
+// proxyWithGroupScopes builds the admission-enabled proxy over a real
+// (frozen-clock) miniredis.
+func proxyWithGroupScopes(t *testing.T) (*Server, *recordingEmitter) {
+	t.Helper()
+	return proxyWithGroupScopesEnabled(t, true)
+}
+
+// proxyWithGroupScopesEnabled builds the proxy over a real (frozen-clock)
+// miniredis with the given admission.enabled flag. The admitter runs with the
+// effective settings — operator tiers cleared under admission.enabled=false,
+// exactly as a default chart install renders them.
+func proxyWithGroupScopesEnabled(t *testing.T, enabled bool) (*Server, *recordingEmitter) {
+	t.Helper()
+	mr := frozenMiniredis(t)
+	cfg := proxyAdmissionConfig(10)
+	cfg.Enabled = enabled
+	cfg.ValkeyAddr = mr.Addr()
+	eff, ok := (&config.Settings{Admission: cfg}).EffectiveAdmission()
+	if !ok {
+		t.Fatal("effective admission settings: no store configured")
+	}
+	client := redis.NewClient(&redis.Options{Addr: mr.Addr()})
+	t.Cleanup(func() { _ = client.Close() })
+	admitter := admission.New(client, eff)
+	em := &recordingEmitter{}
+	s := New(&config.Settings{Admission: cfg}, logging.New(logging.ERROR), em).WithAdmitter(admitter)
+	return s, em
+}
+
+// TestSharedGroupRateLimitAnswers429: a group requests-per-minute cap on the
+// envelope is enforced exactly like the contract scopes — the burst admits,
+// the overrun answers 429 + Retry-After (the contractual mapping).
+func TestSharedGroupRateLimitAnswers429(t *testing.T) {
+	up, hits := sharedGroupBackend(t)
+	s, _ := proxyWithGroupScopes(t)
+
+	r1 := groupScopesRequest(t, up, groupScopesValue(testGroupA, "1,,,", ""))
+	rr1 := httptest.NewRecorder()
+	s.Handler().ServeHTTP(rr1, r1)
+	if rr1.Code != http.StatusOK {
+		t.Fatalf("first request status=%d, want 200", rr1.Code)
+	}
+
+	r2 := groupScopesRequest(t, up, groupScopesValue(testGroupA, "1,,,", ""))
+	rr2 := httptest.NewRecorder()
+	s.Handler().ServeHTTP(rr2, r2)
+	if rr2.Code != http.StatusTooManyRequests {
+		t.Fatalf("overrun status=%d, want 429", rr2.Code)
+	}
+	if rr2.Header().Get("Retry-After") == "" {
+		t.Fatal("overrun missing Retry-After")
+	}
+	if *hits != 1 {
+		t.Fatalf("upstream hits=%d, want 1 (the overrun never forwards)", *hits)
+	}
+}
+
+// TestSharedGroupRateZeroCapAnswers429: an explicit 0 blocks every request
+// for the group (R4 zero cap), whatever the other scopes say.
+func TestSharedGroupRateZeroCapAnswers429(t *testing.T) {
+	up, _ := sharedGroupBackend(t)
+	s, _ := proxyWithGroupScopes(t)
+
+	rr := httptest.NewRecorder()
+	s.Handler().ServeHTTP(rr, groupScopesRequest(t, up, groupScopesValue(testGroupA, "0,,,", "")))
+	if rr.Code != http.StatusTooManyRequests {
+		t.Fatalf("zero-cap status=%d, want 429", rr.Code)
+	}
+}
+
+// TestSharedGroupScopesMalformedHeaderFailsClosed: a malformed group envelope
+// is a broken trusted policy, not a quota — 503 at the proxy, before
+// admission, and nothing reaches the upstream or the emitter.
+func TestSharedGroupScopesMalformedHeaderFailsClosed(t *testing.T) {
+	up, hits := sharedGroupBackend(t)
+	s, em := proxyWithGroupScopes(t)
+
+	r := groupScopesRequest(t, up, "v1;NOT-A-GROUP:,,,,")
+	rr := httptest.NewRecorder()
+	s.Handler().ServeHTTP(rr, r)
+	if rr.Code != http.StatusServiceUnavailable {
+		t.Fatalf("malformed envelope status=%d, want 503", rr.Code)
+	}
+	if *hits != 0 {
+		t.Fatalf("upstream hits=%d, want 0 (fail closed before forwarding)", *hits)
+	}
+	if evs := em.waitForEvents(1, 200*time.Millisecond); len(evs) != 0 {
+		t.Fatalf("emitted events=%d, want 0 (a refused request meters nothing)", len(evs))
+	}
+}
+
+// TestSharedGroupScopesNonEmptySpendFailsClosed pins the parked-activation
+// boundary end to end: the envelope's fifth field is reserved for the
+// deferred monthly spend cap, and a producer stamping ANY non-empty value
+// there — a well-formed decimal included — has its request refused 503 with
+// a loud log, before upstream, metering nothing. Rejecting here (rather than
+// ignoring the field) is deliberate: silently dropping a stamped cap would
+// bill group traffic the operator believed was capped.
+func TestSharedGroupScopesNonEmptySpendFailsClosed(t *testing.T) {
+	up, hits := sharedGroupBackend(t)
+	cfg := proxyAdmissionConfig(10)
+	var errBuf bytes.Buffer
+	logger := &logging.Logger{Debug: log.New(io.Discard, "", 0), Info: log.New(io.Discard, "", 0), Warn: log.New(io.Discard, "", 0), Error: log.New(&errBuf, "", 0)}
+	em := &recordingEmitter{}
+	s := New(&config.Settings{Admission: cfg}, logger, em).WithAdmitter(&countingAdmitter{})
+
+	r := groupScopesRequest(t, up, groupScopesValue(testGroupA, ",,,", "100.000000000"))
+	rr := httptest.NewRecorder()
+	s.Handler().ServeHTTP(rr, r)
+	if rr.Code != http.StatusServiceUnavailable {
+		t.Fatalf("non-empty spend field status=%d, want 503 (fail closed at the parse)", rr.Code)
+	}
+	if !strings.Contains(errBuf.String(), "non-empty spend field") {
+		t.Fatalf("error log = %q, want the loud non-empty-spend line", errBuf.String())
+	}
+	if *hits != 0 {
+		t.Fatalf("upstream hits=%d, want 0 (fail closed before forwarding)", *hits)
+	}
+	if evs := em.waitForEvents(1, 200*time.Millisecond); len(evs) != 0 {
+		t.Fatalf("emitted events=%d, want 0 (a refused request meters nothing)", len(evs))
+	}
+}
+
+// TestSharedGroupScopesUnlimitedHeaderAdmits: the fully-unlimited envelope
+// (every field empty) parses to scopes with nothing to enforce — requests
+// flow and are metered.
+func TestSharedGroupScopesUnlimitedHeaderAdmits(t *testing.T) {
+	up, hits := sharedGroupBackend(t)
+	s, em := proxyWithGroupScopes(t)
+
+	r := groupScopesRequest(t, up, groupScopesHeader)
+	rr := httptest.NewRecorder()
+	s.Handler().ServeHTTP(rr, r)
+	if rr.Code != http.StatusOK {
+		t.Fatalf("status=%d, want 200", rr.Code)
+	}
+	if *hits != 1 {
+		t.Fatalf("upstream hits=%d, want 1", *hits)
+	}
+	evs := em.waitForEvents(1, time.Second)
+	if len(evs) != 1 {
+		t.Fatalf("emitted events=%d, want 1", len(evs))
+	}
+}
+
+// sharedGroupBackend is a shared-path upstream counting its hits.
+func sharedGroupBackend(t *testing.T) (*url.URL, *int) {
+	t.Helper()
+	hits := 0
+	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		hits++
+		_, _ = w.Write([]byte(`{"model":"model-a","usage":{"prompt_tokens":2,"completion_tokens":3}}`))
+	}))
+	t.Cleanup(backend.Close)
+	up, err := url.Parse(backend.URL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return up, &hits
+}
+
+// TestSharedGroupScopesAdmissionTriggerWithAdmissionFlagOff pins the trigger:
+// under admission.enabled=false the Admit round-trip is engaged by a scope
+// that carries a rate limit, not by the mere presence of the group envelope.
+// Every org/owner scoped limit header is absent, so only the group scopes can
+// engage the trigger. An all-unlimited group envelope performs no admission
+// call; an envelope with a rate limit still performs exactly one, unchanged
+// from the enabled=true path.
+func TestSharedGroupScopesAdmissionTriggerWithAdmissionFlagOff(t *testing.T) {
+	up, _ := sharedGroupBackend(t)
+	cfg := proxyAdmissionConfig(10)
+	cfg.Enabled = false
+	send := func(a *countingAdmitter, envelope string) *httptest.ResponseRecorder {
+		s := New(&config.Settings{Admission: cfg}, logging.New(logging.ERROR), &recordingEmitter{}).WithAdmitter(a)
+		req := groupScopesRequest(t, up, envelope)
+		for _, header := range identity.ScopedRateLimitHeaders {
+			req.Header.Del(header)
+		}
+		rr := httptest.NewRecorder()
+		s.Handler().ServeHTTP(rr, req)
+		return rr
+	}
+
+	// The all-unlimited envelope (every rate empty) enforces nothing: no
+	// Admit, no Valkey reservation, no completion round-trip.
+	a := &countingAdmitter{}
+	if rr := send(a, groupScopesHeader); rr.Code != http.StatusOK || a.calls != 0 {
+		t.Fatalf("all-unlimited envelope: status=%d Admit calls=%d, want 200 and no admission round-trip", rr.Code, a.calls)
+	}
+
+	// A rate-limited group scope engages admission exactly as a contract
+	// limit header does.
+	a = &countingAdmitter{}
+	if rr := send(a, groupScopesValue(testGroupA, "30,,,", "")); rr.Code != http.StatusOK || a.calls != 1 {
+		t.Fatalf("rate-limited group scope: status=%d Admit calls=%d, want 200 and exactly one Admit", rr.Code, a.calls)
+	}
+}
+
+// TestSharedGroupScopesEnforcedWithAdmissionFlagOff is the envelope-driven
+// enforcement test for the item-13 posture: admission.enabled=false with ONLY
+// X-Saturn-Group-Scopes stamped (no org/owner limit headers). A group zero
+// cap answers 429 + Retry-After before upstream, and a request within the
+// group limits is admitted — the group-scope mirror of the contract-limits
+// enabled=false cases in contract_limits_test.go.
+func TestSharedGroupScopesEnforcedWithAdmissionFlagOff(t *testing.T) {
+	up, hits := sharedGroupBackend(t)
+	s, em := proxyWithGroupScopesEnabled(t, false)
+
+	// Only the group envelope: every org/owner scoped limit header absent.
+	envelopeOnly := func(envelope string) *http.Request {
+		req := groupScopesRequest(t, up, envelope)
+		for _, header := range identity.ScopedRateLimitHeaders {
+			req.Header.Del(header)
+		}
+		return req
+	}
+
+	// A group zero cap blocks every request with the contractual 429.
+	rr := httptest.NewRecorder()
+	s.Handler().ServeHTTP(rr, envelopeOnly(groupScopesValue(testGroupA, "0,,,", "")))
+	if rr.Code != http.StatusTooManyRequests {
+		t.Fatalf("zero-cap status=%d, want 429", rr.Code)
+	}
+	if rr.Header().Get("Retry-After") == "" {
+		t.Fatal("zero-cap response missing Retry-After")
+	}
+
+	// A request within the group limits is admitted and forwarded.
+	rr = httptest.NewRecorder()
+	s.Handler().ServeHTTP(rr, envelopeOnly(groupScopesValue(testGroupA, "30,,,", "")))
+	if rr.Code != http.StatusOK {
+		t.Fatalf("within-limits status=%d, want 200", rr.Code)
+	}
+	if *hits != 1 {
+		t.Fatalf("upstream hits=%d, want 1 (the zero cap never forwards)", *hits)
+	}
+	evs := em.waitForEvents(1, time.Second)
+	if len(evs) != 1 {
+		t.Fatalf("emitted events=%d, want 1", len(evs))
+	}
+}
+
+// TestSharedGroupScopesOnlyEnvelopeFailsClosedWithAdmissionFlagOff closes the
+// trigger hole in the enabled=false test above: that one builds on
+// sharedRequest, which always stamps X-Saturn-Owner-Id, so its owner-id
+// anchor alone makes trustedPolicyEnvelopePresent true — a regression
+// dropping id.GroupScopes != "" from that function would leave every case
+// above green. This test sends the group envelope with NO other trusted
+// policy header: the owner-id anchor and every scoped rate-limit header are
+// deleted, so only the group clause of trustedPolicyEnvelopePresent can
+// engage admission.
+//
+// What the proxy actually answers for that shape, and why it is not 429 or
+// 200: parseTrustedRateLimits runs first inside the admission block and
+// fails closed on the missing contract anchor (errNoTrustedRateLimitPolicy),
+// so the request is refused 503 before the group scopes are even parsed — a
+// group zero cap can never be the rejecting reason here, and a within-limits
+// envelope is never admitted either. Group enforcement under
+// admission.enabled=false is only reachable WITH the owner-id anchor (the
+// tests above); this shape pins the trigger, not the enforcement.
+//
+// The pin: with the group envelope as the only trusted header, both a zero
+// cap and a within-limits envelope answer 503 and never reach the upstream.
+// Drop id.GroupScopes != "" from trustedPolicyEnvelopePresent and both are
+// forwarded (200), failing this test.
+func TestSharedGroupScopesOnlyEnvelopeFailsClosedWithAdmissionFlagOff(t *testing.T) {
+	up, hits := sharedGroupBackend(t)
+	s, _ := proxyWithGroupScopesEnabled(t, false)
+
+	// Only the group envelope: the owner-id anchor and every scoped
+	// rate-limit header deleted.
+	groupOnly := func(envelope string) *http.Request {
+		req := groupScopesRequest(t, up, envelope)
+		req.Header.Del(identity.HeaderOwnerID)
+		for _, header := range identity.ScopedRateLimitHeaders {
+			req.Header.Del(header)
+		}
+		return req
+	}
+
+	rr := httptest.NewRecorder()
+	s.Handler().ServeHTTP(rr, groupOnly(groupScopesValue(testGroupA, "0,,,", "")))
+	if rr.Code != http.StatusServiceUnavailable {
+		t.Fatalf("group-only zero-cap status=%d, want 503 (the contract-anchor parse fails closed before group scopes)", rr.Code)
+	}
+
+	rr = httptest.NewRecorder()
+	s.Handler().ServeHTTP(rr, groupOnly(groupScopesValue(testGroupA, "30,,,", "")))
+	if rr.Code != http.StatusServiceUnavailable {
+		t.Fatalf("group-only within-limits status=%d, want 503", rr.Code)
+	}
+
+	if *hits != 0 {
+		t.Fatalf("upstream hits=%d, want 0 — a group-only request never forwards; with the group clause dropped from trustedPolicyEnvelopePresent both requests are admitted and this fails", *hits)
+	}
+}
+
+// TestSharedGroupGeneratedCapClampsUndeclaredMaxTokensReservation: the
+// undeclared-max_tokens output reservation is clamped to the tightest
+// positive generated-token limit across EVERY scope class on the request —
+// organization, owner, and each stamped group scope. A group whose generated
+// cap sits below the configured default reserves the cap, not the default, so
+// its undeclared requests admit instead of reserving the default and hitting
+// the unsatisfiable 400 of
+// TestMaxTokensAboveGeneratedLimitIsUnsatisfiable400. Dropping the group
+// limits from the undeclaredOutputReservation call at proxy.go leaves every
+// case here green only if it also breaks the group cap below the default —
+// the end-to-end half fails: the unclamped 20-token default reservation over
+// a 10-token group cap is rejected before upstream.
+func TestSharedGroupGeneratedCapClampsUndeclaredMaxTokensReservation(t *testing.T) {
+	up, _ := sharedGroupBackend(t)
+	cfg := proxyAdmissionConfig(10) // DefaultMaxOutputTokens: 20
+
+	// noMaxTokens swaps the shared body ({"model":"model-a","max_tokens":20})
+	// for an undeclared-output one, the shape the reservation clamp exists
+	// for.
+	noMaxTokens := func(req *http.Request) {
+		req.Body = io.NopCloser(strings.NewReader(`{"model":"model-a"}`))
+		req.ContentLength = -1
+	}
+	noMaxTokensReq := func(req *http.Request) *http.Request {
+		noMaxTokens(req)
+		return req
+	}
+	send := func(recording *recordingAdmitter, envelope string, mutate func(*http.Request)) *httptest.ResponseRecorder {
+		s := New(&config.Settings{Admission: cfg}, logging.New(logging.ERROR), &recordingEmitter{}).WithAdmitter(recording)
+		req := groupScopesRequest(t, up, envelope)
+		if mutate != nil {
+			mutate(req)
+		}
+		rr := httptest.NewRecorder()
+		s.Handler().ServeHTTP(rr, req)
+		return rr
+	}
+
+	// The group generated cap below the default drives the reservation: 10,
+	// not the 20-token default.
+	recording := &recordingAdmitter{}
+	rr := send(recording, groupScopesValue(testGroupA, ",,,10", ""), noMaxTokens)
+	if rr.Code != http.StatusOK || recording.last.ReservedOutputTokens != 10 {
+		t.Fatalf("group cap 10: status=%d reserved=%d, want 200 with a 10-token reservation (the group cap, not the 20-token default)", rr.Code, recording.last.ReservedOutputTokens)
+	}
+
+	// A group cap above the default changes nothing: the default stands.
+	recording = &recordingAdmitter{}
+	rr = send(recording, groupScopesValue(testGroupA, ",,,30", ""), noMaxTokens)
+	if rr.Code != http.StatusOK || recording.last.ReservedOutputTokens != 20 {
+		t.Fatalf("group cap 30: status=%d reserved=%d, want 200 with the 20-token default (a cap above the default does not raise the reservation)", rr.Code, recording.last.ReservedOutputTokens)
+	}
+
+	// Every scope class feeds the same clamp and the tightest wins: org 5,
+	// owner 8, group 10 → 5.
+	recording = &recordingAdmitter{}
+	rr = send(recording, groupScopesValue(testGroupA, ",,,10", ""), func(req *http.Request) {
+		req.Header.Set(identity.HeaderOrgRateLimitGeneratedTokens, "5")
+		req.Header.Set(identity.HeaderOwnerRateLimitGeneratedTokens, "8")
+		noMaxTokens(req)
+	})
+	if rr.Code != http.StatusOK || recording.last.ReservedOutputTokens != 5 {
+		t.Fatalf("org 5 / owner 8 / group 10: status=%d reserved=%d, want 200 with the tightest (5)", rr.Code, recording.last.ReservedOutputTokens)
+	}
+
+	// End to end against the real store: the undeclared request from a
+	// group capped below the default is ADMITTED. Without the group limits in
+	// the clamp the reservation stays 20 over the 10-token cap and this is
+	// the unsatisfiable 400 — this half fails on that mutation.
+	s, _ := proxyWithGroupScopes(t)
+	rr = httptest.NewRecorder()
+	s.Handler().ServeHTTP(rr, noMaxTokensReq(groupScopesRequest(t, up, groupScopesValue(testGroupA, ",,,10", ""))))
+	if rr.Code != http.StatusOK {
+		t.Fatalf("undeclared request, group cap 10: status=%d body=%q, want 200 admitted (the reservation clamped to the cap)", rr.Code, strings.TrimSpace(rr.Body.String()))
+	}
+
+	// The declared path is unchanged: max_tokens above the group cap can
+	// never be admitted — 400 without Retry-After, the group-scope twin of
+	// TestMaxTokensAboveGeneratedLimitIsUnsatisfiable400.
+	hits := 0
+	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		hits++
+		_, _ = w.Write([]byte(`{"model":"model-a","usage":{"prompt_tokens":2,"completion_tokens":3}}`))
+	}))
+	t.Cleanup(backend.Close)
+	declUp, err := url.Parse(backend.URL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	rr = httptest.NewRecorder()
+	s.Handler().ServeHTTP(rr, groupScopesRequest(t, declUp, groupScopesValue(testGroupA, ",,,10", "")))
+	if rr.Code != http.StatusBadRequest || rr.Header().Get("Retry-After") != "" || hits != 0 {
+		t.Fatalf("declared max_tokens 20 over group cap 10: status=%d Retry-After=%q hits=%d, want 400 without Retry-After before upstream", rr.Code, rr.Header().Get("Retry-After"), hits)
+	}
+	if got := strings.TrimSpace(rr.Body.String()); got != "max_tokens exceeds the per-window generated-token limit" {
+		t.Fatalf("body=%q", got)
+	}
+}
