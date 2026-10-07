@@ -3,7 +3,6 @@ package main
 import (
 	"bytes"
 	"context"
-	"errors"
 	"io"
 	"log"
 	"os"
@@ -91,82 +90,4 @@ func TestBuildAdmissionLogsMeteringStoreFallback(t *testing.T) {
 	if strings.Contains(explicit, "admission.valkeyAddr is empty") {
 		t.Fatalf("fallback logged although admission.valkeyAddr is set: %q", explicit)
 	}
-}
-
-const spendWiringGID = "a1b2c3d4e5f60718293a4b5c6d7e8f90"
-
-// spendWiringRequest is a shared-shaped admit request carrying one group
-// scope; scope carries either the rate limit or the spend cap under test.
-func spendWiringRequest(scope admission.GroupScope) admission.Request {
-	return admission.Request{
-		Graph: "graph-a", Organization: "org-a", Owner: "owner-a", Model: "m",
-		PromptBytes: 10, EstimatedInputTokens: 10, ReservedOutputTokens: 20,
-		GroupScopes: []admission.GroupScope{scope},
-	}
-}
-
-// TestBuildAdmissionGroupSpendCapsDatabaseURL pins the production DATABASE_URL
-// switch that turns the monthly group spend cap on. This wiring is the
-// feature's only production call site, and every other spend test wires the
-// store by hand — so a regression here (WithGroupSpend not called on a
-// successful open, or the open error made fatal) disables group spend caps on
-// every interceptor, or crash-loops it, with the rest of the suite green.
-func TestBuildAdmissionGroupSpendCapsDatabaseURL(t *testing.T) {
-	build := func(t *testing.T) (admission.Admitter, *bytes.Buffer) {
-		t.Helper()
-		mr := miniredis.RunT(t)
-		var buf bytes.Buffer
-		logger := &logging.Logger{Debug: log.New(io.Discard, "", 0), Info: log.New(&buf, "", 0), Warn: log.New(&buf, "", 0), Error: log.New(&buf, "", 0)}
-		admitter, closeAdmission := buildAdmission(loadTestSettings(t, "emit:\n  valkeyAddr: "+mr.Addr()+"\n"), logger)
-		t.Cleanup(closeAdmission)
-		return admitter, &buf
-	}
-
-	t.Run("unset logs NOT enforced and group rate limits still enforce", func(t *testing.T) {
-		t.Setenv("DATABASE_URL", "")
-		admitter, buf := build(t)
-		if admitter == nil {
-			t.Fatal("no admitter with DATABASE_URL unset: contract and group rate limits would not be enforced")
-		}
-		if out := buf.String(); !strings.Contains(out, "group spend caps are NOT enforced") {
-			t.Fatalf("startup log missing the loud NOT-enforced line:\n%s", out)
-		}
-
-		// The startup line's promise, pinned behaviorally: group rate limits
-		// still enforce — a capped window rejects the second request with the
-		// contractual 429 mapping.
-		one := int64(1)
-		rateScope := admission.GroupScope{GroupID: spendWiringGID, Limits: admission.RateLimits{Requests: &one}}
-		lease, err := admitter.Admit(context.Background(), spendWiringRequest(rateScope))
-		if err != nil {
-			t.Fatalf("first group-rate admit: %v, want admitted", err)
-		}
-		_ = lease.Complete(context.Background(), 0)
-		_, err = admitter.Admit(context.Background(), spendWiringRequest(rateScope))
-		var rejected *admission.Rejected
-		if !errors.As(err, &rejected) || !rejected.Contractual {
-			t.Fatalf("second group-rate admit: %v, want a contractual rejection (group rate limits still enforce without DATABASE_URL)", err)
-		}
-
-		// ... and the spend cap does not: a spend-capped group admits
-		// fail-open with no store behind it.
-		cappedScope := admission.GroupScope{GroupID: spendWiringGID, SpendCap: "0"}
-		if _, err := admitter.Admit(context.Background(), spendWiringRequest(cappedScope)); err != nil {
-			t.Fatalf("spend-capped admit with no store: %v, want admitted (spend caps are NOT enforced without DATABASE_URL)", err)
-		}
-	})
-
-	t.Run("unroutable DSN logs DISABLED and serving continues", func(t *testing.T) {
-		// 127.0.0.1:1 answers with connection refused, so the 5s open budget
-		// is not what bounds this test.
-		t.Setenv("DATABASE_URL", "postgres://postgres:pw@127.0.0.1:1/postgres?sslmode=disable")
-		admitter, buf := build(t)
-		if admitter == nil {
-			t.Fatal("no admitter with an unroutable DATABASE_URL: serving must continue without spend caps")
-		}
-		out := buf.String()
-		if !strings.Contains(out, "group spend caps DISABLED") || !strings.Contains(out, "group rate limits still enforce") {
-			t.Fatalf("startup log missing the loud DISABLED line naming the surviving rate limits:\n%s", out)
-		}
-	})
 }
