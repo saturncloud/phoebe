@@ -58,7 +58,7 @@ type GroupSpendStore interface {
 	// (NUMERIC, never a Go number). cap is a plain decimal NUMERIC(20,9)
 	// string straight from the trusted envelope. The verdict — not the spend
 	// sum — crosses this seam, so no money value becomes a Go number.
-	GroupSpendExhausted(ctx context.Context, groupID, cap string) (bool, error)
+	GroupSpendExhausted(ctx context.Context, groupID, spendCap string) (bool, error)
 }
 
 // PostgresSpendStore answers the monthly spend check against group_usage
@@ -125,9 +125,9 @@ FROM group_usage
 WHERE group_id = $1
   AND window_start >= date_trunc('month', now() AT TIME ZONE 'UTC') AT TIME ZONE 'UTC'`
 
-func (s *PostgresSpendStore) GroupSpendExhausted(ctx context.Context, groupID, cap string) (bool, error) {
+func (s *PostgresSpendStore) GroupSpendExhausted(ctx context.Context, groupID, spendCap string) (bool, error) {
 	var exhausted bool
-	if err := s.db.QueryRowContext(ctx, groupSpendExhaustedSQL, groupID, cap).Scan(&exhausted); err != nil {
+	if err := s.db.QueryRowContext(ctx, groupSpendExhaustedSQL, groupID, spendCap).Scan(&exhausted); err != nil {
 		return false, fmt.Errorf("admission: spend check: group %s: %w", groupID, err)
 	}
 	return exhausted, nil
@@ -170,10 +170,10 @@ func newSpendVerdictCache() *spendVerdictCache {
 // spend, so a verdict taken in the old month says nothing about the new one.
 // The negative (store-error) entries use the shorter groupSpendNegativeCacheTTL
 // and skip the month check — see spendVerdictEntry.failed.
-func (c *spendVerdictCache) lookup(groupID, cap string) (spendVerdictEntry, bool) {
+func (c *spendVerdictCache) lookup(groupID, spendCap string) (spendVerdictEntry, bool) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	e, ok := c.entries[groupID+"\x00"+cap]
+	e, ok := c.entries[groupID+"\x00"+spendCap]
 	if !ok {
 		return spendVerdictEntry{}, false
 	}
@@ -193,27 +193,27 @@ func (c *spendVerdictCache) lookup(groupID, cap string) (spendVerdictEntry, bool
 }
 
 // store records a fresh verdict for (groupID, cap).
-func (c *spendVerdictCache) store(groupID, cap string, exhausted bool) {
+func (c *spendVerdictCache) store(groupID, spendCap string, exhausted bool) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	now := time.Now
 	if c.now != nil {
 		now = c.now
 	}
-	c.entries[groupID+"\x00"+cap] = spendVerdictEntry{exhausted: exhausted, at: now()}
+	c.entries[groupID+"\x00"+spendCap] = spendVerdictEntry{exhausted: exhausted, at: now()}
 }
 
 // storeFailure records a fail-open entry for (groupID, cap) after a store
 // error: for groupSpendNegativeCacheTTL the check admits without querying and
 // without waiting, then re-probes the store.
-func (c *spendVerdictCache) storeFailure(groupID, cap string) {
+func (c *spendVerdictCache) storeFailure(groupID, spendCap string) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	now := time.Now
 	if c.now != nil {
 		now = c.now
 	}
-	c.entries[groupID+"\x00"+cap] = spendVerdictEntry{failed: true, at: now()}
+	c.entries[groupID+"\x00"+spendCap] = spendVerdictEntry{failed: true, at: now()}
 }
 
 // nextUTCMonth returns the first instant of the UTC calendar month after t's.

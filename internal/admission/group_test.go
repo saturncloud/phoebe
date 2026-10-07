@@ -29,12 +29,12 @@ type fakeGroupSpendStore struct {
 	gotCap    []string
 }
 
-func (f *fakeGroupSpendStore) GroupSpendExhausted(_ context.Context, groupID, cap string) (bool, error) {
+func (f *fakeGroupSpendStore) GroupSpendExhausted(_ context.Context, groupID, spendCap string) (bool, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.calls++
 	f.gotGID = append(f.gotGID, groupID)
-	f.gotCap = append(f.gotCap, cap)
+	f.gotCap = append(f.gotCap, spendCap)
 	return f.exhausted, f.err
 }
 
