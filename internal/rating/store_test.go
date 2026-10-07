@@ -46,8 +46,8 @@ func TestPostgresStore_RateWindowSQL(t *testing.T) {
 	// missing_usage_events is the TOTAL; expected + unexplained partition it
 	// (6 = 4 routine aborts/failures + 2 successes with no usage block), so the
 	// fixture cannot pass while the SQL's partition is wrong.
-	rows := sqlmock.NewRows([]string{"rollups_written", "events_rated", "group_rollups_written", "group_reconciled_deletions", "total_cost", "reconciled_deletions", "unpriced_events", "unattributable_events", "missing_usage_events", "expected_missing_usage_events", "unexplained_missing_usage_events", "invalid_usage_events", "ambiguous_base_events", "ambiguous_org_events", "owner_conflict_events", "ambiguous_graph_rollups", "invalid_serving_mode_events"}).
-		AddRow(2, 5, 3, 1, "0.001234500", 0, 3, 1, 6, 4, 2, 7, 4, 2, 3, 1, 5)
+	rows := sqlmock.NewRows([]string{"rollups_written", "events_rated", "total_cost", "reconciled_deletions", "unpriced_events", "unattributable_events", "missing_usage_events", "expected_missing_usage_events", "unexplained_missing_usage_events", "invalid_usage_events", "ambiguous_base_events", "ambiguous_org_events", "owner_conflict_events", "ambiguous_graph_rollups", "invalid_serving_mode_events"}).
+		AddRow(2, 5, "0.001234500", 0, 3, 1, 6, 4, 2, 7, 4, 2, 3, 1, 5)
 	// The statement binds $3 = the ft: LIKE pattern (single-sourced from fineTunePrefix).
 	mock.ExpectQuery(`INSERT INTO rated_usage`).
 		WithArgs(start.UTC(), end.UTC(), ftLikePattern).
@@ -91,9 +91,6 @@ func TestPostgresStore_RateWindowSQL(t *testing.T) {
 	}
 	if res.ReconciledDeletions != 0 {
 		t.Fatalf("reconciled deletions = %d, want 0 (the projected count must scan into the result)", res.ReconciledDeletions)
-	}
-	if res.GroupRollupsWritten != 3 || res.GroupReconciledDeletions != 1 {
-		t.Fatalf("group attribution = %d rollups/%d deletions, want 3/1 (the projected counts must scan into the result)", res.GroupRollupsWritten, res.GroupReconciledDeletions)
 	}
 	if err := mock.ExpectationsWereMet(); err != nil {
 		t.Fatalf("unmet: %v", err)
@@ -259,24 +256,6 @@ func TestRateWindowSQL_Shape(t *testing.T) {
 		// a both-ambiguous rollup counts only as base)
 		"WHERE ambiguous_org AND NOT ambiguous_base",
 		"AS ambiguous_org_events",
-		// GROUP ATTRIBUTION (group_usage, migration 0008; membership-aware group
-		// quotas, ruled 2026-10-07): the money events re-attached to their groups
-		// (token group_id + member_group_ids), deduped per (event, group), summed
-		// per (group, hour), upserted with the SAME reconcile contract as
-		// rated_usage. Attribution rides the same statement and snapshot.
-		"SELECT DISTINCT ON (pe.request_id, g.gid)",
-		"COALESCE(pe.member_group_ids, '{}'::text[])",
-		"COALESCE(ARRAY[pe.group_id],    '{}'::text[])",
-		"FROM unnest(",
-		"JOIN resolved pe",
-		"AND date_trunc('hour', pe.ev_ts AT TIME ZONE 'UTC') AT TIME ZONE 'UTC' = p.window_start",
-		"GROUP BY group_id, window_start",
-		"INSERT INTO group_usage (",
-		"ON CONFLICT (group_id, window_start) DO UPDATE SET",
-		"DELETE FROM group_usage gu",
-		"FROM group_rollup gr",
-		"AS group_rollups_written",
-		"AS group_reconciled_deletions",
 	}
 	// The price tables are GONE (prices are YAML now): no reference to model_price,
 	// derivation_policy, effective-dating, or a derivation CASE may remain.

@@ -59,9 +59,6 @@ func ratingSchemaDDL(t *testing.T) string {
 		// 0007 makes rated_usage.serving_mode 'shared'/'dedicated' only (CHECK, no
 		// default), which the rater's upsert must satisfy.
 		"../../migrations/0007_serving_mode_explicit.up.sql",
-		// 0008 adds billing_event.member_group_ids (read by the rater's group
-		// attribution) and the group_usage rollup it writes.
-		"../../migrations/0008_group_scopes.up.sql",
 	} {
 		ddl, err := os.ReadFile(f)
 		if err != nil {
@@ -945,10 +942,6 @@ func TestIntegration_InvalidUsageEvidenceNeverEntersMoney(t *testing.T) {
 		"0004_billing_event_serving_mode.up.sql",
 		"0005_invoice_grade_attempts.up.sql",
 		"0006_rollup_grain.up.sql",
-		// 0008 adds billing_event.member_group_ids (read by the rater's group
-		// attribution) and group_usage (written by it) — the current rater
-		// requires both, like 0006's graph_k8s_name before it.
-		"0008_group_scopes.up.sql",
 	} {
 		apply(name)
 	}
@@ -2113,7 +2106,6 @@ func TestIntegration_FreshInputTokensSurvivesInt32Overflow(t *testing.T) {
 		"0004_billing_event_serving_mode.up.sql",
 		"0005_invoice_grade_attempts.up.sql",
 		"0006_rollup_grain.up.sql",
-		"0008_group_scopes.up.sql",
 	} {
 		ddl, readErr := os.ReadFile("../../migrations/" + name)
 		if readErr != nil {
@@ -2224,7 +2216,6 @@ func TestIntegration_MissingUsagePartitionedByCause(t *testing.T) {
 		"0004_billing_event_serving_mode.up.sql",
 		"0005_invoice_grade_attempts.up.sql",
 		"0006_rollup_grain.up.sql",
-		"0008_group_scopes.up.sql",
 	} {
 		ddl, readErr := os.ReadFile("../../migrations/" + name)
 		if readErr != nil {
@@ -3244,10 +3235,6 @@ func TestIntegration_Migration0007ServingModeExplicit(t *testing.T) {
 	exec(t, db, "UPDATE rated_usage SET id = "+idExpr("")+" WHERE auth_id = 'a-ded'")
 
 	exec(t, db, readMigration(t, "0007_serving_mode_explicit.up.sql"))
-	// The current rater also reads member_group_ids / writes group_usage
-	// (0008): apply it before the first RateWindow below. 0008 is independent
-	// of everything 0007 asserts.
-	exec(t, db, readMigration(t, "0008_group_scopes.up.sql"))
 
 	rows := map[string]string{}
 	r, err := db.QueryContext(ctx, `SELECT auth_id || '/' || serving_mode, id FROM rated_usage`)
@@ -3495,9 +3482,6 @@ func TestIntegration_Migration0007BackfillMakesPreCutoverReRateANoOp(t *testing.
 	}
 
 	exec(t, db, readMigration(t, "0007_serving_mode_explicit.up.sql"))
-	// The current rater reads member_group_ids / writes group_usage (0008) —
-	// apply it before the re-rate below (see TestIntegration_Migration0007ServingModeExplicit).
-	exec(t, db, readMigration(t, "0008_group_scopes.up.sql"))
 
 	var leftover int
 	if err := db.QueryRowContext(ctx,
@@ -3593,7 +3577,7 @@ func TestIntegration_RolloutReRunBackfillLeavesExplicitEmptyServingModeWithheld(
 	exec(t, db, "SET search_path TO "+sch)
 	defer func() { exec(t, db, "DROP SCHEMA IF EXISTS "+sch+" CASCADE") }()
 	for _, f := range []string{"0001_billing_event", "0002_rating", "0004_billing_event_serving_mode",
-		"0005_invoice_grade_attempts", "0006_rollup_grain", "0007_serving_mode_explicit", "0008_group_scopes"} {
+		"0005_invoice_grade_attempts", "0006_rollup_grain", "0007_serving_mode_explicit"} {
 		exec(t, db, readMigration(t, f+".up.sql"))
 	}
 	exec(t, db, "ALTER TABLE billing_event ALTER COLUMN usage_found SET DEFAULT TRUE")
@@ -3696,9 +3680,6 @@ func TestIntegration_Migration0007TwinHourIsWholeAfterExplicitReRate(t *testing.
 	}
 
 	exec(t, db, readMigration(t, "0007_serving_mode_explicit.up.sql"))
-	// The current rater reads member_group_ids / writes group_usage (0008) —
-	// apply it before the re-rates below.
-	exec(t, db, readMigration(t, "0008_group_scopes.up.sql"))
 
 	var partial int64
 	if err := db.QueryRowContext(ctx, `SELECT SUM(event_count) FROM rated_usage WHERE window_start = $1`, hour).

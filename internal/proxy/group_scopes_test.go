@@ -1,9 +1,9 @@
 package proxy
 
 import (
-	"context"
-	"errors"
+	"bytes"
 	"io"
+	"log"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -23,20 +23,22 @@ import (
 // These tests cover the membership-aware group quota envelope
 // (X-Saturn-Group-Scopes, ruled 2026-10-07) at the proxy layer: the strict
 // parse (fail-visible: malformed/oversize → 503) and the end-to-end
-// enforcement of both scope classes (per-minute rates and the monthly spend
-// cap, both answering 429 + Retry-After on denial).
+// enforcement of the per-minute group rate limits (429 + Retry-After on
+// denial). The envelope's fifth field is reserved for the deferred monthly
+// spend cap: non-empty is malformed → 503 (the parked-activation boundary).
 
 const (
 	testGroupA = "a1b2c3d4e5f60718293a4b5c6d7e8f90"
 	testGroupB = "00112233445566778899aabbccddeeff"
 
 	// groupScopesHeader is a fully-unlimited two-group envelope: every rate
-	// empty (unlimited), no spend cap. Tests override individual fields.
+	// empty (unlimited).
 	groupScopesHeader = "v1;" + testGroupA + ":,,,," + ";" + testGroupB + ":,,,,"
 )
 
 // groupScopesValue builds an envelope for one group with the given rate field
-// string (verbatim between the colons) and spend field.
+// string (verbatim between the colons) and spend field (always "" in valid
+// envelopes; non-empty builds the malformed spend cases).
 func groupScopesValue(gid, rates, spend string) string {
 	return "v1;" + gid + ":" + rates + "," + spend
 }
@@ -60,7 +62,7 @@ func TestParseTrustedGroupScopes(t *testing.T) {
 			nil,
 		},
 		{
-			"single group all unlimited no spend cap",
+			"single group all unlimited",
 			groupScopesValue(testGroupA, ",,,", ""),
 			[]admission.GroupScope{{GroupID: testGroupA}},
 		},
@@ -76,26 +78,6 @@ func TestParseTrustedGroupScopes(t *testing.T) {
 			}},
 		},
 		{
-			"spend cap decimal",
-			groupScopesValue(testGroupA, ",,,", "100.000000001"),
-			[]admission.GroupScope{{GroupID: testGroupA, SpendCap: "100.000000001"}},
-		},
-		{
-			"spend cap 11-digit integer",
-			groupScopesValue(testGroupA, ",,,", "99999999999"),
-			[]admission.GroupScope{{GroupID: testGroupA, SpendCap: "99999999999"}},
-		},
-		{
-			"spend cap at the numeric 20 9 bound",
-			groupScopesValue(testGroupA, ",,,", "99999999999.999999999"),
-			[]admission.GroupScope{{GroupID: testGroupA, SpendCap: "99999999999.999999999"}},
-		},
-		{
-			"spend cap zero is a zero cap not absent",
-			groupScopesValue(testGroupA, ",,,", "0"),
-			[]admission.GroupScope{{GroupID: testGroupA, SpendCap: "0"}},
-		},
-		{
 			"rate zero is a zero cap",
 			groupScopesValue(testGroupA, "0,,,", ""),
 			[]admission.GroupScope{{
@@ -105,10 +87,10 @@ func TestParseTrustedGroupScopes(t *testing.T) {
 		},
 		{
 			"multi group in envelope order",
-			"v1;" + testGroupA + ":1,,,," + ";" + testGroupB + ":,2,,,100",
+			"v1;" + testGroupA + ":1,,,," + ";" + testGroupB + ":,2,,,",
 			[]admission.GroupScope{
 				{GroupID: testGroupA, Limits: admission.RateLimits{Requests: ptr64(1)}},
-				{GroupID: testGroupB, Limits: admission.RateLimits{TotalPromptTokens: ptr64(2)}, SpendCap: "100"},
+				{GroupID: testGroupB, Limits: admission.RateLimits{TotalPromptTokens: ptr64(2)}},
 			},
 		},
 	}
@@ -123,7 +105,7 @@ func TestParseTrustedGroupScopes(t *testing.T) {
 			}
 			for i, want := range tc.want {
 				got := scopes[i]
-				if got.GroupID != want.GroupID || got.SpendCap != want.SpendCap {
+				if got.GroupID != want.GroupID {
 					t.Fatalf("scope %d = %+v, want %+v", i, got, want)
 				}
 				if (got.Limits.Requests == nil) != (want.Limits.Requests == nil) ||
@@ -167,14 +149,11 @@ func TestParseTrustedGroupScopes(t *testing.T) {
 		{"zero-padded uncached rate", groupScopesValue(testGroupA, ",,05,", "")},
 		{"signed generated rate", groupScopesValue(testGroupA, ",,,+30", "")},
 		{"zero-padded requests rate", groupScopesValue(testGroupA, "0030,,,", "")},
-		{"spend cap 12-digit integer", groupScopesValue(testGroupA, ",,,", "100000000000")},
-		{"spend cap 12-digit integer with full fraction", groupScopesValue(testGroupA, ",,,", "100000000000.000000000")},
+		{"non-empty spend field", groupScopesValue(testGroupA, ",,,", "100")},
+		{"non-empty spend field, decimal shape", groupScopesValue(testGroupA, ",,,", "100.000000000")},
+		{"non-empty spend field, zero", groupScopesValue(testGroupA, ",,,", "0")},
+		{"non-empty spend field, exponent shape", groupScopesValue(testGroupA, ",,,", "1e3")},
 		{"uncached above total", groupScopesValue(testGroupA, ",100,101,", "")},
-		{"spend cap exponent", groupScopesValue(testGroupA, ",,,", "1e3")},
-		{"spend cap sign", groupScopesValue(testGroupA, ",,,", "+100")},
-		{"spend cap bare dot", groupScopesValue(testGroupA, ",,,", ".5")},
-		{"spend cap trailing dot", groupScopesValue(testGroupA, ",,,", "5.")},
-		{"spend cap too many fraction digits", groupScopesValue(testGroupA, ",,,", "0.0000000001")},
 		{"duplicate gid", "v1;" + testGroupA + ":,,,," + ";" + testGroupA + ":1,,,"},
 	}
 	for _, tc := range malformed {
@@ -198,12 +177,12 @@ func TestParseTrustedGroupScopes(t *testing.T) {
 	t.Run("maximal valid envelope stays under the size bound", func(t *testing.T) {
 		// K4B: a >4 KiB fixture built only from grammatically valid entries
 		// does not exist. The 16-entry cap bounds the count and every field
-		// is length-bounded by its own grammar, so the largest envelope the
-		// grammar admits is the one below — 16 entries, every rate at the 18
-		// nines that stay inside int64, every spend cap at spendCapRe's
-		// 11+9 digits, about 2 KiB, half the 4 KiB bound. Any header long
-		// enough to reach 4 KiB is malformed in at least one other way (an
-		// over-long spend field fails spendCapRe first), so the parser's
+		// is length-bounded by its own grammar — the spend field reserved-
+		// empty in this build — so the largest envelope the grammar admits is
+		// the one below: 16 entries, every rate at the 18 nines that stay
+		// inside int64, about 1.3 KiB, well under the 4 KiB bound. Any header
+		// long enough to reach 4 KiB is malformed in at least one other way
+		// (an over-long rate field fails groupRateRe first), so the parser's
 		// size check is defense-in-depth ordering, not a bound a valid
 		// producer can ever hit — no valid-but-oversize fixture can pin it.
 		// The transport-level ceiling on any single header is the HTTP
@@ -214,11 +193,10 @@ func TestParseTrustedGroupScopes(t *testing.T) {
 		// fail on the 16-entry cap (the "over the entry bound" case) or the
 		// per-entry grammar (the malformed table) — remove either check and
 		// this test's siblings fail.
-		maxRate := strings.Repeat("9", 18)  // largest rate that still fits int64
-		maxSpend := "99999999999.999999999" // largest spend spendCapRe admits
+		maxRate := strings.Repeat("9", 18) // largest rate that still fits int64
 		entries := make([]string, 0, maxGroupScopeEntries)
 		for i := 0; i < maxGroupScopeEntries; i++ {
-			entries = append(entries, groupIDFor(i)+":"+maxRate+","+maxRate+","+maxRate+","+maxRate+","+maxSpend)
+			entries = append(entries, groupIDFor(i)+":"+maxRate+","+maxRate+","+maxRate+","+maxRate+",")
 		}
 		in := "v1;" + strings.Join(entries, ";")
 		if len(in) >= maxGroupScopeBytes {
@@ -247,18 +225,17 @@ func groupScopesRequest(t *testing.T, upstream *url.URL, envelope string) *http.
 }
 
 // proxyWithGroupScopes builds the admission-enabled proxy over a real
-// (frozen-clock) miniredis, with an optional spend store.
-func proxyWithGroupScopes(t *testing.T, spend admission.GroupSpendStore) (*Server, *recordingEmitter) {
+// (frozen-clock) miniredis.
+func proxyWithGroupScopes(t *testing.T) (*Server, *recordingEmitter) {
 	t.Helper()
-	return proxyWithGroupScopesEnabled(t, true, spend)
+	return proxyWithGroupScopesEnabled(t, true)
 }
 
 // proxyWithGroupScopesEnabled builds the proxy over a real (frozen-clock)
 // miniredis with the given admission.enabled flag. The admitter runs with the
 // effective settings — operator tiers cleared under admission.enabled=false,
-// exactly as a default chart install renders them — and an optional spend
-// store.
-func proxyWithGroupScopesEnabled(t *testing.T, enabled bool, spend admission.GroupSpendStore) (*Server, *recordingEmitter) {
+// exactly as a default chart install renders them.
+func proxyWithGroupScopesEnabled(t *testing.T, enabled bool) (*Server, *recordingEmitter) {
 	t.Helper()
 	mr := frozenMiniredis(t)
 	cfg := proxyAdmissionConfig(10)
@@ -271,9 +248,6 @@ func proxyWithGroupScopesEnabled(t *testing.T, enabled bool, spend admission.Gro
 	client := redis.NewClient(&redis.Options{Addr: mr.Addr()})
 	t.Cleanup(func() { _ = client.Close() })
 	admitter := admission.New(client, eff)
-	if spend != nil {
-		admitter.WithGroupSpend(spend, logging.New(logging.ERROR))
-	}
 	em := &recordingEmitter{}
 	s := New(&config.Settings{Admission: cfg}, logging.New(logging.ERROR), em).WithAdmitter(admitter)
 	return s, em
@@ -284,7 +258,7 @@ func proxyWithGroupScopesEnabled(t *testing.T, enabled bool, spend admission.Gro
 // the overrun answers 429 + Retry-After (the contractual mapping).
 func TestSharedGroupRateLimitAnswers429(t *testing.T) {
 	up, hits := sharedGroupBackend(t)
-	s, _ := proxyWithGroupScopes(t, nil)
+	s, _ := proxyWithGroupScopes(t)
 
 	r1 := groupScopesRequest(t, up, groupScopesValue(testGroupA, "1,,,", ""))
 	rr1 := httptest.NewRecorder()
@@ -311,7 +285,7 @@ func TestSharedGroupRateLimitAnswers429(t *testing.T) {
 // for the group (R4 zero cap), whatever the other scopes say.
 func TestSharedGroupRateZeroCapAnswers429(t *testing.T) {
 	up, _ := sharedGroupBackend(t)
-	s, _ := proxyWithGroupScopes(t, nil)
+	s, _ := proxyWithGroupScopes(t)
 
 	rr := httptest.NewRecorder()
 	s.Handler().ServeHTTP(rr, groupScopesRequest(t, up, groupScopesValue(testGroupA, "0,,,", "")))
@@ -320,66 +294,12 @@ func TestSharedGroupRateZeroCapAnswers429(t *testing.T) {
 	}
 }
 
-// staticSpendStore is a GroupSpendStore fake with a fixed verdict.
-type staticSpendStore struct{ exhausted bool }
-
-func (s staticSpendStore) GroupSpendExhausted(context.Context, string, string) (bool, error) {
-	return s.exhausted, nil
-}
-
-// TestSharedGroupSpendCapAnswers429: a group whose month-to-date spend
-// reached its cap is refused with 429 + Retry-After — the contractual class,
-// never 503 — even though its per-minute rates are unlimited.
-func TestSharedGroupSpendCapAnswers429(t *testing.T) {
-	up, hits := sharedGroupBackend(t)
-	s, _ := proxyWithGroupScopes(t, staticSpendStore{exhausted: true})
-
-	r := groupScopesRequest(t, up, groupScopesValue(testGroupA, ",,,", "100"))
-	rr := httptest.NewRecorder()
-	s.Handler().ServeHTTP(rr, r)
-	if rr.Code != http.StatusTooManyRequests {
-		t.Fatalf("capped status=%d, want 429", rr.Code)
-	}
-	if rr.Header().Get("Retry-After") == "" {
-		t.Fatal("capped response missing Retry-After")
-	}
-	if *hits != 0 {
-		t.Fatalf("upstream hits=%d, want 0 (the capped request never forwards)", *hits)
-	}
-}
-
-// TestSharedGroupSpendStoreErrorFailsOpen: a broken spend store must not deny
-// traffic — the request is admitted (fail open) and independently metered.
-func TestSharedGroupSpendStoreErrorFailsOpen(t *testing.T) {
-	up, hits := sharedGroupBackend(t)
-	s, em := proxyWithGroupScopes(t, errSpendStore{})
-
-	r := groupScopesRequest(t, up, groupScopesValue(testGroupA, ",,,", "100"))
-	rr := httptest.NewRecorder()
-	s.Handler().ServeHTTP(rr, r)
-	if rr.Code != http.StatusOK {
-		t.Fatalf("store-error status=%d, want 200 (fail open)", rr.Code)
-	}
-	if *hits != 1 {
-		t.Fatalf("upstream hits=%d, want 1", *hits)
-	}
-	if evs := em.waitForEvents(1, time.Second); len(evs) != 1 {
-		t.Fatalf("emitted events=%d, want 1 (metering is independent of admission)", len(evs))
-	}
-}
-
-type errSpendStore struct{}
-
-func (errSpendStore) GroupSpendExhausted(context.Context, string, string) (bool, error) {
-	return false, errors.New("postgres unreachable")
-}
-
 // TestSharedGroupScopesMalformedHeaderFailsClosed: a malformed group envelope
 // is a broken trusted policy, not a quota — 503 at the proxy, before
 // admission, and nothing reaches the upstream or the emitter.
 func TestSharedGroupScopesMalformedHeaderFailsClosed(t *testing.T) {
 	up, hits := sharedGroupBackend(t)
-	s, em := proxyWithGroupScopes(t, nil)
+	s, em := proxyWithGroupScopes(t)
 
 	r := groupScopesRequest(t, up, "v1;NOT-A-GROUP:,,,,")
 	rr := httptest.NewRecorder()
@@ -395,12 +315,44 @@ func TestSharedGroupScopesMalformedHeaderFailsClosed(t *testing.T) {
 	}
 }
 
+// TestSharedGroupScopesNonEmptySpendFailsClosed pins the parked-activation
+// boundary end to end: the envelope's fifth field is reserved for the
+// deferred monthly spend cap, and a producer stamping ANY non-empty value
+// there — a well-formed decimal included — has its request refused 503 with
+// a loud log, before upstream, metering nothing. Rejecting here (rather than
+// ignoring the field) is deliberate: silently dropping a stamped cap would
+// bill group traffic the operator believed was capped.
+func TestSharedGroupScopesNonEmptySpendFailsClosed(t *testing.T) {
+	up, hits := sharedGroupBackend(t)
+	cfg := proxyAdmissionConfig(10)
+	var errBuf bytes.Buffer
+	logger := &logging.Logger{Debug: log.New(io.Discard, "", 0), Info: log.New(io.Discard, "", 0), Warn: log.New(io.Discard, "", 0), Error: log.New(&errBuf, "", 0)}
+	em := &recordingEmitter{}
+	s := New(&config.Settings{Admission: cfg}, logger, em).WithAdmitter(&countingAdmitter{})
+
+	r := groupScopesRequest(t, up, groupScopesValue(testGroupA, ",,,", "100.000000000"))
+	rr := httptest.NewRecorder()
+	s.Handler().ServeHTTP(rr, r)
+	if rr.Code != http.StatusServiceUnavailable {
+		t.Fatalf("non-empty spend field status=%d, want 503 (fail closed at the parse)", rr.Code)
+	}
+	if !strings.Contains(errBuf.String(), "non-empty spend field") {
+		t.Fatalf("error log = %q, want the loud non-empty-spend line", errBuf.String())
+	}
+	if *hits != 0 {
+		t.Fatalf("upstream hits=%d, want 0 (fail closed before forwarding)", *hits)
+	}
+	if evs := em.waitForEvents(1, 200*time.Millisecond); len(evs) != 0 {
+		t.Fatalf("emitted events=%d, want 0 (a refused request meters nothing)", len(evs))
+	}
+}
+
 // TestSharedGroupScopesUnlimitedHeaderAdmits: the fully-unlimited envelope
 // (every field empty) parses to scopes with nothing to enforce — requests
-// flow, and the membership list rides the emitted event for the rater.
+// flow and are metered.
 func TestSharedGroupScopesUnlimitedHeaderAdmits(t *testing.T) {
 	up, hits := sharedGroupBackend(t)
-	s, em := proxyWithGroupScopes(t, nil)
+	s, em := proxyWithGroupScopes(t)
 
 	r := groupScopesRequest(t, up, groupScopesHeader)
 	rr := httptest.NewRecorder()
@@ -414,30 +366,6 @@ func TestSharedGroupScopesUnlimitedHeaderAdmits(t *testing.T) {
 	evs := em.waitForEvents(1, time.Second)
 	if len(evs) != 1 {
 		t.Fatalf("emitted events=%d, want 1", len(evs))
-	}
-	got := evs[0].MemberGroupIDs
-	if len(got) != 2 || got[0] != testGroupA || got[1] != testGroupB {
-		t.Fatalf("MemberGroupIDs = %v, want [%s %s] (the envelope order)", got, testGroupA, testGroupB)
-	}
-}
-
-// TestSharedNoGroupHeaderNoMembership: without the envelope the emitted event
-// carries no membership (the drainer stores NULL).
-func TestSharedNoGroupHeaderNoMembership(t *testing.T) {
-	up, _ := sharedGroupBackend(t)
-	s, em := proxyWithGroupScopes(t, nil)
-
-	rr := httptest.NewRecorder()
-	s.Handler().ServeHTTP(rr, groupScopesRequest(t, up, ""))
-	if rr.Code != http.StatusOK {
-		t.Fatalf("status=%d, want 200", rr.Code)
-	}
-	evs := em.waitForEvents(1, time.Second)
-	if len(evs) != 1 {
-		t.Fatalf("emitted events=%d, want 1", len(evs))
-	}
-	if len(evs[0].MemberGroupIDs) != 0 {
-		t.Fatalf("MemberGroupIDs = %v, want none", evs[0].MemberGroupIDs)
 	}
 }
 
@@ -459,11 +387,11 @@ func sharedGroupBackend(t *testing.T) (*url.URL, *int) {
 
 // TestSharedGroupScopesAdmissionTriggerWithAdmissionFlagOff pins the trigger:
 // under admission.enabled=false the Admit round-trip is engaged by a scope
-// that carries enforcement, not by the mere presence of the group envelope.
+// that carries a rate limit, not by the mere presence of the group envelope.
 // Every org/owner scoped limit header is absent, so only the group scopes can
 // engage the trigger. An all-unlimited group envelope performs no admission
-// call; an envelope with a rate limit or a spend cap still performs exactly
-// one, unchanged from the enabled=true path.
+// call; an envelope with a rate limit still performs exactly one, unchanged
+// from the enabled=true path.
 func TestSharedGroupScopesAdmissionTriggerWithAdmissionFlagOff(t *testing.T) {
 	up, _ := sharedGroupBackend(t)
 	cfg := proxyAdmissionConfig(10)
@@ -479,8 +407,8 @@ func TestSharedGroupScopesAdmissionTriggerWithAdmissionFlagOff(t *testing.T) {
 		return rr
 	}
 
-	// The all-unlimited envelope (every rate empty, no spend cap) enforces
-	// nothing: no Admit, no Valkey reservation, no completion round-trip.
+	// The all-unlimited envelope (every rate empty) enforces nothing: no
+	// Admit, no Valkey reservation, no completion round-trip.
 	a := &countingAdmitter{}
 	if rr := send(a, groupScopesHeader); rr.Code != http.StatusOK || a.calls != 0 {
 		t.Fatalf("all-unlimited envelope: status=%d Admit calls=%d, want 200 and no admission round-trip", rr.Code, a.calls)
@@ -492,12 +420,6 @@ func TestSharedGroupScopesAdmissionTriggerWithAdmissionFlagOff(t *testing.T) {
 	if rr := send(a, groupScopesValue(testGroupA, "30,,,", "")); rr.Code != http.StatusOK || a.calls != 1 {
 		t.Fatalf("rate-limited group scope: status=%d Admit calls=%d, want 200 and exactly one Admit", rr.Code, a.calls)
 	}
-
-	// A group carrying only a spend cap engages admission too.
-	a = &countingAdmitter{}
-	if rr := send(a, groupScopesValue(testGroupA, ",,,", "100")); rr.Code != http.StatusOK || a.calls != 1 {
-		t.Fatalf("spend-capped group scope: status=%d Admit calls=%d, want 200 and exactly one Admit", rr.Code, a.calls)
-	}
 }
 
 // TestSharedGroupScopesEnforcedWithAdmissionFlagOff is the envelope-driven
@@ -508,7 +430,7 @@ func TestSharedGroupScopesAdmissionTriggerWithAdmissionFlagOff(t *testing.T) {
 // enabled=false cases in contract_limits_test.go.
 func TestSharedGroupScopesEnforcedWithAdmissionFlagOff(t *testing.T) {
 	up, hits := sharedGroupBackend(t)
-	s, em := proxyWithGroupScopesEnabled(t, false, nil)
+	s, em := proxyWithGroupScopesEnabled(t, false)
 
 	// Only the group envelope: every org/owner scoped limit header absent.
 	envelopeOnly := func(envelope string) *http.Request {
@@ -542,11 +464,6 @@ func TestSharedGroupScopesEnforcedWithAdmissionFlagOff(t *testing.T) {
 	if len(evs) != 1 {
 		t.Fatalf("emitted events=%d, want 1", len(evs))
 	}
-	// Membership attribution rides the emitted event whether or not admission
-	// ran: skipping the store for an unlimited envelope never drops it.
-	if got := evs[0].MemberGroupIDs; len(got) != 1 || got[0] != testGroupA {
-		t.Fatalf("MemberGroupIDs = %v, want [%s]", got, testGroupA)
-	}
 }
 
 // TestSharedGroupScopesOnlyEnvelopeFailsClosedWithAdmissionFlagOff closes the
@@ -574,7 +491,7 @@ func TestSharedGroupScopesEnforcedWithAdmissionFlagOff(t *testing.T) {
 // forwarded (200), failing this test.
 func TestSharedGroupScopesOnlyEnvelopeFailsClosedWithAdmissionFlagOff(t *testing.T) {
 	up, hits := sharedGroupBackend(t)
-	s, _ := proxyWithGroupScopesEnabled(t, false, nil)
+	s, _ := proxyWithGroupScopesEnabled(t, false)
 
 	// Only the group envelope: the owner-id anchor and every scoped
 	// rate-limit header deleted.
@@ -673,7 +590,7 @@ func TestSharedGroupGeneratedCapClampsUndeclaredMaxTokensReservation(t *testing.
 	// group capped below the default is ADMITTED. Without the group limits in
 	// the clamp the reservation stays 20 over the 10-token cap and this is
 	// the unsatisfiable 400 — this half fails on that mutation.
-	s, _ := proxyWithGroupScopes(t, nil)
+	s, _ := proxyWithGroupScopes(t)
 	rr = httptest.NewRecorder()
 	s.Handler().ServeHTTP(rr, noMaxTokensReq(groupScopesRequest(t, up, groupScopesValue(testGroupA, ",,,10", ""))))
 	if rr.Code != http.StatusOK {

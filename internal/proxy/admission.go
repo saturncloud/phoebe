@@ -447,7 +447,7 @@ func anyScopedLimitPresent(id identity.Identity) bool {
 // and an underivable graph scope all answer 503.
 // Under admission.enabled=false the admission store itself is only consulted
 // when a limit is present to enforce — a contract limit header or a group
-// scope carrying a rate limit or spend cap (see the Admit call in proxy.go).
+// scope carrying a rate limit (see the Admit call in proxy.go).
 func trustedPolicyEnvelopePresent(id identity.Identity) bool {
 	return id.OwnerID != "" || anyScopedLimitPresent(id) || id.GroupScopes != ""
 }
@@ -487,14 +487,6 @@ const (
 // mints). The frozen envelope pins this grammar; anything else is malformed.
 var groupIDRe = regexp.MustCompile(`^[0-9a-f]{32}$`)
 
-// spendCapRe pins a monthly spend cap to a plain fixed-point decimal in the
-// NUMERIC(20,9) unit: at most 11 integer digits, an optional fraction of at
-// most 9 digits, no sign, no exponent (mirrors rating.decimalRe's no-float
-// discipline — the cap is money). "" parses to no cap; "0" is the explicit
-// zero cap. The integer part is bounded because NUMERIC(20,9) holds at most
-// 11 integer digits; a longer cap is out of contract and fails closed.
-var spendCapRe = regexp.MustCompile(`^[0-9]{1,11}(\.[0-9]{1,9})?$`)
-
 // groupRateRe pins a rate field to the frozen grammar: "0" (zero cap) or a
 // positive unpadded decimal. strconv.ParseInt alone also accepts "+30",
 // "-0" and "0030", which the grammar forbids — an encoder bug there must
@@ -504,14 +496,19 @@ var groupRateRe = regexp.MustCompile(`^(0|[1-9][0-9]*)$`)
 // parseTrustedGroupScopes parses the trusted group quota envelope
 // (X-Saturn-Scopes grammar: v1;<gid>:<req>,<tot>,<unc>,<gen>,<spend>;...).
 // R4 sentinels exactly as parseTrustedRateLimits: an empty rate field is
-// unlimited (nil), "0" is a zero cap, a positive value is the per-minute cap;
-// an empty <spend> is no cap, "0" blocks all paid work for the group. The
-// parse is STRICT — a malformed entry, an out-of-grammar gid or spend cap, a
+// unlimited (nil), "0" is a zero cap, a positive value is the per-minute cap.
+// The parse is STRICT — a malformed entry, an out-of-grammar gid, a
 // duplicate gid, an uncached-above-total relation, more than
 // maxGroupScopeEntries entries, or a header at/over maxGroupScopeBytes is an
 // error and the request fails closed (503), like every other envelope
 // violation. An absent header parses to nil scopes (no group quotas on this
 // request), and "v1" alone parses to zero groups.
+//
+// THE SPEND FIELD IS THE PARKED-ACTIVATION BOUNDARY: the fifth field is
+// reserved for the deferred monthly spend cap and MUST be empty in this
+// build. A non-empty spend field is malformed and fails closed (503) with a
+// loud log, whatever its shape — activating spend caps later is a parser
+// change at this one site, not an envelope renegotiation.
 //
 // TRUST: the value is read by identity.FromRequest ONLY when the header is in
 // the active trusted set, so a client can never stamp its own group quotas.
@@ -569,11 +566,12 @@ func parseTrustedGroupScopes(id identity.Identity) ([]admission.GroupScope, erro
 			*scope.Limits.UncachedPromptTokens > *scope.Limits.TotalPromptTokens {
 			return nil, fmt.Errorf("trusted %s group %s: uncached prompt limit exceeds total prompt limit", identity.HeaderGroupScopes, gid)
 		}
-		if spend := rates[4]; spend != "" {
-			if !spendCapRe.MatchString(spend) {
-				return nil, fmt.Errorf("trusted %s group %s has a malformed spend cap %q (want a plain decimal, at most 9 fraction digits)", identity.HeaderGroupScopes, gid, spend)
-			}
-			scope.SpendCap = spend
+		// The fifth field is reserved for the deferred monthly spend cap: it
+		// MUST be empty in this build. A non-empty value — whatever its shape —
+		// is malformed and fails closed (the parked-activation boundary; see
+		// the parseTrustedGroupScopes doc).
+		if rates[4] != "" {
+			return nil, fmt.Errorf("trusted %s group %s carries a non-empty spend field %q (monthly spend caps are not active in this build)", identity.HeaderGroupScopes, gid, rates[4])
 		}
 		scopes = append(scopes, scope)
 	}
@@ -598,14 +596,13 @@ func parseGroupRate(gid, dimension, value string) (*int64, error) {
 	return &limit, nil
 }
 
-// anyGroupScopeEnforced reports whether at least one group scope carries
-// something to enforce: a non-empty spend cap or any non-nil per-minute rate
-// limit. An all-unlimited group envelope (every rate empty, no spend cap)
-// enforces nothing, so under admission.enabled=false it must not touch the
-// admission store — exactly like a request with no envelope.
+// anyGroupScopeEnforced reports whether at least one group scope carries a
+// non-nil per-minute rate limit. An all-unlimited group envelope (every rate
+// empty) enforces nothing, so under admission.enabled=false it must not touch
+// the admission store — exactly like a request with no envelope.
 func anyGroupScopeEnforced(scopes []admission.GroupScope) bool {
 	for _, scope := range scopes {
-		if scope.SpendCap != "" || scope.Limits.Any() {
+		if scope.Limits.Any() {
 			return true
 		}
 	}
