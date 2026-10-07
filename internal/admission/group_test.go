@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"fmt"
 	"regexp"
 	"strings"
 	"sync"
@@ -172,6 +173,17 @@ func TestGroupSpendCapAdmitsBelowCap(t *testing.T) {
 	_ = lease.Complete(context.Background(), 0)
 	if store.calls != 1 {
 		t.Fatalf("store calls = %d, want 1", store.calls)
+	}
+
+	// For contrast: a scope without a spend cap never reads the store.
+	lease, err = a.Admit(context.Background(), groupRequest("org-b", "m",
+		groupScope("ffffffffffffffffffffffffffffffff", nil, "")))
+	if err != nil {
+		t.Fatalf("uncapped admit: %v, want admitted", err)
+	}
+	_ = lease.Complete(context.Background(), 0)
+	if store.calls != 1 {
+		t.Fatalf("store calls = %d, want still 1 (an empty SpendCap skips the store)", store.calls)
 	}
 }
 
@@ -400,6 +412,99 @@ func TestGroupSpendConcurrentMissSingleflight(t *testing.T) {
 	}
 	if calls := store.Calls(); calls != 1 {
 		t.Fatalf("store calls = %d, want 1 (concurrent misses share one in-flight read)", calls)
+	}
+}
+
+// TestGroupSpendSharedBudgetAcrossGroups: many uncached capped groups against
+// a store that never answers share ONE query budget — the request is held
+// about one groupSpendQueryBudget in total, not one per group — and admits.
+func TestGroupSpendSharedBudgetAcrossGroups(t *testing.T) {
+	a, _ := testAdmitter(t, config.AdmissionSettings{})
+	a.WithGroupSpend(blockingGroupSpendStore{}, logging.New(logging.ERROR))
+
+	scopes := make([]GroupScope, 16)
+	for i := range scopes {
+		scopes[i] = groupScope(fmt.Sprintf("%032x", i+1), nil, "100")
+	}
+	start := time.Now()
+	lease, err := a.Admit(context.Background(), groupRequest("org-sb", "m", scopes...))
+	elapsed := time.Since(start)
+	if err != nil {
+		t.Fatalf("16-group hung-store admit: %v, want fail-open admission", err)
+	}
+	_ = lease.Complete(context.Background(), 0)
+	if elapsed >= 2*groupSpendQueryBudget {
+		t.Fatalf("16-group admit took %v, want under %v (one shared query budget)", elapsed, 2*groupSpendQueryBudget)
+	}
+}
+
+// releasedSpendStore answers exhausted=true once released, or the context's
+// error if the context ends first; entered signals the first read began.
+type releasedSpendStore struct {
+	entered chan struct{}
+	release chan struct{}
+	once    sync.Once
+	mu      sync.Mutex
+	calls   int
+}
+
+func (s *releasedSpendStore) GroupSpendExhausted(ctx context.Context, _, _ string) (bool, error) {
+	s.mu.Lock()
+	s.calls++
+	s.mu.Unlock()
+	s.once.Do(func() { close(s.entered) })
+	select {
+	case <-s.release:
+		return true, nil
+	case <-ctx.Done():
+		return false, ctx.Err()
+	}
+}
+
+// TestGroupSpendLeaderCancelDoesNotCancelCoalescedQuery: the leader's client
+// disconnecting mid-read must not end the coalesced read. A waiter with a live
+// context still gets the real verdict (the over-cap 429), from that one read.
+func TestGroupSpendLeaderCancelDoesNotCancelCoalescedQuery(t *testing.T) {
+	a, _ := testAdmitter(t, config.AdmissionSettings{})
+	store := &releasedSpendStore{entered: make(chan struct{}), release: make(chan struct{})}
+	a.WithGroupSpend(store, logging.New(logging.ERROR))
+
+	leaderCtx, cancelLeader := context.WithCancel(context.Background())
+	leaderDone := make(chan struct{})
+	go func() {
+		defer close(leaderDone)
+		if lease, err := a.Admit(leaderCtx, groupRequest("org-lc", "m",
+			groupScope(testGID, nil, "100"))); err == nil {
+			_ = lease.Complete(context.Background(), 0)
+		}
+	}()
+	<-store.entered
+	cancelLeader()
+
+	waiterErr := make(chan error, 1)
+	go func() {
+		lease, err := a.Admit(context.Background(), groupRequest("org-lc", "m",
+			groupScope(testGID, nil, "100")))
+		if err == nil {
+			_ = lease.Complete(context.Background(), 0)
+		}
+		waiterErr <- err
+	}()
+	// Let the waiter join the in-flight read, then let the read answer.
+	time.Sleep(20 * time.Millisecond)
+	close(store.release)
+
+	err := <-waiterErr
+	<-leaderDone
+	var rejected *Rejected
+	if !errors.As(err, &rejected) || rejected.Dimension != "monthly_spend" || !rejected.Contractual {
+		t.Fatalf("waiter admit: %v, want the 429 monthly_spend rejection from the coalesced read", err)
+	}
+	store.mu.Lock()
+	calls := store.calls
+	store.mu.Unlock()
+	if calls != 1 {
+		t.Fatalf("store calls = %d, want 1 (the waiter shares the leader's read)", calls)
 	}
 }
 

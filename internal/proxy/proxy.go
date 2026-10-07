@@ -576,7 +576,9 @@ func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request) {
 		// Contract limits therefore engage whenever Atlas stamped them, with or
 		// without operator tiers (ruling R12 clarification). Under
 		// admission.enabled=false the store itself is consulted only when a
-		// contract limit header is present (the Admit call below); a limit
+		// contract limit header is present (the Admit call below; a group
+		// envelope engages it only when a group scope carries a rate limit or
+		// spend cap); a limit
 		// header without the owner-id anchor still fails closed in
 		// parseTrustedRateLimits. Only a shared request with NO envelope at all,
 		// under admission.enabled=false, skips admission entirely: the
@@ -706,9 +708,11 @@ func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request) {
 		}
 		// Under admission.enabled=false a request whose envelope carries no
 		// limit is unlimited in every scope, so it does not touch the store: no
-		// Admit, no lease renewal, no completion. Every fail-closed check above
-		// has already run.
-		if enforceAdmission && (s.settings.Admission.Enabled || organizationLimits.Any() || ownerLimits.Any() || len(groupScopes) > 0) {
+		// Admit, no lease renewal, no completion. A group envelope engages the
+		// store only when at least one group scope carries enforcement — a
+		// spend cap or a rate limit; an all-unlimited envelope enforces
+		// nothing. Every fail-closed check above has already run.
+		if enforceAdmission && (s.settings.Admission.Enabled || organizationLimits.Any() || ownerLimits.Any() || anyGroupScopeEnforced(groupScopes)) {
 			admitted, err = s.admitter.Admit(r.Context(), admission.Request{
 				Graph: graph, Organization: id.OrgID, Owner: id.OwnerID, Model: estimate.Model,
 				PromptBytes: originalPromptBytes, EstimatedInputTokens: estimate.InputTokens,

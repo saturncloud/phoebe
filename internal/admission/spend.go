@@ -276,14 +276,19 @@ func newSpendFlight() *spendFlight {
 // result to every caller: concurrent waiters take the leader's verdict, or
 // its error (the fail-open path), without re-running the query. The leader
 // reports leader=true so exactly one caller records and logs the outcome.
-func (f *spendFlight) do(key string, fn func() (bool, error)) (spendFlightResult, bool) {
+// A waiter stops waiting when its own ctx is done (its share of the spend
+// query budget ran out, or its client left) and gets ctx's error, which the
+// caller treats as fail-open; the leader's read keeps running for the others.
+func (f *spendFlight) do(ctx context.Context, key string, fn func() (bool, error)) (spendFlightResult, bool) {
 	f.mu.Lock()
 	if call, ok := f.in[key]; ok {
 		f.mu.Unlock()
-		// The leader's query is bounded by groupSpendQueryBudget, so this
-		// wait cannot hold the request past one query budget either.
-		<-call.done
-		return call.result, false
+		select {
+		case <-call.done:
+			return call.result, false
+		case <-ctx.Done():
+			return spendFlightResult{err: ctx.Err()}, false
+		}
 	}
 	call := &spendFlightCall{done: make(chan struct{})}
 	f.in[key] = call

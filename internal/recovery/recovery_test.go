@@ -57,18 +57,127 @@ func TestLoadJSONLAndFloorLogsDedupeIdenticalEvents(t *testing.T) {
 }
 
 func TestLoadRejectsConflictingDuplicate(t *testing.T) {
-	ev1 := testEvent("phoebe-same")
-	ev2 := ev1
-	ev2.CompletionTokens = 1
-	one, _ := json.Marshal(ev1)
-	two, _ := json.Marshal(ev2)
-	path := filepath.Join(t.TempDir(), "evidence.jsonl")
-	if err := os.WriteFile(path, append(append(one, '\n'), two...), 0o600); err != nil {
-		t.Fatal(err)
+	gidA := strings.Repeat("a", 32)
+	gidB := strings.Repeat("b", 32)
+
+	t.Run("differing token counts", func(t *testing.T) {
+		ev1 := testEvent("phoebe-same")
+		ev2 := ev1
+		ev2.CompletionTokens = 1
+		one, _ := json.Marshal(ev1)
+		two, _ := json.Marshal(ev2)
+		path := filepath.Join(t.TempDir(), "evidence.jsonl")
+		if err := os.WriteFile(path, append(append(one, '\n'), two...), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		_, err := Load(path)
+		if err == nil || !strings.Contains(err.Error(), "conflicting duplicate") {
+			t.Fatalf("expected conflicting duplicate error, got %v", err)
+		}
+	})
+
+	// A regression that dropped MemberGroupIDs from the canonical comparison
+	// would still pass the token-count case above, so the membership list
+	// needs its own conflicting-duplicate case.
+	t.Run("differing member group ids", func(t *testing.T) {
+		ev1 := testEvent("phoebe-same")
+		ev1.MemberGroupIDs = []string{gidA}
+		ev2 := ev1
+		ev2.MemberGroupIDs = []string{gidB}
+		one, _ := json.Marshal(ev1)
+		two, _ := json.Marshal(ev2)
+		path := filepath.Join(t.TempDir(), "evidence.jsonl")
+		if err := os.WriteFile(path, append(append(one, '\n'), two...), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		_, err := Load(path)
+		if err == nil || !strings.Contains(err.Error(), "conflicting duplicate") {
+			t.Fatalf("expected conflicting duplicate error, got %v", err)
+		}
+	})
+
+	// Identical records, membership list included, must still dedupe as
+	// before rather than be reported as a conflict.
+	t.Run("identical events with identical memberships dedupe", func(t *testing.T) {
+		ev1 := testEvent("phoebe-same")
+		ev1.MemberGroupIDs = []string{gidA}
+		ev2 := ev1
+		one, _ := json.Marshal(ev1)
+		two, _ := json.Marshal(ev2)
+		path := filepath.Join(t.TempDir(), "evidence.jsonl")
+		if err := os.WriteFile(path, append(append(one, '\n'), two...), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		evidence, err := Load(path)
+		if err != nil {
+			t.Fatalf("identical records must dedupe, got %v", err)
+		}
+		if evidence.Duplicates != 1 || len(evidence.Events) != 1 {
+			t.Fatalf("evidence = %+v, want one event with one duplicate", evidence)
+		}
+	})
+}
+
+// TestLoadRejectsMalformedMemberGroupIDs pins the envelope contract (ruling 3)
+// at the recovery boundary: recovered evidence bypasses the proxy's strict
+// envelope parse, and the stored list is what the rater attributes into
+// group_usage, so a malformed, duplicate, or oversize list must be refused
+// here rather than replayed.
+func TestLoadRejectsMalformedMemberGroupIDs(t *testing.T) {
+	validGID := func(n int) string {
+		return fmt.Sprintf("%032x", n)
 	}
-	_, err := Load(path)
-	if err == nil || !strings.Contains(err.Error(), "conflicting duplicate") {
-		t.Fatalf("expected conflicting duplicate error, got %v", err)
+	sixteenValid := func() []string {
+		ids := make([]string, 16)
+		for i := range ids {
+			ids[i] = validGID(i)
+		}
+		return ids
+	}
+
+	cases := []struct {
+		name    string
+		ids     []string
+		wantErr bool
+	}{
+		{"no memberships is valid", nil, false},
+		{"wrong length id", []string{strings.Repeat("a", 31)}, true},
+		{"long id", []string{strings.Repeat("a", 33)}, true},
+		{"non-hex id", []string{strings.Repeat("g", 32)}, true},
+		{"uppercase id", []string{strings.ToUpper(strings.Repeat("a", 32))}, true},
+		{"duplicate ids within one event", []string{validGID(1), validGID(1)}, true},
+		{"more than 16 ids", append(sixteenValid(), validGID(16)), true},
+		{"16 valid ids", sixteenValid(), false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			ev := testEvent("req-groups")
+			ev.MemberGroupIDs = tc.ids
+			data, err := json.Marshal(ev)
+			if err != nil {
+				t.Fatal(err)
+			}
+			path := filepath.Join(t.TempDir(), "evidence.jsonl")
+			if err := os.WriteFile(path, data, 0o600); err != nil {
+				t.Fatal(err)
+			}
+			evidence, err := Load(path)
+			if tc.wantErr {
+				if err == nil {
+					t.Fatalf("member_group_ids %v was accepted; the envelope contract rejects it", tc.ids)
+				}
+				if !strings.Contains(err.Error(), "member_group_ids") {
+					t.Fatalf("error %q does not name member_group_ids", err)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("member_group_ids %v must be accepted: %v", tc.ids, err)
+			}
+			if len(evidence.Events) != 1 {
+				t.Fatalf("events = %+v, want one event", evidence.Events)
+			}
+		})
 	}
 }
 

@@ -232,11 +232,27 @@ func groupScopesRequest(t *testing.T, upstream *url.URL, envelope string) *http.
 // (frozen-clock) miniredis, with an optional spend store.
 func proxyWithGroupScopes(t *testing.T, spend admission.GroupSpendStore) (*Server, *recordingEmitter) {
 	t.Helper()
+	return proxyWithGroupScopesEnabled(t, true, spend)
+}
+
+// proxyWithGroupScopesEnabled builds the proxy over a real (frozen-clock)
+// miniredis with the given admission.enabled flag. The admitter runs with the
+// effective settings — operator tiers cleared under admission.enabled=false,
+// exactly as a default chart install renders them — and an optional spend
+// store.
+func proxyWithGroupScopesEnabled(t *testing.T, enabled bool, spend admission.GroupSpendStore) (*Server, *recordingEmitter) {
+	t.Helper()
 	mr := frozenMiniredis(t)
 	cfg := proxyAdmissionConfig(10)
+	cfg.Enabled = enabled
+	cfg.ValkeyAddr = mr.Addr()
+	eff, ok := (&config.Settings{Admission: cfg}).EffectiveAdmission()
+	if !ok {
+		t.Fatal("effective admission settings: no store configured")
+	}
 	client := redis.NewClient(&redis.Options{Addr: mr.Addr()})
 	t.Cleanup(func() { _ = client.Close() })
-	admitter := admission.New(client, cfg)
+	admitter := admission.New(client, eff)
 	if spend != nil {
 		admitter.WithGroupSpend(spend, logging.New(logging.ERROR))
 	}
@@ -421,4 +437,96 @@ func sharedGroupBackend(t *testing.T) (*url.URL, *int) {
 		t.Fatal(err)
 	}
 	return up, &hits
+}
+
+// TestSharedGroupScopesAdmissionTriggerWithAdmissionFlagOff pins the trigger:
+// under admission.enabled=false the Admit round-trip is engaged by a scope
+// that carries enforcement, not by the mere presence of the group envelope.
+// Every org/owner scoped limit header is absent, so only the group scopes can
+// engage the trigger. An all-unlimited group envelope performs no admission
+// call; an envelope with a rate limit or a spend cap still performs exactly
+// one, unchanged from the enabled=true path.
+func TestSharedGroupScopesAdmissionTriggerWithAdmissionFlagOff(t *testing.T) {
+	up, _ := sharedGroupBackend(t)
+	cfg := proxyAdmissionConfig(10)
+	cfg.Enabled = false
+	send := func(a *countingAdmitter, envelope string) *httptest.ResponseRecorder {
+		s := New(&config.Settings{Admission: cfg}, logging.New(logging.ERROR), &recordingEmitter{}).WithAdmitter(a)
+		req := groupScopesRequest(t, up, envelope)
+		for _, header := range identity.ScopedRateLimitHeaders {
+			req.Header.Del(header)
+		}
+		rr := httptest.NewRecorder()
+		s.Handler().ServeHTTP(rr, req)
+		return rr
+	}
+
+	// The all-unlimited envelope (every rate empty, no spend cap) enforces
+	// nothing: no Admit, no Valkey reservation, no completion round-trip.
+	a := &countingAdmitter{}
+	if rr := send(a, groupScopesHeader); rr.Code != http.StatusOK || a.calls != 0 {
+		t.Fatalf("all-unlimited envelope: status=%d Admit calls=%d, want 200 and no admission round-trip", rr.Code, a.calls)
+	}
+
+	// A rate-limited group scope engages admission exactly as a contract
+	// limit header does.
+	a = &countingAdmitter{}
+	if rr := send(a, groupScopesValue(testGroupA, "30,,,", "")); rr.Code != http.StatusOK || a.calls != 1 {
+		t.Fatalf("rate-limited group scope: status=%d Admit calls=%d, want 200 and exactly one Admit", rr.Code, a.calls)
+	}
+
+	// A group carrying only a spend cap engages admission too.
+	a = &countingAdmitter{}
+	if rr := send(a, groupScopesValue(testGroupA, ",,,", "100")); rr.Code != http.StatusOK || a.calls != 1 {
+		t.Fatalf("spend-capped group scope: status=%d Admit calls=%d, want 200 and exactly one Admit", rr.Code, a.calls)
+	}
+}
+
+// TestSharedGroupScopesEnforcedWithAdmissionFlagOff is the envelope-driven
+// enforcement test for the item-13 posture: admission.enabled=false with ONLY
+// X-Saturn-Group-Scopes stamped (no org/owner limit headers). A group zero
+// cap answers 429 + Retry-After before upstream, and a request within the
+// group limits is admitted — the group-scope mirror of the contract-limits
+// enabled=false cases in contract_limits_test.go.
+func TestSharedGroupScopesEnforcedWithAdmissionFlagOff(t *testing.T) {
+	up, hits := sharedGroupBackend(t)
+	s, em := proxyWithGroupScopesEnabled(t, false, nil)
+
+	// Only the group envelope: every org/owner scoped limit header absent.
+	envelopeOnly := func(envelope string) *http.Request {
+		req := groupScopesRequest(t, up, envelope)
+		for _, header := range identity.ScopedRateLimitHeaders {
+			req.Header.Del(header)
+		}
+		return req
+	}
+
+	// A group zero cap blocks every request with the contractual 429.
+	rr := httptest.NewRecorder()
+	s.Handler().ServeHTTP(rr, envelopeOnly(groupScopesValue(testGroupA, "0,,,", "")))
+	if rr.Code != http.StatusTooManyRequests {
+		t.Fatalf("zero-cap status=%d, want 429", rr.Code)
+	}
+	if rr.Header().Get("Retry-After") == "" {
+		t.Fatal("zero-cap response missing Retry-After")
+	}
+
+	// A request within the group limits is admitted and forwarded.
+	rr = httptest.NewRecorder()
+	s.Handler().ServeHTTP(rr, envelopeOnly(groupScopesValue(testGroupA, "30,,,", "")))
+	if rr.Code != http.StatusOK {
+		t.Fatalf("within-limits status=%d, want 200", rr.Code)
+	}
+	if *hits != 1 {
+		t.Fatalf("upstream hits=%d, want 1 (the zero cap never forwards)", *hits)
+	}
+	evs := em.waitForEvents(1, time.Second)
+	if len(evs) != 1 {
+		t.Fatalf("emitted events=%d, want 1", len(evs))
+	}
+	// Membership attribution rides the emitted event whether or not admission
+	// ran: skipping the store for an unlimited envelope never drops it.
+	if got := evs[0].MemberGroupIDs; len(got) != 1 || got[0] != testGroupA {
+		t.Fatalf("MemberGroupIDs = %v, want [%s]", got, testGroupA)
+	}
 }

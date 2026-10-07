@@ -446,7 +446,8 @@ func anyScopedLimitPresent(id identity.Identity) bool {
 // malformed group scope envelope fails closed in parseTrustedGroupScopes),
 // and an underivable graph scope all answer 503.
 // Under admission.enabled=false the admission store itself is only consulted
-// when a contract limit header is present (see the Admit call in proxy.go).
+// when a limit is present to enforce — a contract limit header or a group
+// scope carrying a rate limit or spend cap (see the Admit call in proxy.go).
 func trustedPolicyEnvelopePresent(id identity.Identity) bool {
 	return id.OwnerID != "" || anyScopedLimitPresent(id) || id.GroupScopes != ""
 }
@@ -595,6 +596,20 @@ func parseGroupRate(gid, dimension, value string) (*int64, error) {
 		return nil, fmt.Errorf("trusted %s group %s has a malformed %s limit %q", identity.HeaderGroupScopes, gid, dimension, value)
 	}
 	return &limit, nil
+}
+
+// anyGroupScopeEnforced reports whether at least one group scope carries
+// something to enforce: a non-empty spend cap or any non-nil per-minute rate
+// limit. An all-unlimited group envelope (every rate empty, no spend cap)
+// enforces nothing, so under admission.enabled=false it must not touch the
+// admission store — exactly like a request with no envelope.
+func anyGroupScopeEnforced(scopes []admission.GroupScope) bool {
+	for _, scope := range scopes {
+		if scope.SpendCap != "" || scope.Limits.Any() {
+			return true
+		}
+	}
+	return false
 }
 
 // legacyQuotaHeaderNames are the five single-scope quota headers that R8

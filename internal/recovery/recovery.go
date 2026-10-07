@@ -33,6 +33,13 @@ type Evidence struct {
 	Duplicates int
 }
 
+const (
+	// maxMemberGroupIDs and groupIDHexLength are the frozen envelope contract
+	// (ruling 3) applied to recovered evidence.
+	maxMemberGroupIDs = 16
+	groupIDHexLength  = 32
+)
+
 // Digest returns a stable SHA-256 digest binding the COMPLETE validated,
 // de-duplicated event set — not merely its request-id set. -apply compares this
 // value so that the artifact an operator reviewed during dry-run is provably
@@ -344,7 +351,52 @@ func validate(ev metering.Event) error {
 	if ev.StatusCode != 0 && (ev.StatusCode < 100 || ev.StatusCode > 599) {
 		return fmt.Errorf("status_code %d is outside the database range 100..599", ev.StatusCode)
 	}
+	if err := validateMemberGroupIDs(ev.MemberGroupIDs); err != nil {
+		return err
+	}
 	return nil
+}
+
+// validateMemberGroupIDs checks a recovered event's membership list against
+// the frozen envelope contract (ruling 3): at most 16 entries, each unique,
+// each exactly 32 lowercase hexadecimal characters. The normal request path
+// validates the envelope strictly at the proxy, but recovered evidence
+// bypasses that parse, and the stored list is what the rater attributes into
+// group_usage — an attacker-chosen or malformed list would land in the
+// rollup and could deny real spend caps. Reject it here, on the same error
+// path as every other malformed recovered event.
+func validateMemberGroupIDs(ids []string) error {
+	if len(ids) > maxMemberGroupIDs {
+		return fmt.Errorf("member_group_ids has %d entries; the envelope contract allows at most %d",
+			len(ids), maxMemberGroupIDs)
+	}
+	seen := make(map[string]struct{}, len(ids))
+	for _, id := range ids {
+		if !isGroupID(id) {
+			return fmt.Errorf("member_group_ids entry %q is not exactly 32 lowercase hexadecimal characters", id)
+		}
+		if _, dup := seen[id]; dup {
+			return fmt.Errorf("member_group_ids contains duplicate entry %q", id)
+		}
+		seen[id] = struct{}{}
+	}
+	return nil
+}
+
+// isGroupID reports whether s is a 32-character lowercase hex group id, the
+// frozen envelope grammar (ruling 3). Uppercase or any other spelling is
+// not a group id.
+func isGroupID(s string) bool {
+	if len(s) != groupIDHexLength {
+		return false
+	}
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		if !('0' <= c && c <= '9' || 'a' <= c && c <= 'f') {
+			return false
+		}
+	}
+	return true
 }
 
 func printableID(name, value string) error {

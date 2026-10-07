@@ -481,6 +481,12 @@ func (a *RedisAdmitter) checkGroupSpend(ctx context.Context, scopes []GroupScope
 		}
 		return nil
 	}
+	// One query budget covers the whole check, not one per group: a request
+	// carrying many uncached capped groups against a slow store waits at most
+	// one groupSpendQueryBudget in total. A group whose read cannot finish
+	// before the shared deadline fails open like any other store error. The
+	// budget starts at the first cache miss, so all-cached checks pay nothing.
+	var budgetCtx context.Context
 	for _, gs := range scopes {
 		if gs.SpendCap == "" {
 			continue
@@ -497,13 +503,23 @@ func (a *RedisAdmitter) checkGroupSpend(ctx context.Context, scopes []GroupScope
 			}
 			continue
 		}
+		if budgetCtx == nil {
+			var cancelBudget context.CancelFunc
+			budgetCtx, cancelBudget = context.WithTimeout(ctx, groupSpendQueryBudget)
+			defer cancelBudget()
+		}
+		deadline, _ := budgetCtx.Deadline()
 		// Collapse concurrent misses on one (group, cap) into a single store
 		// read: waiters take the leader's result (verdict, or fail-open on
 		// error) instead of each running their own query against a slow store.
-		result, leader := a.spendFlight.do(gs.GroupID+"\x00"+gs.SpendCap, func() (bool, error) {
+		result, leader := a.spendFlight.do(budgetCtx, gs.GroupID+"\x00"+gs.SpendCap, func() (bool, error) {
 			// Bounded: a hung store read fails open (deadline exceeded is just
-			// another store error) instead of holding the request.
-			queryCtx, cancel := context.WithTimeout(ctx, groupSpendQueryBudget)
+			// another store error) instead of holding the request. Detached
+			// from the leader's cancellation: other requests are waiting on
+			// this read, and one client disconnecting must not end it and
+			// hand every waiter a free admit. The shared deadline still
+			// bounds it.
+			queryCtx, cancel := context.WithDeadline(context.WithoutCancel(ctx), deadline)
 			defer cancel()
 			return a.spendStore.GroupSpendExhausted(queryCtx, gs.GroupID, gs.SpendCap)
 		})
