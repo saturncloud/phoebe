@@ -7,7 +7,9 @@ import (
 	"fmt"
 	"math"
 	"net/http"
+	"regexp"
 	"strconv"
+	"strings"
 	"sync/atomic"
 	"time"
 
@@ -436,15 +438,17 @@ func anyScopedLimitPresent(id identity.Identity) bool {
 }
 
 // trustedPolicyEnvelopePresent reports whether any part of the trusted quota
-// envelope — the owner-id anchor or any scoped limit header — reached this
-// request. Any part of it engages admission's fail-closed checks even under
-// admission.enabled=false: a missing organization identity, a malformed or
-// partial envelope (a limit header without the owner-id anchor fails closed
-// in parseTrustedRateLimits), and an underivable graph scope all answer 503.
+// envelope — the owner-id anchor, any scoped limit header, or the group scope
+// envelope — reached this request. Any part of it engages admission's
+// fail-closed checks even under admission.enabled=false: a missing
+// organization identity, a malformed or partial envelope (a limit header
+// without the owner-id anchor fails closed in parseTrustedRateLimits; a
+// malformed group scope envelope fails closed in parseTrustedGroupScopes),
+// and an underivable graph scope all answer 503.
 // Under admission.enabled=false the admission store itself is only consulted
 // when a contract limit header is present (see the Admit call in proxy.go).
 func trustedPolicyEnvelopePresent(id identity.Identity) bool {
-	return id.OwnerID != "" || anyScopedLimitPresent(id)
+	return id.OwnerID != "" || anyScopedLimitPresent(id) || id.GroupScopes != ""
 }
 
 // undeclaredOutputReservation is the output-token reservation for a request
@@ -466,6 +470,120 @@ func undeclaredOutputReservation(defaultOutput int64, scopes ...admission.RateLi
 // at all" result. The proxy call site matches it to add a log-only diagnostic
 // for pre-R8 producers (see legacyQuotaHeadersPresent).
 var errNoTrustedRateLimitPolicy = errors.New("incomplete trusted shared-inference rate-limit policy")
+
+// The group scope envelope (X-Saturn-Group-Scopes) bounds, frozen with the
+// grammar (see identity.HeaderGroupScopes): at most 16 entries and the whole
+// header under 4 KiB. Exceeding either, like any malformed field, is a 503 at
+// the proxy with a loud log — the fail-visible default for the multi-group
+// case: usage counts against EVERY group the caller belongs to that carries
+// limits, and the envelope must never silently drop one.
+const (
+	maxGroupScopeEntries = 16
+	maxGroupScopeBytes   = 4096
+)
+
+// groupIDRe pins a group id to 32 lowercase hex chars (uuid4 hex, as Atlas
+// mints). The frozen envelope pins this grammar; anything else is malformed.
+var groupIDRe = regexp.MustCompile(`^[0-9a-f]{32}$`)
+
+// spendCapRe pins a monthly spend cap to a plain fixed-point decimal in the
+// NUMERIC(20,9) unit: digits, an optional fraction of at most 9 digits, no
+// sign, no exponent (mirrors rating.decimalRe's no-float discipline — the cap
+// is money). "" parses to no cap; "0" is the explicit zero cap.
+var spendCapRe = regexp.MustCompile(`^[0-9]+(\.[0-9]{1,9})?$`)
+
+// parseTrustedGroupScopes parses the trusted group quota envelope
+// (X-Saturn-Scopes grammar: v1;<gid>:<req>,<tot>,<unc>,<gen>,<spend>;...).
+// R4 sentinels exactly as parseTrustedRateLimits: an empty rate field is
+// unlimited (nil), "0" is a zero cap, a positive value is the per-minute cap;
+// an empty <spend> is no cap, "0" blocks all paid work for the group. The
+// parse is STRICT — a malformed entry, an out-of-grammar gid or spend cap, a
+// duplicate gid, an uncached-above-total relation, more than
+// maxGroupScopeEntries entries, or a header at/over maxGroupScopeBytes is an
+// error and the request fails closed (503), like every other envelope
+// violation. An absent header parses to nil scopes (no group quotas on this
+// request), and "v1" alone parses to zero groups.
+//
+// TRUST: the value is read by identity.FromRequest ONLY when the header is in
+// the active trusted set, so a client can never stamp its own group quotas.
+func parseTrustedGroupScopes(id identity.Identity) ([]admission.GroupScope, error) {
+	raw := id.GroupScopes
+	if raw == "" {
+		return nil, nil
+	}
+	if len(raw) >= maxGroupScopeBytes {
+		return nil, fmt.Errorf("trusted %s header exceeds the %d-byte envelope bound (%d bytes)", identity.HeaderGroupScopes, maxGroupScopeBytes, len(raw))
+	}
+	parts := strings.Split(raw, ";")
+	if parts[0] != "v1" {
+		return nil, fmt.Errorf("trusted %s header missing the v1 prefix", identity.HeaderGroupScopes)
+	}
+	entries := parts[1:]
+	if len(entries) > maxGroupScopeEntries {
+		return nil, fmt.Errorf("trusted %s header carries %d group entries, over the %d-entry bound", identity.HeaderGroupScopes, len(entries), maxGroupScopeEntries)
+	}
+	scopes := make([]admission.GroupScope, 0, len(entries))
+	seen := make(map[string]struct{}, len(entries))
+	for _, entry := range entries {
+		fields := strings.Split(entry, ":")
+		if len(fields) != 2 {
+			return nil, fmt.Errorf("trusted %s entry %q is not <gid>:<req>,<tot>,<unc>,<gen>,<spend>", identity.HeaderGroupScopes, entry)
+		}
+		gid := fields[0]
+		if !groupIDRe.MatchString(gid) {
+			return nil, fmt.Errorf("trusted %s entry has a malformed group id %q (want 32 lowercase hex)", identity.HeaderGroupScopes, gid)
+		}
+		if _, dup := seen[gid]; dup {
+			return nil, fmt.Errorf("trusted %s header lists group %s twice", identity.HeaderGroupScopes, gid)
+		}
+		seen[gid] = struct{}{}
+		rates := strings.Split(fields[1], ",")
+		if len(rates) != 5 {
+			return nil, fmt.Errorf("trusted %s entry for group %s has %d fields, want <req>,<tot>,<unc>,<gen>,<spend>", identity.HeaderGroupScopes, gid, len(rates))
+		}
+		var scope admission.GroupScope
+		scope.GroupID = gid
+		var err error
+		if scope.Limits.Requests, err = parseGroupRate(gid, "requests", rates[0]); err != nil {
+			return nil, err
+		}
+		if scope.Limits.TotalPromptTokens, err = parseGroupRate(gid, "total prompt tokens", rates[1]); err != nil {
+			return nil, err
+		}
+		if scope.Limits.UncachedPromptTokens, err = parseGroupRate(gid, "uncached prompt tokens", rates[2]); err != nil {
+			return nil, err
+		}
+		if scope.Limits.GeneratedTokens, err = parseGroupRate(gid, "generated tokens", rates[3]); err != nil {
+			return nil, err
+		}
+		if scope.Limits.TotalPromptTokens != nil && scope.Limits.UncachedPromptTokens != nil &&
+			*scope.Limits.UncachedPromptTokens > *scope.Limits.TotalPromptTokens {
+			return nil, fmt.Errorf("trusted %s group %s: uncached prompt limit exceeds total prompt limit", identity.HeaderGroupScopes, gid)
+		}
+		if spend := rates[4]; spend != "" {
+			if !spendCapRe.MatchString(spend) {
+				return nil, fmt.Errorf("trusted %s group %s has a malformed spend cap %q (want a plain decimal, at most 9 fraction digits)", identity.HeaderGroupScopes, gid, spend)
+			}
+			scope.SpendCap = spend
+		}
+		scopes = append(scopes, scope)
+	}
+	return scopes, nil
+}
+
+// parseGroupRate parses one group envelope rate field: empty is unlimited
+// (nil), "0" is a zero cap, a positive integer is the per-minute cap. A
+// negative or non-integer value is malformed and fails closed.
+func parseGroupRate(gid, dimension, value string) (*int64, error) {
+	if value == "" {
+		return nil, nil
+	}
+	limit, err := strconv.ParseInt(value, 10, 64)
+	if err != nil || limit < 0 {
+		return nil, fmt.Errorf("trusted %s group %s has a malformed %s limit %q", identity.HeaderGroupScopes, gid, dimension, value)
+	}
+	return &limit, nil
+}
 
 // legacyQuotaHeaderNames are the five single-scope quota headers that R8
 // removed from the trusted envelope. Phoebe never reads them for a trust or
