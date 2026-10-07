@@ -141,7 +141,7 @@ func TestIntegration_GroupSpendExhausted(t *testing.T) {
 	for _, tc := range []struct {
 		name  string
 		group string
-		cap   string
+		spendCap string
 		want  bool
 	}{
 		// 1. Zero cap, no rows at all for the group: exhausted.
@@ -162,13 +162,13 @@ func TestIntegration_GroupSpendExhausted(t *testing.T) {
 		// time zone would drop this row late in the month and admit.
 		{"current month first hour counted", gStart, "2.5", true},
 	} {
-		got, err := store.GroupSpendExhausted(ctx, tc.group, tc.cap)
+		got, err := store.GroupSpendExhausted(ctx, tc.group, tc.spendCap)
 		if err != nil {
-			t.Fatalf("%s: GroupSpendExhausted(%s, %s): %v", tc.name, tc.group, tc.cap, err)
+			t.Fatalf("%s: GroupSpendExhausted(%s, %s): %v", tc.name, tc.group, tc.spendCap, err)
 		}
 		if got != tc.want {
 			t.Errorf("%s: GroupSpendExhausted(%s, %s) = %v, want %v",
-				tc.name, tc.group, tc.cap, got, tc.want)
+				tc.name, tc.group, tc.spendCap, got, tc.want)
 		}
 	}
 }

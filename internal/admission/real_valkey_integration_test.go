@@ -447,11 +447,11 @@ func TestRealValkeyGroupScopes(t *testing.T) {
 		time.Sleep(time.Duration(61-s) * time.Second)
 	}
 
-	cap := int64(50)
+	spendCap := int64(50)
 	scopes := make([]GroupScope, 16)
 	for i := range scopes {
 		scopes[i] = GroupScope{GroupID: fmt.Sprintf("%032x", i+1),
-			Limits: RateLimits{GeneratedTokens: &cap}}
+			Limits: RateLimits{GeneratedTokens: &spendCap}}
 	}
 	r := request("org-g", "model")
 	r.GroupScopes = scopes
