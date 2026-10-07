@@ -62,14 +62,6 @@ type Event struct {
 	GroupID      string `json:"group_id,omitempty"`      // present on group tokens
 	ResourceID   string `json:"resource_id,omitempty"`   // model / deployment id
 	ResourceType string `json:"resource_type,omitempty"` // e.g. workspace, deployment
-	// MemberGroupIDs is the caller's group list from the trusted
-	// X-Saturn-Group-Scopes envelope (membership-aware group quotas, ruled
-	// 2026-10-07): the groups whose quotas this request counts against even
-	// though the token is the caller's own (a user token). EVIDENCE ONLY — it
-	// never enters the money grain; the rater attributes usage to each listed
-	// group (plus GroupID, the group-token case) in the group_usage rollup.
-	// Empty/nil when the caller belongs to no group (stored as NULL).
-	MemberGroupIDs []string `json:"member_group_ids,omitempty"`
 	// OrgID is the org that OWNS the served deployment (E2 customer attribution),
 	// injected by Atlas as a per-deployment Traefik header (X-Saturn-Org-Id). Captured
 	// verbatim at meter time so push reads org off the rollup instead of re-joining

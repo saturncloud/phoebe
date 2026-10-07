@@ -4,10 +4,7 @@
 // headers, exactly as auth-server emits them.
 package identity
 
-import (
-	"net/http"
-	"strings"
-)
+import "net/http"
 
 // Header names injected by atlas-auth. Kept identical to auth-server's
 // constants so the contract between the two services stays in one shape.
@@ -159,12 +156,14 @@ const (
 	//	v1;<gid>:<req>,<tot>,<unc>,<gen>,<spend>;<gid>:...
 	//
 	// <gid> is the 32-hex group id; each rate field is empty (unlimited), 0
-	// (zero cap), or a positive per-minute value (R4 sentinels); <spend> is
-	// empty (no cap) or a plain decimal NUMERIC(20,9) cap, 0 = zero cap. At
-	// most 16 entries, under 4 KiB; malformed or oversize fails closed (503)
-	// at the proxy. Like every scoped limit header it resolves through the R3
-	// trusted-header registry: outside the active set it reads as ABSENT, so
-	// no group quota is ever read from a client-supplied value.
+	// (zero cap), or a positive per-minute value (R4 sentinels). The <spend>
+	// field is RESERVED for the deferred monthly spend cap: it must be EMPTY
+	// in this build — a non-empty value is malformed and fails closed (503)
+	// at the proxy (the parked-activation boundary; parseTrustedGroupScopes).
+	// At most 16 entries, under 4 KiB. Like every scoped limit header it
+	// resolves through the R3 trusted-header registry: outside the active set
+	// it reads as ABSENT, so no group quota is ever read from a client-
+	// supplied value.
 	HeaderGroupScopes = "X-Saturn-Group-Scopes"
 
 	// HeaderUpstream carries the EXACT backend the request must be forwarded to —
@@ -251,20 +250,10 @@ type Identity struct {
 	// GroupScopes is the raw, trusted X-Saturn-Group-Scopes envelope value
 	// (see HeaderGroupScopes), read through the R3 trusted-header registry.
 	// Empty when the header is absent or untrusted. The strict parse — per-group
-	// rate limits, monthly spend caps, bounds — happens at the proxy/admission
-	// layer (parseTrustedGroupScopes); Identity carries the envelope verbatim,
+	// rate limits, bounds — happens at the proxy/admission layer
+	// (parseTrustedGroupScopes); Identity carries the envelope verbatim,
 	// exactly like the eight scoped rate-limit fields above.
 	GroupScopes string
-	// MemberGroupIDs is the caller's group list extracted from GroupScopes —
-	// the <gid> of every well-formed entry, in envelope order. It rides the
-	// metering event as billing_event.member_group_ids so the rater can
-	// attribute usage to each group the caller belongs to (membership-aware
-	// group quotas, ruled 2026-10-07). Empty when the envelope is absent or
-	// carries no group. Extraction is deliberately LENIENT (see
-	// memberGroupIDs): the strict, fail-closed parse runs at the proxy before
-	// enforcement, and a malformed envelope never reaches metering because the
-	// request is refused first.
-	MemberGroupIDs []string
 }
 
 // The two serving modes, spelled exactly as they are stored in billing_event and
@@ -300,7 +289,7 @@ func ValidServingMode(s string) bool {
 // request's serving mode is overwritten later by gateway resolution from the
 // served-model registry.
 func FromRequest(r *http.Request) Identity {
-	id := Identity{
+	return Identity{
 		AuthID:                             r.Header.Get(HeaderAuthID),
 		UserID:                             r.Header.Get(HeaderUserID),
 		GroupID:                            r.Header.Get(HeaderGroupID),
@@ -324,54 +313,6 @@ func FromRequest(r *http.Request) Identity {
 		OwnerRateLimitGeneratedTokens:      trustedHeaderValue(r, HeaderOwnerRateLimitGeneratedTokens),
 		GroupScopes:                        trustedHeaderValue(r, HeaderGroupScopes),
 	}
-	id.MemberGroupIDs = memberGroupIDs(id.GroupScopes)
-	return id
-}
-
-// memberGroupIDs extracts the group list from a raw X-Saturn-Group-Scopes
-// envelope value: the <gid> of every well-formed v1 entry, in envelope order.
-// The extraction is LENIENT by design — it validates only the pieces metering
-// needs (the v1 prefix and each entry's 32-hex group id) and skips anything
-// else. The full envelope — rate fields, spend cap, the 16-entry and 4 KiB
-// bounds, duplicate gids — is parsed STRICTLY at the proxy before enforcement,
-// and a malformed or oversize envelope fails closed there (503), so a request
-// carrying one never reaches metering; this extraction feeding the evidence
-// column therefore only ever sees values the strict parse already accepted.
-// Absent/empty/untrusted header → nil, stored as NULL by the drainer like
-// every other absent identity field.
-func memberGroupIDs(raw string) []string {
-	if raw == "" {
-		return nil
-	}
-	parts := strings.Split(raw, ";")
-	if len(parts) < 2 || parts[0] != "v1" {
-		return nil
-	}
-	var out []string
-	for _, entry := range parts[1:] {
-		fields := strings.SplitN(entry, ":", 2)
-		if len(fields) != 2 || !isGroupID(fields[0]) {
-			continue
-		}
-		out = append(out, fields[0])
-	}
-	return out
-}
-
-// isGroupID reports whether s is a 32-char lowercase hex group id (uuid4 hex,
-// as Atlas mints). The frozen envelope pins this grammar; uppercase or any
-// other spelling is not a group id.
-func isGroupID(s string) bool {
-	if len(s) != 32 {
-		return false
-	}
-	for i := 0; i < len(s); i++ {
-		c := s[i]
-		if !('0' <= c && c <= '9' || 'a' <= c && c <= 'f') {
-			return false
-		}
-	}
-	return true
 }
 
 // OrgScopedRateLimitHeaders and OwnerScopedRateLimitHeaders are the scoped

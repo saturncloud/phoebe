@@ -3,7 +3,6 @@ package drain
 import (
 	"context"
 	"errors"
-	"reflect"
 	"regexp"
 	"testing"
 	"time"
@@ -46,14 +45,14 @@ func TestPostgresStore_UpsertSQL(t *testing.T) {
 
 	mock.ExpectBegin()
 	mock.ExpectExec(regexp.QuoteMeta(
-		"INSERT INTO billing_event (request_id, client_request_id, auth_id, user_id, group_id, resource_id, resource_type, member_group_ids, org_id, model, base_model, adapter, serving_mode, prompt_tokens, cached_tokens, completion_tokens, finish_reason, gpu_type, aborted, usage_found, status_code, streamed, graph_k8s_name, event_ts) VALUES",
+		"INSERT INTO billing_event (request_id, client_request_id, auth_id, user_id, group_id, resource_id, resource_type, org_id, model, base_model, adapter, serving_mode, prompt_tokens, cached_tokens, completion_tokens, finish_reason, gpu_type, aborted, usage_found, status_code, streamed, graph_k8s_name, event_ts) VALUES",
 	)).
 		WithArgs(
 			// row 1 (org_id + base_model NULL: a pre-cutover-shaped event with no org
 			// header and no derived_from)
-			"req-1", "logical-1", "auth-1", nil, nil, nil, nil, nil, nil, "m1", nil, nil, "dedicated", 5, 0, 7, nil, nil, false, false, nil, false, nil, time.UnixMilli(ts).UTC(),
+			"req-1", "logical-1", "auth-1", nil, nil, nil, nil, nil, "m1", nil, nil, "dedicated", 5, 0, 7, nil, nil, false, false, nil, false, nil, time.UnixMilli(ts).UTC(),
 			// row 2 (no identity, no timestamp → event_ts NULL)
-			"req-2", nil, nil, nil, nil, nil, nil, nil, nil, "m2", nil, nil, "shared", 0, 0, 0, nil, nil, false, false, nil, false, nil, nil,
+			"req-2", nil, nil, nil, nil, nil, nil, nil, "m2", nil, nil, "shared", 0, 0, 0, nil, nil, false, false, nil, false, nil, nil,
 		).
 		WillReturnResult(sqlmock.NewResult(0, 2))
 	mock.ExpectCommit()
@@ -125,7 +124,7 @@ func TestPostgresStore_EmptyModelStoredAsNull(t *testing.T) {
 	mock.ExpectBegin()
 	mock.ExpectExec("INSERT INTO billing_event").
 		WithArgs(
-			"req-no-model", nil, "auth-1", nil, nil, nil, nil, nil,
+			"req-no-model", nil, "auth-1", nil, nil, nil, nil,
 			nil,         // org_id: "" must bind NULL
 			nil,         // model: "" must bind NULL
 			nil,         // base_model: "" must bind NULL
@@ -159,7 +158,7 @@ func TestPostgresStore_EmptyModelStoredAsNull(t *testing.T) {
 // and billing_event_status_code_ck admits NULL or 100..599 — so 0 must bind NULL
 // (a never-answered attempt), while a real status binds through verbatim.
 func TestEventArgs_ZeroStatusCodeBindsNullNoResponse(t *testing.T) {
-	const statusCodeIdx = 20 // request_id..usage_found is 20 columns; status_code is next.
+	const statusCodeIdx = 19 // request_id..usage_found is 19 columns; status_code is next.
 
 	noResponse := eventArgs(metering.Event{RequestID: "r", Model: "m"})
 	if noResponse[statusCodeIdx] != nil {
@@ -185,43 +184,31 @@ func TestEventArgs_NullsEmptyIdentities(t *testing.T) {
 	if args[2] != nil {
 		t.Fatalf("auth_id arg = %v, want nil for empty AuthID", args[2])
 	}
-	// member_group_ids is index 7 (after resource_type) — must be nil for empty
-	// (no memberships), like every other absent identity field.
-	if args[7] != nil {
-		t.Fatalf("member_group_ids arg = %v, want nil for empty MemberGroupIDs", args[7])
-	}
-	// org_id is index 8 (member_group_ids pushed it down by one) — must be nil for empty (no producer
+	// org_id is index 6 (after resource_type) — must be nil for empty (no producer
 	// header / rollout gap); a stored '' would dodge the rater/push `org_id IS NULL`
 	// held-not-billed predicate.
-	if args[8] != nil {
-		t.Fatalf("org_id arg = %v, want nil for empty OrgID", args[8])
+	if args[7] != nil {
+		t.Fatalf("org_id arg = %v, want nil for empty OrgID", args[7])
 	}
-	// base_model is index 10 (member_group_ids pushed org_id/model/base_model down by one) — nil for empty.
-	if args[10] != nil {
-		t.Fatalf("base_model arg = %v, want nil for empty BaseModel", args[10])
+	// base_model is index 8 (org_id pushed model/base_model down by one) — nil for empty.
+	if args[9] != nil {
+		t.Fatalf("base_model arg = %v, want nil for empty BaseModel", args[9])
 	}
-	// prompt_tokens is index 13 (…base_model=10, adapter=11, serving_mode=12) — int, not nil.
-	if args[13] != 3 {
-		t.Fatalf("prompt_tokens arg = %v, want 3", args[13])
+	// prompt_tokens is index 11 (…base_model=8, adapter=9, serving_mode=10) — int, not nil.
+	if args[12] != 3 {
+		t.Fatalf("prompt_tokens arg = %v, want 3", args[12])
 	}
 	// event_ts is the last index — nil when TimestampUnixMs==0.
 	if args[colsPerRow-1] != nil {
 		t.Fatalf("event_ts arg = %v, want nil for zero timestamp", args[colsPerRow-1])
 	}
 
-	// POSITIVE bind: a non-empty OrgID must reach the org_id column verbatim (index 8),
+	// POSITIVE bind: a non-empty OrgID must reach the org_id column verbatim (index 6),
 	// not just be NULLed when empty — the meter-time org capture is the point of the
 	// change, so the happy path is pinned here (not only transitively via e2e).
 	withOrg := eventArgs(metering.Event{RequestID: "r", Model: "m", OrgID: "org-xyz"})
-	if withOrg[8] != "org-xyz" {
-		t.Fatalf("org_id arg = %v, want \"org-xyz\" (a non-empty OrgID must bind through)", withOrg[8])
-	}
-
-	// POSITIVE bind: a membership list binds as the slice (pgx encodes text[]),
-	// so the group attribution rollup can read it.
-	withGroups := eventArgs(metering.Event{RequestID: "r", Model: "m", MemberGroupIDs: []string{"group-a"}})
-	if got := withGroups[7]; !reflect.DeepEqual(got, []string{"group-a"}) {
-		t.Fatalf("member_group_ids arg = %#v, want [group-a] (a membership list must bind through)", got)
+	if withOrg[7] != "org-xyz" {
+		t.Fatalf("org_id arg = %v, want \"org-xyz\" (a non-empty OrgID must bind through)", withOrg[7])
 	}
 }
 
@@ -231,7 +218,7 @@ func TestEventArgs_NullsEmptyIdentities(t *testing.T) {
 // as ” (not NULL, not 'dedicated') so the rater withholds it as an invalid
 // serving mode, and every other value binds verbatim.
 func TestEventArgs_ServingModeStoredAsDecoded(t *testing.T) {
-	const servingModeIdx = 12 // request_id..adapter is 12 columns; serving_mode is next.
+	const servingModeIdx = 11 // request_id..adapter is 11 columns; serving_mode is next.
 
 	cases := []struct {
 		in   string
