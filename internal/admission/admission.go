@@ -489,7 +489,11 @@ func (a *RedisAdmitter) checkGroupSpend(ctx context.Context, scopes []GroupScope
 			}
 			continue
 		}
-		exhausted, err := a.spendStore.GroupSpendExhausted(ctx, gs.GroupID, gs.SpendCap)
+		// Bounded: a hung store read fails open (deadline exceeded is just
+		// another store error) instead of holding the request.
+		queryCtx, cancel := context.WithTimeout(ctx, groupSpendQueryBudget)
+		exhausted, err := a.spendStore.GroupSpendExhausted(queryCtx, gs.GroupID, gs.SpendCap)
+		cancel()
 		if err != nil {
 			a.spendBypass(gs.GroupID, err)
 			continue

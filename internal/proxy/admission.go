@@ -487,10 +487,18 @@ const (
 var groupIDRe = regexp.MustCompile(`^[0-9a-f]{32}$`)
 
 // spendCapRe pins a monthly spend cap to a plain fixed-point decimal in the
-// NUMERIC(20,9) unit: digits, an optional fraction of at most 9 digits, no
-// sign, no exponent (mirrors rating.decimalRe's no-float discipline — the cap
-// is money). "" parses to no cap; "0" is the explicit zero cap.
-var spendCapRe = regexp.MustCompile(`^[0-9]+(\.[0-9]{1,9})?$`)
+// NUMERIC(20,9) unit: at most 11 integer digits, an optional fraction of at
+// most 9 digits, no sign, no exponent (mirrors rating.decimalRe's no-float
+// discipline — the cap is money). "" parses to no cap; "0" is the explicit
+// zero cap. The integer part is bounded because NUMERIC(20,9) holds at most
+// 11 integer digits; a longer cap is out of contract and fails closed.
+var spendCapRe = regexp.MustCompile(`^[0-9]{1,11}(\.[0-9]{1,9})?$`)
+
+// groupRateRe pins a rate field to the frozen grammar: "0" (zero cap) or a
+// positive unpadded decimal. strconv.ParseInt alone also accepts "+30",
+// "-0" and "0030", which the grammar forbids — an encoder bug there must
+// fail closed (503), not be silently enforced.
+var groupRateRe = regexp.MustCompile(`^(0|[1-9][0-9]*)$`)
 
 // parseTrustedGroupScopes parses the trusted group quota envelope
 // (X-Saturn-Scopes grammar: v1;<gid>:<req>,<tot>,<unc>,<gen>,<spend>;...).
@@ -573,10 +581,14 @@ func parseTrustedGroupScopes(id identity.Identity) ([]admission.GroupScope, erro
 
 // parseGroupRate parses one group envelope rate field: empty is unlimited
 // (nil), "0" is a zero cap, a positive integer is the per-minute cap. A
-// negative or non-integer value is malformed and fails closed.
+// signed, zero-padded, negative, or non-integer value is malformed and fails
+// closed.
 func parseGroupRate(gid, dimension, value string) (*int64, error) {
 	if value == "" {
 		return nil, nil
+	}
+	if !groupRateRe.MatchString(value) {
+		return nil, fmt.Errorf("trusted %s group %s has a malformed %s limit %q", identity.HeaderGroupScopes, gid, dimension, value)
 	}
 	limit, err := strconv.ParseInt(value, 10, 64)
 	if err != nil || limit < 0 {

@@ -7,11 +7,8 @@ import (
 	"sync"
 	"time"
 
-	// pgx stdlib driver registers itself as "pgx" with database/sql — the same
-	// driver/DSN convention as the drainer and the rater. The spend check reads
-	// Postgres (group_usage, written by the rater), NOT the Valkey admission
-	// store, so the Valkey-outage ruling's store is not in this path.
-	_ "github.com/jackc/pgx/v5/stdlib"
+	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/stdlib"
 
 	"github.com/saturncloud/phoebe/internal/logging"
 )
@@ -24,6 +21,18 @@ import (
 // rating cadence doesn't already bound.
 const groupSpendCacheTTL = time.Minute
 
+// groupSpendQueryBudget bounds one spend-check read on the request path. The
+// check runs synchronously before the Valkey reservation, so a slow or
+// blackholed Postgres must not hold the request: past this budget the read is
+// abandoned and the check fails open like any other store error. It sits well
+// inside admitOperationBudget so the reservation keeps its own time.
+const groupSpendQueryBudget = 250 * time.Millisecond
+
+// groupSpendConnectTimeout bounds establishing one pool connection, so a
+// Postgres that drops packets cannot pin a dial (and with it one of the four
+// pool slots) forever.
+const groupSpendConnectTimeout = 2 * time.Second
+
 // GroupSpendStore is the admission package's seam onto the group spend the
 // monthly cap compares against. It is an interface so admission can be tested
 // against a fake and the SQL tested in isolation via sqlmock, mirroring the
@@ -31,7 +40,7 @@ const groupSpendCacheTTL = time.Minute
 type GroupSpendStore interface {
 	// GroupSpendExhausted reports whether the group's spend in the CURRENT
 	// CALENDAR MONTH has reached the cap: SUM(cost) over group_usage for
-	// window_start >= date_trunc('month', now()), compared in Postgres
+	// window_start >= the start of the current UTC month, compared in Postgres
 	// (NUMERIC, never a Go number). cap is a plain decimal NUMERIC(20,9)
 	// string straight from the trusted envelope. The verdict — not the spend
 	// sum — crosses this seam, so no money value becomes a Go number.
@@ -54,10 +63,21 @@ func OpenPostgresSpendStore(ctx context.Context, databaseURL string) (*PostgresS
 	if databaseURL == "" {
 		return nil, fmt.Errorf("admission: spend check: DATABASE_URL is empty (group_usage lives in phoebe's Postgres; the spend cap cannot be checked without it)")
 	}
-	db, err := sql.Open("pgx", databaseURL)
+	// The pgx stdlib driver, opened from a parsed config so the connect
+	// timeout can be set — the same driver/DSN convention as the drainer and
+	// the rater. The spend check reads Postgres (group_usage, written by the
+	// rater), NOT the Valkey admission store, so the Valkey-outage ruling's
+	// store is not in this path.
+	cfg, err := pgx.ParseConfig(databaseURL)
 	if err != nil {
-		return nil, fmt.Errorf("admission: spend check: open postgres: %w", err)
+		return nil, fmt.Errorf("admission: spend check: parse DATABASE_URL: %w", err)
 	}
+	// A connect_timeout given in the DSN wins; otherwise dials are bounded
+	// here rather than left to the kernel's TCP timeout.
+	if cfg.ConnectTimeout == 0 {
+		cfg.ConnectTimeout = groupSpendConnectTimeout
+	}
+	db := stdlib.OpenDB(*cfg)
 	// The hot path is served from the in-process verdict cache: the pool sees
 	// at most one query per (group, cap) per TTL, so a handful of connections
 	// is generous.
@@ -79,14 +99,17 @@ func (s *PostgresSpendStore) Close() error { return s.db.Close() }
 
 // groupSpendExhaustedSQL compares the group's month-to-date attribution spend
 // against the cap in ONE round-trip, in Postgres, so money never becomes a Go
-// number. An empty group_usage month (no rating yet, or a group with no
+// number. The month boundary is computed in UTC explicitly: the rater fills
+// window_start from UTC hour buckets, so a boundary taken in the session's
+// TimeZone would shift the month by the session's UTC offset. An empty
+// group_usage month (no rating yet, or a group with no
 // attributed usage) sums to NULL → COALESCE to 0 → the cap is unreached until
 // rated spend says otherwise.
 const groupSpendExhaustedSQL = `
 SELECT COALESCE(SUM(cost), 0) >= $2::numeric
 FROM group_usage
 WHERE group_id = $1
-  AND window_start >= date_trunc('month', now())`
+  AND window_start >= date_trunc('month', now() AT TIME ZONE 'UTC') AT TIME ZONE 'UTC'`
 
 func (s *PostgresSpendStore) GroupSpendExhausted(ctx context.Context, groupID, cap string) (bool, error) {
 	var exhausted bool
@@ -121,7 +144,9 @@ func newSpendVerdictCache() *spendVerdictCache {
 }
 
 // lookup returns the cached verdict for (groupID, cap) and whether it is
-// fresh enough to trust.
+// fresh enough to trust. An entry expires at the earlier of its TTL and the
+// next UTC month boundary after its capture: the cap counts calendar-month
+// spend, so a verdict taken in the old month says nothing about the new one.
 func (c *spendVerdictCache) lookup(groupID, cap string) (bool, bool) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -133,7 +158,8 @@ func (c *spendVerdictCache) lookup(groupID, cap string) (bool, bool) {
 	if c.now != nil {
 		now = c.now
 	}
-	if now().Sub(e.at) >= groupSpendCacheTTL {
+	t := now()
+	if t.Sub(e.at) >= groupSpendCacheTTL || !t.Before(nextUTCMonth(e.at)) {
 		return false, false
 	}
 	return e.exhausted, true
@@ -148,6 +174,12 @@ func (c *spendVerdictCache) store(groupID, cap string, exhausted bool) {
 		now = c.now
 	}
 	c.entries[groupID+"\x00"+cap] = spendVerdictEntry{exhausted: exhausted, at: now()}
+}
+
+// nextUTCMonth returns the first instant of the UTC calendar month after t's.
+func nextUTCMonth(t time.Time) time.Time {
+	u := t.UTC()
+	return time.Date(u.Year(), u.Month()+1, 1, 0, 0, 0, 0, time.UTC)
 }
 
 // spendFailureLog throttles the fail-open spend-check ERROR lines: the first

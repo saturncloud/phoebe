@@ -1,10 +1,15 @@
 package admission
 
 import (
+	"bytes"
 	"context"
 	"errors"
+	"regexp"
+	"strings"
 	"testing"
 	"time"
+
+	sqlmock "github.com/DATA-DOG/go-sqlmock"
 
 	"github.com/saturncloud/phoebe/internal/config"
 	"github.com/saturncloud/phoebe/internal/logging"
@@ -252,6 +257,103 @@ func TestGroupSpendStoreErrorFailsOpen(t *testing.T) {
 	_ = lease2.Complete(context.Background(), 0)
 	if store.calls != 2 {
 		t.Fatalf("store calls = %d, want 2 (errors never cache)", store.calls)
+	}
+}
+
+// blockingGroupSpendStore models a blackholed Postgres: the read never
+// answers and returns only when its context is done.
+type blockingGroupSpendStore struct{}
+
+func (blockingGroupSpendStore) GroupSpendExhausted(ctx context.Context, _, _ string) (bool, error) {
+	<-ctx.Done()
+	return false, ctx.Err()
+}
+
+// TestGroupSpendHungStoreFailsOpenWithinBudget: a store read that never
+// returns must not hold the request. The check abandons it after
+// groupSpendQueryBudget, admits (fail open), and logs the bypass loudly.
+func TestGroupSpendHungStoreFailsOpenWithinBudget(t *testing.T) {
+	a, _ := testAdmitter(t, config.AdmissionSettings{})
+	log := logging.New(logging.ERROR)
+	var buf bytes.Buffer
+	log.Error.SetOutput(&buf)
+	a.WithGroupSpend(blockingGroupSpendStore{}, log)
+
+	start := time.Now()
+	lease, err := a.Admit(context.Background(), groupRequest("org-h", "m",
+		groupScope(testGID, nil, "100")))
+	elapsed := time.Since(start)
+	if err != nil {
+		t.Fatalf("hung-store admit: %v, want fail-open admission", err)
+	}
+	_ = lease.Complete(context.Background(), 0)
+	if elapsed > admitOperationBudget {
+		t.Fatalf("hung-store admit took %v, want it bounded by the spend query budget (%v)", elapsed, groupSpendQueryBudget)
+	}
+	out := buf.String()
+	if !strings.Contains(out, "monthly spend cap NOT enforced (fail open)") || !strings.Contains(out, context.DeadlineExceeded.Error()) {
+		t.Fatalf("bypass log = %q, want a fail-open ERROR naming the deadline", out)
+	}
+}
+
+// TestGroupSpendMonthBoundaryIsUTC: the month predicate is computed in UTC,
+// matching the rater's UTC hour buckets, not in the session TimeZone.
+func TestGroupSpendMonthBoundaryIsUTC(t *testing.T) {
+	db, mock, err := sqlmock.New()
+	if err != nil {
+		t.Fatalf("sqlmock: %v", err)
+	}
+	defer db.Close()
+	mock.ExpectQuery(regexp.QuoteMeta(
+		"window_start >= date_trunc('month', now() AT TIME ZONE 'UTC') AT TIME ZONE 'UTC'")).
+		WithArgs(testGID, "100").
+		WillReturnRows(sqlmock.NewRows([]string{"exhausted"}).AddRow(true))
+
+	exhausted, err := NewPostgresSpendStore(db).GroupSpendExhausted(context.Background(), testGID, "100")
+	if err != nil {
+		t.Fatalf("GroupSpendExhausted: %v", err)
+	}
+	if !exhausted {
+		t.Fatalf("exhausted = false, want the row's verdict")
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Fatalf("expectations: %v", err)
+	}
+}
+
+// TestGroupSpendCacheExpiresAtUTCMonthBoundary: an exhausted verdict cached
+// just before the UTC month turns must not deny requests in the new month —
+// the rollover invalidates it even though the TTL has not elapsed.
+func TestGroupSpendCacheExpiresAtUTCMonthBoundary(t *testing.T) {
+	a, store := spendTestAdmitter(t)
+	store.exhausted = true
+	now := time.Date(2026, time.October, 31, 23, 59, 50, 0, time.UTC)
+	a.spendCache.now = func() time.Time { return now }
+	scope := groupScope(testGID, nil, "100")
+	ctx := context.Background()
+
+	var rejected *Rejected
+	if _, err := a.Admit(ctx, groupRequest("org-m", "m", scope)); !errors.As(err, &rejected) {
+		t.Fatalf("pre-boundary admit: %v, want a monthly_spend rejection", err)
+	}
+	if _, err := a.Admit(ctx, groupRequest("org-m", "m", scope)); !errors.As(err, &rejected) {
+		t.Fatalf("cached pre-boundary admit: %v, want a monthly_spend rejection", err)
+	}
+	if store.calls != 1 {
+		t.Fatalf("store calls = %d, want 1 (verdict cached inside the old month)", store.calls)
+	}
+
+	// Twenty seconds later, inside the TTL but in November: the new month's
+	// spend is zero, so the cached verdict must be dropped and re-read.
+	now = now.Add(20 * time.Second)
+	store.exhausted = false
+	lease, err := a.Admit(ctx, groupRequest("org-m", "m", scope))
+	if err != nil {
+		t.Fatalf("post-boundary admit: %v, want admission (new month)", err)
+	}
+	_ = lease.Complete(ctx, 0)
+	if store.calls != 2 {
+		t.Fatalf("store calls = %d, want 2 (month rollover re-reads the store)", store.calls)
 	}
 }
 
