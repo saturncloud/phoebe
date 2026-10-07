@@ -50,6 +50,7 @@ golang-migrate up/down pairs, applied in version order:
 | 0005 | `0005_invoice_grade_attempts.{up,down}.sql` | trusted/client request identity, attempt outcome and usage evidence, invalid-usage reconciliation, and the hourly reconciliation view at the rated natural key (exposing missing/conflicting org evidence) |
 | 0006 | `0006_rollup_grain.{up,down}.sql` | widens the `rated_usage` grain with `serving_mode`, the owner pair and `graph_k8s_name` evidence |
 | 0007 | `0007_serving_mode_explicit.{up,down}.sql` | `rated_usage.serving_mode` becomes `'shared'`/`'dedicated'` only (CHECK, no default; dedicated rows renamed from `''` with their ids recomputed) |
+| 0008 | `0008_group_scopes.{up,down}.sql` | `billing_event.member_group_ids` (membership evidence) + `group_usage`, the group attribution rollup the admission group spend check reads |
 
 `embed.go` embeds these into the `migrations` package; `cmd/migrate` applies them.
 
@@ -63,6 +64,24 @@ migrate            # or "migrate up" — apply all pending migrations (default)
 migrate down       # roll back one step
 migrate version    # print the current applied version
 ```
+
+### Rollout order for migration 0008
+
+Migration 0008 adds `billing_event.member_group_ids` and the `group_usage`
+table, both of which the rater's single rating statement reads/writes. A
+pre-0008 rater fails against this schema and a post-0008 rater fails against
+the old one (SQLSTATE 42703), so roll code and schema together, in the
+migration-0007 order: run `cmd/migrate up`, then deploy the new drainer and
+rater (the drainer's INSERT gains the column; an old drainer against schema
+0008 simply writes NULL membership). The interceptor's group scope enforcement
+is envelope-driven, so it is safe across the cutover: no stamped envelope, no
+group check.
+
+`group_usage` rows for already-rated hours exist only after a re-rate (the
+rollup is written by the rater, not backfilled). Until a window is re-rated,
+the admission spend check sums an empty rollup for that group's hours — group
+rate limits still enforce from the envelope; spend caps enforce once rating
+has covered the month.
 
 Rolling back 0007 is not exact. The 0007 down migration maps every
 `billing_event.serving_mode = 'dedicated'` back to NULL. It also renames the
