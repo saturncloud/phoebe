@@ -40,7 +40,7 @@ func main() {
 
 	// R3 trusted-header registry: parse PHOEBE_TRUSTED_HEADERS (rendered
 	// from the phoebe chart's ConfigMap) into the active set the parser's
-	// envelope reads resolve through. The pinned 13 already govern from
+	// envelope reads resolve through. The pinned 14 already govern from
 	// package init; this engages the runtime config once, at startup, and
 	// warns loudly if the chart render was empty/malformed.
 	identity.LoadTrustedHeaders(log)
@@ -100,6 +100,26 @@ func buildAdmission(s *config.Settings, log *logging.Logger) (admission.Admitter
 		// docs/shared-tier-admission.md).
 		log.Info.Printf("admission: admission.valkeyAddr is empty; using the metering Valkey from emit.valkeyAddr (%s) as the admission store", cfg.ValkeyAddr)
 	}
+	// The monthly group spend cap reads group_usage in Postgres (the rater's
+	// attribution rollup), NOT the admission Valkey. Without a DATABASE_URL
+	// (a serving-only spoke install runs no Postgres at all) the cap cannot
+	// be checked: group rate limits still enforce, the spend cap is bypassed
+	// fail-open — said loudly here, never assumed silently.
+	closeSpend := func() {}
+	if dsn := os.Getenv("DATABASE_URL"); dsn != "" {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		store, err := admission.OpenPostgresSpendStore(ctx, dsn)
+		cancel()
+		if err != nil {
+			log.Error.Printf("admission: group spend caps DISABLED (spend-check store could not be built: %v); group rate limits still enforce", err)
+		} else {
+			admitter.WithGroupSpend(store, log)
+			closeSpend = func() { _ = store.Close() }
+			log.Info.Printf("admission: group spend caps enabled (spend check reads group_usage in Postgres)")
+		}
+	} else {
+		log.Error.Printf("admission: DATABASE_URL is unset; group spend caps are NOT enforced (group rate limits still enforce)")
+	}
 	mode := "contract limits only (admission.enabled=false: operator capacity tiers off, envelope-less shared routes allowed)"
 	if cfg.Enabled {
 		mode = "contract limits + operator capacity tiers (admission.enabled=true: every shared request must carry the trusted envelope)"
@@ -114,7 +134,10 @@ func buildAdmission(s *config.Settings, log *logging.Logger) (admission.Admitter
 	} else {
 		log.Info.Printf("admission: enforcing %s (valkey %s, lease ttl %s)", mode, cfg.ValkeyAddr, cfg.LeaseTTL)
 	}
-	return admitter, func() { _ = client.Close() }
+	return admitter, func() {
+		closeSpend()
+		_ = client.Close()
+	}
 }
 
 // buildGateway constructs the TF gateway (org, model) resolver. DEFAULT: the
