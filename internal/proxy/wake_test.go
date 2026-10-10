@@ -2,6 +2,9 @@ package proxy
 
 import (
 	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -188,25 +191,175 @@ func TestServeWithWake_ColdThenWarm(t *testing.T) {
 	}
 }
 
-func TestServeWithWake_WakeErrorReturnsCold(t *testing.T) {
-	backend := &coldToWarmBackend{} // stays cold
-	be := httptest.NewServer(backend)
-	defer be.Close()
-	up, _ := url.Parse(be.URL)
+// errScaleForbidden stands in for a wake failure that never started a
+// scale-up (an RBAC or API error on the DGDSA patch, a missing adapter).
+var errScaleForbidden = errors.New("waker: scale DGDSA tf-shared/g-worker to 1: forbidden")
 
-	waker := &fakeWaker{err: context.DeadlineExceeded}
-	s := testServerWithWaker(waker)
-
-	req := httptest.NewRequest("POST", "http://x/v1/chat/completions", strings.NewReader(`{"model":"m"}`))
-	id := identity.Identity{ResourceID: "r1", ServedModel: "m"}
-	rec := httptest.NewRecorder()
-
-	served := s.serveWithWake(rec, req, up, id, "req-1", "client-req-1", nil)
-	if !served {
-		t.Fatal("wake error should serve the cold response (served=true)")
+// TestServeWithWake_HeldColdOutcomes pins what a client receives after its
+// cold request was held for a wake (QA 2026-10-10, uk2: a cold node needed
+// ~6.5 min, the 300 s hold expired, and the client got the cold 404 with no
+// Retry-After — read as "model not found" and never retried).
+func TestServeWithWake_HeldColdOutcomes(t *testing.T) {
+	notReady := fmt.Errorf("waker: upstream h not ready before deadline: %w: %w",
+		ErrWakeNotReady, context.DeadlineExceeded)
+	cases := []struct {
+		name string
+		// waker setup
+		wakeErr  error
+		warmsAt  int32 // 0 = never warms
+		maxTries int
+		// expectations
+		wantServed     bool
+		wantStatus     int
+		wantRetryAfter string
+		wantStarting   bool // JSON "model is starting" body
+		wantColdBody   bool // upstream cold body passed through
+	}{
+		{
+			name:    "wake timed out after scale-up -> 503 + Retry-After, not the cold 404",
+			wakeErr: notReady, maxTries: 3,
+			wantServed: true, wantStatus: http.StatusServiceUnavailable,
+			wantRetryAfter: "30", wantStarting: true,
+		},
+		{
+			name:    "wake ran out of retries but stayed cold -> 503 + Retry-After",
+			warmsAt: 99, maxTries: 2,
+			wantServed: true, wantStatus: http.StatusServiceUnavailable,
+			wantRetryAfter: "30", wantStarting: true,
+		},
+		{
+			name:    "wake failed without starting a scale-up -> cold 404 passed through",
+			wakeErr: errScaleForbidden, maxTries: 3,
+			wantServed: true, wantStatus: http.StatusNotFound, wantColdBody: true,
+		},
+		{
+			name:    "bare deadline error from a waker that never said it scaled -> cold 404 passed through",
+			wakeErr: context.DeadlineExceeded, maxTries: 3,
+			wantServed: true, wantStatus: http.StatusNotFound, wantColdBody: true,
+		},
+		{
+			name:    "wake completes -> caller forwards normally",
+			warmsAt: 1, maxTries: 3,
+			wantServed: false,
+		},
 	}
-	if rec.Code != 404 {
-		t.Fatalf("expected the cold 404 flushed to client, got %d", rec.Code)
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			backend := &coldToWarmBackend{}
+			be := httptest.NewServer(backend)
+			defer be.Close()
+			up, _ := url.Parse(be.URL)
+
+			waker := &fakeWaker{err: tc.wakeErr}
+			if tc.warmsAt > 0 {
+				waker.warmsAt, waker.backend = tc.warmsAt, backend
+			}
+			em := &recordingEmitter{}
+			s := New(&config.Settings{}, logging.New(logging.ERROR), em).
+				WithWaker(waker, 5*time.Second, tc.maxTries)
+
+			req := httptest.NewRequest("POST", "http://x/v1/chat/completions", strings.NewReader(`{"model":"m"}`))
+			id := identity.Identity{ResourceID: "r1", ServedModel: "m", ServingMode: "shared"}
+			rec := httptest.NewRecorder()
+
+			served := s.serveWithWake(rec, req, up, id, "req-1", "client-req-1", nil)
+			if served != tc.wantServed {
+				t.Fatalf("served = %v, want %v", served, tc.wantServed)
+			}
+			if !tc.wantServed {
+				if n := len(em.all()); n != 0 {
+					t.Fatalf("wake path emitted %d rows, want 0 (the caller's forward meters it)", n)
+				}
+				return
+			}
+			if rec.Code != tc.wantStatus {
+				t.Fatalf("status = %d, want %d", rec.Code, tc.wantStatus)
+			}
+			if got := rec.Header().Get("Retry-After"); got != tc.wantRetryAfter {
+				t.Fatalf("Retry-After = %q, want %q", got, tc.wantRetryAfter)
+			}
+			if got := rec.Header().Get(requestIDHeader); got != "req-1" {
+				t.Fatalf("X-Request-Id = %q, want the minted attempt id", got)
+			}
+			if tc.wantStarting {
+				if ct := rec.Header().Get("Content-Type"); ct != "application/json" {
+					t.Fatalf("Content-Type = %q, want application/json", ct)
+				}
+				var body map[string]string
+				if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil {
+					t.Fatalf("503 body is not JSON: %q (%v)", rec.Body.String(), err)
+				}
+				if want := "The model is starting from zero; retry in about 30 seconds."; body["error"] != want {
+					t.Fatalf("503 body error = %q, want %q", body["error"], want)
+				}
+				if strings.Contains(rec.Body.String(), "Model not found") {
+					t.Fatalf("503 body leaked the upstream cold body: %q", rec.Body.String())
+				}
+			}
+			if tc.wantColdBody && !strings.Contains(rec.Body.String(), "Model not found") {
+				t.Fatalf("body = %q, want the upstream cold body passed through", rec.Body.String())
+			}
+			events := em.waitForEvents(1, 2*time.Second)
+			if len(events) != 1 {
+				t.Fatalf("emitted %d rows, want exactly 1 raw reconciliation row: %+v", len(events), events)
+			}
+			if ev := events[0]; ev.Aborted || ev.UsageFound || ev.StatusCode != tc.wantStatus {
+				t.Fatalf("row = {Aborted:%v UsageFound:%v StatusCode:%d}, want {false false %d}",
+					ev.Aborted, ev.UsageFound, ev.StatusCode, tc.wantStatus)
+			}
+		})
+	}
+}
+
+// TestNonWakeableColdPassesThrough pins that the 503 rewrite is confined to
+// held wakeable requests: a cold 404 on a route that is not wakeable (a
+// dedicated route, or a shared route with no waker configured) reaches the
+// client unchanged, and the waker is never called.
+func TestNonWakeableColdPassesThrough(t *testing.T) {
+	cases := []struct {
+		name        string
+		servingMode string
+		withWaker   bool
+	}{
+		{"dedicated route with a waker configured", identity.ServingModeDedicated, true},
+		{"shared route with no waker configured", identity.ServingModeShared, false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			backend := &coldToWarmBackend{} // stays cold
+			be := httptest.NewServer(backend)
+			defer be.Close()
+			up, _ := url.Parse(be.URL)
+
+			waker := &fakeWaker{err: fmt.Errorf("x: %w", ErrWakeNotReady)}
+			s := New(&config.Settings{}, logging.New(logging.ERROR), &recordingEmitter{})
+			if tc.withWaker {
+				s = s.WithWaker(waker, 5*time.Second, 3)
+			}
+
+			rr := httptest.NewRecorder()
+			req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions",
+				strings.NewReader(`{"model":"m","messages":[]}`))
+			setUpstream(req, up)
+			req.Header.Set(identity.HeaderAuthID, "auth-1")
+			req.Header.Set(identity.HeaderResourceID, "r1")
+			req.Header.Set(identity.HeaderServedModel, "m")
+			req.Header.Set(identity.HeaderServingMode, tc.servingMode)
+			s.Handler().ServeHTTP(rr, req)
+
+			if rr.Code != http.StatusNotFound {
+				t.Fatalf("status = %d, want the cold 404 passed through", rr.Code)
+			}
+			if got := rr.Header().Get("Retry-After"); got != "" {
+				t.Fatalf("Retry-After = %q on a non-wakeable cold 404, want none", got)
+			}
+			if !strings.Contains(rr.Body.String(), "Model not found") {
+				t.Fatalf("body = %q, want the upstream cold body unchanged", rr.Body.String())
+			}
+			if got := atomic.LoadInt32(&waker.calls); got != 0 {
+				t.Fatalf("waker called %d times on a non-wakeable route", got)
+			}
+		})
 	}
 }
 
@@ -250,7 +403,7 @@ func TestWakeErrorColdEmitsReconciliationRow(t *testing.T) {
 
 	em := &recordingEmitter{}
 	s := New(&config.Settings{}, logging.New(logging.ERROR), em).
-		WithWaker(&fakeWaker{err: context.DeadlineExceeded}, 5*time.Second, 3)
+		WithWaker(&fakeWaker{err: errScaleForbidden}, 5*time.Second, 3)
 
 	req := httptest.NewRequest("POST", "http://x/v1/chat/completions", strings.NewReader(`{"model":"m"}`))
 	id := identity.Identity{ResourceID: "r1", ServedModel: "m"}
@@ -261,7 +414,7 @@ func TestWakeErrorColdEmitsReconciliationRow(t *testing.T) {
 		t.Fatal("wake error should serve the cold response (served=true)")
 	}
 	if rec.Code != http.StatusNotFound {
-		t.Fatalf("client got %d, want the cold 404", rec.Code)
+		t.Fatalf("client got %d, want the cold 404 (no scale-up started, so no 503)", rec.Code)
 	}
 	events := em.waitForEvents(1, 2*time.Second)
 	if len(events) != 1 {

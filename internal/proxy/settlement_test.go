@@ -12,6 +12,7 @@ package proxy
 import (
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"net"
 	"net/http"
@@ -350,11 +351,12 @@ func TestWakeExhaustedColdSettlesZeroNeverServed(t *testing.T) {
 		callsBefore := atomic.LoadInt32(&waker.calls)
 		rr := httptest.NewRecorder()
 		s.Handler().ServeHTTP(rr, withContractEnvelope(sharedRequest(up)))
-		if rr.Code != http.StatusNotFound {
-			t.Fatalf("status=%d, want the final cold 404 after wake exhaustion", rr.Code)
+		if rr.Code != http.StatusServiceUnavailable || rr.Header().Get("Retry-After") == "" {
+			t.Fatalf("status=%d Retry-After=%q, want the model-starting 503 + Retry-After after wake exhaustion",
+				rr.Code, rr.Header().Get("Retry-After"))
 		}
 		if got := rr.Header().Get("X-Request-Id"); !strings.HasPrefix(got, "phoebe-") {
-			t.Fatalf("final cold 404 response missing the minted X-Request-Id echo, got %q", got)
+			t.Fatalf("final model-starting 503 missing the minted X-Request-Id echo, got %q", got)
 		}
 		// serveWithWake wakes once per cold attempt: maxTries=2 means two wakes
 		// (each followed by a still-cold re-probe), then the honest final cold
@@ -385,8 +387,8 @@ func TestWakeExhaustedColdSettlesZeroNeverServed(t *testing.T) {
 	if len(rows) != 1 {
 		t.Fatalf("exhausted cold response emitted %d events, want exactly 1 raw row: %+v", len(rows), rows)
 	}
-	if rows[0].Aborted || rows[0].UsageFound || rows[0].StatusCode != http.StatusNotFound {
-		t.Fatalf("exhausted-cold row = {Aborted:%v UsageFound:%v StatusCode:%d}, want {false false 404}",
+	if rows[0].Aborted || rows[0].UsageFound || rows[0].StatusCode != http.StatusServiceUnavailable {
+		t.Fatalf("exhausted-cold row = {Aborted:%v UsageFound:%v StatusCode:%d}, want {false false 503}",
 			rows[0].Aborted, rows[0].UsageFound, rows[0].StatusCode)
 	}
 }
@@ -408,7 +410,9 @@ func TestWakeErrorColdSettlementZeroNeverServed(t *testing.T) {
 	c := redis.NewClient(&redis.Options{Addr: mr.Addr()})
 	t.Cleanup(func() { _ = c.Close() })
 	a := admission.New(c, cfg)
-	waker := &fakeWaker{err: context.DeadlineExceeded}
+	// The QA case: the scale-up landed but the worker was not ready within
+	// the hold.
+	waker := &fakeWaker{err: fmt.Errorf("waker: not ready: %w: %w", ErrWakeNotReady, context.DeadlineExceeded)}
 	em := &recordingEmitter{}
 	s := New(&config.Settings{Admission: cfg}, logging.New(logging.ERROR), em).
 		WithAdmitter(a).
@@ -418,11 +422,12 @@ func TestWakeErrorColdSettlementZeroNeverServed(t *testing.T) {
 		callsBefore := atomic.LoadInt32(&waker.calls)
 		rr := httptest.NewRecorder()
 		s.Handler().ServeHTTP(rr, withContractEnvelope(sharedRequest(up)))
-		if rr.Code != http.StatusNotFound {
-			t.Fatalf("status=%d, want the final cold 404 after the waker failed", rr.Code)
+		if rr.Code != http.StatusServiceUnavailable || rr.Header().Get("Retry-After") == "" {
+			t.Fatalf("status=%d Retry-After=%q, want the model-starting 503 + Retry-After after the wake hold expired",
+				rr.Code, rr.Header().Get("Retry-After"))
 		}
 		if got := rr.Header().Get("X-Request-Id"); !strings.HasPrefix(got, "phoebe-") {
-			t.Fatalf("waker-failure cold 404 response missing the minted X-Request-Id echo, got %q", got)
+			t.Fatalf("wake-timeout 503 missing the minted X-Request-Id echo, got %q", got)
 		}
 		if got := atomic.LoadInt32(&waker.calls) - callsBefore; got != 1 {
 			t.Fatalf("waker delta=%d, want 1 (a failed wake must not retry)", got)
@@ -450,8 +455,8 @@ func TestWakeErrorColdSettlementZeroNeverServed(t *testing.T) {
 	if len(rows) != 1 {
 		t.Fatalf("waker-failure cold response emitted %d events, want exactly 1 raw row: %+v", len(rows), rows)
 	}
-	if rows[0].Aborted || rows[0].UsageFound || rows[0].StatusCode != http.StatusNotFound {
-		t.Fatalf("waker-failure row = {Aborted:%v UsageFound:%v StatusCode:%d}, want {false false 404}",
+	if rows[0].Aborted || rows[0].UsageFound || rows[0].StatusCode != http.StatusServiceUnavailable {
+		t.Fatalf("waker-failure row = {Aborted:%v UsageFound:%v StatusCode:%d}, want {false false 503}",
 			rows[0].Aborted, rows[0].UsageFound, rows[0].StatusCode)
 	}
 }
