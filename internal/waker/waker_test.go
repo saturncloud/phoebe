@@ -3,6 +3,7 @@ package waker
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -224,6 +225,9 @@ func TestWake_BothDGDSANamesMissingErrors(t *testing.T) {
 	if err == nil {
 		t.Fatal("Wake with no DGDSA under either name must error")
 	}
+	if errors.Is(err, proxy.ErrWakeNotReady) {
+		t.Fatalf("missing-DGDSA error %v wraps ErrWakeNotReady; nothing is starting, so the proxy must pass the cold response through", err)
+	}
 	for _, name := range []string{"g1-worker", "g1-vllmworker"} {
 		if !strings.Contains(err.Error(), name) {
 			t.Fatalf("error %q does not name candidate %q", err, name)
@@ -312,6 +316,11 @@ func TestWake_HoldsUntilReadyOrDeadline(t *testing.T) {
 	defer cancel()
 	if err := w.Wake(ctx, target("g1")); err == nil || !strings.Contains(err.Error(), "not ready before deadline") {
 		t.Fatalf("never-ready Wake err = %v, want deadline error", err)
+	}
+	// The scale-up landed, so the deadline error must carry the sentinel that
+	// makes the proxy answer 503 + Retry-After instead of the cold 404.
+	if err := w.Wake(ctx, target("g1")); !errors.Is(err, proxy.ErrWakeNotReady) || !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("never-ready Wake err = %v, want it to wrap proxy.ErrWakeNotReady and context.DeadlineExceeded", err)
 	}
 
 	// Ready-after-a-few-polls: Wake returns nil once the probe flips.
