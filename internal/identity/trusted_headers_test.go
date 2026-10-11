@@ -48,18 +48,20 @@ func pinnedSet() map[string]struct{} {
 	return set
 }
 
-// TestPinnedFallbackIsExactlyThe14 pins the fallback to the exact
+// TestPinnedFallbackIsExactlyThe15 pins the fallback to the exact
 // pinned names, in the exact pinned order — the set the chart's ConfigMap
 // is supposed to render. Ruling R8 removed the five legacy single-scope
 // quota headers (X-Saturn-Service-Tier, X-Saturn-Rate-Limit-*), taking the
 // R3 set from 18 to 13; the membership-aware group scope envelope
-// (X-Saturn-Group-Scopes, ruled 2026-10-07) takes it from 13 to 14.
-func TestPinnedFallbackIsExactlyThe14(t *testing.T) {
+// (X-Saturn-Group-Scopes, ruled 2026-10-07) takes it from 13 to 14; the
+// serving-profile header takes the current set from 14 to 15.
+func TestPinnedFallbackIsExactlyThe15(t *testing.T) {
 	want := []string{
 		"X-Saturn-Gateway",
 		"X-Saturn-Org-Id",
 		"X-Saturn-Owner-Id",
 		"X-Saturn-Serving-Mode",
+		"X-Saturn-Serving-Profile",
 		"X-Saturn-Served-Model",
 		"X-Saturn-Org-Rate-Limit-Requests",
 		"X-Saturn-Org-Rate-Limit-Total-Prompt-Tokens",
@@ -72,12 +74,12 @@ func TestPinnedFallbackIsExactlyThe14(t *testing.T) {
 		"X-Saturn-Group-Scopes",
 	}
 	if !reflect.DeepEqual(pinnedTrustedHeaders, want) {
-		t.Fatalf("pinnedTrustedHeaders = %v, want the pinned 14 in order %v", pinnedTrustedHeaders, want)
+		t.Fatalf("pinnedTrustedHeaders = %v, want the pinned 15 in order %v", pinnedTrustedHeaders, want)
 	}
 }
 
 // TestLoadTrustedHeadersFallback: unset, empty, whitespace-only, or
-// all-empty-after-split config engages the pinned 14 — never an empty set.
+// all-empty-after-split config engages the pinned 15 — never an empty set.
 func TestLoadTrustedHeadersFallback(t *testing.T) {
 	cases := []struct {
 		name  string
@@ -94,7 +96,7 @@ func TestLoadTrustedHeadersFallback(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			withTrustedHeadersEnv(t, tc.value, tc.set)
 			if got := ActiveTrustedHeaders(); !reflect.DeepEqual(got, pinnedSet()) {
-				t.Fatalf("active set = %v, want the pinned 14 %v", got, pinnedSet())
+				t.Fatalf("active set = %v, want the pinned 15 %v", got, pinnedSet())
 			}
 		})
 	}
@@ -277,10 +279,22 @@ func TestLoadTrustedHeadersErrorsWhenGatewayMissing(t *testing.T) {
 	}
 }
 
+// TestLoadTrustedHeadersErrorsWhenServingProfileMissing reports that an old
+// configured list cannot support dedicated disaggregated cold wake.
+func TestLoadTrustedHeadersErrorsWhenServingProfileMissing(t *testing.T) {
+	out := loadTrustedHeadersCapturingErrors(t, strings.Join([]string{
+		HeaderGateway, HeaderServingMode, HeaderOrgID, HeaderOwnerID,
+	}, ","))
+	if !strings.Contains(out, "omits "+HeaderServingProfile) ||
+		!strings.Contains(out, "dedicated disaggregated requests will bypass cold wake") {
+		t.Fatalf("error log %q does not flag the missing %s", out, HeaderServingProfile)
+	}
+}
+
 // TestLoadTrustedHeadersNoErrorWhenRequiredHeadersPresent: a configured list
 // containing every required header (in any case) logs nothing at ERROR.
 func TestLoadTrustedHeadersNoErrorWhenRequiredHeadersPresent(t *testing.T) {
-	out := loadTrustedHeadersCapturingErrors(t, "x-saturn-gateway, X-SATURN-SERVING-MODE, X-Saturn-Org-Id, x-saturn-owner-id")
+	out := loadTrustedHeadersCapturingErrors(t, "x-saturn-gateway, X-SATURN-SERVING-MODE, X-Saturn-Serving-Profile, X-Saturn-Org-Id, x-saturn-owner-id")
 	if out != "" {
 		t.Fatalf("unexpected error log for a list with every required header: %q", out)
 	}
@@ -310,7 +324,7 @@ func TestLoadTrustedHeadersErrorsWhenOwnerOrOrgAnchorMissing(t *testing.T) {
 	}
 }
 
-// TestLoadTrustedHeadersNoErrorForPinnedList: the full pinned 14, configured
+// TestLoadTrustedHeadersNoErrorForPinnedList: the full pinned 15, configured
 // explicitly, satisfies every required header and logs nothing at ERROR.
 func TestLoadTrustedHeadersNoErrorForPinnedList(t *testing.T) {
 	out := loadTrustedHeadersCapturingErrors(t, strings.Join(pinnedTrustedHeaders, ","))
@@ -424,6 +438,7 @@ var candidateSaturnHeaders = []string{
 	HeaderBaseModel,
 	HeaderAdapter,
 	HeaderServingMode,
+	HeaderServingProfile,
 	HeaderServedModel,
 	HeaderUpstream,
 	HeaderGateway,

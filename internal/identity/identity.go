@@ -81,6 +81,11 @@ const (
 	// copies the value verbatim; there is no default. The empty string is not a
 	// serving mode anywhere (the 2026-09-29 serving-mode ruling).
 	HeaderServingMode = "X-Saturn-Serving-Mode"
+	// HeaderServingProfile distinguishes the established aggregated dedicated
+	// path from the disaggregated topology whose two pools may be parked at
+	// zero. Atlas stamps it per route; only "disaggregated" enables dedicated
+	// wake probing.
+	HeaderServingProfile = "X-Saturn-Serving-Profile"
 
 	// HeaderGateway marks a request that arrived on the TF shared-inference
 	// GATEWAY route: the single gateway host that replaces per-model subdomains
@@ -214,7 +219,8 @@ type Identity struct {
 	// the SKU pricing axis. Never empty after FromRequest. Carried to the metering
 	// event so the rater prices shared traffic from the distinct shared:<base>
 	// row. See HeaderServingMode.
-	ServingMode string
+	ServingMode    string
+	ServingProfile string
 	// ServedModel is the comma-separated allow-list of served-model names the
 	// subdomain-authorized resource may serve. Empty = binding not enforced for
 	// this route. Phoebe asserts the request-body `model=` is in this set and
@@ -275,7 +281,7 @@ func ValidServingMode(s string) bool {
 //
 // The R3 envelope reads (gateway mark, org, owner, serving mode, served
 // model, every rate-limit policy header, and the group scope envelope —
-// the pinned 14) resolve through the trusted-header registry: a header
+// the pinned 15) resolve through the trusted-header registry: a header
 // outside the active set is treated
 // as ABSENT, never read for a trust decision. The remaining identity headers
 // are read directly (ratified edge contract, outside the R3 gate). The proxy
@@ -299,6 +305,7 @@ func FromRequest(r *http.Request) Identity {
 		BaseModel:                          r.Header.Get(HeaderBaseModel),
 		Adapter:                            r.Header.Get(HeaderAdapter),
 		ServingMode:                        trustedHeaderValue(r, HeaderServingMode),
+		ServingProfile:                     trustedHeaderValue(r, HeaderServingProfile),
 		ServedModel:                        trustedHeaderValue(r, HeaderServedModel),
 		Upstream:                           r.Header.Get(HeaderUpstream),
 		Gateway:                            trustedHeaderValue(r, HeaderGateway) == "true",

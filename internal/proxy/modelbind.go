@@ -169,12 +169,6 @@ const (
 // Atlas-rendered Traefik middleware (identity.HeaderServedModel), so a client
 // cannot cause its absence; a real route always carries it.
 //
-// The binding check once also returned the SINGULAR model the request selected
-// (a comma-separated allow-list can never equal one /v1/models entry, so wake
-// readiness needed the resolved value). The wake reconciliation (72f7ec1)
-// removed that consumer — serveWithWake probes for a cold response and retries
-// instead of polling /v1/models — so the value is gone with it.
-//
 // Atlas decides access; this only guarantees the body can't escape the
 // Atlas-authorized resource.
 func checkModelBinding(body []byte, servedModelAllowList string) modelBindingResult {

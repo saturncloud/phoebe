@@ -350,10 +350,8 @@ func TestWake_EmptyGraphNameErrors(t *testing.T) {
 // TestUpstreamServesModelsIsAnyModel pins the readiness signal: the frontend is
 // ready when it serves ANY model, not one specific id.
 //
-// It used to require the REQUESTED model, which mattered while Wake was the thing
-// that decided a request could proceed. serveWithWake now proves coldness by
-// probing with the real request and re-probes afterwards, so the waker only has to
-// answer "is this graph serving again". A per-model check would additionally FAIL
+// The proxy proves coldness from the normal upstream response, so the waker only
+// has to answer "is this graph serving again". A per-model check would also fail
 // on a graph that came back up serving a different set — a false negative that
 // burns the whole wake budget.
 //
@@ -388,12 +386,12 @@ func TestUpstreamServesModelsIsAnyModel(t *testing.T) {
 
 // NOTE: the warm short-circuit test that lived here was REMOVED, not fixed.
 // It pinned Wake returning early for an already-warm graph, which mattered while
-// Wake ran on every wakeable request. serveWithWake now calls Wake ONLY after a
-// probe saw a genuinely cold response, so a warm graph never reaches the waker
+// Wake once ran on every wakeable request. The proxy now calls Wake only after
+// the normal upstream attempt returns a cold response, so a warm graph never reaches the waker
 // and the short-circuit has moved up a layer (and got cheaper — the proxy was
 // going to make that request anyway). The equivalent coverage now lives in
 // internal/proxy's wake tests, which assert the waker is not called when the
-// first probe comes back warm.
+// first response is warm.
 
 // TestWake_ColdGraphStillActuates is the other half: the short-circuit must not
 // suppress a real wake. A cold graph is still read, scaled and unpaused.

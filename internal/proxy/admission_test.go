@@ -232,6 +232,7 @@ func TestAdmissionStateFailureBypassesGate(t *testing.T) {
 	var hits int
 	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		hits++
+		w.Header().Set(wakeNeverServedHeader, "true")
 		_, _ = w.Write([]byte(`{"model":"model-a","usage":{"prompt_tokens":7,"completion_tokens":3,"prompt_tokens_details":{"cached_tokens":2}}}`))
 	}))
 	defer backend.Close()
@@ -276,16 +277,17 @@ func TestWakeEnabledWarmRequestExecutesMetersAndSettlesOnce(t *testing.T) {
 	waker := &fakeWaker{}
 	s := New(&config.Settings{Admission: cfg}, logging.New(logging.ERROR), em).
 		WithAdmitter(a).
-		WithWaker(waker, time.Second, 3)
+		WithWaker(waker, time.Second)
 
 	rr := httptest.NewRecorder()
 	s.Handler().ServeHTTP(rr, sharedRequest(up))
-	// serveWithWake costs one readiness probe on the wake path (the backend is
-	// warm, so the probe returns not-cold and the caller performs the real
-	// metered forward): two backend hits, one wake-eligible probe and one
-	// inference, zero wakes.
-	if rr.Code != http.StatusOK || hits != 2 || waker.calls != 0 {
+	// The first warm response is the metered response. It is not discarded and
+	// the customer POST is not replayed.
+	if rr.Code != http.StatusOK || hits != 1 || waker.calls != 0 {
 		t.Fatalf("status=%d backend hits=%d wake calls=%d", rr.Code, hits, waker.calls)
+	}
+	if got := rr.Header().Get(wakeNeverServedHeader); got != "" {
+		t.Fatalf("upstream settlement marker reached client: %q", got)
 	}
 	events := em.waitForEvents(1, time.Second)
 	if len(events) != 1 || events[0].PromptTokens != 7 || events[0].CompletionTokens != 3 {
@@ -318,7 +320,7 @@ func TestWakeColdHoldRejectionFailsClosedAndReleasesLease(t *testing.T) {
 	waker := &fakeWaker{}
 	s := New(&config.Settings{Admission: cfg}, logging.New(logging.ERROR), &recordingEmitter{}).
 		WithAdmitter(a).
-		WithWaker(waker, time.Second, 3)
+		WithWaker(waker, time.Second)
 
 	// A contending hold occupies the platform's single cold-hold slot.
 	holder, err := a.Admit(context.Background(), admission.Request{
@@ -363,6 +365,47 @@ func TestWakeColdHoldRejectionFailsClosedAndReleasesLease(t *testing.T) {
 	_ = lease.Complete(context.Background(), 0)
 	_ = holder.EndColdHold(context.Background())
 	_ = holder.Complete(context.Background(), 0)
+}
+
+func TestUnavailableModeActuatorSkipsColdHoldAdmission(t *testing.T) {
+	backend := &coldToWarmBackend{}
+	be := httptest.NewServer(backend)
+	defer be.Close()
+	up, _ := url.Parse(be.URL)
+	mr := miniredis.RunT(t)
+	cfg := proxyAdmissionConfig(2)
+	cfg.Platform.MaxColdHolds = ptr64(1)
+	c := redis.NewClient(&redis.Options{Addr: mr.Addr()})
+	t.Cleanup(func() { _ = c.Close() })
+	a := admission.New(c, cfg)
+	waker := &unsupportedWaker{}
+	s := New(&config.Settings{Admission: cfg}, logging.New(logging.ERROR), &recordingEmitter{}).
+		WithAdmitter(a).
+		WithWaker(waker, time.Second)
+
+	holder, err := a.Admit(context.Background(), admission.Request{
+		Graph: "graph", Organization: "holder", Model: "m",
+		PromptBytes: 1, EstimatedInputTokens: 1, ReservedOutputTokens: 1,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := holder.BeginColdHold(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	defer func() {
+		_ = holder.EndColdHold(context.Background())
+		_ = holder.Complete(context.Background(), 0)
+	}()
+
+	rr := httptest.NewRecorder()
+	s.Handler().ServeHTTP(rr, sharedRequest(up))
+	if rr.Code != http.StatusNotFound {
+		t.Fatalf("status=%d, want original cold 404 pass-through", rr.Code)
+	}
+	if calls := atomic.LoadInt32(&waker.calls); calls != 0 {
+		t.Fatalf("unsupported waker invoked %d times", calls)
+	}
 }
 
 // The prefill reservation must release at the first response BODY byte, not at
@@ -704,7 +747,7 @@ func TestWakeExhaustedReturnsColdAndReleasesCapacity(t *testing.T) {
 	waker := &fakeWaker{warmsAt: 99, backend: backend}
 	s := New(&config.Settings{Admission: cfg}, logging.New(logging.ERROR), &recordingEmitter{}).
 		WithAdmitter(a).
-		WithWaker(waker, time.Second, 2)
+		WithWaker(waker, time.Second)
 
 	rr := httptest.NewRecorder()
 	s.Handler().ServeHTTP(rr, sharedRequest(up))
@@ -712,10 +755,9 @@ func TestWakeExhaustedReturnsColdAndReleasesCapacity(t *testing.T) {
 		t.Fatalf("status=%d Retry-After=%q, want the model-starting 503 + Retry-After after wake exhaustion",
 			rr.Code, rr.Header().Get("Retry-After"))
 	}
-	// serveWithWake wakes once per cold attempt: maxTries=2 means two probes
-	// (both cold) with a wake between them, then the final still-cold probe.
-	if calls := atomic.LoadInt32(&waker.calls); calls != 2 {
-		t.Fatalf("waker calls=%d, want 2 for maxTries=2 (one wake per cold attempt)", calls)
+	// The contract permits one wake and one retry.
+	if calls := atomic.LoadInt32(&waker.calls); calls != 1 {
+		t.Fatalf("waker calls=%d, want 1", calls)
 	}
 	lease, err := a.Admit(context.Background(), admission.Request{
 		Graph: "graph", Organization: "org-b", Model: "m",
@@ -727,7 +769,7 @@ func TestWakeExhaustedReturnsColdAndReleasesCapacity(t *testing.T) {
 	_ = lease.Complete(context.Background(), 0)
 }
 
-// A store outage between Admit and the cold probe fails closed at the cold
+// A store outage between Admit and the cold response fails closed at the cold
 // hold: the request gets the admission-unavailable error (503), the waker is
 // never invoked, and the handler's deferred release fallback — not a cold-hold
 // bypass — owns the lease release. (The bypass lives at Admit time: when the
@@ -754,7 +796,7 @@ func TestWakeColdHoldStoreOutageFailsClosed(t *testing.T) {
 	waker := &fakeWaker{}
 	s := New(&config.Settings{Admission: cfg}, logging.New(logging.ERROR), &recordingEmitter{}).
 		WithAdmitter(a).
-		WithWaker(waker, time.Second, 2)
+		WithWaker(waker, time.Second)
 
 	rr := httptest.NewRecorder()
 	s.Handler().ServeHTTP(rr, sharedRequest(up))
@@ -2479,7 +2521,7 @@ func TestSampledErrorLogAdmissionReleaseSites(t *testing.T) {
 }
 
 // Real-path proof that the admission bypass site emits through the Server
-// sampler under the merged serveWithWake architecture. With the store dead
+// sampler while wake handling is enabled. With the store dead
 // from the start, every request's Admit fails with ErrUnavailable and the
 // request bypasses the whole gate (admitted == nil) — the wake path then runs
 // with no lease, so the cold-hold sites are never reached. 250 bypassed
@@ -2518,7 +2560,7 @@ func TestWakeColdHoldStoreOutageLogsSampled(t *testing.T) {
 	logger := &logging.Logger{Error: log.New(&buf, "", 0), Warn: log.New(io.Discard, "", 0)}
 	s := New(&config.Settings{Admission: cfg}, logger, &recordingEmitter{}).
 		WithAdmitter(a).
-		WithWaker(&fakeWaker{}, time.Second, 3)
+		WithWaker(&fakeWaker{}, time.Second)
 
 	const requests = 250
 	for i := 0; i < requests; i++ {

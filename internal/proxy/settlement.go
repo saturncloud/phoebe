@@ -48,9 +48,8 @@ const (
 // path) to its settlement kind. A captured usage block always settles actual;
 // without one the usage of a dispatched request is indeterminate (engine
 // 4xx/5xx, client abort, mid-stream fault) and settles conservative-unknown.
-// Determinate never-served outcomes (the cold-hold rejection, the final cold
-// response after the wake gave up) never reach this path: serveWithWake serves
-// them itself and settles them to zero directly.
+// The wake transport marks determinate never-served outcomes so its caller can
+// settle them to zero instead of using this classification.
 func classifyCaptureSettlement(res capture.Result) settlementKind {
 	if res.UsageFound {
 		return settlementActual

@@ -653,8 +653,8 @@ func TestGateway_WakeEligible(t *testing.T) {
 			GraphK8sName: "graph-llama31",
 		},
 	}}
-	// warmsAt: 1 — the backend goes warm after the first wake, so serveWithWake's
-	// re-probe succeeds and the caller performs the real metered forward.
+	// warmsAt: 1 — the backend goes warm after the first wake, so the single
+	// retry succeeds.
 	waker := &fakeWaker{backend: backend, warmsAt: 1}
 	em := &recordingEmitter{}
 	mr := miniredis.RunT(t)
@@ -665,7 +665,7 @@ func TestGateway_WakeEligible(t *testing.T) {
 	a := admission.New(client, cfg)
 	srv := newGatewayTestServer(t, em, resolver, beURL)
 	srv.settings.Admission = cfg
-	srv.WithAdmitter(a).WithWaker(waker, 5*time.Second, 0)
+	srv.WithAdmitter(a).WithWaker(waker, 5*time.Second)
 
 	rr := httptest.NewRecorder()
 	srv.Handler().ServeHTTP(rr, gatewayRequest("org-1", `{"model":"sleepy-bot","max_tokens":20}`))
@@ -676,10 +676,10 @@ func TestGateway_WakeEligible(t *testing.T) {
 	if got := atomic.LoadInt32(&waker.calls); got != 1 {
 		t.Fatalf("waker called %d times, want 1 (gateway route must be wakeable)", got)
 	}
-	// serveWithWake costs one readiness probe on the wake path: one cold probe,
-	// one warm re-probe after the wake, then the caller's metered forward.
-	if backend.requests.Load() != 3 || backend.successes.Load() != 2 {
-		t.Fatalf("backend requests=%d successes=%d, want one cold probe, one warm re-probe, one successful inference", backend.requests.Load(), backend.successes.Load())
+	// One cold response is suppressed, then the single bounded retry is the
+	// successful metered inference.
+	if backend.requests.Load() != 2 || backend.successes.Load() != 1 {
+		t.Fatalf("backend requests=%d successes=%d, want one cold attempt and one successful retry", backend.requests.Load(), backend.successes.Load())
 	}
 	events := em.waitForEvents(1, time.Second)
 	if len(events) != 1 || events[0].PromptTokens != 7 || events[0].CachedTokens != 2 || events[0].CompletionTokens != 3 {
@@ -744,7 +744,7 @@ func TestGateway_ResolutionWithoutLegalServingModeRefusedAtGate(t *testing.T) {
 			}}
 			em := &recordingEmitter{}
 			waker := &fakeWaker{}
-			srv := newGatewayTestServer(t, em, resolver, beURL).WithWaker(waker, 5*time.Second, 0)
+			srv := newGatewayTestServer(t, em, resolver, beURL).WithWaker(waker, 5*time.Second)
 
 			rr := httptest.NewRecorder()
 			srv.Handler().ServeHTTP(rr, gatewayRequest("org-1", `{"model":"m"}`))

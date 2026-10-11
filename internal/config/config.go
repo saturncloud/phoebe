@@ -8,6 +8,7 @@ import (
 	"os"
 	"path"
 	"path/filepath"
+	"strings"
 	"time"
 
 	"gopkg.in/yaml.v2"
@@ -43,11 +44,9 @@ type Settings struct {
 	// internal/gateway resolver wiring (same pattern as Emit/IOLog).
 	Gateway GatewaySettings `yaml:"gateway"`
 
-	// Wake configures wake-from-zero actuation (the client-go DGDSA waker,
-	// internal/waker). OFF by default — without it a cold response passes
-	// through to the client exactly as before. main.go builds the waker; an
-	// unavailable kubernetes config degrades to wake-off (logged), never a
-	// crash.
+	// Wake configures shared Kubernetes and dedicated Atlas wake actuation.
+	// OFF by default — without it a cold response passes through unchanged.
+	// main.go builds each configured actuator independently.
 	Wake WakeSettings `yaml:"wake"`
 
 	// Admission configures distributed shared-lane admission. It is deliberately
@@ -231,12 +230,9 @@ type GatewaySettings struct {
 	DatabaseURL string `yaml:"databaseUrl"`
 }
 
-// WakeSettings is the YAML shape for the wake-from-zero actuator.
-//
-// The DGDSAs/ScaledObjects the waker patches live in the SAME namespace as
-// the gateway's serving graphs, so enabling wake requires gateway.namespace
-// (validated in Settings.parse — fail closed rather than actuate in a guessed
-// namespace).
+// WakeSettings is the YAML shape for wake-from-zero actuators. Shared graphs
+// use the Kubernetes actuator and require gateway.namespace. Dedicated
+// disaggregated graphs use Atlas and require atlasURL instead.
 type WakeSettings struct {
 	// Enabled turns the proactive DGDSA waker on. Default false: requests
 	// forward directly without a readiness wait.
@@ -245,6 +241,11 @@ type WakeSettings struct {
 	// Kubeconfig is a kubeconfig file path for dev/tests. Empty (production)
 	// uses in-cluster config.
 	Kubeconfig string `yaml:"kubeconfig"`
+
+	// AtlasURL is the in-cluster Atlas base URL. Dedicated disaggregated
+	// endpoints wake through Atlas so it can validate the resource and restore
+	// the persisted prefill and decode counts without broader Kubernetes RBAC.
+	AtlasURL string `yaml:"atlasURL"`
 
 	// TimeoutStr bounds how long a single wake may hold the woken request
 	// (empty = the proxy default, 300s). THE TRADEOFF: this must exceed the
@@ -305,12 +306,12 @@ func (s *Settings) parse() error {
 	if err := s.Gateway.parse(); err != nil {
 		return err
 	}
-	// The waker patches DGDSAs in the gateway namespace; without it there is
-	// no safe namespace to actuate in (fail closed at startup, not a guessed
-	// patch at wake time). gateway.enabled itself is NOT required — wake also
-	// serves header-routed shared subdomains.
-	if s.Wake.Enabled && s.Gateway.Namespace == "" {
-		return fmt.Errorf("wake.enabled=true requires gateway.namespace (the namespace the serving graphs' DGDSAs live in)")
+	s.Wake.AtlasURL = strings.TrimSpace(s.Wake.AtlasURL)
+	// Shared wake needs the graph namespace. Dedicated wake uses Atlas and does
+	// not need Kubernetes access, so its configured Atlas URL is independently
+	// sufficient to enable the wake dispatcher.
+	if s.Wake.Enabled && s.Gateway.Namespace == "" && s.Wake.AtlasURL == "" {
+		return fmt.Errorf("wake.enabled=true requires gateway.namespace or wake.atlasURL")
 	}
 	if s.Wake.TimeoutStr != "" {
 		if s.Wake.Timeout, err = time.ParseDuration(s.Wake.TimeoutStr); err != nil {

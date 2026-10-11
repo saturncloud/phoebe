@@ -151,7 +151,7 @@ func requireSent(t *testing.T, sent http.Header, names ...string) {
 // TestNoSaturnHeadersReachUpstreamOnEveryRoute covers every route type that
 // forwards upstream: header-routed dedicated, header-routed shared (phoebe's
 // own policy headers added), the single-host gateway, and the shared wake path
-// (cold probe, warm re-probe, then the metered forward). On each, the
+// (a cold first attempt followed by one warm retry). On each, the
 // upstream sees ZERO X-Saturn-* headers, including the trusted envelope and
 // the edge-contract identity headers (X-Saturn-Upstream and friends), while
 // the request still reaches the right upstream and is metered with the
@@ -159,7 +159,7 @@ func requireSent(t *testing.T, sent http.Header, names ...string) {
 func TestNoSaturnHeadersReachUpstreamOnEveryRoute(t *testing.T) {
 	type outcome struct {
 		code     int
-		requests int // upstream requests expected (wake: probe, re-probe, forward)
+		requests int // upstream requests expected (wake: first attempt and retry)
 		want     metering.Event
 	}
 	cases := []struct {
@@ -241,7 +241,7 @@ func TestNoSaturnHeadersReachUpstreamOnEveryRoute(t *testing.T) {
 			run: func(t *testing.T, rec *headerRecorder, u, _ *url.URL, em *recordingEmitter) outcome {
 				cold := rec.next.(*coldToWarmBackend)
 				waker := &fakeWaker{warmsAt: 1, backend: cold}
-				srv := newTestServerE(t, u, em).WithWaker(waker, 5*time.Second, 3)
+				srv := newTestServerE(t, u, em).WithWaker(waker, 5*time.Second)
 				req := sharedRequest(u)
 				addClientSaturnHeaders(req)
 				requireSent(t, req.Header, identity.HeaderUpstream, identity.HeaderServingMode, identity.HeaderResourceID)
@@ -250,8 +250,8 @@ func TestNoSaturnHeadersReachUpstreamOnEveryRoute(t *testing.T) {
 				if got := waker.last().ResourceID; got != "resource-a" {
 					t.Errorf("wake target resource = %q, want resource-a (from the parsed identity)", got)
 				}
-				// cold probe, warm re-probe after the wake, metered forward
-				return outcome{rr.Code, 3, metering.Event{
+				// cold attempt, then one warm metered retry
+				return outcome{rr.Code, 2, metering.Event{
 					AuthID: "auth-a", ResourceID: "resource-a", OrgID: "org-a", ServingMode: identity.ServingModeShared,
 				}}
 			},
@@ -447,8 +447,8 @@ func rawChunkedPost(t *testing.T, addr string, header http.Header, declared, bod
 // mixed-case name, and look-alikes that must survive. Covered: a declared and
 // an undeclared trailer name (the server merges both), on the dedicated
 // header-routed, shared header-routed and gateway routes, and on the shared
-// wake path, where the cold probe, the re-probe after the wake and the metered
-// forward each reach the upstream. A harmless trailer must arrive on every
+// wake path, where the cold first attempt and the retry each reach the upstream.
+// A harmless trailer must arrive on every
 // upstream request that carries a body, proving the trailer channel is live.
 //
 // The "empty-body-served-not-502" case cannot observe trailer stripping:
@@ -484,12 +484,11 @@ func TestNoSaturnTrailersReachUpstreamOverWire(t *testing.T) {
 		return newGatewayTestServer(t, &recordingEmitter{}, resolver, u)
 	}
 	// wakeServer makes the upstream cold until the first wake, so the request
-	// takes the wake path: cold probe, re-probe after the wake, then the
-	// metered forward.
+	// takes the wake path: one cold attempt followed by one warm retry.
 	wakeServer := func(t *testing.T, u *url.URL, rec *trailerRecorder) *Server {
 		rec.cold = &coldToWarmBackend{warmBody: `{"model":"model-a","usage":{"prompt_tokens":3,"completion_tokens":2,"total_tokens":5}}`}
 		waker := &fakeWaker{warmsAt: 1, backend: rec.cold}
-		return newTestServer(t, u).WithWaker(waker, 5*time.Second, 3)
+		return newTestServer(t, u).WithWaker(waker, 5*time.Second)
 	}
 	const body = `{"model":"model-a","max_tokens":5}`
 	const streamBody = `{"model":"model-a","stream":true,"max_tokens":5}`
@@ -512,8 +511,8 @@ func TestNoSaturnTrailersReachUpstreamOverWire(t *testing.T) {
 		{"shared/undeclared", plainServer, sharedHeader, "X-Other-Trailer", body, 1, false},
 		{"gateway/declared", gatewayServer, gatewayHeader, allTrailers, streamBody, 1, false},
 		{"gateway/undeclared", gatewayServer, gatewayHeader, "X-Other-Trailer", body, 1, false},
-		{"shared-wake/declared", wakeServer, sharedHeader, allTrailers, body, 3, false},
-		{"shared-wake/undeclared", wakeServer, sharedHeader, "X-Other-Trailer", body, 3, false},
+		{"shared-wake/declared", wakeServer, sharedHeader, allTrailers, body, 2, false},
+		{"shared-wake/undeclared", wakeServer, sharedHeader, "X-Other-Trailer", body, 2, false},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			rec := &trailerRecorder{}

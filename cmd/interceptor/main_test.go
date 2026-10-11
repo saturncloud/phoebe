@@ -5,6 +5,9 @@ import (
 	"context"
 	"io"
 	"log"
+	"net/http"
+	"net/http/httptest"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strings"
@@ -14,7 +17,9 @@ import (
 
 	"github.com/saturncloud/phoebe/internal/admission"
 	"github.com/saturncloud/phoebe/internal/config"
+	"github.com/saturncloud/phoebe/internal/identity"
 	"github.com/saturncloud/phoebe/internal/logging"
+	"github.com/saturncloud/phoebe/internal/proxy"
 )
 
 func loadTestSettings(t *testing.T, yaml string) *config.Settings {
@@ -89,5 +94,84 @@ func TestBuildAdmissionLogsMeteringStoreFallback(t *testing.T) {
 	explicit := logs("emit:\n  valkeyAddr: " + mr.Addr() + "\nadmission:\n  valkeyAddr: " + mr.Addr() + "\n")
 	if strings.Contains(explicit, "admission.valkeyAddr is empty") {
 		t.Fatalf("fallback logged although admission.valkeyAddr is set: %q", explicit)
+	}
+}
+
+func TestBuildWakerSharedOnlyDoesNotLogAtlasUnavailable(t *testing.T) {
+	var buf bytes.Buffer
+	logger := &logging.Logger{
+		Debug: log.New(io.Discard, "", 0),
+		Info:  log.New(io.Discard, "", 0),
+		Warn:  log.New(&buf, "", 0),
+		Error: log.New(&buf, "", 0),
+	}
+	s := &config.Settings{}
+	s.Wake.Enabled = true
+	s.Gateway.Namespace = "shared"
+	_ = buildWaker(s, logger)
+	if strings.Contains(buf.String(), "Atlas actuator unavailable") {
+		t.Fatalf("valid shared-only wake logged a false Atlas error: %q", buf.String())
+	}
+}
+
+func TestBuildWakerConnectsDedicatedAtlasActuator(t *testing.T) {
+	var wakeCalls int
+	atlas := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/api/internal/token-factory/inference-endpoints/wake":
+			wakeCalls++
+			if got := r.Header.Get("X-Saturn-Internal-Wake-Token"); got != "secret" {
+				t.Fatalf("wake token = %q, want secret", got)
+			}
+			w.WriteHeader(http.StatusNoContent)
+		case "/v1/models":
+			_, _ = w.Write([]byte(`{"object":"list","data":[{"id":"model-a"}]}`))
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer atlas.Close()
+	atlasURL, err := url.Parse(atlas.URL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv(internalWakeTokenEnv, "secret")
+
+	s := &config.Settings{}
+	s.Wake.Enabled = true
+	s.Wake.AtlasURL = atlas.URL
+	built := buildWaker(s, logging.New(logging.ERROR))
+	if built == nil {
+		t.Fatal("buildWaker returned nil for valid dedicated Atlas configuration")
+	}
+	err = built.Wake(context.Background(), proxy.WakeTarget{
+		ResourceID: "dep-1", UpstreamHost: atlasURL.Host, ServedModel: "model-a",
+		ServingMode: identity.ServingModeDedicated,
+	})
+	if err != nil {
+		t.Fatalf("dedicated Wake: %v", err)
+	}
+	if wakeCalls != 1 {
+		t.Fatalf("Atlas wake calls = %d, want 1", wakeCalls)
+	}
+}
+
+func TestBuildWakerLogsMissingDedicatedToken(t *testing.T) {
+	t.Setenv(internalWakeTokenEnv, "")
+	var buf bytes.Buffer
+	logger := &logging.Logger{
+		Debug: log.New(io.Discard, "", 0),
+		Info:  log.New(io.Discard, "", 0),
+		Warn:  log.New(&buf, "", 0),
+		Error: log.New(&buf, "", 0),
+	}
+	s := &config.Settings{}
+	s.Wake.Enabled = true
+	s.Wake.AtlasURL = "http://atlas.internal"
+	if built := buildWaker(s, logger); built != nil {
+		t.Fatalf("buildWaker returned %T without %s, want nil", built, internalWakeTokenEnv)
+	}
+	if got := buf.String(); !strings.Contains(got, "Atlas actuator unavailable") || !strings.Contains(got, "internal wake token is empty") {
+		t.Fatalf("missing-token startup log = %q", got)
 	}
 }

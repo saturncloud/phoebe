@@ -207,10 +207,9 @@ func TestLoadWakeOffByDefault(t *testing.T) {
 	}
 }
 
-// TestLoadWakeEnabledRequiresGatewayNamespace: the waker patches DGDSAs in the
-// gateway namespace; enabling wake without one is a startup error (fail closed
-// — never actuate in a guessed namespace). gateway.enabled itself is NOT
-// required (wake also serves header-routed shared subdomains).
+// TestLoadWakeEnabledRequiresGatewayNamespace: shared wake patches DGDSAs in
+// the gateway namespace. With no Atlas URL selecting dedicated-only wake,
+// enabling wake without a namespace is a startup error.
 func TestLoadWakeEnabledRequiresGatewayNamespace(t *testing.T) {
 	if _, err := Load(writeTemp(t, "wake:\n  enabled: true\n")); err == nil {
 		t.Fatal("expected error: wake.enabled without gateway.namespace")
@@ -221,6 +220,22 @@ func TestLoadWakeEnabledRequiresGatewayNamespace(t *testing.T) {
 	}
 	if !s.Wake.Enabled || s.Gateway.Enabled {
 		t.Fatalf("settings wrong: wake=%+v gateway=%+v", s.Wake, s.Gateway)
+	}
+}
+
+func TestLoadDedicatedWakeRequiresOnlyAtlasURL(t *testing.T) {
+	s, err := Load(writeTemp(t, "wake:\n  enabled: true\n  atlasURL: http://atlas.saturn:8888\n"))
+	if err != nil {
+		t.Fatalf("dedicated Atlas wake must not require shared gateway configuration: %v", err)
+	}
+	if !s.Wake.Enabled || s.Wake.AtlasURL != "http://atlas.saturn:8888" {
+		t.Fatalf("settings wrong: wake=%+v", s.Wake)
+	}
+}
+
+func TestLoadDedicatedWakeRejectsWhitespaceOnlyAtlasURL(t *testing.T) {
+	if _, err := Load(writeTemp(t, "wake:\n  enabled: true\n  atlasURL: \"   \"\n")); err == nil {
+		t.Fatal("expected whitespace-only wake.atlasURL to fail without gateway.namespace")
 	}
 }
 
