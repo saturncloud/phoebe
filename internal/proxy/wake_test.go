@@ -158,6 +158,37 @@ type closeUnblocksBody struct {
 	once   sync.Once
 }
 
+type delayedChunksBody struct {
+	chunks  [][]byte
+	release <-chan struct{}
+	chunk   int
+	offset  int
+	waited  bool
+	closed  atomic.Bool
+}
+
+func (b *delayedChunksBody) Read(p []byte) (int, error) {
+	if b.chunk >= len(b.chunks) {
+		return 0, io.EOF
+	}
+	if b.chunk == 1 && !b.waited {
+		<-b.release
+		b.waited = true
+	}
+	n := copy(p, b.chunks[b.chunk][b.offset:])
+	b.offset += n
+	if b.offset == len(b.chunks[b.chunk]) {
+		b.chunk++
+		b.offset = 0
+	}
+	return n, nil
+}
+
+func (b *delayedChunksBody) Close() error {
+	b.closed.Store(true)
+	return nil
+}
+
 func (b *closeUnblocksBody) Read(p []byte) (int, error) {
 	if !b.sent {
 		b.sent = true
@@ -474,9 +505,11 @@ func TestBufferColdCandidatePreservesOversized503BodyReadError(t *testing.T) {
 }
 
 func TestBufferColdCandidateTimesOutIncompleteBody(t *testing.T) {
-	body := &closeUnblocksBody{
-		prefix: []byte(`{"error":"partial"}`),
-		closed: make(chan struct{}),
+	secondChunk := make(chan struct{})
+	delayed := strings.Repeat("x", coldCandidatePrefixLimit+100)
+	body := &delayedChunksBody{
+		chunks:  [][]byte{[]byte(`{"error":"partial"}`), []byte(delayed)},
+		release: secondChunk,
 	}
 	resp := &http.Response{
 		StatusCode: http.StatusServiceUnavailable,
@@ -484,16 +517,143 @@ func TestBufferColdCandidateTimesOutIncompleteBody(t *testing.T) {
 	}
 	started := time.Now()
 	cold, err := bufferColdCandidateWithin(context.Background(), resp, 20*time.Millisecond)
-	if cold || !errors.Is(err, context.DeadlineExceeded) {
-		t.Fatalf("classification: cold=%v err=%v, want false and deadline exceeded", cold, err)
+	if cold || err != nil {
+		t.Fatalf("classification: cold=%v err=%v, want false and nil", cold, err)
 	}
 	if elapsed := time.Since(started); elapsed > time.Second {
 		t.Fatalf("classification timeout took %s", elapsed)
 	}
-	select {
-	case <-body.closed:
-	default:
-		t.Fatal("incomplete upstream body was not closed on classification timeout")
+	close(secondChunk)
+	replayed, err := io.ReadAll(resp.Body)
+	want := `{"error":"partial"}` + delayed
+	if err != nil || string(replayed) != want {
+		t.Fatalf("replayed body=%q err=%v, want both chunks", replayed, err)
+	}
+	if err := resp.Body.Close(); err != nil {
+		t.Fatalf("close handed-off body: %v", err)
+	}
+	if !body.closed.Load() {
+		t.Fatal("closing handed-off body did not close the upstream body")
+	}
+}
+
+func TestWakeCandidateInspectionTimeoutPreservesDelayed404StatusAndBody(t *testing.T) {
+	testWakeCandidateInspectionTimeoutPreservesResponse(
+		t,
+		http.StatusNotFound,
+		`{"message":"delayed missing model"}`,
+	)
+}
+
+func TestWakeCandidateInspectionTimeoutPreservesDelayedGeneric503StatusAndBody(t *testing.T) {
+	testWakeCandidateInspectionTimeoutPreservesResponse(
+		t,
+		http.StatusServiceUnavailable,
+		`{"error":"delayed overload"}`,
+	)
+}
+
+func testWakeCandidateInspectionTimeoutPreservesResponse(t *testing.T, status int, responseBody string) {
+	t.Helper()
+	firstChunk := responseBody[:len(responseBody)/2]
+	secondChunk := responseBody[len(responseBody)/2:]
+	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(status)
+		_, _ = io.WriteString(w, firstChunk)
+		w.(http.Flusher).Flush()
+		time.Sleep(150 * time.Millisecond)
+		_, _ = io.WriteString(w, secondChunk)
+	}))
+	defer backend.Close()
+	upstream, _ := url.Parse(backend.URL)
+	waker := &fakeWaker{}
+	server := New(&config.Settings{}, logging.New(logging.ERROR), &recordingEmitter{}).
+		WithWaker(waker, 50*time.Millisecond)
+
+	recorder := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(`{"model":"m","messages":[]}`))
+	setUpstream(req, upstream)
+	req.Header.Set(identity.HeaderAuthID, "auth-1")
+	req.Header.Set(identity.HeaderResourceID, "r1")
+	req.Header.Set(identity.HeaderServedModel, "m")
+	req.Header.Set(identity.HeaderServingMode, identity.ServingModeShared)
+	server.Handler().ServeHTTP(recorder, req)
+
+	if recorder.Code != status || recorder.Body.String() != responseBody {
+		t.Fatalf("response = status %d body %q, want status %d body %q",
+			recorder.Code, recorder.Body.String(), status, responseBody)
+	}
+	if got := atomic.LoadInt32(&waker.calls); got != 0 {
+		t.Fatalf("incomplete candidate invoked the waker %d times, want 0", got)
+	}
+}
+
+func TestWakeUnsupportedModeSlowResponseBypassesInspection(t *testing.T) {
+	body := &closeUnblocksBody{
+		prefix: []byte(`{"error":"slow unsupported mode"}`),
+		closed: make(chan struct{}),
+	}
+	waker := &unsupportedWaker{}
+	server := New(&config.Settings{}, logging.New(logging.ERROR), nil).
+		WithWaker(waker, 20*time.Millisecond)
+	transport := &wakeRoundTripper{
+		server: server,
+		base: roundTripFunc(func(*http.Request) (*http.Response, error) {
+			return &http.Response{StatusCode: http.StatusServiceUnavailable, Body: body}, nil
+		}),
+		target: WakeTarget{ServingMode: identity.ServingModeDedicated},
+	}
+
+	started := time.Now()
+	resp, err := transport.RoundTrip(httptest.NewRequest(http.MethodPost, "/v1/chat/completions", nil))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if elapsed := time.Since(started); elapsed > 100*time.Millisecond {
+		t.Fatalf("unsupported response was held for inspection for %s", elapsed)
+	}
+	if resp.Body != body || body.sent {
+		t.Fatalf("unsupported response body was inspected: same=%v read=%v", resp.Body == body, body.sent)
+	}
+	if got := atomic.LoadInt32(&waker.calls); got != 0 {
+		t.Fatalf("unsupported response invoked the waker %d times, want 0", got)
+	}
+	_ = resp.Body.Close()
+}
+
+func TestWakeCompleted503ColdMarkerStillWakes(t *testing.T) {
+	var requests atomic.Int32
+	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		if requests.Add(1) == 1 {
+			w.WriteHeader(http.StatusServiceUnavailable)
+			_, _ = io.WriteString(w, "Model m is not ready to serve requests yet")
+			return
+		}
+		_, _ = io.WriteString(w, `{"served":true}`)
+	}))
+	defer backend.Close()
+	upstream, _ := url.Parse(backend.URL)
+	waker := &fakeWaker{}
+	server := New(&config.Settings{}, logging.New(logging.ERROR), &recordingEmitter{}).
+		WithWaker(waker, time.Second)
+
+	recorder := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(`{"model":"m","messages":[]}`))
+	setUpstream(req, upstream)
+	req.Header.Set(identity.HeaderAuthID, "auth-1")
+	req.Header.Set(identity.HeaderResourceID, "r1")
+	req.Header.Set(identity.HeaderServedModel, "m")
+	req.Header.Set(identity.HeaderServingMode, identity.ServingModeShared)
+	server.Handler().ServeHTTP(recorder, req)
+
+	if recorder.Code != http.StatusOK || recorder.Body.String() != `{"served":true}` {
+		t.Fatalf("response = status %d body %q, want 200 warm response", recorder.Code, recorder.Body.String())
+	}
+	if got := atomic.LoadInt32(&waker.calls); got != 1 {
+		t.Fatalf("completed marker-bearing 503 invoked the waker %d times, want 1", got)
+	}
+	if got := requests.Load(); got != 2 {
+		t.Fatalf("upstream requests = %d, want cold attempt plus one retry", got)
 	}
 }
 

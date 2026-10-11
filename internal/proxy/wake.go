@@ -12,6 +12,7 @@ import (
 	"net/url"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/saturncloud/phoebe/internal/admission"
@@ -258,6 +259,9 @@ type wakeRoundTripper struct {
 }
 
 func (t *wakeRoundTripper) RoundTrip(req *http.Request) (*http.Response, error) {
+	if supporter, ok := t.server.waker.(wakeTargetSupporter); ok && !supporter.SupportsWake(t.target) {
+		return t.base.RoundTrip(req)
+	}
 	resp, err := t.base.RoundTrip(req)
 	if err != nil {
 		return nil, err
@@ -269,10 +273,6 @@ func (t *wakeRoundTripper) RoundTrip(req *http.Request) (*http.Response, error) 
 		}
 		return resp, nil
 	}
-	if supporter, ok := t.server.waker.(wakeTargetSupporter); ok && !supporter.SupportsWake(t.target) {
-		return resp, nil
-	}
-
 	if t.lease != nil {
 		if err := t.lease.BeginColdHold(req.Context()); err != nil {
 			_ = resp.Body.Close()
@@ -372,11 +372,136 @@ func (r *terminalErrorReader) Read([]byte) (int, error) {
 	return 0, err
 }
 
+type candidateReadResult struct {
+	data []byte
+	err  error
+}
+
+// candidateBody keeps exactly one goroutine reading the network body. During
+// classification, reads can be abandoned at the inspection deadline without
+// abandoning the in-flight network read. The response consumer then receives
+// that result and all later bytes through the same reader.
+type candidateBody struct {
+	body     io.ReadCloser
+	requests chan int
+	results  chan candidateReadResult
+	done     chan struct{}
+
+	readMu      sync.Mutex
+	pending     bool
+	terminal    bool
+	buffered    []byte
+	bufferedErr error
+	closeOnce   sync.Once
+	closeResult error
+}
+
+func newCandidateBody(body io.ReadCloser) *candidateBody {
+	b := &candidateBody{
+		body:     body,
+		requests: make(chan int),
+		results:  make(chan candidateReadResult, 1),
+		done:     make(chan struct{}),
+	}
+	go b.readNetworkBody()
+	return b
+}
+
+func (b *candidateBody) readNetworkBody() {
+	for {
+		var size int
+		select {
+		case size = <-b.requests:
+		case <-b.done:
+			return
+		}
+		buf := make([]byte, size)
+		n, err := b.body.Read(buf)
+		result := candidateReadResult{data: buf[:n], err: err}
+		select {
+		case b.results <- result:
+		case <-b.done:
+			return
+		}
+		if err != nil {
+			return
+		}
+	}
+}
+
+func (b *candidateBody) Read(p []byte) (int, error) {
+	return b.readWithin(context.Background(), p)
+}
+
+func (b *candidateBody) readWithin(ctx context.Context, p []byte) (int, error) {
+	if len(p) == 0 {
+		return 0, nil
+	}
+	b.readMu.Lock()
+	defer b.readMu.Unlock()
+	if len(b.buffered) > 0 {
+		n := copy(p, b.buffered)
+		b.buffered = b.buffered[n:]
+		if len(b.buffered) > 0 {
+			return n, nil
+		}
+		err := b.bufferedErr
+		b.bufferedErr = nil
+		if err != nil {
+			b.terminal = true
+		}
+		return n, err
+	}
+	if b.terminal {
+		return 0, io.EOF
+	}
+	if !b.pending {
+		select {
+		case b.requests <- len(p):
+			b.pending = true
+		case <-ctx.Done():
+			return 0, ctx.Err()
+		case <-b.done:
+			return 0, io.ErrClosedPipe
+		}
+	}
+	select {
+	case result := <-b.results:
+		b.pending = false
+		n := copy(p, result.data)
+		if n < len(result.data) {
+			b.buffered = result.data[n:]
+			b.bufferedErr = result.err
+			return n, nil
+		}
+		if result.err != nil {
+			b.terminal = true
+		}
+		return n, result.err
+	case <-ctx.Done():
+		return 0, ctx.Err()
+	case <-b.done:
+		return 0, io.ErrClosedPipe
+	}
+}
+
+func (b *candidateBody) Close() error {
+	b.closeOnce.Do(func() {
+		close(b.done)
+		b.closeResult = b.body.Close()
+	})
+	return b.closeResult
+}
+
 // bufferColdCandidate inspects only statuses that can be cold. A response may
 // enter a long wake hold only when its complete body fits within the fixed
 // bound. Then the network body is closed and replaced with an in-memory replay
 // before Wake starts. Oversized candidates are restored and returned as
-// non-cold without waiting.
+// non-cold without waiting. If the inspection deadline expires before the
+// body is complete, the bytes received so far and the still-live body reader
+// are handed to the response consumer. An incomplete candidate is not enough
+// evidence to wake, and the inspection deadline must not truncate or rewrite
+// the upstream response.
 func bufferColdCandidate(resp *http.Response) (bool, error) {
 	return bufferColdCandidateWithin(context.Background(), resp, coldCandidateReadTimeout)
 }
@@ -385,22 +510,30 @@ func bufferColdCandidateWithin(ctx context.Context, resp *http.Response, timeout
 	if resp.StatusCode != http.StatusNotFound && resp.StatusCode != http.StatusServiceUnavailable {
 		return false, nil
 	}
-	body := resp.Body
+	body := newCandidateBody(resp.Body)
 	readCtx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
-	stopClose := context.AfterFunc(readCtx, func() { _ = body.Close() })
-	prefix, readErr := io.ReadAll(io.LimitReader(body, coldCandidatePrefixLimit+1))
-	stopped := stopClose()
-	if ctxErr := readCtx.Err(); ctxErr != nil {
-		return false, fmt.Errorf("wake: read cold-candidate response body: %w", ctxErr)
+	prefix := make([]byte, 0, coldCandidatePrefixLimit+1)
+	var readErr error
+	for len(prefix) <= coldCandidatePrefixLimit && readErr == nil {
+		remaining := coldCandidatePrefixLimit + 1 - len(prefix)
+		buf := make([]byte, remaining)
+		var n int
+		n, readErr = body.readWithin(readCtx, buf)
+		prefix = append(prefix, buf[:n]...)
 	}
-	if !stopped {
-		return false, errors.New("wake: cold-candidate response body read was interrupted")
+	if readCtx.Err() != nil {
+		if ctx.Err() != nil {
+			_ = body.Close()
+			return false, fmt.Errorf("wake: read cold-candidate response body: %w", ctx.Err())
+		}
+		resp.Body = &replayReadCloser{Reader: io.MultiReader(bytes.NewReader(prefix), body), closer: body}
+		return false, nil
 	}
 	if len(prefix) > coldCandidatePrefixLimit {
 		if readErr != nil {
 			_ = body.Close()
-			resp.Body = io.NopCloser(io.MultiReader(bytes.NewReader(prefix), &terminalErrorReader{err: readErr}))
+			resp.Body = &replayReadCloser{Reader: io.MultiReader(bytes.NewReader(prefix), &terminalErrorReader{err: readErr}), closer: body}
 			return false, nil
 		}
 		resp.Body = &replayReadCloser{Reader: io.MultiReader(bytes.NewReader(prefix), body), closer: body}
@@ -408,9 +541,9 @@ func bufferColdCandidateWithin(ctx context.Context, resp *http.Response, timeout
 	}
 	_ = body.Close()
 	if readErr != nil {
-		resp.Body = io.NopCloser(io.MultiReader(bytes.NewReader(prefix), &terminalErrorReader{err: readErr}))
+		resp.Body = &replayReadCloser{Reader: io.MultiReader(bytes.NewReader(prefix), &terminalErrorReader{err: readErr}), closer: body}
 	} else {
-		resp.Body = io.NopCloser(bytes.NewReader(prefix))
+		resp.Body = &replayReadCloser{Reader: bytes.NewReader(prefix), closer: body}
 	}
 	return resp.StatusCode == http.StatusNotFound || bodyLooksNotReady(prefix), nil
 }
