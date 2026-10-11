@@ -687,8 +687,8 @@ func TestPrefillReleaseOffFirstBytePath(t *testing.T) {
 	})
 }
 
-// When every wake attempt stays cold, the client receives the final cold
-// response and the request's lease is fully settled — no capacity leaks even
+// When every wake attempt stays cold, the client receives the model-starting
+// 503 + Retry-After and the request's lease is fully settled — no capacity leaks even
 // though no warm response ever arrived.
 func TestWakeExhaustedReturnsColdAndReleasesCapacity(t *testing.T) {
 	backend := &coldToWarmBackend{} // never warms
@@ -708,11 +708,12 @@ func TestWakeExhaustedReturnsColdAndReleasesCapacity(t *testing.T) {
 
 	rr := httptest.NewRecorder()
 	s.Handler().ServeHTTP(rr, sharedRequest(up))
-	if rr.Code != http.StatusNotFound {
-		t.Fatalf("status=%d, want the final cold 404 after wake exhaustion", rr.Code)
+	if rr.Code != http.StatusServiceUnavailable || rr.Header().Get("Retry-After") == "" {
+		t.Fatalf("status=%d Retry-After=%q, want the model-starting 503 + Retry-After after wake exhaustion",
+			rr.Code, rr.Header().Get("Retry-After"))
 	}
 	// serveWithWake wakes once per cold attempt: maxTries=2 means two probes
-	// (both cold) with a wake between them, then the honest final cold forward.
+	// (both cold) with a wake between them, then the final still-cold probe.
 	if calls := atomic.LoadInt32(&waker.calls); calls != 2 {
 		t.Fatalf("waker calls=%d, want 2 for maxTries=2 (one wake per cold attempt)", calls)
 	}
@@ -2523,8 +2524,11 @@ func TestWakeColdHoldStoreOutageLogsSampled(t *testing.T) {
 	for i := 0; i < requests; i++ {
 		rr := httptest.NewRecorder()
 		s.Handler().ServeHTTP(rr, sharedRequest(up))
-		if i == 0 && rr.Code != http.StatusNotFound {
-			t.Fatalf("status=%d, want the cold 404 — a bypassed request must still complete the wake path", rr.Code)
+		// The wake path's own answer for a graph still cold after every wake
+		// (503 + "starting from zero" body), not the admission-unavailable 503.
+		if i == 0 && (rr.Code != http.StatusServiceUnavailable || !strings.Contains(rr.Body.String(), "starting from zero")) {
+			t.Fatalf("status=%d body=%q, want the model-starting 503 — a bypassed request must still complete the wake path",
+				rr.Code, rr.Body.String())
 		}
 	}
 

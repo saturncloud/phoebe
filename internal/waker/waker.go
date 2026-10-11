@@ -324,8 +324,8 @@ func (w *KubeWaker) graphLock(graph string) *sync.Mutex {
 }
 
 // waitReady polls w.ready until the upstream serves again or ctx expires.
-// Returns ctx.Err() on expiry — the proxy then performs its one honest,
-// metered inference forward rather than hanging forever.
+// On expiry it returns an error wrapping both proxy.ErrWakeNotReady and
+// ctx.Err(); the proxy then answers 503 + Retry-After rather than hanging.
 func (w *KubeWaker) waitReady(ctx context.Context, upstreamHost string) error {
 	if w.ready(ctx, upstreamHost) {
 		return nil
@@ -335,7 +335,12 @@ func (w *KubeWaker) waitReady(ctx context.Context, upstreamHost string) error {
 	for {
 		select {
 		case <-ctx.Done():
-			return fmt.Errorf("waker: upstream %s not ready before deadline: %w", upstreamHost, ctx.Err())
+			// Wrap proxy.ErrWakeNotReady: the scale-up already landed (or the
+			// graph was already scaled up), so the proxy tells the client the
+			// model is starting (503 + Retry-After) instead of passing the cold
+			// 404 through.
+			return fmt.Errorf("waker: upstream %s not ready before deadline: %w: %w",
+				upstreamHost, proxy.ErrWakeNotReady, ctx.Err())
 		case <-ticker.C:
 			if w.ready(ctx, upstreamHost) {
 				return nil
