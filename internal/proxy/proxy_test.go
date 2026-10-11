@@ -334,7 +334,7 @@ func TestDedicatedBoundRouteDoesNotUseSharedWakeProbe(t *testing.T) {
 	defer backend.Close()
 	upstream, _ := url.Parse(backend.URL)
 	waker := &fakeWaker{}
-	srv := newTestServer(t, upstream).WithWaker(waker, time.Second, 2)
+	srv := newTestServer(t, upstream).WithWaker(waker, time.Second)
 	req := httptest.NewRequest(
 		http.MethodPost,
 		"/v1/chat/completions",

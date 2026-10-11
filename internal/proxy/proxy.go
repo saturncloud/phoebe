@@ -98,9 +98,8 @@ type Server struct {
 	// for the shared serverless mode. nil (the default) = wake disabled: a cold
 	// response passes straight through to the client, exactly as before. Set via
 	// WithWaker when shared serving is enabled.
-	waker        Waker
-	wakeTimeout  time.Duration
-	wakeMaxTries int
+	waker       Waker
+	wakeTimeout time.Duration
 
 	// gateway wires the TF gateway resolution path ((org, body model=) →
 	// tf_model → identity + upstream). nil (the default) = gateway disabled:
@@ -173,24 +172,19 @@ const (
 	// multi-minute holds, and the alternative (a budget shorter than the
 	// cold start) makes the wake feature a no-op. Still bounded; operators can
 	// tune per install via wake.timeout in the settings.
-	defaultWakeTimeout  = 300 * time.Second
-	defaultWakeMaxTries = 3 // probe -> wake -> re-probe attempts
+	defaultWakeTimeout = 300 * time.Second
 )
 
-// WithWaker enables shared-mode wake-from-zero. Before forwarding a wakeable
-// request, the proxy triggers a 0->1 scale and waits for the requested model to
-// appear in non-billable readiness discovery. It then forwards the customer's
-// inference request exactly once. A wake failure also falls through to that one
-// honest, metered forward. A timeout <= 0 uses the default.
-func (s *Server) WithWaker(waker Waker, timeout time.Duration, maxTries int) *Server {
+// WithWaker enables wake-from-zero. The normal proxy transport sends one
+// metered request. If and only if that response proves the endpoint is cold,
+// the transport suppresses it, wakes the endpoint, and retries once. Every
+// non-cold first response is returned without replay. A timeout <= 0 uses the
+// default.
+func (s *Server) WithWaker(waker Waker, timeout time.Duration) *Server {
 	s.waker = waker
 	s.wakeTimeout = timeout
 	if s.wakeTimeout <= 0 {
 		s.wakeTimeout = defaultWakeTimeout
-	}
-	s.wakeMaxTries = maxTries
-	if s.wakeMaxTries <= 0 {
-		s.wakeMaxTries = defaultWakeMaxTries
 	}
 	return s
 }
@@ -237,8 +231,8 @@ func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request) {
 	// only on that parsed identity, never on a raw X-Saturn-* header. The strip
 	// removes every X-Saturn-* request header (trusted, edge-contract, retired
 	// or unknown) from the request every forward is cloned from: the gateway
-	// route, the header-routed shared and dedicated routes, the wake probes,
-	// and the final metered forward. Traefik strips the same namespace first
+	// route, the header-routed shared and dedicated routes, and both attempts on
+	// a cold wake path. Traefik strips the same namespace first
 	// (an enumerated list rendered by saturn-k8s); this is phoebe's backstop.
 	//
 	// Trailers need a different mechanism. The net/http server fills in
@@ -469,6 +463,7 @@ func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request) {
 	// THE ORG, so resolution IS the binding (id.ServedModel was set FROM the
 	// resolved request model; re-checking it against itself would be a
 	// tautology).
+	wakeServedModel := id.ServedModel
 	if !id.Gateway {
 		allowed := pathCanonical
 		switch {
@@ -552,6 +547,7 @@ func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request) {
 			http.Error(w, "requested model is not authorized for this endpoint", http.StatusForbidden)
 			return
 		case bindingOK:
+			wakeServedModel, _ = extractRequestModel(body)
 		}
 	}
 	// SHARED REQUEST POLICY + DISTRIBUTED ADMISSION. Trusted Dynamo hints and
@@ -771,25 +767,17 @@ func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// WAKE-FROM-ZERO (shared serverless mode, the 0->1 leg). Probe the upstream
-	// with a buffered dispatch of the customer's (already-rewritten) POST: a cold
-	// response triggers Kubernetes actuation via the configured waker, holding
-	// the request for bounded retries. Regardless of wake success or failure,
-	// the normal path below forwards the customer's POST at most once and meters
-	// its honest response. No inference response is ever discarded and replayed.
-	//
-	// Wake is attempted ONLY for the model-bearing inference surface: a cold
-	// control probe (GET /health, /v1/models on a bound shared route) must not
-	// trigger a 0->1 scale — the probe gets the honest cold response and the
-	// sanitizers reduce it, while a monitoring loop could otherwise hold a
-	// bounded wake on every check.
-	if s.wakeEnabled(id) && inferenceRequestPathAllowed(routePath) {
-		if served := s.serveWithWake(w, r, upstream, id, requestID, clientRequestID, admitted); served {
-			return
-		}
-	}
-
 	rp := newUpstreamProxy(upstream)
+	var wakeTransport *wakeRoundTripper
+	// Wake is an interception around the normal metered proxy attempt. The first
+	// non-cold response is returned directly and never replayed. Only a
+	// recognized cold response is suppressed; after a bounded wake, the request
+	// is retried once. Successful responses remain streaming because the
+	// transport buffers only candidate 404/503 responses.
+	if s.wakeEnabled(id) && inferenceRequestPathAllowed(routePath) {
+		wakeTransport = s.newWakeTransport(rp.Transport, upstream, id, wakeServedModel, requestID, admitted)
+		rp.Transport = wakeTransport
+	}
 
 	// FlushInterval=-1 flushes every write immediately — per-chunk SSE
 	// delivery with no buffering. This is the streaming-correctness linchpin.
@@ -798,6 +786,8 @@ func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request) {
 	rp.FlushInterval = -1
 
 	rp.ModifyResponse = func(resp *http.Response) error {
+		wakeNeverServed := wakeTransport != nil && wakeTransport.neverServed
+		resp.Header.Del(wakeNeverServedHeader)
 		// Dynamo's model-list endpoint is graph-wide. A dedicated subdomain is
 		// deployment-scoped, so expose only the served name Atlas authorized for
 		// this route; otherwise endpoint A could enumerate attached endpoint B.
@@ -868,6 +858,9 @@ func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request) {
 			ctx := context.WithoutCancel(r.Context())
 			if admitted != nil {
 				kind := classifyCaptureSettlement(res)
+				if wakeNeverServed {
+					kind = settlementZeroNeverServed
+				}
 				e := settleAdmissionLease(ctx, admitted, kind, admission.Usage{
 					TotalPromptTokens:  int64(res.Usage.PromptTokens),
 					CachedPromptTokens: int64(res.Usage.CachedTokens()),

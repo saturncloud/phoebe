@@ -48,23 +48,31 @@ emit:
 #   legacyPostgresResolver: false
 #   databaseUrl: ""
 
-# Wake-from-zero actuation (OFF by default). When enabled, a cold response on
-# a wakeable route patches the graph's DGDSA <graph>-vllmworker to 1 replica
-# and unpauses its KEDA ScaledObject <graph>-scaler (in that order — the KEDA
-# pause handoff), holding the request until the worker serves. Requires
+# Wake-from-zero actuation (OFF by default). Shared routes use the Kubernetes
+# actuator: it patches the graph's DGDSA <graph>-worker to 1 replica, falling
+# back to the legacy <graph>-vllmworker name, and unpauses its KEDA ScaledObject
+# <graph>-scaler. That actuator requires
 # gateway.namespace (where the DGDSAs live) and the RBAC in
-# deploy/rbac-waker.yaml on phoebe's ServiceAccount. Uses in-cluster config;
-# kubeconfig is a dev/test override. If the kubernetes config is unavailable,
-# wake degrades to off (cold responses pass through) — it never crashes the
-# proxy.
+# deploy/rbac-waker.yaml on phoebe's ServiceAccount. It uses in-cluster config;
+# kubeconfig is a dev/test override.
+#
+# Dedicated disaggregated routes use the Atlas actuator configured by atlasURL.
+# It asks Atlas to restore the graph's persisted prefill and decode counts, then
+# waits for the requested model. Set TF_INTERNAL_WAKE_TOKEN to the same internal
+# wake token configured in Atlas. At least one actuator must be configured when
+# wake is enabled: gateway.namespace for shared routes or atlasURL for dedicated
+# routes. An unavailable actuator degrades to off for its serving mode (cold
+# responses pass through) rather than crashing the proxy.
 # timeout bounds one wake's request hold (default 300s). It MUST exceed the
-# real cold start — vLLM's cold reload measured ~2.5min on staging; a smaller
-# budget holds the client and then serves the cold response anyway — but it is
-# also how long a doomed wake keeps a client waiting. Measured cold start +
-# headroom, not impatience.
+# real cold start — vLLM's cold reload measured ~2.5min on staging. If worker
+# restoration was confirmed but readiness exceeds this budget, the client gets
+# a model-starting 503 with Retry-After guidance. A definite failure before
+# actuation returns the original cold response. Measured cold start + headroom,
+# not impatience.
 # wake:
 #   enabled: true
 #   kubeconfig: ""
+#   atlasURL: "http://atlas.saturn.svc.cluster.local:8000"
 #   timeout: "300s"
 
 # Distributed admission for SHARED serving mode (OFF by default). This is

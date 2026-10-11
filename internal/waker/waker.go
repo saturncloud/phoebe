@@ -182,25 +182,18 @@ func NewWithClient(client dynamic.Interface, cfg Config, log *logging.Logger) *K
 // Wake implements proxy.Waker: scale the target graph's worker 0->1 (KEDA
 // pause-handoff order), then HOLD until the upstream serves again or ctx
 // expires. The Waker contract requires blocking-until-ready: the proxy's
-// inference request must not be used as a readiness probe or replayed.
+// readiness checks must not execute the customer's inference request.
 func (w *KubeWaker) Wake(ctx context.Context, target proxy.WakeTarget) error {
 	if target.GraphK8sName == "" {
 		return errors.New("waker: no graph name on wake target")
 	}
-	// NO WARM SHORT-CIRCUIT HERE ANY MORE, deliberately. It used to matter because
-	// Wake ran on EVERY wakeable request, so a warm graph paid a Kubernetes DGDSA
-	// GET — serialized behind the per-graph mutex in scaleUp — on every inference
-	// request. serveWithWake now calls Wake ONLY after a probe observed a genuinely
-	// COLD response (buf.isColdWakeable()), so a warm graph never reaches this
-	// function at all. The short-circuit moved up a layer and got cheaper: the
-	// proxy was already going to make that request, whereas the old check was an
-	// extra HTTP GET per request.
+	// The proxy calls Wake only after the normal upstream attempt returns a
+	// recognized cold response, so a warm graph never reaches this function.
 	if err := w.scaleUp(ctx, target.GraphK8sName, target.ResourceID); err != nil {
 		return err
 	}
-	// Hold until the graph serves again. Not strictly required for correctness —
-	// the proxy re-probes after Wake returns — but returning the instant the patch
-	// lands would burn a retry attempt on a graph that is still starting.
+	// Hold until the graph serves again. Returning as soon as the scale patch
+	// lands would spend the single retry while the graph is still starting.
 	//
 	// Readiness is "the frontend is serving ANY model" rather than one specific id.
 	// The caller already proved THIS request's model was cold, and a DGDSA scale is

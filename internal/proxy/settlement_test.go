@@ -233,8 +233,8 @@ func zeroSettlementProbeSet(est admissionEstimate) []admission.Request {
 // holder, the wakeable request's BeginColdHold is rejected (503 + Retry-After,
 // waker never invoked — pinned by TestWakeColdHoldRejectionFailsClosedAndReleasesLease),
 // and the rejection settles ZERO: token windows uncharged, the requests-window
-// +1 kept, the physical platform reservation released. serveWithWake does not
-// settle this path itself; the handler's deferred release fallback owns the
+// +1 kept, the physical platform reservation released. The handler's deferred
+// release fallback owns the
 // lease release, and it lands on exactly the R1 never-served settlement:
 // Complete(0). (The 429 contractual rendering would take the same path through
 // the same fallback — no current config produces a contractual cold-holds
@@ -254,7 +254,7 @@ func TestWakeColdHoldRejectionSettlesZeroNeverServed(t *testing.T) {
 	em := &recordingEmitter{}
 	s := New(&config.Settings{Admission: cfg}, logging.New(logging.ERROR), em).
 		WithAdmitter(a).
-		WithWaker(waker, time.Second, 3)
+		WithWaker(waker, time.Second)
 
 	var holder *admission.Lease
 	charge := func() {
@@ -324,8 +324,8 @@ func TestWakeColdHoldRejectionSettlesZeroNeverServed(t *testing.T) {
 	}
 }
 
-// TestWakeExhaustedColdSettlesZeroNeverServed pins the wake-exhausted cold 404
-// (serveWithWake's give-up after maxTries cold attempts): the engine refused
+// TestWakeExhaustedColdSettlesZeroNeverServed pins the still-cold bounded retry:
+// the engine refused
 // every dispatch before any inference, so the final cold 404 settles ZERO —
 // token windows uncharged, the requests-window +1 kept, the physical
 // reservation released — rather than the conservative estimate a usage-less
@@ -345,7 +345,7 @@ func TestWakeExhaustedColdSettlesZeroNeverServed(t *testing.T) {
 	em := &recordingEmitter{}
 	s := New(&config.Settings{Admission: cfg}, logging.New(logging.ERROR), em).
 		WithAdmitter(a).
-		WithWaker(waker, time.Second, 2)
+		WithWaker(waker, time.Second)
 
 	charge := func() {
 		callsBefore := atomic.LoadInt32(&waker.calls)
@@ -358,11 +358,8 @@ func TestWakeExhaustedColdSettlesZeroNeverServed(t *testing.T) {
 		if got := rr.Header().Get("X-Request-Id"); !strings.HasPrefix(got, "phoebe-") {
 			t.Fatalf("final model-starting 503 missing the minted X-Request-Id echo, got %q", got)
 		}
-		// serveWithWake wakes once per cold attempt: maxTries=2 means two wakes
-		// (each followed by a still-cold re-probe), then the honest final cold
-		// forward.
-		if got := atomic.LoadInt32(&waker.calls) - callsBefore; got != 2 {
-			t.Fatalf("waker delta=%d, want 2 for maxTries=2 (one wake per cold attempt)", got)
+		if got := atomic.LoadInt32(&waker.calls) - callsBefore; got != 1 {
+			t.Fatalf("waker delta=%d, want 1", got)
 		}
 	}
 
@@ -416,7 +413,7 @@ func TestWakeErrorColdSettlementZeroNeverServed(t *testing.T) {
 	em := &recordingEmitter{}
 	s := New(&config.Settings{Admission: cfg}, logging.New(logging.ERROR), em).
 		WithAdmitter(a).
-		WithWaker(waker, time.Second, 3)
+		WithWaker(waker, time.Second)
 
 	charge := func() {
 		callsBefore := atomic.LoadInt32(&waker.calls)
@@ -461,19 +458,18 @@ func TestWakeErrorColdSettlementZeroNeverServed(t *testing.T) {
 	}
 }
 
-// TestWakeExhaustedWarmFinalSettlesActualUsage pins the tries-exhausted tail's
-// NON-cold final axis: the in-loop probes stay cold (each triggering a wake)
-// but the FINAL dispatch comes back warm — the engine DID real work. The tail
-// must NOT settle Complete(0) and flush the buffer: it returns false so the
-// caller's metered forward serves the response, emits exactly one usage-bearing
-// metering row, and settles the lease with the engine-authoritative usage.
+// TestWakeExhaustedWarmFinalSettlesActualUsage pins the cold-then-warm axis:
+// the first attempt is cold and the one bounded retry performs real work. The
+// retry is the single usage-bearing response and settles the lease with the
+// engine-authoritative usage.
 // Under the old unconditional-zero settlement the generated/prompt probes below
 // would be ADMITTED (nothing charged); with actual usage settled they must be
 // REJECTED.
 func TestWakeExhaustedWarmFinalSettlesActualUsage(t *testing.T) {
 	var requests atomic.Int32
 	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
-		if requests.Add(1) > 2 { // in-loop probes (2) stay cold; the final dispatch is warm
+		if requests.Add(1) > 1 { // first attempt cold; the one retry is warm
+			w.Header().Set(wakeNeverServedHeader, "true")
 			w.WriteHeader(http.StatusOK)
 			_, _ = w.Write([]byte(`{"model":"model-a","usage":{"prompt_tokens":5,"completion_tokens":7}}`))
 			return
@@ -495,7 +491,7 @@ func TestWakeExhaustedWarmFinalSettlesActualUsage(t *testing.T) {
 	em := &recordingEmitter{}
 	s := New(&config.Settings{Admission: cfg}, logging.New(logging.ERROR), em).
 		WithAdmitter(a).
-		WithWaker(waker, time.Second, 2)
+		WithWaker(waker, time.Second)
 
 	charge := func() {
 		callsBefore := atomic.LoadInt32(&waker.calls)
@@ -507,13 +503,14 @@ func TestWakeExhaustedWarmFinalSettlesActualUsage(t *testing.T) {
 		if !strings.Contains(rr.Body.String(), `"completion_tokens":7`) {
 			t.Fatalf("body=%q, want the warm response body served to the client", rr.Body.String())
 		}
-		if got := atomic.LoadInt32(&waker.calls) - callsBefore; got != 2 {
-			t.Fatalf("waker delta=%d, want 2 for maxTries=2 (one wake per cold in-loop probe)", got)
+		if got := rr.Header().Get(wakeNeverServedHeader); got != "" {
+			t.Fatalf("upstream settlement marker reached client: %q", got)
 		}
-		// Two cold in-loop probes + the warm final probe + the caller's metered
-		// forward: four dispatches total, two warm.
-		if got := requests.Load(); got != 4 {
-			t.Fatalf("backend requests=%d, want 4 (2 cold probes + warm final probe + warm forward)", got)
+		if got := atomic.LoadInt32(&waker.calls) - callsBefore; got != 1 {
+			t.Fatalf("waker delta=%d, want 1", got)
+		}
+		if got := requests.Load(); got != 2 {
+			t.Fatalf("backend requests=%d, want 2 (one cold attempt and one warm retry)", got)
 		}
 	}
 
@@ -559,17 +556,15 @@ func TestWakeExhaustedWarmFinalSettlesActualUsage(t *testing.T) {
 	_ = physical.Complete(context.Background(), 0)
 }
 
-// TestWakeExhaustedTransportErrorSettlesUnknownUsage pins the tries-exhausted
-// tail's indeterminate-fault axis: the in-loop probes stay cold, then the
-// engine dies before the final dispatch — the connection drops mid-retry. The
-// tail must NOT settle never-served zero and flush an unclassified 502: it
-// returns false so the caller's error handler classifies the fault — one
+// TestWakeExhaustedTransportErrorSettlesUnknownUsage pins the bounded retry's
+// indeterminate-fault axis: the first attempt is cold, then the engine drops
+// the retry connection. The caller's error handler classifies the fault — one
 // UsageFound=false 502 metering row and the conservative reservation retained
 // (CompleteUnknownUsage), exactly the R1 ruling for indeterminate faults.
 func TestWakeExhaustedTransportErrorSettlesUnknownUsage(t *testing.T) {
 	var requests atomic.Int32
 	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
-		if requests.Add(1) > 2 { // engine dies after the last in-loop probe
+		if requests.Add(1) > 1 { // engine dies on the one bounded retry
 			hj, ok := w.(http.Hijacker)
 			if !ok {
 				t.Error("backend ResponseWriter is not a Hijacker")
@@ -600,7 +595,7 @@ func TestWakeExhaustedTransportErrorSettlesUnknownUsage(t *testing.T) {
 	em := &recordingEmitter{}
 	s := New(&config.Settings{Admission: cfg}, logging.New(logging.ERROR), em).
 		WithAdmitter(a).
-		WithWaker(waker, time.Second, 2)
+		WithWaker(waker, time.Second)
 
 	charge := func() {
 		callsBefore := atomic.LoadInt32(&waker.calls)
@@ -609,13 +604,11 @@ func TestWakeExhaustedTransportErrorSettlesUnknownUsage(t *testing.T) {
 		if rr.Code != http.StatusBadGateway {
 			t.Fatalf("status=%d, want the classified 502 from the caller's error handler", rr.Code)
 		}
-		if got := atomic.LoadInt32(&waker.calls) - callsBefore; got != 2 {
-			t.Fatalf("waker delta=%d, want 2 for maxTries=2 (one wake per cold in-loop probe)", got)
+		if got := atomic.LoadInt32(&waker.calls) - callsBefore; got != 1 {
+			t.Fatalf("waker delta=%d, want 1", got)
 		}
-		// Two cold in-loop probes + the failed final probe + the caller's failed
-		// forward: four dispatches, none warm.
-		if got := requests.Load(); got != 4 {
-			t.Fatalf("backend requests=%d, want 4 (2 cold probes + failed final probe + failed forward)", got)
+		if got := requests.Load(); got != 2 {
+			t.Fatalf("backend requests=%d, want 2 (one cold attempt and one failed retry)", got)
 		}
 	}
 

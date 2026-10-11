@@ -9,10 +9,10 @@ package identity
 // PHOEBE_TRUSTED_HEADERS, comma-separated, rendered from the saturn-k8s
 // phoebe chart's ConfigMap); when the config is empty, unset, or malformed
 // (nothing left after trimming and dropping empties), a hard-coded fallback
-// equal to the pinned 14 engages so phoebe fails closed, and a loud warning
+// equal to the pinned 15 engages so phoebe fails closed, and a loud warning
 // flags the misrendered chart for the operator.
 //
-// The set covers exactly the R3 envelope headers listed in the pinned 14.
+// The set covers exactly the R3 envelope headers listed in the pinned 15.
 // The remaining identity headers (AuthID / UserID / GroupID / ResourceID /
 // ResourceType / BaseModel / Adapter / Upstream) are read under the ratified
 // edge contract (ForwardAuth authResponseHeaders allowlist + Atlas
@@ -53,6 +53,7 @@ var pinnedTrustedHeaders = []string{
 	HeaderOrgID,
 	HeaderOwnerID,
 	HeaderServingMode,
+	HeaderServingProfile,
 	HeaderServedModel,
 	HeaderOrgRateLimitRequests,
 	HeaderOrgRateLimitTotalPromptTokens,
@@ -80,6 +81,7 @@ var requiredTrustedHeaders = []struct {
 }{
 	{HeaderGateway, "gateway requests will not be recognized"},
 	{HeaderServingMode, "every header-routed (non-gateway) inference request will be refused with 404 because the serving mode reads as absent (ruling #19)"},
+	{HeaderServingProfile, "dedicated disaggregated requests will bypass cold wake because the serving profile reads as absent"},
 	{HeaderOwnerID, "every shared inference request that carries a contract rate limit (and, with admission enabled, every shared gateway inference request) will be refused with 503 because the quota policy has no owner-id anchor (R7/R8: the legacy service-tier envelope is no longer read)"},
 	{HeaderOrgID, "every shared inference request that carries the trusted quota envelope (owner id or any contract rate-limit header), and with admission enabled every shared inference request, will be refused with 503 because the trusted organization identity reads as absent"},
 }
@@ -92,7 +94,7 @@ type trustedHeaderSet map[string]struct{}
 var activeTrustedHeaders atomic.Pointer[trustedHeaderSet]
 
 func init() {
-	// Before config load the pinned 14 are active: phoebe never reads an
+	// Before config load the pinned 15 are active: phoebe never reads an
 	// envelope header outside the list, before OR after the runtime config
 	// is loaded, and the pre-load default must preserve request handling.
 	fallback := newTrustedHeaderSet(pinnedTrustedHeaders)
@@ -130,7 +132,7 @@ func trustedHeaderValue(r *http.Request, name string) string {
 //     active (entries are canonicalized; case is ignored per HTTP
 //     convention);
 //   - unset, empty/whitespace-only, or nothing left after splitting and
-//     trimming -> the pinned 14 engage AND a loud warning flags the
+//     trimming -> the pinned 15 engage AND a loud warning flags the
 //     misrendered chart. Fallback, never a startup failure: phoebe must keep
 //     serving with the pinned set rather than crash-loop behind a broken
 //     ConfigMap render.

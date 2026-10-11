@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"flag"
 	"os"
+	"strings"
 	"time"
 
 	// pgx stdlib driver: registers "pgx" with database/sql for the gateway
@@ -24,6 +25,8 @@ import (
 	"github.com/saturncloud/phoebe/internal/waker"
 )
 
+const internalWakeTokenEnv = "TF_INTERNAL_WAKE_TOKEN"
+
 func main() {
 	settingsFile := flag.String("f", "/etc/saturn/config/settings.yaml", "Settings YAML file path")
 	flag.Parse()
@@ -40,7 +43,7 @@ func main() {
 
 	// R3 trusted-header registry: parse PHOEBE_TRUSTED_HEADERS (rendered
 	// from the phoebe chart's ConfigMap) into the active set the parser's
-	// envelope reads resolve through. The pinned 14 already govern from
+	// envelope reads resolve through. The pinned 15 already govern from
 	// package init; this engages the runtime config once, at startup, and
 	// warns loudly if the chart render was empty/malformed.
 	identity.LoadTrustedHeaders(log)
@@ -62,8 +65,8 @@ func main() {
 	}
 	if w := buildWaker(settings, log); w != nil {
 		// Timeout 0 = the proxy default (300s — sized above vLLM's measured
-		// ~2.5min cold reload); tries 0 = the proxy default (3).
-		srv = srv.WithWaker(w, settings.Wake.Timeout, 0)
+		// ~2.5min cold reload). A recognized cold response permits one retry.
+		srv = srv.WithWaker(w, settings.Wake.Timeout)
 	}
 	srvErr := srv.Run()
 
@@ -183,27 +186,41 @@ func buildLegacyPGGateway(s *config.Settings, log *logging.Logger) (gateway.Reso
 	return resolver, func() { _ = db.Close() }
 }
 
-// buildWaker constructs the client-go DGDSA waker (wake-from-zero actuation
-// in the MAIN phoebe container — no separate waker pod; see
-// deploy/rbac-waker.yaml for the RBAC it needs). Returns nil when wake is
-// disabled (the default) OR when the kubernetes config is unavailable: the
-// proxy then runs with wake off — cold responses pass through exactly as
-// before — because a broken wake path must degrade the cold-start UX, never
-// crash or block the proxy (which also serves warm traffic).
+// buildWaker constructs both wake actuators. Shared graphs retain the narrow
+// DGDSA Kubernetes patch. Dedicated disaggregated graphs call Atlas, which
+// validates the endpoint and restores both persisted pool counts. Either side
+// may be unavailable without disabling the other.
 func buildWaker(s *config.Settings, log *logging.Logger) proxy.Waker {
 	if !s.Wake.Enabled {
 		return nil
 	}
-	w, err := waker.New(waker.Config{
-		Namespace:  s.Gateway.Namespace,
-		Kubeconfig: s.Wake.Kubeconfig,
-	}, log)
-	if err != nil {
-		log.Error.Printf("wake: kubernetes client unavailable (%v); wake-from-zero DISABLED — cold responses pass through", err)
+	var shared proxy.Waker
+	if s.Gateway.Namespace != "" {
+		kubeWaker, err := waker.New(waker.Config{
+			Namespace:  s.Gateway.Namespace,
+			Kubeconfig: s.Wake.Kubeconfig,
+		}, log)
+		if err != nil {
+			log.Error.Printf("wake: kubernetes client unavailable (%v); shared wake-from-zero is disabled", err)
+		} else {
+			shared = kubeWaker
+			log.Info.Printf("wake: shared actuator enabled (DGDSA namespace=%s)", s.Gateway.Namespace)
+		}
+	}
+	var dedicated proxy.Waker
+	if strings.TrimSpace(s.Wake.AtlasURL) != "" {
+		atlasWaker, err := waker.NewAtlas(s.Wake.AtlasURL, os.Getenv(internalWakeTokenEnv), log)
+		if err != nil {
+			log.Error.Printf("wake: Atlas actuator unavailable (%v); dedicated wake-from-zero is disabled", err)
+		} else {
+			dedicated = atlasWaker
+			log.Info.Printf("wake: dedicated actuator enabled (Atlas %s)", s.Wake.AtlasURL)
+		}
+	}
+	if shared == nil && dedicated == nil {
 		return nil
 	}
-	log.Info.Printf("wake: enabled (DGDSA namespace=%s)", s.Gateway.Namespace)
-	return w
+	return waker.ModeWaker{Shared: shared, Dedicated: dedicated}
 }
 
 // buildEmitter constructs the durable metering emitter. When ValkeyAddr is set
