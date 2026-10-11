@@ -3,10 +3,13 @@ package proxy
 import (
 	"bytes"
 	"context"
+	"encoding/json"
+	"errors"
 	"io"
 	"net"
 	"net/http"
 	"net/url"
+	"strconv"
 	"strings"
 
 	"github.com/saturncloud/phoebe/internal/admission"
@@ -40,10 +43,55 @@ type WakeTarget struct {
 // identical either way.
 //
 // Wake returns nil once the worker is ready, or an error if wake could not
-// complete within the deadline (the caller then returns the original cold
-// response to the client rather than hanging forever).
+// complete. The caller never hangs forever; what the client then receives
+// depends on WHY the wake did not complete:
+//
+//   - The scale-up was triggered (or was already in progress) but the worker
+//     was not ready before ctx expired: Wake returns an error wrapping
+//     ErrWakeNotReady. The caller answers 503 Service Unavailable with a
+//     Retry-After header and a JSON error body saying the model is starting.
+//     The scale-up keeps going after the hold expires, so a retry is served
+//     once the worker is ready.
+//   - Any other failure (no scalable adapter for the graph, an RBAC or API
+//     error on the scale patch, a malformed target): Wake returns an error that
+//     does NOT wrap ErrWakeNotReady. Nothing is starting, so telling the client
+//     to retry would be false; the caller returns the original cold upstream
+//     response unchanged.
 type Waker interface {
 	Wake(ctx context.Context, target WakeTarget) error
+}
+
+// ErrWakeNotReady is the error a Waker wraps when it triggered the 0->1
+// scale-up (or found the graph already scaled up) but the worker did not
+// become ready before the context expired. It is the only wake error that
+// turns the held cold response into a 503 + Retry-After (see Waker).
+var ErrWakeNotReady = errors.New("wake triggered but the worker was not ready before the deadline")
+
+// wakeRetryAfterSeconds is the Retry-After value (in seconds) phoebe sends on
+// the 503 it returns when a scale-up from zero is in progress but the worker
+// was not ready within the wake hold (wake.timeout). Long enough not to hammer
+// a graph that is still pulling its image or loading weights, short enough
+// that a client retrying on it is served soon after the worker becomes ready.
+const wakeRetryAfterSeconds = 30
+
+// writeWakeStarting answers a held cold request whose scale-up was triggered
+// but whose worker was not ready before the hold expired: 503 + Retry-After +
+// a JSON error body in phoebe's {"error": "..."} shape. The cold upstream
+// response (a Dynamo 404 "Model not found", or the not-ready 503) is NOT
+// passed through: a 404 tells API clients the model does not exist and they
+// do not retry it, which is wrong while the model is starting.
+func writeWakeStarting(w http.ResponseWriter, requestID string) {
+	body, _ := json.Marshal(map[string]string{
+		"error": "The model is starting from zero; retry in about " +
+			strconv.Itoa(wakeRetryAfterSeconds) + " seconds.",
+	})
+	h := w.Header()
+	h.Set(requestIDHeader, requestID)
+	h.Set("Content-Type", "application/json")
+	h.Set("Retry-After", strconv.Itoa(wakeRetryAfterSeconds))
+	h.Set("Content-Length", strconv.Itoa(len(body)))
+	w.WriteHeader(http.StatusServiceUnavailable)
+	_, _ = w.Write(body)
 }
 
 // Shared-mode wake-from-zero (the 0->1 leg). Dynamo has NO wake-from-zero: when
@@ -223,8 +271,10 @@ func (s *Server) emitWakeFailureRow(r *http.Request, id identity.Identity, reque
 
 // serveWithWake probes the upstream and, on a cold (scaled-to-zero) response,
 // triggers a 0->1 wake and retries. Returns true if it produced the client's
-// FINAL response here (a genuine error, or the wake deadline was exceeded and
-// the cold response was returned) — the caller then returns. Returns false when
+// FINAL response here (a genuine error; a 503 + Retry-After because the
+// scale-up is in progress but the worker was not ready within the hold; or the
+// cold response passed through because the wake failed without starting a
+// scale-up) — the caller then returns. Returns false when
 // the base is warm and the caller should perform the normal metered streaming
 // forward (the request body has been restored for that attempt).
 //
@@ -238,12 +288,12 @@ func (s *Server) emitWakeFailureRow(r *http.Request, id identity.Identity, reque
 // return false so the caller re-forwards it with full streaming + metering
 // intact. Cost: one extra round-trip on the (rare) first-request-after-idle.
 //
-// SETTLEMENT (R1 ruling): when this function returns true with a FINAL cold
-// response (the wake-error give-up, or tries exhausted with the final probe
-// STILL cold), the engine provably did no inference work — every dispatch was
-// refused before any token ran — so the admitted lease is settled to zero here
-// (settlementZeroNeverServed), in addition to the cold response being flushed
-// to the client. A tries-exhausted final probe that is NOT cold (warm, or a
+// SETTLEMENT (R1 ruling): when this function returns true with a FINAL
+// answer to a cold probe (the wake-error give-up, or tries exhausted with the
+// final probe STILL cold), the engine provably did no inference work — every
+// dispatch was refused before any token ran — so the admitted lease is settled
+// to zero here (settlementZeroNeverServed), in addition to the 503 (or the
+// passed-through cold response) being written to the client. A tries-exhausted final probe that is NOT cold (warm, or a
 // non-cold transport/overload error) returns false instead: the R1
 // never-served precondition does not hold for it, so the caller's metered
 // forward owns both the metering row and the settlement (actual usage, or
@@ -345,16 +395,24 @@ func (s *Server) serveWithWake(
 			}
 		}
 		if werr != nil {
-			// Wake couldn't complete (deadline/scale error): return the cold
-			// response to the client rather than hang. It's a real, honest 503/404
-			// for a base we couldn't bring up in time — and determinate
-			// never-served (no inference ran), so the lease settles zero before
-			// the flush. The probe above was a real forwarded attempt and this
-			// served=true exit bypasses the normal metered forward, so the
-			// attempt is recorded at the served status below.
+			// Wake couldn't complete: answer now rather than hang. Either way
+			// the outcome is determinate never-served (no inference ran), so
+			// the lease settles zero before the response is written. The probe
+			// above was a real forwarded attempt and this served=true exit
+			// bypasses the normal metered forward, so the attempt is recorded
+			// at the status the client received.
 			s.log.Warn.Printf("wake: could not warm base for request_id=%s resource_id=%s: %v",
 				requestID, id.ResourceID, werr)
 			s.settleFinalColdLease(r, lease)
+			if errors.Is(werr, ErrWakeNotReady) {
+				// The scale-up is in progress but the worker was not ready
+				// within the hold: 503 + Retry-After, never the cold 404.
+				writeWakeStarting(w, requestID)
+				s.emitWakeFailureRow(r, id, requestID, clientRequestID, http.StatusServiceUnavailable)
+				return true
+			}
+			// No scale-up is in progress (no adapter, RBAC/API error): pass
+			// the cold upstream response through unchanged.
 			w.Header().Set(requestIDHeader, requestID)
 			buf.flushTo(w)
 			s.emitWakeFailureRow(r, id, requestID, clientRequestID, buf.status)
@@ -384,10 +442,12 @@ func (s *Server) serveWithWake(
 		restoreBody()
 		return false
 	}
+	// Still cold after every wake reported success: the scale-up was triggered
+	// (Wake returned nil), so the model is starting, not missing. Same answer
+	// as a wake that ran out of time: 503 + Retry-After, never the cold 404.
 	s.settleFinalColdLease(r, lease)
-	w.Header().Set(requestIDHeader, requestID)
-	buf.flushTo(w)
-	s.emitWakeFailureRow(r, id, requestID, clientRequestID, buf.status)
+	writeWakeStarting(w, requestID)
+	s.emitWakeFailureRow(r, id, requestID, clientRequestID, http.StatusServiceUnavailable)
 	return true
 }
 
