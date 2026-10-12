@@ -55,6 +55,9 @@ func NewKubeClient(kubeconfig string) (kubernetes.Interface, error) {
 //	           base_model        — HF base id (the catalog price key)
 //	           adapter           — fine-tune checkpoint id; MAY BE EMPTY
 //	                               (base-model endpoint)
+//	           ready             — "true" only after Atlas observes an
+//	                               adapter DynamoModel ready; missing or any
+//	                               other value fails closed for adapters
 //	           serving_mode      — REQUIRED, exactly "shared" | "dedicated"
 //	                               (SKU axis). It is load-bearing at request
 //	                               time — it selects the shared price row, the
@@ -306,6 +309,7 @@ func parseRegistryConfigMap(cm *corev1.ConfigMap) (Resolution, cacheKey, error) 
 		ResourceID:   d["resource_id"],
 		BaseModel:    d["base_model"],
 		Adapter:      d["adapter"],
+		Ready:        d["adapter"] == "" || d["ready"] == "true",
 		ServingMode:  d["serving_mode"],
 		GraphK8sName: d["graph_k8s_name"],
 	}

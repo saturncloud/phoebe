@@ -24,6 +24,7 @@ func registryCM(name string, data map[string]string) *corev1.ConfigMap {
 		"resource_id":       "tfm-1",
 		"base_model":        "meta-llama/Llama-3.1-8B-Instruct",
 		"adapter":           "",
+		"ready":             "true",
 		"serving_mode":      "shared",
 		"graph_k8s_name":    "graph-llama31",
 		"port":              "8000",
@@ -125,6 +126,34 @@ func TestRegistry_InformerFedHappyPath(t *testing.T) {
 	}
 	if res.ResourceID != "tfm-ft-1" || res.Adapter != "ckpt-42" || res.Port != 9099 {
 		t.Fatalf("adapter resolution = %+v", res)
+	}
+	if !res.Ready {
+		t.Fatal("adapter with ready=true must resolve ready")
+	}
+}
+
+func TestRegistry_AdapterReadinessFailsClosed(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		ready string
+	}{
+		{name: "explicit false", ready: "false"},
+		{name: "missing", ready: ""},
+		{name: "invalid", ready: "yes"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			cm := registryCM("tf-model-ft", map[string]string{
+				"adapter": "ckpt-42",
+				"ready":   tc.ready,
+			})
+			res, _, err := parseRegistryConfigMap(cm)
+			if err != nil {
+				t.Fatalf("parse: %v", err)
+			}
+			if res.Ready {
+				t.Fatalf("ready=%q resolved ready; want fail-closed false", tc.ready)
+			}
+		})
 	}
 }
 
