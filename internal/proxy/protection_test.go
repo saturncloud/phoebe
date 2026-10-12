@@ -332,6 +332,58 @@ func TestResponseBufferAccountLimits(t *testing.T) {
 	}
 }
 
+// B4: a refused oversized reservation never inflates the replica total, so a
+// concurrent small request that fits is never cut by a false over-total.
+func TestResponseBufferRefusedReservationNeverBlocksOneThatFits(t *testing.T) {
+	var budget responseBufferBudget
+	p := config.ProtectionSettings{MaxResponseBufferBytesPerStream: 100, MaxResponseBufferBytesTotal: 100}
+	noop := func(error) {}
+	holder := budget.newAccount(p, noop)
+	if err := holder.set(bufferSlotCapture, 90); err != nil {
+		t.Fatal(err)
+	}
+	big := budget.newAccount(p, noop)
+	small := budget.newAccount(p, noop)
+
+	stop := make(chan struct{})
+	var wg sync.WaitGroup
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		for {
+			select {
+			case <-stop:
+				return
+			default:
+			}
+			if err := big.set(bufferSlotCapture, 50); err == nil {
+				t.Error("an oversized reservation must be refused")
+				return
+			}
+		}
+	}()
+	for i := 0; i < 20000; i++ {
+		n := int64(i%5 + 1)
+		if err := small.set(bufferSlotCapture, n); err != nil {
+			close(stop)
+			wg.Wait()
+			t.Fatalf("iteration %d: a reservation that fits (%d bytes on 90 of 100) was refused", i, n)
+		}
+	}
+	close(stop)
+	wg.Wait()
+	// small's last reservation was (19999%5)+1 = 5 bytes on top of 90.
+	if got := budget.held.Load(); got != 95 {
+		t.Fatalf("held=%d, want 95", got)
+	}
+	small.close()
+	big.close()
+	holder.close()
+	if got := budget.held.Load(); got != 0 {
+		t.Fatalf("held=%d after close, want 0", got)
+	}
+}
+
 // blockingWaker holds every wake until released, so the test can fill the
 // dedicated cold-hold limit.
 type blockingWaker struct {

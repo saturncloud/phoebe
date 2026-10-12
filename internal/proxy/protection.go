@@ -185,12 +185,22 @@ func (a *responseBufferAccount) set(slot int, n int64) error {
 				mine += v
 			}
 		}
-		if mine+n > a.perStream || a.budget.held.Add(delta) > a.total {
-			if mine+n <= a.perStream {
-				a.budget.held.Add(-delta)
-			}
+		if mine+n > a.perStream {
 			a.cancel(errResponseBufferLimit)
 			return errResponseBufferLimit
+		}
+		// Reserve with compare-and-swap so a refused delta never touches the
+		// shared counter: an add-then-roll-back would briefly inflate it and
+		// could make a concurrent small request see a false over-total.
+		for {
+			cur := a.budget.held.Load()
+			if cur+delta > a.total {
+				a.cancel(errResponseBufferLimit)
+				return errResponseBufferLimit
+			}
+			if a.budget.held.CompareAndSwap(cur, cur+delta) {
+				break
+			}
 		}
 	} else if delta < 0 {
 		a.budget.held.Add(delta)
