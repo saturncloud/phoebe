@@ -106,7 +106,7 @@ func TestGatewayRequestBodyBoundedBeforeResolution(t *testing.T) {
 		},
 	}}
 	s := newGatewayTestServer(t, &recordingEmitter{}, resolver, up)
-	s.settings.Admission.Platform.MaxPromptBytes = ptr64(limit)
+	s.settings.Protection.MaxRequestBodyBytes = limit
 
 	rr := httptest.NewRecorder()
 	s.Handler().ServeHTTP(rr, gatewayRequestBodyOfSize(t, "org-1", limit))

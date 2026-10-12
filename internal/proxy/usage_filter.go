@@ -27,14 +27,18 @@ type usageFilterReader struct {
 	includeFinalUsage bool
 	maxLineBytes      int
 	terminalErr       error
+	// buffers charges the held line against the gateway protection limits on
+	// buffered response bytes; nil = only maxLineBytes applies.
+	buffers *responseBufferAccount
 }
 
-func newUsageFilterReader(src io.ReadCloser, includeFinalUsage bool) io.ReadCloser {
+func newUsageFilterReader(src io.ReadCloser, includeFinalUsage bool, buffers *responseBufferAccount) io.ReadCloser {
 	return &usageFilterReader{
 		src:               src,
 		reader:            bufio.NewReader(src),
 		includeFinalUsage: includeFinalUsage,
 		maxLineBytes:      maxSSEEventLineBytes,
+		buffers:           buffers,
 	}
 }
 
@@ -51,12 +55,17 @@ func (r *usageFilterReader) Read(p []byte) (int, error) {
 			return 0, errSSEEventLineTooLarge
 		}
 		r.line.Write(fragment)
+		if berr := r.buffers.set(bufferSlotFilter, int64(r.line.Len())); berr != nil {
+			_ = r.src.Close()
+			return 0, berr
+		}
 		if errors.Is(err, bufio.ErrBufferFull) {
 			continue
 		}
 		if r.line.Len() > 0 {
 			r.pending.Write(filterUsageLine(r.line.Bytes(), r.includeFinalUsage))
 			r.line.Reset()
+			_ = r.buffers.set(bufferSlotFilter, 0)
 		}
 		if err != nil {
 			if r.pending.Len() == 0 {

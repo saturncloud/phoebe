@@ -10,8 +10,34 @@ listenPort: 8080
 # the address on the envelope and FAILS CLOSED (refuses, never guesses) when the
 # header is absent or unparseable.
 
-# Long idle timeout: token streams can idle between chunks.
+# How long an idle keep-alive connection stays open BETWEEN requests. It does
+# not bound a request in flight; see protection.streamStallTimeout.
 idleTimeout: "10m"
+
+# Gateway protection: bounds on what any one request can hold in phoebe. They
+# apply to ALL traffic, shared and dedicated, and are set once for the whole
+# gateway (they protect phoebe itself, which every tenant shares). Every key is
+# optional; an absent key uses the default shown. Values must be positive.
+# protection:
+#   # Largest request body phoebe reads, on every route (413 above it).
+#   maxRequestBodyBytes: 67108864
+#   # A single write to the client that makes no progress for this long ends
+#   # the request (a client that stopped reading mid-stream). Streams may still
+#   # idle between chunks for as long as the engine needs.
+#   streamStallTimeout: "2m"
+#   # Longest a request may run, from arrival to its last response byte,
+#   # including any wake hold. With no response headers by then the client
+#   # gets 504; mid-stream the stream is ended.
+#   maxStreamDuration: "60m"
+#   # Response bytes held in memory for inspection (an incomplete SSE line or a
+#   # whole non-streamed body), per request and summed over this replica. Over
+#   # either limit the response is cut. The 16 MiB SSE event-line limit still
+#   # applies inside the per-request value.
+#   maxResponseBufferBytesPerStream: 67108864
+#   maxResponseBufferBytesTotal: 268435456
+#   # Requests to ONE dedicated endpoint this replica holds while the endpoint
+#   # starts from zero; the next gets 503 + Retry-After.
+#   maxDedicatedColdHoldsPerEndpoint: 32
 
 # Durable metering emit (M2). Valkey Streams hot path → local-disk WAL fallback
 # → structured-log floor. Leave valkeyAddr empty to run WAL-only.

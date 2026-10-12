@@ -84,6 +84,14 @@ type captureReader struct {
 	logBuf       *bytes.Buffer
 	logCap       int  // max bytes to retain in logBuf
 	logTruncated bool // true once we hit the cap and stopped appending
+
+	// buffers charges scan's size against the gateway protection limits on
+	// buffered response bytes (per request and per replica). nil = unbounded
+	// (unit tests that build a reader directly).
+	buffers *responseBufferAccount
+	// bufferErr is the limit error once scan outgrew its allowance; every
+	// later Read returns it.
+	bufferErr error
 }
 
 func newCaptureReader(ctx context.Context, src io.ReadCloser, streamed bool, onDone func(capture.Result)) *captureReader {
@@ -144,6 +152,9 @@ func (c *captureReader) appendLog(p []byte) {
 }
 
 func (c *captureReader) Read(p []byte) (int, error) {
+	if c.bufferErr != nil {
+		return 0, c.bufferErr
+	}
 	n, err := c.src.Read(p)
 	if n > 0 {
 		c.firstRead.Do(func() {
@@ -163,6 +174,16 @@ func (c *captureReader) Read(p []byte) (int, error) {
 		// COPY of the forwarded bytes. No-op (nil logBuf) when logging is off,
 		// so the common path is unchanged.
 		c.appendLog(p[:n])
+		// scan now holds the unparsed tail of a stream (normally under one
+		// line) or the whole non-streamed body so far. Past the protection
+		// limit the response is cut: these bytes still reach the client, the
+		// error ends the copy, and the account has cancelled the request so
+		// capture records it as aborted.
+		if berr := c.buffers.set(bufferSlotCapture, int64(c.scan.Len())); berr != nil {
+			c.bufferErr = berr
+			c.scan.Reset()
+			return n, berr
+		}
 	}
 	if err == io.EOF {
 		c.finish()
@@ -305,6 +326,8 @@ func (c *captureReader) finish() {
 	if c.ctx != nil && c.ctx.Err() != nil {
 		c.result.Aborted = true
 	}
+
+	c.buffers.close()
 
 	if c.onDone != nil {
 		c.onDone(c.result)

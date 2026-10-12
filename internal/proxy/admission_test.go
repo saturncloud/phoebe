@@ -97,9 +97,8 @@ func TestSharedRequestBodyBoundariesBeforeAdmission(t *testing.T) {
 
 	newServer := func(a *countingAdmitter) *Server {
 		cfg := proxyAdmissionConfig(2)
-		cfg.Platform.MaxPromptBytes = ptr64(limit)
-		return New(&config.Settings{Admission: cfg}, logging.New(logging.ERROR), &recordingEmitter{}).
-			WithAdmitter(a)
+		return New(&config.Settings{Admission: cfg, Protection: config.ProtectionSettings{MaxRequestBodyBytes: limit}},
+			logging.New(logging.ERROR), &recordingEmitter{}).WithAdmitter(a)
 	}
 
 	t.Run("exact limit reaches admission and upstream", func(t *testing.T) {
@@ -158,12 +157,6 @@ func TestSharedRequestAtExactBodyLimitAdmitsWithRedisAdmitter(t *testing.T) {
 	s.Handler().ServeHTTP(rr, sharedRequestBodyOfSize(t, up, limit))
 	if rr.Code != http.StatusOK || upstreamHits != 1 {
 		t.Fatalf("status=%d upstream=%d, exact original JSON limit must admit", rr.Code, upstreamHits)
-	}
-}
-
-func TestSharedRequestBodyLimitUsesSafeUnlimitedFallback(t *testing.T) {
-	if got := sharedRequestBodyLimit(config.AdmissionSettings{}, config.AdmissionLane{}); got != defaultSharedRequestBodyLimit {
-		t.Fatalf("unlimited fallback=%d, want %d", got, defaultSharedRequestBodyLimit)
 	}
 }
 

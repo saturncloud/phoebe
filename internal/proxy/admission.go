@@ -115,8 +115,6 @@ type admissionEstimate struct {
 	OutputTokens int64
 }
 
-const defaultSharedRequestBodyLimit int64 = 64 << 20
-
 func admissionLaneForIdentity(settings config.AdmissionSettings, id identity.Identity) config.AdmissionLane {
 	laneName := settings.OrganizationLanes[id.OrgID]
 	if laneName == "" {
@@ -129,53 +127,16 @@ func admissionLaneForIdentity(settings config.AdmissionSettings, id identity.Ide
 	return lane
 }
 
-// sharedRequestBodyLimit returns the tightest individual body size that could
-// possibly fit every applicable aggregate prompt-byte scope. R4 sentinel
-// semantics: a nil (unset) dimension is unlimited and does not tighten the
-// bound; neither does an explicit zero cap — no body can fit a zero-capped
-// scope, and admission rejects the request there. Even when every scope is
-// configured as unlimited, retain a process-safety ceiling so an
-// authenticated request cannot force an unbounded io.ReadAll allocation.
-func sharedRequestBodyLimit(settings config.AdmissionSettings, lane config.AdmissionLane) int64 {
-	limit := int64(0)
-	add := func(candidate *int64) {
-		if candidate == nil || *candidate <= 0 {
-			return
-		}
-		if limit == 0 || *candidate < limit {
-			limit = *candidate
-		}
-	}
-	add(settings.Platform.MaxPromptBytes)
-	add(settings.Graph.MaxPromptBytes)
-	add(settings.Organization.MaxPromptBytes)
-	add(settings.OrganizationModel.MaxPromptBytes)
-	if laneBytes := lane.Limits.MaxPromptBytes; laneBytes != nil && *laneBytes > 0 {
-		weighted := *laneBytes
-		weight := lane.Weight
-		if weight < 1 {
-			weight = 1
-		}
-		if weighted <= math.MaxInt64/weight {
-			weighted *= weight
-		}
-		add(&weighted)
-	}
-	if limit == 0 {
-		return defaultSharedRequestBodyLimit
-	}
-	return limit
-}
-
-func boundSharedRequestBody(w http.ResponseWriter, r *http.Request, limit int64) bool {
-	if limit <= 0 {
-		limit = defaultSharedRequestBodyLimit
-	}
+// boundRequestBody enforces the gateway-wide request body ceiling. A declared
+// Content-Length over the limit is refused before any read; a chunked or
+// understated body is cut off by MaxBytesReader at the limit, and the first
+// reader that hits it answers 413 through writeRequestBodyError.
+func boundRequestBody(w http.ResponseWriter, r *http.Request, limit int64) bool {
 	if r.ContentLength > limit {
-		http.Error(w, "shared inference request body too large", http.StatusRequestEntityTooLarge)
+		http.Error(w, "request body too large", http.StatusRequestEntityTooLarge)
 		return false
 	}
-	if r.Body != nil {
+	if r.Body != nil && r.Body != http.NoBody {
 		r.Body = http.MaxBytesReader(w, r.Body, limit)
 	}
 	return true
@@ -184,7 +145,7 @@ func boundSharedRequestBody(w http.ResponseWriter, r *http.Request, limit int64)
 func writeRequestBodyError(w http.ResponseWriter, err error) {
 	var tooLarge *http.MaxBytesError
 	if errors.As(err, &tooLarge) {
-		http.Error(w, "shared inference request body too large", http.StatusRequestEntityTooLarge)
+		http.Error(w, "request body too large", http.StatusRequestEntityTooLarge)
 		return
 	}
 	http.Error(w, "bad request body", http.StatusBadRequest)

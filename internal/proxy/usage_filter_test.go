@@ -17,7 +17,7 @@ func TestUsageFilterRestoresClientStreamShape(t *testing.T) {
 		"data: [DONE]\n\n"
 
 	t.Run("caller omitted usage", func(t *testing.T) {
-		filtered := newUsageFilterReader(io.NopCloser(strings.NewReader(upstream)), false)
+		filtered := newUsageFilterReader(io.NopCloser(strings.NewReader(upstream)), false, nil)
 		got, err := io.ReadAll(filtered)
 		if err != nil {
 			t.Fatal(err)
@@ -32,7 +32,7 @@ func TestUsageFilterRestoresClientStreamShape(t *testing.T) {
 	})
 
 	t.Run("caller requested final usage", func(t *testing.T) {
-		filtered := newUsageFilterReader(io.NopCloser(strings.NewReader(upstream)), true)
+		filtered := newUsageFilterReader(io.NopCloser(strings.NewReader(upstream)), true, nil)
 		got, err := io.ReadAll(filtered)
 		if err != nil {
 			t.Fatal(err)
@@ -78,7 +78,7 @@ func TestUsageFilterFragmentationAndTerminalError(t *testing.T) {
 	input := "data: {\"choices\":[{\"delta\":{\"content\":\"a\"}}],\"usage\":{\"prompt_tokens\":4}}\r\n\r\n" +
 		"data: {\"choices\":[],\"usage\":{\"prompt_tokens\":4}}"
 
-	fragmented := newUsageFilterReader(io.NopCloser(usageOneByteReader{Reader: strings.NewReader(input)}), true)
+	fragmented := newUsageFilterReader(io.NopCloser(usageOneByteReader{Reader: strings.NewReader(input)}), true, nil)
 	var got bytes.Buffer
 	buf := make([]byte, 3)
 	for {
@@ -96,7 +96,7 @@ func TestUsageFilterFragmentationAndTerminalError(t *testing.T) {
 		t.Fatalf("fragmented stream changed shape: %q", text)
 	}
 
-	failing := newUsageFilterReader(io.NopCloser(&dataAndErrorReader{data: []byte("data: {\"choices\":[{}],\"usage\":{}}")}), false)
+	failing := newUsageFilterReader(io.NopCloser(&dataAndErrorReader{data: []byte("data: {\"choices\":[{}],\"usage\":{}}")}), false, nil)
 	got.Reset()
 	_, err := io.Copy(&got, failing)
 	if !errors.Is(err, errUsageStream) {
@@ -108,7 +108,7 @@ func TestUsageFilterFragmentationAndTerminalError(t *testing.T) {
 }
 
 func TestUsageFilterRejectsOversizedEventLine(t *testing.T) {
-	filtered := newUsageFilterReader(io.NopCloser(strings.NewReader("123456789\n")), false).(*usageFilterReader)
+	filtered := newUsageFilterReader(io.NopCloser(strings.NewReader("123456789\n")), false, nil).(*usageFilterReader)
 	filtered.maxLineBytes = 8
 	if _, err := io.ReadAll(filtered); !errors.Is(err, errSSEEventLineTooLarge) {
 		t.Fatalf("oversized event error = %v, want %v", err, errSSEEventLineTooLarge)

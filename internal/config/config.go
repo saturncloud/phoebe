@@ -23,9 +23,17 @@ type Settings struct {
 	// Port the interceptor listens on for inbound (post-Traefik) traffic.
 	ListenPort int `yaml:"listenPort"`
 
-	// IdleTimeout bounds how long an idle streaming connection may stay open.
-	// Token streams can idle between chunks, so this is intentionally long.
+	// IdleTimeout bounds how long an idle keep-alive connection may stay open
+	// BETWEEN requests (http.Server.IdleTimeout). It does not bound a request
+	// in flight: a client that stops reading a stream is ended by
+	// protection.streamStallTimeout instead.
 	IdleTimeoutStr string `yaml:"idleTimeout"`
+
+	// Protection bounds the resources any single request can hold in phoebe.
+	// It applies to ALL traffic, shared and dedicated, and is set once for the
+	// whole gateway (ruling 2026-10-12): it protects phoebe itself, which every
+	// tenant shares, so it is not a per-model or per-tenant setting.
+	Protection ProtectionSettings `yaml:"protection"`
 
 	// Emit configures the durable metering emitter (M2). main.go translates
 	// these into an emit.Config for the same reason.
@@ -63,6 +71,114 @@ type Settings struct {
 	// configDir is the directory the settings file was loaded from; relative
 	// paths in the YAML are resolved against it.
 	configDir string
+}
+
+// ProtectionSettings is the YAML shape for gateway-wide resource bounds. Every
+// field is optional: absent (zero) selects the shipped default below, and a
+// negative value is a startup error. There is deliberately no "off" value —
+// each bound protects the shared process, and the defaults are generous enough
+// that a well-behaved client never meets them.
+type ProtectionSettings struct {
+	// MaxRequestBodyBytes caps every request body phoebe reads, on every route.
+	MaxRequestBodyBytes int64 `yaml:"maxRequestBodyBytes"`
+	// StreamStallTimeoutStr bounds how long one write to the client may make no
+	// progress. A client that stops reading mid-response fills its TCP window
+	// and the write blocks; without this bound the request (and its engine
+	// work, admission lease and buffers) would be held forever.
+	StreamStallTimeoutStr string        `yaml:"streamStallTimeout"`
+	StreamStallTimeout    time.Duration `yaml:"-"`
+	// MaxStreamDurationStr bounds a whole request, from arrival to the last
+	// response byte, including any wake hold.
+	MaxStreamDurationStr string        `yaml:"maxStreamDuration"`
+	MaxStreamDuration    time.Duration `yaml:"-"`
+	// MaxResponseBufferBytesPerStream caps the response bytes phoebe holds in
+	// memory for one request while it inspects them (an incomplete SSE line,
+	// or a whole non-streamed JSON body). The fixed 16 MiB SSE event-line
+	// limit still applies inside it.
+	MaxResponseBufferBytesPerStream int64 `yaml:"maxResponseBufferBytesPerStream"`
+	// MaxResponseBufferBytesTotal caps those bytes summed over every request
+	// in this phoebe replica.
+	MaxResponseBufferBytesTotal int64 `yaml:"maxResponseBufferBytesTotal"`
+	// MaxDedicatedColdHoldsPerEndpoint caps, per phoebe replica, how many
+	// requests to ONE dedicated endpoint may be held while it starts from
+	// zero. The shared tier bounds the same thing with admission's
+	// maxColdHolds; dedicated endpoints have no admission.
+	MaxDedicatedColdHoldsPerEndpoint int64 `yaml:"maxDedicatedColdHoldsPerEndpoint"`
+}
+
+// Shipped protection defaults.
+const (
+	DefaultMaxRequestBodyBytes              int64 = 64 << 20
+	DefaultStreamStallTimeout                     = 2 * time.Minute
+	DefaultMaxStreamDuration                      = 60 * time.Minute
+	DefaultMaxResponseBufferBytesPerStream  int64 = 64 << 20
+	DefaultMaxResponseBufferBytesTotal      int64 = 256 << 20
+	DefaultMaxDedicatedColdHoldsPerEndpoint int64 = 32
+)
+
+// Effective returns the settings with every absent (zero) field replaced by
+// its default. The proxy calls it rather than reading fields directly, so a
+// hand-built Settings (tests, embedders) is protected exactly like a loaded
+// one.
+func (p ProtectionSettings) Effective() ProtectionSettings {
+	if p.MaxRequestBodyBytes <= 0 {
+		p.MaxRequestBodyBytes = DefaultMaxRequestBodyBytes
+	}
+	if p.StreamStallTimeout <= 0 {
+		p.StreamStallTimeout = DefaultStreamStallTimeout
+	}
+	if p.MaxStreamDuration <= 0 {
+		p.MaxStreamDuration = DefaultMaxStreamDuration
+	}
+	if p.MaxResponseBufferBytesPerStream <= 0 {
+		p.MaxResponseBufferBytesPerStream = DefaultMaxResponseBufferBytesPerStream
+	}
+	if p.MaxResponseBufferBytesTotal <= 0 {
+		p.MaxResponseBufferBytesTotal = DefaultMaxResponseBufferBytesTotal
+	}
+	if p.MaxDedicatedColdHoldsPerEndpoint <= 0 {
+		p.MaxDedicatedColdHoldsPerEndpoint = DefaultMaxDedicatedColdHoldsPerEndpoint
+	}
+	return p
+}
+
+func (p *ProtectionSettings) parse() error {
+	for _, item := range []struct {
+		name  string
+		value int64
+	}{
+		{"maxRequestBodyBytes", p.MaxRequestBodyBytes},
+		{"maxResponseBufferBytesPerStream", p.MaxResponseBufferBytesPerStream},
+		{"maxResponseBufferBytesTotal", p.MaxResponseBufferBytesTotal},
+		{"maxDedicatedColdHoldsPerEndpoint", p.MaxDedicatedColdHoldsPerEndpoint},
+	} {
+		if item.value < 0 {
+			return fmt.Errorf("protection.%s cannot be negative", item.name)
+		}
+	}
+	for _, item := range []struct {
+		name string
+		raw  string
+		dst  *time.Duration
+	}{
+		{"streamStallTimeout", p.StreamStallTimeoutStr, &p.StreamStallTimeout},
+		{"maxStreamDuration", p.MaxStreamDurationStr, &p.MaxStreamDuration},
+	} {
+		if item.raw == "" {
+			continue
+		}
+		d, err := time.ParseDuration(item.raw)
+		if err != nil || d <= 0 {
+			return fmt.Errorf("invalid protection.%s %q (a positive duration such as 2m)", item.name, item.raw)
+		}
+		*item.dst = d
+	}
+	eff := p.Effective()
+	if eff.MaxResponseBufferBytesPerStream > eff.MaxResponseBufferBytesTotal {
+		return fmt.Errorf("protection.maxResponseBufferBytesPerStream (%d) cannot exceed maxResponseBufferBytesTotal (%d)",
+			eff.MaxResponseBufferBytesPerStream, eff.MaxResponseBufferBytesTotal)
+	}
+	return nil
 }
 
 // AdmissionLimits is one independently-enforced scope budget. R4 sentinel
@@ -299,6 +415,10 @@ func (s *Settings) parse() error {
 	}
 
 	s.ListenAddr = fmt.Sprintf(":%d", s.ListenPort)
+
+	if err := s.Protection.parse(); err != nil {
+		return err
+	}
 
 	if err := s.IOLog.parse(); err != nil {
 		return err

@@ -283,6 +283,23 @@ func (t *wakeRoundTripper) RoundTrip(req *http.Request) (*http.Response, error) 
 		}
 	}
 
+	if t.target.ServingMode == identity.ServingModeDedicated {
+		// Dedicated endpoints have no admission lease, so the shared tier's
+		// maxColdHolds never applies to them; this per-endpoint cap bounds how
+		// many requests one cold endpoint can park in this replica.
+		release, ok := t.server.dedicatedHolds.acquire(t.target.ResourceID, t.server.protection().MaxDedicatedColdHoldsPerEndpoint)
+		if !ok {
+			_ = resp.Body.Close()
+			t.neverServed = true
+			t.server.log.Warn.Printf("wake: dedicated cold-hold limit reached request_id=%s resource_id=%s",
+				t.requestID, t.target.ResourceID)
+			buf := newBufferingResponseWriter()
+			writeDedicatedColdHoldsFull(buf, t.requestID)
+			return bufferedHTTPResponse(req, buf, true), nil
+		}
+		defer release()
+	}
+
 	ctx := req.Context()
 	if t.server.wakeTimeout > 0 {
 		var cancel context.CancelFunc

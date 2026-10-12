@@ -565,3 +565,31 @@ func TestAdmissionLeaseTTLValidatedOnlyWhenStoreConfigured(t *testing.T) {
 		})
 	}
 }
+
+func TestLoadProtection(t *testing.T) {
+	s, err := Load(writeTemp(t, "protection:\n  maxRequestBodyBytes: 1024\n  streamStallTimeout: 30s\n  maxStreamDuration: 2h\n"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	eff := s.Protection.Effective()
+	if eff.MaxRequestBodyBytes != 1024 || eff.StreamStallTimeout != 30*time.Second || eff.MaxStreamDuration != 2*time.Hour {
+		t.Fatalf("parsed protection = %+v", eff)
+	}
+	if eff.MaxResponseBufferBytesTotal != DefaultMaxResponseBufferBytesTotal {
+		t.Fatalf("absent fields keep their default, got total=%d", eff.MaxResponseBufferBytesTotal)
+	}
+
+	for _, tc := range []struct{ name, yaml string }{
+		{"negative size", "protection:\n  maxRequestBodyBytes: -1\n"},
+		{"negative holds", "protection:\n  maxDedicatedColdHoldsPerEndpoint: -1\n"},
+		{"unparseable duration", "protection:\n  streamStallTimeout: soon\n"},
+		{"zero duration", "protection:\n  maxStreamDuration: 0s\n"},
+		{"per-stream over total", "protection:\n  maxResponseBufferBytesPerStream: 2048\n  maxResponseBufferBytesTotal: 1024\n"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if _, err := Load(writeTemp(t, tc.yaml)); err == nil {
+				t.Fatal("want a startup error")
+			}
+		})
+	}
+}

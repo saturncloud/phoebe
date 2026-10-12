@@ -164,6 +164,11 @@ type Server struct {
 	admissionReleaseFallbackLog, admissionCompletionReleaseLog sampledErrorLog
 	admissionPrefillReleaseLog, admissionUpstreamReleaseLog    sampledErrorLog
 	admissionColdHoldReleaseLog                                sampledErrorLog
+
+	// responseBuffers and dedicatedHolds are the replica-wide state behind the
+	// gateway protection bounds (see protection.go).
+	responseBuffers responseBufferBudget
+	dedicatedHolds  dedicatedColdHolds
 }
 
 func (s *Server) WithAdmitter(a admission.Admitter) *Server { s.admitter = a; return s }
@@ -306,20 +311,28 @@ func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "invalid X-Request-Id", http.StatusBadRequest)
 		return
 	}
-	var sharedLane config.AdmissionLane
-	bodyBound := false
+	// GATEWAY PROTECTION: per-request resource bounds for EVERY route (see
+	// protection.go). The request context is replaced by one this handler can
+	// cancel with a cause: maxStreamDuration ends the request outright, and
+	// the stall guard ends it when the client stops reading. Every consumer
+	// below — the upstream forward, wake holds, admission lease renewal and
+	// the capture reader's abort detection — reads this context.
+	prot := s.protection()
+	ctx, cancel := context.WithCancelCause(r.Context())
+	defer cancel(nil)
+	maxDuration := time.AfterFunc(prot.MaxStreamDuration, func() { cancel(errMaxStreamDuration) })
+	defer maxDuration.Stop()
+	r = r.WithContext(ctx)
+	w = newStallGuardWriter(w, prot.StreamStallTimeout, cancel)
 
-	// Gateway resolution must inspect model=, so apply the shared-inference body
-	// ceiling before that first read. The gateway ForwardAuth has already
-	// stamped the trusted organization. Preserve the existing
-	// fail-closed gateway-not-configured/missing-org responses without reading
-	// a body in those cases.
-	if id.Gateway && s.gateway != nil && id.OrgID != "" {
-		sharedLane = admissionLaneForIdentity(s.settings.Admission, id)
-		if !boundSharedRequestBody(w, r, sharedRequestBodyLimit(s.settings.Admission, sharedLane)) {
-			return
-		}
-		bodyBound = true
+	// One body ceiling for EVERY route — shared,
+	// gateway, header-routed dedicated and control routes alike — installed
+	// before anything reads the body (gateway resolution, model binding, the
+	// usage-preference read and the include_usage rewrite all buffer it
+	// whole). Gateway-wide by ruling: it protects phoebe's own memory, which
+	// every tenant shares.
+	if !boundRequestBody(w, r, prot.MaxRequestBodyBytes) {
+		return
 	}
 
 	// GATEWAY RESOLUTION (TF single-host gateway): a request the trusted
@@ -423,15 +436,6 @@ func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request) {
 		s.log.Error.Printf("refusing %q: %v (resource_id=%q)", identity.HeaderUpstream, err, id.ResourceID)
 		http.Error(w, "no upstream for this request", http.StatusBadGateway)
 		return
-	}
-
-	if id.ServingMode == identity.ServingModeShared {
-		if !bodyBound {
-			sharedLane = admissionLaneForIdentity(s.settings.Admission, id)
-			if !boundSharedRequestBody(w, r, sharedRequestBodyLimit(s.settings.Admission, sharedLane)) {
-				return
-			}
-		}
 	}
 
 	// Resolve the serving graph ONCE, here, so every downstream consumer (the wake
@@ -622,6 +626,7 @@ func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request) {
 	var responseCaptureInstalled atomic.Bool
 	responseCaptureDone := make(chan struct{})
 	if id.ServingMode == identity.ServingModeShared && inferenceRequestPathAllowed(routePath) {
+		sharedLane := admissionLaneForIdentity(s.settings.Admission, id)
 		// Admission's fail-closed checks run whenever an admitter exists (an
 		// admission store is configured) and either admission.enabled requires
 		// the envelope on every shared request, or this request carries any
@@ -926,6 +931,9 @@ func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request) {
 			// be able to drop the emit OR the I/O-log record (a sink that
 			// honours ctx would otherwise lose every aborted request).
 			ctx := context.WithoutCancel(r.Context())
+			if cause := protectionCause(r.Context()); cause != nil {
+				s.log.Warn.Printf("protection: ended response request_id=%s resource_id=%s: %v", requestID, id.ResourceID, cause)
+			}
 			if admitted != nil {
 				kind := classifyCaptureSettlement(res)
 				if wakeNeverServed {
@@ -974,6 +982,8 @@ func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request) {
 		// goroutine racing the body's Close(). On abort, ReverseProxy cancels
 		// this context, so by the time finish() runs ctx.Err() is non-nil.
 		cr = newCaptureReader(r.Context(), resp.Body, streamed, onDone)
+		buffers := s.responseBuffers.newAccount(prot, cancel)
+		cr.buffers = buffers
 		if admitted != nil {
 			// The first response body byte is the observable prefill→decode
 			// boundary. Headers alone can arrive before an engine finishes prefill,
@@ -1002,7 +1012,7 @@ func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request) {
 				"Content-Length", "Content-MD5", "Digest", "Content-Digest", "Repr-Digest", "ETag",
 			}
 			resp.Body = &trailerClearingReadCloser{
-				src:     newUsageFilterReader(cr, clientUsage.includeUsage),
+				src:     newUsageFilterReader(cr, clientUsage.includeUsage, buffers),
 				trailer: resp.Trailer,
 				names:   invalidBodyMetadata,
 			}
@@ -1127,6 +1137,18 @@ func (s *Server) errorHandler(upstream string, id identity.Identity, requestID, 
 			s.emit(context.WithoutCancel(r.Context()), id, requestID, clientRequestID,
 				http.StatusServiceUnavailable, capture.Result{UsageFound: false})
 			s.writeAdmissionError(w, requestID, cause)
+			return
+		}
+		if errors.Is(context.Cause(r.Context()), errMaxStreamDuration) {
+			// protection.maxStreamDuration expired before the upstream sent
+			// response headers. The client is still connected and owed an
+			// answer: this is a gateway timeout, recorded like any other
+			// upstream failure (a zero-token raw row, never an abort).
+			s.log.Warn.Printf("upstream %s sent no response within protection.maxStreamDuration (request_id=%s)", upstream, requestID)
+			w.Header().Set("X-Request-Id", requestID)
+			s.emit(context.WithoutCancel(r.Context()), id, requestID, clientRequestID,
+				http.StatusGatewayTimeout, capture.Result{UpstreamFault: true, UsageFound: false})
+			http.Error(w, "upstream did not respond in time", http.StatusGatewayTimeout)
 			return
 		}
 		if isClientAbort(err) {
