@@ -392,14 +392,6 @@ func makeContractScope(name, id string, limits RateLimits) scope {
 	}
 }
 
-func anyLimit(l config.AdmissionLimits) bool {
-	return l.MaxActiveRequests != nil || l.MaxConcurrentPrefills != nil || l.MaxReservedDecodeSlots != nil ||
-		l.MaxPrefillTokens != nil || l.MaxReservedOutputTokens != nil || l.MaxReservedKVTokens != nil ||
-		l.MaxActiveAdapters != nil || l.RequestsPerWindow != nil || l.TotalPromptTokensPerWindow != nil ||
-		l.UncachedPromptTokensPerWindow != nil || l.GeneratedTokensPerWindow != nil || l.MaxColdHolds != nil ||
-		l.WakesPerWindow != nil
-}
-
 // unsatisfiableSuffix ends the dimension name admitScript returns when one
 // request alone exceeds a contract scope's whole per-window limit.
 const unsatisfiableSuffix = "_exceeds_limit"
@@ -426,7 +418,7 @@ func (a *RedisAdmitter) scopes(r Request) []scope {
 	if t, ok := a.cfg.Lanes[laneName]; ok {
 		out = append(out, makeScope("lane", laneName, scaled(t.Limits, t.Weight)))
 	}
-	if anyLimit(r.GraphCapacity) {
+	if r.GraphCapacity.Any() {
 		out = append(out, makeScope("graph_capacity", r.Graph, r.GraphCapacity))
 	}
 	if r.OrganizationLimits.Any() {

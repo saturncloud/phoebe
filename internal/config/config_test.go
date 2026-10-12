@@ -3,6 +3,7 @@ package config
 import (
 	"os"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"testing"
 	"time"
@@ -618,5 +619,61 @@ func TestLoadRejectsRemovedMaxPromptBytes(t *testing.T) {
 	}
 	if _, err := Load(writeTemp(t, "admission:\n  platform:\n    maxPromptBytes: null\n")); err != nil {
 		t.Fatalf("a null leftover must load: %v", err)
+	}
+}
+
+// TestLimitValuesListsEveryAdmissionLimitField guards the canonical field
+// list: a new *int64 limit on AdmissionLimits that LimitValues misses would
+// silently drop out of lane-share validation and of AdmissionLimits.Any (and
+// so of per-graph capacity enforcement). RemovedMaxPromptBytes is a rename
+// tripwire, not a limit, and is excluded.
+func TestLimitValuesListsEveryAdmissionLimitField(t *testing.T) {
+	var l AdmissionLimits
+	v := reflect.ValueOf(&l).Elem()
+	want := map[*int64]string{}
+	for i := 0; i < v.NumField(); i++ {
+		f := v.Type().Field(i)
+		if f.Type != reflect.TypeOf((*int64)(nil)) || f.Name == "RemovedMaxPromptBytes" {
+			continue
+		}
+		p := new(int64)
+		v.Field(i).Set(reflect.ValueOf(p))
+		want[p] = f.Name
+	}
+	got := LimitValues(l)
+	if len(got) != len(want) {
+		t.Fatalf("LimitValues has %d entries, AdmissionLimits has %d limit fields", len(got), len(want))
+	}
+	for _, p := range got {
+		if _, ok := want[p]; !ok {
+			t.Fatalf("LimitValues returned a pointer that is not a distinct limit field")
+		}
+		delete(want, p)
+	}
+	for _, name := range want {
+		t.Errorf("LimitValues does not list %s", name)
+	}
+}
+
+// TestAdmissionLimitsAnyReportsEachField: Any is true when any single limit
+// field is set (an explicit zero cap included) and false only when all are nil.
+func TestAdmissionLimitsAnyReportsEachField(t *testing.T) {
+	if (AdmissionLimits{}).Any() {
+		t.Fatal("empty limits must report no limit")
+	}
+	if (AdmissionLimits{RemovedMaxPromptBytes: new(int64)}).Any() {
+		t.Fatal("the removed maxPromptBytes tripwire is not a limit")
+	}
+	v := reflect.ValueOf(AdmissionLimits{})
+	for i := 0; i < v.NumField(); i++ {
+		f := v.Type().Field(i)
+		if f.Type != reflect.TypeOf((*int64)(nil)) || f.Name == "RemovedMaxPromptBytes" {
+			continue
+		}
+		var l AdmissionLimits
+		reflect.ValueOf(&l).Elem().Field(i).Set(reflect.ValueOf(new(int64)))
+		if !l.Any() {
+			t.Errorf("Any() false with only %s set", f.Name)
+		}
 	}
 }

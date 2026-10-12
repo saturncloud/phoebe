@@ -605,11 +605,25 @@ func (s *Settings) EffectiveAdmission() (AdmissionSettings, bool) {
 	return cfg, true
 }
 
-func limitValues(l AdmissionLimits) []*int64 {
+// LimitValues is the one canonical list of AdmissionLimits limit fields, in a
+// fixed order. Every caller that walks the limit fields (lane-share
+// validation, Any) goes through it, so a new limit field is added here once.
+func LimitValues(l AdmissionLimits) []*int64 {
 	return []*int64{l.MaxActiveRequests, l.MaxConcurrentPrefills, l.MaxReservedDecodeSlots, l.MaxPrefillTokens,
 		l.MaxReservedOutputTokens, l.MaxReservedKVTokens, l.MaxActiveAdapters, l.RequestsPerWindow,
 		l.TotalPromptTokensPerWindow, l.UncachedPromptTokensPerWindow,
 		l.GeneratedTokensPerWindow, l.MaxColdHolds, l.WakesPerWindow}
+}
+
+// Any reports whether at least one limit field is set (nil means unlimited;
+// an explicit zero cap counts as set).
+func (l AdmissionLimits) Any() bool {
+	for _, v := range LimitValues(l) {
+		if v != nil {
+			return true
+		}
+	}
+	return false
 }
 
 func (a *AdmissionSettings) validateLaneShares() error {
@@ -617,10 +631,10 @@ func (a *AdmissionSettings) validateLaneShares() error {
 		"maxReservedOutputTokens", "maxReservedKvTokens", "maxActiveAdapters", "requestsPerWindow",
 		"totalPromptTokensPerWindow", "uncachedPromptTokensPerWindow",
 		"generatedTokensPerWindow", "maxColdHolds", "wakesPerWindow"}
-	platform := limitValues(a.Platform)
+	platform := LimitValues(a.Platform)
 	sums := make([]int64, len(platform))
 	for laneName, lane := range a.Lanes {
-		for i, v := range limitValues(lane.Limits) {
+		for i, v := range LimitValues(lane.Limits) {
 			if platform[i] != nil && *platform[i] > 0 && v == nil {
 				return fmt.Errorf("admission.lanes.%s.%s must be set when the platform limit is set", laneName, names[i])
 			}
