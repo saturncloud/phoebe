@@ -336,7 +336,16 @@ func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request) {
 	// usage-preference read and the include_usage rewrite all buffer it
 	// whole). Gateway-wide by ruling: it protects phoebe's own memory, which
 	// every tenant shares.
-	if !boundRequestBody(w, r, prot.MaxRequestBodyBytes) {
+	//
+	// The one exception keeps the existing fail-closed answers on the gateway
+	// path: a gateway-marked request when gateway resolution is not
+	// configured (503) or when the trusted org is missing (403) gets that
+	// answer, not a 413, so a broken gateway or ForwardAuth is reported as
+	// what it is. resolveGateway (and the route and preflight checks before
+	// it) never read the body in either case, so leaving it unbounded there
+	// is safe. Every other request is bounded here before anything reads it.
+	gatewayFailsClosed := id.Gateway && (s.gateway == nil || id.OrgID == "")
+	if !gatewayFailsClosed && !boundRequestBody(w, r, prot.MaxRequestBodyBytes) {
 		return
 	}
 
