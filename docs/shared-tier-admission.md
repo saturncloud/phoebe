@@ -267,6 +267,36 @@ requires a non-empty trusted organization ID and rejects a broken identity
 contract before the Valkey fail-open boundary. Gateway registry entries must
 resolve with `serving_mode: shared`; empty or dedicated entries fail closed.
 
+Rolling back across the versioned lease keys needs one extra step. The
+release that adds the prefill-token and kv counters writes its leases under
+`{<keyPrefix>}:leases:v2` and `{<keyPrefix>}:expiries:v2`, and it also reaps
+expired leases from the previous release's `{<keyPrefix>}:leases` and
+`{<keyPrefix>}:expiries`. That makes a forward rolling deploy safe: no lease
+counter is stranded. The previous release reads only its own keys and never
+reaps the versioned ones. After a rollback, any versioned lease that was still
+held when its replica stopped (a crash, an OOM kill, or termination before the
+in-flight request finished) is never released. Its `active`, `prefills`,
+`reserved_decode_slots`, `kv`, and `prefill_tokens` counters stay incremented
+in the shared `{<keyPrefix>}:counters` hash, and the graph and lane capacity
+scopes under-admit with 503 until something releases them. Replicas that drain
+cleanly release their own leases, so the counters are only stranded for leases
+that were in flight when a replica died.
+
+After a rollback, check whether `{<keyPrefix>}:leases:v2` is empty (`HLEN`).
+If it is not, do one of the following:
+
+- Redeploy the newer release. Its reaper releases every expired versioned
+  lease within one `leaseTtl`, and nothing else is needed.
+- Stay on the older release and, once it is fully rolled out, delete
+  `{<keyPrefix>}:counters`, `{<keyPrefix>}:leases:v2`,
+  `{<keyPrefix>}:expiries:v2`, and `{<keyPrefix>}:window-expiries` together.
+  Delete the versioned lease keys along with the counters. Otherwise a later
+  forward deploy would reap those leases and subtract them from counters that
+  no longer include them. Deleting the counters hash also resets every
+  contract window and briefly under-counts requests that are in flight at that
+  moment. Both effects only loosen the soft fairness limits (ruling R2) and do
+  not affect billing.
+
 ## Enforcement boundaries
 
 Fairness is deliberately layered instead of pretending one counter is an exact

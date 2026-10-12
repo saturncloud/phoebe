@@ -4,7 +4,9 @@ import "github.com/redis/go-redis/v9"
 
 // The counter store is intentionally compact: every operation is one Lua
 // transaction over six keys in one Redis Cluster slot (KEYS[5]/KEYS[6] are
-// the previous release's lease keys, only ever reaped). Expired lease and
+// the previous release's lease keys, only ever reaped; the previous release
+// never reaps ours, so a rollback needs the operator step in
+// docs/shared-tier-admission.md, "Rollout and rollback"). Expired lease and
 // fixed-window reaping occurs before every mutation, so replica death cannot
 // leak reservations past leaseTtl and retired dynamic scopes cannot grow the
 // counters hash forever.

@@ -171,6 +171,10 @@ type RedisAdmitter struct {
 	// release (and so strand the counters of) a new-format lease. The new
 	// reaper drains expired leases from the legacy keys, so a lease an old
 	// replica wrote is still released if that replica dies mid-request.
+	// The reverse does not hold: after a rollback no replica reads the
+	// versioned keys, so a versioned lease whose replica died holds its
+	// counters until this release is redeployed or an operator flushes the
+	// admission keys (docs/shared-tier-admission.md, "Rollout and rollback").
 	legacyLeases, legacyExpiries string
 }
 
