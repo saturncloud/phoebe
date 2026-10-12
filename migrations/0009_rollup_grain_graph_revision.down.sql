@@ -2,6 +2,10 @@
 -- graph or revision cannot both survive the narrower key. Keep one per old-grain key
 -- (development databases only; see migrations/README.md), then restore the 0007 key,
 -- ids and the nullable evidence graph.
+--
+-- Roll the code back first: deploy the pre-0009 rater and token-push before running
+-- this, then re-rate (`rater --since ... --until ...`) and re-push the hours whose
+-- rows were deleted here. See "Rollout order for migration 0009" in the README.
 DELETE FROM rated_usage ru
 USING rated_usage keep
 WHERE ru.auth_id = keep.auth_id

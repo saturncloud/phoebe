@@ -29,12 +29,24 @@
 -- constraint, and it can write graph_k8s_name NULL, which now violates NOT NULL.
 -- Either error rolls back the whole RateWindow transaction, so the failure is
 -- closed and nothing is written; the new rater re-rates the window on its next
--- run. Order: suspend the rater CronJob (and token-push if desired) or let any
--- in-flight run finish, run cmd/migrate up, deploy the new rater/drainer/token-push
--- images, then resume. If the gap was longer than the rater's trailing re-rate
--- window, run `rater --since <gap start> --until <current hour start>` and then
--- token-push over the same range. See "Rollout order for migration 0009" in
--- migrations/README.md.
+-- run. Order:
+--   1. suspend the rater CronJob (and token-push), or let any in-flight run
+--      finish;
+--   2. run cmd/migrate up (0008 and 0009);
+--   3. deploy the new drainer, interceptor and rater images;
+--   4. deploy the saturn-aws-manager release whose TokenRollupSchema accepts
+--      graph_k8s_name, topology_revision, region and request_count BEFORE the
+--      new token-push image (the old manager rejects the new keys with a 400);
+--   5. resume the rater (and token-push).
+-- If the gap was longer than the rater's trailing re-rate window, run
+-- `rater --since <gap start> --until <current hour start>` and then token-push
+-- over the same range.
+--
+-- Rollback: the down migration is LOSSY (rollups that differ only in graph or
+-- revision collapse to one row per 0007 key; the others are deleted). Roll the
+-- code back before the schema: deploy the pre-0009 rater and token-push, then
+-- run migrate down, then re-rate and re-push the affected hours. Pre-production
+-- only. See "Rollout order for migration 0009" in migrations/README.md.
 
 ALTER TABLE rated_usage ADD COLUMN topology_revision INTEGER NOT NULL DEFAULT 0;
 ALTER TABLE rated_usage ADD COLUMN region VARCHAR(64);
