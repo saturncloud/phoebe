@@ -94,7 +94,10 @@ type ProtectionSettings struct {
 	// MaxResponseBufferBytesPerStream caps the response bytes phoebe holds in
 	// memory for one request while it inspects them (an incomplete SSE line,
 	// or a whole non-streamed JSON body). The fixed 16 MiB SSE event-line
-	// limit still applies inside it.
+	// limit still applies inside it. While an SSE line is being assembled it
+	// is held twice, once in the capture buffer and once in the usage
+	// filter, and both copies count; a value below 32 MiB therefore cuts
+	// lines shorter than the 16 MiB event-line limit.
 	MaxResponseBufferBytesPerStream int64 `yaml:"maxResponseBufferBytesPerStream"`
 	// MaxResponseBufferBytesTotal caps those bytes summed over every request
 	// in this phoebe replica.

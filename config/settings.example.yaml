@@ -32,7 +32,9 @@ idleTimeout: "10m"
 #   # Response bytes held in memory for inspection (an incomplete SSE line or a
 #   # whole non-streamed body), per request and summed over this replica. Over
 #   # either limit the response is cut. The 16 MiB SSE event-line limit still
-#   # applies inside the per-request value.
+#   # applies inside the per-request value. An SSE line being assembled is
+#   # held twice (capture buffer and usage filter) and both copies count, so
+#   # a per-request value below 32 MiB cuts lines shorter than 16 MiB.
 #   maxResponseBufferBytesPerStream: 67108864
 #   maxResponseBufferBytesTotal: 268435456
 #   # Requests to ONE dedicated endpoint this replica holds while the endpoint
