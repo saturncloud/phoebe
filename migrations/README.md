@@ -191,6 +191,28 @@ together. Roll out in this order:
    for the same reason as 0007.
 
 The migration header (`0009_rollup_grain_graph_revision.up.sql`) points here.
+The order relative to saturn-aws-manager is in the next section.
+
+### Rollout order for migration 0009 and the token-push wire change
+
+The same release also changes what token-push sends. Every rollup on the wire
+now carries three new keys: `topology_revision`, `region` and `request_count`
+(next to `graph_k8s_name`, which is now always sent). saturn-aws-manager's
+`TokenRollupSchema` is a marshmallow schema with the default `unknown=RAISE`, so
+a manager that does not know these keys rejects the whole window POST with a
+400. Roll out in this order:
+
+1. Deploy saturn-aws-manager first, using the release whose `TokenRollupSchema`
+   accepts `graph_k8s_name`, `topology_revision`, `region` and `request_count`
+   (each with a `load_default`, so the old phoebe's payload still loads). The
+   current manager `main` rejects unknown keys with a 400 (marshmallow RAISE).
+2. Then suspend the rater and token-push CronJobs, run `cmd/migrate up` (0008
+   and 0009), deploy the new interceptor, drainer, rater and token-push images,
+   and resume the CronJobs.
+3. If token-push ran against an old manager, each window was rejected with a 400
+   and nothing was written for it. The next run retries automatically, but only
+   within its trailing window (24h by default). For any older hour, run
+   `token-push --since <first failed hour> --until <start of the current hour>`.
 
 ## Local dev
 
