@@ -312,7 +312,7 @@ WITH ev AS (
         -- 0007 rewrote pre-cutover NULL/'' to 'dedicated', and the drainer maps an
         -- absent key to 'dedicated', so a NULL, '' or other value that reaches
         -- this point is a missed backfill or a post-cutover producer bug. The
-        -- event is withheld from money per event (see grouped's WHERE) and
+        -- event is withheld from money per event (see billable's WHERE) and
         -- counted as invalid_serving_mode_events.
         -- billing_event keeps the raw row; nothing here rewrites evidence.
         COALESCE(serving_mode IN ('shared', 'dedicated'), false) AS valid_serving_mode,
@@ -321,7 +321,7 @@ WITH ev AS (
         -- DISTINCT 'shared:'||base_model row; dedicated keys on the bare base_model
         -- (the price-key grammar is unchanged: dedicated rows carry no prefix). An
         -- invalid serving mode also lands on the bare key here, but it never reaches
-        -- money: grouped drops it first. The (b) derived and (c) plain-base joins
+        -- money: billable drops it first. The (b) derived and (c) plain-base joins
         -- below key on THIS, so shared and dedicated of the same base resolve to
         -- independent rate rows.
         CASE WHEN serving_mode = 'shared' THEN 'shared:' || base_model ELSE base_model END
@@ -350,8 +350,8 @@ WITH ev AS (
             WHEN COALESCE(group_id, '') <> '' THEN group_id
             ELSE ''
         END AS owner_id,
-        -- owner_conflict: both a user AND a group on one event. Carried so the grouped
-        -- gate below can withhold the whole rollup rather than bill a guessed owner.
+        -- owner_conflict: both a user AND a group on one event. Carried so billable
+        -- below can drop that one event rather than bill a guessed owner.
         (COALESCE(user_id, '') <> '' AND COALESCE(group_id, '') <> '') AS owner_conflict,
         -- graph_k8s_name and topology_revision: the DynamoGraphDeployment that served
         -- the request (the cost centre) and the Atlas topology revision it ran (its
@@ -389,9 +389,9 @@ resolved AS (
         ev.org_id,
         ev.model_id,
         ev.base_model,
-        -- serving_mode: a GRAIN key column from here on (see the grouped GROUP BY).
+        -- serving_mode: a GRAIN key column from here on (see the grouped_raw GROUP BY).
         -- Carried verbatim, not defaulted: an event without a valid serving mode is
-        -- dropped in grouped's WHERE, so every row that reaches a rollup carries
+        -- dropped in billable's WHERE, so every row that reaches a rollup carries
         -- 'shared' or 'dedicated' and the key column is never NULL (UNIQUE treats
         -- NULLs as distinct, so a NULL key column would let one logical rollup be
         -- written twice and double-bill; the rated_usage CHECK also forbids it).
@@ -467,92 +467,13 @@ resolved AS (
        AND rp.model_id IS NULL
        AND NOT (ev.model_id LIKE $3 OR ev.adapter IS NOT NULL)
 ),
--- grouped: the per-(auth_id, resource_id, model_id, hour) rollup BEFORE the
--- single-rate gate.
--- A rollup stores ONE applied-rate triple, so every priced row in it must have
--- resolved to the SAME rate. Rows that priced through base_model (via_derived or
--- via_base) can violate that two ways, both stamped ambiguous_base:
---   - >1 DISTINCT base_model among them: for an ft: id that is the E3 ft-uniqueness
---     violation (a globally-unique uuid4 checkpoint id can't carry two bases); for
---     an endpoint-name model_id it is the same hazard via C4 (e.g. an endpoint name
---     reused across deployments with different bases inside one window). Either
---     way the rates differ and a blind MIN()-applied-rate would silently bill the
---     rollup at the CHEAPER base — under-billing, counted as rated.
---   - BOTH paths present (some rows derived, some plain-base — the adapter header
---     flapping on one endpoint name): premium and no-premium rates differ even on a
---     SINGLE base_model, and MIN() would again silently pick the cheaper.
--- Both are base_model/adapter PROPAGATION violations: they must SCREAM, not
--- silently pick a rate. Ambiguous rollups are split out below (counted as an
--- anomaly, never upserted). Direct-priced (via model_id) rows never trip the gate —
--- their base_model/adapter never affected their rate.
-grouped AS (
-    SELECT
-        auth_id,
-        resource_id,
-        model_id,
-        -- GRAIN KEY: shared and dedicated price from different SKUs, so they must never
-        -- merge into one rollup (a merge would let MIN() below apply the cheaper rate
-        -- to both). Always 'shared' or 'dedicated' here (see the WHERE below).
-        serving_mode,
-        -- GRAIN KEYS: the owner pair, so charges are presentable per person/team as
-        -- well as per API key. '' / '' means the producer supplied no owner.
-        owner_type,
-        owner_id,
-        -- GRAIN KEYS since 0009: the serving graph and its topology revision (see ev).
-        graph_k8s_name,
-        topology_revision,
+-- billable: the events that may enter money, filtered ONCE so the rollup (grouped_raw)
+-- and the attribution gates (gate) read EXACTLY the same rows. Every filter is per
+-- event, never a group-level gate (see each one).
+billable AS (
+    SELECT *,
         -- Session-TZ-independent hour bucket; see the statement comment.
-        date_trunc('hour', ev_ts AT TIME ZONE 'UTC') AT TIME ZONE 'UTC'                     AS window_start,
-        date_trunc('hour', ev_ts AT TIME ZONE 'UTC') AT TIME ZONE 'UTC' + interval '1 hour' AS window_end,
-        SUM(prompt_tokens)::bigint                       AS prompt_tokens,
-        SUM(cached_tokens)::bigint                       AS cached_tokens,
-        SUM(completion_tokens)::bigint                   AS completion_tokens,
-        SUM(billable_prompt)::bigint                     AS billable_prompt_tokens,
-        -- THE MONEY: per-event cost summed in SQL. NUMERIC throughout, no float.
-        SUM(
-            billable_prompt   * prompt_price
-          + cached_tokens     * cached_price
-          + completion_tokens * completion_price
-        )                                                AS cost,
-        -- The applied per-token rates frozen onto the row. A rollup is single-model and
-        -- (by the single-rate gate enforced below) single base-and-path, so all
-        -- rows share ONE rate; MIN picks it deterministically. The ambiguous_base guard
-        -- guarantees MIN is not silently masking a second, different rate.
-        MIN(prompt_price)                                AS applied_prompt_rate,
-        MIN(cached_price)                                AS applied_cached_rate,
-        MIN(completion_price)                            AS applied_completion_rate,
-        COUNT(*)::bigint                                 AS event_count,
-        -- org_id carried onto the rollup via MAX (NOT a GROUP BY key — org is a function
-        -- of resource_id, so it must never split a rollup). MAX ignores NULLs, so a
-        -- deployment that metered some events before its org header was wired and some
-        -- after collapses to the one non-NULL org (a partial-NULL is NOT ambiguity). The
-        -- result is NULL only if EVERY event in the rollup lacked org — then push holds
-        -- + screams the rollup, never bills a guessed org. The ambiguous_org guard below
-        -- guarantees MAX is not silently masking a SECOND, distinct non-NULL org.
-        MAX(org_id)                                      AS org_id,
-        -- THE SINGLE-RATE GATE (see the grouped comment): among rows whose rate came
-        -- from base_model (derived OR plain-base), >1 distinct base_model — or a MIX
-        -- of the two paths (premium vs no-premium on one endpoint name) — means more
-        -- than one rate in the rollup → ambiguous. Rows priced directly on model_id
-        -- never affect it.
-        (COUNT(DISTINCT base_model) FILTER (WHERE via_derived OR via_base) > 1
-         OR (bool_or(via_derived) AND bool_or(via_base)))          AS ambiguous_base,
-        -- > 1 distinct NON-NULL org_id for one (auth, resource, model, hour) rollup →
-        -- ambiguous org. Org is a deployment property, so a resource resolving to two
-        -- distinct orgs in one window is an attribution PROPAGATION bug (Atlas injected
-        -- conflicting org labels). A blind MAX(org_id) would silently bill the whole
-        -- rollup to ONE of them — mis-attribution counted as rated. So ambiguous-org
-        -- rollups are split out (counted as an anomaly, never upserted), exactly like
-        -- ambiguous_base. A partial-NULL (one real org + missing-header rows) is NOT
-        -- ambiguous (DISTINCT over non-NULLs is 1).
-        COUNT(DISTINCT org_id) > 1 AS ambiguous_org,
-        -- region carried via MAX: one revision names one cluster, so every event of a
-        -- rollup with a known revision carries the same region. NULL when no event
-        -- carried one (unknown, never withholds money).
-        -- NOTE: there is deliberately NO owner_conflict aggregate here. Conflicted
-        -- events are dropped by the WHERE below, per event, so none survives to be
-        -- aggregated -- see the comment there for why a group-level gate was wrong.
-        MAX(region)                                      AS region
+        date_trunc('hour', ev_ts AT TIME ZONE 'UTC') AT TIME ZONE 'UTC' AS window_start
     FROM resolved
     WHERE usage_found                       -- authoritative engine counts only
       AND valid_usage                       -- malformed legacy evidence never enters money
@@ -578,12 +499,141 @@ grouped AS (
       -- so an event without a legal one has no rollup it can correctly join, and a
       -- group-level gate would withhold innocent neighbours. Counted below.
       AND valid_serving_mode
+),
+-- gate: the attribution gates and the org, computed over the IDENTITY the rollup had
+-- before 0009 -- (auth_id, owner_type, owner_id, resource_id, model_id, serving_mode,
+-- hour) -- and so spanning EVERY graph and topology revision of that identity in the
+-- hour. 0009 split a rollup by graph and revision for margin reporting, but who is
+-- billed and at what rate are properties of the deployment, not of the graph
+-- revision that served it. Computing them per (graph, revision) sub-rollup would
+-- (a) stop detecting a resource that resolves to two orgs or two rates across a graph
+-- or revision boundary (each sub-rollup sees one value, so both bill), and (b) give an
+-- org-less sub-rollup (events from before the org header, which also predate the
+-- revision stamp) a NULL org that push withholds for the whole hour, on every re-rate.
+-- Each sub-rollup inherits its identity's org and flags, so the event-count partition
+-- below still holds. (COUNT(DISTINCT) is not allowed as a window function, so this is
+-- a separate grouped CTE joined back, not an OVER clause.)
+--
+-- A rollup stores ONE applied-rate triple, so every priced row of the identity must
+-- have resolved to the SAME rate. Rows that priced through base_model (via_derived or
+-- via_base) can violate that two ways, both stamped ambiguous_base:
+--   - >1 DISTINCT base_model among them: for an ft: id that is the E3 ft-uniqueness
+--     violation (a globally-unique uuid4 checkpoint id can't carry two bases); for
+--     an endpoint-name model_id it is the same hazard via C4 (e.g. an endpoint name
+--     reused across deployments with different bases inside one window). Either
+--     way the rates differ and a blind MIN()-applied-rate would silently bill the
+--     rollup at the CHEAPER base — under-billing, counted as rated.
+--   - BOTH paths present (some rows derived, some plain-base — the adapter header
+--     flapping on one endpoint name): premium and no-premium rates differ even on a
+--     SINGLE base_model, and MIN() would again silently pick the cheaper.
+-- Both are base_model/adapter PROPAGATION violations: they must SCREAM, not
+-- silently pick a rate. Ambiguous rollups are split out below (counted as an
+-- anomaly, never upserted). Direct-priced (via model_id) rows never trip the gate —
+-- their base_model/adapter never affected their rate.
+gate AS (
+    SELECT
+        auth_id, owner_type, owner_id, resource_id, model_id, serving_mode, window_start,
+        -- org_id carried onto the rollup via MAX (NOT a grain key — org is a function
+        -- of resource_id, so it must never split a rollup). Resolved per identity, so
+        -- it spans graph and revision. MAX ignores NULLs, so a deployment that metered
+        -- some events before its org header was wired and some after collapses to the
+        -- one non-NULL org (a partial-NULL is NOT ambiguity), even when the two groups
+        -- of events fall in different graph revisions. The result is NULL only if EVERY
+        -- event of the identity lacked org — then push holds + screams the rollup,
+        -- never bills a guessed org. The ambiguous_org guard below guarantees MAX is
+        -- not silently masking a SECOND, distinct non-NULL org.
+        MAX(org_id)                                      AS org_id,
+        -- THE SINGLE-RATE GATE (see the gate comment): among rows whose rate came
+        -- from base_model (derived OR plain-base), >1 distinct base_model — or a MIX
+        -- of the two paths (premium vs no-premium on one endpoint name) — means more
+        -- than one rate for the identity → ambiguous. Rows priced directly on
+        -- model_id never affect it.
+        (COUNT(DISTINCT base_model) FILTER (WHERE via_derived OR via_base) > 1
+         OR (bool_or(via_derived) AND bool_or(via_base)))          AS ambiguous_base,
+        -- > 1 distinct NON-NULL org_id for one identity in one hour → ambiguous org.
+        -- Org is a deployment property, so a resource resolving to two distinct orgs
+        -- in one window is an attribution PROPAGATION bug (Atlas injected conflicting
+        -- org labels), whether or not the two orgs sit in different graph revisions.
+        -- A blind MAX(org_id) would silently bill the whole rollup to ONE of them —
+        -- mis-attribution counted as rated. So ambiguous-org rollups are split out
+        -- (counted as an anomaly, never upserted), exactly like ambiguous_base. A
+        -- partial-NULL (one real org + missing-header rows) is NOT ambiguous
+        -- (DISTINCT over non-NULLs is 1).
+        COUNT(DISTINCT org_id) > 1 AS ambiguous_org
+    FROM billable
+    GROUP BY auth_id, owner_type, owner_id, resource_id, model_id, serving_mode, window_start
+),
+-- grouped_raw: the per-(auth_id, owner, resource_id, model_id, serving_mode, graph,
+-- revision, hour) rollup, before the gates are attached.
+grouped_raw AS (
+    SELECT
+        auth_id,
+        resource_id,
+        model_id,
+        -- GRAIN KEY: shared and dedicated price from different SKUs, so they must never
+        -- merge into one rollup (a merge would let MIN() below apply the cheaper rate
+        -- to both). Always 'shared' or 'dedicated' here (see billable's WHERE).
+        serving_mode,
+        -- GRAIN KEYS: the owner pair, so charges are presentable per person/team as
+        -- well as per API key. '' / '' means the producer supplied no owner.
+        owner_type,
+        owner_id,
+        -- GRAIN KEYS since 0009: the serving graph and its topology revision (see ev).
+        graph_k8s_name,
+        topology_revision,
+        window_start,
+        window_start + interval '1 hour'                 AS window_end,
+        SUM(prompt_tokens)::bigint                       AS prompt_tokens,
+        SUM(cached_tokens)::bigint                       AS cached_tokens,
+        SUM(completion_tokens)::bigint                   AS completion_tokens,
+        SUM(billable_prompt)::bigint                     AS billable_prompt_tokens,
+        -- THE MONEY: per-event cost summed in SQL. NUMERIC throughout, no float.
+        SUM(
+            billable_prompt   * prompt_price
+          + cached_tokens     * cached_price
+          + completion_tokens * completion_price
+        )                                                AS cost,
+        -- The applied per-token rates frozen onto the row. A rollup is single-model and
+        -- (by the single-rate gate, enforced over its whole identity) single
+        -- base-and-path, so all rows share ONE rate; MIN picks it deterministically.
+        -- The ambiguous_base guard guarantees MIN is not silently masking a second,
+        -- different rate.
+        MIN(prompt_price)                                AS applied_prompt_rate,
+        MIN(cached_price)                                AS applied_cached_rate,
+        MIN(completion_price)                            AS applied_completion_rate,
+        COUNT(*)::bigint                                 AS event_count,
+        -- region is the serving cluster's region as Atlas published it in the graph's
+        -- ConfigMap. It is operator-editable (a cluster region relabel, a display-region
+        -- fix), so it can change inside one topology revision without a revision bump.
+        -- When the events of a rollup disagree, the column is set to NULL instead of
+        -- guessing one of them: a rollup whose region is unknown must not look like it
+        -- has a known region. COUNT(DISTINCT) ignores NULLs, so a rollup with some NULL
+        -- regions and one known region resolves to that known region. NULL never
+        -- withholds money.
+        -- NOTE: there is deliberately NO owner_conflict aggregate here. Conflicted
+        -- events are dropped by billable's WHERE, per event, so none survives to be
+        -- aggregated -- see the comment there for why a group-level gate was wrong.
+        CASE WHEN COUNT(DISTINCT region) > 1 THEN NULL ELSE MAX(region) END AS region
+    FROM billable
     GROUP BY auth_id, owner_type, owner_id, resource_id, model_id, serving_mode,
-             graph_k8s_name, topology_revision,
-             date_trunc('hour', ev_ts AT TIME ZONE 'UTC') AT TIME ZONE 'UTC'
+             graph_k8s_name, topology_revision, window_start
+),
+-- grouped: each rollup with its identity's org and gates attached (see gate). The
+-- join keys are never NULL here (billable guarantees it), so no rollup is dropped.
+grouped AS (
+    SELECT r.*, g.org_id, g.ambiguous_base, g.ambiguous_org
+    FROM grouped_raw r
+    JOIN gate g
+      ON  g.auth_id      = r.auth_id
+      AND g.owner_type   = r.owner_type
+      AND g.owner_id     = r.owner_id
+      AND g.resource_id  = r.resource_id
+      AND g.model_id     = r.model_id
+      AND g.serving_mode = r.serving_mode
+      AND g.window_start = r.window_start
 ),
 -- owner_conflict is NOT a gate here: conflicted events never reach grouped (they are
--- dropped per event in its WHERE), so there is no group left to filter.
+-- dropped per event in billable's WHERE), so there is no group left to filter.
 priced AS (
     SELECT * FROM grouped
     WHERE NOT ambiguous_base AND NOT ambiguous_org
@@ -695,8 +745,10 @@ upserted AS (
         -- above already withholds + screams, so it never reaches this UPDATE.
         org_id                  = COALESCE(EXCLUDED.org_id, rated_usage.org_id),
         -- graph_k8s_name and topology_revision are key columns since 0009, so a
-        -- conflict means they are equal; nothing to refresh. region is a function of
-        -- the revision; refreshed like the other carried values.
+        -- conflict means they are equal; nothing to refresh. region is a PLAIN
+        -- overwrite, NOT org_id's COALESCE: a re-rate whose events now disagree on the
+        -- region, or no longer carry one, must replace a stored region with NULL
+        -- rather than keep a stale or guessed value (see grouped_raw's region).
         region                  = EXCLUDED.region,
         window_end              = EXCLUDED.window_end,
         prompt_tokens           = EXCLUDED.prompt_tokens,
@@ -773,7 +825,7 @@ SELECT
       WHERE usage_found AND NOT valid_usage)                           AS invalid_usage_events,
     -- AMBIGUOUS-BASE events: the EVENT count under ambiguous rollups (a single
     -- model_id whose base_model-priced rows carried >1 rate in one window — >1
-    -- distinct base_model, or mixed premium/plain-base pricing; see the grouped
+    -- distinct base_model, or mixed premium/plain-base pricing; see the gate
     -- comment). These rollups are NOT upserted (excluded from priced),
     -- so their events are neither rated nor $0-billed; they are counted here, from the
     -- SAME snapshot, and drive the fail-loud exit. SUM(event_count) (not COUNT(*) of

@@ -196,7 +196,18 @@ func TestRateWindowSQL_Shape(t *testing.T) {
 		"ON CONFLICT (auth_id, owner_type, owner_id, resource_id, model_id, serving_mode,\n                 graph_k8s_name, topology_revision, window_start) DO UPDATE SET",
 		"|| '|' || length(graph_k8s_name)::text || ':' || graph_k8s_name\n          || '|' || topology_revision::text",
 		"            AND p.graph_k8s_name = ru.graph_k8s_name\n            AND p.topology_revision = ru.topology_revision",
-		"             graph_k8s_name, topology_revision,\n             date_trunc('hour', ev_ts AT TIME ZONE 'UTC') AT TIME ZONE 'UTC'\n),",
+		"    GROUP BY auth_id, owner_type, owner_id, resource_id, model_id, serving_mode,\n             graph_k8s_name, topology_revision, window_start\n),",
+		// THE GATES SPAN EVERY GRAPH REVISION of the pre-0009 identity: org, the
+		// single-rate gate and the org gate are computed by `gate`, grouped WITHOUT graph
+		// and revision, and joined onto every (graph, revision) sub-rollup. Computing them
+		// per sub-rollup would bill a two-org or two-rate resource split across a revision
+		// boundary, and would give an org-less pre-rollout sub-rollup a NULL org.
+		"gate AS (\n    SELECT\n        auth_id, owner_type, owner_id, resource_id, model_id, serving_mode, window_start,",
+		"    FROM billable\n    GROUP BY auth_id, owner_type, owner_id, resource_id, model_id, serving_mode, window_start\n),",
+		"    SELECT r.*, g.org_id, g.ambiguous_base, g.ambiguous_org\n    FROM grouped_raw r\n    JOIN gate g",
+		// a region the rollup's events disagree on is NULL, never a guess
+		"CASE WHEN COUNT(DISTINCT region) > 1 THEN NULL ELSE MAX(region) END AS region",
+		"        region                  = EXCLUDED.region,",
 		// unknown graph / revision normalize to the key sentinels, never NULL
 		"COALESCE(graph_k8s_name, '') AS graph_k8s_name",
 		"COALESCE(topology_revision, 0) AS topology_revision",
@@ -222,7 +233,7 @@ func TestRateWindowSQL_Shape(t *testing.T) {
 		// wouldn't catch the guard being dropped from the unpriced count.
 		"WHERE usage_found\n        AND valid_usage\n        AND valid_serving_mode\n        AND prompt_price  IS NULL\n        AND auth_id     IS NOT NULL\n        AND resource_id IS NOT NULL\n        AND model_id    IS NOT NULL)",
 		// SERVING MODE (2026-09-29 ruling): only 'shared'/'dedicated' reach money. The
-		// validity flag is computed once, the per-event drop sits in grouped's WHERE
+		// validity flag is computed once, the per-event drop sits in billable's WHERE
 		// right before GROUP BY, the grain key is carried verbatim (no COALESCE to ''),
 		// and the withheld events are counted in their own exclusive bucket. The SQL
 		// literals are built from identity's constants — the ONE definition of the
@@ -230,7 +241,7 @@ func TestRateWindowSQL_Shape(t *testing.T) {
 		// vocabulary change that misses the SQL fails here.
 		fmt.Sprintf("COALESCE(serving_mode IN ('%s', '%s'), false) AS valid_serving_mode", identity.ServingModeShared, identity.ServingModeDedicated),
 		fmt.Sprintf("CASE WHEN serving_mode = '%s' THEN '%s' || base_model ELSE base_model END", identity.ServingModeShared, sharedPrefix),
-		"      AND valid_serving_mode\n    GROUP BY auth_id, owner_type, owner_id, resource_id, model_id, serving_mode,",
+		"      AND valid_serving_mode\n),\n-- gate:",
 		"        ev.serving_mode,\n        ev.valid_serving_mode,",
 		"WHERE NOT valid_serving_mode\n        AND usage_found\n        AND valid_usage\n        AND auth_id     IS NOT NULL\n        AND resource_id IS NOT NULL\n        AND model_id    IS NOT NULL)                        AS invalid_serving_mode_events",
 		"AS unpriced_events",
