@@ -71,9 +71,13 @@ func newStallGuardWriter(w http.ResponseWriter, timeout time.Duration, cancel co
 	return &stallGuardWriter{ResponseWriter: w, rc: http.NewResponseController(w), timeout: timeout, cancel: cancel}
 }
 
-// arm sets the deadline for the write about to happen. net/http clears the
-// connection's write deadline after every request, so it never outlives this
-// one. ErrNotSupported (a ResponseWriter without deadline support, such as a
+// arm sets the deadline for the write about to happen. The proxy handler also
+// arms once more when it returns, covering the writes net/http makes after
+// the handler (the chunked terminator and final flush in finishRequest).
+// net/http then clears the connection's write deadline (conn.serve, right
+// after finishRequest), so it never outlives this request; pinned by
+// TestStallGuardDeadlineDoesNotAffectPostHandlerWritesOrNextRequest.
+// ErrNotSupported (a ResponseWriter without deadline support, such as a
 // test recorder) leaves the write unbounded, exactly as before.
 func (g *stallGuardWriter) arm() {
 	_ = g.rc.SetWriteDeadline(time.Now().Add(g.timeout))

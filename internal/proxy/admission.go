@@ -139,14 +139,17 @@ func admissionLaneForIdentity(settings config.AdmissionSettings, id identity.Ide
 // boundRequestBody enforces the gateway-wide request body ceiling. A declared
 // Content-Length over the limit is refused before any read; a chunked or
 // understated body is cut off by MaxBytesReader at the limit, and the first
-// reader that hits it answers 413 through writeRequestBodyError.
-func boundRequestBody(w http.ResponseWriter, r *http.Request, limit int64) bool {
+// reader that hits it answers 413 through writeRequestBodyError. Responses go
+// through w; rawW must be the connection's own ResponseWriter, because
+// MaxBytesReader marks the connection close-after-reply only through an
+// unexported net/http method that a wrapper cannot forward.
+func boundRequestBody(w, rawW http.ResponseWriter, r *http.Request, limit int64) bool {
 	if r.ContentLength > limit {
 		http.Error(w, "request body too large", http.StatusRequestEntityTooLarge)
 		return false
 	}
 	if r.Body != nil && r.Body != http.NoBody {
-		r.Body = http.MaxBytesReader(w, r.Body, limit)
+		r.Body = http.MaxBytesReader(rawW, r.Body, limit)
 	}
 	return true
 }

@@ -327,8 +327,21 @@ func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request) {
 	maxDuration := time.AfterFunc(prot.MaxStreamDuration, func() { cancel(errMaxStreamDuration) })
 	defer maxDuration.Stop()
 	r = r.WithContext(ctx)
+	// rawW is the connection's own ResponseWriter. http.MaxBytesReader needs
+	// it (not the guard) to reach net/http's unexported requestTooLarge hook,
+	// which marks the connection to close after an oversize body's 413.
+	rawW := w
 	stallGuard := newStallGuardWriter(w, prot.StreamStallTimeout, cancel)
 	w = stallGuard
+	// Re-arm once more when the handler returns (deferred, so it also runs on
+	// early returns and on ReverseProxy's abort panic). net/http writes the
+	// final chunk, the chunked terminator and the last flush in finishRequest,
+	// after the handler, through no guarded method; without this they would
+	// run on the deadline the last guarded write armed, which may already
+	// have expired during a long upstream idle. net/http clears the write
+	// deadline right after finishRequest (conn.serve), so this never reaches
+	// the next request on a keep-alive connection.
+	defer stallGuard.arm()
 
 	// One body ceiling for EVERY route — shared,
 	// gateway, header-routed dedicated and control routes alike — installed
@@ -345,7 +358,7 @@ func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request) {
 	// it) never read the body in either case, so leaving it unbounded there
 	// is safe. Every other request is bounded here before anything reads it.
 	gatewayFailsClosed := id.Gateway && (s.gateway == nil || id.OrgID == "")
-	if !gatewayFailsClosed && !boundRequestBody(w, r, prot.MaxRequestBodyBytes) {
+	if !gatewayFailsClosed && !boundRequestBody(w, rawW, r, prot.MaxRequestBodyBytes) {
 		return
 	}
 
