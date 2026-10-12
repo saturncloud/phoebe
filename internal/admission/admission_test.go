@@ -1142,8 +1142,8 @@ func TestImpossibleRequestRejectedBeforeReservation(t *testing.T) {
 	a, _ := testAdmitter(t, config.AdmissionSettings{Platform: l})
 	_, err := a.Admit(context.Background(), request("a", "m"))
 	var rejected *Rejected
-	if !errors.As(err, &rejected) || rejected.Dimension != "prefill_tokens" {
-		t.Fatalf("err=%v, want prefill_tokens rejection", err)
+	if !errors.As(err, &rejected) || rejected.Dimension != "prefill_tokens_exceeds_limit" || !rejected.Unsatisfiable {
+		t.Fatalf("err=%v, want an unsatisfiable prefill_tokens rejection", err)
 	}
 }
 

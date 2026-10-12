@@ -184,3 +184,29 @@ func TestNewLeaseNeverWrittenToLegacyKeys(t *testing.T) {
 	}
 	assertOnlyVersioned("finish")
 }
+
+// A request alone larger than a positive physical cap is unsatisfiable (the
+// proxy answers 413), not a retryable capacity rejection; a zero cap stays
+// retryable.
+func TestRequestLargerThanCapacityIsUnsatisfiable(t *testing.T) {
+	ctx := context.Background()
+	for _, tc := range []struct {
+		name          string
+		limits        config.AdmissionLimits
+		dimension     string
+		unsatisfiable bool
+	}{
+		{"prefill tokens", config.AdmissionLimits{MaxPrefillTokens: ptr64(9)}, "prefill_tokens_exceeds_limit", true},
+		{"kv tokens", config.AdmissionLimits{MaxReservedKVTokens: ptr64(29)}, "kv_exceeds_limit", true},
+		{"zero prefill cap stays retryable", config.AdmissionLimits{MaxPrefillTokens: ptr64(0)}, "prefill_tokens", false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			a, _ := testAdmitter(t, config.AdmissionSettings{Graph: tc.limits})
+			_, err := a.Admit(ctx, request("a", "m")) // 10 input + 20 output
+			var rejected *Rejected
+			if !errors.As(err, &rejected) || rejected.Dimension != tc.dimension || rejected.Unsatisfiable != tc.unsatisfiable || rejected.Contractual {
+				t.Fatalf("err=%+v, want dimension %s unsatisfiable=%v", rejected, tc.dimension, tc.unsatisfiable)
+			}
+		})
+	}
+}

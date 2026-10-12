@@ -103,6 +103,12 @@ local q=cjson.decode(ARGV[1]); q.now=current_time_ms(); reap(q.now); q.kv=q.esti
 if redis.call('HEXISTS',KEYS[2],q.id) == 1 then return {1} end
 for _,s in ipairs(q.scopes) do
   local contract=s.contractual and 1 or 0
+  -- A request whose OWN estimate is larger than a positive physical cap can
+  -- never be admitted at that scope, however long it waits: answer it as
+  -- unsatisfiable (the proxy's 413) instead of a 503 that repeats forever.
+  -- An explicit zero cap (-1) keeps its retryable answer.
+  if s.prefill_tokens > 0 and q.prefill_tokens > s.prefill_tokens then return {0,s.name,'prefill_tokens_exceeds_limit',contract} end
+  if s.kv > 0 and q.kv > s.kv then return {0,s.name,'kv_exceeds_limit',contract} end
   local checks={{'active',s.active,1},{'prefills',s.prefills,1},{'reserved_decode_slots',s.reserved_decode_slots,1},{'prefill_tokens',s.prefill_tokens,q.prefill_tokens},{'output',s.output,q.output},{'kv',s.kv,q.kv},{'adapters',s.adapters,q.adapter}}
   for _,c in ipairs(checks) do if c[2] ~= 0 and get(field(s,c[1])) + c[3] > c[2] then return {0,s.name,c[1],contract} end end
   -- A contract request that alone reserves more than the scope's whole

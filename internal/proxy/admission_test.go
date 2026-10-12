@@ -222,8 +222,10 @@ func TestSharedPrefillTokensAtExactLimitAdmits(t *testing.T) {
 	if rr := serve(estimate); rr.Code != http.StatusOK || upstreamHits != 1 {
 		t.Fatalf("status=%d upstream=%d, an estimate exactly at maxPrefillTokens must be admitted", rr.Code, upstreamHits)
 	}
-	if rr := serve(estimate - 1); rr.Code != http.StatusServiceUnavailable || upstreamHits != 1 {
-		t.Fatalf("status=%d upstream=%d, an estimate one over maxPrefillTokens must be refused before the upstream", rr.Code, upstreamHits)
+	// One request alone over the limit can never fit: refused as too large
+	// (413), never a retryable 503, and before the upstream.
+	if rr := serve(estimate - 1); rr.Code != http.StatusRequestEntityTooLarge || rr.Header().Get("Retry-After") != "" || upstreamHits != 1 {
+		t.Fatalf("status=%d upstream=%d, an estimate one over maxPrefillTokens must be refused with 413 before the upstream", rr.Code, upstreamHits)
 	}
 }
 

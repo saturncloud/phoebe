@@ -288,6 +288,19 @@ func (s *Server) writeAdmissionError(w http.ResponseWriter, requestID string, er
 	// a rejected client needs its billing-record correlation id just as much.
 	w.Header().Set(requestIDHeader, requestID)
 	var rejected *admission.Rejected
+	if errors.As(err, &rejected) && rejected.Unsatisfiable && !rejected.Contractual {
+		// One request alone is larger than a capacity limit (estimated prompt
+		// tokens, or prompt plus max_tokens against reserved KV). It can never
+		// be admitted, so it is refused as too large, the same answer an
+		// oversized prompt got from the byte-based limit this replaced.
+		message := "estimated prompt tokens exceed this model's prefill capacity"
+		if rejected.Dimension == "kv_exceeds_limit" {
+			message = "estimated prompt tokens plus max_tokens exceed this model's KV-cache capacity"
+		}
+		http.Error(w, message, http.StatusRequestEntityTooLarge)
+		s.log.Warn.Printf("admission: request larger than capacity scope=%s dimension=%s", rejected.Scope, rejected.Dimension)
+		return
+	}
 	if errors.As(err, &rejected) && rejected.Unsatisfiable {
 		// One request alone exceeds a contract's whole per-window limit, so
 		// waiting can never admit it: no Retry-After.
