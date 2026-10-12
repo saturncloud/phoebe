@@ -26,6 +26,13 @@ type gatewayRoute struct {
 	upstreamFor func(graphK8sName string, port int) string
 }
 
+// graphCapacitySource is the per-graph admission capacity Atlas publishes in
+// the served-model registry (gateway.RegistryResolver implements it; the
+// deprecated Postgres resolver does not, so it publishes no limits).
+type graphCapacitySource interface {
+	GraphCapacity(graph string) gateway.GraphCapacity
+}
+
 // WithGateway enables gateway resolution: requests carrying the trusted
 // X-Saturn-Gateway marker resolve their (org, body model=) against Atlas's
 // tf_model via resolver, and forward to the resolved graph's frontend Service
@@ -41,6 +48,9 @@ func (s *Server) WithGateway(resolver gateway.Resolver, namespace string, port i
 	}
 	if port <= 0 {
 		port = 8000
+	}
+	if source, ok := resolver.(graphCapacitySource); ok {
+		s.graphCapacity = source
 	}
 	s.gateway = &gatewayRoute{
 		resolver: resolver,

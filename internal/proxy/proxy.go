@@ -165,6 +165,10 @@ type Server struct {
 	admissionPrefillReleaseLog, admissionUpstreamReleaseLog    sampledErrorLog
 	admissionColdHoldReleaseLog                                sampledErrorLog
 
+	// graphCapacity supplies the per-graph admission capacity Atlas publishes
+	// (B8). nil = none published (no registry resolver wired).
+	graphCapacity graphCapacitySource
+
 	// responseBuffers and dedicatedHolds are the replica-wide state behind the
 	// gateway protection bounds (see protection.go).
 	responseBuffers responseBufferBudget
@@ -641,7 +645,14 @@ func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request) {
 		// parseTrustedRateLimits. Only a shared request with NO envelope at all,
 		// under admission.enabled=false, skips admission entirely: the
 		// historical per-resource routes that never carried the policy contract.
-		enforceAdmission := s.admitter != nil && (s.settings.Admission.Enabled || trustedPolicyEnvelopePresent(id))
+		// Per-graph capacity Atlas published (B8) engages admission whenever an
+		// admission store exists, like a contract limit — there is no
+		// enablement gate (R12 clarification). It needs the trusted org (the
+		// admitter keys every scope set on it), so a historical route that
+		// does not stamp one keeps its old behavior rather than starting to 503.
+		graphCapacity := s.publishedGraphCapacity(id.GraphK8sName)
+		enforceAdmission := s.admitter != nil && (s.settings.Admission.Enabled || trustedPolicyEnvelopePresent(id) ||
+			(graphCapacity.Any() && id.OrgID != ""))
 		tenantIdentity := id.OrgID
 		if tenantIdentity == "" {
 			if enforceAdmission {
@@ -671,17 +682,23 @@ func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request) {
 			// absent limit headers parse as unlimited (R4). Under
 			// admission.enabled=true a request with no envelope at all also
 			// fails closed here (errNoTrustedRateLimitPolicy).
-			var policyErr error
-			organizationLimits, ownerLimits, policyErr = parseTrustedRateLimits(id)
-			if policyErr != nil {
-				s.log.Error.Printf("admission: invalid trusted rate-limit policy: %v", policyErr)
-				if errors.Is(policyErr, errNoTrustedRateLimitPolicy) && legacyEnvelope {
-					// Log-only diagnostic for the R8 cutover: the legacy headers
-					// decide nothing, but their presence names the root cause.
-					s.log.Warn.Printf("admission: legacy single-scope quota headers present without %s (removed by R8); legacy_envelope_present=true (pre-R8 producer; upgrade Atlas/Traefik) request_id=%s", identity.HeaderOwnerID, requestID)
+			//
+			// Published graph capacity alone (admission.enabled=false, no
+			// envelope) needs no contract policy: the request is unlimited in
+			// every contract scope, as it would be with no admission at all.
+			if s.settings.Admission.Enabled || trustedPolicyEnvelopePresent(id) {
+				var policyErr error
+				organizationLimits, ownerLimits, policyErr = parseTrustedRateLimits(id)
+				if policyErr != nil {
+					s.log.Error.Printf("admission: invalid trusted rate-limit policy: %v", policyErr)
+					if errors.Is(policyErr, errNoTrustedRateLimitPolicy) && legacyEnvelope {
+						// Log-only diagnostic for the R8 cutover: the legacy headers
+						// decide nothing, but their presence names the root cause.
+						s.log.Warn.Printf("admission: legacy single-scope quota headers present without %s (removed by R8); legacy_envelope_present=true (pre-R8 producer; upgrade Atlas/Traefik) request_id=%s", identity.HeaderOwnerID, requestID)
+					}
+					http.Error(w, "shared inference policy unavailable", http.StatusServiceUnavailable)
+					return
 				}
-				http.Error(w, "shared inference policy unavailable", http.StatusServiceUnavailable)
-				return
 			}
 			// The group quota envelope is a separate fail-closed parse:
 			// malformed, oversized, or over-count is a 503 with a loud log —
@@ -769,13 +786,19 @@ func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request) {
 		// store only when at least one group scope carries a rate limit; an
 		// all-unlimited envelope enforces
 		// nothing. Every fail-closed check above has already run.
-		if enforceAdmission && (s.settings.Admission.Enabled || organizationLimits.Any() || ownerLimits.Any() || anyGroupScopeEnforced(groupScopes)) {
+		if enforceAdmission && (s.settings.Admission.Enabled || organizationLimits.Any() || ownerLimits.Any() ||
+			anyGroupScopeEnforced(groupScopes) || graphCapacity.Any()) {
 			admitted, err = s.admitter.Admit(r.Context(), admission.Request{
 				Graph: graph, Organization: id.OrgID, Owner: id.OwnerID, Model: estimate.Model,
 				PrefillTokens: estimate.InputTokens, EstimatedInputTokens: estimate.InputTokens,
 				ReservedOutputTokens: estimate.OutputTokens,
 				Adapter:              id.Adapter != "", OrganizationLimits: organizationLimits, OwnerLimits: ownerLimits,
 				GroupScopes: groupScopes,
+				GraphCapacity: config.AdmissionLimits{
+					MaxActiveRequests:   graphCapacity.MaxActiveRequests,
+					MaxReservedKVTokens: graphCapacity.MaxReservedKVTokens,
+					MaxPrefillTokens:    graphCapacity.MaxPrefillTokens,
+				},
 			})
 			if err != nil {
 				if errors.Is(err, admission.ErrInvalidIdentity) {

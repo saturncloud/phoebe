@@ -94,6 +94,12 @@ type Request struct {
 	// lease/CompleteUsage path). Empty when the envelope carried no group
 	// (the common case).
 	GroupScopes []GroupScope
+	// GraphCapacity is the per-graph capacity Atlas published for this
+	// request's graph (B8): the operator override, else the profiled value
+	// times the install safety margin. Enforced as its own operator scope —
+	// a rejection is "out of capacity" (503), never a contract 429 — on top
+	// of the install-wide graph tier. Zero value = nothing published.
+	GraphCapacity config.AdmissionLimits
 }
 
 // GroupScope is one group's quota contract within a Request: the group's id
@@ -386,6 +392,14 @@ func makeContractScope(name, id string, limits RateLimits) scope {
 	}
 }
 
+func anyLimit(l config.AdmissionLimits) bool {
+	return l.MaxActiveRequests != nil || l.MaxConcurrentPrefills != nil || l.MaxReservedDecodeSlots != nil ||
+		l.MaxPrefillTokens != nil || l.MaxReservedOutputTokens != nil || l.MaxReservedKVTokens != nil ||
+		l.MaxActiveAdapters != nil || l.RequestsPerWindow != nil || l.TotalPromptTokensPerWindow != nil ||
+		l.UncachedPromptTokensPerWindow != nil || l.GeneratedTokensPerWindow != nil || l.MaxColdHolds != nil ||
+		l.WakesPerWindow != nil
+}
+
 // unsatisfiableSuffix ends the dimension name admitScript returns when one
 // request alone exceeds a contract scope's whole per-window limit.
 const unsatisfiableSuffix = "_exceeds_limit"
@@ -411,6 +425,9 @@ func (a *RedisAdmitter) scopes(r Request) []scope {
 	}
 	if t, ok := a.cfg.Lanes[laneName]; ok {
 		out = append(out, makeScope("lane", laneName, scaled(t.Limits, t.Weight)))
+	}
+	if anyLimit(r.GraphCapacity) {
+		out = append(out, makeScope("graph_capacity", r.Graph, r.GraphCapacity))
 	}
 	if r.OrganizationLimits.Any() {
 		out = append(out, makeContractScope("contract_organization", r.Organization, r.OrganizationLimits))

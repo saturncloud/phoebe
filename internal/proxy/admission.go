@@ -15,6 +15,7 @@ import (
 
 	"github.com/saturncloud/phoebe/internal/admission"
 	"github.com/saturncloud/phoebe/internal/config"
+	"github.com/saturncloud/phoebe/internal/gateway"
 	"github.com/saturncloud/phoebe/internal/identity"
 	"github.com/saturncloud/phoebe/internal/logging"
 )
@@ -113,6 +114,14 @@ type admissionEstimate struct {
 	Model        string
 	InputTokens  int64
 	OutputTokens int64
+}
+
+// publishedGraphCapacity is the capacity Atlas published for graph, or none.
+func (s *Server) publishedGraphCapacity(graph string) gateway.GraphCapacity {
+	if s.graphCapacity == nil || graph == "" {
+		return gateway.GraphCapacity{}
+	}
+	return s.graphCapacity.GraphCapacity(graph)
 }
 
 func admissionLaneForIdentity(settings config.AdmissionSettings, id identity.Identity) config.AdmissionLane {
