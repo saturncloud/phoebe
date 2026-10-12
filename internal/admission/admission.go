@@ -72,11 +72,15 @@ func (r *Rejected) Error() string {
 }
 
 type Request struct {
-	Graph                string
-	Organization         string
-	Owner                string
-	Model                string
-	PromptBytes          int64
+	Graph        string
+	Organization string
+	Owner        string
+	Model        string
+	// PrefillTokens is the estimated prompt tokens held against the prefill
+	// limit until the first response byte. EstimatedInputTokens is the same
+	// estimate as charged to the contract windows and the reserved-KV
+	// counter; the proxy sets both from one estimate.
+	PrefillTokens        int64
 	EstimatedInputTokens int64
 	ReservedOutputTokens int64
 	Adapter              bool
@@ -120,8 +124,9 @@ type scope struct {
 	Active              int64  `json:"active"`
 	Prefills            int64  `json:"prefills"`
 	ReservedDecodeSlots int64  `json:"reserved_decode_slots"`
-	Prompt              int64  `json:"prompt"`
+	Prefill             int64  `json:"prefill_tokens"`
 	Output              int64  `json:"output"`
+	KV                  int64  `json:"kv"`
 	Adapters            int64  `json:"adapters"`
 	Requests            int64  `json:"requests"`
 	TotalPrompt         int64  `json:"total_prompt"`
@@ -136,7 +141,7 @@ type scope struct {
 type wireRequest struct {
 	ID             string  `json:"id"`
 	LeaseMs        int64   `json:"lease_ms"`
-	Prompt         int64   `json:"prompt"`
+	Prefill        int64   `json:"prefill_tokens"`
 	EstimatedInput int64   `json:"estimated_input"`
 	Output         int64   `json:"output"`
 	Adapter        int64   `json:"adapter"`
@@ -225,14 +230,14 @@ func (a *RedisAdmitter) Admit(ctx context.Context, req Request) (*Lease, error) 
 			return nil, fmt.Errorf("%w: group scope carries limits without a group id", ErrInvalidIdentity)
 		}
 	}
-	if req.PromptBytes < 0 || req.EstimatedInputTokens <= 0 || req.ReservedOutputTokens <= 0 {
+	if req.PrefillTokens < 0 || req.EstimatedInputTokens <= 0 || req.ReservedOutputTokens <= 0 {
 		return nil, &Rejected{Scope: "request", Dimension: "work estimate", RetryAfter: time.Second}
 	}
 	id, err := randomID()
 	if err != nil {
 		return nil, fmt.Errorf("%w: lease id: %v", ErrUnavailable, err)
 	}
-	w := wireRequest{ID: id, LeaseMs: a.cfg.LeaseTTL.Milliseconds(), Prompt: req.PromptBytes,
+	w := wireRequest{ID: id, LeaseMs: a.cfg.LeaseTTL.Milliseconds(), Prefill: req.PrefillTokens,
 		EstimatedInput: req.EstimatedInputTokens, Output: req.ReservedOutputTokens, Scopes: a.scopes(req)}
 	if req.Adapter {
 		w.Adapter = 1
@@ -329,8 +334,9 @@ func scaled(l config.AdmissionLimits, weight int64) config.AdmissionLimits {
 	l.MaxActiveRequests = mul(l.MaxActiveRequests)
 	l.MaxConcurrentPrefills = mul(l.MaxConcurrentPrefills)
 	l.MaxReservedDecodeSlots = mul(l.MaxReservedDecodeSlots)
-	l.MaxPromptBytes = mul(l.MaxPromptBytes)
+	l.MaxPrefillTokens = mul(l.MaxPrefillTokens)
 	l.MaxReservedOutputTokens = mul(l.MaxReservedOutputTokens)
+	l.MaxReservedKVTokens = mul(l.MaxReservedKVTokens)
 	l.MaxActiveAdapters = mul(l.MaxActiveAdapters)
 	l.RequestsPerWindow = mul(l.RequestsPerWindow)
 	l.TotalPromptTokensPerWindow = mul(l.TotalPromptTokensPerWindow)
@@ -363,7 +369,8 @@ func makeScope(name, id string, l config.AdmissionLimits) scope {
 	digest := sha256.Sum256([]byte(id))
 	return scope{ID: name + ":" + hex.EncodeToString(digest[:]), Name: name, Active: wireLimit(l.MaxActiveRequests), Prefills: wireLimit(l.MaxConcurrentPrefills),
 		ReservedDecodeSlots: wireLimit(l.MaxReservedDecodeSlots),
-		Prompt:              wireLimit(l.MaxPromptBytes), Output: wireLimit(l.MaxReservedOutputTokens), Adapters: wireLimit(l.MaxActiveAdapters),
+		Prefill:             wireLimit(l.MaxPrefillTokens), Output: wireLimit(l.MaxReservedOutputTokens), KV: wireLimit(l.MaxReservedKVTokens),
+		Adapters: wireLimit(l.MaxActiveAdapters),
 		Requests: wireLimit(l.RequestsPerWindow), TotalPrompt: wireLimit(l.TotalPromptTokensPerWindow),
 		UncachedPrompt: wireLimit(l.UncachedPromptTokensPerWindow), Generated: wireLimit(l.GeneratedTokensPerWindow), Cold: wireLimit(l.MaxColdHolds),
 		Wakes: wireLimit(l.WakesPerWindow), WindowMs: windowMs}
@@ -464,7 +471,7 @@ func (l *Lease) CompleteUnknownUsage(ctx context.Context) error {
 
 // Usage is the engine-authoritative token result used to settle contractual
 // throughput windows. CachedPromptTokens is a subset of TotalPromptTokens.
-// Prompt-byte reservations remain a separate physical guard and are never
+// Prefill and KV reservations remain separate physical guards and are never
 // converted into contractual token usage.
 type Usage struct {
 	TotalPromptTokens  int64

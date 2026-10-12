@@ -57,7 +57,7 @@ func ptr64(v int64) *int64 { return &v }
 func limits(active int64) config.AdmissionLimits {
 	return config.AdmissionLimits{MaxActiveRequests: ptr64(active), MaxConcurrentPrefills: ptr64(active),
 		MaxReservedDecodeSlots: ptr64(active),
-		MaxPromptBytes:         ptr64(1024), MaxReservedOutputTokens: ptr64(1024), MaxActiveAdapters: ptr64(active),
+		MaxPrefillTokens:       ptr64(1024), MaxReservedOutputTokens: ptr64(1024), MaxActiveAdapters: ptr64(active),
 		RequestsPerWindow: ptr64(100), TotalPromptTokensPerWindow: ptr64(1000),
 		UncachedPromptTokensPerWindow: ptr64(1000), GeneratedTokensPerWindow: ptr64(1000), MaxColdHolds: ptr64(active),
 		WakesPerWindow: ptr64(100), Window: time.Minute}
@@ -78,7 +78,7 @@ func testAdmitter(t *testing.T, cfg config.AdmissionSettings) (*RedisAdmitter, *
 }
 
 func request(org, model string) Request {
-	return Request{Graph: "graph-a", Organization: org, Owner: "owner-" + org, Model: model, PromptBytes: 10, EstimatedInputTokens: 10, ReservedOutputTokens: 20, Adapter: true}
+	return Request{Graph: "graph-a", Organization: org, Owner: "owner-" + org, Model: model, PrefillTokens: 10, EstimatedInputTokens: 10, ReservedOutputTokens: 20, Adapter: true}
 }
 
 func TestConcurrentReplicasShareOneAtomicCapacityPool(t *testing.T) {
@@ -496,13 +496,13 @@ func TestUnknownUsageRetainsConservativeOwnerAndOrganizationCharges(t *testing.T
 		{
 			name: "organization",
 			req: Request{Graph: "graph-a", Organization: "org-a", Owner: "other-owner", Model: "model-a",
-				PromptBytes: 1, EstimatedInputTokens: 1, ReservedOutputTokens: 1, OrganizationLimits: contract},
+				PrefillTokens: 1, EstimatedInputTokens: 1, ReservedOutputTokens: 1, OrganizationLimits: contract},
 			want: "contract_organization",
 		},
 		{
 			name: "owner",
 			req: Request{Graph: "graph-a", Organization: "other-org", Owner: "owner-a", Model: "model-a",
-				PromptBytes: 1, EstimatedInputTokens: 1, ReservedOutputTokens: 1, OwnerLimits: contract},
+				PrefillTokens: 1, EstimatedInputTokens: 1, ReservedOutputTokens: 1, OwnerLimits: contract},
 			want: "contract_owner",
 		},
 	} {
@@ -576,7 +576,7 @@ func TestExplicitZeroCapBlocksEveryRequest(t *testing.T) {
 		{"maxActiveRequests", func(l *config.AdmissionLimits) { l.MaxActiveRequests = ptr64(0) }, "active"},
 		{"maxConcurrentPrefills", func(l *config.AdmissionLimits) { l.MaxConcurrentPrefills = ptr64(0) }, "prefills"},
 		{"maxReservedDecodeSlots", func(l *config.AdmissionLimits) { l.MaxReservedDecodeSlots = ptr64(0) }, "reserved_decode_slots"},
-		{"maxPromptBytes", func(l *config.AdmissionLimits) { l.MaxPromptBytes = ptr64(0) }, "prompt"},
+		{"maxPrefillTokens", func(l *config.AdmissionLimits) { l.MaxPrefillTokens = ptr64(0) }, "prefill_tokens"},
 		{"maxReservedOutputTokens", func(l *config.AdmissionLimits) { l.MaxReservedOutputTokens = ptr64(0) }, "output"},
 		{"maxActiveAdapters", func(l *config.AdmissionLimits) { l.MaxActiveAdapters = ptr64(0) }, "adapters"},
 		{"requestsPerWindow", func(l *config.AdmissionLimits) { l.RequestsPerWindow = ptr64(0) }, "requests"},
@@ -613,13 +613,13 @@ func TestExplicitZeroCapBlocksEveryRequest(t *testing.T) {
 	})
 	t.Run("prompt zero cap blocks zero-byte prompts", func(t *testing.T) {
 		l := limits(5)
-		l.MaxPromptBytes = ptr64(0)
+		l.MaxPrefillTokens = ptr64(0)
 		a, _ := testAdmitter(t, config.AdmissionSettings{Platform: l})
 		req := request("a", "m")
-		req.PromptBytes = 0
+		req.PrefillTokens = 0
 		_, err := a.Admit(context.Background(), req)
 		var rejected *Rejected
-		if !errors.As(err, &rejected) || rejected.Dimension != "prompt" {
+		if !errors.As(err, &rejected) || rejected.Dimension != "prefill_tokens" {
 			t.Fatalf("err=%v, want prompt rejection even with a zero prompt-byte delta", err)
 		}
 	})
@@ -684,7 +684,7 @@ func TestExpiredLeaseIsReapedAfterReplicaDeath(t *testing.T) {
 
 func TestExpiredLeaseReapingIsBoundedAndConverges(t *testing.T) {
 	l := limits(300)
-	l.MaxPromptBytes = ptr64(100_000)
+	l.MaxPrefillTokens = ptr64(100_000)
 	l.MaxReservedOutputTokens = ptr64(100_000)
 	l.RequestsPerWindow = nil
 	l.TotalPromptTokensPerWindow = nil
@@ -1138,11 +1138,11 @@ func TestAdmitCleanupBudgetIndependentOfAttemptDeadline(t *testing.T) {
 
 func TestImpossibleRequestRejectedBeforeReservation(t *testing.T) {
 	l := limits(5)
-	l.MaxPromptBytes = ptr64(9)
+	l.MaxPrefillTokens = ptr64(9)
 	a, _ := testAdmitter(t, config.AdmissionSettings{Platform: l})
 	_, err := a.Admit(context.Background(), request("a", "m"))
 	var rejected *Rejected
-	if !errors.As(err, &rejected) || rejected.Dimension != "prompt" {
+	if !errors.As(err, &rejected) || rejected.Dimension != "prefill_tokens" {
 		t.Fatalf("err=%v, want prompt rejection", err)
 	}
 }
@@ -1154,7 +1154,7 @@ func TestInvalidWorkEstimateRejectedBeforeReservation(t *testing.T) {
 		name   string
 		mutate func(*Request)
 	}{
-		{name: "negative prompt bytes", mutate: func(r *Request) { r.PromptBytes = -1 }},
+		{name: "negative prefill tokens", mutate: func(r *Request) { r.PrefillTokens = -1 }},
 		{name: "zero estimated input", mutate: func(r *Request) { r.EstimatedInputTokens = 0 }},
 		{name: "zero reserved output", mutate: func(r *Request) { r.ReservedOutputTokens = 0 }},
 	} {

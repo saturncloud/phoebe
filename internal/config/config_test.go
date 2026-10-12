@@ -334,18 +334,18 @@ func TestLoadAdmissionLimitsNullableSentinel(t *testing.T) {
 	}{
 		{
 			name: "absent keys are nil",
-			yaml: "admission:\n  enabled: true\n  valkeyAddr: v\n  platform:\n    maxPromptBytes: 1024\n",
-			want: map[string]*int64{"MaxActiveRequests": nil, "MaxPromptBytes": int64ptr(1024)},
+			yaml: "admission:\n  enabled: true\n  valkeyAddr: v\n  platform:\n    maxPrefillTokens: 1024\n",
+			want: map[string]*int64{"MaxActiveRequests": nil, "MaxPrefillTokens": int64ptr(1024)},
 		},
 		{
 			name: "explicit null is nil",
-			yaml: "admission:\n  enabled: true\n  valkeyAddr: v\n  platform:\n    maxActiveRequests: null\n    maxPromptBytes: 1024\n",
-			want: map[string]*int64{"MaxActiveRequests": nil, "MaxPromptBytes": int64ptr(1024)},
+			yaml: "admission:\n  enabled: true\n  valkeyAddr: v\n  platform:\n    maxActiveRequests: null\n    maxPrefillTokens: 1024\n",
+			want: map[string]*int64{"MaxActiveRequests": nil, "MaxPrefillTokens": int64ptr(1024)},
 		},
 		{
 			name: "explicit zero is a zero cap",
-			yaml: "admission:\n  enabled: true\n  valkeyAddr: v\n  platform:\n    maxActiveRequests: 0\n    maxPromptBytes: 0\n",
-			want: map[string]*int64{"MaxActiveRequests": int64ptr(0), "MaxPromptBytes": int64ptr(0)},
+			yaml: "admission:\n  enabled: true\n  valkeyAddr: v\n  platform:\n    maxActiveRequests: 0\n    maxPrefillTokens: 0\n",
+			want: map[string]*int64{"MaxActiveRequests": int64ptr(0), "MaxPrefillTokens": int64ptr(0)},
 		},
 	}
 	for _, tc := range tests {
@@ -393,8 +393,8 @@ func fieldValue(l AdmissionLimits, name string) *int64 {
 	switch name {
 	case "MaxActiveRequests":
 		return l.MaxActiveRequests
-	case "MaxPromptBytes":
-		return l.MaxPromptBytes
+	case "MaxPrefillTokens":
+		return l.MaxPrefillTokens
 	}
 	return nil
 }
@@ -421,7 +421,7 @@ func TestLoadAdmissionRejectsInvalidPolicy(t *testing.T) {
 		// weight*value int64 overflow.
 		"admission:\n  enabled: true\n  valkeyAddr: v\n  lanes:\n    default:\n      weight: 9223372036854775807\n      limits:\n        maxActiveRequests: 2\n",
 		// The platform sets a dimension the lane omits.
-		"admission:\n  enabled: true\n  valkeyAddr: v\n  platform:\n    maxActiveRequests: 10\n  lanes:\n    default:\n      weight: 1\n      limits:\n        maxPromptBytes: 1024\n",
+		"admission:\n  enabled: true\n  valkeyAddr: v\n  platform:\n    maxActiveRequests: 10\n  lanes:\n    default:\n      weight: 1\n      limits:\n        maxPrefillTokens: 1024\n",
 		// Individually valid weighted shares whose sum overflows int64.
 		"admission:\n  enabled: true\n  valkeyAddr: v\n  lanes:\n    default:\n      weight: 4611686018427387904\n      limits:\n        maxActiveRequests: 1\n    gold:\n      weight: 4611686018427387904\n      limits:\n        maxActiveRequests: 1\n",
 	}
@@ -591,5 +591,25 @@ func TestLoadProtection(t *testing.T) {
 				t.Fatal("want a startup error")
 			}
 		})
+	}
+}
+
+// maxPromptBytes was renamed (and changed unit). A leftover value must stop
+// startup rather than be dropped in silence, wherever it appears and whether
+// or not admission is enabled; a null leftover (the shipped chart value) is
+// absent and harmless.
+func TestLoadRejectsRemovedMaxPromptBytes(t *testing.T) {
+	for _, yaml := range []string{
+		"admission:\n  platform:\n    maxPromptBytes: 1024\n",
+		"admission:\n  enabled: true\n  valkeyAddr: v\n  graph:\n    maxPromptBytes: 0\n",
+		"admission:\n  lanes:\n    default:\n      weight: 1\n      limits:\n        maxPromptBytes: 5\n",
+	} {
+		_, err := Load(writeTemp(t, yaml))
+		if err == nil || !strings.Contains(err.Error(), "maxPrefillTokens") {
+			t.Fatalf("yaml %q: err=%v, want a rename error naming maxPrefillTokens", yaml, err)
+		}
+	}
+	if _, err := Load(writeTemp(t, "admission:\n  platform:\n    maxPromptBytes: null\n")); err != nil {
+		t.Fatalf("a null leftover must load: %v", err)
 	}
 }

@@ -109,14 +109,18 @@ emit:
 # actual engine usage through its Valkey/WAL/log path.
 #
 # Each request is checked atomically at platform, serving-graph, organization,
-# and organization×model scopes. Prompt work is the complete OpenAI JSON body
-# size for the physical byte guard. Token windows reserve a cheap ceil(JSON
-# bytes/4) estimate as uncached input, then reconcile the engine's exact total
-# and cached token counts after the response. Output is
-# max_completion_tokens/max_tokens, or defaultMaxOutputTokens. Decode capacity
+# and organization×model scopes. Prompt work is an ESTIMATE in tokens: the
+# characters of the request's message text divided by 4, plus a fixed 1024
+# tokens per image part (no chat template, no tokenizer). maxPrefillTokens
+# bounds that estimate for requests still in prefill. Token windows reserve the
+# same estimate as uncached input, then reconcile the engine's exact total and
+# cached token counts after the response. Output is
+# max_completion_tokens/max_tokens, or defaultMaxOutputTokens.
+# maxReservedKvTokens bounds estimated input plus reserved output, held until
+# the request finishes. Decode capacity
 # is a future slot reserved before forwarding because a proxy cannot safely
 # queue once the engine starts responding. Leases release prefill/input work at
-# the first upstream body byte and active/decode/output work at completion,
+# the first upstream body byte and active/decode/output/KV work at completion,
 # abort, or failure. Live streams renew their lease;
 # leaseTtl is the crash-recovery bound when a replica stops renewing.
 #
@@ -139,8 +143,9 @@ emit:
 #     maxActiveRequests: 256
 #     maxConcurrentPrefills: 32
 #     maxReservedDecodeSlots: 256
-#     maxPromptBytes: 67108864
+#     maxPrefillTokens: 262144
 #     maxReservedOutputTokens: 262144
+#     maxReservedKvTokens: null
 #     maxActiveAdapters: 128
 #     requestsPerWindow: 6000
 #     totalPromptTokensPerWindow: 16000000
@@ -153,8 +158,9 @@ emit:
 #     maxActiveRequests: 64
 #     maxConcurrentPrefills: 8
 #     maxReservedDecodeSlots: 64
-#     maxPromptBytes: 16777216
+#     maxPrefillTokens: 65536
 #     maxReservedOutputTokens: 65536
+#     maxReservedKvTokens: null
 #     maxActiveAdapters: 32
 #     requestsPerWindow: 1500
 #     totalPromptTokensPerWindow: 4000000
@@ -167,8 +173,9 @@ emit:
 #     maxActiveRequests: 32
 #     maxConcurrentPrefills: 4
 #     maxReservedDecodeSlots: 32
-#     maxPromptBytes: 8388608
+#     maxPrefillTokens: 32768
 #     maxReservedOutputTokens: 32768
+#     maxReservedKvTokens: null
 #     maxActiveAdapters: 16
 #     requestsPerWindow: 600
 #     totalPromptTokensPerWindow: 1600000
@@ -181,8 +188,9 @@ emit:
 #     maxActiveRequests: 16
 #     maxConcurrentPrefills: 2
 #     maxReservedDecodeSlots: 16
-#     maxPromptBytes: 4194304
+#     maxPrefillTokens: 16384
 #     maxReservedOutputTokens: 16384
+#     maxReservedKvTokens: null
 #     maxActiveAdapters: 8
 #     requestsPerWindow: 300
 #     totalPromptTokensPerWindow: 800000
@@ -198,8 +206,9 @@ emit:
 #         maxActiveRequests: 64
 #         maxConcurrentPrefills: 8
 #         maxReservedDecodeSlots: 64
-#         maxPromptBytes: 16777216
+#         maxPrefillTokens: 65536
 #         maxReservedOutputTokens: 65536
+#         maxReservedKvTokens: null
 #         maxActiveAdapters: 32
 #         requestsPerWindow: 1500
 #         totalPromptTokensPerWindow: 4000000
@@ -214,8 +223,9 @@ emit:
 #         maxActiveRequests: 64
 #         maxConcurrentPrefills: 8
 #         maxReservedDecodeSlots: 64
-#         maxPromptBytes: 16777216
+#         maxPrefillTokens: 65536
 #         maxReservedOutputTokens: 65536
+#         maxReservedKvTokens: null
 #         maxActiveAdapters: 32
 #         requestsPerWindow: 1200
 #         totalPromptTokensPerWindow: 4000000

@@ -189,11 +189,19 @@ func (p *ProtectionSettings) parse() error {
 // windows, and WakesPerWindow. Total prompt includes cached and uncached
 // prompt tokens; uncached prompt is the subset that required prefill compute.
 type AdmissionLimits struct {
-	MaxActiveRequests             *int64        `yaml:"maxActiveRequests"`
-	MaxConcurrentPrefills         *int64        `yaml:"maxConcurrentPrefills"`
-	MaxReservedDecodeSlots        *int64        `yaml:"maxReservedDecodeSlots"`
-	MaxPromptBytes                *int64        `yaml:"maxPromptBytes"`
-	MaxReservedOutputTokens       *int64        `yaml:"maxReservedOutputTokens"`
+	MaxActiveRequests      *int64 `yaml:"maxActiveRequests"`
+	MaxConcurrentPrefills  *int64 `yaml:"maxConcurrentPrefills"`
+	MaxReservedDecodeSlots *int64 `yaml:"maxReservedDecodeSlots"`
+	// MaxPrefillTokens bounds the estimated prompt tokens of requests still in
+	// prefill (admitted, no response byte yet). The estimate is the request's
+	// message-text characters divided by 4 plus a fixed cost per image part
+	// (ruling 2026-10-12); it replaced the old byte-based maxPromptBytes.
+	MaxPrefillTokens        *int64 `yaml:"maxPrefillTokens"`
+	MaxReservedOutputTokens *int64 `yaml:"maxReservedOutputTokens"`
+	// MaxReservedKVTokens bounds the KV-cache tokens admitted requests may
+	// need: estimated input plus reserved output tokens, held until the
+	// request finishes.
+	MaxReservedKVTokens           *int64        `yaml:"maxReservedKvTokens"`
 	MaxActiveAdapters             *int64        `yaml:"maxActiveAdapters"`
 	RequestsPerWindow             *int64        `yaml:"requestsPerWindow"`
 	TotalPromptTokensPerWindow    *int64        `yaml:"totalPromptTokensPerWindow"`
@@ -203,6 +211,11 @@ type AdmissionLimits struct {
 	WakesPerWindow                *int64        `yaml:"wakesPerWindow"`
 	WindowStr                     string        `yaml:"window"`
 	Window                        time.Duration `yaml:"-"`
+
+	// RemovedMaxPromptBytes catches the renamed maxPromptBytes key. phoebe
+	// reads YAML non-strictly, so a leftover value would otherwise be dropped
+	// in silence and the operator would believe a limit is in force.
+	RemovedMaxPromptBytes *int64 `yaml:"maxPromptBytes"`
 }
 
 // AdmissionLane gives an operator-defined scheduling class an isolated protected
@@ -454,6 +467,16 @@ func (s *Settings) parse() error {
 // store settings are only in use when it does, so their validation is fatal
 // only then.
 func (a *AdmissionSettings) parse(storeConfigured bool) error {
+	removed := map[string]AdmissionLimits{"platform": a.Platform, "graph": a.Graph,
+		"organization": a.Organization, "organizationModel": a.OrganizationModel}
+	for name, lane := range a.Lanes {
+		removed["lanes."+name+".limits"] = lane.Limits
+	}
+	for name, l := range removed {
+		if l.RemovedMaxPromptBytes != nil {
+			return fmt.Errorf("admission.%s.maxPromptBytes was renamed to maxPrefillTokens and is now counted in estimated tokens, not bytes; convert and rename it", name)
+		}
+	}
 	// Trusted lane hints are stamped onto every shared request even while
 	// admission is disabled (the proxy overwrites client-supplied Dynamo
 	// priority headers from the lane), so hint ranges and the lane map's
@@ -580,15 +603,15 @@ func (s *Settings) EffectiveAdmission() (AdmissionSettings, bool) {
 }
 
 func limitValues(l AdmissionLimits) []*int64 {
-	return []*int64{l.MaxActiveRequests, l.MaxConcurrentPrefills, l.MaxReservedDecodeSlots, l.MaxPromptBytes,
-		l.MaxReservedOutputTokens, l.MaxActiveAdapters, l.RequestsPerWindow,
+	return []*int64{l.MaxActiveRequests, l.MaxConcurrentPrefills, l.MaxReservedDecodeSlots, l.MaxPrefillTokens,
+		l.MaxReservedOutputTokens, l.MaxReservedKVTokens, l.MaxActiveAdapters, l.RequestsPerWindow,
 		l.TotalPromptTokensPerWindow, l.UncachedPromptTokensPerWindow,
 		l.GeneratedTokensPerWindow, l.MaxColdHolds, l.WakesPerWindow}
 }
 
 func (a *AdmissionSettings) validateLaneShares() error {
-	names := []string{"maxActiveRequests", "maxConcurrentPrefills", "maxReservedDecodeSlots", "maxPromptBytes",
-		"maxReservedOutputTokens", "maxActiveAdapters", "requestsPerWindow",
+	names := []string{"maxActiveRequests", "maxConcurrentPrefills", "maxReservedDecodeSlots", "maxPrefillTokens",
+		"maxReservedOutputTokens", "maxReservedKvTokens", "maxActiveAdapters", "requestsPerWindow",
 		"totalPromptTokensPerWindow", "uncachedPromptTokensPerWindow",
 		"generatedTokensPerWindow", "maxColdHolds", "wakesPerWindow"}
 	platform := limitValues(a.Platform)
@@ -621,8 +644,8 @@ func (a *AdmissionSettings) validateLaneShares() error {
 }
 
 func (l *AdmissionLimits) parse(name string) error {
-	values := []*int64{l.MaxActiveRequests, l.MaxConcurrentPrefills, l.MaxReservedDecodeSlots, l.MaxPromptBytes, l.MaxReservedOutputTokens, l.MaxActiveAdapters,
-		l.RequestsPerWindow, l.TotalPromptTokensPerWindow, l.UncachedPromptTokensPerWindow,
+	values := []*int64{l.MaxActiveRequests, l.MaxConcurrentPrefills, l.MaxReservedDecodeSlots, l.MaxPrefillTokens, l.MaxReservedOutputTokens,
+		l.MaxReservedKVTokens, l.MaxActiveAdapters, l.RequestsPerWindow, l.TotalPromptTokensPerWindow, l.UncachedPromptTokensPerWindow,
 		l.GeneratedTokensPerWindow, l.MaxColdHolds, l.WakesPerWindow}
 	for _, value := range values {
 		if value != nil && *value < 0 {

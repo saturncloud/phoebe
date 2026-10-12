@@ -151,8 +151,8 @@ func writeRequestBodyError(w http.ResponseWriter, err error) {
 	http.Error(w, "bad request body", http.StatusBadRequest)
 }
 
-// admissionWork returns the exact routed model and cheap, conservative token
-// reservations. The input estimate follows the common bytes/4 approximation;
+// admissionWork returns the exact routed model and cheap token reservations.
+// The input estimate is message-text characters / 4 (estimatePromptTokens);
 // Dynamo remains authoritative and Phoebe reconciles its actual cache-aware
 // token counts after the response.
 func admissionWork(body []byte, defaultOutput int64) (admissionEstimate, bool) {
@@ -183,11 +183,7 @@ func admissionWork(body []byte, defaultOutput int64) (admissionEstimate, bool) {
 	if maximum <= 0 || maximum > math.MaxUint32 {
 		return admissionEstimate{}, false
 	}
-	input := int64((len(body) + 3) / 4)
-	if input < 1 {
-		input = 1
-	}
-	return admissionEstimate{Model: v.Model, InputTokens: input, OutputTokens: maximum}, true
+	return admissionEstimate{Model: v.Model, InputTokens: estimatePromptTokens(body), OutputTokens: maximum}, true
 }
 
 // prepareSharedDynamoRequest replaces every client-controlled scheduling and

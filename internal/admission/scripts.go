@@ -45,8 +45,14 @@ local function window_retry_ms(s, now)
   if remaining <= 0 then return s.window_ms end
   return remaining
 end
+-- A record's kv is its estimated input plus reserved output. Records written
+-- before the prefill-token and kv counters existed carry neither field (and
+-- hold prompt BYTES under 'prompt'), so every read defaults to 0 and the
+-- legacy 'prompt' field is still released: a rolling deploy never strands a
+-- counter in either direction.
 local function release_record(rec)
   for _,s in ipairs(rec.scopes) do
+    add(field(s,'kv'), -(rec.kv or 0))
     add(field(s,'active'), -1)
     add(field(s,'reserved_decode_slots'), -1)
     add(field(s,'output'), -rec.output)
@@ -54,7 +60,7 @@ local function release_record(rec)
     add(field(s,'total_prompt_reserved'), -rec.estimated_input)
     add(field(s,'uncached_prompt_reserved'), -rec.estimated_input)
     if rec.adapter == 1 then add(field(s,'adapters'), -1) end
-    if rec.prefill then add(field(s,'prefills'), -1); add(field(s,'prompt'), -rec.prompt) end
+    if rec.prefill then add(field(s,'prefills'), -1); add(field(s,'prompt'), -(rec.prompt or 0)); add(field(s,'prefill_tokens'), -(rec.prefill_tokens or 0)) end
     if rec.cold then add(field(s,'cold'), -1) end
   end
 end
@@ -80,14 +86,14 @@ end
 `
 
 var admitScript = redis.NewScript(luaHelpers + `
-local q=cjson.decode(ARGV[1]); q.now=current_time_ms(); reap(q.now)
+local q=cjson.decode(ARGV[1]); q.now=current_time_ms(); reap(q.now); q.kv=q.estimated_input+q.output
 -- A caller may lose the reply after this script commits. Retrying the exact
 -- request id must recover the existing lease rather than reserve every
 -- dimension a second time.
 if redis.call('HEXISTS',KEYS[2],q.id) == 1 then return {1} end
 for _,s in ipairs(q.scopes) do
   local contract=s.contractual and 1 or 0
-  local checks={{'active',s.active,1},{'prefills',s.prefills,1},{'reserved_decode_slots',s.reserved_decode_slots,1},{'prompt',s.prompt,q.prompt},{'output',s.output,q.output},{'adapters',s.adapters,q.adapter}}
+  local checks={{'active',s.active,1},{'prefills',s.prefills,1},{'reserved_decode_slots',s.reserved_decode_slots,1},{'prefill_tokens',s.prefill_tokens,q.prefill_tokens},{'output',s.output,q.output},{'kv',s.kv,q.kv},{'adapters',s.adapters,q.adapter}}
   for _,c in ipairs(checks) do if c[2] ~= 0 and get(field(s,c[1])) + c[3] > c[2] then return {0,s.name,c[1],contract} end end
   -- A contract request that alone reserves more than the scope's whole
   -- positive per-window limit can never be admitted, however long it waits:
@@ -103,9 +109,11 @@ for _,s in ipairs(q.scopes) do
   if s.uncached_prompt ~= 0 and window_get(s,'uncached_prompt',q.now)+get(field(s,'uncached_prompt_reserved'))+q.estimated_input > s.uncached_prompt then return {0,s.name,'uncached_prompt_tokens',contract,window_retry_ms(s,q.now)} end
   if s.generated ~= 0 and window_get(s,'generated',q.now)+get(field(s,'genreserved'))+q.output > s.generated then return {0,s.name,'generated_tokens',contract,window_retry_ms(s,q.now)} end
 end
-local rec={scopes=q.scopes,prompt=q.prompt,estimated_input=q.estimated_input,output=q.output,adapter=q.adapter,prefill=true,cold=false,admitted_at=q.now}
+-- prompt=0 keeps the record readable by a not-yet-upgraded replica's reaper,
+-- whose release_record subtracts rec.prompt unconditionally.
+local rec={scopes=q.scopes,prompt=0,prefill_tokens=q.prefill_tokens,kv=q.kv,estimated_input=q.estimated_input,output=q.output,adapter=q.adapter,prefill=true,cold=false,admitted_at=q.now}
 for _,s in ipairs(q.scopes) do
-  add(field(s,'active'),1); add(field(s,'prefills'),1); add(field(s,'reserved_decode_slots'),1); add(field(s,'prompt'),q.prompt); add(field(s,'output'),q.output); add(field(s,'genreserved'),q.output)
+  add(field(s,'active'),1); add(field(s,'prefills'),1); add(field(s,'reserved_decode_slots'),1); add(field(s,'prefill_tokens'),q.prefill_tokens); add(field(s,'output'),q.output); add(field(s,'kv'),q.kv); add(field(s,'genreserved'),q.output)
   add(field(s,'total_prompt_reserved'),q.estimated_input); add(field(s,'uncached_prompt_reserved'),q.estimated_input)
   if q.adapter == 1 then add(field(s,'adapters'),1) end
   if s.requests ~= 0 then window_add(s,'requests',q.now,1) end
@@ -136,7 +144,7 @@ var transitionScript = redis.NewScript(luaHelpers + `
 reap(current_time_ms()); local raw=redis.call('HGET',KEYS[2],ARGV[1]); if not raw then return {1} end
 local rec=cjson.decode(raw)
 if ARGV[2] == 'prefill' and rec.prefill then
-  for _,s in ipairs(rec.scopes) do add(field(s,'prefills'),-1); add(field(s,'prompt'),-rec.prompt) end
+  for _,s in ipairs(rec.scopes) do add(field(s,'prefills'),-1); add(field(s,'prompt'),-(rec.prompt or 0)); add(field(s,'prefill_tokens'),-(rec.prefill_tokens or 0)) end
   rec.prefill=false; redis.call('HSET',KEYS[2],ARGV[1],cjson.encode(rec))
 end
 return {1}

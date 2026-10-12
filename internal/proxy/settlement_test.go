@@ -97,7 +97,7 @@ func TestSettleAdmissionLeaseRejectsUnsetKind(t *testing.T) {
 	t.Cleanup(func() { _ = c.Close() })
 	lease, err := admission.New(c, cfg).Admit(context.Background(), admission.Request{
 		Graph: "graph", Organization: "org-a", Model: "m",
-		PromptBytes: 1, EstimatedInputTokens: 1, ReservedOutputTokens: 1,
+		PrefillTokens: 1, EstimatedInputTokens: 1, ReservedOutputTokens: 1,
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -164,7 +164,7 @@ func rejectedScopeDimension(err error) (scope, dimension string, ok bool) {
 func contractProbe(estInput, reservedOutput int64, limits admission.RateLimits) admission.Request {
 	return admission.Request{
 		Graph: "graph", Organization: "org-a", Model: "m",
-		PromptBytes: 1, EstimatedInputTokens: estInput, ReservedOutputTokens: reservedOutput,
+		PrefillTokens: 1, EstimatedInputTokens: estInput, ReservedOutputTokens: reservedOutput,
 		OrganizationLimits: limits,
 	}
 }
@@ -264,7 +264,7 @@ func TestWakeColdHoldRejectionSettlesZeroNeverServed(t *testing.T) {
 		// flushes the store) re-establishes it.
 		h, err := a.Admit(context.Background(), admission.Request{
 			Graph: "graph", Organization: "holder", Model: "m",
-			PromptBytes: 1, EstimatedInputTokens: 1, ReservedOutputTokens: 1,
+			PrefillTokens: 1, EstimatedInputTokens: 1, ReservedOutputTokens: 1,
 		})
 		if err != nil {
 			t.Fatal(err)
@@ -302,7 +302,7 @@ func TestWakeColdHoldRejectionSettlesZeroNeverServed(t *testing.T) {
 	// a plain Admit fits alongside the holder's.
 	physical, err := a.Admit(context.Background(), admission.Request{
 		Graph: "graph", Organization: "org-c", Model: "m",
-		PromptBytes: 1, EstimatedInputTokens: 1, ReservedOutputTokens: 1,
+		PrefillTokens: 1, EstimatedInputTokens: 1, ReservedOutputTokens: 1,
 	})
 	if err != nil {
 		t.Fatalf("cold-hold rejection leaked its platform reservation: %v", err)
@@ -370,7 +370,7 @@ func TestWakeExhaustedColdSettlesZeroNeverServed(t *testing.T) {
 
 	physical, err := a.Admit(context.Background(), admission.Request{
 		Graph: "graph", Organization: "org-c", Model: "m",
-		PromptBytes: 1, EstimatedInputTokens: 1, ReservedOutputTokens: 1,
+		PrefillTokens: 1, EstimatedInputTokens: 1, ReservedOutputTokens: 1,
 	})
 	if err != nil {
 		t.Fatalf("exhausted wake leaked its platform reservation: %v", err)
@@ -438,7 +438,7 @@ func TestWakeErrorColdSettlementZeroNeverServed(t *testing.T) {
 
 	physical, err := a.Admit(context.Background(), admission.Request{
 		Graph: "graph", Organization: "org-c", Model: "m",
-		PromptBytes: 1, EstimatedInputTokens: 1, ReservedOutputTokens: 1,
+		PrefillTokens: 1, EstimatedInputTokens: 1, ReservedOutputTokens: 1,
 	})
 	if err != nil {
 		t.Fatalf("waker-failure cold response leaked its platform reservation: %v", err)
@@ -548,7 +548,7 @@ func TestWakeExhaustedWarmFinalSettlesActualUsage(t *testing.T) {
 	// Physical capacity is released by the usage settlement.
 	physical, err := a.Admit(context.Background(), admission.Request{
 		Graph: "graph", Organization: "org-c", Model: "m",
-		PromptBytes: 1, EstimatedInputTokens: 1, ReservedOutputTokens: 1,
+		PrefillTokens: 1, EstimatedInputTokens: 1, ReservedOutputTokens: 1,
 	})
 	if err != nil {
 		t.Fatalf("warm-final usage settlement leaked its platform reservation: %v", err)
@@ -642,7 +642,7 @@ func TestWakeExhaustedTransportErrorSettlesUnknownUsage(t *testing.T) {
 	// Physical capacity is released even though the conservative charges stand.
 	physical, err := a.Admit(context.Background(), admission.Request{
 		Graph: "graph", Organization: "org-c", Model: "m",
-		PromptBytes: 1, EstimatedInputTokens: 1, ReservedOutputTokens: 1,
+		PrefillTokens: 1, EstimatedInputTokens: 1, ReservedOutputTokens: 1,
 	})
 	if err != nil {
 		t.Fatalf("transport-error final leaked its platform reservation: %v", err)
@@ -701,7 +701,7 @@ func TestAdmissionEngineErrorResponseChargesUnknownUsage(t *testing.T) {
 			// contract charges stand.
 			physical, err := a.Admit(context.Background(), admission.Request{
 				Graph: "graph", Organization: "org-c", Model: "m",
-				PromptBytes: 1, EstimatedInputTokens: 1, ReservedOutputTokens: 1,
+				PrefillTokens: 1, EstimatedInputTokens: 1, ReservedOutputTokens: 1,
 			})
 			if err != nil {
 				t.Fatalf("engine error response leaked its platform reservation: %v", err)

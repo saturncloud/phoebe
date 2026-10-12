@@ -729,7 +729,7 @@ func TestGateway_WakeEligible(t *testing.T) {
 	// separately proves the wake path released its one allowed cold hold as well.
 	next, err := a.Admit(context.Background(), admission.Request{
 		Graph: "graph-llama31", Organization: "org-1", Model: "sleepy-bot",
-		PromptBytes: 1, EstimatedInputTokens: 1, ReservedOutputTokens: 1,
+		PrefillTokens: 1, EstimatedInputTokens: 1, ReservedOutputTokens: 1,
 	})
 	if err != nil {
 		t.Fatalf("cold-to-warm request did not release admission reservations: %v", err)

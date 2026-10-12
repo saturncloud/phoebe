@@ -32,7 +32,7 @@ func ptr64(v int64) *int64 { return &v }
 func proxyAdmissionConfig(active int64) config.AdmissionSettings {
 	return config.AdmissionSettings{Enabled: true, KeyPrefix: "proxy-test", LeaseTTL: time.Minute,
 		DefaultMaxOutputTokens: 20, Platform: config.AdmissionLimits{MaxActiveRequests: ptr64(active),
-			MaxConcurrentPrefills: ptr64(active), MaxReservedDecodeSlots: ptr64(active), MaxPromptBytes: ptr64(1024), MaxReservedOutputTokens: ptr64(100),
+			MaxConcurrentPrefills: ptr64(active), MaxReservedDecodeSlots: ptr64(active), MaxPrefillTokens: ptr64(1024), MaxReservedOutputTokens: ptr64(100),
 			RequestsPerWindow: ptr64(100), GeneratedTokensPerWindow: ptr64(1000), Window: time.Minute}}
 }
 
@@ -147,7 +147,7 @@ func TestSharedRequestAtExactBodyLimitAdmitsWithRedisAdmitter(t *testing.T) {
 	up, _ := url.Parse(backend.URL)
 	mr := miniredis.RunT(t)
 	cfg := proxyAdmissionConfig(2)
-	cfg.Platform.MaxPromptBytes = ptr64(limit)
+	cfg.Platform.MaxPrefillTokens = ptr64(limit)
 	client := redis.NewClient(&redis.Options{Addr: mr.Addr()})
 	t.Cleanup(func() { _ = client.Close() })
 	s := New(&config.Settings{Admission: cfg}, logging.New(logging.ERROR), &recordingEmitter{}).
@@ -288,7 +288,7 @@ func TestWakeEnabledWarmRequestExecutesMetersAndSettlesOnce(t *testing.T) {
 	}
 	lease, err := a.Admit(context.Background(), admission.Request{
 		Graph: "graph-a", Organization: "org-b", Model: "model-a",
-		PromptBytes: 1, EstimatedInputTokens: 1, ReservedOutputTokens: 1,
+		PrefillTokens: 1, EstimatedInputTokens: 1, ReservedOutputTokens: 1,
 	})
 	if err != nil {
 		t.Fatalf("warm request did not settle its admission lease: %v", err)
@@ -318,7 +318,7 @@ func TestWakeColdHoldRejectionFailsClosedAndReleasesLease(t *testing.T) {
 	// A contending hold occupies the platform's single cold-hold slot.
 	holder, err := a.Admit(context.Background(), admission.Request{
 		Graph: "graph", Organization: "holder", Model: "m",
-		PromptBytes: 1, EstimatedInputTokens: 1, ReservedOutputTokens: 1,
+		PrefillTokens: 1, EstimatedInputTokens: 1, ReservedOutputTokens: 1,
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -344,14 +344,14 @@ func TestWakeColdHoldRejectionFailsClosedAndReleasesLease(t *testing.T) {
 	// the one after fails. A leaked lease would reject the first.
 	lease, err := a.Admit(context.Background(), admission.Request{
 		Graph: "graph", Organization: "org-b", Model: "m",
-		PromptBytes: 1, EstimatedInputTokens: 1, ReservedOutputTokens: 1,
+		PrefillTokens: 1, EstimatedInputTokens: 1, ReservedOutputTokens: 1,
 	})
 	if err != nil {
 		t.Fatalf("cold-hold rejection leaked its lease: %v", err)
 	}
 	if _, err := a.Admit(context.Background(), admission.Request{
 		Graph: "graph", Organization: "org-c", Model: "m",
-		PromptBytes: 1, EstimatedInputTokens: 1, ReservedOutputTokens: 1,
+		PrefillTokens: 1, EstimatedInputTokens: 1, ReservedOutputTokens: 1,
 	}); err == nil {
 		t.Fatal("platform active limit not enforced after cold-hold rejection")
 	}
@@ -378,7 +378,7 @@ func TestUnavailableModeActuatorSkipsColdHoldAdmission(t *testing.T) {
 
 	holder, err := a.Admit(context.Background(), admission.Request{
 		Graph: "graph", Organization: "holder", Model: "m",
-		PromptBytes: 1, EstimatedInputTokens: 1, ReservedOutputTokens: 1,
+		PrefillTokens: 1, EstimatedInputTokens: 1, ReservedOutputTokens: 1,
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -714,7 +714,7 @@ func TestPrefillReleaseOffFirstBytePath(t *testing.T) {
 		// releases the prefill reservation itself — capacity cannot leak.
 		lease, err := admission.New(c, cfg).Admit(context.Background(), admission.Request{
 			Graph: "graph", Organization: "org-b", Model: "m",
-			PromptBytes: 1, EstimatedInputTokens: 1, ReservedOutputTokens: 1,
+			PrefillTokens: 1, EstimatedInputTokens: 1, ReservedOutputTokens: 1,
 		})
 		if err != nil {
 			t.Fatalf("failed prefill release leaked the reservation past settlement: %v", err)
@@ -754,7 +754,7 @@ func TestWakeExhaustedReturnsColdAndReleasesCapacity(t *testing.T) {
 	}
 	lease, err := a.Admit(context.Background(), admission.Request{
 		Graph: "graph", Organization: "org-b", Model: "m",
-		PromptBytes: 1, EstimatedInputTokens: 1, ReservedOutputTokens: 1,
+		PrefillTokens: 1, EstimatedInputTokens: 1, ReservedOutputTokens: 1,
 	})
 	if err != nil {
 		t.Fatalf("exhausted wake leaked its lease: %v", err)
@@ -1512,7 +1512,7 @@ func TestDegenerateUpstreamGraphFailsClosedNoBypass(t *testing.T) {
 	// platform scope (capacity 1) must succeed immediately.
 	lease, err := admission.New(c, cfg).Admit(context.Background(), admission.Request{
 		Graph: "graph-a", Organization: "org-a", Owner: "owner-a", Model: "model-a",
-		PromptBytes: 1, EstimatedInputTokens: 1, ReservedOutputTokens: 1,
+		PrefillTokens: 1, EstimatedInputTokens: 1, ReservedOutputTokens: 1,
 	})
 	if err != nil {
 		t.Fatalf("degenerate upstream request leaked into admission state: %v", err)
@@ -1601,14 +1601,14 @@ func TestAdmissionReleasesAbortedStream(t *testing.T) {
 		{
 			name: "organization contract",
 			req: admission.Request{Graph: "graph", Organization: "org-a", Owner: "other-owner", Model: "m",
-				PromptBytes: 1, EstimatedInputTokens: 1, ReservedOutputTokens: 1,
+				PrefillTokens: 1, EstimatedInputTokens: 1, ReservedOutputTokens: 1,
 				OrganizationLimits: admission.RateLimits{GeneratedTokens: ptr64(20)}},
 			want: "contract_organization",
 		},
 		{
 			name: "owner contract",
 			req: admission.Request{Graph: "graph", Organization: "other-org", Owner: "owner-a", Model: "m",
-				PromptBytes: 1, EstimatedInputTokens: 1, ReservedOutputTokens: 1,
+				PrefillTokens: 1, EstimatedInputTokens: 1, ReservedOutputTokens: 1,
 				OwnerLimits: admission.RateLimits{GeneratedTokens: ptr64(20)}},
 			want: "contract_owner",
 		},
@@ -1657,7 +1657,7 @@ func TestAdmissionReleasesAbortedStream(t *testing.T) {
 			t.Errorf("%s: err=%v, want %s generated_tokens rejection", tc.name, errs[i], tc.want)
 		}
 	}
-	lease, err := a.Admit(context.Background(), admission.Request{Graph: "graph", Organization: "other", Model: "m", PromptBytes: 1, EstimatedInputTokens: 1, ReservedOutputTokens: 1})
+	lease, err := a.Admit(context.Background(), admission.Request{Graph: "graph", Organization: "other", Model: "m", PrefillTokens: 1, EstimatedInputTokens: 1, ReservedOutputTokens: 1})
 	if err != nil {
 		t.Fatalf("aborted stream leaked reservation: %v", err)
 	}
@@ -1701,14 +1701,14 @@ func TestAdmissionChargesUnknownUsageOnPreHeaderAbort(t *testing.T) {
 		{
 			name: "organization contract",
 			req: admission.Request{Graph: "graph", Organization: "org-a", Owner: "other-owner", Model: "m",
-				PromptBytes: 1, EstimatedInputTokens: 1, ReservedOutputTokens: 1,
+				PrefillTokens: 1, EstimatedInputTokens: 1, ReservedOutputTokens: 1,
 				OrganizationLimits: admission.RateLimits{GeneratedTokens: ptr64(20)}},
 			want: "contract_organization",
 		},
 		{
 			name: "owner contract",
 			req: admission.Request{Graph: "graph", Organization: "other-org", Owner: "owner-a", Model: "m",
-				PromptBytes: 1, EstimatedInputTokens: 1, ReservedOutputTokens: 1,
+				PrefillTokens: 1, EstimatedInputTokens: 1, ReservedOutputTokens: 1,
 				OwnerLimits: admission.RateLimits{GeneratedTokens: ptr64(20)}},
 			want: "contract_owner",
 		},
@@ -1798,14 +1798,14 @@ func TestAdmissionChargesUnknownUsageOnUpstreamReset(t *testing.T) {
 		{
 			name: "organization contract",
 			req: admission.Request{Graph: "graph", Organization: "org-a", Owner: "other-owner", Model: "m",
-				PromptBytes: 1, EstimatedInputTokens: 1, ReservedOutputTokens: 1,
+				PrefillTokens: 1, EstimatedInputTokens: 1, ReservedOutputTokens: 1,
 				OrganizationLimits: admission.RateLimits{GeneratedTokens: ptr64(20)}},
 			want: "contract_organization",
 		},
 		{
 			name: "owner contract",
 			req: admission.Request{Graph: "graph", Organization: "other-org", Owner: "owner-a", Model: "m",
-				PromptBytes: 1, EstimatedInputTokens: 1, ReservedOutputTokens: 1,
+				PrefillTokens: 1, EstimatedInputTokens: 1, ReservedOutputTokens: 1,
 				OwnerLimits: admission.RateLimits{GeneratedTokens: ptr64(20)}},
 			want: "contract_owner",
 		},
@@ -1868,7 +1868,7 @@ func TestAdmissionChargesUnknownUsageOnUpstreamReset(t *testing.T) {
 	}
 	// Physical capacity itself is released; only the conservative contract
 	// charges are retained.
-	lease, err := a.Admit(context.Background(), admission.Request{Graph: "graph", Organization: "other", Model: "m", PromptBytes: 1, EstimatedInputTokens: 1, ReservedOutputTokens: 1})
+	lease, err := a.Admit(context.Background(), admission.Request{Graph: "graph", Organization: "other", Model: "m", PrefillTokens: 1, EstimatedInputTokens: 1, ReservedOutputTokens: 1})
 	if err != nil {
 		t.Fatalf("reset upstream leaked physical reservation: %v", err)
 	}
@@ -1953,14 +1953,14 @@ func TestAdmissionDialFailureChargesOnlyRequestsWindow(t *testing.T) {
 		{
 			name: "organization requests window",
 			req: admission.Request{Graph: "graph", Organization: "org-a", Owner: "other-owner", Model: "m",
-				PromptBytes: 1, EstimatedInputTokens: 1, ReservedOutputTokens: 1,
+				PrefillTokens: 1, EstimatedInputTokens: 1, ReservedOutputTokens: 1,
 				OrganizationLimits: admission.RateLimits{Requests: ptr64(1)}},
 			want: "contract_organization",
 		},
 		{
 			name: "owner requests window",
 			req: admission.Request{Graph: "graph", Organization: "other-org", Owner: "owner-a", Model: "m",
-				PromptBytes: 1, EstimatedInputTokens: 1, ReservedOutputTokens: 1,
+				PrefillTokens: 1, EstimatedInputTokens: 1, ReservedOutputTokens: 1,
 				OwnerLimits: admission.RateLimits{Requests: ptr64(1)}},
 			want: "contract_owner",
 		},
@@ -2026,7 +2026,7 @@ func TestAdmissionDialFailureChargesOnlyRequestsWindow(t *testing.T) {
 	// contract. A phantom conservative charge would have filled the window and
 	// rejected this probe.
 	lease, err := a.Admit(context.Background(), admission.Request{Graph: "graph", Organization: "org-a", Owner: "other-owner", Model: "m",
-		PromptBytes: 1, EstimatedInputTokens: 7, ReservedOutputTokens: 20,
+		PrefillTokens: 1, EstimatedInputTokens: 7, ReservedOutputTokens: 20,
 		OrganizationLimits: admission.RateLimits{GeneratedTokens: ptr64(20), TotalPromptTokens: ptr64(7), UncachedPromptTokens: ptr64(7)}})
 	if err != nil {
 		t.Fatalf("dial failure left a phantom prompt/generated charge: %v", err)
@@ -2266,7 +2266,7 @@ func TestAdmissionWorkRejectsAmbiguousOrImpossibleRequests(t *testing.T) {
 		t.Fatal("conflicting output limits accepted")
 	}
 	body := []byte(`{"model":"m"}`)
-	if estimate, ok := admissionWork(body, 10); !ok || estimate.Model != "m" || estimate.OutputTokens != 10 || estimate.InputTokens != int64((len(body)+3)/4) {
+	if estimate, ok := admissionWork(body, 10); !ok || estimate.Model != "m" || estimate.OutputTokens != 10 || estimate.InputTokens != 1 {
 		t.Fatalf("estimate=(%+v,%t)", estimate, ok)
 	}
 	for _, body := range []string{
@@ -2539,7 +2539,7 @@ func TestWakeColdHoldStoreOutageLogsSampled(t *testing.T) {
 	// request's Admit fails with ErrUnavailable and bypasses the gate.
 	lease, err := a.Admit(context.Background(), admission.Request{
 		Graph: "graph", Organization: "org-a", Model: "m",
-		PromptBytes: 1, EstimatedInputTokens: 1, ReservedOutputTokens: 1,
+		PrefillTokens: 1, EstimatedInputTokens: 1, ReservedOutputTokens: 1,
 	})
 	if err != nil {
 		t.Fatal(err)
