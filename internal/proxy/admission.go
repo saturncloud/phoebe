@@ -160,15 +160,20 @@ func writeRequestBodyError(w http.ResponseWriter, err error) {
 	http.Error(w, "bad request body", http.StatusBadRequest)
 }
 
+// admissionInterpretedFields are the top-level request fields admission reads.
+var admissionInterpretedFields = []string{"model", "max_tokens", "max_completion_tokens", "messages", "prompt", "input"}
+
 // admissionWork returns the exact routed model and cheap token reservations.
 // The input estimate is message-text characters / 4 (estimatePromptTokens);
 // Dynamo remains authoritative and Phoebe reconciles its actual cache-aware
 // token counts after the response.
 func admissionWork(body []byte, defaultOutput int64) (admissionEstimate, bool) {
-	counts, err := countTopLevelKeys(body, map[string]struct{}{
-		"model": {}, "max_tokens": {}, "max_completion_tokens": {},
-	})
-	if err != nil || counts["model"] != 1 || counts["max_tokens"] > 1 || counts["max_completion_tokens"] > 1 {
+	// Every field the estimate and the routed model are read from must be
+	// unambiguous: no duplicates and no case variants (see
+	// checkTopLevelKeyAmbiguity), or phoebe could admit against one value
+	// while the engine processes another.
+	counts, err := checkTopLevelKeyAmbiguity(body, admissionInterpretedFields)
+	if err != nil || counts["model"] != 1 {
 		return admissionEstimate{}, false
 	}
 	var v struct {

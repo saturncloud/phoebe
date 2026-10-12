@@ -2348,6 +2348,32 @@ func TestAdmissionWorkRejectsAmbiguousOrImpossibleRequests(t *testing.T) {
 	}
 }
 
+// Admission must never estimate one prompt while the engine processes
+// another: a duplicate or case-variant key for any field admission reads is
+// refused (encoding/json matches keys case-insensitively and keeps the last
+// match; the engine frontend matches exactly).
+func TestAdmissionWorkRejectsCaseVariantAndDuplicateInterpretedKeys(t *testing.T) {
+	long := strings.Repeat("x", 4000)
+	for _, body := range []string{
+		`{"model":"m","messages":[{"role":"user","content":"` + long + `"}],"Messages":[]}`,
+		`{"model":"m","messages":[{"role":"user","content":"` + long + `"}],"messages":[]}`,
+		`{"model":"m","prompt":"` + long + `","Prompt":""}`,
+		`{"model":"m","input":"` + long + `","Input":""}`,
+		`{"model":"m","Model":"x"}`,
+		`{"model":"m","MAX_TOKENS":2}`,
+	} {
+		if _, ok := admissionWork([]byte(body), 10); ok {
+			t.Fatalf("ambiguous interpreted key accepted: %.80s", body)
+		}
+	}
+	// An ordinary body is unaffected and keeps its estimate.
+	body := []byte(`{"model":"m","max_tokens":5,"messages":[{"role":"user","content":"` + long + `"}],"Stream":true}`)
+	estimate, ok := admissionWork(body, 10)
+	if !ok || estimate.Model != "m" || estimate.OutputTokens != 5 || estimate.InputTokens != estimatePromptTokens(body) || estimate.InputTokens != 1000 {
+		t.Fatalf("estimate=(%+v,%t), want model m, 5 output tokens, 1000 input tokens", estimate, ok)
+	}
+}
+
 func TestPrepareSharedDynamoRequestOverwritesUntrustedHints(t *testing.T) {
 	body := []byte(`{"model":"m","max_tokens":41,"stream":true,"stream_options":{"include_usage":false},"cache_salt":"attacker","nvext":{"cache_salt":"attacker","keep":"yes","backend_instance_id":99,"token_data":[1,2],"agent_hints":{"priority":2147483647,"strict_priority":4294967295,"osl":1,"speculative_prefill":true}}}`)
 	lane := config.AdmissionLane{DynamoPriority: 9, DynamoStrictPriority: 2}
