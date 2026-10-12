@@ -31,12 +31,40 @@ func withRequestStart(ctx context.Context, t time.Time) context.Context {
 	return context.WithValue(ctx, requestStartKey{}, t)
 }
 
+type topologySnapshotKey struct{}
+
+// topologySnapshot is the graph's topology as published when phoebe resolved
+// the serving graph for the request. ok=false records a miss at that instant.
+type topologySnapshot struct {
+	graph string
+	topo  gateway.Topology
+	ok    bool
+}
+
+// withTopologySnapshot records the serving graph's topology at request time,
+// so a revision published (or a ConfigMap deleted) while the request is in
+// flight never relabels the tokens the earlier topology served.
+func withTopologySnapshot(ctx context.Context, graph string, topo gateway.Topology, ok bool) context.Context {
+	return context.WithValue(ctx, topologySnapshotKey{}, topologySnapshot{graph: graph, topo: topo, ok: ok})
+}
+
 // stampServing fills the platform-set serving fields of e: the graph's
 // published topology and the request's start time and duration on phoebe's
 // clock. Owner ruling 2026-10-12: topology, region and serving time come from
 // the platform, never from what the engine echoes back.
+//
+// The topology is the one snapshotted when the request's graph was resolved
+// (handleProxy), not the one current at emit time: a long stream or a cold
+// wake can outlive a revision change or the graph's teardown. Only an emit
+// with no snapshot (an early return before the graph was resolved) looks the
+// graph up now.
 func (s *Server) stampServing(ctx context.Context, e *metering.Event) {
-	if s.topology != nil {
+	if snap, ok := ctx.Value(topologySnapshotKey{}).(topologySnapshot); ok && snap.graph == e.GraphK8sName {
+		if snap.ok {
+			e.TopologyRevision = snap.topo.Revision
+			e.Region = snap.topo.Region
+		}
+	} else if s.topology != nil {
 		if topo, ok := s.topology.Lookup(e.GraphK8sName); ok {
 			e.TopologyRevision = topo.Revision
 			e.Region = topo.Region
