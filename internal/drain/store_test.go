@@ -34,6 +34,12 @@ func TestPostgresStore_UpsertSQL(t *testing.T) {
 			CompletionTokens: 7,
 			ServingMode:      "dedicated",
 			TimestampUnixMs:  ts,
+			// Platform-set serving fields. A zero duration with a known start
+			// is a measured value and must be stored as 0, not NULL.
+			TopologyRevision:     3,
+			Region:               "eu-north1",
+			RequestStartedUnixMs: ts - 1500,
+			ServingDurationMs:    0,
 		},
 		{
 			RequestID: "req-2",
@@ -45,14 +51,17 @@ func TestPostgresStore_UpsertSQL(t *testing.T) {
 
 	mock.ExpectBegin()
 	mock.ExpectExec(regexp.QuoteMeta(
-		"INSERT INTO billing_event (request_id, client_request_id, auth_id, user_id, group_id, resource_id, resource_type, org_id, model, base_model, adapter, serving_mode, prompt_tokens, cached_tokens, completion_tokens, finish_reason, gpu_type, aborted, usage_found, status_code, streamed, graph_k8s_name, event_ts) VALUES",
+		"INSERT INTO billing_event (request_id, client_request_id, auth_id, user_id, group_id, resource_id, resource_type, org_id, model, base_model, adapter, serving_mode, prompt_tokens, cached_tokens, completion_tokens, finish_reason, aborted, usage_found, status_code, streamed, graph_k8s_name, topology_revision, region, request_started_at, serving_duration_ms, event_ts) VALUES",
 	)).
 		WithArgs(
 			// row 1 (org_id + base_model NULL: a pre-cutover-shaped event with no org
 			// header and no derived_from)
-			"req-1", "logical-1", "auth-1", nil, nil, nil, nil, nil, "m1", nil, nil, "dedicated", 5, 0, 7, nil, nil, false, false, nil, false, nil, time.UnixMilli(ts).UTC(),
-			// row 2 (no identity, no timestamp → event_ts NULL)
-			"req-2", nil, nil, nil, nil, nil, nil, nil, "m2", nil, nil, "shared", 0, 0, 0, nil, nil, false, false, nil, false, nil, nil,
+			"req-1", "logical-1", "auth-1", nil, nil, nil, nil, nil, "m1", nil, nil, "dedicated", 5, 0, 7, nil, false, false, nil, false, nil,
+			3, "eu-north1", time.UnixMilli(ts-1500).UTC(), int64(0), time.UnixMilli(ts).UTC(),
+			// row 2 (no identity, no timestamp → event_ts NULL; no topology, no
+			// start → all four serving fields NULL)
+			"req-2", nil, nil, nil, nil, nil, nil, nil, "m2", nil, nil, "shared", 0, 0, 0, nil, false, false, nil, false, nil,
+			nil, nil, nil, nil, nil,
 		).
 		WillReturnResult(sqlmock.NewResult(0, 2))
 	mock.ExpectCommit()
@@ -130,8 +139,9 @@ func TestPostgresStore_EmptyModelStoredAsNull(t *testing.T) {
 			nil,         // base_model: "" must bind NULL
 			nil,         // adapter: "" must bind NULL
 			"dedicated", // serving_mode: bound as decoded
-			1, 0, 2, nil, nil, false, false, nil, false,
-			nil, // graph_k8s_name: "" must bind NULL
+			1, 0, 2, nil, false, false, nil, false,
+			nil,                // graph_k8s_name: "" must bind NULL
+			nil, nil, nil, nil, // topology_revision, region, request_started_at, serving_duration_ms
 			nil,
 		).
 		WillReturnResult(sqlmock.NewResult(0, 1))
@@ -158,7 +168,7 @@ func TestPostgresStore_EmptyModelStoredAsNull(t *testing.T) {
 // and billing_event_status_code_ck admits NULL or 100..599 — so 0 must bind NULL
 // (a never-answered attempt), while a real status binds through verbatim.
 func TestEventArgs_ZeroStatusCodeBindsNullNoResponse(t *testing.T) {
-	const statusCodeIdx = 19 // request_id..usage_found is 19 columns; status_code is next.
+	const statusCodeIdx = 18 // request_id..usage_found is 18 columns; status_code is next.
 
 	noResponse := eventArgs(metering.Event{RequestID: "r", Model: "m"})
 	if noResponse[statusCodeIdx] != nil {

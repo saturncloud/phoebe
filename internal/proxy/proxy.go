@@ -121,6 +121,10 @@ type Server struct {
 	admissionReleaseFallbackLog, admissionCompletionReleaseLog sampledErrorLog
 	admissionPrefillReleaseLog, admissionUpstreamReleaseLog    sampledErrorLog
 	admissionColdHoldReleaseLog                                sampledErrorLog
+
+	// topology annotates usage events with the graph's published topology
+	// revision and region (WithTopology). nil = not annotated.
+	topology TopologyLookup
 }
 
 func (s *Server) WithAdmitter(a admission.Admitter) *Server { s.admitter = a; return s }
@@ -226,6 +230,7 @@ func (s *Server) handleHealth(w http.ResponseWriter, _ *http.Request) {
 // is non-nil, so onDone sees Aborted=true. The once-guard in finish() ensures
 // onDone fires exactly once regardless of whether EOF or Close reaches it first.
 func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request) {
+	r = r.WithContext(withRequestStart(r.Context(), time.Now()))
 	id := identity.FromRequest(r)
 	// The legacy quota headers feed only a log diagnostic on the admission path
 	// (R8 cutover); record their presence now, because the strip below removes
@@ -1153,6 +1158,7 @@ func (s *Server) emit(ctx context.Context, id identity.Identity, requestID, clie
 		StatusCode:       statusCode,
 		Streamed:         res.Streamed,
 	}
+	s.stampServing(ctx, &e)
 	s.emitter.Emit(ctx, e)
 }
 

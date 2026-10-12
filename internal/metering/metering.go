@@ -123,13 +123,32 @@ type Event struct {
 	CompletionTokens int `json:"completion_tokens"`
 
 	FinishReason string `json:"finish_reason,omitempty"`
-	GPUType      string `json:"gpu_type,omitempty"` // for margin; echoed by router/engine
 	Aborted      bool   `json:"aborted,omitempty"`
 	// UsageFound distinguishes a legitimate zero-token engine usage block from a
 	// failed/aborted attempt for which no authoritative counts were available.
 	UsageFound bool `json:"usage_found"`
 	StatusCode int  `json:"status_code,omitempty"`
 	Streamed   bool `json:"streamed,omitempty"`
+
+	// Serving topology, region and serving time (owner ruling 2026-10-12:
+	// usage events record the serving topology by revision). All are
+	// PLATFORM-SET, never taken from the engine's response, and EVIDENCE ONLY
+	// for margin analysis: never part of the billing grain, never a reason to
+	// withhold or reprice a row.
+	//
+	// TopologyRevision is the graph's tf_topology_revision number in Atlas,
+	// which holds each pool's role, instance type, GPU type and GPUs per
+	// replica; Region is the graph's cluster region. Both come from the
+	// graph's topology entry Atlas publishes (internal/gateway/topology.go),
+	// looked up by GraphK8sName. 0 / "" = no entry (stored NULL).
+	TopologyRevision int    `json:"topology_revision,omitempty"`
+	Region           string `json:"region,omitempty"`
+	// RequestStartedUnixMs is when phoebe received the request; ServingDurationMs
+	// is the time from then until this attempt's outcome was recorded (the
+	// response finished, the client went away, or the attempt failed). Both
+	// from phoebe's clock. Wake holds and admission waits are included.
+	RequestStartedUnixMs int64 `json:"request_started_unix_ms,omitempty"`
+	ServingDurationMs    int64 `json:"serving_duration_ms,omitempty"`
 
 	// TimestampUnixMs is stamped by the emitter, not in the hot path here.
 	TimestampUnixMs int64 `json:"timestamp_unix_ms"`

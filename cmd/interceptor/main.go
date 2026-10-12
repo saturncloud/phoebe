@@ -60,6 +60,11 @@ func main() {
 	if gwResolver != nil {
 		srv = srv.WithGateway(gwResolver, settings.Gateway.Namespace, settings.Gateway.Port)
 	}
+	topology, closeTopology := buildTopology(settings, log)
+	defer closeTopology()
+	if topology != nil {
+		srv = srv.WithTopology(topology)
+	}
 	if w := buildWaker(settings, log); w != nil {
 		// Timeout 0 = the proxy default (300s — sized above vLLM's measured
 		// ~2.5min cold reload); tries 0 = the proxy default (3).
@@ -115,6 +120,28 @@ func buildAdmission(s *config.Settings, log *logging.Logger) (admission.Admitter
 		log.Info.Printf("admission: enforcing %s (valkey %s, lease ttl %s)", mode, cfg.ValkeyAddr, cfg.LeaseTTL)
 	}
 	return admitter, func() { _ = client.Close() }
+}
+
+// buildTopology starts the graph topology index (internal/gateway/topology.go)
+// that stamps each usage event with its graph's topology revision and region.
+// It watches ConfigMaps in the gateway namespace, the same access the
+// registry resolver already uses, so it runs only where the registry
+// resolver runs. Anywhere else, or when the kubernetes config is missing,
+// it returns nil and events carry no topology: the fields are margin
+// evidence, so their absence is never a reason to stop serving.
+func buildTopology(s *config.Settings, log *logging.Logger) (*gateway.TopologyIndex, func()) {
+	if !s.Gateway.Enabled || s.Gateway.LegacyPostgresResolver || s.Gateway.Namespace == "" {
+		return nil, func() {}
+	}
+	client, err := gateway.NewKubeClient(s.Gateway.Kubeconfig)
+	if err != nil {
+		log.Warn.Printf("gateway: graph topology index disabled (%v); usage events carry no topology revision or region", err)
+		return nil, func() {}
+	}
+	index := gateway.NewTopologyIndex(client, s.Gateway.Namespace, log)
+	ctx, cancel := context.WithCancel(context.Background())
+	go index.Run(ctx)
+	return index, cancel
 }
 
 // buildGateway constructs the TF gateway (org, model) resolver. DEFAULT: the
