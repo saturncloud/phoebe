@@ -611,7 +611,7 @@ func TestExplicitZeroCapBlocksEveryRequest(t *testing.T) {
 			t.Fatalf("err=%v, want adapters rejection even with a zero adapter delta", err)
 		}
 	})
-	t.Run("prompt zero cap blocks zero-byte prompts", func(t *testing.T) {
+	t.Run("prefill zero cap blocks zero-token prompts", func(t *testing.T) {
 		l := limits(5)
 		l.MaxPrefillTokens = ptr64(0)
 		a, _ := testAdmitter(t, config.AdmissionSettings{Platform: l})
@@ -620,7 +620,7 @@ func TestExplicitZeroCapBlocksEveryRequest(t *testing.T) {
 		_, err := a.Admit(context.Background(), req)
 		var rejected *Rejected
 		if !errors.As(err, &rejected) || rejected.Dimension != "prefill_tokens" {
-			t.Fatalf("err=%v, want prompt rejection even with a zero prompt-byte delta", err)
+			t.Fatalf("err=%v, want prefill_tokens rejection even with a zero prefill-token delta", err)
 		}
 	})
 
@@ -1143,7 +1143,7 @@ func TestImpossibleRequestRejectedBeforeReservation(t *testing.T) {
 	_, err := a.Admit(context.Background(), request("a", "m"))
 	var rejected *Rejected
 	if !errors.As(err, &rejected) || rejected.Dimension != "prefill_tokens" {
-		t.Fatalf("err=%v, want prompt rejection", err)
+		t.Fatalf("err=%v, want prefill_tokens rejection", err)
 	}
 }
 
