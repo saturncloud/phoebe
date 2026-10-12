@@ -23,6 +23,18 @@
 -- changes every id, exactly as 0006 and 0007 did. Existing rows are rewritten below
 -- with the rater's new formula so a re-rate reproduces them. Pre-production: no
 -- settled rows hold the old ids (same reckoning as 0007).
+--
+-- Rollout: NOT additive. A pre-0009 rater must not run against this schema. Its
+-- ON CONFLICT target (the 7-column 0006 grain) no longer matches any unique
+-- constraint, and it can write graph_k8s_name NULL, which now violates NOT NULL.
+-- Either error rolls back the whole RateWindow transaction, so the failure is
+-- closed and nothing is written; the new rater re-rates the window on its next
+-- run. Order: suspend the rater CronJob (and token-push if desired) or let any
+-- in-flight run finish, run cmd/migrate up, deploy the new rater/drainer/token-push
+-- images, then resume. If the gap was longer than the rater's trailing re-rate
+-- window, run `rater --since <gap start> --until <current hour start>` and then
+-- token-push over the same range. See "Rollout order for migration 0009" in
+-- migrations/README.md.
 
 ALTER TABLE rated_usage ADD COLUMN topology_revision INTEGER NOT NULL DEFAULT 0;
 ALTER TABLE rated_usage ADD COLUMN region VARCHAR(64);

@@ -160,6 +160,38 @@ dedicated or NULL events. The CHECK constraint rejects that write, and the whole
 for that window, and the next run of the new rater re-rates it. The failure is
 closed and heals itself; the order above only avoids the delayed windows.
 
+### Rollout order for migration 0009
+
+Migration 0009 replaces `rated_usage_grain_uq` with a 9-column key (adding
+`graph_k8s_name` and `topology_revision`) and makes `graph_k8s_name` NOT NULL.
+Unlike 0008, it is not additive: the rater's SQL and the schema must change
+together. Roll out in this order:
+
+1. Before applying 0009, suspend the rater CronJob (and the token-push CronJob if
+   you want the push paused too), or let any in-flight rater run finish.
+2. Run `cmd/migrate up`, deploy the new rater and token-push images (and the
+   0008-aware interceptor and drainer), then resume the rater.
+3. A pre-0009 rater must not run against schema 0009. Its ON CONFLICT on the old
+   7-column key matches no unique constraint, so Postgres rejects the upsert
+   ("there is no unique or exclusion constraint matching the ON CONFLICT
+   specification"); it can also write `graph_k8s_name` NULL, which now violates
+   NOT NULL. Either error rolls back the whole `RateWindow` transaction. A
+   post-0009 rater against a pre-0009 schema fails the same way, because the
+   `topology_revision` column is missing. Both failures are closed: nothing is
+   written or deleted, and the next run of the new rater re-rates the window. If
+   the rater was stopped or failing for longer than its trailing re-rate window
+   (24h by default), run `rater --since <gap start> --until <start of the current
+   hour>` and then `token-push` over the same range.
+4. 0009 recomputes every `rated_usage` id, so the first token-push after the
+   cutover replaces saturn-aws-manager's rows for each pushed window: old ids are
+   deleted because they are absent from the snapshot, and new ids are inserted.
+   Windows older than token-push's trailing window keep their old-id rows until
+   they are re-pushed; re-push them with `token-push --since ... --until ...`.
+   This is acceptable only before production (no settled rows hold the old ids),
+   for the same reason as 0007.
+
+The migration header (`0009_rollup_grain_graph_revision.up.sql`) points here.
+
 ## Local dev
 
 ```
