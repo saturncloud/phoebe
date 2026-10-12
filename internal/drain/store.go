@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"fmt"
+	"math"
 	"strings"
 	"time"
 
@@ -238,7 +239,7 @@ func eventArgs(e metering.Event) []any {
 		// Topology, region and serving time: evidence for margin analysis,
 		// NULL when unknown (no topology entry for the graph, or an event
 		// written before these fields existed).
-		nullInt(e.TopologyRevision),
+		nullRevision(e.TopologyRevision),
 		nullStr(e.Region),
 		requestStartedAt,
 		nullInt64(e.ServingDurationMs, e.RequestStartedUnixMs > 0),
@@ -265,6 +266,17 @@ func nullStr(s string) any {
 // out-of-range value before it can reach this bind.
 func nullInt(v int) any {
 	if v == 0 {
+		return nil
+	}
+	return v
+}
+
+// nullRevision is nullInt for topology_revision, which is a Postgres INTEGER:
+// a value outside 1..MaxInt32 is stored as NULL ("not captured") so that
+// out-of-range evidence can never fail the insert and drop billable usage as
+// poison. The gateway already rejects such entries; this is the backstop.
+func nullRevision(v int) any {
+	if v < 1 || v > math.MaxInt32 {
 		return nil
 	}
 	return v

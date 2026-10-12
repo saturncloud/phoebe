@@ -17,19 +17,28 @@ package gateway
 //     tf-graph-topology-<graph_k8s_name>.
 //   - label saturncloud.io/tf-graph-topology: "true" (this informer's
 //     selector).
-//   - data keys (strings): graph_k8s_name (the lookup key),
-//     topology_revision (decimal, >= 1), region (may be "").
+//   - data keys (strings): graph_k8s_name (the lookup key; the ConfigMap
+//     name must be tf-graph-topology-<graph_k8s_name>, so the namespace's
+//     name uniqueness gives at most one entry per graph),
+//     topology_revision (decimal, 1..2147483647), region (may be "", at most
+//     64 characters).
 //
 // The fields are EVIDENCE for margin analysis, not billing inputs: a missing
-// or malformed entry only leaves them NULL on the event. Nothing fails or
-// waits on this index, unlike the served-model registry, which fails closed
-// before its first sync.
+// or malformed entry only leaves them NULL on the event. An entry whose name
+// does not match its graph, or whose revision is out of range, is ignored
+// whole. A region that is not valid UTF-8 or is longer than 64 characters is
+// dropped (logged) and the revision is kept. Startup waits up to 10s for the
+// first sync so the first requests after a pod start carry their revision,
+// but serving never fails or waits beyond that on this index, unlike the
+// served-model registry, which fails closed before its first sync.
 
 import (
 	"context"
 	"fmt"
+	"math"
 	"strconv"
 	"sync"
+	"unicode/utf8"
 
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -40,7 +49,15 @@ import (
 	"github.com/saturncloud/phoebe/internal/logging"
 )
 
-const topologyLabelSelector = "saturncloud.io/tf-graph-topology=true"
+const (
+	topologyLabelSelector = "saturncloud.io/tf-graph-topology=true"
+	// topologyConfigMapPrefix + graph_k8s_name is the required ConfigMap name
+	// (Atlas: pdc/tf_metering.py topology_configmap_name).
+	topologyConfigMapPrefix = "tf-graph-topology-"
+	// maxRegionChars matches Atlas's Cluster.region Unicode(64) and
+	// billing_event.region VARCHAR(64), both counted in characters.
+	maxRegionChars = 64
+)
 
 // Topology is what Atlas published for one graph.
 type Topology struct {
@@ -95,6 +112,12 @@ func (t *TopologyIndex) Run(ctx context.Context) {
 	t.informer.Run(ctx.Done())
 }
 
+// WaitSynced blocks until the informer's initial list has been indexed or
+// ctx is done, and reports whether it synced.
+func (t *TopologyIndex) WaitSynced(ctx context.Context) bool {
+	return cache.WaitForCacheSync(ctx.Done(), t.informer.HasSynced)
+}
+
 // Lookup returns the topology Atlas published for graph, if any.
 func (t *TopologyIndex) Lookup(graph string) (Topology, bool) {
 	if t == nil || graph == "" {
@@ -111,7 +134,7 @@ func (t *TopologyIndex) upsert(obj any) {
 	if !ok {
 		return
 	}
-	graph, topo, err := parseTopologyConfigMap(cm)
+	graph, topo, regionDropped, err := parseTopologyConfigMap(cm)
 	t.mu.Lock()
 	defer t.mu.Unlock()
 	if old, had := t.byCM[cm.Name]; had {
@@ -121,6 +144,9 @@ func (t *TopologyIndex) upsert(obj any) {
 	if err != nil {
 		t.log.Warn.Printf("gateway: ignoring graph topology ConfigMap %s/%s: %v", cm.Namespace, cm.Name, err)
 		return
+	}
+	if regionDropped {
+		t.log.Warn.Printf("gateway: graph topology ConfigMap %s/%s: region is not valid UTF-8 or longer than %d characters; keeping the revision and recording no region", cm.Namespace, cm.Name, maxRegionChars)
 	}
 	t.byGraph[graph] = topo
 	t.byCM[cm.Name] = graph
@@ -145,20 +171,31 @@ func (t *TopologyIndex) remove(obj any) {
 	}
 }
 
-// parseTopologyConfigMap validates an entry against the contract above.
-func parseTopologyConfigMap(cm *corev1.ConfigMap) (string, Topology, error) {
+// parseTopologyConfigMap validates an entry against the contract above. It
+// returns an error when the entry must be ignored whole; regionDropped
+// reports a bad region that was cleared while the revision was kept.
+func parseTopologyConfigMap(cm *corev1.ConfigMap) (graph string, topo Topology, regionDropped bool, err error) {
 	d := cm.Data
-	graph := d["graph_k8s_name"]
+	graph = d["graph_k8s_name"]
 	if graph == "" {
-		return "", Topology{}, fmt.Errorf("missing required data key %q", "graph_k8s_name")
+		return "", Topology{}, false, fmt.Errorf("missing required data key %q", "graph_k8s_name")
 	}
-	revision, err := strconv.Atoi(d["topology_revision"])
-	if err != nil || revision < 1 {
-		return "", Topology{}, fmt.Errorf("invalid topology_revision %q", d["topology_revision"])
+	// One ConfigMap per graph: the name is derived from the graph, so two
+	// ConfigMaps can never index (and on delete, un-index) the same graph.
+	if cm.Name != topologyConfigMapPrefix+graph {
+		return "", Topology{}, false, fmt.Errorf("name %q does not match graph_k8s_name %q (want %s<graph>)", cm.Name, graph, topologyConfigMapPrefix)
+	}
+	// Bounded to int32: billing_event.topology_revision and
+	// rated_usage.topology_revision are Postgres INTEGER, and a larger value
+	// would make every event for this graph drain as poison (dropped usage).
+	r64, perr := strconv.ParseInt(d["topology_revision"], 10, 32)
+	if perr != nil || r64 < 1 || r64 > math.MaxInt32 {
+		return "", Topology{}, false, fmt.Errorf("invalid topology_revision %q", d["topology_revision"])
 	}
 	region := d["region"]
-	if len(region) > 64 {
-		return "", Topology{}, fmt.Errorf("region longer than 64 bytes")
+	if !utf8.ValidString(region) || utf8.RuneCountInString(region) > maxRegionChars {
+		region = ""
+		regionDropped = true
 	}
-	return graph, Topology{Revision: revision, Region: region}, nil
+	return graph, Topology{Revision: int(r64), Region: region}, regionDropped, nil
 }

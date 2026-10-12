@@ -129,6 +129,8 @@ func buildAdmission(s *config.Settings, log *logging.Logger) (admission.Admitter
 // resolver runs. Anywhere else, or when the kubernetes config is missing,
 // it returns nil and events carry no topology: the fields are margin
 // evidence, so their absence is never a reason to stop serving.
+const topologySyncWait = 10 * time.Second
+
 func buildTopology(s *config.Settings, log *logging.Logger) (*gateway.TopologyIndex, func()) {
 	if !s.Gateway.Enabled || s.Gateway.LegacyPostgresResolver || s.Gateway.Namespace == "" {
 		return nil, func() {}
@@ -141,6 +143,13 @@ func buildTopology(s *config.Settings, log *logging.Logger) (*gateway.TopologyIn
 	index := gateway.NewTopologyIndex(client, s.Gateway.Namespace, log)
 	ctx, cancel := context.WithCancel(context.Background())
 	go index.Run(ctx)
+	// Bounded wait for the first list so requests right after a pod start
+	// carry their revision. Never fail serving on it: topology is evidence.
+	wctx, wcancel := context.WithTimeout(ctx, topologySyncWait)
+	if !index.WaitSynced(wctx) {
+		log.Warn.Printf("gateway: graph topology index not synced within %s; usage events carry topology revision 0 until it syncs", topologySyncWait)
+	}
+	wcancel()
 	return index, cancel
 }
 
