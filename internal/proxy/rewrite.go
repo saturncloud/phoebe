@@ -44,16 +44,19 @@ func captureRequestBody(r *http.Request, maxBodyBytes int) (body string, truncat
 	return string(logCopy), truncated, len(raw), nil
 }
 
-// forceIncludeUsage rewrites a request body so that streamed responses carry a
-// usage block. vLLM only emits streaming usage when
-// request.stream_options.include_usage is true; without stream_options it
-// emits NONE, which would silently under-bill every streamed request.
+// forceIncludeUsage rewrites a request body so that streamed responses carry
+// cumulative usage on every chunk. vLLM only emits streaming usage when
+// request.stream_options.include_usage is true, and it waits until the final
+// chunk unless continuous_usage_stats is also true. A client can disconnect
+// before that final chunk, so both values are required to retain the latest
+// engine-reported counts for an aborted stream.
 //
-// We parse → set body["stream_options"]["include_usage"]=true → re-serialize,
+// We parse → set include_usage=true and continuous_usage_stats=true →
+// re-serialize,
 // rather than relying on duplicate-key last-writer-wins (vLLM parses via
 // Pydantic; duplicate-key resolution is not portable). Overwriting a client's
-// explicit include_usage:false is intentional and safe — it mirrors vLLM's own
-// --enable-force-include-usage server flag.
+// explicit false values is intentional: billing requires the engine's
+// cumulative counts even if the caller does not want usage fields.
 //
 // Non-streaming requests are left untouched: their responses always carry
 // usage. A body that isn't JSON, or has no token-bearing shape, is passed
@@ -112,9 +115,40 @@ func forceIncludeUsage(r *http.Request) error {
 	return nil
 }
 
-// rewriteIncludeUsage returns the body with stream_options.include_usage forced
-// to true for streaming requests, and whether it changed anything. It is a pure
-// function for testability.
+type streamUsagePreference struct {
+	stream          bool
+	includeUsage    bool
+	continuousUsage bool
+}
+
+// clientRequestedStreamUsage reports the caller's original usage preferences
+// and restores the request body byte-for-byte. Phoebe may force both options
+// upstream for billing, but these values control what it exposes to the caller.
+func clientRequestedStreamUsage(r *http.Request) (streamUsagePreference, error) {
+	body, err := readAndRestoreBody(r)
+	if err != nil {
+		return streamUsagePreference{}, err
+	}
+	var request struct {
+		Stream        bool `json:"stream"`
+		StreamOptions struct {
+			IncludeUsage         bool `json:"include_usage"`
+			ContinuousUsageStats bool `json:"continuous_usage_stats"`
+		} `json:"stream_options"`
+	}
+	if json.Unmarshal(body, &request) != nil || !request.Stream {
+		return streamUsagePreference{}, nil
+	}
+	return streamUsagePreference{
+		stream:          true,
+		includeUsage:    request.StreamOptions.IncludeUsage,
+		continuousUsage: request.StreamOptions.IncludeUsage && request.StreamOptions.ContinuousUsageStats,
+	}, nil
+}
+
+// rewriteIncludeUsage returns the body with stream_options.include_usage and
+// stream_options.continuous_usage_stats forced to true for streaming requests,
+// and whether it changed anything. It is a pure function for testability.
 func rewriteIncludeUsage(body []byte) (out []byte, changed bool) {
 	var m map[string]json.RawMessage
 	if err := json.Unmarshal(body, &m); err != nil {
@@ -142,15 +176,20 @@ func rewriteIncludeUsage(body []byte) (out []byte, changed bool) {
 		}
 	}
 
-	// Already true? Then nothing to do.
+	includeUsage := false
 	if raw, ok := opts["include_usage"]; ok {
-		var v bool
-		if json.Unmarshal(raw, &v) == nil && v {
-			return body, false
-		}
+		_ = json.Unmarshal(raw, &includeUsage)
+	}
+	continuousUsage := false
+	if raw, ok := opts["continuous_usage_stats"]; ok {
+		_ = json.Unmarshal(raw, &continuousUsage)
+	}
+	if includeUsage && continuousUsage {
+		return body, false
 	}
 
 	opts["include_usage"] = json.RawMessage("true")
+	opts["continuous_usage_stats"] = json.RawMessage("true")
 	optsBytes, err := json.Marshal(opts)
 	if err != nil {
 		return body, false

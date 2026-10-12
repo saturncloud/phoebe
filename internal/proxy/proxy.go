@@ -25,6 +25,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"mime"
 	"net"
 	"net/http"
 	"net/url"
@@ -64,6 +65,49 @@ func validClientRequestID(value string) bool {
 	for i := 0; i < len(value); i++ {
 		if value[i] < 0x20 || value[i] > 0x7e {
 			return false
+		}
+	}
+	return true
+}
+
+func identityEncodingAllowed(value string) bool {
+	identitySeen := false
+	wildcardExcluded := false
+	for _, item := range strings.Split(value, ",") {
+		parts := strings.Split(item, ";")
+		coding := strings.ToLower(strings.TrimSpace(parts[0]))
+		quality := 1.0
+		for _, parameter := range parts[1:] {
+			keyValue := strings.SplitN(strings.TrimSpace(parameter), "=", 2)
+			if len(keyValue) == 2 && strings.EqualFold(strings.TrimSpace(keyValue[0]), "q") {
+				parsed, err := strconv.ParseFloat(strings.TrimSpace(keyValue[1]), 64)
+				if err != nil || parsed < 0 || parsed > 1 {
+					quality = 0
+				} else {
+					quality = parsed
+				}
+			}
+		}
+		switch coding {
+		case "identity":
+			identitySeen = true
+			if quality <= 0 {
+				return false
+			}
+		case "*":
+			wildcardExcluded = quality <= 0
+		}
+	}
+	return identitySeen || !wildcardExcluded
+}
+
+func hasOnlyIdentityContentEncoding(values []string) bool {
+	for _, value := range values {
+		for _, coding := range strings.Split(value, ",") {
+			coding = strings.TrimSpace(coding)
+			if coding != "" && !strings.EqualFold(coding, "identity") {
+				return false
+			}
 		}
 	}
 	return true
@@ -550,6 +594,19 @@ func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request) {
 			wakeServedModel, _ = extractRequestModel(body)
 		}
 	}
+	// Capture the original response preference only for an authorized inference
+	// request, before shared-request preparation or the billing rewrite changes
+	// stream_options. Control routes and rejected requests never need their body
+	// read for this purpose.
+	var clientUsage streamUsagePreference
+	if r.Method == http.MethodPost && inferenceRequestPathAllowed(routePath) {
+		clientUsage, err = clientRequestedStreamUsage(r)
+		if err != nil {
+			s.log.Error.Printf("read streaming usage preference: %v", err)
+			writeRequestBodyError(w, err)
+			return
+		}
+	}
 	// SHARED REQUEST POLICY + DISTRIBUTED ADMISSION. Trusted Dynamo hints and
 	// cache isolation are enforced for every shared request ON THE MODEL-BEARING
 	// INFERENCE SURFACE — the block reserves output tokens against a body model=
@@ -760,11 +817,21 @@ func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 	}
+	if clientUsage.stream && !identityEncodingAllowed(strings.Join(r.Header.Values("Accept-Encoding"), ",")) {
+		http.Error(w, "identity response encoding is required for streaming inference", http.StatusNotAcceptable)
+		return
+	}
 	// Force streaming usage so we never under-bill a streamed response.
 	if err := forceIncludeUsage(r); err != nil {
 		s.log.Error.Printf("rewrite request body: %v", err)
 		writeRequestBodyError(w, err)
 		return
+	}
+	if clientUsage.stream {
+		// Phoebe must inspect the authoritative SSE bytes before forwarding them.
+		// Force an identity upstream representation so capture and response
+		// filtering cannot be bypassed by a client-controlled Accept-Encoding.
+		r.Header.Set("Accept-Encoding", "identity")
 	}
 
 	rp := newUpstreamProxy(upstream)
@@ -840,6 +907,9 @@ func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request) {
 		resp.Header.Set(requestIDHeader, requestID)
 
 		streamed := isEventStream(resp)
+		if streamed && !hasOnlyIdentityContentEncoding(resp.Header.Values("Content-Encoding")) {
+			return fmt.Errorf("unsupported encoded event stream: %s", strings.Join(resp.Header.Values("Content-Encoding"), ","))
+		}
 		statusCode := resp.StatusCode
 
 		// Declared before onDone so the callback can capture it by reference
@@ -927,7 +997,23 @@ func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request) {
 		if shouldLog {
 			cr.enableBodyLog(s.ioMaxBodyLen)
 		}
-		resp.Body = cr
+		if streamed && !clientUsage.continuousUsage {
+			invalidBodyMetadata := []string{
+				"Content-Length", "Content-MD5", "Digest", "Content-Digest", "Repr-Digest", "ETag",
+			}
+			resp.Body = &trailerClearingReadCloser{
+				src:     newUsageFilterReader(cr, clientUsage.includeUsage),
+				trailer: resp.Trailer,
+				names:   invalidBodyMetadata,
+			}
+			resp.ContentLength = -1
+			for _, header := range invalidBodyMetadata {
+				resp.Header.Del(header)
+				resp.Trailer.Del(header)
+			}
+		} else {
+			resp.Body = cr
+		}
 		responseCaptureInstalled.Store(true)
 		return nil
 	}
@@ -1221,8 +1307,8 @@ func parseUpstreamHeader(v string) (*url.URL, error) {
 
 // isEventStream reports whether the response is an SSE stream.
 func isEventStream(resp *http.Response) bool {
-	ct := resp.Header.Get("Content-Type")
-	return strings.HasPrefix(ct, "text/event-stream")
+	mediaType, _, err := mime.ParseMediaType(resp.Header.Get("Content-Type"))
+	return err == nil && strings.EqualFold(mediaType, "text/event-stream")
 }
 
 // isClientAbort reports whether a ReverseProxy error is a client-side abort (the

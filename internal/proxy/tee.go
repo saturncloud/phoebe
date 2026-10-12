@@ -250,8 +250,24 @@ func (c *captureReader) inspectChunk(payload []byte) {
 		}
 	}
 	if ch.Usage != nil {
-		c.result.Usage = *ch.Usage
-		c.result.UsageFound = true
+		next := *ch.Usage
+		current := c.result.Usage
+		// Some engines omit prompt_tokens_details after reporting it once.
+		// Absence means no new cache information, not that cumulative cached
+		// usage fell to zero. Preserve the last known cache count while still
+		// accepting newer prompt, completion, and total counts.
+		if c.result.UsageFound && next.PromptTokensDetails == nil && current.PromptTokensDetails != nil {
+			details := *current.PromptTokensDetails
+			next.PromptTokensDetails = &details
+		}
+		if !c.result.UsageFound ||
+			(next.PromptTokens >= current.PromptTokens &&
+				next.CompletionTokens >= current.CompletionTokens &&
+				next.TotalTokens >= current.TotalTokens &&
+				next.CachedTokens() >= current.CachedTokens()) {
+			c.result.Usage = next
+			c.result.UsageFound = true
+		}
 	}
 }
 
@@ -268,7 +284,14 @@ func (c *captureReader) finish() {
 	}
 	c.done = true
 
-	if !c.streamed {
+	if c.streamed {
+		// EOF and transport errors may arrive immediately after a complete SSE
+		// data line without its optional trailing newline. Parse that residual
+		// line once; malformed partial JSON remains safely ignored.
+		if c.scan.Len() > 0 {
+			c.inspectSSELine(bytes.TrimRight(c.scan.Bytes(), "\r"))
+		}
+	} else {
 		// Single JSON body: parse the whole thing once.
 		c.inspectChunk(bytes.TrimSpace(c.scan.Bytes()))
 	}
