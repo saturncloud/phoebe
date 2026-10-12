@@ -257,37 +257,54 @@ func countTopLevelModelKeys(body []byte) (int, error) {
 	return counts["model"], err
 }
 
+// scanTopLevelKeys walks the keys of the top-level JSON object in body, in
+// order and including duplicates, calling visit for each one. It is the one
+// scanner behind countTopLevelKeys and checkTopLevelKeyAmbiguity: it opens
+// the object, skips every value (so nested keys are never visited) and
+// requires the closing token. A non-object body returns errNotObject; an
+// error from visit stops the scan and is returned unchanged.
+func scanTopLevelKeys(body []byte, visit func(key string) error) error {
+	dec := json.NewDecoder(bytes.NewReader(body))
+	tok, err := dec.Token()
+	if err != nil {
+		return err
+	}
+	if d, ok := tok.(json.Delim); !ok || d != '{' {
+		return errNotObject
+	}
+	for dec.More() {
+		tok, err := dec.Token()
+		if err != nil {
+			return err
+		}
+		key, ok := tok.(string)
+		if !ok {
+			return errNotObject
+		}
+		if err := visit(key); err != nil {
+			return err
+		}
+		if err := skipValue(dec); err != nil {
+			return err
+		}
+	}
+	_, err = dec.Token() // closing top-level object
+	return err
+}
+
 // countTopLevelKeys rejects ambiguity in fields whose interpretation affects
 // authorization or capacity. Downstream JSON stacks do not universally agree
 // on first-vs-last duplicate-key handling, so Phoebe must never validate or
 // reserve against one value while Dynamo/vLLM consumes another.
 func countTopLevelKeys(body []byte, wanted map[string]struct{}) (map[string]int, error) {
-	dec := json.NewDecoder(bytes.NewReader(body))
-	tok, err := dec.Token()
-	if err != nil {
-		return nil, err
-	}
-	if d, ok := tok.(json.Delim); !ok || d != '{' {
-		return nil, errNotObject
-	}
 	counts := make(map[string]int, len(wanted))
-	for dec.More() {
-		tok, err := dec.Token()
-		if err != nil {
-			return nil, err
-		}
-		key, ok := tok.(string)
-		if !ok {
-			return nil, errNotObject
-		}
+	err := scanTopLevelKeys(body, func(key string) error {
 		if _, ok := wanted[key]; ok {
 			counts[key]++
 		}
-		if err := skipValue(dec); err != nil {
-			return nil, err
-		}
-	}
-	if _, err := dec.Token(); err != nil { // closing top-level object
+		return nil
+	})
+	if err != nil {
 		return nil, err
 	}
 	return counts, nil
@@ -304,40 +321,22 @@ var errAmbiguousKey = errors.New("ambiguous top-level key")
 // case variant ("Messages" next to "messages") would let phoebe estimate one
 // value while the engine processes another.
 func checkTopLevelKeyAmbiguity(body []byte, fields []string) (map[string]int, error) {
-	dec := json.NewDecoder(bytes.NewReader(body))
-	tok, err := dec.Token()
-	if err != nil {
-		return nil, err
-	}
-	if d, ok := tok.(json.Delim); !ok || d != '{' {
-		return nil, errNotObject
-	}
 	counts := make(map[string]int, len(fields))
-	for dec.More() {
-		tok, err := dec.Token()
-		if err != nil {
-			return nil, err
-		}
-		key, ok := tok.(string)
-		if !ok {
-			return nil, errNotObject
-		}
+	err := scanTopLevelKeys(body, func(key string) error {
 		for _, f := range fields {
 			if !strings.EqualFold(key, f) {
 				continue
 			}
 			if key != f {
-				return nil, fmt.Errorf("%w: %q is a case variant of %q", errAmbiguousKey, key, f)
+				return fmt.Errorf("%w: %q is a case variant of %q", errAmbiguousKey, key, f)
 			}
 			if counts[f]++; counts[f] > 1 {
-				return nil, fmt.Errorf("%w: duplicate %q", errAmbiguousKey, f)
+				return fmt.Errorf("%w: duplicate %q", errAmbiguousKey, f)
 			}
 		}
-		if err := skipValue(dec); err != nil {
-			return nil, err
-		}
-	}
-	if _, err := dec.Token(); err != nil { // closing top-level object
+		return nil
+	})
+	if err != nil {
 		return nil, err
 	}
 	return counts, nil
