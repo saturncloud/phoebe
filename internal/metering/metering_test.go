@@ -111,3 +111,16 @@ func TestApplyAbsentServingModeDefault_OnlyAbsentKeyInAnyCasingBecomesDedicated(
 		})
 	}
 }
+
+// TestUnmarshalEvent_OldGPUTypeKeyIsIgnored: events spooled before 0008 still
+// carry gpu_type (always empty); they must decode, with the new serving fields
+// absent.
+func TestUnmarshalEvent_OldGPUTypeKeyIsIgnored(t *testing.T) {
+	ev, err := UnmarshalEvent([]byte(`{"request_id":"r","serving_mode":"shared","gpu_type":"","timestamp_unix_ms":1}`))
+	if err != nil {
+		t.Fatalf("UnmarshalEvent: %v", err)
+	}
+	if ev.RequestID != "r" || ev.TopologyRevision != 0 || ev.Region != "" || ev.RequestStartedUnixMs != 0 {
+		t.Fatalf("decoded %+v", ev)
+	}
+}
