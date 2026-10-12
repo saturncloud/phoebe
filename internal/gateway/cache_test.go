@@ -73,6 +73,33 @@ func TestCache_PositiveHitWithinTTL(t *testing.T) {
 	}
 }
 
+// TestCache_AdapterReadinessIsNeverCached: adapter identity is stable, but
+// readiness changes while workers load or fail. Consecutive legacy resolver
+// calls must therefore observe the inner resolver every time.
+func TestCache_AdapterReadinessIsNeverCached(t *testing.T) {
+	key := [2]string{"org-1", "bot"}
+	inner := &countingResolver{m: map[[2]string]Resolution{
+		key: {ResourceID: "tfm-1", Adapter: "ckpt-1", Ready: true, GraphK8sName: "g"},
+	}}
+	c, _ := testCache(inner, 30*time.Second, 5*time.Second)
+	ctx := context.Background()
+
+	first, err := c.Resolve(ctx, key[0], key[1])
+	if err != nil || !first.Ready {
+		t.Fatalf("first Resolve: r=%+v err=%v", first, err)
+	}
+	inner.m[key] = Resolution{
+		ResourceID: "tfm-1", Adapter: "ckpt-1", Ready: false, GraphK8sName: "g",
+	}
+	second, err := c.Resolve(ctx, key[0], key[1])
+	if err != nil || second.Ready {
+		t.Fatalf("second Resolve: r=%+v err=%v", second, err)
+	}
+	if n := atomic.LoadInt32(&inner.calls); n != 2 {
+		t.Fatalf("inner calls = %d, want 2 (adapter readiness must not be cached)", n)
+	}
+}
+
 // TestCache_NegativeHitWithinShorterTTL: ErrNotFound is cached, but only for
 // the (shorter) negative TTL — a just-created model becomes resolvable fast.
 func TestCache_NegativeHitWithinShorterTTL(t *testing.T) {

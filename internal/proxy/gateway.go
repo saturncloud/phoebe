@@ -170,6 +170,15 @@ func (s *Server) resolveGateway(w http.ResponseWriter, r *http.Request, id *iden
 		http.Error(w, "service unavailable", http.StatusServiceUnavailable)
 		return false
 	}
+	if res.Adapter != "" && !res.Ready {
+		// Atlas has registered the endpoint but has not observed its
+		// DynamoModel ready (or has observed a later load failure). Keep this
+		// distinct from 404: the model exists and the caller may retry.
+		s.log.Warn.Printf("gateway: adapter not loaded org_id=%s model=%q request_id=%q",
+			id.OrgID, model, requestID)
+		http.Error(w, "adapter_not_loaded", http.StatusServiceUnavailable)
+		return false
+	}
 	// The resolved model is definitionally the single model this request is
 	// bound to — recorded on the identity both as documentation-of-binding and
 	// because wake eligibility (isWakeable) keys on

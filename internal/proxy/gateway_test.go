@@ -335,6 +335,7 @@ func TestGateway_ResolvesFineTune(t *testing.T) {
 			ResourceID:   "tfm-ft-1",
 			BaseModel:    "meta-llama/Llama-3.1-8B-Instruct",
 			Adapter:      "ckpt-42",
+			Ready:        true,
 			ServingMode:  "shared",
 			GraphK8sName: "graph-llama31",
 		},
@@ -354,6 +355,37 @@ func TestGateway_ResolvesFineTune(t *testing.T) {
 	}
 	if e := events[0]; e.Adapter != "ckpt-42" || e.ResourceID != "tfm-ft-1" {
 		t.Fatalf("fine-tune identity wrong: %+v", e)
+	}
+}
+
+func TestGateway_AdapterNotLoaded503(t *testing.T) {
+	var upstreamHits int32
+	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		atomic.AddInt32(&upstreamHits, 1)
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer backend.Close()
+	beURL, _ := url.Parse(backend.URL)
+
+	resolver := &mapResolver{m: map[[2]string]gateway.Resolution{
+		{"org-1", "support-bot"}: {
+			ResourceID: "tfm-ft-1", BaseModel: "base", Adapter: "ckpt-42",
+			ServingMode: "shared", GraphK8sName: "graph", Ready: false,
+		},
+	}}
+	em := &recordingEmitter{}
+	srv := newGatewayTestServer(t, em, resolver, beURL)
+	rr := httptest.NewRecorder()
+	srv.Handler().ServeHTTP(rr, gatewayRequest("org-1", `{"model":"support-bot"}`))
+
+	if rr.Code != http.StatusServiceUnavailable {
+		t.Fatalf("status = %d, want 503", rr.Code)
+	}
+	if strings.TrimSpace(rr.Body.String()) != "adapter_not_loaded" {
+		t.Fatalf("body = %q, want adapter_not_loaded", rr.Body.String())
+	}
+	if atomic.LoadInt32(&upstreamHits) != 0 || em.count() != 0 {
+		t.Fatalf("not-ready adapter reached upstream or billed: hits=%d events=%d", upstreamHits, em.count())
 	}
 }
 
