@@ -327,7 +327,8 @@ func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request) {
 	maxDuration := time.AfterFunc(prot.MaxStreamDuration, func() { cancel(errMaxStreamDuration) })
 	defer maxDuration.Stop()
 	r = r.WithContext(ctx)
-	w = newStallGuardWriter(w, prot.StreamStallTimeout, cancel)
+	stallGuard := newStallGuardWriter(w, prot.StreamStallTimeout, cancel)
+	w = stallGuard
 
 	// One body ceiling for EVERY route — shared,
 	// gateway, header-routed dedicated and control routes alike — installed
@@ -953,7 +954,14 @@ func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request) {
 			// be able to drop the emit OR the I/O-log record (a sink that
 			// honours ctx would otherwise lose every aborted request).
 			ctx := context.WithoutCancel(r.Context())
-			if cause := protectionCause(r.Context()); cause != nil {
+			// The stall guard's flag covers the usual stall path, where
+			// net/http has already cancelled the parent context (cause
+			// context.Canceled) before the guard could record its cause.
+			cause := protectionCause(r.Context())
+			if cause == nil {
+				cause = stallGuard.stallCause()
+			}
+			if cause != nil {
 				s.log.Warn.Printf("protection: ended response request_id=%s resource_id=%s: %v", requestID, id.ResourceID, cause)
 			}
 			if admitted != nil {

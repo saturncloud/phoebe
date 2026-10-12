@@ -4,7 +4,9 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"net"
 	"net/http"
+	"os"
 	"strconv"
 	"sync"
 	"sync/atomic"
@@ -57,6 +59,12 @@ type stallGuardWriter struct {
 	rc      *http.ResponseController
 	timeout time.Duration
 	cancel  context.CancelCauseFunc
+	// stalled records that a write failed on its deadline. It is kept apart
+	// from the context cause because net/http cancels the parent connection
+	// context on the same write error before Write returns, so by the time
+	// fail runs the request context is usually already cancelled with
+	// context.Canceled and cancel(errStreamStalled) cannot set the cause.
+	stalled atomic.Bool
 }
 
 func newStallGuardWriter(w http.ResponseWriter, timeout time.Duration, cancel context.CancelCauseFunc) *stallGuardWriter {
@@ -71,10 +79,31 @@ func (g *stallGuardWriter) arm() {
 	_ = g.rc.SetWriteDeadline(time.Now().Add(g.timeout))
 }
 
+// fail records a stall when err is a write that ran past its deadline. A
+// network write deadline surfaces as a *net.OpError wrapping
+// os.ErrDeadlineExceeded ("i/o timeout"), which does NOT match
+// context.DeadlineExceeded; any net.Error reporting Timeout() is treated the
+// same way. The cancel still runs: it sets the cause when the parent context
+// has not been cancelled yet.
 func (g *stallGuardWriter) fail(err error) {
-	if err != nil && errors.Is(err, context.DeadlineExceeded) {
+	if err == nil {
+		return
+	}
+	var ne net.Error
+	if errors.Is(err, os.ErrDeadlineExceeded) || errors.Is(err, context.DeadlineExceeded) ||
+		(errors.As(err, &ne) && ne.Timeout()) {
+		g.stalled.Store(true)
 		g.cancel(errStreamStalled)
 	}
+}
+
+// stallCause returns errStreamStalled when a write to the client failed on
+// its deadline, otherwise nil.
+func (g *stallGuardWriter) stallCause() error {
+	if g.stalled.Load() {
+		return errStreamStalled
+	}
+	return nil
 }
 
 func (g *stallGuardWriter) Write(p []byte) (int, error) {

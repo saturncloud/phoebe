@@ -3,12 +3,14 @@ package proxy
 import (
 	"bufio"
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"net"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"os"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -142,7 +144,10 @@ func TestStalledClientIsCutOffAndRecordedAsAborted(t *testing.T) {
 	defer backend.Close()
 	up, _ := url.Parse(backend.URL)
 	em := &recordingEmitter{}
-	proxySrv := liveProxy(t, newProtectedServer(config.ProtectionSettings{StreamStallTimeout: 200 * time.Millisecond}, em))
+	var warnings lockedBuffer
+	log := logging.New(logging.WARN)
+	log.Warn.SetOutput(&warnings)
+	proxySrv := liveProxy(t, New(&config.Settings{Protection: config.ProtectionSettings{StreamStallTimeout: 200 * time.Millisecond}}, log, em))
 
 	conn, err := net.Dial("tcp", proxySrv.Listener.Addr().String())
 	if err != nil {
@@ -169,6 +174,31 @@ func TestStalledClientIsCutOffAndRecordedAsAborted(t *testing.T) {
 	if len(events) != 1 || !events[0].Aborted {
 		t.Fatalf("events=%+v, want one aborted attempt", events)
 	}
+	// The cut must be attributed to the stall guard, not logged as an
+	// ordinary client disconnect: operators need to see that B2 fired.
+	if got := warnings.String(); !strings.Contains(got, "protection: ended response") ||
+		!strings.Contains(got, "protection.streamStallTimeout") {
+		t.Fatalf("stall cut was not recorded as a protection cut; warnings=%q", got)
+	}
+}
+
+// lockedBuffer is a bytes.Buffer safe to write from the handler goroutine
+// while the test reads it.
+type lockedBuffer struct {
+	mu  sync.Mutex
+	buf strings.Builder
+}
+
+func (b *lockedBuffer) Write(p []byte) (int, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.Write(p)
+}
+
+func (b *lockedBuffer) String() string {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.String()
 }
 
 // B3: a stream that outlives maxStreamDuration is ended and recorded as aborted.
@@ -373,5 +403,71 @@ func TestDedicatedColdHoldsCappedPerEndpoint(t *testing.T) {
 	defer s.dedicatedHolds.mu.Unlock()
 	if len(s.dedicatedHolds.held) != 0 {
 		t.Fatalf("holds not released: %v", s.dedicatedHolds.held)
+	}
+}
+
+// timeoutWriter is a ResponseWriter whose Write and FlushError fail the way a
+// real connection does when the write deadline passes.
+type timeoutWriter struct {
+	http.ResponseWriter
+	err error
+}
+
+func (w *timeoutWriter) Write([]byte) (int, error) { return 0, w.err }
+func (w *timeoutWriter) FlushError() error         { return w.err }
+
+// B2: a write that runs past its deadline (a *net.OpError wrapping
+// os.ErrDeadlineExceeded, which does not match context.DeadlineExceeded) is
+// recorded as a stall, through both Write and FlushError.
+func TestStallGuardRecordsNetWriteDeadlineAsStall(t *testing.T) {
+	opErr := &net.OpError{Op: "write", Net: "tcp", Err: os.ErrDeadlineExceeded}
+	for _, tc := range []struct {
+		name string
+		do   func(g *stallGuardWriter)
+	}{
+		{"write", func(g *stallGuardWriter) { _, _ = g.Write([]byte("x")) }},
+		{"flush", func(g *stallGuardWriter) { _ = g.FlushError() }},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx, cancel := context.WithCancelCause(context.Background())
+			defer cancel(nil)
+			g := newStallGuardWriter(&timeoutWriter{ResponseWriter: httptest.NewRecorder(), err: opErr}, time.Second, cancel)
+			tc.do(g)
+			if !g.stalled.Load() || !errors.Is(g.stallCause(), errStreamStalled) {
+				t.Fatal("a write past its deadline must set the stall flag")
+			}
+			if !errors.Is(context.Cause(ctx), errStreamStalled) || protectionCause(ctx) == nil {
+				t.Fatalf("cause=%v, want errStreamStalled", context.Cause(ctx))
+			}
+		})
+	}
+}
+
+// B2: the stall is still recorded when net/http has already cancelled the
+// parent context (as it does on a failed connection write) before the guard
+// runs, so the context cause can no longer be set.
+func TestStallGuardRecordsStallAfterParentCancelled(t *testing.T) {
+	ctx, cancel := context.WithCancelCause(context.Background())
+	cancel(context.Canceled)
+	g := newStallGuardWriter(&timeoutWriter{ResponseWriter: httptest.NewRecorder(),
+		err: &net.OpError{Op: "write", Err: os.ErrDeadlineExceeded}}, time.Second, cancel)
+	_, _ = g.Write([]byte("x"))
+	if protectionCause(ctx) != nil {
+		t.Fatal("precondition: the parent cause should stay context.Canceled")
+	}
+	if !errors.Is(g.stallCause(), errStreamStalled) {
+		t.Fatal("stall must be recorded on the guard when the context cause is already set")
+	}
+}
+
+// A write that fails for any reason other than its deadline is not a stall.
+func TestStallGuardIgnoresNonTimeoutWriteErrors(t *testing.T) {
+	ctx, cancel := context.WithCancelCause(context.Background())
+	defer cancel(nil)
+	g := newStallGuardWriter(&timeoutWriter{ResponseWriter: httptest.NewRecorder(),
+		err: &net.OpError{Op: "write", Err: errors.New("connection reset by peer")}}, time.Second, cancel)
+	_, _ = g.Write([]byte("x"))
+	if g.stallCause() != nil || ctx.Err() != nil {
+		t.Fatal("a non-timeout write error must not be recorded as a stall")
 	}
 }
