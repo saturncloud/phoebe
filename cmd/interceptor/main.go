@@ -127,12 +127,17 @@ func buildAdmission(s *config.Settings, log *logging.Logger) (admission.Admitter
 // It watches ConfigMaps in the gateway namespace, the same access the
 // registry resolver already uses, so it runs only where the registry
 // resolver runs. Anywhere else, or when the kubernetes config is missing,
-// it returns nil and events carry no topology: the fields are margin
-// evidence, so their absence is never a reason to stop serving.
+// it logs a warning naming the reason and returns nil, and events carry no
+// topology: the fields are margin evidence, so their absence is never a
+// reason to stop serving.
 const topologySyncWait = 10 * time.Second
 
 func buildTopology(s *config.Settings, log *logging.Logger) (*gateway.TopologyIndex, func()) {
-	if !s.Gateway.Enabled || s.Gateway.LegacyPostgresResolver || s.Gateway.Namespace == "" {
+	// Each disabled case says so at Warn: without the index every usage
+	// event, dedicated traffic included, records no topology revision or
+	// region, and the margin pipeline sees revision-0 rollups.
+	if reason := topologyDisabledReason(s); reason != "" {
+		log.Warn.Printf("gateway: graph topology index disabled (%s); usage events, including dedicated traffic, carry no topology revision or region", reason)
 		return nil, func() {}
 	}
 	client, err := gateway.NewKubeClient(s.Gateway.Kubeconfig)
@@ -151,6 +156,21 @@ func buildTopology(s *config.Settings, log *logging.Logger) (*gateway.TopologyIn
 	}
 	wcancel()
 	return index, cancel
+}
+
+// topologyDisabledReason names the setting that keeps the topology index off,
+// or returns "" when the index can run. The index reuses the registry
+// resolver's ConfigMap access, so it runs only where that resolver runs.
+func topologyDisabledReason(s *config.Settings) string {
+	switch {
+	case !s.Gateway.Enabled:
+		return "gateway.enabled=false"
+	case s.Gateway.LegacyPostgresResolver:
+		return "gateway.legacyPostgresResolver=true"
+	case s.Gateway.Namespace == "":
+		return "gateway.namespace is empty"
+	}
+	return ""
 }
 
 // buildGateway constructs the TF gateway (org, model) resolver. DEFAULT: the

@@ -91,3 +91,34 @@ func TestBuildAdmissionLogsMeteringStoreFallback(t *testing.T) {
 		t.Fatalf("fallback logged although admission.valkeyAddr is set: %q", explicit)
 	}
 }
+
+// TestBuildTopologyDisabledLogsTheReason: wherever the topology index cannot
+// run, buildTopology returns nil (serving continues) and logs a warning that
+// names the setting responsible, so revision-0 rollups have an operator signal.
+func TestBuildTopologyDisabledLogsTheReason(t *testing.T) {
+	cases := []struct {
+		name   string
+		gw     config.GatewaySettings
+		reason string
+	}{
+		{"gateway disabled", config.GatewaySettings{Enabled: false, Namespace: "ns"}, "gateway.enabled=false"},
+		{"legacy resolver", config.GatewaySettings{Enabled: true, LegacyPostgresResolver: true, Namespace: "ns"}, "gateway.legacyPostgresResolver=true"},
+		{"empty namespace", config.GatewaySettings{Enabled: true}, "gateway.namespace is empty"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			var buf bytes.Buffer
+			logger := &logging.Logger{Debug: log.New(io.Discard, "", 0), Info: log.New(io.Discard, "", 0), Warn: log.New(&buf, "", 0), Error: log.New(io.Discard, "", 0)}
+			s := &config.Settings{Gateway: tc.gw}
+			idx, closeTopology := buildTopology(s, logger)
+			closeTopology()
+			if idx != nil {
+				t.Fatalf("buildTopology returned an index although %s", tc.reason)
+			}
+			out := buf.String()
+			if !strings.Contains(out, "graph topology index disabled ("+tc.reason+")") || !strings.Contains(out, "including dedicated traffic") {
+				t.Fatalf("warning does not name %q: %q", tc.reason, out)
+			}
+		})
+	}
+}
