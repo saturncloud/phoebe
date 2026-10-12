@@ -1,12 +1,20 @@
 -- Serving topology, region and serving time on every usage event (build item
 -- B24; owner ruling 2026-10-12: usage events record the serving topology by
--- revision). All four columns are platform-set evidence for margin analysis:
--- nullable, no CHECK (billing_event is the evidence ledger, see
--- contracts/billing-event-ledger.md). 0009 makes topology_revision a rollup grain
--- key. An unknown revision (NULL, rated as 0) never withholds or reprices a
--- row, but rated_usage has CHECK (topology_revision >= 0), so a negative
--- revision fails rating for its window. Writers (the gateway parser and
--- recovery) must reject negative values and values above the INTEGER range.
+-- revision). All four columns are platform-set, nullable and have no CHECK
+-- here (billing_event is the evidence ledger, see
+-- contracts/billing-event-ledger.md).
+--
+-- region, request_started_at and serving_duration_ms are carried evidence for
+-- margin analysis: they are not rollup keys and do not affect price (0009
+-- copies region onto rated_usage as an attribute of the revision).
+--
+-- topology_revision becomes a rollup GRAIN key in 0009: rows with different
+-- revisions roll up separately and the revision is part of the rated_usage
+-- id. NULL (unknown) rates as revision 0. A known value must be within
+-- 1..2147483647 (int32): rated_usage has CHECK (topology_revision >= 0), so a
+-- negative value fails rating for its window, and this INTEGER column cannot
+-- hold a larger value. The gateway parser, the drain writer and recovery
+-- each enforce that range.
 --
 --   topology_revision   Atlas tf_topology_revision.revision of the serving
 --                       graph; with graph_k8s_name it names each pool's role,
