@@ -262,36 +262,79 @@ func TestMaxStreamDurationBeforeHeadersIsGatewayTimeout(t *testing.T) {
 	}
 }
 
-// B4: a non-streamed body larger than the per-stream buffer limit is cut, the
-// attempt is recorded as aborted, and every byte returns to the replica budget.
-func TestResponseBufferPerStreamLimitCutsResponse(t *testing.T) {
-	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
-		w.Header().Set("Content-Type", "application/json")
-		_, _ = io.WriteString(w, `{"model":"m","data":"`+strings.Repeat("x", 64<<10)+`"}`)
-	}))
-	defer backend.Close()
-	up, _ := url.Parse(backend.URL)
-	em := &recordingEmitter{}
-	s := newProtectedServer(config.ProtectionSettings{MaxResponseBufferBytesPerStream: 4 << 10}, em)
+// B4: a non-streamed body larger than the per-stream buffer limit is cut
+// BECAUSE of that limit: the client sees a cut response, the attempt is
+// recorded as aborted, the protection log names the buffer-limit cause, and
+// every byte returns to the replica budget. The control case (a body under the
+// same limit) passes whole and is not aborted, so a limit that cut everything
+// would fail here.
+func TestResponseBufferPerStreamLimitAbortsWithBufferLimitCause(t *testing.T) {
+	const perStream = 4 << 10
+	for _, tc := range []struct {
+		name    string
+		payload int
+		cut     bool
+	}{
+		{"over the limit is cut with the buffer-limit cause", 64 << 10, true},
+		{"under the limit passes whole", 2 << 10, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			full := `{"model":"m","data":"` + strings.Repeat("x", tc.payload) + `"}`
+			backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				w.Header().Set("Content-Type", "application/json")
+				_, _ = io.WriteString(w, full)
+			}))
+			defer backend.Close()
+			up, _ := url.Parse(backend.URL)
+			em := &recordingEmitter{}
+			var warnings lockedBuffer
+			log := logging.New(logging.WARN)
+			log.Warn.SetOutput(&warnings)
+			s := New(&config.Settings{Protection: config.ProtectionSettings{MaxResponseBufferBytesPerStream: perStream}}, log, em)
+			proxySrv := liveProxy(t, s)
 
-	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(`{"model":"m","messages":[]}`))
-	setUpstream(req, up)
-	req.Header.Set(identity.HeaderAuthID, "auth-1")
-	req.Header.Set(identity.HeaderResourceID, "r1")
-	rr := httptest.NewRecorder()
-	func() {
-		defer func() { _ = recover() }()
-		s.Handler().ServeHTTP(rr, req)
-	}()
-	if rr.Body.Len() >= 64<<10 {
-		t.Fatalf("response of %d bytes was not cut at the buffer limit", rr.Body.Len())
-	}
-	events := em.waitForEvents(1, 5*time.Second)
-	if len(events) != 1 || !events[0].Aborted {
-		t.Fatalf("events=%+v, want one aborted attempt", events)
-	}
-	if held := s.responseBuffers.held.Load(); held != 0 {
-		t.Fatalf("replica budget still holds %d bytes after the request finished", held)
+			req, err := http.NewRequest(http.MethodPost, proxySrv.URL+"/v1/chat/completions", strings.NewReader(`{"model":"m","messages":[]}`))
+			if err != nil {
+				t.Fatal(err)
+			}
+			setUpstream(req, up)
+			req.Header.Set(identity.HeaderAuthID, "auth-1")
+			req.Header.Set(identity.HeaderResourceID, "r1")
+			resp, err := http.DefaultClient.Do(req)
+			var body []byte
+			var readErr error
+			if err == nil {
+				body, readErr = io.ReadAll(resp.Body)
+				resp.Body.Close()
+			}
+
+			events := em.waitForEvents(1, 5*time.Second)
+			if tc.cut {
+				if err == nil && readErr == nil && len(body) == len(full) {
+					t.Fatalf("response of %d bytes was delivered whole past the buffer limit", len(body))
+				}
+				if len(events) != 1 || !events[0].Aborted {
+					t.Fatalf("events=%+v, want one aborted attempt", events)
+				}
+				if got := warnings.String(); !strings.Contains(got, "protection: ended response") ||
+					!strings.Contains(got, errResponseBufferLimit.Error()) {
+					t.Fatalf("cut was not attributed to the buffer limit; warnings=%q", got)
+				}
+			} else {
+				if err != nil || readErr != nil || string(body) != full {
+					t.Fatalf("under-limit body not passed whole: err=%v readErr=%v len=%d", err, readErr, len(body))
+				}
+				if len(events) != 1 || events[0].Aborted {
+					t.Fatalf("events=%+v, want one non-aborted attempt", events)
+				}
+				if got := warnings.String(); strings.Contains(got, "protection: ended response") {
+					t.Fatalf("an under-limit response fired a protection bound; warnings=%q", got)
+				}
+			}
+			if held := s.responseBuffers.held.Load(); held != 0 {
+				t.Fatalf("replica budget still holds %d bytes after the request finished", held)
+			}
+		})
 	}
 }
 

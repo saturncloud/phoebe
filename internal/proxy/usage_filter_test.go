@@ -8,6 +8,8 @@ import (
 	"net/http"
 	"strings"
 	"testing"
+
+	"github.com/saturncloud/phoebe/internal/config"
 )
 
 func TestUsageFilterRestoresClientStreamShape(t *testing.T) {
@@ -150,4 +152,73 @@ func TestClientRequestedContinuousUsage(t *testing.T) {
 	if !requested.includeUsage || !requested.continuousUsage {
 		t.Fatalf("preference = %+v, want include and continuous", requested)
 	}
+}
+
+// closeRecorder is an upstream body that records Close.
+type closeRecorder struct {
+	io.Reader
+	closed bool
+}
+
+func (c *closeRecorder) Close() error { c.closed = true; return nil }
+
+// B4: when the SSE line the filter holds would exceed the per-stream response
+// buffer limit, the filter fails closed: it closes the upstream body, surfaces
+// errResponseBufferLimit, returns no bytes of the oversize line, never holds
+// more than the limit, and the request's account returns every byte to the
+// replica budget on close. The control stream (lines under the limit) passes
+// through unchanged.
+func TestUsageFilterBufferLimitClosesSourceAndSurfacesError(t *testing.T) {
+	const perStream = 8 << 10
+	p := config.ProtectionSettings{MaxResponseBufferBytesPerStream: perStream, MaxResponseBufferBytesTotal: 1 << 20}
+
+	t.Run("line over the limit", func(t *testing.T) {
+		var budget responseBufferBudget
+		var cause error
+		account := budget.newAccount(p, func(err error) { cause = err })
+		short := "data: {\"choices\":[{\"delta\":{\"content\":\"a\"}}]}\n\n"
+		long := "data: {\"choices\":[{\"delta\":{\"content\":\"" + strings.Repeat("x", 4*perStream) + "\"}}]}\n\n"
+		src := &closeRecorder{Reader: strings.NewReader(short + long)}
+		filtered := newUsageFilterReader(src, false, account)
+
+		var got bytes.Buffer
+		buf := make([]byte, 512)
+		var err error
+		for err == nil {
+			var n int
+			n, err = filtered.Read(buf)
+			got.Write(buf[:n])
+			if held := budget.held.Load(); held > perStream {
+				t.Fatalf("filter held %d bytes, over the %d per-stream limit", held, perStream)
+			}
+		}
+		if !errors.Is(err, errResponseBufferLimit) || !errors.Is(cause, errResponseBufferLimit) {
+			t.Fatalf("err=%v cause=%v, want %v", err, cause, errResponseBufferLimit)
+		}
+		if !src.closed {
+			t.Fatal("upstream body was not closed on the buffer-limit failure")
+		}
+		if got.String() != short {
+			t.Fatalf("bytes returned = %d, want only the %d bytes before the oversize line", got.Len(), len(short))
+		}
+		account.close()
+		if held := budget.held.Load(); held != 0 {
+			t.Fatalf("budget holds %d bytes after the account closed, want 0", held)
+		}
+	})
+
+	t.Run("lines under the limit pass unchanged", func(t *testing.T) {
+		var budget responseBufferBudget
+		account := budget.newAccount(p, func(error) { t.Error("an under-limit stream fired the buffer limit") })
+		line := "data: {\"choices\":[{\"delta\":{\"content\":\"" + strings.Repeat("y", perStream/2) + "\"}}]}\n\n"
+		stream := line + line + "data: [DONE]\n\n"
+		src := &closeRecorder{Reader: strings.NewReader(stream)}
+		got, err := io.ReadAll(newUsageFilterReader(src, false, account))
+		if err != nil || string(got) != stream {
+			t.Fatalf("err=%v, under-limit stream changed (len %d, want %d)", err, len(got), len(stream))
+		}
+		if held := budget.held.Load(); held != 0 {
+			t.Fatalf("budget holds %d bytes after the stream finished, want 0", held)
+		}
+	})
 }
