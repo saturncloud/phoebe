@@ -4,6 +4,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"sync"
 	"testing"
 	"time"
 
@@ -51,6 +52,11 @@ func TestPublishedGraphCapacityEnforcedWithoutEnablement(t *testing.T) {
 		_, _ = w.Write([]byte(`{"model":"model-a","usage":{"prompt_tokens":1,"completion_tokens":1}}`))
 	}))
 	defer backend.Close()
+	// Runs before backend.Close on a failed assertion, so a held handler
+	// cannot make Close (and the test) hang.
+	var releaseOnce sync.Once
+	releaseAll := func() { releaseOnce.Do(func() { close(release) }) }
+	defer releaseAll()
 	up, _ := url.Parse(backend.URL)
 	graph := graphFromUpstreamHost(up.Host)
 
@@ -85,6 +91,52 @@ func TestPublishedGraphCapacityEnforcedWithoutEnablement(t *testing.T) {
 		t.Fatalf("second request on a full graph: status=%d retry-after=%q, want 503 with Retry-After", rr.Code, rr.Header().Get("Retry-After"))
 	}
 
+	// Other graphs are unaffected: while graph A is full, a graph with no
+	// published capacity stays unlimited. Two concurrent requests are held
+	// there, so a capacity lookup that ignored its graph (and capped this
+	// graph at one) is caught too, not only one sharing graph A's counter.
+	release2 := make(chan struct{})
+	hit2 := make(chan struct{}, 2)
+	backend2 := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		hit2 <- struct{}{}
+		<-release2
+		_, _ = w.Write([]byte(`{"model":"model-a","usage":{"prompt_tokens":1,"completion_tokens":1}}`))
+	}))
+	defer backend2.Close()
+	var release2Once sync.Once
+	release2All := func() { release2Once.Do(func() { close(release2) }) }
+	defer release2All()
+	up2, _ := url.Parse(backend2.URL)
+	// Both test servers listen on 127.0.0.1 (graph "127"); "localhost" is a
+	// different graph with no published capacity.
+	up2.Host = "localhost:" + up2.Port()
+	if graphFromUpstreamHost(up2.Host) == graph {
+		t.Fatal("precondition: the second upstream must map to a different graph")
+	}
+	done2 := make(chan int, 2)
+	for i := 0; i < 2; i++ {
+		go func() {
+			rr := httptest.NewRecorder()
+			s.Handler().ServeHTTP(rr, bareSharedRequest(up2, "org-b"))
+			done2 <- rr.Code
+		}()
+	}
+	for i := 0; i < 2; i++ {
+		select {
+		case <-hit2:
+		case code := <-done2:
+			t.Fatalf("an unpublished graph must not be limited by another graph's capacity: status=%d", code)
+		case <-time.After(5 * time.Second):
+			t.Fatal("an unpublished graph must not be limited by another graph's capacity: request never reached the engine")
+		}
+	}
+	release2All()
+	for i := 0; i < 2; i++ {
+		if code := <-done2; code != http.StatusOK {
+			t.Fatalf("an unpublished graph must not be limited by another graph's capacity: status=%d", code)
+		}
+	}
+
 	// A route with no trusted org keeps its historical behavior: published
 	// capacity alone does not start failing it closed.
 	go func() {
@@ -97,7 +149,7 @@ func TestPublishedGraphCapacityEnforcedWithoutEnablement(t *testing.T) {
 	case <-time.After(5 * time.Second):
 		t.Fatal("an org-less historical route must not be refused by published capacity")
 	}
-	close(release)
+	releaseAll()
 	for i := 0; i < 2; i++ {
 		if code := <-done; code != http.StatusOK {
 			t.Fatalf("held request status=%d", code)
@@ -105,13 +157,13 @@ func TestPublishedGraphCapacityEnforcedWithoutEnablement(t *testing.T) {
 	}
 
 	// Freed: the graph admits again.
-	release2 := httptest.NewRecorder()
+	afterRelease := httptest.NewRecorder()
 	backend.Config.Handler = http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		_, _ = w.Write([]byte(`{"model":"model-a","usage":{"prompt_tokens":1,"completion_tokens":1}}`))
 	})
-	s.Handler().ServeHTTP(release2, bareSharedRequest(up, "org-b"))
-	if release2.Code != http.StatusOK {
-		t.Fatalf("after release status=%d, want 200", release2.Code)
+	s.Handler().ServeHTTP(afterRelease, bareSharedRequest(up, "org-b"))
+	if afterRelease.Code != http.StatusOK {
+		t.Fatalf("after release status=%d, want 200", afterRelease.Code)
 	}
 }
 
