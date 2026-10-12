@@ -194,10 +194,10 @@ func TestIOLog_ShouldLogTrue_ProducesRecord(t *testing.T) {
 	}
 }
 
-// TestIOLog_StreamingForwardedVerbatim verifies that enabling body capture does
-// NOT break streaming: the client still receives the SSE bytes unchanged, and a
-// record with the concatenated stream is produced.
-func TestIOLog_StreamingForwardedVerbatim(t *testing.T) {
+// TestIOLog_StreamingPreservesClientUsagePreference verifies that body capture
+// does not expose Phoebe's forced upstream usage fields. The internal log keeps
+// the complete engine stream while the caller receives the shape it requested.
+func TestIOLog_StreamingPreservesClientUsagePreference(t *testing.T) {
 	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		w.Header().Set("Content-Type", "text/event-stream")
 		w.WriteHeader(http.StatusOK)
@@ -223,8 +223,8 @@ func TestIOLog_StreamingForwardedVerbatim(t *testing.T) {
 	req := iologRequest(upstream, http.MethodPost, `{"model":"m","stream":true,"messages":[]}`)
 	srv.Handler().ServeHTTP(rr, req)
 
-	if rr.Body.String() != vllmStream {
-		t.Fatalf("streaming not forwarded verbatim under logging:\n%q", rr.Body.String())
+	if strings.Contains(rr.Body.String(), `"usage"`) || !strings.Contains(rr.Body.String(), "data: [DONE]") {
+		t.Fatalf("client stream did not preserve omitted-usage semantics:\n%q", rr.Body.String())
 	}
 	recs := sink.all()
 	if len(recs) != 1 {

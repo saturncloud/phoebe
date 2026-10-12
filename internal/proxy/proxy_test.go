@@ -2,11 +2,14 @@ package proxy
 
 import (
 	"bytes"
+	"compress/gzip"
 	"context"
+	"errors"
 	"io"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -103,6 +106,24 @@ func TestHealthz(t *testing.T) {
 	srv.Handler().ServeHTTP(rr, req)
 	if rr.Code != http.StatusOK {
 		t.Fatalf("healthz: got %d, want 200", rr.Code)
+	}
+}
+
+func TestIdentityEncodingAllowed(t *testing.T) {
+	for _, tc := range []struct {
+		value string
+		want  bool
+	}{
+		{value: "", want: true},
+		{value: "gzip", want: true},
+		{value: "gzip, identity;q=1", want: true},
+		{value: "gzip, identity;q=0", want: false},
+		{value: "gzip, *;q=0", want: false},
+		{value: "gzip, *;q=0, identity;q=0.5", want: true},
+	} {
+		if got := identityEncodingAllowed(tc.value); got != tc.want {
+			t.Errorf("identityEncodingAllowed(%q) = %t, want %t", tc.value, got, tc.want)
+		}
 	}
 }
 
@@ -797,8 +818,8 @@ func TestProxyStreamingEndToEnd(t *testing.T) {
 	if !gotIncludeUsage {
 		t.Fatal("backend did not receive include_usage:true — forcing failed")
 	}
-	if rr.Body.String() != vllmStream {
-		t.Fatalf("client did not receive SSE verbatim:\n%q", rr.Body.String())
+	if strings.Contains(rr.Body.String(), `"usage"`) || !strings.Contains(rr.Body.String(), "data: [DONE]") {
+		t.Fatalf("client stream did not preserve omitted-usage semantics:\n%q", rr.Body.String())
 	}
 
 	events := em.all()
@@ -840,6 +861,329 @@ func TestProxyStreamingEndToEnd(t *testing.T) {
 	}
 	if e.FinishReason != "stop" {
 		t.Fatalf("event finish_reason = %q, want stop", e.FinishReason)
+	}
+}
+
+func TestProxyStreamingResponsePreferencesAndFraming(t *testing.T) {
+	const stream = "data: {\"model\":\"m\",\"choices\":[{\"delta\":{\"content\":\"a\"}}],\"usage\":{\"prompt_tokens\":4,\"completion_tokens\":1}}\n\n" +
+		"data: {\"model\":\"m\",\"choices\":[],\"usage\":{\"prompt_tokens\":4,\"completion_tokens\":1}}\n\n" +
+		"data: [DONE]\n\n"
+	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.Header().Set("Content-Length", strconv.Itoa(len(stream)))
+		w.Header().Set("ETag", `"upstream-body"`)
+		_, _ = io.WriteString(w, stream)
+	}))
+	defer backend.Close()
+	upstream, _ := url.Parse(backend.URL)
+	phoebe := httptest.NewServer(newTestServer(t, upstream).Handler())
+	defer phoebe.Close()
+
+	request := func(t *testing.T, streamOptions string, shared bool) (*http.Response, string) {
+		t.Helper()
+		body := `{"model":"m","stream":true,"messages":[]` + streamOptions + `}`
+		req, err := http.NewRequestWithContext(context.Background(), http.MethodPost, phoebe.URL+"/v1/chat/completions", strings.NewReader(body))
+		if err != nil {
+			t.Fatal(err)
+		}
+		setUpstream(req, upstream)
+		req.Header.Set(identity.HeaderAuthID, "auth-1")
+		req.Header.Set(identity.HeaderResourceID, "model-1")
+		req.Header.Set(identity.HeaderOrgID, "org-1")
+		req.Header.Set(identity.HeaderServedModel, "m")
+		if shared {
+			req.Header.Set(identity.HeaderServingMode, identity.ServingModeShared)
+		}
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		data, err := io.ReadAll(resp.Body)
+		_ = resp.Body.Close()
+		if err != nil {
+			t.Fatalf("read filtered response: %v", err)
+		}
+		return resp, string(data)
+	}
+
+	for _, tc := range []struct {
+		name          string
+		streamOptions string
+	}{
+		{name: "shared omitted usage"},
+		{name: "shared usage false", streamOptions: `,"stream_options":{"include_usage":false}`},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			resp, body := request(t, tc.streamOptions, true)
+			if strings.Contains(body, `"usage"`) {
+				t.Fatalf("usage leaked after shared request rewrite: %s", body)
+			}
+			if resp.ContentLength != -1 || resp.Header.Get("Content-Length") != "" || resp.Header.Get("ETag") != "" {
+				t.Fatalf("stale transformed-body metadata: length=%d headers=%v", resp.ContentLength, resp.Header)
+			}
+		})
+	}
+
+	t.Run("final only", func(t *testing.T) {
+		_, body := request(t, `,"stream_options":{"include_usage":true}`, false)
+		if strings.Count(body, `"usage":null`) != 1 || strings.Count(body, `"prompt_tokens"`) != 1 {
+			t.Fatalf("final-only response shape is wrong: %s", body)
+		}
+	})
+
+	t.Run("explicit continuous", func(t *testing.T) {
+		resp, body := request(t, `,"stream_options":{"include_usage":true,"continuous_usage_stats":true}`, false)
+		if body != stream {
+			t.Fatalf("continuous response changed:\n got %q\nwant %q", body, stream)
+		}
+		if resp.ContentLength != int64(len(stream)) || resp.Header.Get("ETag") == "" {
+			t.Fatalf("unchanged response metadata was removed: length=%d headers=%v", resp.ContentLength, resp.Header)
+		}
+	})
+}
+
+func TestProxyStreamingFilteredBodyRemovesDigestTrailer(t *testing.T) {
+	const stream = "data: {\"choices\":[{\"delta\":{\"content\":\"a\"}}],\"usage\":{\"prompt_tokens\":4}}\n\n" +
+		"data: {\"choices\":[],\"usage\":{\"prompt_tokens\":4}}\n\n"
+	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.Header().Add("Trailer", "Digest, Content-Digest, Repr-Digest")
+		_, _ = io.WriteString(w, stream)
+		w.Header().Set("Digest", "sha-256=upstream-body")
+		w.Header().Set("Content-Digest", "sha-256=:upstream-body:")
+		w.Header().Set("Repr-Digest", "sha-256=:upstream-representation:")
+	}))
+	defer backend.Close()
+	upstream, _ := url.Parse(backend.URL)
+	phoebe := httptest.NewServer(newTestServer(t, upstream).Handler())
+	defer phoebe.Close()
+
+	for _, tc := range []struct {
+		name       string
+		options    string
+		wantDigest bool
+	}{
+		{name: "filtered"},
+		{name: "explicit continuous", options: `,"stream_options":{"include_usage":true,"continuous_usage_stats":true}`, wantDigest: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			body := `{"model":"m","stream":true,"messages":[]` + tc.options + `}`
+			req, err := http.NewRequestWithContext(context.Background(), http.MethodPost, phoebe.URL+"/v1/chat/completions", strings.NewReader(body))
+			if err != nil {
+				t.Fatal(err)
+			}
+			setUpstream(req, upstream)
+			req.Header.Set(identity.HeaderAuthID, "auth-1")
+			req.Header.Set(identity.HeaderResourceID, "model-1")
+			req.Header.Set(identity.HeaderServedModel, "m")
+			resp, err := http.DefaultClient.Do(req)
+			if err != nil {
+				t.Fatal(err)
+			}
+			_, err = io.ReadAll(resp.Body)
+			_ = resp.Body.Close()
+			if err != nil {
+				t.Fatal(err)
+			}
+			for _, name := range []string{"Digest", "Content-Digest", "Repr-Digest"} {
+				if got := resp.Trailer.Get(name); (got != "") != tc.wantDigest {
+					t.Fatalf("%s trailer = %q, want present=%t", name, got, tc.wantDigest)
+				}
+			}
+		})
+	}
+}
+
+func TestProxyStreamingForcesIdentityEncodingUpstream(t *testing.T) {
+	var upstreamAcceptEncoding string
+	var upstreamHits atomic.Int32
+	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		upstreamHits.Add(1)
+		upstreamAcceptEncoding = r.Header.Get("Accept-Encoding")
+		w.Header().Set("Content-Type", "text/event-stream")
+		if r.Header.Get("X-Test-Response-Encoding") == "multiple" {
+			w.Header().Add("Content-Encoding", "identity")
+			w.Header().Add("Content-Encoding", "gzip")
+			_, _ = io.WriteString(w, vllmStream)
+			return
+		}
+		if upstreamAcceptEncoding != "identity" {
+			w.Header().Set("Content-Encoding", "gzip")
+			zw := gzip.NewWriter(w)
+			_, _ = io.WriteString(zw, vllmStream)
+			_ = zw.Close()
+			return
+		}
+		_, _ = io.WriteString(w, vllmStream)
+	}))
+	defer backend.Close()
+	upstream, _ := url.Parse(backend.URL)
+	em := &recordingEmitter{}
+	phoebe := httptest.NewServer(newTestServerE(t, upstream, em).Handler())
+	defer phoebe.Close()
+
+	req, err := http.NewRequestWithContext(context.Background(), http.MethodPost, phoebe.URL+"/v1/chat/completions",
+		strings.NewReader(`{"model":"m","stream":true,"messages":[]}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	setUpstream(req, upstream)
+	req.Header.Set("Accept-Encoding", "gzip")
+	req.Header.Set(identity.HeaderAuthID, "auth-1")
+	req.Header.Set(identity.HeaderResourceID, "model-1")
+	req.Header.Set(identity.HeaderServedModel, "m")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	body, err := io.ReadAll(resp.Body)
+	_ = resp.Body.Close()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if upstreamAcceptEncoding != "identity" {
+		t.Fatalf("upstream Accept-Encoding = %q, want identity representation", upstreamAcceptEncoding)
+	}
+	if strings.Contains(string(body), `"usage"`) || !strings.Contains(string(body), "data: [DONE]") {
+		t.Fatalf("filtered identity stream has wrong shape: %q", body)
+	}
+	events := em.waitForEvents(1, time.Second)
+	if len(events) != 1 || !events[0].UsageFound || events[0].CompletionTokens != 300 {
+		t.Fatalf("authoritative usage was not captured: %+v", events)
+	}
+
+	rejected, err := http.NewRequestWithContext(context.Background(), http.MethodPost, phoebe.URL+"/v1/chat/completions",
+		strings.NewReader(`{"model":"m","stream":true,"messages":[]}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	setUpstream(rejected, upstream)
+	rejected.Header.Set("Accept-Encoding", "gzip, identity;q=0")
+	rejected.Header.Set(identity.HeaderAuthID, "auth-1")
+	rejected.Header.Set(identity.HeaderResourceID, "model-1")
+	rejected.Header.Set(identity.HeaderServedModel, "m")
+	rejectedResp, err := http.DefaultClient.Do(rejected)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = rejectedResp.Body.Close()
+	if rejectedResp.StatusCode != http.StatusNotAcceptable {
+		t.Fatalf("identity-forbidden status = %d, want 406", rejectedResp.StatusCode)
+	}
+	if upstreamHits.Load() != 1 {
+		t.Fatalf("identity-forbidden request reached upstream; hits=%d", upstreamHits.Load())
+	}
+
+	for _, values := range [][]string{
+		{"gzip", "identity;q=0"},
+		{"identity;q=0", "gzip"},
+	} {
+		rejected, err := http.NewRequestWithContext(context.Background(), http.MethodPost, phoebe.URL+"/v1/chat/completions",
+			strings.NewReader(`{"model":"m","stream":true,"messages":[]}`))
+		if err != nil {
+			t.Fatal(err)
+		}
+		setUpstream(rejected, upstream)
+		for _, value := range values {
+			rejected.Header.Add("Accept-Encoding", value)
+		}
+		rejected.Header.Set(identity.HeaderAuthID, "auth-1")
+		rejected.Header.Set(identity.HeaderResourceID, "model-1")
+		rejected.Header.Set(identity.HeaderServedModel, "m")
+		rejectedResp, err := http.DefaultClient.Do(rejected)
+		if err != nil {
+			t.Fatal(err)
+		}
+		_ = rejectedResp.Body.Close()
+		if rejectedResp.StatusCode != http.StatusNotAcceptable {
+			t.Fatalf("identity-forbidden fields %q status = %d, want 406", values, rejectedResp.StatusCode)
+		}
+	}
+	if upstreamHits.Load() != 1 {
+		t.Fatalf("multi-field identity-forbidden requests reached upstream; hits=%d", upstreamHits.Load())
+	}
+
+	encoded, err := http.NewRequestWithContext(context.Background(), http.MethodPost, phoebe.URL+"/v1/chat/completions",
+		strings.NewReader(`{"model":"m","stream":true,"messages":[]}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	setUpstream(encoded, upstream)
+	encoded.Header.Set("X-Test-Response-Encoding", "multiple")
+	encoded.Header.Set(identity.HeaderAuthID, "auth-1")
+	encoded.Header.Set(identity.HeaderResourceID, "model-1")
+	encoded.Header.Set(identity.HeaderServedModel, "m")
+	encodedResp, err := http.DefaultClient.Do(encoded)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, _ = io.Copy(io.Discard, encodedResp.Body)
+	_ = encodedResp.Body.Close()
+	if encodedResp.StatusCode != http.StatusBadGateway {
+		t.Fatalf("multi-field encoded upstream status = %d, want 502", encodedResp.StatusCode)
+	}
+	events = em.waitForEvents(2, time.Second)
+	if len(events) != 2 || events[1].StatusCode != http.StatusBadGateway || events[1].UsageFound || events[1].Streamed {
+		t.Fatalf("encoded response did not produce the expected reconciliation event: %+v", events)
+	}
+}
+
+func TestIsEventStreamUsesExactCaseInsensitiveMediaType(t *testing.T) {
+	for _, tc := range []struct {
+		contentType string
+		want        bool
+	}{
+		{contentType: "text/event-stream", want: true},
+		{contentType: "Text/Event-Stream; charset=utf-8", want: true},
+		{contentType: "text/event-streaming", want: false},
+		{contentType: "text/event-stream; invalid", want: false},
+	} {
+		resp := &http.Response{Header: http.Header{"Content-Type": []string{tc.contentType}}}
+		if got := isEventStream(resp); got != tc.want {
+			t.Errorf("isEventStream(%q) = %t, want %t", tc.contentType, got, tc.want)
+		}
+	}
+}
+
+type failOnReadBody struct{ reads atomic.Int32 }
+
+func (b *failOnReadBody) Read([]byte) (int, error) {
+	b.reads.Add(1)
+	return 0, errors.New("body must not be read")
+}
+
+func (b *failOnReadBody) Close() error { return nil }
+
+func TestProxyDoesNotReadBodyBeforeLocalOrRejectedRouteDecision(t *testing.T) {
+	upstream, _ := url.Parse("http://127.0.0.1:1")
+	srv := newTestServer(t, upstream)
+	for _, tc := range []struct {
+		name   string
+		method string
+		path   string
+		want   int
+	}{
+		{name: "local preflight", method: http.MethodOptions, path: "/v1/chat/completions", want: http.StatusNoContent},
+		{name: "rejected route", method: http.MethodGet, path: "/future-admin", want: http.StatusNotFound},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			body := &failOnReadBody{}
+			req := httptest.NewRequest(tc.method, tc.path, nil)
+			req.Body = body
+			req.ContentLength = -1
+			setUpstream(req, upstream)
+			req.Header.Set(identity.HeaderAuthID, "auth-1")
+			req.Header.Set(identity.HeaderResourceID, "model-1")
+			req.Header.Set(identity.HeaderServedModel, "m")
+			rr := httptest.NewRecorder()
+			srv.Handler().ServeHTTP(rr, req)
+			if rr.Code != tc.want {
+				t.Fatalf("status = %d, want %d", rr.Code, tc.want)
+			}
+			if body.reads.Load() != 0 {
+				t.Fatalf("body was read %d times before route decision", body.reads.Load())
+			}
+		})
 	}
 }
 

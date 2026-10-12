@@ -31,6 +31,7 @@ import (
 	"flag"
 	"fmt"
 	"io"
+	"mime"
 	"net/http"
 	"os"
 	"strings"
@@ -97,16 +98,37 @@ func (c *checker) run(name string, fn func() error) bool {
 }
 
 func (c *checker) post(ctx context.Context, body map[string]any) (*http.Response, error) {
+	return c.postWithHeaders(ctx, body, nil)
+}
+
+func (c *checker) postWithHeaders(ctx context.Context, body map[string]any, headers http.Header) (*http.Response, error) {
 	b, _ := json.Marshal(body)
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.base+"/v1/chat/completions", bytes.NewReader(b))
 	if err != nil {
 		return nil, err
 	}
 	req.Header.Set("Content-Type", "application/json")
+	for name, values := range headers {
+		for _, value := range values {
+			req.Header.Add(name, value)
+		}
+	}
 	if c.apiKey != "" {
 		req.Header.Set("Authorization", "Bearer "+c.apiKey)
 	}
 	return c.client.Do(req)
+}
+
+func hasOnlyIdentityContentEncoding(values []string) bool {
+	for _, value := range values {
+		for _, coding := range strings.Split(value, ",") {
+			coding = strings.TrimSpace(coding)
+			if coding != "" && !strings.EqualFold(coding, "identity") {
+				return false
+			}
+		}
+	}
+	return true
 }
 
 // checkNonStreaming asserts a non-streaming response carries a usage block that
@@ -128,7 +150,6 @@ func (c *checker) checkNonStreaming() error {
 	if resp.StatusCode != http.StatusOK {
 		return fmt.Errorf("status %d: %s", resp.StatusCode, truncate(raw, 300))
 	}
-
 	// Parse via the SAME struct Phoebe bills on.
 	var body struct {
 		Usage *metering.Usage `json:"usage"`
@@ -148,20 +169,20 @@ func (c *checker) checkNonStreaming() error {
 	return nil
 }
 
-// checkStreaming asserts that, with stream_options.include_usage=true, the
-// engine emits a trailing chunk with choices:[] carrying the usage block — the
-// exact shape Phoebe's tee depends on — and that it parses into metering.Usage.
+// checkStreaming asserts that the engine accepts Phoebe's two forced stream
+// options and emits multiple cumulative usage reports before the final event.
+// Early-abort billing depends on receiving those intermediate reports.
 func (c *checker) checkStreaming() error {
 	ctx, cancel := context.WithTimeout(context.Background(), c.timeout)
 	defer cancel()
 
-	resp, err := c.post(ctx, map[string]any{
+	resp, err := c.postWithHeaders(ctx, map[string]any{
 		"model":          c.model,
 		"messages":       []map[string]string{{"role": "user", "content": "Count to three."}},
 		"max_tokens":     32,
 		"stream":         true,
-		"stream_options": map[string]any{"include_usage": true},
-	})
+		"stream_options": map[string]any{"include_usage": true, "continuous_usage_stats": true},
+	}, http.Header{"Accept-Encoding": []string{"identity"}})
 	if err != nil {
 		return fmt.Errorf("request: %w", err)
 	}
@@ -170,10 +191,24 @@ func (c *checker) checkStreaming() error {
 		raw, _ := io.ReadAll(resp.Body)
 		return fmt.Errorf("status %d: %s", resp.StatusCode, truncate(raw, 300))
 	}
+	mediaType, _, err := mime.ParseMediaType(resp.Header.Get("Content-Type"))
+	if err != nil || !strings.EqualFold(mediaType, "text/event-stream") {
+		return fmt.Errorf("Content-Type = %q, want text/event-stream", resp.Header.Get("Content-Type"))
+	}
+	encodings := resp.Header.Values("Content-Encoding")
+	if !hasOnlyIdentityContentEncoding(encodings) {
+		return fmt.Errorf("Content-Encoding = %q, want identity", encodings)
+	}
 
 	// Scan SSE lines for the trailing usage chunk, mirroring the tee's logic.
-	var usage *metering.Usage
-	var usageHadEmptyChoices bool
+	type usageReport struct {
+		usage        metering.Usage
+		emptyChoices bool
+	}
+	var reports []usageReport
+	var dataEvents int
+	var finalUsageEvents int
+	var finalUsageEventIndex int
 	var sawDone bool
 	sc := bufio.NewScanner(resp.Body)
 	sc.Buffer(make([]byte, 0, 64*1024), 1024*1024)
@@ -184,19 +219,32 @@ func (c *checker) checkStreaming() error {
 		}
 		payload := strings.TrimSpace(strings.TrimPrefix(line, "data: "))
 		if payload == "[DONE]" {
+			if sawDone {
+				return fmt.Errorf("stream sent more than one `data: [DONE]` terminator")
+			}
 			sawDone = true
 			continue
 		}
+		if sawDone {
+			return fmt.Errorf("data event appeared after `data: [DONE]`")
+		}
+		dataEvents++
 		var chunk struct {
 			Choices []json.RawMessage `json:"choices"`
 			Usage   *metering.Usage   `json:"usage"`
 		}
-		if json.Unmarshal([]byte(payload), &chunk) != nil {
-			continue
+		if err := json.Unmarshal([]byte(payload), &chunk); err != nil {
+			return fmt.Errorf("malformed JSON in data event %d: %w", dataEvents, err)
+		}
+		if len(chunk.Choices) > 0 && chunk.Usage == nil {
+			return fmt.Errorf("generated-content event %d omitted cumulative usage", dataEvents)
 		}
 		if chunk.Usage != nil {
-			usage = chunk.Usage
-			usageHadEmptyChoices = len(chunk.Choices) == 0
+			reports = append(reports, usageReport{usage: *chunk.Usage, emptyChoices: len(chunk.Choices) == 0})
+			if len(chunk.Choices) == 0 {
+				finalUsageEvents++
+				finalUsageEventIndex = dataEvents
+			}
 		}
 	}
 	if err := sc.Err(); err != nil {
@@ -205,18 +253,39 @@ func (c *checker) checkStreaming() error {
 	if !sawDone {
 		return fmt.Errorf("stream never sent `data: [DONE]` — unexpected SSE framing")
 	}
-	if usage == nil {
-		return fmt.Errorf("no usage chunk in stream — engine may not honor stream_options.include_usage (Phoebe would under-bill every streamed request)")
+	if len(reports) < 2 {
+		return fmt.Errorf("got %d usage reports, want at least 2 — engine may not honor continuous_usage_stats (Phoebe would under-bill an early abort)", len(reports))
 	}
-	if !usageHadEmptyChoices {
-		// Not fatal for billing, but it's the documented vLLM shape; flag it.
-		fmt.Printf("        WARN: usage chunk had non-empty choices (expected choices:[]) — verify the tee still captures it\n")
+	if finalUsageEvents != 1 || finalUsageEventIndex != dataEvents || !reports[len(reports)-1].emptyChoices {
+		return fmt.Errorf("got %d empty-choices usage events and final index %d of %d; want exactly one as the last data event", finalUsageEvents, finalUsageEventIndex, dataEvents)
 	}
-	if usage.PromptTokens <= 0 || usage.CompletionTokens <= 0 {
-		return fmt.Errorf("streamed usage counts look wrong: prompt=%d completion=%d", usage.PromptTokens, usage.CompletionTokens)
+	var sawBillableIntermediate bool
+	for i, report := range reports {
+		usage := report.usage
+		if i > 0 && usage.PromptTokensDetails == nil && reports[i-1].usage.PromptTokensDetails != nil {
+			details := *reports[i-1].usage.PromptTokensDetails
+			usage.PromptTokensDetails = &details
+			reports[i].usage = usage
+		}
+		if usage.PromptTokens <= 0 || usage.CompletionTokens < 0 || usage.TotalTokens < 0 || usage.CachedTokens() < 0 || usage.CachedTokens() > usage.PromptTokens {
+			return fmt.Errorf("usage report %d has invalid counts: prompt=%d completion=%d total=%d cached=%d", i+1, usage.PromptTokens, usage.CompletionTokens, usage.TotalTokens, usage.CachedTokens())
+		}
+		if i > 0 && (usage.PromptTokens < reports[i-1].usage.PromptTokens || usage.CompletionTokens < reports[i-1].usage.CompletionTokens || usage.TotalTokens < reports[i-1].usage.TotalTokens || usage.CachedTokens() < reports[i-1].usage.CachedTokens()) {
+			return fmt.Errorf("usage report %d decreased: previous=%+v current=%+v", i+1, reports[i-1].usage, usage)
+		}
+		if i < len(reports)-1 && !report.emptyChoices && usage.CompletionTokens > 0 {
+			sawBillableIntermediate = true
+		}
 	}
-	fmt.Printf("        prompt=%d completion=%d cached=%d (trailing chunk)\n",
-		usage.PromptTokens, usage.CompletionTokens, usage.CachedTokens())
+	if !sawBillableIntermediate {
+		return fmt.Errorf("no content-bearing intermediate chunk carried positive completion usage — an abort during generation would still be under-billed")
+	}
+	usage := reports[len(reports)-1].usage
+	if usage.CompletionTokens <= 0 {
+		return fmt.Errorf("final completion usage is not positive: %d", usage.CompletionTokens)
+	}
+	fmt.Printf("        reports=%d prompt=%d completion=%d total=%d cached=%d (final report)\n",
+		len(reports), usage.PromptTokens, usage.CompletionTokens, usage.TotalTokens, usage.CachedTokens())
 	return nil
 }
 
