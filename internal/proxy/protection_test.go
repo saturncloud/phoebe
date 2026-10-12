@@ -92,7 +92,7 @@ func TestRequestBodyCapAppliesToDedicatedRoutes(t *testing.T) {
 	}
 }
 
-func TestProtectionSettingsDefaultsAndValidation(t *testing.T) {
+func TestProtectionSettingsAbsentSelectsDefaults(t *testing.T) {
 	eff := config.ProtectionSettings{}.Effective()
 	if eff.MaxRequestBodyBytes != config.DefaultMaxRequestBodyBytes ||
 		eff.StreamStallTimeout != config.DefaultStreamStallTimeout ||

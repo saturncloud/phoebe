@@ -579,16 +579,23 @@ func TestLoadProtection(t *testing.T) {
 		t.Fatalf("absent fields keep their default, got total=%d", eff.MaxResponseBufferBytesTotal)
 	}
 
-	for _, tc := range []struct{ name, yaml string }{
-		{"negative size", "protection:\n  maxRequestBodyBytes: -1\n"},
-		{"negative holds", "protection:\n  maxDedicatedColdHoldsPerEndpoint: -1\n"},
-		{"unparseable duration", "protection:\n  streamStallTimeout: soon\n"},
-		{"zero duration", "protection:\n  maxStreamDuration: 0s\n"},
-		{"per-stream over total", "protection:\n  maxResponseBufferBytesPerStream: 2048\n  maxResponseBufferBytesTotal: 1024\n"},
+	// One case per rule in ProtectionSettings.parse; each error must name
+	// the offending protection.<field>.
+	for _, tc := range []struct{ name, yaml, field string }{
+		{"negative body size", "protection:\n  maxRequestBodyBytes: -1\n", "protection.maxRequestBodyBytes"},
+		{"negative per-stream buffer", "protection:\n  maxResponseBufferBytesPerStream: -1\n", "protection.maxResponseBufferBytesPerStream"},
+		{"negative total buffer", "protection:\n  maxResponseBufferBytesTotal: -1\n", "protection.maxResponseBufferBytesTotal"},
+		{"negative holds", "protection:\n  maxDedicatedColdHoldsPerEndpoint: -1\n", "protection.maxDedicatedColdHoldsPerEndpoint"},
+		{"unparseable stall timeout", "protection:\n  streamStallTimeout: soon\n", "protection.streamStallTimeout"},
+		{"zero stall timeout", "protection:\n  streamStallTimeout: 0s\n", "protection.streamStallTimeout"},
+		{"unparseable stream duration", "protection:\n  maxStreamDuration: later\n", "protection.maxStreamDuration"},
+		{"zero stream duration", "protection:\n  maxStreamDuration: 0s\n", "protection.maxStreamDuration"},
+		{"per-stream over total", "protection:\n  maxResponseBufferBytesPerStream: 2048\n  maxResponseBufferBytesTotal: 1024\n", "protection.maxResponseBufferBytesPerStream"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			if _, err := Load(writeTemp(t, tc.yaml)); err == nil {
-				t.Fatal("want a startup error")
+			_, err := Load(writeTemp(t, tc.yaml))
+			if err == nil || !strings.Contains(err.Error(), tc.field) {
+				t.Fatalf("err=%v, want a startup error naming %s", err, tc.field)
 			}
 		})
 	}
