@@ -12,6 +12,7 @@ import (
 	"fmt"
 	"io"
 	"io/fs"
+	"math"
 	"os"
 	"path/filepath"
 	"sort"
@@ -334,6 +335,14 @@ func validate(ev metering.Event) error {
 	// here where the failure is still an operator-visible dry-run error.
 	if ev.StatusCode != 0 && (ev.StatusCode < 100 || ev.StatusCode > 599) {
 		return fmt.Errorf("status_code %d is outside the database range 100..599", ev.StatusCode)
+	}
+	// rated_usage_topology_revision_ck requires >= 0 and
+	// billing_event.topology_revision is INTEGER. Zero marshals as the
+	// omitted/NULL case; a negative or overflowing revision would replay into
+	// Valkey and only then be nulled by the drainer, so reject it here where it
+	// is still an operator-visible dry-run error.
+	if ev.TopologyRevision < 0 || ev.TopologyRevision > math.MaxInt32 {
+		return fmt.Errorf("topology_revision %d is outside the database range 0..2147483647", ev.TopologyRevision)
 	}
 	return nil
 }

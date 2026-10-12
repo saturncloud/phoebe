@@ -265,3 +265,20 @@ func TestEventArgs_OutOfRangeTopologyRevisionBindsNullNeverPoisons(t *testing.T)
 		}
 	}
 }
+
+// TestEventArgs_NegativeServingDurationStoresNull: a negative serving time is
+// impossible evidence, so it is stored as NULL ("not captured") rather than
+// as a misleading value; zero (a sub-millisecond request) is kept.
+func TestEventArgs_NegativeServingDurationStoresNull(t *testing.T) {
+	const servingDurationIdx = 24 // topology_revision 21, region 22, request_started_at 23.
+
+	for _, tc := range []struct {
+		ms   int64
+		want any
+	}{{0, int64(0)}, {42, int64(42)}, {-1, nil}} {
+		args := eventArgs(metering.Event{RequestID: "r", Model: "m", RequestStartedUnixMs: 1, ServingDurationMs: tc.ms})
+		if args[servingDurationIdx] != tc.want {
+			t.Fatalf("serving_duration_ms arg for %d = %v, want %v", tc.ms, args[servingDurationIdx], tc.want)
+		}
+	}
+}

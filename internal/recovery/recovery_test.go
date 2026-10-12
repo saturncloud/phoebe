@@ -232,6 +232,54 @@ func TestLoadRejectsStatusCodesOutsideDatabaseRange(t *testing.T) {
 	}
 }
 
+// TestLoadRejectsTopologyRevisionsOutsideDatabaseRange pins validation against
+// rated_usage_topology_revision_ck (>= 0) and the INTEGER column type. A
+// negative or overflowing revision would otherwise replay into Valkey; reject
+// it during dry-run so one bad evidence row cannot reach the rating of an hour.
+func TestLoadRejectsTopologyRevisionsOutsideDatabaseRange(t *testing.T) {
+	cases := []struct {
+		name     string
+		revision int
+		wantErr  bool
+	}{
+		{"zero is the NULL case", 0, false},
+		{"in range", 5, false},
+		{"int32 max", 2147483647, false},
+		{"negative", -1, true},
+		{"above int32 max", 2147483648, true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			ev := testEvent("req-revision")
+			ev.TopologyRevision = tc.revision
+			data, err := json.Marshal(ev)
+			if err != nil {
+				t.Fatal(err)
+			}
+			path := filepath.Join(t.TempDir(), "evidence.jsonl")
+			if err := os.WriteFile(path, data, 0o600); err != nil {
+				t.Fatal(err)
+			}
+			evidence, err := Load(path)
+			if tc.wantErr {
+				if err == nil {
+					t.Fatalf("topology_revision %d was accepted; the database would reject it", tc.revision)
+				}
+				if !strings.Contains(err.Error(), "topology_revision") {
+					t.Fatalf("error %q does not name topology_revision", err)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("topology_revision %d must be accepted: %v", tc.revision, err)
+			}
+			if len(evidence.Events) != 1 || evidence.Events[0].TopologyRevision != tc.revision {
+				t.Fatalf("events = %+v, want one event with revision %d", evidence.Events, tc.revision)
+			}
+		})
+	}
+}
+
 // TestDigestBindsCompleteEventSet proves the digest is a function of the whole
 // event content, not merely the request-id set, and is order-independent.
 func TestDigestBindsCompleteEventSet(t *testing.T) {

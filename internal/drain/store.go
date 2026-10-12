@@ -242,7 +242,9 @@ func eventArgs(e metering.Event) []any {
 		nullRevision(e.TopologyRevision),
 		nullStr(e.Region),
 		requestStartedAt,
-		nullInt64(e.ServingDurationMs, e.RequestStartedUnixMs > 0),
+		// A negative duration is impossible evidence (clock skew or a producer
+		// bug), so it is stored as NULL ("not captured") like a missing start.
+		nullInt64(e.ServingDurationMs, e.RequestStartedUnixMs > 0 && e.ServingDurationMs >= 0),
 		eventTS,
 	}
 }
