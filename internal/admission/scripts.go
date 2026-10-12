@@ -3,7 +3,8 @@ package admission
 import "github.com/redis/go-redis/v9"
 
 // The counter store is intentionally compact: every operation is one Lua
-// transaction over four keys in one Redis Cluster slot. Expired lease and
+// transaction over six keys in one Redis Cluster slot (KEYS[5]/KEYS[6] are
+// the previous release's lease keys, only ever reaped). Expired lease and
 // fixed-window reaping occurs before every mutation, so replica death cannot
 // leak reservations past leaseTtl and retired dynamic scopes cannot grow the
 // counters hash forever.
@@ -46,10 +47,10 @@ local function window_retry_ms(s, now)
   return remaining
 end
 -- A record's kv is its estimated input plus reserved output. Records written
--- before the prefill-token and kv counters existed carry neither field (and
--- hold prompt BYTES under 'prompt'), so every read defaults to 0 and the
--- legacy 'prompt' field is still released: a rolling deploy never strands a
--- counter in either direction.
+-- by the previous release (reaped from KEYS[5]/KEYS[6]) carry neither field
+-- and hold prompt BYTES under 'prompt', so every read defaults to 0 and the
+-- legacy 'prompt' field is still released. The previous release never sees
+-- a new record: it reaps only its own keys.
 local function release_record(rec)
   for _,s in ipairs(rec.scopes) do
     add(field(s,'kv'), -(rec.kv or 0))
@@ -64,16 +65,25 @@ local function release_record(rec)
     if rec.cold then add(field(s,'cold'), -1) end
   end
 end
+local function reap_leases(leases, expiries, now)
+  local expired=redis.call('ZRANGEBYSCORE',expiries,'-inf',now,'LIMIT',0,100)
+  for _,id in ipairs(expired) do
+    local raw=redis.call('HGET',leases,id)
+    if raw then release_record(cjson.decode(raw)); redis.call('HDEL',leases,id) end
+    redis.call('ZREM',expiries,id)
+  end
+end
 local function reap(now)
   -- Keep each atomic mutation bounded. Leases left behind still hold their
   -- counters, so a backlog can only reject conservatively until later calls
   -- drain it; it can never create unaccounted capacity.
-  local expired=redis.call('ZRANGEBYSCORE',KEYS[3],'-inf',now,'LIMIT',0,100)
-  for _,id in ipairs(expired) do
-    local raw=redis.call('HGET',KEYS[2],id)
-    if raw then release_record(cjson.decode(raw)); redis.call('HDEL',KEYS[2],id) end
-    redis.call('ZREM',KEYS[3],id)
-  end
+  reap_leases(KEYS[2], KEYS[3], now)
+  -- Leases a not-yet-upgraded replica wrote under the previous release's
+  -- keys. That replica reaps only those keys, never ours, so it cannot
+  -- release a new-format lease without its prefill_tokens and kv; draining
+  -- its expired leases here keeps one that died mid-request from holding
+  -- capacity forever.
+  reap_leases(KEYS[5], KEYS[6], now)
   local windows=redis.call('ZRANGEBYSCORE',KEYS[4],'-inf',now,'LIMIT',0,100)
   for _,member in ipairs(windows) do
     local item=cjson.decode(member)
@@ -109,9 +119,7 @@ for _,s in ipairs(q.scopes) do
   if s.uncached_prompt ~= 0 and window_get(s,'uncached_prompt',q.now)+get(field(s,'uncached_prompt_reserved'))+q.estimated_input > s.uncached_prompt then return {0,s.name,'uncached_prompt_tokens',contract,window_retry_ms(s,q.now)} end
   if s.generated ~= 0 and window_get(s,'generated',q.now)+get(field(s,'genreserved'))+q.output > s.generated then return {0,s.name,'generated_tokens',contract,window_retry_ms(s,q.now)} end
 end
--- prompt=0 keeps the record readable by a not-yet-upgraded replica's reaper,
--- whose release_record subtracts rec.prompt unconditionally.
-local rec={scopes=q.scopes,prompt=0,prefill_tokens=q.prefill_tokens,kv=q.kv,estimated_input=q.estimated_input,output=q.output,adapter=q.adapter,prefill=true,cold=false,admitted_at=q.now}
+local rec={scopes=q.scopes,prefill_tokens=q.prefill_tokens,kv=q.kv,estimated_input=q.estimated_input,output=q.output,adapter=q.adapter,prefill=true,cold=false,admitted_at=q.now}
 for _,s in ipairs(q.scopes) do
   add(field(s,'active'),1); add(field(s,'prefills'),1); add(field(s,'reserved_decode_slots'),1); add(field(s,'prefill_tokens'),q.prefill_tokens); add(field(s,'output'),q.output); add(field(s,'kv'),q.kv); add(field(s,'genreserved'),q.output)
   add(field(s,'total_prompt_reserved'),q.estimated_input); add(field(s,'uncached_prompt_reserved'),q.estimated_input)

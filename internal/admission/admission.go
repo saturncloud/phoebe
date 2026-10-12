@@ -164,6 +164,14 @@ type RedisAdmitter struct {
 	cfg                        config.AdmissionSettings
 	counters, leases, expiries string
 	windowExpiries             string
+	// legacyLeases and legacyExpiries are the lease keys of the release
+	// before the prefill-token and kv counters. This release writes its
+	// leases under versioned keys so a not-yet-upgraded replica's reaper,
+	// whose release_record does not know prefill_tokens or kv, can never
+	// release (and so strand the counters of) a new-format lease. The new
+	// reaper drains expired leases from the legacy keys, so a lease an old
+	// replica wrote is still released if that replica dies mid-request.
+	legacyLeases, legacyExpiries string
 }
 
 func New(client redis.Cmdable, cfg config.AdmissionSettings) *RedisAdmitter {
@@ -172,8 +180,9 @@ func New(client redis.Cmdable, cfg config.AdmissionSettings) *RedisAdmitter {
 	// Cluster as well as single-node Valkey.
 	tag := "{" + prefix + "}"
 	return &RedisAdmitter{
-		client: client, cfg: cfg, counters: tag + ":counters", leases: tag + ":leases",
-		expiries: tag + ":expiries", windowExpiries: tag + ":window-expiries",
+		client: client, cfg: cfg, counters: tag + ":counters", leases: tag + ":leases:v2",
+		expiries: tag + ":expiries:v2", windowExpiries: tag + ":window-expiries",
+		legacyLeases: tag + ":leases", legacyExpiries: tag + ":expiries",
 	}
 }
 
@@ -210,7 +219,7 @@ func FromSettings(s *config.Settings) (*RedisAdmitter, *redis.Client, bool) {
 func (a *RedisAdmitter) Settings() config.AdmissionSettings { return a.cfg }
 
 func (a *RedisAdmitter) keys() []string {
-	return []string{a.counters, a.leases, a.expiries, a.windowExpiries}
+	return []string{a.counters, a.leases, a.expiries, a.windowExpiries, a.legacyLeases, a.legacyExpiries}
 }
 
 func randomID() (string, error) {

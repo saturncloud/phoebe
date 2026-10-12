@@ -39,7 +39,7 @@ func TestRealValkeyAtomicAdmission(t *testing.T) {
 	}
 	a, b := New(one, cfg), New(two, cfg)
 	t.Cleanup(func() {
-		_ = one.Del(context.Background(), a.counters, a.leases, a.expiries, a.windowExpiries).Err()
+		_ = one.Del(context.Background(), a.counters, a.leases, a.expiries, a.windowExpiries, a.legacyLeases, a.legacyExpiries).Err()
 		_ = one.Close()
 		_ = two.Close()
 	})
@@ -108,7 +108,7 @@ func TestRealValkeyLeaseLifecycleTransitions(t *testing.T) {
 	}
 	a := New(client, cfg)
 	t.Cleanup(func() {
-		_ = client.Del(context.Background(), a.counters, a.leases, a.expiries, a.windowExpiries).Err()
+		_ = client.Del(context.Background(), a.counters, a.leases, a.expiries, a.windowExpiries, a.legacyLeases, a.legacyExpiries).Err()
 		_ = client.Close()
 	})
 
@@ -214,7 +214,7 @@ func TestRealValkeyReapsRetiredScopeWindows(t *testing.T) {
 	}
 	a := New(client, cfg)
 	t.Cleanup(func() {
-		_ = client.Del(context.Background(), a.counters, a.leases, a.expiries, a.windowExpiries).Err()
+		_ = client.Del(context.Background(), a.counters, a.leases, a.expiries, a.windowExpiries, a.legacyLeases, a.legacyExpiries).Err()
 		_ = client.Close()
 	})
 
@@ -264,7 +264,7 @@ func TestRealValkeySettlesIndependentContractsExactly(t *testing.T) {
 	}
 	a := New(client, cfg)
 	t.Cleanup(func() {
-		_ = client.Del(context.Background(), a.counters, a.leases, a.expiries, a.windowExpiries).Err()
+		_ = client.Del(context.Background(), a.counters, a.leases, a.expiries, a.windowExpiries, a.legacyLeases, a.legacyExpiries).Err()
 		_ = client.Close()
 	})
 
@@ -353,7 +353,7 @@ func TestRealValkeyContractOnlyBurst(t *testing.T) {
 	}
 	a := New(client, cfg)
 	t.Cleanup(func() {
-		_ = client.Del(context.Background(), a.counters, a.leases, a.expiries, a.windowExpiries).Err()
+		_ = client.Del(context.Background(), a.counters, a.leases, a.expiries, a.windowExpiries, a.legacyLeases, a.legacyExpiries).Err()
 		_ = client.Close()
 	})
 	for _, tc := range []struct {
@@ -437,7 +437,7 @@ func TestRealValkeyGroupScopes(t *testing.T) {
 	}
 	a := New(client, cfg)
 	t.Cleanup(func() {
-		_ = client.Del(context.Background(), a.counters, a.leases, a.expiries, a.windowExpiries).Err()
+		_ = client.Del(context.Background(), a.counters, a.leases, a.expiries, a.windowExpiries, a.legacyLeases, a.legacyExpiries).Err()
 		_ = client.Close()
 	})
 

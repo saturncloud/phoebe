@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"testing"
+	"time"
 
 	"github.com/saturncloud/phoebe/internal/config"
 )
@@ -96,4 +97,90 @@ func TestLegacyLeaseRecordReleasesCleanly(t *testing.T) {
 	if got := mr.HGet(a.counters, scopeID+"|kv"); got != "" {
 		t.Fatalf("kv=%q after every lease finished, want released", got)
 	}
+}
+
+// During a rolling deploy an old replica can die mid-request, leaving a lease
+// under the previous release's keys that only the reaper can release. The new
+// reaper must drain it (every counter it holds, legacy prompt bytes included)
+// so it cannot strand capacity forever.
+func TestExpiredLegacyKeyLeaseIsReapedByNewReplica(t *testing.T) {
+	a, mr := testAdmitter(t, config.AdmissionSettings{Platform: config.AdmissionLimits{MaxActiveRequests: ptr64(1)}})
+	ctx := context.Background()
+	req := request("a", "m")
+	req.Adapter = false
+	sc := a.scopes(req)[0]
+	legacy := map[string]any{
+		"scopes": []scope{sc}, "prompt": 400, "estimated_input": 10, "output": 20,
+		"adapter": 0, "prefill": true, "cold": false, "admitted_at": 0,
+	}
+	raw, _ := json.Marshal(legacy)
+	mr.HSet(a.legacyLeases, "old-replica-lease", string(raw))
+	if _, err := mr.ZAdd(a.legacyExpiries, 1, "old-replica-lease"); err != nil {
+		t.Fatal(err)
+	}
+	// The counters the old replica's admit wrote for that lease.
+	for dim, v := range map[string]string{
+		"active": "1", "prefills": "1", "reserved_decode_slots": "1", "output": "20", "genreserved": "20",
+		"total_prompt_reserved": "10", "uncached_prompt_reserved": "10", "prompt": "400",
+	} {
+		mr.HSet(a.counters, sc.ID+"|"+dim, v)
+	}
+	lease, err := a.Admit(ctx, req)
+	if err != nil {
+		t.Fatalf("the expired legacy lease still holds the only active slot: %v", err)
+	}
+	if mr.Exists(a.legacyLeases) || mr.Exists(a.legacyExpiries) {
+		t.Fatal("expired legacy lease not removed from the legacy keys")
+	}
+	want := map[string]string{
+		"active": "1", "prefills": "1", "reserved_decode_slots": "1", "output": "20", "genreserved": "20",
+		"total_prompt_reserved": "10", "uncached_prompt_reserved": "10", "prompt": "", "prefill_tokens": "10", "kv": "30",
+	}
+	for dim, v := range want {
+		if got := mr.HGet(a.counters, sc.ID+"|"+dim); got != v {
+			t.Errorf("%s=%q, want %q (only the new lease's reservation)", dim, got, v)
+		}
+	}
+	_ = lease.Complete(ctx, 0)
+}
+
+// A new lease lives only under the versioned keys, through its whole life, so
+// a not-yet-upgraded replica (which reaps only the legacy keys and does not
+// know prefill_tokens or kv) can never release it and strand those counters.
+func TestNewLeaseNeverWrittenToLegacyKeys(t *testing.T) {
+	a, mr := testAdmitter(t, config.AdmissionSettings{Platform: limits(5), LeaseTTL: time.Minute})
+	ctx := context.Background()
+	if a.leases == a.legacyLeases || a.expiries == a.legacyExpiries {
+		t.Fatal("lease keys must be versioned apart from the legacy keys")
+	}
+	lease, err := a.Admit(ctx, request("a", "m"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	assertOnlyVersioned := func(stage string) {
+		t.Helper()
+		if mr.Exists(a.legacyLeases) || mr.Exists(a.legacyExpiries) {
+			t.Fatalf("%s: a new lease appeared in the legacy keys", stage)
+		}
+	}
+	if ok, _ := a.client.HExists(ctx, a.leases, lease.id).Result(); !ok {
+		t.Fatal("new lease not stored under the versioned lease key")
+	}
+	assertOnlyVersioned("admit")
+	if err := lease.PrefillDone(ctx); err != nil {
+		t.Fatal(err)
+	}
+	assertOnlyVersioned("prefill done")
+	if err := lease.BeginColdHold(ctx); err != nil {
+		t.Fatal(err)
+	}
+	assertOnlyVersioned("cold hold")
+	if renewed, err := renewScript.Run(ctx, a.client, a.keys(), lease.id, time.Minute.Milliseconds()).Int64(); err != nil || renewed != 1 {
+		t.Fatalf("renew=%d err=%v, want the versioned lease renewed", renewed, err)
+	}
+	assertOnlyVersioned("renew")
+	if err := lease.Complete(ctx, 1); err != nil {
+		t.Fatal(err)
+	}
+	assertOnlyVersioned("finish")
 }
