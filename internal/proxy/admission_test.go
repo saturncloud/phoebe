@@ -136,7 +136,11 @@ func TestSharedRequestBodyBoundariesBeforeAdmission(t *testing.T) {
 	}
 }
 
-func TestSharedRequestAtExactBodyLimitAdmitsWithRedisAdmitter(t *testing.T) {
+// The body ceiling with the real Redis admitter: a body of exactly
+// protection.maxRequestBodyBytes is admitted and served; one byte more is
+// refused with 413 before admission, so it reserves nothing and the next
+// exact-size request still admits.
+func TestRequestBodyCeilingExactAdmitsOneOverRejects(t *testing.T) {
 	const limit = 128
 	var upstreamHits int
 	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
@@ -146,17 +150,80 @@ func TestSharedRequestAtExactBodyLimitAdmitsWithRedisAdmitter(t *testing.T) {
 	defer backend.Close()
 	up, _ := url.Parse(backend.URL)
 	mr := miniredis.RunT(t)
-	cfg := proxyAdmissionConfig(2)
-	cfg.Platform.MaxPrefillTokens = ptr64(limit)
+	// One active request: a leaked reservation from the refused request
+	// would make the follow-up exact-size request fail.
+	cfg := proxyAdmissionConfig(1)
 	client := redis.NewClient(&redis.Options{Addr: mr.Addr()})
 	t.Cleanup(func() { _ = client.Close() })
-	s := New(&config.Settings{Admission: cfg}, logging.New(logging.ERROR), &recordingEmitter{}).
-		WithAdmitter(admission.New(client, cfg))
+	s := New(&config.Settings{Admission: cfg, Protection: config.ProtectionSettings{MaxRequestBodyBytes: limit}},
+		logging.New(logging.ERROR), &recordingEmitter{}).WithAdmitter(admission.New(client, cfg))
 
 	rr := httptest.NewRecorder()
 	s.Handler().ServeHTTP(rr, sharedRequestBodyOfSize(t, up, limit))
 	if rr.Code != http.StatusOK || upstreamHits != 1 {
-		t.Fatalf("status=%d upstream=%d, exact original JSON limit must admit", rr.Code, upstreamHits)
+		t.Fatalf("status=%d upstream=%d, a body exactly at the ceiling must be admitted and served", rr.Code, upstreamHits)
+	}
+
+	rr = httptest.NewRecorder()
+	s.Handler().ServeHTTP(rr, sharedRequestBodyOfSize(t, up, limit+1))
+	if rr.Code != http.StatusRequestEntityTooLarge || upstreamHits != 1 {
+		t.Fatalf("status=%d upstream=%d, a body one byte over the ceiling must be refused with 413 before the upstream", rr.Code, upstreamHits)
+	}
+
+	rr = httptest.NewRecorder()
+	s.Handler().ServeHTTP(rr, sharedRequestBodyOfSize(t, up, limit))
+	if rr.Code != http.StatusOK || upstreamHits != 2 {
+		t.Fatalf("status=%d upstream=%d, the refused request must not hold an admission reservation", rr.Code, upstreamHits)
+	}
+}
+
+// sharedChatRequest is a shared request whose single message has content of
+// contentChars characters, so its prefill estimate is controlled by the test.
+func sharedChatRequest(upstream *url.URL, contentChars int) (*http.Request, []byte) {
+	body := []byte(`{"model":"model-a","max_tokens":20,"messages":[{"role":"user","content":"` +
+		strings.Repeat("x", contentChars) + `"}]}`)
+	req := sharedRequest(upstream)
+	replaceRequestBody(req, body)
+	return req, body
+}
+
+// The prefill-token limit is inclusive with the real Redis admitter: a
+// request whose estimate equals maxPrefillTokens is admitted and served; with
+// the limit one below the estimate it is refused before the upstream.
+func TestSharedPrefillTokensAtExactLimitAdmits(t *testing.T) {
+	var upstreamHits int
+	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		upstreamHits++
+		_, _ = w.Write([]byte(`{"model":"model-a","usage":{"prompt_tokens":1,"completion_tokens":1}}`))
+	}))
+	defer backend.Close()
+	up, _ := url.Parse(backend.URL)
+
+	_, body := sharedChatRequest(up, 4*50)
+	estimate := estimatePromptTokens(body)
+	if estimate < 2 {
+		t.Fatalf("estimate=%d, want a message-driven estimate above the minimum", estimate)
+	}
+
+	serve := func(limit int64) *httptest.ResponseRecorder {
+		mr := miniredis.RunT(t)
+		cfg := proxyAdmissionConfig(2)
+		cfg.Platform.MaxPrefillTokens = ptr64(limit)
+		client := redis.NewClient(&redis.Options{Addr: mr.Addr()})
+		t.Cleanup(func() { _ = client.Close() })
+		s := New(&config.Settings{Admission: cfg}, logging.New(logging.ERROR), &recordingEmitter{}).
+			WithAdmitter(admission.New(client, cfg))
+		req, _ := sharedChatRequest(up, 4*50)
+		rr := httptest.NewRecorder()
+		s.Handler().ServeHTTP(rr, req)
+		return rr
+	}
+
+	if rr := serve(estimate); rr.Code != http.StatusOK || upstreamHits != 1 {
+		t.Fatalf("status=%d upstream=%d, an estimate exactly at maxPrefillTokens must be admitted", rr.Code, upstreamHits)
+	}
+	if rr := serve(estimate - 1); rr.Code != http.StatusServiceUnavailable || upstreamHits != 1 {
+		t.Fatalf("status=%d upstream=%d, an estimate one over maxPrefillTokens must be refused before the upstream", rr.Code, upstreamHits)
 	}
 }
 

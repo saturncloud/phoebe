@@ -1147,6 +1147,19 @@ func TestImpossibleRequestRejectedBeforeReservation(t *testing.T) {
 	}
 }
 
+// The prefill-token limit is inclusive: a request whose estimate equals
+// maxPrefillTokens is admitted.
+func TestPrefillTokensAtExactLimitAdmitted(t *testing.T) {
+	l := limits(5)
+	l.MaxPrefillTokens = ptr64(10)
+	a, _ := testAdmitter(t, config.AdmissionSettings{Platform: l})
+	lease, err := a.Admit(context.Background(), request("a", "m")) // PrefillTokens 10
+	if err != nil {
+		t.Fatalf("an estimate exactly at maxPrefillTokens must be admitted: %v", err)
+	}
+	_ = lease.Complete(context.Background(), 0)
+}
+
 // A request with an unusable work estimate is rejected before any reservation:
 // no lease is created and no counter or lease state is written.
 func TestInvalidWorkEstimateRejectedBeforeReservation(t *testing.T) {
