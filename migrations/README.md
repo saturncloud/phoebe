@@ -51,6 +51,7 @@ golang-migrate up/down pairs, applied in version order:
 | 0006 | `0006_rollup_grain.{up,down}.sql` | widens the `rated_usage` grain with `serving_mode`, the owner pair and `graph_k8s_name` evidence |
 | 0007 | `0007_serving_mode_explicit.{up,down}.sql` | `rated_usage.serving_mode` becomes `'shared'`/`'dedicated'` only (CHECK, no default; dedicated rows renamed from `''` with their ids recomputed) |
 | 0008 | `0008_billing_event_topology.{up,down}.sql` | `billing_event.topology_revision`, `region`, `request_started_at`, `serving_duration_ms` (platform-set margin evidence); `gpu_type` no longer written |
+| 0009 | `0009_rollup_grain_graph_revision.{up,down}.sql` | `rated_usage` grain gains `graph_k8s_name` ('' = unknown) and `topology_revision` (0 = unknown); `region` attribute; every id recomputed |
 
 `embed.go` embeds these into the `migrations` package; `cmd/migrate` applies them.
 

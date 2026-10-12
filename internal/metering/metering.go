@@ -114,7 +114,8 @@ type Event struct {
 	// Sourced from gateway resolution (tf_model.graph_k8s_name) on the gateway
 	// path, and derived from the upstream host on the header path. Empty is valid
 	// and never withholds money — it only means the cost is not pool-attributable.
-	// EVIDENCE ONLY: never part of the billing grain (see migrations/0006).
+	// A rollup GRAIN key since migration 0009 (with TopologyRevision), so every
+	// rollup names one graph revision; empty is the "unknown" grain value.
 	GraphK8sName string `json:"graph_k8s_name,omitempty"`
 
 	// Token counts (the engine's own usage block; never re-tokenized).
@@ -133,8 +134,9 @@ type Event struct {
 	// Serving topology, region and serving time (owner ruling 2026-10-12:
 	// usage events record the serving topology by revision). All are
 	// PLATFORM-SET, never taken from the engine's response, and EVIDENCE ONLY
-	// for margin analysis: never part of the billing grain, never a reason to
-	// withhold or reprice a row.
+	// for margin analysis: never a reason to withhold or reprice a row.
+	// TopologyRevision is a rollup GRAIN key since migration 0009 (an unknown
+	// revision rates as 0); the rest are carried values.
 	//
 	// TopologyRevision is the graph's tf_topology_revision number in Atlas,
 	// which holds each pool's role, instance type, GPU type and GPUs per

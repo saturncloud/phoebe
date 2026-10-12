@@ -2,7 +2,8 @@
 -- B24; owner ruling 2026-10-12: usage events record the serving topology by
 -- revision). All four columns are platform-set evidence for margin analysis:
 -- nullable, no CHECK (billing_event is the evidence ledger, see
--- contracts/billing-event-ledger.md), never part of the billing grain.
+-- contracts/billing-event-ledger.md). 0009 makes topology_revision a rollup grain
+-- key; none of them can withhold or reprice a row.
 --
 --   topology_revision   Atlas tf_topology_revision.revision of the serving
 --                       graph; with graph_k8s_name it names each pool's role,

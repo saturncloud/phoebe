@@ -92,12 +92,7 @@ type Result struct {
 	// selects the price SKU, so such an event is NOT billed; the raw event stays
 	// in billing_event as evidence.
 	InvalidServingModeEvents int64
-	// AmbiguousGraphRollups counts ROLLUPS whose traffic spanned more than one serving
-	// graph. NOT a withholding signal and NOT in event units: these rollups ARE billed
-	// (the graph is cost-attribution evidence, not identity) with a NULL graph rather
-	// than a guessed one. Reported so lost attribution is visible.
-	AmbiguousGraphRollups int64
-	RollupsWritten        int64 // distinct grain rows upserted (see rated_usage_grain_uq)
+	RollupsWritten           int64 // distinct grain rows upserted (see rated_usage_grain_uq)
 	// UnratedHours counts hours in the window that were SKIPPED — prices could not
 	// be obtained, or rating them failed. Each hour is independent and the upsert is
 	// idempotent, so a skipped hour is rated by a later run whose trailing window
@@ -182,13 +177,6 @@ func (r Result) HasOwnerConflict() bool { return r.OwnerConflictEvents > 0 }
 // and must be re-run; otherwise the proxy's serving-mode gate is broken.
 func (r Result) HasInvalidServingMode() bool { return r.InvalidServingModeEvents > 0 }
 
-// HasAmbiguousGraph reports whether any BILLED rollup drew traffic from more than one
-// serving graph. Deliberately NOT part of HasAnomaly: the graph is cost-attribution
-// evidence, not billing identity, so the money is still correct — only the pool the
-// cost is attributed against is unknown, and the rollup carries NULL rather than a
-// guess. Surfaced for operators, never a reason to withhold revenue.
-func (r Result) HasAmbiguousGraph() bool { return r.AmbiguousGraphRollups > 0 }
-
 // HasAnomaly reports whether something leaked: events that could not be priced,
 // rows that could not be attributed, a SUCCESSFUL attempt that reported no engine
 // usage, malformed authoritative counts, an ft: rollup spanning multiple
@@ -201,10 +189,6 @@ func (r Result) HasAmbiguousGraph() bool { return r.AmbiguousGraphRollups > 0 }
 // including them would make exit 2 fire hourly and destroy its meaning for the
 // conditions above. Those are reported (and land in
 // billing_reconciliation_hourly) rather than paged.
-//
-// Also deliberately NOT here: AmbiguousGraphRollups. Those rollups ARE billed and
-// their money is correct; only the cost-attribution pool is unknown. Paging on it
-// would conflate "we may have mis-billed" with "we cannot compute margin".
 func (r Result) HasAnomaly() bool {
 	return r.HasUnpriced() || r.HasUnattributable() || r.HasUnexplainedMissingUsage() || r.HasInvalidUsage() || r.HasAmbiguousBase() || r.HasAmbiguousOrg() || r.HasOwnerConflict() || r.HasInvalidServingMode()
 }
@@ -268,7 +252,6 @@ func (r *Rater) Run(ctx context.Context, windowStart, windowEnd time.Time, windo
 	res.AmbiguousOrgEvents = rr.AmbiguousOrgEvents
 	res.OwnerConflictEvents = rr.OwnerConflictEvents
 	res.InvalidServingModeEvents = rr.InvalidServingModeEvents
-	res.AmbiguousGraphRollups = rr.AmbiguousGraphRollups
 
 	if res.HasAmbiguousBase() {
 		r.log.Error.Printf("rating: window [%s,%s) has %d events under AMBIGUOUS-BASE rollups (a single model_id whose base_model-priced events carried MORE THAN ONE rate in a window: >1 distinct base_model, or mixed premium/plain-base pricing from an X-Saturn-Adapter flap) — a base_model/adapter PROPAGATION violation, NOT a priceable rollup; these rollups are NOT billed (billing the MIN rate would silently under-charge). Fix header propagation and re-rate this window",
@@ -285,12 +268,6 @@ func (r *Rater) Run(ctx context.Context, windowStart, windowEnd time.Time, windo
 	if res.HasInvalidServingMode() {
 		r.log.Error.Printf("rating: window [%s,%s) has %d INVALID-SERVING-MODE events (serving_mode is neither \"shared\" nor \"dedicated\") — the serving mode selects the price SKU, so these events are NOT billed. The raw events are retained in billing_event. NULL or empty rows should already have been backfilled to 'dedicated' by migration 0007 (ledger item 6); any that remain mean the backfill was missed (for example, drainer pods on the pre-0007 image kept writing NULL after the migration ran; re-run the NULL-only backfill once no old drainer pod is left, see docs/billing-reconciliation.md) or the proxy's serving-mode gate is broken. Per hour and key, billing_reconciliation_hourly.invalid_serving_mode_attempts shows how many attempts this withheld",
 			windowStart.Format(time.RFC3339), windowEnd.Format(time.RFC3339), res.InvalidServingModeEvents)
-	}
-	if res.HasAmbiguousGraph() {
-		// WARN, not ERROR: these rollups ARE billed and the money is right. Only the
-		// cost-attribution pool is unknown, so this must not read like a revenue fault.
-		r.log.Warn.Printf("rating: window [%s,%s) has %d BILLED rollup(s) spanning MORE THAN ONE serving graph — the money is correct, but the rollup carries a NULL graph_k8s_name rather than a guessed one, so its cost cannot be attributed to a serving pool (margin analysis will not see it). Usually a deployment moved graphs mid-hour",
-			windowStart.Format(time.RFC3339), windowEnd.Format(time.RFC3339), res.AmbiguousGraphRollups)
 	}
 	if res.HasUnattributable() {
 		r.log.Error.Printf("rating: window [%s,%s) has %d UNATTRIBUTABLE billing_event rows (NULL auth_id/resource_id/model_id — a NULL resource_id can't name the deployment/org for E2 billing) — these cannot be rated; the interceptor's billing gate should reject them before metering, so a nonzero count means revenue is leaking upstream",
@@ -485,5 +462,4 @@ func (r *Result) accumulate(hour Result) {
 	r.AmbiguousOrgEvents += hour.AmbiguousOrgEvents
 	r.OwnerConflictEvents += hour.OwnerConflictEvents
 	r.InvalidServingModeEvents += hour.InvalidServingModeEvents
-	r.AmbiguousGraphRollups += hour.AmbiguousGraphRollups
 }

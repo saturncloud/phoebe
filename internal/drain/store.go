@@ -231,12 +231,9 @@ func eventArgs(e metering.Event) []any {
 		e.UsageFound,
 		nullInt(e.StatusCode),
 		e.Streamed,
-		// GraphK8sName is the serving graph (the cost centre) — evidence only, never
-		// part of the billing grain. nullStr so an unresolvable graph stores NULL
-		// rather than '': the rater's MAX(graph_k8s_name) ignores NULLs (so a rollup
-		// whose events partly predate graph propagation still resolves to the one
-		// known graph), whereas a stored '' would read as a DISTINCT second graph and
-		// falsely trip the ambiguous-graph count.
+		// GraphK8sName is the serving graph (the cost centre). nullStr so an
+		// unresolvable graph stores NULL ("not captured") in the evidence ledger;
+		// the rater maps NULL to the '' grain sentinel (migration 0009).
 		nullStr(e.GraphK8sName),
 		// Topology, region and serving time: evidence for margin analysis,
 		// NULL when unknown (no topology entry for the graph, or an event
