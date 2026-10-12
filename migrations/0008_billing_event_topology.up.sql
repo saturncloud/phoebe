@@ -3,7 +3,10 @@
 -- revision). All four columns are platform-set evidence for margin analysis:
 -- nullable, no CHECK (billing_event is the evidence ledger, see
 -- contracts/billing-event-ledger.md). 0009 makes topology_revision a rollup grain
--- key; none of them can withhold or reprice a row.
+-- key. An unknown revision (NULL, rated as 0) never withholds or reprices a
+-- row, but rated_usage has CHECK (topology_revision >= 0), so a negative
+-- revision fails rating for its window. Writers (the gateway parser and
+-- recovery) must reject negative values and values above the INTEGER range.
 --
 --   topology_revision   Atlas tf_topology_revision.revision of the serving
 --                       graph; with graph_k8s_name it names each pool's role,

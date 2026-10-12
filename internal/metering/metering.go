@@ -133,10 +133,16 @@ type Event struct {
 
 	// Serving topology, region and serving time (owner ruling 2026-10-12:
 	// usage events record the serving topology by revision). All are
-	// PLATFORM-SET, never taken from the engine's response, and EVIDENCE ONLY
-	// for margin analysis: never a reason to withhold or reprice a row.
-	// TopologyRevision is a rollup GRAIN key since migration 0009 (an unknown
-	// revision rates as 0); the rest are carried values.
+	// PLATFORM-SET, never taken from the engine's response. Region,
+	// RequestStartedUnixMs and ServingDurationMs are EVIDENCE ONLY for margin
+	// analysis: never a reason to withhold or reprice a row.
+	//
+	// TopologyRevision is a rollup GRAIN key since migration 0009. Unknown (0)
+	// never withholds money, but the value must be 0 or within 1..2147483647.
+	// A negative value violates rated_usage_topology_revision_ck and fails
+	// rating for the window, and a value above int32 fails the billing_event
+	// INTEGER insert. Validate it at every producer (gateway/topology.go,
+	// recovery).
 	//
 	// TopologyRevision is the graph's tf_topology_revision number in Atlas,
 	// which holds each pool's role, instance type, GPU type and GPUs per
