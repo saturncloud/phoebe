@@ -390,9 +390,18 @@ type blockingWaker struct {
 	started chan struct{}
 	release chan struct{}
 	backend *coldToWarmBackend
+
+	mu    sync.Mutex
+	calls map[string]int // wakes per resource
 }
 
-func (b *blockingWaker) Wake(ctx context.Context, _ WakeTarget) error {
+func (b *blockingWaker) Wake(ctx context.Context, target WakeTarget) error {
+	b.mu.Lock()
+	if b.calls == nil {
+		b.calls = map[string]int{}
+	}
+	b.calls[target.ResourceID]++
+	b.mu.Unlock()
 	b.started <- struct{}{}
 	select {
 	case <-b.release:
@@ -401,6 +410,12 @@ func (b *blockingWaker) Wake(ctx context.Context, _ WakeTarget) error {
 	case <-ctx.Done():
 		return ctx.Err()
 	}
+}
+
+func (b *blockingWaker) wakes(resource string) int {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.calls[resource]
 }
 
 func dedicatedColdRequest(up *url.URL, resource string) *http.Request {
@@ -437,6 +452,17 @@ func TestDedicatedColdHoldsCappedPerEndpoint(t *testing.T) {
 	if over.Code != http.StatusServiceUnavailable || over.Header().Get("Retry-After") == "" {
 		t.Fatalf("over-limit status=%d retry-after=%q, want 503 with Retry-After", over.Code, over.Header().Get("Retry-After"))
 	}
+	// The refused request never reached Wake. Checking started is empty also
+	// means the endpoint-b wait below can only be satisfied by endpoint-b's
+	// own wake, not by a stray one from the refused request.
+	if n := waker.wakes("endpoint-a"); n != 1 {
+		t.Fatalf("endpoint-a wakes=%d after the over-limit request, want 1 (refused without a wake)", n)
+	}
+	select {
+	case <-waker.started:
+		t.Fatal("over-limit request must be refused without a wake")
+	default:
+	}
 
 	other := httptest.NewRecorder()
 	wg.Add(1)
@@ -445,6 +471,9 @@ func TestDedicatedColdHoldsCappedPerEndpoint(t *testing.T) {
 	case <-waker.started:
 	case <-time.After(5 * time.Second):
 		t.Fatal("a different endpoint must still get its own cold hold")
+	}
+	if a, b := waker.wakes("endpoint-a"), waker.wakes("endpoint-b"); a != 1 || b != 1 {
+		t.Fatalf("wakes endpoint-a=%d endpoint-b=%d, want 1 each", a, b)
 	}
 	close(waker.release)
 	wg.Wait()
