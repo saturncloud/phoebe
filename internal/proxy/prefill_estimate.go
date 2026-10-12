@@ -24,34 +24,36 @@ const imagePartTokens = 1024
 // completions prompt; the embeddings input. JSON structure, keys, sampling
 // parameters and the like are not message text. A body with none of these
 // estimates 1, the minimum admission accepts.
+//
+// Every field is looked up by its exact key. encoding/json's struct decoding
+// matches keys case-insensitively and keeps the last match, while the engine
+// frontend reads exact keys, so a struct decode would let
+// {"content":"<huge>","Content":""} estimate as empty text that the engine
+// then prefills in full. Top-level case variants are refused earlier (D13);
+// exact lookup here closes the same gap in nested objects. A duplicated exact
+// key keeps its last value, as both encoding/json and the engine do.
 func estimatePromptTokens(body []byte) int64 {
-	var req struct {
-		Messages []struct {
-			Content   json.RawMessage `json:"content"`
-			ToolCalls []struct {
-				Function struct {
-					Arguments string `json:"arguments"`
-				} `json:"function"`
-			} `json:"tool_calls"`
-		} `json:"messages"`
-		Prompt json.RawMessage `json:"prompt"`
-		Input  json.RawMessage `json:"input"`
-	}
 	// The caller has already validated the body as one JSON object with a
-	// model; a shape this decoder rejects (a field of an unexpected type)
-	// still gets the minimum rather than failing the request here.
-	_ = json.Unmarshal(body, &req)
+	// model; a field of an unexpected shape contributes nothing rather than
+	// failing the request here.
+	top := jsonObject(body)
 
 	var chars, tokens int64
-	for _, m := range req.Messages {
-		c, images := contentText(m.Content)
+	var messages []json.RawMessage
+	_ = json.Unmarshal(top["messages"], &messages)
+	for _, rawMsg := range messages {
+		m := jsonObject(rawMsg)
+		c, images := contentText(m["content"])
 		chars += c
 		tokens += images * imagePartTokens
-		for _, call := range m.ToolCalls {
-			chars += int64(utf8.RuneCountInString(call.Function.Arguments))
+		var calls []json.RawMessage
+		_ = json.Unmarshal(m["tool_calls"], &calls)
+		for _, rawCall := range calls {
+			fn := jsonObject(jsonObject(rawCall)["function"])
+			chars += jsonStringChars(fn["arguments"])
 		}
 	}
-	for _, raw := range []json.RawMessage{req.Prompt, req.Input} {
+	for _, raw := range []json.RawMessage{top["prompt"], top["input"]} {
 		c, t := promptText(raw)
 		chars += c
 		tokens += t
@@ -61,6 +63,35 @@ func estimatePromptTokens(body []byte) int64 {
 		estimate = 1
 	}
 	return estimate
+}
+
+// jsonObject decodes raw as a JSON object keyed by exact field name, or
+// returns nil when raw is absent or not an object. Indexing a nil map yields
+// a nil RawMessage, which every reader here treats as "field absent".
+func jsonObject(raw json.RawMessage) map[string]json.RawMessage {
+	if len(raw) == 0 {
+		return nil
+	}
+	var obj map[string]json.RawMessage
+	if json.Unmarshal(raw, &obj) != nil {
+		return nil
+	}
+	return obj
+}
+
+// jsonString decodes raw as a JSON string; ok is false when raw is absent or
+// not a string.
+func jsonString(raw json.RawMessage) (s string, ok bool) {
+	if len(raw) == 0 {
+		return "", false
+	}
+	return s, json.Unmarshal(raw, &s) == nil
+}
+
+// jsonStringChars counts the characters of raw when it is a JSON string, else 0.
+func jsonStringChars(raw json.RawMessage) int64 {
+	s, _ := jsonString(raw)
+	return int64(utf8.RuneCountInString(s))
 }
 
 // contentText measures a chat message's content: a plain string, or an array
@@ -75,17 +106,16 @@ func contentText(raw json.RawMessage) (chars, images int64) {
 	if json.Unmarshal(raw, &text) == nil {
 		return int64(utf8.RuneCountInString(text)), 0
 	}
-	var parts []struct {
-		Type string `json:"type"`
-		Text string `json:"text"`
-	}
+	var parts []json.RawMessage
 	if json.Unmarshal(raw, &parts) != nil {
 		return 0, 0
 	}
-	for _, p := range parts {
-		switch p.Type {
+	for _, rawPart := range parts {
+		p := jsonObject(rawPart)
+		typ, _ := jsonString(p["type"])
+		switch typ {
 		case "text", "input_text":
-			chars += int64(utf8.RuneCountInString(p.Text))
+			chars += jsonStringChars(p["text"])
 		case "image_url", "input_image", "image":
 			images++
 		}

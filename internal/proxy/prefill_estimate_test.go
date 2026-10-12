@@ -36,3 +36,38 @@ func TestEstimatePromptTokens(t *testing.T) {
 		})
 	}
 }
+
+// The engine frontend reads nested fields by exact key; encoding/json's struct
+// decoding matches case-insensitively and keeps the last match. A case-variant
+// sibling must not hide the text the engine will prefill.
+func TestEstimatePromptTokensReadsNestedFieldsByExactKey(t *testing.T) {
+	long := strings.Repeat("a", 400)
+	for _, tc := range []struct {
+		name string
+		body string
+		want int64
+	}{
+		{"message content beside an empty Content",
+			`{"model":"m","messages":[{"role":"user","content":"` + long + `","Content":""}]}`, 100},
+		{"message Content alone is not content",
+			`{"model":"m","messages":[{"role":"user","Content":"` + long + `"}]}`, 1},
+		{"text part beside an empty Text",
+			`{"model":"m","messages":[{"role":"user","content":[{"type":"text","text":"` + long + `","Text":""}]}]}`, 100},
+		{"part type beside a different Type",
+			`{"model":"m","messages":[{"role":"user","content":[{"type":"text","Type":"other","text":"` + long + `"}]}]}`, 100},
+		{"tool-call arguments beside an empty Arguments",
+			`{"model":"m","messages":[{"role":"assistant","content":null,"tool_calls":[{"function":{"name":"f","arguments":"` + long + `","Arguments":""}}]}]}`, 100},
+		{"tool-call function beside an empty Function",
+			`{"model":"m","messages":[{"role":"assistant","content":null,"tool_calls":[{"function":{"name":"f","arguments":"` + long + `"},"Function":{}}]}]}`, 100},
+		{"tool_calls beside an empty Tool_calls",
+			`{"model":"m","messages":[{"role":"assistant","content":null,"tool_calls":[{"function":{"name":"f","arguments":"` + long + `"}}],"Tool_calls":[]}]}`, 100},
+		{"a duplicated exact key keeps its last value, as the engine does",
+			`{"model":"m","messages":[{"role":"user","content":"abcd","content":"` + long + `"}]}`, 100},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := estimatePromptTokens([]byte(tc.body)); got != tc.want {
+				t.Fatalf("estimate=%d, want %d", got, tc.want)
+			}
+		})
+	}
+}
