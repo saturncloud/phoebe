@@ -76,6 +76,11 @@ func classifyRoundTripSettlement(err error) settlementKind {
 		// The request never left the process.
 		return settlementZeroPreWriteDial
 	}
+	if errors.Is(err, errRequestBufferFull) {
+		// The request-buffer budget cut the forwarded body short: the
+		// upstream only ever saw an incomplete request.
+		return settlementZeroNeverServed
+	}
 	if tooLarge := (*http.MaxBytesError)(nil); errors.As(err, &tooLarge) {
 		// The body ceiling cut the forwarded body short, so the upstream only
 		// ever saw an incomplete request it cannot have run.

@@ -840,3 +840,27 @@ func TestLoadMaxStreamDurationMustExceedWakeTimeout(t *testing.T) {
 		})
 	}
 }
+
+// Q6: the request-buffer total defaults to 256 MiB, must be positive, and may
+// not be smaller than the per-request body limit.
+func TestLoadRequestBufferTotal(t *testing.T) {
+	s, err := Load(writeTemp(t, "listenPort: 8080\n"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := s.Protection.Effective().MaxRequestBufferBytesTotal; got != DefaultMaxRequestBufferBytesTotal {
+		t.Fatalf("default=%d, want %d", got, DefaultMaxRequestBufferBytesTotal)
+	}
+	for _, yaml := range []string{
+		"protection:\n  maxRequestBufferBytesTotal: 0\n",
+		"protection:\n  maxRequestBufferBytesTotal: 1024\n",                              // under the 64 MiB body default
+		"protection:\n  maxRequestBodyBytes: 4096\n  maxRequestBufferBytesTotal: 2048\n", // under a set body limit
+	} {
+		if _, err := Load(writeTemp(t, yaml)); err == nil {
+			t.Fatalf("yaml %q loaded, want a startup error", yaml)
+		}
+	}
+	if _, err := Load(writeTemp(t, "protection:\n  maxRequestBodyBytes: 2048\n  maxRequestBufferBytesTotal: 2048\n")); err != nil {
+		t.Fatalf("equal body and total must load: %v", err)
+	}
+}

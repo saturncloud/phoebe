@@ -3,6 +3,7 @@ package proxy
 import (
 	"context"
 	"errors"
+	"io"
 	"net"
 	"net/http"
 	"os"
@@ -300,4 +301,59 @@ func (d *dedicatedColdHolds) acquire(endpoint string, limit int64) (func(), bool
 func writeDedicatedColdHoldsFull(w http.ResponseWriter, requestID string) {
 	writeRetryLater(w, requestID, "The endpoint is starting from zero and too many requests are already waiting; retry in about "+
 		strconv.Itoa(wakeRetryAfterSeconds)+" seconds.")
+}
+
+// errRequestBufferFull reports that the replica-wide request-buffer budget
+// (protection.maxRequestBufferBytesTotal) could not hold more of a request's
+// body. The request is refused with 503 + Retry-After: the gateway is out of
+// memory headroom for request bodies right now, not the request at fault.
+var errRequestBufferFull = errors.New("replica request-buffer budget is full")
+
+// requestBufferRetryAfterSeconds is the Retry-After on a request refused
+// because the replica's request-buffer budget was full. Request bodies are
+// held only while their requests run, so headroom returns quickly.
+const requestBufferRetryAfterSeconds = 1
+
+// requestBufferBudget is the replica-wide total of request-body bytes held by
+// requests in flight (protection.maxRequestBufferBytesTotal).
+type requestBufferBudget struct {
+	held atomic.Int64
+}
+
+// budgetedBody charges every request-body byte received to the replica budget
+// until the request finishes (release). Bodies are buffered whole and kept
+// for retries, so bytes received is the memory the request holds.
+type budgetedBody struct {
+	io.ReadCloser
+	budget *requestBufferBudget
+	total  int64
+	held   atomic.Int64
+}
+
+func (b *requestBufferBudget) wrap(body io.ReadCloser, total int64) *budgetedBody {
+	return &budgetedBody{ReadCloser: body, budget: b, total: total}
+}
+
+func (b *budgetedBody) Read(p []byte) (int, error) {
+	n, err := b.ReadCloser.Read(p)
+	if n > 0 {
+		delta := int64(n)
+		for {
+			cur := b.budget.held.Load()
+			if cur+delta > b.total {
+				return 0, errRequestBufferFull
+			}
+			if b.budget.held.CompareAndSwap(cur, cur+delta) {
+				break
+			}
+		}
+		b.held.Add(delta)
+	}
+	return n, err
+}
+
+// release returns every byte this request held to the replica budget.
+// Idempotent.
+func (b *budgetedBody) release() {
+	b.budget.held.Add(-b.held.Swap(0))
 }

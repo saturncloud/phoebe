@@ -178,6 +178,11 @@ func writeRequestBodyError(w http.ResponseWriter, r *http.Request, err error) {
 		http.Error(w, "request body not received in time", http.StatusRequestTimeout)
 		return
 	}
+	if errors.Is(err, errRequestBufferFull) {
+		w.Header().Set("Retry-After", strconv.Itoa(requestBufferRetryAfterSeconds))
+		http.Error(w, "gateway request buffer is full; retry shortly", http.StatusServiceUnavailable)
+		return
+	}
 	var tooLarge *http.MaxBytesError
 	if errors.As(err, &tooLarge) {
 		http.Error(w, "request body too large", http.StatusRequestEntityTooLarge)

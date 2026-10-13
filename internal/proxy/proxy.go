@@ -170,6 +170,9 @@ type Server struct {
 	// (B8). nil = none published (no registry resolver wired).
 	graphCapacity graphCapacitySource
 
+	// requestBuffers is the replica-wide request-body budget (Q6).
+	requestBuffers requestBufferBudget
+
 	// responseBuffers and dedicatedHolds are the replica-wide state behind the
 	// gateway protection bounds (see protection.go).
 	responseBuffers responseBufferBudget
@@ -374,6 +377,15 @@ func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request) {
 	gatewayFailsClosed := id.Gateway && (s.gateway == nil || id.OrgID == "")
 	if !gatewayFailsClosed && !boundRequestBody(w, rawW, r, prot.MaxRequestBodyBytes) {
 		return
+	}
+	// Every body byte received counts against the replica-wide request-buffer
+	// budget until this request finishes (Q6, the request-side twin of the
+	// response-buffer total). A full budget fails the read with
+	// errRequestBufferFull, answered 503 + Retry-After.
+	if !gatewayFailsClosed && r.Body != nil && r.Body != http.NoBody {
+		budgeted := s.requestBuffers.wrap(r.Body, prot.MaxRequestBufferBytesTotal)
+		r.Body = budgeted
+		defer budgeted.release()
 	}
 
 	// GATEWAY RESOLUTION (TF single-host gateway): a request the trusted
@@ -999,6 +1011,15 @@ func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request) {
 
 		onDone := func(res capture.Result) {
 			defer close(responseCaptureDone)
+			// D22/Q7: a non-streamed body past its buffer allowance is metered
+			// from its retained head and tail. A body laid out so that no
+			// usage object sits in the tail is recorded as an unmetered
+			// attempt; log it with a fixed marker so the residual is countable.
+			// onDone runs inside finish, which holds the reader's lock.
+			if cr.overflowed && !res.UsageFound && !res.Aborted {
+				s.log.Warn.Printf("metering anomaly: overflowed non-streamed response had no usage in its retained tail (unmetered attempt) request_id=%s resource_id=%s status=%d",
+					requestID, id.ResourceID, statusCode)
+			}
 			// Everything downstream of onDone gets a context DECOUPLED from the
 			// client request: onDone runs on the abort path precisely BECAUSE
 			// r.Context() was cancelled (that is how Aborted is detected), and
@@ -1235,6 +1256,15 @@ func (s *Server) errorHandler(upstream string, id identity.Identity, requestID, 
 			s.emit(context.WithoutCancel(r.Context()), id, requestID, clientRequestID,
 				http.StatusGatewayTimeout, capture.Result{UpstreamFault: true, UsageFound: false})
 			http.Error(w, "upstream did not respond in time", http.StatusGatewayTimeout)
+			return
+		}
+		if errors.Is(err, errRequestBufferFull) {
+			// The replica's request-buffer budget filled while the body was
+			// being forwarded. Nothing complete reached the upstream.
+			w.Header().Set("X-Request-Id", requestID)
+			s.emit(context.WithoutCancel(r.Context()), id, requestID, clientRequestID,
+				http.StatusServiceUnavailable, capture.Result{UsageFound: false})
+			writeRequestBodyError(w, r, err)
 			return
 		}
 		if tooLarge := (*http.MaxBytesError)(nil); errors.As(err, &tooLarge) {

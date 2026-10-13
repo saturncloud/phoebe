@@ -109,6 +109,13 @@ type ProtectionSettings struct {
 	// zero. The shared tier bounds the same thing with admission's
 	// maxColdHolds; dedicated endpoints have no admission.
 	MaxDedicatedColdHoldsPerEndpoint int64 `yaml:"maxDedicatedColdHoldsPerEndpoint"`
+	// MaxRequestBufferBytesTotal caps the request-body bytes received by
+	// every request in flight in this phoebe replica, summed. Bodies are
+	// buffered whole (gateway resolution, model binding, the usage rewrite,
+	// wake retries), so without a total, many requests near
+	// maxRequestBodyBytes would exhaust the replica's memory. The
+	// request-side twin of maxResponseBufferBytesTotal.
+	MaxRequestBufferBytesTotal int64 `yaml:"maxRequestBufferBytesTotal"`
 
 	// intKeyPresent records which integer keys the YAML set to a non-null
 	// value, in protectionIntKeys order, so parse can tell an explicit 0 (an
@@ -124,6 +131,7 @@ var protectionIntKeys = [...]string{
 	"maxResponseBufferBytesPerStream",
 	"maxResponseBufferBytesTotal",
 	"maxDedicatedColdHoldsPerEndpoint",
+	"maxRequestBufferBytesTotal",
 }
 
 func (p *ProtectionSettings) intValues() [len(protectionIntKeys)]int64 {
@@ -132,6 +140,7 @@ func (p *ProtectionSettings) intValues() [len(protectionIntKeys)]int64 {
 		p.MaxResponseBufferBytesPerStream,
 		p.MaxResponseBufferBytesTotal,
 		p.MaxDedicatedColdHoldsPerEndpoint,
+		p.MaxRequestBufferBytesTotal,
 	}
 }
 
@@ -161,6 +170,7 @@ const (
 	DefaultMaxResponseBufferBytesPerStream  int64 = 64 << 20
 	DefaultMaxResponseBufferBytesTotal      int64 = 256 << 20
 	DefaultMaxDedicatedColdHoldsPerEndpoint int64 = 32
+	DefaultMaxRequestBufferBytesTotal       int64 = 256 << 20
 )
 
 // Effective returns the settings with every absent (zero) field replaced by
@@ -186,6 +196,9 @@ func (p ProtectionSettings) Effective() ProtectionSettings {
 	}
 	if p.MaxDedicatedColdHoldsPerEndpoint <= 0 {
 		p.MaxDedicatedColdHoldsPerEndpoint = DefaultMaxDedicatedColdHoldsPerEndpoint
+	}
+	if p.MaxRequestBufferBytesTotal <= 0 {
+		p.MaxRequestBufferBytesTotal = DefaultMaxRequestBufferBytesTotal
 	}
 	return p
 }
@@ -218,6 +231,10 @@ func (p *ProtectionSettings) parse() error {
 	if eff.MaxResponseBufferBytesPerStream > eff.MaxResponseBufferBytesTotal {
 		return fmt.Errorf("protection.maxResponseBufferBytesPerStream (%d) cannot exceed maxResponseBufferBytesTotal (%d)",
 			eff.MaxResponseBufferBytesPerStream, eff.MaxResponseBufferBytesTotal)
+	}
+	if eff.MaxRequestBodyBytes > eff.MaxRequestBufferBytesTotal {
+		return fmt.Errorf("protection.maxRequestBodyBytes (%d) cannot exceed maxRequestBufferBytesTotal (%d): a request at the body limit could never be received",
+			eff.MaxRequestBodyBytes, eff.MaxRequestBufferBytesTotal)
 	}
 	return nil
 }
