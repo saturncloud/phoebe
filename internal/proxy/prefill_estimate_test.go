@@ -71,3 +71,30 @@ func TestEstimatePromptTokensReadsNestedFieldsByExactKey(t *testing.T) {
 		})
 	}
 }
+
+// D7: a token-array prompt or input counts one token per element whatever
+// JSON number form the ids take, so an array a lax engine parser accepts
+// (integral floats, exponent form) can never estimate to the one-token
+// minimum and slip past the prefill and KV caps. Exact int arrays keep their
+// exact count (TestEstimatePromptTokens).
+func TestTokenArrayOfAnyNumberFormCountsEveryElement(t *testing.T) {
+	big := "[" + strings.Repeat("1.0,", 9999) + "1.0]"
+	for _, tc := range []struct {
+		name string
+		body string
+		want int64
+	}{
+		{"float token ids", `{"model":"m","prompt":[1.0,2.0,3.0]}`, 3},
+		{"nested float token ids", `{"model":"m","prompt":[[1.0,2.0],[3]]}`, 3},
+		{"exponent-form embeddings ids", `{"model":"m","input":[1e0,2]}`, 2},
+		{"numeric strings inside nested arrays", `{"model":"m","prompt":[["1","2"],["3"]]}`, 3},
+		{"mixed array: strings are text, other elements tokens", `{"model":"m","prompt":["abcd",5,null]}`, 3},
+		{"a large float array is not the minimum", `{"model":"m","prompt":` + big + `}`, 10000},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := estimatePromptTokens([]byte(tc.body)); got != tc.want {
+				t.Fatalf("estimate=%d, want %d", got, tc.want)
+			}
+		})
+	}
+}

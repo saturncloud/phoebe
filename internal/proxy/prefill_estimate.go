@@ -1,6 +1,7 @@
 package proxy
 
 import (
+	"bytes"
 	"encoding/json"
 	"unicode/utf8"
 )
@@ -125,7 +126,11 @@ func contentText(raw json.RawMessage) (chars, images int64) {
 
 // promptText measures a completions prompt or an embeddings input: a string,
 // an array of strings, an array of token ids, or an array of token-id arrays.
-// Strings return characters; token ids return an exact token count.
+// Strings return characters; token ids return an exact token count. An array
+// element that is not a string counts as one token whatever its JSON form
+// (1.0, 1e0, a numeric string inside a nested array, null, ...), because a
+// lax engine parser may accept it as a token id and prefill it: an array
+// never estimates to zero just because its elements are not exact int64s.
 func promptText(raw json.RawMessage) (chars, tokens int64) {
 	if len(raw) == 0 {
 		return 0, 0
@@ -134,22 +139,26 @@ func promptText(raw json.RawMessage) (chars, tokens int64) {
 	if json.Unmarshal(raw, &text) == nil {
 		return int64(utf8.RuneCountInString(text)), 0
 	}
-	var texts []string
-	if json.Unmarshal(raw, &texts) == nil {
-		for _, t := range texts {
-			chars += int64(utf8.RuneCountInString(t))
+	var elems []json.RawMessage
+	if json.Unmarshal(raw, &elems) != nil {
+		return 0, 0
+	}
+	for _, e := range elems {
+		e = bytes.TrimSpace(e)
+		switch {
+		case len(e) > 0 && e[0] == '"':
+			var t string
+			if json.Unmarshal(e, &t) == nil {
+				chars += int64(utf8.RuneCountInString(t))
+			}
+		case len(e) > 0 && e[0] == '[':
+			var inner []json.RawMessage
+			if json.Unmarshal(e, &inner) == nil {
+				tokens += int64(len(inner))
+			}
+		default:
+			tokens++
 		}
-		return chars, 0
 	}
-	var ids []int64
-	if json.Unmarshal(raw, &ids) == nil {
-		return 0, int64(len(ids))
-	}
-	var batches [][]int64
-	if json.Unmarshal(raw, &batches) == nil {
-		for _, b := range batches {
-			tokens += int64(len(b))
-		}
-	}
-	return 0, tokens
+	return chars, tokens
 }
