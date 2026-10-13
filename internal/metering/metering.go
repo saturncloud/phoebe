@@ -7,6 +7,7 @@ import (
 	"context"
 	"encoding/json"
 	"strings"
+	"unicode/utf8"
 
 	"github.com/saturncloud/phoebe/internal/identity"
 	"github.com/saturncloud/phoebe/internal/logging"
@@ -35,6 +36,25 @@ func (u Usage) CachedTokens() int {
 		return 0
 	}
 	return u.PromptTokensDetails.CachedTokens
+}
+
+// MaxRegionChars is the longest Event.Region that can be stored, counted in
+// characters. It matches billing_event.region VARCHAR(64) and Atlas's
+// Cluster.region Unicode(64). The gateway (topology parse), the drainer
+// (nullRegion) and recovery (validateAndDedupe) all apply it through
+// StorableRegion.
+const MaxRegionChars = 64
+
+// StorableRegion reports whether billing_event.region can store region: it
+// must be valid UTF-8, contain no NUL byte (PostgreSQL text rejects it) and be
+// at most MaxRegionChars characters. "" is storable (it means no region).
+// Region is evidence, so every path that meets an unstorable region drops the
+// region and keeps the event and its topology revision: the gateway clears it
+// at topology parse, the drainer binds NULL, and recovery clears it with a
+// counted warning.
+func StorableRegion(region string) bool {
+	return utf8.ValidString(region) && !strings.ContainsRune(region, 0) &&
+		utf8.RuneCountInString(region) <= MaxRegionChars
 }
 
 // Event is one immutable, idempotent metering record per request. It is keyed
@@ -153,6 +173,10 @@ type Event struct {
 	// replica; Region is the graph's cluster region. Both come from the
 	// graph's topology entry Atlas publishes (internal/gateway/topology.go),
 	// looked up by GraphK8sName. 0 / "" = no entry (stored NULL).
+	// A Region longer than MaxRegionChars, with a NUL byte, or not valid UTF-8
+	// cannot be stored (see StorableRegion): the gateway clears it at parse, the
+	// drainer binds NULL, and recovery clears it with a counted warning. The
+	// event and its revision are kept on every path.
 	TopologyRevision int    `json:"topology_revision,omitempty"`
 	Region           string `json:"region,omitempty"`
 	// RequestStartedUnixMs is when phoebe received the request; ServingDurationMs

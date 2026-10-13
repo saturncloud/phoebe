@@ -167,6 +167,18 @@ Migration 0009 replaces `rated_usage_grain_uq` with a 9-column key (adding
 Unlike 0008, it is not additive: the rater's SQL and the schema must change
 together, so every run of a pre-0009 rater against schema 0009 fails.
 
+Because the graph is now a grain key, events that carry no graph (the header
+path before graph propagation, or events from before 0008) form their own
+rollup under the `''` (unknown graph) value. Before 0009 the rater merged them
+into the rollup of the one graph the other events of that hour named; 0009
+removes that rule on purpose, so tokens are never filed under a graph the
+events did not name. Expect a `''` rollup next to a named-graph rollup for the
+same resource and hour while pre-propagation events are still being rated.
+Money is unaffected (both parts bill at the same rate); only per-graph margin
+loses those events. The rater's revision-0 warning does not count `''`
+rollups. See ledger entries D1 and D9 in
+`saturn-architecture-docs/agent-wip/metering-margin-decisions-ledger.md`.
+
 The same release also changes what token-push sends. Every rollup on the wire
 now carries three new keys: `topology_revision`, `region` and `request_count`
 (next to `graph_k8s_name`, which is now always sent). saturn-aws-manager's
@@ -176,6 +188,33 @@ a manager that does not know these keys rejects the whole window POST with a
 
 Roll out in this order:
 
+0. Confirm that saturn-aws-manager has emitted no `rated_usage` hour of this
+   install to Stripe with billing enabled: the manager's `stripe_meter_emit`
+   ledger holds no row with `emitted_cost > 0` for this install's
+   `customer_id`. Shadow-ledger rows count too if you want the shadow totals to
+   stay meaningful. If it holds any, stop. Do not run 0009 until either the
+   manager has un-billed those ids (a credit note for each real emit, then the
+   ledger rows tombstoned) or the emitted hours are otherwise excluded from
+   re-push. The reason is the answer recorded below.
+
+   **Recorded answer (checked against saturn-aws-manager `main` at 5e19869,
+   2026-10-13): the manager's delete-by-absence does NOT reverse an emitted
+   cost.** The manager keys both `token_usage_record` and its emit ledger
+   `stripe_meter_emit` on `(customer_id, rated_usage_id)`. 0009 rewrites every
+   `rated_usage.id`. When token-push re-sends a window, `apply_snapshot`
+   (`saturn_aws_manager/token_usage.py`) deletes the old-id
+   `token_usage_record` rows by absence and inserts the new ids. The ingest
+   path does not touch `stripe_meter_emit`, so the old emit stays. The emit
+   loop (`token_settlement.py`) sees the new ids with no ledger row and emits
+   their full cost once their window is settled. The reconcile job
+   (`token_reconcile.py`) reports the old ledger rows as VANISHED but moves no
+   money by itself; for a real (non-shadow) row the money comes back only
+   through a credit note issued by a person. So an hour emitted before 0009
+   and re-pushed after it is billed twice.
+
+   0009 prints a `0009:` NOTICE with the number of rows whose id it rewrites
+   and the earliest `window_start` among them. Any hour from that earliest
+   `window_start` onwards that the manager has already emitted is at risk.
 1. Suspend the rater CronJob (and the token-push CronJob), or let any in-flight
    rater run finish.
 2. Run `cmd/migrate up`, which applies 0008 and 0009 together.
@@ -213,8 +252,9 @@ cutover replaces saturn-aws-manager's rows for each pushed window: old ids are
 deleted because they are absent from the snapshot, and new ids are inserted.
 Windows older than token-push's trailing window keep their old-id rows until
 they are re-pushed; re-push them with `token-push --since ... --until ...`.
-This is acceptable only before production (no settled rows hold the old ids),
-for the same reason as 0007.
+This is safe only when step 0 holds (the manager has emitted none of the old
+ids). Otherwise each re-pushed emitted hour is billed a second time, as
+described in step 0.
 
 Rolling back 0009 is lossy. The 0009 down migration narrows the key back to the
 7-column 0007 grain, so rollups for the same hour that differ only in graph or
@@ -224,7 +264,10 @@ every id. The deleted rows held real tokens and money for that hour, so after a
 rollback re-rate the affected hours with the pre-0009 rater
 (`rater --since <earliest affected hour> --until <start of the current hour>`,
 while `billing_event` still holds those hours) and then re-push them with
-`token-push` over the same range.
+`token-push` over the same range. Before it deletes anything, the down
+migration prints a `0009 down:` NOTICE with the number of rows it deletes, their
+sum of cost and event_count, and the earliest `window_start` among them; use that
+earliest hour as `--since`. No NOTICE means nothing was deleted.
 
 Roll the code back before the schema. Suspend the rater and token-push
 CronJobs, deploy the pre-0009 rater and token-push images, run `migrate down`,

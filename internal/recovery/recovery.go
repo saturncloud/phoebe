@@ -32,6 +32,11 @@ type Evidence struct {
 	Events     []metering.Event
 	Records    int
 	Duplicates int
+	// RegionsDropped counts records whose region billing_event.region cannot
+	// store (metering.StorableRegion). Region is evidence, so recovery clears it
+	// and keeps the event and its topology revision, the same as the gateway
+	// and the drainer do. The command prints a warning when it is non-zero.
+	RegionsDropped int
 }
 
 // Digest returns a stable SHA-256 digest binding the COMPLETE validated,
@@ -271,6 +276,10 @@ func validateAndDedupe(events []metering.Event) (Evidence, error) {
 	result := Evidence{Records: len(events)}
 	seen := make(map[string]metering.Event, len(events))
 	for i, ev := range events {
+		if !metering.StorableRegion(ev.Region) {
+			ev.Region = ""
+			result.RegionsDropped++
+		}
 		if err := validate(ev); err != nil {
 			return Evidence{}, fmt.Errorf("record %d: %w", i+1, err)
 		}
@@ -306,7 +315,7 @@ func validate(ev metering.Event) error {
 		{"resource_type", ev.ResourceType, 64}, {"org_id", ev.OrgID, 64},
 		{"model", ev.Model, 255}, {"base_model", ev.BaseModel, 255},
 		{"adapter", ev.Adapter, 255}, {"serving_mode", ev.ServingMode, 32},
-		{"finish_reason", ev.FinishReason, 64}, {"region", ev.Region, 64},
+		{"finish_reason", ev.FinishReason, 64},
 	} {
 		if !utf8.ValidString(field.value) {
 			return fmt.Errorf("%s is not valid UTF-8", field.name)

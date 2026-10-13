@@ -238,9 +238,10 @@ func eventArgs(e metering.Event) []any {
 		nullStr(e.GraphK8sName),
 		// Topology, region and serving time: evidence for margin analysis,
 		// NULL when unknown (no topology entry for the graph, or an event
-		// written before these fields existed).
+		// written before these fields existed). A region the column cannot
+		// store is bound as NULL ("not captured") and never fails the insert.
 		nullRevision(e.TopologyRevision),
-		nullStr(e.Region),
+		nullRegion(e.Region),
 		requestStartedAt,
 		// A negative duration is impossible evidence (clock skew or a producer
 		// bug), so it is stored as NULL ("not captured") like a missing start.
@@ -282,6 +283,21 @@ func nullRevision(v int) any {
 		return nil
 	}
 	return v
+}
+
+// nullRegion returns a driver NULL for a region that billing_event.region
+// cannot store: "", one containing a NUL byte (PostgreSQL text rejects it),
+// invalid UTF-8, or longer than metering.MaxRegionChars (billing_event.region
+// is VARCHAR(64)); the test is metering.StorableRegion, shared with the
+// gateway and recovery. It mirrors nullRevision as the drain-side
+// backstop: a bad region would fail the multi-row insert and drop the whole
+// batch, losing billable usage for unrelated requests. Region is evidence, so
+// NULL ("not captured") is the safe value.
+func nullRegion(s string) any {
+	if s == "" || !metering.StorableRegion(s) {
+		return nil
+	}
+	return s
 }
 
 // nullInt64 returns v when known is true and a driver NULL otherwise. Used

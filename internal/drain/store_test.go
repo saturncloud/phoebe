@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"regexp"
+	"strings"
 	"testing"
 	"time"
 
@@ -280,5 +281,35 @@ func TestEventArgs_NegativeServingDurationStoresNull(t *testing.T) {
 		if args[servingDurationIdx] != tc.want {
 			t.Fatalf("serving_duration_ms arg for %d = %v, want %v", tc.ms, args[servingDurationIdx], tc.want)
 		}
+	}
+}
+
+// TestEventArgs_UnstorableRegionBindsNullNeverPoisons: billing_event.region
+// is VARCHAR(64) text, so a region with a NUL byte, invalid UTF-8, or more
+// than 64 characters would fail the multi-row insert and drop the whole
+// batch. It binds NULL instead; a normal region binds as the string.
+func TestEventArgs_UnstorableRegionBindsNullNeverPoisons(t *testing.T) {
+	const regionIdx = 22 // topology_revision 21, request_started_at 23.
+
+	cases := []struct {
+		name   string
+		region string
+		want   any
+	}{
+		{"empty is not captured", "", nil},
+		{"short region kept", "eu-north1", "eu-north1"},
+		{"exactly max ASCII characters kept", strings.Repeat("a", metering.MaxRegionChars), strings.Repeat("a", metering.MaxRegionChars)},
+		{"exactly max multibyte characters kept", strings.Repeat("é", metering.MaxRegionChars), strings.Repeat("é", metering.MaxRegionChars)},
+		{"one over max is NULL", strings.Repeat("a", metering.MaxRegionChars+1), nil},
+		{"invalid UTF-8 is NULL", "\xff", nil},
+		{"NUL byte is NULL", "a\x00b", nil},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			args := eventArgs(metering.Event{RequestID: "r", Model: "m", Region: tc.region})
+			if args[regionIdx] != tc.want {
+				t.Fatalf("region arg for %q = %v, want %v", tc.region, args[regionIdx], tc.want)
+			}
+		})
 	}
 }
