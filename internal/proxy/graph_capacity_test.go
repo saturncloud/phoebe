@@ -1,6 +1,8 @@
 package proxy
 
 import (
+	"io"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -294,5 +296,89 @@ func TestPublishedGraphCapacityOversizeIs413(t *testing.T) {
 	}
 	if n := hits.Load(); n != 0 {
 		t.Fatalf("upstream hits=%d after a zero KV cap refusal, want 0", n)
+	}
+}
+
+// R-C (with D5): when published graph capacity is the only reason admission
+// runs (admission.enabled=false, no limit envelope) and the admission store
+// is unavailable, shared requests fail open: they reach the engine with 200
+// and the published capacity is not enforced while the store is down. Both a
+// refused connection and a store that accepts but never replies are covered.
+func TestPublishedGraphCapacityFailsOpenWhenStoreUnavailable(t *testing.T) {
+	refused := func(t *testing.T) string {
+		l, err := net.Listen("tcp", "127.0.0.1:0")
+		if err != nil {
+			t.Fatal(err)
+		}
+		addr := l.Addr().String()
+		_ = l.Close()
+		return addr
+	}
+	silent := func(t *testing.T) string {
+		l, err := net.Listen("tcp", "127.0.0.1:0")
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { _ = l.Close() })
+		go func() {
+			for {
+				conn, err := l.Accept()
+				if err != nil {
+					return
+				}
+				go func() {
+					defer conn.Close()
+					_, _ = io.Copy(io.Discard, conn)
+				}()
+			}
+		}()
+		return l.Addr().String()
+	}
+	for name, storeAddr := range map[string]func(*testing.T) string{"refused": refused, "accepts but never replies": silent} {
+		t.Run(name, func(t *testing.T) {
+			var hits atomic.Int64
+			release := make(chan struct{})
+			var releaseOnce sync.Once
+			releaseAll := func() { releaseOnce.Do(func() { close(release) }) }
+			backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				hits.Add(1)
+				<-release
+				_, _ = w.Write([]byte(`{"model":"model-a","usage":{"prompt_tokens":1,"completion_tokens":1}}`))
+			}))
+			t.Cleanup(backend.Close)
+			t.Cleanup(releaseAll)
+			up, _ := url.Parse(backend.URL)
+
+			settings := &config.Settings{Admission: config.AdmissionSettings{KeyPrefix: "b8", LeaseTTL: time.Minute, DefaultMaxOutputTokens: 20}}
+			client := admission.NewValkeyClient(storeAddr(t))
+			t.Cleanup(func() { _ = client.Close() })
+			s := New(settings, logging.New(logging.ERROR), &recordingEmitter{}).WithAdmitter(admission.New(client, settings.Admission))
+			s.graphCapacity = staticGraphCapacity{graphFromUpstreamHost(up.Host): {MaxActiveRequests: ptr64(1)}}
+
+			// Two concurrent requests against a published capacity of one:
+			// both reach the engine, so the capacity is not enforced.
+			done := make(chan int, 2)
+			started := time.Now()
+			for range 2 {
+				go func() {
+					rr := httptest.NewRecorder()
+					s.Handler().ServeHTTP(rr, bareSharedRequest(up, "org-a"))
+					done <- rr.Code
+				}()
+			}
+			deadline := time.Now().Add(2 * time.Second)
+			for hits.Load() < 2 {
+				if time.Now().After(deadline) {
+					t.Fatalf("upstream hits=%d after %s, want both requests to fail open to the engine", hits.Load(), time.Since(started))
+				}
+				time.Sleep(5 * time.Millisecond)
+			}
+			releaseAll()
+			for range 2 {
+				if code := <-done; code != http.StatusOK {
+					t.Fatalf("status=%d, want 200 (fail open)", code)
+				}
+			}
+		})
 	}
 }

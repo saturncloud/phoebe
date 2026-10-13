@@ -315,12 +315,13 @@ func TestMaxStreamDurationBeforeHeadersIsGatewayTimeout(t *testing.T) {
 	}
 }
 
-// B4: a non-streamed body larger than the per-stream buffer limit is cut
+// B4: a streamed (SSE) line larger than the per-stream buffer limit is cut
 // BECAUSE of that limit: the client sees a cut response, the attempt is
 // recorded as aborted, the protection log names the buffer-limit cause, and
-// every byte returns to the replica budget. The control case (a body under the
-// same limit) passes whole and is not aborted, so a limit that cut everything
-// would fail here.
+// every byte returns to the replica budget. The control case (a streamed line
+// under the same limit) passes whole and is not aborted, so a limit that cut
+// everything would fail here. A non-streamed body is never cut (D22); see
+// TestNonStreamedBodyOverBufferLimitIsDeliveredAndMetered.
 func TestResponseBufferPerStreamLimitAbortsWithBufferLimitCause(t *testing.T) {
 	const perStream = 4 << 10
 	for _, tc := range []struct {
@@ -778,5 +779,27 @@ func TestNonStreamedBodyOverBufferLimitIsDeliveredAndMetered(t *testing.T) {
 	}
 	if held := s.responseBuffers.held.Load(); held != 0 {
 		t.Fatalf("replica budget still holds %d bytes", held)
+	}
+}
+
+// The release returned by dedicatedColdHolds.acquire returns its hold once,
+// however many times it is called, so a second release never takes another
+// request's hold on the same endpoint.
+func TestDedicatedColdHoldReleaseIsIdempotent(t *testing.T) {
+	var d dedicatedColdHolds
+	first, ok := d.acquire("ep", 4)
+	if !ok {
+		t.Fatal("first acquire refused")
+	}
+	if _, ok := d.acquire("ep", 4); !ok {
+		t.Fatal("second acquire refused")
+	}
+	first()
+	first()
+	d.mu.Lock()
+	held := d.held["ep"]
+	d.mu.Unlock()
+	if held != 1 {
+		t.Fatalf("held=%d after releasing the first hold twice, want 1 (the second hold kept)", held)
 	}
 }

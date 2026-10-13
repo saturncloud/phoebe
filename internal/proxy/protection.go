@@ -269,7 +269,8 @@ type dedicatedColdHolds struct {
 }
 
 // acquire takes one hold on endpoint if fewer than limit are held, returning
-// its release function.
+// its release function. The release function is idempotent: only its first
+// call returns the hold, so a caller may call it from several exit paths.
 func (d *dedicatedColdHolds) acquire(endpoint string, limit int64) (func(), bool) {
 	d.mu.Lock()
 	defer d.mu.Unlock()

@@ -299,7 +299,7 @@ func (t *wakeRoundTripper) RoundTrip(req *http.Request) (*http.Response, error) 
 			writeDedicatedColdHoldsFull(buf, t.requestID)
 			return bufferedHTTPResponse(req, buf, true), nil
 		}
-		releaseHold = sync.OnceFunc(release)
+		releaseHold = release // idempotent (acquire), so the explicit call and the defer are both safe
 		defer releaseHold()
 	}
 
