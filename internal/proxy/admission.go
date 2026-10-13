@@ -169,12 +169,13 @@ func boundRequestBody(w, rawW http.ResponseWriter, r *http.Request, limit int64)
 // writeRequestBodyError answers a failed request-body read. A read cut off
 // because protection.maxStreamDuration expired (the handler sets the
 // connection read deadline when it fires, so a trickled body cannot hold the
-// handler past the bound) answers 504, the same status as any other
-// pre-header max-duration expiry (D3). Nothing was forwarded, so no metering
-// row is recorded, as for every other pre-forward refusal.
+// handler past the bound) answers 408: the client was too slow to send its
+// own request (504 is kept for an upstream that sent no headers in time,
+// D3/D40). Nothing was forwarded, so no metering row is recorded, as for
+// every other pre-forward refusal.
 func writeRequestBodyError(w http.ResponseWriter, r *http.Request, err error) {
 	if errors.Is(context.Cause(r.Context()), errMaxStreamDuration) {
-		http.Error(w, "request body not received in time", http.StatusGatewayTimeout)
+		http.Error(w, "request body not received in time", http.StatusRequestTimeout)
 		return
 	}
 	var tooLarge *http.MaxBytesError

@@ -223,8 +223,8 @@ func TestMaxStreamDurationBoundsAStalledRequestBodyRead(t *testing.T) {
 	}
 	_, _ = io.ReadAll(resp.Body)
 	resp.Body.Close()
-	if resp.StatusCode != http.StatusGatewayTimeout {
-		t.Fatalf("status=%d, want 504 for a body not received within maxStreamDuration", resp.StatusCode)
+	if resp.StatusCode != http.StatusRequestTimeout {
+		t.Fatalf("status=%d, want 408 for a body not received within maxStreamDuration", resp.StatusCode)
 	}
 }
 
