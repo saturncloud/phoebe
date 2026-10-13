@@ -92,7 +92,18 @@ type captureReader struct {
 	// bufferErr is the limit error once scan outgrew its allowance; every
 	// later Read returns it.
 	bufferErr error
+
+	// A non-streamed body that outgrows its buffer allowance is never cut:
+	// the client gets every byte. Capture then keeps only the body's head
+	// (where the top-level "model" sits) and a rolling tail (where "usage"
+	// sits in OpenAI-style bodies) and parses those at finish.
+	overflowed bool
+	head, tail []byte
 }
+
+// overflowKeep is how much of a non-streamed body's head and tail capture
+// keeps once the body outgrows its buffer allowance.
+const overflowKeep = 256 << 10
 
 func newCaptureReader(ctx context.Context, src io.ReadCloser, streamed bool, onDone func(capture.Result)) *captureReader {
 	return &captureReader{
@@ -164,6 +175,15 @@ func (c *captureReader) Read(p []byte) (int, error) {
 		})
 		// Inspect a COPY of exactly the bytes we forward. The bytes in p are
 		// returned to the client verbatim; we never mutate them.
+		if c.overflowed {
+			c.keepTail(p[:n])
+			c.appendLog(p[:n])
+			_ = c.buffers.reserve(bufferSlotCapture, int64(len(c.head)+len(c.tail)))
+			if err == io.EOF {
+				c.finish()
+			}
+			return n, err
+		}
 		c.scan.Write(p[:n])
 		if c.streamed {
 			c.mu.Lock()
@@ -179,7 +199,11 @@ func (c *captureReader) Read(p []byte) (int, error) {
 		// limit the response is cut: these bytes still reach the client, the
 		// error ends the copy, and the account has cancelled the request so
 		// capture records it as aborted.
-		if berr := c.buffers.set(bufferSlotCapture, int64(c.scan.Len())); berr != nil {
+		if !c.streamed {
+			if c.buffers.reserve(bufferSlotCapture, int64(c.scan.Len())) != nil {
+				c.overflow()
+			}
+		} else if berr := c.buffers.set(bufferSlotCapture, int64(c.scan.Len())); berr != nil {
 			c.bufferErr = berr
 			c.scan.Reset()
 			return n, berr
@@ -312,6 +336,8 @@ func (c *captureReader) finish() {
 		if c.scan.Len() > 0 {
 			c.inspectSSELine(bytes.TrimRight(c.scan.Bytes(), "\r"))
 		}
+	} else if c.overflowed {
+		c.inspectHeadAndTail()
 	} else {
 		// Single JSON body: parse the whole thing once.
 		c.inspectChunk(bytes.TrimSpace(c.scan.Bytes()))
@@ -331,5 +357,70 @@ func (c *captureReader) finish() {
 
 	if c.onDone != nil {
 		c.onDone(c.result)
+	}
+}
+
+// overflow switches a non-streamed capture from holding the whole body to
+// holding its head and tail.
+func (c *captureReader) overflow() {
+	body := c.scan.Bytes()
+	c.head = append([]byte(nil), body[:min(len(body), overflowKeep)]...)
+	c.tail = nil
+	c.keepTail(body)
+	c.scan.Reset()
+	c.scan = bytes.Buffer{} // release the large backing array
+	c.overflowed = true
+	_ = c.buffers.reserve(bufferSlotCapture, int64(len(c.head)+len(c.tail)))
+}
+
+// keepTail appends p to the rolling tail, keeping the last overflowKeep bytes.
+func (c *captureReader) keepTail(p []byte) {
+	c.tail = append(c.tail, p...)
+	if extra := len(c.tail) - overflowKeep; extra > 0 {
+		c.tail = append(c.tail[:0:0], c.tail[extra:]...)
+	}
+}
+
+// inspectHeadAndTail recovers model and usage from an overflowed body: the
+// top-level "model" by walking the head's keys in order, and "usage" from the
+// LAST "usage" key in the tail, decoded as an object. A body laid out
+// otherwise yields no usage, recorded as an unmetered attempt.
+//
+// Must be called with mu held.
+func (c *captureReader) inspectHeadAndTail() {
+	dec := json.NewDecoder(bytes.NewReader(c.head))
+	if tok, err := dec.Token(); err == nil && tok == json.Delim('{') {
+		for dec.More() {
+			key, err := dec.Token()
+			if err != nil {
+				break
+			}
+			if key == "model" {
+				var model string
+				if dec.Decode(&model) == nil && model != "" {
+					c.result.Model = model
+				}
+				break
+			}
+			if skipValue(dec) != nil {
+				break
+			}
+		}
+	}
+	idx := bytes.LastIndex(c.tail, []byte(`"usage"`))
+	if idx < 0 {
+		return
+	}
+	rest := bytes.TrimLeft(c.tail[idx+len(`"usage"`):], " \t\r\n")
+	if len(rest) == 0 || rest[0] != ':' {
+		return
+	}
+	if rest = bytes.TrimLeft(rest[1:], " \t\r\n"); len(rest) == 0 || rest[0] != '{' {
+		return
+	}
+	var usage metering.Usage
+	if json.NewDecoder(bytes.NewReader(rest)).Decode(&usage) == nil {
+		c.result.Usage = usage
+		c.result.UsageFound = true
 	}
 }

@@ -288,13 +288,15 @@ func TestResponseBufferPerStreamLimitAbortsWithBufferLimitCause(t *testing.T) {
 		payload int
 		cut     bool
 	}{
-		{"over the limit is cut with the buffer-limit cause", 64 << 10, true},
+		{"a streamed line over the limit is cut with the buffer-limit cause", 64 << 10, true},
 		{"under the limit passes whole", 2 << 10, false},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			full := `{"model":"m","data":"` + strings.Repeat("x", tc.payload) + `"}`
+			// Streamed, so the over-limit case is cut (a non-streamed body is
+			// never cut; see TestNonStreamedBodyOverBufferLimitIsDeliveredAndMetered).
+			full := `data: {"model":"m","choices":[{"delta":{"content":"` + strings.Repeat("x", tc.payload) + `"}}]}` + "\n\n"
 			backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
-				w.Header().Set("Content-Type", "application/json")
+				w.Header().Set("Content-Type", "text/event-stream")
 				_, _ = io.WriteString(w, full)
 			}))
 			defer backend.Close()
@@ -306,7 +308,7 @@ func TestResponseBufferPerStreamLimitAbortsWithBufferLimitCause(t *testing.T) {
 			s := New(&config.Settings{Protection: config.ProtectionSettings{MaxResponseBufferBytesPerStream: perStream}}, log, em)
 			proxySrv := liveProxy(t, s)
 
-			req, err := http.NewRequestWithContext(context.Background(), http.MethodPost, proxySrv.URL+"/v1/chat/completions", strings.NewReader(`{"model":"m","messages":[]}`))
+			req, err := http.NewRequestWithContext(context.Background(), http.MethodPost, proxySrv.URL+"/v1/chat/completions", strings.NewReader(`{"model":"m","stream":true,"stream_options":{"continuous_usage_stats":true},"messages":[]}`))
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -683,5 +685,39 @@ func TestDedicatedColdHoldReleasedWhenWakeCompletes(t *testing.T) {
 	<-done
 	if rec.Code != http.StatusOK {
 		t.Fatalf("held request status=%d, want 200 after the wake", rec.Code)
+	}
+}
+
+// A non-streamed body larger than its buffer allowance is never cut: the
+// client gets every byte, and capture recovers model and usage from the
+// body's head and tail, so the request is metered normally.
+func TestNonStreamedBodyOverBufferLimitIsDeliveredAndMetered(t *testing.T) {
+	full := `{"id":"x","object":"list","model":"emb-model","data":"` + strings.Repeat("x", 2<<20) +
+		`","usage":{"prompt_tokens":11,"completion_tokens":0,"total_tokens":11}}`
+	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, full)
+	}))
+	defer backend.Close()
+	up, _ := url.Parse(backend.URL)
+	em := &recordingEmitter{}
+	s := New(&config.Settings{Protection: config.ProtectionSettings{MaxResponseBufferBytesPerStream: 64 << 10}},
+		logging.New(logging.ERROR), em)
+
+	req := httptest.NewRequest(http.MethodPost, "/v1/embeddings", strings.NewReader(`{"model":"emb-model","input":"hi"}`))
+	setUpstream(req, up)
+	req.Header.Set(identity.HeaderAuthID, "auth-1")
+	req.Header.Set(identity.HeaderResourceID, "r1")
+	rr := httptest.NewRecorder()
+	s.Handler().ServeHTTP(rr, req)
+	if rr.Code != http.StatusOK || rr.Body.String() != full {
+		t.Fatalf("status=%d len=%d, want the whole %d-byte body", rr.Code, rr.Body.Len(), len(full))
+	}
+	events := em.waitForEvents(1, 5*time.Second)
+	if len(events) != 1 || events[0].Aborted || !events[0].UsageFound || events[0].PromptTokens != 11 || events[0].Model != "emb-model" {
+		t.Fatalf("events=%+v, want one metered, non-aborted attempt with the tail's usage and the head's model", events)
+	}
+	if held := s.responseBuffers.held.Load(); held != 0 {
+		t.Fatalf("replica budget still holds %d bytes", held)
 	}
 }

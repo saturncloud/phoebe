@@ -173,6 +173,16 @@ func (b *responseBufferBudget) newAccount(p config.ProtectionSettings, cancel co
 // cancelled so capture records the cut. A nil account (no protection wired,
 // as in some unit tests) accepts everything.
 func (a *responseBufferAccount) set(slot int, n int64) error {
+	if err := a.reserve(slot, n); err != nil {
+		a.cancel(err)
+		return err
+	}
+	return nil
+}
+
+// reserve is set without cancelling the request on refusal, for a caller
+// that can shrink what it holds instead of ending the response.
+func (a *responseBufferAccount) reserve(slot int, n int64) error {
 	if a == nil {
 		return nil
 	}
@@ -190,7 +200,6 @@ func (a *responseBufferAccount) set(slot int, n int64) error {
 			}
 		}
 		if mine+n > a.perStream {
-			a.cancel(errResponseBufferLimit)
 			return errResponseBufferLimit
 		}
 		// Reserve with compare-and-swap so a refused delta never touches the
@@ -199,7 +208,6 @@ func (a *responseBufferAccount) set(slot int, n int64) error {
 		for {
 			cur := a.budget.held.Load()
 			if cur+delta > a.total {
-				a.cancel(errResponseBufferLimit)
 				return errResponseBufferLimit
 			}
 			if a.budget.held.CompareAndSwap(cur, cur+delta) {
