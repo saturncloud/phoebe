@@ -201,19 +201,26 @@ func (b *lockedBuffer) String() string {
 	return b.buf.String()
 }
 
-// B3: a stream that outlives maxStreamDuration is ended and recorded as aborted.
+// B3: a stream that outlives maxStreamDuration is ended within a small
+// multiple of the limit (the backend never ends it on its own), recorded as
+// aborted, and the protection log names maxStreamDuration as the cause.
 func TestMaxStreamDurationEndsStream(t *testing.T) {
 	backend, unblock := slowBackend(t, `data: {"model":"m","choices":[{"index":0,"delta":{"content":"hi"}}]}`+"\n\n")
 	defer backend.Close()
 	defer close(unblock)
 	up, _ := url.Parse(backend.URL)
 	em := &recordingEmitter{}
-	s := newProtectedServer(config.ProtectionSettings{MaxStreamDuration: 200 * time.Millisecond}, em)
+	var warnings lockedBuffer
+	log := logging.New(logging.WARN)
+	log.Warn.SetOutput(&warnings)
+	const limit = 200 * time.Millisecond
+	s := New(&config.Settings{Protection: config.ProtectionSettings{MaxStreamDuration: limit}}, log, em)
 
 	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(`{"model":"m","stream":true,"messages":[]}`))
 	setUpstream(req, up)
 	req.Header.Set(identity.HeaderAuthID, "auth-1")
 	req.Header.Set(identity.HeaderResourceID, "r1")
+	start := time.Now()
 	done := make(chan struct{})
 	go func() {
 		defer close(done)
@@ -225,9 +232,15 @@ func TestMaxStreamDurationEndsStream(t *testing.T) {
 	case <-time.After(5 * time.Second):
 		t.Fatal("stream was not ended by maxStreamDuration")
 	}
+	if elapsed := time.Since(start); elapsed > 10*limit {
+		t.Fatalf("stream ended after %v, want within a small multiple of the %v limit", elapsed, limit)
+	}
 	events := em.waitForEvents(1, 5*time.Second)
 	if len(events) != 1 || !events[0].Aborted {
 		t.Fatalf("events=%+v, want one aborted attempt", events)
+	}
+	if got := warnings.String(); !strings.Contains(got, "protection: ended response") || !strings.Contains(got, errMaxStreamDuration.Error()) {
+		t.Fatalf("duration cut was not attributed to maxStreamDuration; warnings=%q", got)
 	}
 }
 
