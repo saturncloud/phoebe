@@ -225,6 +225,9 @@ func admissionWork(body []byte, defaultOutput int64) (admissionEstimate, bool) {
 			sequences = *c
 		}
 	}
+	if maximum*sequences > maxReservedOutput {
+		return admissionEstimate{}, false
+	}
 	return admissionEstimate{Model: v.Model, InputTokens: estimatePromptTokens(body), OutputTokens: maximum,
 		OutputDeclared: v.MaxTokens != nil || v.MaxCompletionTokens != nil, OutputSequences: sequences}, true
 }
@@ -503,6 +506,16 @@ func undeclaredOutputReservation(defaultOutput int64, scopes ...admission.RateLi
 // small enough that output x sequences cannot overflow the KV charge
 // (output is at most MaxUint32).
 const maxOutputSequences = 1 << 16
+
+// maxReservedOutput bounds output x sequences, the reserved-output part of the
+// KV charge. Redis's Lua cjson encodes numbers with only 14 significant
+// digits, so a charge at or above 1e14 could not be written to a lease record
+// as a JSON number without rounding. 2^46 (about 7.0e13) keeps the whole
+// charge, prompt estimate included, below 1e14; no real request comes near it
+// (it is max_tokens near 2^32 with n=16384). A larger product is refused like
+// a broken body. The lease script also stores kv as a decimal string, so this
+// bound is the first of two guards, not the only one.
+const maxReservedOutput = 1 << 46
 
 // undeclaredOutputWithinKV clamps the output reservation of a request that
 // declared no max_tokens so the prompt plus the reservation fits kvCap, the

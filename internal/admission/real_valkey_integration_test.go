@@ -489,3 +489,31 @@ func TestRealValkeyGroupScopes(t *testing.T) {
 		t.Fatalf("zero-capped group admit = %T %v, want a contractual rejection", err, err)
 	}
 }
+
+// TestRealValkeyReleaseSubtractsExactlyWhatAdmitAdded pins the lease-record
+// invariant on the real Lua engine: Redis's cjson encodes numbers with only
+// 14 significant digits, so a kv above 1e14 written as a JSON number came back
+// rounded and finish released a different amount than admit reserved. The
+// counter must return to exactly zero.
+func TestRealValkeyReleaseSubtractsExactlyWhatAdmitAdded(t *testing.T) {
+	addr := os.Getenv("PHOEBE_TEST_ADMISSION_VALKEY_ADDR")
+	if addr == "" {
+		t.Fatal("PHOEBE_TEST_ADMISSION_VALKEY_ADDR is required")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	client := redis.NewClient(&redis.Options{Addr: addr})
+	cfg := config.AdmissionSettings{
+		KeyPrefix: fmt.Sprintf("phoebe-admission-kv-precision-%d", time.Now().UnixNano()),
+		LeaseTTL:  time.Minute,
+		Platform:  config.AdmissionLimits{},
+	}
+	a := New(client, cfg)
+	t.Cleanup(func() {
+		_ = client.Del(context.Background(), a.counters, a.leases, a.expiries, a.windowExpiries, a.legacyLeases, a.legacyExpiries).Err()
+		_ = client.Close()
+	})
+	assertReleaseSubtractsExactlyWhatAdmitAdded(t, ctx, a, func(field string) string {
+		return client.HGet(ctx, a.counters, field).Val()
+	})
+}

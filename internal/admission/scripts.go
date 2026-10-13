@@ -48,7 +48,8 @@ local function window_retry_ms(s, now)
   if remaining <= 0 then return s.window_ms end
   return remaining
 end
--- A record's kv is its estimated input plus reserved output. Records written
+-- A record's kv is its estimated input plus reserved output, held as a
+-- decimal string (see admitScript) and coerced back here. Records written
 -- by the previous release (reaped from KEYS[5]/KEYS[6]) carry neither field
 -- and hold prompt BYTES under 'prompt', so every read defaults to 0 and the
 -- legacy 'prompt' field is still released. The previous release never sees
@@ -130,7 +131,12 @@ for _,s in ipairs(q.scopes) do
   if s.uncached_prompt ~= 0 and window_get(s,'uncached_prompt',q.now)+get(field(s,'uncached_prompt_reserved'))+q.estimated_input > s.uncached_prompt then return {0,s.name,'uncached_prompt_tokens',contract,window_retry_ms(s,q.now)} end
   if s.generated ~= 0 and window_get(s,'generated',q.now)+get(field(s,'genreserved'))+q.output > s.generated then return {0,s.name,'generated_tokens',contract,window_retry_ms(s,q.now)} end
 end
-local rec={scopes=q.scopes,prefill_tokens=q.prefill_tokens,kv=q.kv,estimated_input=q.estimated_input,output=q.output,adapter=q.adapter,prefill=true,cold=false,admitted_at=q.now}
+-- kv is stored as a decimal string: Redis's cjson encodes a number with only
+-- 14 significant digits, so a kv above 1e14 written as a number came back
+-- rounded and release subtracted a different amount than was added here.
+-- cjson round-trips a string unchanged through every later re-encode, and
+-- release_record's arithmetic coerces it back to the exact number.
+local rec={scopes=q.scopes,prefill_tokens=q.prefill_tokens,kv=string.format('%d',q.kv),estimated_input=q.estimated_input,output=q.output,adapter=q.adapter,prefill=true,cold=false,admitted_at=q.now}
 for _,s in ipairs(q.scopes) do
   add(field(s,'active'),1); add(field(s,'prefills'),1); add(field(s,'reserved_decode_slots'),1); add(field(s,'prefill_tokens'),q.prefill_tokens); add(field(s,'output'),q.output); add(field(s,'kv'),q.kv); add(field(s,'genreserved'),q.output)
   add(field(s,'total_prompt_reserved'),q.estimated_input); add(field(s,'uncached_prompt_reserved'),q.estimated_input)

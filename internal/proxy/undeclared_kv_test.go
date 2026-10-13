@@ -209,3 +209,29 @@ func TestAdmissionWorkCountsOutputSequences(t *testing.T) {
 		}
 	}
 }
+
+// TestAdmissionWorkRefusesReservedOutputBeyondExactLeasePrecision: output x
+// sequences above maxReservedOutput (2^46) is refused like a broken body, so no
+// KV charge reaches the 14 significant digits Redis's cjson keeps for a
+// number; a huge max_tokens with one sequence is still accepted.
+func TestAdmissionWorkRefusesReservedOutputBeyondExactLeasePrecision(t *testing.T) {
+	for _, c := range []struct {
+		body string
+		ok   bool
+	}{
+		{`{"model":"m","max_tokens":4000000000,"n":40000}`, false},       // 1.6e14
+		{`{"model":"m","max_tokens":4000000000,"best_of":40000}`, false}, // same via best_of
+		{`{"model":"m","max_tokens":4000000000,"n":1}`, true},
+		{`{"model":"m","max_tokens":4000000000}`, true},
+		{`{"model":"m","max_tokens":1073741824,"n":65536}`, true},  // exactly 2^46
+		{`{"model":"m","max_tokens":1073741825,"n":65536}`, false}, // one sequence-width past
+	} {
+		got, ok := admissionWork([]byte(c.body), 10)
+		if ok != c.ok {
+			t.Errorf("admissionWork(%s) ok=%v, want %v", c.body, ok, c.ok)
+		}
+		if ok && got.OutputTokens*got.OutputSequences > maxReservedOutput {
+			t.Errorf("admissionWork(%s) accepted %d x %d past the bound", c.body, got.OutputTokens, got.OutputSequences)
+		}
+	}
+}

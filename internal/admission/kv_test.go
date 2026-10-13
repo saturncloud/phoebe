@@ -275,3 +275,48 @@ func TestReservedKVChargesEveryOutputSequence(t *testing.T) {
 		t.Fatalf("kv=%q after finish, want released", got)
 	}
 }
+
+// TestReleaseSubtractsExactlyWhatAdmitAdded: the lease record must carry the
+// kv charge exactly, so finish subtracts the same amount admit added. Redis's
+// cjson keeps only 14 significant digits for a JSON number, so the record
+// stores kv as a decimal string. (miniredis encodes numbers exactly; the
+// real-Valkey twin of this test is the one that reproduces the rounding.)
+func TestReleaseSubtractsExactlyWhatAdmitAdded(t *testing.T) {
+	a, mr := testAdmitter(t, config.AdmissionSettings{})
+	assertReleaseSubtractsExactlyWhatAdmitAdded(t, context.Background(), a, func(field string) string {
+		return mr.HGet(a.counters, field)
+	})
+}
+
+func assertReleaseSubtractsExactlyWhatAdmitAdded(t *testing.T, ctx context.Context, a *RedisAdmitter, hget func(string) string) {
+	t.Helper()
+	req := request("a", "m")
+	// 3 + 4e9 x 40000 = 160000000000003: 15 significant digits, which a
+	// 14-digit encoding rounds DOWN to 1.6e14, leaving 3 behind. (Rounding up
+	// would drive the counter negative, and add() deletes a field at <= 0,
+	// hiding the drift.)
+	req.PrefillTokens, req.EstimatedInputTokens = 3, 3
+	req.ReservedOutputTokens, req.OutputSequences = 4_000_000_000, 40_000
+	for _, finish := range []string{"complete", "prefill then complete"} {
+		lease, err := a.Admit(ctx, req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		scopeID := a.scopes(req)[0].ID
+		if got := hget(scopeID + "|kv"); got != "160000000000003" {
+			t.Fatalf("kv=%q, want 160000000000003", got)
+		}
+		if finish != "complete" {
+			// PrefillDone re-encodes the record; the kv must survive it.
+			if err := lease.PrefillDone(ctx); err != nil {
+				t.Fatal(err)
+			}
+		}
+		if err := lease.Complete(ctx, 0); err != nil {
+			t.Fatal(err)
+		}
+		if got := hget(scopeID + "|kv"); got != "" {
+			t.Fatalf("%s: kv=%q after release, want exactly zero (field removed)", finish, got)
+		}
+	}
+}
