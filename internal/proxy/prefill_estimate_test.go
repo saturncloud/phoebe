@@ -234,3 +234,42 @@ func TestTypedMediaPartsCountAsOneImage(t *testing.T) {
 		t.Errorf("unknown typed part: images=%d, want 0", images)
 	}
 }
+
+// Tool-call arguments the chat template renders are never estimated as zero:
+// a string counts its characters, and any other present shape counts its raw
+// JSON length, so a multi-megabyte arguments object cannot slip past the
+// prefill, KV and contract prompt windows. Only absent or null counts nothing.
+func TestToolCallArgumentsOfAnyShapeCountTowardThePrompt(t *testing.T) {
+	obj := `{"q":"` + strings.Repeat("a", 400) + `"}`
+	arr := `[` + strings.TrimSuffix(strings.Repeat(`"abcdefgh",`, 50), ",") + `]`
+	call := func(args string) string {
+		return `{"model":"m","messages":[{"role":"assistant","content":null,"tool_calls":[{"function":{"name":"f","arguments":` + args + `}}]}]}`
+	}
+	for _, tc := range []struct {
+		name string
+		body string
+		want int64
+	}{
+		{"string arguments count characters", call(`"` + strings.Repeat("a", 400) + `"`), 100},
+		{"object arguments count raw JSON length", call(obj), (int64(len(obj)) + 3) / 4},
+		{"array arguments count raw JSON length", call(arr), (int64(len(arr)) + 3) / 4},
+		{"number arguments count raw JSON length", call(`12345678`), 2},
+		{"null arguments count nothing", call(`null`), 1},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := estimatePromptTokens([]byte(tc.body)); got != tc.want {
+				t.Fatalf("estimate=%d, want %d", got, tc.want)
+			}
+		})
+	}
+	// A value that does not parse as JSON counts its raw byte length rather
+	// than zero, so an unknown shape errs toward over-estimating.
+	for _, raw := range []string{`{"a":`, `"unterminated`, `nul`} {
+		if got := toolCallArgumentChars([]byte(raw)); got != int64(len(raw)) {
+			t.Errorf("toolCallArgumentChars(%q) = %d, want %d", raw, got, len(raw))
+		}
+	}
+	if got := toolCallArgumentChars(nil); got != 0 {
+		t.Errorf("absent arguments = %d, want 0", got)
+	}
+}

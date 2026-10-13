@@ -21,7 +21,8 @@ const imagePartTokens = 1024
 // arrays) count one token per element, exactly.
 //
 // Message text is the text the model reads: chat message content (a string,
-// or the text of each text part) and assistant tool-call arguments; the
+// or the text of each text part) and assistant tool-call arguments (a
+// non-string arguments value counts by its raw JSON length); the
 // completions prompt; the embeddings input. JSON structure, keys, sampling
 // parameters and the like are not message text. A body with none of these
 // estimates 1, the minimum admission accepts.
@@ -69,7 +70,7 @@ func estimatePromptTokens(body []byte) int64 {
 		_ = json.Unmarshal(m["tool_calls"], &calls)
 		for _, rawCall := range calls {
 			fn := jsonObject(jsonObject(rawCall)["function"])
-			chars += jsonStringChars(fn["arguments"])
+			chars += toolCallArgumentChars(fn["arguments"])
 		}
 	}
 	for _, raw := range []json.RawMessage{top["prompt"], top["input"]} {
@@ -121,6 +122,24 @@ func jsonString(raw json.RawMessage) (s string, ok bool) {
 		return "", false
 	}
 	return s, json.Unmarshal(raw, &s) == nil
+}
+
+// toolCallArgumentChars measures a tool call's function.arguments. A JSON
+// string counts its characters. Any other present value (an object, an array,
+// a number, or bytes that do not parse) counts its raw JSON length, because
+// the engine does not strictly validate message tool-call arguments and the
+// chat template renders whatever is there into the prompt. Only an absent
+// value or a JSON null counts nothing, so an unexpected shape errs toward
+// over-estimating, never toward zero.
+func toolCallArgumentChars(raw json.RawMessage) int64 {
+	if s, ok := jsonString(raw); ok {
+		return int64(utf8.RuneCountInString(s))
+	}
+	trimmed := bytes.TrimSpace(raw)
+	if len(trimmed) == 0 || bytes.Equal(trimmed, []byte("null")) {
+		return 0
+	}
+	return int64(len(trimmed))
 }
 
 // jsonStringChars counts the characters of raw when it is a JSON string, else 0.
