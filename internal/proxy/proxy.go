@@ -1057,6 +1057,9 @@ func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request) {
 			invalidBodyMetadata := []string{
 				"Content-Length", "Content-MD5", "Digest", "Content-Digest", "Repr-Digest", "ETag",
 			}
+			// The filter outlives cr's EOF while it holds the final line,
+			// so it, not cr, closes the buffer account.
+			cr.deferBufferClose = true
 			resp.Body = &trailerClearingReadCloser{
 				src:     newUsageFilterReader(cr, clientUsage.includeUsage, buffers),
 				trailer: resp.Trailer,

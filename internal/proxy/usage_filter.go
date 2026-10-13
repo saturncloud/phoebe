@@ -46,17 +46,20 @@ func (r *usageFilterReader) Read(p []byte) (int, error) {
 	if r.pending.Len() == 0 && r.terminalErr != nil {
 		err := r.terminalErr
 		r.terminalErr = nil
+		r.buffers.close()
 		return 0, err
 	}
 	for r.pending.Len() == 0 {
 		fragment, err := r.reader.ReadSlice('\n')
 		if r.line.Len()+len(fragment) > r.maxLineBytes {
 			_ = r.src.Close()
+			r.buffers.close()
 			return 0, errSSEEventLineTooLarge
 		}
 		r.line.Write(fragment)
 		if berr := r.charge(); berr != nil {
 			_ = r.src.Close()
+			r.buffers.close()
 			return 0, berr
 		}
 		if errors.Is(err, bufio.ErrBufferFull) {
@@ -68,6 +71,7 @@ func (r *usageFilterReader) Read(p []byte) (int, error) {
 			// pending copy then stays charged until the client has read it.
 			if berr := r.charge(); berr != nil {
 				_ = r.src.Close()
+				r.buffers.close()
 				return 0, berr
 			}
 			r.line.Reset()
@@ -78,6 +82,7 @@ func (r *usageFilterReader) Read(p []byte) (int, error) {
 		}
 		if err != nil {
 			if r.pending.Len() == 0 {
+				r.buffers.close()
 				return 0, err
 			}
 			r.terminalErr = err
@@ -103,7 +108,15 @@ func (r *usageFilterReader) charge() error {
 	return r.buffers.set(bufferSlotFilter, int64(r.line.Len()+r.pending.Len()))
 }
 
-func (r *usageFilterReader) Close() error { return r.src.Close() }
+// Close closes the source and then the buffer account. The filter, not the
+// capture reader under it, closes the account: after upstream EOF it can still
+// hold the stream's last line, and those bytes stay charged until the client
+// has read them or the response ends.
+func (r *usageFilterReader) Close() error {
+	err := r.src.Close()
+	r.buffers.close()
+	return err
+}
 
 // trailerClearingReadCloser removes body validators both before and after the
 // upstream body is consumed. The HTTP transport populates response trailers at

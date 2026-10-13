@@ -99,6 +99,12 @@ type captureReader struct {
 	// sits in OpenAI-style bodies) and parses those at finish.
 	overflowed bool
 	head, tail []byte
+
+	// deferBufferClose leaves closing buffers to the reader that wraps this
+	// one (the usage filter), which can still hold the stream's last line
+	// after upstream EOF. The account must stay open, and keep charging,
+	// for as long as any reader holds bytes.
+	deferBufferClose bool
 }
 
 // overflowKeep is how much of a non-streamed body's head and tail capture
@@ -355,7 +361,9 @@ func (c *captureReader) finish() {
 		c.result.Aborted = true
 	}
 
-	c.buffers.close()
+	if !c.deferBufferClose {
+		c.buffers.close()
+	}
 
 	if c.onDone != nil {
 		c.onDone(c.result)

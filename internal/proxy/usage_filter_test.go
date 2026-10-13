@@ -311,3 +311,64 @@ func TestUnreadPendingLineCountsTowardReplicaTotal(t *testing.T) {
 	first.close()
 	second.close()
 }
+
+// filterOverCapture builds the production pairing: a streamed capture reader
+// that defers closing the buffer account, wrapped by the usage filter.
+func filterOverCapture(stream string, account *responseBufferAccount) io.ReadCloser {
+	cr := newCaptureReader(nil, io.NopCloser(strings.NewReader(stream)), true, nil)
+	cr.buffers = account
+	cr.deferBufferClose = true
+	return newUsageFilterReader(cr, false, account)
+}
+
+// The account stays open past upstream EOF while the filter still holds the
+// stream's last line: those bytes stay charged until the client drains them
+// and the filter is closed.
+func TestFinalLineAfterUpstreamEOFStaysChargedUntilFilterCloses(t *testing.T) {
+	line := "data: {\"choices\":[{\"delta\":{\"content\":\"" + strings.Repeat("f", 300<<10) + "\"}}]}"
+	p := config.ProtectionSettings{MaxResponseBufferBytesPerStream: 4 * int64(len(line)), MaxResponseBufferBytesTotal: 4 * int64(len(line))}
+	var budget responseBufferBudget
+	account := budget.newAccount(p, func(err error) { t.Errorf("unexpected buffer cancel: %v", err) })
+	filtered := filterOverCapture(line, account)
+
+	if n, err := filtered.Read(make([]byte, 16)); n != 16 || err != nil {
+		t.Fatalf("n=%d err=%v", n, err)
+	}
+	if held := budget.held.Load(); held < int64(len(line))-16 {
+		t.Fatalf("after upstream EOF the budget holds %d, want at least the %d unread pending bytes", held, len(line)-16)
+	}
+	rest, err := io.ReadAll(filtered)
+	if err != nil || len(rest) != len(line)-16 {
+		t.Fatalf("drained %d bytes err=%v, want %d", len(rest), err, len(line)-16)
+	}
+	if err := filtered.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if held := budget.held.Load(); held != 0 {
+		t.Fatalf("budget holds %d bytes after the filter closed, want 0", held)
+	}
+}
+
+// Because the account is still open after upstream EOF, a final line whose
+// filtered copy would push the request over its limit is refused there too.
+func TestFinalLineAfterUpstreamEOFIsHeldToTheBufferLimit(t *testing.T) {
+	line := "data: {\"choices\":[{\"delta\":{\"content\":\"" + strings.Repeat("g", 300<<10) + "\"}}]}"
+	limit := 5 * int64(len(line)) / 2 // capture + line fit; the pending copy does not
+	p := config.ProtectionSettings{MaxResponseBufferBytesPerStream: limit, MaxResponseBufferBytesTotal: limit}
+	var budget responseBufferBudget
+	var cause error
+	account := budget.newAccount(p, func(err error) { cause = err })
+	filtered := filterOverCapture(line, account)
+
+	got, err := io.ReadAll(filtered)
+	if !errors.Is(err, errResponseBufferLimit) || !errors.Is(cause, errResponseBufferLimit) {
+		t.Fatalf("err=%v cause=%v, want %v", err, cause, errResponseBufferLimit)
+	}
+	if len(got) != 0 {
+		t.Fatalf("returned %d bytes of the refused line", len(got))
+	}
+	_ = filtered.Close()
+	if held := budget.held.Load(); held != 0 {
+		t.Fatalf("budget holds %d bytes after close, want 0", held)
+	}
+}

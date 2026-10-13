@@ -329,7 +329,11 @@ func TestResponseBufferPerStreamLimitAbortsWithBufferLimitCause(t *testing.T) {
 		cut     bool
 	}{
 		{"a streamed line over the limit is cut with the buffer-limit cause", 64 << 10, true},
-		{"under the limit passes whole", 2 << 10, false},
+		// The filter charges a completed line and its filtered copy together
+		// (D21), so a line under the limit is one whose two copies fit. A
+		// 2 KiB payload only passed while the account closed at upstream EOF
+		// and stopped charging the filter's last line.
+		{"under the limit passes whole", 1 << 10, false},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			// Streamed, so the over-limit case is cut (a non-streamed body is
