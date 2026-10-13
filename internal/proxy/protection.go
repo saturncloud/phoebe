@@ -220,6 +220,26 @@ func (a *responseBufferAccount) reserve(slot int, n int64) error {
 	return nil
 }
 
+// force records that slot now holds n bytes with no per-stream or total
+// check. It charges bytes the caller has already committed to hold: the head
+// and tail an overflowed non-streamed capture keeps, which D22 says is never
+// cut. Charging them anyway keeps the replica total honest — it may go above
+// its cap, and while it is above, every other request's reserve and set are
+// refused, so the pressure those bytes put on the replica is seen. A nil or
+// closed account does nothing.
+func (a *responseBufferAccount) force(slot int, n int64) {
+	if a == nil {
+		return
+	}
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if a.closed {
+		return
+	}
+	a.budget.held.Add(n - a.slots[slot])
+	a.slots[slot] = n
+}
+
 // close returns every byte the request still holds to the budget. Idempotent.
 func (a *responseBufferAccount) close() {
 	if a == nil {

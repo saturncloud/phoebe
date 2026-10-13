@@ -178,7 +178,9 @@ func (c *captureReader) Read(p []byte) (int, error) {
 		if c.overflowed {
 			c.keepTail(p[:n])
 			c.appendLog(p[:n])
-			_ = c.buffers.reserve(bufferSlotCapture, int64(len(c.head)+len(c.tail)))
+			// D22 keeps the head and tail whatever the limits say, so they are
+			// charged even past them to keep the replica total honest.
+			c.buffers.force(bufferSlotCapture, int64(len(c.head)+len(c.tail)))
 			if err == io.EOF {
 				c.finish()
 			}
@@ -370,7 +372,9 @@ func (c *captureReader) overflow() {
 	c.scan.Reset()
 	c.scan = bytes.Buffer{} // release the large backing array
 	c.overflowed = true
-	_ = c.buffers.reserve(bufferSlotCapture, int64(len(c.head)+len(c.tail)))
+	// D22 keeps the head and tail whatever the limits say, so they are
+	// charged even past them to keep the replica total honest.
+	c.buffers.force(bufferSlotCapture, int64(len(c.head)+len(c.tail)))
 }
 
 // keepTail appends p to the rolling tail, keeping the last overflowKeep bytes.
