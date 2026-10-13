@@ -25,15 +25,14 @@ import (
 	"github.com/saturncloud/phoebe/internal/config"
 	"github.com/saturncloud/phoebe/internal/identity"
 	"github.com/saturncloud/phoebe/internal/logging"
+	"github.com/saturncloud/phoebe/internal/testutil"
 )
-
-func ptr64(v int64) *int64 { return &v }
 
 func proxyAdmissionConfig(active int64) config.AdmissionSettings {
 	return config.AdmissionSettings{Enabled: true, KeyPrefix: "proxy-test", LeaseTTL: time.Minute,
-		DefaultMaxOutputTokens: 20, Platform: config.AdmissionLimits{MaxActiveRequests: ptr64(active),
-			MaxConcurrentPrefills: ptr64(active), MaxReservedDecodeSlots: ptr64(active), MaxPrefillTokens: ptr64(1024), MaxReservedOutputTokens: ptr64(100),
-			RequestsPerWindow: ptr64(100), GeneratedTokensPerWindow: ptr64(1000), Window: time.Minute}}
+		DefaultMaxOutputTokens: 20, Platform: config.AdmissionLimits{MaxActiveRequests: testutil.Ptr[int64](active),
+			MaxConcurrentPrefills: testutil.Ptr[int64](active), MaxReservedDecodeSlots: testutil.Ptr[int64](active), MaxPrefillTokens: testutil.Ptr[int64](1024), MaxReservedOutputTokens: testutil.Ptr[int64](100),
+			RequestsPerWindow: testutil.Ptr[int64](100), GeneratedTokensPerWindow: testutil.Ptr[int64](1000), Window: time.Minute}}
 }
 
 // fixedWindowBucket mirrors the admission store's fixed 1-minute window bucket
@@ -215,7 +214,7 @@ func TestSharedPrefillTokensAtExactLimitAdmits(t *testing.T) {
 	serve := func(limit int64) *httptest.ResponseRecorder {
 		mr := miniredis.RunT(t)
 		cfg := proxyAdmissionConfig(2)
-		cfg.Platform.MaxPrefillTokens = ptr64(limit)
+		cfg.Platform.MaxPrefillTokens = testutil.Ptr[int64](limit)
 		client := redis.NewClient(&redis.Options{Addr: mr.Addr()})
 		t.Cleanup(func() { _ = client.Close() })
 		s := New(&config.Settings{Admission: cfg}, logging.New(logging.ERROR), &recordingEmitter{}).
@@ -382,7 +381,7 @@ func TestWakeColdHoldRejectionFailsClosedAndReleasesLease(t *testing.T) {
 	up, _ := url.Parse(be.URL)
 	mr := miniredis.RunT(t)
 	cfg := proxyAdmissionConfig(2)
-	cfg.Platform.MaxColdHolds = ptr64(1)
+	cfg.Platform.MaxColdHolds = testutil.Ptr[int64](1)
 	c := redis.NewClient(&redis.Options{Addr: mr.Addr()})
 	t.Cleanup(func() { _ = c.Close() })
 	a := admission.New(c, cfg)
@@ -443,7 +442,7 @@ func TestUnavailableModeActuatorSkipsColdHoldAdmission(t *testing.T) {
 	up, _ := url.Parse(be.URL)
 	mr := miniredis.RunT(t)
 	cfg := proxyAdmissionConfig(2)
-	cfg.Platform.MaxColdHolds = ptr64(1)
+	cfg.Platform.MaxColdHolds = testutil.Ptr[int64](1)
 	c := redis.NewClient(&redis.Options{Addr: mr.Addr()})
 	t.Cleanup(func() { _ = c.Close() })
 	a := admission.New(c, cfg)
@@ -509,7 +508,7 @@ func TestPrefillReservationReleasesAtFirstBodyByte(t *testing.T) {
 	up, _ := url.Parse(backend.URL)
 	mr := miniredis.RunT(t)
 	cfg := proxyAdmissionConfig(2)
-	cfg.Platform.MaxConcurrentPrefills = ptr64(1) // prefill is the only binding dimension
+	cfg.Platform.MaxConcurrentPrefills = testutil.Ptr[int64](1) // prefill is the only binding dimension
 	c := redis.NewClient(&redis.Options{Addr: mr.Addr()})
 	t.Cleanup(func() { _ = c.Close() })
 	s := New(&config.Settings{Admission: cfg}, logging.New(logging.ERROR), &recordingEmitter{}).WithAdmitter(admission.New(c, cfg))
@@ -659,7 +658,7 @@ func TestPrefillReleaseOffFirstBytePath(t *testing.T) {
 		up, _ := url.Parse(backend.URL)
 		mr := miniredis.RunT(t)
 		cfg := proxyAdmissionConfig(2)
-		cfg.Platform.MaxConcurrentPrefills = ptr64(1) // prefill is the only binding dimension
+		cfg.Platform.MaxConcurrentPrefills = testutil.Ptr[int64](1) // prefill is the only binding dimension
 		c := redis.NewClient(&redis.Options{Addr: mr.Addr()})
 		t.Cleanup(func() { _ = c.Close() })
 		hook := &prefillTransitionHook{entered: make(chan struct{}), release: make(chan struct{})}
@@ -753,7 +752,7 @@ func TestPrefillReleaseOffFirstBytePath(t *testing.T) {
 		up, _ := url.Parse(backend.URL)
 		mr := miniredis.RunT(t)
 		cfg := proxyAdmissionConfig(2)
-		cfg.Platform.MaxConcurrentPrefills = ptr64(1)
+		cfg.Platform.MaxConcurrentPrefills = testutil.Ptr[int64](1)
 		c := redis.NewClient(&redis.Options{Addr: mr.Addr()})
 		t.Cleanup(func() { _ = c.Close() })
 		hook := &prefillTransitionHook{entered: make(chan struct{}), fail: errors.New("valkey unavailable")}
@@ -809,7 +808,7 @@ func TestWakeExhaustedReturnsColdAndReleasesCapacity(t *testing.T) {
 	up, _ := url.Parse(be.URL)
 	mr := miniredis.RunT(t)
 	cfg := proxyAdmissionConfig(1)
-	cfg.Platform.MaxColdHolds = ptr64(1)
+	cfg.Platform.MaxColdHolds = testutil.Ptr[int64](1)
 	c := redis.NewClient(&redis.Options{Addr: mr.Addr()})
 	t.Cleanup(func() { _ = c.Close() })
 	a := admission.New(c, cfg)
@@ -858,7 +857,7 @@ func TestWakeColdHoldStoreOutageFailsClosed(t *testing.T) {
 	defer backend.Close()
 	up, _ := url.Parse(backend.URL)
 	cfg := proxyAdmissionConfig(1)
-	cfg.Platform.MaxColdHolds = ptr64(1)
+	cfg.Platform.MaxColdHolds = testutil.Ptr[int64](1)
 	c := redis.NewClient(&redis.Options{Addr: mr.Addr()})
 	t.Cleanup(func() { _ = c.Close() })
 	a := admission.New(c, cfg)
@@ -884,7 +883,7 @@ func TestAdmissionImpossibleOutputRejectedBeforeUpstream(t *testing.T) {
 	up, _ := url.Parse(backend.URL)
 	mr := miniredis.RunT(t)
 	cfg := proxyAdmissionConfig(2)
-	cfg.Platform.MaxReservedOutputTokens = ptr64(10)
+	cfg.Platform.MaxReservedOutputTokens = testutil.Ptr[int64](10)
 	c := redis.NewClient(&redis.Options{Addr: mr.Addr()})
 	s := New(&config.Settings{Admission: cfg}, logging.New(logging.ERROR), &recordingEmitter{}).WithAdmitter(admission.New(c, cfg))
 	rr := httptest.NewRecorder()
@@ -1144,8 +1143,8 @@ func TestTrustedRateLimitPolicyParsing(t *testing.T) {
 		OrgRateLimitRequests: "5", OwnerRateLimitGeneratedTokens: "7",
 	})
 	if err != nil ||
-		!rateLimitsEqual(organization, admission.RateLimits{Requests: ptr64(5)}) ||
-		!rateLimitsEqual(owner, admission.RateLimits{GeneratedTokens: ptr64(7)}) {
+		!rateLimitsEqual(organization, admission.RateLimits{Requests: testutil.Ptr[int64](5)}) ||
+		!rateLimitsEqual(owner, admission.RateLimits{GeneratedTokens: testutil.Ptr[int64](7)}) {
 		t.Fatalf("per-field parse = org=%+v owner=%+v, %v; absent fields must be nil (unlimited)", organization, owner, err)
 	}
 
@@ -1159,8 +1158,8 @@ func TestTrustedRateLimitPolicyParsing(t *testing.T) {
 		OwnerRateLimitRequests: "0", OwnerRateLimitTotalPromptTokens: "0",
 		OwnerRateLimitUncachedPromptTokens: "0", OwnerRateLimitGeneratedTokens: "0",
 	})
-	zeroCap := admission.RateLimits{Requests: ptr64(0), TotalPromptTokens: ptr64(0),
-		UncachedPromptTokens: ptr64(0), GeneratedTokens: ptr64(0)}
+	zeroCap := admission.RateLimits{Requests: testutil.Ptr[int64](0), TotalPromptTokens: testutil.Ptr[int64](0),
+		UncachedPromptTokens: testutil.Ptr[int64](0), GeneratedTokens: testutil.Ptr[int64](0)}
 	if err != nil || !rateLimitsEqual(organization, zeroCap) || !rateLimitsEqual(owner, zeroCap) {
 		t.Fatalf("all-zeros envelope must parse as zero-quota: org=%+v owner=%+v, %v", organization, owner, err)
 	}
@@ -1680,14 +1679,14 @@ func TestAdmissionReleasesAbortedStream(t *testing.T) {
 			name: "organization contract",
 			req: admission.Request{Graph: "graph", Organization: "org-a", Owner: "other-owner", Model: "m",
 				PrefillTokens: 1, EstimatedInputTokens: 1, ReservedOutputTokens: 1,
-				OrganizationLimits: admission.RateLimits{GeneratedTokens: ptr64(20)}},
+				OrganizationLimits: admission.RateLimits{GeneratedTokens: testutil.Ptr[int64](20)}},
 			want: "contract_organization",
 		},
 		{
 			name: "owner contract",
 			req: admission.Request{Graph: "graph", Organization: "other-org", Owner: "owner-a", Model: "m",
 				PrefillTokens: 1, EstimatedInputTokens: 1, ReservedOutputTokens: 1,
-				OwnerLimits: admission.RateLimits{GeneratedTokens: ptr64(20)}},
+				OwnerLimits: admission.RateLimits{GeneratedTokens: testutil.Ptr[int64](20)}},
 			want: "contract_owner",
 		},
 	}
@@ -1780,14 +1779,14 @@ func TestAdmissionChargesUnknownUsageOnPreHeaderAbort(t *testing.T) {
 			name: "organization contract",
 			req: admission.Request{Graph: "graph", Organization: "org-a", Owner: "other-owner", Model: "m",
 				PrefillTokens: 1, EstimatedInputTokens: 1, ReservedOutputTokens: 1,
-				OrganizationLimits: admission.RateLimits{GeneratedTokens: ptr64(20)}},
+				OrganizationLimits: admission.RateLimits{GeneratedTokens: testutil.Ptr[int64](20)}},
 			want: "contract_organization",
 		},
 		{
 			name: "owner contract",
 			req: admission.Request{Graph: "graph", Organization: "other-org", Owner: "owner-a", Model: "m",
 				PrefillTokens: 1, EstimatedInputTokens: 1, ReservedOutputTokens: 1,
-				OwnerLimits: admission.RateLimits{GeneratedTokens: ptr64(20)}},
+				OwnerLimits: admission.RateLimits{GeneratedTokens: testutil.Ptr[int64](20)}},
 			want: "contract_owner",
 		},
 	}
@@ -1877,14 +1876,14 @@ func TestAdmissionChargesUnknownUsageOnUpstreamReset(t *testing.T) {
 			name: "organization contract",
 			req: admission.Request{Graph: "graph", Organization: "org-a", Owner: "other-owner", Model: "m",
 				PrefillTokens: 1, EstimatedInputTokens: 1, ReservedOutputTokens: 1,
-				OrganizationLimits: admission.RateLimits{GeneratedTokens: ptr64(20)}},
+				OrganizationLimits: admission.RateLimits{GeneratedTokens: testutil.Ptr[int64](20)}},
 			want: "contract_organization",
 		},
 		{
 			name: "owner contract",
 			req: admission.Request{Graph: "graph", Organization: "other-org", Owner: "owner-a", Model: "m",
 				PrefillTokens: 1, EstimatedInputTokens: 1, ReservedOutputTokens: 1,
-				OwnerLimits: admission.RateLimits{GeneratedTokens: ptr64(20)}},
+				OwnerLimits: admission.RateLimits{GeneratedTokens: testutil.Ptr[int64](20)}},
 			want: "contract_owner",
 		},
 	}
@@ -2032,14 +2031,14 @@ func TestAdmissionDialFailureChargesOnlyRequestsWindow(t *testing.T) {
 			name: "organization requests window",
 			req: admission.Request{Graph: "graph", Organization: "org-a", Owner: "other-owner", Model: "m",
 				PrefillTokens: 1, EstimatedInputTokens: 1, ReservedOutputTokens: 1,
-				OrganizationLimits: admission.RateLimits{Requests: ptr64(1)}},
+				OrganizationLimits: admission.RateLimits{Requests: testutil.Ptr[int64](1)}},
 			want: "contract_organization",
 		},
 		{
 			name: "owner requests window",
 			req: admission.Request{Graph: "graph", Organization: "other-org", Owner: "owner-a", Model: "m",
 				PrefillTokens: 1, EstimatedInputTokens: 1, ReservedOutputTokens: 1,
-				OwnerLimits: admission.RateLimits{Requests: ptr64(1)}},
+				OwnerLimits: admission.RateLimits{Requests: testutil.Ptr[int64](1)}},
 			want: "contract_owner",
 		},
 	}
@@ -2105,7 +2104,7 @@ func TestAdmissionDialFailureChargesOnlyRequestsWindow(t *testing.T) {
 	// rejected this probe.
 	lease, err := a.Admit(context.Background(), admission.Request{Graph: "graph", Organization: "org-a", Owner: "other-owner", Model: "m",
 		PrefillTokens: 1, EstimatedInputTokens: 7, ReservedOutputTokens: 20,
-		OrganizationLimits: admission.RateLimits{GeneratedTokens: ptr64(20), TotalPromptTokens: ptr64(7), UncachedPromptTokens: ptr64(7)}})
+		OrganizationLimits: admission.RateLimits{GeneratedTokens: testutil.Ptr[int64](20), TotalPromptTokens: testutil.Ptr[int64](7), UncachedPromptTokens: testutil.Ptr[int64](7)}})
 	if err != nil {
 		t.Fatalf("dial failure left a phantom prompt/generated charge: %v", err)
 	}
@@ -2631,7 +2630,7 @@ func TestWakeColdHoldStoreOutageLogsSampled(t *testing.T) {
 	defer be.Close()
 	up, _ := url.Parse(be.URL)
 	cfg := proxyAdmissionConfig(1)
-	cfg.Platform.MaxColdHolds = ptr64(1)
+	cfg.Platform.MaxColdHolds = testutil.Ptr[int64](1)
 	// MaxRetries=-1: against a dead store every op otherwise pays go-redis's
 	// retry backoff (~85ms), which would stretch this 250-request test to
 	// minutes. The sampling behavior under test is unaffected.
@@ -3005,7 +3004,7 @@ func TestKVLargerThanCapacityIs413NoRetryAfter(t *testing.T) {
 	serve := func(kvCap int64) *httptest.ResponseRecorder {
 		mr := miniredis.RunT(t)
 		cfg := proxyAdmissionConfig(2)
-		cfg.Platform.MaxReservedKVTokens = ptr64(kvCap)
+		cfg.Platform.MaxReservedKVTokens = testutil.Ptr[int64](kvCap)
 		client := redis.NewClient(&redis.Options{Addr: mr.Addr()})
 		t.Cleanup(func() { _ = client.Close() })
 		s := New(&config.Settings{Admission: cfg}, logging.New(logging.ERROR), &recordingEmitter{}).
@@ -3128,7 +3127,7 @@ func TestOversizeRequestIs413WithoutRetryAfterWhenEarlierScopeFull(t *testing.T)
 	client := redis.NewClient(&redis.Options{Addr: mr.Addr()})
 	t.Cleanup(func() { _ = client.Close() })
 	cfg := config.AdmissionSettings{Enabled: true, KeyPrefix: "proxy-oversize", LeaseTTL: time.Minute,
-		Platform: config.AdmissionLimits{MaxActiveRequests: ptr64(1)}}
+		Platform: config.AdmissionLimits{MaxActiveRequests: testutil.Ptr[int64](1)}}
 	a := admission.New(client, cfg)
 	holder, err := a.Admit(ctx, admission.Request{Graph: "g", Organization: "o", Owner: "u", Model: "m",
 		PrefillTokens: 1, EstimatedInputTokens: 1, ReservedOutputTokens: 1})
@@ -3138,7 +3137,7 @@ func TestOversizeRequestIs413WithoutRetryAfterWhenEarlierScopeFull(t *testing.T)
 	defer func() { _ = holder.Complete(ctx, 0) }()
 	_, err = a.Admit(ctx, admission.Request{Graph: "g", Organization: "o", Owner: "u", Model: "m",
 		PrefillTokens: 100, EstimatedInputTokens: 100, ReservedOutputTokens: 1,
-		GraphCapacity: config.AdmissionLimits{MaxPrefillTokens: ptr64(64)}})
+		GraphCapacity: config.AdmissionLimits{MaxPrefillTokens: testutil.Ptr[int64](64)}})
 	var rejected *admission.Rejected
 	if !errors.As(err, &rejected) || rejected.Scope != "graph_capacity" || rejected.Dimension != "prefill_tokens_exceeds_limit" {
 		t.Fatalf("err=%v, want prefill_tokens_exceeds_limit at graph_capacity", err)
@@ -3161,7 +3160,7 @@ func TestZeroPlatformKVCapIsRetryable503Not413(t *testing.T) {
 	up, _ := url.Parse(backend.URL)
 	mr := miniredis.RunT(t)
 	cfg := proxyAdmissionConfig(2)
-	cfg.Platform.MaxReservedKVTokens = ptr64(0)
+	cfg.Platform.MaxReservedKVTokens = testutil.Ptr[int64](0)
 	c := redis.NewClient(&redis.Options{Addr: mr.Addr()})
 	t.Cleanup(func() { _ = c.Close() })
 	s := New(&config.Settings{Admission: cfg}, logging.New(logging.ERROR), &recordingEmitter{}).WithAdmitter(admission.New(c, cfg))

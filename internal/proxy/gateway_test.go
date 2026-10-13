@@ -20,6 +20,7 @@ import (
 	"github.com/saturncloud/phoebe/internal/gateway"
 	"github.com/saturncloud/phoebe/internal/identity"
 	"github.com/saturncloud/phoebe/internal/logging"
+	"github.com/saturncloud/phoebe/internal/testutil"
 )
 
 // mapResolver is a fake gateway.Resolver keyed on (org, model). A missing key
@@ -750,7 +751,7 @@ func TestGateway_WakeEligible(t *testing.T) {
 	em := &recordingEmitter{}
 	mr := miniredis.RunT(t)
 	cfg := proxyAdmissionConfig(1)
-	cfg.Platform.MaxColdHolds = ptr64(1)
+	cfg.Platform.MaxColdHolds = testutil.Ptr[int64](1)
 	client := redis.NewClient(&redis.Options{Addr: mr.Addr()})
 	t.Cleanup(func() { _ = client.Close() })
 	a := admission.New(client, cfg)

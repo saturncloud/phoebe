@@ -20,6 +20,7 @@ import (
 	"github.com/saturncloud/phoebe/internal/gateway"
 	"github.com/saturncloud/phoebe/internal/identity"
 	"github.com/saturncloud/phoebe/internal/logging"
+	"github.com/saturncloud/phoebe/internal/testutil"
 )
 
 type staticGraphCapacity map[string]gateway.GraphCapacity
@@ -81,7 +82,7 @@ func newCapacityFixture(t *testing.T) *capacityFixture {
 		t.Fatal("store must resolve")
 	}
 	s := New(settings, logging.New(logging.ERROR), &recordingEmitter{}).WithAdmitter(admission.New(client, eff))
-	s.graphCapacity = staticGraphCapacity{graph: {MaxActiveRequests: ptr64(1)}}
+	s.graphCapacity = staticGraphCapacity{graph: {MaxActiveRequests: testutil.Ptr[int64](1)}}
 	return &capacityFixture{s: s, up: up, graph: graph, hit: hit, releaseAll: releaseAll}
 }
 
@@ -269,7 +270,7 @@ func TestPublishedGraphCapacityOversizeIs413(t *testing.T) {
 	}
 
 	// bareSharedRequest declares max_tokens=20, so it needs at least 21 KV tokens.
-	rr := serve(gateway.GraphCapacity{MaxReservedKVTokens: ptr64(10)})
+	rr := serve(gateway.GraphCapacity{MaxReservedKVTokens: testutil.Ptr[int64](10)})
 	if rr.Code != http.StatusRequestEntityTooLarge || rr.Header().Get("Retry-After") != "" {
 		t.Fatalf("status=%d retry-after=%q, want 413 without Retry-After", rr.Code, rr.Header().Get("Retry-After"))
 	}
@@ -280,7 +281,7 @@ func TestPublishedGraphCapacityOversizeIs413(t *testing.T) {
 		t.Fatalf("upstream hits=%d, an oversize request must not reach the engine", n)
 	}
 
-	rr = serve(gateway.GraphCapacity{MaxReservedKVTokens: ptr64(0), MaxPrefillTokens: ptr64(0)})
+	rr = serve(gateway.GraphCapacity{MaxReservedKVTokens: testutil.Ptr[int64](0), MaxPrefillTokens: testutil.Ptr[int64](0)})
 	if rr.Code != http.StatusServiceUnavailable || rr.Header().Get("Retry-After") == "" {
 		t.Fatalf("published zero caps: status=%d retry-after=%q, want a retryable 503", rr.Code, rr.Header().Get("Retry-After"))
 	}
@@ -290,7 +291,7 @@ func TestPublishedGraphCapacityOversizeIs413(t *testing.T) {
 
 	// A zero reserved-KV cap on its own (no zero prefill cap to answer
 	// first) is also the retryable 503, never the 413 kv_exceeds_limit.
-	rr = serve(gateway.GraphCapacity{MaxReservedKVTokens: ptr64(0)})
+	rr = serve(gateway.GraphCapacity{MaxReservedKVTokens: testutil.Ptr[int64](0)})
 	if rr.Code != http.StatusServiceUnavailable || rr.Header().Get("Retry-After") == "" {
 		t.Fatalf("published zero KV cap alone: status=%d retry-after=%q, want a retryable 503", rr.Code, rr.Header().Get("Retry-After"))
 	}
@@ -353,7 +354,7 @@ func TestPublishedGraphCapacityFailsOpenWhenStoreUnavailable(t *testing.T) {
 			client := admission.NewValkeyClient(storeAddr(t))
 			t.Cleanup(func() { _ = client.Close() })
 			s := New(settings, logging.New(logging.ERROR), &recordingEmitter{}).WithAdmitter(admission.New(client, settings.Admission))
-			s.graphCapacity = staticGraphCapacity{graphFromUpstreamHost(up.Host): {MaxActiveRequests: ptr64(1)}}
+			s.graphCapacity = staticGraphCapacity{graphFromUpstreamHost(up.Host): {MaxActiveRequests: testutil.Ptr[int64](1)}}
 
 			// Two concurrent requests against a published capacity of one:
 			// both reach the engine, so the capacity is not enforced.

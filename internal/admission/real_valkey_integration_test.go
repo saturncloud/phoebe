@@ -14,6 +14,7 @@ import (
 	"github.com/redis/go-redis/v9"
 
 	"github.com/saturncloud/phoebe/internal/config"
+	"github.com/saturncloud/phoebe/internal/testutil"
 )
 
 // requireValkeyAddr returns the real-Valkey address and fails the test when it
@@ -104,9 +105,9 @@ func TestRealValkeyLeaseLifecycleTransitions(t *testing.T) {
 	}
 
 	l := limits(2)
-	l.MaxConcurrentPrefills = ptr64(1)
-	l.MaxColdHolds = ptr64(1)
-	l.WakesPerWindow = ptr64(10)
+	l.MaxConcurrentPrefills = testutil.Ptr[int64](1)
+	l.MaxColdHolds = testutil.Ptr[int64](1)
+	l.WakesPerWindow = testutil.Ptr[int64](10)
 	cfg := config.AdmissionSettings{
 		KeyPrefix: fmt.Sprintf("phoebe-admission-lifecycle-%d", time.Now().UnixNano()),
 		LeaseTTL:  300 * time.Millisecond,
@@ -274,10 +275,10 @@ func TestRealValkeySettlesIndependentContractsExactly(t *testing.T) {
 		r.EstimatedInputTokens = input
 		r.ReservedOutputTokens = output
 		r.OrganizationLimits = RateLimits{
-			TotalPromptTokens: ptr64(12), UncachedPromptTokens: ptr64(8), GeneratedTokens: ptr64(7),
+			TotalPromptTokens: testutil.Ptr[int64](12), UncachedPromptTokens: testutil.Ptr[int64](8), GeneratedTokens: testutil.Ptr[int64](7),
 		}
 		r.OwnerLimits = RateLimits{
-			TotalPromptTokens: ptr64(9), UncachedPromptTokens: ptr64(5), GeneratedTokens: ptr64(6),
+			TotalPromptTokens: testutil.Ptr[int64](9), UncachedPromptTokens: testutil.Ptr[int64](5), GeneratedTokens: testutil.Ptr[int64](6),
 		}
 		return r
 	}
@@ -359,13 +360,13 @@ func TestRealValkeyContractOnlyBurst(t *testing.T) {
 	}{
 		{scope: "contract_organization", mk: func() Request {
 			r := request("org-contract", "model")
-			r.OrganizationLimits = RateLimits{Requests: ptr64(30)}
+			r.OrganizationLimits = RateLimits{Requests: testutil.Ptr[int64](30)}
 			return r
 		}},
 		{scope: "contract_owner", mk: func() Request {
 			r := request("org-owner", "model")
 			r.Owner = "owner-1"
-			r.OwnerLimits = RateLimits{Requests: ptr64(30)}
+			r.OwnerLimits = RateLimits{Requests: testutil.Ptr[int64](30)}
 			return r
 		}},
 	} {

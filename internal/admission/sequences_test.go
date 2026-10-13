@@ -6,6 +6,7 @@ import (
 	"testing"
 
 	"github.com/saturncloud/phoebe/internal/config"
+	"github.com/saturncloud/phoebe/internal/testutil"
 )
 
 // n / best_of make the engine generate up to max_tokens for each sequence, so
@@ -16,7 +17,7 @@ func TestContractGeneratedPreCheckChargesEveryOutputSequence(t *testing.T) {
 	a, _ := testAdmitter(t, config.AdmissionSettings{Platform: limits(10)})
 	req := request("a", "m")
 	req.ReservedOutputTokens, req.OutputSequences = 100, 2
-	req.OwnerLimits = RateLimits{GeneratedTokens: ptr64(100)}
+	req.OwnerLimits = RateLimits{GeneratedTokens: testutil.Ptr[int64](100)}
 	_, err := a.Admit(ctx, req)
 	var rejected *Rejected
 	if !errors.As(err, &rejected) || rejected.Scope != "contract_owner" ||
@@ -38,7 +39,7 @@ func TestReleaseReturnsOutputSequenceReservationsToZero(t *testing.T) {
 	a, mr := testAdmitter(t, config.AdmissionSettings{Platform: limits(10)})
 	req := request("a", "m") // 20 output
 	req.OutputSequences = 3
-	req.OwnerLimits = RateLimits{GeneratedTokens: ptr64(1000)}
+	req.OwnerLimits = RateLimits{GeneratedTokens: testutil.Ptr[int64](1000)}
 	for _, finish := range []string{"complete", "abandon via unknown usage"} {
 		lease, err := a.Admit(ctx, req)
 		if err != nil {
@@ -75,7 +76,7 @@ func TestReleaseReturnsOutputSequenceReservationsToZero(t *testing.T) {
 func TestReservedOutputCapChargesEveryOutputSequence(t *testing.T) {
 	ctx := context.Background()
 	l := limits(10)
-	l.MaxReservedOutputTokens = ptr64(50)
+	l.MaxReservedOutputTokens = testutil.Ptr[int64](50)
 	a, _ := testAdmitter(t, config.AdmissionSettings{Platform: l})
 	held := request("held", "m") // 20 output x 1
 	holder, err := a.Admit(ctx, held)
@@ -104,7 +105,7 @@ func TestReservedOutputCapChargesEveryOutputSequence(t *testing.T) {
 func TestRequestOutputAboveReservedOutputCapIsUnsatisfiable(t *testing.T) {
 	ctx := context.Background()
 	l := limits(10)
-	l.MaxReservedOutputTokens = ptr64(64)
+	l.MaxReservedOutputTokens = testutil.Ptr[int64](64)
 	a, _ := testAdmitter(t, config.AdmissionSettings{Platform: l})
 	req := request("a", "m")
 	req.ReservedOutputTokens, req.OutputSequences = 1, 128
@@ -127,7 +128,7 @@ func TestRequestOutputAboveReservedOutputCapIsUnsatisfiable(t *testing.T) {
 func TestUnknownUsageChargesEveryOutputSequence(t *testing.T) {
 	ctx := context.Background()
 	a, _ := testAdmitter(t, config.AdmissionSettings{Platform: limits(10)})
-	contract := RateLimits{GeneratedTokens: ptr64(100)}
+	contract := RateLimits{GeneratedTokens: testutil.Ptr[int64](100)}
 	req := request("a", "m") // 20 output
 	req.OutputSequences = 3
 	req.OwnerLimits = contract

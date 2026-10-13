@@ -11,6 +11,7 @@ import (
 	"github.com/redis/go-redis/v9"
 
 	"github.com/saturncloud/phoebe/internal/config"
+	"github.com/saturncloud/phoebe/internal/testutil"
 )
 
 // B7: reserved KV tokens are the estimated input plus the reserved output,
@@ -18,7 +19,7 @@ import (
 // response byte, unlike prefill tokens).
 func TestReservedKVTokensHeldUntilFinish(t *testing.T) {
 	// request(): 10 estimated input + 20 reserved output = 30 KV tokens.
-	a, _ := testAdmitter(t, config.AdmissionSettings{Platform: config.AdmissionLimits{MaxReservedKVTokens: ptr64(59)}})
+	a, _ := testAdmitter(t, config.AdmissionSettings{Platform: config.AdmissionLimits{MaxReservedKVTokens: testutil.Ptr[int64](59)}})
 	ctx := context.Background()
 	first, err := a.Admit(ctx, request("a", "m"))
 	if err != nil {
@@ -47,7 +48,7 @@ func TestReservedKVTokensHeldUntilFinish(t *testing.T) {
 
 // B6: prefill tokens are released at the first response byte.
 func TestPrefillTokensReleasedAtFirstByte(t *testing.T) {
-	a, _ := testAdmitter(t, config.AdmissionSettings{Platform: config.AdmissionLimits{MaxPrefillTokens: ptr64(15)}})
+	a, _ := testAdmitter(t, config.AdmissionSettings{Platform: config.AdmissionLimits{MaxPrefillTokens: testutil.Ptr[int64](15)}})
 	ctx := context.Background()
 	first, err := a.Admit(ctx, request("a", "m"))
 	if err != nil {
@@ -73,7 +74,7 @@ func TestPrefillTokensReleasedAtFirstByte(t *testing.T) {
 // reaper must drain it (every counter it holds, legacy prompt bytes included)
 // so it cannot strand capacity forever.
 func TestExpiredLegacyKeyLeaseIsReapedByNewReplica(t *testing.T) {
-	a, mr := testAdmitter(t, config.AdmissionSettings{Platform: config.AdmissionLimits{MaxActiveRequests: ptr64(1)}})
+	a, mr := testAdmitter(t, config.AdmissionSettings{Platform: config.AdmissionLimits{MaxActiveRequests: testutil.Ptr[int64](1)}})
 	ctx := context.Background()
 	req := request("a", "m")
 	req.Adapter = false
@@ -165,9 +166,9 @@ func TestRequestLargerThanCapacityIsUnsatisfiable(t *testing.T) {
 		dimension     string
 		unsatisfiable bool
 	}{
-		{"prefill tokens", config.AdmissionLimits{MaxPrefillTokens: ptr64(9)}, "prefill_tokens_exceeds_limit", true},
-		{"kv tokens", config.AdmissionLimits{MaxReservedKVTokens: ptr64(29)}, "kv_exceeds_limit", true},
-		{"zero prefill cap stays retryable", config.AdmissionLimits{MaxPrefillTokens: ptr64(0)}, "prefill_tokens", false},
+		{"prefill tokens", config.AdmissionLimits{MaxPrefillTokens: testutil.Ptr[int64](9)}, "prefill_tokens_exceeds_limit", true},
+		{"kv tokens", config.AdmissionLimits{MaxReservedKVTokens: testutil.Ptr[int64](29)}, "kv_exceeds_limit", true},
+		{"zero prefill cap stays retryable", config.AdmissionLimits{MaxPrefillTokens: testutil.Ptr[int64](0)}, "prefill_tokens", false},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			a, _ := testAdmitter(t, config.AdmissionSettings{Graph: tc.limits})
@@ -195,7 +196,7 @@ func TestTightestReservedCapsReadsKVFromAdmitScopes(t *testing.T) {
 	if got := TightestReservedCaps(cfg, r).KV; got != 3000 {
 		t.Fatalf("cap=%d, want the weighted lane share 3000", got)
 	}
-	r.GraphCapacity = config.AdmissionLimits{MaxReservedKVTokens: ptr64(2500)}
+	r.GraphCapacity = config.AdmissionLimits{MaxReservedKVTokens: testutil.Ptr[int64](2500)}
 	if got := TightestReservedCaps(cfg, r).KV; got != 2500 {
 		t.Fatalf("cap=%d, want the published graph capacity 2500", got)
 	}
@@ -221,7 +222,7 @@ func TestTightestReservedCapsReadsOutputFromAdmitScopes(t *testing.T) {
 	if got := TightestReservedCaps(cfg, r); got.Output != 3000 || got.KV != 0 {
 		t.Fatalf("caps=%+v, want output = the weighted lane share 3000 and no KV cap", got)
 	}
-	r.GraphCapacity = config.AdmissionLimits{MaxReservedOutputTokens: ptr64(2048)}
+	r.GraphCapacity = config.AdmissionLimits{MaxReservedOutputTokens: testutil.Ptr[int64](2048)}
 	if got := TightestReservedCaps(cfg, r).Output; got != 2048 {
 		t.Fatalf("output cap=%d, want the published graph capacity 2048", got)
 	}
@@ -246,20 +247,22 @@ func TestOversizeRequestIsUnsatisfiableEvenWhenEarlierScopeFull(t *testing.T) {
 		contractual bool
 	}{
 		{"published graph capacity prefill", config.AdmissionSettings{},
-			func(r *Request) { r.GraphCapacity = config.AdmissionLimits{MaxPrefillTokens: ptr64(9)} },
+			func(r *Request) { r.GraphCapacity = config.AdmissionLimits{MaxPrefillTokens: testutil.Ptr[int64](9)} },
 			"graph_capacity", "prefill_tokens_exceeds_limit", false},
 		{"published graph capacity kv", config.AdmissionSettings{},
-			func(r *Request) { r.GraphCapacity = config.AdmissionLimits{MaxReservedKVTokens: ptr64(29)} },
+			func(r *Request) {
+				r.GraphCapacity = config.AdmissionLimits{MaxReservedKVTokens: testutil.Ptr[int64](29)}
+			},
 			"graph_capacity", "kv_exceeds_limit", false},
-		{"organization prefill", config.AdmissionSettings{Organization: config.AdmissionLimits{MaxPrefillTokens: ptr64(9)}},
+		{"organization prefill", config.AdmissionSettings{Organization: config.AdmissionLimits{MaxPrefillTokens: testutil.Ptr[int64](9)}},
 			func(*Request) {}, "organization", "prefill_tokens_exceeds_limit", false},
 		{"contract generated tokens", config.AdmissionSettings{},
-			func(r *Request) { r.OwnerLimits = RateLimits{GeneratedTokens: ptr64(19)} },
+			func(r *Request) { r.OwnerLimits = RateLimits{GeneratedTokens: testutil.Ptr[int64](19)} },
 			"contract_owner", "generated_tokens_exceeds_limit", true},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			cfg := tc.cfg
-			cfg.Platform = config.AdmissionLimits{MaxActiveRequests: ptr64(1)}
+			cfg.Platform = config.AdmissionLimits{MaxActiveRequests: testutil.Ptr[int64](1)}
 			a, _ := testAdmitter(t, cfg)
 			// Fill the platform's only active slot with a request small
 			// enough to pass every cap under test.
@@ -285,7 +288,7 @@ func TestOversizeRequestIsUnsatisfiableEvenWhenEarlierScopeFull(t *testing.T) {
 // n / best_of: the prompt's KV is shared, each output sequence needs its own.
 func TestReservedKVChargesEveryOutputSequence(t *testing.T) {
 	ctx := context.Background()
-	a, mr := testAdmitter(t, config.AdmissionSettings{Platform: config.AdmissionLimits{MaxReservedKVTokens: ptr64(1000)}})
+	a, mr := testAdmitter(t, config.AdmissionSettings{Platform: config.AdmissionLimits{MaxReservedKVTokens: testutil.Ptr[int64](1000)}})
 	req := request("a", "m") // 10 input + 20 output
 	req.OutputSequences = 4
 	lease, err := a.Admit(ctx, req)

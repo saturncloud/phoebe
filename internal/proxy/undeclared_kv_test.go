@@ -19,6 +19,7 @@ import (
 	"github.com/saturncloud/phoebe/internal/config"
 	"github.com/saturncloud/phoebe/internal/identity"
 	"github.com/saturncloud/phoebe/internal/logging"
+	"github.com/saturncloud/phoebe/internal/testutil"
 )
 
 // oslRecordingBackend serves every request and records the Dynamo output
@@ -102,7 +103,7 @@ func TestUndeclaredOutputReservationFitsLaneKVShare(t *testing.T) {
 		t.Fatalf("precondition: estimate=%d, want 200", est)
 	}
 	cfg := kvTestConfig()
-	cfg.Lanes = map[string]config.AdmissionLane{"default": {Weight: 2, Limits: config.AdmissionLimits{MaxReservedKVTokens: ptr64(1500)}}}
+	cfg.Lanes = map[string]config.AdmissionLane{"default": {Weight: 2, Limits: config.AdmissionLimits{MaxReservedKVTokens: testutil.Ptr[int64](1500)}}}
 	s := kvTestServer(t, cfg)
 
 	if rr := serveChat(s, up, body); rr.Code != http.StatusOK {
@@ -140,7 +141,7 @@ func TestUndeclaredOutputReservationFitsPublishedGraphKV(t *testing.T) {
 	cfg := kvTestConfig()
 	cfg.Enabled = false
 	s := kvTestServer(t, cfg)
-	s.graphCapacity = staticGraphCapacity{graphFromUpstreamHost(up.Host): {MaxReservedKVTokens: ptr64(est + 3500)}}
+	s.graphCapacity = staticGraphCapacity{graphFromUpstreamHost(up.Host): {MaxReservedKVTokens: testutil.Ptr[int64](est + 3500)}}
 
 	if rr := serveChat(s, up, body); rr.Code != http.StatusOK {
 		t.Fatalf("undeclared request status=%d body=%q, want 200", rr.Code, rr.Body.String())
@@ -457,7 +458,7 @@ func TestUndeclaredPromptFillingKVCapIs413(t *testing.T) {
 			cfg := kvTestConfig()
 			cfg.Enabled = false
 			s, mr := kvTestServerWithStore(t, cfg)
-			s.graphCapacity = staticGraphCapacity{graphFromUpstreamHost(up.Host): {MaxReservedKVTokens: ptr64(c.kvCap)}}
+			s.graphCapacity = staticGraphCapacity{graphFromUpstreamHost(up.Host): {MaxReservedKVTokens: testutil.Ptr[int64](c.kvCap)}}
 			assert413(t, s, mr, be, up)
 		})
 	}
@@ -467,7 +468,7 @@ func TestUndeclaredPromptFillingKVCapIs413(t *testing.T) {
 		defer srv.Close()
 		up, _ := url.Parse(srv.URL)
 		cfg := kvTestConfig()
-		cfg.Lanes = map[string]config.AdmissionLane{"default": {Weight: 2, Limits: config.AdmissionLimits{MaxReservedKVTokens: ptr64(est / 2)}}}
+		cfg.Lanes = map[string]config.AdmissionLane{"default": {Weight: 2, Limits: config.AdmissionLimits{MaxReservedKVTokens: testutil.Ptr[int64](est / 2)}}}
 		s, mr := kvTestServerWithStore(t, cfg)
 		assert413(t, s, mr, be, up)
 	})
@@ -486,7 +487,7 @@ func TestUndeclaredOutputReservationFitsOperatorOutputCap(t *testing.T) {
 	up, _ := url.Parse(srv.URL)
 
 	cfg := kvTestConfig()
-	cfg.Graph = config.AdmissionLimits{MaxReservedOutputTokens: ptr64(2048)}
+	cfg.Graph = config.AdmissionLimits{MaxReservedOutputTokens: testutil.Ptr[int64](2048)}
 	s := kvTestServer(t, cfg)
 	if rr := serveChat(s, up, chatBody(4*200, 0)); rr.Code != http.StatusOK {
 		t.Fatalf("undeclared request status=%d body=%q, want 200", rr.Code, rr.Body.String())
@@ -495,7 +496,7 @@ func TestUndeclaredOutputReservationFitsOperatorOutputCap(t *testing.T) {
 		t.Fatalf("hits=%d osl=%v, want one request reserving 2048 output tokens", hits, osl)
 	}
 
-	cfg.Graph.MaxReservedKVTokens = ptr64(200 + 1000)
+	cfg.Graph.MaxReservedKVTokens = testutil.Ptr[int64](200 + 1000)
 	s = kvTestServer(t, cfg)
 	if rr := serveChat(s, up, chatBody(4*200, 0)); rr.Code != http.StatusOK {
 		t.Fatalf("undeclared request under both caps status=%d body=%q, want 200", rr.Code, rr.Body.String())
@@ -541,7 +542,7 @@ func TestEmbeddingsKVRefusalNeverMentionsMaxTokens(t *testing.T) {
 	cfg := kvTestConfig()
 	cfg.Enabled = false
 	s := kvTestServer(t, cfg)
-	s.graphCapacity = staticGraphCapacity{graphFromUpstreamHost(up.Host): {MaxReservedKVTokens: ptr64(10)}}
+	s.graphCapacity = staticGraphCapacity{graphFromUpstreamHost(up.Host): {MaxReservedKVTokens: testutil.Ptr[int64](10)}}
 
 	embed := sharedRequest(up)
 	embed.URL.Path = "/v1/embeddings"
@@ -575,7 +576,7 @@ func TestUndeclaredKVRefusalDrivenByNNamesSequences(t *testing.T) {
 	s := kvTestServer(t, cfg)
 	prompt := chatBody(4*2000, 0)
 	est := estimatePromptTokens(prompt)
-	s.graphCapacity = staticGraphCapacity{graphFromUpstreamHost(up.Host): {MaxReservedKVTokens: ptr64(est + 10)}}
+	s.graphCapacity = staticGraphCapacity{graphFromUpstreamHost(up.Host): {MaxReservedKVTokens: testutil.Ptr[int64](est + 10)}}
 
 	body := []byte(strings.Replace(string(prompt), `{"model":"model-a",`, `{"model":"model-a","n":64,`, 1))
 	rr := serveChat(s, up, body)
@@ -603,7 +604,7 @@ func TestRequestOutputAboveReservedOutputCapIs413(t *testing.T) {
 	up, _ := url.Parse(srv.URL)
 
 	cfg := kvTestConfig()
-	cfg.Lanes = map[string]config.AdmissionLane{"default": {Weight: 1, Limits: config.AdmissionLimits{MaxReservedOutputTokens: ptr64(64)}}}
+	cfg.Lanes = map[string]config.AdmissionLane{"default": {Weight: 1, Limits: config.AdmissionLimits{MaxReservedOutputTokens: testutil.Ptr[int64](64)}}}
 	s := kvTestServer(t, cfg)
 
 	for _, tc := range []struct {

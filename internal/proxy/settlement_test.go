@@ -31,6 +31,7 @@ import (
 	"github.com/saturncloud/phoebe/internal/config"
 	"github.com/saturncloud/phoebe/internal/identity"
 	"github.com/saturncloud/phoebe/internal/logging"
+	"github.com/saturncloud/phoebe/internal/testutil"
 )
 
 func TestClassifyRoundTripSettlement(t *testing.T) {
@@ -224,10 +225,10 @@ func settleZeroProbes(t *testing.T, errs []error) {
 
 func zeroSettlementProbeSet(est admissionEstimate) []admission.Request {
 	return []admission.Request{
-		contractProbe(1, 1, admission.RateLimits{Requests: ptr64(1)}),
-		contractProbe(1, 20, admission.RateLimits{GeneratedTokens: ptr64(20)}),
+		contractProbe(1, 1, admission.RateLimits{Requests: testutil.Ptr[int64](1)}),
+		contractProbe(1, 20, admission.RateLimits{GeneratedTokens: testutil.Ptr[int64](20)}),
 		contractProbe(est.InputTokens, 1, admission.RateLimits{
-			TotalPromptTokens: ptr64(est.InputTokens), UncachedPromptTokens: ptr64(est.InputTokens),
+			TotalPromptTokens: testutil.Ptr[int64](est.InputTokens), UncachedPromptTokens: testutil.Ptr[int64](est.InputTokens),
 		}),
 	}
 }
@@ -250,7 +251,7 @@ func TestWakeColdHoldRejectionSettlesZeroNeverServed(t *testing.T) {
 	up, _ := url.Parse(be.URL)
 	mr := miniredis.RunT(t)
 	cfg := proxyAdmissionConfig(2)
-	cfg.Platform.MaxColdHolds = ptr64(1)
+	cfg.Platform.MaxColdHolds = testutil.Ptr[int64](1)
 	c := redis.NewClient(&redis.Options{Addr: mr.Addr()})
 	t.Cleanup(func() { _ = c.Close() })
 	a := admission.New(c, cfg)
@@ -341,7 +342,7 @@ func TestWakeExhaustedColdSettlesZeroNeverServed(t *testing.T) {
 	up, _ := url.Parse(be.URL)
 	mr := miniredis.RunT(t)
 	cfg := proxyAdmissionConfig(1)
-	cfg.Platform.MaxColdHolds = ptr64(1)
+	cfg.Platform.MaxColdHolds = testutil.Ptr[int64](1)
 	c := redis.NewClient(&redis.Options{Addr: mr.Addr()})
 	t.Cleanup(func() { _ = c.Close() })
 	a := admission.New(c, cfg)
@@ -407,7 +408,7 @@ func TestWakeErrorColdSettlementZeroNeverServed(t *testing.T) {
 	up, _ := url.Parse(be.URL)
 	mr := miniredis.RunT(t)
 	cfg := proxyAdmissionConfig(1)
-	cfg.Platform.MaxColdHolds = ptr64(1)
+	cfg.Platform.MaxColdHolds = testutil.Ptr[int64](1)
 	c := redis.NewClient(&redis.Options{Addr: mr.Addr()})
 	t.Cleanup(func() { _ = c.Close() })
 	a := admission.New(c, cfg)
@@ -485,7 +486,7 @@ func TestWakeExhaustedWarmFinalSettlesActualUsage(t *testing.T) {
 	up, _ := url.Parse(backend.URL)
 	mr := miniredis.RunT(t)
 	cfg := proxyAdmissionConfig(1)
-	cfg.Platform.MaxColdHolds = ptr64(1)
+	cfg.Platform.MaxColdHolds = testutil.Ptr[int64](1)
 	c := redis.NewClient(&redis.Options{Addr: mr.Addr()})
 	t.Cleanup(func() { _ = c.Close() })
 	a := admission.New(c, cfg)
@@ -591,7 +592,7 @@ func TestWakeExhaustedTransportErrorSettlesUnknownUsage(t *testing.T) {
 	up, _ := url.Parse(backend.URL)
 	mr := miniredis.RunT(t)
 	cfg := proxyAdmissionConfig(1)
-	cfg.Platform.MaxColdHolds = ptr64(1)
+	cfg.Platform.MaxColdHolds = testutil.Ptr[int64](1)
 	c := redis.NewClient(&redis.Options{Addr: mr.Addr()})
 	t.Cleanup(func() { _ = c.Close() })
 	a := admission.New(c, cfg)
