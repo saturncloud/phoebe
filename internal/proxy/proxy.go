@@ -773,13 +773,14 @@ func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request) {
 		}
 		if routePath != "/v1/embeddings" && enforceAdmission && !estimate.OutputDeclared {
 			// The undeclared reservation must also fit every positive
-			// reserved-KV cap admission will check (operator tiers, the
-			// weighted lane share, published graph capacity), or a client
-			// that sent no max_tokens could be refused for the default.
-			kvCap := admission.TightestReservedKVCap(s.admitterSettings(), admission.Request{
+			// reserved-KV and reserved-output cap admission will check
+			// (operator tiers, the weighted lane share, published graph
+			// capacity), or a client that sent no max_tokens could be
+			// refused, or told to retry forever, for the default.
+			caps := admission.TightestReservedCaps(s.admitterSettings(), admission.Request{
 				Graph: graph, Organization: id.OrgID, Model: estimate.Model, GraphCapacity: graphCapacity.Limits(),
 			})
-			estimate.OutputTokens = undeclaredOutputWithinKV(estimate.OutputTokens, estimate.InputTokens, estimate.OutputSequences, kvCap)
+			estimate.OutputTokens = undeclaredOutputWithinCaps(estimate.OutputTokens, estimate.InputTokens, estimate.OutputSequences, caps.KV, caps.Output)
 		}
 		body, tenant, rerr := prepareSharedDynamoRequest(body, tenantIdentity, estimate.OutputTokens, sharedLane)
 		if rerr != nil {

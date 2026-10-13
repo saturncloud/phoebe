@@ -170,18 +170,23 @@ func TestUndeclaredOutputReservationFitsPublishedGraphKV(t *testing.T) {
 	}
 }
 
-func TestUndeclaredOutputWithinKV(t *testing.T) {
-	for _, c := range []struct{ output, input, sequences, cap, want int64 }{
-		{4096, 200, 1, 0, 4096},    // no cap
-		{4096, 200, 1, 3000, 2800}, // clamped to the room left
-		{100, 200, 1, 3000, 100},   // already fits
-		{4096, 3000, 1, 3000, 1},   // prompt fills the cap: floor 1, still 413
-		{4096, 5000, 1, 3000, 1},   // prompt alone over the cap
-		{4096, 200, 4, 3000, 700},  // n=4: each sequence gets a quarter of the room
-		{4096, 200, 0, 3000, 2800}, // 0 sequences reads as 1
+func TestUndeclaredOutputWithinCaps(t *testing.T) {
+	for _, c := range []struct{ output, input, sequences, kvCap, outCap, want int64 }{
+		{4096, 200, 1, 0, 0, 4096},        // no cap
+		{4096, 200, 1, 3000, 0, 2800},     // clamped to the KV room left
+		{100, 200, 1, 3000, 0, 100},       // already fits
+		{4096, 3000, 1, 3000, 0, 1},       // prompt fills the cap: floor 1, still 413
+		{4096, 5000, 1, 3000, 0, 1},       // prompt alone over the cap
+		{4096, 200, 4, 3000, 0, 700},      // n=4: each sequence gets a quarter of the room
+		{4096, 200, 0, 3000, 0, 2800},     // 0 sequences reads as 1
+		{4096, 200, 1, 0, 2048, 2048},     // output cap alone
+		{4096, 200, 4, 0, 2048, 2048},     // the output counter is charged once, not per sequence
+		{4096, 200, 1, 3000, 2048, 2048},  // output cap tighter than the KV room
+		{4096, 2000, 1, 3000, 2048, 1000}, // KV room tighter than the output cap
+		{100, 200, 1, 3000, 2048, 100},    // fits both
 	} {
-		if got := undeclaredOutputWithinKV(c.output, c.input, c.sequences, c.cap); got != c.want {
-			t.Errorf("undeclaredOutputWithinKV(%d, %d, %d, %d) = %d, want %d", c.output, c.input, c.sequences, c.cap, got, c.want)
+		if got := undeclaredOutputWithinCaps(c.output, c.input, c.sequences, c.kvCap, c.outCap); got != c.want {
+			t.Errorf("undeclaredOutputWithinCaps(%d, %d, %d, %d, %d) = %d, want %d", c.output, c.input, c.sequences, c.kvCap, c.outCap, got, c.want)
 		}
 	}
 }
@@ -239,5 +244,118 @@ func TestAdmissionWorkRefusesReservedOutputBeyondExactLeasePrecision(t *testing.
 		if ok && got.OutputTokens*got.OutputSequences > maxReservedOutput {
 			t.Errorf("admissionWork(%s) accepted %d x %d past the bound", c.body, got.OutputTokens, got.OutputSequences)
 		}
+	}
+}
+
+// assertNoAdmissionCountersHeld fails when any admission counter in mr is
+// non-zero: a refused request must leave nothing charged.
+func assertNoAdmissionCountersHeld(t *testing.T, mr *miniredis.Miniredis, prefix string) {
+	t.Helper()
+	key := "{" + prefix + "}:counters"
+	if !mr.Exists(key) {
+		return
+	}
+	fields, err := mr.HKeys(key)
+	if err != nil {
+		t.Fatalf("read admission counters: %v", err)
+	}
+	for _, field := range fields {
+		if v := mr.HGet(key, field); v != "0" && v != "" {
+			t.Fatalf("admission counter %s=%s after a refused request, want 0", field, v)
+		}
+	}
+}
+
+func kvTestServerWithStore(t *testing.T, cfg config.AdmissionSettings) (*Server, *miniredis.Miniredis) {
+	t.Helper()
+	mr := miniredis.RunT(t)
+	client := redis.NewClient(&redis.Options{Addr: mr.Addr()})
+	t.Cleanup(func() { _ = client.Close() })
+	return New(&config.Settings{Admission: cfg}, logging.New(logging.ERROR), &recordingEmitter{}).
+		WithAdmitter(admission.New(client, cfg)), mr
+}
+
+// A request that sent no max_tokens and whose prompt alone fills (or passes)
+// a positive KV cap cannot be fitted by clamping its default output: it is
+// refused 413 without Retry-After, the message blames the prompt alone (there
+// is no max_tokens to lower), nothing reaches the engine and nothing stays
+// charged.
+func TestUndeclaredPromptFillingKVCapIs413(t *testing.T) {
+	body := chatBody(4*2500, 0)
+	est := estimatePromptTokens(body)
+	assert413 := func(t *testing.T, s *Server, mr *miniredis.Miniredis, be *oslRecordingBackend, up *url.URL) {
+		t.Helper()
+		rr := serveChat(s, up, body)
+		if rr.Code != http.StatusRequestEntityTooLarge || rr.Header().Get("Retry-After") != "" {
+			t.Fatalf("status=%d retry-after=%q body=%q, want 413 without Retry-After", rr.Code, rr.Header().Get("Retry-After"), rr.Body.String())
+		}
+		if b := rr.Body.String(); !strings.Contains(b, "KV-cache") || strings.Contains(b, "max_tokens") {
+			t.Fatalf("body=%q, want the KV-cache message without max_tokens", b)
+		}
+		if hits, _ := be.snapshot(); hits != 0 {
+			t.Fatalf("upstream hits=%d, a refused request must not reach the engine", hits)
+		}
+		assertNoAdmissionCountersHeld(t, mr, kvTestConfig().KeyPrefix)
+	}
+	for _, c := range []struct {
+		name  string
+		kvCap int64
+	}{
+		{"prompt fills the published cap exactly", est},
+		{"prompt alone is over the published cap", est - 100},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			be := &oslRecordingBackend{}
+			srv := httptest.NewServer(be)
+			defer srv.Close()
+			up, _ := url.Parse(srv.URL)
+			cfg := kvTestConfig()
+			cfg.Enabled = false
+			s, mr := kvTestServerWithStore(t, cfg)
+			s.graphCapacity = staticGraphCapacity{graphFromUpstreamHost(up.Host): {MaxReservedKVTokens: ptr64(c.kvCap)}}
+			assert413(t, s, mr, be, up)
+		})
+	}
+	t.Run("prompt fills the weighted lane share", func(t *testing.T) {
+		be := &oslRecordingBackend{}
+		srv := httptest.NewServer(be)
+		defer srv.Close()
+		up, _ := url.Parse(srv.URL)
+		cfg := kvTestConfig()
+		cfg.Lanes = map[string]config.AdmissionLane{"default": {Weight: 2, Limits: config.AdmissionLimits{MaxReservedKVTokens: ptr64(est / 2)}}}
+		s, mr := kvTestServerWithStore(t, cfg)
+		assert413(t, s, mr, be, up)
+	})
+}
+
+// A request that sent no max_tokens is never answered a retry-forever 503
+// for a default it did not choose: under an operator graph
+// maxReservedOutputTokens of 2048 with a default of 4096 it is admitted, and
+// the reservation (the Dynamo output hint) is clamped to 2048. A prompt that
+// fits the KV cap but whose default output does not is admitted the same way
+// with its reservation clamped to the KV room.
+func TestUndeclaredOutputReservationFitsOperatorOutputCap(t *testing.T) {
+	be := &oslRecordingBackend{}
+	srv := httptest.NewServer(be)
+	defer srv.Close()
+	up, _ := url.Parse(srv.URL)
+
+	cfg := kvTestConfig()
+	cfg.Graph = config.AdmissionLimits{MaxReservedOutputTokens: ptr64(2048)}
+	s := kvTestServer(t, cfg)
+	if rr := serveChat(s, up, chatBody(4*200, 0)); rr.Code != http.StatusOK {
+		t.Fatalf("undeclared request status=%d body=%q, want 200", rr.Code, rr.Body.String())
+	}
+	if hits, osl := be.snapshot(); hits != 1 || len(osl) != 1 || osl[0] != 2048 {
+		t.Fatalf("hits=%d osl=%v, want one request reserving 2048 output tokens", hits, osl)
+	}
+
+	cfg.Graph.MaxReservedKVTokens = ptr64(200 + 1000)
+	s = kvTestServer(t, cfg)
+	if rr := serveChat(s, up, chatBody(4*200, 0)); rr.Code != http.StatusOK {
+		t.Fatalf("undeclared request under both caps status=%d body=%q, want 200", rr.Code, rr.Body.String())
+	}
+	if _, osl := be.snapshot(); len(osl) != 2 || osl[1] != 1000 {
+		t.Fatalf("osl=%v, want the second request reserving the 1000-token KV room", osl)
 	}
 }

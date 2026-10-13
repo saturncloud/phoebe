@@ -177,11 +177,11 @@ func TestRequestLargerThanCapacityIsUnsatisfiable(t *testing.T) {
 	}
 }
 
-// TightestReservedKVCap reads the same scopes Admit checks: the smallest
+// TightestReservedCaps reads the same scopes Admit checks: the smallest
 // positive KV cap wins, the lane share counts after its weight, published
 // graph capacity counts, and an explicit zero cap is ignored (that scope
 // rejects in admission with its retryable answer).
-func TestTightestReservedKVCapReadsAdmitScopes(t *testing.T) {
+func TestTightestReservedCapsReadsKVFromAdmitScopes(t *testing.T) {
 	zero, five, nine, lane := int64(0), int64(5000), int64(9000), int64(1500)
 	cfg := config.AdmissionSettings{
 		Platform:     config.AdmissionLimits{MaxReservedKVTokens: &nine},
@@ -189,18 +189,41 @@ func TestTightestReservedKVCapReadsAdmitScopes(t *testing.T) {
 		Lanes:        map[string]config.AdmissionLane{"default": {Weight: 2, Limits: config.AdmissionLimits{MaxReservedKVTokens: &lane}}},
 	}
 	r := Request{Graph: "g", Organization: "o", Model: "m"}
-	if got := TightestReservedKVCap(cfg, r); got != 3000 {
+	if got := TightestReservedCaps(cfg, r).KV; got != 3000 {
 		t.Fatalf("cap=%d, want the weighted lane share 3000", got)
 	}
 	r.GraphCapacity = config.AdmissionLimits{MaxReservedKVTokens: ptr64(2500)}
-	if got := TightestReservedKVCap(cfg, r); got != 2500 {
+	if got := TightestReservedCaps(cfg, r).KV; got != 2500 {
 		t.Fatalf("cap=%d, want the published graph capacity 2500", got)
 	}
-	if got := TightestReservedKVCap(config.AdmissionSettings{Graph: config.AdmissionLimits{MaxReservedKVTokens: &five}}, Request{}); got != 5000 {
+	if got := TightestReservedCaps(config.AdmissionSettings{Graph: config.AdmissionLimits{MaxReservedKVTokens: &five}}, Request{}).KV; got != 5000 {
 		t.Fatalf("cap=%d, want 5000", got)
 	}
-	if got := TightestReservedKVCap(config.AdmissionSettings{Platform: config.AdmissionLimits{MaxReservedKVTokens: &zero}}, Request{}); got != 0 {
+	if got := TightestReservedCaps(config.AdmissionSettings{Platform: config.AdmissionLimits{MaxReservedKVTokens: &zero}}, Request{}).KV; got != 0 {
 		t.Fatalf("cap=%d, an explicit zero cap must be ignored", got)
+	}
+}
+
+// The output cap is read from the same scope walk: the smallest positive
+// maxReservedOutputTokens wins, the lane share after its weight, published
+// graph capacity counts, and an explicit zero is ignored.
+func TestTightestReservedCapsReadsOutputFromAdmitScopes(t *testing.T) {
+	zero, nine, lane := int64(0), int64(9000), int64(1500)
+	cfg := config.AdmissionSettings{
+		Platform:     config.AdmissionLimits{MaxReservedOutputTokens: &nine},
+		Organization: config.AdmissionLimits{MaxReservedOutputTokens: &zero},
+		Lanes:        map[string]config.AdmissionLane{"default": {Weight: 2, Limits: config.AdmissionLimits{MaxReservedOutputTokens: &lane}}},
+	}
+	r := Request{Graph: "g", Organization: "o", Model: "m"}
+	if got := TightestReservedCaps(cfg, r); got.Output != 3000 || got.KV != 0 {
+		t.Fatalf("caps=%+v, want output = the weighted lane share 3000 and no KV cap", got)
+	}
+	r.GraphCapacity = config.AdmissionLimits{MaxReservedOutputTokens: ptr64(2048)}
+	if got := TightestReservedCaps(cfg, r).Output; got != 2048 {
+		t.Fatalf("output cap=%d, want the published graph capacity 2048", got)
+	}
+	if got := TightestReservedCaps(config.AdmissionSettings{Platform: config.AdmissionLimits{MaxReservedOutputTokens: &zero}}, Request{}).Output; got != 0 {
+		t.Fatalf("output cap=%d, an explicit zero cap must be ignored", got)
 	}
 }
 

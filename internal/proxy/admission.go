@@ -552,25 +552,29 @@ const maxOutputSequences = 1 << 16
 // bound is the first of two guards, not the only one.
 const maxReservedOutput = 1 << 46
 
-// undeclaredOutputWithinKV clamps the output reservation of a request that
-// declared no max_tokens so the prompt plus the reservation fits kvCap, the
-// tightest positive reserved-KV cap that applies (0 = none). Like the contract
-// clamp above, a request is never refused as too large for a default the
+// undeclaredOutputWithinCaps clamps the output reservation of a request
+// that declared no max_tokens so it fits every positive per-request-bounding
+// cap that applies: the prompt plus the reservation (times sequences) fits
+// kvCap, the tightest positive reserved-KV cap, and the reservation fits
+// outputCap, the tightest positive reserved-output cap (admission charges the
+// output counter once per request, not per sequence). 0 means no cap. Like
+// the contract clamp above, a request is never refused for a default the
 // client did not choose. The result is at least 1; when the prompt alone
-// fills the cap the request is still refused for its prompt (413).
-func undeclaredOutputWithinKV(output, input, sequences, kvCap int64) int64 {
-	if kvCap <= 0 {
-		return output
+// fills the KV cap the request is still refused for its prompt (413).
+func undeclaredOutputWithinCaps(output, input, sequences, kvCap, outputCap int64) int64 {
+	if kvCap > 0 {
+		if sequences < 1 {
+			sequences = 1
+		}
+		if room := (kvCap - input) / sequences; room < output {
+			output = room
+		}
 	}
-	if sequences < 1 {
-		sequences = 1
+	if outputCap > 0 && outputCap < output {
+		output = outputCap
 	}
-	room := (kvCap - input) / sequences
-	if room < 1 {
-		room = 1
-	}
-	if room < output {
-		return room
+	if output < 1 {
+		output = 1
 	}
 	return output
 }

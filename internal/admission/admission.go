@@ -434,17 +434,27 @@ func (l RateLimits) Any() bool {
 
 func (a *RedisAdmitter) scopes(r Request) []scope { return scopesFor(a.cfg, r) }
 
-// TightestReservedKVCap is the smallest positive reserved-KV cap among the
-// scopes Admit would check for r under cfg — the operator tiers (the lane
-// share after its weight), and r.GraphCapacity — or 0 when none applies. An
-// explicit zero cap is not a positive cap and is ignored: that scope rejects
-// in admission with its retryable answer. The proxy uses it to keep an
-// undeclared max_tokens reservation inside the KV caps.
-func TightestReservedKVCap(cfg config.AdmissionSettings, r Request) int64 {
-	var out int64
+// ReservedCaps are the tightest positive per-request-bounding caps among the
+// scopes Admit would check: reserved KV tokens and reserved output tokens.
+// 0 means no positive cap of that kind applies.
+type ReservedCaps struct {
+	KV, Output int64
+}
+
+// TightestReservedCaps is the smallest positive reserved-KV cap and the
+// smallest positive reserved-output cap among the scopes Admit would check
+// for r under cfg — the operator tiers (the lane share after its weight), and
+// r.GraphCapacity. An explicit zero cap is not a positive cap and is ignored:
+// that scope rejects in admission with its retryable answer. The proxy uses
+// it to keep an undeclared max_tokens reservation inside both caps.
+func TightestReservedCaps(cfg config.AdmissionSettings, r Request) ReservedCaps {
+	var out ReservedCaps
 	for _, sc := range scopesFor(cfg, r) {
-		if sc.KV > 0 && (out == 0 || sc.KV < out) {
-			out = sc.KV
+		if sc.KV > 0 && (out.KV == 0 || sc.KV < out.KV) {
+			out.KV = sc.KV
+		}
+		if sc.Output > 0 && (out.Output == 0 || sc.Output < out.Output) {
+			out.Output = sc.Output
 		}
 	}
 	return out
