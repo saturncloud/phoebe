@@ -179,7 +179,7 @@ func sharedRequestEstimate(t *testing.T, req *http.Request) admissionEstimate {
 		t.Fatal(err)
 	}
 	req.Body = io.NopCloser(strings.NewReader(string(body)))
-	est, ok := admissionWork(body, 20) // 20 = proxyAdmissionConfig's DefaultMaxOutputTokens
+	est, ok := admissionWork(body, 20, req.URL.Path) // 20 = proxyAdmissionConfig's DefaultMaxOutputTokens
 	if !ok {
 		t.Fatal("shared request body must parse for an admission estimate")
 	}

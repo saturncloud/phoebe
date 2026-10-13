@@ -193,29 +193,128 @@ func TestUndeclaredOutputWithinCaps(t *testing.T) {
 }
 
 func TestAdmissionWorkCountsOutputSequences(t *testing.T) {
+	const chat, completions = "/v1/chat/completions", "/v1/completions"
 	for _, c := range []struct {
-		body string
-		want int64
-		ok   bool
+		route string
+		body  string
+		want  int64
+		ok    bool
 	}{
-		{`{"model":"m"}`, 1, true},
-		{`{"model":"m","n":4}`, 4, true},
-		{`{"model":"m","n":2,"best_of":5}`, 5, true},
-		{`{"model":"m","n":0}`, 1, true},
-		{`{"model":"m","n":70000}`, 0, false},
-		{`{"model":"m","n":2,"N":9}`, 0, false},
+		{chat, `{"model":"m"}`, 1, true},
+		{chat, `{"model":"m","n":4}`, 4, true},
+		{chat, `{"model":"m","n":2,"best_of":5}`, 5, true},
+		{chat, `{"model":"m","n":0}`, 1, true},
+		{chat, `{"model":"m","n":70000}`, 0, false},
+		{chat, `{"model":"m","n":2,"N":9}`, 0, false},
 		// A batched completions prompt is one generation per prompt.
-		{`{"model":"m","prompt":["a","b","c"],"n":2}`, 6, true},
-		{`{"model":"m","prompt":[[1,2],[3]]}`, 2, true},
-		{`{"model":"m","prompt":[1,2,3]}`, 1, true},
-		{`{"model":"m","prompt":"abc","n":3}`, 3, true},
-		{`{"model":"m","prompt":["a","b"],"best_of":40000}`, 0, false}, // 80000 sequences
+		{completions, `{"model":"m","prompt":["a","b","c"],"n":2}`, 6, true},
+		{completions, `{"model":"m","prompt":[[1,2],[3]]}`, 2, true},
+		{completions, `{"model":"m","prompt":[1,2,3]}`, 1, true},
+		{completions, `{"model":"m","prompt":"abc","n":3}`, 3, true},
+		{completions, `{"model":"m","prompt":["a","b"],"best_of":40000}`, 0, false}, // 80000 sequences
 	} {
-		got, ok := admissionWork([]byte(c.body), 10)
+		got, ok := admissionWork([]byte(c.body), 10, c.route)
 		if ok != c.ok || (ok && got.OutputSequences != c.want) {
-			t.Errorf("admissionWork(%s) = (%d, %v), want (%d, %v)", c.body, got.OutputSequences, ok, c.want, c.ok)
+			t.Errorf("admissionWork(%s, %s) = (%d, %v), want (%d, %v)", c.route, c.body, got.OutputSequences, ok, c.want, c.ok)
 		}
 	}
+}
+
+// The batched-prompt multiplier applies only on /v1/completions (D27). Chat
+// completions and embeddings ignore a top-level "prompt", so an extra
+// "prompt" array there must not multiply the output sequences admission
+// charges, nor push a request past the sequence bound.
+func TestAdmissionWorkBatchMultiplierIsCompletionsOnly(t *testing.T) {
+	body := []byte(`{"model":"m","messages":[{"role":"user","content":"hi"}],"prompt":["a","b"]}`)
+	for _, c := range []struct {
+		route string
+		want  int64
+	}{
+		{"/v1/chat/completions", 1},
+		{"/v1/embeddings", 1},
+		{"/v1/completions", 2},
+	} {
+		got, ok := admissionWork(body, 10, c.route)
+		if !ok || got.OutputSequences != c.want {
+			t.Errorf("admissionWork(%s) = (%d, %v), want (%d, true)", c.route, got.OutputSequences, ok, c.want)
+		}
+	}
+	// 70000 prompts would be refused on completions; chat ignores them.
+	huge := []byte(`{"model":"m","prompt":[` + strings.TrimSuffix(strings.Repeat(`"a",`, 70000), ",") + `]}`)
+	if got, ok := admissionWork(huge, 10, "/v1/chat/completions"); !ok || got.OutputSequences != 1 {
+		t.Errorf("chat with a 70000-prompt array = (%d, %v), want (1, true)", got.OutputSequences, ok)
+	}
+	if _, ok := admissionWork(huge, 10, "/v1/completions"); ok {
+		t.Error("completions with a 70000-prompt array accepted past the sequence bound")
+	}
+}
+
+// D28: n, best_of, max_tokens and max_completion_tokens must be JSON
+// integers. A float (even an integral one such as 1.0 or 1e0) or a numeric
+// string is refused, so the engine can never run a different value than the
+// one admission charged.
+func TestAdmissionWorkRequiresJSONIntegers(t *testing.T) {
+	for _, body := range []string{
+		`{"model":"m","n":1.0}`,
+		`{"model":"m","n":"4"}`,
+		`{"model":"m","n":1e0}`,
+		`{"model":"m","best_of":2.0}`,
+		`{"model":"m","best_of":"2"}`,
+		`{"model":"m","max_tokens":16.0}`,
+		`{"model":"m","max_tokens":"16"}`,
+		`{"model":"m","max_completion_tokens":16.0}`,
+		`{"model":"m","max_completion_tokens":"16"}`,
+	} {
+		if _, ok := admissionWork([]byte(body), 10, "/v1/chat/completions"); ok {
+			t.Errorf("admissionWork(%s) accepted a non-integer count, want refused", body)
+		}
+	}
+	if _, ok := admissionWork([]byte(`{"model":"m","n":1,"max_tokens":16}`), 10, "/v1/chat/completions"); !ok {
+		t.Error("admissionWork with plain integer n and max_tokens refused, want accepted")
+	}
+}
+
+// D28 end to end: a shared request whose n, best_of, max_tokens or
+// max_completion_tokens is not a JSON integer gets 400, creates no admission
+// state and never reaches the engine; a plain integer is served.
+func TestSharedRequestRejectsNonIntegerSequenceAndTokenFields(t *testing.T) {
+	for _, field := range []string{"n", "best_of", "max_tokens", "max_completion_tokens"} {
+		for _, value := range []string{`1.0`, `"4"`, `1.5`} {
+			t.Run(field+"="+value, func(t *testing.T) {
+				be := &oslRecordingBackend{}
+				srv := httptest.NewServer(be)
+				defer srv.Close()
+				up, _ := url.Parse(srv.URL)
+				s, mr := kvTestServerWithStore(t, kvTestConfig())
+				body := []byte(`{"model":"model-a","` + field + `":` + value + `,"messages":[{"role":"user","content":"hi"}]}`)
+				rr := serveChat(s, up, body)
+				if rr.Code != http.StatusBadRequest || !strings.Contains(rr.Body.String(), "invalid shared inference request") {
+					t.Fatalf("status=%d body=%q, want the 400 invalid shared inference request", rr.Code, rr.Body.String())
+				}
+				if hits, _ := be.snapshot(); hits != 0 {
+					t.Fatalf("upstream hits=%d, a refused request must not reach the engine", hits)
+				}
+				if keys := mr.Keys(); len(keys) != 0 {
+					t.Fatalf("admission store holds %v after a 400, want no admission record", keys)
+				}
+			})
+		}
+	}
+	t.Run("plain integer 4 is served", func(t *testing.T) {
+		be := &oslRecordingBackend{}
+		srv := httptest.NewServer(be)
+		defer srv.Close()
+		up, _ := url.Parse(srv.URL)
+		s, _ := kvTestServerWithStore(t, kvTestConfig())
+		body := []byte(`{"model":"model-a","n":4,"best_of":4,"max_tokens":4,"max_completion_tokens":4,"messages":[{"role":"user","content":"hi"}]}`)
+		rr := serveChat(s, up, body)
+		if rr.Code != http.StatusOK {
+			t.Fatalf("status=%d body=%q, want 200", rr.Code, rr.Body.String())
+		}
+		if hits, _ := be.snapshot(); hits != 1 {
+			t.Fatalf("upstream hits=%d, want 1", hits)
+		}
+	})
 }
 
 // TestAdmissionWorkRefusesReservedOutputBeyondExactLeasePrecision: output x
@@ -238,7 +337,7 @@ func TestAdmissionWorkRefusesReservedOutputBeyondExactLeasePrecision(t *testing.
 		{`{"model":"m","max_tokens":1073741824,"n":2,"prompt":[` + strings.TrimSuffix(strings.Repeat(`"a",`, 32768), ",") + `]}`, true},
 		{`{"model":"m","max_tokens":1073741825,"n":2,"prompt":[` + strings.TrimSuffix(strings.Repeat(`"a",`, 32768), ",") + `]}`, false},
 	} {
-		got, ok := admissionWork([]byte(c.body), 10)
+		got, ok := admissionWork([]byte(c.body), 10, "/v1/completions")
 		if ok != c.ok {
 			t.Errorf("admissionWork(%s) ok=%v, want %v", c.body, ok, c.ok)
 		}

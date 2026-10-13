@@ -755,7 +755,7 @@ func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request) {
 			// minimum of one that admission requires.
 			defaultOutput = 1
 		}
-		estimate, ok := admissionWork(body, defaultOutput)
+		estimate, ok := admissionWork(body, defaultOutput, routePath)
 		if !ok {
 			http.Error(w, "invalid shared inference request", http.StatusBadRequest)
 			return

@@ -180,12 +180,14 @@ var admissionInterpretedFields = []string{"model", "max_tokens", "max_completion
 // The input estimate is message-text characters / 4 (estimatePromptTokens);
 // Dynamo remains authoritative and Phoebe reconciles its actual cache-aware
 // token counts after the response. The output sequence count is
-// max(n, best_of, 1) times the number of prompts in a batched completions
-// prompt (promptBatchCount), since the engine generates for each prompt.
+// max(n, best_of, 1), times the number of prompts in a batched prompt
+// (promptBatchCount) on /v1/completions only, since the completions engine
+// generates for each prompt. Other routes (chat completions, embeddings)
+// ignore a top-level "prompt", so it never multiplies their sequences (D27).
 // n, best_of, max_tokens and max_completion_tokens must be JSON integers: a
 // float such as 1.0 or a numeric string is refused 400, as Dynamo's own
 // integer request types refuse them.
-func admissionWork(body []byte, defaultOutput int64) (admissionEstimate, bool) {
+func admissionWork(body []byte, defaultOutput int64, routePath string) (admissionEstimate, bool) {
 	// Every field the estimate and the routed model are read from must be
 	// unambiguous: no duplicates and no case variants (see
 	// checkTopLevelKeyAmbiguity), or phoebe could admit against one value
@@ -233,10 +235,14 @@ func admissionWork(body []byte, defaultOutput int64) (admissionEstimate, bool) {
 			sequences = *c
 		}
 	}
-	// A batched prompt is one generation per prompt. Both factors are
-	// bounded by maxOutputSequences before multiplying, so the product
-	// cannot overflow, and the product is held to the same bound.
-	prompts := promptBatchCount(v.Prompt)
+	// A batched completions prompt is one generation per prompt. Only the
+	// completions route reads "prompt"; elsewhere the engine ignores it.
+	// Both factors are bounded by maxOutputSequences before multiplying, so
+	// the product cannot overflow, and the product is held to the same bound.
+	prompts := int64(1)
+	if routePath == "/v1/completions" {
+		prompts = promptBatchCount(v.Prompt)
+	}
 	if prompts > maxOutputSequences {
 		return admissionEstimate{}, false
 	}

@@ -2338,11 +2338,11 @@ func TestSharedPolicyOverwritesClientPriorityWhenAdmissionDisabled(t *testing.T)
 }
 
 func TestAdmissionWorkRejectsAmbiguousOrImpossibleRequests(t *testing.T) {
-	if _, ok := admissionWork([]byte(`{"model":"m","max_tokens":2,"max_completion_tokens":3}`), 10); ok {
+	if _, ok := admissionWork([]byte(`{"model":"m","max_tokens":2,"max_completion_tokens":3}`), 10, "/v1/chat/completions"); ok {
 		t.Fatal("conflicting output limits accepted")
 	}
 	body := []byte(`{"model":"m"}`)
-	if estimate, ok := admissionWork(body, 10); !ok || estimate.Model != "m" || estimate.OutputTokens != 10 || estimate.InputTokens != 1 {
+	if estimate, ok := admissionWork(body, 10, "/v1/chat/completions"); !ok || estimate.Model != "m" || estimate.OutputTokens != 10 || estimate.InputTokens != 1 {
 		t.Fatalf("estimate=(%+v,%t)", estimate, ok)
 	}
 	for _, body := range []string{
@@ -2351,7 +2351,7 @@ func TestAdmissionWorkRejectsAmbiguousOrImpossibleRequests(t *testing.T) {
 		`{"model":"m","max_completion_tokens":200,"max_completion_tokens":2}`,
 		`{"model":"m","max_tokens":4294967296}`,
 	} {
-		if _, ok := admissionWork([]byte(body), 10); ok {
+		if _, ok := admissionWork([]byte(body), 10, "/v1/chat/completions"); ok {
 			t.Fatalf("ambiguous admission work accepted: %s", body)
 		}
 	}
@@ -2371,13 +2371,13 @@ func TestAdmissionWorkRejectsCaseVariantAndDuplicateInterpretedKeys(t *testing.T
 		`{"model":"m","Model":"x"}`,
 		`{"model":"m","MAX_TOKENS":2}`,
 	} {
-		if _, ok := admissionWork([]byte(body), 10); ok {
+		if _, ok := admissionWork([]byte(body), 10, "/v1/chat/completions"); ok {
 			t.Fatalf("ambiguous interpreted key accepted: %.80s", body)
 		}
 	}
 	// An ordinary body is unaffected and keeps its estimate.
 	body := []byte(`{"model":"m","max_tokens":5,"messages":[{"role":"user","content":"` + long + `"}],"Stream":true}`)
-	estimate, ok := admissionWork(body, 10)
+	estimate, ok := admissionWork(body, 10, "/v1/chat/completions")
 	if !ok || estimate.Model != "m" || estimate.OutputTokens != 5 || estimate.InputTokens != estimatePromptTokens(body) || estimate.InputTokens != 1000 {
 		t.Fatalf("estimate=(%+v,%t), want model m, 5 output tokens, 1000 input tokens", estimate, ok)
 	}
