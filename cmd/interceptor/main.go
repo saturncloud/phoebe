@@ -130,7 +130,13 @@ func buildAdmission(s *config.Settings, log *logging.Logger) (admission.Admitter
 // it logs a warning naming the reason and returns nil, and events carry no
 // topology: the fields are margin evidence, so their absence is never a
 // reason to stop serving.
-const topologySyncWait = 10 * time.Second
+//
+// topologySyncWait and newTopologyKubeClient are variables so tests can
+// shorten the wait and inject a client that never syncs.
+var (
+	topologySyncWait      = 10 * time.Second
+	newTopologyKubeClient = gateway.NewKubeClient
+)
 
 func buildTopology(s *config.Settings, log *logging.Logger) (*gateway.TopologyIndex, func()) {
 	// Each disabled case says so at Warn: without the index every usage
@@ -140,7 +146,7 @@ func buildTopology(s *config.Settings, log *logging.Logger) (*gateway.TopologyIn
 		log.Warn.Printf("gateway: graph topology index disabled (%s); usage events, including dedicated traffic, carry no topology revision or region", reason)
 		return nil, func() {}
 	}
-	client, err := gateway.NewKubeClient(s.Gateway.Kubeconfig)
+	client, err := newTopologyKubeClient(s.Gateway.Kubeconfig)
 	if err != nil {
 		log.Warn.Printf("gateway: graph topology index disabled (%v); usage events carry no topology revision or region", err)
 		return nil, func() {}
