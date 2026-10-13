@@ -595,3 +595,80 @@ func TestStallGuardIgnoresNonTimeoutWriteErrors(t *testing.T) {
 		t.Fatal("a non-timeout write error must not be recorded as a stall")
 	}
 }
+
+// blockingWarmBackend answers cold (404) until the wake warms it, then holds
+// each warm request before sending headers until release is closed, the way
+// an engine holds a request until its first token.
+type blockingWarmBackend struct {
+	warm     atomic.Bool
+	inWarm   chan struct{}
+	release  chan struct{}
+	warmBody string
+}
+
+func (b *blockingWarmBackend) ServeHTTP(w http.ResponseWriter, _ *http.Request) {
+	if !b.warm.Load() {
+		w.WriteHeader(http.StatusNotFound)
+		_, _ = w.Write([]byte(`{"message":"Model not found"}`))
+		return
+	}
+	b.inWarm <- struct{}{}
+	<-b.release
+	_, _ = w.Write([]byte(b.warmBody))
+}
+
+type warmingWaker struct{ backend *blockingWarmBackend }
+
+func (w *warmingWaker) Wake(context.Context, WakeTarget) error {
+	w.backend.warm.Store(true)
+	return nil
+}
+
+// B5: a dedicated cold hold covers only the time the endpoint is starting.
+// It is released when the wake completes, before the retried request waits
+// for the warm engine's headers, so a second cold request to the same
+// endpoint can take the single slot while the first is still waiting.
+func TestDedicatedColdHoldReleasedWhenWakeCompletes(t *testing.T) {
+	backend := &blockingWarmBackend{
+		inWarm:   make(chan struct{}, 1),
+		release:  make(chan struct{}),
+		warmBody: `{"model":"m","usage":{"prompt_tokens":1,"completion_tokens":1}}`,
+	}
+	be := httptest.NewServer(backend)
+	defer be.Close()
+	// Unblock the warm backend before be.Close on every exit, so a failed
+	// assertion ends the test instead of hanging it.
+	var releaseOnce sync.Once
+	unblock := func() { releaseOnce.Do(func() { close(backend.release) }) }
+	defer unblock()
+	up, _ := url.Parse(be.URL)
+	s := newProtectedServer(config.ProtectionSettings{MaxDedicatedColdHoldsPerEndpoint: 1}, &recordingEmitter{}).
+		WithWaker(&warmingWaker{backend: backend}, 5*time.Second)
+
+	rec := httptest.NewRecorder()
+	done := make(chan struct{})
+	go func() { defer close(done); s.Handler().ServeHTTP(rec, dedicatedColdRequest(up, "endpoint-a")) }()
+	select {
+	case <-backend.inWarm:
+	case <-time.After(5 * time.Second):
+		t.Fatal("the retried request never reached the warm backend")
+	}
+
+	s.dedicatedHolds.mu.Lock()
+	inUse := s.dedicatedHolds.held["endpoint-a"]
+	s.dedicatedHolds.mu.Unlock()
+	if inUse != 0 {
+		t.Fatalf("endpoint-a holds in use while the retry waits for headers = %d, want 0", inUse)
+	}
+	second, ok := s.dedicatedHolds.acquire("endpoint-a", s.protection().MaxDedicatedColdHoldsPerEndpoint)
+	if !ok {
+		t.Fatal("a second cold request could not take the only slot while the first waited on the warm engine")
+	}
+	second()
+
+	unblock()
+	<-done
+	if rec.Code != http.StatusOK {
+		t.Fatalf("held request status=%d, want 200 after the wake", rec.Code)
+	}
+}

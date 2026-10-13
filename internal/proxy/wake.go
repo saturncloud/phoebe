@@ -283,6 +283,11 @@ func (t *wakeRoundTripper) RoundTrip(req *http.Request) (*http.Response, error) 
 		}
 	}
 
+	// releaseHold ends this request's dedicated cold hold. It runs as soon as
+	// the wake finishes, so the hold covers only the time the endpoint is
+	// starting and not the retried request's wait for headers; the defer is a
+	// backstop for the early returns.
+	releaseHold := func() {}
 	if t.target.ServingMode == identity.ServingModeDedicated {
 		// Dedicated endpoints have no admission lease, so the shared tier's
 		// maxColdHolds never applies to them; this per-endpoint cap bounds how
@@ -297,7 +302,8 @@ func (t *wakeRoundTripper) RoundTrip(req *http.Request) (*http.Response, error) 
 			writeDedicatedColdHoldsFull(buf, t.requestID)
 			return bufferedHTTPResponse(req, buf, true), nil
 		}
-		defer release()
+		releaseHold = sync.OnceFunc(release)
+		defer releaseHold()
 	}
 
 	ctx := req.Context()
@@ -307,6 +313,7 @@ func (t *wakeRoundTripper) RoundTrip(req *http.Request) (*http.Response, error) 
 		defer cancel()
 	}
 	wakeErr := t.server.waker.Wake(ctx, t.target)
+	releaseHold()
 	if t.lease != nil {
 		if err := t.lease.EndColdHold(context.WithoutCancel(req.Context())); err != nil {
 			t.server.admissionColdHoldReleaseLog.logf(
