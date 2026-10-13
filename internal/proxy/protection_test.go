@@ -92,15 +92,55 @@ func TestRequestBodyCapAppliesToDedicatedRoutes(t *testing.T) {
 	}
 }
 
-func TestProtectionSettingsAbsentSelectsDefaults(t *testing.T) {
-	eff := config.ProtectionSettings{}.Effective()
-	if eff.MaxRequestBodyBytes != config.DefaultMaxRequestBodyBytes ||
-		eff.StreamStallTimeout != config.DefaultStreamStallTimeout ||
-		eff.MaxStreamDuration != config.DefaultMaxStreamDuration ||
-		eff.MaxResponseBufferBytesPerStream != config.DefaultMaxResponseBufferBytesPerStream ||
-		eff.MaxResponseBufferBytesTotal != config.DefaultMaxResponseBufferBytesTotal ||
-		eff.MaxDedicatedColdHoldsPerEndpoint != config.DefaultMaxDedicatedColdHoldsPerEndpoint {
-		t.Fatalf("absent settings must select every default, got %+v", eff)
+// A Server built with no protection settings runs on every shipped default,
+// and the default request body cap is actually enforced on the request path.
+func TestServerWithAbsentProtectionSettingsEnforcesDefaults(t *testing.T) {
+	var upstreamHits atomic.Int32
+	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		upstreamHits.Add(1)
+		_, _ = io.Copy(io.Discard, r.Body)
+		_, _ = io.WriteString(w, `{"model":"m","usage":{"prompt_tokens":1,"completion_tokens":1}}`)
+	}))
+	defer backend.Close()
+	up, _ := url.Parse(backend.URL)
+	s := newProtectedServer(config.ProtectionSettings{}, &recordingEmitter{})
+
+	eff := s.protection()
+	for _, f := range []struct {
+		name      string
+		got, want any
+	}{
+		{"MaxRequestBodyBytes", eff.MaxRequestBodyBytes, config.DefaultMaxRequestBodyBytes},
+		{"StreamStallTimeout", eff.StreamStallTimeout, config.DefaultStreamStallTimeout},
+		{"MaxStreamDuration", eff.MaxStreamDuration, config.DefaultMaxStreamDuration},
+		{"MaxResponseBufferBytesPerStream", eff.MaxResponseBufferBytesPerStream, config.DefaultMaxResponseBufferBytesPerStream},
+		{"MaxResponseBufferBytesTotal", eff.MaxResponseBufferBytesTotal, config.DefaultMaxResponseBufferBytesTotal},
+		{"MaxDedicatedColdHoldsPerEndpoint", eff.MaxDedicatedColdHoldsPerEndpoint, config.DefaultMaxDedicatedColdHoldsPerEndpoint},
+	} {
+		if f.got != f.want {
+			t.Errorf("server %s=%v, want default %v", f.name, f.got, f.want)
+		}
+	}
+
+	for _, tc := range []struct {
+		name string
+		size int
+		want int
+	}{
+		{"a body at the default cap is served", int(config.DefaultMaxRequestBodyBytes), http.StatusOK},
+		{"a body one byte over the default cap is refused", int(config.DefaultMaxRequestBodyBytes) + 1, http.StatusRequestEntityTooLarge},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			before := upstreamHits.Load()
+			rr := httptest.NewRecorder()
+			s.Handler().ServeHTTP(rr, dedicatedBoundRequest(up, bodyOfSize(tc.size)))
+			if rr.Code != tc.want {
+				t.Fatalf("status=%d, want %d", rr.Code, tc.want)
+			}
+			if tc.want != http.StatusOK && upstreamHits.Load() != before {
+				t.Fatal("an oversized body reached the upstream")
+			}
+		})
 	}
 }
 
@@ -558,7 +598,7 @@ func (w *timeoutWriter) FlushError() error         { return w.err }
 // B2: a write that runs past its deadline (a *net.OpError wrapping
 // os.ErrDeadlineExceeded, which does not match context.DeadlineExceeded) is
 // recorded as a stall, through both Write and FlushError.
-func TestStallGuardRecordsNetWriteDeadlineAsStall(t *testing.T) {
+func TestStallGuardRecordsWriteAndFlushDeadlineAsStall(t *testing.T) {
 	opErr := &net.OpError{Op: "write", Net: "tcp", Err: os.ErrDeadlineExceeded}
 	for _, tc := range []struct {
 		name string
@@ -599,15 +639,30 @@ func TestStallGuardRecordsStallAfterParentCancelled(t *testing.T) {
 	}
 }
 
-// A write that fails for any reason other than its deadline is not a stall.
-func TestStallGuardIgnoresNonTimeoutWriteErrors(t *testing.T) {
-	ctx, cancel := context.WithCancelCause(context.Background())
-	defer cancel(nil)
-	g := newStallGuardWriter(&timeoutWriter{ResponseWriter: httptest.NewRecorder(),
-		err: &net.OpError{Op: "write", Err: errors.New("connection reset by peer")}}, time.Second, cancel)
-	_, _ = g.Write([]byte("x"))
-	if g.stallCause() != nil || ctx.Err() != nil {
-		t.Fatal("a non-timeout write error must not be recorded as a stall")
+// A Write or FlushError that fails for any reason other than its deadline (a
+// client that reset the connection) is not a stall. WriteHeader returns no
+// error and never records one, so it has no case here.
+func TestStallGuardIgnoresNonTimeoutWriteAndFlushErrors(t *testing.T) {
+	resetErr := &net.OpError{Op: "write", Err: errors.New("connection reset by peer")}
+	for _, tc := range []struct {
+		name string
+		do   func(g *stallGuardWriter)
+	}{
+		{"write", func(g *stallGuardWriter) { _, _ = g.Write([]byte("x")) }},
+		{"flush", func(g *stallGuardWriter) { _ = g.FlushError() }},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx, cancel := context.WithCancelCause(context.Background())
+			defer cancel(nil)
+			g := newStallGuardWriter(&timeoutWriter{ResponseWriter: httptest.NewRecorder(), err: resetErr}, time.Second, cancel)
+			tc.do(g)
+			if g.stallCause() != nil || g.stalled.Load() {
+				t.Fatal("a non-timeout error must not be recorded as a stall")
+			}
+			if ctx.Err() != nil {
+				t.Fatalf("a non-timeout error must not cancel the request, cause=%v", context.Cause(ctx))
+			}
+		})
 	}
 }
 
