@@ -310,14 +310,47 @@ func (r *RegistryResolver) dropClaimLocked(cmName string, key cacheKey) {
 }
 
 // GraphCapacity returns the admission capacity Atlas publishes for graph, the
-// tightest value per limit across the graph's registry entries. Before the
-// first sync, or for a graph with nothing published, it returns no limits:
-// "no profile and no override" means no capacity limit (ruling 2026-10-12).
-// Pure memory read.
+// tightest value per limit across the graph's registry entries that win their
+// (org, served name) key. A ConfigMap that loses a duplicate claim (see
+// resolveClaimants) does not serve traffic, so its capacity values do not
+// count either: a stale duplicate must not cap the graph for as long as it
+// lives. Before the first sync, or for a graph with nothing published, it
+// returns no limits: "no profile and no override" means no capacity limit
+// (ruling 2026-10-12). Pure memory read.
 func (r *RegistryResolver) GraphCapacity(graph string) GraphCapacity {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
-	return tightest(r.byGraph[graph])
+	caps := r.byGraph[graph]
+	winners := make(map[string]GraphCapacity, len(caps))
+	for cmName, c := range caps {
+		if r.winsClaimLocked(cmName) {
+			winners[cmName] = c
+		}
+	}
+	return tightest(winners)
+}
+
+// winsClaimLocked reports whether cmName is the claimant resolveClaimants
+// serves for its (org, served name) key: no other claimant on that key has a
+// lower resource_id. Claimants that tie on the lowest resource_id all count
+// as winners, so the answer never depends on map iteration order. Caller
+// holds mu (read or write).
+func (r *RegistryResolver) winsClaimLocked(cmName string) bool {
+	key, ok := r.cmKey[cmName]
+	if !ok {
+		return false
+	}
+	claims := r.byKey[key]
+	mine, ok := claims[cmName]
+	if !ok {
+		return false
+	}
+	for _, other := range claims {
+		if other.ResourceID < mine.ResourceID {
+			return false
+		}
+	}
+	return true
 }
 
 func (r *RegistryResolver) size() int {

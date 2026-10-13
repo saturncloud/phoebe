@@ -99,6 +99,38 @@ func TestRegistry_GraphCapacityLifecycle(t *testing.T) {
 	}
 }
 
+// A ConfigMap that loses a duplicate (org, served name) claim does not serve
+// traffic, so its capacity must not cap the graph: only the claimant
+// resolveClaimants serves (lowest resource_id) publishes. Deleting the winner
+// promotes the survivor's capacity along with its resolution.
+func TestRegistry_GraphCapacityOnlyFromWinningClaimant(t *testing.T) {
+	winner := registryCM("tf-model-winner", map[string]string{
+		"resource_id": "tfm-aaa", "admission_max_active_requests": "10", "admission_max_prefill_tokens": "4096",
+	})
+	stale := registryCM("tf-model-stale", map[string]string{
+		"resource_id": "tfm-bbb", "admission_max_active_requests": "2", "admission_max_prefill_tokens": "512",
+	})
+	r, client, _ := startedRegistry(t, winner, stale)
+
+	if res, ok := waitResolve(t, r, "org-1", "support-bot"); !ok || res.ResourceID != "tfm-aaa" {
+		t.Fatalf("resolution = %+v (ok=%v), want winner tfm-aaa", res, ok)
+	}
+	c := waitCapacity(t, r, "graph-llama31", func(c GraphCapacity) bool { return val(c.MaxActiveRequests) == 10 })
+	if val(c.MaxActiveRequests) != 10 || val(c.MaxPrefillTokens) != 4096 {
+		t.Fatalf("capacity = (active %d, prefill %d), want the winner's (10, 4096), not the losing duplicate's (2, 512)",
+			val(c.MaxActiveRequests), val(c.MaxPrefillTokens))
+	}
+
+	if err := client.CoreV1().ConfigMaps(registryNS).Delete(context.Background(), "tf-model-winner", metav1.DeleteOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	c = waitCapacity(t, r, "graph-llama31", func(c GraphCapacity) bool { return val(c.MaxActiveRequests) == 2 })
+	if val(c.MaxActiveRequests) != 2 || val(c.MaxPrefillTokens) != 512 {
+		t.Fatalf("after the winner was deleted capacity = (active %d, prefill %d), want the survivor's (2, 512)",
+			val(c.MaxActiveRequests), val(c.MaxPrefillTokens))
+	}
+}
+
 // GraphCapacity.Limits is the one conversion of published capacity into the
 // graph_capacity admission scope. Every GraphCapacity field must reach the
 // AdmissionLimits field of the same name, or a published key would engage
