@@ -88,8 +88,11 @@ type Request struct {
 	// counter; the proxy sets both from one estimate.
 	PrefillTokens        int64
 	EstimatedInputTokens int64
-	// OutputSequences multiplies ReservedOutputTokens in the reserved-KV
-	// charge (n / best_of). 0 is read as 1.
+	// OutputSequences multiplies ReservedOutputTokens (n / best_of, times
+	// the prompts in a batch) in every output charge: the reserved-output
+	// counter, the contract generated-token reservation and pre-check, the
+	// reserved-KV charge, and the generated tokens charged when a request
+	// ends without usage. 0 is read as 1.
 	OutputSequences      int64
 	ReservedOutputTokens int64
 	Adapter              bool
@@ -313,7 +316,7 @@ func (a *RedisAdmitter) Admit(ctx context.Context, req Request) (*Lease, error) 
 			id:    id,
 			unknownUsage: Usage{
 				TotalPromptTokens: req.EstimatedInputTokens,
-				GeneratedTokens:   req.ReservedOutputTokens,
+				GeneratedTokens:   req.ReservedOutputTokens * max(req.OutputSequences, 1),
 			},
 		}, nil
 	}
@@ -512,7 +515,7 @@ type Lease struct {
 	// unknownUsage is the conservative contractual charge when the engine's
 	// authoritative usage block never arrives. The estimate was already
 	// reserved as wholly uncached input, and generated capacity was reserved at
-	// the request's maximum output, so retaining both prevents an abort-before-
+	// the request's maximum output times its output sequences, so retaining both prevents an abort-before-
 	// usage client from turning consumed model work into a zero-token request.
 	unknownUsage Usage
 }

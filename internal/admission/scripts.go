@@ -99,7 +99,12 @@ end
 `
 
 var admitScript = redis.NewScript(luaHelpers + `
-local q=cjson.decode(ARGV[1]); q.now=current_time_ms(); reap(q.now); q.kv=q.estimated_input+q.output*(q.sequences or 1)
+local q=cjson.decode(ARGV[1]); q.now=current_time_ms(); reap(q.now)
+-- n / best_of (and a batched prompt) make the engine generate up to output
+-- tokens for each sequence, so every output charge (the reserved-output
+-- counter, the contract generated-token reservation and the reserved KV) is
+-- output x sequences. q.gen is that product; the prompt's KV is shared.
+q.gen=q.output*(q.sequences or 1); q.kv=q.estimated_input+q.gen
 -- A caller may lose the reply after this script commits. Retrying the exact
 -- request id must recover the existing lease rather than reserve every
 -- dimension a second time.
@@ -118,27 +123,28 @@ for _,s in ipairs(q.scopes) do
   if s.contractual then
     if s.total_prompt > 0 and q.estimated_input > s.total_prompt then return {0,s.name,'total_prompt_tokens_exceeds_limit',contract} end
     if s.uncached_prompt > 0 and q.estimated_input > s.uncached_prompt then return {0,s.name,'uncached_prompt_tokens_exceeds_limit',contract} end
-    if s.generated > 0 and q.output > s.generated then return {0,s.name,'generated_tokens_exceeds_limit',contract} end
+    if s.generated > 0 and q.gen > s.generated then return {0,s.name,'generated_tokens_exceeds_limit',contract} end
   end
 end
 -- Pass 2: the counter and window checks.
 for _,s in ipairs(q.scopes) do
   local contract=s.contractual and 1 or 0
-  local checks={{'active',s.active,1},{'prefills',s.prefills,1},{'reserved_decode_slots',s.reserved_decode_slots,1},{'prefill_tokens',s.prefill_tokens,q.prefill_tokens},{'output',s.output,q.output},{'kv',s.kv,q.kv},{'adapters',s.adapters,q.adapter}}
+  local checks={{'active',s.active,1},{'prefills',s.prefills,1},{'reserved_decode_slots',s.reserved_decode_slots,1},{'prefill_tokens',s.prefill_tokens,q.prefill_tokens},{'output',s.output,q.gen},{'kv',s.kv,q.kv},{'adapters',s.adapters,q.adapter}}
   for _,c in ipairs(checks) do if c[2] ~= 0 and get(field(s,c[1])) + c[3] > c[2] then return {0,s.name,c[1],contract} end end
   if s.requests ~= 0 and window_get(s,'requests',q.now)+1 > s.requests then return {0,s.name,'requests',contract,window_retry_ms(s,q.now)} end
   if s.total_prompt ~= 0 and window_get(s,'total_prompt',q.now)+get(field(s,'total_prompt_reserved'))+q.estimated_input > s.total_prompt then return {0,s.name,'total_prompt_tokens',contract,window_retry_ms(s,q.now)} end
   if s.uncached_prompt ~= 0 and window_get(s,'uncached_prompt',q.now)+get(field(s,'uncached_prompt_reserved'))+q.estimated_input > s.uncached_prompt then return {0,s.name,'uncached_prompt_tokens',contract,window_retry_ms(s,q.now)} end
-  if s.generated ~= 0 and window_get(s,'generated',q.now)+get(field(s,'genreserved'))+q.output > s.generated then return {0,s.name,'generated_tokens',contract,window_retry_ms(s,q.now)} end
+  if s.generated ~= 0 and window_get(s,'generated',q.now)+get(field(s,'genreserved'))+q.gen > s.generated then return {0,s.name,'generated_tokens',contract,window_retry_ms(s,q.now)} end
 end
--- kv is stored as a decimal string: Redis's cjson encodes a number with only
--- 14 significant digits, so a kv above 1e14 written as a number came back
--- rounded and release subtracted a different amount than was added here.
+-- kv and output (output x sequences) are stored as decimal strings: Redis's
+-- cjson encodes a number with only 14 significant digits, so a charge above
+-- 1e14 written as a number came back rounded and release subtracted a
+-- different amount than was added here.
 -- cjson round-trips a string unchanged through every later re-encode, and
 -- release_record's arithmetic coerces it back to the exact number.
-local rec={scopes=q.scopes,prefill_tokens=q.prefill_tokens,kv=string.format('%d',q.kv),estimated_input=q.estimated_input,output=q.output,adapter=q.adapter,prefill=true,cold=false,admitted_at=q.now}
+local rec={scopes=q.scopes,prefill_tokens=q.prefill_tokens,kv=string.format('%d',q.kv),estimated_input=q.estimated_input,output=string.format('%d',q.gen),adapter=q.adapter,prefill=true,cold=false,admitted_at=q.now}
 for _,s in ipairs(q.scopes) do
-  add(field(s,'active'),1); add(field(s,'prefills'),1); add(field(s,'reserved_decode_slots'),1); add(field(s,'prefill_tokens'),q.prefill_tokens); add(field(s,'output'),q.output); add(field(s,'kv'),q.kv); add(field(s,'genreserved'),q.output)
+  add(field(s,'active'),1); add(field(s,'prefills'),1); add(field(s,'reserved_decode_slots'),1); add(field(s,'prefill_tokens'),q.prefill_tokens); add(field(s,'output'),q.gen); add(field(s,'kv'),q.kv); add(field(s,'genreserved'),q.gen)
   add(field(s,'total_prompt_reserved'),q.estimated_input); add(field(s,'uncached_prompt_reserved'),q.estimated_input)
   if q.adapter == 1 then add(field(s,'adapters'),1) end
   if s.requests ~= 0 then window_add(s,'requests',q.now,1) end

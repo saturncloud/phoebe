@@ -609,3 +609,18 @@ func TestMaxTokensAboveGeneratedLimitIsUnsatisfiable400(t *testing.T) {
 		t.Fatalf("body=%q", got)
 	}
 }
+
+// n multiplies what a request can generate, so max_tokens=1500 with n=2
+// (3000 tokens) against a 2000-token generated window can never be admitted:
+// the same 400 as max_tokens above the limit, before the engine.
+func TestMaxTokensTimesSequencesAboveGeneratedLimitIsUnsatisfiable400(t *testing.T) {
+	s, _, hits := flagOffServer(t)
+	req := contractGatewayRequest(map[string]string{identity.HeaderOrgRateLimitGeneratedTokens: "2000"})
+	req.Body = io.NopCloser(strings.NewReader(`{"model":"model-a","max_tokens":1500,"n":2}`))
+	req.ContentLength = -1
+	rr := httptest.NewRecorder()
+	s.Handler().ServeHTTP(rr, req)
+	if rr.Code != http.StatusBadRequest || rr.Header().Get("Retry-After") != "" || hits.Load() != 0 {
+		t.Fatalf("status=%d Retry-After=%q hits=%d, want 400 without Retry-After before upstream", rr.Code, rr.Header().Get("Retry-After"), hits.Load())
+	}
+}

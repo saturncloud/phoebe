@@ -237,7 +237,11 @@ type AdmissionLimits struct {
 	// prefill (admitted, no response byte yet). The estimate is the request's
 	// message-text characters divided by 4 plus a fixed cost per image part
 	// (ruling 2026-10-12); it replaced the old byte-based maxPromptBytes.
-	MaxPrefillTokens        *int64 `yaml:"maxPrefillTokens"`
+	MaxPrefillTokens *int64 `yaml:"maxPrefillTokens"`
+	// MaxReservedOutputTokens bounds the output tokens admitted requests may
+	// generate; each request is charged max_tokens x its output sequences
+	// (max(n, best_of, 1) x batched prompts), since the engine generates up
+	// to max_tokens for each sequence (ledger D29).
 	MaxReservedOutputTokens *int64 `yaml:"maxReservedOutputTokens"`
 	// MaxReservedKVTokens bounds the KV-cache tokens admitted requests may
 	// need: estimated input plus reserved output tokens, held until the

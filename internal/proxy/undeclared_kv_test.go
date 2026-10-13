@@ -17,6 +17,7 @@ import (
 
 	"github.com/saturncloud/phoebe/internal/admission"
 	"github.com/saturncloud/phoebe/internal/config"
+	"github.com/saturncloud/phoebe/internal/identity"
 	"github.com/saturncloud/phoebe/internal/logging"
 )
 
@@ -180,7 +181,7 @@ func TestUndeclaredOutputWithinCaps(t *testing.T) {
 		{4096, 200, 4, 3000, 0, 700},      // n=4: each sequence gets a quarter of the room
 		{4096, 200, 0, 3000, 0, 2800},     // 0 sequences reads as 1
 		{4096, 200, 1, 0, 2048, 2048},     // output cap alone
-		{4096, 200, 4, 0, 2048, 2048},     // the output counter is charged once, not per sequence
+		{4096, 200, 4, 0, 2048, 512},      // n=4: the output counter is charged output x sequences
 		{4096, 200, 1, 3000, 2048, 2048},  // output cap tighter than the KV room
 		{4096, 2000, 1, 3000, 2048, 1000}, // KV room tighter than the output cap
 		{100, 200, 1, 3000, 2048, 100},    // fits both
@@ -357,5 +358,30 @@ func TestUndeclaredOutputReservationFitsOperatorOutputCap(t *testing.T) {
 	}
 	if _, osl := be.snapshot(); len(osl) != 2 || osl[1] != 1000 {
 		t.Fatalf("osl=%v, want the second request reserving the 1000-token KV room", osl)
+	}
+}
+
+// An undeclared max_tokens with n=4 reserves the default only as far as
+// default x 4 fits the tightest contract generated-token limit: with a
+// 400-token owner window each sequence gets 100, the Dynamo hint is 100,
+// and the request is admitted instead of refused for a default the client
+// did not choose.
+func TestUndeclaredOutputPerSequenceFitsContractGeneratedLimit(t *testing.T) {
+	be := &oslRecordingBackend{}
+	srv := httptest.NewServer(be)
+	defer srv.Close()
+	up, _ := url.Parse(srv.URL)
+	s := kvTestServer(t, kvTestConfig())
+
+	req := sharedRequest(up)
+	req.Header.Set(identity.HeaderOwnerRateLimitGeneratedTokens, "400")
+	replaceRequestBody(req, []byte(`{"model":"model-a","n":4,"messages":[{"role":"user","content":"hi"}]}`))
+	rr := httptest.NewRecorder()
+	s.Handler().ServeHTTP(rr, req)
+	if rr.Code != http.StatusOK {
+		t.Fatalf("undeclared n=4 status=%d body=%q, want 200", rr.Code, rr.Body.String())
+	}
+	if hits, osl := be.snapshot(); hits != 1 || len(osl) != 1 || osl[0] != 100 {
+		t.Fatalf("hits=%d osl=%v, want one request reserving 400 / 4 = 100 output tokens", hits, osl)
 	}
 }

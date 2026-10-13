@@ -3121,3 +3121,27 @@ func TestOversizeRequestIs413WithoutRetryAfterWhenEarlierScopeFull(t *testing.T)
 		t.Fatalf("status=%d retry-after=%q, want 413 without Retry-After", rr.Code, rr.Header().Get("Retry-After"))
 	}
 }
+
+// R4 / D12 for the reserved-KV dimension: an explicit zero platform KV cap
+// is the retryable 503 with Retry-After, never the 413 kv_exceeds_limit
+// answer for a request too large to ever fit.
+func TestZeroPlatformKVCapIsRetryable503Not413(t *testing.T) {
+	var hits atomic.Int32
+	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) { hits.Add(1); w.WriteHeader(200) }))
+	defer backend.Close()
+	up, _ := url.Parse(backend.URL)
+	mr := miniredis.RunT(t)
+	cfg := proxyAdmissionConfig(2)
+	cfg.Platform.MaxReservedKVTokens = ptr64(0)
+	c := redis.NewClient(&redis.Options{Addr: mr.Addr()})
+	t.Cleanup(func() { _ = c.Close() })
+	s := New(&config.Settings{Admission: cfg}, logging.New(logging.ERROR), &recordingEmitter{}).WithAdmitter(admission.New(c, cfg))
+	rr := httptest.NewRecorder()
+	s.Handler().ServeHTTP(rr, sharedRequest(up))
+	if rr.Code != http.StatusServiceUnavailable || rr.Header().Get("Retry-After") == "" {
+		t.Fatalf("status=%d retry-after=%q, want a retryable 503 at the zero KV cap", rr.Code, rr.Header().Get("Retry-After"))
+	}
+	if n := hits.Load(); n != 0 {
+		t.Fatalf("upstream hits=%d, a zero-capped request must not reach the engine", n)
+	}
+}

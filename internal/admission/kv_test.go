@@ -342,4 +342,33 @@ func assertReleaseSubtractsExactlyWhatAdmitAdded(ctx context.Context, t *testing
 			t.Fatalf("%s: kv=%q after release, want exactly zero (field removed)", finish, got)
 		}
 	}
+	// The output and generated-token reservations are output x sequences
+	// too, and must also survive the record exactly: 3999999999 x 40001 =
+	// 160003999959999 has 15 significant digits.
+	req.ReservedOutputTokens, req.OutputSequences = 3_999_999_999, 40_001
+	for _, finish := range []string{"complete", "prefill then complete"} {
+		lease, err := a.Admit(ctx, req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		scopeID := a.scopes(req)[0].ID
+		for _, dim := range []string{"output", "genreserved"} {
+			if got := hget(scopeID + "|" + dim); got != "160003999959999" {
+				t.Fatalf("%s=%q, want 160003999959999", dim, got)
+			}
+		}
+		if finish != "complete" {
+			if err := lease.PrefillDone(ctx); err != nil {
+				t.Fatal(err)
+			}
+		}
+		if err := lease.Complete(ctx, 0); err != nil {
+			t.Fatal(err)
+		}
+		for _, dim := range []string{"output", "genreserved", "kv"} {
+			if got := hget(scopeID + "|" + dim); got != "" {
+				t.Fatalf("%s: %s=%q after release, want exactly zero (field removed)", finish, dim, got)
+			}
+		}
+	}
 }

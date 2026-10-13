@@ -119,8 +119,10 @@ type admissionEstimate struct {
 	OutputDeclared bool
 	// OutputSequences is how many output sequences the engine generates in
 	// parallel for the request: the larger of n and best_of, at least 1. The
-	// prompt's KV is shared across them, but each sequence needs its own
-	// output KV, so the reserved-KV charge is input + output x sequences.
+	// prompt's KV is shared across them, but each sequence generates up to
+	// OutputTokens and needs its own output KV, so admission multiplies the
+	// output by sequences in the reserved-output, contract generated-token
+	// and reserved-KV charges (the KV charge is input + output x sequences).
 	OutputSequences int64
 }
 
@@ -522,17 +524,26 @@ func trustedPolicyEnvelopePresent(id identity.Identity) bool {
 	return id.OwnerID != "" || anyScopedLimitPresent(id) || id.GroupScopes != ""
 }
 
-// undeclaredOutputReservation is the output-token reservation for a request
-// that declares neither max_tokens nor max_completion_tokens: the configured
-// default, clamped to the smallest positive contract generated-token limit so
-// that an undeclared request always fits an otherwise empty window. An
-// explicit zero cap does not clamp; that scope rejects in admission.
-func undeclaredOutputReservation(defaultOutput int64, scopes ...admission.RateLimits) int64 {
+// undeclaredOutputReservation is the per-sequence output-token reservation
+// for a request that declares neither max_tokens nor max_completion_tokens:
+// the configured default, clamped so the reservation times sequences fits
+// the smallest positive contract generated-token limit (admission charges
+// the generated-token window output x sequences), so that an undeclared
+// request always fits an otherwise empty window. An explicit zero cap does
+// not clamp; that scope rejects in admission. The result is at least 1; a
+// request whose sequence count alone passes a limit is refused for its n.
+func undeclaredOutputReservation(defaultOutput, sequences int64, scopes ...admission.RateLimits) int64 {
+	if sequences < 1 {
+		sequences = 1
+	}
 	out := defaultOutput
 	for _, limits := range scopes {
-		if g := limits.GeneratedTokens; g != nil && *g > 0 && *g < out {
-			out = *g
+		if g := limits.GeneratedTokens; g != nil && *g > 0 && *g/sequences < out {
+			out = *g / sequences
 		}
+	}
+	if out < 1 {
+		out = 1
 	}
 	return out
 }
@@ -555,23 +566,23 @@ const maxReservedOutput = 1 << 46
 // undeclaredOutputWithinCaps clamps the output reservation of a request
 // that declared no max_tokens so it fits every positive per-request-bounding
 // cap that applies: the prompt plus the reservation (times sequences) fits
-// kvCap, the tightest positive reserved-KV cap, and the reservation fits
-// outputCap, the tightest positive reserved-output cap (admission charges the
-// output counter once per request, not per sequence). 0 means no cap. Like
+// kvCap, the tightest positive reserved-KV cap, and the reservation times
+// sequences fits outputCap, the tightest positive reserved-output cap
+// (admission charges the output counter output x sequences). 0 means no cap. Like
 // the contract clamp above, a request is never refused for a default the
 // client did not choose. The result is at least 1; when the prompt alone
 // fills the KV cap the request is still refused for its prompt (413).
 func undeclaredOutputWithinCaps(output, input, sequences, kvCap, outputCap int64) int64 {
+	if sequences < 1 {
+		sequences = 1
+	}
 	if kvCap > 0 {
-		if sequences < 1 {
-			sequences = 1
-		}
 		if room := (kvCap - input) / sequences; room < output {
 			output = room
 		}
 	}
-	if outputCap > 0 && outputCap < output {
-		output = outputCap
+	if outputCap > 0 && outputCap/sequences < output {
+		output = outputCap / sequences
 	}
 	if output < 1 {
 		output = 1

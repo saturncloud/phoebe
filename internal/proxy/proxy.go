@@ -754,22 +754,24 @@ func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request) {
 			// Embeddings generate no tokens, so they reserve none beyond the
 			// minimum of one that admission requires.
 			defaultOutput = 1
-		} else {
-			// An undeclared max_tokens reserves no more than the tightest
-			// contract generated-token limit, so it is never rejected for a
-			// default the client did not choose. The reservation is clamped
-			// before prepareSharedDynamoRequest so the Dynamo output hint
-			// still equals the reservation.
-			groupLimits := make([]admission.RateLimits, len(groupScopes))
-			for i, gs := range groupScopes {
-				groupLimits[i] = gs.Limits
-			}
-			defaultOutput = undeclaredOutputReservation(defaultOutput, append([]admission.RateLimits{organizationLimits, ownerLimits}, groupLimits...)...)
 		}
 		estimate, ok := admissionWork(body, defaultOutput)
 		if !ok {
 			http.Error(w, "invalid shared inference request", http.StatusBadRequest)
 			return
+		}
+		if routePath != "/v1/embeddings" && !estimate.OutputDeclared {
+			// An undeclared max_tokens reserves no more than the tightest
+			// contract generated-token limit divided by the output sequences
+			// (admission charges output x sequences), so it is never rejected
+			// for a default the client did not choose. The reservation is
+			// clamped before prepareSharedDynamoRequest so the Dynamo output
+			// hint still equals the reservation.
+			contractLimits := []admission.RateLimits{organizationLimits, ownerLimits}
+			for _, gs := range groupScopes {
+				contractLimits = append(contractLimits, gs.Limits)
+			}
+			estimate.OutputTokens = undeclaredOutputReservation(estimate.OutputTokens, estimate.OutputSequences, contractLimits...)
 		}
 		if routePath != "/v1/embeddings" && enforceAdmission && !estimate.OutputDeclared {
 			// The undeclared reservation must also fit every positive
