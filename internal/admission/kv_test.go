@@ -283,12 +283,12 @@ func TestReservedKVChargesEveryOutputSequence(t *testing.T) {
 // real-Valkey twin of this test is the one that reproduces the rounding.)
 func TestReleaseSubtractsExactlyWhatAdmitAdded(t *testing.T) {
 	a, mr := testAdmitter(t, config.AdmissionSettings{})
-	assertReleaseSubtractsExactlyWhatAdmitAdded(t, context.Background(), a, func(field string) string {
+	assertReleaseSubtractsExactlyWhatAdmitAdded(context.Background(), t, a, func(field string) string {
 		return mr.HGet(a.counters, field)
 	})
 }
 
-func assertReleaseSubtractsExactlyWhatAdmitAdded(t *testing.T, ctx context.Context, a *RedisAdmitter, hget func(string) string) {
+func assertReleaseSubtractsExactlyWhatAdmitAdded(ctx context.Context, t *testing.T, a *RedisAdmitter, hget func(string) string) {
 	t.Helper()
 	req := request("a", "m")
 	// 3 + 4e9 x 40000 = 160000000000003: 15 significant digits, which a

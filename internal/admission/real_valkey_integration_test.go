@@ -513,7 +513,7 @@ func TestRealValkeyReleaseSubtractsExactlyWhatAdmitAdded(t *testing.T) {
 		_ = client.Del(context.Background(), a.counters, a.leases, a.expiries, a.windowExpiries, a.legacyLeases, a.legacyExpiries).Err()
 		_ = client.Close()
 	})
-	assertReleaseSubtractsExactlyWhatAdmitAdded(t, ctx, a, func(field string) string {
+	assertReleaseSubtractsExactlyWhatAdmitAdded(ctx, t, a, func(field string) string {
 		return client.HGet(ctx, a.counters, field).Val()
 	})
 }
