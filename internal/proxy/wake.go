@@ -111,24 +111,21 @@ const wakeNeverServedHeader = "X-Phoebe-Wake-Never-Served"
 // passed through: a 404 tells API clients the model does not exist and they
 // do not retry it, which is wrong while the model is starting.
 func writeWakeStarting(w http.ResponseWriter, requestID string) {
-	body, _ := json.Marshal(map[string]string{
-		"error": "The model is starting from zero; retry in about " +
-			strconv.Itoa(wakeRetryAfterSeconds) + " seconds.",
-	})
-	h := w.Header()
-	h.Set(requestIDHeader, requestID)
-	h.Set("Content-Type", "application/json")
-	h.Set("Retry-After", strconv.Itoa(wakeRetryAfterSeconds))
-	h.Set("Content-Length", strconv.Itoa(len(body)))
-	w.WriteHeader(http.StatusServiceUnavailable)
-	_, _ = w.Write(body)
+	writeRetryLater(w, requestID, "The model is starting from zero; retry in about "+
+		strconv.Itoa(wakeRetryAfterSeconds)+" seconds.")
 }
 
 func writeWakeStatusUnknown(w http.ResponseWriter, requestID string) {
-	body, _ := json.Marshal(map[string]string{
-		"error": "The wake service could not confirm whether startup began; retry in about " +
-			strconv.Itoa(wakeRetryAfterSeconds) + " seconds.",
-	})
+	writeRetryLater(w, requestID, "The wake service could not confirm whether startup began; retry in about "+
+		strconv.Itoa(wakeRetryAfterSeconds)+" seconds.")
+}
+
+// writeRetryLater is phoebe's one retryable 503 answer: Retry-After
+// (wakeRetryAfterSeconds) and a JSON {"error": msg} body. The wake writers and
+// the dedicated cold-hold overflow (D4) all answer through it so the shape
+// cannot drift between them.
+func writeRetryLater(w http.ResponseWriter, requestID, msg string) {
+	body, _ := json.Marshal(map[string]string{"error": msg})
 	h := w.Header()
 	h.Set(requestIDHeader, requestID)
 	h.Set("Content-Type", "application/json")

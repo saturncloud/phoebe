@@ -2,7 +2,6 @@ package proxy
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
 	"net"
 	"net/http"
@@ -278,15 +277,6 @@ func (d *dedicatedColdHolds) acquire(endpoint string, limit int64) (func(), bool
 // (out of capacity, the code the shared tier's cold-hold limit uses) with
 // Retry-After, in phoebe's {"error": "..."} shape.
 func writeDedicatedColdHoldsFull(w http.ResponseWriter, requestID string) {
-	body, _ := json.Marshal(map[string]string{
-		"error": "The endpoint is starting from zero and too many requests are already waiting; retry in about " +
-			strconv.Itoa(wakeRetryAfterSeconds) + " seconds.",
-	})
-	h := w.Header()
-	h.Set(requestIDHeader, requestID)
-	h.Set("Content-Type", "application/json")
-	h.Set("Retry-After", strconv.Itoa(wakeRetryAfterSeconds))
-	h.Set("Content-Length", strconv.Itoa(len(body)))
-	w.WriteHeader(http.StatusServiceUnavailable)
-	_, _ = w.Write(body)
+	writeRetryLater(w, requestID, "The endpoint is starting from zero and too many requests are already waiting; retry in about "+
+		strconv.Itoa(wakeRetryAfterSeconds)+" seconds.")
 }
