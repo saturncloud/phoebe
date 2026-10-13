@@ -48,6 +48,7 @@ import (
 	"k8s.io/client-go/tools/cache"
 
 	"github.com/saturncloud/phoebe/internal/logging"
+	"github.com/saturncloud/phoebe/internal/metering"
 )
 
 const (
@@ -55,9 +56,6 @@ const (
 	// topologyConfigMapPrefix + graph_k8s_name is the required ConfigMap name
 	// (Atlas: pdc/tf_metering.py topology_configmap_name).
 	topologyConfigMapPrefix = "tf-graph-topology-"
-	// maxRegionChars matches Atlas's Cluster.region Unicode(64) and
-	// billing_event.region VARCHAR(64), both counted in characters.
-	maxRegionChars = 64
 )
 
 // Topology is what Atlas published for one graph.
@@ -162,7 +160,7 @@ func (t *TopologyIndex) upsert(obj any) {
 		return
 	}
 	if regionDropped {
-		t.log.Warn.Printf("gateway: graph topology ConfigMap %s/%s: region is not valid UTF-8, contains a NUL byte, or is longer than %d characters; keeping the revision and recording no region", cm.Namespace, cm.Name, maxRegionChars)
+		t.log.Warn.Printf("gateway: graph topology ConfigMap %s/%s: region is not valid UTF-8, contains a NUL byte, or is longer than %d characters; keeping the revision and recording no region", cm.Namespace, cm.Name, metering.MaxRegionChars)
 	}
 	t.byGraph[graph] = topo
 	t.byCM[cm.Name] = graph
@@ -211,7 +209,7 @@ func parseTopologyConfigMap(cm *corev1.ConfigMap) (graph string, topo Topology, 
 	region := d["region"]
 	// NUL is rejected because PostgreSQL text cannot store it: the drainer's
 	// insert would fail and drop the batch.
-	if !utf8.ValidString(region) || strings.ContainsRune(region, 0) || utf8.RuneCountInString(region) > maxRegionChars {
+	if !utf8.ValidString(region) || strings.ContainsRune(region, 0) || utf8.RuneCountInString(region) > metering.MaxRegionChars {
 		region = ""
 		regionDropped = true
 	}

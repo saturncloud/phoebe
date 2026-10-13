@@ -37,6 +37,12 @@ func (u Usage) CachedTokens() int {
 	return u.PromptTokensDetails.CachedTokens
 }
 
+// MaxRegionChars is the longest Event.Region that can be stored, counted in
+// characters. It matches billing_event.region VARCHAR(64) and Atlas's
+// Cluster.region Unicode(64). The gateway (topology parse), the drainer
+// (nullRegion) and recovery (validate) all enforce this one limit.
+const MaxRegionChars = 64
+
 // Event is one immutable, idempotent metering record per request. It is keyed
 // by RequestID for downstream dedup (at-least-once delivery).
 //
@@ -153,6 +159,9 @@ type Event struct {
 	// replica; Region is the graph's cluster region. Both come from the
 	// graph's topology entry Atlas publishes (internal/gateway/topology.go),
 	// looked up by GraphK8sName. 0 / "" = no entry (stored NULL).
+	// A Region longer than MaxRegionChars, with a NUL byte, or not valid UTF-8
+	// cannot be stored: the gateway clears it at parse, the drainer binds NULL,
+	// and recovery rejects the row.
 	TopologyRevision int    `json:"topology_revision,omitempty"`
 	Region           string `json:"region,omitempty"`
 	// RequestStartedUnixMs is when phoebe received the request; ServingDurationMs

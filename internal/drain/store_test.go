@@ -291,16 +291,25 @@ func TestEventArgs_NegativeServingDurationStoresNull(t *testing.T) {
 func TestEventArgs_UnstorableRegionBindsNullNeverPoisons(t *testing.T) {
 	const regionIdx = 22 // topology_revision 21, request_started_at 23.
 
-	for _, ok := range []string{"eu-north1", strings.Repeat("é", 64)} {
-		args := eventArgs(metering.Event{RequestID: "r", Model: "m", Region: ok})
-		if args[regionIdx] != ok {
-			t.Fatalf("region arg = %v, want %q", args[regionIdx], ok)
-		}
+	cases := []struct {
+		name   string
+		region string
+		want   any
+	}{
+		{"empty is not captured", "", nil},
+		{"short region kept", "eu-north1", "eu-north1"},
+		{"exactly max ASCII characters kept", strings.Repeat("a", metering.MaxRegionChars), strings.Repeat("a", metering.MaxRegionChars)},
+		{"exactly max multibyte characters kept", strings.Repeat("é", metering.MaxRegionChars), strings.Repeat("é", metering.MaxRegionChars)},
+		{"one over max is NULL", strings.Repeat("a", metering.MaxRegionChars+1), nil},
+		{"invalid UTF-8 is NULL", "\xff", nil},
+		{"NUL byte is NULL", "a\x00b", nil},
 	}
-	for _, bad := range []string{"", "a\x00b", "\xff", strings.Repeat("a", 65)} {
-		args := eventArgs(metering.Event{RequestID: "r", Model: "m", Region: bad})
-		if args[regionIdx] != nil {
-			t.Fatalf("region arg for %q = %v, want nil", bad, args[regionIdx])
-		}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			args := eventArgs(metering.Event{RequestID: "r", Model: "m", Region: tc.region})
+			if args[regionIdx] != tc.want {
+				t.Fatalf("region arg for %q = %v, want %v", tc.region, args[regionIdx], tc.want)
+			}
+		})
 	}
 }

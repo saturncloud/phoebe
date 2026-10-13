@@ -306,7 +306,7 @@ func validate(ev metering.Event) error {
 		{"resource_type", ev.ResourceType, 64}, {"org_id", ev.OrgID, 64},
 		{"model", ev.Model, 255}, {"base_model", ev.BaseModel, 255},
 		{"adapter", ev.Adapter, 255}, {"serving_mode", ev.ServingMode, 32},
-		{"finish_reason", ev.FinishReason, 64}, {"region", ev.Region, 64},
+		{"finish_reason", ev.FinishReason, 64}, {"region", ev.Region, metering.MaxRegionChars},
 	} {
 		if !utf8.ValidString(field.value) {
 			return fmt.Errorf("%s is not valid UTF-8", field.name)

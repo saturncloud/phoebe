@@ -239,7 +239,8 @@ func eventArgs(e metering.Event) []any {
 		nullStr(e.GraphK8sName),
 		// Topology, region and serving time: evidence for margin analysis,
 		// NULL when unknown (no topology entry for the graph, or an event
-		// written before these fields existed).
+		// written before these fields existed). A region the column cannot
+		// store is bound as NULL ("not captured") and never fails the insert.
 		nullRevision(e.TopologyRevision),
 		nullRegion(e.Region),
 		requestStartedAt,
@@ -287,13 +288,14 @@ func nullRevision(v int) any {
 
 // nullRegion returns a driver NULL for a region that billing_event.region
 // cannot store: "", one containing a NUL byte (PostgreSQL text rejects it),
-// invalid UTF-8, or longer than 64 characters (VARCHAR(64); the same limit
-// recovery.go's validate enforces). It mirrors nullRevision as the drain-side
+// invalid UTF-8, or longer than metering.MaxRegionChars (billing_event.region
+// is VARCHAR(64); the gateway and recovery.go's validate enforce the same
+// limit). It mirrors nullRevision as the drain-side
 // backstop: a bad region would fail the multi-row insert and drop the whole
 // batch, losing billable usage for unrelated requests. Region is evidence, so
 // NULL ("not captured") is the safe value.
 func nullRegion(s string) any {
-	if s == "" || strings.ContainsRune(s, 0) || !utf8.ValidString(s) || utf8.RuneCountInString(s) > 64 {
+	if s == "" || strings.ContainsRune(s, 0) || !utf8.ValidString(s) || utf8.RuneCountInString(s) > metering.MaxRegionChars {
 		return nil
 	}
 	return s
