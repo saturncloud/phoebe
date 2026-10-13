@@ -14,16 +14,26 @@ import (
 	"github.com/redis/go-redis/v9"
 
 	"github.com/saturncloud/phoebe/internal/config"
+	"github.com/saturncloud/phoebe/internal/testutil"
 )
+
+// requireValkeyAddr returns the real-Valkey address and fails the test when it
+// is unset. These tests never skip: a CI job that builds with the
+// admissionintegration tag but forgets the address must go red, not pass.
+func requireValkeyAddr(t *testing.T) string {
+	t.Helper()
+	addr := os.Getenv("PHOEBE_TEST_ADMISSION_VALKEY_ADDR")
+	if addr == "" {
+		t.Fatal("PHOEBE_TEST_ADMISSION_VALKEY_ADDR is required")
+	}
+	return addr
+}
 
 // TestRealValkeyAtomicAdmission exercises the production Lua transaction
 // against Valkey itself. Unit tests use miniredis for fast failure-path
 // coverage; this gate catches differences in Lua, TIME, hashes, and sorted sets.
 func TestRealValkeyAtomicAdmission(t *testing.T) {
-	addr := os.Getenv("PHOEBE_TEST_ADMISSION_VALKEY_ADDR")
-	if addr == "" {
-		t.Fatal("PHOEBE_TEST_ADMISSION_VALKEY_ADDR is required")
-	}
+	addr := requireValkeyAddr(t)
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 	one := redis.NewClient(&redis.Options{Addr: addr})
@@ -39,7 +49,7 @@ func TestRealValkeyAtomicAdmission(t *testing.T) {
 	}
 	a, b := New(one, cfg), New(two, cfg)
 	t.Cleanup(func() {
-		_ = one.Del(context.Background(), a.counters, a.leases, a.expiries, a.windowExpiries).Err()
+		_ = one.Del(context.Background(), a.counters, a.leases, a.expiries, a.windowExpiries, a.legacyLeases, a.legacyExpiries).Err()
 		_ = one.Close()
 		_ = two.Close()
 	})
@@ -86,10 +96,7 @@ func TestRealValkeyAtomicAdmission(t *testing.T) {
 // prefill and cold counters actually release capacity and that a short
 // KeepAlive renewal advances the lease expiry.
 func TestRealValkeyLeaseLifecycleTransitions(t *testing.T) {
-	addr := os.Getenv("PHOEBE_TEST_ADMISSION_VALKEY_ADDR")
-	if addr == "" {
-		t.Fatal("PHOEBE_TEST_ADMISSION_VALKEY_ADDR is required")
-	}
+	addr := requireValkeyAddr(t)
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 	client := redis.NewClient(&redis.Options{Addr: addr})
@@ -98,9 +105,9 @@ func TestRealValkeyLeaseLifecycleTransitions(t *testing.T) {
 	}
 
 	l := limits(2)
-	l.MaxConcurrentPrefills = ptr64(1)
-	l.MaxColdHolds = ptr64(1)
-	l.WakesPerWindow = ptr64(10)
+	l.MaxConcurrentPrefills = testutil.Ptr[int64](1)
+	l.MaxColdHolds = testutil.Ptr[int64](1)
+	l.WakesPerWindow = testutil.Ptr[int64](10)
 	cfg := config.AdmissionSettings{
 		KeyPrefix: fmt.Sprintf("phoebe-admission-lifecycle-%d", time.Now().UnixNano()),
 		LeaseTTL:  300 * time.Millisecond,
@@ -108,7 +115,7 @@ func TestRealValkeyLeaseLifecycleTransitions(t *testing.T) {
 	}
 	a := New(client, cfg)
 	t.Cleanup(func() {
-		_ = client.Del(context.Background(), a.counters, a.leases, a.expiries, a.windowExpiries).Err()
+		_ = client.Del(context.Background(), a.counters, a.leases, a.expiries, a.windowExpiries, a.legacyLeases, a.legacyExpiries).Err()
 		_ = client.Close()
 	})
 
@@ -195,10 +202,7 @@ func TestRealValkeyLeaseLifecycleTransitions(t *testing.T) {
 }
 
 func TestRealValkeyReapsRetiredScopeWindows(t *testing.T) {
-	addr := os.Getenv("PHOEBE_TEST_ADMISSION_VALKEY_ADDR")
-	if addr == "" {
-		t.Fatal("PHOEBE_TEST_ADMISSION_VALKEY_ADDR is required")
-	}
+	addr := requireValkeyAddr(t)
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 	client := redis.NewClient(&redis.Options{Addr: addr})
@@ -214,7 +218,7 @@ func TestRealValkeyReapsRetiredScopeWindows(t *testing.T) {
 	}
 	a := New(client, cfg)
 	t.Cleanup(func() {
-		_ = client.Del(context.Background(), a.counters, a.leases, a.expiries, a.windowExpiries).Err()
+		_ = client.Del(context.Background(), a.counters, a.leases, a.expiries, a.windowExpiries, a.legacyLeases, a.legacyExpiries).Err()
 		_ = client.Close()
 	})
 
@@ -250,10 +254,7 @@ func TestRealValkeyReapsRetiredScopeWindows(t *testing.T) {
 }
 
 func TestRealValkeySettlesIndependentContractsExactly(t *testing.T) {
-	addr := os.Getenv("PHOEBE_TEST_ADMISSION_VALKEY_ADDR")
-	if addr == "" {
-		t.Fatal("PHOEBE_TEST_ADMISSION_VALKEY_ADDR is required")
-	}
+	addr := requireValkeyAddr(t)
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 	client := redis.NewClient(&redis.Options{Addr: addr})
@@ -264,7 +265,7 @@ func TestRealValkeySettlesIndependentContractsExactly(t *testing.T) {
 	}
 	a := New(client, cfg)
 	t.Cleanup(func() {
-		_ = client.Del(context.Background(), a.counters, a.leases, a.expiries, a.windowExpiries).Err()
+		_ = client.Del(context.Background(), a.counters, a.leases, a.expiries, a.windowExpiries, a.legacyLeases, a.legacyExpiries).Err()
 		_ = client.Close()
 	})
 
@@ -274,10 +275,10 @@ func TestRealValkeySettlesIndependentContractsExactly(t *testing.T) {
 		r.EstimatedInputTokens = input
 		r.ReservedOutputTokens = output
 		r.OrganizationLimits = RateLimits{
-			TotalPromptTokens: ptr64(12), UncachedPromptTokens: ptr64(8), GeneratedTokens: ptr64(7),
+			TotalPromptTokens: testutil.Ptr[int64](12), UncachedPromptTokens: testutil.Ptr[int64](8), GeneratedTokens: testutil.Ptr[int64](7),
 		}
 		r.OwnerLimits = RateLimits{
-			TotalPromptTokens: ptr64(9), UncachedPromptTokens: ptr64(5), GeneratedTokens: ptr64(6),
+			TotalPromptTokens: testutil.Ptr[int64](9), UncachedPromptTokens: testutil.Ptr[int64](5), GeneratedTokens: testutil.Ptr[int64](6),
 		}
 		return r
 	}
@@ -340,10 +341,7 @@ func TestRealValkeySettlesIndependentContractsExactly(t *testing.T) {
 // 31st request in the window is a contractual rejection with a Retry-After
 // inside the window. The owner contract behaves the same way independently.
 func TestRealValkeyContractOnlyBurst(t *testing.T) {
-	addr := os.Getenv("PHOEBE_TEST_ADMISSION_VALKEY_ADDR")
-	if addr == "" {
-		t.Fatal("PHOEBE_TEST_ADMISSION_VALKEY_ADDR is required")
-	}
+	addr := requireValkeyAddr(t)
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 	client := redis.NewClient(&redis.Options{Addr: addr})
@@ -353,7 +351,7 @@ func TestRealValkeyContractOnlyBurst(t *testing.T) {
 	}
 	a := New(client, cfg)
 	t.Cleanup(func() {
-		_ = client.Del(context.Background(), a.counters, a.leases, a.expiries, a.windowExpiries).Err()
+		_ = client.Del(context.Background(), a.counters, a.leases, a.expiries, a.windowExpiries, a.legacyLeases, a.legacyExpiries).Err()
 		_ = client.Close()
 	})
 	for _, tc := range []struct {
@@ -362,13 +360,13 @@ func TestRealValkeyContractOnlyBurst(t *testing.T) {
 	}{
 		{scope: "contract_organization", mk: func() Request {
 			r := request("org-contract", "model")
-			r.OrganizationLimits = RateLimits{Requests: ptr64(30)}
+			r.OrganizationLimits = RateLimits{Requests: testutil.Ptr[int64](30)}
 			return r
 		}},
 		{scope: "contract_owner", mk: func() Request {
 			r := request("org-owner", "model")
 			r.Owner = "owner-1"
-			r.OwnerLimits = RateLimits{Requests: ptr64(30)}
+			r.OwnerLimits = RateLimits{Requests: testutil.Ptr[int64](30)}
 			return r
 		}},
 	} {
@@ -420,10 +418,7 @@ func TestRealValkeyContractOnlyBurst(t *testing.T) {
 // admits and settles, each group's window is charged the settled usage rather
 // than the reservation, and a zero-capped group is a contractual rejection.
 func TestRealValkeyGroupScopes(t *testing.T) {
-	addr := os.Getenv("PHOEBE_TEST_ADMISSION_VALKEY_ADDR")
-	if addr == "" {
-		t.Skip("PHOEBE_TEST_ADMISSION_VALKEY_ADDR not set; skipping real-Valkey group scopes")
-	}
+	addr := requireValkeyAddr(t)
 	ctx, cancel := context.WithTimeout(context.Background(), 75*time.Second)
 	defer cancel()
 	client := redis.NewClient(&redis.Options{Addr: addr})
@@ -437,7 +432,7 @@ func TestRealValkeyGroupScopes(t *testing.T) {
 	}
 	a := New(client, cfg)
 	t.Cleanup(func() {
-		_ = client.Del(context.Background(), a.counters, a.leases, a.expiries, a.windowExpiries).Err()
+		_ = client.Del(context.Background(), a.counters, a.leases, a.expiries, a.windowExpiries, a.legacyLeases, a.legacyExpiries).Err()
 		_ = client.Close()
 	})
 
@@ -488,4 +483,50 @@ func TestRealValkeyGroupScopes(t *testing.T) {
 	if rejected, ok := err.(*Rejected); !ok || !rejected.Contractual {
 		t.Fatalf("zero-capped group admit = %T %v, want a contractual rejection", err, err)
 	}
+}
+
+// TestRealValkeyReleaseSubtractsExactlyWhatAdmitAdded pins the lease-record
+// invariant on the real Lua engine: Redis's cjson encodes numbers with only
+// 14 significant digits, so a kv above 1e14 written as a JSON number came back
+// rounded and finish released a different amount than admit reserved. The
+// counter must return to exactly zero.
+func TestRealValkeyReleaseSubtractsExactlyWhatAdmitAdded(t *testing.T) {
+	addr := requireValkeyAddr(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	client := redis.NewClient(&redis.Options{Addr: addr})
+	cfg := config.AdmissionSettings{
+		KeyPrefix: fmt.Sprintf("phoebe-admission-kv-precision-%d", time.Now().UnixNano()),
+		LeaseTTL:  time.Minute,
+		Platform:  config.AdmissionLimits{},
+	}
+	a := New(client, cfg)
+	t.Cleanup(func() {
+		_ = client.Del(context.Background(), a.counters, a.leases, a.expiries, a.windowExpiries, a.legacyLeases, a.legacyExpiries).Err()
+		_ = client.Close()
+	})
+	assertReleaseSubtractsExactlyWhatAdmitAdded(ctx, t, a, func(field string) string {
+		return client.HGet(ctx, a.counters, field).Val()
+	})
+}
+
+// TestRealValkeyZeroChargeLeaseReleasesWithoutNegativeZero is the real-Valkey
+// twin of TestZeroChargeLeaseReleasesWithoutNegativeZero: only real Valkey
+// renders a Lua negative zero as "-0", which HINCRBY rejects.
+func TestRealValkeyZeroChargeLeaseReleasesWithoutNegativeZero(t *testing.T) {
+	addr := requireValkeyAddr(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	client := redis.NewClient(&redis.Options{Addr: addr})
+	cfg := config.AdmissionSettings{
+		KeyPrefix: fmt.Sprintf("phoebe-admission-zero-charge-%d", time.Now().UnixNano()),
+		LeaseTTL:  time.Minute,
+		Platform:  config.AdmissionLimits{},
+	}
+	a := New(client, cfg)
+	t.Cleanup(func() {
+		_ = client.Del(context.Background(), a.counters, a.leases, a.expiries, a.windowExpiries, a.legacyLeases, a.legacyExpiries).Err()
+		_ = client.Close()
+	})
+	assertZeroChargeLeaseReleasesCleanly(ctx, t, a)
 }

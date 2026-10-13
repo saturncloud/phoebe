@@ -15,6 +15,7 @@ import (
 	"github.com/redis/go-redis/v9"
 
 	"github.com/saturncloud/phoebe/internal/config"
+	"github.com/saturncloud/phoebe/internal/testutil"
 )
 
 type scriptFailureHook struct {
@@ -52,15 +53,13 @@ func (h *scriptFailureHook) ProcessHook(next redis.ProcessHook) redis.ProcessHoo
 	}
 }
 
-func ptr64(v int64) *int64 { return &v }
-
 func limits(active int64) config.AdmissionLimits {
-	return config.AdmissionLimits{MaxActiveRequests: ptr64(active), MaxConcurrentPrefills: ptr64(active),
-		MaxReservedDecodeSlots: ptr64(active),
-		MaxPromptBytes:         ptr64(1024), MaxReservedOutputTokens: ptr64(1024), MaxActiveAdapters: ptr64(active),
-		RequestsPerWindow: ptr64(100), TotalPromptTokensPerWindow: ptr64(1000),
-		UncachedPromptTokensPerWindow: ptr64(1000), GeneratedTokensPerWindow: ptr64(1000), MaxColdHolds: ptr64(active),
-		WakesPerWindow: ptr64(100), Window: time.Minute}
+	return config.AdmissionLimits{MaxActiveRequests: testutil.Ptr[int64](active), MaxConcurrentPrefills: testutil.Ptr[int64](active),
+		MaxReservedDecodeSlots: testutil.Ptr[int64](active),
+		MaxPrefillTokens:       testutil.Ptr[int64](1024), MaxReservedOutputTokens: testutil.Ptr[int64](1024), MaxActiveAdapters: testutil.Ptr[int64](active),
+		RequestsPerWindow: testutil.Ptr[int64](100), TotalPromptTokensPerWindow: testutil.Ptr[int64](1000),
+		UncachedPromptTokensPerWindow: testutil.Ptr[int64](1000), GeneratedTokensPerWindow: testutil.Ptr[int64](1000), MaxColdHolds: testutil.Ptr[int64](active),
+		WakesPerWindow: testutil.Ptr[int64](100), Window: time.Minute}
 }
 
 func testAdmitter(t *testing.T, cfg config.AdmissionSettings) (*RedisAdmitter, *miniredis.Miniredis) {
@@ -78,7 +77,7 @@ func testAdmitter(t *testing.T, cfg config.AdmissionSettings) (*RedisAdmitter, *
 }
 
 func request(org, model string) Request {
-	return Request{Graph: "graph-a", Organization: org, Owner: "owner-" + org, Model: model, PromptBytes: 10, EstimatedInputTokens: 10, ReservedOutputTokens: 20, Adapter: true}
+	return Request{Graph: "graph-a", Organization: org, Owner: "owner-" + org, Model: model, PrefillTokens: 10, EstimatedInputTokens: 10, ReservedOutputTokens: 20, Adapter: true}
 }
 
 func TestConcurrentReplicasShareOneAtomicCapacityPool(t *testing.T) {
@@ -188,8 +187,8 @@ func TestOrganizationAndOwnerContractsApplyIndependently(t *testing.T) {
 	a, _ := testAdmitter(t, config.AdmissionSettings{Platform: limits(10)})
 	first := request("org-a", "m")
 	first.Owner = "owner-a"
-	first.OrganizationLimits = RateLimits{Requests: ptr64(2)}
-	first.OwnerLimits = RateLimits{Requests: ptr64(1)}
+	first.OrganizationLimits = RateLimits{Requests: testutil.Ptr[int64](2)}
+	first.OwnerLimits = RateLimits{Requests: testutil.Ptr[int64](1)}
 	lease, err := a.Admit(context.Background(), first)
 	if err != nil {
 		t.Fatal(err)
@@ -221,7 +220,7 @@ func TestOwnerContractRequiresStableOwnerIdentity(t *testing.T) {
 	a, _ := testAdmitter(t, config.AdmissionSettings{Platform: limits(10)})
 	req := request("org-a", "m")
 	req.Owner = ""
-	req.OwnerLimits = RateLimits{Requests: ptr64(1)}
+	req.OwnerLimits = RateLimits{Requests: testutil.Ptr[int64](1)}
 	if _, err := a.Admit(context.Background(), req); !errors.Is(err, ErrInvalidIdentity) {
 		t.Fatalf("missing owner identity error = %v, want ErrInvalidIdentity", err)
 	} else if errors.Is(err, ErrUnavailable) {
@@ -254,10 +253,10 @@ func TestAdmitRequiresCompleteTrustedIdentity(t *testing.T) {
 }
 
 func TestWeightedAdmissionLanesAreIsolated(t *testing.T) {
-	cfg := config.AdmissionSettings{Platform: config.AdmissionLimits{MaxActiveRequests: ptr64(3), Window: time.Minute},
+	cfg := config.AdmissionSettings{Platform: config.AdmissionLimits{MaxActiveRequests: testutil.Ptr[int64](3), Window: time.Minute},
 		Lanes: map[string]config.AdmissionLane{
-			"default":   {Weight: 1, Limits: config.AdmissionLimits{MaxActiveRequests: ptr64(1), Window: time.Minute}},
-			"protected": {Weight: 2, Limits: config.AdmissionLimits{MaxActiveRequests: ptr64(1), Window: time.Minute}},
+			"default":   {Weight: 1, Limits: config.AdmissionLimits{MaxActiveRequests: testutil.Ptr[int64](1), Window: time.Minute}},
+			"protected": {Weight: 2, Limits: config.AdmissionLimits{MaxActiveRequests: testutil.Ptr[int64](1), Window: time.Minute}},
 		}, OrganizationLanes: map[string]string{"org-p": "protected"}}
 	a, _ := testAdmitter(t, cfg)
 	d1, err := a.Admit(context.Background(), request("org-d", "m"))
@@ -282,7 +281,7 @@ func TestWeightedAdmissionLanesAreIsolated(t *testing.T) {
 
 func TestPrefillReservationReleasesAtResponseHeaders(t *testing.T) {
 	l := limits(2)
-	l.MaxConcurrentPrefills = ptr64(1)
+	l.MaxConcurrentPrefills = testutil.Ptr[int64](1)
 	a, _ := testAdmitter(t, config.AdmissionSettings{Platform: l})
 	first, err := a.Admit(context.Background(), request("a", "m"))
 	if err != nil {
@@ -304,7 +303,7 @@ func TestPrefillReservationReleasesAtResponseHeaders(t *testing.T) {
 
 func TestDecodeReservationHeldUntilCompletion(t *testing.T) {
 	l := limits(2)
-	l.MaxReservedDecodeSlots = ptr64(1)
+	l.MaxReservedDecodeSlots = testutil.Ptr[int64](1)
 	a, _ := testAdmitter(t, config.AdmissionSettings{Platform: l})
 	first, err := a.Admit(context.Background(), request("a", "m"))
 	if err != nil {
@@ -328,7 +327,7 @@ func TestDecodeReservationHeldUntilCompletion(t *testing.T) {
 
 func TestGeneratedWindowReservesThenChargesActual(t *testing.T) {
 	l := limits(5)
-	l.GeneratedTokensPerWindow = ptr64(25)
+	l.GeneratedTokensPerWindow = testutil.Ptr[int64](25)
 	a, _ := testAdmitter(t, config.AdmissionSettings{Platform: l})
 	first, err := a.Admit(context.Background(), request("a", "m"))
 	if err != nil {
@@ -348,7 +347,7 @@ func TestGeneratedWindowReservesThenChargesActual(t *testing.T) {
 
 func TestFixedWindowRejectionReportsRemainingWindow(t *testing.T) {
 	l := limits(5)
-	l.RequestsPerWindow = ptr64(1)
+	l.RequestsPerWindow = testutil.Ptr[int64](1)
 	a, mr := testAdmitter(t, config.AdmissionSettings{Platform: l})
 	mr.SetTime(time.UnixMilli(118_500)) // 1.5 seconds remain in the 60-second bucket.
 	first, err := a.Admit(context.Background(), request("a", "m"))
@@ -369,7 +368,7 @@ func TestFixedWindowRejectionReportsRemainingWindow(t *testing.T) {
 func TestPromptWindowsSettleAuthoritativeCachedUsage(t *testing.T) {
 	t.Run("total prompt includes cached tokens", func(t *testing.T) {
 		l := limits(5)
-		l.TotalPromptTokensPerWindow = ptr64(100)
+		l.TotalPromptTokensPerWindow = testutil.Ptr[int64](100)
 		a, _ := testAdmitter(t, config.AdmissionSettings{Platform: l})
 		first, err := a.Admit(context.Background(), request("a", "m"))
 		if err != nil {
@@ -389,8 +388,8 @@ func TestPromptWindowsSettleAuthoritativeCachedUsage(t *testing.T) {
 
 	t.Run("uncached prompt excludes cache hits", func(t *testing.T) {
 		l := limits(5)
-		l.TotalPromptTokensPerWindow = ptr64(1000)
-		l.UncachedPromptTokensPerWindow = ptr64(20)
+		l.TotalPromptTokensPerWindow = testutil.Ptr[int64](1000)
+		l.UncachedPromptTokensPerWindow = testutil.Ptr[int64](20)
 		a, _ := testAdmitter(t, config.AdmissionSettings{Platform: l})
 		first, err := a.Admit(context.Background(), request("a", "m"))
 		if err != nil {
@@ -412,8 +411,8 @@ func TestPromptWindowsSettleAuthoritativeCachedUsage(t *testing.T) {
 func TestEstimatedPromptTokensReserveThenReconcileActual(t *testing.T) {
 	t.Run("concurrent estimates cannot overbook", func(t *testing.T) {
 		l := limits(5)
-		l.TotalPromptTokensPerWindow = ptr64(15)
-		l.UncachedPromptTokensPerWindow = ptr64(15)
+		l.TotalPromptTokensPerWindow = testutil.Ptr[int64](15)
+		l.UncachedPromptTokensPerWindow = testutil.Ptr[int64](15)
 		a, _ := testAdmitter(t, config.AdmissionSettings{Platform: l})
 		first, err := a.Admit(context.Background(), request("a", "m"))
 		if err != nil {
@@ -429,8 +428,8 @@ func TestEstimatedPromptTokensReserveThenReconcileActual(t *testing.T) {
 
 	t.Run("overestimate is refunded and cache-aware actual is charged", func(t *testing.T) {
 		l := limits(5)
-		l.TotalPromptTokensPerWindow = ptr64(10)
-		l.UncachedPromptTokensPerWindow = ptr64(10)
+		l.TotalPromptTokensPerWindow = testutil.Ptr[int64](10)
+		l.UncachedPromptTokensPerWindow = testutil.Ptr[int64](10)
 		a, _ := testAdmitter(t, config.AdmissionSettings{Platform: l})
 		first, err := a.Admit(context.Background(), request("a", "m"))
 		if err != nil {
@@ -450,8 +449,8 @@ func TestEstimatedPromptTokensReserveThenReconcileActual(t *testing.T) {
 
 	t.Run("underestimate records debt", func(t *testing.T) {
 		l := limits(5)
-		l.TotalPromptTokensPerWindow = ptr64(10)
-		l.UncachedPromptTokensPerWindow = ptr64(10)
+		l.TotalPromptTokensPerWindow = testutil.Ptr[int64](10)
+		l.UncachedPromptTokensPerWindow = testutil.Ptr[int64](10)
 		a, _ := testAdmitter(t, config.AdmissionSettings{Platform: l})
 		first := request("a", "m")
 		first.EstimatedInputTokens = 2
@@ -474,7 +473,7 @@ func TestEstimatedPromptTokensReserveThenReconcileActual(t *testing.T) {
 
 func TestUnknownUsageRetainsConservativeOwnerAndOrganizationCharges(t *testing.T) {
 	ctx := context.Background()
-	contract := RateLimits{TotalPromptTokens: ptr64(10), UncachedPromptTokens: ptr64(10), GeneratedTokens: ptr64(20)}
+	contract := RateLimits{TotalPromptTokens: testutil.Ptr[int64](10), UncachedPromptTokens: testutil.Ptr[int64](10), GeneratedTokens: testutil.Ptr[int64](20)}
 	a, _ := testAdmitter(t, config.AdmissionSettings{Platform: limits(10)})
 	first := request("org-a", "model-a")
 	first.Owner = "owner-a"
@@ -496,13 +495,13 @@ func TestUnknownUsageRetainsConservativeOwnerAndOrganizationCharges(t *testing.T
 		{
 			name: "organization",
 			req: Request{Graph: "graph-a", Organization: "org-a", Owner: "other-owner", Model: "model-a",
-				PromptBytes: 1, EstimatedInputTokens: 1, ReservedOutputTokens: 1, OrganizationLimits: contract},
+				PrefillTokens: 1, EstimatedInputTokens: 1, ReservedOutputTokens: 1, OrganizationLimits: contract},
 			want: "contract_organization",
 		},
 		{
 			name: "owner",
 			req: Request{Graph: "graph-a", Organization: "other-org", Owner: "owner-a", Model: "model-a",
-				PromptBytes: 1, EstimatedInputTokens: 1, ReservedOutputTokens: 1, OwnerLimits: contract},
+				PrefillTokens: 1, EstimatedInputTokens: 1, ReservedOutputTokens: 1, OwnerLimits: contract},
 			want: "contract_owner",
 		},
 	} {
@@ -518,8 +517,8 @@ func TestUnknownUsageRetainsConservativeOwnerAndOrganizationCharges(t *testing.T
 
 func TestPromptUsageClampsMalformedCachedSubset(t *testing.T) {
 	l := limits(5)
-	l.TotalPromptTokensPerWindow = ptr64(10)
-	l.UncachedPromptTokensPerWindow = ptr64(1)
+	l.TotalPromptTokensPerWindow = testutil.Ptr[int64](10)
+	l.UncachedPromptTokensPerWindow = testutil.Ptr[int64](1)
 	a, _ := testAdmitter(t, config.AdmissionSettings{Platform: l})
 	req := request("a", "m")
 	req.EstimatedInputTokens = 1
@@ -541,8 +540,8 @@ func TestPromptUsageClampsMalformedCachedSubset(t *testing.T) {
 
 func TestColdHoldAndWakeBurstLimits(t *testing.T) {
 	l := limits(5)
-	l.MaxColdHolds = ptr64(1)
-	l.WakesPerWindow = ptr64(1)
+	l.MaxColdHolds = testutil.Ptr[int64](1)
+	l.WakesPerWindow = testutil.Ptr[int64](1)
 	a, _ := testAdmitter(t, config.AdmissionSettings{Platform: l})
 	one, _ := a.Admit(context.Background(), request("a", "m"))
 	two, _ := a.Admit(context.Background(), request("b", "m"))
@@ -573,16 +572,17 @@ func TestExplicitZeroCapBlocksEveryRequest(t *testing.T) {
 		mutate    func(*config.AdmissionLimits)
 		dimension string
 	}{
-		{"maxActiveRequests", func(l *config.AdmissionLimits) { l.MaxActiveRequests = ptr64(0) }, "active"},
-		{"maxConcurrentPrefills", func(l *config.AdmissionLimits) { l.MaxConcurrentPrefills = ptr64(0) }, "prefills"},
-		{"maxReservedDecodeSlots", func(l *config.AdmissionLimits) { l.MaxReservedDecodeSlots = ptr64(0) }, "reserved_decode_slots"},
-		{"maxPromptBytes", func(l *config.AdmissionLimits) { l.MaxPromptBytes = ptr64(0) }, "prompt"},
-		{"maxReservedOutputTokens", func(l *config.AdmissionLimits) { l.MaxReservedOutputTokens = ptr64(0) }, "output"},
-		{"maxActiveAdapters", func(l *config.AdmissionLimits) { l.MaxActiveAdapters = ptr64(0) }, "adapters"},
-		{"requestsPerWindow", func(l *config.AdmissionLimits) { l.RequestsPerWindow = ptr64(0) }, "requests"},
-		{"totalPromptTokensPerWindow", func(l *config.AdmissionLimits) { l.TotalPromptTokensPerWindow = ptr64(0) }, "total_prompt_tokens"},
-		{"uncachedPromptTokensPerWindow", func(l *config.AdmissionLimits) { l.UncachedPromptTokensPerWindow = ptr64(0) }, "uncached_prompt_tokens"},
-		{"generatedTokensPerWindow", func(l *config.AdmissionLimits) { l.GeneratedTokensPerWindow = ptr64(0) }, "generated_tokens"},
+		{"maxActiveRequests", func(l *config.AdmissionLimits) { l.MaxActiveRequests = testutil.Ptr[int64](0) }, "active"},
+		{"maxConcurrentPrefills", func(l *config.AdmissionLimits) { l.MaxConcurrentPrefills = testutil.Ptr[int64](0) }, "prefills"},
+		{"maxReservedDecodeSlots", func(l *config.AdmissionLimits) { l.MaxReservedDecodeSlots = testutil.Ptr[int64](0) }, "reserved_decode_slots"},
+		{"maxPrefillTokens", func(l *config.AdmissionLimits) { l.MaxPrefillTokens = testutil.Ptr[int64](0) }, "prefill_tokens"},
+		{"maxReservedOutputTokens", func(l *config.AdmissionLimits) { l.MaxReservedOutputTokens = testutil.Ptr[int64](0) }, "output"},
+		{"maxReservedKvTokens", func(l *config.AdmissionLimits) { l.MaxReservedKVTokens = testutil.Ptr[int64](0) }, "kv"},
+		{"maxActiveAdapters", func(l *config.AdmissionLimits) { l.MaxActiveAdapters = testutil.Ptr[int64](0) }, "adapters"},
+		{"requestsPerWindow", func(l *config.AdmissionLimits) { l.RequestsPerWindow = testutil.Ptr[int64](0) }, "requests"},
+		{"totalPromptTokensPerWindow", func(l *config.AdmissionLimits) { l.TotalPromptTokensPerWindow = testutil.Ptr[int64](0) }, "total_prompt_tokens"},
+		{"uncachedPromptTokensPerWindow", func(l *config.AdmissionLimits) { l.UncachedPromptTokensPerWindow = testutil.Ptr[int64](0) }, "uncached_prompt_tokens"},
+		{"generatedTokensPerWindow", func(l *config.AdmissionLimits) { l.GeneratedTokensPerWindow = testutil.Ptr[int64](0) }, "generated_tokens"},
 	}
 	for _, tc := range admitCases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -594,6 +594,12 @@ func TestExplicitZeroCapBlocksEveryRequest(t *testing.T) {
 			if !errors.As(err, &rejected) || rejected.Scope != "platform" || rejected.Dimension != tc.dimension {
 				t.Fatalf("err=%v, want platform %s rejection at the zero cap", err, tc.dimension)
 			}
+			// A zero cap is the retryable answer (503 with Retry-After), never
+			// the unsatisfiable one (413 kv_exceeds_limit /
+			// prefill_tokens_exceeds_limit, or a contract 400).
+			if rejected.Contractual || rejected.Unsatisfiable || rejected.RetryAfter <= 0 {
+				t.Fatalf("rejection=%+v, want a retryable, non-contractual %s rejection at the zero cap", rejected, tc.dimension)
+			}
 		})
 	}
 
@@ -601,7 +607,7 @@ func TestExplicitZeroCapBlocksEveryRequest(t *testing.T) {
 	// sentinel is -1, and `get(...) + 0 > -1` still holds.
 	t.Run("adapters zero cap blocks adapter-less requests", func(t *testing.T) {
 		l := limits(5)
-		l.MaxActiveAdapters = ptr64(0)
+		l.MaxActiveAdapters = testutil.Ptr[int64](0)
 		a, _ := testAdmitter(t, config.AdmissionSettings{Platform: l})
 		req := request("a", "m")
 		req.Adapter = false
@@ -611,16 +617,16 @@ func TestExplicitZeroCapBlocksEveryRequest(t *testing.T) {
 			t.Fatalf("err=%v, want adapters rejection even with a zero adapter delta", err)
 		}
 	})
-	t.Run("prompt zero cap blocks zero-byte prompts", func(t *testing.T) {
+	t.Run("prefill zero cap blocks zero-token prompts", func(t *testing.T) {
 		l := limits(5)
-		l.MaxPromptBytes = ptr64(0)
+		l.MaxPrefillTokens = testutil.Ptr[int64](0)
 		a, _ := testAdmitter(t, config.AdmissionSettings{Platform: l})
 		req := request("a", "m")
-		req.PromptBytes = 0
+		req.PrefillTokens = 0
 		_, err := a.Admit(context.Background(), req)
 		var rejected *Rejected
-		if !errors.As(err, &rejected) || rejected.Dimension != "prompt" {
-			t.Fatalf("err=%v, want prompt rejection even with a zero prompt-byte delta", err)
+		if !errors.As(err, &rejected) || rejected.Dimension != "prefill_tokens" {
+			t.Fatalf("err=%v, want prefill_tokens rejection even with a zero prefill-token delta", err)
 		}
 	})
 
@@ -631,8 +637,8 @@ func TestExplicitZeroCapBlocksEveryRequest(t *testing.T) {
 		mutate    func(*config.AdmissionLimits)
 		dimension string
 	}{
-		{"maxColdHolds", func(l *config.AdmissionLimits) { l.MaxColdHolds = ptr64(0) }, "cold_holds"},
-		{"wakesPerWindow", func(l *config.AdmissionLimits) { l.WakesPerWindow = ptr64(0) }, "wakes"},
+		{"maxColdHolds", func(l *config.AdmissionLimits) { l.MaxColdHolds = testutil.Ptr[int64](0) }, "cold_holds"},
+		{"wakesPerWindow", func(l *config.AdmissionLimits) { l.WakesPerWindow = testutil.Ptr[int64](0) }, "wakes"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			l := limits(5)
@@ -684,8 +690,8 @@ func TestExpiredLeaseIsReapedAfterReplicaDeath(t *testing.T) {
 
 func TestExpiredLeaseReapingIsBoundedAndConverges(t *testing.T) {
 	l := limits(300)
-	l.MaxPromptBytes = ptr64(100_000)
-	l.MaxReservedOutputTokens = ptr64(100_000)
+	l.MaxPrefillTokens = testutil.Ptr[int64](100_000)
+	l.MaxReservedOutputTokens = testutil.Ptr[int64](100_000)
 	l.RequestsPerWindow = nil
 	l.TotalPromptTokensPerWindow = nil
 	l.UncachedPromptTokensPerWindow = nil
@@ -701,7 +707,7 @@ func TestExpiredLeaseReapingIsBoundedAndConverges(t *testing.T) {
 
 	// Tighten the client-supplied scope contract so stale reservations make the
 	// first two attempts fail closed while each Lua mutation reaps at most 100.
-	a.cfg.Platform.MaxActiveRequests = ptr64(1)
+	a.cfg.Platform.MaxActiveRequests = testutil.Ptr[int64](1)
 	mr.SetTime(time.UnixMilli(180_001))
 	for attempt, wantRemaining := range []int64{150, 50} {
 		if _, err := a.Admit(ctx, request("live-org", "live-model")); err == nil {
@@ -832,7 +838,7 @@ func TestCompletionRetryRetainsAuthoritativeUsage(t *testing.T) {
 	}
 	client.AddHook(newScriptFailureHook(finishScript.Hash(), 1, false))
 	l := limits(5)
-	l.TotalPromptTokensPerWindow = ptr64(10)
+	l.TotalPromptTokensPerWindow = testutil.Ptr[int64](10)
 	a := New(client, config.AdmissionSettings{Platform: l, LeaseTTL: time.Minute, KeyPrefix: "completion-retry"})
 	lease, err := a.Admit(context.Background(), request("a", "m"))
 	if err != nil {
@@ -899,7 +905,7 @@ func TestConcurrentSettlementKeepsAuthoritativeUsage(t *testing.T) {
 	client.AddHook(hook)
 	a := New(client, config.AdmissionSettings{Platform: limits(5), LeaseTTL: time.Minute, KeyPrefix: "concurrent-settle"})
 	req := request("a", "m") // reserves 20 generated tokens
-	req.OrganizationLimits = RateLimits{GeneratedTokens: ptr64(23)}
+	req.OrganizationLimits = RateLimits{GeneratedTokens: testutil.Ptr[int64](23)}
 	lease, err := a.Admit(context.Background(), req)
 	if err != nil {
 		t.Fatal(err)
@@ -936,14 +942,14 @@ func TestConcurrentSettlementKeepsAuthoritativeUsage(t *testing.T) {
 	// wrongly reject the first. Probes use the settled request's organization
 	// because contract scopes are per-organization.
 	boundary := request("a", "m2")
-	boundary.OrganizationLimits = RateLimits{GeneratedTokens: ptr64(23)}
+	boundary.OrganizationLimits = RateLimits{GeneratedTokens: testutil.Ptr[int64](23)}
 	held, err := a.Admit(context.Background(), boundary)
 	if err != nil {
 		t.Fatalf("window after concurrent settlement rejected the exact boundary: %v", err)
 	}
 	_ = held.Complete(context.Background(), 0)
 	over := request("a", "m3")
-	over.OrganizationLimits = RateLimits{GeneratedTokens: ptr64(23)}
+	over.OrganizationLimits = RateLimits{GeneratedTokens: testutil.Ptr[int64](23)}
 	over.ReservedOutputTokens = 21
 	_, err = a.Admit(context.Background(), over)
 	var rejected *Rejected
@@ -984,7 +990,7 @@ func TestAdmitCleansCommittedLeaseWhenRecoveryReplyAlsoLost(t *testing.T) {
 	}
 	client.AddHook(newScriptFailureHook(admitScript.Hash(), 2, true))
 	l := limits(1)
-	l.RequestsPerWindow = ptr64(1)
+	l.RequestsPerWindow = testutil.Ptr[int64](1)
 	a := New(client, config.AdmissionSettings{Platform: l, LeaseTTL: time.Minute, KeyPrefix: "lost-reply-cleanup"})
 	if _, err := a.Admit(context.Background(), request("a", "m")); !errors.Is(err, ErrUnavailable) {
 		t.Fatalf("err=%v, want indeterminate admission failure", err)
@@ -1138,13 +1144,26 @@ func TestAdmitCleanupBudgetIndependentOfAttemptDeadline(t *testing.T) {
 
 func TestImpossibleRequestRejectedBeforeReservation(t *testing.T) {
 	l := limits(5)
-	l.MaxPromptBytes = ptr64(9)
+	l.MaxPrefillTokens = testutil.Ptr[int64](9)
 	a, _ := testAdmitter(t, config.AdmissionSettings{Platform: l})
 	_, err := a.Admit(context.Background(), request("a", "m"))
 	var rejected *Rejected
-	if !errors.As(err, &rejected) || rejected.Dimension != "prompt" {
-		t.Fatalf("err=%v, want prompt rejection", err)
+	if !errors.As(err, &rejected) || rejected.Dimension != "prefill_tokens_exceeds_limit" || !rejected.Unsatisfiable {
+		t.Fatalf("err=%v, want an unsatisfiable prefill_tokens rejection", err)
 	}
+}
+
+// The prefill-token limit is inclusive: a request whose estimate equals
+// maxPrefillTokens is admitted.
+func TestPrefillTokensAtExactLimitAdmitted(t *testing.T) {
+	l := limits(5)
+	l.MaxPrefillTokens = testutil.Ptr[int64](10)
+	a, _ := testAdmitter(t, config.AdmissionSettings{Platform: l})
+	lease, err := a.Admit(context.Background(), request("a", "m")) // PrefillTokens 10
+	if err != nil {
+		t.Fatalf("an estimate exactly at maxPrefillTokens must be admitted: %v", err)
+	}
+	_ = lease.Complete(context.Background(), 0)
 }
 
 // A request with an unusable work estimate is rejected before any reservation:
@@ -1154,7 +1173,7 @@ func TestInvalidWorkEstimateRejectedBeforeReservation(t *testing.T) {
 		name   string
 		mutate func(*Request)
 	}{
-		{name: "negative prompt bytes", mutate: func(r *Request) { r.PromptBytes = -1 }},
+		{name: "negative prefill tokens", mutate: func(r *Request) { r.PrefillTokens = -1 }},
 		{name: "zero estimated input", mutate: func(r *Request) { r.EstimatedInputTokens = 0 }},
 		{name: "zero reserved output", mutate: func(r *Request) { r.ReservedOutputTokens = 0 }},
 	} {

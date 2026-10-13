@@ -1,6 +1,7 @@
 package proxy
 
 import (
+	"context"
 	"crypto/sha256"
 	"encoding/json"
 	"errors"
@@ -15,6 +16,7 @@ import (
 
 	"github.com/saturncloud/phoebe/internal/admission"
 	"github.com/saturncloud/phoebe/internal/config"
+	"github.com/saturncloud/phoebe/internal/gateway"
 	"github.com/saturncloud/phoebe/internal/identity"
 	"github.com/saturncloud/phoebe/internal/logging"
 )
@@ -113,9 +115,26 @@ type admissionEstimate struct {
 	Model        string
 	InputTokens  int64
 	OutputTokens int64
+	// OutputDeclared reports that the body set max_tokens or
+	// max_completion_tokens; otherwise OutputTokens is the default reservation.
+	OutputDeclared bool
+	// OutputSequences is how many output sequences the engine generates in
+	// parallel for the request: the larger of n and best_of on the routes
+	// whose engine reads them (see admissionWork), at least 1. The
+	// prompt's KV is shared across them, but each sequence generates up to
+	// OutputTokens and needs its own output KV, so admission multiplies the
+	// output by sequences in the reserved-output, contract generated-token
+	// and reserved-KV charges (the KV charge is input + output x sequences).
+	OutputSequences int64
 }
 
-const defaultSharedRequestBodyLimit int64 = 64 << 20
+// publishedGraphCapacity is the capacity Atlas published for graph, or none.
+func (s *Server) publishedGraphCapacity(graph string) gateway.GraphCapacity {
+	if s.graphCapacity == nil || graph == "" {
+		return gateway.GraphCapacity{}
+	}
+	return s.graphCapacity.GraphCapacity(graph)
+}
 
 func admissionLaneForIdentity(settings config.AdmissionSettings, id identity.Identity) config.AdmissionLane {
 	laneName := settings.OrganizationLanes[id.OrgID]
@@ -129,104 +148,175 @@ func admissionLaneForIdentity(settings config.AdmissionSettings, id identity.Ide
 	return lane
 }
 
-// sharedRequestBodyLimit returns the tightest individual body size that could
-// possibly fit every applicable aggregate prompt-byte scope. R4 sentinel
-// semantics: a nil (unset) dimension is unlimited and does not tighten the
-// bound; neither does an explicit zero cap — no body can fit a zero-capped
-// scope, and admission rejects the request there. Even when every scope is
-// configured as unlimited, retain a process-safety ceiling so an
-// authenticated request cannot force an unbounded io.ReadAll allocation.
-func sharedRequestBodyLimit(settings config.AdmissionSettings, lane config.AdmissionLane) int64 {
-	limit := int64(0)
-	add := func(candidate *int64) {
-		if candidate == nil || *candidate <= 0 {
-			return
-		}
-		if limit == 0 || *candidate < limit {
-			limit = *candidate
-		}
-	}
-	add(settings.Platform.MaxPromptBytes)
-	add(settings.Graph.MaxPromptBytes)
-	add(settings.Organization.MaxPromptBytes)
-	add(settings.OrganizationModel.MaxPromptBytes)
-	if laneBytes := lane.Limits.MaxPromptBytes; laneBytes != nil && *laneBytes > 0 {
-		weighted := *laneBytes
-		weight := lane.Weight
-		if weight < 1 {
-			weight = 1
-		}
-		if weighted <= math.MaxInt64/weight {
-			weighted *= weight
-		}
-		add(&weighted)
-	}
-	if limit == 0 {
-		return defaultSharedRequestBodyLimit
-	}
-	return limit
-}
-
-func boundSharedRequestBody(w http.ResponseWriter, r *http.Request, limit int64) bool {
-	if limit <= 0 {
-		limit = defaultSharedRequestBodyLimit
-	}
+// boundRequestBody enforces the gateway-wide request body ceiling. A declared
+// Content-Length over the limit is refused before any read; a chunked or
+// understated body is cut off by MaxBytesReader at the limit, and the first
+// reader that hits it answers 413 through writeRequestBodyError. Responses go
+// through w; rawW must be the connection's own ResponseWriter, because
+// MaxBytesReader marks the connection close-after-reply only through an
+// unexported net/http method that a wrapper cannot forward.
+func boundRequestBody(w, rawW http.ResponseWriter, r *http.Request, limit int64) bool {
 	if r.ContentLength > limit {
-		http.Error(w, "shared inference request body too large", http.StatusRequestEntityTooLarge)
+		http.Error(w, "request body too large", http.StatusRequestEntityTooLarge)
 		return false
 	}
-	if r.Body != nil {
-		r.Body = http.MaxBytesReader(w, r.Body, limit)
+	if r.Body != nil && r.Body != http.NoBody {
+		r.Body = http.MaxBytesReader(rawW, r.Body, limit)
 	}
 	return true
 }
 
-func writeRequestBodyError(w http.ResponseWriter, err error) {
+// writeRequestBodyError answers a failed request-body read. A read cut off
+// because protection.maxStreamDuration expired (the handler sets the
+// connection read deadline when it fires, so a trickled body cannot hold the
+// handler past the bound) answers 408: the client was too slow to send its
+// own request (504 is kept for an upstream that sent no headers in time,
+// D3/D40). Nothing was forwarded, so no metering row is recorded, as for
+// every other pre-forward refusal.
+func writeRequestBodyError(w http.ResponseWriter, r *http.Request, err error) {
+	if errors.Is(context.Cause(r.Context()), errMaxStreamDuration) {
+		http.Error(w, "request body not received in time", http.StatusRequestTimeout)
+		return
+	}
 	var tooLarge *http.MaxBytesError
 	if errors.As(err, &tooLarge) {
-		http.Error(w, "shared inference request body too large", http.StatusRequestEntityTooLarge)
+		http.Error(w, "request body too large", http.StatusRequestEntityTooLarge)
 		return
 	}
 	http.Error(w, "bad request body", http.StatusBadRequest)
 }
 
-// admissionWork returns the exact routed model and cheap, conservative token
-// reservations. The input estimate follows the common bytes/4 approximation;
+// admissionInterpretedFields are the top-level request fields admission reads.
+var admissionInterpretedFields = []string{"model", "max_tokens", "max_completion_tokens", "messages", "prompt", "input", "n", "best_of"}
+
+// admissionWork returns the exact routed model and cheap token reservations.
+// The input estimate is message-text characters / 4 (estimatePromptTokens);
 // Dynamo remains authoritative and Phoebe reconciles its actual cache-aware
-// token counts after the response.
-func admissionWork(body []byte, defaultOutput int64) (admissionEstimate, bool) {
-	counts, err := countTopLevelKeys(body, map[string]struct{}{
-		"model": {}, "max_tokens": {}, "max_completion_tokens": {},
-	})
-	if err != nil || counts["model"] != 1 || counts["max_tokens"] > 1 || counts["max_completion_tokens"] > 1 {
+// token counts after the response. The output sequence count is
+// max(n, best_of, 1), times the number of prompts in a batched prompt
+// (promptBatchCount) on /v1/completions only, since the completions engine
+// generates for each prompt. Other routes (chat completions, embeddings)
+// ignore a top-level "prompt", so it never multiplies their sequences (D27).
+// Likewise best_of counts only on /v1/completions and n only on completions
+// and chat completions; a route that ignores the field is never charged for
+// it (D40).
+// n, best_of, max_tokens and max_completion_tokens are read like the engine's
+// lax integer validation (laxInt, ledger D32): integers, integral floats such
+// as 2.0 and integer strings such as "4" count at their value; a fraction, a
+// non-numeric string or a bool is refused 400.
+func admissionWork(body []byte, defaultOutput int64, routePath string) (admissionEstimate, bool) {
+	// Every field the estimate and the routed model are read from must be
+	// unambiguous: no duplicates and no case variants (see
+	// checkTopLevelKeyAmbiguity), or phoebe could admit against one value
+	// while the engine processes another.
+	counts, err := checkTopLevelKeyAmbiguity(body, admissionInterpretedFields)
+	if err != nil || counts["model"] != 1 {
 		return admissionEstimate{}, false
 	}
 	var v struct {
-		Model               string `json:"model"`
-		MaxTokens           *int64 `json:"max_tokens"`
-		MaxCompletionTokens *int64 `json:"max_completion_tokens"`
+		Model               string          `json:"model"`
+		MaxTokens           json.RawMessage `json:"max_tokens"`
+		MaxCompletionTokens json.RawMessage `json:"max_completion_tokens"`
+		N                   json.RawMessage `json:"n"`
+		BestOf              json.RawMessage `json:"best_of"`
+		Prompt              json.RawMessage `json:"prompt"`
 	}
 	if err := json.Unmarshal(body, &v); err != nil || v.Model == "" {
 		return admissionEstimate{}, false
 	}
-	maximum := defaultOutput
-	if v.MaxTokens != nil {
-		maximum = *v.MaxTokens
+	maxTokens, hasMaxTokens, ok1 := laxInt(v.MaxTokens)
+	maxCompletion, hasMaxCompletion, ok2 := laxInt(v.MaxCompletionTokens)
+	n, hasN, ok3 := laxInt(v.N)
+	bestOf, hasBestOf, ok4 := laxInt(v.BestOf)
+	if !ok1 || !ok2 || !ok3 || !ok4 {
+		return admissionEstimate{}, false
 	}
-	if v.MaxCompletionTokens != nil {
-		if v.MaxTokens != nil && *v.MaxTokens != *v.MaxCompletionTokens {
+	maximum := defaultOutput
+	if hasMaxTokens {
+		maximum = maxTokens
+	}
+	if hasMaxCompletion {
+		if hasMaxTokens && maxTokens != maxCompletion {
 			return admissionEstimate{}, false
 		}
-		maximum = *v.MaxCompletionTokens
+		maximum = maxCompletion
 	}
 	if maximum <= 0 || maximum > math.MaxUint32 {
 		return admissionEstimate{}, false
 	}
-	input := int64((len(body) + 3) / 4)
-	if input < 1 {
-		input = 1
+	// Each count multiplies only on a route whose engine reads it: n on
+	// completions and chat completions, best_of on completions alone.
+	// Embeddings generate nothing per sequence and chat completions has no
+	// best_of, so there the field is still validated above (a malformed
+	// value is a 400) but never charged (D40).
+	hasN = hasN && (routePath == "/v1/completions" || routePath == "/v1/chat/completions")
+	hasBestOf = hasBestOf && routePath == "/v1/completions"
+	sequences := int64(1)
+	for _, c := range []struct {
+		value int64
+		set   bool
+	}{{n, hasN}, {bestOf, hasBestOf}} {
+		if !c.set {
+			continue
+		}
+		// A count the engine would refuse (< 1) is not ours to judge; one
+		// past maxOutputSequences cannot be a real request and would
+		// overflow the KV charge, so it is refused like a broken body.
+		if c.value > maxOutputSequences {
+			return admissionEstimate{}, false
+		}
+		if c.value > sequences {
+			sequences = c.value
+		}
 	}
-	return admissionEstimate{Model: v.Model, InputTokens: input, OutputTokens: maximum}, true
+	// A batched completions prompt is one generation per prompt. Only the
+	// completions route reads "prompt"; elsewhere the engine ignores it.
+	// Both factors are bounded by maxOutputSequences before multiplying, so
+	// the product cannot overflow, and the product is held to the same bound.
+	prompts := int64(1)
+	if routePath == "/v1/completions" {
+		prompts = promptBatchCount(v.Prompt)
+	}
+	if prompts > maxOutputSequences {
+		return admissionEstimate{}, false
+	}
+	sequences *= prompts
+	if sequences > maxOutputSequences {
+		return admissionEstimate{}, false
+	}
+	if maximum*sequences > maxReservedOutput {
+		return admissionEstimate{}, false
+	}
+	return admissionEstimate{Model: v.Model, InputTokens: estimatePromptTokens(body), OutputTokens: maximum,
+		OutputDeclared: hasMaxTokens || hasMaxCompletion, OutputSequences: sequences}, true
+}
+
+// laxInt reads a count field the way the engine's request validation does
+// (pydantic's lax integer mode): a JSON integer, a number with no fractional
+// part (2.0, 1e0) or a string holding an integer ("4") is that integer. Absent
+// or null reports set=false. Anything else (a fraction, a non-numeric string,
+// a bool) reports ok=false: the engine would refuse it too, and phoebe must
+// never charge one value while the engine runs another.
+func laxInt(raw json.RawMessage) (value int64, set, ok bool) {
+	if len(raw) == 0 || string(raw) == "null" {
+		return 0, false, true
+	}
+	var number json.Number
+	if json.Unmarshal(raw, &number) != nil {
+		var text string
+		if json.Unmarshal(raw, &text) != nil {
+			return 0, true, false
+		}
+		number = json.Number(strings.TrimSpace(text))
+	}
+	if i, err := number.Int64(); err == nil {
+		return i, true, true
+	}
+	f, err := number.Float64()
+	if err != nil || f != math.Trunc(f) || math.Abs(f) > 1<<53 {
+		return 0, true, false
+	}
+	return int64(f), true, true
 }
 
 // prepareSharedDynamoRequest replaces every client-controlled scheduling and
@@ -235,7 +325,13 @@ func admissionWork(body []byte, defaultOutput int64) (admissionEstimate, bool) {
 // nvext.agent_hints; the caller also overwrites Dynamo's higher-precedence
 // priority headers. x-tenant-id has highest precedence for cache isolation;
 // nvext.cache_salt is also set so the invariant remains visible in the body.
-func prepareSharedDynamoRequest(body []byte, tenantIdentity string, maxOutput int64, lane config.AdmissionLane) ([]byte, string, error) {
+//
+// capOutput sets max_tokens to maxOutput in the forwarded body. The caller
+// passes it when the client declared no max_tokens: the reservation phoebe
+// admits against (the R10 default, clamped to fit the applicable limits) is
+// then also the cap the engine enforces, as ruling R10 defines it, instead of
+// the engine generating up to its own default past what was reserved.
+func prepareSharedDynamoRequest(body []byte, tenantIdentity string, maxOutput int64, capOutput bool, lane config.AdmissionLane) ([]byte, string, error) {
 	var root map[string]json.RawMessage
 	if err := json.Unmarshal(body, &root); err != nil || root == nil {
 		return nil, "", fmt.Errorf("request body must be a JSON object")
@@ -288,6 +384,11 @@ func prepareSharedDynamoRequest(body []byte, tenantIdentity string, maxOutput in
 	if err := setJSON(hints, "strict_priority", lane.DynamoStrictPriority); err != nil {
 		return nil, "", err
 	}
+	if capOutput {
+		if err := setJSON(root, "max_tokens", maxOutput); err != nil {
+			return nil, "", err
+		}
+	}
 	if err := setJSON(hints, "osl", maxOutput); err != nil {
 		return nil, "", err
 	}
@@ -311,19 +412,135 @@ func prepareSharedDynamoRequest(body []byte, tenantIdentity string, maxOutput in
 	return out, tenant, nil
 }
 
+// outputShape describes the output a request reserved, so a refusal names
+// the term the client controls. hasOutput is false for embeddings, which
+// have no client-declared output (phoebe reserves one token on its own);
+// declared reports that the client sent max_tokens or max_completion_tokens;
+// sequences is the output sequence count (n, best_of, batched prompts).
+type outputShape struct {
+	hasOutput, declared bool
+	sequences           int64
+}
+
+// declaredSingleOutput is the shape for a refusal that does not depend on
+// the request's output terms.
+var declaredSingleOutput = outputShape{hasOutput: true, declared: true, sequences: 1}
+
+// sequenceTerms names the client fields that set the output sequence count.
+const sequenceTerms = "(n, best_of, or batched prompts)"
+
+// oversizeMessage is the 413 text for a request larger than an operator or
+// published capacity scope. Only the graph's own capacity (the published
+// graph_capacity scope and the per-graph operator tier) is described as the
+// model's; every other scope (platform, organization, organization_model,
+// lane) gets neutral wording so the client is not told the model cannot take
+// a request that a configured limit refused. The scope id itself stays in the
+// server log, not the client body.
+//
+// The KV text names the terms of the reservation the client controls: the
+// prompt alone for embeddings (which have no client-declared output) and for
+// an undeclared max_tokens with one sequence; the prompt plus one output token
+// per sequence for an undeclared max_tokens with several sequences; the
+// prompt plus max_tokens, times the sequence count when it is above one, for
+// a declared max_tokens. A client is never told to lower a field it did not
+// send.
+func oversizeMessage(rejected *admission.Rejected, out outputShape) string {
+	limit := "a configured KV-cache limit"
+	prefill := "a configured prefill-token limit"
+	output := "a configured reserved-output limit"
+	if rejected.Scope == "graph_capacity" || rejected.Scope == "graph" {
+		limit = "this model's KV-cache capacity"
+		prefill = "this model's prefill capacity"
+		output = "this model's reserved-output capacity"
+	}
+	if rejected.Dimension == "output_exceeds_limit" {
+		return outputOversizeMessage(out, output)
+	}
+	if rejected.Dimension != "kv_exceeds_limit" {
+		return "estimated prompt tokens exceed " + prefill
+	}
+	switch {
+	case !out.hasOutput:
+		return "estimated prompt tokens exceed " + limit
+	case out.declared && out.sequences > 1:
+		return "estimated prompt tokens plus max_tokens times the number of output sequences " + sequenceTerms + " exceed " + limit
+	case out.declared:
+		return "estimated prompt tokens plus max_tokens exceed " + limit
+	case out.sequences > 1:
+		return "estimated prompt tokens plus one output token per requested sequence " + sequenceTerms + " exceed " + limit
+	default:
+		return "estimated prompt tokens exceed " + limit
+	}
+}
+
+// outputOversizeMessage is the 413 text for a request whose own reserved
+// output (max_tokens x output sequences, D29) exceeds a positive capacity
+// cap. Like the KV text it names only the fields the client sent: an
+// undeclared max_tokens is the one-token clamp, so the sequence count is the
+// term to lower.
+func outputOversizeMessage(out outputShape, limit string) string {
+	switch {
+	case out.declared && out.sequences > 1:
+		return "max_tokens times the number of output sequences " + sequenceTerms + " exceeds " + limit
+	case out.declared:
+		return "max_tokens exceeds " + limit
+	case out.sequences > 1:
+		return "the number of output sequences " + sequenceTerms + " exceeds " + limit
+	default:
+		return "the minimum one-token output reservation exceeds " + limit
+	}
+}
+
+// generatedLimitMessage is the 400 text for a request whose generated-token
+// charge (max_tokens x output sequences, D29) alone exceeds a contract's
+// per-window limit. It names the sequence count when it is above one, and
+// never blames max_tokens when the client did not send it.
+func generatedLimitMessage(out outputShape) string {
+	switch {
+	case out.declared && out.sequences > 1:
+		return "max_tokens times the number of output sequences " + sequenceTerms + " exceeds the per-window generated-token limit"
+	case out.declared:
+		return "max_tokens exceeds the per-window generated-token limit"
+	case out.sequences > 1:
+		return "the number of output sequences " + sequenceTerms + " exceeds the per-window generated-token limit"
+	default:
+		return "the minimum one-token output reservation exceeds the per-window generated-token limit"
+	}
+}
+
+// writeAdmissionError answers an admission refusal that does not depend on
+// the request's output terms (a cold-hold or lease-renewal refusal): the
+// wording is that of a declared max_tokens with one sequence.
 func (s *Server) writeAdmissionError(w http.ResponseWriter, requestID string, err error) {
+	s.writeAdmissionErrorOutput(w, requestID, err, declaredSingleOutput)
+}
+
+// writeAdmissionErrorOutput answers an admission refusal; out selects the
+// 413 KV and 400 generated-token wording (oversizeMessage,
+// generatedLimitMessage).
+func (s *Server) writeAdmissionErrorOutput(w http.ResponseWriter, requestID string, err error, out outputShape) {
 	// Echo the authoritative attempt id on rejections too — the same handle the
 	// normal path stamps in ModifyResponse and the error handler stamps on 502s:
 	// a rejected client needs its billing-record correlation id just as much.
 	w.Header().Set(requestIDHeader, requestID)
 	var rejected *admission.Rejected
+	if errors.As(err, &rejected) && rejected.Unsatisfiable && !rejected.Contractual {
+		// One request alone is larger than a capacity limit (estimated prompt
+		// tokens, prompt plus max_tokens against reserved KV, or max_tokens x
+		// output sequences against reserved output). It can never
+		// be admitted, so it is refused as too large, the same answer an
+		// oversized prompt got from the byte-based limit this replaced.
+		http.Error(w, oversizeMessage(rejected, out), http.StatusRequestEntityTooLarge)
+		s.log.Warn.Printf("admission: request larger than capacity scope=%s dimension=%s", rejected.Scope, rejected.Dimension)
+		return
+	}
 	if errors.As(err, &rejected) && rejected.Unsatisfiable {
 		// One request alone exceeds a contract's whole per-window limit, so
 		// waiting can never admit it: no Retry-After.
 		message := "shared inference request exceeds the per-window contract limit"
 		switch rejected.Dimension {
 		case "generated_tokens_exceeds_limit":
-			message = "max_tokens exceeds the per-window generated-token limit"
+			message = generatedLimitMessage(out)
 		case "total_prompt_tokens_exceeds_limit", "uncached_prompt_tokens_exceeds_limit":
 			message = "estimated prompt tokens exceed the per-window prompt-token limit"
 		}
@@ -452,19 +669,79 @@ func trustedPolicyEnvelopePresent(id identity.Identity) bool {
 	return id.OwnerID != "" || anyScopedLimitPresent(id) || id.GroupScopes != ""
 }
 
-// undeclaredOutputReservation is the output-token reservation for a request
-// that declares neither max_tokens nor max_completion_tokens: the configured
-// default, clamped to the smallest positive contract generated-token limit so
-// that an undeclared request always fits an otherwise empty window. An
-// explicit zero cap does not clamp; that scope rejects in admission.
-func undeclaredOutputReservation(defaultOutput int64, scopes ...admission.RateLimits) int64 {
+// undeclaredOutputReservation is the per-sequence output-token reservation
+// for a request that declares neither max_tokens nor max_completion_tokens:
+// the configured default, clamped so the reservation times sequences fits
+// the smallest positive contract generated-token limit (admission charges
+// the generated-token window output x sequences), so that an undeclared
+// request always fits an otherwise empty window. An explicit zero cap does
+// not clamp; that scope rejects in admission. The result is at least 1; a
+// request whose sequence count alone passes a limit is refused for its n.
+func undeclaredOutputReservation(defaultOutput, sequences int64, scopes ...admission.RateLimits) int64 {
+	if sequences < 1 {
+		sequences = 1
+	}
 	out := defaultOutput
 	for _, limits := range scopes {
-		if g := limits.GeneratedTokens; g != nil && *g > 0 && *g < out {
-			out = *g
+		if g := limits.GeneratedTokens; g != nil && *g > 0 && *g/sequences < out {
+			out = *g / sequences
 		}
 	}
+	if out < 1 {
+		out = 1
+	}
 	return out
+}
+
+// maxOutputSequences bounds n and best_of: far above any engine's limit, and
+// small enough that output x sequences cannot overflow the KV charge
+// (output is at most MaxUint32).
+const maxOutputSequences = 1 << 16
+
+// maxReservedOutput bounds output x sequences, the reserved-output part of the
+// KV charge. Redis's Lua cjson encodes numbers with only 14 significant
+// digits, so a charge at or above 1e14 could not be written to a lease record
+// as a JSON number without rounding. 2^46 (about 7.0e13) keeps the whole
+// charge, prompt estimate included, below 1e14; no real request comes near it
+// (it is max_tokens near 2^32 with n=16384). A larger product is refused like
+// a broken body. The lease script also stores kv as a decimal string, so this
+// bound is the first of two guards, not the only one.
+const maxReservedOutput = 1 << 46
+
+// undeclaredOutputWithinCaps clamps the output reservation of a request
+// that declared no max_tokens so it fits every positive per-request-bounding
+// cap that applies: the prompt plus the reservation (times sequences) fits
+// kvCap, the tightest positive reserved-KV cap, and the reservation times
+// sequences fits outputCap, the tightest positive reserved-output cap
+// (admission charges the output counter output x sequences). 0 means no cap. Like
+// the contract clamp above, a request is never refused for a default the
+// client did not choose. The result is at least 1; when the prompt alone
+// fills the KV cap the request is still refused for its prompt (413).
+func undeclaredOutputWithinCaps(output, input, sequences, kvCap, outputCap int64) int64 {
+	if sequences < 1 {
+		sequences = 1
+	}
+	if kvCap > 0 {
+		if room := (kvCap - input) / sequences; room < output {
+			output = room
+		}
+	}
+	if outputCap > 0 && outputCap/sequences < output {
+		output = outputCap / sequences
+	}
+	if output < 1 {
+		output = 1
+	}
+	return output
+}
+
+// admitterSettings is the admission configuration the admitter enforces, as
+// reported by the admitter; with no admitter there are no operator tiers.
+func (s *Server) admitterSettings() config.AdmissionSettings {
+	if s.admitter == nil {
+		return config.AdmissionSettings{}
+	}
+	return s.admitter.Settings()
 }
 
 // errNoTrustedRateLimitPolicy is the parser's "no anchor and no scoped policy

@@ -60,10 +60,16 @@ type Rejected struct {
 	Dimension   string
 	RetryAfter  time.Duration
 	Contractual bool
-	// Unsatisfiable marks a contract rejection that no amount of waiting can
-	// clear: the single request alone reserves more than the scope's whole
-	// per-window limit (for example max_tokens above the generated-token
-	// limit). RetryAfter is zero; the proxy answers 400 without Retry-After.
+	// Unsatisfiable marks a rejection that no amount of waiting can clear,
+	// because the single request alone exceeds the scope's whole limit. There
+	// are two cases. For a contract scope (Contractual=true), the request
+	// reserves more than the per-window limit (for example max_tokens above
+	// the generated-token limit), and the proxy answers 400. For a capacity
+	// scope (Contractual=false), the request's estimated prefill tokens, KV
+	// reservation, or reserved output (output x sequences) exceed a positive
+	// physical cap (prefill_tokens_exceeds_limit, kv_exceeds_limit,
+	// output_exceeds_limit), and the proxy answers 413 (decision D12). In both cases RetryAfter is zero and no Retry-After
+	// header is sent. Callers must branch on Contractual to choose the status.
 	Unsatisfiable bool
 }
 
@@ -72,12 +78,22 @@ func (r *Rejected) Error() string {
 }
 
 type Request struct {
-	Graph                string
-	Organization         string
-	Owner                string
-	Model                string
-	PromptBytes          int64
+	Graph        string
+	Organization string
+	Owner        string
+	Model        string
+	// PrefillTokens is the estimated prompt tokens held against the prefill
+	// limit until the first response byte. EstimatedInputTokens is the same
+	// estimate as charged to the contract windows and the reserved-KV
+	// counter; the proxy sets both from one estimate.
+	PrefillTokens        int64
 	EstimatedInputTokens int64
+	// OutputSequences multiplies ReservedOutputTokens (n / best_of, times
+	// the prompts in a batch) in every output charge: the reserved-output
+	// counter, the contract generated-token reservation and pre-check, the
+	// reserved-KV charge, and the generated tokens charged when a request
+	// ends without usage. 0 is read as 1.
+	OutputSequences      int64
 	ReservedOutputTokens int64
 	Adapter              bool
 	OrganizationLimits   RateLimits
@@ -90,6 +106,12 @@ type Request struct {
 	// lease/CompleteUsage path). Empty when the envelope carried no group
 	// (the common case).
 	GroupScopes []GroupScope
+	// GraphCapacity is the per-graph capacity Atlas published for this
+	// request's graph (B8): the operator override, else the profiled value
+	// times the install safety margin. Enforced as its own operator scope —
+	// a rejection is "out of capacity" (503), never a contract 429 — on top
+	// of the install-wide graph tier. Zero value = nothing published.
+	GraphCapacity config.AdmissionLimits
 }
 
 // GroupScope is one group's quota contract within a Request: the group's id
@@ -120,8 +142,9 @@ type scope struct {
 	Active              int64  `json:"active"`
 	Prefills            int64  `json:"prefills"`
 	ReservedDecodeSlots int64  `json:"reserved_decode_slots"`
-	Prompt              int64  `json:"prompt"`
+	Prefill             int64  `json:"prefill_tokens"`
 	Output              int64  `json:"output"`
+	KV                  int64  `json:"kv"`
 	Adapters            int64  `json:"adapters"`
 	Requests            int64  `json:"requests"`
 	TotalPrompt         int64  `json:"total_prompt"`
@@ -136,7 +159,8 @@ type scope struct {
 type wireRequest struct {
 	ID             string  `json:"id"`
 	LeaseMs        int64   `json:"lease_ms"`
-	Prompt         int64   `json:"prompt"`
+	Prefill        int64   `json:"prefill_tokens"`
+	Sequences      int64   `json:"sequences"`
 	EstimatedInput int64   `json:"estimated_input"`
 	Output         int64   `json:"output"`
 	Adapter        int64   `json:"adapter"`
@@ -146,6 +170,10 @@ type wireRequest struct {
 // Admitter is the proxy-facing seam, allowing deterministic lifecycle tests.
 type Admitter interface {
 	Admit(context.Context, Request) (*Lease, error)
+	// Settings is the admission configuration the admitter enforces. The
+	// proxy reads its caps from here so the undeclared-output clamp and
+	// admission agree on one source.
+	Settings() config.AdmissionSettings
 }
 
 type RedisAdmitter struct {
@@ -153,6 +181,18 @@ type RedisAdmitter struct {
 	cfg                        config.AdmissionSettings
 	counters, leases, expiries string
 	windowExpiries             string
+	// legacyLeases and legacyExpiries are the lease keys of the release
+	// before the prefill-token and kv counters. This release writes its
+	// leases under versioned keys so a not-yet-upgraded replica's reaper,
+	// whose release_record does not know prefill_tokens or kv, can never
+	// release (and so strand the counters of) a new-format lease. The new
+	// reaper drains expired leases from the legacy keys, so a lease an old
+	// replica wrote is still released if that replica dies mid-request.
+	// The reverse does not hold: after a rollback no replica reads the
+	// versioned keys, so a versioned lease whose replica died holds its
+	// counters until this release is redeployed or an operator flushes the
+	// admission keys (docs/shared-tier-admission.md, "Rollout and rollback").
+	legacyLeases, legacyExpiries string
 }
 
 func New(client redis.Cmdable, cfg config.AdmissionSettings) *RedisAdmitter {
@@ -161,8 +201,9 @@ func New(client redis.Cmdable, cfg config.AdmissionSettings) *RedisAdmitter {
 	// Cluster as well as single-node Valkey.
 	tag := "{" + prefix + "}"
 	return &RedisAdmitter{
-		client: client, cfg: cfg, counters: tag + ":counters", leases: tag + ":leases",
-		expiries: tag + ":expiries", windowExpiries: tag + ":window-expiries",
+		client: client, cfg: cfg, counters: tag + ":counters", leases: tag + ":leases:v2",
+		expiries: tag + ":expiries:v2", windowExpiries: tag + ":window-expiries",
+		legacyLeases: tag + ":leases", legacyExpiries: tag + ":expiries",
 	}
 }
 
@@ -199,7 +240,7 @@ func FromSettings(s *config.Settings) (*RedisAdmitter, *redis.Client, bool) {
 func (a *RedisAdmitter) Settings() config.AdmissionSettings { return a.cfg }
 
 func (a *RedisAdmitter) keys() []string {
-	return []string{a.counters, a.leases, a.expiries, a.windowExpiries}
+	return []string{a.counters, a.leases, a.expiries, a.windowExpiries, a.legacyLeases, a.legacyExpiries}
 }
 
 func randomID() (string, error) {
@@ -225,15 +266,16 @@ func (a *RedisAdmitter) Admit(ctx context.Context, req Request) (*Lease, error) 
 			return nil, fmt.Errorf("%w: group scope carries limits without a group id", ErrInvalidIdentity)
 		}
 	}
-	if req.PromptBytes < 0 || req.EstimatedInputTokens <= 0 || req.ReservedOutputTokens <= 0 {
+	if req.PrefillTokens < 0 || req.EstimatedInputTokens <= 0 || req.ReservedOutputTokens <= 0 {
 		return nil, &Rejected{Scope: "request", Dimension: "work estimate", RetryAfter: time.Second}
 	}
 	id, err := randomID()
 	if err != nil {
 		return nil, fmt.Errorf("%w: lease id: %v", ErrUnavailable, err)
 	}
-	w := wireRequest{ID: id, LeaseMs: a.cfg.LeaseTTL.Milliseconds(), Prompt: req.PromptBytes,
-		EstimatedInput: req.EstimatedInputTokens, Output: req.ReservedOutputTokens, Scopes: a.scopes(req)}
+	w := wireRequest{ID: id, LeaseMs: a.cfg.LeaseTTL.Milliseconds(), Prefill: req.PrefillTokens,
+		EstimatedInput: req.EstimatedInputTokens, Output: req.ReservedOutputTokens, Scopes: a.scopes(req),
+		Sequences: max(req.OutputSequences, 1)}
 	if req.Adapter {
 		w.Adapter = 1
 	}
@@ -274,7 +316,7 @@ func (a *RedisAdmitter) Admit(ctx context.Context, req Request) (*Lease, error) 
 			id:    id,
 			unknownUsage: Usage{
 				TotalPromptTokens: req.EstimatedInputTokens,
-				GeneratedTokens:   req.ReservedOutputTokens,
+				GeneratedTokens:   req.ReservedOutputTokens * max(req.OutputSequences, 1),
 			},
 		}, nil
 	}
@@ -329,8 +371,9 @@ func scaled(l config.AdmissionLimits, weight int64) config.AdmissionLimits {
 	l.MaxActiveRequests = mul(l.MaxActiveRequests)
 	l.MaxConcurrentPrefills = mul(l.MaxConcurrentPrefills)
 	l.MaxReservedDecodeSlots = mul(l.MaxReservedDecodeSlots)
-	l.MaxPromptBytes = mul(l.MaxPromptBytes)
+	l.MaxPrefillTokens = mul(l.MaxPrefillTokens)
 	l.MaxReservedOutputTokens = mul(l.MaxReservedOutputTokens)
+	l.MaxReservedKVTokens = mul(l.MaxReservedKVTokens)
 	l.MaxActiveAdapters = mul(l.MaxActiveAdapters)
 	l.RequestsPerWindow = mul(l.RequestsPerWindow)
 	l.TotalPromptTokensPerWindow = mul(l.TotalPromptTokensPerWindow)
@@ -363,7 +406,8 @@ func makeScope(name, id string, l config.AdmissionLimits) scope {
 	digest := sha256.Sum256([]byte(id))
 	return scope{ID: name + ":" + hex.EncodeToString(digest[:]), Name: name, Active: wireLimit(l.MaxActiveRequests), Prefills: wireLimit(l.MaxConcurrentPrefills),
 		ReservedDecodeSlots: wireLimit(l.MaxReservedDecodeSlots),
-		Prompt:              wireLimit(l.MaxPromptBytes), Output: wireLimit(l.MaxReservedOutputTokens), Adapters: wireLimit(l.MaxActiveAdapters),
+		Prefill:             wireLimit(l.MaxPrefillTokens), Output: wireLimit(l.MaxReservedOutputTokens), KV: wireLimit(l.MaxReservedKVTokens),
+		Adapters: wireLimit(l.MaxActiveAdapters),
 		Requests: wireLimit(l.RequestsPerWindow), TotalPrompt: wireLimit(l.TotalPromptTokensPerWindow),
 		UncachedPrompt: wireLimit(l.UncachedPromptTokensPerWindow), Generated: wireLimit(l.GeneratedTokensPerWindow), Cold: wireLimit(l.MaxColdHolds),
 		Wakes: wireLimit(l.WakesPerWindow), WindowMs: windowMs}
@@ -380,7 +424,10 @@ func makeContractScope(name, id string, limits RateLimits) scope {
 }
 
 // unsatisfiableSuffix ends the dimension name admitScript returns when one
-// request alone exceeds a contract scope's whole per-window limit.
+// request alone exceeds a scope's whole limit: a contract scope's per-window
+// limit (the proxy answers 400), or a capacity scope's positive prefill, KV
+// or reserved-output cap (prefill_tokens_exceeds_limit, kv_exceeds_limit,
+// output_exceeds_limit; the proxy answers 413). Neither carries a Retry-After.
 const unsatisfiableSuffix = "_exceeds_limit"
 
 // Any reports whether the contract carries at least one limit. A contract with
@@ -389,21 +436,52 @@ func (l RateLimits) Any() bool {
 	return l.Requests != nil || l.TotalPromptTokens != nil || l.UncachedPromptTokens != nil || l.GeneratedTokens != nil
 }
 
-func (a *RedisAdmitter) scopes(r Request) []scope {
-	out := []scope{makeScope("platform", "all", a.cfg.Platform), makeScope("graph", r.Graph, a.cfg.Graph),
-		makeScope("organization", r.Organization, a.cfg.Organization), makeScope("organization_model", r.Organization+"\x1f"+r.Model, a.cfg.OrganizationModel)}
+func (a *RedisAdmitter) scopes(r Request) []scope { return scopesFor(a.cfg, r) }
+
+// ReservedCaps are the tightest positive per-request-bounding caps among the
+// scopes Admit would check: reserved KV tokens and reserved output tokens.
+// 0 means no positive cap of that kind applies.
+type ReservedCaps struct {
+	KV, Output int64
+}
+
+// TightestReservedCaps is the smallest positive reserved-KV cap and the
+// smallest positive reserved-output cap among the scopes Admit would check
+// for r under cfg — the operator tiers (the lane share after its weight), and
+// r.GraphCapacity. An explicit zero cap is not a positive cap and is ignored:
+// that scope rejects in admission with its retryable answer. The proxy uses
+// it to keep an undeclared max_tokens reservation inside both caps.
+func TightestReservedCaps(cfg config.AdmissionSettings, r Request) ReservedCaps {
+	var out ReservedCaps
+	for _, sc := range scopesFor(cfg, r) {
+		if sc.KV > 0 && (out.KV == 0 || sc.KV < out.KV) {
+			out.KV = sc.KV
+		}
+		if sc.Output > 0 && (out.Output == 0 || sc.Output < out.Output) {
+			out.Output = sc.Output
+		}
+	}
+	return out
+}
+
+func scopesFor(cfg config.AdmissionSettings, r Request) []scope {
+	out := []scope{makeScope("platform", "all", cfg.Platform), makeScope("graph", r.Graph, cfg.Graph),
+		makeScope("organization", r.Organization, cfg.Organization), makeScope("organization_model", r.Organization+"\x1f"+r.Model, cfg.OrganizationModel)}
 	// Every operator scope, the lane included, precedes the contract scopes:
 	// admitScript checks scopes in order, so at an exact tie the operator scope
 	// answers (503) before the contract scope (429).
-	laneName := a.cfg.OrganizationLanes[r.Organization]
+	laneName := cfg.OrganizationLanes[r.Organization]
 	if laneName == "" {
 		laneName = "default"
 	}
-	if _, ok := a.cfg.Lanes[laneName]; !ok {
+	if _, ok := cfg.Lanes[laneName]; !ok {
 		laneName = "default"
 	}
-	if t, ok := a.cfg.Lanes[laneName]; ok {
+	if t, ok := cfg.Lanes[laneName]; ok {
 		out = append(out, makeScope("lane", laneName, scaled(t.Limits, t.Weight)))
+	}
+	if r.GraphCapacity.Any() {
+		out = append(out, makeScope("graph_capacity", r.Graph, r.GraphCapacity))
 	}
 	if r.OrganizationLimits.Any() {
 		out = append(out, makeContractScope("contract_organization", r.Organization, r.OrganizationLimits))
@@ -438,7 +516,7 @@ type Lease struct {
 	// unknownUsage is the conservative contractual charge when the engine's
 	// authoritative usage block never arrives. The estimate was already
 	// reserved as wholly uncached input, and generated capacity was reserved at
-	// the request's maximum output, so retaining both prevents an abort-before-
+	// the request's maximum output times its output sequences, so retaining both prevents an abort-before-
 	// usage client from turning consumed model work into a zero-token request.
 	unknownUsage Usage
 }
@@ -464,7 +542,7 @@ func (l *Lease) CompleteUnknownUsage(ctx context.Context) error {
 
 // Usage is the engine-authoritative token result used to settle contractual
 // throughput windows. CachedPromptTokens is a subset of TotalPromptTokens.
-// Prompt-byte reservations remain a separate physical guard and are never
+// Prefill and KV reservations remain separate physical guards and are never
 // converted into contractual token usage.
 type Usage struct {
 	TotalPromptTokens  int64

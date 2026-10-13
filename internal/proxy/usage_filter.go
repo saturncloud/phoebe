@@ -27,14 +27,18 @@ type usageFilterReader struct {
 	includeFinalUsage bool
 	maxLineBytes      int
 	terminalErr       error
+	// buffers charges the held line and the unread filtered lines against the gateway protection limits on
+	// buffered response bytes; nil = only maxLineBytes applies.
+	buffers *responseBufferAccount
 }
 
-func newUsageFilterReader(src io.ReadCloser, includeFinalUsage bool) io.ReadCloser {
+func newUsageFilterReader(src io.ReadCloser, includeFinalUsage bool, buffers *responseBufferAccount) io.ReadCloser {
 	return &usageFilterReader{
 		src:               src,
 		reader:            bufio.NewReader(src),
 		includeFinalUsage: includeFinalUsage,
 		maxLineBytes:      maxSSEEventLineBytes,
+		buffers:           buffers,
 	}
 }
 
@@ -42,34 +46,77 @@ func (r *usageFilterReader) Read(p []byte) (int, error) {
 	if r.pending.Len() == 0 && r.terminalErr != nil {
 		err := r.terminalErr
 		r.terminalErr = nil
+		r.buffers.close()
 		return 0, err
 	}
 	for r.pending.Len() == 0 {
 		fragment, err := r.reader.ReadSlice('\n')
 		if r.line.Len()+len(fragment) > r.maxLineBytes {
 			_ = r.src.Close()
+			r.buffers.close()
 			return 0, errSSEEventLineTooLarge
 		}
 		r.line.Write(fragment)
+		if berr := r.charge(); berr != nil {
+			_ = r.src.Close()
+			r.buffers.close()
+			return 0, berr
+		}
 		if errors.Is(err, bufio.ErrBufferFull) {
 			continue
 		}
 		if r.line.Len() > 0 {
 			r.pending.Write(filterUsageLine(r.line.Bytes(), r.includeFinalUsage))
+			// Charge the moment both the line and its filtered copy exist; the
+			// pending copy then stays charged until the client has read it.
+			if berr := r.charge(); berr != nil {
+				_ = r.src.Close()
+				r.buffers.close()
+				return 0, berr
+			}
 			r.line.Reset()
+			if r.line.Cap() > releaseBufferCap {
+				r.line = bytes.Buffer{}
+			}
+			_ = r.charge()
 		}
 		if err != nil {
 			if r.pending.Len() == 0 {
+				r.buffers.close()
 				return 0, err
 			}
 			r.terminalErr = err
 			break
 		}
 	}
-	return r.pending.Read(p)
+	n, err := r.pending.Read(p)
+	_ = r.charge()
+	if r.pending.Len() == 0 && r.pending.Cap() > releaseBufferCap {
+		r.pending = bytes.Buffer{}
+	}
+	return n, err
 }
 
-func (r *usageFilterReader) Close() error { return r.src.Close() }
+// releaseBufferCap is the backing-array size above which an emptied line or
+// pending buffer is replaced, so one large event does not pin its memory for
+// the rest of the stream.
+const releaseBufferCap = 64 << 10
+
+// charge reports every byte the filter holds — the partial line and the
+// filtered lines the client has not read yet — to the buffer account.
+func (r *usageFilterReader) charge() error {
+	return r.buffers.set(bufferSlotFilter, int64(r.line.Len()+r.pending.Len()))
+}
+
+// Close closes the source and then the buffer account. The filter, not the
+// capture reader under it, closes the account: after upstream EOF it can still
+// hold the stream's last line, and those bytes stay charged until the client
+// has read them or the response ends.
+func (r *usageFilterReader) Close() error {
+	err := r.src.Close()
+	r.buffers.close()
+	return err
+}
 
 // trailerClearingReadCloser removes body validators both before and after the
 // upstream body is consumed. The HTTP transport populates response trailers at

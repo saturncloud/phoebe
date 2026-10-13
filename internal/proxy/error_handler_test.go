@@ -122,3 +122,44 @@ func TestErrorHandlerUpstreamFaultStill502(t *testing.T) {
 		})
 	}
 }
+
+// A body that passes the gateway-wide limit while it is being forwarded,
+// rather than read by phoebe, surfaces from the transport as an
+// *http.MaxBytesError. That is the client's fault: it gets the same 413 as any
+// oversize body and a 413 attempt row, never the upstream-fault 502. Today
+// forceIncludeUsage buffers every body before the forward, so this guards the
+// route where that ever stops being true. The 502 negative is
+// TestErrorHandlerUpstreamFaultStill502.
+func TestErrorHandlerAnswersForwardedOversizeBodyWith413NotUpstreamFault(t *testing.T) {
+	upstream, _ := url.Parse("http://upstream.invalid")
+	id := identity.Identity{AuthID: "auth-1", ResourceID: "model-abc"}
+	for _, tc := range []struct {
+		name string
+		err  error
+	}{
+		{"bare", &http.MaxBytesError{Limit: 256}},
+		{"wrapped by the transport", &url.Error{Op: "Get", URL: upstream.String(), Err: &http.MaxBytesError{Limit: 256}}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			em := &recordingEmitter{}
+			srv := newTestServerE(t, upstream, em)
+			h := srv.errorHandler(upstream.String(), id, "req-1", "logical-1", nil, nil)
+			rr := httptest.NewRecorder()
+			h(rr, httptest.NewRequest(http.MethodGet, "/health", nil), tc.err)
+
+			if rr.Code != http.StatusRequestEntityTooLarge {
+				t.Fatalf("Code=%d body=%q, want 413", rr.Code, rr.Body.String())
+			}
+			if got := rr.Header().Get("X-Request-Id"); got != "req-1" {
+				t.Fatalf("X-Request-Id=%q, want trusted attempt id req-1", got)
+			}
+			events := em.all()
+			if len(events) != 1 {
+				t.Fatalf("emitted %d events, want 1 observable attempt", len(events))
+			}
+			if e := events[0]; e.StatusCode != http.StatusRequestEntityTooLarge || e.UsageFound || e.Aborted {
+				t.Fatalf("event = %+v, want a usage-missing, non-aborted 413 row (not an upstream-fault 502)", e)
+			}
+		})
+	}
+}

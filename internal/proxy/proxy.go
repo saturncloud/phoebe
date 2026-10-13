@@ -31,6 +31,7 @@ import (
 	"net/url"
 	"strconv"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -164,6 +165,15 @@ type Server struct {
 	admissionReleaseFallbackLog, admissionCompletionReleaseLog sampledErrorLog
 	admissionPrefillReleaseLog, admissionUpstreamReleaseLog    sampledErrorLog
 	admissionColdHoldReleaseLog                                sampledErrorLog
+
+	// graphCapacity supplies the per-graph admission capacity Atlas publishes
+	// (B8). nil = none published (no registry resolver wired).
+	graphCapacity graphCapacitySource
+
+	// responseBuffers and dedicatedHolds are the replica-wide state behind the
+	// gateway protection bounds (see protection.go).
+	responseBuffers responseBufferBudget
+	dedicatedHolds  dedicatedColdHolds
 }
 
 func (s *Server) WithAdmitter(a admission.Admitter) *Server { s.admitter = a; return s }
@@ -203,21 +213,9 @@ func NewWithIOLog(s *config.Settings, log *logging.Logger, emitter metering.Emit
 	return srv
 }
 
-// Default wake bounds when a waker is wired without explicit values.
-const (
-	// defaultWakeTimeout is the per-wake ceiling the woken request is held for.
-	// 300s, sized to the MEASURED cold path: a vLLM worker's cold reload is
-	// ~2.5min on the live staging cluster, so the previous 120s default meant a
-	// real wake NEVER completed inside the budget — every genuinely cold
-	// request held two minutes and then got the cold response anyway. The
-	// tradeoff of a longer hold: a wake that will ultimately fail keeps the
-	// client (and one upstream slot) waiting up to 5 minutes before the honest
-	// cold response — acceptable because OpenAI-style clients tolerate
-	// multi-minute holds, and the alternative (a budget shorter than the
-	// cold start) makes the wake feature a no-op. Still bounded; operators can
-	// tune per install via wake.timeout in the settings.
-	defaultWakeTimeout = 300 * time.Second
-)
+// defaultWakeTimeout is used when a waker is wired without an explicit
+// timeout (see config.DefaultWakeTimeout for why it is 300s).
+const defaultWakeTimeout = config.DefaultWakeTimeout
 
 // WithWaker enables wake-from-zero. The normal proxy transport sends one
 // metered request. If and only if that response proves the endpoint is cold,
@@ -306,20 +304,76 @@ func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "invalid X-Request-Id", http.StatusBadRequest)
 		return
 	}
-	var sharedLane config.AdmissionLane
-	bodyBound := false
-
-	// Gateway resolution must inspect model=, so apply the shared-inference body
-	// ceiling before that first read. The gateway ForwardAuth has already
-	// stamped the trusted organization. Preserve the existing
-	// fail-closed gateway-not-configured/missing-org responses without reading
-	// a body in those cases.
-	if id.Gateway && s.gateway != nil && id.OrgID != "" {
-		sharedLane = admissionLaneForIdentity(s.settings.Admission, id)
-		if !boundSharedRequestBody(w, r, sharedRequestBodyLimit(s.settings.Admission, sharedLane)) {
+	// GATEWAY PROTECTION: per-request resource bounds for EVERY route (see
+	// protection.go). The request context is replaced by one this handler can
+	// cancel with a cause: maxStreamDuration ends the request outright, and
+	// the stall guard ends it when the client stops reading. Every consumer
+	// below — the upstream forward, wake holds, admission lease renewal and
+	// the capture reader's abort detection — reads this context.
+	prot := s.protection()
+	ctx, cancel := context.WithCancelCause(r.Context())
+	defer cancel(nil)
+	// rawW is the connection's own ResponseWriter. http.MaxBytesReader needs
+	// it (not the guard) to reach net/http's unexported requestTooLarge hook,
+	// which marks the connection to close after an oversize body's 413.
+	rawW := w
+	// When maxStreamDuration fires, cancelling the context is not enough on
+	// its own: a request-body read (io.ReadAll of a trickled body) blocks in a
+	// connection read that never observes the context. Setting the
+	// connection's read deadline to now fails that read, so the handler
+	// returns within the bound. The cause is set first, so the failed read is
+	// answered as a max-duration expiry (writeRequestBodyError). The deadline
+	// is set only while this handler runs (handlerDone), so it can never reach
+	// the next request on a keep-alive connection; net/http also resets the
+	// read deadline before reading each request. A writer that cannot set
+	// deadlines (http.ErrNotSupported, e.g. a test recorder) is ignored.
+	var maxDurationMu sync.Mutex
+	handlerDone := false
+	maxDuration := time.AfterFunc(prot.MaxStreamDuration, func() {
+		maxDurationMu.Lock()
+		defer maxDurationMu.Unlock()
+		if handlerDone {
 			return
 		}
-		bodyBound = true
+		cancel(errMaxStreamDuration)
+		_ = http.NewResponseController(rawW).SetReadDeadline(time.Now())
+	})
+	defer func() {
+		maxDuration.Stop()
+		maxDurationMu.Lock()
+		handlerDone = true
+		maxDurationMu.Unlock()
+	}()
+	r = r.WithContext(ctx)
+	stallGuard := newStallGuardWriter(w, prot.StreamStallTimeout, cancel)
+	w = stallGuard
+	// Re-arm once more when the handler returns (deferred, so it also runs on
+	// early returns and on ReverseProxy's abort panic). net/http writes the
+	// final chunk, the chunked terminator and the last flush in finishRequest,
+	// after the handler, through no guarded method; without this they would
+	// run on the deadline the last guarded write armed, which may already
+	// have expired during a long upstream idle. net/http clears the write
+	// deadline right after finishRequest (conn.serve), so this never reaches
+	// the next request on a keep-alive connection.
+	defer stallGuard.arm()
+
+	// One body ceiling for EVERY route — shared,
+	// gateway, header-routed dedicated and control routes alike — installed
+	// before anything reads the body (gateway resolution, model binding, the
+	// usage-preference read and the include_usage rewrite all buffer it
+	// whole). Gateway-wide by ruling: it protects phoebe's own memory, which
+	// every tenant shares.
+	//
+	// The one exception keeps the existing fail-closed answers on the gateway
+	// path: a gateway-marked request when gateway resolution is not
+	// configured (503) or when the trusted org is missing (403) gets that
+	// answer, not a 413, so a broken gateway or ForwardAuth is reported as
+	// what it is. resolveGateway (and the route and preflight checks before
+	// it) never read the body in either case, so leaving it unbounded there
+	// is safe. Every other request is bounded here before anything reads it.
+	gatewayFailsClosed := id.Gateway && (s.gateway == nil || id.OrgID == "")
+	if !gatewayFailsClosed && !boundRequestBody(w, rawW, r, prot.MaxRequestBodyBytes) {
+		return
 	}
 
 	// GATEWAY RESOLUTION (TF single-host gateway): a request the trusted
@@ -425,15 +479,6 @@ func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if id.ServingMode == identity.ServingModeShared {
-		if !bodyBound {
-			sharedLane = admissionLaneForIdentity(s.settings.Admission, id)
-			if !boundSharedRequestBody(w, r, sharedRequestBodyLimit(s.settings.Admission, sharedLane)) {
-				return
-			}
-		}
-	}
-
 	// Resolve the serving graph ONCE, here, so every downstream consumer (the wake
 	// target and the metering event) reads one value rather than deriving its own.
 	// The gateway path already set it from tf_model.graph_k8s_name; the header path
@@ -469,7 +514,7 @@ func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request) {
 		reqBody, reqTruncated, reqOrigLen, err = captureRequestBody(r, s.ioMaxBodyLen)
 		if err != nil {
 			s.log.Error.Printf("capture request body: %v", err)
-			writeRequestBodyError(w, err)
+			writeRequestBodyError(w, r, err)
 			return
 		}
 		// Hard truncation is intentional (an uncapped body fails the to_tsvector
@@ -577,7 +622,7 @@ func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request) {
 		body, rerr := readAndRestoreBody(r)
 		if rerr != nil {
 			s.log.Error.Printf("model-binding: read request body: %v", rerr)
-			writeRequestBodyError(w, rerr)
+			writeRequestBodyError(w, r, rerr)
 			return
 		}
 		switch checkModelBinding(body, id.ServedModel) {
@@ -603,7 +648,7 @@ func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request) {
 		clientUsage, err = clientRequestedStreamUsage(r)
 		if err != nil {
 			s.log.Error.Printf("read streaming usage preference: %v", err)
-			writeRequestBodyError(w, err)
+			writeRequestBodyError(w, r, err)
 			return
 		}
 	}
@@ -622,6 +667,7 @@ func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request) {
 	var responseCaptureInstalled atomic.Bool
 	responseCaptureDone := make(chan struct{})
 	if id.ServingMode == identity.ServingModeShared && inferenceRequestPathAllowed(routePath) {
+		sharedLane := admissionLaneForIdentity(s.settings.Admission, id)
 		// Admission's fail-closed checks run whenever an admitter exists (an
 		// admission store is configured) and either admission.enabled requires
 		// the envelope on every shared request, or this request carries any
@@ -636,7 +682,14 @@ func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request) {
 		// parseTrustedRateLimits. Only a shared request with NO envelope at all,
 		// under admission.enabled=false, skips admission entirely: the
 		// historical per-resource routes that never carried the policy contract.
-		enforceAdmission := s.admitter != nil && (s.settings.Admission.Enabled || trustedPolicyEnvelopePresent(id))
+		// Per-graph capacity Atlas published (B8) engages admission whenever an
+		// admission store exists, like a contract limit — there is no
+		// enablement gate (R12 clarification). It needs the trusted org (the
+		// admitter keys every scope set on it), so a historical route that
+		// does not stamp one keeps its old behavior rather than starting to 503.
+		graphCapacity := s.publishedGraphCapacity(id.GraphK8sName)
+		enforceAdmission := s.admitter != nil && (s.settings.Admission.Enabled || trustedPolicyEnvelopePresent(id) ||
+			(graphCapacity.Any() && id.OrgID != ""))
 		tenantIdentity := id.OrgID
 		if tenantIdentity == "" {
 			if enforceAdmission {
@@ -666,17 +719,23 @@ func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request) {
 			// absent limit headers parse as unlimited (R4). Under
 			// admission.enabled=true a request with no envelope at all also
 			// fails closed here (errNoTrustedRateLimitPolicy).
-			var policyErr error
-			organizationLimits, ownerLimits, policyErr = parseTrustedRateLimits(id)
-			if policyErr != nil {
-				s.log.Error.Printf("admission: invalid trusted rate-limit policy: %v", policyErr)
-				if errors.Is(policyErr, errNoTrustedRateLimitPolicy) && legacyEnvelope {
-					// Log-only diagnostic for the R8 cutover: the legacy headers
-					// decide nothing, but their presence names the root cause.
-					s.log.Warn.Printf("admission: legacy single-scope quota headers present without %s (removed by R8); legacy_envelope_present=true (pre-R8 producer; upgrade Atlas/Traefik) request_id=%s", identity.HeaderOwnerID, requestID)
+			//
+			// Published graph capacity alone (admission.enabled=false, no
+			// envelope) needs no contract policy: the request is unlimited in
+			// every contract scope, as it would be with no admission at all.
+			if s.settings.Admission.Enabled || trustedPolicyEnvelopePresent(id) {
+				var policyErr error
+				organizationLimits, ownerLimits, policyErr = parseTrustedRateLimits(id)
+				if policyErr != nil {
+					s.log.Error.Printf("admission: invalid trusted rate-limit policy: %v", policyErr)
+					if errors.Is(policyErr, errNoTrustedRateLimitPolicy) && legacyEnvelope {
+						// Log-only diagnostic for the R8 cutover: the legacy headers
+						// decide nothing, but their presence names the root cause.
+						s.log.Warn.Printf("admission: legacy single-scope quota headers present without %s (removed by R8); legacy_envelope_present=true (pre-R8 producer; upgrade Atlas/Traefik) request_id=%s", identity.HeaderOwnerID, requestID)
+					}
+					http.Error(w, "shared inference policy unavailable", http.StatusServiceUnavailable)
+					return
 				}
-				http.Error(w, "shared inference policy unavailable", http.StatusServiceUnavailable)
-				return
 			}
 			// The group quota envelope is a separate fail-closed parse:
 			// malformed, oversized, or over-count is a 503 with a loud log —
@@ -705,13 +764,12 @@ func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request) {
 		}
 		body, rerr := readAndRestoreBody(r)
 		if rerr != nil {
-			writeRequestBodyError(w, rerr)
+			writeRequestBodyError(w, r, rerr)
 			return
 		}
-		// Physical prompt-byte accounting is defined over the original bounded
-		// OpenAI JSON. Phoebe's cache-isolation and scheduler metadata is internal
-		// forwarding overhead, not tenant prompt work.
-		originalPromptBytes := int64(len(body))
+		// The prompt-token estimate is taken from the client's original body
+		// (admissionWork, below), before phoebe adds its cache-isolation and
+		// scheduler metadata, which is forwarding overhead, not prompt text.
 		// config.parse sets the R10 default (config.DefaultMaxOutputTokens);
 		// this guard covers only hand-built Settings.
 		defaultOutput := s.settings.Admission.DefaultMaxOutputTokens
@@ -722,24 +780,41 @@ func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request) {
 			// Embeddings generate no tokens, so they reserve none beyond the
 			// minimum of one that admission requires.
 			defaultOutput = 1
-		} else {
-			// An undeclared max_tokens reserves no more than the tightest
-			// contract generated-token limit, so it is never rejected for a
-			// default the client did not choose. The reservation is clamped
-			// before prepareSharedDynamoRequest so the Dynamo output hint
-			// still equals the reservation.
-			groupLimits := make([]admission.RateLimits, len(groupScopes))
-			for i, gs := range groupScopes {
-				groupLimits[i] = gs.Limits
-			}
-			defaultOutput = undeclaredOutputReservation(defaultOutput, append([]admission.RateLimits{organizationLimits, ownerLimits}, groupLimits...)...)
 		}
-		estimate, ok := admissionWork(body, defaultOutput)
+		estimate, ok := admissionWork(body, defaultOutput, routePath)
 		if !ok {
 			http.Error(w, "invalid shared inference request", http.StatusBadRequest)
 			return
 		}
-		body, tenant, rerr := prepareSharedDynamoRequest(body, tenantIdentity, estimate.OutputTokens, sharedLane)
+		if routePath != "/v1/embeddings" && !estimate.OutputDeclared {
+			// An undeclared max_tokens reserves no more than the tightest
+			// contract generated-token limit divided by the output sequences
+			// (admission charges output x sequences), so it is never rejected
+			// for a default the client did not choose. The reservation is
+			// clamped before prepareSharedDynamoRequest so the Dynamo output
+			// hint still equals the reservation.
+			contractLimits := []admission.RateLimits{organizationLimits, ownerLimits}
+			for _, gs := range groupScopes {
+				contractLimits = append(contractLimits, gs.Limits)
+			}
+			estimate.OutputTokens = undeclaredOutputReservation(estimate.OutputTokens, estimate.OutputSequences, contractLimits...)
+		}
+		if routePath != "/v1/embeddings" && enforceAdmission && !estimate.OutputDeclared {
+			// The undeclared reservation must also fit every positive
+			// reserved-KV and reserved-output cap admission will check
+			// (operator tiers, the weighted lane share, published graph
+			// capacity), or a client that sent no max_tokens could be
+			// refused, or told to retry forever, for the default.
+			caps := admission.TightestReservedCaps(s.admitterSettings(), admission.Request{
+				Graph: graph, Organization: id.OrgID, Model: estimate.Model, GraphCapacity: graphCapacity.Limits(),
+			})
+			estimate.OutputTokens = undeclaredOutputWithinCaps(estimate.OutputTokens, estimate.InputTokens, estimate.OutputSequences, caps.KV, caps.Output)
+		}
+		// An undeclared max_tokens is capped on the engine at the reservation
+		// (R10: the documented default is both the user-visible cap and the
+		// admission reservation). Embeddings generate nothing.
+		capOutput := routePath != "/v1/embeddings" && !estimate.OutputDeclared
+		body, tenant, rerr := prepareSharedDynamoRequest(body, tenantIdentity, estimate.OutputTokens, capOutput, sharedLane)
 		if rerr != nil {
 			http.Error(w, "invalid shared inference request", http.StatusBadRequest)
 			return
@@ -765,13 +840,15 @@ func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request) {
 		// store only when at least one group scope carries a rate limit; an
 		// all-unlimited envelope enforces
 		// nothing. Every fail-closed check above has already run.
-		if enforceAdmission && (s.settings.Admission.Enabled || organizationLimits.Any() || ownerLimits.Any() || anyGroupScopeEnforced(groupScopes)) {
+		if enforceAdmission && (s.settings.Admission.Enabled || organizationLimits.Any() || ownerLimits.Any() ||
+			anyGroupScopeEnforced(groupScopes) || graphCapacity.Any()) {
 			admitted, err = s.admitter.Admit(r.Context(), admission.Request{
 				Graph: graph, Organization: id.OrgID, Owner: id.OwnerID, Model: estimate.Model,
-				PromptBytes: originalPromptBytes, EstimatedInputTokens: estimate.InputTokens,
-				ReservedOutputTokens: estimate.OutputTokens,
-				Adapter:              id.Adapter != "", OrganizationLimits: organizationLimits, OwnerLimits: ownerLimits,
-				GroupScopes: groupScopes,
+				PrefillTokens: estimate.InputTokens, EstimatedInputTokens: estimate.InputTokens,
+				ReservedOutputTokens: estimate.OutputTokens, OutputSequences: estimate.OutputSequences,
+				Adapter: id.Adapter != "", OrganizationLimits: organizationLimits, OwnerLimits: ownerLimits,
+				GroupScopes:   groupScopes,
+				GraphCapacity: graphCapacity.Limits(),
 			})
 			if err != nil {
 				if errors.Is(err, admission.ErrInvalidIdentity) {
@@ -792,7 +869,11 @@ func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request) {
 					}
 					admitted = nil
 				} else {
-					s.writeAdmissionError(w, requestID, err)
+					s.writeAdmissionErrorOutput(w, requestID, err, outputShape{
+						hasOutput: routePath != "/v1/embeddings",
+						declared:  routePath != "/v1/embeddings" && estimate.OutputDeclared,
+						sequences: estimate.OutputSequences,
+					})
 					return
 				}
 			}
@@ -824,7 +905,7 @@ func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request) {
 	// Force streaming usage so we never under-bill a streamed response.
 	if err := forceIncludeUsage(r); err != nil {
 		s.log.Error.Printf("rewrite request body: %v", err)
-		writeRequestBodyError(w, err)
+		writeRequestBodyError(w, r, err)
 		return
 	}
 	if clientUsage.stream {
@@ -926,6 +1007,16 @@ func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request) {
 			// be able to drop the emit OR the I/O-log record (a sink that
 			// honours ctx would otherwise lose every aborted request).
 			ctx := context.WithoutCancel(r.Context())
+			// The stall guard's flag covers the usual stall path, where
+			// net/http has already cancelled the parent context (cause
+			// context.Canceled) before the guard could record its cause.
+			cause := protectionCause(r.Context())
+			if cause == nil {
+				cause = stallGuard.stallCause()
+			}
+			if cause != nil {
+				s.log.Warn.Printf("protection: ended response request_id=%s resource_id=%s: %v", requestID, id.ResourceID, cause)
+			}
 			if admitted != nil {
 				kind := classifyCaptureSettlement(res)
 				if wakeNeverServed {
@@ -974,6 +1065,8 @@ func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request) {
 		// goroutine racing the body's Close(). On abort, ReverseProxy cancels
 		// this context, so by the time finish() runs ctx.Err() is non-nil.
 		cr = newCaptureReader(r.Context(), resp.Body, streamed, onDone)
+		buffers := s.responseBuffers.newAccount(prot, cancel)
+		cr.buffers = buffers
 		if admitted != nil {
 			// The first response body byte is the observable prefill→decode
 			// boundary. Headers alone can arrive before an engine finishes prefill,
@@ -1001,8 +1094,11 @@ func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request) {
 			invalidBodyMetadata := []string{
 				"Content-Length", "Content-MD5", "Digest", "Content-Digest", "Repr-Digest", "ETag",
 			}
+			// The filter outlives cr's EOF while it holds the final line,
+			// so it, not cr, closes the buffer account.
+			cr.deferBufferClose = true
 			resp.Body = &trailerClearingReadCloser{
-				src:     newUsageFilterReader(cr, clientUsage.includeUsage),
+				src:     newUsageFilterReader(cr, clientUsage.includeUsage, buffers),
 				trailer: resp.Trailer,
 				names:   invalidBodyMetadata,
 			}
@@ -1127,6 +1223,30 @@ func (s *Server) errorHandler(upstream string, id identity.Identity, requestID, 
 			s.emit(context.WithoutCancel(r.Context()), id, requestID, clientRequestID,
 				http.StatusServiceUnavailable, capture.Result{UsageFound: false})
 			s.writeAdmissionError(w, requestID, cause)
+			return
+		}
+		if errors.Is(context.Cause(r.Context()), errMaxStreamDuration) {
+			// protection.maxStreamDuration expired before the upstream sent
+			// response headers. The client is still connected and owed an
+			// answer: this is a gateway timeout, recorded like any other
+			// upstream failure (a zero-token raw row, never an abort).
+			s.log.Warn.Printf("upstream %s sent no response within protection.maxStreamDuration (request_id=%s)", upstream, requestID)
+			w.Header().Set("X-Request-Id", requestID)
+			s.emit(context.WithoutCancel(r.Context()), id, requestID, clientRequestID,
+				http.StatusGatewayTimeout, capture.Result{UpstreamFault: true, UsageFound: false})
+			http.Error(w, "upstream did not respond in time", http.StatusGatewayTimeout)
+			return
+		}
+		if tooLarge := (*http.MaxBytesError)(nil); errors.As(err, &tooLarge) {
+			// The gateway-wide body ceiling (boundRequestBody) tripped while
+			// the body was being forwarded rather than read by phoebe (a
+			// chunked body on a route phoebe does not buffer). The fault is
+			// the client's, not the upstream's: answer 413 like every other
+			// oversize body, and record the attempt without UpstreamFault.
+			w.Header().Set("X-Request-Id", requestID)
+			s.emit(context.WithoutCancel(r.Context()), id, requestID, clientRequestID,
+				http.StatusRequestEntityTooLarge, capture.Result{UsageFound: false})
+			writeRequestBodyError(w, r, err)
 			return
 		}
 		if isClientAbort(err) {

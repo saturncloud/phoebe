@@ -23,9 +23,17 @@ type Settings struct {
 	// Port the interceptor listens on for inbound (post-Traefik) traffic.
 	ListenPort int `yaml:"listenPort"`
 
-	// IdleTimeout bounds how long an idle streaming connection may stay open.
-	// Token streams can idle between chunks, so this is intentionally long.
+	// IdleTimeout bounds how long an idle keep-alive connection may stay open
+	// BETWEEN requests (http.Server.IdleTimeout). It does not bound a request
+	// in flight: a client that stops reading a stream is ended by
+	// protection.streamStallTimeout instead.
 	IdleTimeoutStr string `yaml:"idleTimeout"`
+
+	// Protection bounds the resources any single request can hold in phoebe.
+	// It applies to ALL traffic, shared and dedicated, and is set once for the
+	// whole gateway (ruling 2026-10-12): it protects phoebe itself, which every
+	// tenant shares, so it is not a per-model or per-tenant setting.
+	Protection ProtectionSettings `yaml:"protection"`
 
 	// Emit configures the durable metering emitter (M2). main.go translates
 	// these into an emit.Config for the same reason.
@@ -65,6 +73,155 @@ type Settings struct {
 	configDir string
 }
 
+// ProtectionSettings is the YAML shape for gateway-wide resource bounds. Every
+// field is optional: an absent (or null) key selects the shipped default
+// below, and an explicit zero or negative value is a startup error. There is
+// deliberately no "off" value — each bound protects the shared process, and
+// the defaults are generous enough that a well-behaved client never meets
+// them. An operator who writes 0 meaning "unlimited" is told no at startup
+// rather than silently given the default.
+type ProtectionSettings struct {
+	// MaxRequestBodyBytes caps every request body phoebe reads, on every route.
+	MaxRequestBodyBytes int64 `yaml:"maxRequestBodyBytes"`
+	// StreamStallTimeoutStr bounds how long one write to the client may make no
+	// progress. A client that stops reading mid-response fills its TCP window
+	// and the write blocks; without this bound the request (and its engine
+	// work, admission lease and buffers) would be held forever.
+	StreamStallTimeoutStr string        `yaml:"streamStallTimeout"`
+	StreamStallTimeout    time.Duration `yaml:"-"`
+	// MaxStreamDurationStr bounds a whole request, from arrival to the last
+	// response byte, including any wake hold.
+	MaxStreamDurationStr string        `yaml:"maxStreamDuration"`
+	MaxStreamDuration    time.Duration `yaml:"-"`
+	// MaxResponseBufferBytesPerStream caps the response bytes phoebe holds in
+	// memory for one request while it inspects them (an incomplete SSE line,
+	// or a whole non-streamed JSON body). The fixed 16 MiB SSE event-line
+	// limit still applies inside it. While an SSE line is being assembled it
+	// is held twice, once in the capture buffer and once in the usage
+	// filter, and both copies count; a value below 32 MiB therefore cuts
+	// lines shorter than the 16 MiB event-line limit.
+	MaxResponseBufferBytesPerStream int64 `yaml:"maxResponseBufferBytesPerStream"`
+	// MaxResponseBufferBytesTotal caps those bytes summed over every request
+	// in this phoebe replica.
+	MaxResponseBufferBytesTotal int64 `yaml:"maxResponseBufferBytesTotal"`
+	// MaxDedicatedColdHoldsPerEndpoint caps, per phoebe replica, how many
+	// requests to ONE dedicated endpoint may be held while it starts from
+	// zero. The shared tier bounds the same thing with admission's
+	// maxColdHolds; dedicated endpoints have no admission.
+	MaxDedicatedColdHoldsPerEndpoint int64 `yaml:"maxDedicatedColdHoldsPerEndpoint"`
+
+	// intKeyPresent records which integer keys the YAML set to a non-null
+	// value, in protectionIntKeys order, so parse can tell an explicit 0 (an
+	// error) from an absent key (the default). A hand-built value leaves it
+	// all false, and Effective treats its zero fields as absent.
+	intKeyPresent [len(protectionIntKeys)]bool
+}
+
+// protectionIntKeys are the YAML names of ProtectionSettings' integer limits,
+// in the order intKeyPresent and intValues use.
+var protectionIntKeys = [...]string{
+	"maxRequestBodyBytes",
+	"maxResponseBufferBytesPerStream",
+	"maxResponseBufferBytesTotal",
+	"maxDedicatedColdHoldsPerEndpoint",
+}
+
+func (p *ProtectionSettings) intValues() [len(protectionIntKeys)]int64 {
+	return [...]int64{
+		p.MaxRequestBodyBytes,
+		p.MaxResponseBufferBytesPerStream,
+		p.MaxResponseBufferBytesTotal,
+		p.MaxDedicatedColdHoldsPerEndpoint,
+	}
+}
+
+// UnmarshalYAML decodes the fields as usual and also records which integer
+// keys were present, since int64 alone cannot tell an explicit 0 from absent.
+func (p *ProtectionSettings) UnmarshalYAML(unmarshal func(interface{}) error) error {
+	type plain ProtectionSettings
+	if err := unmarshal((*plain)(p)); err != nil {
+		return err
+	}
+	var raw map[string]interface{}
+	if err := unmarshal(&raw); err != nil {
+		return err
+	}
+	for i, key := range protectionIntKeys {
+		v, ok := raw[key]
+		p.intKeyPresent[i] = ok && v != nil
+	}
+	return nil
+}
+
+// Shipped protection defaults.
+const (
+	DefaultMaxRequestBodyBytes              int64 = 64 << 20
+	DefaultStreamStallTimeout                     = 2 * time.Minute
+	DefaultMaxStreamDuration                      = 60 * time.Minute
+	DefaultMaxResponseBufferBytesPerStream  int64 = 64 << 20
+	DefaultMaxResponseBufferBytesTotal      int64 = 256 << 20
+	DefaultMaxDedicatedColdHoldsPerEndpoint int64 = 32
+)
+
+// Effective returns the settings with every absent (zero) field replaced by
+// its default. A loaded Settings never reaches here with an explicit zero:
+// parse rejects it. The proxy calls it rather than reading fields directly, so a
+// hand-built Settings (tests, embedders) is protected exactly like a loaded
+// one.
+func (p ProtectionSettings) Effective() ProtectionSettings {
+	if p.MaxRequestBodyBytes <= 0 {
+		p.MaxRequestBodyBytes = DefaultMaxRequestBodyBytes
+	}
+	if p.StreamStallTimeout <= 0 {
+		p.StreamStallTimeout = DefaultStreamStallTimeout
+	}
+	if p.MaxStreamDuration <= 0 {
+		p.MaxStreamDuration = DefaultMaxStreamDuration
+	}
+	if p.MaxResponseBufferBytesPerStream <= 0 {
+		p.MaxResponseBufferBytesPerStream = DefaultMaxResponseBufferBytesPerStream
+	}
+	if p.MaxResponseBufferBytesTotal <= 0 {
+		p.MaxResponseBufferBytesTotal = DefaultMaxResponseBufferBytesTotal
+	}
+	if p.MaxDedicatedColdHoldsPerEndpoint <= 0 {
+		p.MaxDedicatedColdHoldsPerEndpoint = DefaultMaxDedicatedColdHoldsPerEndpoint
+	}
+	return p
+}
+
+func (p *ProtectionSettings) parse() error {
+	values := p.intValues()
+	for i, key := range protectionIntKeys {
+		if values[i] < 0 || (p.intKeyPresent[i] && values[i] == 0) {
+			return fmt.Errorf("protection.%s must be positive, got %d (omit the key for the default; there is no unlimited value)", key, values[i])
+		}
+	}
+	for _, item := range []struct {
+		name string
+		raw  string
+		dst  *time.Duration
+	}{
+		{"streamStallTimeout", p.StreamStallTimeoutStr, &p.StreamStallTimeout},
+		{"maxStreamDuration", p.MaxStreamDurationStr, &p.MaxStreamDuration},
+	} {
+		if item.raw == "" {
+			continue
+		}
+		d, err := time.ParseDuration(item.raw)
+		if err != nil || d <= 0 {
+			return fmt.Errorf("invalid protection.%s %q (a positive duration such as 2m)", item.name, item.raw)
+		}
+		*item.dst = d
+	}
+	eff := p.Effective()
+	if eff.MaxResponseBufferBytesPerStream > eff.MaxResponseBufferBytesTotal {
+		return fmt.Errorf("protection.maxResponseBufferBytesPerStream (%d) cannot exceed maxResponseBufferBytesTotal (%d)",
+			eff.MaxResponseBufferBytesPerStream, eff.MaxResponseBufferBytesTotal)
+	}
+	return nil
+}
+
 // AdmissionLimits is one independently-enforced scope budget. R4 sentinel
 // semantics (the Saturn UsageLimit pattern): nil — a YAML null or an absent
 // key — means that dimension is unlimited; an explicit 0 is a zero cap that
@@ -73,11 +230,23 @@ type Settings struct {
 // windows, and WakesPerWindow. Total prompt includes cached and uncached
 // prompt tokens; uncached prompt is the subset that required prefill compute.
 type AdmissionLimits struct {
-	MaxActiveRequests             *int64        `yaml:"maxActiveRequests"`
-	MaxConcurrentPrefills         *int64        `yaml:"maxConcurrentPrefills"`
-	MaxReservedDecodeSlots        *int64        `yaml:"maxReservedDecodeSlots"`
-	MaxPromptBytes                *int64        `yaml:"maxPromptBytes"`
-	MaxReservedOutputTokens       *int64        `yaml:"maxReservedOutputTokens"`
+	MaxActiveRequests      *int64 `yaml:"maxActiveRequests"`
+	MaxConcurrentPrefills  *int64 `yaml:"maxConcurrentPrefills"`
+	MaxReservedDecodeSlots *int64 `yaml:"maxReservedDecodeSlots"`
+	// MaxPrefillTokens bounds the estimated prompt tokens of requests still in
+	// prefill (admitted, no response byte yet). The estimate is the request's
+	// message-text characters divided by 4 plus a fixed cost per image part
+	// (ruling 2026-10-12); it replaced the old byte-based maxPromptBytes.
+	MaxPrefillTokens *int64 `yaml:"maxPrefillTokens"`
+	// MaxReservedOutputTokens bounds the output tokens admitted requests may
+	// generate; each request is charged max_tokens x its output sequences
+	// (max(n, best_of, 1) x batched prompts), since the engine generates up
+	// to max_tokens for each sequence (ledger D29).
+	MaxReservedOutputTokens *int64 `yaml:"maxReservedOutputTokens"`
+	// MaxReservedKVTokens bounds the KV-cache tokens admitted requests may
+	// need: estimated input plus reserved output tokens, held until the
+	// request finishes.
+	MaxReservedKVTokens           *int64        `yaml:"maxReservedKvTokens"`
 	MaxActiveAdapters             *int64        `yaml:"maxActiveAdapters"`
 	RequestsPerWindow             *int64        `yaml:"requestsPerWindow"`
 	TotalPromptTokensPerWindow    *int64        `yaml:"totalPromptTokensPerWindow"`
@@ -87,6 +256,11 @@ type AdmissionLimits struct {
 	WakesPerWindow                *int64        `yaml:"wakesPerWindow"`
 	WindowStr                     string        `yaml:"window"`
 	Window                        time.Duration `yaml:"-"`
+
+	// RemovedMaxPromptBytes catches the renamed maxPromptBytes key. phoebe
+	// reads YAML non-strictly, so a leftover value would otherwise be dropped
+	// in silence and the operator would believe a limit is in force.
+	RemovedMaxPromptBytes *int64 `yaml:"maxPromptBytes"`
 }
 
 // AdmissionLane gives an operator-defined scheduling class an isolated protected
@@ -260,6 +434,19 @@ type WakeSettings struct {
 	Timeout time.Duration `yaml:"-"`
 }
 
+// DefaultWakeTimeout is the per-wake ceiling the woken request is held for.
+// 300s, sized to the MEASURED cold path: a vLLM worker's cold reload is
+// ~2.5min on the live staging cluster, so the previous 120s default meant a
+// real wake NEVER completed inside the budget — every genuinely cold
+// request held two minutes and then got the cold response anyway. The
+// tradeoff of a longer hold: a wake that will ultimately fail keeps the
+// client (and one upstream slot) waiting up to 5 minutes before the honest
+// cold response — acceptable because OpenAI-style clients tolerate
+// multi-minute holds, and the alternative (a budget shorter than the
+// cold start) makes the wake feature a no-op. Still bounded; operators can
+// tune per install via wake.timeout in the settings.
+const DefaultWakeTimeout = 300 * time.Second
+
 // Load reads, defaults, and parses a settings YAML file.
 func Load(settingsFile string) (*Settings, error) {
 	s := &Settings{
@@ -300,6 +487,10 @@ func (s *Settings) parse() error {
 
 	s.ListenAddr = fmt.Sprintf(":%d", s.ListenPort)
 
+	if err := s.Protection.parse(); err != nil {
+		return err
+	}
+
 	if err := s.IOLog.parse(); err != nil {
 		return err
 	}
@@ -321,6 +512,18 @@ func (s *Settings) parse() error {
 			return fmt.Errorf("wake.timeout %q must be positive", s.Wake.TimeoutStr)
 		}
 	}
+	// protection.maxStreamDuration bounds the whole request, wake hold
+	// included, so one not longer than the wake hold would answer every
+	// request that arrives while a model starts from zero with 504.
+	if s.Wake.Enabled {
+		wake := s.Wake.Timeout
+		if wake <= 0 {
+			wake = DefaultWakeTimeout
+		}
+		if stream := s.Protection.Effective().MaxStreamDuration; stream <= wake {
+			return fmt.Errorf("protection.maxStreamDuration (%s) must be longer than wake.timeout (%s): it bounds the whole request including the wake hold", stream, wake)
+		}
+	}
 	// Emit is already decoded, so AdmissionStoreAddr sees the metering
 	// Valkey fallback here.
 	if err := s.Admission.parse(s.AdmissionStoreAddr() != ""); err != nil {
@@ -334,6 +537,16 @@ func (s *Settings) parse() error {
 // store settings are only in use when it does, so their validation is fatal
 // only then.
 func (a *AdmissionSettings) parse(storeConfigured bool) error {
+	removed := map[string]AdmissionLimits{"platform": a.Platform, "graph": a.Graph,
+		"organization": a.Organization, "organizationModel": a.OrganizationModel}
+	for name, lane := range a.Lanes {
+		removed["lanes."+name+".limits"] = lane.Limits
+	}
+	for name, l := range removed {
+		if l.RemovedMaxPromptBytes != nil {
+			return fmt.Errorf("admission.%s.maxPromptBytes was renamed to maxPrefillTokens and is now counted in estimated tokens, not bytes; convert and rename it", name)
+		}
+	}
 	// Trusted lane hints are stamped onto every shared request even while
 	// admission is disabled (the proxy overwrites client-supplied Dynamo
 	// priority headers from the lane), so hint ranges and the lane map's
@@ -459,52 +672,101 @@ func (s *Settings) EffectiveAdmission() (AdmissionSettings, bool) {
 	return cfg, true
 }
 
-func limitValues(l AdmissionLimits) []*int64 {
-	return []*int64{l.MaxActiveRequests, l.MaxConcurrentPrefills, l.MaxReservedDecodeSlots, l.MaxPromptBytes,
-		l.MaxReservedOutputTokens, l.MaxActiveAdapters, l.RequestsPerWindow,
-		l.TotalPromptTokensPerWindow, l.UncachedPromptTokensPerWindow,
-		l.GeneratedTokensPerWindow, l.MaxColdHolds, l.WakesPerWindow}
+// LimitField is one AdmissionLimits limit field: its YAML key and a pointer
+// to its value (nil means unlimited).
+type LimitField struct {
+	Name  string
+	Value *int64
+}
+
+// LimitFields is the one canonical list of AdmissionLimits limit fields, in a
+// fixed order, each with its YAML key. Every caller that walks the limit
+// fields (parse's negative check, lane-share validation) goes through it or
+// through LimitValues, so a new limit field is added here once. Any is the one
+// exception: it lists the fields inline because it runs per request, and its
+// test catches a field added here but not there.
+func LimitFields(l AdmissionLimits) []LimitField {
+	return []LimitField{
+		{"maxActiveRequests", l.MaxActiveRequests},
+		{"maxConcurrentPrefills", l.MaxConcurrentPrefills},
+		{"maxReservedDecodeSlots", l.MaxReservedDecodeSlots},
+		{"maxPrefillTokens", l.MaxPrefillTokens},
+		{"maxReservedOutputTokens", l.MaxReservedOutputTokens},
+		{"maxReservedKvTokens", l.MaxReservedKVTokens},
+		{"maxActiveAdapters", l.MaxActiveAdapters},
+		{"requestsPerWindow", l.RequestsPerWindow},
+		{"totalPromptTokensPerWindow", l.TotalPromptTokensPerWindow},
+		{"uncachedPromptTokensPerWindow", l.UncachedPromptTokensPerWindow},
+		{"generatedTokensPerWindow", l.GeneratedTokensPerWindow},
+		{"maxColdHolds", l.MaxColdHolds},
+		{"wakesPerWindow", l.WakesPerWindow},
+	}
+}
+
+// LimitValues returns the values of LimitFields, in the same order.
+func LimitValues(l AdmissionLimits) []*int64 {
+	fields := LimitFields(l)
+	values := make([]*int64, len(fields))
+	for i, f := range fields {
+		values[i] = f.Value
+	}
+	return values
+}
+
+// Any reports whether at least one limit field is set (nil means unlimited;
+// an explicit zero cap counts as set). It runs on every proxied request, so it
+// checks the fields directly instead of building the LimitFields slice. The
+// fields are listed in LimitFields order; TestAdmissionLimitsAnyReportsEachField
+// sets every *int64 limit field in turn, so a field missing here fails it.
+func (l AdmissionLimits) Any() bool {
+	return l.MaxActiveRequests != nil ||
+		l.MaxConcurrentPrefills != nil ||
+		l.MaxReservedDecodeSlots != nil ||
+		l.MaxPrefillTokens != nil ||
+		l.MaxReservedOutputTokens != nil ||
+		l.MaxReservedKVTokens != nil ||
+		l.MaxActiveAdapters != nil ||
+		l.RequestsPerWindow != nil ||
+		l.TotalPromptTokensPerWindow != nil ||
+		l.UncachedPromptTokensPerWindow != nil ||
+		l.GeneratedTokensPerWindow != nil ||
+		l.MaxColdHolds != nil ||
+		l.WakesPerWindow != nil
 }
 
 func (a *AdmissionSettings) validateLaneShares() error {
-	names := []string{"maxActiveRequests", "maxConcurrentPrefills", "maxReservedDecodeSlots", "maxPromptBytes",
-		"maxReservedOutputTokens", "maxActiveAdapters", "requestsPerWindow",
-		"totalPromptTokensPerWindow", "uncachedPromptTokensPerWindow",
-		"generatedTokensPerWindow", "maxColdHolds", "wakesPerWindow"}
-	platform := limitValues(a.Platform)
+	fields := LimitFields(a.Platform)
+	platform := LimitValues(a.Platform)
 	sums := make([]int64, len(platform))
 	for laneName, lane := range a.Lanes {
-		for i, v := range limitValues(lane.Limits) {
+		for i, v := range LimitValues(lane.Limits) {
 			if platform[i] != nil && *platform[i] > 0 && v == nil {
-				return fmt.Errorf("admission.lanes.%s.%s must be set when the platform limit is set", laneName, names[i])
+				return fmt.Errorf("admission.lanes.%s.%s must be set when the platform limit is set", laneName, fields[i].Name)
 			}
 			if v == nil {
 				continue
 			}
 			value := *v
 			if value > 0 && lane.Weight > (1<<63-1)/value {
-				return fmt.Errorf("admission.lanes.%s.%s overflows after weight", laneName, names[i])
+				return fmt.Errorf("admission.lanes.%s.%s overflows after weight", laneName, fields[i].Name)
 			}
 			weighted := value * lane.Weight
 			if weighted > 0 && sums[i] > (1<<63-1)-weighted {
-				return fmt.Errorf("weighted admission lane shares for %s overflow", names[i])
+				return fmt.Errorf("weighted admission lane shares for %s overflow", fields[i].Name)
 			}
 			sums[i] += weighted
 		}
 	}
 	for i, max := range platform {
 		if max != nil && *max > 0 && sums[i] > *max {
-			return fmt.Errorf("weighted admission lane shares for %s total %d above platform limit %d", names[i], sums[i], *max)
+			return fmt.Errorf("weighted admission lane shares for %s total %d above platform limit %d", fields[i].Name, sums[i], *max)
 		}
 	}
 	return nil
 }
 
 func (l *AdmissionLimits) parse(name string) error {
-	values := []*int64{l.MaxActiveRequests, l.MaxConcurrentPrefills, l.MaxReservedDecodeSlots, l.MaxPromptBytes, l.MaxReservedOutputTokens, l.MaxActiveAdapters,
-		l.RequestsPerWindow, l.TotalPromptTokensPerWindow, l.UncachedPromptTokensPerWindow,
-		l.GeneratedTokensPerWindow, l.MaxColdHolds, l.WakesPerWindow}
-	for _, value := range values {
+	for _, value := range LimitValues(*l) {
 		if value != nil && *value < 0 {
 			return fmt.Errorf("%s limits cannot be negative", name)
 		}

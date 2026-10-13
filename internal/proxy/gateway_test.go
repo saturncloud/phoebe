@@ -20,6 +20,7 @@ import (
 	"github.com/saturncloud/phoebe/internal/gateway"
 	"github.com/saturncloud/phoebe/internal/identity"
 	"github.com/saturncloud/phoebe/internal/logging"
+	"github.com/saturncloud/phoebe/internal/testutil"
 )
 
 // mapResolver is a fake gateway.Resolver keyed on (org, model). A missing key
@@ -106,7 +107,7 @@ func TestGatewayRequestBodyBoundedBeforeResolution(t *testing.T) {
 		},
 	}}
 	s := newGatewayTestServer(t, &recordingEmitter{}, resolver, up)
-	s.settings.Admission.Platform.MaxPromptBytes = ptr64(limit)
+	s.settings.Protection.MaxRequestBodyBytes = limit
 
 	rr := httptest.NewRecorder()
 	s.Handler().ServeHTTP(rr, gatewayRequestBodyOfSize(t, "org-1", limit))
@@ -434,6 +435,65 @@ func TestGateway_CrossTenantModel404(t *testing.T) {
 	}
 }
 
+// The gateway path's fail-closed answers (gateway not configured, missing
+// org) take precedence over the body ceiling: an oversized body gets the same
+// status and body as a small one, never 413, and nothing reaches the upstream.
+func TestGatewayFailClosedAnswersPrecedeBodyCeiling(t *testing.T) {
+	const limit = 128
+	var upstreamHits atomic.Int32
+	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		upstreamHits.Add(1)
+		_, _ = w.Write([]byte(`{"model":"model-a","usage":{"prompt_tokens":1,"completion_tokens":1}}`))
+	}))
+	defer backend.Close()
+	up, _ := url.Parse(backend.URL)
+	prot := config.ProtectionSettings{MaxRequestBodyBytes: limit}
+
+	for _, tc := range []struct {
+		name   string
+		server func() *Server
+		org    string
+		want   int
+	}{
+		{
+			name: "gateway not configured",
+			server: func() *Server {
+				return New(&config.Settings{Protection: prot}, logging.New(logging.ERROR), &recordingEmitter{})
+			},
+			org:  "org-a",
+			want: http.StatusServiceUnavailable,
+		},
+		{
+			name: "missing org",
+			server: func() *Server {
+				s := New(&config.Settings{Protection: prot}, logging.New(logging.ERROR), &recordingEmitter{}).
+					WithGateway(&mapResolver{}, "tf-shared", 8000)
+				s.gateway.upstreamFor = func(string, int) string { return up.Host }
+				return s
+			},
+			org:  "",
+			want: http.StatusForbidden,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			s := tc.server()
+			small := httptest.NewRecorder()
+			s.Handler().ServeHTTP(small, gatewayRequestBodyOfSize(t, tc.org, limit))
+			big := httptest.NewRecorder()
+			s.Handler().ServeHTTP(big, gatewayRequestBodyOfSize(t, tc.org, limit+1))
+			if small.Code != tc.want || big.Code != tc.want {
+				t.Fatalf("small=%d oversized=%d, want both %d (the fail-closed answer, not 413)", small.Code, big.Code, tc.want)
+			}
+			if big.Body.String() != small.Body.String() {
+				t.Fatalf("oversized body=%q, want the same answer as a small request %q", big.Body.String(), small.Body.String())
+			}
+			if upstreamHits.Load() != 0 {
+				t.Fatal("a fail-closed gateway request reached the upstream")
+			}
+		})
+	}
+}
+
 // TestGateway_MissingOrg403: a gateway-marked request without X-Saturn-Org-Id
 // means the edge contract is broken — 403 before any resolution is attempted.
 func TestGateway_MissingOrg403(t *testing.T) {
@@ -691,7 +751,7 @@ func TestGateway_WakeEligible(t *testing.T) {
 	em := &recordingEmitter{}
 	mr := miniredis.RunT(t)
 	cfg := proxyAdmissionConfig(1)
-	cfg.Platform.MaxColdHolds = ptr64(1)
+	cfg.Platform.MaxColdHolds = testutil.Ptr[int64](1)
 	client := redis.NewClient(&redis.Options{Addr: mr.Addr()})
 	t.Cleanup(func() { _ = client.Close() })
 	a := admission.New(client, cfg)
@@ -729,7 +789,7 @@ func TestGateway_WakeEligible(t *testing.T) {
 	// separately proves the wake path released its one allowed cold hold as well.
 	next, err := a.Admit(context.Background(), admission.Request{
 		Graph: "graph-llama31", Organization: "org-1", Model: "sleepy-bot",
-		PromptBytes: 1, EstimatedInputTokens: 1, ReservedOutputTokens: 1,
+		PrefillTokens: 1, EstimatedInputTokens: 1, ReservedOutputTokens: 1,
 	})
 	if err != nil {
 		t.Fatalf("cold-to-warm request did not release admission reservations: %v", err)

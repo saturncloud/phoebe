@@ -3,7 +3,10 @@ package admission
 import "github.com/redis/go-redis/v9"
 
 // The counter store is intentionally compact: every operation is one Lua
-// transaction over four keys in one Redis Cluster slot. Expired lease and
+// transaction over six keys in one Redis Cluster slot (KEYS[5]/KEYS[6] are
+// the previous release's lease keys, only ever reaped; the previous release
+// never reaps ours, so a rollback needs the operator step in
+// docs/shared-tier-admission.md, "Rollout and rollback"). Expired lease and
 // fixed-window reaping occurs before every mutation, so replica death cannot
 // leak reservations past leaseTtl and retired dynamic scopes cannot grow the
 // counters hash forever.
@@ -17,7 +20,12 @@ local function get(field) return tonumber(redis.call('HGET', KEYS[1], field) or 
 local function current_time_ms()
   local t=redis.call('TIME'); return tonumber(t[1])*1000 + math.floor(tonumber(t[2])/1000)
 end
+-- A zero delta is a no-op. Skipping it also keeps a Lua negative zero
+-- (-0.0, which -(0) produces) from reaching HINCRBY: Redis renders it as
+-- "-0", which HINCRBY rejects as not an integer, aborting the script after
+-- its earlier writes have already applied.
 local function add(field, delta)
+  if delta == 0 then return end
   local v = redis.call('HINCRBY', KEYS[1], field, delta)
   if tonumber(v) <= 0 then redis.call('HDEL', KEYS[1], field) end
 end
@@ -45,29 +53,45 @@ local function window_retry_ms(s, now)
   if remaining <= 0 then return s.window_ms end
   return remaining
 end
+-- A record's kv is its estimated input plus reserved output, held as a
+-- decimal string (see admitScript) and coerced back here. Records written
+-- by the previous release (reaped from KEYS[5]/KEYS[6]) carry neither field
+-- and hold prompt BYTES under 'prompt', so every read defaults to 0 and the
+-- legacy 'prompt' field is still released. The previous release never sees
+-- a new record: it reaps only its own keys.
 local function release_record(rec)
   for _,s in ipairs(rec.scopes) do
+    add(field(s,'kv'), 0-(rec.kv or 0))
     add(field(s,'active'), -1)
     add(field(s,'reserved_decode_slots'), -1)
-    add(field(s,'output'), -rec.output)
-    add(field(s,'genreserved'), -rec.output)
-    add(field(s,'total_prompt_reserved'), -rec.estimated_input)
-    add(field(s,'uncached_prompt_reserved'), -rec.estimated_input)
+    add(field(s,'output'), 0-rec.output)
+    add(field(s,'genreserved'), 0-rec.output)
+    add(field(s,'total_prompt_reserved'), 0-rec.estimated_input)
+    add(field(s,'uncached_prompt_reserved'), 0-rec.estimated_input)
     if rec.adapter == 1 then add(field(s,'adapters'), -1) end
-    if rec.prefill then add(field(s,'prefills'), -1); add(field(s,'prompt'), -rec.prompt) end
+    if rec.prefill then add(field(s,'prefills'), -1); add(field(s,'prompt'), 0-(rec.prompt or 0)); add(field(s,'prefill_tokens'), 0-(rec.prefill_tokens or 0)) end
     if rec.cold then add(field(s,'cold'), -1) end
+  end
+end
+local function reap_leases(leases, expiries, now)
+  local expired=redis.call('ZRANGEBYSCORE',expiries,'-inf',now,'LIMIT',0,100)
+  for _,id in ipairs(expired) do
+    local raw=redis.call('HGET',leases,id)
+    if raw then release_record(cjson.decode(raw)); redis.call('HDEL',leases,id) end
+    redis.call('ZREM',expiries,id)
   end
 end
 local function reap(now)
   -- Keep each atomic mutation bounded. Leases left behind still hold their
   -- counters, so a backlog can only reject conservatively until later calls
   -- drain it; it can never create unaccounted capacity.
-  local expired=redis.call('ZRANGEBYSCORE',KEYS[3],'-inf',now,'LIMIT',0,100)
-  for _,id in ipairs(expired) do
-    local raw=redis.call('HGET',KEYS[2],id)
-    if raw then release_record(cjson.decode(raw)); redis.call('HDEL',KEYS[2],id) end
-    redis.call('ZREM',KEYS[3],id)
-  end
+  reap_leases(KEYS[2], KEYS[3], now)
+  -- Leases a not-yet-upgraded replica wrote under the previous release's
+  -- keys. That replica reaps only those keys, never ours, so it cannot
+  -- release a new-format lease without its prefill_tokens and kv; draining
+  -- its expired leases here keeps one that died mid-request from holding
+  -- capacity forever.
+  reap_leases(KEYS[5], KEYS[6], now)
   local windows=redis.call('ZRANGEBYSCORE',KEYS[4],'-inf',now,'LIMIT',0,100)
   for _,member in ipairs(windows) do
     local item=cjson.decode(member)
@@ -81,31 +105,52 @@ end
 
 var admitScript = redis.NewScript(luaHelpers + `
 local q=cjson.decode(ARGV[1]); q.now=current_time_ms(); reap(q.now)
+-- n / best_of (and a batched prompt) make the engine generate up to output
+-- tokens for each sequence, so every output charge (the reserved-output
+-- counter, the contract generated-token reservation and the reserved KV) is
+-- output x sequences. q.gen is that product; the prompt's KV is shared.
+q.gen=q.output*(q.sequences or 1); q.kv=q.estimated_input+q.gen
 -- A caller may lose the reply after this script commits. Retrying the exact
 -- request id must recover the existing lease rather than reserve every
 -- dimension a second time.
 if redis.call('HEXISTS',KEYS[2],q.id) == 1 then return {1} end
+-- Pass 1: a request whose OWN estimate is larger than a scope's whole
+-- positive limit can never be admitted there, however long it waits. Check
+-- every scope for that before any counter, so the answer (the proxy's 413 for
+-- a capacity scope, 400 for a contract scope, never a Retry-After) does not
+-- depend on whether an earlier scope happens to be full at this moment. An
+-- explicit zero cap (-1) is excluded; it keeps its retryable answer. Scope
+-- order still decides which limit is reported when several are exceeded.
 for _,s in ipairs(q.scopes) do
   local contract=s.contractual and 1 or 0
-  local checks={{'active',s.active,1},{'prefills',s.prefills,1},{'reserved_decode_slots',s.reserved_decode_slots,1},{'prompt',s.prompt,q.prompt},{'output',s.output,q.output},{'adapters',s.adapters,q.adapter}}
-  for _,c in ipairs(checks) do if c[2] ~= 0 and get(field(s,c[1])) + c[3] > c[2] then return {0,s.name,c[1],contract} end end
-  -- A contract request that alone reserves more than the scope's whole
-  -- positive per-window limit can never be admitted, however long it waits:
-  -- answer that without a retry hint instead of a 429 that repeats forever.
-  -- An explicit zero cap (-1) is excluded; it keeps its retryable answer.
+  if s.prefill_tokens > 0 and q.prefill_tokens > s.prefill_tokens then return {0,s.name,'prefill_tokens_exceeds_limit',contract} end
+  if s.kv > 0 and q.kv > s.kv then return {0,s.name,'kv_exceeds_limit',contract} end
+  if s.output > 0 and q.gen > s.output then return {0,s.name,'output_exceeds_limit',contract} end
   if s.contractual then
     if s.total_prompt > 0 and q.estimated_input > s.total_prompt then return {0,s.name,'total_prompt_tokens_exceeds_limit',contract} end
     if s.uncached_prompt > 0 and q.estimated_input > s.uncached_prompt then return {0,s.name,'uncached_prompt_tokens_exceeds_limit',contract} end
-    if s.generated > 0 and q.output > s.generated then return {0,s.name,'generated_tokens_exceeds_limit',contract} end
+    if s.generated > 0 and q.gen > s.generated then return {0,s.name,'generated_tokens_exceeds_limit',contract} end
   end
+end
+-- Pass 2: the counter and window checks.
+for _,s in ipairs(q.scopes) do
+  local contract=s.contractual and 1 or 0
+  local checks={{'active',s.active,1},{'prefills',s.prefills,1},{'reserved_decode_slots',s.reserved_decode_slots,1},{'prefill_tokens',s.prefill_tokens,q.prefill_tokens},{'output',s.output,q.gen},{'kv',s.kv,q.kv},{'adapters',s.adapters,q.adapter}}
+  for _,c in ipairs(checks) do if c[2] ~= 0 and get(field(s,c[1])) + c[3] > c[2] then return {0,s.name,c[1],contract} end end
   if s.requests ~= 0 and window_get(s,'requests',q.now)+1 > s.requests then return {0,s.name,'requests',contract,window_retry_ms(s,q.now)} end
   if s.total_prompt ~= 0 and window_get(s,'total_prompt',q.now)+get(field(s,'total_prompt_reserved'))+q.estimated_input > s.total_prompt then return {0,s.name,'total_prompt_tokens',contract,window_retry_ms(s,q.now)} end
   if s.uncached_prompt ~= 0 and window_get(s,'uncached_prompt',q.now)+get(field(s,'uncached_prompt_reserved'))+q.estimated_input > s.uncached_prompt then return {0,s.name,'uncached_prompt_tokens',contract,window_retry_ms(s,q.now)} end
-  if s.generated ~= 0 and window_get(s,'generated',q.now)+get(field(s,'genreserved'))+q.output > s.generated then return {0,s.name,'generated_tokens',contract,window_retry_ms(s,q.now)} end
+  if s.generated ~= 0 and window_get(s,'generated',q.now)+get(field(s,'genreserved'))+q.gen > s.generated then return {0,s.name,'generated_tokens',contract,window_retry_ms(s,q.now)} end
 end
-local rec={scopes=q.scopes,prompt=q.prompt,estimated_input=q.estimated_input,output=q.output,adapter=q.adapter,prefill=true,cold=false,admitted_at=q.now}
+-- kv and output (output x sequences) are stored as decimal strings: Redis's
+-- cjson encodes a number with only 14 significant digits, so a charge above
+-- 1e14 written as a number came back rounded and release subtracted a
+-- different amount than was added here.
+-- cjson round-trips a string unchanged through every later re-encode, and
+-- release_record's arithmetic coerces it back to the exact number.
+local rec={scopes=q.scopes,prefill_tokens=q.prefill_tokens,kv=string.format('%d',q.kv),estimated_input=q.estimated_input,output=string.format('%d',q.gen),adapter=q.adapter,prefill=true,cold=false,admitted_at=q.now}
 for _,s in ipairs(q.scopes) do
-  add(field(s,'active'),1); add(field(s,'prefills'),1); add(field(s,'reserved_decode_slots'),1); add(field(s,'prompt'),q.prompt); add(field(s,'output'),q.output); add(field(s,'genreserved'),q.output)
+  add(field(s,'active'),1); add(field(s,'prefills'),1); add(field(s,'reserved_decode_slots'),1); add(field(s,'prefill_tokens'),q.prefill_tokens); add(field(s,'output'),q.gen); add(field(s,'kv'),q.kv); add(field(s,'genreserved'),q.gen)
   add(field(s,'total_prompt_reserved'),q.estimated_input); add(field(s,'uncached_prompt_reserved'),q.estimated_input)
   if q.adapter == 1 then add(field(s,'adapters'),1) end
   if s.requests ~= 0 then window_add(s,'requests',q.now,1) end
@@ -136,7 +181,7 @@ var transitionScript = redis.NewScript(luaHelpers + `
 reap(current_time_ms()); local raw=redis.call('HGET',KEYS[2],ARGV[1]); if not raw then return {1} end
 local rec=cjson.decode(raw)
 if ARGV[2] == 'prefill' and rec.prefill then
-  for _,s in ipairs(rec.scopes) do add(field(s,'prefills'),-1); add(field(s,'prompt'),-rec.prompt) end
+  for _,s in ipairs(rec.scopes) do add(field(s,'prefills'),-1); add(field(s,'prefill_tokens'),0-(rec.prefill_tokens or 0)) end
   rec.prefill=false; redis.call('HSET',KEYS[2],ARGV[1],cjson.encode(rec))
 end
 return {1}

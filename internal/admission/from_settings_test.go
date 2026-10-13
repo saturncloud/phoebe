@@ -10,6 +10,7 @@ import (
 	"github.com/alicebob/miniredis/v2"
 
 	"github.com/saturncloud/phoebe/internal/config"
+	"github.com/saturncloud/phoebe/internal/testutil"
 )
 
 func loadSettingsYAML(t *testing.T, yaml string) *config.Settings {
@@ -91,8 +92,8 @@ func TestOperatorScopesPrecedeContractScopes(t *testing.T) {
 	}
 	a, _ := testAdmitter(t, cfg)
 	req := request("org-a", "m")
-	req.OrganizationLimits = RateLimits{Requests: ptr64(1)}
-	req.OwnerLimits = RateLimits{Requests: ptr64(1)}
+	req.OrganizationLimits = RateLimits{Requests: testutil.Ptr[int64](1)}
+	req.OwnerLimits = RateLimits{Requests: testutil.Ptr[int64](1)}
 	var names []string
 	for _, s := range a.scopes(req) {
 		names = append(names, s.Name)
@@ -117,9 +118,9 @@ func TestSingleRequestAboveContractWindowLimitIsUnsatisfiable(t *testing.T) {
 		limits    RateLimits
 		dimension string
 	}{
-		{"generated", RateLimits{GeneratedTokens: ptr64(10)}, "generated_tokens_exceeds_limit"},
-		{"total prompt", RateLimits{TotalPromptTokens: ptr64(5)}, "total_prompt_tokens_exceeds_limit"},
-		{"uncached prompt", RateLimits{UncachedPromptTokens: ptr64(5)}, "uncached_prompt_tokens_exceeds_limit"},
+		{"generated", RateLimits{GeneratedTokens: testutil.Ptr[int64](10)}, "generated_tokens_exceeds_limit"},
+		{"total prompt", RateLimits{TotalPromptTokens: testutil.Ptr[int64](5)}, "total_prompt_tokens_exceeds_limit"},
+		{"uncached prompt", RateLimits{UncachedPromptTokens: testutil.Ptr[int64](5)}, "uncached_prompt_tokens_exceeds_limit"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			a, _ := testAdmitter(t, config.AdmissionSettings{})
@@ -136,7 +137,7 @@ func TestSingleRequestAboveContractWindowLimitIsUnsatisfiable(t *testing.T) {
 	t.Run("explicit zero cap stays retryable", func(t *testing.T) {
 		a, _ := testAdmitter(t, config.AdmissionSettings{})
 		req := request("org-a", "m")
-		req.OrganizationLimits = RateLimits{GeneratedTokens: ptr64(0)}
+		req.OrganizationLimits = RateLimits{GeneratedTokens: testutil.Ptr[int64](0)}
 		_, err := a.Admit(context.Background(), req)
 		var rejected *Rejected
 		if !errors.As(err, &rejected) || rejected.Unsatisfiable || rejected.Dimension != "generated_tokens" || rejected.RetryAfter <= 0 {
@@ -145,7 +146,7 @@ func TestSingleRequestAboveContractWindowLimitIsUnsatisfiable(t *testing.T) {
 	})
 	t.Run("operator generated tier keeps its retryable answer", func(t *testing.T) {
 		l := limits(5)
-		l.GeneratedTokensPerWindow = ptr64(10)
+		l.GeneratedTokensPerWindow = testutil.Ptr[int64](10)
 		a, _ := testAdmitter(t, config.AdmissionSettings{Platform: l})
 		_, err := a.Admit(context.Background(), request("org-a", "m"))
 		var rejected *Rejected

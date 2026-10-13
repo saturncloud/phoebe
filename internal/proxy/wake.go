@@ -111,24 +111,21 @@ const wakeNeverServedHeader = "X-Phoebe-Wake-Never-Served"
 // passed through: a 404 tells API clients the model does not exist and they
 // do not retry it, which is wrong while the model is starting.
 func writeWakeStarting(w http.ResponseWriter, requestID string) {
-	body, _ := json.Marshal(map[string]string{
-		"error": "The model is starting from zero; retry in about " +
-			strconv.Itoa(wakeRetryAfterSeconds) + " seconds.",
-	})
-	h := w.Header()
-	h.Set(requestIDHeader, requestID)
-	h.Set("Content-Type", "application/json")
-	h.Set("Retry-After", strconv.Itoa(wakeRetryAfterSeconds))
-	h.Set("Content-Length", strconv.Itoa(len(body)))
-	w.WriteHeader(http.StatusServiceUnavailable)
-	_, _ = w.Write(body)
+	writeRetryLater(w, requestID, "The model is starting from zero; retry in about "+
+		strconv.Itoa(wakeRetryAfterSeconds)+" seconds.")
 }
 
 func writeWakeStatusUnknown(w http.ResponseWriter, requestID string) {
-	body, _ := json.Marshal(map[string]string{
-		"error": "The wake service could not confirm whether startup began; retry in about " +
-			strconv.Itoa(wakeRetryAfterSeconds) + " seconds.",
-	})
+	writeRetryLater(w, requestID, "The wake service could not confirm whether startup began; retry in about "+
+		strconv.Itoa(wakeRetryAfterSeconds)+" seconds.")
+}
+
+// writeRetryLater is phoebe's one retryable 503 answer: Retry-After
+// (wakeRetryAfterSeconds) and a JSON {"error": msg} body. The wake writers and
+// the dedicated cold-hold overflow (D4) all answer through it so the shape
+// cannot drift between them.
+func writeRetryLater(w http.ResponseWriter, requestID, msg string) {
+	body, _ := json.Marshal(map[string]string{"error": msg})
 	h := w.Header()
 	h.Set(requestIDHeader, requestID)
 	h.Set("Content-Type", "application/json")
@@ -283,6 +280,29 @@ func (t *wakeRoundTripper) RoundTrip(req *http.Request) (*http.Response, error) 
 		}
 	}
 
+	// releaseHold ends this request's dedicated cold hold. It runs as soon as
+	// the wake finishes, so the hold covers only the time the endpoint is
+	// starting and not the retried request's wait for headers; the defer is a
+	// backstop for the early returns.
+	releaseHold := func() {}
+	if t.target.ServingMode == identity.ServingModeDedicated {
+		// Dedicated endpoints have no admission lease, so the shared tier's
+		// maxColdHolds never applies to them; this per-endpoint cap bounds how
+		// many requests one cold endpoint can park in this replica.
+		release, ok := t.server.dedicatedHolds.acquire(t.target.ResourceID, t.server.protection().MaxDedicatedColdHoldsPerEndpoint)
+		if !ok {
+			_ = resp.Body.Close()
+			t.neverServed = true
+			t.server.log.Warn.Printf("wake: dedicated cold-hold limit reached request_id=%s resource_id=%s",
+				t.requestID, t.target.ResourceID)
+			buf := newBufferingResponseWriter()
+			writeDedicatedColdHoldsFull(buf, t.requestID)
+			return bufferedHTTPResponse(req, buf, true), nil
+		}
+		releaseHold = release // idempotent (acquire), so the explicit call and the defer are both safe
+		defer releaseHold()
+	}
+
 	ctx := req.Context()
 	if t.server.wakeTimeout > 0 {
 		var cancel context.CancelFunc
@@ -290,6 +310,7 @@ func (t *wakeRoundTripper) RoundTrip(req *http.Request) (*http.Response, error) 
 		defer cancel()
 	}
 	wakeErr := t.server.waker.Wake(ctx, t.target)
+	releaseHold()
 	if t.lease != nil {
 		if err := t.lease.EndColdHold(context.WithoutCancel(req.Context())); err != nil {
 			t.server.admissionColdHoldReleaseLog.logf(

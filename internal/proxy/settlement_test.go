@@ -31,6 +31,7 @@ import (
 	"github.com/saturncloud/phoebe/internal/config"
 	"github.com/saturncloud/phoebe/internal/identity"
 	"github.com/saturncloud/phoebe/internal/logging"
+	"github.com/saturncloud/phoebe/internal/testutil"
 )
 
 func TestClassifyRoundTripSettlement(t *testing.T) {
@@ -50,6 +51,10 @@ func TestClassifyRoundTripSettlement(t *testing.T) {
 		// process, wrapped or bare.
 		{"dial failure", dialFailure, settlementZeroPreWriteDial},
 		{"wrapped dial failure", &url.Error{Op: "Post", URL: "http://up", Err: dialFailure}, settlementZeroPreWriteDial},
+		// The gateway body ceiling cut the forwarded body short: the upstream
+		// saw only an incomplete request, so nothing was served.
+		{"body over the gateway limit", &http.MaxBytesError{Limit: 10}, settlementZeroNeverServed},
+		{"wrapped body over the gateway limit", &url.Error{Op: "Post", URL: "http://up", Err: &http.MaxBytesError{Limit: 10}}, settlementZeroNeverServed},
 		{"nil", nil, settlementUnknown},
 	}
 	for _, tc := range tests {
@@ -97,7 +102,7 @@ func TestSettleAdmissionLeaseRejectsUnsetKind(t *testing.T) {
 	t.Cleanup(func() { _ = c.Close() })
 	lease, err := admission.New(c, cfg).Admit(context.Background(), admission.Request{
 		Graph: "graph", Organization: "org-a", Model: "m",
-		PromptBytes: 1, EstimatedInputTokens: 1, ReservedOutputTokens: 1,
+		PrefillTokens: 1, EstimatedInputTokens: 1, ReservedOutputTokens: 1,
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -164,7 +169,7 @@ func rejectedScopeDimension(err error) (scope, dimension string, ok bool) {
 func contractProbe(estInput, reservedOutput int64, limits admission.RateLimits) admission.Request {
 	return admission.Request{
 		Graph: "graph", Organization: "org-a", Model: "m",
-		PromptBytes: 1, EstimatedInputTokens: estInput, ReservedOutputTokens: reservedOutput,
+		PrefillTokens: 1, EstimatedInputTokens: estInput, ReservedOutputTokens: reservedOutput,
 		OrganizationLimits: limits,
 	}
 }
@@ -179,7 +184,7 @@ func sharedRequestEstimate(t *testing.T, req *http.Request) admissionEstimate {
 		t.Fatal(err)
 	}
 	req.Body = io.NopCloser(strings.NewReader(string(body)))
-	est, ok := admissionWork(body, 20) // 20 = proxyAdmissionConfig's DefaultMaxOutputTokens
+	est, ok := admissionWork(body, 20, req.URL.Path) // 20 = proxyAdmissionConfig's DefaultMaxOutputTokens
 	if !ok {
 		t.Fatal("shared request body must parse for an admission estimate")
 	}
@@ -220,10 +225,10 @@ func settleZeroProbes(t *testing.T, errs []error) {
 
 func zeroSettlementProbeSet(est admissionEstimate) []admission.Request {
 	return []admission.Request{
-		contractProbe(1, 1, admission.RateLimits{Requests: ptr64(1)}),
-		contractProbe(1, 20, admission.RateLimits{GeneratedTokens: ptr64(20)}),
+		contractProbe(1, 1, admission.RateLimits{Requests: testutil.Ptr[int64](1)}),
+		contractProbe(1, 20, admission.RateLimits{GeneratedTokens: testutil.Ptr[int64](20)}),
 		contractProbe(est.InputTokens, 1, admission.RateLimits{
-			TotalPromptTokens: ptr64(est.InputTokens), UncachedPromptTokens: ptr64(est.InputTokens),
+			TotalPromptTokens: testutil.Ptr[int64](est.InputTokens), UncachedPromptTokens: testutil.Ptr[int64](est.InputTokens),
 		}),
 	}
 }
@@ -246,7 +251,7 @@ func TestWakeColdHoldRejectionSettlesZeroNeverServed(t *testing.T) {
 	up, _ := url.Parse(be.URL)
 	mr := miniredis.RunT(t)
 	cfg := proxyAdmissionConfig(2)
-	cfg.Platform.MaxColdHolds = ptr64(1)
+	cfg.Platform.MaxColdHolds = testutil.Ptr[int64](1)
 	c := redis.NewClient(&redis.Options{Addr: mr.Addr()})
 	t.Cleanup(func() { _ = c.Close() })
 	a := admission.New(c, cfg)
@@ -264,7 +269,7 @@ func TestWakeColdHoldRejectionSettlesZeroNeverServed(t *testing.T) {
 		// flushes the store) re-establishes it.
 		h, err := a.Admit(context.Background(), admission.Request{
 			Graph: "graph", Organization: "holder", Model: "m",
-			PromptBytes: 1, EstimatedInputTokens: 1, ReservedOutputTokens: 1,
+			PrefillTokens: 1, EstimatedInputTokens: 1, ReservedOutputTokens: 1,
 		})
 		if err != nil {
 			t.Fatal(err)
@@ -302,7 +307,7 @@ func TestWakeColdHoldRejectionSettlesZeroNeverServed(t *testing.T) {
 	// a plain Admit fits alongside the holder's.
 	physical, err := a.Admit(context.Background(), admission.Request{
 		Graph: "graph", Organization: "org-c", Model: "m",
-		PromptBytes: 1, EstimatedInputTokens: 1, ReservedOutputTokens: 1,
+		PrefillTokens: 1, EstimatedInputTokens: 1, ReservedOutputTokens: 1,
 	})
 	if err != nil {
 		t.Fatalf("cold-hold rejection leaked its platform reservation: %v", err)
@@ -337,7 +342,7 @@ func TestWakeExhaustedColdSettlesZeroNeverServed(t *testing.T) {
 	up, _ := url.Parse(be.URL)
 	mr := miniredis.RunT(t)
 	cfg := proxyAdmissionConfig(1)
-	cfg.Platform.MaxColdHolds = ptr64(1)
+	cfg.Platform.MaxColdHolds = testutil.Ptr[int64](1)
 	c := redis.NewClient(&redis.Options{Addr: mr.Addr()})
 	t.Cleanup(func() { _ = c.Close() })
 	a := admission.New(c, cfg)
@@ -370,7 +375,7 @@ func TestWakeExhaustedColdSettlesZeroNeverServed(t *testing.T) {
 
 	physical, err := a.Admit(context.Background(), admission.Request{
 		Graph: "graph", Organization: "org-c", Model: "m",
-		PromptBytes: 1, EstimatedInputTokens: 1, ReservedOutputTokens: 1,
+		PrefillTokens: 1, EstimatedInputTokens: 1, ReservedOutputTokens: 1,
 	})
 	if err != nil {
 		t.Fatalf("exhausted wake leaked its platform reservation: %v", err)
@@ -403,7 +408,7 @@ func TestWakeErrorColdSettlementZeroNeverServed(t *testing.T) {
 	up, _ := url.Parse(be.URL)
 	mr := miniredis.RunT(t)
 	cfg := proxyAdmissionConfig(1)
-	cfg.Platform.MaxColdHolds = ptr64(1)
+	cfg.Platform.MaxColdHolds = testutil.Ptr[int64](1)
 	c := redis.NewClient(&redis.Options{Addr: mr.Addr()})
 	t.Cleanup(func() { _ = c.Close() })
 	a := admission.New(c, cfg)
@@ -438,7 +443,7 @@ func TestWakeErrorColdSettlementZeroNeverServed(t *testing.T) {
 
 	physical, err := a.Admit(context.Background(), admission.Request{
 		Graph: "graph", Organization: "org-c", Model: "m",
-		PromptBytes: 1, EstimatedInputTokens: 1, ReservedOutputTokens: 1,
+		PrefillTokens: 1, EstimatedInputTokens: 1, ReservedOutputTokens: 1,
 	})
 	if err != nil {
 		t.Fatalf("waker-failure cold response leaked its platform reservation: %v", err)
@@ -481,7 +486,7 @@ func TestWakeExhaustedWarmFinalSettlesActualUsage(t *testing.T) {
 	up, _ := url.Parse(backend.URL)
 	mr := miniredis.RunT(t)
 	cfg := proxyAdmissionConfig(1)
-	cfg.Platform.MaxColdHolds = ptr64(1)
+	cfg.Platform.MaxColdHolds = testutil.Ptr[int64](1)
 	c := redis.NewClient(&redis.Options{Addr: mr.Addr()})
 	t.Cleanup(func() { _ = c.Close() })
 	a := admission.New(c, cfg)
@@ -548,7 +553,7 @@ func TestWakeExhaustedWarmFinalSettlesActualUsage(t *testing.T) {
 	// Physical capacity is released by the usage settlement.
 	physical, err := a.Admit(context.Background(), admission.Request{
 		Graph: "graph", Organization: "org-c", Model: "m",
-		PromptBytes: 1, EstimatedInputTokens: 1, ReservedOutputTokens: 1,
+		PrefillTokens: 1, EstimatedInputTokens: 1, ReservedOutputTokens: 1,
 	})
 	if err != nil {
 		t.Fatalf("warm-final usage settlement leaked its platform reservation: %v", err)
@@ -587,7 +592,7 @@ func TestWakeExhaustedTransportErrorSettlesUnknownUsage(t *testing.T) {
 	up, _ := url.Parse(backend.URL)
 	mr := miniredis.RunT(t)
 	cfg := proxyAdmissionConfig(1)
-	cfg.Platform.MaxColdHolds = ptr64(1)
+	cfg.Platform.MaxColdHolds = testutil.Ptr[int64](1)
 	c := redis.NewClient(&redis.Options{Addr: mr.Addr()})
 	t.Cleanup(func() { _ = c.Close() })
 	a := admission.New(c, cfg)
@@ -642,7 +647,7 @@ func TestWakeExhaustedTransportErrorSettlesUnknownUsage(t *testing.T) {
 	// Physical capacity is released even though the conservative charges stand.
 	physical, err := a.Admit(context.Background(), admission.Request{
 		Graph: "graph", Organization: "org-c", Model: "m",
-		PromptBytes: 1, EstimatedInputTokens: 1, ReservedOutputTokens: 1,
+		PrefillTokens: 1, EstimatedInputTokens: 1, ReservedOutputTokens: 1,
 	})
 	if err != nil {
 		t.Fatalf("transport-error final leaked its platform reservation: %v", err)
@@ -701,7 +706,7 @@ func TestAdmissionEngineErrorResponseChargesUnknownUsage(t *testing.T) {
 			// contract charges stand.
 			physical, err := a.Admit(context.Background(), admission.Request{
 				Graph: "graph", Organization: "org-c", Model: "m",
-				PromptBytes: 1, EstimatedInputTokens: 1, ReservedOutputTokens: 1,
+				PrefillTokens: 1, EstimatedInputTokens: 1, ReservedOutputTokens: 1,
 			})
 			if err != nil {
 				t.Fatalf("engine error response leaked its platform reservation: %v", err)

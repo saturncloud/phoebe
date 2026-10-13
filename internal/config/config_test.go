@@ -1,8 +1,10 @@
 package config
 
 import (
+	"fmt"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"testing"
 	"time"
@@ -334,18 +336,18 @@ func TestLoadAdmissionLimitsNullableSentinel(t *testing.T) {
 	}{
 		{
 			name: "absent keys are nil",
-			yaml: "admission:\n  enabled: true\n  valkeyAddr: v\n  platform:\n    maxPromptBytes: 1024\n",
-			want: map[string]*int64{"MaxActiveRequests": nil, "MaxPromptBytes": int64ptr(1024)},
+			yaml: "admission:\n  enabled: true\n  valkeyAddr: v\n  platform:\n    maxPrefillTokens: 1024\n",
+			want: map[string]*int64{"MaxActiveRequests": nil, "MaxPrefillTokens": int64ptr(1024)},
 		},
 		{
 			name: "explicit null is nil",
-			yaml: "admission:\n  enabled: true\n  valkeyAddr: v\n  platform:\n    maxActiveRequests: null\n    maxPromptBytes: 1024\n",
-			want: map[string]*int64{"MaxActiveRequests": nil, "MaxPromptBytes": int64ptr(1024)},
+			yaml: "admission:\n  enabled: true\n  valkeyAddr: v\n  platform:\n    maxActiveRequests: null\n    maxPrefillTokens: 1024\n",
+			want: map[string]*int64{"MaxActiveRequests": nil, "MaxPrefillTokens": int64ptr(1024)},
 		},
 		{
 			name: "explicit zero is a zero cap",
-			yaml: "admission:\n  enabled: true\n  valkeyAddr: v\n  platform:\n    maxActiveRequests: 0\n    maxPromptBytes: 0\n",
-			want: map[string]*int64{"MaxActiveRequests": int64ptr(0), "MaxPromptBytes": int64ptr(0)},
+			yaml: "admission:\n  enabled: true\n  valkeyAddr: v\n  platform:\n    maxActiveRequests: 0\n    maxPrefillTokens: 0\n",
+			want: map[string]*int64{"MaxActiveRequests": int64ptr(0), "MaxPrefillTokens": int64ptr(0)},
 		},
 	}
 	for _, tc := range tests {
@@ -393,8 +395,8 @@ func fieldValue(l AdmissionLimits, name string) *int64 {
 	switch name {
 	case "MaxActiveRequests":
 		return l.MaxActiveRequests
-	case "MaxPromptBytes":
-		return l.MaxPromptBytes
+	case "MaxPrefillTokens":
+		return l.MaxPrefillTokens
 	}
 	return nil
 }
@@ -421,7 +423,7 @@ func TestLoadAdmissionRejectsInvalidPolicy(t *testing.T) {
 		// weight*value int64 overflow.
 		"admission:\n  enabled: true\n  valkeyAddr: v\n  lanes:\n    default:\n      weight: 9223372036854775807\n      limits:\n        maxActiveRequests: 2\n",
 		// The platform sets a dimension the lane omits.
-		"admission:\n  enabled: true\n  valkeyAddr: v\n  platform:\n    maxActiveRequests: 10\n  lanes:\n    default:\n      weight: 1\n      limits:\n        maxPromptBytes: 1024\n",
+		"admission:\n  enabled: true\n  valkeyAddr: v\n  platform:\n    maxActiveRequests: 10\n  lanes:\n    default:\n      weight: 1\n      limits:\n        maxPrefillTokens: 1024\n",
 		// Individually valid weighted shares whose sum overflows int64.
 		"admission:\n  enabled: true\n  valkeyAddr: v\n  lanes:\n    default:\n      weight: 4611686018427387904\n      limits:\n        maxActiveRequests: 1\n    gold:\n      weight: 4611686018427387904\n      limits:\n        maxActiveRequests: 1\n",
 	}
@@ -561,6 +563,279 @@ func TestAdmissionLeaseTTLValidatedOnlyWhenStoreConfigured(t *testing.T) {
 			_, err := Load(writeTemp(t, tc.body))
 			if err == nil || !strings.Contains(err.Error(), "invalid admission.leaseTtl") {
 				t.Fatalf("err=%v, want invalid admission.leaseTtl", err)
+			}
+		})
+	}
+}
+
+func TestLoadProtection(t *testing.T) {
+	s, err := Load(writeTemp(t, "protection:\n  maxRequestBodyBytes: 1024\n  streamStallTimeout: 30s\n  maxStreamDuration: 2h\n"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	eff := s.Protection.Effective()
+	if eff.MaxRequestBodyBytes != 1024 || eff.StreamStallTimeout != 30*time.Second || eff.MaxStreamDuration != 2*time.Hour {
+		t.Fatalf("parsed protection = %+v", eff)
+	}
+	if eff.MaxResponseBufferBytesTotal != DefaultMaxResponseBufferBytesTotal {
+		t.Fatalf("absent fields keep their default, got total=%d", eff.MaxResponseBufferBytesTotal)
+	}
+
+	// One case per rule in ProtectionSettings.parse; each error must name
+	// the offending protection.<field>.
+	for _, tc := range []struct{ name, yaml, field string }{
+		{"negative body size", "protection:\n  maxRequestBodyBytes: -1\n", "protection.maxRequestBodyBytes"},
+		{"negative per-stream buffer", "protection:\n  maxResponseBufferBytesPerStream: -1\n", "protection.maxResponseBufferBytesPerStream"},
+		{"negative total buffer", "protection:\n  maxResponseBufferBytesTotal: -1\n", "protection.maxResponseBufferBytesTotal"},
+		{"negative holds", "protection:\n  maxDedicatedColdHoldsPerEndpoint: -1\n", "protection.maxDedicatedColdHoldsPerEndpoint"},
+		{"zero body size", "protection:\n  maxRequestBodyBytes: 0\n", "protection.maxRequestBodyBytes"},
+		{"zero per-stream buffer", "protection:\n  maxResponseBufferBytesPerStream: 0\n", "protection.maxResponseBufferBytesPerStream"},
+		{"zero total buffer", "protection:\n  maxResponseBufferBytesTotal: 0\n", "protection.maxResponseBufferBytesTotal"},
+		{"zero holds", "protection:\n  maxDedicatedColdHoldsPerEndpoint: 0\n", "protection.maxDedicatedColdHoldsPerEndpoint"},
+		{"unparseable stall timeout", "protection:\n  streamStallTimeout: soon\n", "protection.streamStallTimeout"},
+		{"zero stall timeout", "protection:\n  streamStallTimeout: 0s\n", "protection.streamStallTimeout"},
+		{"unparseable stream duration", "protection:\n  maxStreamDuration: later\n", "protection.maxStreamDuration"},
+		{"zero stream duration", "protection:\n  maxStreamDuration: 0s\n", "protection.maxStreamDuration"},
+		{"per-stream over total", "protection:\n  maxResponseBufferBytesPerStream: 2048\n  maxResponseBufferBytesTotal: 1024\n", "protection.maxResponseBufferBytesPerStream"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			_, err := Load(writeTemp(t, tc.yaml))
+			if err == nil || !strings.Contains(err.Error(), tc.field) {
+				t.Fatalf("err=%v, want a startup error naming %s", err, tc.field)
+			}
+		})
+	}
+}
+
+// Every protection limit follows one rule: an absent (or null) key takes the
+// shipped default, an explicit zero or a negative value stops startup with an
+// error naming the key, and a positive value is kept. There is no "0 means
+// unlimited" for any of them.
+func TestProtectionLimitsRejectZeroAndNegativeDefaultWhenAbsent(t *testing.T) {
+	for _, f := range []struct {
+		key      string
+		positive string
+		get      func(ProtectionSettings) string
+		want     string
+		def      string
+	}{
+		{"maxRequestBodyBytes", "1024", func(p ProtectionSettings) string { return fmt.Sprint(p.MaxRequestBodyBytes) }, "1024", fmt.Sprint(DefaultMaxRequestBodyBytes)},
+		{"maxResponseBufferBytesPerStream", "1024", func(p ProtectionSettings) string { return fmt.Sprint(p.MaxResponseBufferBytesPerStream) }, "1024", fmt.Sprint(DefaultMaxResponseBufferBytesPerStream)},
+		{"maxResponseBufferBytesTotal", "536870912", func(p ProtectionSettings) string { return fmt.Sprint(p.MaxResponseBufferBytesTotal) }, "536870912", fmt.Sprint(DefaultMaxResponseBufferBytesTotal)},
+		{"maxDedicatedColdHoldsPerEndpoint", "3", func(p ProtectionSettings) string { return fmt.Sprint(p.MaxDedicatedColdHoldsPerEndpoint) }, "3", fmt.Sprint(DefaultMaxDedicatedColdHoldsPerEndpoint)},
+		{"streamStallTimeout", "30s", func(p ProtectionSettings) string { return p.StreamStallTimeout.String() }, "30s", DefaultStreamStallTimeout.String()},
+		{"maxStreamDuration", "2h", func(p ProtectionSettings) string { return p.MaxStreamDuration.String() }, "2h0m0s", DefaultMaxStreamDuration.String()},
+	} {
+		zero, negative := "0", "-1"
+		if strings.HasSuffix(f.positive, "s") || strings.HasSuffix(f.positive, "h") {
+			zero, negative = "0s", "-1s"
+		}
+		t.Run(f.key+" absent takes the default", func(t *testing.T) {
+			s, err := Load(writeTemp(t, "protection: {}\n"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			if got := f.get(s.Protection.Effective()); got != f.def {
+				t.Fatalf("%s=%s, want default %s", f.key, got, f.def)
+			}
+		})
+		t.Run(f.key+" null takes the default", func(t *testing.T) {
+			s, err := Load(writeTemp(t, "protection:\n  "+f.key+": null\n"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			if got := f.get(s.Protection.Effective()); got != f.def {
+				t.Fatalf("%s=%s, want default %s", f.key, got, f.def)
+			}
+		})
+		for _, bad := range []struct{ name, value string }{{"zero", zero}, {"negative", negative}} {
+			t.Run(f.key+" "+bad.name+" stops startup", func(t *testing.T) {
+				_, err := Load(writeTemp(t, "protection:\n  "+f.key+": "+bad.value+"\n"))
+				if err == nil || !strings.Contains(err.Error(), "protection."+f.key) {
+					t.Fatalf("err=%v, want a startup error naming protection.%s", err, f.key)
+				}
+			})
+		}
+		t.Run(f.key+" positive is kept", func(t *testing.T) {
+			s, err := Load(writeTemp(t, "protection:\n  "+f.key+": "+f.positive+"\n"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			if got := f.get(s.Protection.Effective()); got != f.want {
+				t.Fatalf("%s=%s, want %s", f.key, got, f.want)
+			}
+		})
+	}
+}
+
+// maxPromptBytes was renamed (and changed unit). A leftover value must stop
+// startup rather than be dropped in silence, wherever it appears and whether
+// or not admission is enabled; a null leftover (the shipped chart value) is
+// absent and harmless.
+func TestLoadRejectsRemovedMaxPromptBytes(t *testing.T) {
+	for _, yaml := range []string{
+		"admission:\n  platform:\n    maxPromptBytes: 1024\n",
+		"admission:\n  enabled: true\n  valkeyAddr: v\n  graph:\n    maxPromptBytes: 0\n",
+		"admission:\n  lanes:\n    default:\n      weight: 1\n      limits:\n        maxPromptBytes: 5\n",
+	} {
+		_, err := Load(writeTemp(t, yaml))
+		if err == nil || !strings.Contains(err.Error(), "maxPrefillTokens") {
+			t.Fatalf("yaml %q: err=%v, want a rename error naming maxPrefillTokens", yaml, err)
+		}
+	}
+	if _, err := Load(writeTemp(t, "admission:\n  platform:\n    maxPromptBytes: null\n")); err != nil {
+		t.Fatalf("a null leftover must load: %v", err)
+	}
+}
+
+// TestLimitValuesListsEveryAdmissionLimitField guards the canonical field
+// list: a new *int64 limit on AdmissionLimits that LimitValues misses would
+// silently drop out of lane-share validation and of AdmissionLimits.Any (and
+// so of per-graph capacity enforcement). RemovedMaxPromptBytes is a rename
+// tripwire, not a limit, and is excluded.
+func TestLimitValuesListsEveryAdmissionLimitField(t *testing.T) {
+	var l AdmissionLimits
+	v := reflect.ValueOf(&l).Elem()
+	want := map[*int64]string{}
+	for i := 0; i < v.NumField(); i++ {
+		f := v.Type().Field(i)
+		if f.Type != reflect.TypeOf((*int64)(nil)) || f.Name == "RemovedMaxPromptBytes" {
+			continue
+		}
+		p := new(int64)
+		v.Field(i).Set(reflect.ValueOf(p))
+		want[p] = f.Name
+	}
+	got := LimitValues(l)
+	if len(got) != len(want) {
+		t.Fatalf("LimitValues has %d entries, AdmissionLimits has %d limit fields", len(got), len(want))
+	}
+	for _, p := range got {
+		if _, ok := want[p]; !ok {
+			t.Fatalf("LimitValues returned a pointer that is not a distinct limit field")
+		}
+		delete(want, p)
+	}
+	for _, name := range want {
+		t.Errorf("LimitValues does not list %s", name)
+	}
+}
+
+// TestLimitFieldsNameMatchesYAMLTag guards the name each LimitFields entry
+// carries: lane-share errors report that name, so it must be the YAML key of
+// the very field whose value the entry points at. A misaligned entry would
+// make an error name the wrong field.
+func TestLimitFieldsNameMatchesYAMLTag(t *testing.T) {
+	var l AdmissionLimits
+	v := reflect.ValueOf(&l).Elem()
+	tagOf := map[*int64]string{}
+	for i := 0; i < v.NumField(); i++ {
+		f := v.Type().Field(i)
+		if f.Type != reflect.TypeOf((*int64)(nil)) || f.Name == "RemovedMaxPromptBytes" {
+			continue
+		}
+		p := new(int64)
+		v.Field(i).Set(reflect.ValueOf(p))
+		tagOf[p] = strings.Split(f.Tag.Get("yaml"), ",")[0]
+	}
+	fields := LimitFields(l)
+	values := LimitValues(l)
+	if len(fields) != len(tagOf) || len(values) != len(fields) {
+		t.Fatalf("LimitFields has %d entries, LimitValues %d, AdmissionLimits has %d limit fields", len(fields), len(values), len(tagOf))
+	}
+	for i, f := range fields {
+		tag, ok := tagOf[f.Value]
+		if !ok {
+			t.Fatalf("LimitFields[%d] (%s) does not point at a distinct limit field", i, f.Name)
+		}
+		if f.Name != tag {
+			t.Errorf("LimitFields[%d].Name = %q, but its value is the field tagged %q", i, f.Name, tag)
+		}
+		if values[i] != f.Value {
+			t.Errorf("LimitValues[%d] differs from LimitFields[%d].Value", i, i)
+		}
+	}
+}
+
+// TestAdmissionLimitsParseRejectsEachNegativeField guards that parse's
+// negative check covers every limit field: each field set to -1 on its own
+// must fail to load.
+func TestAdmissionLimitsParseRejectsEachNegativeField(t *testing.T) {
+	n := len(LimitFields(AdmissionLimits{}))
+	for i := 0; i < n; i++ {
+		var l AdmissionLimits
+		f := LimitFields(l)[i]
+		v := reflect.ValueOf(&l).Elem()
+		for j := 0; j < v.NumField(); j++ {
+			if strings.Split(v.Type().Field(j).Tag.Get("yaml"), ",")[0] == f.Name {
+				v.Field(j).Set(reflect.ValueOf(func() *int64 { x := int64(-1); return &x }()))
+			}
+		}
+		if LimitFields(l)[i].Value == nil {
+			t.Fatalf("could not set field %s by its yaml tag", f.Name)
+		}
+		err := l.parse("admission.platform")
+		if err == nil || !strings.Contains(err.Error(), "cannot be negative") {
+			t.Errorf("%s = -1: err=%v, want a cannot-be-negative error", f.Name, err)
+		}
+	}
+}
+
+// TestAdmissionLimitsAnyReportsEachField: Any is true when any single limit
+// field is set (an explicit zero cap included) and false only when all are nil.
+func TestAdmissionLimitsAnyReportsEachField(t *testing.T) {
+	if (AdmissionLimits{}).Any() {
+		t.Fatal("empty limits must report no limit")
+	}
+	if (AdmissionLimits{RemovedMaxPromptBytes: new(int64)}).Any() {
+		t.Fatal("the removed maxPromptBytes tripwire is not a limit")
+	}
+	v := reflect.ValueOf(AdmissionLimits{})
+	for i := 0; i < v.NumField(); i++ {
+		f := v.Type().Field(i)
+		if f.Type != reflect.TypeOf((*int64)(nil)) || f.Name == "RemovedMaxPromptBytes" {
+			continue
+		}
+		var l AdmissionLimits
+		reflect.ValueOf(&l).Elem().Field(i).Set(reflect.ValueOf(new(int64)))
+		if !l.Any() {
+			t.Errorf("Any() false with only %s set", f.Name)
+		}
+	}
+}
+
+// TestAdmissionLimitsAnyDoesNotAllocate guards that Any stays cheap on the
+// proxy hot path, where it runs for every request on several limit sets.
+func TestAdmissionLimitsAnyDoesNotAllocate(t *testing.T) {
+	set := AdmissionLimits{WakesPerWindow: new(int64)}
+	empty := AdmissionLimits{}
+	allocs := testing.AllocsPerRun(100, func() {
+		_ = set.Any()
+		_ = empty.Any()
+	})
+	if allocs != 0 {
+		t.Errorf("Any() allocated %.0f times per call pair, want 0", allocs)
+	}
+}
+
+// protection.maxStreamDuration bounds the wake hold too, so with wake enabled
+// it must be longer than the effective wake.timeout (default 300s).
+func TestLoadMaxStreamDurationMustExceedWakeTimeout(t *testing.T) {
+	const wake = "gateway:\n  enabled: true\n  namespace: ns\nwake:\n  enabled: true\n"
+	for _, tc := range []struct {
+		name, yaml string
+		ok         bool
+	}{
+		{"defaults", wake, true},
+		{"stream equal to default wake", wake + "protection:\n  maxStreamDuration: 300s\n", false},
+		{"stream under set wake", wake + "  timeout: 90m\n", false}, // 60m default stream
+		{"stream above set wake", wake + "  timeout: 90m\nprotection:\n  maxStreamDuration: 2h\n", true},
+		{"wake disabled", "protection:\n  maxStreamDuration: 10s\n", true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			_, err := Load(writeTemp(t, tc.yaml))
+			if (err == nil) != tc.ok {
+				t.Fatalf("err=%v, want ok=%v", err, tc.ok)
 			}
 		})
 	}

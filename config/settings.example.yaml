@@ -10,8 +10,42 @@ listenPort: 8080
 # the address on the envelope and FAILS CLOSED (refuses, never guesses) when the
 # header is absent or unparseable.
 
-# Long idle timeout: token streams can idle between chunks.
+# How long an idle keep-alive connection stays open BETWEEN requests. It does
+# not bound a request in flight; see protection.streamStallTimeout.
 idleTimeout: "10m"
+
+# Gateway protection: bounds on what any one request can hold in phoebe. They
+# apply to ALL traffic, shared and dedicated, and are set once for the whole
+# gateway (they protect phoebe itself, which every tenant shares). Every key is
+# optional; an absent key uses the default shown. Values must be positive: an
+# explicit 0 is a startup error, not "unlimited" (there is no off switch).
+# protection:
+#   # Largest request body phoebe reads, on every route (413 above it).
+#   maxRequestBodyBytes: 67108864
+#   # A single write to the client that makes no progress for this long ends
+#   # the request (a client that stopped reading mid-stream). Streams may still
+#   # idle between chunks for as long as the engine needs.
+#   streamStallTimeout: "2m"
+#   # Longest a request may run, from arrival to its last response byte,
+#   # including any wake hold. With no response headers by then the client
+#   # gets 504; mid-stream the stream is ended.
+#   maxStreamDuration: "60m"
+#   # Response bytes held in memory for inspection (an incomplete SSE line or a
+#   # whole non-streamed body), per request and summed over this replica. Over
+#   # either limit a streamed (SSE) response is cut. A non-streamed response
+#   # is never cut: the client gets every byte, and capture keeps only its
+#   # first and last 256 KiB to read model and usage. Those kept bytes are
+#   # always charged, so while they are held the replica total can go above
+#   # maxResponseBufferBytesTotal and other buffering on this replica is
+#   # refused (D22, D31). The 16 MiB SSE event-line limit still
+#   # applies inside the per-request value. An SSE line being assembled is
+#   # held twice (capture buffer and usage filter) and both copies count, so
+#   # a per-request value below 32 MiB cuts lines shorter than 16 MiB.
+#   maxResponseBufferBytesPerStream: 67108864
+#   maxResponseBufferBytesTotal: 268435456
+#   # Requests to ONE dedicated endpoint this replica holds while the endpoint
+#   # starts from zero; the next gets 503 + Retry-After.
+#   maxDedicatedColdHoldsPerEndpoint: 32
 
 # Durable metering emit (M2). Valkey Streams hot path → local-disk WAL fallback
 # → structured-log floor. Leave valkeyAddr empty to run WAL-only.
@@ -83,14 +117,28 @@ emit:
 # actual engine usage through its Valkey/WAL/log path.
 #
 # Each request is checked atomically at platform, serving-graph, organization,
-# and organization×model scopes. Prompt work is the complete OpenAI JSON body
-# size for the physical byte guard. Token windows reserve a cheap ceil(JSON
-# bytes/4) estimate as uncached input, then reconcile the engine's exact total
-# and cached token counts after the response. Output is
-# max_completion_tokens/max_tokens, or defaultMaxOutputTokens. Decode capacity
+# and organization×model scopes. Prompt work is an ESTIMATE in tokens: the
+# characters of the request's message text divided by 4, plus a fixed 1024
+# tokens per image part, plus the raw JSON length / 4 of tool/function
+# definitions and structured-output schemas (tools, functions,
+# response_format, guided_json, guided_regex, guided_grammar, guided_choice,
+# structured_outputs) and of documents, chat_template, chat_template_kwargs
+# and prompt_embeds (no chat template, no tokenizer). maxPrefillTokens
+# bounds that estimate for requests still in prefill. Token windows reserve the
+# same estimate as uncached input, then reconcile the engine's exact total and
+# cached token counts after the response. Reserved output is
+# max_completion_tokens/max_tokens, or defaultMaxOutputTokens, times the
+# output-sequence count. The count is max(n, best_of, 1) times the number of
+# prompts in a batched /v1/completions prompt; a flat token-id array counts
+# as one prompt. A count above 65536 is refused with 400. maxReservedOutputTokens
+# therefore bounds total decode work, not max_tokens per request (D23, D29).
+# maxReservedKvTokens bounds estimated input plus this multiplied output,
+# held until the request finishes. A contract's generated-token window
+# likewise refuses a request whose max_tokens x n alone exceeds the window
+# (D29). Decode capacity
 # is a future slot reserved before forwarding because a proxy cannot safely
 # queue once the engine starts responding. Leases release prefill/input work at
-# the first upstream body byte and active/decode/output work at completion,
+# the first upstream body byte and active/decode/output/KV work at completion,
 # abort, or failure. Live streams renew their lease;
 # leaseTtl is the crash-recovery bound when a replica stops renewing.
 #
@@ -113,8 +161,9 @@ emit:
 #     maxActiveRequests: 256
 #     maxConcurrentPrefills: 32
 #     maxReservedDecodeSlots: 256
-#     maxPromptBytes: 67108864
+#     maxPrefillTokens: 262144
 #     maxReservedOutputTokens: 262144
+#     maxReservedKvTokens: null
 #     maxActiveAdapters: 128
 #     requestsPerWindow: 6000
 #     totalPromptTokensPerWindow: 16000000
@@ -127,8 +176,9 @@ emit:
 #     maxActiveRequests: 64
 #     maxConcurrentPrefills: 8
 #     maxReservedDecodeSlots: 64
-#     maxPromptBytes: 16777216
+#     maxPrefillTokens: 65536
 #     maxReservedOutputTokens: 65536
+#     maxReservedKvTokens: null
 #     maxActiveAdapters: 32
 #     requestsPerWindow: 1500
 #     totalPromptTokensPerWindow: 4000000
@@ -141,8 +191,9 @@ emit:
 #     maxActiveRequests: 32
 #     maxConcurrentPrefills: 4
 #     maxReservedDecodeSlots: 32
-#     maxPromptBytes: 8388608
+#     maxPrefillTokens: 32768
 #     maxReservedOutputTokens: 32768
+#     maxReservedKvTokens: null
 #     maxActiveAdapters: 16
 #     requestsPerWindow: 600
 #     totalPromptTokensPerWindow: 1600000
@@ -155,8 +206,9 @@ emit:
 #     maxActiveRequests: 16
 #     maxConcurrentPrefills: 2
 #     maxReservedDecodeSlots: 16
-#     maxPromptBytes: 4194304
+#     maxPrefillTokens: 16384
 #     maxReservedOutputTokens: 16384
+#     maxReservedKvTokens: null
 #     maxActiveAdapters: 8
 #     requestsPerWindow: 300
 #     totalPromptTokensPerWindow: 800000
@@ -172,8 +224,9 @@ emit:
 #         maxActiveRequests: 64
 #         maxConcurrentPrefills: 8
 #         maxReservedDecodeSlots: 64
-#         maxPromptBytes: 16777216
+#         maxPrefillTokens: 65536
 #         maxReservedOutputTokens: 65536
+#         maxReservedKvTokens: null
 #         maxActiveAdapters: 32
 #         requestsPerWindow: 1500
 #         totalPromptTokensPerWindow: 4000000
@@ -188,8 +241,9 @@ emit:
 #         maxActiveRequests: 64
 #         maxConcurrentPrefills: 8
 #         maxReservedDecodeSlots: 64
-#         maxPromptBytes: 16777216
+#         maxPrefillTokens: 65536
 #         maxReservedOutputTokens: 65536
+#         maxReservedKvTokens: null
 #         maxActiveAdapters: 32
 #         requestsPerWindow: 1200
 #         totalPromptTokensPerWindow: 4000000
