@@ -20,7 +20,12 @@ local function get(field) return tonumber(redis.call('HGET', KEYS[1], field) or 
 local function current_time_ms()
   local t=redis.call('TIME'); return tonumber(t[1])*1000 + math.floor(tonumber(t[2])/1000)
 end
+-- A zero delta is a no-op. Skipping it also keeps a Lua negative zero
+-- (-0.0, which -(0) produces) from reaching HINCRBY: Redis renders it as
+-- "-0", which HINCRBY rejects as not an integer, aborting the script after
+-- its earlier writes have already applied.
 local function add(field, delta)
+  if delta == 0 then return end
   local v = redis.call('HINCRBY', KEYS[1], field, delta)
   if tonumber(v) <= 0 then redis.call('HDEL', KEYS[1], field) end
 end
@@ -56,15 +61,15 @@ end
 -- a new record: it reaps only its own keys.
 local function release_record(rec)
   for _,s in ipairs(rec.scopes) do
-    add(field(s,'kv'), -(rec.kv or 0))
+    add(field(s,'kv'), 0-(rec.kv or 0))
     add(field(s,'active'), -1)
     add(field(s,'reserved_decode_slots'), -1)
-    add(field(s,'output'), -rec.output)
-    add(field(s,'genreserved'), -rec.output)
-    add(field(s,'total_prompt_reserved'), -rec.estimated_input)
-    add(field(s,'uncached_prompt_reserved'), -rec.estimated_input)
+    add(field(s,'output'), 0-rec.output)
+    add(field(s,'genreserved'), 0-rec.output)
+    add(field(s,'total_prompt_reserved'), 0-rec.estimated_input)
+    add(field(s,'uncached_prompt_reserved'), 0-rec.estimated_input)
     if rec.adapter == 1 then add(field(s,'adapters'), -1) end
-    if rec.prefill then add(field(s,'prefills'), -1); add(field(s,'prompt'), -(rec.prompt or 0)); add(field(s,'prefill_tokens'), -(rec.prefill_tokens or 0)) end
+    if rec.prefill then add(field(s,'prefills'), -1); add(field(s,'prompt'), 0-(rec.prompt or 0)); add(field(s,'prefill_tokens'), 0-(rec.prefill_tokens or 0)) end
     if rec.cold then add(field(s,'cold'), -1) end
   end
 end
@@ -175,7 +180,7 @@ var transitionScript = redis.NewScript(luaHelpers + `
 reap(current_time_ms()); local raw=redis.call('HGET',KEYS[2],ARGV[1]); if not raw then return {1} end
 local rec=cjson.decode(raw)
 if ARGV[2] == 'prefill' and rec.prefill then
-  for _,s in ipairs(rec.scopes) do add(field(s,'prefills'),-1); add(field(s,'prefill_tokens'),-(rec.prefill_tokens or 0)) end
+  for _,s in ipairs(rec.scopes) do add(field(s,'prefills'),-1); add(field(s,'prefill_tokens'),0-(rec.prefill_tokens or 0)) end
   rec.prefill=false; redis.call('HSET',KEYS[2],ARGV[1],cjson.encode(rec))
 end
 return {1}

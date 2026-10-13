@@ -517,3 +517,27 @@ func TestRealValkeyReleaseSubtractsExactlyWhatAdmitAdded(t *testing.T) {
 		return client.HGet(ctx, a.counters, field).Val()
 	})
 }
+
+// TestRealValkeyZeroChargeLeaseReleasesWithoutNegativeZero is the real-Valkey
+// twin of TestZeroChargeLeaseReleasesWithoutNegativeZero: only real Valkey
+// renders a Lua negative zero as "-0", which HINCRBY rejects.
+func TestRealValkeyZeroChargeLeaseReleasesWithoutNegativeZero(t *testing.T) {
+	addr := os.Getenv("PHOEBE_TEST_ADMISSION_VALKEY_ADDR")
+	if addr == "" {
+		t.Fatal("PHOEBE_TEST_ADMISSION_VALKEY_ADDR is required")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	client := redis.NewClient(&redis.Options{Addr: addr})
+	cfg := config.AdmissionSettings{
+		KeyPrefix: fmt.Sprintf("phoebe-admission-zero-charge-%d", time.Now().UnixNano()),
+		LeaseTTL:  time.Minute,
+		Platform:  config.AdmissionLimits{},
+	}
+	a := New(client, cfg)
+	t.Cleanup(func() {
+		_ = client.Del(context.Background(), a.counters, a.leases, a.expiries, a.windowExpiries, a.legacyLeases, a.legacyExpiries).Err()
+		_ = client.Close()
+	})
+	assertZeroChargeLeaseReleasesCleanly(ctx, t, a)
+}

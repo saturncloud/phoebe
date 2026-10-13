@@ -4,8 +4,11 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"testing"
 	"time"
+
+	"github.com/redis/go-redis/v9"
 
 	"github.com/saturncloud/phoebe/internal/config"
 )
@@ -370,5 +373,109 @@ func assertReleaseSubtractsExactlyWhatAdmitAdded(ctx context.Context, t *testing
 				t.Fatalf("%s: %s=%q after release, want exactly zero (field removed)", finish, dim, got)
 			}
 		}
+	}
+}
+
+// TestZeroChargeLeaseReleasesWithoutNegativeZero: a lease whose charges are
+// zero (prefill_tokens=0, so the new-format record has no 'prompt' field to
+// release, or output=0) must release through finish, abandon and reap and
+// return every counter to zero. release_record once computed -(0), a Lua
+// negative zero. Redis 5 formats a Lua number argument with "%.17g", giving
+// "-0", which HINCRBY rejects, aborting the script with the lease and
+// counters stranded (reproduced against redis:5). Valkey 8 formats an
+// integral number as an integer and accepts it; miniredis does not
+// reproduce the failure either. The real-server twin of this test, pointed
+// at a Redis 5 server, fails without the fix.
+func TestZeroChargeLeaseReleasesWithoutNegativeZero(t *testing.T) {
+	a, _ := testAdmitter(t, config.AdmissionSettings{})
+	assertZeroChargeLeaseReleasesCleanly(context.Background(), t, a)
+}
+
+func assertZeroChargeLeaseReleasesCleanly(ctx context.Context, t *testing.T, a *RedisAdmitter) {
+	t.Helper()
+	c := a.client
+	req := request("a", "m")
+	req.PrefillTokens = 0
+	scopes := a.scopes(req)
+	gen := req.ReservedOutputTokens * max(req.OutputSequences, 1)
+
+	assertReleased := func(name string) {
+		t.Helper()
+		if n := c.HLen(ctx, a.leases).Val(); n != 0 {
+			t.Fatalf("%s: %d leases remain after release, want 0", name, n)
+		}
+		if n := c.ZCard(ctx, a.expiries).Val(); n != 0 {
+			t.Fatalf("%s: %d lease expiries remain after release, want 0", name, n)
+		}
+		if left := c.HGetAll(ctx, a.counters).Val(); len(left) != 0 {
+			t.Fatalf("%s: counters not returned to zero: %v", name, left)
+		}
+	}
+	release := func(path string, lease *Lease) {
+		t.Helper()
+		switch path {
+		case "finish":
+			if err := lease.Complete(ctx, 0); err != nil {
+				t.Fatalf("finish: %v", err)
+			}
+		case "abandon":
+			if err := abandonScript.Run(ctx, c, a.keys(), lease.id).Err(); err != nil {
+				t.Fatalf("abandon: %v", err)
+			}
+		case "reap":
+			// Expire the lease now; any later script reaps it first.
+			if err := c.ZAdd(ctx, a.expiries, redis.Z{Score: 0, Member: lease.id}).Err(); err != nil {
+				t.Fatal(err)
+			}
+			if err := renewScript.Run(ctx, c, a.keys(), "no-such-lease", 1000).Err(); err != nil {
+				t.Fatalf("reap: %v", err)
+			}
+		}
+	}
+
+	for _, path := range []string{"finish", "abandon", "reap"} {
+		// prefill_tokens=0, still in the prefill phase: the record carries no
+		// 'prompt' field, so both prompt and prefill_tokens release as zero.
+		lease, err := a.Admit(ctx, req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var rec map[string]interface{}
+		if err := json.Unmarshal([]byte(c.HGet(ctx, a.leases, lease.id).Val()), &rec); err != nil {
+			t.Fatal(err)
+		}
+		if _, ok := rec["prompt"]; ok || rec["prefill"] != true {
+			t.Fatalf("want a new-format prefill-phase record without 'prompt', got %v", rec)
+		}
+		release(path, lease)
+		assertReleased("prefill_tokens=0 via " + path)
+
+		// output=0: the proxy never admits one, but a stored record with a
+		// zero output charge must still release cleanly. Rewrite the record
+		// and the counters it holds to match.
+		lease, err = a.Admit(ctx, req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		rec = nil
+		if err := json.Unmarshal([]byte(c.HGet(ctx, a.leases, lease.id).Val()), &rec); err != nil {
+			t.Fatal(err)
+		}
+		rec["output"] = "0"
+		rec["kv"] = fmt.Sprintf("%d", req.EstimatedInputTokens)
+		raw, _ := json.Marshal(rec)
+		if err := c.HSet(ctx, a.leases, lease.id, string(raw)).Err(); err != nil {
+			t.Fatal(err)
+		}
+		for _, s := range scopes {
+			if err := c.HDel(ctx, a.counters, s.ID+"|output", s.ID+"|genreserved").Err(); err != nil {
+				t.Fatal(err)
+			}
+			if err := c.HIncrBy(ctx, a.counters, s.ID+"|kv", -gen).Err(); err != nil {
+				t.Fatal(err)
+			}
+		}
+		release(path, lease)
+		assertReleased("output=0 via " + path)
 	}
 }
