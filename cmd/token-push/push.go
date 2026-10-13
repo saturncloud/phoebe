@@ -57,10 +57,14 @@ type rollup struct {
 	GraphK8sName     string `json:"graph_k8s_name"`
 	TopologyRevision int    `json:"topology_revision"`
 	// Region is the serving cluster's region (a function of the revision, so not
-	// grain). "" when unknown; always sent, so the manager can require the key.
+	// grain). "" when unknown. This version always sends the key so the wire
+	// shape is stable. The manager (ledger D3) treats the key as optional and
+	// reads an absent key as unknown (""), so older phoebe installs that do not
+	// send it keep working. Do not make it required on the manager side.
+	// topology_revision and request_count follow the same rule.
 	Region string `json:"region"`
 	// RequestCount is the number of rated requests in the rollup
-	// (rated_usage.event_count).
+	// (rated_usage.event_count). Optional on the manager side (ledger D3).
 	RequestCount          int64  `json:"request_count"`
 	Cost                  string `json:"cost"`
 	AppliedPromptRate     string `json:"applied_prompt_rate"`
