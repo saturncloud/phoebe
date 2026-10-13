@@ -78,7 +78,10 @@ func classifyRoundTripSettlement(err error) settlementKind {
 	}
 	if errors.Is(err, errRequestBufferFull) {
 		// The request-buffer budget cut the forwarded body short: the
-		// upstream only ever saw an incomplete request.
+		// upstream only ever saw an incomplete request (D43). Defensive:
+		// unreachable today, because forceIncludeUsage buffers the whole
+		// budgeted body before the forward; it keeps a future streaming
+		// forward zero-settled.
 		return settlementZeroNeverServed
 	}
 	if tooLarge := (*http.MaxBytesError)(nil); errors.As(err, &tooLarge) {

@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	stdlog "log"
 	"math"
 	"net/http"
 	"regexp"
@@ -71,6 +72,16 @@ func (l *sampledErrorLog) quietGapNanos() int64 {
 }
 
 func (l *sampledErrorLog) logf(log *logging.Logger, format string, args ...interface{}) {
+	l.logTo(log.Error, format, args...)
+}
+
+// warnf is logf at WARN, for a recurring site that is routine load shedding
+// rather than a fault (a full request-buffer budget).
+func (l *sampledErrorLog) warnf(log *logging.Logger, format string, args ...interface{}) {
+	l.logTo(log.Warn, format, args...)
+}
+
+func (l *sampledErrorLog) logTo(out *stdlog.Logger, format string, args ...interface{}) {
 	now := time.Now()
 	if l.now != nil {
 		now = l.now()
@@ -105,10 +116,10 @@ func (l *sampledErrorLog) logf(log *logging.Logger, format string, args ...inter
 		return
 	}
 	if dropped := l.suppressed.Swap(0); dropped > 0 {
-		log.Error.Printf(format+" (+%d similar suppressed)", append(args, dropped)...)
+		out.Printf(format+" (+%d similar suppressed)", append(args, dropped)...)
 		return
 	}
-	log.Error.Printf(format, args...)
+	out.Printf(format, args...)
 }
 
 type admissionEstimate struct {
@@ -171,16 +182,18 @@ func boundRequestBody(w, rawW http.ResponseWriter, r *http.Request, limit int64)
 // connection read deadline when it fires, so a trickled body cannot hold the
 // handler past the bound) answers 408: the client was too slow to send its
 // own request (504 is kept for an upstream that sent no headers in time,
-// D3/D40). Nothing was forwarded, so no metering row is recorded, as for
-// every other pre-forward refusal.
-func writeRequestBodyError(w http.ResponseWriter, r *http.Request, err error) {
+// D3/D40). A full replica request-buffer budget answers phoebe's retryable
+// 503 (writeRetryLaterAfter: JSON error body, request id, Retry-After, D43).
+// Nothing was forwarded, so no metering row is recorded, as for every other
+// pre-forward refusal.
+func writeRequestBodyError(w http.ResponseWriter, r *http.Request, requestID string, err error) {
 	if errors.Is(context.Cause(r.Context()), errMaxStreamDuration) {
 		http.Error(w, "request body not received in time", http.StatusRequestTimeout)
 		return
 	}
 	if errors.Is(err, errRequestBufferFull) {
-		w.Header().Set("Retry-After", strconv.Itoa(requestBufferRetryAfterSeconds))
-		http.Error(w, "gateway request buffer is full; retry shortly", http.StatusServiceUnavailable)
+		writeRetryLaterAfter(w, requestID, "The gateway request buffer is full; retry in about "+
+			strconv.Itoa(requestBufferRetryAfterSeconds)+" second.", requestBufferRetryAfterSeconds)
 		return
 	}
 	var tooLarge *http.MaxBytesError
@@ -189,6 +202,20 @@ func writeRequestBodyError(w http.ResponseWriter, r *http.Request, err error) {
 		return
 	}
 	http.Error(w, "bad request body", http.StatusBadRequest)
+}
+
+// logRequestBodyError logs a failed request-body read before
+// writeRequestBodyError answers it. A full replica request-buffer budget is
+// routine load shedding that recurs on every request while the replica is
+// saturated, so it is logged at WARN through a sampler (onset, then 1 in
+// admissionErrorLogEvery) with a fixed countable message; every other body
+// error is logged at ERROR as before.
+func (s *Server) logRequestBodyError(site, requestID string, err error) {
+	if errors.Is(err, errRequestBufferFull) {
+		s.requestBufferFullLog.warnf(s.log, "%s: replica request-buffer budget full; refused 503 request_id=%s", site, requestID)
+		return
+	}
+	s.log.Error.Printf("%s: %v (request_id=%s)", site, err, requestID)
 }
 
 // admissionInterpretedFields are the top-level request fields admission reads.

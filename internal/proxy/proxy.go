@@ -165,6 +165,10 @@ type Server struct {
 	admissionReleaseFallbackLog, admissionCompletionReleaseLog sampledErrorLog
 	admissionPrefillReleaseLog, admissionUpstreamReleaseLog    sampledErrorLog
 	admissionColdHoldReleaseLog                                sampledErrorLog
+	// requestBufferFullLog samples the WARN logged when a request is refused
+	// because the replica request-buffer budget is full (D43), so a
+	// saturated replica does not also flood its logs.
+	requestBufferFullLog sampledErrorLog
 
 	// graphCapacity supplies the per-graph admission capacity Atlas publishes
 	// (B8). nil = none published (no registry resolver wired).
@@ -525,8 +529,8 @@ func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request) {
 		var reqOrigLen int
 		reqBody, reqTruncated, reqOrigLen, err = captureRequestBody(r, s.ioMaxBodyLen)
 		if err != nil {
-			s.log.Error.Printf("capture request body: %v", err)
-			writeRequestBodyError(w, r, err)
+			s.logRequestBodyError("capture request body", requestID, err)
+			writeRequestBodyError(w, r, requestID, err)
 			return
 		}
 		// Hard truncation is intentional (an uncapped body fails the to_tsvector
@@ -633,8 +637,8 @@ func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request) {
 	if id.ServedModel != "" && !id.Gateway && r.Method == "POST" {
 		body, rerr := readAndRestoreBody(r)
 		if rerr != nil {
-			s.log.Error.Printf("model-binding: read request body: %v", rerr)
-			writeRequestBodyError(w, r, rerr)
+			s.logRequestBodyError("model-binding: read request body", requestID, rerr)
+			writeRequestBodyError(w, r, requestID, rerr)
 			return
 		}
 		switch checkModelBinding(body, id.ServedModel) {
@@ -659,8 +663,8 @@ func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request) {
 	if r.Method == http.MethodPost && inferenceRequestPathAllowed(routePath) {
 		clientUsage, err = clientRequestedStreamUsage(r)
 		if err != nil {
-			s.log.Error.Printf("read streaming usage preference: %v", err)
-			writeRequestBodyError(w, r, err)
+			s.logRequestBodyError("read streaming usage preference", requestID, err)
+			writeRequestBodyError(w, r, requestID, err)
 			return
 		}
 	}
@@ -776,7 +780,7 @@ func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request) {
 		}
 		body, rerr := readAndRestoreBody(r)
 		if rerr != nil {
-			writeRequestBodyError(w, r, rerr)
+			writeRequestBodyError(w, r, requestID, rerr)
 			return
 		}
 		// The prompt-token estimate is taken from the client's original body
@@ -916,8 +920,8 @@ func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request) {
 	}
 	// Force streaming usage so we never under-bill a streamed response.
 	if err := forceIncludeUsage(r); err != nil {
-		s.log.Error.Printf("rewrite request body: %v", err)
-		writeRequestBodyError(w, r, err)
+		s.logRequestBodyError("rewrite request body", requestID, err)
+		writeRequestBodyError(w, r, requestID, err)
 		return
 	}
 	if clientUsage.stream {
@@ -1011,12 +1015,17 @@ func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request) {
 
 		onDone := func(res capture.Result) {
 			defer close(responseCaptureDone)
-			// D22/Q7: a non-streamed body past its buffer allowance is metered
-			// from its retained head and tail. A body laid out so that no
-			// usage object sits in the tail is recorded as an unmetered
-			// attempt; log it with a fixed marker so the residual is countable.
+			// D22/Q7/D44: a non-streamed body past its buffer allowance is
+			// metered from its retained head and tail. A successful body laid
+			// out so that no usage object sits in what was kept is recorded
+			// as an unmetered attempt; log it with a fixed marker so that
+			// billing tail risk is countable. The marker counts only 2xx
+			// bodies whose head and tail missed part of the body: error
+			// responses never carry usage, and a body the head and tail
+			// covered whole (an early overflow forced by replica-total
+			// pressure) had nothing to miss, so neither is the D22 risk.
 			// onDone runs inside finish, which holds the reader's lock.
-			if cr.overflowed && !res.UsageFound && !res.Aborted {
+			if cr.droppedBytes() && statusCode >= 200 && statusCode < 300 && !res.UsageFound && !res.Aborted {
 				s.log.Warn.Printf("metering anomaly: overflowed non-streamed response had no usage in its retained tail (unmetered attempt) request_id=%s resource_id=%s status=%d",
 					requestID, id.ResourceID, statusCode)
 			}
@@ -1259,12 +1268,20 @@ func (s *Server) errorHandler(upstream string, id identity.Identity, requestID, 
 			return
 		}
 		if errors.Is(err, errRequestBufferFull) {
-			// The replica's request-buffer budget filled while the body was
-			// being forwarded. Nothing complete reached the upstream.
+			// Defensive (D43): the replica's request-buffer budget filled
+			// while the body was being forwarded, so nothing complete reached
+			// the upstream. Unreachable today: forceIncludeUsage reads the
+			// whole budgeted body and restores it as a buffered copy before
+			// rp.ServeHTTP, so the budget can only trip on a pre-forward read.
+			// The branch exists so a future change that forwards the budgeted
+			// body without buffering it still answers 503 + Retry-After, with
+			// one 503 row and a zero settlement (settlement.go), instead of an
+			// upstream-fault 502.
+			s.logRequestBodyError("forward request body", requestID, err)
 			w.Header().Set("X-Request-Id", requestID)
 			s.emit(context.WithoutCancel(r.Context()), id, requestID, clientRequestID,
 				http.StatusServiceUnavailable, capture.Result{UsageFound: false})
-			writeRequestBodyError(w, r, err)
+			writeRequestBodyError(w, r, requestID, err)
 			return
 		}
 		if tooLarge := (*http.MaxBytesError)(nil); errors.As(err, &tooLarge) {
@@ -1276,7 +1293,7 @@ func (s *Server) errorHandler(upstream string, id identity.Identity, requestID, 
 			w.Header().Set("X-Request-Id", requestID)
 			s.emit(context.WithoutCancel(r.Context()), id, requestID, clientRequestID,
 				http.StatusRequestEntityTooLarge, capture.Result{UsageFound: false})
-			writeRequestBodyError(w, r, err)
+			writeRequestBodyError(w, r, requestID, err)
 			return
 		}
 		if isClientAbort(err) {

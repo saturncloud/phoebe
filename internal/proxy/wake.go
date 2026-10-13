@@ -121,15 +121,21 @@ func writeWakeStatusUnknown(w http.ResponseWriter, requestID string) {
 }
 
 // writeRetryLater is phoebe's one retryable 503 answer: Retry-After
-// (wakeRetryAfterSeconds) and a JSON {"error": msg} body. The wake writers and
-// the dedicated cold-hold overflow (D4) all answer through it so the shape
-// cannot drift between them.
+// (wakeRetryAfterSeconds), the request id, and a JSON {"error": msg} body.
+// The wake writers, the dedicated cold-hold overflow (D4) and, through
+// writeRetryLaterAfter, the request-buffer-full refusal (D43) all answer
+// through it so the shape cannot drift between them.
 func writeRetryLater(w http.ResponseWriter, requestID, msg string) {
+	writeRetryLaterAfter(w, requestID, msg, wakeRetryAfterSeconds)
+}
+
+// writeRetryLaterAfter is writeRetryLater with its own Retry-After seconds.
+func writeRetryLaterAfter(w http.ResponseWriter, requestID, msg string, retryAfterSeconds int) {
 	body, _ := json.Marshal(map[string]string{"error": msg})
 	h := w.Header()
 	h.Set(requestIDHeader, requestID)
 	h.Set("Content-Type", "application/json")
-	h.Set("Retry-After", strconv.Itoa(wakeRetryAfterSeconds))
+	h.Set("Retry-After", strconv.Itoa(retryAfterSeconds))
 	h.Set("Content-Length", strconv.Itoa(len(body)))
 	w.WriteHeader(http.StatusServiceUnavailable)
 	_, _ = w.Write(body)
