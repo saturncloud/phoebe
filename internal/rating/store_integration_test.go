@@ -2768,6 +2768,102 @@ func TestIntegration_OwnerConflictWithheldAndGraphSplits(t *testing.T) {
 	}
 }
 
+// TestIntegration_NullGraphEventsFormSeparateUnknownGraphRollup pins ledger D9: since
+// 0009 made the graph a grain key, events of one hour that carry no graph (the header
+// path before graph propagation, or events from before 0008) are NOT merged into the
+// rollup of the graph the other events name. Before 0009 the graph was evidence carried
+// via MAX, which ignores NULL, so the two groups formed ONE rollup under the known
+// graph. Now they form two: one under the empty-string (unknown graph) key and one under the
+// named graph. Merging would put tokens under a graph the events did not name. The
+// split must not lose or duplicate anything: the two rollups' token, event and cost
+// totals add up to the events' totals, and each part bills at the same rate.
+func TestIntegration_NullGraphEventsFormSeparateUnknownGraphRollup(t *testing.T) {
+	db := openRatingSchema(t, "phoebe_rating_null_graph_it")
+	ctx := context.Background()
+	hour := mustTime("2026-06-08T10:00:00Z")
+	book := newTestBook(map[string]Rate3{"b": rate3("0.000005", "0", "0.00001")}, nil, PolicyIdentity, Dec{}, Dec{})
+
+	// One identity (auth, resource, model, serving mode, owner) in one hour: two
+	// events with no graph, three on graph dgd-a revision 1.
+	if _, err := db.ExecContext(ctx,
+		`INSERT INTO billing_event (request_id, auth_id, resource_id, org_id, model, base_model, graph_k8s_name, topology_revision, prompt_tokens, completion_tokens, event_ts)
+		 VALUES ('n1','a','res','org-1','m','b',NULL,   NULL,100,10,$1),
+		        ('n2','a','res','org-1','m','b',NULL,   NULL, 50, 5,$2),
+		        ('k1','a','res','org-1','m','b','dgd-a',1,   200,20,$1),
+		        ('k2','a','res','org-1','m','b','dgd-a',1,   300,30,$2),
+		        ('k3','a','res','org-1','m','b','dgd-a',1,   400,40,$3)`,
+		hour.Add(5*time.Minute), hour.Add(20*time.Minute), hour.Add(50*time.Minute)); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+
+	res, err := NewPostgresStore(db).RateWindow(ctx, book, hour, hour.Add(time.Hour))
+	if err != nil {
+		t.Fatalf("RateWindow: %v", err)
+	}
+	if res.RollupsWritten != 2 || res.EventsRated != 5 {
+		t.Fatalf("rollups/events = %d/%d, want 2/5 (no-graph events form their own '' rollup beside the named graph's)",
+			res.RollupsWritten, res.EventsRated)
+	}
+	// The '' rollup is not a named-graph revision-0 rollup, so D1's warning ignores it.
+	if res.UnknownRevisionRollups != 0 {
+		t.Fatalf("UnknownRevisionRollups = %d, want 0 (the count looks only at rollups that name a graph)", res.UnknownRevisionRollups)
+	}
+
+	type rollup struct {
+		graph      string
+		rev        int
+		prompt     int64
+		completion int64
+		events     int64
+		cost       string
+	}
+	rows, err := db.QueryContext(ctx,
+		`SELECT graph_k8s_name, topology_revision, prompt_tokens, completion_tokens, event_count, cost::text
+		   FROM rated_usage ORDER BY graph_k8s_name`)
+	if err != nil {
+		t.Fatalf("read rollups: %v", err)
+	}
+	defer func() { _ = rows.Close() }()
+	var got []rollup
+	for rows.Next() {
+		var r rollup
+		if err := rows.Scan(&r.graph, &r.rev, &r.prompt, &r.completion, &r.events, &r.cost); err != nil {
+			t.Fatalf("scan: %v", err)
+		}
+		got = append(got, r)
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatalf("rows: %v", err)
+	}
+
+	// '' : 150 prompt x 0.000005 + 15 completion x 0.00001 = 0.00075 + 0.00015.
+	// dgd-a: 900 prompt x 0.000005 + 90 completion x 0.00001 = 0.0045 + 0.0009.
+	want := []rollup{
+		{graph: "", rev: 0, prompt: 150, completion: 15, events: 2, cost: "0.000900000"},
+		{graph: "dgd-a", rev: 1, prompt: 900, completion: 90, events: 3, cost: "0.005400000"},
+	}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("rollups = %+v, want %+v (no-graph events must form a separate '' rollup, never merge into dgd-a)", got, want)
+	}
+
+	// The split loses and duplicates nothing: the rollups add up to the events.
+	var evPrompt, evCompletion, ruPrompt, ruCompletion, ruEvents int64
+	var ruCost string
+	if err := db.QueryRowContext(ctx,
+		`SELECT SUM(prompt_tokens), SUM(completion_tokens) FROM billing_event`).Scan(&evPrompt, &evCompletion); err != nil {
+		t.Fatalf("sum events: %v", err)
+	}
+	if err := db.QueryRowContext(ctx,
+		`SELECT SUM(prompt_tokens), SUM(completion_tokens), SUM(event_count), SUM(cost)::text FROM rated_usage`).
+		Scan(&ruPrompt, &ruCompletion, &ruEvents, &ruCost); err != nil {
+		t.Fatalf("sum rollups: %v", err)
+	}
+	if ruPrompt != evPrompt || ruCompletion != evCompletion || ruEvents != 5 || ruCost != "0.006300000" {
+		t.Fatalf("rollup totals prompt/completion/events/cost = %d/%d/%d/%s, want %d/%d/5/0.006300000 (the events' totals)",
+			ruPrompt, ruCompletion, ruEvents, ruCost, evPrompt, evCompletion)
+	}
+}
+
 // TestIntegration_TopologyRevisionSplitsRollupsAndKeepsIDsStable pins the 0009 grain
 // across re-rates against real Postgres: a graph that changes topology revision
 // inside an hour is two rollups (one per revision, each carrying its region), a

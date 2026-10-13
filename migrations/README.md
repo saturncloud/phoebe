@@ -167,6 +167,18 @@ Migration 0009 replaces `rated_usage_grain_uq` with a 9-column key (adding
 Unlike 0008, it is not additive: the rater's SQL and the schema must change
 together, so every run of a pre-0009 rater against schema 0009 fails.
 
+Because the graph is now a grain key, events that carry no graph (the header
+path before graph propagation, or events from before 0008) form their own
+rollup under the `''` (unknown graph) value. Before 0009 the rater merged them
+into the rollup of the one graph the other events of that hour named; 0009
+removes that rule on purpose, so tokens are never filed under a graph the
+events did not name. Expect a `''` rollup next to a named-graph rollup for the
+same resource and hour while pre-propagation events are still being rated.
+Money is unaffected (both parts bill at the same rate); only per-graph margin
+loses those events. The rater's revision-0 warning does not count `''`
+rollups. See ledger entries D1 and D9 in
+`saturn-architecture-docs/agent-wip/metering-margin-decisions-ledger.md`.
+
 The same release also changes what token-push sends. Every rollup on the wire
 now carries three new keys: `topology_revision`, `region` and `request_count`
 (next to `graph_k8s_name`, which is now always sent). saturn-aws-manager's
