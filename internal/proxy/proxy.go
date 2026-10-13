@@ -212,21 +212,9 @@ func NewWithIOLog(s *config.Settings, log *logging.Logger, emitter metering.Emit
 	return srv
 }
 
-// Default wake bounds when a waker is wired without explicit values.
-const (
-	// defaultWakeTimeout is the per-wake ceiling the woken request is held for.
-	// 300s, sized to the MEASURED cold path: a vLLM worker's cold reload is
-	// ~2.5min on the live staging cluster, so the previous 120s default meant a
-	// real wake NEVER completed inside the budget — every genuinely cold
-	// request held two minutes and then got the cold response anyway. The
-	// tradeoff of a longer hold: a wake that will ultimately fail keeps the
-	// client (and one upstream slot) waiting up to 5 minutes before the honest
-	// cold response — acceptable because OpenAI-style clients tolerate
-	// multi-minute holds, and the alternative (a budget shorter than the
-	// cold start) makes the wake feature a no-op. Still bounded; operators can
-	// tune per install via wake.timeout in the settings.
-	defaultWakeTimeout = 300 * time.Second
-)
+// defaultWakeTimeout is used when a waker is wired without an explicit
+// timeout (see config.DefaultWakeTimeout for why it is 300s).
+const defaultWakeTimeout = config.DefaultWakeTimeout
 
 // WithWaker enables wake-from-zero. The normal proxy transport sends one
 // metered request. If and only if that response proves the endpoint is cold,

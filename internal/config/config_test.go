@@ -743,3 +743,26 @@ func TestAdmissionLimitsAnyReportsEachField(t *testing.T) {
 		}
 	}
 }
+
+// protection.maxStreamDuration bounds the wake hold too, so with wake enabled
+// it must be longer than the effective wake.timeout (default 300s).
+func TestLoadMaxStreamDurationMustExceedWakeTimeout(t *testing.T) {
+	const wake = "gateway:\n  enabled: true\n  namespace: ns\nwake:\n  enabled: true\n"
+	for _, tc := range []struct {
+		name, yaml string
+		ok         bool
+	}{
+		{"defaults", wake, true},
+		{"stream equal to default wake", wake + "protection:\n  maxStreamDuration: 300s\n", false},
+		{"stream under set wake", wake + "  timeout: 90m\n", false}, // 60m default stream
+		{"stream above set wake", wake + "  timeout: 90m\nprotection:\n  maxStreamDuration: 2h\n", true},
+		{"wake disabled", "protection:\n  maxStreamDuration: 10s\n", true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			_, err := Load(writeTemp(t, tc.yaml))
+			if (err == nil) != tc.ok {
+				t.Fatalf("err=%v, want ok=%v", err, tc.ok)
+			}
+		})
+	}
+}

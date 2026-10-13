@@ -430,6 +430,19 @@ type WakeSettings struct {
 	Timeout time.Duration `yaml:"-"`
 }
 
+// DefaultWakeTimeout is the per-wake ceiling the woken request is held for.
+// 300s, sized to the MEASURED cold path: a vLLM worker's cold reload is
+// ~2.5min on the live staging cluster, so the previous 120s default meant a
+// real wake NEVER completed inside the budget — every genuinely cold
+// request held two minutes and then got the cold response anyway. The
+// tradeoff of a longer hold: a wake that will ultimately fail keeps the
+// client (and one upstream slot) waiting up to 5 minutes before the honest
+// cold response — acceptable because OpenAI-style clients tolerate
+// multi-minute holds, and the alternative (a budget shorter than the
+// cold start) makes the wake feature a no-op. Still bounded; operators can
+// tune per install via wake.timeout in the settings.
+const DefaultWakeTimeout = 300 * time.Second
+
 // Load reads, defaults, and parses a settings YAML file.
 func Load(settingsFile string) (*Settings, error) {
 	s := &Settings{
@@ -493,6 +506,18 @@ func (s *Settings) parse() error {
 		}
 		if s.Wake.Timeout <= 0 {
 			return fmt.Errorf("wake.timeout %q must be positive", s.Wake.TimeoutStr)
+		}
+	}
+	// protection.maxStreamDuration bounds the whole request, wake hold
+	// included, so one not longer than the wake hold would answer every
+	// request that arrives while a model starts from zero with 504.
+	if s.Wake.Enabled {
+		wake := s.Wake.Timeout
+		if wake <= 0 {
+			wake = DefaultWakeTimeout
+		}
+		if stream := s.Protection.Effective().MaxStreamDuration; stream <= wake {
+			return fmt.Errorf("protection.maxStreamDuration (%s) must be longer than wake.timeout (%s): it bounds the whole request including the wake hold", stream, wake)
 		}
 	}
 	// Emit is already decoded, so AdmissionStoreAddr sees the metering
