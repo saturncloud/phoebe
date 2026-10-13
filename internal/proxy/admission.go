@@ -117,6 +117,11 @@ type admissionEstimate struct {
 	// OutputDeclared reports that the body set max_tokens or
 	// max_completion_tokens; otherwise OutputTokens is the default reservation.
 	OutputDeclared bool
+	// OutputSequences is how many output sequences the engine generates in
+	// parallel for the request: the larger of n and best_of, at least 1. The
+	// prompt's KV is shared across them, but each sequence needs its own
+	// output KV, so the reserved-KV charge is input + output x sequences.
+	OutputSequences int64
 }
 
 // publishedGraphCapacity is the capacity Atlas published for graph, or none.
@@ -167,7 +172,7 @@ func writeRequestBodyError(w http.ResponseWriter, err error) {
 }
 
 // admissionInterpretedFields are the top-level request fields admission reads.
-var admissionInterpretedFields = []string{"model", "max_tokens", "max_completion_tokens", "messages", "prompt", "input"}
+var admissionInterpretedFields = []string{"model", "max_tokens", "max_completion_tokens", "messages", "prompt", "input", "n", "best_of"}
 
 // admissionWork returns the exact routed model and cheap token reservations.
 // The input estimate is message-text characters / 4 (estimatePromptTokens);
@@ -186,6 +191,8 @@ func admissionWork(body []byte, defaultOutput int64) (admissionEstimate, bool) {
 		Model               string `json:"model"`
 		MaxTokens           *int64 `json:"max_tokens"`
 		MaxCompletionTokens *int64 `json:"max_completion_tokens"`
+		N                   *int64 `json:"n"`
+		BestOf              *int64 `json:"best_of"`
 	}
 	if err := json.Unmarshal(body, &v); err != nil || v.Model == "" {
 		return admissionEstimate{}, false
@@ -203,8 +210,23 @@ func admissionWork(body []byte, defaultOutput int64) (admissionEstimate, bool) {
 	if maximum <= 0 || maximum > math.MaxUint32 {
 		return admissionEstimate{}, false
 	}
+	sequences := int64(1)
+	for _, c := range []*int64{v.N, v.BestOf} {
+		if c == nil {
+			continue
+		}
+		// A count the engine would refuse (< 1) is not ours to judge; one
+		// past maxOutputSequences cannot be a real request and would
+		// overflow the KV charge, so it is refused like a broken body.
+		if *c > maxOutputSequences {
+			return admissionEstimate{}, false
+		}
+		if *c > sequences {
+			sequences = *c
+		}
+	}
 	return admissionEstimate{Model: v.Model, InputTokens: estimatePromptTokens(body), OutputTokens: maximum,
-		OutputDeclared: v.MaxTokens != nil || v.MaxCompletionTokens != nil}, true
+		OutputDeclared: v.MaxTokens != nil || v.MaxCompletionTokens != nil, OutputSequences: sequences}, true
 }
 
 // prepareSharedDynamoRequest replaces every client-controlled scheduling and
@@ -477,17 +499,25 @@ func undeclaredOutputReservation(defaultOutput int64, scopes ...admission.RateLi
 	return out
 }
 
+// maxOutputSequences bounds n and best_of: far above any engine's limit, and
+// small enough that output x sequences cannot overflow the KV charge
+// (output is at most MaxUint32).
+const maxOutputSequences = 1 << 16
+
 // undeclaredOutputWithinKV clamps the output reservation of a request that
 // declared no max_tokens so the prompt plus the reservation fits kvCap, the
 // tightest positive reserved-KV cap that applies (0 = none). Like the contract
 // clamp above, a request is never refused as too large for a default the
 // client did not choose. The result is at least 1; when the prompt alone
 // fills the cap the request is still refused for its prompt (413).
-func undeclaredOutputWithinKV(output, input, kvCap int64) int64 {
+func undeclaredOutputWithinKV(output, input, sequences, kvCap int64) int64 {
 	if kvCap <= 0 {
 		return output
 	}
-	room := kvCap - input
+	if sequences < 1 {
+		sequences = 1
+	}
+	room := (kvCap - input) / sequences
 	if room < 1 {
 		room = 1
 	}

@@ -791,7 +791,7 @@ func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request) {
 			kvCap := admission.TightestReservedKVCap(s.admitterSettings(), admission.Request{
 				Graph: graph, Organization: id.OrgID, Model: estimate.Model, GraphCapacity: graphCapacity.Limits(),
 			})
-			estimate.OutputTokens = undeclaredOutputWithinKV(estimate.OutputTokens, estimate.InputTokens, kvCap)
+			estimate.OutputTokens = undeclaredOutputWithinKV(estimate.OutputTokens, estimate.InputTokens, estimate.OutputSequences, kvCap)
 		}
 		body, tenant, rerr := prepareSharedDynamoRequest(body, tenantIdentity, estimate.OutputTokens, sharedLane)
 		if rerr != nil {
@@ -824,8 +824,8 @@ func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request) {
 			admitted, err = s.admitter.Admit(r.Context(), admission.Request{
 				Graph: graph, Organization: id.OrgID, Owner: id.OwnerID, Model: estimate.Model,
 				PrefillTokens: estimate.InputTokens, EstimatedInputTokens: estimate.InputTokens,
-				ReservedOutputTokens: estimate.OutputTokens,
-				Adapter:              id.Adapter != "", OrganizationLimits: organizationLimits, OwnerLimits: ownerLimits,
+				ReservedOutputTokens: estimate.OutputTokens, OutputSequences: estimate.OutputSequences,
+				Adapter: id.Adapter != "", OrganizationLimits: organizationLimits, OwnerLimits: ownerLimits,
 				GroupScopes:   groupScopes,
 				GraphCapacity: graphCapacity.Limits(),
 			})

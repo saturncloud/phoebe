@@ -175,15 +175,37 @@ func TestUndeclaredOutputReservationFitsPublishedGraphKV(t *testing.T) {
 }
 
 func TestUndeclaredOutputWithinKV(t *testing.T) {
-	for _, c := range []struct{ output, input, cap, want int64 }{
-		{4096, 200, 0, 4096},    // no cap
-		{4096, 200, 3000, 2800}, // clamped to the room left
-		{100, 200, 3000, 100},   // already fits
-		{4096, 3000, 3000, 1},   // prompt fills the cap: floor 1, still 413
-		{4096, 5000, 3000, 1},   // prompt alone over the cap
+	for _, c := range []struct{ output, input, sequences, cap, want int64 }{
+		{4096, 200, 1, 0, 4096},    // no cap
+		{4096, 200, 1, 3000, 2800}, // clamped to the room left
+		{100, 200, 1, 3000, 100},   // already fits
+		{4096, 3000, 1, 3000, 1},   // prompt fills the cap: floor 1, still 413
+		{4096, 5000, 1, 3000, 1},   // prompt alone over the cap
+		{4096, 200, 4, 3000, 700},  // n=4: each sequence gets a quarter of the room
+		{4096, 200, 0, 3000, 2800}, // 0 sequences reads as 1
 	} {
-		if got := undeclaredOutputWithinKV(c.output, c.input, c.cap); got != c.want {
-			t.Errorf("undeclaredOutputWithinKV(%d, %d, %d) = %d, want %d", c.output, c.input, c.cap, got, c.want)
+		if got := undeclaredOutputWithinKV(c.output, c.input, c.sequences, c.cap); got != c.want {
+			t.Errorf("undeclaredOutputWithinKV(%d, %d, %d, %d) = %d, want %d", c.output, c.input, c.sequences, c.cap, got, c.want)
+		}
+	}
+}
+
+func TestAdmissionWorkCountsOutputSequences(t *testing.T) {
+	for _, c := range []struct {
+		body string
+		want int64
+		ok   bool
+	}{
+		{`{"model":"m"}`, 1, true},
+		{`{"model":"m","n":4}`, 4, true},
+		{`{"model":"m","n":2,"best_of":5}`, 5, true},
+		{`{"model":"m","n":0}`, 1, true},
+		{`{"model":"m","n":70000}`, 0, false},
+		{`{"model":"m","n":2,"N":9}`, 0, false},
+	} {
+		got, ok := admissionWork([]byte(c.body), 10)
+		if ok != c.ok || (ok && got.OutputSequences != c.want) {
+			t.Errorf("admissionWork(%s) = (%d, %v), want (%d, %v)", c.body, got.OutputSequences, ok, c.want, c.ok)
 		}
 	}
 }

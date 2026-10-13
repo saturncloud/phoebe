@@ -88,6 +88,9 @@ type Request struct {
 	// counter; the proxy sets both from one estimate.
 	PrefillTokens        int64
 	EstimatedInputTokens int64
+	// OutputSequences multiplies ReservedOutputTokens in the reserved-KV
+	// charge (n / best_of). 0 is read as 1.
+	OutputSequences      int64
 	ReservedOutputTokens int64
 	Adapter              bool
 	OrganizationLimits   RateLimits
@@ -154,6 +157,7 @@ type wireRequest struct {
 	ID             string  `json:"id"`
 	LeaseMs        int64   `json:"lease_ms"`
 	Prefill        int64   `json:"prefill_tokens"`
+	Sequences      int64   `json:"sequences"`
 	EstimatedInput int64   `json:"estimated_input"`
 	Output         int64   `json:"output"`
 	Adapter        int64   `json:"adapter"`
@@ -263,7 +267,8 @@ func (a *RedisAdmitter) Admit(ctx context.Context, req Request) (*Lease, error) 
 		return nil, fmt.Errorf("%w: lease id: %v", ErrUnavailable, err)
 	}
 	w := wireRequest{ID: id, LeaseMs: a.cfg.LeaseTTL.Milliseconds(), Prefill: req.PrefillTokens,
-		EstimatedInput: req.EstimatedInputTokens, Output: req.ReservedOutputTokens, Scopes: a.scopes(req)}
+		EstimatedInput: req.EstimatedInputTokens, Output: req.ReservedOutputTokens, Scopes: a.scopes(req),
+		Sequences: max(req.OutputSequences, 1)}
 	if req.Adapter {
 		w.Adapter = 1
 	}

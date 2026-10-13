@@ -98,7 +98,7 @@ end
 `
 
 var admitScript = redis.NewScript(luaHelpers + `
-local q=cjson.decode(ARGV[1]); q.now=current_time_ms(); reap(q.now); q.kv=q.estimated_input+q.output
+local q=cjson.decode(ARGV[1]); q.now=current_time_ms(); reap(q.now); q.kv=q.estimated_input+q.output*(q.sequences or 1)
 -- A caller may lose the reply after this script commits. Retrying the exact
 -- request id must recover the existing lease rather than reserve every
 -- dimension a second time.

@@ -255,3 +255,23 @@ func TestOversizeRequestIsUnsatisfiableEvenWhenEarlierScopeFull(t *testing.T) {
 		})
 	}
 }
+
+// n / best_of: the prompt's KV is shared, each output sequence needs its own.
+func TestReservedKVChargesEveryOutputSequence(t *testing.T) {
+	ctx := context.Background()
+	a, mr := testAdmitter(t, config.AdmissionSettings{Platform: config.AdmissionLimits{MaxReservedKVTokens: ptr64(1000)}})
+	req := request("a", "m") // 10 input + 20 output
+	req.OutputSequences = 4
+	lease, err := a.Admit(ctx, req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	scopeID := a.scopes(req)[0].ID
+	if got := mr.HGet(a.counters, scopeID+"|kv"); got != "90" {
+		t.Fatalf("kv=%q, want 10 + 20x4 = 90", got)
+	}
+	_ = lease.Complete(ctx, 0)
+	if got := mr.HGet(a.counters, scopeID+"|kv"); got != "" {
+		t.Fatalf("kv=%q after finish, want released", got)
+	}
+}
