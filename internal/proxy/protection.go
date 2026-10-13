@@ -202,17 +202,8 @@ func (a *responseBufferAccount) reserve(slot int, n int64) error {
 		if mine+n > a.perStream {
 			return errResponseBufferLimit
 		}
-		// Reserve with compare-and-swap so a refused delta never touches the
-		// shared counter: an add-then-roll-back would briefly inflate it and
-		// could make a concurrent small request see a false over-total.
-		for {
-			cur := a.budget.held.Load()
-			if cur+delta > a.total {
-				return errResponseBufferLimit
-			}
-			if a.budget.held.CompareAndSwap(cur, cur+delta) {
-				break
-			}
+		if !tryCharge(&a.budget.held, delta, a.total) {
+			return errResponseBufferLimit
 		}
 	} else if delta < 0 {
 		a.budget.held.Add(delta)
@@ -314,6 +305,24 @@ var errRequestBufferFull = errors.New("replica request-buffer budget is full")
 // held only while their requests run, so headroom returns quickly.
 const requestBufferRetryAfterSeconds = 1
 
+// tryCharge adds delta to held only if the result stays at or below total,
+// and reports whether it did. It uses compare-and-swap so a refused charge
+// never touches the shared counter: an add-then-roll-back would briefly
+// inflate it and could make a concurrent small request see a false
+// over-total. The response-buffer and request-buffer budgets both charge
+// through it.
+func tryCharge(held *atomic.Int64, delta, total int64) bool {
+	for {
+		cur := held.Load()
+		if cur+delta > total {
+			return false
+		}
+		if held.CompareAndSwap(cur, cur+delta) {
+			return true
+		}
+	}
+}
+
 // requestBufferBudget is the replica-wide total of request-body bytes held by
 // requests in flight (protection.maxRequestBufferBytesTotal).
 type requestBufferBudget struct {
@@ -321,8 +330,14 @@ type requestBufferBudget struct {
 }
 
 // budgetedBody charges every request-body byte received to the replica budget
-// until the request finishes (release). Bodies are buffered whole and kept
-// for retries, so bytes received is the memory the request holds.
+// until the request finishes (release). The budget counts each byte received
+// off the wire once (D43); it is a lower bound on the memory the request
+// holds, not resident memory. Once read, the body is held as one buffer that
+// later reads share (bufferedBody), but parsing it and the streaming usage
+// rewrite briefly hold further copies (about 3x the body for a streaming
+// request), the request log may keep its own capped copy, and Go's garbage
+// collector needs headroom on top. Operators sizing pod memory should allow
+// for that multiple over maxRequestBufferBytesTotal.
 type budgetedBody struct {
 	io.ReadCloser
 	budget *requestBufferBudget
@@ -338,14 +353,8 @@ func (b *budgetedBody) Read(p []byte) (int, error) {
 	n, err := b.ReadCloser.Read(p)
 	if n > 0 {
 		delta := int64(n)
-		for {
-			cur := b.budget.held.Load()
-			if cur+delta > b.total {
-				return 0, errRequestBufferFull
-			}
-			if b.budget.held.CompareAndSwap(cur, cur+delta) {
-				break
-			}
+		if !tryCharge(&b.budget.held, delta, b.total) {
+			return 0, errRequestBufferFull
 		}
 		b.held.Add(delta)
 	}

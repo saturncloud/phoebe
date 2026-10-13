@@ -46,9 +46,11 @@ idleTimeout: "10m"
 #   # Requests to ONE dedicated endpoint this replica holds while the endpoint
 #   # starts from zero; the next gets 503 + Retry-After.
 #   maxDedicatedColdHoldsPerEndpoint: 32
-#   # Request-body bytes held by every request in flight on this replica,
-#   # summed (bodies are buffered whole). When full, a request is refused
-#   # 503 + Retry-After. Must be at least maxRequestBodyBytes.
+#   # Request-body bytes received by every request in flight on this
+#   # replica, summed (bodies are buffered whole). When full, a request is
+#   # refused 503 + Retry-After. Must be at least maxRequestBodyBytes. This
+#   # counts bytes received, not heap: parsing and the usage rewrite hold
+#   # extra copies, so size pod memory at roughly 2-3x this value.
 #   maxRequestBufferBytesTotal: 268435456
 
 # Durable metering emit (M2). Valkey Streams hot path → local-disk WAL fallback

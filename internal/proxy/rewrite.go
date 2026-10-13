@@ -31,8 +31,7 @@ func captureRequestBody(r *http.Request, maxBodyBytes int) (body string, truncat
 	if r.Body == nil {
 		return "", false, 0, nil
 	}
-	raw, err := io.ReadAll(r.Body)
-	_ = r.Body.Close()
+	raw, err := readBody(r)
 	if err != nil {
 		return "", false, 0, err
 	}
@@ -69,8 +68,7 @@ func readAndRestoreBody(r *http.Request) ([]byte, error) {
 	if r.Body == nil {
 		return nil, nil
 	}
-	body, err := io.ReadAll(r.Body)
-	_ = r.Body.Close()
+	body, err := readBody(r)
 	if err != nil {
 		return nil, err
 	}
@@ -78,8 +76,48 @@ func readAndRestoreBody(r *http.Request) ([]byte, error) {
 	return body, nil
 }
 
+// bufferedBody is a request body phoebe has already read whole and restored.
+// It keeps the buffer so a later full read reuses it (bufferedBytes) instead
+// of copying it again: the request-buffer budget charges each received byte
+// once, so every extra copy is memory the budget does not see.
+type bufferedBody struct {
+	*bytes.Reader
+	buf []byte
+}
+
+func (*bufferedBody) Close() error { return nil }
+
+// bufferedBytes returns the buffer behind a restored, not yet read body
+// (looking through the request-buffer budget wrapper). A body something has
+// partly read is a miss, so a caller never sees bytes the reader already
+// consumed. Callers must not modify the returned slice: it is the same buffer
+// the forwarded request and GetBody read.
+func bufferedBytes(r *http.Request) ([]byte, bool) {
+	body := r.Body
+	if bb, ok := body.(*budgetedBody); ok {
+		body = bb.ReadCloser
+	}
+	buffered, ok := body.(*bufferedBody)
+	if !ok || buffered.Len() != len(buffered.buf) {
+		return nil, false
+	}
+	return buffered.buf, true
+}
+
+// readBody reads the whole request body and closes it, reusing the buffer
+// of a body phoebe already restored. Only the first read off the wire
+// allocates a copy.
+func readBody(r *http.Request) ([]byte, error) {
+	if buf, ok := bufferedBytes(r); ok {
+		return buf, nil
+	}
+	body, err := io.ReadAll(r.Body)
+	_ = r.Body.Close()
+	return body, err
+}
+
 func replaceRequestBody(r *http.Request, body []byte) {
-	r.Body = io.NopCloser(bytes.NewReader(body))
+	r.Body = &bufferedBody{Reader: bytes.NewReader(body), buf: body}
 	r.ContentLength = int64(len(body))
 	r.Header.Set("Content-Length", strconv.Itoa(len(body)))
 	r.GetBody = func() (io.ReadCloser, error) {
@@ -92,8 +130,7 @@ func forceIncludeUsage(r *http.Request) error {
 		return nil
 	}
 
-	body, err := io.ReadAll(r.Body)
-	_ = r.Body.Close()
+	body, err := readBody(r)
 	if err != nil {
 		return err
 	}

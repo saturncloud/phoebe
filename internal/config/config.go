@@ -110,11 +110,16 @@ type ProtectionSettings struct {
 	// maxColdHolds; dedicated endpoints have no admission.
 	MaxDedicatedColdHoldsPerEndpoint int64 `yaml:"maxDedicatedColdHoldsPerEndpoint"`
 	// MaxRequestBufferBytesTotal caps the request-body bytes received by
-	// every request in flight in this phoebe replica, summed. Bodies are
-	// buffered whole (gateway resolution, model binding, the usage rewrite,
-	// wake retries), so without a total, many requests near
-	// maxRequestBodyBytes would exhaust the replica's memory. The
-	// request-side twin of maxResponseBufferBytesTotal.
+	// every request in flight in this phoebe replica, summed (each byte
+	// counted once). Bodies are buffered whole (gateway resolution, model
+	// binding, the usage rewrite, wake retries), so without a total, many
+	// requests near maxRequestBodyBytes would exhaust the replica's memory.
+	// This bounds request-body bytes received in flight, not heap: parsing
+	// and the streaming usage rewrite briefly hold extra copies (up to about
+	// 3x for a streaming body), the request log may keep its own copy, and
+	// Go's garbage collector needs headroom, so size replica memory with
+	// that multiple above this value. The request-side twin of
+	// maxResponseBufferBytesTotal.
 	MaxRequestBufferBytesTotal int64 `yaml:"maxRequestBufferBytesTotal"`
 
 	// intKeyPresent records which integer keys the YAML set to a non-null
