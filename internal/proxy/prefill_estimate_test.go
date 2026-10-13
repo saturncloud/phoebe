@@ -28,6 +28,20 @@ func TestEstimatePromptTokens(t *testing.T) {
 		{"pre-tokenized batch counts exactly", `{"model":"m","prompt":[[1,2,3],[4,5]]}`, 5},
 		{"embeddings input", `{"model":"m","input":"` + long + `"}`, 100},
 		{"unexpected shapes fall back to the minimum", `{"model":"m","messages":"not-a-list"}`, 1},
+		// vLLM's simplified part format: a part with no "type" is classified
+		// by its keys, so type-less images cost the same as typed ones.
+		{"type-less image_url part is an image",
+			`{"model":"m","messages":[{"role":"user","content":[{"image_url":{"url":"data:image/png;base64,` + long + `"}}]}]}`, imagePartTokens},
+		{"type-less image_url string is an image",
+			`{"model":"m","messages":[{"role":"user","content":[{"image_url":"https://x"}]}]}`, imagePartTokens},
+		{"type-less text part counts its text",
+			`{"model":"m","messages":[{"role":"user","content":[{"text":"abcdefgh"}]}]}`, 2},
+		{"type-less many images count each",
+			`{"model":"m","messages":[{"role":"user","content":[` + strings.TrimSuffix(strings.Repeat(`{"image_url":{"url":"data:x"}},`, 200), ",") + `]}]}`, 200 * imagePartTokens},
+		{"type-less audio part is not free",
+			`{"model":"m","messages":[{"role":"user","content":[{"input_audio":{"data":"x"}}]}]}`, imagePartTokens},
+		{"a typed text part with an image_url key is text only",
+			`{"model":"m","messages":[{"role":"user","content":[{"type":"text","text":"abcdefgh","image_url":{"url":"data:x"}}]}]}`, 2},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			if got := estimatePromptTokens([]byte(tc.body)); got != tc.want {
@@ -96,5 +110,27 @@ func TestTokenArrayOfAnyNumberFormCountsEveryElement(t *testing.T) {
 				t.Fatalf("estimate=%d, want %d", got, tc.want)
 			}
 		})
+	}
+}
+
+// promptBatchCount counts the prompts of a batched completions request and
+// classifies elements exactly as promptText does.
+func TestPromptBatchCountCountsBatchedPrompts(t *testing.T) {
+	for _, tc := range []struct {
+		prompt string
+		want   int64
+	}{
+		{``, 1},
+		{`"abc"`, 1},
+		{`[]`, 1},
+		{`[1,2,3]`, 1},
+		{`["a","b","c"]`, 3},
+		{`[[1,2],[3]]`, 2},
+		{`[1,"a",2]`, 3},
+		{` [ [1] , 2 ]`, 2},
+	} {
+		if got := promptBatchCount([]byte(tc.prompt)); got != tc.want {
+			t.Errorf("promptBatchCount(%q) = %d, want %d", tc.prompt, got, tc.want)
+		}
 	}
 }

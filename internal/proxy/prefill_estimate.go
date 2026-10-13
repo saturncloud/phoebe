@@ -97,8 +97,15 @@ func jsonStringChars(raw json.RawMessage) int64 {
 
 // contentText measures a chat message's content: a plain string, or an array
 // of parts where text parts contribute their text and image parts count one
-// image each. Other part types (audio, files) contribute nothing; no shared
+// image each. Other typed parts (audio, files) contribute nothing; no shared
 // model accepts them.
+//
+// A part with no "type" is classified by its keys, as vLLM's chat frontend
+// does for its simplified part format ({"image_url": ...}, {"text": ...}): an
+// image key makes it one image, else a "text" key makes it text, else an
+// audio or video key counts it as one image so media the engine encodes
+// never estimates to zero. A typed part keeps its type's handling whatever
+// other keys it carries.
 func contentText(raw json.RawMessage) (chars, images int64) {
 	if len(raw) == 0 {
 		return 0, 0
@@ -114,6 +121,9 @@ func contentText(raw json.RawMessage) (chars, images int64) {
 	for _, rawPart := range parts {
 		p := jsonObject(rawPart)
 		typ, _ := jsonString(p["type"])
+		if typ == "" {
+			typ = untypedPartKind(p)
+		}
 		switch typ {
 		case "text", "input_text":
 			chars += jsonStringChars(p["text"])
@@ -122,6 +132,47 @@ func contentText(raw json.RawMessage) (chars, images int64) {
 		}
 	}
 	return chars, images
+}
+
+// untypedPartKind classifies a content part that carries no "type" by its
+// keys, in the order vLLM's simplified format is read: an image key first,
+// then text, then other media (counted as one image). It returns "" for a
+// part with none of them.
+func untypedPartKind(p map[string]json.RawMessage) string {
+	for _, k := range []string{"image_url", "image", "input_image", "image_pil", "image_embeds"} {
+		if _, ok := p[k]; ok {
+			return "image"
+		}
+	}
+	if _, ok := p["text"]; ok {
+		return "text"
+	}
+	for _, k := range []string{"video_url", "audio_url", "input_audio"} {
+		if _, ok := p[k]; ok {
+			return "image"
+		}
+	}
+	return ""
+}
+
+// promptBatchCount is how many prompts a completions request's prompt holds:
+// the element count of an array whose elements include a string or an array
+// (a batch of text prompts or of token-id arrays), else 1 (absent, a single
+// string, an empty array, or a flat token-id array). Elements are classified
+// exactly as promptText classifies them. The engine runs every prompt of a
+// batch as its own generation, so admission multiplies the output sequences
+// by this count.
+func promptBatchCount(raw json.RawMessage) int64 {
+	var elems []json.RawMessage
+	if len(raw) == 0 || json.Unmarshal(raw, &elems) != nil || len(elems) == 0 {
+		return 1
+	}
+	for _, e := range elems {
+		if e = bytes.TrimSpace(e); len(e) > 0 && (e[0] == '"' || e[0] == '[') {
+			return int64(len(elems))
+		}
+	}
+	return 1
 }
 
 // promptText measures a completions prompt or an embeddings input: a string,

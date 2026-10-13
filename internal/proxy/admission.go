@@ -177,7 +177,12 @@ var admissionInterpretedFields = []string{"model", "max_tokens", "max_completion
 // admissionWork returns the exact routed model and cheap token reservations.
 // The input estimate is message-text characters / 4 (estimatePromptTokens);
 // Dynamo remains authoritative and Phoebe reconciles its actual cache-aware
-// token counts after the response.
+// token counts after the response. The output sequence count is
+// max(n, best_of, 1) times the number of prompts in a batched completions
+// prompt (promptBatchCount), since the engine generates for each prompt.
+// n, best_of, max_tokens and max_completion_tokens must be JSON integers: a
+// float such as 1.0 or a numeric string is refused 400, as Dynamo's own
+// integer request types refuse them.
 func admissionWork(body []byte, defaultOutput int64) (admissionEstimate, bool) {
 	// Every field the estimate and the routed model are read from must be
 	// unambiguous: no duplicates and no case variants (see
@@ -188,11 +193,12 @@ func admissionWork(body []byte, defaultOutput int64) (admissionEstimate, bool) {
 		return admissionEstimate{}, false
 	}
 	var v struct {
-		Model               string `json:"model"`
-		MaxTokens           *int64 `json:"max_tokens"`
-		MaxCompletionTokens *int64 `json:"max_completion_tokens"`
-		N                   *int64 `json:"n"`
-		BestOf              *int64 `json:"best_of"`
+		Model               string          `json:"model"`
+		MaxTokens           *int64          `json:"max_tokens"`
+		MaxCompletionTokens *int64          `json:"max_completion_tokens"`
+		N                   *int64          `json:"n"`
+		BestOf              *int64          `json:"best_of"`
+		Prompt              json.RawMessage `json:"prompt"`
 	}
 	if err := json.Unmarshal(body, &v); err != nil || v.Model == "" {
 		return admissionEstimate{}, false
@@ -224,6 +230,17 @@ func admissionWork(body []byte, defaultOutput int64) (admissionEstimate, bool) {
 		if *c > sequences {
 			sequences = *c
 		}
+	}
+	// A batched prompt is one generation per prompt. Both factors are
+	// bounded by maxOutputSequences before multiplying, so the product
+	// cannot overflow, and the product is held to the same bound.
+	prompts := promptBatchCount(v.Prompt)
+	if prompts > maxOutputSequences {
+		return admissionEstimate{}, false
+	}
+	sequences *= prompts
+	if sequences > maxOutputSequences {
+		return admissionEstimate{}, false
 	}
 	if maximum*sequences > maxReservedOutput {
 		return admissionEstimate{}, false

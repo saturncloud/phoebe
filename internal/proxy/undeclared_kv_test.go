@@ -198,6 +198,12 @@ func TestAdmissionWorkCountsOutputSequences(t *testing.T) {
 		{`{"model":"m","n":0}`, 1, true},
 		{`{"model":"m","n":70000}`, 0, false},
 		{`{"model":"m","n":2,"N":9}`, 0, false},
+		// A batched completions prompt is one generation per prompt.
+		{`{"model":"m","prompt":["a","b","c"],"n":2}`, 6, true},
+		{`{"model":"m","prompt":[[1,2],[3]]}`, 2, true},
+		{`{"model":"m","prompt":[1,2,3]}`, 1, true},
+		{`{"model":"m","prompt":"abc","n":3}`, 3, true},
+		{`{"model":"m","prompt":["a","b"],"best_of":40000}`, 0, false}, // 80000 sequences
 	} {
 		got, ok := admissionWork([]byte(c.body), 10)
 		if ok != c.ok || (ok && got.OutputSequences != c.want) {
@@ -221,6 +227,10 @@ func TestAdmissionWorkRefusesReservedOutputBeyondExactLeasePrecision(t *testing.
 		{`{"model":"m","max_tokens":4000000000}`, true},
 		{`{"model":"m","max_tokens":1073741824,"n":65536}`, true},  // exactly 2^46
 		{`{"model":"m","max_tokens":1073741825,"n":65536}`, false}, // one sequence-width past
+		// The prompt count multiplies too: 2^30 x 2 x 32768 = 2^46 fits, one
+		// more token per sequence does not.
+		{`{"model":"m","max_tokens":1073741824,"n":2,"prompt":[` + strings.TrimSuffix(strings.Repeat(`"a",`, 32768), ",") + `]}`, true},
+		{`{"model":"m","max_tokens":1073741825,"n":2,"prompt":[` + strings.TrimSuffix(strings.Repeat(`"a",`, 32768), ",") + `]}`, false},
 	} {
 		got, ok := admissionWork([]byte(c.body), 10)
 		if ok != c.ok {
