@@ -67,6 +67,12 @@ func NewKubeClient(kubeconfig string) (kubernetes.Interface, error) {
 //	                               never defaulted.
 //	           graph_k8s_name    — the serving DGD k8s name
 //	           port              — the graph's OpenAI-compatible serve port
+//	           admission_max_active_requests,
+//	           admission_max_reserved_kv_tokens,
+//	           admission_max_prefill_tokens
+//	                             — OPTIONAL graph-level admission capacity
+//	                               (B8): non-negative integers, empty or
+//	                               absent = no limit; see GraphCapacity
 //
 // Atlas guarantees (org_id, served_model_name) uniqueness across live
 // registrations; the resolver still tolerates duplicates deterministically
@@ -117,6 +123,11 @@ type RegistryResolver struct {
 	// that moves a ConfigMap to a different (org, name) — or breaks it — also
 	// removes the old claim.
 	cmKey map[string]cacheKey
+	// byGraph holds each graph's published capacity per ConfigMap, and
+	// cmGraph which graph each ConfigMap last published for, so an update or
+	// delete withdraws exactly that entry's contribution.
+	byGraph map[string]map[string]GraphCapacity
+	cmGraph map[string]string
 }
 
 // compile-time: the registry implements the same seam the PG resolver does.
@@ -139,6 +150,8 @@ func NewRegistryResolver(client kubernetes.Interface, namespace string, log *log
 		informer: factory.Core().V1().ConfigMaps().Informer(),
 		byKey:    map[cacheKey]map[string]Resolution{},
 		cmKey:    map[string]cacheKey{},
+		byGraph:  map[string]map[string]GraphCapacity{},
+		cmGraph:  map[string]string{},
 	}
 
 	// Loud, periodic connectivity logging: client-go invokes this on every
@@ -234,6 +247,17 @@ func (r *RegistryResolver) upsert(obj any) {
 		r.log.Error.Printf("gateway: ignoring registry ConfigMap %s/%s: %v", cm.Namespace, cm.Name, err)
 		return
 	}
+	capacity, problems := parseGraphCapacity(cm.Data)
+	if len(problems) > 0 {
+		r.log.Error.Printf("gateway: registry ConfigMap %s/%s publishes malformed admission capacity %v — ignoring those limits (no limit)", cm.Namespace, cm.Name, problems)
+	}
+	if capacity.Any() {
+		if r.byGraph[res.GraphK8sName] == nil {
+			r.byGraph[res.GraphK8sName] = map[string]GraphCapacity{}
+		}
+		r.byGraph[res.GraphK8sName][cm.Name] = capacity
+		r.cmGraph[cm.Name] = res.GraphK8sName
+	}
 	if r.byKey[key] == nil {
 		r.byKey[key] = map[string]Resolution{}
 	}
@@ -264,7 +288,8 @@ func (r *RegistryResolver) remove(obj any) {
 	}
 }
 
-// dropClaimLocked removes one ConfigMap's claim. Caller holds mu.
+// dropClaimLocked removes one ConfigMap's claim and its published capacity.
+// Caller holds mu.
 func (r *RegistryResolver) dropClaimLocked(cmName string, key cacheKey) {
 	if claims := r.byKey[key]; claims != nil {
 		delete(claims, cmName)
@@ -273,6 +298,59 @@ func (r *RegistryResolver) dropClaimLocked(cmName string, key cacheKey) {
 		}
 	}
 	delete(r.cmKey, cmName)
+	if graph, had := r.cmGraph[cmName]; had {
+		if caps := r.byGraph[graph]; caps != nil {
+			delete(caps, cmName)
+			if len(caps) == 0 {
+				delete(r.byGraph, graph)
+			}
+		}
+		delete(r.cmGraph, cmName)
+	}
+}
+
+// GraphCapacity returns the admission capacity Atlas publishes for graph, the
+// tightest value per limit across the graph's registry entries that win their
+// (org, served name) key. A ConfigMap that loses a duplicate claim (see
+// resolveClaimants) does not serve traffic, so its capacity values do not
+// count either: a stale duplicate must not cap the graph for as long as it
+// lives. Before the first sync, or for a graph with nothing published, it
+// returns no limits: "no profile and no override" means no capacity limit
+// (ruling 2026-10-12). Pure memory read.
+func (r *RegistryResolver) GraphCapacity(graph string) GraphCapacity {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	caps := r.byGraph[graph]
+	winners := make(map[string]GraphCapacity, len(caps))
+	for cmName, c := range caps {
+		if r.winsClaimLocked(cmName) {
+			winners[cmName] = c
+		}
+	}
+	return tightest(winners)
+}
+
+// winsClaimLocked reports whether cmName is the claimant resolveClaimants
+// serves for its (org, served name) key: no other claimant on that key has a
+// lower resource_id. Claimants that tie on the lowest resource_id all count
+// as winners, so the answer never depends on map iteration order. Caller
+// holds mu (read or write).
+func (r *RegistryResolver) winsClaimLocked(cmName string) bool {
+	key, ok := r.cmKey[cmName]
+	if !ok {
+		return false
+	}
+	claims := r.byKey[key]
+	mine, ok := claims[cmName]
+	if !ok {
+		return false
+	}
+	for _, other := range claims {
+		if other.ResourceID < mine.ResourceID {
+			return false
+		}
+	}
+	return true
 }
 
 func (r *RegistryResolver) size() int {

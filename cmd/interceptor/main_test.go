@@ -73,7 +73,7 @@ func TestBuildAdmissionEnabledFalseDropsOperatorTiers(t *testing.T) {
 	for i := 0; i < 3; i++ {
 		_, err := admitter.Admit(context.Background(), admission.Request{
 			Graph: "graph-a", Organization: "org-a", Owner: "owner-a", Model: "m",
-			PromptBytes: 10, EstimatedInputTokens: 10, ReservedOutputTokens: 20,
+			PrefillTokens: 10, EstimatedInputTokens: 10, ReservedOutputTokens: 20,
 		})
 		if err != nil {
 			t.Fatalf("request %d: %v, want admitted (operator tiers are off under admission.enabled=false)", i+1, err)

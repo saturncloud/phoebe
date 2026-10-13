@@ -44,10 +44,10 @@ var sseDone = []byte("[DONE]")
 // racing Close(); if Close() won, onDone fired with Aborted=false and the
 // partial-bill event was lost. Reading ctx eliminates that race.)
 //
-// scan (the SSE line buffer) is only ever accessed from Read (the single
-// ReverseProxy copy goroutine) and from the non-streaming branch of finish(),
-// which by then has exclusive access (Read is done). No extra locking needed
-// for scan itself.
+// scan, head, tail and overflowed are written only from Read (the single
+// ReverseProxy copy goroutine) but read by finish(), which Close can run on
+// another goroutine while Read is still in progress (a client abort), so
+// every access to them holds mu.
 type captureReader struct {
 	src      io.ReadCloser
 	streamed bool
@@ -57,12 +57,11 @@ type captureReader struct {
 	ctx context.Context
 
 	// scan holds bytes not yet split into complete SSE lines (streaming) or
-	// the whole accumulating body (non-streaming). Only touched from Read and
-	// the non-streaming finish() path.
+	// the whole accumulating body (non-streaming). Guarded by mu.
 	scan bytes.Buffer
 
-	// mu guards result and done. All paths that read or write result or done
-	// must hold mu for the duration of the access.
+	// mu guards result, done, scan, head, tail and overflowed. All paths that
+	// read or write any of them must hold mu for the duration of the access.
 	mu     sync.Mutex
 	result capture.Result
 	onDone func(capture.Result)
@@ -84,7 +83,36 @@ type captureReader struct {
 	logBuf       *bytes.Buffer
 	logCap       int  // max bytes to retain in logBuf
 	logTruncated bool // true once we hit the cap and stopped appending
+
+	// buffers charges scan's size against the gateway protection limits on
+	// buffered response bytes (per request and per replica). nil = unbounded
+	// (unit tests that build a reader directly).
+	buffers *responseBufferAccount
+	// bufferErr is the limit error once scan outgrew its allowance; every
+	// later Read returns it.
+	bufferErr error
+
+	// A non-streamed body that outgrows its buffer allowance is never cut:
+	// the client gets every byte. Capture then keeps only the body's head
+	// (where the top-level "model" sits) and a rolling tail (where "usage"
+	// sits in OpenAI-style bodies) and parses those at finish. Guarded by mu.
+	// tail may hold up to 2*overflowKeep bytes between compactions (see
+	// keepTail); only its last overflowKeep bytes are the tail (tailView).
+	overflowed bool
+	head, tail []byte
+	// seen is how many body bytes Read has passed through. Guarded by mu.
+	seen int64
+
+	// deferBufferClose leaves closing buffers to the reader that wraps this
+	// one (the usage filter), which can still hold the stream's last line
+	// after upstream EOF. The account must stay open, and keep charging,
+	// for as long as any reader holds bytes.
+	deferBufferClose bool
 }
+
+// overflowKeep is how much of a non-streamed body's head and tail capture
+// keeps once the body outgrows its buffer allowance.
+const overflowKeep = 256 << 10
 
 func newCaptureReader(ctx context.Context, src io.ReadCloser, streamed bool, onDone func(capture.Result)) *captureReader {
 	return &captureReader{
@@ -144,6 +172,9 @@ func (c *captureReader) appendLog(p []byte) {
 }
 
 func (c *captureReader) Read(p []byte) (int, error) {
+	if c.bufferErr != nil {
+		return 0, c.bufferErr
+	}
 	n, err := c.src.Read(p)
 	if n > 0 {
 		c.firstRead.Do(func() {
@@ -153,16 +184,68 @@ func (c *captureReader) Read(p []byte) (int, error) {
 		})
 		// Inspect a COPY of exactly the bytes we forward. The bytes in p are
 		// returned to the client verbatim; we never mutate them.
+		//
+		// scan, head, tail and overflowed are read by finish(), which Close
+		// can run on another goroutine, so every change to them happens under
+		// mu. The buffer account takes its own lock; it is charged after mu
+		// is released, and finish() calling buffers.close under mu keeps the
+		// one lock order (mu, then the account's).
+		c.mu.Lock()
+		c.seen += int64(n)
+		if c.overflowed {
+			// A capture can overflow after only a few bytes, when the replica
+			// total (not its own limit) refuses the reserve. Keep filling the
+			// head up to overflowKeep so the top-level "model" is still in it
+			// (D22 keeps the first overflowKeep bytes). Head and tail may
+			// overlap; the charge stays at most 2*overflowKeep (D31).
+			if room := overflowKeep - len(c.head); room > 0 {
+				c.head = append(c.head, p[:min(n, room)]...)
+			}
+			c.keepTail(p[:n])
+			held := c.overflowHeld()
+			c.mu.Unlock()
+			c.appendLog(p[:n])
+			// D22 keeps the head and tail whatever the limits say, so they are
+			// charged even past them to keep the replica total honest.
+			c.buffers.force(bufferSlotCapture, held)
+			if err == io.EOF {
+				c.finish()
+			}
+			return n, err
+		}
 		c.scan.Write(p[:n])
 		if c.streamed {
-			c.mu.Lock()
 			c.scanSSELines()
-			c.mu.Unlock()
 		}
+		scanLen := int64(c.scan.Len())
+		// scan now holds the unparsed tail of a stream (normally under one
+		// line) or the whole non-streamed body so far. A non-streamed body
+		// past its allowance switches to keeping only its head and tail.
+		forceHeld := int64(-1)
+		if !c.streamed && c.buffers.reserve(bufferSlotCapture, scanLen) != nil {
+			forceHeld = c.overflow()
+		}
+		c.mu.Unlock()
 		// M5: when body logging is enabled for this request, retain a bounded
 		// COPY of the forwarded bytes. No-op (nil logBuf) when logging is off,
 		// so the common path is unchanged.
 		c.appendLog(p[:n])
+		if forceHeld >= 0 {
+			// D22 keeps the head and tail whatever the limits say, so they are
+			// charged even past them to keep the replica total honest.
+			c.buffers.force(bufferSlotCapture, forceHeld)
+		} else if c.streamed {
+			// Past the protection limit a stream is cut: these bytes still
+			// reach the client, the error ends the copy, and the account has
+			// cancelled the request so capture records it as aborted.
+			if berr := c.buffers.set(bufferSlotCapture, scanLen); berr != nil {
+				c.bufferErr = berr
+				c.mu.Lock()
+				c.scan.Reset()
+				c.mu.Unlock()
+				return n, berr
+			}
+		}
 	}
 	if err == io.EOF {
 		c.finish()
@@ -291,6 +374,8 @@ func (c *captureReader) finish() {
 		if c.scan.Len() > 0 {
 			c.inspectSSELine(bytes.TrimRight(c.scan.Bytes(), "\r"))
 		}
+	} else if c.overflowed {
+		c.inspectHeadAndTail()
 	} else {
 		// Single JSON body: parse the whole thing once.
 		c.inspectChunk(bytes.TrimSpace(c.scan.Bytes()))
@@ -306,7 +391,131 @@ func (c *captureReader) finish() {
 		c.result.Aborted = true
 	}
 
+	if !c.deferBufferClose {
+		c.buffers.close()
+	}
+
 	if c.onDone != nil {
 		c.onDone(c.result)
+	}
+}
+
+// overflow switches a non-streamed capture from holding the whole body to
+// holding its head and tail, and returns the bytes to charge for them (the
+// caller charges them with buffers.force after releasing mu).
+//
+// Must be called with mu held.
+func (c *captureReader) overflow() int64 {
+	body := c.scan.Bytes()
+	c.head = append([]byte(nil), body[:min(len(body), overflowKeep)]...)
+	// Copy only the last overflowKeep bytes into a fresh array sized for
+	// keepTail's compaction, so the large scan array is not kept alive.
+	c.tail = append(make([]byte, 0, 2*overflowKeep), body[max(0, len(body)-overflowKeep):]...)
+	c.scan = bytes.Buffer{} // release the large backing array
+	c.overflowed = true
+	return c.overflowHeld()
+}
+
+// droppedBytes reports that an overflowed capture's retained head and tail
+// do not cover the whole body: some bytes between them were never kept, so a
+// usage object there could not be seen. A capture that overflowed early only
+// because the replica total refused its reserve, on a body small enough for
+// head and tail to cover it, has dropped nothing.
+//
+// Must be called with mu held.
+func (c *captureReader) droppedBytes() bool {
+	return c.overflowed && c.seen > int64(len(c.head))+int64(len(c.tailView()))
+}
+
+// overflowHeld is what an overflowed capture is charged: the head plus the
+// tail view, at most 2*overflowKeep (D31) whatever spare bytes tail holds
+// between compactions.
+//
+// Must be called with mu held.
+func (c *captureReader) overflowHeld() int64 {
+	return int64(len(c.head) + len(c.tailView()))
+}
+
+// keepTail appends p to the rolling tail. To avoid reallocating and copying
+// the tail on every read, it compacts only once tail reaches 2*overflowKeep,
+// moving the last overflowKeep bytes to the front of the same array.
+//
+// Must be called with mu held.
+func (c *captureReader) keepTail(p []byte) {
+	c.tail = append(c.tail, p...)
+	if len(c.tail) > 2*overflowKeep {
+		n := copy(c.tail, c.tail[len(c.tail)-overflowKeep:])
+		c.tail = c.tail[:n]
+	}
+}
+
+// tailView is the rolling tail: the last overflowKeep bytes seen.
+//
+// Must be called with mu held.
+func (c *captureReader) tailView() []byte {
+	t := c.tail
+	if len(t) > overflowKeep {
+		t = t[len(t)-overflowKeep:]
+	}
+	return t
+}
+
+// inspectHeadAndTail recovers model and usage from an overflowed body. When
+// the head is not full, nothing was dropped and the head is the whole body, so
+// it is parsed like any non-streamed body. Otherwise the top-level "model" is
+// read by walking the head's keys in order, and "usage" from the last "usage"
+// in the tail that is followed by ':' and an object which decodes. Walking
+// back past earlier matches skips a string VALUE "usage" (for example a
+// logprob token after the usage block). A body laid out otherwise yields no
+// usage, recorded as an unmetered attempt.
+//
+// Must be called with mu held.
+func (c *captureReader) inspectHeadAndTail() {
+	if len(c.head) < overflowKeep {
+		var whole chunk
+		if json.Unmarshal(bytes.TrimSpace(c.head), &whole) == nil {
+			c.inspectChunk(bytes.TrimSpace(c.head))
+			return
+		}
+	}
+	dec := json.NewDecoder(bytes.NewReader(c.head))
+	if tok, err := dec.Token(); err == nil && tok == json.Delim('{') {
+		for dec.More() {
+			key, err := dec.Token()
+			if err != nil {
+				break
+			}
+			if key == "model" {
+				var model string
+				if dec.Decode(&model) == nil && model != "" {
+					c.result.Model = model
+				}
+				break
+			}
+			if skipValue(dec) != nil {
+				break
+			}
+		}
+	}
+	tail := c.tailView()
+	for end := len(tail); end > 0; {
+		idx := bytes.LastIndex(tail[:end], []byte(`"usage"`))
+		if idx < 0 {
+			return
+		}
+		end = idx
+		rest := bytes.TrimLeft(tail[idx+len(`"usage"`):], " \t\r\n")
+		if len(rest) == 0 || rest[0] != ':' {
+			continue
+		}
+		if rest = bytes.TrimLeft(rest[1:], " \t\r\n"); len(rest) == 0 || rest[0] != '{' {
+			continue
+		}
+		var usage metering.Usage
+		if json.NewDecoder(bytes.NewReader(rest)).Decode(&usage) == nil {
+			c.result.Usage = usage
+			c.result.UsageFound = true
+			return
+		}
 	}
 }

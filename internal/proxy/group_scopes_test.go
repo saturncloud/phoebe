@@ -18,6 +18,7 @@ import (
 	"github.com/saturncloud/phoebe/internal/config"
 	"github.com/saturncloud/phoebe/internal/identity"
 	"github.com/saturncloud/phoebe/internal/logging"
+	"github.com/saturncloud/phoebe/internal/testutil"
 )
 
 // These tests cover the membership-aware group quota envelope
@@ -72,8 +73,8 @@ func TestParseTrustedGroupScopes(t *testing.T) {
 			[]admission.GroupScope{{
 				GroupID: testGroupA,
 				Limits: admission.RateLimits{
-					Requests: ptr64(30), TotalPromptTokens: ptr64(1000),
-					UncachedPromptTokens: ptr64(500), GeneratedTokens: ptr64(2000),
+					Requests: testutil.Ptr[int64](30), TotalPromptTokens: testutil.Ptr[int64](1000),
+					UncachedPromptTokens: testutil.Ptr[int64](500), GeneratedTokens: testutil.Ptr[int64](2000),
 				},
 			}},
 		},
@@ -82,15 +83,15 @@ func TestParseTrustedGroupScopes(t *testing.T) {
 			groupScopesValue(testGroupA, "0,,,", ""),
 			[]admission.GroupScope{{
 				GroupID: testGroupA,
-				Limits:  admission.RateLimits{Requests: ptr64(0)},
+				Limits:  admission.RateLimits{Requests: testutil.Ptr[int64](0)},
 			}},
 		},
 		{
 			"multi group in envelope order",
 			"v1;" + testGroupA + ":1,,,," + ";" + testGroupB + ":,2,,,",
 			[]admission.GroupScope{
-				{GroupID: testGroupA, Limits: admission.RateLimits{Requests: ptr64(1)}},
-				{GroupID: testGroupB, Limits: admission.RateLimits{TotalPromptTokens: ptr64(2)}},
+				{GroupID: testGroupA, Limits: admission.RateLimits{Requests: testutil.Ptr[int64](1)}},
+				{GroupID: testGroupB, Limits: admission.RateLimits{TotalPromptTokens: testutil.Ptr[int64](2)}},
 			},
 		},
 	}
