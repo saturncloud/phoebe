@@ -1211,6 +1211,18 @@ func (s *Server) errorHandler(upstream string, id identity.Identity, requestID, 
 			http.Error(w, "upstream did not respond in time", http.StatusGatewayTimeout)
 			return
 		}
+		if tooLarge := (*http.MaxBytesError)(nil); errors.As(err, &tooLarge) {
+			// The gateway-wide body ceiling (boundRequestBody) tripped while
+			// the body was being forwarded rather than read by phoebe (a
+			// chunked body on a route phoebe does not buffer). The fault is
+			// the client's, not the upstream's: answer 413 like every other
+			// oversize body, and record the attempt without UpstreamFault.
+			w.Header().Set("X-Request-Id", requestID)
+			s.emit(context.WithoutCancel(r.Context()), id, requestID, clientRequestID,
+				http.StatusRequestEntityTooLarge, capture.Result{UsageFound: false})
+			writeRequestBodyError(w, err)
+			return
+		}
 		if isClientAbort(err) {
 			s.log.Debug.Printf("client disconnected for %s", upstream)
 			// Pre-header abort: ModifyResponse never ran, so onDone will not emit.

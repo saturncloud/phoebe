@@ -50,6 +50,10 @@ func TestClassifyRoundTripSettlement(t *testing.T) {
 		// process, wrapped or bare.
 		{"dial failure", dialFailure, settlementZeroPreWriteDial},
 		{"wrapped dial failure", &url.Error{Op: "Post", URL: "http://up", Err: dialFailure}, settlementZeroPreWriteDial},
+		// The gateway body ceiling cut the forwarded body short: the upstream
+		// saw only an incomplete request, so nothing was served.
+		{"body over the gateway limit", &http.MaxBytesError{Limit: 10}, settlementZeroNeverServed},
+		{"wrapped body over the gateway limit", &url.Error{Op: "Post", URL: "http://up", Err: &http.MaxBytesError{Limit: 10}}, settlementZeroNeverServed},
 		{"nil", nil, settlementUnknown},
 	}
 	for _, tc := range tests {

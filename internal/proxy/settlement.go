@@ -2,7 +2,9 @@ package proxy
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"net/http"
 
 	"github.com/saturncloud/phoebe/internal/admission"
 	"github.com/saturncloud/phoebe/internal/capture"
@@ -38,7 +40,8 @@ const (
 	settlementZeroPreWriteDial
 	// settlementZeroNeverServed: determinate never-served — the engine
 	// provably did no work for this request (the cold-hold capacity rejection,
-	// or the cold response served final after the wake gave up). Settles zero.
+	// the cold response served final after the wake gave up, or a forwarded
+	// body the gateway body ceiling cut short). Settles zero.
 	// The requests-window +1 charged at Admit time is KEPT: that window
 	// measures demand, not work.
 	settlementZeroNeverServed
@@ -72,6 +75,11 @@ func classifyRoundTripSettlement(err error) settlementKind {
 	if isPreWriteDialFailure(err) {
 		// The request never left the process.
 		return settlementZeroPreWriteDial
+	}
+	if tooLarge := (*http.MaxBytesError)(nil); errors.As(err, &tooLarge) {
+		// The body ceiling cut the forwarded body short, so the upstream only
+		// ever saw an incomplete request it cannot have run.
+		return settlementZeroNeverServed
 	}
 	// Any other transport fault is indeterminate: the upstream may have read
 	// the request and consumed engine work before failing.
