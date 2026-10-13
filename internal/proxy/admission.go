@@ -1,6 +1,7 @@
 package proxy
 
 import (
+	"context"
 	"crypto/sha256"
 	"encoding/json"
 	"errors"
@@ -165,7 +166,17 @@ func boundRequestBody(w, rawW http.ResponseWriter, r *http.Request, limit int64)
 	return true
 }
 
-func writeRequestBodyError(w http.ResponseWriter, err error) {
+// writeRequestBodyError answers a failed request-body read. A read cut off
+// because protection.maxStreamDuration expired (the handler sets the
+// connection read deadline when it fires, so a trickled body cannot hold the
+// handler past the bound) answers 504, the same status as any other
+// pre-header max-duration expiry (D3). Nothing was forwarded, so no metering
+// row is recorded, as for every other pre-forward refusal.
+func writeRequestBodyError(w http.ResponseWriter, r *http.Request, err error) {
+	if errors.Is(context.Cause(r.Context()), errMaxStreamDuration) {
+		http.Error(w, "request body not received in time", http.StatusGatewayTimeout)
+		return
+	}
 	var tooLarge *http.MaxBytesError
 	if errors.As(err, &tooLarge) {
 		http.Error(w, "request body too large", http.StatusRequestEntityTooLarge)

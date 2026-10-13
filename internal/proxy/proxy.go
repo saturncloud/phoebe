@@ -31,6 +31,7 @@ import (
 	"net/url"
 	"strconv"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -312,13 +313,38 @@ func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request) {
 	prot := s.protection()
 	ctx, cancel := context.WithCancelCause(r.Context())
 	defer cancel(nil)
-	maxDuration := time.AfterFunc(prot.MaxStreamDuration, func() { cancel(errMaxStreamDuration) })
-	defer maxDuration.Stop()
-	r = r.WithContext(ctx)
 	// rawW is the connection's own ResponseWriter. http.MaxBytesReader needs
 	// it (not the guard) to reach net/http's unexported requestTooLarge hook,
 	// which marks the connection to close after an oversize body's 413.
 	rawW := w
+	// When maxStreamDuration fires, cancelling the context is not enough on
+	// its own: a request-body read (io.ReadAll of a trickled body) blocks in a
+	// connection read that never observes the context. Setting the
+	// connection's read deadline to now fails that read, so the handler
+	// returns within the bound. The cause is set first, so the failed read is
+	// answered as a max-duration expiry (writeRequestBodyError). The deadline
+	// is set only while this handler runs (handlerDone), so it can never reach
+	// the next request on a keep-alive connection; net/http also resets the
+	// read deadline before reading each request. A writer that cannot set
+	// deadlines (http.ErrNotSupported, e.g. a test recorder) is ignored.
+	var maxDurationMu sync.Mutex
+	handlerDone := false
+	maxDuration := time.AfterFunc(prot.MaxStreamDuration, func() {
+		maxDurationMu.Lock()
+		defer maxDurationMu.Unlock()
+		if handlerDone {
+			return
+		}
+		cancel(errMaxStreamDuration)
+		_ = http.NewResponseController(rawW).SetReadDeadline(time.Now())
+	})
+	defer func() {
+		maxDuration.Stop()
+		maxDurationMu.Lock()
+		handlerDone = true
+		maxDurationMu.Unlock()
+	}()
+	r = r.WithContext(ctx)
 	stallGuard := newStallGuardWriter(w, prot.StreamStallTimeout, cancel)
 	w = stallGuard
 	// Re-arm once more when the handler returns (deferred, so it also runs on
@@ -488,7 +514,7 @@ func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request) {
 		reqBody, reqTruncated, reqOrigLen, err = captureRequestBody(r, s.ioMaxBodyLen)
 		if err != nil {
 			s.log.Error.Printf("capture request body: %v", err)
-			writeRequestBodyError(w, err)
+			writeRequestBodyError(w, r, err)
 			return
 		}
 		// Hard truncation is intentional (an uncapped body fails the to_tsvector
@@ -596,7 +622,7 @@ func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request) {
 		body, rerr := readAndRestoreBody(r)
 		if rerr != nil {
 			s.log.Error.Printf("model-binding: read request body: %v", rerr)
-			writeRequestBodyError(w, rerr)
+			writeRequestBodyError(w, r, rerr)
 			return
 		}
 		switch checkModelBinding(body, id.ServedModel) {
@@ -622,7 +648,7 @@ func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request) {
 		clientUsage, err = clientRequestedStreamUsage(r)
 		if err != nil {
 			s.log.Error.Printf("read streaming usage preference: %v", err)
-			writeRequestBodyError(w, err)
+			writeRequestBodyError(w, r, err)
 			return
 		}
 	}
@@ -738,7 +764,7 @@ func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request) {
 		}
 		body, rerr := readAndRestoreBody(r)
 		if rerr != nil {
-			writeRequestBodyError(w, rerr)
+			writeRequestBodyError(w, r, rerr)
 			return
 		}
 		// The prompt-token estimate is taken from the client's original body
@@ -879,7 +905,7 @@ func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request) {
 	// Force streaming usage so we never under-bill a streamed response.
 	if err := forceIncludeUsage(r); err != nil {
 		s.log.Error.Printf("rewrite request body: %v", err)
-		writeRequestBodyError(w, err)
+		writeRequestBodyError(w, r, err)
 		return
 	}
 	if clientUsage.stream {
@@ -1220,7 +1246,7 @@ func (s *Server) errorHandler(upstream string, id identity.Identity, requestID, 
 			w.Header().Set("X-Request-Id", requestID)
 			s.emit(context.WithoutCancel(r.Context()), id, requestID, clientRequestID,
 				http.StatusRequestEntityTooLarge, capture.Result{UsageFound: false})
-			writeRequestBodyError(w, err)
+			writeRequestBodyError(w, r, err)
 			return
 		}
 		if isClientAbort(err) {

@@ -170,3 +170,107 @@ func TestStallGuardKeepsResponseControllerFlushAndDeadlineControl(t *testing.T) 
 		t.Fatal("Unwrap must return the wrapped ResponseWriter")
 	}
 }
+
+// maxStreamDuration bounds the request-body read too: a client that sends its
+// headers and a large Content-Length, then trickles nothing, is answered 504
+// and the handler returns within the bound, instead of holding the handler
+// goroutine and the partial body until the client disconnects (the context
+// alone cannot unblock a pending connection read). The upstream never sees it.
+func TestMaxStreamDurationBoundsAStalledRequestBodyRead(t *testing.T) {
+	const bound = 200 * time.Millisecond
+	backend := httptest.NewServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {
+		t.Error("a request whose body never arrived reached the upstream")
+	}))
+	defer backend.Close()
+	up, _ := url.Parse(backend.URL)
+	s := New(&config.Settings{Protection: config.ProtectionSettings{MaxStreamDuration: bound}},
+		logging.New(logging.ERROR), &recordingEmitter{})
+	handlerReturned := make(chan time.Time, 1)
+	proxySrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		s.Handler().ServeHTTP(w, r)
+		handlerReturned <- time.Now()
+	}))
+	defer proxySrv.Close()
+
+	conn, err := net.Dial("tcp", proxySrv.Listener.Addr().String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+	raw := "POST /v1/chat/completions HTTP/1.1\r\nHost: phoebe\r\n" +
+		identity.HeaderUpstream + ": " + up.Host + "\r\n" +
+		identity.HeaderServingMode + ": dedicated\r\n" +
+		identity.HeaderAuthID + ": auth-1\r\n" +
+		identity.HeaderResourceID + ": dedicated-1\r\n" +
+		identity.HeaderServedModel + ": m\r\n" +
+		"Content-Type: application/json\r\nContent-Length: 1048576\r\n\r\n" + `{"model":"m",`
+	start := time.Now()
+	if _, err := io.WriteString(conn, raw); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case at := <-handlerReturned:
+		if took := at.Sub(start); took > time.Second {
+			t.Fatalf("handler returned after %v, want within about %v", took, bound)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("handler still blocked reading the request body long past protection.maxStreamDuration")
+	}
+	_ = conn.SetReadDeadline(time.Now().Add(3 * time.Second))
+	resp, err := http.ReadResponse(bufio.NewReader(conn), nil)
+	if err != nil {
+		t.Fatalf("no response after the body read was cut off: %v", err)
+	}
+	_, _ = io.ReadAll(resp.Body)
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusGatewayTimeout {
+		t.Fatalf("status=%d, want 504 for a body not received within maxStreamDuration", resp.StatusCode)
+	}
+}
+
+// The max-duration read deadline never leaks to the next request on a
+// keep-alive connection: a request that finishes well inside the bound is
+// followed, after the bound has passed, by a second request on the same
+// connection that is served normally.
+func TestMaxStreamDurationReadDeadlineDoesNotReachTheNextKeepAliveRequest(t *testing.T) {
+	const bound = 200 * time.Millisecond
+	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = io.Copy(io.Discard, r.Body)
+		_, _ = io.WriteString(w, `{"model":"m","usage":{"prompt_tokens":1,"completion_tokens":1}}`)
+	}))
+	defer backend.Close()
+	up, _ := url.Parse(backend.URL)
+	proxySrv := liveProxy(t, New(&config.Settings{Protection: config.ProtectionSettings{MaxStreamDuration: bound}},
+		logging.New(logging.ERROR), &recordingEmitter{}))
+
+	conn, err := net.Dial("tcp", proxySrv.Listener.Addr().String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+	br := bufio.NewReader(conn)
+	body := `{"model":"m","messages":[]}`
+	raw := "POST /v1/chat/completions HTTP/1.1\r\nHost: phoebe\r\n" +
+		identity.HeaderUpstream + ": " + up.Host + "\r\n" +
+		identity.HeaderServingMode + ": dedicated\r\n" +
+		identity.HeaderAuthID + ": auth-1\r\n" +
+		identity.HeaderResourceID + ": dedicated-1\r\n" +
+		identity.HeaderServedModel + ": m\r\n" +
+		fmt.Sprintf("Content-Type: application/json\r\nContent-Length: %d\r\n\r\n", len(body)) + body
+	for i := 0; i < 2; i++ {
+		if _, err := io.WriteString(conn, raw); err != nil {
+			t.Fatal(err)
+		}
+		_ = conn.SetReadDeadline(time.Now().Add(3 * time.Second))
+		resp, err := http.ReadResponse(br, nil)
+		if err != nil {
+			t.Fatalf("request %d on the keep-alive connection: %v", i+1, err)
+		}
+		_, _ = io.ReadAll(resp.Body)
+		resp.Body.Close()
+		if resp.StatusCode != http.StatusOK || resp.Close {
+			t.Fatalf("request %d: status=%d close=%v, want 200 on a reusable connection", i+1, resp.StatusCode, resp.Close)
+		}
+		time.Sleep(2 * bound)
+	}
+}

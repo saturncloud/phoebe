@@ -117,7 +117,7 @@ func (s *Server) resolveGateway(w http.ResponseWriter, r *http.Request, id *iden
 	body, err := readAndRestoreBody(r)
 	if err != nil {
 		s.log.Error.Printf("gateway: read request body: %v (request_id=%q)", err, requestID)
-		writeRequestBodyError(w, err)
+		writeRequestBodyError(w, r, err)
 		return false
 	}
 	model, ok := extractRequestModel(body)
