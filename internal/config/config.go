@@ -681,8 +681,10 @@ type LimitField struct {
 
 // LimitFields is the one canonical list of AdmissionLimits limit fields, in a
 // fixed order, each with its YAML key. Every caller that walks the limit
-// fields (parse's negative check, lane-share validation, Any) goes through it
-// or through LimitValues, so a new limit field is added here once.
+// fields (parse's negative check, lane-share validation) goes through it or
+// through LimitValues, so a new limit field is added here once. Any is the one
+// exception: it lists the fields inline because it runs per request, and its
+// test catches a field added here but not there.
 func LimitFields(l AdmissionLimits) []LimitField {
 	return []LimitField{
 		{"maxActiveRequests", l.MaxActiveRequests},
@@ -712,14 +714,24 @@ func LimitValues(l AdmissionLimits) []*int64 {
 }
 
 // Any reports whether at least one limit field is set (nil means unlimited;
-// an explicit zero cap counts as set).
+// an explicit zero cap counts as set). It runs on every proxied request, so it
+// checks the fields directly instead of building the LimitFields slice. The
+// fields are listed in LimitFields order; TestAdmissionLimitsAnyReportsEachField
+// sets every *int64 limit field in turn, so a field missing here fails it.
 func (l AdmissionLimits) Any() bool {
-	for _, v := range LimitValues(l) {
-		if v != nil {
-			return true
-		}
-	}
-	return false
+	return l.MaxActiveRequests != nil ||
+		l.MaxConcurrentPrefills != nil ||
+		l.MaxReservedDecodeSlots != nil ||
+		l.MaxPrefillTokens != nil ||
+		l.MaxReservedOutputTokens != nil ||
+		l.MaxReservedKVTokens != nil ||
+		l.MaxActiveAdapters != nil ||
+		l.RequestsPerWindow != nil ||
+		l.TotalPromptTokensPerWindow != nil ||
+		l.UncachedPromptTokensPerWindow != nil ||
+		l.GeneratedTokensPerWindow != nil ||
+		l.MaxColdHolds != nil ||
+		l.WakesPerWindow != nil
 }
 
 func (a *AdmissionSettings) validateLaneShares() error {

@@ -804,6 +804,20 @@ func TestAdmissionLimitsAnyReportsEachField(t *testing.T) {
 	}
 }
 
+// TestAdmissionLimitsAnyDoesNotAllocate guards that Any stays cheap on the
+// proxy hot path, where it runs for every request on several limit sets.
+func TestAdmissionLimitsAnyDoesNotAllocate(t *testing.T) {
+	set := AdmissionLimits{WakesPerWindow: new(int64)}
+	empty := AdmissionLimits{}
+	allocs := testing.AllocsPerRun(100, func() {
+		_ = set.Any()
+		_ = empty.Any()
+	})
+	if allocs != 0 {
+		t.Errorf("Any() allocated %.0f times per call pair, want 0", allocs)
+	}
+}
+
 // protection.maxStreamDuration bounds the wake hold too, so with wake enabled
 // it must be longer than the effective wake.timeout (default 300s).
 func TestLoadMaxStreamDurationMustExceedWakeTimeout(t *testing.T) {
