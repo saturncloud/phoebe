@@ -198,41 +198,51 @@ func admissionWork(body []byte, defaultOutput int64, routePath string) (admissio
 	}
 	var v struct {
 		Model               string          `json:"model"`
-		MaxTokens           *int64          `json:"max_tokens"`
-		MaxCompletionTokens *int64          `json:"max_completion_tokens"`
-		N                   *int64          `json:"n"`
-		BestOf              *int64          `json:"best_of"`
+		MaxTokens           json.RawMessage `json:"max_tokens"`
+		MaxCompletionTokens json.RawMessage `json:"max_completion_tokens"`
+		N                   json.RawMessage `json:"n"`
+		BestOf              json.RawMessage `json:"best_of"`
 		Prompt              json.RawMessage `json:"prompt"`
 	}
 	if err := json.Unmarshal(body, &v); err != nil || v.Model == "" {
 		return admissionEstimate{}, false
 	}
-	maximum := defaultOutput
-	if v.MaxTokens != nil {
-		maximum = *v.MaxTokens
+	maxTokens, hasMaxTokens, ok1 := laxInt(v.MaxTokens)
+	maxCompletion, hasMaxCompletion, ok2 := laxInt(v.MaxCompletionTokens)
+	n, hasN, ok3 := laxInt(v.N)
+	bestOf, hasBestOf, ok4 := laxInt(v.BestOf)
+	if !ok1 || !ok2 || !ok3 || !ok4 {
+		return admissionEstimate{}, false
 	}
-	if v.MaxCompletionTokens != nil {
-		if v.MaxTokens != nil && *v.MaxTokens != *v.MaxCompletionTokens {
+	maximum := defaultOutput
+	if hasMaxTokens {
+		maximum = maxTokens
+	}
+	if hasMaxCompletion {
+		if hasMaxTokens && maxTokens != maxCompletion {
 			return admissionEstimate{}, false
 		}
-		maximum = *v.MaxCompletionTokens
+		maximum = maxCompletion
 	}
 	if maximum <= 0 || maximum > math.MaxUint32 {
 		return admissionEstimate{}, false
 	}
 	sequences := int64(1)
-	for _, c := range []*int64{v.N, v.BestOf} {
-		if c == nil {
+	for _, c := range []struct {
+		value int64
+		set   bool
+	}{{n, hasN}, {bestOf, hasBestOf}} {
+		if !c.set {
 			continue
 		}
 		// A count the engine would refuse (< 1) is not ours to judge; one
 		// past maxOutputSequences cannot be a real request and would
 		// overflow the KV charge, so it is refused like a broken body.
-		if *c > maxOutputSequences {
+		if c.value > maxOutputSequences {
 			return admissionEstimate{}, false
 		}
-		if *c > sequences {
-			sequences = *c
+		if c.value > sequences {
+			sequences = c.value
 		}
 	}
 	// A batched completions prompt is one generation per prompt. Only the
@@ -254,7 +264,35 @@ func admissionWork(body []byte, defaultOutput int64, routePath string) (admissio
 		return admissionEstimate{}, false
 	}
 	return admissionEstimate{Model: v.Model, InputTokens: estimatePromptTokens(body), OutputTokens: maximum,
-		OutputDeclared: v.MaxTokens != nil || v.MaxCompletionTokens != nil, OutputSequences: sequences}, true
+		OutputDeclared: hasMaxTokens || hasMaxCompletion, OutputSequences: sequences}, true
+}
+
+// laxInt reads a count field the way the engine's request validation does
+// (pydantic's lax integer mode): a JSON integer, a number with no fractional
+// part (2.0, 1e0) or a string holding an integer ("4") is that integer. Absent
+// or null reports set=false. Anything else (a fraction, a non-numeric string,
+// a bool) reports ok=false: the engine would refuse it too, and phoebe must
+// never charge one value while the engine runs another.
+func laxInt(raw json.RawMessage) (value int64, set, ok bool) {
+	if len(raw) == 0 || string(raw) == "null" {
+		return 0, false, true
+	}
+	var number json.Number
+	if json.Unmarshal(raw, &number) != nil {
+		var text string
+		if json.Unmarshal(raw, &text) != nil {
+			return 0, true, false
+		}
+		number = json.Number(strings.TrimSpace(text))
+	}
+	if i, err := number.Int64(); err == nil {
+		return i, true, true
+	}
+	f, err := number.Float64()
+	if err != nil || f != math.Trunc(f) || math.Abs(f) > 1<<53 {
+		return 0, true, false
+	}
+	return int64(f), true, true
 }
 
 // prepareSharedDynamoRequest replaces every client-controlled scheduling and

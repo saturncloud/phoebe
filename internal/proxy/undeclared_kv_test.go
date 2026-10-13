@@ -249,49 +249,71 @@ func TestAdmissionWorkBatchMultiplierIsCompletionsOnly(t *testing.T) {
 	}
 }
 
-// D28: n, best_of, max_tokens and max_completion_tokens must be JSON
-// integers. A float (even an integral one such as 1.0 or 1e0) or a numeric
-// string is refused, so the engine can never run a different value than the
-// one admission charged.
-func TestAdmissionWorkRequiresJSONIntegers(t *testing.T) {
-	for _, body := range []string{
-		`{"model":"m","n":1.0}`,
-		`{"model":"m","n":"4"}`,
-		`{"model":"m","n":1e0}`,
-		`{"model":"m","best_of":2.0}`,
-		`{"model":"m","best_of":"2"}`,
-		`{"model":"m","max_tokens":16.0}`,
-		`{"model":"m","max_tokens":"16"}`,
-		`{"model":"m","max_completion_tokens":16.0}`,
-		`{"model":"m","max_completion_tokens":"16"}`,
+// D28 (revised, D32): n, best_of, max_tokens and max_completion_tokens are
+// read the way the engine's validation reads them (pydantic lax integers): a
+// JSON integer, an integral float (2.0, 1e0) or an integer string ("4") counts
+// at its value, so admission charges what the engine runs and no request the
+// engine accepts gets a new phoebe 400. A fraction or a non-numeric value,
+// which the engine would refuse too, is refused.
+func TestAdmissionWorkReadsCountsLikeTheEngine(t *testing.T) {
+	for _, c := range []struct {
+		body      string
+		sequences int64
+		output    int64
+		ok        bool
+	}{
+		{`{"model":"m","n":4}`, 4, 10, true},
+		{`{"model":"m","n":4.0}`, 4, 10, true},
+		{`{"model":"m","n":"4"}`, 4, 10, true},
+		{`{"model":"m","n":1e0}`, 1, 10, true},
+		{`{"model":"m","best_of":"2"}`, 2, 10, true},
+		{`{"model":"m","max_tokens":16.0}`, 1, 16, true},
+		{`{"model":"m","max_tokens":"16"}`, 1, 16, true},
+		{`{"model":"m","max_completion_tokens":"16"}`, 1, 16, true},
+		{`{"model":"m","n":null}`, 1, 10, true},
+		{`{"model":"m","n":1.5}`, 0, 0, false},
+		{`{"model":"m","n":"four"}`, 0, 0, false},
+		{`{"model":"m","n":true}`, 0, 0, false},
+		{`{"model":"m","max_tokens":16.5}`, 0, 0, false},
+		{`{"model":"m","max_tokens":"16","max_completion_tokens":16}`, 1, 16, true},
+		{`{"model":"m","max_tokens":"16","max_completion_tokens":17}`, 0, 0, false},
 	} {
-		if _, ok := admissionWork([]byte(body), 10, "/v1/chat/completions"); ok {
-			t.Errorf("admissionWork(%s) accepted a non-integer count, want refused", body)
+		got, ok := admissionWork([]byte(c.body), 10, "/v1/chat/completions")
+		if ok != c.ok || (ok && (got.OutputSequences != c.sequences || got.OutputTokens != c.output)) {
+			t.Errorf("admissionWork(%s) = (seq %d, out %d, %v), want (seq %d, out %d, %v)",
+				c.body, got.OutputSequences, got.OutputTokens, ok, c.sequences, c.output, c.ok)
 		}
-	}
-	if _, ok := admissionWork([]byte(`{"model":"m","n":1,"max_tokens":16}`), 10, "/v1/chat/completions"); !ok {
-		t.Error("admissionWork with plain integer n and max_tokens refused, want accepted")
 	}
 }
 
-// D28 end to end: a shared request whose n, best_of, max_tokens or
-// max_completion_tokens is not a JSON integer gets 400, creates no admission
-// state and never reaches the engine; a plain integer is served.
-func TestSharedRequestRejectsNonIntegerSequenceAndTokenFields(t *testing.T) {
+// End to end: a count the engine would accept is served and charged at its
+// value; a fractional one gets 400, creates no admission state and never
+// reaches the engine.
+func TestSharedRequestReadsCountsLikeTheEngine(t *testing.T) {
 	for _, field := range []string{"n", "best_of", "max_tokens", "max_completion_tokens"} {
-		for _, value := range []string{`1.0`, `"4"`, `1.5`} {
-			t.Run(field+"="+value, func(t *testing.T) {
+		for _, c := range []struct {
+			value string
+			ok    bool
+		}{{`2.0`, true}, {`"2"`, true}, {`1.5`, false}} {
+			t.Run(field+"="+c.value, func(t *testing.T) {
 				be := &oslRecordingBackend{}
 				srv := httptest.NewServer(be)
 				defer srv.Close()
 				up, _ := url.Parse(srv.URL)
 				s, mr := kvTestServerWithStore(t, kvTestConfig())
-				body := []byte(`{"model":"model-a","` + field + `":` + value + `,"messages":[{"role":"user","content":"hi"}]}`)
+				body := []byte(`{"model":"model-a","` + field + `":` + c.value + `,"messages":[{"role":"user","content":"hi"}]}`)
 				rr := serveChat(s, up, body)
+				hits, _ := be.snapshot()
+				if c.ok {
+					if rr.Code != http.StatusOK || hits != 1 {
+						t.Fatalf("status=%d hits=%d, want 200 served", rr.Code, hits)
+					}
+					return
+				}
 				if rr.Code != http.StatusBadRequest || !strings.Contains(rr.Body.String(), "invalid shared inference request") {
 					t.Fatalf("status=%d body=%q, want the 400 invalid shared inference request", rr.Code, rr.Body.String())
 				}
-				if hits, _ := be.snapshot(); hits != 0 {
+				if hits != 0 {
 					t.Fatalf("upstream hits=%d, a refused request must not reach the engine", hits)
 				}
 				if keys := mr.Keys(); len(keys) != 0 {
@@ -300,21 +322,6 @@ func TestSharedRequestRejectsNonIntegerSequenceAndTokenFields(t *testing.T) {
 			})
 		}
 	}
-	t.Run("plain integer 4 is served", func(t *testing.T) {
-		be := &oslRecordingBackend{}
-		srv := httptest.NewServer(be)
-		defer srv.Close()
-		up, _ := url.Parse(srv.URL)
-		s, _ := kvTestServerWithStore(t, kvTestConfig())
-		body := []byte(`{"model":"model-a","n":4,"best_of":4,"max_tokens":4,"max_completion_tokens":4,"messages":[{"role":"user","content":"hi"}]}`)
-		rr := serveChat(s, up, body)
-		if rr.Code != http.StatusOK {
-			t.Fatalf("status=%d body=%q, want 200", rr.Code, rr.Body.String())
-		}
-		if hits, _ := be.snapshot(); hits != 1 {
-			t.Fatalf("upstream hits=%d, want 1", hits)
-		}
-	})
 }
 
 // TestAdmissionWorkRefusesReservedOutputBeyondExactLeasePrecision: output x
