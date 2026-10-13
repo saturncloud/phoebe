@@ -7,7 +7,6 @@ import (
 	"math"
 	"strings"
 	"time"
-	"unicode/utf8"
 
 	// pgx stdlib driver registers itself as "pgx" with database/sql. We use the
 	// standard library sql package (not the native pgx pool) so the store is a
@@ -289,13 +288,13 @@ func nullRevision(v int) any {
 // nullRegion returns a driver NULL for a region that billing_event.region
 // cannot store: "", one containing a NUL byte (PostgreSQL text rejects it),
 // invalid UTF-8, or longer than metering.MaxRegionChars (billing_event.region
-// is VARCHAR(64); the gateway and recovery.go's validate enforce the same
-// limit). It mirrors nullRevision as the drain-side
+// is VARCHAR(64)); the test is metering.StorableRegion, shared with the
+// gateway and recovery. It mirrors nullRevision as the drain-side
 // backstop: a bad region would fail the multi-row insert and drop the whole
 // batch, losing billable usage for unrelated requests. Region is evidence, so
 // NULL ("not captured") is the safe value.
 func nullRegion(s string) any {
-	if s == "" || strings.ContainsRune(s, 0) || !utf8.ValidString(s) || utf8.RuneCountInString(s) > metering.MaxRegionChars {
+	if s == "" || !metering.StorableRegion(s) {
 		return nil
 	}
 	return s

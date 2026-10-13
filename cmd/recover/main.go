@@ -16,6 +16,7 @@ import (
 
 	"github.com/redis/go-redis/v9"
 
+	"github.com/saturncloud/phoebe/internal/metering"
 	"github.com/saturncloud/phoebe/internal/recovery"
 )
 
@@ -56,6 +57,11 @@ func run(parent context.Context, args []string, stdout, stderr io.Writer) error 
 	}
 	fmt.Fprintf(stdout, "validated records=%d unique=%d duplicates=%d event_set_sha256=%s\n",
 		evidence.Records, len(evidence.Events), evidence.Duplicates, digest)
+	if evidence.RegionsDropped > 0 {
+		fmt.Fprintf(stderr, "warning: %d record(s) had a region that is not valid UTF-8, contains a NUL byte, or is longer than %d characters; "+
+			"the region was cleared and the event and its topology revision were kept\n",
+			evidence.RegionsDropped, metering.MaxRegionChars)
+	}
 	if !*apply {
 		fmt.Fprintf(stdout, "dry-run only; replay with -apply -expected-count %d -expected-digest %s after reviewing this result\n",
 			len(evidence.Events), digest)

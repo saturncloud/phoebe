@@ -2,6 +2,7 @@ package metering
 
 import (
 	"encoding/json"
+	"strings"
 	"testing"
 )
 
@@ -122,5 +123,28 @@ func TestUnmarshalEvent_OldGPUTypeKeyIsIgnored(t *testing.T) {
 	}
 	if ev.RequestID != "r" || ev.TopologyRevision != 0 || ev.Region != "" || ev.RequestStartedUnixMs != 0 {
 		t.Fatalf("decoded %+v", ev)
+	}
+}
+
+// TestStorableRegionMatchesBillingEventColumn pins the one region test that the
+// gateway, the drainer and recovery share: billing_event.region is
+// VARCHAR(64), counted in characters, and PostgreSQL text cannot hold NUL.
+func TestStorableRegionMatchesBillingEventColumn(t *testing.T) {
+	cases := []struct {
+		name   string
+		region string
+		want   bool
+	}{
+		{"empty", "", true},
+		{"exactly max ASCII characters", strings.Repeat("a", MaxRegionChars), true},
+		{"exactly max multibyte characters", strings.Repeat("é", MaxRegionChars), true},
+		{"one over max", strings.Repeat("a", MaxRegionChars+1), false},
+		{"NUL byte", "eu\x00", false},
+		{"invalid UTF-8", "eu-\xff", false},
+	}
+	for _, tc := range cases {
+		if got := StorableRegion(tc.region); got != tc.want {
+			t.Errorf("%s: StorableRegion = %v, want %v", tc.name, got, tc.want)
+		}
 	}
 }

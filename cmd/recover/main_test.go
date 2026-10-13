@@ -47,6 +47,31 @@ func TestRunDryRunAndApplyGuard(t *testing.T) {
 	}
 }
 
+// TestDryRunWarnsWhenRegionsAreDropped pins that the operator is told when
+// recovery cleared an unstorable region, and that the dry-run still validates
+// the event (the stdout summary line keeps its format).
+func TestDryRunWarnsWhenRegionsAreDropped(t *testing.T) {
+	ev := metering.Event{
+		RequestID: "phoebe-recovery-region", ServingMode: "dedicated", TimestampUnixMs: 1,
+		TopologyRevision: 2, Region: strings.Repeat("a", metering.MaxRegionChars+1),
+	}
+	data, _ := json.Marshal(ev)
+	path := filepath.Join(t.TempDir(), "evidence.jsonl")
+	if err := os.WriteFile(path, data, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	var stdout, stderr bytes.Buffer
+	if err := run(context.Background(), []string{"-input", path}, &stdout, &stderr); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(stdout.String(), "unique=1") {
+		t.Fatalf("unexpected dry-run output: %s", stdout.String())
+	}
+	if !strings.Contains(stderr.String(), "warning: 1 record(s) had a region") {
+		t.Fatalf("missing region warning on stderr: %q", stderr.String())
+	}
+}
+
 // TestApplyRequiresDigestBindingCompleteEventSet pins the recovery apply
 // contract: -apply is bound to the COMPLETE reviewed event set, not merely its
 // cardinality or its request-id set. Without this, an operator can review

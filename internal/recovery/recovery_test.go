@@ -280,6 +280,75 @@ func TestLoadRejectsTopologyRevisionsOutsideDatabaseRange(t *testing.T) {
 	}
 }
 
+// TestLoadDropsUnstorableRegionAndKeepsEventAndRevision pins that recovery
+// treats region the way the gateway and the drainer do: region is evidence, so
+// a region billing_event.region cannot store is cleared and counted, and the
+// event and its topology revision are still replayed. Refusing the event would
+// block replay of billable usage over a field that never affects money.
+func TestLoadDropsUnstorableRegionAndKeepsEventAndRevision(t *testing.T) {
+	cases := []struct {
+		name        string
+		region      string
+		wantRegion  string
+		wantDropped int
+	}{
+		{"empty kept", "", "", 0},
+		{"exactly max ASCII characters kept", strings.Repeat("a", metering.MaxRegionChars), strings.Repeat("a", metering.MaxRegionChars), 0},
+		{"exactly max multibyte characters kept", strings.Repeat("é", metering.MaxRegionChars), strings.Repeat("é", metering.MaxRegionChars), 0},
+		{"one over max dropped", strings.Repeat("a", metering.MaxRegionChars+1), "", 1},
+		{"NUL byte dropped", "eu-north1\x00", "", 1},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			ev := testEvent("req-region")
+			ev.TopologyRevision = 7
+			ev.Region = tc.region
+			data, err := json.Marshal(ev)
+			if err != nil {
+				t.Fatal(err)
+			}
+			path := filepath.Join(t.TempDir(), "evidence.jsonl")
+			if err := os.WriteFile(path, data, 0o600); err != nil {
+				t.Fatal(err)
+			}
+			evidence, err := Load(path)
+			if err != nil {
+				t.Fatalf("region %q must not refuse the event: %v", tc.region, err)
+			}
+			if len(evidence.Events) != 1 {
+				t.Fatalf("events = %+v, want one event", evidence.Events)
+			}
+			got := evidence.Events[0]
+			if got.Region != tc.wantRegion || got.TopologyRevision != 7 || got.RequestID != "req-region" {
+				t.Fatalf("event = %+v, want region %q with revision 7 kept", got, tc.wantRegion)
+			}
+			if evidence.RegionsDropped != tc.wantDropped {
+				t.Fatalf("RegionsDropped = %d, want %d", evidence.RegionsDropped, tc.wantDropped)
+			}
+		})
+	}
+}
+
+// TestValidateAndDedupeDropsInvalidUTF8Region covers the invalid-UTF-8 case,
+// which cannot reach validateAndDedupe through JSON decoding (encoding/json
+// replaces invalid bytes with U+FFFD) but is still guarded: the region is
+// cleared and counted, and the event and its revision are kept.
+func TestValidateAndDedupeDropsInvalidUTF8Region(t *testing.T) {
+	ev := testEvent("req-utf8")
+	ev.TopologyRevision = 3
+	ev.Region = "eu-\xff"
+	evidence, err := validateAndDedupe([]metering.Event{ev})
+	if err != nil {
+		t.Fatalf("invalid UTF-8 region must not refuse the event: %v", err)
+	}
+	if len(evidence.Events) != 1 || evidence.Events[0].Region != "" || evidence.Events[0].TopologyRevision != 3 {
+		t.Fatalf("events = %+v, want one event with no region and revision 3", evidence.Events)
+	}
+	if evidence.RegionsDropped != 1 {
+		t.Fatalf("RegionsDropped = %d, want 1", evidence.RegionsDropped)
+	}
+}
+
 // TestDigestBindsCompleteEventSet proves the digest is a function of the whole
 // event content, not merely the request-id set, and is order-independent.
 func TestDigestBindsCompleteEventSet(t *testing.T) {

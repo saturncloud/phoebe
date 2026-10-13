@@ -37,9 +37,7 @@ import (
 	"fmt"
 	"math"
 	"strconv"
-	"strings"
 	"sync"
-	"unicode/utf8"
 
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -209,7 +207,7 @@ func parseTopologyConfigMap(cm *corev1.ConfigMap) (graph string, topo Topology, 
 	region := d["region"]
 	// NUL is rejected because PostgreSQL text cannot store it: the drainer's
 	// insert would fail and drop the batch.
-	if !utf8.ValidString(region) || strings.ContainsRune(region, 0) || utf8.RuneCountInString(region) > metering.MaxRegionChars {
+	if !metering.StorableRegion(region) {
 		region = ""
 		regionDropped = true
 	}
