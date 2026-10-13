@@ -103,25 +103,28 @@ local q=cjson.decode(ARGV[1]); q.now=current_time_ms(); reap(q.now); q.kv=q.esti
 -- request id must recover the existing lease rather than reserve every
 -- dimension a second time.
 if redis.call('HEXISTS',KEYS[2],q.id) == 1 then return {1} end
+-- Pass 1: a request whose OWN estimate is larger than a scope's whole
+-- positive limit can never be admitted there, however long it waits. Check
+-- every scope for that before any counter, so the answer (the proxy's 413 for
+-- a capacity scope, 400 for a contract scope, never a Retry-After) does not
+-- depend on whether an earlier scope happens to be full at this moment. An
+-- explicit zero cap (-1) is excluded; it keeps its retryable answer. Scope
+-- order still decides which limit is reported when several are exceeded.
 for _,s in ipairs(q.scopes) do
   local contract=s.contractual and 1 or 0
-  -- A request whose OWN estimate is larger than a positive physical cap can
-  -- never be admitted at that scope, however long it waits: answer it as
-  -- unsatisfiable (the proxy's 413) instead of a 503 that repeats forever.
-  -- An explicit zero cap (-1) keeps its retryable answer.
   if s.prefill_tokens > 0 and q.prefill_tokens > s.prefill_tokens then return {0,s.name,'prefill_tokens_exceeds_limit',contract} end
   if s.kv > 0 and q.kv > s.kv then return {0,s.name,'kv_exceeds_limit',contract} end
-  local checks={{'active',s.active,1},{'prefills',s.prefills,1},{'reserved_decode_slots',s.reserved_decode_slots,1},{'prefill_tokens',s.prefill_tokens,q.prefill_tokens},{'output',s.output,q.output},{'kv',s.kv,q.kv},{'adapters',s.adapters,q.adapter}}
-  for _,c in ipairs(checks) do if c[2] ~= 0 and get(field(s,c[1])) + c[3] > c[2] then return {0,s.name,c[1],contract} end end
-  -- A contract request that alone reserves more than the scope's whole
-  -- positive per-window limit can never be admitted, however long it waits:
-  -- answer that without a retry hint instead of a 429 that repeats forever.
-  -- An explicit zero cap (-1) is excluded; it keeps its retryable answer.
   if s.contractual then
     if s.total_prompt > 0 and q.estimated_input > s.total_prompt then return {0,s.name,'total_prompt_tokens_exceeds_limit',contract} end
     if s.uncached_prompt > 0 and q.estimated_input > s.uncached_prompt then return {0,s.name,'uncached_prompt_tokens_exceeds_limit',contract} end
     if s.generated > 0 and q.output > s.generated then return {0,s.name,'generated_tokens_exceeds_limit',contract} end
   end
+end
+-- Pass 2: the counter and window checks.
+for _,s in ipairs(q.scopes) do
+  local contract=s.contractual and 1 or 0
+  local checks={{'active',s.active,1},{'prefills',s.prefills,1},{'reserved_decode_slots',s.reserved_decode_slots,1},{'prefill_tokens',s.prefill_tokens,q.prefill_tokens},{'output',s.output,q.output},{'kv',s.kv,q.kv},{'adapters',s.adapters,q.adapter}}
+  for _,c in ipairs(checks) do if c[2] ~= 0 and get(field(s,c[1])) + c[3] > c[2] then return {0,s.name,c[1],contract} end end
   if s.requests ~= 0 and window_get(s,'requests',q.now)+1 > s.requests then return {0,s.name,'requests',contract,window_retry_ms(s,q.now)} end
   if s.total_prompt ~= 0 and window_get(s,'total_prompt',q.now)+get(field(s,'total_prompt_reserved'))+q.estimated_input > s.total_prompt then return {0,s.name,'total_prompt_tokens',contract,window_retry_ms(s,q.now)} end
   if s.uncached_prompt ~= 0 and window_get(s,'uncached_prompt',q.now)+get(field(s,'uncached_prompt_reserved'))+q.estimated_input > s.uncached_prompt then return {0,s.name,'uncached_prompt_tokens',contract,window_retry_ms(s,q.now)} end

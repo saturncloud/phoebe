@@ -3059,3 +3059,35 @@ func TestOversizeMessageBlamesModelOnlyForGraphCapacity(t *testing.T) {
 		}
 	}
 }
+
+// A request larger than the published graph capacity gets the final 413 with
+// no Retry-After even while the platform scope is momentarily full, so the
+// client does not retry a request that can never be admitted.
+func TestOversizeRequestIs413WithoutRetryAfterWhenEarlierScopeFull(t *testing.T) {
+	ctx := context.Background()
+	mr := miniredis.RunT(t)
+	client := redis.NewClient(&redis.Options{Addr: mr.Addr()})
+	t.Cleanup(func() { _ = client.Close() })
+	cfg := config.AdmissionSettings{Enabled: true, KeyPrefix: "proxy-oversize", LeaseTTL: time.Minute,
+		Platform: config.AdmissionLimits{MaxActiveRequests: ptr64(1)}}
+	a := admission.New(client, cfg)
+	holder, err := a.Admit(ctx, admission.Request{Graph: "g", Organization: "o", Owner: "u", Model: "m",
+		PrefillTokens: 1, EstimatedInputTokens: 1, ReservedOutputTokens: 1})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = holder.Complete(ctx, 0) }()
+	_, err = a.Admit(ctx, admission.Request{Graph: "g", Organization: "o", Owner: "u", Model: "m",
+		PrefillTokens: 100, EstimatedInputTokens: 100, ReservedOutputTokens: 1,
+		GraphCapacity: config.AdmissionLimits{MaxPrefillTokens: ptr64(64)}})
+	var rejected *admission.Rejected
+	if !errors.As(err, &rejected) || rejected.Scope != "graph_capacity" || rejected.Dimension != "prefill_tokens_exceeds_limit" {
+		t.Fatalf("err=%v, want prefill_tokens_exceeds_limit at graph_capacity", err)
+	}
+	s := New(&config.Settings{Admission: cfg}, logging.New(logging.ERROR), &recordingEmitter{}).WithAdmitter(a)
+	rr := httptest.NewRecorder()
+	s.writeAdmissionError(rr, "req-1", err)
+	if rr.Code != http.StatusRequestEntityTooLarge || rr.Header().Get("Retry-After") != "" {
+		t.Fatalf("status=%d retry-after=%q, want 413 without Retry-After", rr.Code, rr.Header().Get("Retry-After"))
+	}
+}

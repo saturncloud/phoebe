@@ -203,3 +203,55 @@ func TestTightestReservedKVCapReadsAdmitScopes(t *testing.T) {
 		t.Fatalf("cap=%d, an explicit zero cap must be ignored", got)
 	}
 }
+
+// A request alone larger than some scope's whole limit is unsatisfiable even
+// while an earlier scope is momentarily full: every scope's oversize check
+// runs before any counter check, so the client gets the final answer (413 for
+// a capacity scope, 400 for a contract scope, never a Retry-After) instead of
+// a retryable rejection it would repeat until a quiet moment.
+func TestOversizeRequestIsUnsatisfiableEvenWhenEarlierScopeFull(t *testing.T) {
+	ctx := context.Background()
+	for _, tc := range []struct {
+		name        string
+		cfg         config.AdmissionSettings
+		shape       func(*Request)
+		scope       string
+		dimension   string
+		contractual bool
+	}{
+		{"published graph capacity prefill", config.AdmissionSettings{},
+			func(r *Request) { r.GraphCapacity = config.AdmissionLimits{MaxPrefillTokens: ptr64(9)} },
+			"graph_capacity", "prefill_tokens_exceeds_limit", false},
+		{"published graph capacity kv", config.AdmissionSettings{},
+			func(r *Request) { r.GraphCapacity = config.AdmissionLimits{MaxReservedKVTokens: ptr64(29)} },
+			"graph_capacity", "kv_exceeds_limit", false},
+		{"organization prefill", config.AdmissionSettings{Organization: config.AdmissionLimits{MaxPrefillTokens: ptr64(9)}},
+			func(*Request) {}, "organization", "prefill_tokens_exceeds_limit", false},
+		{"contract generated tokens", config.AdmissionSettings{},
+			func(r *Request) { r.OwnerLimits = RateLimits{GeneratedTokens: ptr64(19)} },
+			"contract_owner", "generated_tokens_exceeds_limit", true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg := tc.cfg
+			cfg.Platform = config.AdmissionLimits{MaxActiveRequests: ptr64(1)}
+			a, _ := testAdmitter(t, cfg)
+			// Fill the platform's only active slot with a request small
+			// enough to pass every cap under test.
+			small := request("a", "m")
+			small.PrefillTokens, small.EstimatedInputTokens, small.ReservedOutputTokens = 1, 1, 1
+			holder, err := a.Admit(ctx, small)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer func() { _ = holder.Complete(ctx, 0) }()
+			req := request("a", "m") // 10 input + 20 output = 30 KV
+			tc.shape(&req)
+			_, err = a.Admit(ctx, req)
+			var rejected *Rejected
+			if !errors.As(err, &rejected) || rejected.Scope != tc.scope || rejected.Dimension != tc.dimension ||
+				!rejected.Unsatisfiable || rejected.Contractual != tc.contractual || rejected.RetryAfter != 0 {
+				t.Fatalf("err=%+v, want unsatisfiable %s at %s with no retry hint, not the full platform scope", rejected, tc.dimension, tc.scope)
+			}
+		})
+	}
+}
