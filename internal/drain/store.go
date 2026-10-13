@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"fmt"
+	"math"
 	"strings"
 	"time"
 
@@ -100,16 +101,22 @@ var upsertColumns = []string{
 	"cached_tokens",
 	"completion_tokens",
 	"finish_reason",
-	"gpu_type",
 	"aborted",
 	"usage_found",
 	"status_code",
 	"streamed",
 	"graph_k8s_name",
+	"topology_revision",
+	"region",
+	"request_started_at",
+	"serving_duration_ms",
 	"event_ts",
 }
 
-const colsPerRow = 23 // len(upsertColumns); created_at is DB-defaulted.
+// colsPerRow is len(upsertColumns); created_at is DB-defaulted. gpu_type is
+// no longer written (migration 0008): nothing ever filled it, and the
+// topology revision replaces it.
+const colsPerRow = 26
 
 // Upsert writes a batch of events in a single transaction with a multi-row
 // INSERT ... ON CONFLICT (request_id) DO NOTHING.
@@ -178,6 +185,10 @@ func eventArgs(e metering.Event) []any {
 	if e.TimestampUnixMs > 0 {
 		eventTS = time.UnixMilli(e.TimestampUnixMs).UTC()
 	}
+	var requestStartedAt any
+	if e.RequestStartedUnixMs > 0 {
+		requestStartedAt = time.UnixMilli(e.RequestStartedUnixMs).UTC()
+	}
 	return []any{
 		e.RequestID,
 		nullStr(e.ClientRequestID),
@@ -217,18 +228,24 @@ func eventArgs(e metering.Event) []any {
 		e.CachedTokens,
 		e.CompletionTokens,
 		nullStr(e.FinishReason),
-		nullStr(e.GPUType),
 		e.Aborted,
 		e.UsageFound,
 		nullInt(e.StatusCode),
 		e.Streamed,
-		// GraphK8sName is the serving graph (the cost centre) — evidence only, never
-		// part of the billing grain. nullStr so an unresolvable graph stores NULL
-		// rather than '': the rater's MAX(graph_k8s_name) ignores NULLs (so a rollup
-		// whose events partly predate graph propagation still resolves to the one
-		// known graph), whereas a stored '' would read as a DISTINCT second graph and
-		// falsely trip the ambiguous-graph count.
+		// GraphK8sName is the serving graph (the cost centre). nullStr so an
+		// unresolvable graph stores NULL ("not captured") in the evidence ledger;
+		// the rater maps NULL to the '' grain sentinel (migration 0009).
 		nullStr(e.GraphK8sName),
+		// Topology, region and serving time: evidence for margin analysis,
+		// NULL when unknown (no topology entry for the graph, or an event
+		// written before these fields existed). A region the column cannot
+		// store is bound as NULL ("not captured") and never fails the insert.
+		nullRevision(e.TopologyRevision),
+		nullRegion(e.Region),
+		requestStartedAt,
+		// A negative duration is impossible evidence (clock skew or a producer
+		// bug), so it is stored as NULL ("not captured") like a missing start.
+		nullInt64(e.ServingDurationMs, e.RequestStartedUnixMs > 0 && e.ServingDurationMs >= 0),
 		eventTS,
 	}
 }
@@ -252,6 +269,42 @@ func nullStr(s string) any {
 // out-of-range value before it can reach this bind.
 func nullInt(v int) any {
 	if v == 0 {
+		return nil
+	}
+	return v
+}
+
+// nullRevision is nullInt for topology_revision, which is a Postgres INTEGER:
+// a value outside 1..MaxInt32 is stored as NULL ("not captured") so that
+// out-of-range evidence can never fail the insert and drop billable usage as
+// poison. The gateway already rejects such entries; this is the backstop.
+func nullRevision(v int) any {
+	if v < 1 || v > math.MaxInt32 {
+		return nil
+	}
+	return v
+}
+
+// nullRegion returns a driver NULL for a region that billing_event.region
+// cannot store: "", one containing a NUL byte (PostgreSQL text rejects it),
+// invalid UTF-8, or longer than metering.MaxRegionChars (billing_event.region
+// is VARCHAR(64)); the test is metering.StorableRegion, shared with the
+// gateway and recovery. It mirrors nullRevision as the drain-side
+// backstop: a bad region would fail the multi-row insert and drop the whole
+// batch, losing billable usage for unrelated requests. Region is evidence, so
+// NULL ("not captured") is the safe value.
+func nullRegion(s string) any {
+	if s == "" || !metering.StorableRegion(s) {
+		return nil
+	}
+	return s
+}
+
+// nullInt64 returns v when known is true and a driver NULL otherwise. Used
+// where 0 is a valid measured value (a sub-millisecond duration), so the
+// zero check of nullInt would lose it.
+func nullInt64(v int64, known bool) any {
+	if !known {
 		return nil
 	}
 	return v

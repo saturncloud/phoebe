@@ -23,6 +23,7 @@ func quietLog() *logging.Logger { return logging.New(logging.ERROR) }
 var snapshotCols = []string{
 	"id", "resource_id", "org_id", "model_id",
 	"serving_mode", "owner_type", "owner_id", "graph_k8s_name",
+	"topology_revision", "region", "event_count",
 	"cost", "applied_prompt_rate", "applied_cached_rate", "applied_completion_rate",
 	"prompt_tokens", "cached_tokens", "completion_tokens", "billable_prompt_tokens",
 }
@@ -60,7 +61,7 @@ func TestBuildSnapshot_CarriesOrgAndShape(t *testing.T) {
 	p, mock := newMockPusher(t)
 	rows := sqlmock.NewRows(snapshotCols).AddRow(
 		"rated-id-1", "res-deploy-1", "org-acme", "meta-llama/Llama-3.1-8B-Instruct",
-		"shared", "user", "usr-17", "dyn-graph-llama31-8b",
+		"shared", "user", "usr-17", "dyn-graph-llama31-8b", 7, "eu-north1", int64(42),
 		"0.001234500", "0.000000150", "0.000000075", "0.000000600",
 		int64(8000), int64(2000), int64(500), int64(6000),
 	)
@@ -86,6 +87,10 @@ func TestBuildSnapshot_CarriesOrgAndShape(t *testing.T) {
 	if r.OrgID != "org-acme" || r.RatedUsageID != "rated-id-1" || r.Rev != 0 {
 		t.Fatalf("rollup identity wrong: %+v", r)
 	}
+	// Grain (0009) and the request count ride the wire.
+	if r.GraphK8sName != "dyn-graph-llama31-8b" || r.TopologyRevision != 7 || r.Region != "eu-north1" || r.RequestCount != 42 {
+		t.Fatalf("graph/revision/region/request_count wrong: %+v", r)
+	}
 	// Money MUST be the exact strings from the DB (C8) — never reparsed through a float.
 	if r.Cost != "0.001234500" || r.AppliedPromptRate != "0.000000150" ||
 		r.AppliedCachedRate != "0.000000075" || r.AppliedCompletionRate != "0.000000600" {
@@ -103,10 +108,10 @@ func TestBuildSnapshot_UnattributableOmitted(t *testing.T) {
 	p, mock := newMockPusher(t)
 	rows := sqlmock.NewRows(snapshotCols).
 		AddRow("rated-ok", "res-1", "org-acme", "m",
-			"dedicated", "user", "usr-1", "dyn-graph-1",
+			"dedicated", "user", "usr-1", "dyn-graph-1", 1, "eu-north1", int64(1),
 									"0.001", "0.1", "0.05", "0.6", int64(1), int64(0), int64(1), int64(1)).
 		AddRow("rated-orphan", "res-vanished", nil, "m", // NULL org_id
-			"dedicated", "", "", nil,
+			"dedicated", "", "", "", 0, nil, int64(1),
 			"0.002", "0.1", "0.05", "0.6", int64(1), int64(0), int64(1), int64(1))
 	mock.ExpectQuery(`FROM rated_usage ru`).
 		WithArgs(win).WillReturnRows(rows)
@@ -132,7 +137,7 @@ func TestBuildSnapshot_EmptyStringOrgIsOmitted(t *testing.T) {
 	p, mock := newMockPusher(t)
 	rows := sqlmock.NewRows(snapshotCols).
 		AddRow("rated-blank", "res-1", "", "m", // non-NULL EMPTY-STRING org_id
-			"dedicated", "group", "grp-9", nil,
+			"dedicated", "group", "grp-9", "", 0, nil, int64(1),
 			"0.001", "0.1", "0.05", "0.6", int64(1), int64(0), int64(1), int64(1))
 	mock.ExpectQuery(`FROM rated_usage ru`).WithArgs(win).WillReturnRows(rows)
 
@@ -245,8 +250,8 @@ func TestPushWindows_WithholdsWindowWithUnattributable(t *testing.T) {
 	p.managerURL = srv.URL
 	p.token = "t"
 	rows := sqlmock.NewRows(snapshotCols).
-		AddRow("ok", "res-1", "org-acme", "m", "shared", "user", "usr-1", "dyn-graph-1", "0.001", "0.1", "0.05", "0.6", int64(1), int64(0), int64(1), int64(1)).
-		AddRow("orphan", "res-x", nil, "m", "dedicated", "", "", nil, "0.002", "0.1", "0.05", "0.6", int64(1), int64(0), int64(1), int64(1))
+		AddRow("ok", "res-1", "org-acme", "m", "shared", "user", "usr-1", "dyn-graph-1", 1, "eu-north1", int64(1), "0.001", "0.1", "0.05", "0.6", int64(1), int64(0), int64(1), int64(1)).
+		AddRow("orphan", "res-x", nil, "m", "dedicated", "", "", "", 0, nil, int64(1), "0.002", "0.1", "0.05", "0.6", int64(1), int64(0), int64(1), int64(1))
 	expectLiveness(mock, true)
 	mock.ExpectQuery(`FROM rated_usage ru`).WithArgs(win).WillReturnRows(rows)
 
@@ -283,10 +288,10 @@ func TestPushWindows_WithheldWindowDoesNotBlockCleanWindow(t *testing.T) {
 	expectLiveness(mock, true)
 	mock.ExpectQuery(`FROM rated_usage ru`).WithArgs(win).WillReturnRows(
 		sqlmock.NewRows(snapshotCols).
-			AddRow("orphan", "res-x", nil, "m", "dedicated", "", "", nil, "0.002", "0.1", "0.05", "0.6", int64(1), int64(0), int64(1), int64(1)))
+			AddRow("orphan", "res-x", nil, "m", "dedicated", "", "", "", 0, nil, int64(1), "0.002", "0.1", "0.05", "0.6", int64(1), int64(0), int64(1), int64(1)))
 	mock.ExpectQuery(`FROM rated_usage ru`).WithArgs(win2).WillReturnRows(
 		sqlmock.NewRows(snapshotCols).
-			AddRow("ok", "res-1", "org-acme", "m", "shared", "user", "usr-1", "dyn-graph-1", "0.001", "0.1", "0.05", "0.6", int64(1), int64(0), int64(1), int64(1)))
+			AddRow("ok", "res-1", "org-acme", "m", "shared", "user", "usr-1", "dyn-graph-1", 1, "eu-north1", int64(1), "0.001", "0.1", "0.05", "0.6", int64(1), int64(0), int64(1), int64(1)))
 
 	code := p.pushWindows(context.Background(), []time.Time{win, win2})
 	if code != exitUnattrib {
@@ -316,7 +321,7 @@ func TestPushWindows_FatalOnPostError(t *testing.T) {
 	expectLiveness(mock, true)
 	mock.ExpectQuery(`FROM rated_usage ru`).WithArgs(win).
 		WillReturnRows(sqlmock.NewRows(snapshotCols).
-			AddRow("ok", "res-1", "org-acme", "m", "shared", "user", "usr-1", "dyn-graph-1", "0.001", "0.1", "0.05", "0.6", int64(1), int64(0), int64(1), int64(1)))
+			AddRow("ok", "res-1", "org-acme", "m", "shared", "user", "usr-1", "dyn-graph-1", 1, "eu-north1", int64(1), "0.001", "0.1", "0.05", "0.6", int64(1), int64(0), int64(1), int64(1)))
 
 	code := p.pushWindows(context.Background(), []time.Time{win})
 	if code != exitFatal {
@@ -366,10 +371,10 @@ func TestPushWindows_FatalDominatesWithheld(t *testing.T) {
 	// win: orphan -> withheld (no POST). win2: clean -> POST fails (fatal).
 	mock.ExpectQuery(`FROM rated_usage ru`).WithArgs(win).WillReturnRows(
 		sqlmock.NewRows(snapshotCols).
-			AddRow("orphan", "res-x", nil, "m", "dedicated", "", "", nil, "0.002", "0.1", "0.05", "0.6", int64(1), int64(0), int64(1), int64(1)))
+			AddRow("orphan", "res-x", nil, "m", "dedicated", "", "", "", 0, nil, int64(1), "0.002", "0.1", "0.05", "0.6", int64(1), int64(0), int64(1), int64(1)))
 	mock.ExpectQuery(`FROM rated_usage ru`).WithArgs(win2).WillReturnRows(
 		sqlmock.NewRows(snapshotCols).
-			AddRow("ok", "res-1", "org-acme", "m", "shared", "user", "usr-1", "dyn-graph-1", "0.001", "0.1", "0.05", "0.6", int64(1), int64(0), int64(1), int64(1)))
+			AddRow("ok", "res-1", "org-acme", "m", "shared", "user", "usr-1", "dyn-graph-1", 1, "eu-north1", int64(1), "0.001", "0.1", "0.05", "0.6", int64(1), int64(0), int64(1), int64(1)))
 
 	code := p.pushWindows(context.Background(), []time.Time{win, win2})
 	if code != exitFatal {
@@ -393,5 +398,25 @@ func TestPostSnapshot_TrimsTrailingSlash(t *testing.T) {
 	}
 	if gotPath != tokenUsagePath {
 		t.Fatalf("path = %q, want %q (trailing slash not trimmed → double-slash)", gotPath, tokenUsagePath)
+	}
+}
+
+// TestRollupWire_UnknownGraphRevisionRegionAreSentAsKeys: since 0009 the graph and
+// revision are grain, and the manager requires every key (its schema has no
+// optional-and-defaulted fields), so the unknown values ” / 0 / ” are sent, not
+// omitted.
+func TestRollupWire_UnknownGraphRevisionRegionAreSentAsKeys(t *testing.T) {
+	b, err := json.Marshal(rollup{RatedUsageID: "x", ServingMode: "shared"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var m map[string]any
+	if err := json.Unmarshal(b, &m); err != nil {
+		t.Fatal(err)
+	}
+	for _, k := range []string{"graph_k8s_name", "topology_revision", "region", "request_count"} {
+		if _, ok := m[k]; !ok {
+			t.Errorf("wire rollup omits %q: %s", k, b)
+		}
 	}
 }

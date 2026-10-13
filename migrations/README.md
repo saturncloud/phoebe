@@ -50,6 +50,8 @@ golang-migrate up/down pairs, applied in version order:
 | 0005 | `0005_invoice_grade_attempts.{up,down}.sql` | trusted/client request identity, attempt outcome and usage evidence, invalid-usage reconciliation, and the hourly reconciliation view at the rated natural key (exposing missing/conflicting org evidence) |
 | 0006 | `0006_rollup_grain.{up,down}.sql` | widens the `rated_usage` grain with `serving_mode`, the owner pair and `graph_k8s_name` evidence |
 | 0007 | `0007_serving_mode_explicit.{up,down}.sql` | `rated_usage.serving_mode` becomes `'shared'`/`'dedicated'` only (CHECK, no default; dedicated rows renamed from `''` with their ids recomputed) |
+| 0008 | `0008_billing_event_topology.{up,down}.sql` | `billing_event.topology_revision`, `region`, `request_started_at`, `serving_duration_ms` (platform-set margin evidence); `gpu_type` no longer written |
+| 0009 | `0009_rollup_grain_graph_revision.{up,down}.sql` | `rated_usage` grain gains `graph_k8s_name` ('' = unknown) and `topology_revision` (0 = unknown); `region` attribute; every id recomputed |
 
 `embed.go` embeds these into the `migrations` package; `cmd/migrate` applies them.
 
@@ -157,6 +159,126 @@ dedicated or NULL events. The CHECK constraint rejects that write, and the whole
 `RateWindow` transaction rolls back, shared rollups included. Nothing is written
 for that window, and the next run of the new rater re-rates it. The failure is
 closed and heals itself; the order above only avoids the delayed windows.
+
+### Rollout order for migration 0009
+
+Migration 0009 replaces `rated_usage_grain_uq` with a 9-column key (adding
+`graph_k8s_name` and `topology_revision`) and makes `graph_k8s_name` NOT NULL.
+Unlike 0008, it is not additive: the rater's SQL and the schema must change
+together, so every run of a pre-0009 rater against schema 0009 fails.
+
+Because the graph is now a grain key, events that carry no graph (the header
+path before graph propagation, or events from before 0008) form their own
+rollup under the `''` (unknown graph) value. Before 0009 the rater merged them
+into the rollup of the one graph the other events of that hour named; 0009
+removes that rule on purpose, so tokens are never filed under a graph the
+events did not name. Expect a `''` rollup next to a named-graph rollup for the
+same resource and hour while pre-propagation events are still being rated.
+Money is unaffected (both parts bill at the same rate); only per-graph margin
+loses those events. The rater's revision-0 warning does not count `''`
+rollups. See ledger entries D1 and D9 in
+`saturn-architecture-docs/agent-wip/metering-margin-decisions-ledger.md`.
+
+The same release also changes what token-push sends. Every rollup on the wire
+now carries three new keys: `topology_revision`, `region` and `request_count`
+(next to `graph_k8s_name`, which is now always sent). saturn-aws-manager's
+`TokenRollupSchema` is a marshmallow schema with the default `unknown=RAISE`, so
+a manager that does not know these keys rejects the whole window POST with a
+400. The manager schema change therefore has to ship before the new token-push.
+
+Roll out in this order:
+
+0. Confirm that saturn-aws-manager has emitted no `rated_usage` hour of this
+   install to Stripe with billing enabled: the manager's `stripe_meter_emit`
+   ledger holds no row with `emitted_cost > 0` for this install's
+   `customer_id`. Shadow-ledger rows count too if you want the shadow totals to
+   stay meaningful. If it holds any, stop. Do not run 0009 until either the
+   manager has un-billed those ids (a credit note for each real emit, then the
+   ledger rows tombstoned) or the emitted hours are otherwise excluded from
+   re-push. The reason is the answer recorded below.
+
+   **Recorded answer (checked against saturn-aws-manager `main` at 5e19869,
+   2026-10-13): the manager's delete-by-absence does NOT reverse an emitted
+   cost.** The manager keys both `token_usage_record` and its emit ledger
+   `stripe_meter_emit` on `(customer_id, rated_usage_id)`. 0009 rewrites every
+   `rated_usage.id`. When token-push re-sends a window, `apply_snapshot`
+   (`saturn_aws_manager/token_usage.py`) deletes the old-id
+   `token_usage_record` rows by absence and inserts the new ids. The ingest
+   path does not touch `stripe_meter_emit`, so the old emit stays. The emit
+   loop (`token_settlement.py`) sees the new ids with no ledger row and emits
+   their full cost once their window is settled. The reconcile job
+   (`token_reconcile.py`) reports the old ledger rows as VANISHED but moves no
+   money by itself; for a real (non-shadow) row the money comes back only
+   through a credit note issued by a person. So an hour emitted before 0009
+   and re-pushed after it is billed twice.
+
+   0009 prints a `0009:` NOTICE with the number of rows whose id it rewrites
+   and the earliest `window_start` among them. Any hour from that earliest
+   `window_start` onwards that the manager has already emitted is at risk.
+1. Suspend the rater CronJob (and the token-push CronJob), or let any in-flight
+   rater run finish.
+2. Run `cmd/migrate up`, which applies 0008 and 0009 together.
+3. Deploy the new drainer, interceptor and rater images. 0008 is additive, so
+   an old drainer keeps working between steps 2 and 3; the rater is the
+   component that must not run on the old image against schema 0009.
+4. Deploy the saturn-aws-manager release whose `TokenRollupSchema` accepts
+   `graph_k8s_name`, `topology_revision`, `region` and `request_count` (each with
+   a `load_default`, so the old phoebe's payload still loads), and only then
+   deploy the new token-push image. The current manager `main` rejects the new
+   keys with a 400. The manager change does not depend on the schema, so it can
+   ship any time before this step, including before step 1.
+5. Resume the rater CronJob (and the token-push CronJob).
+
+What happens if the order is not followed:
+
+- A pre-0009 rater against schema 0009: its ON CONFLICT on the old 7-column key
+  matches no unique constraint, so Postgres rejects the upsert ("there is no
+  unique or exclusion constraint matching the ON CONFLICT specification"); it
+  can also write `graph_k8s_name` NULL, which now violates NOT NULL. Either error
+  rolls back the whole `RateWindow` transaction. A post-0009 rater against a
+  pre-0009 schema fails the same way, because the `topology_revision` column is
+  missing. Both failures are closed: nothing is written or deleted, and the next
+  run of the new rater re-rates the window. If the rater was stopped or failing
+  for longer than its trailing re-rate window (24h by default), run
+  `rater --since <gap start> --until <start of the current hour>` and then
+  `token-push` over the same range.
+- The new token-push against an old manager: each window is rejected with a 400
+  and nothing is written for it. The next run retries automatically, but only
+  within its trailing window (24h by default). For any older hour, run
+  `token-push --since <first failed hour> --until <start of the current hour>`.
+
+0009 recomputes every `rated_usage` id, so the first token-push after the
+cutover replaces saturn-aws-manager's rows for each pushed window: old ids are
+deleted because they are absent from the snapshot, and new ids are inserted.
+Windows older than token-push's trailing window keep their old-id rows until
+they are re-pushed; re-push them with `token-push --since ... --until ...`.
+This is safe only when step 0 holds (the manager has emitted none of the old
+ids). Otherwise each re-pushed emitted hour is billed a second time, as
+described in step 0.
+
+Rolling back 0009 is lossy. The 0009 down migration narrows the key back to the
+7-column 0007 grain, so rollups for the same hour that differ only in graph or
+topology revision cannot all survive: it keeps one row per old-grain key and
+deletes the others, then drops `topology_revision` and `region` and recomputes
+every id. The deleted rows held real tokens and money for that hour, so after a
+rollback re-rate the affected hours with the pre-0009 rater
+(`rater --since <earliest affected hour> --until <start of the current hour>`,
+while `billing_event` still holds those hours) and then re-push them with
+`token-push` over the same range. Before it deletes anything, the down
+migration prints a `0009 down:` NOTICE with the number of rows it deletes, their
+sum of cost and event_count, and the earliest `window_start` among them; use that
+earliest hour as `--since`. No NOTICE means nothing was deleted.
+
+Roll the code back before the schema. Suspend the rater and token-push
+CronJobs, deploy the pre-0009 rater and token-push images, run `migrate down`,
+then resume. A post-0009 rater against the rolled-back schema fails closed (the
+`topology_revision` column is missing), but it delays every window until the old
+image is in place. The manager can stay on its new release: its new keys have
+defaults, so it accepts the old payload. A rollback is acceptable only while
+there are no production rows. See the header of
+`0009_rollup_grain_graph_revision.down.sql`.
+
+The migration header (`0009_rollup_grain_graph_revision.up.sql`) points here.
 
 ## Local dev
 

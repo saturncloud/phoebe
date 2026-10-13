@@ -132,7 +132,8 @@ func sampleEvent(reqID string) metering.Event {
 		CachedTokens:     2,
 		CompletionTokens: 20,
 		FinishReason:     "stop",
-		GPUType:          "h100",
+		TopologyRevision: 3,
+		Region:           "eu-north1",
 		Aborted:          false,
 		TimestampUnixMs:  time.Now().UnixMilli(),
 	}

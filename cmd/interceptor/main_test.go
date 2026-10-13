@@ -12,11 +12,17 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/alicebob/miniredis/v2"
+	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/client-go/kubernetes"
+	"k8s.io/client-go/kubernetes/fake"
+	k8stesting "k8s.io/client-go/testing"
 
 	"github.com/saturncloud/phoebe/internal/admission"
 	"github.com/saturncloud/phoebe/internal/config"
+	"github.com/saturncloud/phoebe/internal/gateway"
 	"github.com/saturncloud/phoebe/internal/identity"
 	"github.com/saturncloud/phoebe/internal/logging"
 	"github.com/saturncloud/phoebe/internal/proxy"
@@ -173,5 +179,101 @@ func TestBuildWakerLogsMissingDedicatedToken(t *testing.T) {
 	}
 	if got := buf.String(); !strings.Contains(got, "Atlas actuator unavailable") || !strings.Contains(got, "internal wake token is empty") {
 		t.Fatalf("missing-token startup log = %q", got)
+	}
+}
+
+// TestBuildTopologyDisabledLogsTheReason: wherever the topology index cannot
+// run, buildTopology returns nil (serving continues) and logs a warning that
+// names the setting responsible, so revision-0 rollups have an operator signal.
+func TestBuildTopologyDisabledLogsTheReason(t *testing.T) {
+	cases := []struct {
+		name   string
+		gw     config.GatewaySettings
+		reason string
+	}{
+		{"gateway disabled", config.GatewaySettings{Enabled: false, Namespace: "ns"}, "gateway.enabled=false"},
+		{"legacy resolver", config.GatewaySettings{Enabled: true, LegacyPostgresResolver: true, Namespace: "ns"}, "gateway.legacyPostgresResolver=true"},
+		{"empty namespace", config.GatewaySettings{Enabled: true}, "gateway.namespace is empty"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			var buf bytes.Buffer
+			logger := &logging.Logger{Debug: log.New(io.Discard, "", 0), Info: log.New(io.Discard, "", 0), Warn: log.New(&buf, "", 0), Error: log.New(io.Discard, "", 0)}
+			s := &config.Settings{Gateway: tc.gw}
+			idx, closeTopology := buildTopology(s, logger)
+			closeTopology()
+			if idx != nil {
+				t.Fatalf("buildTopology returned an index although %s", tc.reason)
+			}
+			out := buf.String()
+			if !strings.Contains(out, "graph topology index disabled ("+tc.reason+")") || !strings.Contains(out, "including dedicated traffic") {
+				t.Fatalf("warning does not name %q: %q", tc.reason, out)
+			}
+		})
+	}
+}
+
+func warnCaptureLogger(buf *bytes.Buffer) *logging.Logger {
+	return &logging.Logger{Debug: log.New(io.Discard, "", 0), Info: log.New(io.Discard, "", 0), Warn: log.New(buf, "", 0), Error: log.New(io.Discard, "", 0)}
+}
+
+// TestBuildTopologyKubeClientErrorDisablesAndWarns: when the kubernetes
+// client cannot be built, buildTopology returns nil (serving continues, no
+// Fatalf) and logs a warning that the index is disabled.
+func TestBuildTopologyKubeClientErrorDisablesAndWarns(t *testing.T) {
+	var buf bytes.Buffer
+	s := &config.Settings{Gateway: config.GatewaySettings{Enabled: true, Namespace: "ns", Kubeconfig: "/nonexistent/kubeconfig"}}
+	done := make(chan struct{})
+	var idx *gateway.TopologyIndex
+	go func() {
+		defer close(done)
+		var closeTopology func()
+		idx, closeTopology = buildTopology(s, warnCaptureLogger(&buf))
+		closeTopology()
+	}()
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("buildTopology blocked on a kube client error")
+	}
+	if idx != nil {
+		t.Fatalf("buildTopology returned an index although the kube client failed: %v", idx)
+	}
+	if out := buf.String(); !strings.Contains(out, "graph topology index disabled") {
+		t.Fatalf("kube client error not logged as a disabled index: %q", out)
+	}
+}
+
+// TestBuildTopologySyncTimeoutKeepsServing: when the ConfigMap list never
+// completes, buildTopology gives up after topologySyncWait, returns the
+// (non-nil, still running) index so serving starts, and warns naming the wait.
+func TestBuildTopologySyncTimeoutKeepsServing(t *testing.T) {
+	block := make(chan struct{})
+	client := fake.NewSimpleClientset()
+	client.PrependReactor("list", "configmaps", func(k8stesting.Action) (bool, runtime.Object, error) {
+		<-block
+		return false, nil, nil
+	})
+	prevWait, prevClient := topologySyncWait, newTopologyKubeClient
+	topologySyncWait = 200 * time.Millisecond
+	newTopologyKubeClient = func(string) (kubernetes.Interface, error) { return client, nil }
+	t.Cleanup(func() { topologySyncWait, newTopologyKubeClient = prevWait, prevClient })
+
+	var buf bytes.Buffer
+	s := &config.Settings{Gateway: config.GatewaySettings{Enabled: true, Namespace: "ns"}}
+	start := time.Now()
+	idx, closeTopology := buildTopology(s, warnCaptureLogger(&buf))
+	elapsed := time.Since(start)
+	closeTopology()
+	close(block)
+
+	if elapsed > 2*time.Second {
+		t.Fatalf("buildTopology took %s with a 200ms sync wait: the wait is not bounded", elapsed)
+	}
+	if idx == nil {
+		t.Fatal("buildTopology returned nil on a sync timeout; serving must continue with the running index")
+	}
+	if out := buf.String(); !strings.Contains(out, "not synced within 200ms") {
+		t.Fatalf("sync timeout warning does not name the wait: %q", out)
 	}
 }

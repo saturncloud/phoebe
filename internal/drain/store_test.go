@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"regexp"
+	"strings"
 	"testing"
 	"time"
 
@@ -34,6 +35,12 @@ func TestPostgresStore_UpsertSQL(t *testing.T) {
 			CompletionTokens: 7,
 			ServingMode:      "dedicated",
 			TimestampUnixMs:  ts,
+			// Platform-set serving fields. A zero duration with a known start
+			// is a measured value and must be stored as 0, not NULL.
+			TopologyRevision:     3,
+			Region:               "eu-north1",
+			RequestStartedUnixMs: ts - 1500,
+			ServingDurationMs:    0,
 		},
 		{
 			RequestID: "req-2",
@@ -45,14 +52,17 @@ func TestPostgresStore_UpsertSQL(t *testing.T) {
 
 	mock.ExpectBegin()
 	mock.ExpectExec(regexp.QuoteMeta(
-		"INSERT INTO billing_event (request_id, client_request_id, auth_id, user_id, group_id, resource_id, resource_type, org_id, model, base_model, adapter, serving_mode, prompt_tokens, cached_tokens, completion_tokens, finish_reason, gpu_type, aborted, usage_found, status_code, streamed, graph_k8s_name, event_ts) VALUES",
+		"INSERT INTO billing_event (request_id, client_request_id, auth_id, user_id, group_id, resource_id, resource_type, org_id, model, base_model, adapter, serving_mode, prompt_tokens, cached_tokens, completion_tokens, finish_reason, aborted, usage_found, status_code, streamed, graph_k8s_name, topology_revision, region, request_started_at, serving_duration_ms, event_ts) VALUES",
 	)).
 		WithArgs(
 			// row 1 (org_id + base_model NULL: a pre-cutover-shaped event with no org
 			// header and no derived_from)
-			"req-1", "logical-1", "auth-1", nil, nil, nil, nil, nil, "m1", nil, nil, "dedicated", 5, 0, 7, nil, nil, false, false, nil, false, nil, time.UnixMilli(ts).UTC(),
-			// row 2 (no identity, no timestamp → event_ts NULL)
-			"req-2", nil, nil, nil, nil, nil, nil, nil, "m2", nil, nil, "shared", 0, 0, 0, nil, nil, false, false, nil, false, nil, nil,
+			"req-1", "logical-1", "auth-1", nil, nil, nil, nil, nil, "m1", nil, nil, "dedicated", 5, 0, 7, nil, false, false, nil, false, nil,
+			3, "eu-north1", time.UnixMilli(ts-1500).UTC(), int64(0), time.UnixMilli(ts).UTC(),
+			// row 2 (no identity, no timestamp → event_ts NULL; no topology, no
+			// start → all four serving fields NULL)
+			"req-2", nil, nil, nil, nil, nil, nil, nil, "m2", nil, nil, "shared", 0, 0, 0, nil, false, false, nil, false, nil,
+			nil, nil, nil, nil, nil,
 		).
 		WillReturnResult(sqlmock.NewResult(0, 2))
 	mock.ExpectCommit()
@@ -130,8 +140,9 @@ func TestPostgresStore_EmptyModelStoredAsNull(t *testing.T) {
 			nil,         // base_model: "" must bind NULL
 			nil,         // adapter: "" must bind NULL
 			"dedicated", // serving_mode: bound as decoded
-			1, 0, 2, nil, nil, false, false, nil, false,
-			nil, // graph_k8s_name: "" must bind NULL
+			1, 0, 2, nil, false, false, nil, false,
+			nil,                // graph_k8s_name: "" must bind NULL
+			nil, nil, nil, nil, // topology_revision, region, request_started_at, serving_duration_ms
 			nil,
 		).
 		WillReturnResult(sqlmock.NewResult(0, 1))
@@ -158,7 +169,7 @@ func TestPostgresStore_EmptyModelStoredAsNull(t *testing.T) {
 // and billing_event_status_code_ck admits NULL or 100..599 — so 0 must bind NULL
 // (a never-answered attempt), while a real status binds through verbatim.
 func TestEventArgs_ZeroStatusCodeBindsNullNoResponse(t *testing.T) {
-	const statusCodeIdx = 19 // request_id..usage_found is 19 columns; status_code is next.
+	const statusCodeIdx = 18 // request_id..usage_found is 18 columns; status_code is next.
 
 	noResponse := eventArgs(metering.Event{RequestID: "r", Model: "m"})
 	if noResponse[statusCodeIdx] != nil {
@@ -234,5 +245,71 @@ func TestEventArgs_ServingModeStoredAsDecoded(t *testing.T) {
 		if args[servingModeIdx] != tc.want {
 			t.Fatalf("serving_mode arg for %q = %v, want %v", tc.in, args[servingModeIdx], tc.want)
 		}
+	}
+}
+
+// TestEventArgs_OutOfRangeTopologyRevisionBindsNullNeverPoisons:
+// billing_event.topology_revision is INTEGER, so a revision above MaxInt32
+// would fail the insert and the row-at-a-time fallback would drop the
+// billable event as poison. It binds NULL instead; an in-range value binds.
+func TestEventArgs_OutOfRangeTopologyRevisionBindsNullNeverPoisons(t *testing.T) {
+	const topologyRevisionIdx = 21 // status_code 18, streamed 19, graph_k8s_name 20.
+
+	inRange := eventArgs(metering.Event{RequestID: "r", Model: "m", TopologyRevision: 2147483647})
+	if inRange[topologyRevisionIdx] != 2147483647 {
+		t.Fatalf("topology_revision arg = %v, want 2147483647", inRange[topologyRevisionIdx])
+	}
+	for _, rev := range []int{2147483648, -1, 0} {
+		args := eventArgs(metering.Event{RequestID: "r", Model: "m", TopologyRevision: rev})
+		if args[topologyRevisionIdx] != nil {
+			t.Fatalf("topology_revision arg for %d = %v, want nil", rev, args[topologyRevisionIdx])
+		}
+	}
+}
+
+// TestEventArgs_NegativeServingDurationStoresNull: a negative serving time is
+// impossible evidence, so it is stored as NULL ("not captured") rather than
+// as a misleading value; zero (a sub-millisecond request) is kept.
+func TestEventArgs_NegativeServingDurationStoresNull(t *testing.T) {
+	const servingDurationIdx = 24 // topology_revision 21, region 22, request_started_at 23.
+
+	for _, tc := range []struct {
+		ms   int64
+		want any
+	}{{0, int64(0)}, {42, int64(42)}, {-1, nil}} {
+		args := eventArgs(metering.Event{RequestID: "r", Model: "m", RequestStartedUnixMs: 1, ServingDurationMs: tc.ms})
+		if args[servingDurationIdx] != tc.want {
+			t.Fatalf("serving_duration_ms arg for %d = %v, want %v", tc.ms, args[servingDurationIdx], tc.want)
+		}
+	}
+}
+
+// TestEventArgs_UnstorableRegionBindsNullNeverPoisons: billing_event.region
+// is VARCHAR(64) text, so a region with a NUL byte, invalid UTF-8, or more
+// than 64 characters would fail the multi-row insert and drop the whole
+// batch. It binds NULL instead; a normal region binds as the string.
+func TestEventArgs_UnstorableRegionBindsNullNeverPoisons(t *testing.T) {
+	const regionIdx = 22 // topology_revision 21, request_started_at 23.
+
+	cases := []struct {
+		name   string
+		region string
+		want   any
+	}{
+		{"empty is not captured", "", nil},
+		{"short region kept", "eu-north1", "eu-north1"},
+		{"exactly max ASCII characters kept", strings.Repeat("a", metering.MaxRegionChars), strings.Repeat("a", metering.MaxRegionChars)},
+		{"exactly max multibyte characters kept", strings.Repeat("é", metering.MaxRegionChars), strings.Repeat("é", metering.MaxRegionChars)},
+		{"one over max is NULL", strings.Repeat("a", metering.MaxRegionChars+1), nil},
+		{"invalid UTF-8 is NULL", "\xff", nil},
+		{"NUL byte is NULL", "a\x00b", nil},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			args := eventArgs(metering.Event{RequestID: "r", Model: "m", Region: tc.region})
+			if args[regionIdx] != tc.want {
+				t.Fatalf("region arg for %q = %v, want %v", tc.region, args[regionIdx], tc.want)
+			}
+		})
 	}
 }

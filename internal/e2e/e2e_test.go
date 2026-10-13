@@ -155,6 +155,10 @@ func newHarness(t *testing.T, schema string) *harness {
 	// 0007 makes rated_usage.serving_mode 'shared'/'dedicated' only (CHECK, no
 	// default); the rater's upsert must satisfy it.
 	mustExec(t, db, readMigration(t, "0007_serving_mode_explicit.up.sql"))
+	// 0008 adds the serving fields the drainer inserts; 0009 makes graph and
+	// revision rollup grain keys, which the rater upserts on.
+	mustExec(t, db, readMigration(t, "0008_billing_event_topology.up.sql"))
+	mustExec(t, db, readMigration(t, "0009_rollup_grain_graph_revision.up.sql"))
 
 	mr, err := miniredis.Run()
 	if err != nil {

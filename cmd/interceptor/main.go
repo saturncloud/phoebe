@@ -63,6 +63,11 @@ func main() {
 	if gwResolver != nil {
 		srv = srv.WithGateway(gwResolver, settings.Gateway.Namespace, settings.Gateway.Port)
 	}
+	topology, closeTopology := buildTopology(settings, log)
+	defer closeTopology()
+	if topology != nil {
+		srv = srv.WithTopology(topology)
+	}
 	if w := buildWaker(settings, log); w != nil {
 		// Timeout 0 = the proxy default (300s — sized above vLLM's measured
 		// ~2.5min cold reload). A recognized cold response permits one retry.
@@ -118,6 +123,63 @@ func buildAdmission(s *config.Settings, log *logging.Logger) (admission.Admitter
 		log.Info.Printf("admission: enforcing %s (valkey %s, lease ttl %s)", mode, cfg.ValkeyAddr, cfg.LeaseTTL)
 	}
 	return admitter, func() { _ = client.Close() }
+}
+
+// buildTopology starts the graph topology index (internal/gateway/topology.go)
+// that stamps each usage event with its graph's topology revision and region.
+// It watches ConfigMaps in the gateway namespace, the same access the
+// registry resolver already uses, so it runs only where the registry
+// resolver runs. Anywhere else, or when the kubernetes config is missing,
+// it logs a warning naming the reason and returns nil, and events carry no
+// topology: the fields are margin evidence, so their absence is never a
+// reason to stop serving.
+//
+// topologySyncWait and newTopologyKubeClient are variables so tests can
+// shorten the wait and inject a client that never syncs.
+var (
+	topologySyncWait      = 10 * time.Second
+	newTopologyKubeClient = gateway.NewKubeClient
+)
+
+func buildTopology(s *config.Settings, log *logging.Logger) (*gateway.TopologyIndex, func()) {
+	// Each disabled case says so at Warn: without the index every usage
+	// event, dedicated traffic included, records no topology revision or
+	// region, and the margin pipeline sees revision-0 rollups.
+	if reason := topologyDisabledReason(s); reason != "" {
+		log.Warn.Printf("gateway: graph topology index disabled (%s); usage events, including dedicated traffic, carry no topology revision or region", reason)
+		return nil, func() {}
+	}
+	client, err := newTopologyKubeClient(s.Gateway.Kubeconfig)
+	if err != nil {
+		log.Warn.Printf("gateway: graph topology index disabled (%v); usage events carry no topology revision or region", err)
+		return nil, func() {}
+	}
+	index := gateway.NewTopologyIndex(client, s.Gateway.Namespace, log)
+	ctx, cancel := context.WithCancel(context.Background())
+	go index.Run(ctx)
+	// Bounded wait for the first list so requests right after a pod start
+	// carry their revision. Never fail serving on it: topology is evidence.
+	wctx, wcancel := context.WithTimeout(ctx, topologySyncWait)
+	if !index.WaitSynced(wctx) {
+		log.Warn.Printf("gateway: graph topology index not synced within %s; usage events carry topology revision 0 until it syncs", topologySyncWait)
+	}
+	wcancel()
+	return index, cancel
+}
+
+// topologyDisabledReason names the setting that keeps the topology index off,
+// or returns "" when the index can run. The index reuses the registry
+// resolver's ConfigMap access, so it runs only where that resolver runs.
+func topologyDisabledReason(s *config.Settings) string {
+	switch {
+	case !s.Gateway.Enabled:
+		return "gateway.enabled=false"
+	case s.Gateway.LegacyPostgresResolver:
+		return "gateway.legacyPostgresResolver=true"
+	case s.Gateway.Namespace == "":
+		return "gateway.namespace is empty"
+	}
+	return ""
 }
 
 // buildGateway constructs the TF gateway (org, model) resolver. DEFAULT: the
