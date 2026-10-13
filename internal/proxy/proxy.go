@@ -1280,9 +1280,13 @@ func (s *Server) errorHandler(upstream string, id identity.Identity, requestID, 
 		if errors.Is(err, errRequestBufferFull) {
 			// Defensive (D43): the replica's request-buffer budget filled
 			// while the body was being forwarded, so nothing complete reached
-			// the upstream. Unreachable today: forceIncludeUsage reads the
-			// whole budgeted body and restores it as a buffered copy before
-			// rp.ServeHTTP, so the budget can only trip on a pre-forward read.
+			// the upstream. Unreachable today: forceIncludeUsage runs for
+			// every request that reaches the forward, whatever its method or
+			// path, and reads the whole budgeted body and restores it as a
+			// buffered copy before rp.ServeHTTP, so the budget can only trip
+			// on a pre-forward read
+			// (TestRequestBufferBudgetFullMidReadChunkedIsRetryable503 covers
+			// a non-inference route).
 			// The branch exists so a future change that forwards the budgeted
 			// body without buffering it still answers 503 + Retry-After, with
 			// one 503 row and a zero settlement (settlement.go), instead of an

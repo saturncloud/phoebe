@@ -168,8 +168,10 @@ func TestErrorHandlerAnswersForwardedOversizeBodyWith413NotUpstreamFault(t *test
 // D43 (defensive branch): a forward the replica request-buffer budget cut
 // short answers phoebe's retryable 503 (Retry-After, request id, JSON error)
 // and records one non-aborted 503 row without usage, never the upstream-fault
-// 502. Unreachable today (forceIncludeUsage buffers the body before the
-// forward); this pins the branch so a future streaming forward inherits it.
+// 502. Unreachable today (forceIncludeUsage buffers the body of every
+// request, whatever its method or path, before the forward;
+// TestRequestBufferBudgetFullMidReadChunkedIsRetryable503 pins that); this
+// pins the branch so a future streaming forward inherits it.
 func TestErrorHandlerAnswersForwardedBufferFullWith503NotUpstreamFault(t *testing.T) {
 	upstream, _ := url.Parse("http://upstream.invalid")
 	id := identity.Identity{AuthID: "auth-1", ResourceID: "model-abc"}

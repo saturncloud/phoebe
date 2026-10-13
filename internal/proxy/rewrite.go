@@ -80,6 +80,10 @@ func readAndRestoreBody(r *http.Request) ([]byte, error) {
 // It keeps the buffer so a later full read reuses it (bufferedBytes) instead
 // of copying it again: the request-buffer budget charges each received byte
 // once, so every extra copy is memory the budget does not see.
+//
+// replaceRequestBody installs it in place of whatever r.Body was, including
+// the request-buffer budget wrapper (budgetedBody), so it never sits inside
+// one. The bytes stay charged until the handler's deferred budgeted.release().
 type bufferedBody struct {
 	*bytes.Reader
 	buf []byte
@@ -87,17 +91,12 @@ type bufferedBody struct {
 
 func (*bufferedBody) Close() error { return nil }
 
-// bufferedBytes returns the buffer behind a restored, not yet read body
-// (looking through the request-buffer budget wrapper). A body something has
-// partly read is a miss, so a caller never sees bytes the reader already
-// consumed. Callers must not modify the returned slice: it is the same buffer
-// the forwarded request and GetBody read.
+// bufferedBytes returns the buffer behind a restored, not yet read body. A
+// body something has partly read is a miss, so a caller never sees bytes the
+// reader already consumed. Callers must not modify the returned slice: it is
+// the same buffer the forwarded request and GetBody read.
 func bufferedBytes(r *http.Request) ([]byte, bool) {
-	body := r.Body
-	if bb, ok := body.(*budgetedBody); ok {
-		body = bb.ReadCloser
-	}
-	buffered, ok := body.(*bufferedBody)
+	buffered, ok := r.Body.(*bufferedBody)
 	if !ok || buffered.Len() != len(buffered.buf) {
 		return nil, false
 	}
@@ -106,7 +105,8 @@ func bufferedBytes(r *http.Request) ([]byte, bool) {
 
 // readBody reads the whole request body and closes it, reusing the buffer
 // of a body phoebe already restored. Only the first read off the wire
-// allocates a copy.
+// allocates a copy. Callers must not modify the returned slice: for a
+// restored body it is the same buffer the forwarded request and GetBody read.
 func readBody(r *http.Request) ([]byte, error) {
 	if buf, ok := bufferedBytes(r); ok {
 		return buf, nil

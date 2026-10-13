@@ -9,7 +9,9 @@ import (
 	"net/http/httptest"
 	"net/url"
 	"strings"
+	"sync/atomic"
 	"testing"
+	"testing/iotest"
 	"time"
 
 	"github.com/saturncloud/phoebe/internal/config"
@@ -233,9 +235,10 @@ func TestRequestBufferFullRefusalsLogSampledWarnNotError(t *testing.T) {
 	}
 }
 
-// The request-buffer budget charges each received byte once, so a buffered
-// body must not be copied again on every later full read: later reads share
-// its one buffer.
+// A body phoebe already read and restored is not copied again on a later full
+// read: the later read shares its one buffer. A partly read body is a miss,
+// so the caller gets only the bytes left. (The first readAndRestoreBody
+// replaces the budget wrapper with a bufferedBody; later reads see that.)
 func TestReadAndRestoreBodyReusesTheBufferedBody(t *testing.T) {
 	var budget requestBufferBudget
 	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", nil)
@@ -272,8 +275,229 @@ func TestReadAndRestoreBodyReusesTheBufferedBody(t *testing.T) {
 	if err != nil || string(rest) != string(a[1:]) {
 		t.Fatalf("after a partial read got %q err=%v, want %q", rest, err, a[1:])
 	}
-	if got := budget.held.Load(); got != int64(len(a)) {
-		t.Fatalf("budget held=%d, want each received byte charged once (%d)", got, len(a))
+}
+
+// D43: the budget charges each byte received off the wire exactly once, no
+// matter how many times phoebe later reads the restored body (the model
+// binding check, the request log capture, the usage rewrite).
+func TestBudgetChargesEachReceivedByteOnce(t *testing.T) {
+	var budget requestBufferBudget
+	const payload = `{"model":"m","stream":true}`
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", nil)
+	body, err := budget.wrap(io.NopCloser(iotest.OneByteReader(strings.NewReader(payload))), 1<<20, -1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	req.Body = body
+	if _, err := readAndRestoreBody(req); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, _, err := captureRequestBody(req, 1<<10); err != nil {
+		t.Fatal(err)
+	}
+	if err := forceIncludeUsage(req); err != nil {
+		t.Fatal(err)
+	}
+	if got := budget.held.Load(); got != int64(len(payload)) {
+		t.Fatalf("budget held=%d, want each received byte charged once (%d)", got, len(payload))
+	}
+	body.release()
+	if got := budget.held.Load(); got != 0 {
+		t.Fatalf("held=%d after release, want 0", got)
+	}
+}
+
+// A refused read charges nothing, does not count the refused bytes as
+// received, and stays refused: a caller that keeps reading after
+// errRequestBufferFull can never charge the bytes it was refused.
+func TestBudgetedBodyRefusalIsStickyAndChargesNothing(t *testing.T) {
+	var budget requestBufferBudget
+	body, err := budget.wrap(io.NopCloser(strings.NewReader(strings.Repeat("a", 30))), 15, -1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	p := make([]byte, 10)
+	if n, err := body.Read(p); n != 10 || err != nil {
+		t.Fatalf("first read n=%d err=%v, want 10 bytes within the total", n, err)
+	}
+	if n, err := body.Read(p); n != 0 || !errRequestBufferFullIs(err) {
+		t.Fatalf("second read n=%d err=%v, want (0, errRequestBufferFull) past the total", n, err)
+	}
+	if got := budget.held.Load(); got != 10 {
+		t.Fatalf("held=%d after the refusal, want only the 10 charged bytes", got)
+	}
+	if body.received != 10 {
+		t.Fatalf("received=%d after the refusal, want the refused bytes uncounted (10)", body.received)
+	}
+	// Room appears (another request released), but the refusal stands.
+	budget.held.Store(0)
+	body.held = 0
+	if n, err := body.Read(p); n != 0 || !errRequestBufferFullIs(err) {
+		t.Fatalf("read after a refusal n=%d err=%v, want the same refusal", n, err)
+	}
+	if got := budget.held.Load(); got != 0 {
+		t.Fatalf("held=%d after a read past the refusal, want nothing charged", got)
+	}
+}
+
+func errRequestBufferFullIs(err error) bool { return errors.Is(err, errRequestBufferFull) }
+
+// D43: a read after release charges nothing. A charge after the handler's
+// deferred release would never be returned, ratcheting the replica total up
+// until every request is refused.
+func TestBudgetedBodyChargesNothingAfterRelease(t *testing.T) {
+	var budget requestBufferBudget
+	body, err := budget.wrap(io.NopCloser(strings.NewReader(strings.Repeat("a", 40))), 100, -1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	p := make([]byte, 10)
+	if _, err := body.Read(p); err != nil {
+		t.Fatal(err)
+	}
+	body.release()
+	if n, err := body.Read(p); n != 0 || !errors.Is(err, http.ErrBodyReadAfterClose) {
+		t.Fatalf("read after release n=%d err=%v, want (0, ErrBodyReadAfterClose)", n, err)
+	}
+	if got := budget.held.Load(); got != 0 {
+		t.Fatalf("held=%d after a read past release, want 0", got)
+	}
+}
+
+// The same invariant under a race: reads on one goroutine and release on
+// another always leave the replica total at 0 once both finish. Run with
+// -race.
+func TestBudgetedBodyReleaseRacingReadsLeavesNothingHeld(t *testing.T) {
+	var budget requestBufferBudget
+	for i := 0; i < 200; i++ {
+		body, err := budget.wrap(io.NopCloser(iotest.OneByteReader(strings.NewReader(strings.Repeat("a", 64)))), 1<<20, -1)
+		if err != nil {
+			t.Fatal(err)
+		}
+		done := make(chan struct{})
+		go func() {
+			defer close(done)
+			_, _ = io.ReadAll(body)
+		}()
+		body.release()
+		<-done
+		if got := budget.held.Load(); got != 0 {
+			t.Fatalf("iteration %d: held=%d after release and reads, want 0", i, got)
+		}
+	}
+}
+
+// D43: a chunked body (no Content-Length, so nothing reserved up front) that
+// fills the replica budget partway through being read is refused with the
+// retryable 503, never reaches the engine, and returns its partial charge.
+// The non-inference case pins that forceIncludeUsage buffers every request
+// before the forward, so the forward-time branch in the error handler stays
+// unreachable.
+func TestRequestBufferBudgetFullMidReadChunkedIsRetryable503(t *testing.T) {
+	for _, tc := range []struct{ name, method, path string }{
+		{"inference POST", http.MethodPost, "/v1/chat/completions"},
+		{"non-inference GET", http.MethodGet, "/health"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var upstreamHits atomic.Int32
+			backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				upstreamHits.Add(1)
+				_, _ = io.ReadAll(r.Body)
+				_, _ = io.WriteString(w, `{"model":"m","usage":{"prompt_tokens":1,"completion_tokens":1}}`)
+			}))
+			defer backend.Close()
+			up, _ := url.Parse(backend.URL)
+			s := New(&config.Settings{Protection: config.ProtectionSettings{
+				MaxRequestBodyBytes: 1024, MaxRequestBufferBytesTotal: 1024,
+			}}, logging.New(logging.ERROR), &recordingEmitter{})
+			chunked := func() *http.Request {
+				req := dedicatedBoundRequest(up, "")
+				req.Method = tc.method
+				req.URL.Path = tc.path
+				req.Body = io.NopCloser(iotest.OneByteReader(strings.NewReader(bodyOfSize(200))))
+				req.ContentLength = -1
+				req.TransferEncoding = []string{"chunked"}
+				return req
+			}
+
+			// Another request holds 900 of 1024: fewer than 200 bytes fit, so
+			// the budget trips partway through the read.
+			s.requestBuffers.held.Store(900)
+			rr := httptest.NewRecorder()
+			s.Handler().ServeHTTP(rr, chunked())
+			if rr.Code != http.StatusServiceUnavailable || rr.Header().Get("Retry-After") != "1" {
+				t.Fatalf("status=%d retry-after=%q body=%q, want 503 with Retry-After 1", rr.Code, rr.Header().Get("Retry-After"), rr.Body.String())
+			}
+			if ct := rr.Header().Get("Content-Type"); ct != "application/json" {
+				t.Fatalf("Content-Type=%q, want application/json", ct)
+			}
+			var refusal map[string]string
+			if err := json.Unmarshal(rr.Body.Bytes(), &refusal); err != nil || refusal["error"] == "" {
+				t.Fatalf("body=%q err=%v, want a JSON error field", rr.Body.String(), err)
+			}
+			if got := rr.Header().Get("X-Request-Id"); got == "" || got == "saturn-test-request-id" {
+				t.Fatalf("X-Request-Id=%q, want the gateway-assigned attempt id", got)
+			}
+			if upstreamHits.Load() != 0 {
+				t.Fatal("a refused request reached the engine")
+			}
+			if got := s.requestBuffers.held.Load(); got != 900 {
+				t.Fatalf("held=%d after the refusal, want the other request's 900 (partial charge returned)", got)
+			}
+
+			s.requestBuffers.held.Store(0)
+			rr = httptest.NewRecorder()
+			s.Handler().ServeHTTP(rr, chunked())
+			if rr.Code != http.StatusOK || upstreamHits.Load() != 1 {
+				t.Fatalf("status=%d hits=%d body=%q, want served once the budget has room", rr.Code, upstreamHits.Load(), rr.Body.String())
+			}
+			if got := s.requestBuffers.held.Load(); got != 0 {
+				t.Fatalf("held=%d after the request finished, want 0", got)
+			}
+		})
+	}
+}
+
+// readBody hands out the restored body's own buffer (no copy). Every reader
+// phoebe runs over a restored body leaves that buffer intact, so the forwarded
+// body and GetBody (the wake retry's copy) still carry the original bytes.
+func TestRestoredBodyBufferIsNotModifiedByItsReaders(t *testing.T) {
+	original := []byte(`{"model":"m","stream":true,"messages":[]}`)
+	buf := append([]byte(nil), original...)
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", nil)
+	replaceRequestBody(req, buf)
+	if _, err := readBody(req); err != nil {
+		t.Fatal(err)
+	}
+	replaceRequestBody(req, buf)
+	if _, err := readAndRestoreBody(req); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, _, err := captureRequestBody(req, 8); err != nil {
+		t.Fatal(err)
+	}
+	if string(buf) != string(original) {
+		t.Fatalf("shared buffer became %q, want %q", buf, original)
+	}
+	if fwd, _ := io.ReadAll(req.Body); string(fwd) != string(original) {
+		t.Fatalf("forwarded %q, want %q", fwd, original)
+	}
+	rc, _ := req.GetBody()
+	if replay, _ := io.ReadAll(rc); string(replay) != string(original) {
+		t.Fatalf("GetBody replayed %q, want %q", replay, original)
+	}
+}
+
+// rewriteIncludeUsage builds a new body; it never edits the shared buffer it
+// was given.
+func TestRewriteIncludeUsageLeavesItsInputUnchanged(t *testing.T) {
+	in := []byte(`{"model":"m","stream":true,"stream_options":{"include_usage":false}}`)
+	before := append([]byte(nil), in...)
+	if _, changed := rewriteIncludeUsage(in); !changed {
+		t.Fatal("want a streaming body without usage rewritten")
+	}
+	if string(in) != string(before) {
+		t.Fatalf("input became %q, want %q", in, before)
 	}
 }
 

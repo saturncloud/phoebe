@@ -342,11 +342,23 @@ type budgetedBody struct {
 	io.ReadCloser
 	budget *requestBufferBudget
 	total  int64
-	held   atomic.Int64
 	// prepaid is the declared Content-Length reserved up front; reads charge
 	// only what arrives beyond it (nothing, for an honest Content-Length).
-	prepaid  int64
-	received atomic.Int64
+	prepaid int64
+
+	// mu makes a read's charge and release mutually exclusive, so a read
+	// racing the handler's deferred release can never charge the shared
+	// budget after release has returned what this request held (that charge
+	// would never be returned). It is never held across the underlying read,
+	// so release does not wait on a blocked network read.
+	mu       sync.Mutex
+	held     int64
+	received int64
+	// failed makes a refusal sticky: once a read was refused, every later
+	// read is refused too, without charging anything.
+	failed bool
+	// released is set by release; a read after it charges nothing and fails.
+	released bool
 }
 
 // wrap budgets a request body. A declared Content-Length is reserved in full
@@ -361,28 +373,57 @@ func (b *requestBufferBudget) wrap(body io.ReadCloser, total, contentLength int6
 			return nil, errRequestBufferFull
 		}
 		bb.prepaid = contentLength
-		bb.held.Store(contentLength)
+		bb.held = contentLength
 	}
 	return bb, nil
 }
 
+// Read charges the bytes it returns before returning them. A refused charge
+// returns (0, errRequestBufferFull) and leaves the counters untouched: the
+// bytes the wrapped reader produced are dropped rather than handed on
+// uncharged (the io.Reader contract allows n == 0 with an error), and the
+// refusal is sticky, so a caller that keeps reading cannot charge them later.
 func (b *budgetedBody) Read(p []byte) (int, error) {
-	n, err := b.ReadCloser.Read(p)
-	if n > 0 {
-		received := b.received.Add(int64(n))
-		if over := received - b.prepaid; over > 0 {
-			delta := min(over, int64(n))
-			if !tryCharge(&b.budget.held, delta, b.total) {
-				return 0, errRequestBufferFull
-			}
-			b.held.Add(delta)
-		}
+	b.mu.Lock()
+	released, failed := b.released, b.failed
+	b.mu.Unlock()
+	if released {
+		return 0, http.ErrBodyReadAfterClose
 	}
+	if failed {
+		return 0, errRequestBufferFull
+	}
+	n, err := b.ReadCloser.Read(p)
+	if n <= 0 {
+		return n, err
+	}
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if b.released {
+		return 0, http.ErrBodyReadAfterClose
+	}
+	if b.failed {
+		return 0, errRequestBufferFull
+	}
+	received := b.received + int64(n)
+	if over := received - b.prepaid; over > 0 {
+		delta := min(over, int64(n))
+		if !tryCharge(&b.budget.held, delta, b.total) {
+			b.failed = true
+			return 0, errRequestBufferFull
+		}
+		b.held += delta
+	}
+	b.received = received
 	return n, err
 }
 
-// release returns every byte this request held to the replica budget.
-// Idempotent.
+// release returns every byte this request held to the replica budget. After
+// it, reads charge nothing and fail. Idempotent.
 func (b *budgetedBody) release() {
-	b.budget.held.Add(-b.held.Swap(0))
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	b.released = true
+	b.budget.held.Add(-b.held)
+	b.held = 0
 }
