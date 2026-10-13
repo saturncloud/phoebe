@@ -100,6 +100,8 @@ type captureReader struct {
 	// keepTail); only its last overflowKeep bytes are the tail (tailView).
 	overflowed bool
 	head, tail []byte
+	// seen is how many body bytes Read has passed through. Guarded by mu.
+	seen int64
 
 	// deferBufferClose leaves closing buffers to the reader that wraps this
 	// one (the usage filter), which can still hold the stream's last line
@@ -189,6 +191,7 @@ func (c *captureReader) Read(p []byte) (int, error) {
 		// is released, and finish() calling buffers.close under mu keeps the
 		// one lock order (mu, then the account's).
 		c.mu.Lock()
+		c.seen += int64(n)
 		if c.overflowed {
 			// A capture can overflow after only a few bytes, when the replica
 			// total (not its own limit) refuses the reserve. Keep filling the
@@ -411,6 +414,17 @@ func (c *captureReader) overflow() int64 {
 	c.scan = bytes.Buffer{} // release the large backing array
 	c.overflowed = true
 	return c.overflowHeld()
+}
+
+// droppedBytes reports that an overflowed capture's retained head and tail
+// do not cover the whole body: some bytes between them were never kept, so a
+// usage object there could not be seen. A capture that overflowed early only
+// because the replica total refused its reserve, on a body small enough for
+// head and tail to cover it, has dropped nothing.
+//
+// Must be called with mu held.
+func (c *captureReader) droppedBytes() bool {
+	return c.overflowed && c.seen > int64(len(c.head))+int64(len(c.tailView()))
 }
 
 // overflowHeld is what an overflowed capture is charged: the head plus the

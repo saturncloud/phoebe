@@ -3,6 +3,7 @@ package proxy
 import (
 	"context"
 	"errors"
+	"io"
 	"net"
 	"net/http"
 	"os"
@@ -201,17 +202,8 @@ func (a *responseBufferAccount) reserve(slot int, n int64) error {
 		if mine+n > a.perStream {
 			return errResponseBufferLimit
 		}
-		// Reserve with compare-and-swap so a refused delta never touches the
-		// shared counter: an add-then-roll-back would briefly inflate it and
-		// could make a concurrent small request see a false over-total.
-		for {
-			cur := a.budget.held.Load()
-			if cur+delta > a.total {
-				return errResponseBufferLimit
-			}
-			if a.budget.held.CompareAndSwap(cur, cur+delta) {
-				break
-			}
+		if !tryCharge(&a.budget.held, delta, a.total) {
+			return errResponseBufferLimit
 		}
 	} else if delta < 0 {
 		a.budget.held.Add(delta)
@@ -300,4 +292,138 @@ func (d *dedicatedColdHolds) acquire(endpoint string, limit int64) (func(), bool
 func writeDedicatedColdHoldsFull(w http.ResponseWriter, requestID string) {
 	writeRetryLater(w, requestID, "The endpoint is starting from zero and too many requests are already waiting; retry in about "+
 		strconv.Itoa(wakeRetryAfterSeconds)+" seconds.")
+}
+
+// errRequestBufferFull reports that the replica-wide request-buffer budget
+// (protection.maxRequestBufferBytesTotal) could not hold more of a request's
+// body. The request is refused with 503 + Retry-After: the gateway is out of
+// memory headroom for request bodies right now, not the request at fault.
+var errRequestBufferFull = errors.New("replica request-buffer budget is full")
+
+// requestBufferRetryAfterSeconds is the Retry-After on a request refused
+// because the replica's request-buffer budget was full. Request bodies are
+// held only while their requests run, so headroom returns quickly.
+const requestBufferRetryAfterSeconds = 1
+
+// tryCharge adds delta to held only if the result stays at or below total,
+// and reports whether it did. It uses compare-and-swap so a refused charge
+// never touches the shared counter: an add-then-roll-back would briefly
+// inflate it and could make a concurrent small request see a false
+// over-total. The response-buffer and request-buffer budgets both charge
+// through it.
+func tryCharge(held *atomic.Int64, delta, total int64) bool {
+	for {
+		cur := held.Load()
+		if cur+delta > total {
+			return false
+		}
+		if held.CompareAndSwap(cur, cur+delta) {
+			return true
+		}
+	}
+}
+
+// requestBufferBudget is the replica-wide total of request-body bytes held by
+// requests in flight (protection.maxRequestBufferBytesTotal).
+type requestBufferBudget struct {
+	held atomic.Int64
+}
+
+// budgetedBody charges every request-body byte received to the replica budget
+// until the request finishes (release). The budget counts each byte received
+// off the wire once (D43); it is a lower bound on the memory the request
+// holds, not resident memory. Once read, the body is held as one buffer that
+// later reads share (bufferedBody), but parsing it and the streaming usage
+// rewrite briefly hold further copies (about 3x the body for a streaming
+// request), the request log may keep its own capped copy, and Go's garbage
+// collector needs headroom on top. Operators sizing pod memory should allow
+// for that multiple over maxRequestBufferBytesTotal.
+type budgetedBody struct {
+	io.ReadCloser
+	budget *requestBufferBudget
+	total  int64
+	// prepaid is the declared Content-Length reserved up front; reads charge
+	// only what arrives beyond it (nothing, for an honest Content-Length).
+	prepaid int64
+
+	// mu makes a read's charge and release mutually exclusive, so a read
+	// racing the handler's deferred release can never charge the shared
+	// budget after release has returned what this request held (that charge
+	// would never be returned). It is never held across the underlying read,
+	// so release does not wait on a blocked network read.
+	mu       sync.Mutex
+	held     int64
+	received int64
+	// failed makes a refusal sticky: once a read was refused, every later
+	// read is refused too, without charging anything.
+	failed bool
+	// released is set by release; a read after it charges nothing and fails.
+	released bool
+}
+
+// wrap budgets a request body. A declared Content-Length is reserved in full
+// before anything is read, so a request that cannot fit is refused at once
+// (errRequestBufferFull) instead of several concurrent uploads each charging
+// part of their bodies and all failing partway (battery escalation, phoebe
+// #70). A chunked body (no Content-Length) is charged as it arrives.
+func (b *requestBufferBudget) wrap(body io.ReadCloser, total, contentLength int64) (*budgetedBody, error) {
+	bb := &budgetedBody{ReadCloser: body, budget: b, total: total}
+	if contentLength > 0 {
+		if !tryCharge(&b.held, contentLength, total) {
+			return nil, errRequestBufferFull
+		}
+		bb.prepaid = contentLength
+		bb.held = contentLength
+	}
+	return bb, nil
+}
+
+// Read charges the bytes it returns before returning them. A refused charge
+// returns (0, errRequestBufferFull) and leaves the counters untouched: the
+// bytes the wrapped reader produced are dropped rather than handed on
+// uncharged (the io.Reader contract allows n == 0 with an error), and the
+// refusal is sticky, so a caller that keeps reading cannot charge them later.
+func (b *budgetedBody) Read(p []byte) (int, error) {
+	b.mu.Lock()
+	released, failed := b.released, b.failed
+	b.mu.Unlock()
+	if released {
+		return 0, http.ErrBodyReadAfterClose
+	}
+	if failed {
+		return 0, errRequestBufferFull
+	}
+	n, err := b.ReadCloser.Read(p)
+	if n <= 0 {
+		return n, err
+	}
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if b.released {
+		return 0, http.ErrBodyReadAfterClose
+	}
+	if b.failed {
+		return 0, errRequestBufferFull
+	}
+	received := b.received + int64(n)
+	if over := received - b.prepaid; over > 0 {
+		delta := min(over, int64(n))
+		if !tryCharge(&b.budget.held, delta, b.total) {
+			b.failed = true
+			return 0, errRequestBufferFull
+		}
+		b.held += delta
+	}
+	b.received = received
+	return n, err
+}
+
+// release returns every byte this request held to the replica budget. After
+// it, reads charge nothing and fail. Idempotent.
+func (b *budgetedBody) release() {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	b.released = true
+	b.budget.held.Add(-b.held)
+	b.held = 0
 }

@@ -55,6 +55,11 @@ func TestClassifyRoundTripSettlement(t *testing.T) {
 		// saw only an incomplete request, so nothing was served.
 		{"body over the gateway limit", &http.MaxBytesError{Limit: 10}, settlementZeroNeverServed},
 		{"wrapped body over the gateway limit", &url.Error{Op: "Post", URL: "http://up", Err: &http.MaxBytesError{Limit: 10}}, settlementZeroNeverServed},
+		// D43 (defensive): the request-buffer budget cut a forwarded body
+		// short, so the upstream never saw a complete request.
+		{"request buffer full", errRequestBufferFull, settlementZeroNeverServed},
+		{"wrapped request buffer full", &url.Error{Op: "Post", URL: "http://up", Err: errRequestBufferFull}, settlementZeroNeverServed},
+		{"fmt-wrapped request buffer full", fmt.Errorf("wrap: %w", errRequestBufferFull), settlementZeroNeverServed},
 		{"nil", nil, settlementUnknown},
 	}
 	for _, tc := range tests {
@@ -714,4 +719,53 @@ func TestAdmissionEngineErrorResponseChargesUnknownUsage(t *testing.T) {
 			_ = physical.Complete(context.Background(), 0)
 		})
 	}
+}
+
+// D43 (defensive branch): a forward cut short by the replica request-buffer
+// budget settles the admission lease to zero (never served): the contract
+// token windows are left uncharged and only the requests-window +1 is kept.
+// A conservative settlement would reject the generated and prompt probes.
+func TestErrorHandlerBufferFullSettlesLeaseZero(t *testing.T) {
+	mr := miniredis.RunT(t)
+	cfg := proxyAdmissionConfig(2)
+	c := redis.NewClient(&redis.Options{Addr: mr.Addr()})
+	t.Cleanup(func() { _ = c.Close() })
+	a := admission.New(c, cfg)
+	em := &recordingEmitter{}
+	s := New(&config.Settings{Admission: cfg}, logging.New(logging.ERROR), em).WithAdmitter(a)
+	upstream, _ := url.Parse("http://upstream.invalid")
+	id := identity.Identity{AuthID: "auth-1", ResourceID: "model-abc", OrgID: "org-a"}
+	est := admissionEstimate{InputTokens: 5}
+
+	charge := func() {
+		lease, err := a.Admit(context.Background(), admission.Request{
+			Graph: "graph", Organization: "org-a", Model: "m",
+			PrefillTokens: 1, EstimatedInputTokens: est.InputTokens, ReservedOutputTokens: 20,
+			OrganizationLimits: admission.RateLimits{
+				Requests: testutil.Ptr[int64](1), GeneratedTokens: testutil.Ptr[int64](20),
+				TotalPromptTokens: testutil.Ptr[int64](100), UncachedPromptTokens: testutil.Ptr[int64](100),
+			},
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		h := s.errorHandler(upstream.String(), id, "req-1", "logical-1", lease, nil)
+		rr := httptest.NewRecorder()
+		h(rr, httptest.NewRequest(http.MethodPost, "/v1/chat/completions", nil),
+			&url.Error{Op: "Post", URL: upstream.String(), Err: errRequestBufferFull})
+		if rr.Code != http.StatusServiceUnavailable {
+			t.Fatalf("status=%d, want 503", rr.Code)
+		}
+	}
+	errs := chargeThenProbeAdmit(t, a, mr.FlushAll, charge, zeroSettlementProbeSet(est))
+	settleZeroProbes(t, errs)
+
+	physical, err := a.Admit(context.Background(), admission.Request{
+		Graph: "graph", Organization: "org-c", Model: "m",
+		PrefillTokens: 1, EstimatedInputTokens: 1, ReservedOutputTokens: 1,
+	})
+	if err != nil {
+		t.Fatalf("buffer-full forward leaked its platform reservation: %v", err)
+	}
+	_ = physical.Complete(context.Background(), 0)
 }

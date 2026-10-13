@@ -13,6 +13,7 @@ package proxy
 
 import (
 	"context"
+	"encoding/json"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -159,6 +160,54 @@ func TestErrorHandlerAnswersForwardedOversizeBodyWith413NotUpstreamFault(t *test
 			}
 			if e := events[0]; e.StatusCode != http.StatusRequestEntityTooLarge || e.UsageFound || e.Aborted {
 				t.Fatalf("event = %+v, want a usage-missing, non-aborted 413 row (not an upstream-fault 502)", e)
+			}
+		})
+	}
+}
+
+// D43 (defensive branch): a forward the replica request-buffer budget cut
+// short answers phoebe's retryable 503 (Retry-After, request id, JSON error)
+// and records one non-aborted 503 row without usage, never the upstream-fault
+// 502. Unreachable today (forceIncludeUsage buffers the body of every
+// request, whatever its method or path, before the forward;
+// TestRequestBufferBudgetFullMidReadChunkedIsRetryable503 pins that); this
+// pins the branch so a future streaming forward inherits it.
+func TestErrorHandlerAnswersForwardedBufferFullWith503NotUpstreamFault(t *testing.T) {
+	upstream, _ := url.Parse("http://upstream.invalid")
+	id := identity.Identity{AuthID: "auth-1", ResourceID: "model-abc"}
+	for _, tc := range []struct {
+		name string
+		err  error
+	}{
+		{"bare", errRequestBufferFull},
+		{"wrapped by the transport", &url.Error{Op: "Post", URL: upstream.String(), Err: errRequestBufferFull}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			em := &recordingEmitter{}
+			srv := newTestServerE(t, upstream, em)
+			h := srv.errorHandler(upstream.String(), id, "req-1", "logical-1", nil, nil)
+			rr := httptest.NewRecorder()
+			h(rr, httptest.NewRequest(http.MethodPost, "/v1/chat/completions", nil), tc.err)
+
+			if rr.Code != http.StatusServiceUnavailable {
+				t.Fatalf("Code=%d body=%q, want 503", rr.Code, rr.Body.String())
+			}
+			if got := rr.Header().Get("Retry-After"); got != "1" {
+				t.Fatalf("Retry-After=%q, want 1", got)
+			}
+			if got := rr.Header().Get("X-Request-Id"); got != "req-1" {
+				t.Fatalf("X-Request-Id=%q, want trusted attempt id req-1", got)
+			}
+			var body map[string]string
+			if err := json.Unmarshal(rr.Body.Bytes(), &body); err != nil || body["error"] == "" {
+				t.Fatalf("body=%q err=%v, want a JSON {\"error\": ...} body", rr.Body.String(), err)
+			}
+			events := em.all()
+			if len(events) != 1 {
+				t.Fatalf("emitted %d events, want 1 observable attempt", len(events))
+			}
+			if e := events[0]; e.StatusCode != http.StatusServiceUnavailable || e.UsageFound || e.Aborted {
+				t.Fatalf("event = %+v, want a usage-missing, non-aborted 503 row (not an upstream-fault 502)", e)
 			}
 		})
 	}
