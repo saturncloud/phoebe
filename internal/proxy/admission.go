@@ -114,6 +114,9 @@ type admissionEstimate struct {
 	Model        string
 	InputTokens  int64
 	OutputTokens int64
+	// OutputDeclared reports that the body set max_tokens or
+	// max_completion_tokens; otherwise OutputTokens is the default reservation.
+	OutputDeclared bool
 }
 
 // publishedGraphCapacity is the capacity Atlas published for graph, or none.
@@ -200,7 +203,8 @@ func admissionWork(body []byte, defaultOutput int64) (admissionEstimate, bool) {
 	if maximum <= 0 || maximum > math.MaxUint32 {
 		return admissionEstimate{}, false
 	}
-	return admissionEstimate{Model: v.Model, InputTokens: estimatePromptTokens(body), OutputTokens: maximum}, true
+	return admissionEstimate{Model: v.Model, InputTokens: estimatePromptTokens(body), OutputTokens: maximum,
+		OutputDeclared: v.MaxTokens != nil || v.MaxCompletionTokens != nil}, true
 }
 
 // prepareSharedDynamoRequest replaces every client-controlled scheduling and
@@ -452,6 +456,41 @@ func undeclaredOutputReservation(defaultOutput int64, scopes ...admission.RateLi
 		}
 	}
 	return out
+}
+
+// undeclaredOutputWithinKV clamps the output reservation of a request that
+// declared no max_tokens so the prompt plus the reservation fits kvCap, the
+// tightest positive reserved-KV cap that applies (0 = none). Like the contract
+// clamp above, a request is never refused as too large for a default the
+// client did not choose. The result is at least 1; when the prompt alone
+// fills the cap the request is still refused for its prompt (413).
+func undeclaredOutputWithinKV(output, input, kvCap int64) int64 {
+	if kvCap <= 0 {
+		return output
+	}
+	room := kvCap - input
+	if room < 1 {
+		room = 1
+	}
+	if room < output {
+		return room
+	}
+	return output
+}
+
+// admitterSettings is the admission configuration the admitter enforces: the
+// admitter's own when it reports one, else the operator tiers from settings,
+// which apply only under admission.enabled (Settings.EffectiveAdmission).
+func (s *Server) admitterSettings() config.AdmissionSettings {
+	if a, ok := s.admitter.(interface {
+		Settings() config.AdmissionSettings
+	}); ok {
+		return a.Settings()
+	}
+	if !s.settings.Admission.Enabled {
+		return config.AdmissionSettings{}
+	}
+	return s.settings.Admission
 }
 
 // errNoTrustedRateLimitPolicy is the parser's "no anchor and no scoped policy

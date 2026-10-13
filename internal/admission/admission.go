@@ -415,20 +415,38 @@ func (l RateLimits) Any() bool {
 	return l.Requests != nil || l.TotalPromptTokens != nil || l.UncachedPromptTokens != nil || l.GeneratedTokens != nil
 }
 
-func (a *RedisAdmitter) scopes(r Request) []scope {
-	out := []scope{makeScope("platform", "all", a.cfg.Platform), makeScope("graph", r.Graph, a.cfg.Graph),
-		makeScope("organization", r.Organization, a.cfg.Organization), makeScope("organization_model", r.Organization+"\x1f"+r.Model, a.cfg.OrganizationModel)}
+func (a *RedisAdmitter) scopes(r Request) []scope { return scopesFor(a.cfg, r) }
+
+// TightestReservedKVCap is the smallest positive reserved-KV cap among the
+// scopes Admit would check for r under cfg — the operator tiers (the lane
+// share after its weight), and r.GraphCapacity — or 0 when none applies. An
+// explicit zero cap is not a positive cap and is ignored: that scope rejects
+// in admission with its retryable answer. The proxy uses it to keep an
+// undeclared max_tokens reservation inside the KV caps.
+func TightestReservedKVCap(cfg config.AdmissionSettings, r Request) int64 {
+	var out int64
+	for _, sc := range scopesFor(cfg, r) {
+		if sc.KV > 0 && (out == 0 || sc.KV < out) {
+			out = sc.KV
+		}
+	}
+	return out
+}
+
+func scopesFor(cfg config.AdmissionSettings, r Request) []scope {
+	out := []scope{makeScope("platform", "all", cfg.Platform), makeScope("graph", r.Graph, cfg.Graph),
+		makeScope("organization", r.Organization, cfg.Organization), makeScope("organization_model", r.Organization+"\x1f"+r.Model, cfg.OrganizationModel)}
 	// Every operator scope, the lane included, precedes the contract scopes:
 	// admitScript checks scopes in order, so at an exact tie the operator scope
 	// answers (503) before the contract scope (429).
-	laneName := a.cfg.OrganizationLanes[r.Organization]
+	laneName := cfg.OrganizationLanes[r.Organization]
 	if laneName == "" {
 		laneName = "default"
 	}
-	if _, ok := a.cfg.Lanes[laneName]; !ok {
+	if _, ok := cfg.Lanes[laneName]; !ok {
 		laneName = "default"
 	}
-	if t, ok := a.cfg.Lanes[laneName]; ok {
+	if t, ok := cfg.Lanes[laneName]; ok {
 		out = append(out, makeScope("lane", laneName, scaled(t.Limits, t.Weight)))
 	}
 	if r.GraphCapacity.Any() {

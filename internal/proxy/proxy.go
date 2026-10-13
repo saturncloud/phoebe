@@ -783,6 +783,16 @@ func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request) {
 			http.Error(w, "invalid shared inference request", http.StatusBadRequest)
 			return
 		}
+		if routePath != "/v1/embeddings" && enforceAdmission && !estimate.OutputDeclared {
+			// The undeclared reservation must also fit every positive
+			// reserved-KV cap admission will check (operator tiers, the
+			// weighted lane share, published graph capacity), or a client
+			// that sent no max_tokens could be refused for the default.
+			kvCap := admission.TightestReservedKVCap(s.admitterSettings(), admission.Request{
+				Graph: graph, Organization: id.OrgID, Model: estimate.Model, GraphCapacity: graphCapacity.Limits(),
+			})
+			estimate.OutputTokens = undeclaredOutputWithinKV(estimate.OutputTokens, estimate.InputTokens, kvCap)
+		}
 		body, tenant, rerr := prepareSharedDynamoRequest(body, tenantIdentity, estimate.OutputTokens, sharedLane)
 		if rerr != nil {
 			http.Error(w, "invalid shared inference request", http.StatusBadRequest)
@@ -816,7 +826,7 @@ func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request) {
 				PrefillTokens: estimate.InputTokens, EstimatedInputTokens: estimate.InputTokens,
 				ReservedOutputTokens: estimate.OutputTokens,
 				Adapter:              id.Adapter != "", OrganizationLimits: organizationLimits, OwnerLimits: ownerLimits,
-				GroupScopes: groupScopes,
+				GroupScopes:   groupScopes,
 				GraphCapacity: graphCapacity.Limits(),
 			})
 			if err != nil {
