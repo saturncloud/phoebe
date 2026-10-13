@@ -74,10 +74,12 @@ type Settings struct {
 }
 
 // ProtectionSettings is the YAML shape for gateway-wide resource bounds. Every
-// field is optional: absent (zero) selects the shipped default below, and a
-// negative value is a startup error. There is deliberately no "off" value —
-// each bound protects the shared process, and the defaults are generous enough
-// that a well-behaved client never meets them.
+// field is optional: an absent (or null) key selects the shipped default
+// below, and an explicit zero or negative value is a startup error. There is
+// deliberately no "off" value — each bound protects the shared process, and
+// the defaults are generous enough that a well-behaved client never meets
+// them. An operator who writes 0 meaning "unlimited" is told no at startup
+// rather than silently given the default.
 type ProtectionSettings struct {
 	// MaxRequestBodyBytes caps every request body phoebe reads, on every route.
 	MaxRequestBodyBytes int64 `yaml:"maxRequestBodyBytes"`
@@ -107,6 +109,48 @@ type ProtectionSettings struct {
 	// zero. The shared tier bounds the same thing with admission's
 	// maxColdHolds; dedicated endpoints have no admission.
 	MaxDedicatedColdHoldsPerEndpoint int64 `yaml:"maxDedicatedColdHoldsPerEndpoint"`
+
+	// intKeyPresent records which integer keys the YAML set to a non-null
+	// value, in protectionIntKeys order, so parse can tell an explicit 0 (an
+	// error) from an absent key (the default). A hand-built value leaves it
+	// all false, and Effective treats its zero fields as absent.
+	intKeyPresent [len(protectionIntKeys)]bool
+}
+
+// protectionIntKeys are the YAML names of ProtectionSettings' integer limits,
+// in the order intKeyPresent and intValues use.
+var protectionIntKeys = [...]string{
+	"maxRequestBodyBytes",
+	"maxResponseBufferBytesPerStream",
+	"maxResponseBufferBytesTotal",
+	"maxDedicatedColdHoldsPerEndpoint",
+}
+
+func (p *ProtectionSettings) intValues() [len(protectionIntKeys)]int64 {
+	return [...]int64{
+		p.MaxRequestBodyBytes,
+		p.MaxResponseBufferBytesPerStream,
+		p.MaxResponseBufferBytesTotal,
+		p.MaxDedicatedColdHoldsPerEndpoint,
+	}
+}
+
+// UnmarshalYAML decodes the fields as usual and also records which integer
+// keys were present, since int64 alone cannot tell an explicit 0 from absent.
+func (p *ProtectionSettings) UnmarshalYAML(unmarshal func(interface{}) error) error {
+	type plain ProtectionSettings
+	if err := unmarshal((*plain)(p)); err != nil {
+		return err
+	}
+	var raw map[string]interface{}
+	if err := unmarshal(&raw); err != nil {
+		return err
+	}
+	for i, key := range protectionIntKeys {
+		v, ok := raw[key]
+		p.intKeyPresent[i] = ok && v != nil
+	}
+	return nil
 }
 
 // Shipped protection defaults.
@@ -120,7 +164,8 @@ const (
 )
 
 // Effective returns the settings with every absent (zero) field replaced by
-// its default. The proxy calls it rather than reading fields directly, so a
+// its default. A loaded Settings never reaches here with an explicit zero:
+// parse rejects it. The proxy calls it rather than reading fields directly, so a
 // hand-built Settings (tests, embedders) is protected exactly like a loaded
 // one.
 func (p ProtectionSettings) Effective() ProtectionSettings {
@@ -146,17 +191,10 @@ func (p ProtectionSettings) Effective() ProtectionSettings {
 }
 
 func (p *ProtectionSettings) parse() error {
-	for _, item := range []struct {
-		name  string
-		value int64
-	}{
-		{"maxRequestBodyBytes", p.MaxRequestBodyBytes},
-		{"maxResponseBufferBytesPerStream", p.MaxResponseBufferBytesPerStream},
-		{"maxResponseBufferBytesTotal", p.MaxResponseBufferBytesTotal},
-		{"maxDedicatedColdHoldsPerEndpoint", p.MaxDedicatedColdHoldsPerEndpoint},
-	} {
-		if item.value < 0 {
-			return fmt.Errorf("protection.%s cannot be negative", item.name)
+	values := p.intValues()
+	for i, key := range protectionIntKeys {
+		if values[i] < 0 || (p.intKeyPresent[i] && values[i] == 0) {
+			return fmt.Errorf("protection.%s must be positive, got %d (omit the key for the default; there is no unlimited value)", key, values[i])
 		}
 	}
 	for _, item := range []struct {

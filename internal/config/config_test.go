@@ -1,6 +1,7 @@
 package config
 
 import (
+	"fmt"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -587,6 +588,10 @@ func TestLoadProtection(t *testing.T) {
 		{"negative per-stream buffer", "protection:\n  maxResponseBufferBytesPerStream: -1\n", "protection.maxResponseBufferBytesPerStream"},
 		{"negative total buffer", "protection:\n  maxResponseBufferBytesTotal: -1\n", "protection.maxResponseBufferBytesTotal"},
 		{"negative holds", "protection:\n  maxDedicatedColdHoldsPerEndpoint: -1\n", "protection.maxDedicatedColdHoldsPerEndpoint"},
+		{"zero body size", "protection:\n  maxRequestBodyBytes: 0\n", "protection.maxRequestBodyBytes"},
+		{"zero per-stream buffer", "protection:\n  maxResponseBufferBytesPerStream: 0\n", "protection.maxResponseBufferBytesPerStream"},
+		{"zero total buffer", "protection:\n  maxResponseBufferBytesTotal: 0\n", "protection.maxResponseBufferBytesTotal"},
+		{"zero holds", "protection:\n  maxDedicatedColdHoldsPerEndpoint: 0\n", "protection.maxDedicatedColdHoldsPerEndpoint"},
 		{"unparseable stall timeout", "protection:\n  streamStallTimeout: soon\n", "protection.streamStallTimeout"},
 		{"zero stall timeout", "protection:\n  streamStallTimeout: 0s\n", "protection.streamStallTimeout"},
 		{"unparseable stream duration", "protection:\n  maxStreamDuration: later\n", "protection.maxStreamDuration"},
@@ -597,6 +602,67 @@ func TestLoadProtection(t *testing.T) {
 			_, err := Load(writeTemp(t, tc.yaml))
 			if err == nil || !strings.Contains(err.Error(), tc.field) {
 				t.Fatalf("err=%v, want a startup error naming %s", err, tc.field)
+			}
+		})
+	}
+}
+
+// Every protection limit follows one rule: an absent (or null) key takes the
+// shipped default, an explicit zero or a negative value stops startup with an
+// error naming the key, and a positive value is kept. There is no "0 means
+// unlimited" for any of them.
+func TestProtectionLimitsRejectZeroAndNegativeDefaultWhenAbsent(t *testing.T) {
+	for _, f := range []struct {
+		key      string
+		positive string
+		get      func(ProtectionSettings) string
+		want     string
+		def      string
+	}{
+		{"maxRequestBodyBytes", "1024", func(p ProtectionSettings) string { return fmt.Sprint(p.MaxRequestBodyBytes) }, "1024", fmt.Sprint(DefaultMaxRequestBodyBytes)},
+		{"maxResponseBufferBytesPerStream", "1024", func(p ProtectionSettings) string { return fmt.Sprint(p.MaxResponseBufferBytesPerStream) }, "1024", fmt.Sprint(DefaultMaxResponseBufferBytesPerStream)},
+		{"maxResponseBufferBytesTotal", "536870912", func(p ProtectionSettings) string { return fmt.Sprint(p.MaxResponseBufferBytesTotal) }, "536870912", fmt.Sprint(DefaultMaxResponseBufferBytesTotal)},
+		{"maxDedicatedColdHoldsPerEndpoint", "3", func(p ProtectionSettings) string { return fmt.Sprint(p.MaxDedicatedColdHoldsPerEndpoint) }, "3", fmt.Sprint(DefaultMaxDedicatedColdHoldsPerEndpoint)},
+		{"streamStallTimeout", "30s", func(p ProtectionSettings) string { return p.StreamStallTimeout.String() }, "30s", DefaultStreamStallTimeout.String()},
+		{"maxStreamDuration", "2h", func(p ProtectionSettings) string { return p.MaxStreamDuration.String() }, "2h0m0s", DefaultMaxStreamDuration.String()},
+	} {
+		zero, negative := "0", "-1"
+		if strings.HasSuffix(f.positive, "s") || strings.HasSuffix(f.positive, "h") {
+			zero, negative = "0s", "-1s"
+		}
+		t.Run(f.key+" absent takes the default", func(t *testing.T) {
+			s, err := Load(writeTemp(t, "protection: {}\n"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			if got := f.get(s.Protection.Effective()); got != f.def {
+				t.Fatalf("%s=%s, want default %s", f.key, got, f.def)
+			}
+		})
+		t.Run(f.key+" null takes the default", func(t *testing.T) {
+			s, err := Load(writeTemp(t, "protection:\n  "+f.key+": null\n"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			if got := f.get(s.Protection.Effective()); got != f.def {
+				t.Fatalf("%s=%s, want default %s", f.key, got, f.def)
+			}
+		})
+		for _, bad := range []struct{ name, value string }{{"zero", zero}, {"negative", negative}} {
+			t.Run(f.key+" "+bad.name+" stops startup", func(t *testing.T) {
+				_, err := Load(writeTemp(t, "protection:\n  "+f.key+": "+bad.value+"\n"))
+				if err == nil || !strings.Contains(err.Error(), "protection."+f.key) {
+					t.Fatalf("err=%v, want a startup error naming protection.%s", err, f.key)
+				}
+			})
+		}
+		t.Run(f.key+" positive is kept", func(t *testing.T) {
+			s, err := Load(writeTemp(t, "protection:\n  "+f.key+": "+f.positive+"\n"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			if got := f.get(s.Protection.Effective()); got != f.want {
+				t.Fatalf("%s=%s, want %s", f.key, got, f.want)
 			}
 		})
 	}

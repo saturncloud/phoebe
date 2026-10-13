@@ -17,7 +17,8 @@ idleTimeout: "10m"
 # Gateway protection: bounds on what any one request can hold in phoebe. They
 # apply to ALL traffic, shared and dedicated, and are set once for the whole
 # gateway (they protect phoebe itself, which every tenant shares). Every key is
-# optional; an absent key uses the default shown. Values must be positive.
+# optional; an absent key uses the default shown. Values must be positive: an
+# explicit 0 is a startup error, not "unlimited" (there is no off switch).
 # protection:
 #   # Largest request body phoebe reads, on every route (413 above it).
 #   maxRequestBodyBytes: 67108864
