@@ -7,6 +7,7 @@ import (
 	"math"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	// pgx stdlib driver registers itself as "pgx" with database/sql. We use the
 	// standard library sql package (not the native pgx pool) so the store is a
@@ -240,7 +241,7 @@ func eventArgs(e metering.Event) []any {
 		// NULL when unknown (no topology entry for the graph, or an event
 		// written before these fields existed).
 		nullRevision(e.TopologyRevision),
-		nullStr(e.Region),
+		nullRegion(e.Region),
 		requestStartedAt,
 		// A negative duration is impossible evidence (clock skew or a producer
 		// bug), so it is stored as NULL ("not captured") like a missing start.
@@ -282,6 +283,20 @@ func nullRevision(v int) any {
 		return nil
 	}
 	return v
+}
+
+// nullRegion returns a driver NULL for a region that billing_event.region
+// cannot store: "", one containing a NUL byte (PostgreSQL text rejects it),
+// invalid UTF-8, or longer than 64 characters (VARCHAR(64); the same limit
+// recovery.go's validate enforces). It mirrors nullRevision as the drain-side
+// backstop: a bad region would fail the multi-row insert and drop the whole
+// batch, losing billable usage for unrelated requests. Region is evidence, so
+// NULL ("not captured") is the safe value.
+func nullRegion(s string) any {
+	if s == "" || strings.ContainsRune(s, 0) || !utf8.ValidString(s) || utf8.RuneCountInString(s) > 64 {
+		return nil
+	}
+	return s
 }
 
 // nullInt64 returns v when known is true and a driver NULL otherwise. Used

@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"regexp"
+	"strings"
 	"testing"
 	"time"
 
@@ -279,6 +280,27 @@ func TestEventArgs_NegativeServingDurationStoresNull(t *testing.T) {
 		args := eventArgs(metering.Event{RequestID: "r", Model: "m", RequestStartedUnixMs: 1, ServingDurationMs: tc.ms})
 		if args[servingDurationIdx] != tc.want {
 			t.Fatalf("serving_duration_ms arg for %d = %v, want %v", tc.ms, args[servingDurationIdx], tc.want)
+		}
+	}
+}
+
+// TestEventArgs_UnstorableRegionBindsNullNeverPoisons: billing_event.region
+// is VARCHAR(64) text, so a region with a NUL byte, invalid UTF-8, or more
+// than 64 characters would fail the multi-row insert and drop the whole
+// batch. It binds NULL instead; a normal region binds as the string.
+func TestEventArgs_UnstorableRegionBindsNullNeverPoisons(t *testing.T) {
+	const regionIdx = 22 // topology_revision 21, request_started_at 23.
+
+	for _, ok := range []string{"eu-north1", strings.Repeat("é", 64)} {
+		args := eventArgs(metering.Event{RequestID: "r", Model: "m", Region: ok})
+		if args[regionIdx] != ok {
+			t.Fatalf("region arg = %v, want %q", args[regionIdx], ok)
+		}
+	}
+	for _, bad := range []string{"", "a\x00b", "\xff", strings.Repeat("a", 65)} {
+		args := eventArgs(metering.Event{RequestID: "r", Model: "m", Region: bad})
+		if args[regionIdx] != nil {
+			t.Fatalf("region arg for %q = %v, want nil", bad, args[regionIdx])
 		}
 	}
 }
