@@ -118,7 +118,8 @@ type admissionEstimate struct {
 	// max_completion_tokens; otherwise OutputTokens is the default reservation.
 	OutputDeclared bool
 	// OutputSequences is how many output sequences the engine generates in
-	// parallel for the request: the larger of n and best_of, at least 1. The
+	// parallel for the request: the larger of n and best_of on the routes
+	// whose engine reads them (see admissionWork), at least 1. The
 	// prompt's KV is shared across them, but each sequence generates up to
 	// OutputTokens and needs its own output KV, so admission multiplies the
 	// output by sequences in the reserved-output, contract generated-token
@@ -184,6 +185,9 @@ var admissionInterpretedFields = []string{"model", "max_tokens", "max_completion
 // (promptBatchCount) on /v1/completions only, since the completions engine
 // generates for each prompt. Other routes (chat completions, embeddings)
 // ignore a top-level "prompt", so it never multiplies their sequences (D27).
+// Likewise best_of counts only on /v1/completions and n only on completions
+// and chat completions; a route that ignores the field is never charged for
+// it (D40).
 // n, best_of, max_tokens and max_completion_tokens are read like the engine's
 // lax integer validation (laxInt, ledger D32): integers, integral floats such
 // as 2.0 and integer strings such as "4" count at their value; a fraction, a
@@ -228,6 +232,13 @@ func admissionWork(body []byte, defaultOutput int64, routePath string) (admissio
 	if maximum <= 0 || maximum > math.MaxUint32 {
 		return admissionEstimate{}, false
 	}
+	// Each count multiplies only on a route whose engine reads it: n on
+	// completions and chat completions, best_of on completions alone.
+	// Embeddings generate nothing per sequence and chat completions has no
+	// best_of, so there the field is still validated above (a malformed
+	// value is a 400) but never charged (D40).
+	hasN = hasN && (routePath == "/v1/completions" || routePath == "/v1/chat/completions")
+	hasBestOf = hasBestOf && routePath == "/v1/completions"
 	sequences := int64(1)
 	for _, c := range []struct {
 		value int64

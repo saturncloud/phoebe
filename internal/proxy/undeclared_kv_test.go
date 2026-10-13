@@ -202,7 +202,7 @@ func TestAdmissionWorkCountsOutputSequences(t *testing.T) {
 	}{
 		{chat, `{"model":"m"}`, 1, true},
 		{chat, `{"model":"m","n":4}`, 4, true},
-		{chat, `{"model":"m","n":2,"best_of":5}`, 5, true},
+		{completions, `{"model":"m","n":2,"best_of":5}`, 5, true},
 		{chat, `{"model":"m","n":0}`, 1, true},
 		{chat, `{"model":"m","n":70000}`, 0, false},
 		{chat, `{"model":"m","n":2,"N":9}`, 0, false},
@@ -249,6 +249,43 @@ func TestAdmissionWorkBatchMultiplierIsCompletionsOnly(t *testing.T) {
 	}
 }
 
+// D40: a count field multiplies the output sequences only on a route whose
+// engine reads it. best_of exists only on /v1/completions; n has no meaning
+// on /v1/embeddings. Elsewhere the field neither multiplies the reservation
+// nor gets the request refused, but a malformed value is still a 400.
+func TestAdmissionWorkChargesCountFieldsOnlyWhereTheEngineReadsThem(t *testing.T) {
+	const chat, completions, embeddings = "/v1/chat/completions", "/v1/completions", "/v1/embeddings"
+	for _, c := range []struct {
+		route string
+		body  string
+		want  int64
+		ok    bool
+	}{
+		{embeddings, `{"model":"m","input":"hi","best_of":60000}`, 1, true},
+		{embeddings, `{"model":"m","input":"hi","n":60000}`, 1, true},
+		{embeddings, `{"model":"m","input":"hi","best_of":70000}`, 1, true},
+		{chat, `{"model":"m","max_tokens":10,"best_of":60000}`, 1, true},
+		{chat, `{"model":"m","max_tokens":10,"best_of":70000}`, 1, true},
+		{chat, `{"model":"m","max_tokens":10,"n":3,"best_of":60000}`, 3, true},
+		{completions, `{"model":"m","max_tokens":10,"best_of":3}`, 3, true},
+		{completions, `{"model":"m","max_tokens":10,"n":3}`, 3, true},
+		// Parse validation is unchanged on every route.
+		{embeddings, `{"model":"m","input":"hi","best_of":1.5}`, 0, false},
+		{chat, `{"model":"m","best_of":"many"}`, 0, false},
+	} {
+		got, ok := admissionWork([]byte(c.body), 10, c.route)
+		if ok != c.ok || (ok && got.OutputSequences != c.want) {
+			t.Errorf("admissionWork(%s, %s) = (%d, %v), want (%d, %v)", c.route, c.body, got.OutputSequences, ok, c.want, c.ok)
+		}
+	}
+	// The reservation on a route that ignores best_of equals the one without it.
+	base, _ := admissionWork([]byte(`{"model":"m","max_tokens":10}`), 10, chat)
+	withBestOf, _ := admissionWork([]byte(`{"model":"m","max_tokens":10,"best_of":60000}`), 10, chat)
+	if base != withBestOf {
+		t.Errorf("chat reservation with best_of = %+v, want %+v (unchanged)", withBestOf, base)
+	}
+}
+
 // D28 (revised, D32): n, best_of, max_tokens and max_completion_tokens are
 // read the way the engine's validation reads them (pydantic lax integers): a
 // JSON integer, an integral float (2.0, 1e0) or an integer string ("4") counts
@@ -278,7 +315,8 @@ func TestAdmissionWorkReadsCountsLikeTheEngine(t *testing.T) {
 		{`{"model":"m","max_tokens":"16","max_completion_tokens":16}`, 1, 16, true},
 		{`{"model":"m","max_tokens":"16","max_completion_tokens":17}`, 0, 0, false},
 	} {
-		got, ok := admissionWork([]byte(c.body), 10, "/v1/chat/completions")
+		// Completions reads every count field (best_of only exists there).
+		got, ok := admissionWork([]byte(c.body), 10, "/v1/completions")
 		if ok != c.ok || (ok && (got.OutputSequences != c.sequences || got.OutputTokens != c.output)) {
 			t.Errorf("admissionWork(%s) = (seq %d, out %d, %v), want (seq %d, out %d, %v)",
 				c.body, got.OutputSequences, got.OutputTokens, ok, c.sequences, c.output, c.ok)
