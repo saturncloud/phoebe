@@ -27,7 +27,7 @@ type usageFilterReader struct {
 	includeFinalUsage bool
 	maxLineBytes      int
 	terminalErr       error
-	// buffers charges the held line against the gateway protection limits on
+	// buffers charges the held line and the unread filtered lines against the gateway protection limits on
 	// buffered response bytes; nil = only maxLineBytes applies.
 	buffers *responseBufferAccount
 }
@@ -55,7 +55,7 @@ func (r *usageFilterReader) Read(p []byte) (int, error) {
 			return 0, errSSEEventLineTooLarge
 		}
 		r.line.Write(fragment)
-		if berr := r.buffers.set(bufferSlotFilter, int64(r.line.Len())); berr != nil {
+		if berr := r.charge(); berr != nil {
 			_ = r.src.Close()
 			return 0, berr
 		}
@@ -64,8 +64,17 @@ func (r *usageFilterReader) Read(p []byte) (int, error) {
 		}
 		if r.line.Len() > 0 {
 			r.pending.Write(filterUsageLine(r.line.Bytes(), r.includeFinalUsage))
+			// Charge the moment both the line and its filtered copy exist; the
+			// pending copy then stays charged until the client has read it.
+			if berr := r.charge(); berr != nil {
+				_ = r.src.Close()
+				return 0, berr
+			}
 			r.line.Reset()
-			_ = r.buffers.set(bufferSlotFilter, 0)
+			if r.line.Cap() > releaseBufferCap {
+				r.line = bytes.Buffer{}
+			}
+			_ = r.charge()
 		}
 		if err != nil {
 			if r.pending.Len() == 0 {
@@ -75,7 +84,23 @@ func (r *usageFilterReader) Read(p []byte) (int, error) {
 			break
 		}
 	}
-	return r.pending.Read(p)
+	n, err := r.pending.Read(p)
+	_ = r.charge()
+	if r.pending.Len() == 0 && r.pending.Cap() > releaseBufferCap {
+		r.pending = bytes.Buffer{}
+	}
+	return n, err
+}
+
+// releaseBufferCap is the backing-array size above which an emptied line or
+// pending buffer is replaced, so one large event does not pin its memory for
+// the rest of the stream.
+const releaseBufferCap = 64 << 10
+
+// charge reports every byte the filter holds — the partial line and the
+// filtered lines the client has not read yet — to the buffer account.
+func (r *usageFilterReader) charge() error {
+	return r.buffers.set(bufferSlotFilter, int64(r.line.Len()+r.pending.Len()))
 }
 
 func (r *usageFilterReader) Close() error { return r.src.Close() }
