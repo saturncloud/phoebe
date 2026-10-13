@@ -41,24 +41,32 @@ func bareSharedRequest(up *url.URL, org string) *http.Request {
 	return r
 }
 
-// B8: capacity Atlas publishes for a graph is enforced whenever an admission
-// store exists — without admission.enabled and without any contract envelope
-// — as an operator capacity rejection (503 + Retry-After, not a 429). Other
-// graphs are unaffected.
-func TestPublishedGraphCapacityEnforcedWithoutEnablement(t *testing.T) {
+// capacityFixture is a server with an admission store but admission.enabled
+// off, whose graph (the upstream's) has a published capacity of one active
+// request. The upstream holds every request until releaseAll.
+type capacityFixture struct {
+	s          *Server
+	up         *url.URL
+	graph      string
+	hit        chan struct{}
+	releaseAll func()
+}
+
+func newCapacityFixture(t *testing.T) *capacityFixture {
+	t.Helper()
 	release := make(chan struct{})
-	hit := make(chan struct{}, 4)
+	hit := make(chan struct{}, 16)
 	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		hit <- struct{}{}
 		<-release
 		_, _ = w.Write([]byte(`{"model":"model-a","usage":{"prompt_tokens":1,"completion_tokens":1}}`))
 	}))
-	defer backend.Close()
-	// Runs before backend.Close on a failed assertion, so a held handler
-	// cannot make Close (and the test) hang.
+	t.Cleanup(backend.Close)
+	// Cleanups run last-registered first, so a failed assertion releases any
+	// held handler before backend.Close, which would otherwise hang.
 	var releaseOnce sync.Once
 	releaseAll := func() { releaseOnce.Do(func() { close(release) }) }
-	defer releaseAll()
+	t.Cleanup(releaseAll)
 	up, _ := url.Parse(backend.URL)
 	graph := graphFromUpstreamHost(up.Host)
 
@@ -72,31 +80,57 @@ func TestPublishedGraphCapacityEnforcedWithoutEnablement(t *testing.T) {
 	}
 	s := New(settings, logging.New(logging.ERROR), &recordingEmitter{}).WithAdmitter(admission.New(client, eff))
 	s.graphCapacity = staticGraphCapacity{graph: {MaxActiveRequests: ptr64(1)}}
+	return &capacityFixture{s: s, up: up, graph: graph, hit: hit, releaseAll: releaseAll}
+}
 
-	done := make(chan int, 1)
+// serveAsync serves a bare shared request for org in the background and
+// sends its status code to done.
+func (f *capacityFixture) serveAsync(org string, done chan int) {
 	go func() {
 		rr := httptest.NewRecorder()
-		s.Handler().ServeHTTP(rr, bareSharedRequest(up, "org-a"))
+		f.s.Handler().ServeHTTP(rr, bareSharedRequest(f.up, org))
 		done <- rr.Code
 	}()
+}
+
+// fill sends one request from org-a and waits until the upstream holds it,
+// so the graph's single slot is taken. The returned channel receives its
+// status once released.
+func (f *capacityFixture) fill(t *testing.T) chan int {
+	t.Helper()
+	done := make(chan int, 4)
+	f.serveAsync("org-a", done)
 	select {
-	case <-hit:
+	case <-f.hit:
 	case code := <-done:
 		t.Fatalf("first request finished early with %d", code)
 	case <-time.After(5 * time.Second):
 		t.Fatal("first request never reached the engine")
 	}
+	return done
+}
 
+// B8 / D5: capacity Atlas publishes for a graph is enforced whenever an
+// admission store exists, without admission.enabled and without any contract
+// envelope, as an operator capacity rejection (503 + Retry-After, not a 429).
+func TestPublishedGraphCapacityRejectsWith503WithoutAdmissionEnabled(t *testing.T) {
+	f := newCapacityFixture(t)
+	f.fill(t)
 	rr := httptest.NewRecorder()
-	s.Handler().ServeHTTP(rr, bareSharedRequest(up, "org-b"))
+	f.s.Handler().ServeHTTP(rr, bareSharedRequest(f.up, "org-b"))
 	if rr.Code != http.StatusServiceUnavailable || rr.Header().Get("Retry-After") == "" {
 		t.Fatalf("second request on a full graph: status=%d retry-after=%q, want 503 with Retry-After", rr.Code, rr.Header().Get("Retry-After"))
 	}
+}
 
-	// Other graphs are unaffected: while graph A is full, a graph with no
-	// published capacity stays unlimited. Two concurrent requests are held
-	// there, so a capacity lookup that ignored its graph (and capped this
-	// graph at one) is caught too, not only one sharing graph A's counter.
+// While graph A is full, a graph with no published capacity stays unlimited.
+// Two concurrent requests are held there, so a capacity lookup that ignored
+// its graph (and capped this graph at one) is caught too, not only one
+// sharing graph A's counter.
+func TestPublishedGraphCapacityDoesNotAffectOtherGraphs(t *testing.T) {
+	f := newCapacityFixture(t)
+	f.fill(t)
+
 	release2 := make(chan struct{})
 	hit2 := make(chan struct{}, 2)
 	backend2 := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
@@ -112,14 +146,14 @@ func TestPublishedGraphCapacityEnforcedWithoutEnablement(t *testing.T) {
 	// Both test servers listen on 127.0.0.1 (graph "127"); "localhost" is a
 	// different graph with no published capacity.
 	up2.Host = "localhost:" + up2.Port()
-	if graphFromUpstreamHost(up2.Host) == graph {
+	if graphFromUpstreamHost(up2.Host) == f.graph {
 		t.Fatal("precondition: the second upstream must map to a different graph")
 	}
 	done2 := make(chan int, 2)
 	for i := 0; i < 2; i++ {
 		go func() {
 			rr := httptest.NewRecorder()
-			s.Handler().ServeHTTP(rr, bareSharedRequest(up2, "org-b"))
+			f.s.Handler().ServeHTTP(rr, bareSharedRequest(up2, "org-b"))
 			done2 <- rr.Code
 		}()
 	}
@@ -138,32 +172,47 @@ func TestPublishedGraphCapacityEnforcedWithoutEnablement(t *testing.T) {
 			t.Fatalf("an unpublished graph must not be limited by another graph's capacity: status=%d", code)
 		}
 	}
+}
 
-	// A route with no trusted org keeps its historical behavior: published
-	// capacity alone does not start failing it closed.
-	go func() {
-		rr := httptest.NewRecorder()
-		s.Handler().ServeHTTP(rr, bareSharedRequest(up, ""))
-		done <- rr.Code
-	}()
+// D5 applies published capacity to requests with a trusted organization. A
+// route with no trusted org keeps its historical behavior: published capacity
+// alone does not start failing it closed, even while the graph is full.
+func TestPublishedGraphCapacityNotEnforcedForOrglessRoute(t *testing.T) {
+	f := newCapacityFixture(t)
+	done := f.fill(t)
+	f.serveAsync("", done)
 	select {
-	case <-hit:
+	case <-f.hit:
+	case code := <-done:
+		t.Fatalf("an org-less historical route must not be refused by published capacity: status=%d", code)
 	case <-time.After(5 * time.Second):
 		t.Fatal("an org-less historical route must not be refused by published capacity")
 	}
-	releaseAll()
+	f.releaseAll()
 	for i := 0; i < 2; i++ {
 		if code := <-done; code != http.StatusOK {
 			t.Fatalf("held request status=%d", code)
 		}
 	}
+}
 
-	// Freed: the graph admits again.
+// Once the request holding a full graph's only slot finishes, the graph
+// admits again.
+func TestPublishedGraphCapacityReadmitsAfterRelease(t *testing.T) {
+	f := newCapacityFixture(t)
+	done := f.fill(t)
+	full := httptest.NewRecorder()
+	f.s.Handler().ServeHTTP(full, bareSharedRequest(f.up, "org-b"))
+	if full.Code != http.StatusServiceUnavailable {
+		t.Fatalf("precondition: second request on a full graph status=%d, want 503", full.Code)
+	}
+	f.releaseAll()
+	if code := <-done; code != http.StatusOK {
+		t.Fatalf("held request status=%d", code)
+	}
+	// The upstream no longer holds requests once released.
 	afterRelease := httptest.NewRecorder()
-	backend.Config.Handler = http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
-		_, _ = w.Write([]byte(`{"model":"model-a","usage":{"prompt_tokens":1,"completion_tokens":1}}`))
-	})
-	s.Handler().ServeHTTP(afterRelease, bareSharedRequest(up, "org-b"))
+	f.s.Handler().ServeHTTP(afterRelease, bareSharedRequest(f.up, "org-b"))
 	if afterRelease.Code != http.StatusOK {
 		t.Fatalf("after release status=%d, want 200", afterRelease.Code)
 	}
