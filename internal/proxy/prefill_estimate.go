@@ -26,6 +26,14 @@ const imagePartTokens = 1024
 // parameters and the like are not message text. A body with none of these
 // estimates 1, the minimum admission accepts.
 //
+// Tool and schema definitions (schemaFields: tools, functions,
+// response_format and the guided-decoding fields) are counted by their raw
+// JSON length, because the engine's chat template renders tool definitions
+// into the prompt and structured-output schemas can be as large; a request
+// with a tiny message and megabytes of tool schemas must not estimate as
+// one token (D7 extension, battery fix 2026-10-13). A JSON null counts
+// nothing.
+//
 // Every field is looked up by its exact key. encoding/json's struct decoding
 // matches keys case-insensitively and keeps the last match, while the engine
 // frontend reads exact keys, so a struct decode would let
@@ -59,11 +67,25 @@ func estimatePromptTokens(body []byte) int64 {
 		chars += c
 		tokens += t
 	}
+	for _, key := range schemaFields {
+		if raw := bytes.TrimSpace(top[key]); len(raw) > 0 && !bytes.Equal(raw, []byte("null")) {
+			chars += int64(len(raw))
+		}
+	}
 	estimate := tokens + (chars+3)/4
 	if estimate < 1 {
 		estimate = 1
 	}
 	return estimate
+}
+
+// schemaFields are the top-level request fields holding tool or
+// structured-output definitions that the engine renders into, or compiles
+// alongside, the prompt. estimatePromptTokens counts each by raw JSON length.
+var schemaFields = []string{
+	"tools", "functions", "response_format",
+	"guided_json", "guided_regex", "guided_grammar", "guided_choice",
+	"structured_outputs",
 }
 
 // jsonObject decodes raw as a JSON object keyed by exact field name, or

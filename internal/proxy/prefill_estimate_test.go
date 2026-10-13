@@ -134,3 +134,45 @@ func TestPromptBatchCountCountsBatchedPrompts(t *testing.T) {
 		}
 	}
 }
+
+// Tool and schema definitions are counted by raw JSON length / 4: the chat
+// template renders tools into the prompt, so a tiny message carrying 4 MB of
+// tool schemas (or a 4 MB response_format schema) must estimate at least a
+// million tokens, not the one-token minimum. A null field adds nothing, and a
+// body without these fields keeps its estimate.
+func TestEstimatePromptTokensCountsToolAndSchemaDefinitions(t *testing.T) {
+	msg := `"messages":[{"role":"user","content":"hi"}]`
+	bigSchema := `{"type":"object","description":"` + strings.Repeat("d", 4<<20) + `"}`
+	for _, tc := range []struct {
+		name string
+		body string
+		min  int64
+	}{
+		{"4 MB tools array", `{"model":"m",` + msg + `,"tools":[{"type":"function","function":{"name":"f","parameters":` + bigSchema + `}}]}`, 1_000_000},
+		{"4 MB legacy functions array", `{"model":"m",` + msg + `,"functions":[{"name":"f","parameters":` + bigSchema + `}]}`, 1_000_000},
+		{"4 MB response_format json_schema", `{"model":"m",` + msg + `,"response_format":{"type":"json_schema","json_schema":{"name":"s","schema":` + bigSchema + `}}}`, 1_000_000},
+		{"4 MB guided_json", `{"model":"m",` + msg + `,"guided_json":` + bigSchema + `}`, 1_000_000},
+		{"4 MB structured_outputs", `{"model":"m",` + msg + `,"structured_outputs":{"json":` + bigSchema + `}}`, 1_000_000},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := estimatePromptTokens([]byte(tc.body)); got < tc.min {
+				t.Fatalf("estimate=%d, want at least %d", got, tc.min)
+			}
+		})
+	}
+	plain := `{"model":"m","messages":[{"role":"user","content":"abcdefgh"}]}`
+	if got := estimatePromptTokens([]byte(plain)); got != 2 {
+		t.Fatalf("estimate without schema fields=%d, want 2 (unchanged)", got)
+	}
+	for _, key := range schemaFields {
+		withNull := `{"model":"m","messages":[{"role":"user","content":"abcdefgh"}],"` + key + `":null}`
+		if got := estimatePromptTokens([]byte(withNull)); got != 2 {
+			t.Errorf("%s: null added to the estimate (%d), want 2", key, got)
+		}
+	}
+	// The raw length counts exactly: 12 bytes of "tools" JSON add 3 tokens.
+	small := `{"model":"m","messages":[{"role":"user","content":"abcdefgh"}],"tools":[{"a":"bc"}]}`
+	if got := estimatePromptTokens([]byte(small)); got != (8+12+3)/4 {
+		t.Fatalf("estimate=%d, want %d", got, (8+12+3)/4)
+	}
+}
