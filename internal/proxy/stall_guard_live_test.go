@@ -2,6 +2,7 @@ package proxy
 
 import (
 	"bufio"
+	"context"
 	"fmt"
 	"io"
 	"net"
@@ -93,7 +94,7 @@ func TestStallGuardDeadlineDoesNotAffectPostHandlerWritesOrNextRequest(t *testin
 // handler passes it the raw writer, not the guard.
 func TestOversizeRequestBodyReturns413WithStallGuardEnabled(t *testing.T) {
 	const limit = 256
-	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+	backend := httptest.NewServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {
 		t.Error("an oversized body reached the upstream")
 	}))
 	defer backend.Close()
@@ -151,7 +152,11 @@ func TestStallGuardKeepsResponseControllerFlushAndDeadlineControl(t *testing.T) 
 		results <- [2]error{rc.Flush(), rc.SetWriteDeadline(time.Now().Add(time.Second))}
 	}))
 	defer srv.Close()
-	resp, err := http.Get(srv.URL)
+	getReq, err := http.NewRequestWithContext(context.Background(), http.MethodGet, srv.URL, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp, err := http.DefaultClient.Do(getReq)
 	if err != nil {
 		t.Fatal(err)
 	}

@@ -293,7 +293,7 @@ func TestResponseBufferPerStreamLimitAbortsWithBufferLimitCause(t *testing.T) {
 			s := New(&config.Settings{Protection: config.ProtectionSettings{MaxResponseBufferBytesPerStream: perStream}}, log, em)
 			proxySrv := liveProxy(t, s)
 
-			req, err := http.NewRequest(http.MethodPost, proxySrv.URL+"/v1/chat/completions", strings.NewReader(`{"model":"m","messages":[]}`))
+			req, err := http.NewRequestWithContext(context.Background(), http.MethodPost, proxySrv.URL+"/v1/chat/completions", strings.NewReader(`{"model":"m","messages":[]}`))
 			if err != nil {
 				t.Fatal(err)
 			}
