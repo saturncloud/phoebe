@@ -343,20 +343,40 @@ type budgetedBody struct {
 	budget *requestBufferBudget
 	total  int64
 	held   atomic.Int64
+	// prepaid is the declared Content-Length reserved up front; reads charge
+	// only what arrives beyond it (nothing, for an honest Content-Length).
+	prepaid  int64
+	received atomic.Int64
 }
 
-func (b *requestBufferBudget) wrap(body io.ReadCloser, total int64) *budgetedBody {
-	return &budgetedBody{ReadCloser: body, budget: b, total: total}
+// wrap budgets a request body. A declared Content-Length is reserved in full
+// before anything is read, so a request that cannot fit is refused at once
+// (errRequestBufferFull) instead of several concurrent uploads each charging
+// part of their bodies and all failing partway (battery escalation, phoebe
+// #70). A chunked body (no Content-Length) is charged as it arrives.
+func (b *requestBufferBudget) wrap(body io.ReadCloser, total, contentLength int64) (*budgetedBody, error) {
+	bb := &budgetedBody{ReadCloser: body, budget: b, total: total}
+	if contentLength > 0 {
+		if !tryCharge(&b.held, contentLength, total) {
+			return nil, errRequestBufferFull
+		}
+		bb.prepaid = contentLength
+		bb.held.Store(contentLength)
+	}
+	return bb, nil
 }
 
 func (b *budgetedBody) Read(p []byte) (int, error) {
 	n, err := b.ReadCloser.Read(p)
 	if n > 0 {
-		delta := int64(n)
-		if !tryCharge(&b.budget.held, delta, b.total) {
-			return 0, errRequestBufferFull
+		received := b.received.Add(int64(n))
+		if over := received - b.prepaid; over > 0 {
+			delta := min(over, int64(n))
+			if !tryCharge(&b.budget.held, delta, b.total) {
+				return 0, errRequestBufferFull
+			}
+			b.held.Add(delta)
 		}
-		b.held.Add(delta)
 	}
 	return n, err
 }

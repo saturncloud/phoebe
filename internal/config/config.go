@@ -203,7 +203,10 @@ func (p ProtectionSettings) Effective() ProtectionSettings {
 		p.MaxDedicatedColdHoldsPerEndpoint = DefaultMaxDedicatedColdHoldsPerEndpoint
 	}
 	if p.MaxRequestBufferBytesTotal <= 0 {
-		p.MaxRequestBufferBytesTotal = DefaultMaxRequestBufferBytesTotal
+		// Absent, the total never falls below one body at the limit, so an
+		// install that raised maxRequestBodyBytes keeps starting and serving
+		// a request at its limit.
+		p.MaxRequestBufferBytesTotal = max(DefaultMaxRequestBufferBytesTotal, p.MaxRequestBodyBytes)
 	}
 	return p
 }

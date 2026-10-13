@@ -133,7 +133,11 @@ func writeRetryLater(w http.ResponseWriter, requestID, msg string) {
 func writeRetryLaterAfter(w http.ResponseWriter, requestID, msg string, retryAfterSeconds int) {
 	body, _ := json.Marshal(map[string]string{"error": msg})
 	h := w.Header()
-	h.Set(requestIDHeader, requestID)
+	if requestID != "" {
+		// A refusal before the attempt id is minted (the request-buffer
+		// budget at body admission) has none to echo.
+		h.Set(requestIDHeader, requestID)
+	}
 	h.Set("Content-Type", "application/json")
 	h.Set("Retry-After", strconv.Itoa(retryAfterSeconds))
 	h.Set("Content-Length", strconv.Itoa(len(body)))

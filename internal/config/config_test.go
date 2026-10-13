@@ -864,3 +864,16 @@ func TestLoadRequestBufferTotal(t *testing.T) {
 		t.Fatalf("equal body and total must load: %v", err)
 	}
 }
+
+// An install that raised maxRequestBodyBytes above 256 MiB without setting
+// the new request-buffer total keeps starting: the absent total grows to one
+// body at the limit. Only an explicitly set, smaller total is refused.
+func TestLoadRequestBufferTotalDefaultsToAtLeastOneBody(t *testing.T) {
+	s, err := Load(writeTemp(t, "protection:\n  maxRequestBodyBytes: 536870912\n"))
+	if err != nil {
+		t.Fatalf("a large body limit without the new key must load: %v", err)
+	}
+	if got := s.Protection.Effective().MaxRequestBufferBytesTotal; got != 536870912 {
+		t.Fatalf("effective total=%d, want one body at the limit (536870912)", got)
+	}
+}

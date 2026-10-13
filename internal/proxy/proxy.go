@@ -382,12 +382,22 @@ func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request) {
 	if !gatewayFailsClosed && !boundRequestBody(w, rawW, r, prot.MaxRequestBodyBytes) {
 		return
 	}
-	// Every body byte received counts against the replica-wide request-buffer
-	// budget until this request finishes (Q6, the request-side twin of the
-	// response-buffer total). A full budget fails the read with
-	// errRequestBufferFull, answered 503 + Retry-After.
+	// Every body byte counts against the replica-wide request-buffer budget
+	// until this request finishes (Q6, the request-side twin of the
+	// response-buffer total): a declared Content-Length is reserved up front,
+	// a chunked body as it arrives. A full budget is answered 503 +
+	// Retry-After.
 	if !gatewayFailsClosed && r.Body != nil && r.Body != http.NoBody {
-		budgeted := s.requestBuffers.wrap(r.Body, prot.MaxRequestBufferBytesTotal)
+		budgeted, err := s.requestBuffers.wrap(r.Body, prot.MaxRequestBufferBytesTotal, r.ContentLength)
+		if err != nil {
+			// Refused before the attempt id is minted below: mint one for the
+			// response so this 503 carries X-Request-Id like every other
+			// retryable refusal. Nothing is forwarded or metered.
+			refusalID, _ := generateRequestID()
+			s.logRequestBodyError("request-buffer budget", refusalID, err)
+			writeRequestBodyError(w, r, refusalID, err)
+			return
+		}
 		r.Body = budgeted
 		defer budgeted.release()
 	}

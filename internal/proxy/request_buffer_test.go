@@ -19,14 +19,20 @@ import (
 
 func TestBudgetedBodyChargesAndReleases(t *testing.T) {
 	var budget requestBufferBudget
-	a := budget.wrap(io.NopCloser(strings.NewReader(strings.Repeat("a", 60))), 100)
+	a, err := budget.wrap(io.NopCloser(strings.NewReader(strings.Repeat("a", 60))), 100, -1)
+	if err != nil {
+		t.Fatal(err)
+	}
 	if b, err := io.ReadAll(a); err != nil || len(b) != 60 {
 		t.Fatalf("read %d err=%v", len(b), err)
 	}
 	if got := budget.held.Load(); got != 60 {
 		t.Fatalf("held=%d, want 60 while the request runs", got)
 	}
-	b := budget.wrap(io.NopCloser(strings.NewReader(strings.Repeat("b", 41))), 100)
+	b, err := budget.wrap(io.NopCloser(strings.NewReader(strings.Repeat("b", 41))), 100, -1)
+	if err != nil {
+		t.Fatal(err)
+	}
 	if _, err := io.ReadAll(b); !errors.Is(err, errRequestBufferFull) {
 		t.Fatalf("err=%v, want errRequestBufferFull past the total", err)
 	}
@@ -196,7 +202,7 @@ func TestOverflowedBodyAnomalyLogOnlyForUnmeteredSuccess(t *testing.T) {
 // admissionErrorLogEvery), never at ERROR, so a saturated replica does not
 // flood its error log.
 func TestRequestBufferFullRefusalsLogSampledWarnNotError(t *testing.T) {
-	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+	backend := httptest.NewServer(http.HandlerFunc(func(_ http.ResponseWriter, _ *http.Request) {
 		t.Error("a refused request reached the engine")
 	}))
 	defer backend.Close()
@@ -233,7 +239,11 @@ func TestRequestBufferFullRefusalsLogSampledWarnNotError(t *testing.T) {
 func TestReadAndRestoreBodyReusesTheBufferedBody(t *testing.T) {
 	var budget requestBufferBudget
 	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", nil)
-	req.Body = budget.wrap(io.NopCloser(strings.NewReader(`{"model":"m"}`)), 1<<20)
+	body, err := budget.wrap(io.NopCloser(strings.NewReader(`{"model":"m"}`)), 1<<20, -1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	req.Body = body
 	a, err := readAndRestoreBody(req)
 	if err != nil || len(a) == 0 {
 		t.Fatalf("first read: %q err=%v", a, err)
@@ -264,5 +274,38 @@ func TestReadAndRestoreBodyReusesTheBufferedBody(t *testing.T) {
 	}
 	if got := budget.held.Load(); got != int64(len(a)) {
 		t.Fatalf("budget held=%d, want each received byte charged once (%d)", got, len(a))
+	}
+}
+
+// A declared Content-Length is reserved in full before any read: a request
+// that cannot fit is refused at once, holding nothing, and one that fits is
+// not charged again as its bytes arrive.
+func TestBudgetedBodyReservesContentLengthUpFront(t *testing.T) {
+	var budget requestBufferBudget
+	if _, err := budget.wrap(io.NopCloser(strings.NewReader("x")), 100, 101); !errors.Is(err, errRequestBufferFull) {
+		t.Fatalf("err=%v, want an immediate refusal for a declared length over the total", err)
+	}
+	if got := budget.held.Load(); got != 0 {
+		t.Fatalf("held=%d after a refusal, want 0", got)
+	}
+	a, err := budget.wrap(io.NopCloser(strings.NewReader(strings.Repeat("a", 60))), 100, 60)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := budget.held.Load(); got != 60 {
+		t.Fatalf("held=%d before any read, want the 60 reserved up front", got)
+	}
+	if _, err := io.ReadAll(a); err != nil {
+		t.Fatal(err)
+	}
+	if got := budget.held.Load(); got != 60 {
+		t.Fatalf("held=%d after reading, want still 60 (no double charge)", got)
+	}
+	if _, err := budget.wrap(io.NopCloser(strings.NewReader("b")), 100, 41); !errors.Is(err, errRequestBufferFull) {
+		t.Fatalf("err=%v, want a second request refused at once while the first holds 60", err)
+	}
+	a.release()
+	if got := budget.held.Load(); got != 0 {
+		t.Fatalf("held=%d after release, want 0", got)
 	}
 }
