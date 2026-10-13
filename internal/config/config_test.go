@@ -721,6 +721,66 @@ func TestLimitValuesListsEveryAdmissionLimitField(t *testing.T) {
 	}
 }
 
+// TestLimitFieldsNameMatchesYAMLTag guards the name each LimitFields entry
+// carries: lane-share errors report that name, so it must be the YAML key of
+// the very field whose value the entry points at. A misaligned entry would
+// make an error name the wrong field.
+func TestLimitFieldsNameMatchesYAMLTag(t *testing.T) {
+	var l AdmissionLimits
+	v := reflect.ValueOf(&l).Elem()
+	tagOf := map[*int64]string{}
+	for i := 0; i < v.NumField(); i++ {
+		f := v.Type().Field(i)
+		if f.Type != reflect.TypeOf((*int64)(nil)) || f.Name == "RemovedMaxPromptBytes" {
+			continue
+		}
+		p := new(int64)
+		v.Field(i).Set(reflect.ValueOf(p))
+		tagOf[p] = strings.Split(f.Tag.Get("yaml"), ",")[0]
+	}
+	fields := LimitFields(l)
+	values := LimitValues(l)
+	if len(fields) != len(tagOf) || len(values) != len(fields) {
+		t.Fatalf("LimitFields has %d entries, LimitValues %d, AdmissionLimits has %d limit fields", len(fields), len(values), len(tagOf))
+	}
+	for i, f := range fields {
+		tag, ok := tagOf[f.Value]
+		if !ok {
+			t.Fatalf("LimitFields[%d] (%s) does not point at a distinct limit field", i, f.Name)
+		}
+		if f.Name != tag {
+			t.Errorf("LimitFields[%d].Name = %q, but its value is the field tagged %q", i, f.Name, tag)
+		}
+		if values[i] != f.Value {
+			t.Errorf("LimitValues[%d] differs from LimitFields[%d].Value", i, i)
+		}
+	}
+}
+
+// TestAdmissionLimitsParseRejectsEachNegativeField guards that parse's
+// negative check covers every limit field: each field set to -1 on its own
+// must fail to load.
+func TestAdmissionLimitsParseRejectsEachNegativeField(t *testing.T) {
+	n := len(LimitFields(AdmissionLimits{}))
+	for i := 0; i < n; i++ {
+		var l AdmissionLimits
+		f := LimitFields(l)[i]
+		v := reflect.ValueOf(&l).Elem()
+		for j := 0; j < v.NumField(); j++ {
+			if strings.Split(v.Type().Field(j).Tag.Get("yaml"), ",")[0] == f.Name {
+				v.Field(j).Set(reflect.ValueOf(func() *int64 { x := int64(-1); return &x }()))
+			}
+		}
+		if LimitFields(l)[i].Value == nil {
+			t.Fatalf("could not set field %s by its yaml tag", f.Name)
+		}
+		err := l.parse("admission.platform")
+		if err == nil || !strings.Contains(err.Error(), "cannot be negative") {
+			t.Errorf("%s = -1: err=%v, want a cannot-be-negative error", f.Name, err)
+		}
+	}
+}
+
 // TestAdmissionLimitsAnyReportsEachField: Any is true when any single limit
 // field is set (an explicit zero cap included) and false only when all are nil.
 func TestAdmissionLimitsAnyReportsEachField(t *testing.T) {

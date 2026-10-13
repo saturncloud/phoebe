@@ -672,14 +672,43 @@ func (s *Settings) EffectiveAdmission() (AdmissionSettings, bool) {
 	return cfg, true
 }
 
-// LimitValues is the one canonical list of AdmissionLimits limit fields, in a
-// fixed order. Every caller that walks the limit fields (lane-share
-// validation, Any) goes through it, so a new limit field is added here once.
+// LimitField is one AdmissionLimits limit field: its YAML key and a pointer
+// to its value (nil means unlimited).
+type LimitField struct {
+	Name  string
+	Value *int64
+}
+
+// LimitFields is the one canonical list of AdmissionLimits limit fields, in a
+// fixed order, each with its YAML key. Every caller that walks the limit
+// fields (parse's negative check, lane-share validation, Any) goes through it
+// or through LimitValues, so a new limit field is added here once.
+func LimitFields(l AdmissionLimits) []LimitField {
+	return []LimitField{
+		{"maxActiveRequests", l.MaxActiveRequests},
+		{"maxConcurrentPrefills", l.MaxConcurrentPrefills},
+		{"maxReservedDecodeSlots", l.MaxReservedDecodeSlots},
+		{"maxPrefillTokens", l.MaxPrefillTokens},
+		{"maxReservedOutputTokens", l.MaxReservedOutputTokens},
+		{"maxReservedKvTokens", l.MaxReservedKVTokens},
+		{"maxActiveAdapters", l.MaxActiveAdapters},
+		{"requestsPerWindow", l.RequestsPerWindow},
+		{"totalPromptTokensPerWindow", l.TotalPromptTokensPerWindow},
+		{"uncachedPromptTokensPerWindow", l.UncachedPromptTokensPerWindow},
+		{"generatedTokensPerWindow", l.GeneratedTokensPerWindow},
+		{"maxColdHolds", l.MaxColdHolds},
+		{"wakesPerWindow", l.WakesPerWindow},
+	}
+}
+
+// LimitValues returns the values of LimitFields, in the same order.
 func LimitValues(l AdmissionLimits) []*int64 {
-	return []*int64{l.MaxActiveRequests, l.MaxConcurrentPrefills, l.MaxReservedDecodeSlots, l.MaxPrefillTokens,
-		l.MaxReservedOutputTokens, l.MaxReservedKVTokens, l.MaxActiveAdapters, l.RequestsPerWindow,
-		l.TotalPromptTokensPerWindow, l.UncachedPromptTokensPerWindow,
-		l.GeneratedTokensPerWindow, l.MaxColdHolds, l.WakesPerWindow}
+	fields := LimitFields(l)
+	values := make([]*int64, len(fields))
+	for i, f := range fields {
+		values[i] = f.Value
+	}
+	return values
 }
 
 // Any reports whether at least one limit field is set (nil means unlimited;
@@ -694,44 +723,38 @@ func (l AdmissionLimits) Any() bool {
 }
 
 func (a *AdmissionSettings) validateLaneShares() error {
-	names := []string{"maxActiveRequests", "maxConcurrentPrefills", "maxReservedDecodeSlots", "maxPrefillTokens",
-		"maxReservedOutputTokens", "maxReservedKvTokens", "maxActiveAdapters", "requestsPerWindow",
-		"totalPromptTokensPerWindow", "uncachedPromptTokensPerWindow",
-		"generatedTokensPerWindow", "maxColdHolds", "wakesPerWindow"}
+	fields := LimitFields(a.Platform)
 	platform := LimitValues(a.Platform)
 	sums := make([]int64, len(platform))
 	for laneName, lane := range a.Lanes {
 		for i, v := range LimitValues(lane.Limits) {
 			if platform[i] != nil && *platform[i] > 0 && v == nil {
-				return fmt.Errorf("admission.lanes.%s.%s must be set when the platform limit is set", laneName, names[i])
+				return fmt.Errorf("admission.lanes.%s.%s must be set when the platform limit is set", laneName, fields[i].Name)
 			}
 			if v == nil {
 				continue
 			}
 			value := *v
 			if value > 0 && lane.Weight > (1<<63-1)/value {
-				return fmt.Errorf("admission.lanes.%s.%s overflows after weight", laneName, names[i])
+				return fmt.Errorf("admission.lanes.%s.%s overflows after weight", laneName, fields[i].Name)
 			}
 			weighted := value * lane.Weight
 			if weighted > 0 && sums[i] > (1<<63-1)-weighted {
-				return fmt.Errorf("weighted admission lane shares for %s overflow", names[i])
+				return fmt.Errorf("weighted admission lane shares for %s overflow", fields[i].Name)
 			}
 			sums[i] += weighted
 		}
 	}
 	for i, max := range platform {
 		if max != nil && *max > 0 && sums[i] > *max {
-			return fmt.Errorf("weighted admission lane shares for %s total %d above platform limit %d", names[i], sums[i], *max)
+			return fmt.Errorf("weighted admission lane shares for %s total %d above platform limit %d", fields[i].Name, sums[i], *max)
 		}
 	}
 	return nil
 }
 
 func (l *AdmissionLimits) parse(name string) error {
-	values := []*int64{l.MaxActiveRequests, l.MaxConcurrentPrefills, l.MaxReservedDecodeSlots, l.MaxPrefillTokens, l.MaxReservedOutputTokens,
-		l.MaxReservedKVTokens, l.MaxActiveAdapters, l.RequestsPerWindow, l.TotalPromptTokensPerWindow, l.UncachedPromptTokensPerWindow,
-		l.GeneratedTokensPerWindow, l.MaxColdHolds, l.WakesPerWindow}
-	for _, value := range values {
+	for _, value := range LimitValues(*l) {
 		if value != nil && *value < 0 {
 			return fmt.Errorf("%s limits cannot be negative", name)
 		}
