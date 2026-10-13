@@ -2,13 +2,17 @@ package gateway
 
 import (
 	"context"
+	"fmt"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
 
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/client-go/kubernetes/fake"
+	"k8s.io/client-go/tools/cache"
 
 	"github.com/saturncloud/phoebe/internal/logging"
 )
@@ -113,6 +117,7 @@ func TestParseTopologyConfigMap(t *testing.T) {
 		{"multibyte region of 64 characters", "", map[string]string{"graph_k8s_name": "g", "topology_revision": "1", "region": strings.Repeat("é", 64)}, ok(1, strings.Repeat("é", 64)), false},
 		{"region too long keeps revision", "", map[string]string{"graph_k8s_name": "g", "topology_revision": "1", "region": strings.Repeat("a", 65)}, ok(1, ""), true},
 		{"region invalid utf8 keeps revision", "", map[string]string{"graph_k8s_name": "g", "topology_revision": "1", "region": "\xff"}, ok(1, ""), true},
+		{"region with NUL keeps revision", "", map[string]string{"graph_k8s_name": "g", "topology_revision": "1", "region": "eu\x00"}, ok(1, ""), true},
 	} {
 		name := tc.cmName
 		if name == "" {
@@ -190,24 +195,51 @@ func waitInformerHas(t *testing.T, idx *TopologyIndex, name string, want bool) {
 	t.Fatalf("informer store has %q never reached %t", name, want)
 }
 
-// TestTopologyIndex_WaitSyncedIndexesTheInitialList: after WaitSynced
-// returns true, the initial list is indexed, so the first requests after a
-// pod start carry their revision instead of 0.
+// TestTopologyIndex_WaitSyncedIndexesTheInitialList: WaitSynced returns
+// true only after the event handler has indexed every entry of the initial
+// list, so the first requests after a pod start carry their revision instead
+// of 0. The test holds the index lock so upsert blocks: the informer's own
+// store fills (its HasSynced turns true), but WaitSynced must keep waiting
+// until the handler has run. Waiting on the informer's HasSynced instead
+// fails the first assertion.
 func TestTopologyIndex_WaitSyncedIndexesTheInitialList(t *testing.T) {
-	client := fake.NewSimpleClientset(topologyCM("tf-graph-topology-graph-a", map[string]string{
-		"graph_k8s_name": "graph-a", "topology_revision": "4",
-	}))
+	const graphs = 20
+	var objs []runtime.Object
+	for i := 0; i < graphs; i++ {
+		g := fmt.Sprintf("graph-%d", i)
+		objs = append(objs, topologyCM("tf-graph-topology-"+g, map[string]string{
+			"graph_k8s_name": g, "topology_revision": strconv.Itoa(i + 1),
+		}))
+	}
+	client := fake.NewSimpleClientset(objs...)
 	idx := NewTopologyIndex(client, registryNS, logging.New(logging.ERROR))
 	runCtx, cancel := context.WithCancel(context.Background())
 	defer cancel()
+
+	idx.mu.Lock() // upsert blocks until released
 	go idx.Run(runCtx)
+	if !cache.WaitForCacheSync(runCtx.Done(), idx.informer.HasSynced) {
+		idx.mu.Unlock()
+		t.Fatal("informer never synced")
+	}
+	blocked, bcancel := context.WithTimeout(runCtx, 200*time.Millisecond)
+	syncedWhileBlocked := idx.WaitSynced(blocked)
+	bcancel()
+	idx.mu.Unlock()
+	if syncedWhileBlocked {
+		t.Fatal("WaitSynced = true while the handler had not indexed the initial list")
+	}
+
 	wctx, wcancel := context.WithTimeout(runCtx, 5*time.Second)
 	defer wcancel()
 	if !idx.WaitSynced(wctx) {
 		t.Fatal("WaitSynced = false, want true")
 	}
-	if got, ok := idx.Lookup("graph-a"); !ok || got.Revision != 4 {
-		t.Fatalf("Lookup right after sync = %+v ok=%t, want revision 4", got, ok)
+	for i := 0; i < graphs; i++ {
+		g := fmt.Sprintf("graph-%d", i)
+		if got, ok := idx.Lookup(g); !ok || got.Revision != i+1 {
+			t.Fatalf("Lookup(%s) right after sync = %+v ok=%t, want revision %d", g, got, ok, i+1)
+		}
 	}
 }
 

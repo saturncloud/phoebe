@@ -26,7 +26,7 @@ package gateway
 // The fields are EVIDENCE for margin analysis, not billing inputs: a missing
 // or malformed entry only leaves them NULL on the event. An entry whose name
 // does not match its graph, or whose revision is out of range, is ignored
-// whole. A region that is not valid UTF-8 or is longer than 64 characters is
+// whole. A region that is not valid UTF-8, contains a NUL byte, or is longer than 64 characters is
 // dropped (logged) and the revision is kept. Startup waits up to 10s for the
 // first sync so the first requests after a pod start carry their revision,
 // but serving never fails or waits beyond that on this index, unlike the
@@ -37,6 +37,7 @@ import (
 	"fmt"
 	"math"
 	"strconv"
+	"strings"
 	"sync"
 	"unicode/utf8"
 
@@ -70,6 +71,10 @@ type Topology struct {
 type TopologyIndex struct {
 	log      *logging.Logger
 	informer cache.SharedIndexInformer
+	// reg is the event-handler registration. Its HasSynced is true only once
+	// the handler has processed the initial list, which the informer's own
+	// HasSynced does not promise. nil if registration failed.
+	reg cache.ResourceEventHandlerRegistration
 
 	mu sync.RWMutex
 	// byGraph maps graph_k8s_name to its topology. byCM remembers which graph
@@ -99,11 +104,16 @@ func NewTopologyIndex(client kubernetes.Interface, namespace string, log *loggin
 	_ = t.informer.SetWatchErrorHandler(func(_ *cache.Reflector, err error) {
 		t.log.Warn.Printf("gateway: graph topology watch failed (%v); usage events keep the last-known topology", err)
 	})
-	_, _ = t.informer.AddEventHandler(cache.ResourceEventHandlerFuncs{
+	reg, err := t.informer.AddEventHandler(cache.ResourceEventHandlerFuncs{
 		AddFunc:    func(obj any) { t.upsert(obj) },
 		UpdateFunc: func(_, obj any) { t.upsert(obj) },
 		DeleteFunc: func(obj any) { t.remove(obj) },
 	})
+	if err != nil {
+		t.log.Warn.Printf("gateway: registering the graph topology handler failed (%v); usage events will carry no topology", err)
+	} else {
+		t.reg = reg
+	}
 	return t
 }
 
@@ -112,10 +122,16 @@ func (t *TopologyIndex) Run(ctx context.Context) {
 	t.informer.Run(ctx.Done())
 }
 
-// WaitSynced blocks until the informer's initial list has been indexed or
-// ctx is done, and reports whether it synced.
+// WaitSynced blocks until the event handler has indexed the informer's
+// initial list or ctx is done, and reports whether it synced. It waits on the
+// handler registration, not the informer: the informer reports synced once
+// its store is filled, possibly before the handler has run upsert for every
+// entry.
 func (t *TopologyIndex) WaitSynced(ctx context.Context) bool {
-	return cache.WaitForCacheSync(ctx.Done(), t.informer.HasSynced)
+	if t.reg == nil {
+		return false
+	}
+	return cache.WaitForCacheSync(ctx.Done(), t.reg.HasSynced)
 }
 
 // Lookup returns the topology Atlas published for graph, if any.
@@ -146,7 +162,7 @@ func (t *TopologyIndex) upsert(obj any) {
 		return
 	}
 	if regionDropped {
-		t.log.Warn.Printf("gateway: graph topology ConfigMap %s/%s: region is not valid UTF-8 or longer than %d characters; keeping the revision and recording no region", cm.Namespace, cm.Name, maxRegionChars)
+		t.log.Warn.Printf("gateway: graph topology ConfigMap %s/%s: region is not valid UTF-8, contains a NUL byte, or is longer than %d characters; keeping the revision and recording no region", cm.Namespace, cm.Name, maxRegionChars)
 	}
 	t.byGraph[graph] = topo
 	t.byCM[cm.Name] = graph
@@ -193,7 +209,9 @@ func parseTopologyConfigMap(cm *corev1.ConfigMap) (graph string, topo Topology, 
 		return "", Topology{}, false, fmt.Errorf("invalid topology_revision %q", d["topology_revision"])
 	}
 	region := d["region"]
-	if !utf8.ValidString(region) || utf8.RuneCountInString(region) > maxRegionChars {
+	// NUL is rejected because PostgreSQL text cannot store it: the drainer's
+	// insert would fail and drop the batch.
+	if !utf8.ValidString(region) || strings.ContainsRune(region, 0) || utf8.RuneCountInString(region) > maxRegionChars {
 		region = ""
 		regionDropped = true
 	}
