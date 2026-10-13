@@ -176,6 +176,33 @@ a manager that does not know these keys rejects the whole window POST with a
 
 Roll out in this order:
 
+0. Confirm that saturn-aws-manager has emitted no `rated_usage` hour of this
+   install to Stripe with billing enabled: the manager's `stripe_meter_emit`
+   ledger holds no row with `emitted_cost > 0` for this install's
+   `customer_id`. Shadow-ledger rows count too if you want the shadow totals to
+   stay meaningful. If it holds any, stop. Do not run 0009 until either the
+   manager has un-billed those ids (a credit note for each real emit, then the
+   ledger rows tombstoned) or the emitted hours are otherwise excluded from
+   re-push. The reason is the answer recorded below.
+
+   **Recorded answer (checked against saturn-aws-manager `main` at 5e19869,
+   2026-10-13): the manager's delete-by-absence does NOT reverse an emitted
+   cost.** The manager keys both `token_usage_record` and its emit ledger
+   `stripe_meter_emit` on `(customer_id, rated_usage_id)`. 0009 rewrites every
+   `rated_usage.id`. When token-push re-sends a window, `apply_snapshot`
+   (`saturn_aws_manager/token_usage.py`) deletes the old-id
+   `token_usage_record` rows by absence and inserts the new ids. The ingest
+   path does not touch `stripe_meter_emit`, so the old emit stays. The emit
+   loop (`token_settlement.py`) sees the new ids with no ledger row and emits
+   their full cost once their window is settled. The reconcile job
+   (`token_reconcile.py`) reports the old ledger rows as VANISHED but moves no
+   money by itself; for a real (non-shadow) row the money comes back only
+   through a credit note issued by a person. So an hour emitted before 0009
+   and re-pushed after it is billed twice.
+
+   0009 prints a `0009:` NOTICE with the number of rows whose id it rewrites
+   and the earliest `window_start` among them. Any hour from that earliest
+   `window_start` onwards that the manager has already emitted is at risk.
 1. Suspend the rater CronJob (and the token-push CronJob), or let any in-flight
    rater run finish.
 2. Run `cmd/migrate up`, which applies 0008 and 0009 together.
@@ -213,8 +240,9 @@ cutover replaces saturn-aws-manager's rows for each pushed window: old ids are
 deleted because they are absent from the snapshot, and new ids are inserted.
 Windows older than token-push's trailing window keep their old-id rows until
 they are re-pushed; re-push them with `token-push --since ... --until ...`.
-This is acceptable only before production (no settled rows hold the old ids),
-for the same reason as 0007.
+This is safe only when step 0 holds (the manager has emitted none of the old
+ids). Otherwise each re-pushed emitted hour is billed a second time, as
+described in step 0.
 
 Rolling back 0009 is lossy. The 0009 down migration narrows the key back to the
 7-column 0007 grain, so rollups for the same hour that differ only in graph or

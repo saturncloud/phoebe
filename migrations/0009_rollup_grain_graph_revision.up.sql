@@ -21,8 +21,19 @@
 --
 -- WHY THE ID IS RECOMPUTED. rated_usage.id is md5 of the natural key; widening the key
 -- changes every id, exactly as 0006 and 0007 did. Existing rows are rewritten below
--- with the rater's new formula so a re-rate reproduces them. Pre-production: no
--- settled rows hold the old ids (same reckoning as 0007).
+-- with the rater's new formula so a re-rate reproduces them.
+--
+-- PRECONDITION, VERIFIED BY THE OPERATOR (nothing here can check it): no rated_usage
+-- hour has been emitted to Stripe by saturn-aws-manager under its old id. The
+-- manager keys its emit ledger on (customer_id, rated_usage_id). When token-push
+-- re-sends a window under the new ids, the manager deletes the old-id
+-- token_usage_record rows by absence and inserts the new ids. Delete-by-absence does
+-- NOT reverse an emitted cost: the old stripe_meter_emit row stays, the reconcile job
+-- only reports it as VANISHED (a manual credit note), and the new id is emitted again
+-- once its window is settled. An already-billed hour would therefore be billed twice.
+-- See step 0 of "Rollout order for migration 0009" in migrations/README.md. Before
+-- rewriting, this migration prints a "0009:" NOTICE with the number of rows whose id
+-- changes and the earliest window_start among them.
 --
 -- Rollout: NOT additive. A pre-0009 rater must not run against this schema. Its
 -- ON CONFLICT target (the 7-column 0006 grain) no longer matches any unique
@@ -30,6 +41,8 @@
 -- Either error rolls back the whole RateWindow transaction, so the failure is
 -- closed and nothing is written; the new rater re-rates the window on its next
 -- run. Order:
+--   0. confirm saturn-aws-manager has emitted no rollup of this install to Stripe
+--      (the PRECONDITION above; README step 0);
 --   1. suspend the rater CronJob (and token-push), or let any in-flight run
 --      finish;
 --   2. run cmd/migrate up (0008 and 0009);
@@ -54,6 +67,32 @@ ALTER TABLE rated_usage ADD COLUMN region VARCHAR(64);
 UPDATE rated_usage SET graph_k8s_name = '' WHERE graph_k8s_name IS NULL;
 ALTER TABLE rated_usage ALTER COLUMN graph_k8s_name SET DEFAULT '';
 ALTER TABLE rated_usage ALTER COLUMN graph_k8s_name SET NOT NULL;
+
+-- Audit trail for the id rewrite (see the PRECONDITION above). No NOTICE means no
+-- row changes id.
+DO $$
+DECLARE
+    n       bigint;
+    first_w timestamptz;
+BEGIN
+    SELECT COUNT(*), MIN(window_start)
+      INTO n, first_w
+      FROM rated_usage
+     WHERE id <> md5(length(auth_id)::text || ':' || auth_id
+                    || '|' || length(owner_type)::text || ':' || owner_type
+                    || '|' || length(owner_id)::text || ':' || owner_id
+                    || '|' || length(resource_id)::text || ':' || resource_id
+                    || '|' || length(model_id)::text || ':' || model_id
+                    || '|' || length(serving_mode)::text || ':' || serving_mode
+                    || '|' || length(graph_k8s_name)::text || ':' || graph_k8s_name
+                    || '|' || topology_revision::text
+                    || '|' || extract(epoch FROM window_start)::bigint::text);
+    IF n > 0 THEN
+        RAISE NOTICE '0009: rewriting the id of % rated_usage rows (earliest window_start %); saturn-aws-manager bills by rated_usage_id, so an hour it already emitted to Stripe under the old id is billed again under the new id after the next token-push. Confirm step 0 of "Rollout order for migration 0009" in migrations/README.md before resuming token-push',
+            n, to_char(first_w AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS"Z"');
+    END IF;
+END
+$$;
 
 UPDATE rated_usage
 SET id = md5(length(auth_id)::text || ':' || auth_id

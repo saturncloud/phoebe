@@ -4363,3 +4363,87 @@ func TestIntegration_Migration0009DownNoticesEveryRatedRowItDeletes(t *testing.T
 		t.Fatalf("0009 down on a database with nothing to delete raised %v, want no NOTICE", notices)
 	}
 }
+
+// TestIntegration_Migration0009UpNoticesEveryRatedRowWhoseIdItRewrites pins the audit
+// trail for 0009 up's id rewrite. saturn-aws-manager bills by rated_usage_id and its
+// delete-by-absence does not reverse an emitted cost, so a rewritten id of an hour
+// already emitted to Stripe is billed again after the next token-push. Before the
+// rewrite, the migration must RAISE NOTICE with the number of rows whose id changes
+// and the earliest window_start among them, pointing the operator at the README
+// precondition. A database with no rated_usage rows must produce no such NOTICE.
+func TestIntegration_Migration0009UpNoticesEveryRatedRowWhoseIdItRewrites(t *testing.T) {
+	dsn := os.Getenv("PHOEBE_TEST_DATABASE_URL")
+	if dsn == "" {
+		t.Skip("PHOEBE_TEST_DATABASE_URL not set; skipping live-Postgres conformance")
+	}
+	ctx := context.Background()
+	cfg, err := pgx.ParseConfig(dsn)
+	if err != nil {
+		t.Fatalf("parse dsn: %v", err)
+	}
+	var notices []string
+	cfg.OnNotice = func(_ *pgconn.PgConn, n *pgconn.Notice) {
+		if strings.HasPrefix(n.Message, "0009:") {
+			notices = append(notices, n.Message)
+		}
+	}
+	db := stdlib.OpenDB(*cfg)
+	defer db.Close()
+	// One pooled connection so SET search_path sticks and every NOTICE reaches
+	// the callback above.
+	db.SetMaxOpenConns(1)
+
+	setup := func(sch string) {
+		t.Helper()
+		exec(t, db, "DROP SCHEMA IF EXISTS "+sch+" CASCADE")
+		exec(t, db, "CREATE SCHEMA "+sch)
+		exec(t, db, "SET search_path TO "+sch)
+		for _, f := range []string{"0001_billing_event", "0002_rating", "0004_billing_event_serving_mode",
+			"0005_invoice_grade_attempts", "0006_rollup_grain", "0007_serving_mode_explicit",
+			"0008_billing_event_topology"} {
+			exec(t, db, readMigration(t, f+".up.sql"))
+		}
+	}
+	hour := mustTime("2026-06-08T10:00:00Z")
+	// Pre-0009 rows: graph_k8s_name nullable, no topology_revision column.
+	seed := func(auth string, graph any, at time.Time) {
+		t.Helper()
+		if _, err := db.ExecContext(ctx, `INSERT INTO rated_usage
+			(id, auth_id, resource_id, org_id, model_id, serving_mode, graph_k8s_name, window_start, window_end,
+			 prompt_tokens, cached_tokens, completion_tokens, billable_prompt_tokens,
+			 cost, applied_prompt_rate, applied_cached_rate, applied_completion_rate, event_count)
+			VALUES (md5($1), $1, 'res', 'org-1', 'm', 'dedicated', $2, $3::timestamptz, $3::timestamptz + interval '1 hour',
+			        100, 0, 0, 100, 0.001, 0.00001, 0, 0, 1)`, auth, graph, at); err != nil {
+			t.Fatalf("seed rated_usage %s: %v", auth, err)
+		}
+	}
+
+	const sch = "phoebe_migration_0009_up_notice_it"
+	setup(sch)
+	defer func() { exec(t, db, "DROP SCHEMA IF EXISTS "+sch+" CASCADE") }()
+	seed("a-later", "dgd-a", hour.Add(2*time.Hour))
+	seed("a-earliest", nil, hour)
+	seed("a-mid", "dgd-b", hour.Add(time.Hour))
+
+	exec(t, db, readMigration(t, "0009_rollup_grain_graph_revision.up.sql"))
+
+	want := []string{
+		"0009: rewriting the id of 3 rated_usage rows (earliest window_start 2026-06-08T10:00:00Z); " +
+			"saturn-aws-manager bills by rated_usage_id, so an hour it already emitted to Stripe under the old id " +
+			"is billed again under the new id after the next token-push. " +
+			"Confirm step 0 of \"Rollout order for migration 0009\" in migrations/README.md before resuming token-push",
+	}
+	if strings.Join(notices, "\n") != strings.Join(want, "\n") {
+		t.Fatalf("0009 up notices =\n%s\nwant\n%s", strings.Join(notices, "\n"), strings.Join(want, "\n"))
+	}
+
+	// No rows: no id is rewritten, so no NOTICE at all.
+	notices = nil
+	const clean = "phoebe_migration_0009_up_notice_clean_it"
+	setup(clean)
+	defer func() { exec(t, db, "DROP SCHEMA IF EXISTS "+clean+" CASCADE") }()
+	exec(t, db, readMigration(t, "0009_rollup_grain_graph_revision.up.sql"))
+	if len(notices) != 0 {
+		t.Fatalf("0009 up on an empty rated_usage raised %v, want no NOTICE", notices)
+	}
+}
