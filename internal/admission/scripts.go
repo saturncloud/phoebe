@@ -160,7 +160,7 @@ var transitionScript = redis.NewScript(luaHelpers + `
 reap(current_time_ms()); local raw=redis.call('HGET',KEYS[2],ARGV[1]); if not raw then return {1} end
 local rec=cjson.decode(raw)
 if ARGV[2] == 'prefill' and rec.prefill then
-  for _,s in ipairs(rec.scopes) do add(field(s,'prefills'),-1); add(field(s,'prompt'),-(rec.prompt or 0)); add(field(s,'prefill_tokens'),-(rec.prefill_tokens or 0)) end
+  for _,s in ipairs(rec.scopes) do add(field(s,'prefills'),-1); add(field(s,'prefill_tokens'),-(rec.prefill_tokens or 0)) end
   rec.prefill=false; redis.call('HSET',KEYS[2],ARGV[1],cjson.encode(rec))
 end
 return {1}

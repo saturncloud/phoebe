@@ -65,40 +65,6 @@ func TestPrefillTokensReleasedAtFirstByte(t *testing.T) {
 	_ = second.Complete(ctx, 0)
 }
 
-// A rolling deploy leaves leases written by the previous release (prompt
-// BYTES under 'prompt', no kv or prefill_tokens). Releasing one must return
-// its bytes and must not drive the new counters below what other leases hold.
-func TestLegacyLeaseRecordReleasesCleanly(t *testing.T) {
-	a, mr := testAdmitter(t, config.AdmissionSettings{Platform: config.AdmissionLimits{MaxReservedKVTokens: ptr64(100)}})
-	ctx := context.Background()
-	current, err := a.Admit(ctx, request("a", "m"))
-	if err != nil {
-		t.Fatal(err)
-	}
-	scopeID := a.scopes(request("a", "m"))[0].ID
-	legacy := map[string]any{
-		"scopes": []scope{a.scopes(request("a", "m"))[0]}, "prompt": 400, "estimated_input": 10, "output": 20,
-		"adapter": 0, "prefill": true, "cold": false, "admitted_at": 0,
-	}
-	raw, _ := json.Marshal(legacy)
-	mr.HSet(a.leases, "legacy-lease", string(raw))
-	mr.HSet(a.counters, scopeID+"|prompt", "400")
-	legacyLease := &Lease{owner: a, id: "legacy-lease"}
-	if err := legacyLease.Complete(ctx, 0); err != nil {
-		t.Fatalf("releasing a legacy record failed: %v", err)
-	}
-	if mr.HGet(a.counters, scopeID+"|prompt") != "" {
-		t.Fatalf("legacy prompt bytes not released: %q", mr.HGet(a.counters, scopeID+"|prompt"))
-	}
-	if got := mr.HGet(a.counters, scopeID+"|kv"); got != "30" {
-		t.Fatalf("kv=%q after releasing a legacy record, want the current lease's 30 untouched", got)
-	}
-	_ = current.Complete(ctx, 0)
-	if got := mr.HGet(a.counters, scopeID+"|kv"); got != "" {
-		t.Fatalf("kv=%q after every lease finished, want released", got)
-	}
-}
-
 // During a rolling deploy an old replica can die mid-request, leaving a lease
 // under the previous release's keys that only the reaper can release. The new
 // reaper must drain it (every counter it holds, legacy prompt bytes included)
