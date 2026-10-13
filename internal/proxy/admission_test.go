@@ -3038,11 +3038,11 @@ func TestKVLargerThanCapacityIs413NoRetryAfter(t *testing.T) {
 	}
 }
 
-// The 413 wording names the model's capacity only for the graph's own
-// capacity scopes; every other operator scope gets neutral wording, so a
-// tenant refused by its organization's limit is not told the model cannot
-// take its prompt. Status 413 and no Retry-After for all of them.
-func TestOversizeMessageBlamesModelOnlyForGraphCapacity(t *testing.T) {
+// The 413 wording names the model's capacity only for the "graph" and
+// "graph_capacity" scopes; every other operator scope gets neutral wording,
+// so a tenant refused by its organization's limit is not told the model
+// cannot take its prompt. Status 413 and no Retry-After for all of them.
+func TestOversizeMessageBlamesModelOnlyForGraphScopes(t *testing.T) {
 	s := New(&config.Settings{}, logging.New(logging.ERROR), &recordingEmitter{})
 	for _, c := range []struct {
 		scope, dimension string
