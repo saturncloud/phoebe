@@ -6,6 +6,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -56,15 +57,10 @@ func (b *oslRecordingBackend) snapshot() (int, []int64) {
 func chatBody(contentChars int, maxTokens int64) []byte {
 	mt := ""
 	if maxTokens > 0 {
-		mt = `"max_tokens":` + itoa64(maxTokens) + `,`
+		mt = `"max_tokens":` + strconv.FormatInt(maxTokens, 10) + `,`
 	}
 	return []byte(`{"model":"model-a",` + mt + `"messages":[{"role":"user","content":"` +
 		strings.Repeat("x", contentChars) + `"}]}`)
-}
-
-func itoa64(v int64) string {
-	b, _ := json.Marshal(v)
-	return string(b)
 }
 
 func kvTestServer(t *testing.T, cfg config.AdmissionSettings) *Server {
