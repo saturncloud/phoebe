@@ -2,6 +2,7 @@ package proxy
 
 import (
 	"bytes"
+	"context"
 	"errors"
 	"io"
 	"net/http"
@@ -74,7 +75,7 @@ func TestOverflowedCaptureChargesItsHeadAndTail(t *testing.T) {
 	budget := &responseBufferBudget{}
 	account := budget.newAccount(config.ProtectionSettings{MaxResponseBufferBytesPerStream: 64 << 10, MaxResponseBufferBytesTotal: 256 << 20}, noBufferCancel(t))
 	var result capture.Result
-	cr := newCaptureReader(nil, &chunkedBody{r: bytes.NewReader(body), chunk: 32 << 10}, false, func(r capture.Result) { result = r })
+	cr := newCaptureReader(context.Background(), &chunkedBody{r: bytes.NewReader(body), chunk: 32 << 10}, false, func(r capture.Result) { result = r })
 	cr.buffers = account
 
 	var got bytes.Buffer
@@ -122,7 +123,7 @@ func TestOverflowedCaptureChargesPastAnExhaustedReplicaTotal(t *testing.T) {
 		t.Fatalf("holder reserve: %v", err)
 	}
 	account := budget.newAccount(p, noBufferCancel(t))
-	cr := newCaptureReader(nil, &chunkedBody{r: bytes.NewReader(body), chunk: 64 << 10}, false, nil)
+	cr := newCaptureReader(context.Background(), &chunkedBody{r: bytes.NewReader(body), chunk: 64 << 10}, false, nil)
 	cr.buffers = account
 
 	var got bytes.Buffer

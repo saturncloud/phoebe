@@ -315,7 +315,7 @@ func TestUnreadPendingLineCountsTowardReplicaTotal(t *testing.T) {
 // filterOverCapture builds the production pairing: a streamed capture reader
 // that defers closing the buffer account, wrapped by the usage filter.
 func filterOverCapture(stream string, account *responseBufferAccount) io.ReadCloser {
-	cr := newCaptureReader(nil, io.NopCloser(strings.NewReader(stream)), true, nil)
+	cr := newCaptureReader(context.Background(), io.NopCloser(strings.NewReader(stream)), true, nil)
 	cr.buffers = account
 	cr.deferBufferClose = true
 	return newUsageFilterReader(cr, false, account)
