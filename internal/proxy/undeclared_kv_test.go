@@ -552,3 +552,41 @@ func TestUndeclaredKVRefusalDrivenByNNamesSequences(t *testing.T) {
 		t.Fatalf("upstream hits=%d, the over-KV request must not reach the engine", hits)
 	}
 }
+
+// A request whose own reserved output (max_tokens x output sequences, or the
+// one-token clamp x sequences when max_tokens is absent) is larger than a
+// positive maxReservedOutputTokens cap can never be admitted: it is refused
+// 413 without Retry-After, never a retryable 503 the client would retry
+// forever, and it never reaches the engine.
+func TestRequestOutputAboveReservedOutputCapIs413(t *testing.T) {
+	be := &oslRecordingBackend{}
+	srv := httptest.NewServer(be)
+	defer srv.Close()
+	up, _ := url.Parse(srv.URL)
+
+	cfg := kvTestConfig()
+	cfg.Lanes = map[string]config.AdmissionLane{"default": {Weight: 1, Limits: config.AdmissionLimits{MaxReservedOutputTokens: ptr64(64)}}}
+	s := kvTestServer(t, cfg)
+
+	for _, tc := range []struct {
+		name, body, want string
+	}{
+		{"undeclared max_tokens, n=128", `{"model":"model-a","n":128,"messages":[{"role":"user","content":"hi"}]}`,
+			"the number of output sequences " + sequenceTerms + " exceeds a configured reserved-output limit"},
+		{"max_tokens=10, n=10", `{"model":"model-a","max_tokens":10,"n":10,"messages":[{"role":"user","content":"hi"}]}`,
+			"max_tokens times the number of output sequences " + sequenceTerms + " exceeds a configured reserved-output limit"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			rr := serveChat(s, up, []byte(tc.body))
+			if rr.Code != http.StatusRequestEntityTooLarge || rr.Header().Get("Retry-After") != "" {
+				t.Fatalf("status=%d retry-after=%q body=%q, want 413 without Retry-After", rr.Code, rr.Header().Get("Retry-After"), rr.Body.String())
+			}
+			if !strings.Contains(rr.Body.String(), tc.want) {
+				t.Fatalf("body=%q, want %q", rr.Body.String(), tc.want)
+			}
+		})
+	}
+	if hits, _ := be.snapshot(); hits != 0 {
+		t.Fatalf("upstream hits=%d, an over-cap output request must not reach the engine", hits)
+	}
+}

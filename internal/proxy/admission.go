@@ -424,9 +424,14 @@ const sequenceTerms = "(n, best_of, or batched prompts)"
 func oversizeMessage(rejected *admission.Rejected, out outputShape) string {
 	limit := "a configured KV-cache limit"
 	prefill := "a configured prefill-token limit"
+	output := "a configured reserved-output limit"
 	if rejected.Scope == "graph_capacity" || rejected.Scope == "graph" {
 		limit = "this model's KV-cache capacity"
 		prefill = "this model's prefill capacity"
+		output = "this model's reserved-output capacity"
+	}
+	if rejected.Dimension == "output_exceeds_limit" {
+		return outputOversizeMessage(out, output)
 	}
 	if rejected.Dimension != "kv_exceeds_limit" {
 		return "estimated prompt tokens exceed " + prefill
@@ -442,6 +447,24 @@ func oversizeMessage(rejected *admission.Rejected, out outputShape) string {
 		return "estimated prompt tokens plus one output token per requested sequence " + sequenceTerms + " exceed " + limit
 	default:
 		return "estimated prompt tokens exceed " + limit
+	}
+}
+
+// outputOversizeMessage is the 413 text for a request whose own reserved
+// output (max_tokens x output sequences, D29) exceeds a positive capacity
+// cap. Like the KV text it names only the fields the client sent: an
+// undeclared max_tokens is the one-token clamp, so the sequence count is the
+// term to lower.
+func outputOversizeMessage(out outputShape, limit string) string {
+	switch {
+	case out.declared && out.sequences > 1:
+		return "max_tokens times the number of output sequences " + sequenceTerms + " exceeds " + limit
+	case out.declared:
+		return "max_tokens exceeds " + limit
+	case out.sequences > 1:
+		return "the number of output sequences " + sequenceTerms + " exceeds " + limit
+	default:
+		return "the minimum one-token output reservation exceeds " + limit
 	}
 }
 
@@ -480,7 +503,8 @@ func (s *Server) writeAdmissionErrorOutput(w http.ResponseWriter, requestID stri
 	var rejected *admission.Rejected
 	if errors.As(err, &rejected) && rejected.Unsatisfiable && !rejected.Contractual {
 		// One request alone is larger than a capacity limit (estimated prompt
-		// tokens, or prompt plus max_tokens against reserved KV). It can never
+		// tokens, prompt plus max_tokens against reserved KV, or max_tokens x
+		// output sequences against reserved output). It can never
 		// be admitted, so it is refused as too large, the same answer an
 		// oversized prompt got from the byte-based limit this replaced.
 		http.Error(w, oversizeMessage(rejected, out), http.StatusRequestEntityTooLarge)

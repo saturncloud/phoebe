@@ -65,10 +65,10 @@ type Rejected struct {
 	// are two cases. For a contract scope (Contractual=true), the request
 	// reserves more than the per-window limit (for example max_tokens above
 	// the generated-token limit), and the proxy answers 400. For a capacity
-	// scope (Contractual=false), the request's estimated prefill tokens or
-	// KV reservation exceed a positive physical cap
-	// (prefill_tokens_exceeds_limit, kv_exceeds_limit), and the proxy answers
-	// 413 (decision D12). In both cases RetryAfter is zero and no Retry-After
+	// scope (Contractual=false), the request's estimated prefill tokens, KV
+	// reservation, or reserved output (output x sequences) exceed a positive
+	// physical cap (prefill_tokens_exceeds_limit, kv_exceeds_limit,
+	// output_exceeds_limit), and the proxy answers 413 (decision D12). In both cases RetryAfter is zero and no Retry-After
 	// header is sent. Callers must branch on Contractual to choose the status.
 	Unsatisfiable bool
 }
@@ -425,8 +425,9 @@ func makeContractScope(name, id string, limits RateLimits) scope {
 
 // unsatisfiableSuffix ends the dimension name admitScript returns when one
 // request alone exceeds a scope's whole limit: a contract scope's per-window
-// limit (the proxy answers 400), or a capacity scope's positive prefill or KV
-// cap (the proxy answers 413). Neither carries a Retry-After.
+// limit (the proxy answers 400), or a capacity scope's positive prefill, KV
+// or reserved-output cap (prefill_tokens_exceeds_limit, kv_exceeds_limit,
+// output_exceeds_limit; the proxy answers 413). Neither carries a Retry-After.
 const unsatisfiableSuffix = "_exceeds_limit"
 
 // Any reports whether the contract carries at least one limit. A contract with

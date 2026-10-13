@@ -70,23 +70,54 @@ func TestReleaseReturnsOutputSequenceReservationsToZero(t *testing.T) {
 }
 
 // An operator maxReservedOutputTokens cap bounds decode work, which is
-// max_tokens x sequences; a request whose product passes what is left waits.
+// max_tokens x sequences; a request whose product passes what is left (but
+// fits the whole cap) waits.
 func TestReservedOutputCapChargesEveryOutputSequence(t *testing.T) {
 	ctx := context.Background()
 	l := limits(10)
 	l.MaxReservedOutputTokens = ptr64(50)
 	a, _ := testAdmitter(t, config.AdmissionSettings{Platform: l})
+	held := request("held", "m") // 20 output x 1
+	holder, err := a.Admit(ctx, held)
+	if err != nil {
+		t.Fatal(err)
+	}
 	req := request("a", "m") // 20 output
-	req.OutputSequences = 3
-	_, err := a.Admit(ctx, req)
+	req.OutputSequences = 2
+	_, err = a.Admit(ctx, req)
 	var rejected *Rejected
 	if !errors.As(err, &rejected) || rejected.Scope != "platform" || rejected.Dimension != "output" || rejected.Unsatisfiable {
-		t.Fatalf("err=%v, want a retryable platform output rejection for 20 x 3 against a cap of 50", err)
+		t.Fatalf("err=%v, want a retryable platform output rejection for 20 + 20 x 2 against a cap of 50", err)
 	}
-	req.OutputSequences = 2
+	_ = holder.Complete(ctx, 0)
 	lease, err := a.Admit(ctx, req)
 	if err != nil {
-		t.Fatalf("20 x 2 fits a cap of 50: %v", err)
+		t.Fatalf("20 x 2 fits a cap of 50 once the holder is released: %v", err)
+	}
+	_ = lease.Complete(ctx, 0)
+}
+
+// A request whose own reserved output (output x sequences) is larger than a
+// positive maxReservedOutputTokens cap can never be admitted, so it is
+// refused as unsatisfiable (the proxy's 413) with no Retry-After, not as a
+// retryable capacity rejection a client would retry forever.
+func TestRequestOutputAboveReservedOutputCapIsUnsatisfiable(t *testing.T) {
+	ctx := context.Background()
+	l := limits(10)
+	l.MaxReservedOutputTokens = ptr64(64)
+	a, _ := testAdmitter(t, config.AdmissionSettings{Platform: l})
+	req := request("a", "m")
+	req.ReservedOutputTokens, req.OutputSequences = 1, 128
+	_, err := a.Admit(ctx, req)
+	var rejected *Rejected
+	if !errors.As(err, &rejected) || rejected.Scope != "platform" || rejected.Dimension != "output_exceeds_limit" ||
+		!rejected.Unsatisfiable || rejected.Contractual || rejected.RetryAfter != 0 {
+		t.Fatalf("err=%v, want unsatisfiable platform output_exceeds_limit with no RetryAfter for 1 x 128 against a cap of 64", err)
+	}
+	req.OutputSequences = 64
+	lease, err := a.Admit(ctx, req)
+	if err != nil {
+		t.Fatalf("1 x 64 fits a cap of 64: %v", err)
 	}
 	_ = lease.Complete(ctx, 0)
 }

@@ -889,8 +889,10 @@ func TestAdmissionImpossibleOutputRejectedBeforeUpstream(t *testing.T) {
 	s := New(&config.Settings{Admission: cfg}, logging.New(logging.ERROR), &recordingEmitter{}).WithAdmitter(admission.New(c, cfg))
 	rr := httptest.NewRecorder()
 	s.Handler().ServeHTTP(rr, sharedRequest(up))
-	if rr.Code != http.StatusServiceUnavailable {
-		t.Fatalf("status=%d, want 503", rr.Code)
+	// The request's own output is larger than the whole cap, so waiting can
+	// never admit it: 413 without Retry-After, not a retryable 503.
+	if rr.Code != http.StatusRequestEntityTooLarge || rr.Header().Get("Retry-After") != "" {
+		t.Fatalf("status=%d retry-after=%q, want 413 without Retry-After", rr.Code, rr.Header().Get("Retry-After"))
 	}
 	if hits != 0 {
 		t.Fatal("impossible request reached upstream")
@@ -3054,6 +3056,9 @@ func TestOversizeMessageBlamesModelOnlyForGraphCapacity(t *testing.T) {
 		{"organization_model", "kv_exceeds_limit", false, "a configured KV-cache limit"},
 		{"platform", "prefill_tokens_exceeds_limit", false, "a configured prefill-token limit"},
 		{"lane", "kv_exceeds_limit", false, "a configured KV-cache limit"},
+		{"graph_capacity", "output_exceeds_limit", true, "max_tokens exceeds this model's reserved-output capacity"},
+		{"graph", "output_exceeds_limit", true, "max_tokens exceeds this model's reserved-output capacity"},
+		{"lane", "output_exceeds_limit", false, "max_tokens exceeds a configured reserved-output limit"},
 	} {
 		rr := httptest.NewRecorder()
 		s.writeAdmissionError(rr, "req-1", &admission.Rejected{Scope: c.scope, Dimension: c.dimension, Unsatisfiable: true})
