@@ -44,10 +44,10 @@ var sseDone = []byte("[DONE]")
 // racing Close(); if Close() won, onDone fired with Aborted=false and the
 // partial-bill event was lost. Reading ctx eliminates that race.)
 //
-// scan (the SSE line buffer) is only ever accessed from Read (the single
-// ReverseProxy copy goroutine) and from the non-streaming branch of finish(),
-// which by then has exclusive access (Read is done). No extra locking needed
-// for scan itself.
+// scan, head, tail and overflowed are written only from Read (the single
+// ReverseProxy copy goroutine) but read by finish(), which Close can run on
+// another goroutine while Read is still in progress (a client abort), so
+// every access to them holds mu.
 type captureReader struct {
 	src      io.ReadCloser
 	streamed bool
@@ -57,12 +57,11 @@ type captureReader struct {
 	ctx context.Context
 
 	// scan holds bytes not yet split into complete SSE lines (streaming) or
-	// the whole accumulating body (non-streaming). Only touched from Read and
-	// the non-streaming finish() path.
+	// the whole accumulating body (non-streaming). Guarded by mu.
 	scan bytes.Buffer
 
-	// mu guards result and done. All paths that read or write result or done
-	// must hold mu for the duration of the access.
+	// mu guards result, done, scan, head, tail and overflowed. All paths that
+	// read or write any of them must hold mu for the duration of the access.
 	mu     sync.Mutex
 	result capture.Result
 	onDone func(capture.Result)
@@ -96,7 +95,9 @@ type captureReader struct {
 	// A non-streamed body that outgrows its buffer allowance is never cut:
 	// the client gets every byte. Capture then keeps only the body's head
 	// (where the top-level "model" sits) and a rolling tail (where "usage"
-	// sits in OpenAI-style bodies) and parses those at finish.
+	// sits in OpenAI-style bodies) and parses those at finish. Guarded by mu.
+	// tail may hold up to 2*overflowKeep bytes between compactions (see
+	// keepTail); only its last overflowKeep bytes are the tail (tailView).
 	overflowed bool
 	head, tail []byte
 
@@ -181,12 +182,21 @@ func (c *captureReader) Read(p []byte) (int, error) {
 		})
 		// Inspect a COPY of exactly the bytes we forward. The bytes in p are
 		// returned to the client verbatim; we never mutate them.
+		//
+		// scan, head, tail and overflowed are read by finish(), which Close
+		// can run on another goroutine, so every change to them happens under
+		// mu. The buffer account takes its own lock; it is charged after mu
+		// is released, and finish() calling buffers.close under mu keeps the
+		// one lock order (mu, then the account's).
+		c.mu.Lock()
 		if c.overflowed {
 			c.keepTail(p[:n])
+			held := c.overflowHeld()
+			c.mu.Unlock()
 			c.appendLog(p[:n])
 			// D22 keeps the head and tail whatever the limits say, so they are
 			// charged even past them to keep the replica total honest.
-			c.buffers.force(bufferSlotCapture, int64(len(c.head)+len(c.tail)))
+			c.buffers.force(bufferSlotCapture, held)
 			if err == io.EOF {
 				c.finish()
 			}
@@ -194,27 +204,36 @@ func (c *captureReader) Read(p []byte) (int, error) {
 		}
 		c.scan.Write(p[:n])
 		if c.streamed {
-			c.mu.Lock()
 			c.scanSSELines()
-			c.mu.Unlock()
 		}
+		scanLen := int64(c.scan.Len())
+		// scan now holds the unparsed tail of a stream (normally under one
+		// line) or the whole non-streamed body so far. A non-streamed body
+		// past its allowance switches to keeping only its head and tail.
+		forceHeld := int64(-1)
+		if !c.streamed && c.buffers.reserve(bufferSlotCapture, scanLen) != nil {
+			forceHeld = c.overflow()
+		}
+		c.mu.Unlock()
 		// M5: when body logging is enabled for this request, retain a bounded
 		// COPY of the forwarded bytes. No-op (nil logBuf) when logging is off,
 		// so the common path is unchanged.
 		c.appendLog(p[:n])
-		// scan now holds the unparsed tail of a stream (normally under one
-		// line) or the whole non-streamed body so far. Past the protection
-		// limit the response is cut: these bytes still reach the client, the
-		// error ends the copy, and the account has cancelled the request so
-		// capture records it as aborted.
-		if !c.streamed {
-			if c.buffers.reserve(bufferSlotCapture, int64(c.scan.Len())) != nil {
-				c.overflow()
+		if forceHeld >= 0 {
+			// D22 keeps the head and tail whatever the limits say, so they are
+			// charged even past them to keep the replica total honest.
+			c.buffers.force(bufferSlotCapture, forceHeld)
+		} else if c.streamed {
+			// Past the protection limit a stream is cut: these bytes still
+			// reach the client, the error ends the copy, and the account has
+			// cancelled the request so capture records it as aborted.
+			if berr := c.buffers.set(bufferSlotCapture, scanLen); berr != nil {
+				c.bufferErr = berr
+				c.mu.Lock()
+				c.scan.Reset()
+				c.mu.Unlock()
+				return n, berr
 			}
-		} else if berr := c.buffers.set(bufferSlotCapture, int64(c.scan.Len())); berr != nil {
-			c.bufferErr = berr
-			c.scan.Reset()
-			return n, berr
 		}
 	}
 	if err == io.EOF {
@@ -371,26 +390,52 @@ func (c *captureReader) finish() {
 }
 
 // overflow switches a non-streamed capture from holding the whole body to
-// holding its head and tail.
-func (c *captureReader) overflow() {
+// holding its head and tail, and returns the bytes to charge for them (the
+// caller charges them with buffers.force after releasing mu).
+//
+// Must be called with mu held.
+func (c *captureReader) overflow() int64 {
 	body := c.scan.Bytes()
 	c.head = append([]byte(nil), body[:min(len(body), overflowKeep)]...)
-	c.tail = nil
-	c.keepTail(body)
-	c.scan.Reset()
+	// Copy only the last overflowKeep bytes into a fresh array sized for
+	// keepTail's compaction, so the large scan array is not kept alive.
+	c.tail = append(make([]byte, 0, 2*overflowKeep), body[max(0, len(body)-overflowKeep):]...)
 	c.scan = bytes.Buffer{} // release the large backing array
 	c.overflowed = true
-	// D22 keeps the head and tail whatever the limits say, so they are
-	// charged even past them to keep the replica total honest.
-	c.buffers.force(bufferSlotCapture, int64(len(c.head)+len(c.tail)))
+	return c.overflowHeld()
 }
 
-// keepTail appends p to the rolling tail, keeping the last overflowKeep bytes.
+// overflowHeld is what an overflowed capture is charged: the head plus the
+// tail view, at most 2*overflowKeep (D31) whatever spare bytes tail holds
+// between compactions.
+//
+// Must be called with mu held.
+func (c *captureReader) overflowHeld() int64 {
+	return int64(len(c.head) + len(c.tailView()))
+}
+
+// keepTail appends p to the rolling tail. To avoid reallocating and copying
+// the tail on every read, it compacts only once tail reaches 2*overflowKeep,
+// moving the last overflowKeep bytes to the front of the same array.
+//
+// Must be called with mu held.
 func (c *captureReader) keepTail(p []byte) {
 	c.tail = append(c.tail, p...)
-	if extra := len(c.tail) - overflowKeep; extra > 0 {
-		c.tail = append(c.tail[:0:0], c.tail[extra:]...)
+	if len(c.tail) > 2*overflowKeep {
+		n := copy(c.tail, c.tail[len(c.tail)-overflowKeep:])
+		c.tail = c.tail[:n]
 	}
+}
+
+// tailView is the rolling tail: the last overflowKeep bytes seen.
+//
+// Must be called with mu held.
+func (c *captureReader) tailView() []byte {
+	t := c.tail
+	if len(t) > overflowKeep {
+		t = t[len(t)-overflowKeep:]
+	}
+	return t
 }
 
 // inspectHeadAndTail recovers model and usage from an overflowed body: the
@@ -419,11 +464,12 @@ func (c *captureReader) inspectHeadAndTail() {
 			}
 		}
 	}
-	idx := bytes.LastIndex(c.tail, []byte(`"usage"`))
+	tail := c.tailView()
+	idx := bytes.LastIndex(tail, []byte(`"usage"`))
 	if idx < 0 {
 		return
 	}
-	rest := bytes.TrimLeft(c.tail[idx+len(`"usage"`):], " \t\r\n")
+	rest := bytes.TrimLeft(tail[idx+len(`"usage"`):], " \t\r\n")
 	if len(rest) == 0 || rest[0] != ':' {
 		return
 	}

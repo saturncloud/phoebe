@@ -4,11 +4,13 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -84,7 +86,7 @@ func TestOverflowedCaptureChargesItsHeadAndTail(t *testing.T) {
 		n, err := cr.Read(buf)
 		got.Write(buf[:n])
 		if err == nil && cr.overflowed {
-			want := int64(len(cr.head) + len(cr.tail))
+			want := int64(len(cr.head) + min(len(cr.tail), overflowKeep))
 			account.mu.Lock()
 			slot := account.slots[bufferSlotCapture]
 			account.mu.Unlock()
@@ -135,7 +137,7 @@ func TestOverflowedCaptureChargesPastAnExhaustedReplicaTotal(t *testing.T) {
 			if !cr.overflowed {
 				t.Fatal("capture did not overflow with the replica total used up")
 			}
-			want := int64(total + len(cr.head) + len(cr.tail))
+			want := int64(total + len(cr.head) + min(len(cr.tail), overflowKeep))
 			if held := budget.held.Load(); held != want {
 				t.Fatalf("held=%d, want the holder's %d plus head+tail = %d", held, total, want)
 			}
@@ -217,5 +219,112 @@ func TestNonStreamedOverflowIsChargedWhileInFlight(t *testing.T) {
 	}
 	if held := s.responseBuffers.held.Load(); held != 0 {
 		t.Fatalf("replica budget still holds %d bytes after the request", held)
+	}
+}
+
+// A client abort runs Close (and so finish) on another goroutine while Read is
+// still overflowing a non-streamed body. Every access to scan, head, tail and
+// overflowed holds mu, so this is race-free under -race; onDone fires once,
+// each read in flight charges exactly the head plus the overflowKeep tail, and
+// nothing stays charged at the end.
+func TestNonStreamedOverflowCloseConcurrentWithRead(t *testing.T) {
+	body := []byte(`{"model":"m","data":"` + strings.Repeat("z", 8<<20) + `","usage":{"prompt_tokens":3,"completion_tokens":0,"total_tokens":3}}`)
+	budget := &responseBufferBudget{}
+	account := budget.newAccount(config.ProtectionSettings{MaxResponseBufferBytesPerStream: 64 << 10, MaxResponseBufferBytesTotal: 256 << 20}, noBufferCancel(t))
+	var fired int
+	var firedMu sync.Mutex
+	cr := newCaptureReader(context.Background(), &chunkedBody{r: bytes.NewReader(body), chunk: 32 << 10}, false, func(capture.Result) {
+		firedMu.Lock()
+		fired++
+		firedMu.Unlock()
+	})
+	cr.buffers = account
+
+	overflowing := make(chan struct{})
+	readDone := make(chan error, 1)
+	go func() {
+		buf := make([]byte, 32<<10)
+		signalled := false
+		for {
+			_, err := cr.Read(buf)
+			cr.mu.Lock()
+			overflowed := cr.overflowed
+			want := int64(len(cr.head) + min(len(cr.tail), overflowKeep))
+			cr.mu.Unlock()
+			if overflowed {
+				// The account is charged by this goroutine only, so once
+				// Read returns its charge is final until Close closes it.
+				account.mu.Lock()
+				slot, closed := account.slots[bufferSlotCapture], account.closed
+				account.mu.Unlock()
+				if !closed && slot != want {
+					readDone <- fmt.Errorf("slot=%d, want head+tail=%d", slot, want)
+					return
+				}
+				if want > 2*overflowKeep {
+					readDone <- fmt.Errorf("charged %d, past the 2*overflowKeep cap %d", want, 2*overflowKeep)
+					return
+				}
+				if !signalled {
+					signalled = true
+					close(overflowing)
+				}
+			}
+			if err == io.EOF {
+				readDone <- nil
+				return
+			}
+			if err != nil {
+				readDone <- err
+				return
+			}
+		}
+	}()
+	select {
+	case <-overflowing:
+	case err := <-readDone:
+		t.Fatalf("read finished before overflowing: %v", err)
+	}
+	if err := cr.Close(); err != nil {
+		t.Fatalf("close: %v", err)
+	}
+	if err := <-readDone; err != nil {
+		t.Fatal(err)
+	}
+	firedMu.Lock()
+	defer firedMu.Unlock()
+	if fired != 1 {
+		t.Fatalf("onDone fired %d times, want 1", fired)
+	}
+	if held := budget.held.Load(); held != 0 {
+		t.Fatalf("held=%d after Close, want 0", held)
+	}
+}
+
+// keepTail keeps exactly the last overflowKeep bytes of a 50 MiB body fed in
+// small reads, and in steady state allocates nothing per read (it compacts in
+// place only when the tail reaches 2*overflowKeep).
+func TestKeepTailHoldsLastBytesWithoutPerReadAllocation(t *testing.T) {
+	body := make([]byte, 50<<20)
+	for i := range body {
+		body[i] = byte(i % 251)
+	}
+	for _, chunk := range []int{4 << 10, 32 << 10} {
+		cr := &captureReader{}
+		cr.scan.Write(body[:96<<10])
+		cr.overflow()
+		for off := 96 << 10; off < len(body); off += chunk {
+			cr.keepTail(body[off:min(off+chunk, len(body))])
+		}
+		if got := cr.tailView(); !bytes.Equal(got, body[len(body)-overflowKeep:]) {
+			t.Fatalf("chunk=%d: tail is %d bytes and not the body's last %d", chunk, len(got), overflowKeep)
+		}
+		if held := cr.overflowHeld(); held != int64(96<<10+overflowKeep) {
+			t.Fatalf("chunk=%d: charged %d, want head %d + tail %d", chunk, held, 96<<10, overflowKeep)
+		}
+		p := body[:chunk]
+		if allocs := testing.AllocsPerRun(1000, func() { cr.keepTail(p) }); allocs != 0 {
+			t.Fatalf("chunk=%d: keepTail allocated %.2f times per read in steady state, want 0", chunk, allocs)
+		}
 	}
 }
