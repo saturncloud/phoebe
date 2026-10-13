@@ -578,6 +578,7 @@ func TestExplicitZeroCapBlocksEveryRequest(t *testing.T) {
 		{"maxReservedDecodeSlots", func(l *config.AdmissionLimits) { l.MaxReservedDecodeSlots = ptr64(0) }, "reserved_decode_slots"},
 		{"maxPrefillTokens", func(l *config.AdmissionLimits) { l.MaxPrefillTokens = ptr64(0) }, "prefill_tokens"},
 		{"maxReservedOutputTokens", func(l *config.AdmissionLimits) { l.MaxReservedOutputTokens = ptr64(0) }, "output"},
+		{"maxReservedKvTokens", func(l *config.AdmissionLimits) { l.MaxReservedKVTokens = ptr64(0) }, "kv"},
 		{"maxActiveAdapters", func(l *config.AdmissionLimits) { l.MaxActiveAdapters = ptr64(0) }, "adapters"},
 		{"requestsPerWindow", func(l *config.AdmissionLimits) { l.RequestsPerWindow = ptr64(0) }, "requests"},
 		{"totalPromptTokensPerWindow", func(l *config.AdmissionLimits) { l.TotalPromptTokensPerWindow = ptr64(0) }, "total_prompt_tokens"},
@@ -593,6 +594,12 @@ func TestExplicitZeroCapBlocksEveryRequest(t *testing.T) {
 			var rejected *Rejected
 			if !errors.As(err, &rejected) || rejected.Scope != "platform" || rejected.Dimension != tc.dimension {
 				t.Fatalf("err=%v, want platform %s rejection at the zero cap", err, tc.dimension)
+			}
+			// A zero cap is the retryable answer (503 with Retry-After), never
+			// the unsatisfiable one (413 kv_exceeds_limit /
+			// prefill_tokens_exceeds_limit, or a contract 400).
+			if rejected.Contractual || rejected.Unsatisfiable || rejected.RetryAfter <= 0 {
+				t.Fatalf("rejection=%+v, want a retryable, non-contractual %s rejection at the zero cap", rejected, tc.dimension)
 			}
 		})
 	}

@@ -236,4 +236,14 @@ func TestPublishedGraphCapacityOversizeIs413(t *testing.T) {
 	if n := hits.Load(); n != 0 {
 		t.Fatalf("upstream hits=%d after a zero-cap refusal, want 0", n)
 	}
+
+	// A zero reserved-KV cap on its own (no zero prefill cap to answer
+	// first) is also the retryable 503, never the 413 kv_exceeds_limit.
+	rr = serve(gateway.GraphCapacity{MaxReservedKVTokens: ptr64(0)})
+	if rr.Code != http.StatusServiceUnavailable || rr.Header().Get("Retry-After") == "" {
+		t.Fatalf("published zero KV cap alone: status=%d retry-after=%q, want a retryable 503", rr.Code, rr.Header().Get("Retry-After"))
+	}
+	if n := hits.Load(); n != 0 {
+		t.Fatalf("upstream hits=%d after a zero KV cap refusal, want 0", n)
+	}
 }
