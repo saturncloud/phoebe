@@ -24,7 +24,7 @@ engine-usage metering continues through its Valkey/WAL/log path.
 | Reserved decode slots/streams and output | Saturn-owned, implemented here | A future decode slot and `max_tokens`/`max_completion_tokens` are reserved before forwarding and held until completion, abort, timeout, rejection, or upstream failure. The independent prefill cap still bounds that phase. Reserving decode capacity early avoids attempting to queue after response streaming begins. |
 | Request and token-throughput windows | Saturn-owned, implemented here | Separate request, total-prompt, uncached-prompt, and generated-token windows. Admission reserves the estimated prompt tokens (the same approximate estimate as the prefill counter) as fully uncached input plus the reserved output (`max_tokens` x output sequences); engine usage then reconciles estimates to exact total, cached, uncached, and generated currencies. Concurrent estimates therefore cannot overbook a window, overestimates are refunded, and underestimates create debt for later requests. |
 | Cold holds and wake churn | Partially implemented before; completed here | Phoebe already detected/actuated wake-from-zero. Distributed hold and wake-window admission now surrounds actuation. |
-| Adapter and KV pressure | Layered implementation | Phoebe bounds active adapter-bearing requests and reserved work. Saturn enables backend prefix caches and KV event publication; Dynamo routes on actual cache residency and load, while each engine owns allocation/eviction. |
+| Adapter and KV pressure | Layered implementation | Phoebe bounds active adapter-bearing requests and reserved work. `maxReservedKvTokens` bounds estimated input plus reserved output (x output sequences); that reservation is held until the request finishes. Saturn enables backend prefix caches and KV event publication; Dynamo routes on actual cache residency and load, while each engine owns allocation/eviction. |
 | Operator protected lanes | Layered implementation | An operator-owned organization→lane map partitions capacity. Phoebe replaces client hints with the lane's trusted Dynamo soft and strict priorities. Admission lanes are unrelated to Atlas instance-size tiers and UsageLimits names. |
 | Cache-aware/worker routing and prefill/decode scheduling | Saturn-configured Dynamo capability | Shared graphs enable KV routing, output-block tracking, a capacity-triggered WSPT queue, and backend priority scheduling where supported. |
 | Gang lifecycle and replica topology | Saturn-configured Grove/Dynamo capability | The graph remains the lifecycle and gang unit; request fairness is enforced above and inside it. |
@@ -120,11 +120,17 @@ Only a Phoebe with no Valkey at all (no `admission.valkeyAddr` and no
 Phoebe can reserve generated capacity strictly before dispatch because the
 request declares a maximum output. It cannot derive exact rendered prompt or
 cache-hit counts from raw OpenAI JSON without duplicating Dynamo's model chat
-templates, tokenizer, and live KV lookup. Instead it reserves the cheap JSON
-byte estimate before dispatch, conservatively assigns it to both total and
-uncached prompt currencies, and settles the engine's authoritative usage at
-completion. Request-body bytes remain a separate instantaneous physical guard
-and are never written as billing usage.
+templates, tokenizer, and live KV lookup. Instead it reserves the
+pre-tokenization token estimate (described above) before dispatch,
+conservatively assigns it to both total and uncached prompt currencies, and
+settles the engine's authoritative usage at completion. The
+`maxPrefillTokens` counter is the instantaneous prefill guard and is never
+written as billing usage.
+
+`maxPrefillTokens` replaced the old byte-based `maxPromptBytes` limit and is
+counted in estimated tokens, not bytes. A configuration that still sets
+`maxPromptBytes` at any scope fails startup; convert the value to tokens and
+rename the key to `maxPrefillTokens`.
 
 ## Trusted Dynamo request policy
 
@@ -152,9 +158,9 @@ scheduling.
 
 ## Lifecycle and crash recovery
 
-An admitted request owns a lease. Physical request-byte and concurrent-prefill
+An admitted request owns a lease. Prefill-token and concurrent-prefill
 counters release at the first response body byte. Active request, reserved
-decode slot, output, adapter, estimated-input, and generated-window reservation
+decode slot, output, adapter, kv, estimated-input, and generated-window reservation
 state release at final body completion, when authoritative total-prompt,
 uncached-prompt, and generated counts are atomically settled. The owning proxy
 renews the expiry throughout long streams. Pre-header aborts, upstream errors, ordinary

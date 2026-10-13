@@ -116,7 +116,11 @@ emit:
 # Each request is checked atomically at platform, serving-graph, organization,
 # and organization×model scopes. Prompt work is an ESTIMATE in tokens: the
 # characters of the request's message text divided by 4, plus a fixed 1024
-# tokens per image part (no chat template, no tokenizer). maxPrefillTokens
+# tokens per image part, plus the raw JSON length / 4 of tool/function
+# definitions and structured-output schemas (tools, functions,
+# response_format, guided_json, guided_regex, guided_grammar, guided_choice,
+# structured_outputs) and of documents, chat_template, chat_template_kwargs
+# and prompt_embeds (no chat template, no tokenizer). maxPrefillTokens
 # bounds that estimate for requests still in prefill. Token windows reserve the
 # same estimate as uncached input, then reconcile the engine's exact total and
 # cached token counts after the response. Output is
