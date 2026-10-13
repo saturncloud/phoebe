@@ -4264,3 +4264,102 @@ func TestIntegration_Migration0009GraphRevisionGrain(t *testing.T) {
 		t.Fatalf("after down then up, a-graph id is not the id the rater minted (%s)", raterID)
 	}
 }
+
+// TestIntegration_Migration0009DownNoticesEveryRatedRowItDeletes pins the audit
+// trail for 0009 down's lossy DELETE: before removing the rollups that differ from a
+// kept row only in graph or topology revision, the migration must RAISE NOTICE with
+// the row count, SUM(cost), SUM(event_count) and earliest window_start of exactly the
+// rows it deletes, and say the hours MUST be re-rated. A database with nothing to
+// delete must produce no such NOTICE.
+func TestIntegration_Migration0009DownNoticesEveryRatedRowItDeletes(t *testing.T) {
+	dsn := os.Getenv("PHOEBE_TEST_DATABASE_URL")
+	if dsn == "" {
+		t.Skip("PHOEBE_TEST_DATABASE_URL not set; skipping live-Postgres conformance")
+	}
+	ctx := context.Background()
+	cfg, err := pgx.ParseConfig(dsn)
+	if err != nil {
+		t.Fatalf("parse dsn: %v", err)
+	}
+	var notices []string
+	cfg.OnNotice = func(_ *pgconn.PgConn, n *pgconn.Notice) {
+		if strings.HasPrefix(n.Message, "0009 down:") {
+			notices = append(notices, n.Message)
+		}
+	}
+	db := stdlib.OpenDB(*cfg)
+	defer db.Close()
+	// One pooled connection so SET search_path sticks and every NOTICE reaches
+	// the callback above.
+	db.SetMaxOpenConns(1)
+
+	setup := func(sch string) {
+		t.Helper()
+		exec(t, db, "DROP SCHEMA IF EXISTS "+sch+" CASCADE")
+		exec(t, db, "CREATE SCHEMA "+sch)
+		exec(t, db, "SET search_path TO "+sch)
+		for _, f := range []string{"0001_billing_event", "0002_rating", "0004_billing_event_serving_mode",
+			"0005_invoice_grade_attempts", "0006_rollup_grain", "0007_serving_mode_explicit",
+			"0008_billing_event_topology", "0009_rollup_grain_graph_revision"} {
+			exec(t, db, readMigration(t, f+".up.sql"))
+		}
+	}
+	hour := mustTime("2026-06-08T10:00:00Z")
+	// idKey fixes which row survives: down keeps the lowest id per 0007 key.
+	seed := func(idKey, auth, graph string, revision int, at time.Time, cost string, events int) {
+		t.Helper()
+		if _, err := db.ExecContext(ctx, `INSERT INTO rated_usage
+			(id, auth_id, resource_id, org_id, model_id, serving_mode, graph_k8s_name, topology_revision, window_start, window_end,
+			 prompt_tokens, cached_tokens, completion_tokens, billable_prompt_tokens,
+			 cost, applied_prompt_rate, applied_cached_rate, applied_completion_rate, event_count)
+			VALUES ($1, $2, 'res', 'org-1', 'm', 'dedicated', $3, $4, $5::timestamptz, $5::timestamptz + interval '1 hour',
+			        100, 0, 0, 100, $6::numeric, 0.00001, 0, 0, $7)`, idKey, auth, graph, revision, at, cost, events); err != nil {
+			t.Fatalf("seed rated_usage %s: %v", idKey, err)
+		}
+	}
+
+	const sch = "phoebe_migration_0009_down_notice_it"
+	setup(sch)
+	defer func() { exec(t, db, "DROP SCHEMA IF EXISTS "+sch+" CASCADE") }()
+	// Same hour, same 0007 key, differ only in graph: 'b' is deleted.
+	seed("g-a", "a-graph", "dgd-a", 0, hour, "0.500000000", 5)
+	seed("g-b", "a-graph", "dgd-b", 0, hour, "1.250000000", 4)
+	// Next hour, differ only in revision: 'r2' is deleted.
+	seed("r-1", "a-rev", "dgd-a", 1, hour.Add(time.Hour), "0.100000000", 1)
+	seed("r-2", "a-rev", "dgd-a", 2, hour.Add(time.Hour), "0.750000000", 6)
+	// Alone in its 0007 key: untouched.
+	seed("solo", "a-solo", "dgd-c", 3, hour, "9.000000000", 9)
+
+	exec(t, db, readMigration(t, "0009_rollup_grain_graph_revision.down.sql"))
+
+	want := []string{
+		"0009 down: deleting 2 rated_usage rows that differ from a kept row only in graph or topology revision " +
+			"(sum cost 2.000000000, sum event_count 10, earliest window_start 2026-06-08T10:00:00Z); " +
+			"the kept rows are partial until re-rated, so every affected hour MUST be re-rated: " +
+			"rater --since <earliest window_start> --until <now>, then token-push over the same window",
+	}
+	if strings.Join(notices, "\n") != strings.Join(want, "\n") {
+		t.Fatalf("0009 down notices =\n%s\nwant\n%s", strings.Join(notices, "\n"), strings.Join(want, "\n"))
+	}
+	var left int64
+	var leftCost string
+	if err := db.QueryRowContext(ctx, `SELECT COUNT(*), SUM(cost)::text FROM rated_usage`).Scan(&left, &leftCost); err != nil {
+		t.Fatalf("count after down: %v", err)
+	}
+	// The NOTICE must describe exactly the rows removed: 12.6 seeded - 2.0 noticed.
+	if left != 3 || leftCost != "9.600000000" {
+		t.Fatalf("rated_usage after down = %d rows, sum cost %s; want 3 rows, 9.600000000", left, leftCost)
+	}
+
+	// Nothing to delete: no audit NOTICE at all.
+	notices = nil
+	const clean = "phoebe_migration_0009_down_notice_clean_it"
+	setup(clean)
+	defer func() { exec(t, db, "DROP SCHEMA IF EXISTS "+clean+" CASCADE") }()
+	seed("g-a", "a-graph", "dgd-a", 0, hour, "0.500000000", 5)
+	seed("solo", "a-solo", "dgd-c", 3, hour, "9.000000000", 9)
+	exec(t, db, readMigration(t, "0009_rollup_grain_graph_revision.down.sql"))
+	if len(notices) != 0 {
+		t.Fatalf("0009 down on a database with nothing to delete raised %v, want no NOTICE", notices)
+	}
+}

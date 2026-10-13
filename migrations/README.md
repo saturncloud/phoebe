@@ -224,7 +224,10 @@ every id. The deleted rows held real tokens and money for that hour, so after a
 rollback re-rate the affected hours with the pre-0009 rater
 (`rater --since <earliest affected hour> --until <start of the current hour>`,
 while `billing_event` still holds those hours) and then re-push them with
-`token-push` over the same range.
+`token-push` over the same range. Before it deletes anything, the down
+migration prints a `0009 down:` NOTICE with the number of rows it deletes, their
+sum of cost and event_count, and the earliest `window_start` among them; use that
+earliest hour as `--since`. No NOTICE means nothing was deleted.
 
 Roll the code back before the schema. Suspend the rater and token-push
 CronJobs, deploy the pre-0009 rater and token-push images, run `migrate down`,
