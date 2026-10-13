@@ -92,7 +92,11 @@ type Result struct {
 	// selects the price SKU, so such an event is NOT billed; the raw event stays
 	// in billing_event as evidence.
 	InvalidServingModeEvents int64
-	RollupsWritten           int64 // distinct grain rows upserted (see rated_usage_grain_uq)
+	// UnknownRevisionRollups counts billed rollups that name a graph but carry
+	// topology revision 0 (see RateResult). NOT part of HasAnomaly: the money is
+	// right; only margin attribution of that slice of the hour is lost.
+	UnknownRevisionRollups int64
+	RollupsWritten         int64 // distinct grain rows upserted (see rated_usage_grain_uq)
 	// UnratedHours counts hours in the window that were SKIPPED — prices could not
 	// be obtained, or rating them failed. Each hour is independent and the upsert is
 	// idempotent, so a skipped hour is rated by a later run whose trailing window
@@ -252,6 +256,12 @@ func (r *Rater) Run(ctx context.Context, windowStart, windowEnd time.Time, windo
 	res.AmbiguousOrgEvents = rr.AmbiguousOrgEvents
 	res.OwnerConflictEvents = rr.OwnerConflictEvents
 	res.InvalidServingModeEvents = rr.InvalidServingModeEvents
+	res.UnknownRevisionRollups = rr.UnknownRevisionRollups
+	if res.UnknownRevisionRollups > 0 {
+		// WARN, not ERROR: billed correctly; only margin attribution is affected.
+		r.log.Warn.Printf("rating: window [%s,%s) has %d billed rollup(s) naming a graph with topology revision 0 — the money is correct, but that slice of the graph's hour has no published topology, so margin analysis cannot attribute its hardware. Expected briefly after an interceptor restart (before its first topology sync) or a graph start; persistent counts mean Atlas's tf-graph-topology entries are not reaching phoebe",
+			windowStart.Format(time.RFC3339), windowEnd.Format(time.RFC3339), res.UnknownRevisionRollups)
+	}
 
 	if res.HasAmbiguousBase() {
 		r.log.Error.Printf("rating: window [%s,%s) has %d events under AMBIGUOUS-BASE rollups (a single model_id whose base_model-priced events carried MORE THAN ONE rate in a window: >1 distinct base_model, or mixed premium/plain-base pricing from an X-Saturn-Adapter flap) — a base_model/adapter PROPAGATION violation, NOT a priceable rollup; these rollups are NOT billed (billing the MIN rate would silently under-charge). Fix header propagation and re-rate this window",
@@ -462,4 +472,5 @@ func (r *Result) accumulate(hour Result) {
 	r.AmbiguousOrgEvents += hour.AmbiguousOrgEvents
 	r.OwnerConflictEvents += hour.OwnerConflictEvents
 	r.InvalidServingModeEvents += hour.InvalidServingModeEvents
+	r.UnknownRevisionRollups += hour.UnknownRevisionRollups
 }

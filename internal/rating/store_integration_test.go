@@ -2827,6 +2827,10 @@ func TestIntegration_TopologyRevisionSplitsRollupsAndKeepsIDsStable(t *testing.T
 	if err != nil {
 		t.Fatalf("RateWindow B: %v", err)
 	}
+	// e0 names graph dgd-a but carries no revision: billed normally, counted.
+	if resB.UnknownRevisionRollups != 1 {
+		t.Fatalf("UnknownRevisionRollups = %d, want 1 (the named-graph, revision-0 rollup)", resB.UnknownRevisionRollups)
+	}
 	if resB.RollupsWritten != 3 || resB.EventsRated != 3 || resB.ReconciledDeletions != 0 {
 		t.Fatalf("run B rollups/events/deletions = %d/%d/%d, want 3/3/0", resB.RollupsWritten, resB.EventsRated, resB.ReconciledDeletions)
 	}

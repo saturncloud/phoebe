@@ -102,6 +102,10 @@ type RateResult struct {
 	// post-cutover producer bug. Withheld from money per event, retained in
 	// billing_event, and screamed about.
 	InvalidServingModeEvents int64
+	// UnknownRevisionRollups counts billed ROLLUPS that name a graph but carry
+	// topology revision 0. Not an anomaly: the money is right, only the hardware
+	// attribution of that slice of the hour is unknown. Logged as a warning.
+	UnknownRevisionRollups int64
 }
 
 // Anomalies are the fail-loud counts for a window: events that could not be priced
@@ -761,7 +765,7 @@ upserted AS (
         applied_completion_rate = EXCLUDED.applied_completion_rate,
         event_count             = EXCLUDED.event_count,
         rated_at                = now()
-    RETURNING event_count, cost
+    RETURNING event_count, cost, graph_k8s_name, topology_revision
 )
 SELECT
     (SELECT COUNT(*)::bigint                      FROM upserted) AS rollups_written,
@@ -890,7 +894,16 @@ SELECT
         AND valid_usage
         AND auth_id     IS NOT NULL
         AND resource_id IS NOT NULL
-        AND model_id    IS NOT NULL)                        AS invalid_serving_mode_events`
+        AND model_id    IS NOT NULL)                        AS invalid_serving_mode_events,
+    -- UNKNOWN-REVISION rollups: a NAMED graph with revision 0 (no published topology
+    -- when the request arrived: an interceptor before its first topology sync, or a
+    -- graph whose entry Atlas had not yet applied). NOT a withholding signal and NOT
+    -- in the event partition: these rollups bill normally and their money is right;
+    -- they only split the graph's hour into an extra revision-0 rollup whose hardware
+    -- margin analysis cannot attribute. Counted in rollup units, like the rollups
+    -- they are, so operators can see how often it happens.
+    (SELECT COUNT(*)::bigint FROM upserted
+      WHERE graph_k8s_name <> '' AND topology_revision = 0) AS unknown_revision_rollups`
 
 // RateWindow runs the price-projection + the single resolve→sum→upsert→count
 // statement for [start, end) in ONE transaction, and reports the rollups written,
@@ -939,7 +952,7 @@ func (s *PostgresStore) RateWindow(ctx context.Context, book *PriceBook, start, 
 			&res.ExpectedMissingUsageEvents, &res.UnexplainedMissingUsageEvents,
 			&res.InvalidUsageEvents, &res.AmbiguousBaseEvents,
 			&res.AmbiguousOrgEvents, &res.OwnerConflictEvents,
-			&res.InvalidServingModeEvents)
+			&res.InvalidServingModeEvents, &res.UnknownRevisionRollups)
 	if err != nil {
 		return RateResult{}, fmt.Errorf("rating: rate window [%s,%s): %w",
 			start.UTC().Format(time.RFC3339), end.UTC().Format(time.RFC3339), err)

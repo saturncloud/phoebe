@@ -46,8 +46,8 @@ func TestPostgresStore_RateWindowSQL(t *testing.T) {
 	// missing_usage_events is the TOTAL; expected + unexplained partition it
 	// (6 = 4 routine aborts/failures + 2 successes with no usage block), so the
 	// fixture cannot pass while the SQL's partition is wrong.
-	rows := sqlmock.NewRows([]string{"rollups_written", "events_rated", "total_cost", "reconciled_deletions", "unpriced_events", "unattributable_events", "missing_usage_events", "expected_missing_usage_events", "unexplained_missing_usage_events", "invalid_usage_events", "ambiguous_base_events", "ambiguous_org_events", "owner_conflict_events", "invalid_serving_mode_events"}).
-		AddRow(2, 5, "0.001234500", 0, 3, 1, 6, 4, 2, 7, 4, 2, 3, 5)
+	rows := sqlmock.NewRows([]string{"rollups_written", "events_rated", "total_cost", "reconciled_deletions", "unpriced_events", "unattributable_events", "missing_usage_events", "expected_missing_usage_events", "unexplained_missing_usage_events", "invalid_usage_events", "ambiguous_base_events", "ambiguous_org_events", "owner_conflict_events", "invalid_serving_mode_events", "unknown_revision_rollups"}).
+		AddRow(2, 5, "0.001234500", 0, 3, 1, 6, 4, 2, 7, 4, 2, 3, 5, 6)
 	// The statement binds $3 = the ft: LIKE pattern (single-sourced from fineTunePrefix).
 	mock.ExpectQuery(`INSERT INTO rated_usage`).
 		WithArgs(start.UTC(), end.UTC(), ftLikePattern).
@@ -82,6 +82,9 @@ func TestPostgresStore_RateWindowSQL(t *testing.T) {
 	}
 	if res.OwnerConflictEvents != 3 {
 		t.Fatalf("owner-conflict events = %d, want 3 (must ride the same statement)", res.OwnerConflictEvents)
+	}
+	if res.UnknownRevisionRollups != 6 {
+		t.Fatalf("unknown-revision rollups = %d, want 6 (must ride the same statement)", res.UnknownRevisionRollups)
 	}
 	if res.InvalidServingModeEvents != 5 {
 		t.Fatalf("invalid-serving-mode events = %d, want 5 (must ride the same statement)", res.InvalidServingModeEvents)
