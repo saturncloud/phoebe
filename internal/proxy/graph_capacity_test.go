@@ -4,7 +4,9 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -182,5 +184,56 @@ func TestNoPublishedCapacityMeansNoAdmission(t *testing.T) {
 	s.Handler().ServeHTTP(rr, bareSharedRequest(up, "org-a"))
 	if rr.Code != http.StatusOK || a.calls != 0 {
 		t.Fatalf("status=%d admit calls=%d, want 200 and no admission", rr.Code, a.calls)
+	}
+}
+
+// D12 / B8: a request larger than the capacity Atlas published for its
+// graph can never be admitted there, so it is refused 413 with the model's
+// KV-cache wording, without Retry-After and before the engine. The control:
+// a published zero cap stays a retryable 503.
+func TestPublishedGraphCapacityOversizeIs413(t *testing.T) {
+	var hits atomic.Int32
+	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		hits.Add(1)
+		_, _ = w.Write([]byte(`{"model":"model-a","usage":{"prompt_tokens":1,"completion_tokens":1}}`))
+	}))
+	defer backend.Close()
+	up, _ := url.Parse(backend.URL)
+	graph := graphFromUpstreamHost(up.Host)
+
+	serve := func(c gateway.GraphCapacity) *httptest.ResponseRecorder {
+		mr := miniredis.RunT(t)
+		client := redis.NewClient(&redis.Options{Addr: mr.Addr()})
+		t.Cleanup(func() { _ = client.Close() })
+		settings := &config.Settings{Admission: config.AdmissionSettings{KeyPrefix: "b8-oversize", LeaseTTL: time.Minute, DefaultMaxOutputTokens: 20}}
+		eff, ok := (&config.Settings{Admission: settings.Admission, Emit: config.EmitSettings{ValkeyAddr: mr.Addr()}}).EffectiveAdmission()
+		if !ok {
+			t.Fatal("store must resolve")
+		}
+		s := New(settings, logging.New(logging.ERROR), &recordingEmitter{}).WithAdmitter(admission.New(client, eff))
+		s.graphCapacity = staticGraphCapacity{graph: c}
+		rr := httptest.NewRecorder()
+		s.Handler().ServeHTTP(rr, bareSharedRequest(up, "org-a"))
+		return rr
+	}
+
+	// bareSharedRequest declares max_tokens=20, so it needs at least 21 KV tokens.
+	rr := serve(gateway.GraphCapacity{MaxReservedKVTokens: ptr64(10)})
+	if rr.Code != http.StatusRequestEntityTooLarge || rr.Header().Get("Retry-After") != "" {
+		t.Fatalf("status=%d retry-after=%q, want 413 without Retry-After", rr.Code, rr.Header().Get("Retry-After"))
+	}
+	if !strings.Contains(rr.Body.String(), "this model's KV-cache capacity") {
+		t.Fatalf("body=%q, want the model KV-cache wording", rr.Body.String())
+	}
+	if n := hits.Load(); n != 0 {
+		t.Fatalf("upstream hits=%d, an oversize request must not reach the engine", n)
+	}
+
+	rr = serve(gateway.GraphCapacity{MaxReservedKVTokens: ptr64(0), MaxPrefillTokens: ptr64(0)})
+	if rr.Code != http.StatusServiceUnavailable || rr.Header().Get("Retry-After") == "" {
+		t.Fatalf("published zero caps: status=%d retry-after=%q, want a retryable 503", rr.Code, rr.Header().Get("Retry-After"))
+	}
+	if n := hits.Load(); n != 0 {
+		t.Fatalf("upstream hits=%d after a zero-cap refusal, want 0", n)
 	}
 }

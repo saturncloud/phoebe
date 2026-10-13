@@ -2974,3 +2974,88 @@ func TestAdmissionRenewalFailureEmitsReconciliationRow(t *testing.T) {
 			"want {false true 200} (the engine's real usage, recorded by the normal path)", ev.Aborted, ev.UsageFound, ev.StatusCode)
 	}
 }
+
+// D12: a request whose prompt plus max_tokens exceeds an operator reserved-KV
+// cap can never be admitted, so the proxy answers 413 with the KV wording,
+// no Retry-After, the request-id header, and never reaches the engine. A
+// platform cap is a configured limit, not the model's capacity, so the body
+// does not blame the model. The control: an explicit zero cap stays a
+// retryable 503 with Retry-After.
+func TestKVLargerThanCapacityIs413NoRetryAfter(t *testing.T) {
+	var upstreamHits atomic.Int32
+	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		upstreamHits.Add(1)
+		_, _ = w.Write([]byte(`{"model":"model-a","usage":{"prompt_tokens":1,"completion_tokens":1}}`))
+	}))
+	defer backend.Close()
+	up, _ := url.Parse(backend.URL)
+
+	_, body := sharedChatRequest(up, 4*50)
+	kvNeed := estimatePromptTokens(body) + 20 // sharedChatRequest declares max_tokens=20
+
+	serve := func(kvCap int64) *httptest.ResponseRecorder {
+		mr := miniredis.RunT(t)
+		cfg := proxyAdmissionConfig(2)
+		cfg.Platform.MaxReservedKVTokens = ptr64(kvCap)
+		client := redis.NewClient(&redis.Options{Addr: mr.Addr()})
+		t.Cleanup(func() { _ = client.Close() })
+		s := New(&config.Settings{Admission: cfg}, logging.New(logging.ERROR), &recordingEmitter{}).
+			WithAdmitter(admission.New(client, cfg))
+		req, _ := sharedChatRequest(up, 4*50)
+		rr := httptest.NewRecorder()
+		s.Handler().ServeHTTP(rr, req)
+		return rr
+	}
+
+	rr := serve(kvNeed - 1)
+	if rr.Code != http.StatusRequestEntityTooLarge || rr.Header().Get("Retry-After") != "" {
+		t.Fatalf("status=%d retry-after=%q, want 413 without Retry-After", rr.Code, rr.Header().Get("Retry-After"))
+	}
+	if got := rr.Body.String(); !strings.Contains(got, "a configured KV-cache limit") || strings.Contains(got, "this model's") {
+		t.Fatalf("body=%q, want the configured KV-cache limit wording", got)
+	}
+	if rr.Header().Get(requestIDHeader) == "" {
+		t.Fatal("413 is missing the request-id header")
+	}
+	if n := upstreamHits.Load(); n != 0 {
+		t.Fatalf("upstream hits=%d, an over-KV request must not reach the engine", n)
+	}
+
+	if rr := serve(0); rr.Code != http.StatusServiceUnavailable || rr.Header().Get("Retry-After") == "" {
+		t.Fatalf("zero KV cap: status=%d retry-after=%q, want a retryable 503", rr.Code, rr.Header().Get("Retry-After"))
+	}
+	if rr := serve(kvNeed); rr.Code != http.StatusOK || upstreamHits.Load() != 1 {
+		t.Fatalf("KV need exactly at the cap: status=%d upstream=%d, want admitted", rr.Code, upstreamHits.Load())
+	}
+}
+
+// The 413 wording names the model's capacity only for the graph's own
+// capacity scopes; every other operator scope gets neutral wording, so a
+// tenant refused by its organization's limit is not told the model cannot
+// take its prompt. Status 413 and no Retry-After for all of them.
+func TestOversizeMessageBlamesModelOnlyForGraphCapacity(t *testing.T) {
+	s := New(&config.Settings{}, logging.New(logging.ERROR), &recordingEmitter{})
+	for _, c := range []struct {
+		scope, dimension string
+		wantModel        bool
+		want             string
+	}{
+		{"graph_capacity", "kv_exceeds_limit", true, "this model's KV-cache capacity"},
+		{"graph_capacity", "prefill_tokens_exceeds_limit", true, "this model's prefill capacity"},
+		{"graph", "prefill_tokens_exceeds_limit", true, "this model's prefill capacity"},
+		{"organization", "prefill_tokens_exceeds_limit", false, "a configured prefill-token limit"},
+		{"organization_model", "kv_exceeds_limit", false, "a configured KV-cache limit"},
+		{"platform", "prefill_tokens_exceeds_limit", false, "a configured prefill-token limit"},
+		{"lane", "kv_exceeds_limit", false, "a configured KV-cache limit"},
+	} {
+		rr := httptest.NewRecorder()
+		s.writeAdmissionError(rr, "req-1", &admission.Rejected{Scope: c.scope, Dimension: c.dimension, Unsatisfiable: true})
+		body := rr.Body.String()
+		if rr.Code != http.StatusRequestEntityTooLarge || rr.Header().Get("Retry-After") != "" {
+			t.Errorf("%s/%s: status=%d retry-after=%q, want 413 without Retry-After", c.scope, c.dimension, rr.Code, rr.Header().Get("Retry-After"))
+		}
+		if !strings.Contains(body, c.want) || strings.Contains(body, "this model's") != c.wantModel {
+			t.Errorf("%s/%s: body=%q, want %q", c.scope, c.dimension, body, c.want)
+		}
+	}
+}

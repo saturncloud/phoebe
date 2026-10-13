@@ -289,6 +289,29 @@ func prepareSharedDynamoRequest(body []byte, tenantIdentity string, maxOutput in
 	return out, tenant, nil
 }
 
+// oversizeMessage is the 413 text for a request larger than an operator or
+// published capacity scope. Only the graph's own capacity (the published
+// graph_capacity scope and the per-graph operator tier) is described as the
+// model's; every other scope (platform, organization, organization_model,
+// lane) gets neutral wording so the client is not told the model cannot take
+// a request that a configured limit refused. The scope id itself stays in the
+// server log, not the client body.
+func oversizeMessage(rejected *admission.Rejected) string {
+	kv := rejected.Dimension == "kv_exceeds_limit"
+	switch rejected.Scope {
+	case "graph_capacity", "graph":
+		if kv {
+			return "estimated prompt tokens plus max_tokens exceed this model's KV-cache capacity"
+		}
+		return "estimated prompt tokens exceed this model's prefill capacity"
+	default:
+		if kv {
+			return "estimated prompt tokens plus max_tokens exceed a configured KV-cache limit"
+		}
+		return "estimated prompt tokens exceed a configured prefill-token limit"
+	}
+}
+
 func (s *Server) writeAdmissionError(w http.ResponseWriter, requestID string, err error) {
 	// Echo the authoritative attempt id on rejections too — the same handle the
 	// normal path stamps in ModifyResponse and the error handler stamps on 502s:
@@ -300,11 +323,7 @@ func (s *Server) writeAdmissionError(w http.ResponseWriter, requestID string, er
 		// tokens, or prompt plus max_tokens against reserved KV). It can never
 		// be admitted, so it is refused as too large, the same answer an
 		// oversized prompt got from the byte-based limit this replaced.
-		message := "estimated prompt tokens exceed this model's prefill capacity"
-		if rejected.Dimension == "kv_exceeds_limit" {
-			message = "estimated prompt tokens plus max_tokens exceed this model's KV-cache capacity"
-		}
-		http.Error(w, message, http.StatusRequestEntityTooLarge)
+		http.Error(w, oversizeMessage(rejected), http.StatusRequestEntityTooLarge)
 		s.log.Warn.Printf("admission: request larger than capacity scope=%s dimension=%s", rejected.Scope, rejected.Dimension)
 		return
 	}
