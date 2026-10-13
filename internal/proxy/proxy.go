@@ -784,7 +784,11 @@ func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request) {
 			})
 			estimate.OutputTokens = undeclaredOutputWithinCaps(estimate.OutputTokens, estimate.InputTokens, estimate.OutputSequences, caps.KV, caps.Output)
 		}
-		body, tenant, rerr := prepareSharedDynamoRequest(body, tenantIdentity, estimate.OutputTokens, sharedLane)
+		// An undeclared max_tokens is capped on the engine at the reservation
+		// (R10: the documented default is both the user-visible cap and the
+		// admission reservation). Embeddings generate nothing.
+		capOutput := routePath != "/v1/embeddings" && !estimate.OutputDeclared
+		body, tenant, rerr := prepareSharedDynamoRequest(body, tenantIdentity, estimate.OutputTokens, capOutput, sharedLane)
 		if rerr != nil {
 			http.Error(w, "invalid shared inference request", http.StatusBadRequest)
 			return

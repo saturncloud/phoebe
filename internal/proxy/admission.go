@@ -257,7 +257,13 @@ func admissionWork(body []byte, defaultOutput int64) (admissionEstimate, bool) {
 // nvext.agent_hints; the caller also overwrites Dynamo's higher-precedence
 // priority headers. x-tenant-id has highest precedence for cache isolation;
 // nvext.cache_salt is also set so the invariant remains visible in the body.
-func prepareSharedDynamoRequest(body []byte, tenantIdentity string, maxOutput int64, lane config.AdmissionLane) ([]byte, string, error) {
+//
+// capOutput sets max_tokens to maxOutput in the forwarded body. The caller
+// passes it when the client declared no max_tokens: the reservation phoebe
+// admits against (the R10 default, clamped to fit the applicable limits) is
+// then also the cap the engine enforces, as ruling R10 defines it, instead of
+// the engine generating up to its own default past what was reserved.
+func prepareSharedDynamoRequest(body []byte, tenantIdentity string, maxOutput int64, capOutput bool, lane config.AdmissionLane) ([]byte, string, error) {
 	var root map[string]json.RawMessage
 	if err := json.Unmarshal(body, &root); err != nil || root == nil {
 		return nil, "", fmt.Errorf("request body must be a JSON object")
@@ -309,6 +315,11 @@ func prepareSharedDynamoRequest(body []byte, tenantIdentity string, maxOutput in
 	}
 	if err := setJSON(hints, "strict_priority", lane.DynamoStrictPriority); err != nil {
 		return nil, "", err
+	}
+	if capOutput {
+		if err := setJSON(root, "max_tokens", maxOutput); err != nil {
+			return nil, "", err
+		}
 	}
 	if err := setJSON(hints, "osl", maxOutput); err != nil {
 		return nil, "", err

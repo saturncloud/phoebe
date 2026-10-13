@@ -1556,7 +1556,7 @@ func TestSharedRequestMissingOrganizationIdentity(t *testing.T) {
 			t.Fatalf("status=%d, want 200", rr.Code)
 		}
 		_, expectedTenant, err := prepareSharedDynamoRequest(
-			[]byte(requestBody), "resource:resource-a", 20, config.AdmissionLane{},
+			[]byte(requestBody), "resource:resource-a", 20, false, config.AdmissionLane{},
 		)
 		if err != nil {
 			t.Fatal(err)
@@ -2386,7 +2386,7 @@ func TestAdmissionWorkRejectsCaseVariantAndDuplicateInterpretedKeys(t *testing.T
 func TestPrepareSharedDynamoRequestOverwritesUntrustedHints(t *testing.T) {
 	body := []byte(`{"model":"m","max_tokens":41,"stream":true,"stream_options":{"include_usage":false},"cache_salt":"attacker","nvext":{"cache_salt":"attacker","keep":"yes","backend_instance_id":99,"token_data":[1,2],"agent_hints":{"priority":2147483647,"strict_priority":4294967295,"osl":1,"speculative_prefill":true}}}`)
 	lane := config.AdmissionLane{DynamoPriority: 9, DynamoStrictPriority: 2}
-	out, tenant, err := prepareSharedDynamoRequest(body, "org-a", 41, lane)
+	out, tenant, err := prepareSharedDynamoRequest(body, "org-a", 41, false, lane)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -2420,7 +2420,7 @@ func TestPrepareSharedDynamoRequestOverwritesUntrustedHints(t *testing.T) {
 	if got.Nvext.Keep != "yes" || got.Nvext.BackendInstanceID != nil || got.Nvext.TokenData != nil || got.Nvext.Hints.SpeculativePrefill || !got.StreamOptions.IncludeUsage {
 		t.Fatalf("unrelated extensions or usage flag lost: %+v", got)
 	}
-	_, otherTenant, err := prepareSharedDynamoRequest(body, "org-b", 41, lane)
+	_, otherTenant, err := prepareSharedDynamoRequest(body, "org-b", 41, false, lane)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -3143,5 +3143,35 @@ func TestZeroPlatformKVCapIsRetryable503Not413(t *testing.T) {
 	}
 	if n := hits.Load(); n != 0 {
 		t.Fatalf("upstream hits=%d, a zero-capped request must not reach the engine", n)
+	}
+}
+
+// R10: an undeclared max_tokens is capped on the engine at the reservation
+// phoebe admitted against; a declared one is forwarded untouched.
+func TestPrepareSharedDynamoRequestCapsUndeclaredOutput(t *testing.T) {
+	out, _, err := prepareSharedDynamoRequest([]byte(`{"model":"m","messages":[]}`), "org-a", 37, true, config.AdmissionLane{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var got struct {
+		MaxTokens int64 `json:"max_tokens"`
+		Nvext     struct {
+			AgentHints struct {
+				OSL int64 `json:"osl"`
+			} `json:"agent_hints"`
+		} `json:"nvext"`
+	}
+	if err := json.Unmarshal(out, &got); err != nil {
+		t.Fatal(err)
+	}
+	if got.MaxTokens != 37 || got.Nvext.AgentHints.OSL != 37 {
+		t.Fatalf("max_tokens=%d osl=%d, want both 37", got.MaxTokens, got.Nvext.AgentHints.OSL)
+	}
+	out, _, err = prepareSharedDynamoRequest([]byte(`{"model":"m","max_tokens":500,"messages":[]}`), "org-a", 500, false, config.AdmissionLane{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := json.Unmarshal(out, &got); err != nil || got.MaxTokens != 500 {
+		t.Fatalf("declared max_tokens=%d err=%v, want 500 untouched", got.MaxTokens, err)
 	}
 }
