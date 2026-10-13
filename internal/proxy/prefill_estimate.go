@@ -31,8 +31,15 @@ const imagePartTokens = 1024
 // JSON length, because the engine's chat template renders tool definitions
 // into the prompt and structured-output schemas can be as large; a request
 // with a tiny message and megabytes of tool schemas must not estimate as
-// one token (D7 extension, battery fix 2026-10-13). A JSON null counts
-// nothing.
+// one token (D7 extension, battery fix 2026-10-13). The same raw-length
+// count covers the fields the engine renders into the prompt from outside
+// the messages: chat documents (RAG) and a client chat_template and
+// chat_template_kwargs, which the engine's chat template renders, and
+// completions prompt_embeds, whose base64 length over-counts conservatively
+// (billing reconciles to the engine's counts). A JSON null counts nothing.
+//
+// Each message's name, reasoning_content and tool_call_id strings count as
+// message text too, because chat templates render them.
 //
 // Every field is looked up by its exact key. encoding/json's struct decoding
 // matches keys case-insensitively and keeps the last match, while the engine
@@ -55,6 +62,9 @@ func estimatePromptTokens(body []byte) int64 {
 		c, images := contentText(m["content"])
 		chars += c
 		tokens += images * imagePartTokens
+		for _, key := range []string{"name", "reasoning_content", "tool_call_id"} {
+			chars += jsonStringChars(m[key])
+		}
 		var calls []json.RawMessage
 		_ = json.Unmarshal(m["tool_calls"], &calls)
 		for _, rawCall := range calls {
@@ -80,12 +90,14 @@ func estimatePromptTokens(body []byte) int64 {
 }
 
 // schemaFields are the top-level request fields holding tool or
-// structured-output definitions that the engine renders into, or compiles
-// alongside, the prompt. estimatePromptTokens counts each by raw JSON length.
+// structured-output definitions, documents, a client chat template or
+// prompt embeddings that the engine renders into, or compiles alongside,
+// the prompt. estimatePromptTokens counts each by raw JSON length.
 var schemaFields = []string{
 	"tools", "functions", "response_format",
 	"guided_json", "guided_regex", "guided_grammar", "guided_choice",
 	"structured_outputs",
+	"documents", "chat_template", "chat_template_kwargs", "prompt_embeds",
 }
 
 // jsonObject decodes raw as a JSON object keyed by exact field name, or
@@ -119,8 +131,9 @@ func jsonStringChars(raw json.RawMessage) int64 {
 
 // contentText measures a chat message's content: a plain string, or an array
 // of parts where text parts contribute their text and image parts count one
-// image each. Other typed parts (audio, files) contribute nothing; no shared
-// model accepts them.
+// image each. Typed video, audio and file parts also count as one image
+// (imagePartTokens, D7) so that media never estimates to zero, consistent
+// with the untyped path below. A part of any other type contributes nothing.
 //
 // A part with no "type" is classified by its keys, as vLLM's chat frontend
 // does for its simplified part format ({"image_url": ...}, {"text": ...}): an
@@ -149,7 +162,8 @@ func contentText(raw json.RawMessage) (chars, images int64) {
 		switch typ {
 		case "text", "input_text":
 			chars += jsonStringChars(p["text"])
-		case "image_url", "input_image", "image":
+		case "image_url", "input_image", "image", "image_pil", "image_embeds",
+			"video_url", "video", "audio_url", "input_audio", "audio", "file", "input_file":
 			images++
 		}
 	}

@@ -176,3 +176,61 @@ func TestEstimatePromptTokensCountsToolAndSchemaDefinitions(t *testing.T) {
 		t.Fatalf("estimate=%d, want %d", got, (8+12+3)/4)
 	}
 }
+
+// D36 (extends D33): fields the engine renders into the prompt from outside
+// the messages (chat documents, a client chat template and its kwargs,
+// completions prompt_embeds) and the template-rendered message fields (name,
+// reasoning_content, tool_call_id) count in the estimate, so a request with
+// a tiny message and a large document does not estimate as one token.
+func TestEstimatePromptTokensCountsTemplateRenderedFields(t *testing.T) {
+	msg := `"messages":[{"role":"user","content":"hi"}]`
+	text4k := strings.Repeat("d", 4000)
+	for _, tc := range []struct {
+		name string
+		body string
+		min  int64
+	}{
+		{"documents", `{"model":"m",` + msg + `,"documents":[{"text":"` + text4k + `"}]}`, 1000},
+		{"chat_template", `{"model":"m",` + msg + `,"chat_template":"` + text4k + `"}`, 1000},
+		{"chat_template_kwargs", `{"model":"m",` + msg + `,"chat_template_kwargs":{"x":"` + text4k + `"}}`, 1000},
+		{"prompt_embeds", `{"model":"m","prompt_embeds":"` + text4k + `"}`, 1000},
+		{"message reasoning_content", `{"model":"m","messages":[{"role":"assistant","content":"hi","reasoning_content":"` + text4k + `"}]}`, 1000},
+		{"message name", `{"model":"m","messages":[{"role":"user","content":"hi","name":"` + text4k + `"}]}`, 1000},
+	} {
+		if got := estimatePromptTokens([]byte(tc.body)); got < tc.min {
+			t.Errorf("%s: estimate=%d, want at least %d", tc.name, got, tc.min)
+		}
+	}
+	if got := estimatePromptTokens([]byte(`{"model":"m",` + msg + `,"documents":null}`)); got != 1 {
+		t.Errorf("null documents: estimate=%d, want 1 (adds nothing)", got)
+	}
+}
+
+// D37 (extends D7/D27): a typed video, audio or file part counts as one image
+// (imagePartTokens) like an image part, so media never estimates to zero; the
+// untyped form of the same part gets the same count.
+func TestTypedMediaPartsCountAsOneImage(t *testing.T) {
+	for _, tc := range []struct {
+		name, typed, untyped string
+	}{
+		{"video_url", `{"type":"video_url","video_url":{"url":"data:video/mp4;base64,AAAA"}}`, `{"video_url":{"url":"data:video/mp4;base64,AAAA"}}`},
+		{"input_audio", `{"type":"input_audio","input_audio":{"data":"AAAA","format":"wav"}}`, `{"input_audio":{"data":"AAAA","format":"wav"}}`},
+		{"audio_url", `{"type":"audio_url","audio_url":{"url":"data:audio/wav;base64,AAAA"}}`, `{"audio_url":{"url":"data:audio/wav;base64,AAAA"}}`},
+		// An untyped "file" key is not in vLLM's simplified part format (D27),
+		// so only the typed form is checked.
+		{"file", `{"type":"file","file":{"file_data":"AAAA"}}`, ""},
+	} {
+		if _, images := contentText([]byte(`[` + tc.typed + `]`)); images != 1 {
+			t.Errorf("%s typed: images=%d, want 1", tc.name, images)
+		}
+		if tc.untyped == "" {
+			continue
+		}
+		if _, images := contentText([]byte(`[` + tc.untyped + `]`)); images != 1 {
+			t.Errorf("%s untyped: images=%d, want 1 (same as typed)", tc.name, images)
+		}
+	}
+	if _, images := contentText([]byte(`[{"type":"unknown_kind","unknown_kind":{}}]`)); images != 0 {
+		t.Errorf("unknown typed part: images=%d, want 0", images)
+	}
+}
