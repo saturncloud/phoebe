@@ -3,6 +3,8 @@ package gateway
 import (
 	"strconv"
 	"strings"
+
+	"github.com/saturncloud/phoebe/internal/config"
 )
 
 // GraphCapacity is the per-graph admission capacity Atlas publishes for a
@@ -16,9 +18,26 @@ type GraphCapacity struct {
 	MaxPrefillTokens    *int64
 }
 
-// Any reports whether at least one limit is published.
-func (c GraphCapacity) Any() bool {
-	return c.MaxActiveRequests != nil || c.MaxReservedKVTokens != nil || c.MaxPrefillTokens != nil
+// Limits is the capacity as the admission limits of the graph_capacity scope.
+// A new published field must be copied here; TestGraphCapacityLimitsCopiesEveryField
+// fails when one is missing.
+func (c GraphCapacity) Limits() config.AdmissionLimits {
+	return config.AdmissionLimits{
+		MaxActiveRequests:   c.MaxActiveRequests,
+		MaxReservedKVTokens: c.MaxReservedKVTokens,
+		MaxPrefillTokens:    c.MaxPrefillTokens,
+	}
+}
+
+// Any reports whether at least one limit is published. It goes through
+// Limits, so it reads the canonical config.LimitValues list.
+func (c GraphCapacity) Any() bool { return c.Limits().Any() }
+
+// fields lists the capacity fields in the order of capacityKeys. parse and
+// tightest both walk it, so a new published key is added to this list and to
+// capacityKeys only.
+func (c *GraphCapacity) fields() []**int64 {
+	return []**int64{&c.MaxActiveRequests, &c.MaxReservedKVTokens, &c.MaxPrefillTokens}
 }
 
 // The registry data keys carrying GraphCapacity. They are graph-level values
@@ -30,6 +49,9 @@ const (
 	capacityKeyMaxPrefillTokens    = "admission_max_prefill_tokens"
 )
 
+// capacityKeys are the registry keys of GraphCapacity.fields, in that order.
+var capacityKeys = []string{capacityKeyMaxActiveRequests, capacityKeyMaxReservedKVTokens, capacityKeyMaxPrefillTokens}
+
 // parseGraphCapacity reads the capacity keys of one registry entry. A value
 // that is not a non-negative integer is an Atlas producer bug; it is reported
 // in problems and treated as unpublished (no limit) rather than rejecting the
@@ -37,24 +59,18 @@ const (
 // offline over a missing capacity hint (the same direction as having no
 // profile at all).
 func parseGraphCapacity(d map[string]string) (c GraphCapacity, problems []string) {
-	for _, f := range []struct {
-		key string
-		dst **int64
-	}{
-		{capacityKeyMaxActiveRequests, &c.MaxActiveRequests},
-		{capacityKeyMaxReservedKVTokens, &c.MaxReservedKVTokens},
-		{capacityKeyMaxPrefillTokens, &c.MaxPrefillTokens},
-	} {
-		raw := strings.TrimSpace(d[f.key])
+	for i, dst := range c.fields() {
+		key := capacityKeys[i]
+		raw := strings.TrimSpace(d[key])
 		if raw == "" {
 			continue
 		}
 		v, err := strconv.ParseInt(raw, 10, 64)
 		if err != nil || v < 0 {
-			problems = append(problems, f.key+"="+strconv.Quote(raw))
+			problems = append(problems, key+"="+strconv.Quote(raw))
 			continue
 		}
-		*f.dst = &v
+		*dst = &v
 	}
 	return c, problems
 }
@@ -71,10 +87,11 @@ func tightest(all map[string]GraphCapacity) GraphCapacity {
 			*dst = &x
 		}
 	}
+	dst := out.fields()
 	for _, c := range all {
-		pick(&out.MaxActiveRequests, c.MaxActiveRequests)
-		pick(&out.MaxReservedKVTokens, c.MaxReservedKVTokens)
-		pick(&out.MaxPrefillTokens, c.MaxPrefillTokens)
+		for i, src := range c.fields() {
+			pick(dst[i], *src)
+		}
 	}
 	return out
 }

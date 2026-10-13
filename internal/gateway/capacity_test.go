@@ -2,8 +2,11 @@ package gateway
 
 import (
 	"context"
+	"reflect"
 	"testing"
 	"time"
+
+	"github.com/saturncloud/phoebe/internal/config"
 
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 )
@@ -93,5 +96,53 @@ func TestRegistry_GraphCapacityLifecycle(t *testing.T) {
 	}
 	if c := waitCapacity(t, r, "graph-llama31", func(c GraphCapacity) bool { return !c.Any() }); c.Any() {
 		t.Fatalf("capacity still published after every entry was deleted: %+v", c)
+	}
+}
+
+// GraphCapacity.Limits is the one conversion of published capacity into the
+// graph_capacity admission scope. Every GraphCapacity field must reach the
+// AdmissionLimits field of the same name, or a published key would engage
+// admission (Any) without being enforced. A new published key is also added
+// to capacityKeys and GraphCapacity.fields (which parseGraphCapacity and
+// tightest walk); this test catches a field missing from Limits or fields.
+func TestGraphCapacityLimitsCopiesEveryField(t *testing.T) {
+	var c GraphCapacity
+	cv := reflect.ValueOf(&c).Elem()
+	want := map[string]*int64{}
+	for i := 0; i < cv.NumField(); i++ {
+		p := new(int64)
+		*p = int64(i + 1)
+		cv.Field(i).Set(reflect.ValueOf(p))
+		want[cv.Type().Field(i).Name] = p
+	}
+	limits := c.Limits()
+	lv := reflect.ValueOf(limits)
+	for name, p := range want {
+		f := lv.FieldByName(name)
+		if !f.IsValid() {
+			t.Fatalf("config.AdmissionLimits has no field %s", name)
+		}
+		if got, _ := f.Interface().(*int64); got != p {
+			t.Fatalf("Limits().%s = %v, want the GraphCapacity pointer %v", name, got, p)
+		}
+	}
+	var set int
+	for _, v := range config.LimitValues(limits) {
+		if v != nil {
+			set++
+		}
+	}
+	if set != cv.NumField() {
+		t.Fatalf("LimitValues(Limits()) has %d values set, want %d (one per GraphCapacity field)", set, cv.NumField())
+	}
+	if n := len(c.fields()); n != cv.NumField() || len(capacityKeys) != n {
+		t.Fatalf("fields()=%d capacityKeys=%d, want %d each", n, len(capacityKeys), cv.NumField())
+	}
+	seen := map[*int64]bool{}
+	for i, dst := range c.fields() {
+		if *dst == nil || seen[*dst] {
+			t.Fatalf("fields()[%d] does not point at a distinct GraphCapacity field", i)
+		}
+		seen[*dst] = true
 	}
 }

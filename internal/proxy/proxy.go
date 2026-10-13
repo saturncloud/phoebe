@@ -817,11 +817,7 @@ func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request) {
 				ReservedOutputTokens: estimate.OutputTokens,
 				Adapter:              id.Adapter != "", OrganizationLimits: organizationLimits, OwnerLimits: ownerLimits,
 				GroupScopes: groupScopes,
-				GraphCapacity: config.AdmissionLimits{
-					MaxActiveRequests:   graphCapacity.MaxActiveRequests,
-					MaxReservedKVTokens: graphCapacity.MaxReservedKVTokens,
-					MaxPrefillTokens:    graphCapacity.MaxPrefillTokens,
-				},
+				GraphCapacity: graphCapacity.Limits(),
 			})
 			if err != nil {
 				if errors.Is(err, admission.ErrInvalidIdentity) {
