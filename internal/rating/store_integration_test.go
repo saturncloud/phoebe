@@ -19,6 +19,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"reflect"
 	"sort"
 	"strings"
 	"testing"
@@ -2771,7 +2772,9 @@ func TestIntegration_OwnerConflictWithheldAndGraphSplits(t *testing.T) {
 // across re-rates against real Postgres: a graph that changes topology revision
 // inside an hour is two rollups (one per revision, each carrying its region), a
 // re-rate that adds an event on the second revision leaves the first revision's
-// rollup and id untouched, and an identical re-rate rewrites nothing.
+// rollup and id untouched, an identical re-rate reproduces the same ids and values
+// for every rollup, and a re-rate whose events lost their region sets the stored
+// region to NULL instead of keeping the stale one.
 func TestIntegration_TopologyRevisionSplitsRollupsAndKeepsIDsStable(t *testing.T) {
 	dsn := os.Getenv("PHOEBE_TEST_DATABASE_URL")
 	if dsn == "" {
@@ -2824,50 +2827,301 @@ func TestIntegration_TopologyRevisionSplitsRollupsAndKeepsIDsStable(t *testing.T
 	if err != nil {
 		t.Fatalf("RateWindow B: %v", err)
 	}
+	// e0 names graph dgd-a but carries no revision: billed normally, counted.
+	if resB.UnknownRevisionRollups != 1 {
+		t.Fatalf("UnknownRevisionRollups = %d, want 1 (the named-graph, revision-0 rollup)", resB.UnknownRevisionRollups)
+	}
 	if resB.RollupsWritten != 3 || resB.EventsRated != 3 || resB.ReconciledDeletions != 0 {
 		t.Fatalf("run B rollups/events/deletions = %d/%d/%d, want 3/3/0", resB.RollupsWritten, resB.EventsRated, resB.ReconciledDeletions)
 	}
 
-	rows, err := db.QueryContext(ctx,
-		`SELECT topology_revision, COALESCE(region, ''), prompt_tokens, id FROM rated_usage ORDER BY topology_revision`)
-	if err != nil {
-		t.Fatalf("read rollups: %v", err)
-	}
-	defer func() { _ = rows.Close() }()
 	type got struct {
 		rev    int
 		region string
 		prompt int64
+		events int64
+		cost   string
 		id     string
 	}
-	var all []got
-	for rows.Next() {
-		var g got
-		if err := rows.Scan(&g.rev, &g.region, &g.prompt, &g.id); err != nil {
-			t.Fatalf("scan: %v", err)
+	readRollups := func() []got {
+		t.Helper()
+		rows, err := db.QueryContext(ctx,
+			`SELECT topology_revision, COALESCE(region, ''), prompt_tokens, event_count, cost::text, id
+			   FROM rated_usage ORDER BY topology_revision`)
+		if err != nil {
+			t.Fatalf("read rollups: %v", err)
 		}
-		all = append(all, g)
+		defer func() { _ = rows.Close() }()
+		var all []got
+		for rows.Next() {
+			var g got
+			if err := rows.Scan(&g.rev, &g.region, &g.prompt, &g.events, &g.cost, &g.id); err != nil {
+				t.Fatalf("scan: %v", err)
+			}
+			all = append(all, g)
+		}
+		if err := rows.Err(); err != nil {
+			t.Fatalf("rows: %v", err)
+		}
+		return all
 	}
-	if len(all) != 3 {
-		t.Fatalf("rollups = %+v, want 3 (unknown, rev 1, rev 2)", all)
+	snapB := readRollups()
+	if len(snapB) != 3 {
+		t.Fatalf("rollups = %+v, want 3 (unknown, rev 1, rev 2)", snapB)
 	}
-	if all[0].rev != 0 || all[0].region != "" || all[0].prompt != 100 {
-		t.Fatalf("unknown-revision rollup = %+v, want rev 0, no region, 100 prompt tokens", all[0])
+	if snapB[0].rev != 0 || snapB[0].region != "" || snapB[0].prompt != 100 {
+		t.Fatalf("unknown-revision rollup = %+v, want rev 0, no region, 100 prompt tokens", snapB[0])
 	}
-	if all[1].rev != 1 || all[1].region != "eu-north1" || all[1].id != idRev1 {
-		t.Fatalf("revision 1 rollup = %+v, want region eu-north1 and its run A id %s (a re-rate must not re-mint it)", all[1], idRev1)
+	if snapB[1].rev != 1 || snapB[1].region != "eu-north1" || snapB[1].id != idRev1 {
+		t.Fatalf("revision 1 rollup = %+v, want region eu-north1 and its run A id %s (a re-rate must not re-mint it)", snapB[1], idRev1)
 	}
-	if all[2].rev != 2 || all[2].prompt != 300 {
-		t.Fatalf("revision 2 rollup = %+v, want 300 prompt tokens", all[2])
+	if snapB[2].rev != 2 || snapB[2].prompt != 300 || snapB[2].region != "eu-north1" {
+		t.Fatalf("revision 2 rollup = %+v, want 300 prompt tokens and region eu-north1 (each revision rollup carries its region)", snapB[2])
+	}
+	if snapB[0].id == snapB[1].id || snapB[1].id == snapB[2].id || snapB[0].id == snapB[2].id {
+		t.Fatalf("rollup ids not pairwise distinct: %+v (each revision is its own rollup)", snapB)
 	}
 
-	// An identical re-rate reproduces every row and deletes nothing.
+	// An identical re-rate reproduces the same ids and values and deletes nothing.
 	resC, err := store.RateWindow(ctx, book, hour, hour.Add(time.Hour))
 	if err != nil {
 		t.Fatalf("RateWindow C: %v", err)
 	}
 	if resC.RollupsWritten != 3 || resC.ReconciledDeletions != 0 {
 		t.Fatalf("idempotent re-rate rollups/deletions = %d/%d, want 3/0", resC.RollupsWritten, resC.ReconciledDeletions)
+	}
+	if snapC := readRollups(); !reflect.DeepEqual(snapB, snapC) {
+		t.Fatalf("identical re-rate must not change any rollup (ids, regions, values):\n after B: %+v\n after C: %+v", snapB, snapC)
+	}
+
+	// A re-rate whose events no longer carry a region must overwrite the stored region
+	// with NULL. region is a PLAIN overwrite in the upsert (store.go, ON CONFLICT
+	// `region = EXCLUDED.region`), unlike org_id one line above it, which COALESCEs to
+	// the stored value so a known org is never erased. COALESCE-restoring a region would
+	// keep a stale value on a rollup whose evidence no longer supports it.
+	exec(t, db, "UPDATE billing_event SET region = NULL WHERE request_id = 'e1'")
+	if _, err := store.RateWindow(ctx, book, hour, hour.Add(time.Hour)); err != nil {
+		t.Fatalf("RateWindow D: %v", err)
+	}
+	var regionD sql.NullString
+	var idD string
+	if err := db.QueryRowContext(ctx,
+		`SELECT region, id FROM rated_usage WHERE topology_revision = 1`).Scan(&regionD, &idD); err != nil {
+		t.Fatalf("read revision 1 rollup after run D: %v", err)
+	}
+	if regionD.Valid {
+		t.Fatalf("revision 1 region after re-rate = %q, want NULL: a re-rate whose events no longer carry a region "+
+			"must overwrite the stored region (plain region = EXCLUDED.region), never COALESCE-restore the stale value", regionD.String)
+	}
+	if idD != idRev1 {
+		t.Fatalf("revision 1 id after run D = %s, want %s (region is not a key; it must not re-mint the id)", idD, idRev1)
+	}
+}
+
+// openRatingSchema opens the integration database with the rating schema applied in
+// a fresh schema named sch, dropped again when the test ends. It skips the test when
+// PHOEBE_TEST_DATABASE_URL is unset.
+func openRatingSchema(t *testing.T, sch string) *sql.DB {
+	t.Helper()
+	dsn := os.Getenv("PHOEBE_TEST_DATABASE_URL")
+	if dsn == "" {
+		t.Skip("PHOEBE_TEST_DATABASE_URL not set; skipping live-Postgres conformance")
+	}
+	db, err := sql.Open("pgx", dsn)
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	exec(t, db, "DROP SCHEMA IF EXISTS "+sch+" CASCADE")
+	exec(t, db, "CREATE SCHEMA "+sch)
+	exec(t, db, "SET search_path TO "+sch)
+	t.Cleanup(func() {
+		exec(t, db, "DROP SCHEMA IF EXISTS "+sch+" CASCADE")
+		_ = db.Close()
+	})
+	exec(t, db, ratingSchemaDDL(t))
+	return db
+}
+
+// TestIntegration_ConflictingRegionsInOneRollupRateToNull pins that a rollup whose
+// events disagree on the region stores NULL rather than a guess. region is the
+// cluster's operator-editable region, so it can change inside one topology revision
+// (a region relabel without a revision bump); MAX would silently pick the lexically
+// larger value and push it to the manager as if it were known. A rollup with some
+// NULL regions and one known region still resolves to that known region, because
+// COUNT(DISTINCT) ignores NULLs.
+func TestIntegration_ConflictingRegionsInOneRollupRateToNull(t *testing.T) {
+	db := openRatingSchema(t, "phoebe_rating_region_conflict_it")
+	ctx := context.Background()
+	hour := mustTime("2026-06-08T10:00:00Z")
+	book := newTestBook(map[string]Rate3{"b": rate3("0.000005", "0", "0")}, nil, PolicyIdentity, Dec{}, Dec{})
+
+	// Same auth, resource, model, graph, revision and hour: one rollup each.
+	if _, err := db.ExecContext(ctx,
+		`INSERT INTO billing_event (request_id, auth_id, resource_id, org_id, model, base_model, graph_k8s_name, topology_revision, region, prompt_tokens, completion_tokens, event_ts)
+		 VALUES ('c1','a','conflict','org-1','m','b','dgd-a',1,'a', 100,0,$1),
+		        ('c2','a','conflict','org-1','m','b','dgd-a',1,'b', 100,0,$1),
+		        ('p1','a','partial', 'org-1','m','b','dgd-a',1,'a', 100,0,$1),
+		        ('p2','a','partial', 'org-1','m','b','dgd-a',1,NULL,100,0,$1)`, hour.Add(5*time.Minute)); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+	res, err := NewPostgresStore(db).RateWindow(ctx, book, hour, hour.Add(time.Hour))
+	if err != nil {
+		t.Fatalf("RateWindow: %v", err)
+	}
+	if res.RollupsWritten != 2 || res.EventsRated != 4 {
+		t.Fatalf("rollups/events = %d/%d, want 2/4 (a disputed region never withholds money)", res.RollupsWritten, res.EventsRated)
+	}
+	var conflict, partial sql.NullString
+	if err := db.QueryRowContext(ctx, `SELECT region FROM rated_usage WHERE resource_id = 'conflict'`).Scan(&conflict); err != nil {
+		t.Fatalf("read conflict rollup: %v", err)
+	}
+	if conflict.Valid {
+		t.Fatalf("conflicting-region rollup region = %q, want NULL (an unknown region must not look known)", conflict.String)
+	}
+	if err := db.QueryRowContext(ctx, `SELECT region FROM rated_usage WHERE resource_id = 'partial'`).Scan(&partial); err != nil {
+		t.Fatalf("read partial rollup: %v", err)
+	}
+	if !partial.Valid || partial.String != "a" {
+		t.Fatalf("partial-NULL region rollup region = %v, want 'a' (NULL regions are not a conflict)", partial)
+	}
+}
+
+// TestIntegration_ReRateNullsARegionThatBecameAmbiguous pins that a re-rate never
+// COALESCE-restores a region the evidence no longer supports: a rollup first rated
+// with one region, which then gains a same-grain event with a different region, must
+// end with region NULL, not the first run's value.
+func TestIntegration_ReRateNullsARegionThatBecameAmbiguous(t *testing.T) {
+	db := openRatingSchema(t, "phoebe_rating_region_rerate_it")
+	ctx := context.Background()
+	hour := mustTime("2026-06-08T10:00:00Z")
+	book := newTestBook(map[string]Rate3{"b": rate3("0.000005", "0", "0")}, nil, PolicyIdentity, Dec{}, Dec{})
+	store := NewPostgresStore(db)
+
+	if _, err := db.ExecContext(ctx,
+		`INSERT INTO billing_event (request_id, auth_id, resource_id, org_id, model, base_model, graph_k8s_name, topology_revision, region, prompt_tokens, completion_tokens, event_ts)
+		 VALUES ('e1','a','res','org-1','m','b','dgd-a',1,'eu-north1',100,0,$1)`, hour.Add(5*time.Minute)); err != nil {
+		t.Fatalf("seed run A: %v", err)
+	}
+	if _, err := store.RateWindow(ctx, book, hour, hour.Add(time.Hour)); err != nil {
+		t.Fatalf("RateWindow A: %v", err)
+	}
+	var regionA sql.NullString
+	if err := db.QueryRowContext(ctx, `SELECT region FROM rated_usage`).Scan(&regionA); err != nil {
+		t.Fatalf("read run A: %v", err)
+	}
+	if !regionA.Valid || regionA.String != "eu-north1" {
+		t.Fatalf("run A region = %v, want eu-north1", regionA)
+	}
+
+	if _, err := db.ExecContext(ctx,
+		`INSERT INTO billing_event (request_id, auth_id, resource_id, org_id, model, base_model, graph_k8s_name, topology_revision, region, prompt_tokens, completion_tokens, event_ts)
+		 VALUES ('e2','a','res','org-1','m','b','dgd-a',1,'eu-north-1',100,0,$1)`, hour.Add(30*time.Minute)); err != nil {
+		t.Fatalf("seed run B: %v", err)
+	}
+	if _, err := store.RateWindow(ctx, book, hour, hour.Add(time.Hour)); err != nil {
+		t.Fatalf("RateWindow B: %v", err)
+	}
+	var n int
+	var regionB sql.NullString
+	if err := db.QueryRowContext(ctx, `SELECT COUNT(*), MAX(region) FROM rated_usage`).Scan(&n, &regionB); err != nil {
+		t.Fatalf("read run B: %v", err)
+	}
+	if n != 1 || regionB.Valid {
+		t.Fatalf("run B rows/region = %d/%v, want 1/NULL (a re-rate must NULL a disputed region, never keep the stale one)", n, regionB)
+	}
+}
+
+// TestIntegration_OrgResolvedAcrossGraphRevisions pins that org is resolved per
+// (auth, owner, resource, model, serving mode, hour) identity, spanning graph and
+// revision. Events from before the Atlas/phoebe rollout carry no org and no revision
+// (stored as revision 0); the same resource's later events carry org and a revision.
+// The 0009 grain puts them in two rollups, and both must carry the one known org:
+// a NULL-org rollup is withheld at push for the whole hour, for every customer, and
+// no re-rate could fix it because the evidence never changes.
+func TestIntegration_OrgResolvedAcrossGraphRevisions(t *testing.T) {
+	db := openRatingSchema(t, "phoebe_rating_org_across_rev_it")
+	ctx := context.Background()
+	hour := mustTime("2026-06-08T10:00:00Z")
+	book := newTestBook(map[string]Rate3{"b": rate3("0.000005", "0", "0")}, nil, PolicyIdentity, Dec{}, Dec{})
+
+	if _, err := db.ExecContext(ctx,
+		`INSERT INTO billing_event (request_id, auth_id, resource_id, org_id, model, base_model, graph_k8s_name, topology_revision, prompt_tokens, completion_tokens, event_ts)
+		 VALUES ('old','a','res',NULL,   'm','b','dgd-a',NULL,100,0,$1),
+		        ('new','a','res','org-4','m','b','dgd-a',3,   100,0,$1)`, hour.Add(5*time.Minute)); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+	res, err := NewPostgresStore(db).RateWindow(ctx, book, hour, hour.Add(time.Hour))
+	if err != nil {
+		t.Fatalf("RateWindow: %v", err)
+	}
+	if res.RollupsWritten != 2 || res.EventsRated != 2 || res.UnattributableEvents != 0 || res.AmbiguousOrgEvents != 0 {
+		t.Fatalf("rollups/events/unattributable/ambiguous_org = %d/%d/%d/%d, want 2/2/0/0",
+			res.RollupsWritten, res.EventsRated, res.UnattributableEvents, res.AmbiguousOrgEvents)
+	}
+	var total, withOrg4 int
+	if err := db.QueryRowContext(ctx,
+		`SELECT COUNT(*), COUNT(*) FILTER (WHERE org_id = 'org-4') FROM rated_usage`).Scan(&total, &withOrg4); err != nil {
+		t.Fatalf("read rollups: %v", err)
+	}
+	if total != 2 || withOrg4 != 2 {
+		t.Fatalf("rollups/with org-4 = %d/%d, want 2/2 (the revision-0 rollup must inherit its identity's org, not be NULL)", total, withOrg4)
+	}
+}
+
+// TestIntegration_AmbiguousOrgAcrossGraphRevisionsFailsLoud pins that the org gate
+// spans every graph revision of one identity: a resource served by revision 1 with
+// org A and by revision 2 with org B in the same hour is an attribution propagation
+// bug, so neither half bills and every event is counted ambiguous_org. Per-revision
+// gates would see one org in each sub-rollup and bill part to A and part to B.
+func TestIntegration_AmbiguousOrgAcrossGraphRevisionsFailsLoud(t *testing.T) {
+	db := openRatingSchema(t, "phoebe_rating_ambigorg_rev_it")
+	ctx := context.Background()
+	hour := mustTime("2026-06-08T10:00:00Z")
+	book := newTestBook(map[string]Rate3{"b": rate3("0.000005", "0", "0")}, nil, PolicyIdentity, Dec{}, Dec{})
+
+	if _, err := db.ExecContext(ctx,
+		`INSERT INTO billing_event (request_id, auth_id, resource_id, org_id, model, base_model, graph_k8s_name, topology_revision, prompt_tokens, completion_tokens, event_ts)
+		 VALUES ('r1','a','res','org-A','m','b','dgd-1',1,100,0,$1),
+		        ('r2','a','res','org-B','m','b','dgd-2',2,100,0,$1)`, hour.Add(5*time.Minute)); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+	res, err := NewPostgresStore(db).RateWindow(ctx, book, hour, hour.Add(time.Hour))
+	if err != nil {
+		t.Fatalf("RateWindow: %v", err)
+	}
+	if res.RollupsWritten != 0 || res.AmbiguousOrgEvents != 2 {
+		t.Fatalf("rollups/ambiguous_org = %d/%d, want 0/2 (two orgs across revisions must scream, never bill both)",
+			res.RollupsWritten, res.AmbiguousOrgEvents)
+	}
+}
+
+// TestIntegration_AmbiguousBaseAcrossGraphRevisionsFailsLoud is the single-rate gate
+// counterpart: an endpoint priced through the derived (premium) path in one revision
+// and the plain-base path in the next, in one hour, is an adapter flap that happens to
+// coincide with a revision boundary. It must be withheld and counted ambiguous_base,
+// not billed at two different rates.
+func TestIntegration_AmbiguousBaseAcrossGraphRevisionsFailsLoud(t *testing.T) {
+	db := openRatingSchema(t, "phoebe_rating_ambigbase_rev_it")
+	ctx := context.Background()
+	hour := mustTime("2026-06-08T10:00:00Z")
+	book := newTestBook(
+		map[string]Rate3{"cheap/base": rate3("0.000001", "0", "0")},
+		nil, PolicyMultiplier, MustDec("1.5"), Dec{},
+	)
+
+	if _, err := db.ExecContext(ctx,
+		`INSERT INTO billing_event (request_id, auth_id, resource_id, org_id, model, base_model, adapter, graph_k8s_name, topology_revision, prompt_tokens, completion_tokens, event_ts)
+		 VALUES ('d1','a','r','org-1','tf-ep','cheap/base','ckpt-9','dgd-a',1,1000,0,$1),
+		        ('p1','a','r','org-1','tf-ep','cheap/base',NULL,    'dgd-a',2,1000,0,$1)`, hour.Add(5*time.Minute)); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+	res, err := NewPostgresStore(db).RateWindow(ctx, book, hour, hour.Add(time.Hour))
+	if err != nil {
+		t.Fatalf("RateWindow: %v", err)
+	}
+	if res.RollupsWritten != 0 || res.AmbiguousBaseEvents != 2 || res.AmbiguousOrgEvents != 0 {
+		t.Fatalf("rollups/ambiguous_base/ambiguous_org = %d/%d/%d, want 0/2/0 (premium and plain-base across revisions must scream)",
+			res.RollupsWritten, res.AmbiguousBaseEvents, res.AmbiguousOrgEvents)
 	}
 }
 
@@ -3837,7 +4091,10 @@ func readMigration(t *testing.T, name string) string {
 // Up must: turn a NULL graph into the ” key sentinel, give every row revision 0,
 // and rewrite each id so the CURRENT rater mints the same id for the same rollup
 // (otherwise the first re-rate after the migration deletes and re-mints every
-// row). Down must restore the 0007 key, the 7-field ids and NULL for ”.
+// row). Down must keep exactly one row per 0007 key when rollups differ only in graph
+// or revision (its DELETE is lossy by design), restore the 0007 key and the 7-field
+// ids, and turn the ” graph sentinel back into NULL. Up again must reproduce the
+// rater's 9-field ids.
 func TestIntegration_Migration0009GraphRevisionGrain(t *testing.T) {
 	dsn := os.Getenv("PHOEBE_TEST_DATABASE_URL")
 	if dsn == "" {
@@ -3927,7 +4184,57 @@ func TestIntegration_Migration0009GraphRevisionGrain(t *testing.T) {
 		t.Fatalf("rater minted id %s, migration wrote %s — the migration's id formula drifted from the rater's", raterID, migratedID)
 	}
 
+	// Rollups that the 0009 key keeps apart but the 0007 key merges, so the down
+	// migration's lossy DELETE runs against real rows: 'a-dup' differs only in
+	// revision, 'a-dupg' only in graph. 'a-empty' carries the '' graph sentinel that
+	// down must turn back into NULL (the 0007-era rater treats '' as a distinct graph).
+	seed9 := func(idKey, auth, graph string, revision int) {
+		t.Helper()
+		if _, err := db.ExecContext(ctx, `INSERT INTO rated_usage
+			(id, auth_id, resource_id, org_id, model_id, serving_mode, graph_k8s_name, topology_revision, window_start, window_end,
+			 prompt_tokens, cached_tokens, completion_tokens, billable_prompt_tokens,
+			 cost, applied_prompt_rate, applied_cached_rate, applied_completion_rate, event_count)
+			VALUES (md5($1), $2, 'res', 'org-1', 'm', 'dedicated', $3, $4, $5::timestamptz, $5::timestamptz + interval '1 hour',
+			        100, 0, 0, 100, 0.001, 0.00001, 0, 0, 1)`, idKey, auth, graph, revision, hour); err != nil {
+			t.Fatalf("seed 0009-shape rated_usage %s: %v", idKey, err)
+		}
+	}
+	seed9("a-dup-r1", "a-dup", "dgd-b", 1)
+	seed9("a-dup-r2", "a-dup", "dgd-b", 2)
+	seed9("a-dupg-b", "a-dupg", "dgd-b", 0)
+	seed9("a-dupg-c", "a-dupg", "dgd-c", 0)
+	seed9("a-empty", "a-empty", "", 0)
+	count := func(q string) int {
+		t.Helper()
+		var n int
+		if err := db.QueryRowContext(ctx, q).Scan(&n); err != nil {
+			t.Fatalf("count %q: %v", q, err)
+		}
+		return n
+	}
+
 	exec(t, db, readMigration(t, "0009_rollup_grain_graph_revision.down.sql"))
+	// Reaching here means down re-added the 7-column UNIQUE constraint with the
+	// duplicates present, so its DELETE removed them.
+	for _, auth := range []string{"a-dup", "a-dupg"} {
+		if n := count(`SELECT count(*) FROM rated_usage WHERE auth_id = '` + auth + `'`); n != 1 {
+			t.Fatalf("after down, %s rows = %d, want 1 (one survivor per 0007 key)", auth, n)
+		}
+	}
+	if n := count(`SELECT count(*) FROM rated_usage WHERE id <> ` + id7); n != 0 {
+		t.Fatalf("after down, %d rows do not carry the 0007 7-field id", n)
+	}
+	var emptyGraph sql.NullString
+	if err := db.QueryRowContext(ctx,
+		`SELECT graph_k8s_name FROM rated_usage WHERE auth_id = 'a-empty'`).Scan(&emptyGraph); err != nil {
+		t.Fatalf("read a-empty after down: %v", err)
+	}
+	if emptyGraph.Valid {
+		t.Fatalf("after down, a-empty graph = %q, want NULL (down must turn the '' sentinel back into NULL)", emptyGraph.String)
+	}
+	if n := count(`SELECT count(*) FROM rated_usage WHERE graph_k8s_name = ''`); n != 0 {
+		t.Fatalf("after down, %d rows still carry the '' graph sentinel", n)
+	}
 	var downID string
 	var downGraph sql.NullString
 	if err := db.QueryRowContext(ctx,
@@ -3936,5 +4243,24 @@ func TestIntegration_Migration0009GraphRevisionGrain(t *testing.T) {
 	}
 	if downID != oldID || !downGraph.Valid || downGraph.String != "dgd-a" {
 		t.Fatalf("after down id/graph = %s/%v, want %s/dgd-a", downID, downGraph, oldID)
+	}
+
+	// Up again: every surviving row must carry the id the rater's 9-field formula
+	// mints, so a re-rate after a down/up round trip updates rows in place.
+	exec(t, db, readMigration(t, "0009_rollup_grain_graph_revision.up.sql"))
+	id9 := `md5(length(auth_id)::text || ':' || auth_id
+		  || '|' || length(owner_type)::text || ':' || owner_type
+		  || '|' || length(owner_id)::text || ':' || owner_id
+		  || '|' || length(resource_id)::text || ':' || resource_id
+		  || '|' || length(model_id)::text || ':' || model_id
+		  || '|' || length(serving_mode)::text || ':' || serving_mode
+		  || '|' || length(graph_k8s_name)::text || ':' || graph_k8s_name
+		  || '|' || topology_revision::text
+		  || '|' || extract(epoch FROM window_start)::bigint::text)`
+	if n := count(`SELECT count(*) FROM rated_usage WHERE id <> ` + id9); n != 0 {
+		t.Fatalf("after down then up, %d rows do not carry the 9-field id", n)
+	}
+	if n := count(`SELECT count(*) FROM rated_usage WHERE id = ` + id9 + ` AND auth_id = 'a-graph' AND id = '` + raterID + `'`); n != 1 {
+		t.Fatalf("after down then up, a-graph id is not the id the rater minted (%s)", raterID)
 	}
 }

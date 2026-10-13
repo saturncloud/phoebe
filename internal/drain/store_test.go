@@ -246,3 +246,39 @@ func TestEventArgs_ServingModeStoredAsDecoded(t *testing.T) {
 		}
 	}
 }
+
+// TestEventArgs_OutOfRangeTopologyRevisionBindsNullNeverPoisons:
+// billing_event.topology_revision is INTEGER, so a revision above MaxInt32
+// would fail the insert and the row-at-a-time fallback would drop the
+// billable event as poison. It binds NULL instead; an in-range value binds.
+func TestEventArgs_OutOfRangeTopologyRevisionBindsNullNeverPoisons(t *testing.T) {
+	const topologyRevisionIdx = 21 // status_code 18, streamed 19, graph_k8s_name 20.
+
+	inRange := eventArgs(metering.Event{RequestID: "r", Model: "m", TopologyRevision: 2147483647})
+	if inRange[topologyRevisionIdx] != 2147483647 {
+		t.Fatalf("topology_revision arg = %v, want 2147483647", inRange[topologyRevisionIdx])
+	}
+	for _, rev := range []int{2147483648, -1, 0} {
+		args := eventArgs(metering.Event{RequestID: "r", Model: "m", TopologyRevision: rev})
+		if args[topologyRevisionIdx] != nil {
+			t.Fatalf("topology_revision arg for %d = %v, want nil", rev, args[topologyRevisionIdx])
+		}
+	}
+}
+
+// TestEventArgs_NegativeServingDurationStoresNull: a negative serving time is
+// impossible evidence, so it is stored as NULL ("not captured") rather than
+// as a misleading value; zero (a sub-millisecond request) is kept.
+func TestEventArgs_NegativeServingDurationStoresNull(t *testing.T) {
+	const servingDurationIdx = 24 // topology_revision 21, region 22, request_started_at 23.
+
+	for _, tc := range []struct {
+		ms   int64
+		want any
+	}{{0, int64(0)}, {42, int64(42)}, {-1, nil}} {
+		args := eventArgs(metering.Event{RequestID: "r", Model: "m", RequestStartedUnixMs: 1, ServingDurationMs: tc.ms})
+		if args[servingDurationIdx] != tc.want {
+			t.Fatalf("serving_duration_ms arg for %d = %v, want %v", tc.ms, args[servingDurationIdx], tc.want)
+		}
+	}
+}

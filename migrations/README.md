@@ -160,6 +160,83 @@ dedicated or NULL events. The CHECK constraint rejects that write, and the whole
 for that window, and the next run of the new rater re-rates it. The failure is
 closed and heals itself; the order above only avoids the delayed windows.
 
+### Rollout order for migration 0009
+
+Migration 0009 replaces `rated_usage_grain_uq` with a 9-column key (adding
+`graph_k8s_name` and `topology_revision`) and makes `graph_k8s_name` NOT NULL.
+Unlike 0008, it is not additive: the rater's SQL and the schema must change
+together, so every run of a pre-0009 rater against schema 0009 fails.
+
+The same release also changes what token-push sends. Every rollup on the wire
+now carries three new keys: `topology_revision`, `region` and `request_count`
+(next to `graph_k8s_name`, which is now always sent). saturn-aws-manager's
+`TokenRollupSchema` is a marshmallow schema with the default `unknown=RAISE`, so
+a manager that does not know these keys rejects the whole window POST with a
+400. The manager schema change therefore has to ship before the new token-push.
+
+Roll out in this order:
+
+1. Suspend the rater CronJob (and the token-push CronJob), or let any in-flight
+   rater run finish.
+2. Run `cmd/migrate up`, which applies 0008 and 0009 together.
+3. Deploy the new drainer, interceptor and rater images. 0008 is additive, so
+   an old drainer keeps working between steps 2 and 3; the rater is the
+   component that must not run on the old image against schema 0009.
+4. Deploy the saturn-aws-manager release whose `TokenRollupSchema` accepts
+   `graph_k8s_name`, `topology_revision`, `region` and `request_count` (each with
+   a `load_default`, so the old phoebe's payload still loads), and only then
+   deploy the new token-push image. The current manager `main` rejects the new
+   keys with a 400. The manager change does not depend on the schema, so it can
+   ship any time before this step, including before step 1.
+5. Resume the rater CronJob (and the token-push CronJob).
+
+What happens if the order is not followed:
+
+- A pre-0009 rater against schema 0009: its ON CONFLICT on the old 7-column key
+  matches no unique constraint, so Postgres rejects the upsert ("there is no
+  unique or exclusion constraint matching the ON CONFLICT specification"); it
+  can also write `graph_k8s_name` NULL, which now violates NOT NULL. Either error
+  rolls back the whole `RateWindow` transaction. A post-0009 rater against a
+  pre-0009 schema fails the same way, because the `topology_revision` column is
+  missing. Both failures are closed: nothing is written or deleted, and the next
+  run of the new rater re-rates the window. If the rater was stopped or failing
+  for longer than its trailing re-rate window (24h by default), run
+  `rater --since <gap start> --until <start of the current hour>` and then
+  `token-push` over the same range.
+- The new token-push against an old manager: each window is rejected with a 400
+  and nothing is written for it. The next run retries automatically, but only
+  within its trailing window (24h by default). For any older hour, run
+  `token-push --since <first failed hour> --until <start of the current hour>`.
+
+0009 recomputes every `rated_usage` id, so the first token-push after the
+cutover replaces saturn-aws-manager's rows for each pushed window: old ids are
+deleted because they are absent from the snapshot, and new ids are inserted.
+Windows older than token-push's trailing window keep their old-id rows until
+they are re-pushed; re-push them with `token-push --since ... --until ...`.
+This is acceptable only before production (no settled rows hold the old ids),
+for the same reason as 0007.
+
+Rolling back 0009 is lossy. The 0009 down migration narrows the key back to the
+7-column 0007 grain, so rollups for the same hour that differ only in graph or
+topology revision cannot all survive: it keeps one row per old-grain key and
+deletes the others, then drops `topology_revision` and `region` and recomputes
+every id. The deleted rows held real tokens and money for that hour, so after a
+rollback re-rate the affected hours with the pre-0009 rater
+(`rater --since <earliest affected hour> --until <start of the current hour>`,
+while `billing_event` still holds those hours) and then re-push them with
+`token-push` over the same range.
+
+Roll the code back before the schema. Suspend the rater and token-push
+CronJobs, deploy the pre-0009 rater and token-push images, run `migrate down`,
+then resume. A post-0009 rater against the rolled-back schema fails closed (the
+`topology_revision` column is missing), but it delays every window until the old
+image is in place. The manager can stay on its new release: its new keys have
+defaults, so it accepts the old payload. A rollback is acceptable only while
+there are no production rows. See the header of
+`0009_rollup_grain_graph_revision.down.sql`.
+
+The migration header (`0009_rollup_grain_graph_revision.up.sql`) points here.
+
 ## Local dev
 
 ```

@@ -448,6 +448,13 @@ func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request) {
 	if id.GraphK8sName == "" {
 		id.GraphK8sName = graphFromUpstreamHost(upstream.Host)
 	}
+	// Snapshot the serving graph's topology now, at request time: the usage
+	// event records the topology that served the request, even if Atlas
+	// publishes a new revision or tears the graph down before it completes.
+	if s.topology != nil {
+		topo, ok := s.topology.Lookup(id.GraphK8sName)
+		r = r.WithContext(withTopologySnapshot(r.Context(), id.GraphK8sName, topo, ok))
+	}
 
 	// M5 I/O-logging gate — computed ONCE. Everything that adds hot-path cost
 	// (capturing the request body, buffering the response) is guarded by this
