@@ -624,3 +624,35 @@ func TestMaxTokensTimesSequencesAboveGeneratedLimitIsUnsatisfiable400(t *testing
 		t.Fatalf("status=%d Retry-After=%q hits=%d, want 400 without Retry-After before upstream", rr.Code, rr.Header().Get("Retry-After"), hits.Load())
 	}
 }
+
+// D29: the generated-token charge is max_tokens x output sequences, so the
+// unsatisfiable 400 names the sequence count when it is above one, and never
+// names max_tokens when the client did not send it (an undeclared request
+// whose n alone exceeds the window). With one sequence and a declared
+// max_tokens the wording is unchanged.
+func TestGeneratedLimitUnsatisfiableMessageNamesSequenceMultiplier(t *testing.T) {
+	for _, c := range []struct {
+		name, limit, body, want string
+	}{
+		{"declared, n=1", "2000", `{"model":"model-a","max_tokens":3000}`,
+			"max_tokens exceeds the per-window generated-token limit"},
+		{"declared, n=4", "300", `{"model":"model-a","max_tokens":100,"n":4}`,
+			"max_tokens times the number of output sequences (n, best_of, or batched prompts) exceeds the per-window generated-token limit"},
+		{"undeclared, n=8", "5", `{"model":"model-a","n":8}`,
+			"the number of output sequences (n, best_of, or batched prompts) exceeds the per-window generated-token limit"},
+	} {
+		s, _, hits := flagOffServer(t)
+		req := contractGatewayRequest(map[string]string{identity.HeaderOrgRateLimitGeneratedTokens: c.limit})
+		req.Body = io.NopCloser(strings.NewReader(c.body))
+		req.ContentLength = -1
+		rr := httptest.NewRecorder()
+		s.Handler().ServeHTTP(rr, req)
+		if rr.Code != http.StatusBadRequest || rr.Header().Get("Retry-After") != "" || hits.Load() != 0 {
+			t.Errorf("%s: status=%d Retry-After=%q hits=%d, want 400 without Retry-After before upstream", c.name, rr.Code, rr.Header().Get("Retry-After"), hits.Load())
+			continue
+		}
+		if got := strings.TrimSpace(rr.Body.String()); got != c.want {
+			t.Errorf("%s: body=%q, want %q", c.name, got, c.want)
+		}
+	}
+}

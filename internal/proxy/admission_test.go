@@ -3067,25 +3067,49 @@ func TestOversizeMessageBlamesModelOnlyForGraphCapacity(t *testing.T) {
 	}
 }
 
-// A KV 413 for a request that declared no max_tokens blames the prompt
-// alone: the reservation was phoebe's default, so there is no max_tokens for
-// the client to lower.
+// A KV 413 names only the terms of the reservation the client controls: an
+// undeclared max_tokens with one sequence and an embeddings request (no
+// client-declared output) blame the prompt alone; an undeclared max_tokens
+// whose n, best_of or batched prompts push the reservation over the cap
+// names the sequence count; a declared max_tokens names max_tokens, times the
+// sequences when there are several. No text mentions a field the client did
+// not send.
 func TestOversizeMessageForUndeclaredOutputDoesNotMentionMaxTokens(t *testing.T) {
 	s := New(&config.Settings{}, logging.New(logging.ERROR), &recordingEmitter{})
-	for _, c := range []struct{ scope, want string }{
-		{"graph_capacity", "estimated prompt tokens exceed this model's KV-cache capacity"},
-		{"graph", "estimated prompt tokens exceed this model's KV-cache capacity"},
-		{"lane", "estimated prompt tokens exceed a configured KV-cache limit"},
-		{"organization", "estimated prompt tokens exceed a configured KV-cache limit"},
+	undeclared := outputShape{hasOutput: true, sequences: 1}
+	embeddings := outputShape{sequences: 1}
+	undeclaredN := outputShape{hasOutput: true, sequences: 16000}
+	declaredN := outputShape{hasOutput: true, declared: true, sequences: 4}
+	for _, c := range []struct {
+		name, scope string
+		out         outputShape
+		want        string
+		mustNot     []string
+	}{
+		{"undeclared_graph_capacity", "graph_capacity", undeclared, "estimated prompt tokens exceed this model's KV-cache capacity", []string{"max_tokens", "sequence"}},
+		{"undeclared_graph", "graph", undeclared, "estimated prompt tokens exceed this model's KV-cache capacity", []string{"max_tokens", "sequence"}},
+		{"undeclared_lane", "lane", undeclared, "estimated prompt tokens exceed a configured KV-cache limit", []string{"max_tokens", "sequence"}},
+		{"undeclared_organization", "organization", undeclared, "estimated prompt tokens exceed a configured KV-cache limit", []string{"max_tokens", "sequence"}},
+		{"embeddings_kv_413_graph", "graph_capacity", embeddings, "estimated prompt tokens exceed this model's KV-cache capacity", []string{"max_tokens", "sequence"}},
+		{"embeddings_kv_413_lane", "lane", embeddings, "estimated prompt tokens exceed a configured KV-cache limit", []string{"max_tokens", "sequence"}},
+		{"undeclared_n_overflow_graph", "graph", undeclaredN, "estimated prompt tokens plus one output token per requested sequence (n, best_of, or batched prompts) exceed this model's KV-cache capacity", []string{"max_tokens"}},
+		{"undeclared_n_overflow_organization", "organization", undeclaredN, "estimated prompt tokens plus one output token per requested sequence (n, best_of, or batched prompts) exceed a configured KV-cache limit", []string{"max_tokens"}},
+		{"declared_n_overflow", "graph_capacity", declaredN, "estimated prompt tokens plus max_tokens times the number of output sequences (n, best_of, or batched prompts) exceed this model's KV-cache capacity", nil},
+		{"declared_single", "lane", declaredSingleOutput, "estimated prompt tokens plus max_tokens exceed a configured KV-cache limit", []string{"sequence"}},
 	} {
 		rr := httptest.NewRecorder()
-		s.writeAdmissionErrorOutput(rr, "req-1", &admission.Rejected{Scope: c.scope, Dimension: "kv_exceeds_limit", Unsatisfiable: true}, false)
-		body := rr.Body.String()
+		s.writeAdmissionErrorOutput(rr, "req-1", &admission.Rejected{Scope: c.scope, Dimension: "kv_exceeds_limit", Unsatisfiable: true}, c.out)
+		body := strings.TrimSpace(rr.Body.String())
 		if rr.Code != http.StatusRequestEntityTooLarge || rr.Header().Get("Retry-After") != "" {
-			t.Errorf("%s: status=%d retry-after=%q, want 413 without Retry-After", c.scope, rr.Code, rr.Header().Get("Retry-After"))
+			t.Errorf("%s: status=%d retry-after=%q, want 413 without Retry-After", c.name, rr.Code, rr.Header().Get("Retry-After"))
 		}
-		if !strings.Contains(body, c.want) || strings.Contains(body, "max_tokens") {
-			t.Errorf("%s: body=%q, want %q and no mention of max_tokens", c.scope, body, c.want)
+		if body != c.want {
+			t.Errorf("%s: body=%q, want %q", c.name, body, c.want)
+		}
+		for _, word := range c.mustNot {
+			if strings.Contains(body, word) {
+				t.Errorf("%s: body=%q mentions %q", c.name, body, word)
+			}
 		}
 	}
 }

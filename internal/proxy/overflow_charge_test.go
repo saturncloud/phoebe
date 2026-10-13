@@ -388,8 +388,8 @@ func TestOverflowedUsageSearchSkipsUsageStringValues(t *testing.T) {
 	logprobs := `"prompt_logprobs":[null,{"1":{"logprob":-1,"rank":1,"decoded_token":"usage"}}]`
 	big := strings.Repeat("x", 1<<20)
 	for name, body := range map[string]string{
-		"small body, usage string after the key": `{"model":"m",` + usage + `,` + logprobs + `}`,
-		"large body, usage string after the key": `{"model":"m","data":"` + big + `",` + usage + `,` + logprobs + `}`,
+		"small body, usage string after the key":  `{"model":"m",` + usage + `,` + logprobs + `}`,
+		"large body, usage string after the key":  `{"model":"m","data":"` + big + `",` + usage + `,` + logprobs + `}`,
 		"large body, usage string before the key": `{"model":"m","data":"` + big + `","note":"usage",` + usage + `,` + logprobs + `}`,
 	} {
 		var result capture.Result

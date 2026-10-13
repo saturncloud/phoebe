@@ -491,3 +491,64 @@ func TestUndeclaredOutputPerSequenceFitsContractGeneratedLimit(t *testing.T) {
 		t.Fatalf("hits=%d osl=%v, want one request reserving 400 / 4 = 100 output tokens", hits, osl)
 	}
 }
+
+// Embeddings have no client-declared output (phoebe reserves one token on
+// its own), so a KV 413 on /v1/embeddings blames the prompt alone and never
+// tells the client to lower max_tokens.
+func TestEmbeddingsKVRefusalNeverMentionsMaxTokens(t *testing.T) {
+	be := &oslRecordingBackend{}
+	srv := httptest.NewServer(be)
+	defer srv.Close()
+	up, _ := url.Parse(srv.URL)
+	cfg := kvTestConfig()
+	cfg.Enabled = false
+	s := kvTestServer(t, cfg)
+	s.graphCapacity = staticGraphCapacity{graphFromUpstreamHost(up.Host): {MaxReservedKVTokens: ptr64(10)}}
+
+	embed := sharedRequest(up)
+	embed.URL.Path = "/v1/embeddings"
+	embed.RequestURI = "/v1/embeddings"
+	replaceRequestBody(embed, []byte(`{"model":"model-a","input":"`+strings.Repeat("y", 400)+`"}`))
+	rr := httptest.NewRecorder()
+	s.Handler().ServeHTTP(rr, embed)
+	body := rr.Body.String()
+	if rr.Code != http.StatusRequestEntityTooLarge || rr.Header().Get("Retry-After") != "" {
+		t.Fatalf("status=%d retry-after=%q body=%q, want 413 without Retry-After", rr.Code, rr.Header().Get("Retry-After"), body)
+	}
+	if !strings.Contains(body, "estimated prompt tokens exceed") || !strings.Contains(body, "KV-cache") || strings.Contains(body, "max_tokens") {
+		t.Fatalf("body=%q, want the prompt-only KV-cache wording without max_tokens", body)
+	}
+	if hits, _ := be.snapshot(); hits != 0 {
+		t.Fatalf("upstream hits=%d, the over-KV embeddings request must not reach the engine", hits)
+	}
+}
+
+// An undeclared max_tokens is clamped to one token per sequence, so when n
+// pushes the reservation (prompt + n) over the KV cap while the prompt alone
+// fits, the 413 names the sequence count and not the prompt alone or
+// max_tokens: lowering n is what would admit it.
+func TestUndeclaredKVRefusalDrivenByNNamesSequences(t *testing.T) {
+	be := &oslRecordingBackend{}
+	srv := httptest.NewServer(be)
+	defer srv.Close()
+	up, _ := url.Parse(srv.URL)
+	cfg := kvTestConfig()
+	cfg.Enabled = false
+	s := kvTestServer(t, cfg)
+	prompt := chatBody(4*2000, 0)
+	est := estimatePromptTokens(prompt)
+	s.graphCapacity = staticGraphCapacity{graphFromUpstreamHost(up.Host): {MaxReservedKVTokens: ptr64(est + 10)}}
+
+	body := []byte(strings.Replace(string(prompt), `{"model":"model-a",`, `{"model":"model-a","n":64,`, 1))
+	rr := serveChat(s, up, body)
+	got := rr.Body.String()
+	if rr.Code != http.StatusRequestEntityTooLarge || rr.Header().Get("Retry-After") != "" {
+		t.Fatalf("status=%d retry-after=%q body=%q, want 413 without Retry-After", rr.Code, rr.Header().Get("Retry-After"), got)
+	}
+	if !strings.Contains(got, "one output token per requested sequence (n, best_of, or batched prompts)") || strings.Contains(got, "max_tokens") {
+		t.Fatalf("body=%q, want the sequence-count KV wording without max_tokens", got)
+	}
+	if hits, _ := be.snapshot(); hits != 0 {
+		t.Fatalf("upstream hits=%d, the over-KV request must not reach the engine", hits)
+	}
+}

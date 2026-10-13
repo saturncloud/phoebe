@@ -184,9 +184,10 @@ var admissionInterpretedFields = []string{"model", "max_tokens", "max_completion
 // (promptBatchCount) on /v1/completions only, since the completions engine
 // generates for each prompt. Other routes (chat completions, embeddings)
 // ignore a top-level "prompt", so it never multiplies their sequences (D27).
-// n, best_of, max_tokens and max_completion_tokens must be JSON integers: a
-// float such as 1.0 or a numeric string is refused 400, as Dynamo's own
-// integer request types refuse them.
+// n, best_of, max_tokens and max_completion_tokens are read like the engine's
+// lax integer validation (laxInt, ledger D32): integers, integral floats such
+// as 2.0 and integer strings such as "4" count at their value; a fraction, a
+// non-numeric string or a bool is refused 400.
 func admissionWork(body []byte, defaultOutput int64, routePath string) (admissionEstimate, bool) {
 	// Every field the estimate and the routed model are read from must be
 	// unambiguous: no duplicates and no case variants (see
@@ -388,6 +389,23 @@ func prepareSharedDynamoRequest(body []byte, tenantIdentity string, maxOutput in
 	return out, tenant, nil
 }
 
+// outputShape describes the output a request reserved, so a refusal names
+// the term the client controls. hasOutput is false for embeddings, which
+// have no client-declared output (phoebe reserves one token on its own);
+// declared reports that the client sent max_tokens or max_completion_tokens;
+// sequences is the output sequence count (n, best_of, batched prompts).
+type outputShape struct {
+	hasOutput, declared bool
+	sequences           int64
+}
+
+// declaredSingleOutput is the shape for a refusal that does not depend on
+// the request's output terms.
+var declaredSingleOutput = outputShape{hasOutput: true, declared: true, sequences: 1}
+
+// sequenceTerms names the client fields that set the output sequence count.
+const sequenceTerms = "(n, best_of, or batched prompts)"
+
 // oversizeMessage is the 413 text for a request larger than an operator or
 // published capacity scope. Only the graph's own capacity (the published
 // graph_capacity scope and the per-graph operator tier) is described as the
@@ -396,40 +414,65 @@ func prepareSharedDynamoRequest(body []byte, tenantIdentity string, maxOutput in
 // a request that a configured limit refused. The scope id itself stays in the
 // server log, not the client body.
 //
-// outputDeclared is false when the client sent no max_tokens and the output
-// reservation is phoebe's default: the KV text then blames the prompt alone,
-// so the client is not told to lower a field it never sent.
-func oversizeMessage(rejected *admission.Rejected, outputDeclared bool) string {
-	kv := rejected.Dimension == "kv_exceeds_limit"
-	switch rejected.Scope {
-	case "graph_capacity", "graph":
-		if kv && outputDeclared {
-			return "estimated prompt tokens plus max_tokens exceed this model's KV-cache capacity"
-		}
-		if kv {
-			return "estimated prompt tokens exceed this model's KV-cache capacity"
-		}
-		return "estimated prompt tokens exceed this model's prefill capacity"
+// The KV text names the terms of the reservation the client controls: the
+// prompt alone for embeddings (which have no client-declared output) and for
+// an undeclared max_tokens with one sequence; the prompt plus one output token
+// per sequence for an undeclared max_tokens with several sequences; the
+// prompt plus max_tokens, times the sequence count when it is above one, for
+// a declared max_tokens. A client is never told to lower a field it did not
+// send.
+func oversizeMessage(rejected *admission.Rejected, out outputShape) string {
+	limit := "a configured KV-cache limit"
+	prefill := "a configured prefill-token limit"
+	if rejected.Scope == "graph_capacity" || rejected.Scope == "graph" {
+		limit = "this model's KV-cache capacity"
+		prefill = "this model's prefill capacity"
+	}
+	if rejected.Dimension != "kv_exceeds_limit" {
+		return "estimated prompt tokens exceed " + prefill
+	}
+	switch {
+	case !out.hasOutput:
+		return "estimated prompt tokens exceed " + limit
+	case out.declared && out.sequences > 1:
+		return "estimated prompt tokens plus max_tokens times the number of output sequences " + sequenceTerms + " exceed " + limit
+	case out.declared:
+		return "estimated prompt tokens plus max_tokens exceed " + limit
+	case out.sequences > 1:
+		return "estimated prompt tokens plus one output token per requested sequence " + sequenceTerms + " exceed " + limit
 	default:
-		if kv && outputDeclared {
-			return "estimated prompt tokens plus max_tokens exceed a configured KV-cache limit"
-		}
-		if kv {
-			return "estimated prompt tokens exceed a configured KV-cache limit"
-		}
-		return "estimated prompt tokens exceed a configured prefill-token limit"
+		return "estimated prompt tokens exceed " + limit
 	}
 }
 
-// writeAdmissionError answers an admission refusal for a request whose
-// output reservation the client declared (or that has none to declare).
-func (s *Server) writeAdmissionError(w http.ResponseWriter, requestID string, err error) {
-	s.writeAdmissionErrorOutput(w, requestID, err, true)
+// generatedLimitMessage is the 400 text for a request whose generated-token
+// charge (max_tokens x output sequences, D29) alone exceeds a contract's
+// per-window limit. It names the sequence count when it is above one, and
+// never blames max_tokens when the client did not send it.
+func generatedLimitMessage(out outputShape) string {
+	switch {
+	case out.declared && out.sequences > 1:
+		return "max_tokens times the number of output sequences " + sequenceTerms + " exceeds the per-window generated-token limit"
+	case out.declared:
+		return "max_tokens exceeds the per-window generated-token limit"
+	case out.sequences > 1:
+		return "the number of output sequences " + sequenceTerms + " exceeds the per-window generated-token limit"
+	default:
+		return "the minimum one-token output reservation exceeds the per-window generated-token limit"
+	}
 }
 
-// writeAdmissionErrorOutput answers an admission refusal; outputDeclared
-// selects the 413 KV wording (oversizeMessage).
-func (s *Server) writeAdmissionErrorOutput(w http.ResponseWriter, requestID string, err error, outputDeclared bool) {
+// writeAdmissionError answers an admission refusal that does not depend on
+// the request's output terms (a cold-hold or lease-renewal refusal): the
+// wording is that of a declared max_tokens with one sequence.
+func (s *Server) writeAdmissionError(w http.ResponseWriter, requestID string, err error) {
+	s.writeAdmissionErrorOutput(w, requestID, err, declaredSingleOutput)
+}
+
+// writeAdmissionErrorOutput answers an admission refusal; out selects the
+// 413 KV and 400 generated-token wording (oversizeMessage,
+// generatedLimitMessage).
+func (s *Server) writeAdmissionErrorOutput(w http.ResponseWriter, requestID string, err error, out outputShape) {
 	// Echo the authoritative attempt id on rejections too — the same handle the
 	// normal path stamps in ModifyResponse and the error handler stamps on 502s:
 	// a rejected client needs its billing-record correlation id just as much.
@@ -440,7 +483,7 @@ func (s *Server) writeAdmissionErrorOutput(w http.ResponseWriter, requestID stri
 		// tokens, or prompt plus max_tokens against reserved KV). It can never
 		// be admitted, so it is refused as too large, the same answer an
 		// oversized prompt got from the byte-based limit this replaced.
-		http.Error(w, oversizeMessage(rejected, outputDeclared), http.StatusRequestEntityTooLarge)
+		http.Error(w, oversizeMessage(rejected, out), http.StatusRequestEntityTooLarge)
 		s.log.Warn.Printf("admission: request larger than capacity scope=%s dimension=%s", rejected.Scope, rejected.Dimension)
 		return
 	}
@@ -450,7 +493,7 @@ func (s *Server) writeAdmissionErrorOutput(w http.ResponseWriter, requestID stri
 		message := "shared inference request exceeds the per-window contract limit"
 		switch rejected.Dimension {
 		case "generated_tokens_exceeds_limit":
-			message = "max_tokens exceeds the per-window generated-token limit"
+			message = generatedLimitMessage(out)
 		case "total_prompt_tokens_exceeds_limit", "uncached_prompt_tokens_exceeds_limit":
 			message = "estimated prompt tokens exceed the per-window prompt-token limit"
 		}

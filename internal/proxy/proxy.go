@@ -843,7 +843,11 @@ func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request) {
 					}
 					admitted = nil
 				} else {
-					s.writeAdmissionErrorOutput(w, requestID, err, routePath == "/v1/embeddings" || estimate.OutputDeclared)
+					s.writeAdmissionErrorOutput(w, requestID, err, outputShape{
+						hasOutput: routePath != "/v1/embeddings",
+						declared:  routePath != "/v1/embeddings" && estimate.OutputDeclared,
+						sequences: estimate.OutputSequences,
+					})
 					return
 				}
 			}
