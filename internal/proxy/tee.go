@@ -190,6 +190,14 @@ func (c *captureReader) Read(p []byte) (int, error) {
 		// one lock order (mu, then the account's).
 		c.mu.Lock()
 		if c.overflowed {
+			// A capture can overflow after only a few bytes, when the replica
+			// total (not its own limit) refuses the reserve. Keep filling the
+			// head up to overflowKeep so the top-level "model" is still in it
+			// (D22 keeps the first overflowKeep bytes). Head and tail may
+			// overlap; the charge stays at most 2*overflowKeep (D31).
+			if room := overflowKeep - len(c.head); room > 0 {
+				c.head = append(c.head, p[:min(n, room)]...)
+			}
 			c.keepTail(p[:n])
 			held := c.overflowHeld()
 			c.mu.Unlock()
@@ -438,13 +446,24 @@ func (c *captureReader) tailView() []byte {
 	return t
 }
 
-// inspectHeadAndTail recovers model and usage from an overflowed body: the
-// top-level "model" by walking the head's keys in order, and "usage" from the
-// LAST "usage" key in the tail, decoded as an object. A body laid out
-// otherwise yields no usage, recorded as an unmetered attempt.
+// inspectHeadAndTail recovers model and usage from an overflowed body. When
+// the head is not full, nothing was dropped and the head is the whole body, so
+// it is parsed like any non-streamed body. Otherwise the top-level "model" is
+// read by walking the head's keys in order, and "usage" from the last "usage"
+// in the tail that is followed by ':' and an object which decodes. Walking
+// back past earlier matches skips a string VALUE "usage" (for example a
+// logprob token after the usage block). A body laid out otherwise yields no
+// usage, recorded as an unmetered attempt.
 //
 // Must be called with mu held.
 func (c *captureReader) inspectHeadAndTail() {
+	if len(c.head) < overflowKeep {
+		var whole chunk
+		if json.Unmarshal(bytes.TrimSpace(c.head), &whole) == nil {
+			c.inspectChunk(bytes.TrimSpace(c.head))
+			return
+		}
+	}
 	dec := json.NewDecoder(bytes.NewReader(c.head))
 	if tok, err := dec.Token(); err == nil && tok == json.Delim('{') {
 		for dec.More() {
@@ -465,20 +484,24 @@ func (c *captureReader) inspectHeadAndTail() {
 		}
 	}
 	tail := c.tailView()
-	idx := bytes.LastIndex(tail, []byte(`"usage"`))
-	if idx < 0 {
-		return
-	}
-	rest := bytes.TrimLeft(tail[idx+len(`"usage"`):], " \t\r\n")
-	if len(rest) == 0 || rest[0] != ':' {
-		return
-	}
-	if rest = bytes.TrimLeft(rest[1:], " \t\r\n"); len(rest) == 0 || rest[0] != '{' {
-		return
-	}
-	var usage metering.Usage
-	if json.NewDecoder(bytes.NewReader(rest)).Decode(&usage) == nil {
-		c.result.Usage = usage
-		c.result.UsageFound = true
+	for end := len(tail); end > 0; {
+		idx := bytes.LastIndex(tail[:end], []byte(`"usage"`))
+		if idx < 0 {
+			return
+		}
+		end = idx
+		rest := bytes.TrimLeft(tail[idx+len(`"usage"`):], " \t\r\n")
+		if len(rest) == 0 || rest[0] != ':' {
+			continue
+		}
+		if rest = bytes.TrimLeft(rest[1:], " \t\r\n"); len(rest) == 0 || rest[0] != '{' {
+			continue
+		}
+		var usage metering.Usage
+		if json.NewDecoder(bytes.NewReader(rest)).Decode(&usage) == nil {
+			c.result.Usage = usage
+			c.result.UsageFound = true
+			return
+		}
 	}
 }

@@ -328,3 +328,76 @@ func TestKeepTailHoldsLastBytesWithoutPerReadAllocation(t *testing.T) {
 		}
 	}
 }
+
+// exhaustedReplicaCapture returns a capture reader over body, served in
+// chunk-byte reads, whose replica buffer total is already held by another
+// request, so its first reserve is refused and it overflows at once.
+func exhaustedReplicaCapture(t *testing.T, body []byte, chunk int, onDone func(capture.Result)) (*captureReader, func()) {
+	t.Helper()
+	const total = 1 << 10
+	budget := &responseBufferBudget{}
+	p := config.ProtectionSettings{MaxResponseBufferBytesPerStream: total, MaxResponseBufferBytesTotal: total}
+	holder := budget.newAccount(p, func(error) {})
+	holder.force(bufferSlotCapture, total)
+	cr := newCaptureReader(context.Background(), &chunkedBody{r: bytes.NewReader(body), chunk: chunk}, false, onDone)
+	cr.buffers = budget.newAccount(p, noBufferCancel(t))
+	return cr, holder.close
+}
+
+func drainCapture(t *testing.T, cr *captureReader) []byte {
+	t.Helper()
+	var got bytes.Buffer
+	buf := make([]byte, 64<<10)
+	for {
+		n, err := cr.Read(buf)
+		got.Write(buf[:n])
+		if err == io.EOF {
+			return got.Bytes()
+		}
+		if err != nil {
+			t.Fatalf("read: %v", err)
+		}
+	}
+}
+
+// D22: a capture that overflows after a few bytes because the replica total
+// is used up still keeps the body's first overflowKeep bytes, so a small
+// response read a few bytes at a time keeps its model and usage.
+func TestEarlyOverflowedCaptureKeepsHeadAndMeters(t *testing.T) {
+	body := []byte(`{"id":"x","object":"chat.completion","model":"m1","choices":[{"index":0,"message":{"role":"assistant","content":"` +
+		strings.Repeat("hi ", 1000) + `"},"finish_reason":"stop"}],"usage":{"prompt_tokens":7,"completion_tokens":5,"total_tokens":12}}`)
+	var result capture.Result
+	cr, release := exhaustedReplicaCapture(t, body, 3, func(r capture.Result) { result = r })
+	defer release()
+	if got := drainCapture(t, cr); !bytes.Equal(got, body) {
+		t.Fatalf("delivered %d bytes, want the whole %d-byte body", len(got), len(body))
+	}
+	if !cr.overflowed {
+		t.Fatal("capture did not overflow with the replica total used up")
+	}
+	if result.Model != "m1" || !result.UsageFound || result.Usage.PromptTokens != 7 {
+		t.Fatalf("result=%+v, want model m1 and usage prompt_tokens=7", result)
+	}
+}
+
+// D22: the overflowed usage search walks back past a string VALUE "usage"
+// (a prompt-logprob token after the usage block, as vLLM lays it out) to the
+// real usage key, whether the body fits in the head or not.
+func TestOverflowedUsageSearchSkipsUsageStringValues(t *testing.T) {
+	usage := `"usage":{"prompt_tokens":3,"completion_tokens":2,"total_tokens":5}`
+	logprobs := `"prompt_logprobs":[null,{"1":{"logprob":-1,"rank":1,"decoded_token":"usage"}}]`
+	big := strings.Repeat("x", 1<<20)
+	for name, body := range map[string]string{
+		"small body, usage string after the key": `{"model":"m",` + usage + `,` + logprobs + `}`,
+		"large body, usage string after the key": `{"model":"m","data":"` + big + `",` + usage + `,` + logprobs + `}`,
+		"large body, usage string before the key": `{"model":"m","data":"` + big + `","note":"usage",` + usage + `,` + logprobs + `}`,
+	} {
+		var result capture.Result
+		cr, release := exhaustedReplicaCapture(t, []byte(body), 32<<10, func(r capture.Result) { result = r })
+		drainCapture(t, cr)
+		release()
+		if !cr.overflowed || !result.UsageFound || result.Usage.PromptTokens != 3 || result.Model != "m" {
+			t.Errorf("%s: overflowed=%v result=%+v, want usage prompt_tokens=3 and model m", name, cr.overflowed, result)
+		}
+	}
+}
