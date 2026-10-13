@@ -533,3 +533,26 @@ func TestBudgetedBodyReservesContentLengthUpFront(t *testing.T) {
 		t.Fatalf("held=%d after release, want 0", got)
 	}
 }
+
+// D47 ownership rule: the buffered request body is shared read-only (one
+// buffer, no copy per read); any rewrite builds a new slice. The include-usage
+// rewrite must leave the bytes it read untouched.
+func TestBodyRewriteNeverMutatesTheSharedBuffer(t *testing.T) {
+	original := `{"model":"m","stream":true,"messages":[{"role":"user","content":"hi"}]}`
+	buf := []byte(original)
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", nil)
+	replaceRequestBody(req, buf)
+	if err := forceIncludeUsage(req); err != nil {
+		t.Fatal(err)
+	}
+	rewritten, err := io.ReadAll(req.Body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(buf) != original {
+		t.Fatalf("shared buffer mutated by the rewrite: %q", buf)
+	}
+	if string(rewritten) == original {
+		t.Fatal("rewrite did not add include_usage; the test no longer exercises a rewrite")
+	}
+}
