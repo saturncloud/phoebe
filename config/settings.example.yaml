@@ -32,9 +32,12 @@ idleTimeout: "10m"
 #   maxStreamDuration: "60m"
 #   # Response bytes held in memory for inspection (an incomplete SSE line or a
 #   # whole non-streamed body), per request and summed over this replica. Over
-#   # either limit a streamed response is cut; a non-streamed response is
-#   # never cut: it is delivered whole and metered from the first and last
-#   # 256 KiB it keeps past the limit. The 16 MiB SSE event-line limit still
+#   # either limit a streamed (SSE) response is cut. A non-streamed response
+#   # is never cut: the client gets every byte, and capture keeps only its
+#   # first and last 256 KiB to read model and usage. Those kept bytes are
+#   # always charged, so while they are held the replica total can go above
+#   # maxResponseBufferBytesTotal and other buffering on this replica is
+#   # refused (D22, D31). The 16 MiB SSE event-line limit still
 #   # applies inside the per-request value. An SSE line being assembled is
 #   # held twice (capture buffer and usage filter) and both copies count, so
 #   # a per-request value below 32 MiB cuts lines shorter than 16 MiB.
@@ -123,12 +126,16 @@ emit:
 # and prompt_embeds (no chat template, no tokenizer). maxPrefillTokens
 # bounds that estimate for requests still in prefill. Token windows reserve the
 # same estimate as uncached input, then reconcile the engine's exact total and
-# cached token counts after the response. Output is
+# cached token counts after the response. Reserved output is
 # max_completion_tokens/max_tokens, or defaultMaxOutputTokens, times the
-# number of output sequences: max(n, best_of, 1), times the prompts in a
-# batched /v1/completions prompt.
-# maxReservedKvTokens bounds estimated input plus reserved output x output
-# sequences, held until the request finishes. Decode capacity
+# output-sequence count. The count is max(n, best_of, 1) times the number of
+# prompts in a batched /v1/completions prompt; a flat token-id array counts
+# as one prompt. A count above 65536 is refused with 400. maxReservedOutputTokens
+# therefore bounds total decode work, not max_tokens per request (D23, D29).
+# maxReservedKvTokens bounds estimated input plus this multiplied output,
+# held until the request finishes. A contract's generated-token window
+# likewise refuses a request whose max_tokens x n alone exceeds the window
+# (D29). Decode capacity
 # is a future slot reserved before forwarding because a proxy cannot safely
 # queue once the engine starts responding. Leases release prefill/input work at
 # the first upstream body byte and active/decode/output/KV work at completion,
