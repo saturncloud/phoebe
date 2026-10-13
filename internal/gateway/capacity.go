@@ -18,28 +18,6 @@ type GraphCapacity struct {
 	MaxPrefillTokens    *int64
 }
 
-// Limits is the capacity as the admission limits of the graph_capacity scope.
-// A new published field must be copied here; TestGraphCapacityLimitsCopiesEveryField
-// fails when one is missing.
-func (c GraphCapacity) Limits() config.AdmissionLimits {
-	return config.AdmissionLimits{
-		MaxActiveRequests:   c.MaxActiveRequests,
-		MaxReservedKVTokens: c.MaxReservedKVTokens,
-		MaxPrefillTokens:    c.MaxPrefillTokens,
-	}
-}
-
-// Any reports whether at least one limit is published. It goes through
-// Limits, so it reads the canonical config.LimitValues list.
-func (c GraphCapacity) Any() bool { return c.Limits().Any() }
-
-// fields lists the capacity fields in the order of capacityKeys. parse and
-// tightest both walk it, so a new published key is added to this list and to
-// capacityKeys only.
-func (c *GraphCapacity) fields() []**int64 {
-	return []**int64{&c.MaxActiveRequests, &c.MaxReservedKVTokens, &c.MaxPrefillTokens}
-}
-
 // The registry data keys carrying GraphCapacity. They are graph-level values
 // stamped on every entry of the graph (each entry is one tenant's model on
 // it). All optional; empty or absent publishes no limit.
@@ -49,8 +27,47 @@ const (
 	capacityKeyMaxPrefillTokens    = "admission_max_prefill_tokens"
 )
 
-// capacityKeys are the registry keys of GraphCapacity.fields, in that order.
-var capacityKeys = []string{capacityKeyMaxActiveRequests, capacityKeyMaxReservedKVTokens, capacityKeyMaxPrefillTokens}
+// capacityFields is the one list of GraphCapacity fields. Each entry names
+// the registry key carrying the field, the field itself, and the
+// config.AdmissionLimits field it becomes in the graph_capacity scope. Any,
+// Limits, parseGraphCapacity and tightest all walk this table, so a new
+// published limit is a struct field plus one entry here;
+// TestCapacityFieldsCoverEveryGraphCapacityField fails when the entry is
+// missing.
+var capacityFields = []struct {
+	key   string
+	get   func(*GraphCapacity) **int64
+	limit func(*config.AdmissionLimits) **int64
+}{
+	{capacityKeyMaxActiveRequests,
+		func(c *GraphCapacity) **int64 { return &c.MaxActiveRequests },
+		func(l *config.AdmissionLimits) **int64 { return &l.MaxActiveRequests }},
+	{capacityKeyMaxReservedKVTokens,
+		func(c *GraphCapacity) **int64 { return &c.MaxReservedKVTokens },
+		func(l *config.AdmissionLimits) **int64 { return &l.MaxReservedKVTokens }},
+	{capacityKeyMaxPrefillTokens,
+		func(c *GraphCapacity) **int64 { return &c.MaxPrefillTokens },
+		func(l *config.AdmissionLimits) **int64 { return &l.MaxPrefillTokens }},
+}
+
+// Limits is the capacity as the admission limits of the graph_capacity scope.
+func (c GraphCapacity) Limits() config.AdmissionLimits {
+	var out config.AdmissionLimits
+	for _, f := range capacityFields {
+		*f.limit(&out) = *f.get(&c)
+	}
+	return out
+}
+
+// Any reports whether at least one limit is published.
+func (c GraphCapacity) Any() bool {
+	for _, f := range capacityFields {
+		if *f.get(&c) != nil {
+			return true
+		}
+	}
+	return false
+}
 
 // parseGraphCapacity reads the capacity keys of one registry entry. A value
 // that is not a non-negative integer is an Atlas producer bug; it is reported
@@ -59,8 +76,8 @@ var capacityKeys = []string{capacityKeyMaxActiveRequests, capacityKeyMaxReserved
 // offline over a missing capacity hint (the same direction as having no
 // profile at all).
 func parseGraphCapacity(d map[string]string) (c GraphCapacity, problems []string) {
-	for i, dst := range c.fields() {
-		key := capacityKeys[i]
+	for _, f := range capacityFields {
+		key := f.key
 		raw := strings.TrimSpace(d[key])
 		if raw == "" {
 			continue
@@ -70,7 +87,7 @@ func parseGraphCapacity(d map[string]string) (c GraphCapacity, problems []string
 			problems = append(problems, key+"="+strconv.Quote(raw))
 			continue
 		}
-		*dst = &v
+		*f.get(&c) = &v
 	}
 	return c, problems
 }
@@ -87,10 +104,9 @@ func tightest(all map[string]GraphCapacity) GraphCapacity {
 			*dst = &x
 		}
 	}
-	dst := out.fields()
 	for _, c := range all {
-		for i, src := range c.fields() {
-			pick(dst[i], *src)
+		for _, f := range capacityFields {
+			pick(f.get(&out), *f.get(&c))
 		}
 	}
 	return out

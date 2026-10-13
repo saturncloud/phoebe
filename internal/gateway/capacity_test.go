@@ -102,9 +102,7 @@ func TestRegistry_GraphCapacityLifecycle(t *testing.T) {
 // GraphCapacity.Limits is the one conversion of published capacity into the
 // graph_capacity admission scope. Every GraphCapacity field must reach the
 // AdmissionLimits field of the same name, or a published key would engage
-// admission (Any) without being enforced. A new published key is also added
-// to capacityKeys and GraphCapacity.fields (which parseGraphCapacity and
-// tightest walk); this test catches a field missing from Limits or fields.
+// admission (Any) without being enforced.
 func TestGraphCapacityLimitsCopiesEveryField(t *testing.T) {
 	var c GraphCapacity
 	cv := reflect.ValueOf(&c).Elem()
@@ -135,14 +133,49 @@ func TestGraphCapacityLimitsCopiesEveryField(t *testing.T) {
 	if set != cv.NumField() {
 		t.Fatalf("LimitValues(Limits()) has %d values set, want %d (one per GraphCapacity field)", set, cv.NumField())
 	}
-	if n := len(c.fields()); n != cv.NumField() || len(capacityKeys) != n {
-		t.Fatalf("fields()=%d capacityKeys=%d, want %d each", n, len(capacityKeys), cv.NumField())
-	}
-	seen := map[*int64]bool{}
-	for i, dst := range c.fields() {
-		if *dst == nil || seen[*dst] {
-			t.Fatalf("fields()[%d] does not point at a distinct GraphCapacity field", i)
+}
+
+// capacityFields is the one table that Any, Limits, parseGraphCapacity and
+// tightest walk. Every *int64 field of GraphCapacity must have exactly one
+// entry, with a distinct non-empty registry key, whose limit accessor names
+// the config.AdmissionLimits field of the same name. A field added to the
+// struct without an entry would be silently never parsed, merged or enforced.
+func TestCapacityFieldsCoverEveryGraphCapacityField(t *testing.T) {
+	var c GraphCapacity
+	cv := reflect.ValueOf(&c).Elem()
+	byAddr := map[uintptr]string{}
+	for i := 0; i < cv.NumField(); i++ {
+		f := cv.Type().Field(i)
+		if f.Type != reflect.TypeOf((*int64)(nil)) {
+			continue
 		}
-		seen[*dst] = true
+		byAddr[cv.Field(i).Addr().Pointer()] = f.Name
+	}
+	var l config.AdmissionLimits
+	lv := reflect.ValueOf(&l).Elem()
+	covered := map[string]bool{}
+	keys := map[string]bool{}
+	for i, f := range capacityFields {
+		name, ok := byAddr[reflect.ValueOf(f.get(&c)).Pointer()]
+		if !ok {
+			t.Fatalf("capacityFields[%d].get does not point at a GraphCapacity *int64 field", i)
+		}
+		if covered[name] {
+			t.Fatalf("GraphCapacity.%s has more than one capacityFields entry", name)
+		}
+		covered[name] = true
+		if f.key == "" || keys[f.key] {
+			t.Fatalf("capacityFields[%d] (%s) has an empty or duplicate key %q", i, name, f.key)
+		}
+		keys[f.key] = true
+		lf := lv.FieldByName(name)
+		if !lf.IsValid() || reflect.ValueOf(f.limit(&l)).Pointer() != lf.Addr().Pointer() {
+			t.Fatalf("capacityFields[%d].limit does not point at config.AdmissionLimits.%s", i, name)
+		}
+	}
+	for _, name := range byAddr {
+		if !covered[name] {
+			t.Fatalf("GraphCapacity.%s has no capacityFields entry", name)
+		}
 	}
 }
