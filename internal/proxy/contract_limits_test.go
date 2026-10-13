@@ -487,9 +487,12 @@ func TestBrokenEnvelopeFailsClosedWithAdmissionFlagOff(t *testing.T) {
 // recordingAdmitter counts Admit calls and records the last request; it admits
 // with no lease, as an unavailable store would.
 type recordingAdmitter struct {
-	calls int
-	last  admission.Request
+	calls    int
+	last     admission.Request
+	settings config.AdmissionSettings
 }
+
+func (a *recordingAdmitter) Settings() config.AdmissionSettings { return a.settings }
 
 func (a *recordingAdmitter) Admit(_ context.Context, req admission.Request) (*admission.Lease, error) {
 	a.calls++

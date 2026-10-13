@@ -65,7 +65,14 @@ func sharedRequest(upstream *url.URL) *http.Request {
 	return r
 }
 
-type countingAdmitter struct{ calls int }
+// countingAdmitter counts Admit calls and admits with no lease, as an
+// unavailable store would. settings is what it reports enforcing.
+type countingAdmitter struct {
+	calls    int
+	settings config.AdmissionSettings
+}
+
+func (a *countingAdmitter) Settings() config.AdmissionSettings { return a.settings }
 
 func (a *countingAdmitter) Admit(context.Context, admission.Request) (*admission.Lease, error) {
 	a.calls++
@@ -3056,6 +3063,29 @@ func TestOversizeMessageBlamesModelOnlyForGraphCapacity(t *testing.T) {
 		}
 		if !strings.Contains(body, c.want) || strings.Contains(body, "this model's") != c.wantModel {
 			t.Errorf("%s/%s: body=%q, want %q", c.scope, c.dimension, body, c.want)
+		}
+	}
+}
+
+// A KV 413 for a request that declared no max_tokens blames the prompt
+// alone: the reservation was phoebe's default, so there is no max_tokens for
+// the client to lower.
+func TestOversizeMessageForUndeclaredOutputDoesNotMentionMaxTokens(t *testing.T) {
+	s := New(&config.Settings{}, logging.New(logging.ERROR), &recordingEmitter{})
+	for _, c := range []struct{ scope, want string }{
+		{"graph_capacity", "estimated prompt tokens exceed this model's KV-cache capacity"},
+		{"graph", "estimated prompt tokens exceed this model's KV-cache capacity"},
+		{"lane", "estimated prompt tokens exceed a configured KV-cache limit"},
+		{"organization", "estimated prompt tokens exceed a configured KV-cache limit"},
+	} {
+		rr := httptest.NewRecorder()
+		s.writeAdmissionErrorOutput(rr, "req-1", &admission.Rejected{Scope: c.scope, Dimension: "kv_exceeds_limit", Unsatisfiable: true}, false)
+		body := rr.Body.String()
+		if rr.Code != http.StatusRequestEntityTooLarge || rr.Header().Get("Retry-After") != "" {
+			t.Errorf("%s: status=%d retry-after=%q, want 413 without Retry-After", c.scope, rr.Code, rr.Header().Get("Retry-After"))
+		}
+		if !strings.Contains(body, c.want) || strings.Contains(body, "max_tokens") {
+			t.Errorf("%s: body=%q, want %q and no mention of max_tokens", c.scope, body, c.want)
 		}
 	}
 }

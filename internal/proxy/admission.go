@@ -338,23 +338,41 @@ func prepareSharedDynamoRequest(body []byte, tenantIdentity string, maxOutput in
 // lane) gets neutral wording so the client is not told the model cannot take
 // a request that a configured limit refused. The scope id itself stays in the
 // server log, not the client body.
-func oversizeMessage(rejected *admission.Rejected) string {
+//
+// outputDeclared is false when the client sent no max_tokens and the output
+// reservation is phoebe's default: the KV text then blames the prompt alone,
+// so the client is not told to lower a field it never sent.
+func oversizeMessage(rejected *admission.Rejected, outputDeclared bool) string {
 	kv := rejected.Dimension == "kv_exceeds_limit"
 	switch rejected.Scope {
 	case "graph_capacity", "graph":
-		if kv {
+		if kv && outputDeclared {
 			return "estimated prompt tokens plus max_tokens exceed this model's KV-cache capacity"
+		}
+		if kv {
+			return "estimated prompt tokens exceed this model's KV-cache capacity"
 		}
 		return "estimated prompt tokens exceed this model's prefill capacity"
 	default:
-		if kv {
+		if kv && outputDeclared {
 			return "estimated prompt tokens plus max_tokens exceed a configured KV-cache limit"
+		}
+		if kv {
+			return "estimated prompt tokens exceed a configured KV-cache limit"
 		}
 		return "estimated prompt tokens exceed a configured prefill-token limit"
 	}
 }
 
+// writeAdmissionError answers an admission refusal for a request whose
+// output reservation the client declared (or that has none to declare).
 func (s *Server) writeAdmissionError(w http.ResponseWriter, requestID string, err error) {
+	s.writeAdmissionErrorOutput(w, requestID, err, true)
+}
+
+// writeAdmissionErrorOutput answers an admission refusal; outputDeclared
+// selects the 413 KV wording (oversizeMessage).
+func (s *Server) writeAdmissionErrorOutput(w http.ResponseWriter, requestID string, err error, outputDeclared bool) {
 	// Echo the authoritative attempt id on rejections too — the same handle the
 	// normal path stamps in ModifyResponse and the error handler stamps on 502s:
 	// a rejected client needs its billing-record correlation id just as much.
@@ -365,7 +383,7 @@ func (s *Server) writeAdmissionError(w http.ResponseWriter, requestID string, er
 		// tokens, or prompt plus max_tokens against reserved KV). It can never
 		// be admitted, so it is refused as too large, the same answer an
 		// oversized prompt got from the byte-based limit this replaced.
-		http.Error(w, oversizeMessage(rejected), http.StatusRequestEntityTooLarge)
+		http.Error(w, oversizeMessage(rejected, outputDeclared), http.StatusRequestEntityTooLarge)
 		s.log.Warn.Printf("admission: request larger than capacity scope=%s dimension=%s", rejected.Scope, rejected.Dimension)
 		return
 	}
@@ -557,19 +575,13 @@ func undeclaredOutputWithinKV(output, input, sequences, kvCap int64) int64 {
 	return output
 }
 
-// admitterSettings is the admission configuration the admitter enforces: the
-// admitter's own when it reports one, else the operator tiers from settings,
-// which apply only under admission.enabled (Settings.EffectiveAdmission).
+// admitterSettings is the admission configuration the admitter enforces, as
+// reported by the admitter; with no admitter there are no operator tiers.
 func (s *Server) admitterSettings() config.AdmissionSettings {
-	if a, ok := s.admitter.(interface {
-		Settings() config.AdmissionSettings
-	}); ok {
-		return a.Settings()
-	}
-	if !s.settings.Admission.Enabled {
+	if s.admitter == nil {
 		return config.AdmissionSettings{}
 	}
-	return s.settings.Admission
+	return s.admitter.Settings()
 }
 
 // errNoTrustedRateLimitPolicy is the parser's "no anchor and no scoped policy

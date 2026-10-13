@@ -167,6 +167,10 @@ type wireRequest struct {
 // Admitter is the proxy-facing seam, allowing deterministic lifecycle tests.
 type Admitter interface {
 	Admit(context.Context, Request) (*Lease, error)
+	// Settings is the admission configuration the admitter enforces. The
+	// proxy reads its caps from here so the undeclared-output clamp and
+	// admission agree on one source.
+	Settings() config.AdmissionSettings
 }
 
 type RedisAdmitter struct {

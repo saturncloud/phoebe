@@ -836,7 +836,7 @@ func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request) {
 					}
 					admitted = nil
 				} else {
-					s.writeAdmissionError(w, requestID, err)
+					s.writeAdmissionErrorOutput(w, requestID, err, routePath == "/v1/embeddings" || estimate.OutputDeclared)
 					return
 				}
 			}
