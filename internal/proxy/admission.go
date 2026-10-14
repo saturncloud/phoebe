@@ -139,18 +139,9 @@ type admissionEstimate struct {
 	OutputSequences int64
 }
 
-// publishedGraphCapacity is the admission capacity phoebe enforces for graph
-// (RegistryResolver.GraphCapacity: per-worker entries scaled by ready workers
-// plus headroom, graph-level entries as published), or none.
-func (s *Server) publishedGraphCapacity(graph string) gateway.GraphCapacity {
-	if s.graphCapacity == nil || graph == "" {
-		return gateway.GraphCapacity{}
-	}
-	return s.graphCapacity.GraphCapacity(graph)
-}
-
-// publishedGraphCapacities is the scaled capacity (publishedGraphCapacity)
-// and the unscaled per-request capacity (GraphRequestCapacity) for graph,
+// publishedGraphCapacities is the scaled capacity phoebe enforces
+// (GraphCapacity: per-worker entries times ready workers plus headroom,
+// graph-level entries as published) and the unscaled per-request capacity (GraphRequestCapacity) for graph,
 // read together from one registry state when the resolver can do that, or
 // none.
 func (s *Server) publishedGraphCapacities(graph string) (scaled, perRequest gateway.GraphCapacity) {
