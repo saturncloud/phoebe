@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"math"
 	"sort"
 	"strconv"
 	"sync"
@@ -23,10 +24,10 @@ import (
 	"github.com/saturncloud/phoebe/internal/logging"
 )
 
-// NewKubeClient builds the typed clientset the registry resolver watches
-// with: in-cluster config in production, a kubeconfig path for dev/tests
-// (mirrors the waker's config loading).
-func NewKubeClient(kubeconfig string) (kubernetes.Interface, error) {
+// restConfig loads the Kubernetes client config: in-cluster config in
+// production, a kubeconfig path for dev/tests. It mirrors the waker's config
+// loading (internal/waker), which predates it and is left as is.
+func restConfig(kubeconfig string) (*rest.Config, error) {
 	var (
 		rc  *rest.Config
 		err error
@@ -38,6 +39,16 @@ func NewKubeClient(kubeconfig string) (kubernetes.Interface, error) {
 	}
 	if err != nil {
 		return nil, fmt.Errorf("gateway: kubernetes config: %w", err)
+	}
+	return rc, nil
+}
+
+// NewKubeClient builds the typed clientset the registry resolver watches
+// with (see restConfig).
+func NewKubeClient(kubeconfig string) (kubernetes.Interface, error) {
+	rc, err := restConfig(kubeconfig)
+	if err != nil {
+		return nil, err
 	}
 	return kubernetes.NewForConfig(rc)
 }
@@ -45,17 +56,9 @@ func NewKubeClient(kubeconfig string) (kubernetes.Interface, error) {
 // NewDynamicClient is NewKubeClient's dynamic client, for the custom
 // resources phoebe reads (the DynamoGraphDeployments' ready workers).
 func NewDynamicClient(kubeconfig string) (dynamic.Interface, error) {
-	var (
-		rc  *rest.Config
-		err error
-	)
-	if kubeconfig != "" {
-		rc, err = clientcmd.BuildConfigFromFlags("", kubeconfig)
-	} else {
-		rc, err = rest.InClusterConfig()
-	}
+	rc, err := restConfig(kubeconfig)
 	if err != nil {
-		return nil, fmt.Errorf("gateway: kubernetes config: %w", err)
+		return nil, err
 	}
 	return dynamic.NewForConfig(rc)
 }
@@ -94,7 +97,11 @@ func NewDynamicClient(kubeconfig string) (dynamic.Interface, error) {
 //	                               integers, empty or absent = no limit.
 //	                               Phoebe enforces each graph at the value
 //	                               times (ready workers + 1); see
-//	                               GraphCapacity and ReadyWorkers
+//	                               GraphCapacity and ReadyWorkers. The
+//	                               ready workers are read only from the
+//	                               DynamoGraphDeployments labelled
+//	                               saturncloud.io/managed-by=Atlas
+//	                               (atlasManagedSelector)
 //
 // Atlas guarantees (org_id, served_model_name) uniqueness across live
 // registrations; the resolver still tolerates duplicates deterministically
@@ -365,7 +372,17 @@ func (r *RegistryResolver) GraphCapacity(graph string) GraphCapacity {
 	if r.workers == nil {
 		return capacity
 	}
-	return capacity.Scaled(r.workers.Ready(graph) + GraphLimitHeadroomWorkers)
+	// The multiplier saturates at the int64 maximum instead of wrapping, so a
+	// huge ready count cannot turn into a negative (unscaled) multiplier.
+	n := r.workers.Ready(graph)
+	if n < 0 {
+		n = 0
+	}
+	m := int64(math.MaxInt64)
+	if n <= math.MaxInt64-GraphLimitHeadroomWorkers {
+		m = n + GraphLimitHeadroomWorkers
+	}
+	return capacity.Scaled(m)
 }
 
 // winsClaimLocked reports whether cmName is the claimant resolveClaimants

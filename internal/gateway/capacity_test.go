@@ -121,12 +121,21 @@ func TestRegistry_GraphCapacityOnlyFromWinningClaimant(t *testing.T) {
 			val(c.MaxActiveRequests), val(c.MaxPrefillTokens))
 	}
 
+	// Scaling by ready workers (2 ready + 1) multiplies the winner's values,
+	// not the losing duplicate's.
+	r.WithReadyWorkers(fixedWorkers{"graph-llama31": 2})
+	c = r.GraphCapacity("graph-llama31")
+	if val(c.MaxActiveRequests) != 30 || val(c.MaxPrefillTokens) != 12288 {
+		t.Fatalf("scaled capacity = (active %d, prefill %d), want the winner's x 3 (30, 12288), not the duplicate's (6, 1536)",
+			val(c.MaxActiveRequests), val(c.MaxPrefillTokens))
+	}
+
 	if err := client.CoreV1().ConfigMaps(registryNS).Delete(context.Background(), "tf-model-winner", metav1.DeleteOptions{}); err != nil {
 		t.Fatal(err)
 	}
-	c = waitCapacity(t, r, "graph-llama31", func(c GraphCapacity) bool { return val(c.MaxActiveRequests) == 2 })
-	if val(c.MaxActiveRequests) != 2 || val(c.MaxPrefillTokens) != 512 {
-		t.Fatalf("after the winner was deleted capacity = (active %d, prefill %d), want the survivor's (2, 512)",
+	c = waitCapacity(t, r, "graph-llama31", func(c GraphCapacity) bool { return val(c.MaxActiveRequests) == 6 })
+	if val(c.MaxActiveRequests) != 6 || val(c.MaxPrefillTokens) != 1536 {
+		t.Fatalf("after the winner was deleted capacity = (active %d, prefill %d), want the survivor's x 3 (6, 1536)",
 			val(c.MaxActiveRequests), val(c.MaxPrefillTokens))
 	}
 }
