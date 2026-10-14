@@ -16,6 +16,7 @@ import (
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	dynamicfake "k8s.io/client-go/dynamic/fake"
+	clienttesting "k8s.io/client-go/testing"
 	k8stesting "k8s.io/client-go/testing"
 
 	corev1 "k8s.io/api/core/v1"
@@ -304,25 +305,66 @@ func TestReadyWorkersUnsyncedListFailureReadsZero(t *testing.T) {
 	}
 }
 
-// D56: after the first sync a failing watch keeps the last-known counts (the
-// registry informer's tradeoff), however long it fails; a later event
-// updates them as usual.
-func TestReadyWorkersKeepsLastKnownCountsWhileWatchFails(t *testing.T) {
-	w := NewReadyWorkers(dynamicfake.NewSimpleDynamicClientWithCustomListKinds(runtime.NewScheme(),
-		map[schema.GroupVersionResource]string{dynamoGraphResource: "DynamoGraphDeploymentList"}),
-		registryNS, logging.New(logging.ERROR))
+// Q23: after staleAfter without a successful read of the DGDs (API server
+// down, or the grant revoked) every graph reads 0 ready workers, so it admits
+// one worker's worth; the next successful probe restores the last-known
+// counts. Health comes from the probe's list, so watch errors alone change
+// nothing.
+func TestReadyWorkersFailTightWhenTheDGDsCannotBeRead(t *testing.T) {
+	client := dynamicfake.NewSimpleDynamicClientWithCustomListKinds(runtime.NewScheme(),
+		map[schema.GroupVersionResource]string{dynamoGraphResource: "DynamoGraphDeploymentList"})
+	w := NewReadyWorkers(client, registryNS, logging.New(logging.ERROR))
 	w.log.Error.SetOutput(&syncBuffer{})
+	w.log.Info.SetOutput(&syncBuffer{})
+	now := time.Unix(1_000_000, 0)
+	w.now = func() time.Time { return now }
+	w.lastReachable.Store(now.UnixNano())
 	w.synced.Store(true)
 	w.upsert(dgd("graph-a", map[string]any{"Worker": map[string]any{"readyReplicas": int64(8)}}))
 
-	w.watchFailed(errors.New("connection refused"))
-	w.watchFailed(errors.New("connection refused again"))
+	// A watch error with the API server still answering changes nothing.
+	w.watchFailed(errors.New("watch closed"))
+	now = now.Add(2 * w.staleAfter)
+	w.probe(context.Background())
 	if got := w.Ready("graph-a"); got != 8 {
-		t.Fatalf("while the watch fails Ready = %d, want the last-known 8", got)
+		t.Fatalf("API server reachable: Ready = %d, want the last-known 8", got)
 	}
-	w.upsert(dgd("graph-a", map[string]any{"Worker": map[string]any{"readyReplicas": int64(2)}}))
-	if got := w.Ready("graph-a"); got != 2 {
-		t.Fatalf("after a later event Ready = %d, want 2", got)
+
+	// The API server stops answering (or the grant is revoked).
+	failing := true
+	client.PrependReactor("list", "dynamographdeployments", func(clienttesting.Action) (bool, runtime.Object, error) {
+		if failing {
+			return true, nil, errors.New("forbidden")
+		}
+		return false, nil, nil
+	})
+	now = now.Add(w.staleAfter)
+	w.probe(context.Background())
+	if got := w.Ready("graph-a"); got != 8 {
+		t.Fatalf("exactly at the bound Ready = %d, want the last-known 8", got)
+	}
+	now = now.Add(time.Second)
+	w.probe(context.Background())
+	if got := w.Ready("graph-a"); got != 0 {
+		t.Fatalf("past the bound Ready = %d, want 0 (one worker's worth)", got)
+	}
+
+	// A successful probe restores the counts, with no DGD event needed.
+	failing = false
+	w.probe(context.Background())
+	if got := w.Ready("graph-a"); got != 8 {
+		t.Fatalf("after a successful probe Ready = %d, want 8", got)
+	}
+}
+
+// Before the first sync there is nothing stale to expire: unknown counts are
+// already 0, and a probe that never succeeded must not misreport staleness.
+func TestReadyWorkersNotStaleBeforeFirstSync(t *testing.T) {
+	w := NewReadyWorkers(dynamicfake.NewSimpleDynamicClientWithCustomListKinds(runtime.NewScheme(),
+		map[schema.GroupVersionResource]string{dynamoGraphResource: "DynamoGraphDeploymentList"}),
+		registryNS, logging.New(logging.ERROR))
+	if w.stale() {
+		t.Fatal("stale() before any successful read")
 	}
 }
 
