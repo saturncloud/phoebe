@@ -14,8 +14,12 @@
 #   2. The ready-worker informer (workers.go, NewReadyWorkers) watches the
 #      Atlas-managed DynamoGraphDeployments (label
 #      saturncloud.io/managed-by=Atlas) and reads
-#      status.components.Worker/VllmWorker.readyReplicas, so phoebe can scale
-#      each graph's per-worker admission limits by (ready workers + 1).
+#      status.components.Worker.readyReplicas, so phoebe can scale each
+#      graph's per-worker admission limits by (ready workers + 1). The legacy
+#      VllmWorker component is read only when the DGD has no Worker component
+#      at all; a Worker component with 0 ready reads 0 and does not fall back,
+#      so a stale VllmWorker status cannot raise the limit (component names
+#      match case-insensitively; D59).
 #      Decision D54, approved by Hugo 2026-10-14.
 # So phoebe's ServiceAccount needs get/list/watch on configmaps and
 # nvidia.com dynamographdeployments THERE and nothing else — no writes, no
