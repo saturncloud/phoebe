@@ -295,3 +295,20 @@ removed once it was confirmed phoebe performs no cross-joins to Atlas: phoebe no
 owns its own database and its own migrator, so the Alembic artifacts and the
 `atlas/` directory were deleted. phoebe was not deployed in production anywhere at
 the time of the cutover, so there was no data to migrate.
+
+## Upgrade order and backward compatibility
+
+The phoebe chart runs `phoebe-migrate up` as a Helm **pre-upgrade** hook
+(post-install on a fresh install, when the database is created by the same
+release). On an upgrade the schema therefore moves to the new version BEFORE the
+new pods roll, and the previous release's drainer briefly writes into the new
+schema. So every migration must keep the previous release's drainer working:
+add columns with defaults, add tables and indexes, but never drop or rename a
+column or change a unique key the previous release still writes to in the same
+release (expand now, contract one release later).
+
+The drainer also protects itself: it consumes nothing until the database is at
+the schema version it was built with (`migrations.LatestVersion()`), and a row
+that fails because the schema is behind (undefined table or column, or an
+`ON CONFLICT` target the migration has not created yet) is left in the stream
+for redelivery, never dropped as poison.

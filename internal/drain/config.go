@@ -43,6 +43,12 @@ type Config struct {
 	// returning empty (so the loop can check for shutdown / run reclaim).
 	BlockTimeout time.Duration
 
+	// RequiredSchemaVersion is the database schema version (golang-migrate)
+	// this binary writes; the drainer consumes nothing until the database has
+	// reached it, so an upgrade never writes new columns into an old table.
+	// main sets it from migrations.LatestVersion(); 0 disables the gate.
+	RequiredSchemaVersion uint
+
 	// --- Pending-entry reclaim (dead-consumer recovery) ---
 
 	// ClaimMinIdle is the minimum time an entry must sit unacknowledged in

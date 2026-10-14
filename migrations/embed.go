@@ -7,9 +7,39 @@
 // Atlas-owned table), so the tables need not be co-located with the Atlas schema.
 package migrations
 
-import "embed"
+import (
+	"embed"
+	"strconv"
+	"strings"
+)
 
 // FS holds the embedded up/down SQL migration files.
 //
 //go:embed *.sql
 var FS embed.FS
+
+// LatestVersion is the highest migration version embedded in FS: the schema
+// version this binary expects. The drainer waits for the database to reach it
+// before writing (an upgrade must never write new columns into an old table).
+func LatestVersion() uint {
+	entries, err := FS.ReadDir(".")
+	if err != nil {
+		return 0
+	}
+	var latest uint
+	for _, e := range entries {
+		name := e.Name()
+		if !strings.HasSuffix(name, ".up.sql") {
+			continue
+		}
+		prefix, _, ok := strings.Cut(name, "_")
+		if !ok {
+			continue
+		}
+		v, err := strconv.ParseUint(prefix, 10, 32)
+		if err == nil && uint(v) > latest {
+			latest = uint(v)
+		}
+	}
+	return latest
+}

@@ -3,11 +3,13 @@ package drain
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"fmt"
 	"math"
 	"strings"
 	"time"
 
+	"github.com/jackc/pgx/v5/pgconn"
 	// pgx stdlib driver registers itself as "pgx" with database/sql. We use the
 	// standard library sql package (not the native pgx pool) so the store is a
 	// thin, mockable seam and so connection-pool tuning is the familiar
@@ -32,6 +34,45 @@ type Store interface {
 	// Ping verifies connectivity (pool_pre_ping equivalent on startup).
 	Ping(ctx context.Context) error
 	Close() error
+}
+
+// SchemaVersion reads golang-migrate's schema_migrations row: the version the
+// database is at and whether the last migration left it dirty. A missing table
+// (no migration ever applied) reads as version 0, not dirty.
+func (s *PostgresStore) SchemaVersion(ctx context.Context) (uint, bool, error) {
+	var (
+		version int64
+		dirty   bool
+	)
+	err := s.db.QueryRowContext(ctx, `SELECT version, dirty FROM schema_migrations LIMIT 1`).Scan(&version, &dirty)
+	if errors.Is(err, sql.ErrNoRows) || isSchemaNotReady(err) {
+		return 0, false, nil
+	}
+	if err != nil {
+		return 0, false, fmt.Errorf("drain: read schema version: %w", err)
+	}
+	if version < 0 {
+		version = 0
+	}
+	return uint(version), dirty, nil
+}
+
+// isSchemaNotReady reports a Postgres error that means the schema is behind
+// the code (an undefined table or column), not that the row is bad: during an
+// upgrade the new drainer can run before the migration that adds the column it
+// writes. Such a row must be retried, never dropped as poison.
+func isSchemaNotReady(err error) bool {
+	var pgErr *pgconn.PgError
+	if !errors.As(err, &pgErr) {
+		return false
+	}
+	switch pgErr.Code {
+	// undefined_table, undefined_column, and invalid_column_reference (an ON
+	// CONFLICT target whose unique key a pending migration adds).
+	case "42P01", "42703", "42P10":
+		return true
+	}
+	return false
 }
 
 // PostgresStore writes metering events to the billing_event table. It assumes

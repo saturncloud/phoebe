@@ -26,6 +26,7 @@ import (
 
 	"github.com/saturncloud/phoebe/internal/drain"
 	"github.com/saturncloud/phoebe/internal/logging"
+	"github.com/saturncloud/phoebe/migrations"
 )
 
 // drainSettings is the YAML shape for the drainer. It mirrors drain.Config
@@ -88,6 +89,7 @@ func main() {
 	rdb := redis.NewClient(&redis.Options{Addr: cfg.ValkeyAddr})
 	defer func() { _ = rdb.Close() }()
 
+	cfg.RequiredSchemaVersion = migrations.LatestVersion()
 	d := drain.New(cfg, log, rdb, store)
 	if err := d.Run(ctx); err != nil {
 		log.Error.Fatalf("drainer: run: %v", err)
