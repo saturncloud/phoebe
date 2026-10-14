@@ -50,11 +50,11 @@ const atlasManagedSelector = "saturncloud.io/managed-by=Atlas"
 // reads. Before the first sync, and for a graph it has not seen, the count
 // is zero: the graph then admits one worker's worth, never no limit.
 //
-// After the first sync a failing watch keeps the last-known counts while
-// client-go's reflector retries (D56), the same availability tradeoff as the
-// registry informer: an API-server outage must not throttle every healthy
-// graph to one worker's worth, and a graph cannot be scaled by KEDA, the
-// Planner or the waker without that API server anyway.
+// After the first sync the counts are trusted while phoebe can still read
+// the DGDs (a 15 s health probe); after 60 s with no successful read (API
+// server down, or the grant revoked) every graph reads 0, one worker's worth,
+// until a probe succeeds again (Hugo's Q23 condition, D58: losing the read
+// fails tight).
 type ReadyWorkers struct {
 	log      *logging.Logger
 	informer cache.SharedIndexInformer
