@@ -33,8 +33,10 @@ var dynamoGraphResource = schema.GroupVersionResource{
 }
 
 // sharedWorkerComponents are the DGD status component names of a shared
-// graph's worker, in preference order: the uniform Worker, then the
-// pre-rename VllmWorker (compared case-insensitively).
+// graph's worker, in preference order (compared case-insensitively): the
+// uniform Worker, then the pre-rename VllmWorker. The first one present
+// decides the count, so VllmWorker is read only when the DGD has no Worker
+// component; a stale VllmWorker status never raises a Worker reading of 0.
 var sharedWorkerComponents = []string{"worker", "vllmworker"}
 
 // atlasManagedSelector is the label selector phoebe lists DynamoGraphDeployments
@@ -47,8 +49,9 @@ const atlasManagedSelector = "saturncloud.io/managed-by=Atlas"
 // (status.components.Worker.readyReplicas) in memory. Every scaler (KEDA,
 // the Dynamo Planner, phoebe's waker, Atlas's reaper) moves that number, so
 // reading it here needs no hook in any of them. Lookups are pure memory
-// reads. Before the first sync, and for a graph it has not seen, the count
-// is zero: the graph then admits one worker's worth, never no limit.
+// reads. Before the first sync every graph reads zero, even one the initial
+// list has already delivered, and after it a graph it has not seen reads
+// zero: the graph then admits one worker's worth, never no limit.
 //
 // After the first sync the counts are trusted while phoebe can still read
 // the DGDs (a 15 s health probe); after 60 s with no successful read (API
@@ -62,7 +65,9 @@ type ReadyWorkers struct {
 
 	// The health probe (Q23): a one-item list of the same DGDs every
 	// probeEvery. lastReachable is when the API server last answered one
-	// (unix nanoseconds; set at the first sync); when it is older than
+	// (nil until the first sync). It is kept as a time.Time from now, so
+	// with time.Now the comparison uses the monotonic clock and a wall-clock
+	// step (NTP, VM resume) cannot shift the window. When it is older than
 	// staleAfter every graph reads 0 ready workers (one worker's worth), and
 	// the next successful probe restores the counts. Health comes from this
 	// list, not from watch errors, so a watch that reconnects without
@@ -72,7 +77,7 @@ type ReadyWorkers struct {
 	probeEvery    time.Duration
 	staleAfter    time.Duration
 	now           func() time.Time
-	lastReachable atomic.Int64
+	lastReachable atomic.Pointer[time.Time]
 	unreachable   atomic.Bool
 
 	mu    sync.RWMutex
@@ -118,7 +123,7 @@ const (
 func (w *ReadyWorkers) Run(ctx context.Context) {
 	go func() {
 		if cache.WaitForCacheSync(ctx.Done(), w.informer.HasSynced) {
-			w.lastReachable.Store(w.now().UnixNano())
+			w.markReachable()
 			w.synced.Store(true)
 			w.log.Info.Printf("gateway: ready-worker counts synced")
 		}
@@ -152,16 +157,23 @@ func (w *ReadyWorkers) probe(ctx context.Context) {
 		}
 		return
 	}
-	w.lastReachable.Store(w.now().UnixNano())
+	w.markReachable()
 	if w.unreachable.Swap(false) {
 		w.log.Info.Printf("gateway: ready-worker counts confirmed again; graph admission limits follow ready workers")
 	}
 }
 
+// markReachable records that the API server answered a read of the DGDs now.
+func (w *ReadyWorkers) markReachable() {
+	t := w.now()
+	w.lastReachable.Store(&t)
+}
+
 // stale reports whether the last successful read is older than staleAfter.
+// Before the first sync there is no last read, so nothing is stale.
 func (w *ReadyWorkers) stale() bool {
 	last := w.lastReachable.Load()
-	return last != 0 && w.now().Sub(time.Unix(0, last)) > w.staleAfter
+	return last != nil && w.now().Sub(*last) > w.staleAfter
 }
 
 // watchFailed records that the DGD list or watch failed and logs what that
@@ -174,13 +186,16 @@ func (w *ReadyWorkers) watchFailed(err error) {
 	w.log.Error.Printf("gateway: ready-worker watch failed (%v); graph admission limits use the last-known worker counts while phoebe can still read the DynamoGraphDeployments, and one worker's worth after %s without a successful read", err, w.staleAfter)
 }
 
-// Synced reports whether the informer has completed its first list.
+// Synced reports whether the informer has completed its first list. It is
+// for tests and diagnostics: admission does not wait for it, because an
+// unsynced count reads as 0, one worker's worth (D54).
 func (w *ReadyWorkers) Synced() bool { return w.synced.Load() }
 
-// Ready is graph's ready worker count: zero when unknown, and zero for every
-// graph once no read of the DGDs has succeeded for staleAfter.
+// Ready is graph's ready worker count: zero before the first sync, zero when
+// unknown, and zero for every graph once no read of the DGDs has succeeded
+// for staleAfter.
 func (w *ReadyWorkers) Ready(graph string) int64 {
-	if w.stale() {
+	if !w.synced.Load() || w.stale() {
 		return 0
 	}
 	w.mu.RLock()
@@ -213,8 +228,11 @@ func (w *ReadyWorkers) remove(obj any) {
 }
 
 // readyWorkersOf reads a DGD's ready worker count. A missing or malformed
-// status reads as zero. Worker is preferred; VllmWorker is read when Worker
-// has none ready.
+// status reads as zero. Worker is preferred; VllmWorker is read only when the
+// DGD has no Worker component. A Worker component whose readyReplicas is 0,
+// missing or malformed reads as zero rather than falling back, so a stale
+// VllmWorker status cannot raise the limit while the real workers are down.
+// A component entry that is not a map is treated as absent.
 func readyWorkersOf(obj map[string]any) int64 {
 	components, _, _ := unstructured.NestedMap(obj, "status", "components")
 	for _, want := range sharedWorkerComponents {
@@ -236,6 +254,7 @@ func readyWorkersOf(obj map[string]any) int64 {
 					return int64(v)
 				}
 			}
+			return 0
 		}
 	}
 	return 0
