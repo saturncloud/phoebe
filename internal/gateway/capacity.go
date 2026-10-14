@@ -18,9 +18,11 @@ type GraphCapacity struct {
 	MaxPrefillTokens    *int64
 }
 
-// The registry data keys carrying GraphCapacity. They are graph-level values
-// stamped on every entry of the graph (each entry is one tenant's model on
-// it). All optional; empty or absent publishes no limit.
+// The registry data keys carrying GraphCapacity. They are PER-WORKER values
+// (Q22, ruling 2026-10-14) stamped on every entry of the graph (each entry is
+// one tenant's model on it); RegistryResolver.GraphCapacity multiplies them by
+// the graph's ready workers plus one. All optional; empty or absent publishes
+// no limit.
 const (
 	capacityKeyMaxActiveRequests   = "admission_max_active_requests"
 	capacityKeyMaxReservedKVTokens = "admission_max_reserved_kv_tokens"
@@ -94,7 +96,7 @@ func parseGraphCapacity(d map[string]string) (c GraphCapacity, problems []string
 
 // tightest combines the capacity published on several entries of one graph:
 // for each limit the smallest published value wins. Entries of one graph
-// should agree (Atlas stamps one graph-level value on all of them); during a
+// should agree (Atlas stamps one per-worker value on all of them); during a
 // change they briefly may not, and the tighter value is the safe reading.
 func tightest(all map[string]GraphCapacity) GraphCapacity {
 	var out GraphCapacity

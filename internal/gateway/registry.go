@@ -12,6 +12,7 @@ import (
 
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/client-go/dynamic"
 	"k8s.io/client-go/informers"
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/rest"
@@ -39,6 +40,24 @@ func NewKubeClient(kubeconfig string) (kubernetes.Interface, error) {
 		return nil, fmt.Errorf("gateway: kubernetes config: %w", err)
 	}
 	return kubernetes.NewForConfig(rc)
+}
+
+// NewDynamicClient is NewKubeClient's dynamic client, for the custom
+// resources phoebe reads (the DynamoGraphDeployments' ready workers).
+func NewDynamicClient(kubeconfig string) (dynamic.Interface, error) {
+	var (
+		rc  *rest.Config
+		err error
+	)
+	if kubeconfig != "" {
+		rc, err = clientcmd.BuildConfigFromFlags("", kubeconfig)
+	} else {
+		rc, err = rest.InClusterConfig()
+	}
+	if err != nil {
+		return nil, fmt.Errorf("gateway: kubernetes config: %w", err)
+	}
+	return dynamic.NewForConfig(rc)
 }
 
 // THE REGISTRY CONTRACT (contract of record, coordinated with the Atlas side
@@ -70,9 +89,12 @@ func NewKubeClient(kubeconfig string) (kubernetes.Interface, error) {
 //	           admission_max_active_requests,
 //	           admission_max_reserved_kv_tokens,
 //	           admission_max_prefill_tokens
-//	                             — OPTIONAL graph-level admission capacity
-//	                               (B8): non-negative integers, empty or
-//	                               absent = no limit; see GraphCapacity
+//	                             — OPTIONAL PER-WORKER admission capacity
+//	                               (B8; per worker since Q22): non-negative
+//	                               integers, empty or absent = no limit.
+//	                               Phoebe enforces each graph at the value
+//	                               times (ready workers + 1); see
+//	                               GraphCapacity and ReadyWorkers
 //
 // Atlas guarantees (org_id, served_model_name) uniqueness across live
 // registrations; the resolver still tolerates duplicates deterministically
@@ -128,6 +150,17 @@ type RegistryResolver struct {
 	// delete withdraws exactly that entry's contribution.
 	byGraph map[string]map[string]GraphCapacity
 	cmGraph map[string]string
+	// workers, when set, holds each graph's ready workers: Atlas publishes
+	// PER-WORKER limits and GraphCapacity multiplies them by (ready workers +
+	// GraphLimitHeadroomWorkers) (Q4(b), option B).
+	workers readyWorkerSource
+}
+
+// WithReadyWorkers makes GraphCapacity scale the published per-worker limits
+// by each graph's ready workers plus GraphLimitHeadroomWorkers.
+func (r *RegistryResolver) WithReadyWorkers(w readyWorkerSource) *RegistryResolver {
+	r.workers = w
+	return r
 }
 
 // compile-time: the registry implements the same seam the PG resolver does.
@@ -309,9 +342,10 @@ func (r *RegistryResolver) dropClaimLocked(cmName string, key cacheKey) {
 	}
 }
 
-// GraphCapacity returns the admission capacity Atlas publishes for graph, the
-// tightest value per limit across the graph's registry entries that win their
-// (org, served name) key. A ConfigMap that loses a duplicate claim (see
+// GraphCapacity returns the admission capacity phoebe enforces for graph: the
+// tightest per-worker value per limit across the graph's registry entries
+// that win their (org, served name) key, times the graph's ready workers plus
+// GraphLimitHeadroomWorkers when a ReadyWorkers source is attached (Q22). A ConfigMap that loses a duplicate claim (see
 // resolveClaimants) does not serve traffic, so its capacity values do not
 // count either: a stale duplicate must not cap the graph for as long as it
 // lives. Before the first sync, or for a graph with nothing published, it
@@ -327,7 +361,11 @@ func (r *RegistryResolver) GraphCapacity(graph string) GraphCapacity {
 			winners[cmName] = c
 		}
 	}
-	return tightest(winners)
+	capacity := tightest(winners)
+	if r.workers == nil {
+		return capacity
+	}
+	return capacity.Scaled(r.workers.Ready(graph) + GraphLimitHeadroomWorkers)
 }
 
 // winsClaimLocked reports whether cmName is the claimant resolveClaimants
