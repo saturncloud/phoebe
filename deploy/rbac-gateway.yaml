@@ -1,4 +1,5 @@
-# RBAC for phoebe's gateway registry resolver (internal/gateway/registry.go).
+# RBAC for phoebe's gateway registry resolver (internal/gateway/registry.go)
+# and ready-worker informer (internal/gateway/workers.go).
 #
 # DELIVERABLE, NOT AUTO-APPLIED: the durable home for these objects is the
 # saturn-k8s chart (rendered alongside phoebe's Deployment/ServiceAccount);
@@ -6,14 +7,35 @@
 # Apply manually only for dev clusters:
 #   kubectl -n <workload-namespace> apply -f deploy/rbac-gateway.yaml
 #
-# The resolver watches the served-model registry ConfigMaps Atlas renders
-# (label saturncloud.io/tf-served-model: "true", names tf-model-<model_id>)
-# in the workload namespace, so phoebe's ServiceAccount needs get/list/watch
-# on configmaps THERE and nothing else — no writes, no other namespaces.
+# Phoebe reads two things in the workload namespace:
+#   1. The resolver (registry.go) watches the served-model registry ConfigMaps
+#      Atlas renders (label saturncloud.io/tf-served-model: "true", names
+#      tf-model-<model_id>).
+#   2. The ready-worker informer (workers.go, NewReadyWorkers) watches the
+#      Atlas-managed DynamoGraphDeployments (label
+#      saturncloud.io/managed-by=Atlas) and reads
+#      status.components.Worker/VllmWorker.readyReplicas, so phoebe can scale
+#      each graph's per-worker admission limits by (ready workers + 1).
+#      Decision D54, approved by Hugo 2026-10-14.
+# So phoebe's ServiceAccount needs get/list/watch on configmaps and
+# nvidia.com dynamographdeployments THERE and nothing else — no writes, no
+# status subresources, no other namespaces.
 #
-# NOTE on scope: k8s RBAC cannot filter by LABEL, so this grant is read access
-# to ALL ConfigMaps in the workload namespace, not only the registry ones (the
-# label selection happens client-side in the informer's list/watch options).
+# Without the dynamographdeployments grant the informer's list is refused
+# with 403 and never syncs. Phoebe then only logs a watch error, and every
+# graph is held to one worker's worth of admission however many workers are
+# ready. Nothing fails at startup, so check this grant when a scaled-out
+# graph returns capacity 503s.
+#
+# This file mirrors the saturn-k8s chart template
+# charts/phoebe/templates/rbac-gateway.yaml (commit 609a4635 on
+# ctask/gateway-admission-q22-rbac-20261014, saturn-k8s #1097); keep the
+# Role and RoleBinding names and rules identical in both.
+#
+# NOTE on scope: k8s RBAC cannot filter by LABEL, so these grants are read
+# access to ALL ConfigMaps and ALL DynamoGraphDeployments in the workload
+# namespace, not only the registry or Atlas-managed ones (the label selection
+# happens client-side in each informer's list/watch options).
 # That is why it is a namespace-scoped Role in the dedicated workload
 # namespace — never a ClusterRole: nothing secret should live in ConfigMaps
 # there (k8s ConfigMaps are not a secret store anyway; Secrets are separate
@@ -32,6 +54,9 @@ metadata:
 rules:
   - apiGroups: [""]
     resources: ["configmaps"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: ["nvidia.com"]
+    resources: ["dynamographdeployments"]
     verbs: ["get", "list", "watch"]
 ---
 apiVersion: rbac.authorization.k8s.io/v1
