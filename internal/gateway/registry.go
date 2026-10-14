@@ -92,11 +92,14 @@ func NewDynamicClient(kubeconfig string) (dynamic.Interface, error) {
 //	           admission_max_active_requests,
 //	           admission_max_reserved_kv_tokens,
 //	           admission_max_prefill_tokens
-//	                             — OPTIONAL PER-WORKER admission capacity
-//	                               (B8; per worker since Q22): non-negative
-//	                               integers, empty or absent = no limit.
-//	                               Phoebe enforces each graph at the value
-//	                               times (ready workers + 1); see
+//	                             — OPTIONAL admission capacity (B8):
+//	                               non-negative integers, empty or absent =
+//	                               no limit. With admission_capacity_unit:
+//	                               per_worker (Q22) they are per-worker and
+//	                               phoebe enforces each graph at the value
+//	                               times (ready workers + 1); without the
+//	                               marker they are graph-level and enforced
+//	                               as published; see
 //	                               GraphCapacity and ReadyWorkers. The
 //	                               ready workers are read only from the
 //	                               DynamoGraphDeployments labelled
@@ -363,26 +366,38 @@ func (r *RegistryResolver) GraphCapacity(graph string) GraphCapacity {
 	defer r.mu.RUnlock()
 	caps := r.byGraph[graph]
 	winners := make(map[string]GraphCapacity, len(caps))
+	multiplier := int64(-1) // computed on the first per-worker entry
 	for cmName, c := range caps {
-		if r.winsClaimLocked(cmName) {
-			winners[cmName] = c
+		if !r.winsClaimLocked(cmName) {
+			continue
 		}
+		if c.PerWorker {
+			if multiplier < 0 {
+				multiplier = r.graphMultiplierLocked(graph)
+			}
+			c = c.Scaled(multiplier)
+		}
+		winners[cmName] = c
 	}
-	capacity := tightest(winners)
+	return tightest(winners)
+}
+
+// graphMultiplierLocked is what a per-worker entry of graph is multiplied by:
+// its ready workers plus GraphLimitHeadroomWorkers, or one worker's worth
+// with no ready-worker source. The sum saturates at the int64 maximum
+// instead of wrapping, so a huge ready count cannot turn negative.
+func (r *RegistryResolver) graphMultiplierLocked(graph string) int64 {
 	if r.workers == nil {
-		return capacity
+		return GraphLimitHeadroomWorkers
 	}
-	// The multiplier saturates at the int64 maximum instead of wrapping, so a
-	// huge ready count cannot turn into a negative (unscaled) multiplier.
 	n := r.workers.Ready(graph)
 	if n < 0 {
 		n = 0
 	}
-	m := int64(math.MaxInt64)
-	if n <= math.MaxInt64-GraphLimitHeadroomWorkers {
-		m = n + GraphLimitHeadroomWorkers
+	if n > math.MaxInt64-GraphLimitHeadroomWorkers {
+		return math.MaxInt64
 	}
-	return capacity.Scaled(m)
+	return n + GraphLimitHeadroomWorkers
 }
 
 // winsClaimLocked reports whether cmName is the claimant resolveClaimants

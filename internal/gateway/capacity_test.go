@@ -104,10 +104,10 @@ func TestRegistry_GraphCapacityLifecycle(t *testing.T) {
 // resolveClaimants serves (lowest resource_id) publishes. Deleting the winner
 // promotes the survivor's capacity along with its resolution.
 func TestRegistry_GraphCapacityOnlyFromWinningClaimant(t *testing.T) {
-	winner := registryCM("tf-model-winner", map[string]string{
+	winner := registryCM("tf-model-winner", map[string]string{capacityKeyUnit: capacityUnitPerWorker,
 		"resource_id": "tfm-aaa", "admission_max_active_requests": "10", "admission_max_prefill_tokens": "4096",
 	})
-	stale := registryCM("tf-model-stale", map[string]string{
+	stale := registryCM("tf-model-stale", map[string]string{capacityKeyUnit: capacityUnitPerWorker,
 		"resource_id": "tfm-bbb", "admission_max_active_requests": "2", "admission_max_prefill_tokens": "512",
 	})
 	r, client, _ := startedRegistry(t, winner, stale)
@@ -148,7 +148,12 @@ func TestGraphCapacityLimitsCopiesEveryField(t *testing.T) {
 	var c GraphCapacity
 	cv := reflect.ValueOf(&c).Elem()
 	want := map[string]*int64{}
+	limitFields := 0
 	for i := 0; i < cv.NumField(); i++ {
+		if cv.Type().Field(i).Type != reflect.TypeOf((*int64)(nil)) {
+			continue // PerWorker is a marker, not a limit
+		}
+		limitFields++
 		p := new(int64)
 		*p = int64(i + 1)
 		cv.Field(i).Set(reflect.ValueOf(p))
@@ -171,8 +176,8 @@ func TestGraphCapacityLimitsCopiesEveryField(t *testing.T) {
 			set++
 		}
 	}
-	if set != cv.NumField() {
-		t.Fatalf("LimitValues(Limits()) has %d values set, want %d (one per GraphCapacity field)", set, cv.NumField())
+	if set != limitFields {
+		t.Fatalf("LimitValues(Limits()) has %d values set, want %d (one per GraphCapacity limit field)", set, limitFields)
 	}
 }
 

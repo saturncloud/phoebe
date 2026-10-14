@@ -16,6 +16,13 @@ type GraphCapacity struct {
 	MaxActiveRequests   *int64
 	MaxReservedKVTokens *int64
 	MaxPrefillTokens    *int64
+	// PerWorker is true when the entry marks its values as per-worker
+	// (capacityKeyUnit = capacityUnitPerWorker, Q22): the registry then
+	// enforces them times the graph's ready workers plus one. An entry
+	// without the marker carries graph-level values (what Atlas published
+	// before Q22), enforced as they are. Not a limit: tightest and Scaled
+	// leave it false on their results.
+	PerWorker bool
 }
 
 // The registry data keys carrying GraphCapacity. They are PER-WORKER values
@@ -27,6 +34,15 @@ const (
 	capacityKeyMaxActiveRequests   = "admission_max_active_requests"
 	capacityKeyMaxReservedKVTokens = "admission_max_reserved_kv_tokens"
 	capacityKeyMaxPrefillTokens    = "admission_max_prefill_tokens"
+
+	// capacityKeyUnit says what the values above are. Only
+	// capacityUnitPerWorker is defined; absent means graph-level values. The
+	// marker makes either rollout order safe: a phoebe that predates it
+	// ignores the key and enforces a per-worker value as the whole graph's
+	// limit (tighter, never looser), and this phoebe enforces an unmarked
+	// entry from an older Atlas as it was published.
+	capacityKeyUnit       = "admission_capacity_unit"
+	capacityUnitPerWorker = "per_worker"
 )
 
 // capacityFields is the one list of GraphCapacity fields. Each entry names
@@ -90,6 +106,16 @@ func parseGraphCapacity(d map[string]string) (c GraphCapacity, problems []string
 			continue
 		}
 		*f.get(&c) = &v
+	}
+	switch unit := strings.TrimSpace(d[capacityKeyUnit]); unit {
+	case "":
+	case capacityUnitPerWorker:
+		c.PerWorker = true
+	default:
+		// An unknown unit is an Atlas producer bug. Enforcing the values as
+		// they are is the tighter reading of a per-worker value and the
+		// published reading of a graph-level one.
+		problems = append(problems, capacityKeyUnit+"="+strconv.Quote(unit))
 	}
 	return c, problems
 }

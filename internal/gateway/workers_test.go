@@ -96,7 +96,7 @@ func (f fixedWorkers) Ready(graph string) int64 { return f[graph] }
 // stub does not know reads 0 workers). The real-informer fail-closed case is
 // TestRegistryGraphCapacityFailsClosedWhenWorkersUnreadable.
 func TestRegistryGraphCapacityScalesStubReadyWorkersPlusOne(t *testing.T) {
-	r, _, _ := startedRegistry(t, registryCM("tf-model-a", map[string]string{
+	r, _, _ := startedRegistry(t, registryCM("tf-model-a", map[string]string{capacityKeyUnit: capacityUnitPerWorker,
 		"admission_max_active_requests": "16",
 	}))
 	deadline := time.Now().Add(5 * time.Second)
@@ -130,7 +130,7 @@ func TestRegistryGraphCapacityScaledKeepsRegistryInvariants(t *testing.T) {
 	}{
 		{
 			name: "explicit zero cap stays zero (R-K)",
-			cms: []*corev1.ConfigMap{registryCM("tf-model-a", map[string]string{
+			cms: []*corev1.ConfigMap{registryCM("tf-model-a", map[string]string{capacityKeyUnit: capacityUnitPerWorker,
 				"admission_max_active_requests": "0",
 			})},
 			workers: 5,
@@ -142,7 +142,7 @@ func TestRegistryGraphCapacityScaledKeepsRegistryInvariants(t *testing.T) {
 		},
 		{
 			name: "absent key stays no limit",
-			cms: []*corev1.ConfigMap{registryCM("tf-model-a", map[string]string{
+			cms: []*corev1.ConfigMap{registryCM("tf-model-a", map[string]string{capacityKeyUnit: capacityUnitPerWorker,
 				"admission_max_prefill_tokens": "4096",
 			})},
 			workers: 5,
@@ -158,8 +158,8 @@ func TestRegistryGraphCapacityScaledKeepsRegistryInvariants(t *testing.T) {
 		{
 			name: "only the winning duplicate claimant is scaled",
 			cms: []*corev1.ConfigMap{
-				registryCM("tf-model-winner", map[string]string{"resource_id": "tfm-aaa", "admission_max_active_requests": "10"}),
-				registryCM("tf-model-stale", map[string]string{"resource_id": "tfm-bbb", "admission_max_active_requests": "2"}),
+				registryCM("tf-model-winner", map[string]string{capacityKeyUnit: capacityUnitPerWorker, "resource_id": "tfm-aaa", "admission_max_active_requests": "10"}),
+				registryCM("tf-model-stale", map[string]string{capacityKeyUnit: capacityUnitPerWorker, "resource_id": "tfm-bbb", "admission_max_active_requests": "2"}),
 			},
 			workers: 2,
 			ready:   func(c GraphCapacity) bool { return val(c.MaxActiveRequests) == 30 },
@@ -171,7 +171,7 @@ func TestRegistryGraphCapacityScaledKeepsRegistryInvariants(t *testing.T) {
 		},
 		{
 			name: "a huge ready count saturates instead of wrapping",
-			cms: []*corev1.ConfigMap{registryCM("tf-model-a", map[string]string{
+			cms: []*corev1.ConfigMap{registryCM("tf-model-a", map[string]string{capacityKeyUnit: capacityUnitPerWorker,
 				"admission_max_active_requests": "10", "admission_max_reserved_kv_tokens": "0",
 			})},
 			workers: math.MaxInt64,
@@ -204,7 +204,7 @@ func TestRegistryGraphCapacityScaledKeepsRegistryInvariants(t *testing.T) {
 // Scaling keeps an explicit zero cap at zero and an absent key at no limit
 // while multiplying the set limits.
 func TestRegistryGraphCapacityScaledKeepsZeroAndNil(t *testing.T) {
-	r, _, _ := startedRegistry(t, registryCM("tf-model-a", map[string]string{
+	r, _, _ := startedRegistry(t, registryCM("tf-model-a", map[string]string{capacityKeyUnit: capacityUnitPerWorker,
 		"admission_max_active_requests": "0", "admission_max_prefill_tokens": "4096",
 	}))
 	waitCapacity(t, r, "graph-llama31", func(c GraphCapacity) bool { return c.Any() })
@@ -407,5 +407,54 @@ func TestReadyWorkersIgnoresUnmanagedGraphs(t *testing.T) {
 	waitFor("graph-b", 2)
 	if got := w.Ready("graph-unmanaged"); got != 0 {
 		t.Fatalf("Ready(graph-unmanaged) = %d, want 0 (not Atlas-managed)", got)
+	}
+}
+
+// The unit marker makes either rollout order safe (Q22): an entry without
+// admission_capacity_unit (an Atlas older than per-worker publication) is
+// enforced as published, never multiplied; an unknown unit is reported and
+// enforced as published too; and on a graph whose entries disagree during a
+// rollout, each entry is read in its own unit before the tightest wins.
+func TestRegistryGraphCapacityScalesOnlyPerWorkerEntries(t *testing.T) {
+	val := func(p *int64) int64 {
+		if p == nil {
+			return -1
+		}
+		return *p
+	}
+	r, client, _ := startedRegistry(t, registryCM("tf-model-old", map[string]string{
+		"admission_max_active_requests": "40",
+	}))
+	r.WithReadyWorkers(fixedWorkers{"graph-llama31": 3})
+	c := waitCapacity(t, r, "graph-llama31", func(c GraphCapacity) bool { return c.Any() })
+	if val(c.MaxActiveRequests) != 40 {
+		t.Fatalf("an unmarked (graph-level) entry must be enforced as published, got %d", val(c.MaxActiveRequests))
+	}
+
+	// A per-worker entry from a newer Atlas on the same graph: 8 x (3 + 1) =
+	// 32 is tighter than the old entry's 40, so it wins.
+	if _, err := client.CoreV1().ConfigMaps(registryNS).Create(context.Background(), registryCM("tf-model-new", map[string]string{
+		"org_id": "org-b", capacityKeyUnit: capacityUnitPerWorker, "admission_max_active_requests": "8",
+	}), metav1.CreateOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	c = waitCapacity(t, r, "graph-llama31", func(c GraphCapacity) bool { return val(c.MaxActiveRequests) == 32 })
+	if val(c.MaxActiveRequests) != 32 {
+		t.Fatalf("mixed units: want min(40, 8 x 4) = 32, got %d", val(c.MaxActiveRequests))
+	}
+}
+
+func TestParseGraphCapacityUnit(t *testing.T) {
+	c, problems := parseGraphCapacity(map[string]string{"admission_max_active_requests": "5", capacityKeyUnit: " per_worker "})
+	if !c.PerWorker || len(problems) != 0 {
+		t.Fatalf("per_worker marker: PerWorker=%v problems=%v", c.PerWorker, problems)
+	}
+	c, problems = parseGraphCapacity(map[string]string{"admission_max_active_requests": "5"})
+	if c.PerWorker || len(problems) != 0 {
+		t.Fatalf("no marker means graph-level: PerWorker=%v problems=%v", c.PerWorker, problems)
+	}
+	c, problems = parseGraphCapacity(map[string]string{"admission_max_active_requests": "5", capacityKeyUnit: "per_gpu"})
+	if c.PerWorker || len(problems) != 1 {
+		t.Fatalf("unknown unit: enforced as published and reported, got PerWorker=%v problems=%v", c.PerWorker, problems)
 	}
 }
