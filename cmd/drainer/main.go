@@ -9,13 +9,15 @@
 //   - the DATABASE_URL environment variable (Atlas convention) for Postgres.
 //
 // The drainer does NOT run migrations: it assumes the billing_event table
-// already exists in the shared Atlas Postgres (see migrations/README.md). If
-// the table is missing, the first upsert fails with a clear error.
+// already exists in phoebe's Postgres (see migrations/README.md). It waits at
+// startup for the schema version it was built with, and exits non-zero if that
+// version does not arrive within schemaWaitTimeout.
 package main
 
 import (
 	"context"
 	"flag"
+	"fmt"
 	"os"
 	"os/signal"
 	"syscall"
@@ -47,6 +49,11 @@ type drainSettings struct {
 
 	ClaimMinIdle  string `yaml:"claimMinIdle"`
 	ClaimInterval string `yaml:"claimInterval"`
+
+	// SchemaWaitTimeout bounds the startup wait for the database schema; ""
+	// or "0" uses the default. It cannot be disabled: an unbounded wait would
+	// let the emitter's stream cap trim un-drained events silently.
+	SchemaWaitTimeout string `yaml:"schemaWaitTimeout"`
 
 	MaxOpenConns    int    `yaml:"maxOpenConns"`
 	MaxIdleConns    int    `yaml:"maxIdleConns"`
@@ -153,6 +160,18 @@ func loadConfig(path string) (drain.Config, bool, error) {
 			return cfg, false, errInvalidDuration(d.key, err)
 		}
 		*d.dst = v
+	}
+	if s.SchemaWaitTimeout != "" {
+		v, err := time.ParseDuration(s.SchemaWaitTimeout)
+		if err != nil {
+			return cfg, false, errInvalidDuration("schemaWaitTimeout", err)
+		}
+		if v < 0 {
+			return cfg, false, errInvalidDuration("schemaWaitTimeout", fmt.Errorf("must not be negative, got %s", v))
+		}
+		if v > 0 {
+			cfg.SchemaWaitTimeout = v
+		}
 	}
 
 	// DATABASE_URL (Atlas convention) is the authoritative Postgres source; it

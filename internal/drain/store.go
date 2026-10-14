@@ -33,19 +33,30 @@ type Store interface {
 	Upsert(ctx context.Context, events []metering.Event) error
 	// Ping verifies connectivity (pool_pre_ping equivalent on startup).
 	Ping(ctx context.Context) error
+	// SchemaVersion reports the database schema version (golang-migrate) and
+	// whether it is dirty. The drainer's startup gate reads it; every store
+	// must answer, so the gate can never be skipped by a store that cannot.
+	SchemaVersion(ctx context.Context) (version uint, dirty bool, err error)
 	Close() error
 }
 
+var _ Store = (*PostgresStore)(nil)
+
 // SchemaVersion reads golang-migrate's schema_migrations row: the version the
-// database is at and whether the last migration left it dirty. A missing table
-// (no migration ever applied) reads as version 0, not dirty.
+// database is at and whether the last migration left it dirty. Only "no
+// migration ever applied" (the table is missing, or holds no row) reads as
+// version 0, not dirty. Any other error, an unexpected table shape (42703)
+// included, is returned so the drainer's wait log shows the real cause. The
+// query has its own deadline so a hung connection becomes an error.
 func (s *PostgresStore) SchemaVersion(ctx context.Context) (uint, bool, error) {
+	ctx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
 	var (
 		version int64
 		dirty   bool
 	)
 	err := s.db.QueryRowContext(ctx, `SELECT version, dirty FROM schema_migrations LIMIT 1`).Scan(&version, &dirty)
-	if errors.Is(err, sql.ErrNoRows) || isSchemaNotReady(err) {
+	if errors.Is(err, sql.ErrNoRows) || isUndefinedTable(err) {
 		return 0, false, nil
 	}
 	if err != nil {
@@ -55,6 +66,13 @@ func (s *PostgresStore) SchemaVersion(ctx context.Context) (uint, bool, error) {
 		version = 0
 	}
 	return uint(version), dirty, nil
+}
+
+// isUndefinedTable reports Postgres undefined_table (42P01): schema_migrations
+// does not exist yet because no migration has run.
+func isUndefinedTable(err error) bool {
+	var pgErr *pgconn.PgError
+	return errors.As(err, &pgErr) && pgErr.Code == "42P01"
 }
 
 // isSchemaNotReady reports a Postgres error that means the schema is behind

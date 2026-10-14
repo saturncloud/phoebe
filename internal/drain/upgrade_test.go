@@ -1,32 +1,47 @@
 package drain
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
+	"io"
+	"log"
+	"os"
+	"strconv"
+	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/jackc/pgx/v5/pgconn"
+	"github.com/redis/go-redis/v9"
 
+	"github.com/saturncloud/phoebe/internal/logging"
 	"github.com/saturncloud/phoebe/internal/metering"
 	"github.com/saturncloud/phoebe/migrations"
 )
 
 // schemaGapStore fails every Upsert with Postgres's undefined_column until
 // migrated is set, like a new drainer writing a column the old table lacks,
-// and reports a schema version for the startup gate.
+// and reports a schema version for the startup gate. attempts counts every
+// Upsert call, including the ones that fail, so a test can prove the gate
+// held without relying on fakeStore's counter (which a failed call never
+// reaches).
 type schemaGapStore struct {
 	*fakeStore
 	mu       sync.Mutex
 	migrated bool
 	version  uint
 	dirty    bool
+	err      error
+	attempts int
 }
 
 func (s *schemaGapStore) Upsert(ctx context.Context, events []metering.Event) error {
 	s.mu.Lock()
+	s.attempts++
 	migrated := s.migrated
 	s.mu.Unlock()
 	if !migrated {
@@ -38,13 +53,56 @@ func (s *schemaGapStore) Upsert(ctx context.Context, events []metering.Event) er
 func (s *schemaGapStore) SchemaVersion(context.Context) (uint, bool, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	return s.version, s.dirty, nil
+	return s.version, s.dirty, s.err
 }
 
 func (s *schemaGapStore) migrate(version uint) {
 	s.mu.Lock()
 	s.migrated, s.version = true, version
 	s.mu.Unlock()
+}
+
+func (s *schemaGapStore) attemptCount() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.attempts
+}
+
+// lockedBuffer is a goroutine-safe log sink.
+type lockedBuffer struct {
+	mu  sync.Mutex
+	buf bytes.Buffer
+}
+
+func (b *lockedBuffer) Write(p []byte) (int, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.Write(p)
+}
+
+func (b *lockedBuffer) String() string {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.String()
+}
+
+// capturingLogger returns a logger whose WARN and INFO lines go to the
+// returned buffer.
+func capturingLogger() (*logging.Logger, *lockedBuffer) {
+	buf := &lockedBuffer{}
+	return &logging.Logger{
+		Debug: log.New(io.Discard, "", 0),
+		Info:  log.New(buf, "INFO: ", 0),
+		Warn:  log.New(buf, "WARN: ", 0),
+		Error: log.New(buf, "ERROR: ", 0),
+	}, buf
+}
+
+// newGatedDrainer builds a drainer whose schema probe polls quickly.
+func newGatedDrainer(cfg Config, logger *logging.Logger, rdb redis.Cmdable, store Store) *Drainer {
+	d := New(cfg, logger, rdb, store)
+	d.schemaPoll = 10 * time.Millisecond
+	return d
 }
 
 // The severity 2 finding (uk2, phoebe #69): a new drainer that runs before
@@ -82,26 +140,33 @@ func TestDrain_SchemaGapRetriesInsteadOfPoisoning(t *testing.T) {
 }
 
 // The drainer consumes nothing until the database is at the schema version
-// it writes, so an upgrade never writes new columns into the old table.
+// it writes, so an upgrade never writes new columns into an old table. The
+// store accepts writes from the start (migrated) while reporting version 8, so
+// a broken gate would store a row here, and the consumer group must not even
+// exist yet (the gate runs before ensureGroup), so nothing was read.
 func TestDrain_WaitsForRequiredSchemaVersion(t *testing.T) {
 	_, rdb := startMiniredis(t)
 	cfg := testConfig(rdb.Options().Addr)
 	cfg.RequiredSchemaVersion = 9
-	store := &schemaGapStore{fakeStore: newFakeStore(), version: 8}
+	store := &schemaGapStore{fakeStore: newFakeStore(), version: 8, migrated: true}
 	xaddEvent(t, rdb, cfg.StreamName, sampleEvent("e1"))
 
-	d := New(cfg, testLogger(), rdb, store)
+	d := newGatedDrainer(cfg, testLogger(), rdb, store)
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	done := make(chan error, 1)
 	go func() { done <- d.Run(ctx) }()
 
 	time.Sleep(300 * time.Millisecond)
-	store.mu.Lock()
-	calls := store.calls
-	store.mu.Unlock()
-	if calls != 0 || store.rowCount() != 0 {
-		t.Fatalf("calls=%d rows=%d while the schema is behind, want nothing written", calls, store.rowCount())
+	if attempts := store.attemptCount(); attempts != 0 || store.rowCount() != 0 {
+		t.Fatalf("upsert attempts=%d rows=%d while the schema is behind, want no write attempted", attempts, store.rowCount())
+	}
+	groups, err := rdb.XInfoGroups(context.Background(), cfg.StreamName).Result()
+	if err != nil {
+		t.Fatalf("xinfo groups: %v", err)
+	}
+	if len(groups) != 0 {
+		t.Fatalf("consumer groups = %v while the schema is behind, want none (nothing read from the stream)", groups)
 	}
 
 	store.migrate(9)
@@ -118,24 +183,174 @@ func TestDrain_WaitsForRequiredSchemaVersion(t *testing.T) {
 	}
 }
 
-// A dirty schema (a failed migration) is not ready either.
-func TestDrain_DirtySchemaIsNotReady(t *testing.T) {
+func TestSchemaReady(t *testing.T) {
+	for _, c := range []struct {
+		version uint
+		dirty   bool
+		want    bool
+	}{
+		{8, false, false}, // behind
+		{9, false, true},  // at the required version
+		{9, true, false},  // the migration this binary needs is half-applied
+		{10, true, true},  // a LATER migration failed; 9 is intact
+		{10, false, true}, // ahead
+		{8, true, false},  // behind and dirty
+	} {
+		if got := schemaReady(c.version, c.dirty, 9); got != c.want {
+			t.Errorf("schemaReady(%d, dirty=%v, need 9) = %v, want %v", c.version, c.dirty, got, c.want)
+		}
+	}
+}
+
+// A dirty row AT the required version means the migration this binary needs
+// is half-applied: the drainer must not write.
+func TestDrain_DirtyAtRequiredVersionWaits(t *testing.T) {
 	_, rdb := startMiniredis(t)
 	cfg := testConfig(rdb.Options().Addr)
 	cfg.RequiredSchemaVersion = 9
-	store := &schemaGapStore{fakeStore: newFakeStore(), version: 9, dirty: true}
-	d := New(cfg, testLogger(), rdb, store)
+	store := &schemaGapStore{fakeStore: newFakeStore(), version: 9, dirty: true, migrated: true}
+	xaddEvent(t, rdb, cfg.StreamName, sampleEvent("e1"))
+	d := newGatedDrainer(cfg, testLogger(), rdb, store)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 300*time.Millisecond)
+	defer cancel()
+	if err := d.Run(ctx); err != nil {
+		t.Fatalf("Run = %v, want a clean stop at the context deadline", err)
+	}
+	if attempts := store.attemptCount(); attempts != 0 || store.rowCount() != 0 {
+		t.Fatalf("upsert attempts=%d rows=%d on a dirty schema at the required version, want nothing written", attempts, store.rowCount())
+	}
+}
+
+// A failed LATER migration (golang-migrate leaves the version it attempted
+// dirty) does not stop the running release's drainer: every version it needs
+// is fully applied.
+func TestDrain_DirtyAboveRequiredVersionConsumes(t *testing.T) {
+	_, rdb := startMiniredis(t)
+	cfg := testConfig(rdb.Options().Addr)
+	cfg.RequiredSchemaVersion = 9
+	store := &schemaGapStore{fakeStore: newFakeStore(), version: 10, dirty: true, migrated: true}
+	xaddEvent(t, rdb, cfg.StreamName, sampleEvent("e1"))
+	logger, logs := capturingLogger()
+	d := newGatedDrainer(cfg, logger, rdb, store)
+
+	runUntil(t, d, func() bool { return store.rowCount() == 1 }, 5*time.Second)
+	if !strings.Contains(logs.String(), "WARN: drainer: database schema at version 10 is dirty") {
+		t.Fatalf("want a WARN naming the dirty version 10, got logs:\n%s", logs.String())
+	}
+}
+
+// Behind-and-clean, and a probe error, both keep the gate closed: the
+// drainer fails closed until the context ends.
+func TestWaitForSchema_BehindSchemaKeepsWaiting(t *testing.T) {
+	cfg := DefaultConfig()
+	cfg.RequiredSchemaVersion = 9
+	store := &schemaGapStore{fakeStore: newFakeStore(), version: 8}
+	d := newGatedDrainer(cfg, testLogger(), nil, store)
 	ctx, cancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
 	defer cancel()
 	if err := d.waitForSchema(ctx); !errors.Is(err, context.DeadlineExceeded) {
-		t.Fatalf("waitForSchema = %v, want it still waiting on a dirty schema", err)
+		t.Fatalf("waitForSchema = %v, want it still waiting on version 8 (need 9)", err)
+	}
+}
+
+func TestDrain_SchemaVersionErrorIsNotReady(t *testing.T) {
+	cfg := DefaultConfig()
+	cfg.RequiredSchemaVersion = 9
+	store := &schemaGapStore{fakeStore: newFakeStore(), version: 9, err: errors.New("connection refused")}
+	d := newGatedDrainer(cfg, testLogger(), nil, store)
+	ctx, cancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
+	defer cancel()
+	if err := d.waitForSchema(ctx); !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("waitForSchema = %v, want it still waiting while SchemaVersion errors", err)
+	}
+}
+
+// hangingSchemaStore's SchemaVersion blocks until its context ends, like a
+// query stuck behind a lock or a stalled connection.
+type hangingSchemaStore struct {
+	*fakeStore
+	probes atomic.Int32
+}
+
+func (s *hangingSchemaStore) SchemaVersion(ctx context.Context) (uint, bool, error) {
+	s.probes.Add(1)
+	<-ctx.Done()
+	return 0, false, ctx.Err()
+}
+
+// Each probe has its own deadline, so a hung query becomes an error that the
+// wait loop logs and retries, rather than a silent stall with no log line.
+func TestWaitForSchema_HungProbeTimesOutAndIsLogged(t *testing.T) {
+	cfg := DefaultConfig()
+	cfg.RequiredSchemaVersion = 9
+	store := &hangingSchemaStore{fakeStore: newFakeStore()}
+	logger, logs := capturingLogger()
+	d := newGatedDrainer(cfg, logger, nil, store)
+	d.schemaProbeTimeout = 20 * time.Millisecond
+
+	ctx, cancel := context.WithTimeout(context.Background(), 300*time.Millisecond)
+	defer cancel()
+	if err := d.waitForSchema(ctx); !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("waitForSchema = %v, want it still waiting", err)
+	}
+	if n := store.probes.Load(); n < 2 {
+		t.Fatalf("probes = %d, want the hung probe abandoned and retried", n)
+	}
+	if !strings.Contains(logs.String(), "err=context deadline exceeded") {
+		t.Fatalf("want the probe timeout in the wait log, got:\n%s", logs.String())
+	}
+}
+
+// The wait is bounded: once SchemaWaitTimeout passes, Run returns an error
+// (main exits non-zero, the pod restarts visibly) instead of idling while the
+// emitter's stream cap trims un-drained events.
+func TestDrain_RunFailsWhenSchemaNeverArrives(t *testing.T) {
+	cfg := DefaultConfig()
+	cfg.RequiredSchemaVersion = 9
+	cfg.SchemaWaitTimeout = 10 * time.Minute
+	store := &schemaGapStore{fakeStore: newFakeStore(), version: 8}
+	d := newGatedDrainer(cfg, testLogger(), nil, store)
+	d.schemaPoll = time.Millisecond
+	var clock atomic.Int64
+	base := time.Unix(1_700_000_000, 0)
+	d.now = func() time.Time { return base.Add(time.Duration(clock.Add(int64(time.Minute)))) }
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	err := d.Run(ctx)
+	if err == nil || errors.Is(err, context.DeadlineExceeded) || errors.Is(err, context.Canceled) {
+		t.Fatalf("Run = %v, want a schema-timeout error", err)
+	}
+	if !strings.Contains(err.Error(), "not at version 9") {
+		t.Fatalf("Run error = %q, want it to name the missing schema version", err)
+	}
+}
+
+// Every Store reports a schema version (it is part of the interface), so the
+// gate can never be skipped silently by a store that cannot answer.
+func TestDrain_SchemaGateAppliesToEveryStore(t *testing.T) {
+	cfg := DefaultConfig()
+	cfg.RequiredSchemaVersion = 9
+	store := newFakeStore()
+	d := newGatedDrainer(cfg, testLogger(), nil, store)
+	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+	defer cancel()
+	if err := d.waitForSchema(ctx); !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("waitForSchema = %v with a plain store at version 0, want it waiting", err)
+	}
+	store.schemaVersion = 9
+	if err := d.waitForSchema(context.Background()); err != nil {
+		t.Fatalf("waitForSchema = %v with the store at version 9, want the gate open", err)
 	}
 }
 
 // QA's B22 drill: Valkey restarted without persistence, wiping the stream and
 // its consumer group; the drainer looped on NOGROUP until a pod restart. It
-// now recreates the group and keeps draining.
-func TestDrain_RecreatesMissingConsumerGroup(t *testing.T) {
+// now recreates the group from the start of the stream, so an event the
+// emitter wrote between the wipe and the recreate (the stream exists again
+// but has no group) is drained too, not skipped.
+func TestDrain_RecreatedGroupDrainsEventsEmittedDuringTheWipe(t *testing.T) {
 	mr, rdb := startMiniredis(t)
 	cfg := testConfig(rdb.Options().Addr)
 	store := newFakeStore()
@@ -145,22 +360,60 @@ func TestDrain_RecreatesMissingConsumerGroup(t *testing.T) {
 		t.Fatal(err)
 	}
 	mr.Del(cfg.StreamName) // the wipe: stream and group gone
+	xaddEvent(t, rdb, cfg.StreamName, sampleEvent("during-wipe"))
 
 	if _, err := d.readAndStore(ctx); err != nil {
 		t.Fatalf("readAndStore after the wipe = %v, want the group recreated", err)
 	}
-	xaddEvent(t, rdb, cfg.StreamName, sampleEvent("after-wipe"))
-	if _, err := d.readAndStore(ctx); err != nil {
-		t.Fatal(err)
+	xaddEvent(t, rdb, cfg.StreamName, sampleEvent("after-recreate"))
+	for i := 0; i < 3 && store.rowCount() < 2; i++ {
+		if _, err := d.readAndStore(ctx); err != nil {
+			t.Fatal(err)
+		}
 	}
-	if store.rowCount() != 1 {
-		t.Fatalf("rows=%d, want the event emitted after the wipe drained", store.rowCount())
+	store.mu.Lock()
+	_, during := store.rows["during-wipe"]
+	_, after := store.rows["after-recreate"]
+	store.mu.Unlock()
+	if !during || !after {
+		t.Fatalf("stored during-wipe=%v after-recreate=%v, want both: the event emitted between the wipe and the group being recreated, and the one emitted afterwards, must be drained", during, after)
 	}
 }
 
+// LatestVersion must equal the highest NNNN prefix among the .up.sql files on
+// disk, computed here independently, and every up file needs its down file.
 func TestLatestVersionMatchesEmbeddedMigrations(t *testing.T) {
-	if got := migrations.LatestVersion(); got < 9 {
-		t.Fatalf("LatestVersion() = %d, want the highest embedded NNNN prefix (>= 9)", got)
+	entries, err := os.ReadDir("../../migrations")
+	if err != nil {
+		t.Fatal(err)
+	}
+	names := map[string]bool{}
+	for _, e := range entries {
+		names[e.Name()] = true
+	}
+	var want uint
+	for name := range names {
+		base, ok := strings.CutSuffix(name, ".up.sql")
+		if !ok {
+			continue
+		}
+		prefix, _, _ := strings.Cut(base, "_")
+		v, err := strconv.ParseUint(prefix, 10, 32)
+		if err != nil {
+			t.Fatalf("migration %s has no numeric prefix", name)
+		}
+		if uint(v) > want {
+			want = uint(v)
+		}
+		if !names[base+".down.sql"] {
+			t.Errorf("migration %s has no matching %s.down.sql", name, base)
+		}
+	}
+	if want == 0 {
+		t.Fatal("no .up.sql migrations found")
+	}
+	if got := migrations.LatestVersion(); got != want {
+		t.Fatalf("LatestVersion() = %d, want %d (the highest .up.sql prefix on disk)", got, want)
 	}
 }
 

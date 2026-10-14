@@ -32,6 +32,11 @@ type Drainer struct {
 	// against a healthy store and were dropped (logged + ACK'd). A non-zero
 	// value means billing rows were lost to the log; see upsertRowAtATime.
 	poisoned atomic.Uint64
+
+	// schemaPoll is the pause between schema-version probes in waitForSchema,
+	// and schemaProbeTimeout bounds each probe. Tests shorten them.
+	schemaPoll         time.Duration
+	schemaProbeTimeout time.Duration
 }
 
 // Poisoned returns the number of events dropped as store-poison (failed their
@@ -48,6 +53,9 @@ func New(cfg Config, log *logging.Logger, rdb redis.Cmdable, store Store) *Drain
 		rdb:   rdb,
 		store: store,
 		now:   time.Now,
+
+		schemaPoll:         2 * time.Second,
+		schemaProbeTimeout: 10 * time.Second,
 	}
 }
 
@@ -73,40 +81,79 @@ func isNoGroup(err error) bool {
 	return err != nil && strings.HasPrefix(err.Error(), "NOGROUP")
 }
 
-// schemaVersioner is implemented by a store that can report the database
-// schema version (PostgresStore).
-type schemaVersioner interface {
-	SchemaVersion(ctx context.Context) (version uint, dirty bool, err error)
+// schemaReady reports whether a database at version (dirty or not) has every
+// migration a binary that needs required fully applied. golang-migrate records
+// the version it was ATTEMPTING and marks it dirty when that migration fails,
+// so a dirty version V means V-1 and everything below it are complete: a dirty
+// row blocks only at or below the required version. A failed LATER migration
+// (dirty V > required) leaves this binary's schema intact; migrations are
+// expand-only (migrations/README.md), so the drainer of the running release
+// keeps consuming.
+func schemaReady(version uint, dirty bool, required uint) bool {
+	if dirty {
+		return version > required
+	}
+	return version >= required
 }
 
-// waitForSchema blocks until the store's schema is at RequiredSchemaVersion or
-// newer and not dirty, logging while it waits. During an upgrade the new
-// drainer can start before the migrate job has run; writing then would put
-// new columns into the old table. Returns nil when the gate passes (or is
-// disabled), or the context error.
+// waitForSchema blocks until the store's schema has every migration this
+// binary needs (RequiredSchemaVersion; see schemaReady for the dirty rule),
+// logging while it waits. During an upgrade the new drainer can start before
+// the migrate job has run; writing then would put new columns into the old
+// table.
+//
+// Waiting is not free: the emitter caps the stream (MAXLEN ~1M entries,
+// internal/emit), so a long wait trims the oldest un-drained events. The wait
+// is therefore bounded by SchemaWaitTimeout, after which waitForSchema returns
+// an error so Run fails, the process exits non-zero and the pod restarts
+// visibly (CrashLoopBackOff) instead of idling silently. Each probe has its own
+// deadline (schemaProbeTimeout) so a hung query surfaces as an error in the
+// warning log rather than a silent stall.
+//
+// Returns nil when the gate passes (or RequiredSchemaVersion is 0), the
+// context error when ctx ends, or the timeout error.
 func (d *Drainer) waitForSchema(ctx context.Context) error {
-	sv, ok := d.store.(schemaVersioner)
-	if !ok || d.cfg.RequiredSchemaVersion == 0 {
+	required := d.cfg.RequiredSchemaVersion
+	if required == 0 {
 		return nil
 	}
+	start := d.now()
 	var lastLog time.Time
 	for {
-		version, dirty, err := sv.SchemaVersion(ctx)
-		if err == nil && !dirty && version >= d.cfg.RequiredSchemaVersion {
-			d.log.Info.Printf("drainer: database schema at version %d (need %d); consuming", version, d.cfg.RequiredSchemaVersion)
+		qctx, cancel := context.WithTimeout(ctx, d.schemaProbeTimeout)
+		version, dirty, err := d.store.SchemaVersion(qctx)
+		cancel()
+		if err == nil && schemaReady(version, dirty, required) {
+			if dirty {
+				d.log.Warn.Printf("drainer: database schema at version %d is dirty (a newer migration failed partway); version %d this binary needs is intact and migrations are expand-only, so consuming",
+					version, required)
+			} else {
+				d.log.Info.Printf("drainer: database schema at version %d (need %d); consuming", version, required)
+			}
 			return nil
 		}
-		if d.now().Sub(lastLog) >= 30*time.Second {
-			lastLog = d.now()
-			d.log.Warn.Printf("drainer: waiting for database schema version %d (at %d, dirty=%v, err=%v); events stay in the stream until the migration runs",
-				d.cfg.RequiredSchemaVersion, version, dirty, err)
+		if ctx.Err() != nil {
+			return ctx.Err()
 		}
-		d.sleep(ctx, 2*time.Second)
+		if waited := d.now().Sub(start); waited >= d.cfg.SchemaWaitTimeout {
+			return fmt.Errorf("drain: database schema not at version %d after %s (at %d, dirty=%v, err=%v); exiting so the pod restarts and alerts",
+				required, waited, version, dirty, err)
+		}
+		if lastLog.IsZero() || d.now().Sub(lastLog) >= 30*time.Second {
+			lastLog = d.now()
+			d.log.Warn.Printf("drainer: waiting for database schema version %d (at %d, dirty=%v, err=%v); events wait in the stream, which the emitter caps at about %d entries (MAXLEN ~), so the oldest unconsumed events are trimmed if the migration does not run; exiting after %s",
+				required, version, dirty, err, streamMaxLenHint, d.cfg.SchemaWaitTimeout)
+		}
+		d.sleep(ctx, d.schemaPoll)
 		if ctx.Err() != nil {
 			return ctx.Err()
 		}
 	}
 }
+
+// streamMaxLenHint is the emitter's default stream cap (emit.Config
+// StreamMaxLen), quoted in the schema-wait warning. It is a log hint only.
+const streamMaxLenHint = 1_000_000
 
 func isBusyGroup(err error) bool {
 	// go-redis surfaces the BUSYGROUP reply as a plain error string.

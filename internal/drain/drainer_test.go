@@ -26,6 +26,8 @@ type fakeStore struct {
 	failIDs  map[string]bool           // poison: any batch containing one of these request_ids fails
 	failAll  bool                      // outage: every Upsert fails
 	pingErr  error                     // outage: Ping result
+
+	schemaVersion uint // what SchemaVersion reports (never dirty)
 }
 
 func newFakeStore() *fakeStore {
@@ -64,6 +66,12 @@ func (f *fakeStore) Ping(context.Context) error {
 	return f.pingErr
 }
 func (f *fakeStore) Close() error { return nil }
+
+func (f *fakeStore) SchemaVersion(context.Context) (uint, bool, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.schemaVersion, false, nil
+}
 
 func (f *fakeStore) rowCount() int {
 	f.mu.Lock()
