@@ -62,11 +62,38 @@ func TestReadyWorkersOf(t *testing.T) {
 		{"case-insensitive VLLMWorker read when Worker is absent", map[string]any{"VLLMWorker": map[string]any{"readyReplicas": int64(5)}}, 5},
 		{"lowercase worker", map[string]any{"worker": map[string]any{"readyReplicas": int64(3)}}, 3},
 		{"uppercase WORKER", map[string]any{"WORKER": map[string]any{"readyReplicas": int64(3)}}, 3},
+		{"a non-map case variant is absent: the map entry decides", map[string]any{"Worker": "bad", "worker": map[string]any{"readyReplicas": int64(4)}}, 4},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			if got := readyWorkersOf(dgd("g", tc.components).Object); got != tc.want {
 				t.Fatalf("readyWorkersOf = %d, want %d", got, tc.want)
+			}
+		})
+	}
+}
+
+// When component names differ only by case, the smallest ready count wins,
+// whatever order the map is iterated in. Each case runs many times so a
+// random map order cannot hide an order-dependent result.
+func TestReadyWorkersOfCaseVariantsTakeTheLowestCount(t *testing.T) {
+	cases := []struct {
+		name       string
+		components map[string]any
+		want       int64
+	}{
+		{"Worker 4, worker 0", map[string]any{"Worker": map[string]any{"readyReplicas": int64(4)}, "worker": map[string]any{"readyReplicas": int64(0)}}, 0},
+		{"Worker 0, worker 6", map[string]any{"Worker": map[string]any{"readyReplicas": int64(0)}, "worker": map[string]any{"readyReplicas": int64(6)}}, 0},
+		{"Worker 3, worker 5", map[string]any{"Worker": map[string]any{"readyReplicas": int64(3)}, "worker": map[string]any{"readyReplicas": int64(5)}}, 3},
+		{"Worker 3, WORKER 5", map[string]any{"Worker": map[string]any{"readyReplicas": int64(3)}, "WORKER": map[string]any{"readyReplicas": int64(5)}}, 3},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			obj := dgd("g", tc.components).Object
+			for i := 0; i < 50; i++ {
+				if got := readyWorkersOf(obj); got != tc.want {
+					t.Fatalf("iteration %d: readyWorkersOf = %d, want %d", i, got, tc.want)
+				}
 			}
 		})
 	}
@@ -524,7 +551,7 @@ func TestReadyWorkersIgnoresUnmanagedGraphs(t *testing.T) {
 	}
 }
 
-// The unit marker makes either rollout order safe (Q22): an entry without
+// The unit marker means no rollout order over-admits (Q22, D57): an entry without
 // admission_capacity_unit (an Atlas older than per-worker publication) is
 // enforced as published, never multiplied; and on a graph whose entries
 // disagree during a rollout, each entry is read in its own unit before the

@@ -64,7 +64,8 @@ func TestParseGraphCapacity(t *testing.T) {
 	}
 }
 
-// Capacity is graph-level and stamped on each tenant entry of the graph: the
+// Capacity is stamped on each tenant entry of the graph (these entries carry
+// no admission_capacity_unit, so they are enforced as published): the
 // tightest published value wins, an update re-publishes, and deleting the
 // last entry withdraws it. A malformed value never de-registers the model.
 func TestRegistry_GraphCapacityLifecycle(t *testing.T) {

@@ -232,10 +232,15 @@ func (w *ReadyWorkers) remove(obj any) {
 // DGD has no Worker component. A Worker component whose readyReplicas is 0,
 // missing or malformed reads as zero rather than falling back, so a stale
 // VllmWorker status cannot raise the limit while the real workers are down.
-// A component entry that is not a map is treated as absent.
+// A component entry that is not a map is treated as absent. Names match
+// case-insensitively; when several entries differ only by case (for example
+// "Worker" and "worker"), the smallest ready count among them wins, so the
+// result never depends on map iteration order and fails tight.
 func readyWorkersOf(obj map[string]any) int64 {
 	components, _, _ := unstructured.NestedMap(obj, "status", "components")
 	for _, want := range sharedWorkerComponents {
+		found := false
+		var minReady int64
 		for name, raw := range components {
 			if strings.ToLower(name) != want {
 				continue
@@ -244,17 +249,24 @@ func readyWorkersOf(obj map[string]any) int64 {
 			if !ok {
 				continue
 			}
+			var n int64
 			switch v := c["readyReplicas"].(type) {
 			case int64:
 				if v > 0 {
-					return v
+					n = v
 				}
 			case float64:
 				if v > 0 && v < math.MaxInt64 {
-					return int64(v)
+					n = int64(v)
 				}
 			}
-			return 0
+			if !found || n < minReady {
+				minReady = n
+			}
+			found = true
+		}
+		if found {
+			return minReady
 		}
 	}
 	return 0

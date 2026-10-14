@@ -36,11 +36,15 @@ const (
 	capacityKeyMaxPrefillTokens    = "admission_max_prefill_tokens"
 
 	// capacityKeyUnit says what the values above are. Only
-	// capacityUnitPerWorker is defined; absent means graph-level values. The
-	// marker makes either rollout order safe: a phoebe that predates it
-	// ignores the key and enforces a per-worker value as the whole graph's
-	// limit (tighter, never looser), and this phoebe enforces an unmarked
-	// entry from an older Atlas as it was published.
+	// capacityUnitPerWorker is defined; absent means graph-level values. No
+	// rollout order over-admits. A phoebe that predates the marker ignores it
+	// and enforces a per-worker value as the whole graph's limit (tighter,
+	// never looser). This phoebe enforces an unmarked entry from an older
+	// Atlas as it was published. Atlas first is not free, though: deploying
+	// Atlas first, or an old Atlas replica republishing during a rolling
+	// deploy (which drops the marker), holds a shared graph to one worker's
+	// worth until both sides are new. Deploy order (D57): phoebe (with the
+	// saturn-k8s RBAC change) first, then Atlas.
 	capacityKeyUnit       = "admission_capacity_unit"
 	capacityUnitPerWorker = "per_worker"
 )
