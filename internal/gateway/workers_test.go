@@ -304,36 +304,25 @@ func TestReadyWorkersUnsyncedListFailureReadsZero(t *testing.T) {
 	}
 }
 
-// While the watch fails, a last-known count is trusted for at most
-// readyWorkersStaleAfter and then reads as 0; a later event clears the
-// failure and the counts are trusted again.
-func TestReadyWorkersLastKnownCountExpiresWhileWatchFails(t *testing.T) {
+// D56: after the first sync a failing watch keeps the last-known counts (the
+// registry informer's tradeoff), however long it fails; a later event
+// updates them as usual.
+func TestReadyWorkersKeepsLastKnownCountsWhileWatchFails(t *testing.T) {
 	w := NewReadyWorkers(dynamicfake.NewSimpleDynamicClientWithCustomListKinds(runtime.NewScheme(),
 		map[schema.GroupVersionResource]string{dynamoGraphResource: "DynamoGraphDeploymentList"}),
 		registryNS, logging.New(logging.ERROR))
 	w.log.Error.SetOutput(&syncBuffer{})
-	now := time.Unix(1_000_000, 0)
-	w.now = func() time.Time { return now }
 	w.synced.Store(true)
 	w.upsert(dgd("graph-a", map[string]any{"Worker": map[string]any{"readyReplicas": int64(8)}}))
 
-	w.watchFailed(errors.New("forbidden"))
-	now = now.Add(readyWorkersStaleAfter)
+	w.watchFailed(errors.New("connection refused"))
+	w.watchFailed(errors.New("connection refused again"))
 	if got := w.Ready("graph-a"); got != 8 {
-		t.Fatalf("within the bound Ready = %d, want the last-known 8", got)
+		t.Fatalf("while the watch fails Ready = %d, want the last-known 8", got)
 	}
-	w.watchFailed(errors.New("forbidden again")) // must not restart the clock
-	now = now.Add(time.Second)
-	if got := w.Ready("graph-a"); got != 0 {
-		t.Fatalf("past the bound Ready = %d, want 0 (one worker's worth)", got)
-	}
-
 	w.upsert(dgd("graph-a", map[string]any{"Worker": map[string]any{"readyReplicas": int64(2)}}))
 	if got := w.Ready("graph-a"); got != 2 {
-		t.Fatalf("after a recovered event Ready = %d, want 2", got)
-	}
-	if w.failingSince.Load() != 0 {
-		t.Fatal("an event must clear the watch failure")
+		t.Fatalf("after a later event Ready = %d, want 2", got)
 	}
 }
 

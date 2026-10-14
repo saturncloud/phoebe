@@ -6,7 +6,6 @@ import (
 	"strings"
 	"sync"
 	"sync/atomic"
-	"time"
 
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
@@ -42,29 +41,23 @@ var sharedWorkerComponents = []string{"worker", "vllmworker"}
 // read. This label is part of the registry contract (see registry.go).
 const atlasManagedSelector = "saturncloud.io/managed-by=Atlas"
 
-// readyWorkersStaleAfter bounds how long a last-known ready worker count is
-// trusted while the DGD watch keeps failing. After it, every graph reads 0
-// ready workers (one worker's worth, per D54) until the watch recovers.
-const readyWorkersStaleAfter = 60 * time.Second
-
 // ReadyWorkers is an informer over the Atlas-managed DynamoGraphDeployments
 // in the workload namespace, keeping each graph's ready worker count
 // (status.components.Worker.readyReplicas) in memory. Every scaler (KEDA,
 // the Dynamo Planner, phoebe's waker, Atlas's reaper) moves that number, so
 // reading it here needs no hook in any of them. Lookups are pure memory
 // reads. Before the first sync, and for a graph it has not seen, the count
-// is zero: the graph then admits one worker's worth, never no limit. While
-// the watch is failing, a last-known count is trusted for at most
-// readyWorkersStaleAfter; after that every count reads as zero (one worker's
-// worth, per D54) until an event from a recovered watch arrives.
+// is zero: the graph then admits one worker's worth, never no limit.
+//
+// After the first sync a failing watch keeps the last-known counts while
+// client-go's reflector retries (D56), the same availability tradeoff as the
+// registry informer: an API-server outage must not throttle every healthy
+// graph to one worker's worth, and a graph cannot be scaled by KEDA, the
+// Planner or the waker without that API server anyway.
 type ReadyWorkers struct {
 	log      *logging.Logger
 	informer cache.SharedIndexInformer
 	synced   atomic.Bool
-	// failingSince is when the watch started failing, in unix nanoseconds;
-	// zero while the watch is healthy.
-	failingSince atomic.Int64
-	now          func() time.Time
 
 	mu    sync.RWMutex
 	ready map[string]int64
@@ -80,7 +73,6 @@ func NewReadyWorkers(client dynamic.Interface, namespace string, log *logging.Lo
 		log:      log,
 		informer: factory.ForResource(dynamoGraphResource).Informer(),
 		ready:    map[string]int64{},
-		now:      time.Now,
 	}
 	_ = w.informer.SetWatchErrorHandler(func(_ *cache.Reflector, err error) { w.watchFailed(err) })
 	_, _ = w.informer.AddEventHandler(cache.ResourceEventHandlerFuncs{
@@ -105,24 +97,18 @@ func (w *ReadyWorkers) Run(ctx context.Context) {
 // watchFailed records that the DGD list or watch failed and logs what that
 // does to the graph admission limits.
 func (w *ReadyWorkers) watchFailed(err error) {
-	w.failingSince.CompareAndSwap(0, w.now().UnixNano())
 	if !w.synced.Load() {
 		w.log.Error.Printf("gateway: ready-worker list failed before first sync (%v); every graph reads 0 ready workers and admits one worker's worth until the list succeeds (check phoebe RBAC on dynamographdeployments.nvidia.com/v1beta1 and that the CRD exists)", err)
 		return
 	}
-	w.log.Error.Printf("gateway: ready-worker watch failed (%v); graph admission limits use the last-known worker counts for up to %s, then every graph reads 0 ready workers (one worker's worth)", err, readyWorkersStaleAfter)
+	w.log.Error.Printf("gateway: ready-worker watch failed (%v); graph admission limits use the last-known worker counts until the watch reconnects", err)
 }
 
 // Synced reports whether the informer has completed its first list.
 func (w *ReadyWorkers) Synced() bool { return w.synced.Load() }
 
-// Ready is graph's ready worker count: zero when unknown, and zero for every
-// graph once the watch has been failing for longer than
-// readyWorkersStaleAfter.
+// Ready is graph's ready worker count, zero when unknown.
 func (w *ReadyWorkers) Ready(graph string) int64 {
-	if f := w.failingSince.Load(); f != 0 && w.now().Sub(time.Unix(0, f)) > readyWorkersStaleAfter {
-		return 0
-	}
 	w.mu.RLock()
 	defer w.mu.RUnlock()
 	return w.ready[graph]
@@ -134,7 +120,6 @@ func (w *ReadyWorkers) upsert(obj any) {
 		return
 	}
 	n := readyWorkersOf(u.Object)
-	w.failingSince.Store(0)
 	w.mu.Lock()
 	w.ready[u.GetName()] = n
 	w.mu.Unlock()
@@ -148,7 +133,6 @@ func (w *ReadyWorkers) remove(obj any) {
 	if !ok {
 		return
 	}
-	w.failingSince.Store(0)
 	w.mu.Lock()
 	delete(w.ready, u.GetName())
 	w.mu.Unlock()
