@@ -295,3 +295,65 @@ removed once it was confirmed phoebe performs no cross-joins to Atlas: phoebe no
 owns its own database and its own migrator, so the Alembic artifacts and the
 `atlas/` directory were deleted. phoebe was not deployed in production anywhere at
 the time of the cutover, so there was no data to migrate.
+
+## Upgrade order and backward compatibility
+
+The phoebe chart runs `phoebe-migrate up` as a Helm **pre-upgrade** hook
+(post-install on a fresh install, when the database is created by the same
+release). On an upgrade the schema therefore moves to the new version BEFORE the
+new pods roll, and the previous release's drainer briefly writes into the new
+schema. So every migration must keep the previous release's drainer working:
+add columns with defaults, add tables and indexes, but never drop or rename a
+column or change a unique key the previous release still writes to in the same
+release (expand now, contract one release later).
+
+The pre-upgrade hook is introduced by saturn-k8s PR #1098
+(`charts/phoebe/templates/job-migrate.yaml`). Charts without it run the
+migration post-upgrade, so new pods briefly run against the previous schema;
+deploy saturn-k8s #1098 together with or before this phoebe release.
+
+Two more kinds of change belong in the contract-one-release-later step, because
+the previous release's drainer keeps consuming against a newer schema (its gate
+is `version >= RequiredSchemaVersion`, not equality):
+
+- **Constraint tightening.** Adding a CHECK, setting NOT NULL, adding a UNIQUE
+  index or constraint, or narrowing a column type on a table the previous
+  release's drainer writes to. The previous drainer's rows would fail with
+  `23514` (check violation), `23502` (not-null violation) or `23505` (unique
+  violation). `isSchemaNotReady` (`internal/drain/store.go`) does not classify
+  those codes as "schema behind", so the drainer drops those rows as poison and
+  they are lost from billing.
+- **Data backfills.** A backfill that normalizes values the previous drainer
+  still writes must wait one release, or be repeated in the contract release.
+  Under pre-upgrade ordering the old drainer can write rows with the old values
+  after the backfill has run (`0007_serving_mode_explicit` is the precedent: its
+  rewrite of `serving_mode = ''` to `'dedicated'` does not cover rows written
+  with `''` after it runs).
+
+This rule is enforced by `TestMigrations_ExpandOnlyForThePreviousRelease`
+(`migrations/compat_test.go`) on every migration after 0009: it fails on an
+added NOT NULL column without a DEFAULT, a new CHECK, a column type change,
+`SET NOT NULL`, a dropped or renamed `billing_event` column, and a dropped
+`billing_event` unique key. A deliberate contract step one release after its
+expand can opt out with a `-- compat: reviewed <reason>` line in the file.
+The test does not detect a new UNIQUE index or constraint, or a data backfill;
+those two still need a reviewer to apply the rule above.
+
+The drainer also protects itself: it consumes nothing until the database is at
+the schema version it was built with (`migrations.LatestVersion()`), and a row
+that fails because the schema is behind (undefined table or column, or an
+`ON CONFLICT` target the migration has not created yet) is left in the stream
+for redelivery, never dropped as poison. A dirty `schema_migrations` row blocks
+the drainer only at or below that version. A dirty row above it means a later
+migration failed partway; golang-migrate marks the version it was attempting,
+so every version below it is applied, and because migrations are expand-only, a
+failed later migration does not stop the drainer of the running release (it
+logs a warning and consumes).
+
+The wait is not free. Events wait in the Valkey stream, which the emitter caps
+at about 1,000,000 entries (`MAXLEN ~`), so if the migration does not run the
+oldest unconsumed events are trimmed and lost. The drainer therefore waits at
+most `schemaWaitTimeout` (default 10 minutes; it cannot be disabled) and then
+exits non-zero, so the pod goes into CrashLoopBackOff, which is visible and
+alertable, instead of idling silently. Fix the migration (or run
+`migrate force` on a dirty row) promptly.

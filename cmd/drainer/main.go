@@ -9,13 +9,15 @@
 //   - the DATABASE_URL environment variable (Atlas convention) for Postgres.
 //
 // The drainer does NOT run migrations: it assumes the billing_event table
-// already exists in the shared Atlas Postgres (see migrations/README.md). If
-// the table is missing, the first upsert fails with a clear error.
+// already exists in phoebe's Postgres (see migrations/README.md). It waits at
+// startup for the schema version it was built with, and exits non-zero if that
+// version does not arrive within schemaWaitTimeout.
 package main
 
 import (
 	"context"
 	"flag"
+	"fmt"
 	"os"
 	"os/signal"
 	"syscall"
@@ -26,6 +28,7 @@ import (
 
 	"github.com/saturncloud/phoebe/internal/drain"
 	"github.com/saturncloud/phoebe/internal/logging"
+	"github.com/saturncloud/phoebe/migrations"
 )
 
 // drainSettings is the YAML shape for the drainer. It mirrors drain.Config
@@ -46,6 +49,11 @@ type drainSettings struct {
 
 	ClaimMinIdle  string `yaml:"claimMinIdle"`
 	ClaimInterval string `yaml:"claimInterval"`
+
+	// SchemaWaitTimeout bounds the startup wait for the database schema; ""
+	// or "0" uses the default. It cannot be disabled: an unbounded wait would
+	// let the emitter's stream cap trim un-drained events silently.
+	SchemaWaitTimeout string `yaml:"schemaWaitTimeout"`
 
 	MaxOpenConns    int    `yaml:"maxOpenConns"`
 	MaxIdleConns    int    `yaml:"maxIdleConns"`
@@ -88,6 +96,14 @@ func main() {
 	rdb := redis.NewClient(&redis.Options{Addr: cfg.ValkeyAddr})
 	defer func() { _ = rdb.Close() }()
 
+	// The schema gate must never be off in a real binary: 0 disables it, so an
+	// unreadable or unparseable migration set is fatal rather than silently
+	// letting the drainer write into an old schema.
+	required, err := migrations.LatestVersion()
+	if err != nil || required == 0 {
+		log.Error.Fatalf("drainer: cannot determine required schema version: %v", err)
+	}
+	cfg.RequiredSchemaVersion = required
 	d := drain.New(cfg, log, rdb, store)
 	if err := d.Run(ctx); err != nil {
 		log.Error.Fatalf("drainer: run: %v", err)
@@ -151,6 +167,18 @@ func loadConfig(path string) (drain.Config, bool, error) {
 			return cfg, false, errInvalidDuration(d.key, err)
 		}
 		*d.dst = v
+	}
+	if s.SchemaWaitTimeout != "" {
+		v, err := time.ParseDuration(s.SchemaWaitTimeout)
+		if err != nil {
+			return cfg, false, errInvalidDuration("schemaWaitTimeout", err)
+		}
+		if v < 0 {
+			return cfg, false, errInvalidDuration("schemaWaitTimeout", fmt.Errorf("must not be negative, got %s", v))
+		}
+		if v > 0 {
+			cfg.SchemaWaitTimeout = v
+		}
 	}
 
 	// DATABASE_URL (Atlas convention) is the authoritative Postgres source; it

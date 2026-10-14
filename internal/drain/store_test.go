@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/DATA-DOG/go-sqlmock"
+	"github.com/jackc/pgx/v5/pgconn"
 
 	"github.com/saturncloud/phoebe/internal/metering"
 )
@@ -311,5 +312,91 @@ func TestEventArgs_UnstorableRegionBindsNullNeverPoisons(t *testing.T) {
 				t.Fatalf("region arg for %q = %v, want %v", tc.region, args[regionIdx], tc.want)
 			}
 		})
+	}
+}
+
+// schemaVersionStore returns a PostgresStore over sqlmock expecting the
+// schema_migrations probe once.
+func schemaVersionStore(t *testing.T) (*PostgresStore, sqlmock.Sqlmock, *sqlmock.ExpectedQuery) {
+	t.Helper()
+	db, mock, err := sqlmock.New()
+	if err != nil {
+		t.Fatalf("sqlmock: %v", err)
+	}
+	t.Cleanup(func() { _ = db.Close() })
+	q := mock.ExpectQuery(regexp.QuoteMeta("SELECT version, dirty FROM schema_migrations LIMIT 1"))
+	return NewPostgresStore(db), mock, q
+}
+
+func TestPostgresStore_SchemaVersionReadsRow(t *testing.T) {
+	for _, c := range []struct {
+		version int64
+		dirty   bool
+	}{{9, false}, {12, true}} {
+		store, mock, q := schemaVersionStore(t)
+		q.WillReturnRows(sqlmock.NewRows([]string{"version", "dirty"}).AddRow(c.version, c.dirty))
+		v, dirty, err := store.SchemaVersion(context.Background())
+		if err != nil || v != uint(c.version) || dirty != c.dirty {
+			t.Fatalf("SchemaVersion = (%d, %v, %v), want (%d, %v, nil)", v, dirty, err, c.version, c.dirty)
+		}
+		if err := mock.ExpectationsWereMet(); err != nil {
+			t.Fatal(err)
+		}
+	}
+}
+
+// No migration ever applied (no row, or no table) reads as version 0, clean:
+// the gate stays closed for any RequiredSchemaVersion > 0.
+func TestPostgresStore_SchemaVersionNeverMigratedIsZero(t *testing.T) {
+	for name, set := range map[string]func(*sqlmock.ExpectedQuery){
+		"no rows":         func(q *sqlmock.ExpectedQuery) { q.WillReturnRows(sqlmock.NewRows([]string{"version", "dirty"})) },
+		"undefined table": func(q *sqlmock.ExpectedQuery) { q.WillReturnError(&pgconn.PgError{Code: "42P01"}) },
+	} {
+		store, mock, q := schemaVersionStore(t)
+		set(q)
+		v, dirty, err := store.SchemaVersion(context.Background())
+		if err != nil || v != 0 || dirty {
+			t.Fatalf("%s: SchemaVersion = (%d, %v, %v), want (0, false, nil)", name, v, dirty, err)
+		}
+		if err := mock.ExpectationsWereMet(); err != nil {
+			t.Fatal(err)
+		}
+	}
+}
+
+// Any other failure, including a schema_migrations table of an unexpected
+// shape (undefined_column) or an invalid reference, is an error the wait log
+// shows, never a silent "version 0".
+func TestPostgresStore_SchemaVersionErrorIsReported(t *testing.T) {
+	boom := errors.New("boom")
+	for name, qerr := range map[string]error{
+		"generic":          boom,
+		"undefined column": &pgconn.PgError{Code: "42703"},
+		"invalid column":   &pgconn.PgError{Code: "42P10"},
+	} {
+		store, mock, q := schemaVersionStore(t)
+		q.WillReturnError(qerr)
+		v, _, err := store.SchemaVersion(context.Background())
+		if err == nil || v != 0 {
+			t.Fatalf("%s: SchemaVersion = (%d, %v), want version 0 and an error", name, v, err)
+		}
+		if !errors.Is(err, qerr) {
+			t.Fatalf("%s: error %v does not wrap the query error", name, err)
+		}
+		if err := mock.ExpectationsWereMet(); err != nil {
+			t.Fatal(err)
+		}
+	}
+}
+
+func TestPostgresStore_SchemaVersionClampsNegativeToZero(t *testing.T) {
+	store, mock, q := schemaVersionStore(t)
+	q.WillReturnRows(sqlmock.NewRows([]string{"version", "dirty"}).AddRow(int64(-1), false))
+	v, dirty, err := store.SchemaVersion(context.Background())
+	if err != nil || v != 0 || dirty {
+		t.Fatalf("SchemaVersion = (%d, %v, %v), want (0, false, nil)", v, dirty, err)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Fatal(err)
 	}
 }
