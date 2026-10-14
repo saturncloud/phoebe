@@ -159,6 +159,20 @@ func (s *Server) publishedGraphRequestCapacity(graph string, scaled gateway.Grap
 	return s.graphRequestCapacity.GraphRequestCapacity(graph)
 }
 
+// publishedGraphCapacities is publishedGraphCapacity and
+// publishedGraphRequestCapacity for graph, read together from one registry
+// state when the resolver can do that.
+func (s *Server) publishedGraphCapacities(graph string) (scaled, perRequest gateway.GraphCapacity) {
+	if graph == "" {
+		return gateway.GraphCapacity{}, gateway.GraphCapacity{}
+	}
+	if s.graphCapacityPair != nil {
+		return s.graphCapacityPair.GraphCapacities(graph)
+	}
+	scaled = s.publishedGraphCapacity(graph)
+	return scaled, s.publishedGraphRequestCapacity(graph, scaled)
+}
+
 // graphFitRejection is the ONLY "can never fit" check for capacity (Q24,
 // Hugo 2026-10-14): one request's reserved KV (the prompt plus output x
 // sequences) is held on ONE worker, so a request above the graph's

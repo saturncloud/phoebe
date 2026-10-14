@@ -5,6 +5,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"reflect"
 	"strings"
 	"testing"
 
@@ -95,5 +96,53 @@ func TestPerWorkerKVIs413AtAnyGraphSize(t *testing.T) {
 	}
 	if hits, _ := be.snapshot(); hits != 1 {
 		t.Fatalf("upstream hits=%d, want only the admitted request", hits)
+	}
+}
+
+type pairCapacity struct{ scaled, perRequest gateway.GraphCapacity }
+
+func (p pairCapacity) GraphCapacities(string) (gateway.GraphCapacity, gateway.GraphCapacity) {
+	return p.scaled, p.perRequest
+}
+
+// With no per-request source (a resolver that cannot say), or no graph, the
+// per-request capacity is the scaled one passed in; with a source it is the
+// source's unscaled value.
+func TestPublishedGraphRequestCapacityFallsBackToScaledWithoutASource(t *testing.T) {
+	s := &Server{}
+	scaled := kvCap(12000)
+	if got := s.publishedGraphRequestCapacity("g", scaled); !reflect.DeepEqual(got, scaled) {
+		t.Fatalf("no source: got %+v, want the scaled %+v", got, scaled)
+	}
+	s.graphRequestCapacity = perRequestCapacity{"g": kvCap(3000)}
+	if got := s.publishedGraphRequestCapacity("", scaled); !reflect.DeepEqual(got, scaled) {
+		t.Fatalf("empty graph: got %+v, want the scaled %+v", got, scaled)
+	}
+	if got := s.publishedGraphRequestCapacity("g", scaled); !reflect.DeepEqual(got, kvCap(3000)) {
+		t.Fatalf("with a source: got %+v, want the source's %+v", got, kvCap(3000))
+	}
+}
+
+// publishedGraphCapacities takes both values from the one-read pair source
+// when it is wired (so a request never mixes two registry states), falls
+// back to the two separate sources otherwise, and returns nothing for an
+// empty graph.
+func TestPublishedGraphCapacitiesPrefersTheOneReadPair(t *testing.T) {
+	s := &Server{
+		graphCapacity:        staticGraphCapacity{"g": kvCap(12000)},
+		graphRequestCapacity: perRequestCapacity{"g": kvCap(3000)},
+	}
+	scaled, perRequest := s.publishedGraphCapacities("g")
+	if !reflect.DeepEqual(scaled, kvCap(12000)) || !reflect.DeepEqual(perRequest, kvCap(3000)) {
+		t.Fatalf("separate sources: got (%+v, %+v), want (12000, 3000)", scaled, perRequest)
+	}
+	s.graphCapacityPair = pairCapacity{scaled: kvCap(8000), perRequest: kvCap(2000)}
+	scaled, perRequest = s.publishedGraphCapacities("g")
+	if !reflect.DeepEqual(scaled, kvCap(8000)) || !reflect.DeepEqual(perRequest, kvCap(2000)) {
+		t.Fatalf("pair source: got (%+v, %+v), want the pair's (8000, 2000)", scaled, perRequest)
+	}
+	scaled, perRequest = s.publishedGraphCapacities("")
+	if scaled.Any() || perRequest.Any() {
+		t.Fatalf("empty graph: got (%+v, %+v), want no limits", scaled, perRequest)
 	}
 }

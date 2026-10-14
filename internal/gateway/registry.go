@@ -369,24 +369,8 @@ func (r *RegistryResolver) dropClaimLocked(cmName string, key cacheKey) {
 // returns no limits: "no profile and no override" means no capacity limit
 // (ruling 2026-10-12). Pure memory read.
 func (r *RegistryResolver) GraphCapacity(graph string) GraphCapacity {
-	r.mu.RLock()
-	defer r.mu.RUnlock()
-	caps := r.byGraph[graph]
-	winners := make(map[string]GraphCapacity, len(caps))
-	multiplier := int64(-1) // computed on the first per-worker entry
-	for cmName, c := range caps {
-		if !r.winsClaimLocked(cmName) {
-			continue
-		}
-		if c.PerWorker {
-			if multiplier < 0 {
-				multiplier = r.graphMultiplierLocked(graph)
-			}
-			c = c.Scaled(multiplier)
-		}
-		winners[cmName] = c
-	}
-	return tightest(winners)
+	scaled, _ := r.GraphCapacities(graph)
+	return scaled
 }
 
 // GraphRequestCapacity is the capacity ONE request is checked against to
@@ -396,16 +380,35 @@ func (r *RegistryResolver) GraphCapacity(graph string) GraphCapacity {
 // one request can use; a graph-level entry (no unit marker) is its published
 // value, as before. Pure memory read.
 func (r *RegistryResolver) GraphRequestCapacity(graph string) GraphCapacity {
+	_, perRequest := r.GraphCapacities(graph)
+	return perRequest
+}
+
+// GraphCapacities returns GraphCapacity and GraphRequestCapacity for graph
+// from ONE locked read of the registry, so a ConfigMap update cannot land
+// between them and pair a scaled capacity from one registry state with a
+// per-request capacity from another. Pure memory read.
+func (r *RegistryResolver) GraphCapacities(graph string) (scaled, perRequest GraphCapacity) {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
 	caps := r.byGraph[graph]
-	winners := make(map[string]GraphCapacity, len(caps))
+	scaledWinners := make(map[string]GraphCapacity, len(caps))
+	perRequestWinners := make(map[string]GraphCapacity, len(caps))
+	multiplier := int64(-1) // computed on the first per-worker entry
 	for cmName, c := range caps {
-		if r.winsClaimLocked(cmName) {
-			winners[cmName] = c
+		if !r.winsClaimLocked(cmName) {
+			continue
 		}
+		perRequestWinners[cmName] = c
+		if c.PerWorker {
+			if multiplier < 0 {
+				multiplier = r.graphMultiplierLocked(graph)
+			}
+			c = c.Scaled(multiplier)
+		}
+		scaledWinners[cmName] = c
 	}
-	return tightest(winners)
+	return tightest(scaledWinners), tightest(perRequestWinners)
 }
 
 // graphMultiplierLocked is what a per-worker entry of graph is multiplied by:

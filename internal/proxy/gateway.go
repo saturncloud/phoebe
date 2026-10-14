@@ -40,6 +40,12 @@ type graphRequestCapacitySource interface {
 	GraphRequestCapacity(graph string) gateway.GraphCapacity
 }
 
+// graphCapacityPairSource returns GraphCapacity and GraphRequestCapacity from
+// one consistent registry read (gateway.RegistryResolver implements it).
+type graphCapacityPairSource interface {
+	GraphCapacities(graph string) (gateway.GraphCapacity, gateway.GraphCapacity)
+}
+
 // WithGateway enables gateway resolution: requests carrying the trusted
 // X-Saturn-Gateway marker resolve their (org, body model=) against Atlas's
 // tf_model via resolver, and forward to the resolved graph's frontend Service
@@ -61,6 +67,9 @@ func (s *Server) WithGateway(resolver gateway.Resolver, namespace string, port i
 	}
 	if source, ok := resolver.(graphRequestCapacitySource); ok {
 		s.graphRequestCapacity = source
+	}
+	if source, ok := resolver.(graphCapacityPairSource); ok {
+		s.graphCapacityPair = source
 	}
 	s.gateway = &gatewayRoute{
 		resolver: resolver,

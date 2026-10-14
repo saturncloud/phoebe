@@ -176,6 +176,10 @@ type Server struct {
 	// graphRequestCapacity supplies the unscaled per-request capacity the
 	// "can never fit" check uses (Q24); nil leaves that check to admission.
 	graphRequestCapacity graphRequestCapacitySource
+	// graphCapacityPair supplies both capacities from one registry read, so
+	// one request never pairs values from two registry states. nil falls
+	// back to the two sources above.
+	graphCapacityPair graphCapacityPairSource
 
 	// requestBuffers is the replica-wide request-body budget (Q6).
 	requestBuffers requestBufferBudget
@@ -728,8 +732,7 @@ func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request) {
 		// enablement gate (R12 clarification). It needs the trusted org (the
 		// admitter keys every scope set on it), so a historical route that
 		// does not stamp one keeps its old behavior rather than starting to 503.
-		graphCapacity := s.publishedGraphCapacity(id.GraphK8sName)
-		graphRequestCapacity := s.publishedGraphRequestCapacity(id.GraphK8sName, graphCapacity)
+		graphCapacity, graphRequestCapacity := s.publishedGraphCapacities(id.GraphK8sName)
 		enforceAdmission := s.admitter != nil && (s.settings.Admission.Enabled || trustedPolicyEnvelopePresent(id) ||
 			(graphCapacity.Any() && id.OrgID != ""))
 		tenantIdentity := id.OrgID

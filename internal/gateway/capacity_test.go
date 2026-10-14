@@ -144,6 +144,134 @@ func TestRegistry_GraphCapacityOnlyFromWinningClaimant(t *testing.T) {
 	}
 }
 
+func waitRequestCapacity(t *testing.T, r *RegistryResolver, graph string, ok func(GraphCapacity) bool) GraphCapacity {
+	t.Helper()
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		c := r.GraphRequestCapacity(graph)
+		if ok(c) || time.Now().After(deadline) {
+			return c
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+}
+
+// GraphRequestCapacity is the input to the only permanent 413 (Q24, D60(2)):
+// one request runs on one worker, so a per-worker entry is returned as
+// published, never multiplied by ready workers, while GraphCapacity for the
+// same entry is scaled. With no ready-worker source it is still the
+// published value.
+func TestRegistry_GraphRequestCapacityIsUnscaledPerWorker(t *testing.T) {
+	r, _, _ := startedRegistry(t, registryCM("tf-model-a", map[string]string{capacityKeyUnit: capacityUnitPerWorker,
+		capacityKeyMaxActiveRequests: "16", capacityKeyMaxReservedKVTokens: "1000",
+	}))
+	waitCapacity(t, r, "graph-llama31", func(c GraphCapacity) bool { return c.Any() })
+
+	req := r.GraphRequestCapacity("graph-llama31")
+	if val(req.MaxActiveRequests) != 16 || val(req.MaxReservedKVTokens) != 1000 {
+		t.Fatalf("no workers source: request capacity = (active %d, kv %d), want the published (16, 1000)",
+			val(req.MaxActiveRequests), val(req.MaxReservedKVTokens))
+	}
+
+	for _, workers := range []int64{3, 4} {
+		r.WithReadyWorkers(fixedWorkers{"graph-llama31": workers})
+		mult := workers + GraphLimitHeadroomWorkers
+		c := r.GraphCapacity("graph-llama31")
+		if val(c.MaxActiveRequests) != 16*mult || val(c.MaxReservedKVTokens) != 1000*mult {
+			t.Fatalf("%d workers: graph capacity = (active %d, kv %d), want (%d, %d)", workers,
+				val(c.MaxActiveRequests), val(c.MaxReservedKVTokens), 16*mult, 1000*mult)
+		}
+		req := r.GraphRequestCapacity("graph-llama31")
+		if val(req.MaxActiveRequests) != 16 || val(req.MaxReservedKVTokens) != 1000 {
+			t.Fatalf("%d workers: request capacity = (active %d, kv %d), want the unscaled (16, 1000)", workers,
+				val(req.MaxActiveRequests), val(req.MaxReservedKVTokens))
+		}
+	}
+}
+
+// An unmarked (graph-level) entry is used as published by both reads, even
+// with ready workers attached.
+func TestRegistry_GraphRequestCapacityGraphLevelUnmarked(t *testing.T) {
+	r, _, _ := startedRegistry(t, registryCM("tf-model-a", map[string]string{
+		capacityKeyMaxActiveRequests: "40", capacityKeyMaxReservedKVTokens: "2000",
+	}))
+	r.WithReadyWorkers(fixedWorkers{"graph-llama31": 3})
+	c := waitCapacity(t, r, "graph-llama31", func(c GraphCapacity) bool { return c.Any() })
+	req := r.GraphRequestCapacity("graph-llama31")
+	if val(req.MaxActiveRequests) != 40 || val(req.MaxReservedKVTokens) != 2000 {
+		t.Fatalf("request capacity = (active %d, kv %d), want the published (40, 2000)",
+			val(req.MaxActiveRequests), val(req.MaxReservedKVTokens))
+	}
+	if !reflect.DeepEqual(c, req) {
+		t.Fatalf("graph-level entry: GraphCapacity %+v != GraphRequestCapacity %+v", c, req)
+	}
+}
+
+// A ConfigMap that loses a duplicate (org, served name) claim does not serve
+// traffic, so its tighter KV must not make requests a permanent 413. When the
+// winner is deleted, the survivor's values apply.
+func TestRegistry_GraphRequestCapacityOnlyFromWinningClaimant(t *testing.T) {
+	winner := registryCM("tf-model-winner", map[string]string{capacityKeyUnit: capacityUnitPerWorker,
+		"resource_id": "tfm-aaa", capacityKeyMaxActiveRequests: "10", capacityKeyMaxReservedKVTokens: "4096",
+	})
+	stale := registryCM("tf-model-stale", map[string]string{capacityKeyUnit: capacityUnitPerWorker,
+		"resource_id": "tfm-bbb", capacityKeyMaxActiveRequests: "2", capacityKeyMaxReservedKVTokens: "512",
+	})
+	r, client, _ := startedRegistry(t, winner, stale)
+	r.WithReadyWorkers(fixedWorkers{"graph-llama31": 2})
+
+	if res, ok := waitResolve(t, r, "org-1", "support-bot"); !ok || res.ResourceID != "tfm-aaa" {
+		t.Fatalf("resolution = %+v (ok=%v), want winner tfm-aaa", res, ok)
+	}
+	req := waitRequestCapacity(t, r, "graph-llama31", func(c GraphCapacity) bool { return val(c.MaxReservedKVTokens) == 4096 })
+	if val(req.MaxActiveRequests) != 10 || val(req.MaxReservedKVTokens) != 4096 {
+		t.Fatalf("request capacity = (active %d, kv %d), want the winner's (10, 4096), not the losing duplicate's (2, 512)",
+			val(req.MaxActiveRequests), val(req.MaxReservedKVTokens))
+	}
+
+	if err := client.CoreV1().ConfigMaps(registryNS).Delete(context.Background(), "tf-model-winner", metav1.DeleteOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	req = waitRequestCapacity(t, r, "graph-llama31", func(c GraphCapacity) bool { return val(c.MaxReservedKVTokens) == 512 })
+	if val(req.MaxActiveRequests) != 2 || val(req.MaxReservedKVTokens) != 512 {
+		t.Fatalf("after the winner was deleted request capacity = (active %d, kv %d), want the survivor's unscaled (2, 512)",
+			val(req.MaxActiveRequests), val(req.MaxReservedKVTokens))
+	}
+}
+
+// GraphCapacities reads both capacities in one locked read; on a graph with
+// both a per-worker and a graph-level entry it must return exactly what the
+// two separate reads return.
+func TestRegistry_GraphCapacitiesMatchesSeparateReads(t *testing.T) {
+	r, client, _ := startedRegistry(t, registryCM("tf-model-old", map[string]string{
+		capacityKeyMaxActiveRequests: "40", capacityKeyMaxReservedKVTokens: "2000",
+	}))
+	r.WithReadyWorkers(fixedWorkers{"graph-llama31": 3})
+	if _, err := client.CoreV1().ConfigMaps(registryNS).Create(context.Background(), registryCM("tf-model-new", map[string]string{
+		"org_id": "org-b", capacityKeyUnit: capacityUnitPerWorker,
+		capacityKeyMaxActiveRequests: "8", capacityKeyMaxReservedKVTokens: "1000",
+	}), metav1.CreateOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	waitCapacity(t, r, "graph-llama31", func(c GraphCapacity) bool { return val(c.MaxActiveRequests) == 32 })
+
+	scaled, perRequest := r.GraphCapacities("graph-llama31")
+	if !reflect.DeepEqual(scaled, r.GraphCapacity("graph-llama31")) {
+		t.Fatalf("scaled %+v != GraphCapacity %+v", scaled, r.GraphCapacity("graph-llama31"))
+	}
+	if !reflect.DeepEqual(perRequest, r.GraphRequestCapacity("graph-llama31")) {
+		t.Fatalf("perRequest %+v != GraphRequestCapacity %+v", perRequest, r.GraphRequestCapacity("graph-llama31"))
+	}
+	// min(40, 8 x 4) = 32 active and min(2000, 1000 x 4) = 2000 KV scaled;
+	// min(40, 8) = 8 active and min(2000, 1000) = 1000 KV per request.
+	if val(scaled.MaxActiveRequests) != 32 || val(scaled.MaxReservedKVTokens) != 2000 ||
+		val(perRequest.MaxActiveRequests) != 8 || val(perRequest.MaxReservedKVTokens) != 1000 {
+		t.Fatalf("scaled (active %d, kv %d), perRequest (active %d, kv %d), want (32, 2000) and (8, 1000)",
+			val(scaled.MaxActiveRequests), val(scaled.MaxReservedKVTokens),
+			val(perRequest.MaxActiveRequests), val(perRequest.MaxReservedKVTokens))
+	}
+}
+
 // GraphCapacity.Limits is the one conversion of published capacity into the
 // graph_capacity admission scope. Every GraphCapacity field must reach the
 // AdmissionLimits field of the same name, or a published key would engage
