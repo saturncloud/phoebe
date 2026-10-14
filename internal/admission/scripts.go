@@ -110,6 +110,9 @@ local q=cjson.decode(ARGV[1]); q.now=current_time_ms(); reap(q.now)
 -- counter, the contract generated-token reservation and the reserved KV) is
 -- output x sequences. q.gen is that product; the prompt's KV is shared.
 q.gen=q.output*(q.sequences or 1); q.kv=q.estimated_input+q.gen
+-- q.kv must match the proxy's per-worker 413 check (graphFitRejection in
+-- internal/proxy/admission.go), which computes the same prompt + output x
+-- sequences over the same estimate.
 -- A caller may lose the reply after this script commits. Retrying the exact
 -- request id must recover the existing lease rather than reserve every
 -- dimension a second time.

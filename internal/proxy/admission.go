@@ -149,19 +149,10 @@ func (s *Server) publishedGraphCapacity(graph string) gateway.GraphCapacity {
 	return s.graphCapacity.GraphCapacity(graph)
 }
 
-// publishedGraphRequestCapacity is the per-request capacity for graph
-// (GraphRequestCapacity: unscaled), or scaled when the resolver cannot say,
-// which keeps the previous behavior.
-func (s *Server) publishedGraphRequestCapacity(graph string, scaled gateway.GraphCapacity) gateway.GraphCapacity {
-	if s.graphRequestCapacity == nil || graph == "" {
-		return scaled
-	}
-	return s.graphRequestCapacity.GraphRequestCapacity(graph)
-}
-
-// publishedGraphCapacities is publishedGraphCapacity and
-// publishedGraphRequestCapacity for graph, read together from one registry
-// state when the resolver can do that.
+// publishedGraphCapacities is the scaled capacity (publishedGraphCapacity)
+// and the unscaled per-request capacity (GraphRequestCapacity) for graph,
+// read together from one registry state when the resolver can do that, or
+// none.
 func (s *Server) publishedGraphCapacities(graph string) (scaled, perRequest gateway.GraphCapacity) {
 	if graph == "" {
 		return gateway.GraphCapacity{}, gateway.GraphCapacity{}
@@ -169,8 +160,10 @@ func (s *Server) publishedGraphCapacities(graph string) (scaled, perRequest gate
 	if s.graphCapacityPair != nil {
 		return s.graphCapacityPair.GraphCapacities(graph)
 	}
-	scaled = s.publishedGraphCapacity(graph)
-	return scaled, s.publishedGraphRequestCapacity(graph, scaled)
+	if s.graphCapacity == nil {
+		return gateway.GraphCapacity{}, gateway.GraphCapacity{}
+	}
+	return s.graphCapacity.GraphCapacity(graph), s.graphCapacity.GraphRequestCapacity(graph)
 }
 
 // graphFitRejection is the ONLY "can never fit" check for capacity (Q24,
@@ -178,10 +171,17 @@ func (s *Server) publishedGraphCapacities(graph string) (scaled, perRequest gate
 // sequences) is held on ONE worker, so a request above the graph's
 // per-request (per-worker) KV value can never fit, however many workers are
 // up: 413. Every other capacity limit is a load limit that admission handles
-// as retryable (and admits a single oversized request when nothing else is in
-// flight), so it never returns 413. Only a positive cap applies (an explicit
-// zero cap stays a retryable refusal in admission). nil means the request
-// goes on to admission.
+// as retryable (and admits a single oversized request when no other request
+// holds that limit's counter in the scope; for prefill tokens, when no other
+// request is prefilling), so it never returns 413. Only a positive cap
+// applies (an explicit zero cap stays a retryable refusal in admission). nil
+// means the request goes on to admission.
+//
+// The KV computed here must stay the same formula as the admission script's
+// reserved-KV charge (scripts.go: q.gen=q.output*(q.sequences or 1);
+// q.kv=q.estimated_input+q.gen), over the same estimate the proxy sends to
+// Admit (EstimatedInputTokens, ReservedOutputTokens, OutputSequences).
+// TestGraphFitRejectionMatchesScriptReservedKV ties the two together.
 func graphFitRejection(perRequest gateway.GraphCapacity, est admissionEstimate) *admission.Rejected {
 	sequences := est.OutputSequences
 	if sequences < 1 {
@@ -579,8 +579,9 @@ func (s *Server) writeAdmissionErrorOutput(w http.ResponseWriter, requestID stri
 	var rejected *admission.Rejected
 	if errors.As(err, &rejected) && rejected.Unsatisfiable && !rejected.Contractual {
 		// The proxy's per-worker KV check (graphFitRejection, D60(2)): one
-		// request's prompt plus reserved output is larger than one worker's
-		// KV cache, so it can never be admitted and is refused as too large.
+		// request's KV (prompt plus output x sequences) is larger than one
+		// worker's KV capacity, so it can never be admitted and is refused
+		// as too large.
 		// This is the only non-contractual unsatisfiable rejection; the
 		// admission script never produces one (Q24).
 		http.Error(w, oversizeMessage(out), http.StatusRequestEntityTooLarge)

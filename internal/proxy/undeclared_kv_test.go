@@ -421,11 +421,11 @@ func kvTestServerWithStore(t *testing.T, cfg config.AdmissionSettings) (*Server,
 }
 
 // A request that sent no max_tokens and whose prompt alone fills (or passes)
-// a positive KV cap cannot be fitted by clamping its default output: it is
-// refused 413 without Retry-After, the message blames the prompt alone (there
-// is no max_tokens to lower), nothing reaches the engine and nothing stays
-// charged.
-func TestUndeclaredPromptFillingKVCapIs413(t *testing.T) {
+// the published per-worker KV cap (MaxReservedKVTokens from graphCapacity)
+// cannot be fitted by clamping its default output: it is refused 413 without
+// Retry-After, the message blames the prompt alone (there is no max_tokens to
+// lower), nothing reaches the engine and nothing stays charged.
+func TestUndeclaredPromptFillingPublishedKVIs413(t *testing.T) {
 	body := chatBody(4*2500, 0)
 	est := estimatePromptTokens(body)
 	assert413 := func(t *testing.T, s *Server, mr *miniredis.Miniredis, be *oslRecordingBackend, up *url.URL) {
@@ -461,18 +461,24 @@ func TestUndeclaredPromptFillingKVCapIs413(t *testing.T) {
 			assert413(t, s, mr, be, up)
 		})
 	}
-	t.Run("prompt fills the weighted lane share: a load limit, admitted alone (Q24)", func(t *testing.T) {
-		be := &oslRecordingBackend{}
-		srv := httptest.NewServer(be)
-		defer srv.Close()
-		up, _ := url.Parse(srv.URL)
-		cfg := kvTestConfig()
-		cfg.Lanes = map[string]config.AdmissionLane{"default": {Weight: 2, Limits: config.AdmissionLimits{MaxReservedKVTokens: testutil.Ptr[int64](est / 2)}}}
-		s, _ := kvTestServerWithStore(t, cfg)
-		if rr := serveChat(s, up, body); rr.Code != http.StatusOK {
-			t.Fatalf("status=%d body=%q, want 200", rr.Code, rr.Body.String())
-		}
-	})
+}
+
+// Under Q24 (D60) a lane's reserved-KV share is a load limit, so a request
+// that sent no max_tokens and whose prompt fills the weighted share is
+// admitted (200) when no other request holds reserved KV in that lane scope.
+func TestUndeclaredPromptFillingLaneKVShareIsAdmittedAlone(t *testing.T) {
+	body := chatBody(4*2500, 0)
+	est := estimatePromptTokens(body)
+	be := &oslRecordingBackend{}
+	srv := httptest.NewServer(be)
+	defer srv.Close()
+	up, _ := url.Parse(srv.URL)
+	cfg := kvTestConfig()
+	cfg.Lanes = map[string]config.AdmissionLane{"default": {Weight: 2, Limits: config.AdmissionLimits{MaxReservedKVTokens: testutil.Ptr[int64](est / 2)}}}
+	s, _ := kvTestServerWithStore(t, cfg)
+	if rr := serveChat(s, up, body); rr.Code != http.StatusOK {
+		t.Fatalf("status=%d body=%q, want 200", rr.Code, rr.Body.String())
+	}
 }
 
 // A request that sent no max_tokens is never answered a retry-forever 503

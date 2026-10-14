@@ -29,14 +29,13 @@ type gatewayRoute struct {
 // graphCapacitySource is the per-graph admission capacity Atlas publishes in
 // the served-model registry (gateway.RegistryResolver implements it; the
 // deprecated Postgres resolver does not, so it publishes no limits).
+// GraphCapacity is the scaled capacity admission enforces; GraphRequestCapacity
+// is the capacity ONE request is checked against to decide that it can never
+// fit (Q24): the published values, unscaled by ready workers. Both are
+// required, so a resolver that publishes capacity can never leave the 413
+// fit check to fall back to the looser scaled value.
 type graphCapacitySource interface {
 	GraphCapacity(graph string) gateway.GraphCapacity
-}
-
-// graphRequestCapacitySource is the capacity ONE request is checked against
-// to decide that it can never fit (Q24): the published values, unscaled by
-// ready workers (gateway.RegistryResolver implements it).
-type graphRequestCapacitySource interface {
 	GraphRequestCapacity(graph string) gateway.GraphCapacity
 }
 
@@ -64,9 +63,6 @@ func (s *Server) WithGateway(resolver gateway.Resolver, namespace string, port i
 	}
 	if source, ok := resolver.(graphCapacitySource); ok {
 		s.graphCapacity = source
-	}
-	if source, ok := resolver.(graphRequestCapacitySource); ok {
-		s.graphRequestCapacity = source
 	}
 	if source, ok := resolver.(graphCapacityPairSource); ok {
 		s.graphCapacityPair = source

@@ -173,12 +173,9 @@ type Server struct {
 	// graphCapacity supplies the per-graph admission capacity Atlas publishes
 	// (B8). nil = none published (no registry resolver wired).
 	graphCapacity graphCapacitySource
-	// graphRequestCapacity supplies the unscaled per-request capacity the
-	// "can never fit" check uses (Q24); nil leaves that check to admission.
-	graphRequestCapacity graphRequestCapacitySource
 	// graphCapacityPair supplies both capacities from one registry read, so
 	// one request never pairs values from two registry states. nil falls
-	// back to the two sources above.
+	// back to graphCapacity's two separate reads.
 	graphCapacityPair graphCapacityPairSource
 
 	// requestBuffers is the replica-wide request-body budget (Q6).
@@ -811,6 +808,20 @@ func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request) {
 		if rerr != nil {
 			writeRequestBodyError(w, r, requestID, rerr)
 			return
+		}
+		if enforceAdmission {
+			// The scaled graph capacity depends on how many workers are ready
+			// (D54/D59). The body read above can take up to the stream
+			// deadline, so read the limit again after it: the limit Admit
+			// enforces is then as stale as the informer, not as old as the
+			// body upload. If nothing is published now, keep the earlier
+			// snapshot so the check stays tight. The per-request (per-worker)
+			// capacity does not depend on ready workers (Q24); it is re-read
+			// with the scaled one only so both still come from one registry
+			// state.
+			if fresh, freshRequest := s.publishedGraphCapacities(id.GraphK8sName); fresh.Any() {
+				graphCapacity, graphRequestCapacity = fresh, freshRequest
+			}
 		}
 		// The prompt-token estimate is taken from the client's original body
 		// (admissionWork, below), before phoebe adds its cache-isolation and
