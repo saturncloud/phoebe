@@ -173,6 +173,9 @@ type Server struct {
 	// graphCapacity supplies the per-graph admission capacity Atlas publishes
 	// (B8). nil = none published (no registry resolver wired).
 	graphCapacity graphCapacitySource
+	// graphRequestCapacity supplies the unscaled per-request capacity the
+	// "can never fit" check uses (Q24); nil leaves that check to admission.
+	graphRequestCapacity graphRequestCapacitySource
 
 	// requestBuffers is the replica-wide request-body budget (Q6).
 	requestBuffers requestBufferBudget
@@ -726,6 +729,7 @@ func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request) {
 		// admitter keys every scope set on it), so a historical route that
 		// does not stamp one keeps its old behavior rather than starting to 503.
 		graphCapacity := s.publishedGraphCapacity(id.GraphK8sName)
+		graphRequestCapacity := s.publishedGraphRequestCapacity(id.GraphK8sName, graphCapacity)
 		enforceAdmission := s.admitter != nil && (s.settings.Admission.Enabled || trustedPolicyEnvelopePresent(id) ||
 			(graphCapacity.Any() && id.OrgID != ""))
 		tenantIdentity := id.OrgID
@@ -843,8 +847,11 @@ func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request) {
 			// (operator tiers, the weighted lane share, published graph
 			// capacity), or a client that sent no max_tokens could be
 			// refused, or told to retry forever, for the default.
+			// The graph's own cap here is the per-request (per-worker) one
+			// (Q24): one request runs on one worker, so its default must fit
+			// that, not the graph total.
 			caps := admission.TightestReservedCaps(s.admitterSettings(), admission.Request{
-				Graph: graph, Organization: id.OrgID, Model: estimate.Model, GraphCapacity: graphCapacity.Limits(),
+				Graph: graph, Organization: id.OrgID, Model: estimate.Model, GraphCapacity: graphRequestCapacity.Limits(),
 			})
 			estimate.OutputTokens = undeclaredOutputWithinCaps(estimate.OutputTokens, estimate.InputTokens, estimate.OutputSequences, caps.KV, caps.Output)
 		}
@@ -878,6 +885,19 @@ func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request) {
 		// store only when at least one group scope carries a rate limit; an
 		// all-unlimited envelope enforces
 		// nothing. Every fail-closed check above has already run.
+		if enforceAdmission && graphCapacity.Any() {
+			// Q24: the only "can never fit" (413) check, one request's KV
+			// against one worker's, made before the shared counters so it does
+			// not depend on how many workers are up right now.
+			if rejected := graphFitRejection(graphRequestCapacity, estimate); rejected != nil {
+				s.writeAdmissionErrorOutput(w, requestID, rejected, outputShape{
+					hasOutput: routePath != "/v1/embeddings",
+					declared:  routePath != "/v1/embeddings" && estimate.OutputDeclared,
+					sequences: estimate.OutputSequences,
+				})
+				return
+			}
+		}
 		if enforceAdmission && (s.settings.Admission.Enabled || organizationLimits.Any() || ownerLimits.Any() ||
 			anyGroupScopeEnforced(groupScopes) || graphCapacity.Any()) {
 			admitted, err = s.admitter.Admit(r.Context(), admission.Request{

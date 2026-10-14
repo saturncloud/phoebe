@@ -1142,15 +1142,29 @@ func TestAdmitCleanupBudgetIndependentOfAttemptDeadline(t *testing.T) {
 	_ = lease.Complete(context.Background(), 0)
 }
 
-func TestImpossibleRequestRejectedBeforeReservation(t *testing.T) {
+// Q24: a capacity prefill limit is a load limit. A request larger than the
+// whole limit is admitted when nothing else holds prefill tokens in the scope,
+// and refused as retryable (never unsatisfiable) when something does.
+func TestOversizedPrefillIsAdmittedAloneAndRetryableOtherwise(t *testing.T) {
+	ctx := context.Background()
 	l := limits(5)
 	l.MaxPrefillTokens = testutil.Ptr[int64](9)
 	a, _ := testAdmitter(t, config.AdmissionSettings{Platform: l})
-	_, err := a.Admit(context.Background(), request("a", "m"))
-	var rejected *Rejected
-	if !errors.As(err, &rejected) || rejected.Dimension != "prefill_tokens_exceeds_limit" || !rejected.Unsatisfiable {
-		t.Fatalf("err=%v, want an unsatisfiable prefill_tokens rejection", err)
+	alone, err := a.Admit(ctx, request("a", "m")) // 10 prefill tokens > 9
+	if err != nil {
+		t.Fatalf("an oversized prompt with nothing in flight must be admitted: %v", err)
 	}
+	_, err = a.Admit(ctx, request("b", "m"))
+	var rejected *Rejected
+	if !errors.As(err, &rejected) || rejected.Dimension != "prefill_tokens" || rejected.Unsatisfiable || rejected.RetryAfter <= 0 {
+		t.Fatalf("err=%+v, want a retryable prefill_tokens rejection while another prompt is in flight", rejected)
+	}
+	_ = alone.Complete(ctx, 0)
+	again, err := a.Admit(ctx, request("b", "m"))
+	if err != nil {
+		t.Fatalf("admitted again once the scope is idle: %v", err)
+	}
+	_ = again.Complete(ctx, 0)
 }
 
 // The prefill-token limit is inclusive: a request whose estimate equals

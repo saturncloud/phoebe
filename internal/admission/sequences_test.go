@@ -102,25 +102,26 @@ func TestReservedOutputCapChargesEveryOutputSequence(t *testing.T) {
 // positive maxReservedOutputTokens cap can never be admitted, so it is
 // refused as unsatisfiable (the proxy's 413) with no Retry-After, not as a
 // retryable capacity rejection a client would retry forever.
-func TestRequestOutputAboveReservedOutputCapIsUnsatisfiable(t *testing.T) {
+// Q24: a reserved-output cap is a load limit. Output x sequences above the
+// whole cap is admitted alone and refused as retryable while the counter is
+// in use.
+func TestRequestOutputAboveReservedOutputCapIsAdmittedAlone(t *testing.T) {
 	ctx := context.Background()
 	l := limits(10)
 	l.MaxReservedOutputTokens = testutil.Ptr[int64](64)
 	a, _ := testAdmitter(t, config.AdmissionSettings{Platform: l})
 	req := request("a", "m")
 	req.ReservedOutputTokens, req.OutputSequences = 1, 128
-	_, err := a.Admit(ctx, req)
-	var rejected *Rejected
-	if !errors.As(err, &rejected) || rejected.Scope != "platform" || rejected.Dimension != "output_exceeds_limit" ||
-		!rejected.Unsatisfiable || rejected.Contractual || rejected.RetryAfter != 0 {
-		t.Fatalf("err=%v, want unsatisfiable platform output_exceeds_limit with no RetryAfter for 1 x 128 against a cap of 64", err)
-	}
-	req.OutputSequences = 64
-	lease, err := a.Admit(ctx, req)
+	alone, err := a.Admit(ctx, req)
 	if err != nil {
-		t.Fatalf("1 x 64 fits a cap of 64: %v", err)
+		t.Fatalf("1 x 128 against a cap of 64, alone: %v", err)
 	}
-	_ = lease.Complete(ctx, 0)
+	_, err = a.Admit(ctx, req)
+	var rejected *Rejected
+	if !errors.As(err, &rejected) || rejected.Scope != "platform" || rejected.Dimension != "output" || rejected.Unsatisfiable {
+		t.Fatalf("err=%+v, want a retryable platform output rejection while the counter is in use", rejected)
+	}
+	_ = alone.Complete(ctx, 0)
 }
 
 // A request that ends without a usage block is charged its whole reservation,

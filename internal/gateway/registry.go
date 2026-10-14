@@ -389,6 +389,25 @@ func (r *RegistryResolver) GraphCapacity(graph string) GraphCapacity {
 	return tightest(winners)
 }
 
+// GraphRequestCapacity is the capacity ONE request is checked against to
+// decide that it can never fit (Q24): the tightest value per limit across the
+// graph's claim-winning entries, NOT scaled by ready workers. A single request
+// runs on a single worker, so a per-worker entry's own value is the most any
+// one request can use; a graph-level entry (no unit marker) is its published
+// value, as before. Pure memory read.
+func (r *RegistryResolver) GraphRequestCapacity(graph string) GraphCapacity {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	caps := r.byGraph[graph]
+	winners := make(map[string]GraphCapacity, len(caps))
+	for cmName, c := range caps {
+		if r.winsClaimLocked(cmName) {
+			winners[cmName] = c
+		}
+	}
+	return tightest(winners)
+}
+
 // graphMultiplierLocked is what a per-worker entry of graph is multiplied by:
 // its ready workers plus GraphLimitHeadroomWorkers, or one worker's worth
 // with no ready-worker source. The sum saturates at the int64 maximum

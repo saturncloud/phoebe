@@ -91,7 +91,8 @@ func serveChat(s *Server, up *url.URL, body []byte) *httptest.ResponseRecorder {
 // far as the tightest reserved-KV cap allows: with a lane share of 3000 (1500
 // times weight 2) and a 200-token prompt it is admitted with a reservation of
 // 2800, and the Dynamo hint equals that reservation. Declaring
-// max_tokens=4096 explicitly still gets the non-retryable kv_exceeds_limit 413.
+// max_tokens=4096 explicitly is admitted alone (Q24: a lane share is a load
+// limit).
 func TestUndeclaredOutputReservationFitsLaneKVShare(t *testing.T) {
 	be := &oslRecordingBackend{}
 	srv := httptest.NewServer(be)
@@ -113,15 +114,13 @@ func TestUndeclaredOutputReservationFitsLaneKVShare(t *testing.T) {
 		t.Fatalf("hits=%d osl=%v, want one request reserving 2800 output tokens", hits, osl)
 	}
 
-	rr := serveChat(s, up, chatBody(4*200, 4096))
-	if rr.Code != http.StatusRequestEntityTooLarge || rr.Header().Get("Retry-After") != "" {
-		t.Fatalf("declared max_tokens=4096 status=%d retry-after=%q, want 413 without Retry-After", rr.Code, rr.Header().Get("Retry-After"))
+	// Q24: the lane share is a load limit, so a declared request over it with
+	// nothing in flight is admitted (only the published per-worker KV is 413).
+	if rr := serveChat(s, up, chatBody(4*200, 4096)); rr.Code != http.StatusOK {
+		t.Fatalf("declared max_tokens=4096 alone status=%d body=%q, want 200", rr.Code, rr.Body.String())
 	}
-	if !strings.Contains(rr.Body.String(), "KV-cache") {
-		t.Fatalf("declared over-KV body=%q, want the KV-cache message", rr.Body.String())
-	}
-	if hits, _ := be.snapshot(); hits != 1 {
-		t.Fatalf("upstream hits=%d, the declared over-KV request must not reach the engine", hits)
+	if hits, _ := be.snapshot(); hits != 2 {
+		t.Fatalf("upstream hits=%d, want 2", hits)
 	}
 }
 
@@ -462,15 +461,17 @@ func TestUndeclaredPromptFillingKVCapIs413(t *testing.T) {
 			assert413(t, s, mr, be, up)
 		})
 	}
-	t.Run("prompt fills the weighted lane share", func(t *testing.T) {
+	t.Run("prompt fills the weighted lane share: a load limit, admitted alone (Q24)", func(t *testing.T) {
 		be := &oslRecordingBackend{}
 		srv := httptest.NewServer(be)
 		defer srv.Close()
 		up, _ := url.Parse(srv.URL)
 		cfg := kvTestConfig()
 		cfg.Lanes = map[string]config.AdmissionLane{"default": {Weight: 2, Limits: config.AdmissionLimits{MaxReservedKVTokens: testutil.Ptr[int64](est / 2)}}}
-		s, mr := kvTestServerWithStore(t, cfg)
-		assert413(t, s, mr, be, up)
+		s, _ := kvTestServerWithStore(t, cfg)
+		if rr := serveChat(s, up, body); rr.Code != http.StatusOK {
+			t.Fatalf("status=%d body=%q, want 200", rr.Code, rr.Body.String())
+		}
 	})
 }
 
@@ -592,12 +593,10 @@ func TestUndeclaredKVRefusalDrivenByNNamesSequences(t *testing.T) {
 	}
 }
 
-// A request whose own reserved output (max_tokens x output sequences, or the
-// one-token clamp x sequences when max_tokens is absent) is larger than a
-// positive maxReservedOutputTokens cap can never be admitted: it is refused
-// 413 without Retry-After, never a retryable 503 the client would retry
-// forever, and it never reaches the engine.
-func TestRequestOutputAboveReservedOutputCapIs413(t *testing.T) {
+// Q24: a reserved-output cap (here the lane's) is a load limit: a request
+// whose output x sequences is over the whole cap is admitted when nothing
+// else holds output, never answered 413.
+func TestRequestOutputAboveReservedOutputCapIsAdmittedAlone(t *testing.T) {
 	be := &oslRecordingBackend{}
 	srv := httptest.NewServer(be)
 	defer srv.Close()
@@ -607,25 +606,15 @@ func TestRequestOutputAboveReservedOutputCapIs413(t *testing.T) {
 	cfg.Lanes = map[string]config.AdmissionLane{"default": {Weight: 1, Limits: config.AdmissionLimits{MaxReservedOutputTokens: testutil.Ptr[int64](64)}}}
 	s := kvTestServer(t, cfg)
 
-	for _, tc := range []struct {
-		name, body, want string
-	}{
-		{"undeclared max_tokens, n=128", `{"model":"model-a","n":128,"messages":[{"role":"user","content":"hi"}]}`,
-			"the number of output sequences " + sequenceTerms + " exceeds a configured reserved-output limit"},
-		{"max_tokens=10, n=10", `{"model":"model-a","max_tokens":10,"n":10,"messages":[{"role":"user","content":"hi"}]}`,
-			"max_tokens times the number of output sequences " + sequenceTerms + " exceeds a configured reserved-output limit"},
+	for _, body := range []string{
+		`{"model":"model-a","n":128,"messages":[{"role":"user","content":"hi"}]}`,
+		`{"model":"model-a","max_tokens":10,"n":10,"messages":[{"role":"user","content":"hi"}]}`,
 	} {
-		t.Run(tc.name, func(t *testing.T) {
-			rr := serveChat(s, up, []byte(tc.body))
-			if rr.Code != http.StatusRequestEntityTooLarge || rr.Header().Get("Retry-After") != "" {
-				t.Fatalf("status=%d retry-after=%q body=%q, want 413 without Retry-After", rr.Code, rr.Header().Get("Retry-After"), rr.Body.String())
-			}
-			if !strings.Contains(rr.Body.String(), tc.want) {
-				t.Fatalf("body=%q, want %q", rr.Body.String(), tc.want)
-			}
-		})
+		if rr := serveChat(s, up, []byte(body)); rr.Code != http.StatusOK {
+			t.Fatalf("body %s: status=%d resp=%q, want 200", body, rr.Code, rr.Body.String())
+		}
 	}
-	if hits, _ := be.snapshot(); hits != 0 {
-		t.Fatalf("upstream hits=%d, an over-cap output request must not reach the engine", hits)
+	if hits, _ := be.snapshot(); hits != 2 {
+		t.Fatalf("upstream hits=%d, want 2", hits)
 	}
 }

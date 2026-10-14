@@ -158,24 +158,38 @@ func TestNewLeaseNeverWrittenToLegacyKeys(t *testing.T) {
 // A request alone larger than a positive physical cap is unsatisfiable (the
 // proxy answers 413), not a retryable capacity rejection; a zero cap stays
 // retryable.
-func TestRequestLargerThanCapacityIsUnsatisfiable(t *testing.T) {
+// Q24: capacity scopes never answer "can never fit". A request larger than a
+// positive prefill or KV limit is admitted alone and refused as retryable when
+// the scope's counter is in use; an explicit zero cap refuses even alone.
+func TestCapacityLimitsAreLoadLimits(t *testing.T) {
 	ctx := context.Background()
 	for _, tc := range []struct {
-		name          string
-		limits        config.AdmissionLimits
-		dimension     string
-		unsatisfiable bool
+		name      string
+		limits    config.AdmissionLimits
+		dimension string
+		zeroCap   bool
 	}{
-		{"prefill tokens", config.AdmissionLimits{MaxPrefillTokens: testutil.Ptr[int64](9)}, "prefill_tokens_exceeds_limit", true},
-		{"kv tokens", config.AdmissionLimits{MaxReservedKVTokens: testutil.Ptr[int64](29)}, "kv_exceeds_limit", true},
-		{"zero prefill cap stays retryable", config.AdmissionLimits{MaxPrefillTokens: testutil.Ptr[int64](0)}, "prefill_tokens", false},
+		{"prefill tokens", config.AdmissionLimits{MaxPrefillTokens: testutil.Ptr[int64](9)}, "prefill_tokens", false},
+		{"kv tokens", config.AdmissionLimits{MaxReservedKVTokens: testutil.Ptr[int64](29)}, "kv", false},
+		{"zero prefill cap stays retryable even alone", config.AdmissionLimits{MaxPrefillTokens: testutil.Ptr[int64](0)}, "prefill_tokens", true},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			a, _ := testAdmitter(t, config.AdmissionSettings{Graph: tc.limits})
-			_, err := a.Admit(ctx, request("a", "m")) // 10 input + 20 output
+			first, err := a.Admit(ctx, request("a", "m")) // 10 input + 20 output
 			var rejected *Rejected
-			if !errors.As(err, &rejected) || rejected.Dimension != tc.dimension || rejected.Unsatisfiable != tc.unsatisfiable || rejected.Contractual {
-				t.Fatalf("err=%+v, want dimension %s unsatisfiable=%v", rejected, tc.dimension, tc.unsatisfiable)
+			if tc.zeroCap {
+				if !errors.As(err, &rejected) || rejected.Dimension != tc.dimension || rejected.Unsatisfiable {
+					t.Fatalf("err=%+v, want a retryable %s rejection", rejected, tc.dimension)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("oversized but alone must be admitted: %v", err)
+			}
+			defer func() { _ = first.Complete(ctx, 0) }()
+			_, err = a.Admit(ctx, request("b", "m"))
+			if !errors.As(err, &rejected) || rejected.Dimension != tc.dimension || rejected.Unsatisfiable || rejected.Contractual {
+				t.Fatalf("err=%+v, want a retryable %s rejection while the scope is in use", rejected, tc.dimension)
 			}
 		})
 	}
@@ -236,52 +250,28 @@ func TestTightestReservedCapsReadsOutputFromAdmitScopes(t *testing.T) {
 // runs before any counter check, so the client gets the final answer (413 for
 // a capacity scope, 400 for a contract scope, never a Retry-After) instead of
 // a retryable rejection it would repeat until a quiet moment.
-func TestOversizeRequestIsUnsatisfiableEvenWhenEarlierScopeFull(t *testing.T) {
+// A request larger than a CONTRACT scope's whole limit is unsatisfiable (the
+// proxy's 400) even when an earlier scope is full, so the answer does not
+// depend on load. Capacity scopes have no such answer (Q24,
+// TestCapacityLimitsAreLoadLimits).
+func TestOversizeContractRequestIsUnsatisfiableEvenWhenEarlierScopeFull(t *testing.T) {
 	ctx := context.Background()
-	for _, tc := range []struct {
-		name        string
-		cfg         config.AdmissionSettings
-		shape       func(*Request)
-		scope       string
-		dimension   string
-		contractual bool
-	}{
-		{"published graph capacity prefill", config.AdmissionSettings{},
-			func(r *Request) { r.GraphCapacity = config.AdmissionLimits{MaxPrefillTokens: testutil.Ptr[int64](9)} },
-			"graph_capacity", "prefill_tokens_exceeds_limit", false},
-		{"published graph capacity kv", config.AdmissionSettings{},
-			func(r *Request) {
-				r.GraphCapacity = config.AdmissionLimits{MaxReservedKVTokens: testutil.Ptr[int64](29)}
-			},
-			"graph_capacity", "kv_exceeds_limit", false},
-		{"organization prefill", config.AdmissionSettings{Organization: config.AdmissionLimits{MaxPrefillTokens: testutil.Ptr[int64](9)}},
-			func(*Request) {}, "organization", "prefill_tokens_exceeds_limit", false},
-		{"contract generated tokens", config.AdmissionSettings{},
-			func(r *Request) { r.OwnerLimits = RateLimits{GeneratedTokens: testutil.Ptr[int64](19)} },
-			"contract_owner", "generated_tokens_exceeds_limit", true},
-	} {
-		t.Run(tc.name, func(t *testing.T) {
-			cfg := tc.cfg
-			cfg.Platform = config.AdmissionLimits{MaxActiveRequests: testutil.Ptr[int64](1)}
-			a, _ := testAdmitter(t, cfg)
-			// Fill the platform's only active slot with a request small
-			// enough to pass every cap under test.
-			small := request("a", "m")
-			small.PrefillTokens, small.EstimatedInputTokens, small.ReservedOutputTokens = 1, 1, 1
-			holder, err := a.Admit(ctx, small)
-			if err != nil {
-				t.Fatal(err)
-			}
-			defer func() { _ = holder.Complete(ctx, 0) }()
-			req := request("a", "m") // 10 input + 20 output = 30 KV
-			tc.shape(&req)
-			_, err = a.Admit(ctx, req)
-			var rejected *Rejected
-			if !errors.As(err, &rejected) || rejected.Scope != tc.scope || rejected.Dimension != tc.dimension ||
-				!rejected.Unsatisfiable || rejected.Contractual != tc.contractual || rejected.RetryAfter != 0 {
-				t.Fatalf("err=%+v, want unsatisfiable %s at %s with no retry hint, not the full platform scope", rejected, tc.dimension, tc.scope)
-			}
-		})
+	cfg := config.AdmissionSettings{Platform: config.AdmissionLimits{MaxActiveRequests: testutil.Ptr[int64](1)}}
+	a, _ := testAdmitter(t, cfg)
+	small := request("a", "m")
+	small.PrefillTokens, small.EstimatedInputTokens, small.ReservedOutputTokens = 1, 1, 1
+	holder, err := a.Admit(ctx, small)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = holder.Complete(ctx, 0) }()
+	req := request("a", "m") // 20 output
+	req.OwnerLimits = RateLimits{GeneratedTokens: testutil.Ptr[int64](19)}
+	_, err = a.Admit(ctx, req)
+	var rejected *Rejected
+	if !errors.As(err, &rejected) || rejected.Scope != "contract_owner" || rejected.Dimension != "generated_tokens_exceeds_limit" ||
+		!rejected.Unsatisfiable || !rejected.Contractual || rejected.RetryAfter != 0 {
+		t.Fatalf("err=%+v, want unsatisfiable contract_owner generated_tokens_exceeds_limit, not the full platform scope", rejected)
 	}
 }
 

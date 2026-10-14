@@ -228,10 +228,10 @@ func TestSharedPrefillTokensAtExactLimitAdmits(t *testing.T) {
 	if rr := serve(estimate); rr.Code != http.StatusOK || upstreamHits != 1 {
 		t.Fatalf("status=%d upstream=%d, an estimate exactly at maxPrefillTokens must be admitted", rr.Code, upstreamHits)
 	}
-	// One request alone over the limit can never fit: refused as too large
-	// (413), never a retryable 503, and before the upstream.
-	if rr := serve(estimate - 1); rr.Code != http.StatusRequestEntityTooLarge || rr.Header().Get("Retry-After") != "" || upstreamHits != 1 {
-		t.Fatalf("status=%d upstream=%d, an estimate one over maxPrefillTokens must be refused with 413 before the upstream", rr.Code, upstreamHits)
+	// Q24: prefill is a load limit. One request over the whole limit, with
+	// nothing else in flight, is admitted, never refused forever.
+	if rr := serve(estimate - 1); rr.Code != http.StatusOK || upstreamHits != 2 {
+		t.Fatalf("status=%d upstream=%d, an estimate one over maxPrefillTokens with nothing in flight must be admitted", rr.Code, upstreamHits)
 	}
 }
 
@@ -876,7 +876,9 @@ func TestWakeColdHoldStoreOutageFailsClosed(t *testing.T) {
 	}
 }
 
-func TestAdmissionImpossibleOutputRejectedBeforeUpstream(t *testing.T) {
+// Q24: a reserved-output cap is a load limit. A request whose own output is
+// larger than the whole cap is admitted when nothing else holds output.
+func TestAdmissionOversizedOutputAloneIsAdmitted(t *testing.T) {
 	var hits int
 	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) { hits++; w.WriteHeader(200) }))
 	defer backend.Close()
@@ -888,13 +890,8 @@ func TestAdmissionImpossibleOutputRejectedBeforeUpstream(t *testing.T) {
 	s := New(&config.Settings{Admission: cfg}, logging.New(logging.ERROR), &recordingEmitter{}).WithAdmitter(admission.New(c, cfg))
 	rr := httptest.NewRecorder()
 	s.Handler().ServeHTTP(rr, sharedRequest(up))
-	// The request's own output is larger than the whole cap, so waiting can
-	// never admit it: 413 without Retry-After, not a retryable 503.
-	if rr.Code != http.StatusRequestEntityTooLarge || rr.Header().Get("Retry-After") != "" {
-		t.Fatalf("status=%d retry-after=%q, want 413 without Retry-After", rr.Code, rr.Header().Get("Retry-After"))
-	}
-	if hits != 0 {
-		t.Fatal("impossible request reached upstream")
+	if rr.Code != http.StatusOK || hits != 1 {
+		t.Fatalf("status=%d hits=%d, want the lone oversized request admitted", rr.Code, hits)
 	}
 }
 
@@ -2989,7 +2986,7 @@ func TestAdmissionRenewalFailureEmitsReconciliationRow(t *testing.T) {
 // platform cap is a configured limit, not the model's capacity, so the body
 // does not blame the model. The control: an explicit zero cap stays a
 // retryable 503 with Retry-After.
-func TestKVLargerThanCapacityIs413NoRetryAfter(t *testing.T) {
+func TestOperatorKVTierIsALoadLimit(t *testing.T) {
 	var upstreamHits atomic.Int32
 	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		upstreamHits.Add(1)
@@ -3015,24 +3012,17 @@ func TestKVLargerThanCapacityIs413NoRetryAfter(t *testing.T) {
 		return rr
 	}
 
-	rr := serve(kvNeed - 1)
-	if rr.Code != http.StatusRequestEntityTooLarge || rr.Header().Get("Retry-After") != "" {
-		t.Fatalf("status=%d retry-after=%q, want 413 without Retry-After", rr.Code, rr.Header().Get("Retry-After"))
-	}
-	if got := rr.Body.String(); !strings.Contains(got, "a configured KV-cache limit") || strings.Contains(got, "this model's") {
-		t.Fatalf("body=%q, want the configured KV-cache limit wording", got)
-	}
-	if rr.Header().Get(requestIDHeader) == "" {
-		t.Fatal("413 is missing the request-id header")
-	}
-	if n := upstreamHits.Load(); n != 0 {
-		t.Fatalf("upstream hits=%d, an over-KV request must not reach the engine", n)
+	// Q24: an operator KV tier is a graph-wide load limit, not one worker's
+	// memory, so a request over it with nothing in flight is admitted (only
+	// the published per-worker KV answers 413).
+	if rr := serve(kvNeed - 1); rr.Code != http.StatusOK || upstreamHits.Load() != 1 {
+		t.Fatalf("status=%d upstream=%d, want the lone over-tier request admitted", rr.Code, upstreamHits.Load())
 	}
 
 	if rr := serve(0); rr.Code != http.StatusServiceUnavailable || rr.Header().Get("Retry-After") == "" {
 		t.Fatalf("zero KV cap: status=%d retry-after=%q, want a retryable 503", rr.Code, rr.Header().Get("Retry-After"))
 	}
-	if rr := serve(kvNeed); rr.Code != http.StatusOK || upstreamHits.Load() != 1 {
+	if rr := serve(kvNeed); rr.Code != http.StatusOK || upstreamHits.Load() != 2 {
 		t.Fatalf("KV need exactly at the cap: status=%d upstream=%d, want admitted", rr.Code, upstreamHits.Load())
 	}
 }
@@ -3118,10 +3108,10 @@ func TestOversizeMessageForUndeclaredOutputDoesNotMentionMaxTokens(t *testing.T)
 	}
 }
 
-// A request larger than the published graph capacity gets the final 413 with
-// no Retry-After even while the platform scope is momentarily full, so the
-// client does not retry a request that can never be admitted.
-func TestOversizeRequestIs413WithoutRetryAfterWhenEarlierScopeFull(t *testing.T) {
+// Q24: a published prefill capacity is a load limit, so a request larger than
+// it is never answered 413. With the platform's only active slot taken, it is
+// refused as retryable capacity (503 + Retry-After).
+func TestOversizePrefillIsRetryableWhenEarlierScopeFull(t *testing.T) {
 	ctx := context.Background()
 	mr := miniredis.RunT(t)
 	client := redis.NewClient(&redis.Options{Addr: mr.Addr()})
@@ -3139,14 +3129,14 @@ func TestOversizeRequestIs413WithoutRetryAfterWhenEarlierScopeFull(t *testing.T)
 		PrefillTokens: 100, EstimatedInputTokens: 100, ReservedOutputTokens: 1,
 		GraphCapacity: config.AdmissionLimits{MaxPrefillTokens: testutil.Ptr[int64](64)}})
 	var rejected *admission.Rejected
-	if !errors.As(err, &rejected) || rejected.Scope != "graph_capacity" || rejected.Dimension != "prefill_tokens_exceeds_limit" {
-		t.Fatalf("err=%v, want prefill_tokens_exceeds_limit at graph_capacity", err)
+	if !errors.As(err, &rejected) || rejected.Unsatisfiable {
+		t.Fatalf("err=%v, want a retryable rejection", err)
 	}
 	s := New(&config.Settings{Admission: cfg}, logging.New(logging.ERROR), &recordingEmitter{}).WithAdmitter(a)
 	rr := httptest.NewRecorder()
 	s.writeAdmissionError(rr, "req-1", err)
-	if rr.Code != http.StatusRequestEntityTooLarge || rr.Header().Get("Retry-After") != "" {
-		t.Fatalf("status=%d retry-after=%q, want 413 without Retry-After", rr.Code, rr.Header().Get("Retry-After"))
+	if rr.Code != http.StatusServiceUnavailable || rr.Header().Get("Retry-After") == "" {
+		t.Fatalf("status=%d retry-after=%q, want 503 with Retry-After", rr.Code, rr.Header().Get("Retry-After"))
 	}
 }
 

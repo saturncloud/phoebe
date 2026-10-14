@@ -149,6 +149,44 @@ func (s *Server) publishedGraphCapacity(graph string) gateway.GraphCapacity {
 	return s.graphCapacity.GraphCapacity(graph)
 }
 
+// publishedGraphRequestCapacity is the per-request capacity for graph
+// (GraphRequestCapacity: unscaled), or scaled when the resolver cannot say,
+// which keeps the previous behavior.
+func (s *Server) publishedGraphRequestCapacity(graph string, scaled gateway.GraphCapacity) gateway.GraphCapacity {
+	if s.graphRequestCapacity == nil || graph == "" {
+		return scaled
+	}
+	return s.graphRequestCapacity.GraphRequestCapacity(graph)
+}
+
+// graphFitRejection is the ONLY "can never fit" check for capacity (Q24,
+// Hugo 2026-10-14): one request's reserved KV (the prompt plus output x
+// sequences) is held on ONE worker, so a request above the graph's
+// per-request (per-worker) KV value can never fit, however many workers are
+// up: 413. Every other capacity limit is a load limit that admission handles
+// as retryable (and admits a single oversized request when nothing else is in
+// flight), so it never returns 413. Only a positive cap applies (an explicit
+// zero cap stays a retryable refusal in admission). nil means the request
+// goes on to admission.
+func graphFitRejection(perRequest gateway.GraphCapacity, est admissionEstimate) *admission.Rejected {
+	sequences := est.OutputSequences
+	if sequences < 1 {
+		sequences = 1
+	}
+	kv := est.InputTokens
+	if est.OutputTokens > 0 {
+		if est.OutputTokens > (math.MaxInt64-kv)/sequences {
+			kv = math.MaxInt64
+		} else {
+			kv += est.OutputTokens * sequences
+		}
+	}
+	if v := perRequest.MaxReservedKVTokens; v != nil && *v > 0 && kv > *v {
+		return &admission.Rejected{Scope: "graph_capacity", Dimension: "kv_exceeds_limit", Unsatisfiable: true}
+	}
+	return nil
+}
+
 func admissionLaneForIdentity(settings config.AdmissionSettings, id identity.Identity) config.AdmissionLane {
 	laneName := settings.OrganizationLanes[id.OrgID]
 	if laneName == "" {

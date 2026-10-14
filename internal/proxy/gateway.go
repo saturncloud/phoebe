@@ -33,6 +33,13 @@ type graphCapacitySource interface {
 	GraphCapacity(graph string) gateway.GraphCapacity
 }
 
+// graphRequestCapacitySource is the capacity ONE request is checked against
+// to decide that it can never fit (Q24): the published values, unscaled by
+// ready workers (gateway.RegistryResolver implements it).
+type graphRequestCapacitySource interface {
+	GraphRequestCapacity(graph string) gateway.GraphCapacity
+}
+
 // WithGateway enables gateway resolution: requests carrying the trusted
 // X-Saturn-Gateway marker resolve their (org, body model=) against Atlas's
 // tf_model via resolver, and forward to the resolved graph's frontend Service
@@ -51,6 +58,9 @@ func (s *Server) WithGateway(resolver gateway.Resolver, namespace string, port i
 	}
 	if source, ok := resolver.(graphCapacitySource); ok {
 		s.graphCapacity = source
+	}
+	if source, ok := resolver.(graphRequestCapacitySource); ok {
+		s.graphRequestCapacity = source
 	}
 	s.gateway = &gatewayRoute{
 		resolver: resolver,

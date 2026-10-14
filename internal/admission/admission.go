@@ -61,15 +61,17 @@ type Rejected struct {
 	RetryAfter  time.Duration
 	Contractual bool
 	// Unsatisfiable marks a rejection that no amount of waiting can clear,
-	// because the single request alone exceeds the scope's whole limit. There
-	// are two cases. For a contract scope (Contractual=true), the request
-	// reserves more than the per-window limit (for example max_tokens above
-	// the generated-token limit), and the proxy answers 400. For a capacity
-	// scope (Contractual=false), the request's estimated prefill tokens, KV
-	// reservation, or reserved output (output x sequences) exceed a positive
-	// physical cap (prefill_tokens_exceeds_limit, kv_exceeds_limit,
-	// output_exceeds_limit), and the proxy answers 413 (decision D12). In both cases RetryAfter is zero and no Retry-After
-	// header is sent. Callers must branch on Contractual to choose the status.
+	// because the single request alone exceeds the scope's whole limit. The
+	// admission script returns it only for a contract scope
+	// (Contractual=true): the request reserves more than the per-window limit
+	// (for example max_tokens above the generated-token limit), and the proxy
+	// answers 400. Capacity scopes never return it (Q24): their prefill, KV and
+	// output limits are load limits, so an oversized request is admitted when
+	// nothing else holds the counter and is otherwise refused as retryable.
+	// The proxy builds the one capacity Unsatisfiable itself, the per-worker
+	// KV check (kv_exceeds_limit on graph_capacity, 413). RetryAfter is zero
+	// and no Retry-After header is sent. Callers must branch on Contractual to
+	// choose the status.
 	Unsatisfiable bool
 }
 
