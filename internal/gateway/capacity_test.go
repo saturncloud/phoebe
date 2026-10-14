@@ -50,12 +50,15 @@ func TestParseGraphCapacity(t *testing.T) {
 		}, -1, -1, 100, 1},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			c, problems := parseGraphCapacity(tc.data)
+			c, badValues, badUnit := parseGraphCapacity(tc.data)
 			if val(c.MaxActiveRequests) != tc.active || val(c.MaxReservedKVTokens) != tc.kv || val(c.MaxPrefillTokens) != tc.prefill {
 				t.Fatalf("capacity=(%d,%d,%d)", val(c.MaxActiveRequests), val(c.MaxReservedKVTokens), val(c.MaxPrefillTokens))
 			}
-			if len(problems) != tc.wantProblems {
-				t.Fatalf("problems=%v, want %d", problems, tc.wantProblems)
+			if len(badValues) != tc.wantProblems {
+				t.Fatalf("badValues=%v, want %d", badValues, tc.wantProblems)
+			}
+			if badUnit != "" {
+				t.Fatalf("badUnit=%q, want none", badUnit)
 			}
 		})
 	}

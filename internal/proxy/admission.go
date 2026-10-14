@@ -139,7 +139,9 @@ type admissionEstimate struct {
 	OutputSequences int64
 }
 
-// publishedGraphCapacity is the capacity Atlas published for graph, or none.
+// publishedGraphCapacity is the admission capacity phoebe enforces for graph
+// (RegistryResolver.GraphCapacity: per-worker entries scaled by ready workers
+// plus headroom, graph-level entries as published), or none.
 func (s *Server) publishedGraphCapacity(graph string) gateway.GraphCapacity {
 	if s.graphCapacity == nil || graph == "" {
 		return gateway.GraphCapacity{}

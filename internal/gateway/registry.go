@@ -290,9 +290,12 @@ func (r *RegistryResolver) upsert(obj any) {
 		r.log.Error.Printf("gateway: ignoring registry ConfigMap %s/%s: %v", cm.Namespace, cm.Name, err)
 		return
 	}
-	capacity, problems := parseGraphCapacity(cm.Data)
-	if len(problems) > 0 {
-		r.log.Error.Printf("gateway: registry ConfigMap %s/%s publishes malformed admission capacity %v — ignoring those limits (no limit)", cm.Namespace, cm.Name, problems)
+	capacity, badValues, badUnit := parseGraphCapacity(cm.Data)
+	if len(badValues) > 0 {
+		r.log.Error.Printf("gateway: registry ConfigMap %s/%s publishes malformed admission capacity %v — ignoring those limits (no limit)", cm.Namespace, cm.Name, badValues)
+	}
+	if badUnit != "" {
+		r.log.Error.Printf("gateway: registry ConfigMap %s/%s publishes unknown %s — enforcing its admission limits as published, as graph-level values (not multiplied by ready workers)", cm.Namespace, cm.Name, badUnit)
 	}
 	if capacity.Any() {
 		if r.byGraph[res.GraphK8sName] == nil {
@@ -352,10 +355,14 @@ func (r *RegistryResolver) dropClaimLocked(cmName string, key cacheKey) {
 	}
 }
 
-// GraphCapacity returns the admission capacity phoebe enforces for graph: the
-// tightest per-worker value per limit across the graph's registry entries
-// that win their (org, served name) key, times the graph's ready workers plus
-// GraphLimitHeadroomWorkers when a ReadyWorkers source is attached (Q22). A ConfigMap that loses a duplicate claim (see
+// GraphCapacity returns the admission capacity phoebe enforces for graph.
+// Each registry entry that wins its (org, served name) key is read in its own
+// unit first. An entry marked admission_capacity_unit: per_worker is
+// multiplied by the graph's ready workers plus GraphLimitHeadroomWorkers, or
+// by GraphLimitHeadroomWorkers alone when no ReadyWorkers source is attached.
+// An unmarked or unknown-unit entry is a graph-level value and is used as
+// published. The tightest value per limit across these entries is returned
+// (Q22, D55a). A ConfigMap that loses a duplicate claim (see
 // resolveClaimants) does not serve traffic, so its capacity values do not
 // count either: a stale duplicate must not cap the graph for as long as it
 // lives. Before the first sync, or for a graph with nothing published, it

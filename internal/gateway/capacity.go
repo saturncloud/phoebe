@@ -87,13 +87,20 @@ func (c GraphCapacity) Any() bool {
 	return false
 }
 
-// parseGraphCapacity reads the capacity keys of one registry entry. A value
-// that is not a non-negative integer is an Atlas producer bug; it is reported
-// in problems and treated as unpublished (no limit) rather than rejecting the
-// entry, because refusing the registration would take the tenant's model
-// offline over a missing capacity hint (the same direction as having no
-// profile at all).
-func parseGraphCapacity(d map[string]string) (c GraphCapacity, problems []string) {
+// parseGraphCapacity reads the capacity keys of one registry entry and
+// reports the two kinds of Atlas producer bug separately, because phoebe
+// handles them in opposite directions:
+//
+//   - badValues lists limit values that are not non-negative integers. Each
+//     is treated as unpublished (no limit) rather than rejecting the entry,
+//     because refusing the registration would take the tenant's model
+//     offline over a missing capacity hint (the same direction as having no
+//     profile at all).
+//   - badUnit names an unknown admission_capacity_unit. The entry's values
+//     are kept and enforced as published, as graph-level limits (PerWorker
+//     stays false): that is the tighter reading of a per-worker value and
+//     the published reading of a graph-level one (D55(a)).
+func parseGraphCapacity(d map[string]string) (c GraphCapacity, badValues []string, badUnit string) {
 	for _, f := range capacityFields {
 		key := f.key
 		raw := strings.TrimSpace(d[key])
@@ -102,7 +109,7 @@ func parseGraphCapacity(d map[string]string) (c GraphCapacity, problems []string
 		}
 		v, err := strconv.ParseInt(raw, 10, 64)
 		if err != nil || v < 0 {
-			problems = append(problems, key+"="+strconv.Quote(raw))
+			badValues = append(badValues, key+"="+strconv.Quote(raw))
 			continue
 		}
 		*f.get(&c) = &v
@@ -112,12 +119,9 @@ func parseGraphCapacity(d map[string]string) (c GraphCapacity, problems []string
 	case capacityUnitPerWorker:
 		c.PerWorker = true
 	default:
-		// An unknown unit is an Atlas producer bug. Enforcing the values as
-		// they are is the tighter reading of a per-worker value and the
-		// published reading of a graph-level one.
-		problems = append(problems, capacityKeyUnit+"="+strconv.Quote(unit))
+		badUnit = capacityKeyUnit + "=" + strconv.Quote(unit)
 	}
-	return c, problems
+	return c, badValues, badUnit
 }
 
 // tightest combines the capacity published on several entries of one graph:
