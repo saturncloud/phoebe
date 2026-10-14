@@ -110,11 +110,13 @@ func schemaReady(version uint, dirty bool, required uint) bool {
 // deadline (schemaProbeTimeout) so a hung query surfaces as an error in the
 // warning log rather than a silent stall.
 //
-// Returns nil when the gate passes (or RequiredSchemaVersion is 0), the
+// Returns nil when the gate passes (or RequiredSchemaVersion is 0, which logs a
+// warning that the gate is disabled), the
 // context error when ctx ends, or the timeout error.
 func (d *Drainer) waitForSchema(ctx context.Context) error {
 	required := d.cfg.RequiredSchemaVersion
 	if required == 0 {
+		d.log.Warn.Printf("drainer: RequiredSchemaVersion is 0, so the schema gate is disabled (tests only); consuming without checking the database schema")
 		return nil
 	}
 	start := d.now()

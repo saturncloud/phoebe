@@ -96,7 +96,14 @@ func main() {
 	rdb := redis.NewClient(&redis.Options{Addr: cfg.ValkeyAddr})
 	defer func() { _ = rdb.Close() }()
 
-	cfg.RequiredSchemaVersion = migrations.LatestVersion()
+	// The schema gate must never be off in a real binary: 0 disables it, so an
+	// unreadable or unparseable migration set is fatal rather than silently
+	// letting the drainer write into an old schema.
+	required, err := migrations.LatestVersion()
+	if err != nil || required == 0 {
+		log.Error.Fatalf("drainer: cannot determine required schema version: %v", err)
+	}
+	cfg.RequiredSchemaVersion = required
 	d := drain.New(cfg, log, rdb, store)
 	if err := d.Run(ctx); err != nil {
 		log.Error.Fatalf("drainer: run: %v", err)

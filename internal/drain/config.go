@@ -49,7 +49,9 @@ type Config struct {
 	// A dirty schema_migrations row blocks only at or below this version: a
 	// dirty row above it means a LATER migration failed and every version
 	// this binary needs is fully applied (see schemaReady).
-	// main sets it from migrations.LatestVersion(); 0 disables the gate.
+	// main sets it from migrations.LatestVersion() and exits if that fails, so
+	// main never sets 0. 0 disables the gate and is for tests only; the
+	// drainer logs a warning when it runs with the gate disabled.
 	RequiredSchemaVersion uint
 
 	// SchemaWaitTimeout bounds how long the drainer waits for

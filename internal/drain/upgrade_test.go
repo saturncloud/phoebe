@@ -6,8 +6,10 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"io/fs"
 	"log"
 	"os"
+	"regexp"
 	"strconv"
 	"strings"
 	"sync"
@@ -15,6 +17,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/golang-migrate/migrate/v4/source/iofs"
 	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/redis/go-redis/v9"
 
@@ -130,7 +133,11 @@ func TestDrain_SchemaGapRetriesInsteadOfPoisoning(t *testing.T) {
 		t.Fatalf("pending = %d, want both events left un-ACK'd for redelivery", p)
 	}
 
-	store.migrate(migrations.LatestVersion())
+	latest, err := migrations.LatestVersion()
+	if err != nil {
+		t.Fatal(err)
+	}
+	store.migrate(latest)
 	d.cfg.ClaimMinIdle = 0
 	d.reclaim(ctx)
 	if store.rowCount() != 2 || pendingCount(t, rdb, cfg.StreamName, cfg.Group) != 0 {
@@ -380,8 +387,14 @@ func TestDrain_RecreatedGroupDrainsEventsEmittedDuringTheWipe(t *testing.T) {
 	}
 }
 
-// LatestVersion must equal the highest NNNN prefix among the .up.sql files on
-// disk, computed here independently, and every up file needs its down file.
+// golangMigrateUpName is the pattern golang-migrate's source.Parse accepts,
+// restricted to up files. Written out here so the test does not share the
+// implementation's parser.
+var golangMigrateUpName = regexp.MustCompile(`^([0-9]+)_(.*)\.(up)\.sql$`)
+
+// LatestVersion must equal the highest up-migration version on disk, computed
+// here independently; every up file must be a name golang-migrate parses and
+// have its down file.
 func TestLatestVersionMatchesEmbeddedMigrations(t *testing.T) {
 	entries, err := os.ReadDir("../../migrations")
 	if err != nil {
@@ -397,10 +410,13 @@ func TestLatestVersionMatchesEmbeddedMigrations(t *testing.T) {
 		if !ok {
 			continue
 		}
-		prefix, _, _ := strings.Cut(base, "_")
-		v, err := strconv.ParseUint(prefix, 10, 32)
+		m := golangMigrateUpName.FindStringSubmatch(name)
+		if m == nil {
+			t.Fatalf("migration %s does not match golang-migrate's NNNN_name.up.sql pattern", name)
+		}
+		v, err := strconv.ParseUint(m[1], 10, 64)
 		if err != nil {
-			t.Fatalf("migration %s has no numeric prefix", name)
+			t.Fatalf("migration %s: version %q does not parse: %v", name, m[1], err)
 		}
 		if uint(v) > want {
 			want = uint(v)
@@ -412,8 +428,61 @@ func TestLatestVersionMatchesEmbeddedMigrations(t *testing.T) {
 	if want == 0 {
 		t.Fatal("no .up.sql migrations found")
 	}
-	if got := migrations.LatestVersion(); got != want {
-		t.Fatalf("LatestVersion() = %d, want %d (the highest .up.sql prefix on disk)", got, want)
+	got, err := migrations.LatestVersion()
+	if err != nil {
+		t.Fatalf("LatestVersion() error = %v", err)
+	}
+	if got != want {
+		t.Fatalf("LatestVersion() = %d, want %d (the highest .up.sql version on disk)", got, want)
+	}
+}
+
+// The required schema version must be exactly the last version cmd/migrate
+// applies: walk migrations.FS through the same golang-migrate iofs source
+// cmd/migrate uses and compare with its final version.
+func TestLatestVersionIsLastVersionMigrateApplies(t *testing.T) {
+	src, err := iofs.New(migrations.FS, ".")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = src.Close() }()
+	last, err := src.First()
+	if err != nil {
+		t.Fatalf("iofs First: %v", err)
+	}
+	for {
+		next, err := src.Next(last)
+		if errors.Is(err, fs.ErrNotExist) {
+			break
+		}
+		if err != nil {
+			t.Fatalf("iofs Next(%d): %v", last, err)
+		}
+		last = next
+	}
+	got, err := migrations.LatestVersion()
+	if err != nil {
+		t.Fatalf("LatestVersion() error = %v", err)
+	}
+	if got != last {
+		t.Fatalf("LatestVersion() = %d, want %d (the last version golang-migrate applies from migrations.FS)", got, last)
+	}
+}
+
+// RequiredSchemaVersion 0 disables the gate (tests only; main never sets it),
+// and says so in the log so a disabled gate is never silent.
+func TestWaitForSchema_ZeroDisablesGateAndWarns(t *testing.T) {
+	_, rdb := startMiniredis(t)
+	cfg := testConfig(rdb.Options().Addr)
+	cfg.RequiredSchemaVersion = 0
+	store := &schemaGapStore{fakeStore: newFakeStore(), version: 0, migrated: true}
+	logger, buf := capturingLogger()
+	d := newGatedDrainer(cfg, logger, rdb, store)
+	if err := d.waitForSchema(context.Background()); err != nil {
+		t.Fatalf("waitForSchema = %v, want nil with the gate disabled", err)
+	}
+	if out := buf.String(); !strings.Contains(out, "WARN: ") || !strings.Contains(out, "schema gate is disabled") {
+		t.Fatalf("log = %q, want a WARN line saying the schema gate is disabled", out)
 	}
 }
 
