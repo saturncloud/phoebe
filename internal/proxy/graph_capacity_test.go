@@ -23,9 +23,15 @@ import (
 	"github.com/saturncloud/phoebe/internal/testutil"
 )
 
+// staticGraphCapacity publishes the same values as the scaled and the
+// per-request capacity (a graph-level entry, or one ready worker).
 type staticGraphCapacity map[string]gateway.GraphCapacity
 
 func (s staticGraphCapacity) GraphCapacity(graph string) gateway.GraphCapacity { return s[graph] }
+
+func (s staticGraphCapacity) GraphRequestCapacity(graph string) gateway.GraphCapacity {
+	return s[graph]
+}
 
 // bareSharedRequest is a shared request with the trusted org but NO limit
 // envelope: with admission.enabled=false, nothing but published graph

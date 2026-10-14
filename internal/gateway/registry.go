@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"math"
 	"sort"
 	"strconv"
 	"sync"
@@ -12,6 +13,7 @@ import (
 
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/client-go/dynamic"
 	"k8s.io/client-go/informers"
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/rest"
@@ -22,10 +24,10 @@ import (
 	"github.com/saturncloud/phoebe/internal/logging"
 )
 
-// NewKubeClient builds the typed clientset the registry resolver watches
-// with: in-cluster config in production, a kubeconfig path for dev/tests
-// (mirrors the waker's config loading).
-func NewKubeClient(kubeconfig string) (kubernetes.Interface, error) {
+// restConfig loads the Kubernetes client config: in-cluster config in
+// production, a kubeconfig path for dev/tests. It mirrors the waker's config
+// loading (internal/waker), which predates it and is left as is.
+func restConfig(kubeconfig string) (*rest.Config, error) {
 	var (
 		rc  *rest.Config
 		err error
@@ -38,7 +40,27 @@ func NewKubeClient(kubeconfig string) (kubernetes.Interface, error) {
 	if err != nil {
 		return nil, fmt.Errorf("gateway: kubernetes config: %w", err)
 	}
+	return rc, nil
+}
+
+// NewKubeClient builds the typed clientset the registry resolver watches
+// with (see restConfig).
+func NewKubeClient(kubeconfig string) (kubernetes.Interface, error) {
+	rc, err := restConfig(kubeconfig)
+	if err != nil {
+		return nil, err
+	}
 	return kubernetes.NewForConfig(rc)
+}
+
+// NewDynamicClient is NewKubeClient's dynamic client, for the custom
+// resources phoebe reads (the DynamoGraphDeployments' ready workers).
+func NewDynamicClient(kubeconfig string) (dynamic.Interface, error) {
+	rc, err := restConfig(kubeconfig)
+	if err != nil {
+		return nil, err
+	}
+	return dynamic.NewForConfig(rc)
 }
 
 // THE REGISTRY CONTRACT (contract of record, coordinated with the Atlas side
@@ -70,9 +92,19 @@ func NewKubeClient(kubeconfig string) (kubernetes.Interface, error) {
 //	           admission_max_active_requests,
 //	           admission_max_reserved_kv_tokens,
 //	           admission_max_prefill_tokens
-//	                             — OPTIONAL graph-level admission capacity
-//	                               (B8): non-negative integers, empty or
-//	                               absent = no limit; see GraphCapacity
+//	                             — OPTIONAL admission capacity (B8):
+//	                               non-negative integers, empty or absent =
+//	                               no limit. With admission_capacity_unit:
+//	                               per_worker (Q22) they are per-worker and
+//	                               phoebe enforces each graph at the value
+//	                               times (ready workers + 1); without the
+//	                               marker they are graph-level and enforced
+//	                               as published; see
+//	                               GraphCapacity and ReadyWorkers. The
+//	                               ready workers are read only from the
+//	                               DynamoGraphDeployments labelled
+//	                               saturncloud.io/managed-by=Atlas
+//	                               (atlasManagedSelector)
 //
 // Atlas guarantees (org_id, served_model_name) uniqueness across live
 // registrations; the resolver still tolerates duplicates deterministically
@@ -128,6 +160,17 @@ type RegistryResolver struct {
 	// delete withdraws exactly that entry's contribution.
 	byGraph map[string]map[string]GraphCapacity
 	cmGraph map[string]string
+	// workers, when set, holds each graph's ready workers: Atlas publishes
+	// PER-WORKER limits and GraphCapacity multiplies them by (ready workers +
+	// GraphLimitHeadroomWorkers) (Q4(b), option B).
+	workers readyWorkerSource
+}
+
+// WithReadyWorkers makes GraphCapacity scale the published per-worker limits
+// by each graph's ready workers plus GraphLimitHeadroomWorkers.
+func (r *RegistryResolver) WithReadyWorkers(w readyWorkerSource) *RegistryResolver {
+	r.workers = w
+	return r
 }
 
 // compile-time: the registry implements the same seam the PG resolver does.
@@ -247,9 +290,12 @@ func (r *RegistryResolver) upsert(obj any) {
 		r.log.Error.Printf("gateway: ignoring registry ConfigMap %s/%s: %v", cm.Namespace, cm.Name, err)
 		return
 	}
-	capacity, problems := parseGraphCapacity(cm.Data)
-	if len(problems) > 0 {
-		r.log.Error.Printf("gateway: registry ConfigMap %s/%s publishes malformed admission capacity %v — ignoring those limits (no limit)", cm.Namespace, cm.Name, problems)
+	capacity, badValues, badUnit := parseGraphCapacity(cm.Data)
+	if len(badValues) > 0 {
+		r.log.Error.Printf("gateway: registry ConfigMap %s/%s publishes malformed admission capacity %v — ignoring those limits (no limit)", cm.Namespace, cm.Name, badValues)
+	}
+	if badUnit != "" {
+		r.log.Error.Printf("gateway: registry ConfigMap %s/%s publishes unknown %s — enforcing its admission limits as published, as graph-level values (not multiplied by ready workers)", cm.Namespace, cm.Name, badUnit)
 	}
 	if capacity.Any() {
 		if r.byGraph[res.GraphK8sName] == nil {
@@ -309,25 +355,78 @@ func (r *RegistryResolver) dropClaimLocked(cmName string, key cacheKey) {
 	}
 }
 
-// GraphCapacity returns the admission capacity Atlas publishes for graph, the
-// tightest value per limit across the graph's registry entries that win their
-// (org, served name) key. A ConfigMap that loses a duplicate claim (see
+// GraphCapacity returns the admission capacity phoebe enforces for graph.
+// Each registry entry that wins its (org, served name) key is read in its own
+// unit first. An entry marked admission_capacity_unit: per_worker is
+// multiplied by the graph's ready workers plus GraphLimitHeadroomWorkers, or
+// by GraphLimitHeadroomWorkers alone when no ReadyWorkers source is attached.
+// An unmarked or unknown-unit entry is a graph-level value and is used as
+// published. The tightest value per limit across these entries is returned
+// (Q22, D55a). A ConfigMap that loses a duplicate claim (see
 // resolveClaimants) does not serve traffic, so its capacity values do not
 // count either: a stale duplicate must not cap the graph for as long as it
 // lives. Before the first sync, or for a graph with nothing published, it
 // returns no limits: "no profile and no override" means no capacity limit
 // (ruling 2026-10-12). Pure memory read.
 func (r *RegistryResolver) GraphCapacity(graph string) GraphCapacity {
+	scaled, _ := r.GraphCapacities(graph)
+	return scaled
+}
+
+// GraphRequestCapacity is the capacity ONE request is checked against to
+// decide that it can never fit (Q24): the tightest value per limit across the
+// graph's claim-winning entries, NOT scaled by ready workers. A single request
+// runs on a single worker, so a per-worker entry's own value is the most any
+// one request can use; a graph-level entry (no unit marker) is its published
+// value, as before. Pure memory read.
+func (r *RegistryResolver) GraphRequestCapacity(graph string) GraphCapacity {
+	_, perRequest := r.GraphCapacities(graph)
+	return perRequest
+}
+
+// GraphCapacities returns GraphCapacity and GraphRequestCapacity for graph
+// from ONE locked read of the registry, so a ConfigMap update cannot land
+// between them and pair a scaled capacity from one registry state with a
+// per-request capacity from another. Pure memory read.
+func (r *RegistryResolver) GraphCapacities(graph string) (scaled, perRequest GraphCapacity) {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
 	caps := r.byGraph[graph]
-	winners := make(map[string]GraphCapacity, len(caps))
+	scaledWinners := make(map[string]GraphCapacity, len(caps))
+	perRequestWinners := make(map[string]GraphCapacity, len(caps))
+	multiplier := int64(-1) // computed on the first per-worker entry
 	for cmName, c := range caps {
-		if r.winsClaimLocked(cmName) {
-			winners[cmName] = c
+		if !r.winsClaimLocked(cmName) {
+			continue
 		}
+		perRequestWinners[cmName] = c
+		if c.PerWorker {
+			if multiplier < 0 {
+				multiplier = r.graphMultiplierLocked(graph)
+			}
+			c = c.Scaled(multiplier)
+		}
+		scaledWinners[cmName] = c
 	}
-	return tightest(winners)
+	return tightest(scaledWinners), tightest(perRequestWinners)
+}
+
+// graphMultiplierLocked is what a per-worker entry of graph is multiplied by:
+// its ready workers plus GraphLimitHeadroomWorkers, or one worker's worth
+// with no ready-worker source. The sum saturates at the int64 maximum
+// instead of wrapping, so a huge ready count cannot turn negative.
+func (r *RegistryResolver) graphMultiplierLocked(graph string) int64 {
+	if r.workers == nil {
+		return GraphLimitHeadroomWorkers
+	}
+	n := r.workers.Ready(graph)
+	if n < 0 {
+		n = 0
+	}
+	if n > math.MaxInt64-GraphLimitHeadroomWorkers {
+		return math.MaxInt64
+	}
+	return n + GraphLimitHeadroomWorkers
 }
 
 // winsClaimLocked reports whether cmName is the claimant resolveClaimants

@@ -214,6 +214,15 @@ func buildGateway(s *config.Settings, log *logging.Logger) (gateway.Resolver, fu
 	}
 	resolver := gateway.NewRegistryResolver(client, s.Gateway.Namespace, log)
 	ctx, cancel := context.WithCancel(context.Background())
+	// Atlas publishes per-worker admission limits; the graph limit is that
+	// times the graph's ready workers plus one (Q4(b)), read from the DGDs.
+	dyn, err := gateway.NewDynamicClient(s.Gateway.Kubeconfig)
+	if err != nil {
+		log.Error.Fatalf("gateway: kubernetes config unavailable for the ready-worker informer (%v)", err)
+	}
+	workers := gateway.NewReadyWorkers(dyn, s.Gateway.Namespace, log)
+	resolver.WithReadyWorkers(workers)
+	go workers.Run(ctx)
 	go resolver.Run(ctx)
 	log.Info.Printf("gateway: enabled (registry resolver, namespace=%s port=%d) — serving 503 until the registry syncs",
 		s.Gateway.Namespace, s.Gateway.Port)

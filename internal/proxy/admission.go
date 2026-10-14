@@ -139,12 +139,57 @@ type admissionEstimate struct {
 	OutputSequences int64
 }
 
-// publishedGraphCapacity is the capacity Atlas published for graph, or none.
-func (s *Server) publishedGraphCapacity(graph string) gateway.GraphCapacity {
-	if s.graphCapacity == nil || graph == "" {
-		return gateway.GraphCapacity{}
+// publishedGraphCapacities is the scaled capacity phoebe enforces
+// (GraphCapacity: per-worker entries times ready workers plus headroom,
+// graph-level entries as published) and the unscaled per-request capacity (GraphRequestCapacity) for graph,
+// read together from one registry state when the resolver can do that, or
+// none.
+func (s *Server) publishedGraphCapacities(graph string) (scaled, perRequest gateway.GraphCapacity) {
+	if graph == "" {
+		return gateway.GraphCapacity{}, gateway.GraphCapacity{}
 	}
-	return s.graphCapacity.GraphCapacity(graph)
+	if s.graphCapacityPair != nil {
+		return s.graphCapacityPair.GraphCapacities(graph)
+	}
+	if s.graphCapacity == nil {
+		return gateway.GraphCapacity{}, gateway.GraphCapacity{}
+	}
+	return s.graphCapacity.GraphCapacity(graph), s.graphCapacity.GraphRequestCapacity(graph)
+}
+
+// graphFitRejection is the ONLY "can never fit" check for capacity (Q24,
+// Hugo 2026-10-14): one request's reserved KV (the prompt plus output x
+// sequences) is held on ONE worker, so a request above the graph's
+// per-request (per-worker) KV value can never fit, however many workers are
+// up: 413. Every other capacity limit is a load limit that admission handles
+// as retryable (and admits a single oversized request when no other request
+// holds that limit's counter in the scope; for prefill tokens, when no other
+// request is prefilling), so it never returns 413. Only a positive cap
+// applies (an explicit zero cap stays a retryable refusal in admission). nil
+// means the request goes on to admission.
+//
+// The KV computed here must stay the same formula as the admission script's
+// reserved-KV charge (scripts.go: q.gen=q.output*(q.sequences or 1);
+// q.kv=q.estimated_input+q.gen), over the same estimate the proxy sends to
+// Admit (EstimatedInputTokens, ReservedOutputTokens, OutputSequences).
+// TestGraphFitRejectionMatchesScriptReservedKV ties the two together.
+func graphFitRejection(perRequest gateway.GraphCapacity, est admissionEstimate) *admission.Rejected {
+	sequences := est.OutputSequences
+	if sequences < 1 {
+		sequences = 1
+	}
+	kv := est.InputTokens
+	if est.OutputTokens > 0 {
+		if est.OutputTokens > (math.MaxInt64-kv)/sequences {
+			kv = math.MaxInt64
+		} else {
+			kv += est.OutputTokens * sequences
+		}
+	}
+	if v := perRequest.MaxReservedKVTokens; v != nil && *v > 0 && kv > *v {
+		return &admission.Rejected{Scope: "graph_capacity", Dimension: "kv_exceeds_limit", Unsatisfiable: true}
+	}
+	return nil
 }
 
 func admissionLaneForIdentity(settings config.AdmissionSettings, id identity.Identity) config.AdmissionLane {
@@ -461,36 +506,21 @@ var declaredSingleOutput = outputShape{hasOutput: true, declared: true, sequence
 // sequenceTerms names the client fields that set the output sequence count.
 const sequenceTerms = "(n, best_of, or batched prompts)"
 
-// oversizeMessage is the 413 text for a request larger than an operator or
-// published capacity scope. Only the graph's own capacity (the published
-// graph_capacity scope and the per-graph operator tier) is described as the
-// model's; every other scope (platform, organization, organization_model,
-// lane) gets neutral wording so the client is not told the model cannot take
-// a request that a configured limit refused. The scope id itself stays in the
+// oversizeMessage is the 413 text for the proxy's per-worker KV check
+// (graphFitRejection: graph_capacity, kv_exceeds_limit; D60(2)), the only
+// capacity refusal that no amount of waiting can clear. The admission script
+// never returns a capacity *_exceeds_limit (Q24). The scope id stays in the
 // server log, not the client body.
 //
-// The KV text names the terms of the reservation the client controls: the
+// The text names the terms of the reservation the client controls: the
 // prompt alone for embeddings (which have no client-declared output) and for
 // an undeclared max_tokens with one sequence; the prompt plus one output token
 // per sequence for an undeclared max_tokens with several sequences; the
 // prompt plus max_tokens, times the sequence count when it is above one, for
 // a declared max_tokens. A client is never told to lower a field it did not
 // send.
-func oversizeMessage(rejected *admission.Rejected, out outputShape) string {
-	limit := "a configured KV-cache limit"
-	prefill := "a configured prefill-token limit"
-	output := "a configured reserved-output limit"
-	if rejected.Scope == "graph_capacity" || rejected.Scope == "graph" {
-		limit = "this model's KV-cache capacity"
-		prefill = "this model's prefill capacity"
-		output = "this model's reserved-output capacity"
-	}
-	if rejected.Dimension == "output_exceeds_limit" {
-		return outputOversizeMessage(out, output)
-	}
-	if rejected.Dimension != "kv_exceeds_limit" {
-		return "estimated prompt tokens exceed " + prefill
-	}
+func oversizeMessage(out outputShape) string {
+	const limit = "this model's KV-cache capacity"
 	switch {
 	case !out.hasOutput:
 		return "estimated prompt tokens exceed " + limit
@@ -502,24 +532,6 @@ func oversizeMessage(rejected *admission.Rejected, out outputShape) string {
 		return "estimated prompt tokens plus one output token per requested sequence " + sequenceTerms + " exceed " + limit
 	default:
 		return "estimated prompt tokens exceed " + limit
-	}
-}
-
-// outputOversizeMessage is the 413 text for a request whose own reserved
-// output (max_tokens x output sequences, D29) exceeds a positive capacity
-// cap. Like the KV text it names only the fields the client sent: an
-// undeclared max_tokens is the one-token clamp, so the sequence count is the
-// term to lower.
-func outputOversizeMessage(out outputShape, limit string) string {
-	switch {
-	case out.declared && out.sequences > 1:
-		return "max_tokens times the number of output sequences " + sequenceTerms + " exceeds " + limit
-	case out.declared:
-		return "max_tokens exceeds " + limit
-	case out.sequences > 1:
-		return "the number of output sequences " + sequenceTerms + " exceeds " + limit
-	default:
-		return "the minimum one-token output reservation exceeds " + limit
 	}
 }
 
@@ -548,7 +560,7 @@ func (s *Server) writeAdmissionError(w http.ResponseWriter, requestID string, er
 }
 
 // writeAdmissionErrorOutput answers an admission refusal; out selects the
-// 413 KV and 400 generated-token wording (oversizeMessage,
+// per-worker 413 KV and 400 generated-token wording (oversizeMessage,
 // generatedLimitMessage).
 func (s *Server) writeAdmissionErrorOutput(w http.ResponseWriter, requestID string, err error, out outputShape) {
 	// Echo the authoritative attempt id on rejections too — the same handle the
@@ -557,12 +569,13 @@ func (s *Server) writeAdmissionErrorOutput(w http.ResponseWriter, requestID stri
 	w.Header().Set(requestIDHeader, requestID)
 	var rejected *admission.Rejected
 	if errors.As(err, &rejected) && rejected.Unsatisfiable && !rejected.Contractual {
-		// One request alone is larger than a capacity limit (estimated prompt
-		// tokens, prompt plus max_tokens against reserved KV, or max_tokens x
-		// output sequences against reserved output). It can never
-		// be admitted, so it is refused as too large, the same answer an
-		// oversized prompt got from the byte-based limit this replaced.
-		http.Error(w, oversizeMessage(rejected, out), http.StatusRequestEntityTooLarge)
+		// The proxy's per-worker KV check (graphFitRejection, D60(2)): one
+		// request's KV (prompt plus output x sequences) is larger than one
+		// worker's KV capacity, so it can never be admitted and is refused
+		// as too large.
+		// This is the only non-contractual unsatisfiable rejection; the
+		// admission script never produces one (Q24).
+		http.Error(w, oversizeMessage(out), http.StatusRequestEntityTooLarge)
 		s.log.Warn.Printf("admission: request larger than capacity scope=%s dimension=%s", rejected.Scope, rejected.Dimension)
 		return
 	}

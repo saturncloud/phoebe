@@ -859,3 +859,21 @@ func TestGateway_ResolutionWithoutLegalServingModeRefusedAtGate(t *testing.T) {
 		})
 	}
 }
+
+// The real registry resolver must keep satisfying every capacity source the
+// proxy reads, or WithGateway would silently drop the unscaled per-request
+// capacity source or the one-read pair the 413 fit check relies on.
+var (
+	_ graphCapacitySource     = (*gateway.RegistryResolver)(nil)
+	_ graphCapacityPairSource = (*gateway.RegistryResolver)(nil)
+)
+
+func TestWithGatewayWiresEveryRegistryCapacitySource(t *testing.T) {
+	resolver := gateway.NewRegistryResolver(k8sfake.NewSimpleClientset(), "tf-shared", logging.New(logging.ERROR))
+	s := New(&config.Settings{ListenAddr: ":0"}, logging.New(logging.ERROR), &recordingEmitter{}).
+		WithGateway(resolver, "tf-shared", 8000)
+	if s.graphCapacity == nil || s.graphCapacityPair == nil {
+		t.Fatalf("WithGateway(RegistryResolver) wiring: graphCapacity=%v graphCapacityPair=%v, want both set",
+			s.graphCapacity != nil, s.graphCapacityPair != nil)
+	}
+}
