@@ -304,8 +304,12 @@ func (a *RedisAdmitter) Admit(ctx context.Context, req Request) (*Lease, error) 
 				dimension = fmt.Sprint(parts[2])
 			}
 			contractual := len(parts) > 3 && number(parts[3]) == 1
-			if strings.HasSuffix(dimension, unsatisfiableSuffix) {
-				return nil, &Rejected{Scope: scopeName, Dimension: dimension, Contractual: contractual, Unsatisfiable: true}
+			// Only a contract scope can be unsatisfiable here (D60): a
+			// capacity *_exceeds_limit reply has no producer, and if one
+			// appears it fails closed to the retryable rejection below
+			// rather than bringing back a permanent 413.
+			if contractual && strings.HasSuffix(dimension, unsatisfiableSuffix) {
+				return nil, &Rejected{Scope: scopeName, Dimension: dimension, Contractual: true, Unsatisfiable: true}
 			}
 			retryAfter := a.retryAfter(w.Scopes)
 			if len(parts) > 4 && number(parts[4]) > 0 {
@@ -425,11 +429,14 @@ func makeContractScope(name, id string, limits RateLimits) scope {
 	}
 }
 
-// unsatisfiableSuffix ends the dimension name admitScript returns when one
-// request alone exceeds a scope's whole limit: a contract scope's per-window
-// limit (the proxy answers 400), or a capacity scope's positive prefill, KV
-// or reserved-output cap (prefill_tokens_exceeds_limit, kv_exceeds_limit,
-// output_exceeds_limit; the proxy answers 413). Neither carries a Retry-After.
+// unsatisfiableSuffix ends the dimension name admitScript returns only when
+// one request alone exceeds a contract scope's whole positive per-window limit
+// (total_prompt_tokens_exceeds_limit, uncached_prompt_tokens_exceeds_limit,
+// generated_tokens_exceeds_limit; pass 1 of the script). The proxy answers 400
+// with no Retry-After. Capacity scopes never return it (Q24/D60): their
+// prefill, KV and output limits are load limits, refused as retryable. The
+// proxy builds the one capacity unsatisfiable rejection itself,
+// kv_exceeds_limit on graph_capacity (413), before the script runs.
 const unsatisfiableSuffix = "_exceeds_limit"
 
 // Any reports whether the contract carries at least one limit. A contract with

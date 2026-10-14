@@ -595,8 +595,7 @@ func TestExplicitZeroCapBlocksEveryRequest(t *testing.T) {
 				t.Fatalf("err=%v, want platform %s rejection at the zero cap", err, tc.dimension)
 			}
 			// A zero cap is the retryable answer (503 with Retry-After), never
-			// the unsatisfiable one (413 kv_exceeds_limit /
-			// prefill_tokens_exceeds_limit, or a contract 400).
+			// the unsatisfiable one (a contract 400).
 			if rejected.Contractual || rejected.Unsatisfiable || rejected.RetryAfter <= 0 {
 				t.Fatalf("rejection=%+v, want a retryable, non-contractual %s rejection at the zero cap", rejected, tc.dimension)
 			}

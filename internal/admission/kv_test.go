@@ -155,9 +155,6 @@ func TestNewLeaseNeverWrittenToLegacyKeys(t *testing.T) {
 	assertOnlyVersioned("finish")
 }
 
-// A request alone larger than a positive physical cap is unsatisfiable (the
-// proxy answers 413), not a retryable capacity rejection; a zero cap stays
-// retryable.
 // Q24: capacity scopes never answer "can never fit". A request larger than a
 // positive prefill or KV limit is admitted alone and refused as retryable when
 // the scope's counter is in use; an explicit zero cap refuses even alone.
@@ -245,11 +242,6 @@ func TestTightestReservedCapsReadsOutputFromAdmitScopes(t *testing.T) {
 	}
 }
 
-// A request alone larger than some scope's whole limit is unsatisfiable even
-// while an earlier scope is momentarily full: every scope's oversize check
-// runs before any counter check, so the client gets the final answer (413 for
-// a capacity scope, 400 for a contract scope, never a Retry-After) instead of
-// a retryable rejection it would repeat until a quiet moment.
 // A request larger than a CONTRACT scope's whole limit is unsatisfiable (the
 // proxy's 400) even when an earlier scope is full, so the answer does not
 // depend on load. Capacity scopes have no such answer (Q24,
@@ -470,5 +462,42 @@ func assertZeroChargeLeaseReleasesCleanly(ctx context.Context, t *testing.T, a *
 		}
 		release(path, lease)
 		assertReleased("output=0 via " + path)
+	}
+}
+
+// D60: the admission script never returns *_exceeds_limit for a capacity
+// scope. If a reply ever carries one (contract flag 0), Admit fails closed to
+// a retryable rejection with a Retry-After, never a non-contractual
+// Unsatisfiable that the proxy would answer with a permanent 413. A contract
+// reply with the same suffix stays unsatisfiable.
+func TestCapacityExceedsLimitReplyFailsClosedToRetryable(t *testing.T) {
+	original := admitScript
+	t.Cleanup(func() { admitScript = original })
+	for _, tc := range []struct {
+		name          string
+		reply         string
+		unsatisfiable bool
+	}{
+		{"capacity reply is retryable", `return {0,'graph','kv_exceeds_limit',0}`, false},
+		{"contract reply stays unsatisfiable", `return {0,'contract','generated_tokens_exceeds_limit',1}`, true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			admitScript = redis.NewScript(tc.reply)
+			a, _ := testAdmitter(t, config.AdmissionSettings{Platform: limits(1), LeaseTTL: time.Minute})
+			_, err := a.Admit(context.Background(), request("a", "m"))
+			var rejected *Rejected
+			if !errors.As(err, &rejected) {
+				t.Fatalf("err=%v, want a rejection", err)
+			}
+			if rejected.Unsatisfiable != tc.unsatisfiable {
+				t.Fatalf("rejection=%+v, want Unsatisfiable=%v", rejected, tc.unsatisfiable)
+			}
+			if !tc.unsatisfiable && (rejected.Contractual || rejected.RetryAfter <= 0) {
+				t.Fatalf("rejection=%+v, want a retryable non-contractual rejection with a Retry-After", rejected)
+			}
+			if tc.unsatisfiable && (!rejected.Contractual || rejected.RetryAfter != 0) {
+				t.Fatalf("rejection=%+v, want a contractual unsatisfiable rejection with no Retry-After", rejected)
+			}
+		})
 	}
 }

@@ -2980,12 +2980,10 @@ func TestAdmissionRenewalFailureEmitsReconciliationRow(t *testing.T) {
 	}
 }
 
-// D12: a request whose prompt plus max_tokens exceeds an operator reserved-KV
-// cap can never be admitted, so the proxy answers 413 with the KV wording,
-// no Retry-After, the request-id header, and never reaches the engine. A
-// platform cap is a configured limit, not the model's capacity, so the body
-// does not blame the model. The control: an explicit zero cap stays a
-// retryable 503 with Retry-After.
+// Q24/D60: an operator reserved-KV tier is a load limit, not one worker's
+// memory. A request above it with nothing in flight is admitted alone and the
+// engine answers 200; a request exactly at the tier is admitted too. The
+// control: an explicit zero cap stays a retryable 503 with Retry-After.
 func TestOperatorKVTierIsALoadLimit(t *testing.T) {
 	var upstreamHits atomic.Int32
 	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
@@ -3027,40 +3025,6 @@ func TestOperatorKVTierIsALoadLimit(t *testing.T) {
 	}
 }
 
-// The 413 wording names the model's capacity only for the "graph" and
-// "graph_capacity" scopes; every other operator scope gets neutral wording,
-// so a tenant refused by its organization's limit is not told the model
-// cannot take its prompt. Status 413 and no Retry-After for all of them.
-func TestOversizeMessageBlamesModelOnlyForGraphScopes(t *testing.T) {
-	s := New(&config.Settings{}, logging.New(logging.ERROR), &recordingEmitter{})
-	for _, c := range []struct {
-		scope, dimension string
-		wantModel        bool
-		want             string
-	}{
-		{"graph_capacity", "kv_exceeds_limit", true, "this model's KV-cache capacity"},
-		{"graph_capacity", "prefill_tokens_exceeds_limit", true, "this model's prefill capacity"},
-		{"graph", "prefill_tokens_exceeds_limit", true, "this model's prefill capacity"},
-		{"organization", "prefill_tokens_exceeds_limit", false, "a configured prefill-token limit"},
-		{"organization_model", "kv_exceeds_limit", false, "a configured KV-cache limit"},
-		{"platform", "prefill_tokens_exceeds_limit", false, "a configured prefill-token limit"},
-		{"lane", "kv_exceeds_limit", false, "a configured KV-cache limit"},
-		{"graph_capacity", "output_exceeds_limit", true, "max_tokens exceeds this model's reserved-output capacity"},
-		{"graph", "output_exceeds_limit", true, "max_tokens exceeds this model's reserved-output capacity"},
-		{"lane", "output_exceeds_limit", false, "max_tokens exceeds a configured reserved-output limit"},
-	} {
-		rr := httptest.NewRecorder()
-		s.writeAdmissionError(rr, "req-1", &admission.Rejected{Scope: c.scope, Dimension: c.dimension, Unsatisfiable: true})
-		body := rr.Body.String()
-		if rr.Code != http.StatusRequestEntityTooLarge || rr.Header().Get("Retry-After") != "" {
-			t.Errorf("%s/%s: status=%d retry-after=%q, want 413 without Retry-After", c.scope, c.dimension, rr.Code, rr.Header().Get("Retry-After"))
-		}
-		if !strings.Contains(body, c.want) || strings.Contains(body, "this model's") != c.wantModel {
-			t.Errorf("%s/%s: body=%q, want %q", c.scope, c.dimension, body, c.want)
-		}
-	}
-}
-
 // A KV 413 names only the terms of the reservation the client controls: an
 // undeclared max_tokens with one sequence and an embeddings request (no
 // client-declared output) blame the prompt alone; an undeclared max_tokens
@@ -3080,16 +3044,11 @@ func TestOversizeMessageForUndeclaredOutputDoesNotMentionMaxTokens(t *testing.T)
 		want        string
 		mustNot     []string
 	}{
-		{"undeclared_graph_capacity", "graph_capacity", undeclared, "estimated prompt tokens exceed this model's KV-cache capacity", []string{"max_tokens", "sequence"}},
-		{"undeclared_graph", "graph", undeclared, "estimated prompt tokens exceed this model's KV-cache capacity", []string{"max_tokens", "sequence"}},
-		{"undeclared_lane", "lane", undeclared, "estimated prompt tokens exceed a configured KV-cache limit", []string{"max_tokens", "sequence"}},
-		{"undeclared_organization", "organization", undeclared, "estimated prompt tokens exceed a configured KV-cache limit", []string{"max_tokens", "sequence"}},
-		{"embeddings_kv_413_graph", "graph_capacity", embeddings, "estimated prompt tokens exceed this model's KV-cache capacity", []string{"max_tokens", "sequence"}},
-		{"embeddings_kv_413_lane", "lane", embeddings, "estimated prompt tokens exceed a configured KV-cache limit", []string{"max_tokens", "sequence"}},
-		{"undeclared_n_overflow_graph", "graph", undeclaredN, "estimated prompt tokens plus one output token per requested sequence (n, best_of, or batched prompts) exceed this model's KV-cache capacity", []string{"max_tokens"}},
-		{"undeclared_n_overflow_organization", "organization", undeclaredN, "estimated prompt tokens plus one output token per requested sequence (n, best_of, or batched prompts) exceed a configured KV-cache limit", []string{"max_tokens"}},
+		{"undeclared", "graph_capacity", undeclared, "estimated prompt tokens exceed this model's KV-cache capacity", []string{"max_tokens", "sequence"}},
+		{"embeddings", "graph_capacity", embeddings, "estimated prompt tokens exceed this model's KV-cache capacity", []string{"max_tokens", "sequence"}},
+		{"undeclared_n_overflow", "graph_capacity", undeclaredN, "estimated prompt tokens plus one output token per requested sequence (n, best_of, or batched prompts) exceed this model's KV-cache capacity", []string{"max_tokens"}},
 		{"declared_n_overflow", "graph_capacity", declaredN, "estimated prompt tokens plus max_tokens times the number of output sequences (n, best_of, or batched prompts) exceed this model's KV-cache capacity", nil},
-		{"declared_single", "lane", declaredSingleOutput, "estimated prompt tokens plus max_tokens exceed a configured KV-cache limit", []string{"sequence"}},
+		{"declared_single", "graph_capacity", declaredSingleOutput, "estimated prompt tokens plus max_tokens exceed this model's KV-cache capacity", []string{"sequence"}},
 	} {
 		rr := httptest.NewRecorder()
 		s.writeAdmissionErrorOutput(rr, "req-1", &admission.Rejected{Scope: c.scope, Dimension: "kv_exceeds_limit", Unsatisfiable: true}, c.out)

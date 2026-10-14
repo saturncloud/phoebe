@@ -98,10 +98,6 @@ func TestReservedOutputCapChargesEveryOutputSequence(t *testing.T) {
 	_ = lease.Complete(ctx, 0)
 }
 
-// A request whose own reserved output (output x sequences) is larger than a
-// positive maxReservedOutputTokens cap can never be admitted, so it is
-// refused as unsatisfiable (the proxy's 413) with no Retry-After, not as a
-// retryable capacity rejection a client would retry forever.
 // Q24: a reserved-output cap is a load limit. Output x sequences above the
 // whole cap is admitted alone and refused as retryable while the counter is
 // in use.

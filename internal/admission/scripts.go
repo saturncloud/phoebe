@@ -126,9 +126,6 @@ if redis.call('HEXISTS',KEYS[2],q.id) == 1 then return {1} end
 for _,s in ipairs(q.scopes) do
   local contract=s.contractual and 1 or 0
   if s.contractual then
-    if s.prefill_tokens > 0 and q.prefill_tokens > s.prefill_tokens then return {0,s.name,'prefill_tokens_exceeds_limit',contract} end
-    if s.kv > 0 and q.kv > s.kv then return {0,s.name,'kv_exceeds_limit',contract} end
-    if s.output > 0 and q.gen > s.output then return {0,s.name,'output_exceeds_limit',contract} end
     if s.total_prompt > 0 and q.estimated_input > s.total_prompt then return {0,s.name,'total_prompt_tokens_exceeds_limit',contract} end
     if s.uncached_prompt > 0 and q.estimated_input > s.uncached_prompt then return {0,s.name,'uncached_prompt_tokens_exceeds_limit',contract} end
     if s.generated > 0 and q.gen > s.generated then return {0,s.name,'generated_tokens_exceeds_limit',contract} end
