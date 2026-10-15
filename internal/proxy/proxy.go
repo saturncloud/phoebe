@@ -427,6 +427,12 @@ func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request) {
 	// rather than authorized as one string and forwarded as another (see
 	// canonicalRequestPath).
 	routePath, pathCanonical := canonicalRequestPath(r.URL)
+	// Only an inference request does engine work that can be billed. Control
+	// routes (GET/HEAD /health, /live, /v1/models[/<id>]) and OPTIONS
+	// preflights are forwarded but write no billing row: a successful one
+	// carries no usage block, and the rater rightly reads a successful
+	// attempt without usage as unbilled work (UNEXPLAINED MISSING-USAGE).
+	metered := r.Method == http.MethodPost && inferenceRequestPathAllowed(routePath)
 
 	if id.Gateway {
 		if !pathCanonical || !gatewayRequestAllowed(r.Method, routePath) {
@@ -1117,8 +1123,10 @@ func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request) {
 					s.admissionCompletionReleaseLog.logf(s.log, "admission: completion release failed: %v", e)
 				}
 			}
-			// Metering (durable) always fires.
-			s.emit(ctx, id, requestID, clientRequestID, statusCode, res)
+			// Metering (durable) fires for every inference attempt.
+			if metered {
+				s.emit(ctx, id, requestID, clientRequestID, statusCode, res)
+			}
 			// M5 I/O logging (best-effort) only when this request opted in.
 			if shouldLog {
 				respBody, truncated := cr.capturedBody()
@@ -1200,7 +1208,7 @@ func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request) {
 		return nil
 	}
 
-	rp.ErrorHandler = s.errorHandler(upstream.String(), id, requestID, clientRequestID, admitted, &responseCaptureInstalled)
+	rp.ErrorHandler = s.errorHandler(upstream.String(), id, requestID, clientRequestID, metered, admitted, &responseCaptureInstalled)
 
 	rp.ServeHTTP(w, r)
 	if responseCaptureInstalled.Load() {
@@ -1281,8 +1289,14 @@ func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request) {
 // (its completion callback owns settlement; lease settlement is first-writer-
 // wins). Dropping either silently loses a guarantee the other branch's tests
 // do not cover.
-func (s *Server) errorHandler(upstream string, id identity.Identity, requestID, clientRequestID string, admitted *admission.Lease, responseCaptureInstalled *atomic.Bool) func(http.ResponseWriter, *http.Request, error) {
+func (s *Server) errorHandler(upstream string, id identity.Identity, requestID, clientRequestID string, metered bool, admitted *admission.Lease, responseCaptureInstalled *atomic.Bool) func(http.ResponseWriter, *http.Request, error) {
 	return func(w http.ResponseWriter, r *http.Request, err error) {
+		// Only inference attempts write billing rows (see metered in handleProxy).
+		emitAttempt := func(ctx context.Context, statusCode int, res capture.Result) {
+			if metered {
+				s.emit(ctx, id, requestID, clientRequestID, statusCode, res)
+			}
+		}
 		if admitted != nil && (responseCaptureInstalled == nil || !responseCaptureInstalled.Load()) {
 			ctx := context.WithoutCancel(r.Context())
 			// classifyRoundTripSettlement decides the settlement kind at the
@@ -1306,8 +1320,7 @@ func (s *Server) errorHandler(upstream string, id identity.Identity, requestID, 
 			// here, never a contractual Rejected), matching the 502 branch below:
 			// every forwarded attempt is visible to billing exactly once.
 			w.Header().Set("X-Request-Id", requestID)
-			s.emit(context.WithoutCancel(r.Context()), id, requestID, clientRequestID,
-				http.StatusServiceUnavailable, capture.Result{UsageFound: false})
+			emitAttempt(context.WithoutCancel(r.Context()), http.StatusServiceUnavailable, capture.Result{UsageFound: false})
 			s.writeAdmissionError(w, requestID, cause)
 			return
 		}
@@ -1318,8 +1331,7 @@ func (s *Server) errorHandler(upstream string, id identity.Identity, requestID, 
 			// upstream failure (a zero-token raw row, never an abort).
 			s.log.Warn.Printf("upstream %s sent no response within protection.maxStreamDuration (request_id=%s)", upstream, requestID)
 			w.Header().Set("X-Request-Id", requestID)
-			s.emit(context.WithoutCancel(r.Context()), id, requestID, clientRequestID,
-				http.StatusGatewayTimeout, capture.Result{UpstreamFault: true, UsageFound: false})
+			emitAttempt(context.WithoutCancel(r.Context()), http.StatusGatewayTimeout, capture.Result{UpstreamFault: true, UsageFound: false})
 			http.Error(w, "upstream did not respond in time", http.StatusGatewayTimeout)
 			return
 		}
@@ -1339,8 +1351,7 @@ func (s *Server) errorHandler(upstream string, id identity.Identity, requestID, 
 			// upstream-fault 502.
 			s.logRequestBodyError("forward request body", requestID, err)
 			w.Header().Set("X-Request-Id", requestID)
-			s.emit(context.WithoutCancel(r.Context()), id, requestID, clientRequestID,
-				http.StatusServiceUnavailable, capture.Result{UsageFound: false})
+			emitAttempt(context.WithoutCancel(r.Context()), http.StatusServiceUnavailable, capture.Result{UsageFound: false})
 			writeRequestBodyError(w, r, requestID, err)
 			return
 		}
@@ -1351,8 +1362,7 @@ func (s *Server) errorHandler(upstream string, id identity.Identity, requestID, 
 			// the client's, not the upstream's: answer 413 like every other
 			// oversize body, and record the attempt without UpstreamFault.
 			w.Header().Set("X-Request-Id", requestID)
-			s.emit(context.WithoutCancel(r.Context()), id, requestID, clientRequestID,
-				http.StatusRequestEntityTooLarge, capture.Result{UsageFound: false})
+			emitAttempt(context.WithoutCancel(r.Context()), http.StatusRequestEntityTooLarge, capture.Result{UsageFound: false})
 			writeRequestBodyError(w, r, requestID, err)
 			return
 		}
@@ -1362,7 +1372,7 @@ func (s *Server) errorHandler(upstream string, id identity.Identity, requestID, 
 			// Emit a zero-token attributable event so the request is not invisible
 			// to billing. Best-effort, non-blocking — like onDone's emit.
 			ctx := context.WithoutCancel(r.Context())
-			s.emit(ctx, id, requestID, clientRequestID, 499, capture.Result{Aborted: true, UsageFound: false})
+			emitAttempt(ctx, 499, capture.Result{Aborted: true, UsageFound: false})
 			return
 		}
 		s.log.Error.Printf("upstream %s error: %v (request_id=%s)", upstream, err, requestID)
@@ -1377,8 +1387,7 @@ func (s *Server) errorHandler(upstream string, id identity.Identity, requestID, 
 		// Return the same trusted attempt id carried by the raw row so the client
 		// can correlate this terminal failure without relying on its untrusted id.
 		w.Header().Set("X-Request-Id", requestID)
-		s.emit(context.WithoutCancel(r.Context()), id, requestID, clientRequestID,
-			http.StatusBadGateway, capture.Result{UpstreamFault: true, UsageFound: false})
+		emitAttempt(context.WithoutCancel(r.Context()), http.StatusBadGateway, capture.Result{UpstreamFault: true, UsageFound: false})
 		http.Error(w, "upstream error", http.StatusBadGateway)
 	}
 }

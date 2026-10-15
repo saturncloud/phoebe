@@ -749,7 +749,7 @@ func TestErrorHandlerBufferFullSettlesLeaseZero(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		h := s.errorHandler(upstream.String(), id, "req-1", "logical-1", lease, nil)
+		h := s.errorHandler(upstream.String(), id, "req-1", "logical-1", true, lease, nil)
 		rr := httptest.NewRecorder()
 		h(rr, httptest.NewRequest(http.MethodPost, "/v1/chat/completions", nil),
 			&url.Error{Op: "Post", URL: upstream.String(), Err: errRequestBufferFull})
