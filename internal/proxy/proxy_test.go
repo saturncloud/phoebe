@@ -1552,15 +1552,11 @@ func TestGatewayPreflightEmitsNoCORSHeaders(t *testing.T) {
 	}
 }
 
-// Merged-contract pin (billing #48): a ModifyResponse fault is NOT a client
-// abort, so besides releasing the admission lease it emits exactly ONE raw
-// reconciliation row — Aborted=false, UsageFound=false, StatusCode=502 — the
-// same always-record contract as every other failed attempt. The row charges
-// $0 (no authoritative counts); it exists so the failed attempt is visible to
-// reconciliation. Exactly-once holds because every ModifyResponse error returns
-// BEFORE the captureReader installs onDone, so the completion emit was never
-// armed.
-func TestModelListFilterErrorEmitsReconciliationRow(t *testing.T) {
+// A model-list filter fault fails closed with a 502, and, like every control
+// route, writes no billing row: only inference attempts are metered (a GET
+// does no engine work). The billing #48 always-record contract applies to
+// inference attempts; see TestControlRoutesWriteNoBillingRow.
+func TestModelListFilterErrorWritesNoBillingRow(t *testing.T) {
 	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		_, _ = w.Write([]byte(`{"data":[{"id":"sibling","id":"adapter-a"}]}`))
 	}))
@@ -1579,15 +1575,9 @@ func TestModelListFilterErrorEmitsReconciliationRow(t *testing.T) {
 	if rr.Code != http.StatusBadGateway {
 		t.Fatalf("status = %d, want 502", rr.Code)
 	}
-	events := em.waitForEvents(1, 2*time.Second)
-	if len(events) != 1 {
-		t.Fatalf("filter failure emitted %d billing events, want exactly 1 reconciliation row: %+v",
+	if events := em.waitForEvents(1, 200*time.Millisecond); len(events) != 0 {
+		t.Fatalf("model-list filter failure emitted %d billing events, want none (control route): %+v",
 			len(events), events)
-	}
-	ev := events[0]
-	if ev.Aborted || ev.UsageFound || ev.StatusCode != http.StatusBadGateway {
-		t.Fatalf("filter-failure row = {Aborted:%v UsageFound:%v StatusCode:%d}, "+
-			"want {false false 502} (visible to reconciliation, charges $0)", ev.Aborted, ev.UsageFound, ev.StatusCode)
 	}
 }
 
@@ -1702,9 +1692,8 @@ func TestProxyBoundSharedRouteServesSanitizedControlSurface(t *testing.T) {
 // LIST shape, the old ModifyResponse passthrough returned sibling names
 // verbatim; the subtree filter now fails that response closed: the body cannot
 // be a conforming single-object for <id>, so the client gets the generic 502
-// (no sibling names — the fail-closed error carries no upstream bytes) and
-// billing records exactly one raw reconciliation row (UsageFound=false,
-// Aborted=false) — the merged #48 contract for a ModifyResponse fault. HEAD on
+// (no sibling names — the fail-closed error carries no upstream bytes) and,
+// as a control route, it writes no billing row. HEAD on
 // the subtree keeps its 200 while the graph-wide representation headers are
 // stripped exactly like the model-list HEAD sanitizer.
 func TestProxyModelMetadataSubtreeFailsClosedOnGraphWideBody(t *testing.T) {
@@ -1738,14 +1727,8 @@ func TestProxyModelMetadataSubtreeFailsClosedOnGraphWideBody(t *testing.T) {
 	if body := rr.Body.String(); strings.Contains(body, "adapter-b") || strings.Contains(body, "base-internal") {
 		t.Fatalf("subtree failure leaked graph-wide names: %s", body)
 	}
-	events := em.waitForEvents(1, 2*time.Second)
-	if len(events) != 1 {
-		t.Fatalf("subtree filter failure emitted %d billing events, want exactly 1 raw row: %+v", len(events), events)
-	}
-	ev := events[0]
-	if ev.Aborted || ev.UsageFound || ev.StatusCode != http.StatusBadGateway {
-		t.Fatalf("subtree filter-failure row = {Aborted:%v UsageFound:%v StatusCode:%d}, "+
-			"want {false false 502}", ev.Aborted, ev.UsageFound, ev.StatusCode)
+	if events := em.waitForEvents(1, 200*time.Millisecond); len(events) != 0 {
+		t.Fatalf("subtree filter failure emitted %d billing events, want none (control route): %+v", len(events), events)
 	}
 
 	rr = request(http.MethodHead, "/v1/models/adapter-a")
@@ -1765,7 +1748,7 @@ func TestProxyModelMetadataSubtreeFailsClosedOnGraphWideBody(t *testing.T) {
 }
 
 // A malformed subtree body (not JSON) is the same fail-closed shape: 502 with
-// exactly one raw UsageFound=false row, and no upstream bytes in the error.
+// no upstream bytes in the error and no billing row (control route).
 func TestProxyModelMetadataSubtreeFailsClosedOnMalformedBody(t *testing.T) {
 	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		w.Header().Set("X-Graph-Debug", "adapter-b")
@@ -1787,13 +1770,8 @@ func TestProxyModelMetadataSubtreeFailsClosedOnMalformedBody(t *testing.T) {
 	if rr.Code != http.StatusBadGateway {
 		t.Fatalf("subtree GET with malformed body status = %d, want 502", rr.Code)
 	}
-	events := em.waitForEvents(1, 2*time.Second)
-	if len(events) != 1 {
-		t.Fatalf("malformed subtree body emitted %d billing events, want exactly 1 raw row: %+v", len(events), events)
-	}
-	if ev := events[0]; ev.Aborted || ev.UsageFound || ev.StatusCode != http.StatusBadGateway {
-		t.Fatalf("malformed-subtree row = {Aborted:%v UsageFound:%v StatusCode:%d}, want {false false 502}",
-			ev.Aborted, ev.UsageFound, ev.StatusCode)
+	if events := em.waitForEvents(1, 200*time.Millisecond); len(events) != 0 {
+		t.Fatalf("malformed subtree body emitted %d billing events, want none (control route): %+v", len(events), events)
 	}
 }
 
@@ -1895,5 +1873,63 @@ func TestProxyServingMode_RefusalLogsDistinctError(t *testing.T) {
 				t.Fatalf("generic refusal WARN also fired (double log): %q", warnBuf.String())
 			}
 		})
+	}
+}
+
+// Regression (demo-qa, uk2 2026-10-15): a dedicated endpoint's GET /v1/models
+// answered 200 and was recorded as a billing row with no usage, so every hourly
+// rater run failed with UNEXPLAINED MISSING-USAGE. Control routes do no engine
+// work and write no billing row; an inference POST on the same route still
+// writes exactly one.
+func TestControlRoutesWriteNoBillingRow(t *testing.T) {
+	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/v1/chat/completions":
+			_, _ = w.Write([]byte(`{"model":"adapter-a","usage":{"prompt_tokens":3,"completion_tokens":2,"total_tokens":5}}`))
+		case "/v1/models":
+			_, _ = w.Write([]byte(`{"object":"list","data":[{"id":"adapter-a","object":"model"}]}`))
+		default:
+			w.WriteHeader(http.StatusOK)
+		}
+	}))
+	defer backend.Close()
+	upstream, _ := url.Parse(backend.URL)
+	em := &recordingEmitter{}
+	srv := newTestServerE(t, upstream, em)
+
+	request := func(method, path, body string) int {
+		req := httptest.NewRequest(method, path, strings.NewReader(body))
+		setUpstream(req, upstream)
+		req.Header.Set(identity.HeaderAuthID, "auth-1")
+		req.Header.Set(identity.HeaderResourceID, "deployment-a")
+		req.Header.Set(identity.HeaderServedModel, "adapter-a")
+		rr := httptest.NewRecorder()
+		srv.Handler().ServeHTTP(rr, req)
+		return rr.Code
+	}
+
+	for _, c := range []struct{ method, path string }{
+		{http.MethodGet, "/v1/models"},
+		{http.MethodHead, "/v1/models"},
+		{http.MethodGet, "/health"},
+		{http.MethodGet, "/live"},
+	} {
+		if code := request(c.method, c.path, ""); code != http.StatusOK {
+			t.Fatalf("%s %s status = %d, want 200", c.method, c.path, code)
+		}
+	}
+	if events := em.waitForEvents(1, 200*time.Millisecond); len(events) != 0 {
+		t.Fatalf("control routes emitted %d billing events, want none: %+v", len(events), events)
+	}
+
+	if code := request(http.MethodPost, "/v1/chat/completions", `{"model":"adapter-a"}`); code != http.StatusOK {
+		t.Fatalf("inference status = %d, want 200", code)
+	}
+	events := em.waitForEvents(1, 2*time.Second)
+	if len(events) != 1 {
+		t.Fatalf("inference emitted %d billing events, want exactly 1: %+v", len(events), events)
+	}
+	if ev := events[0]; !ev.UsageFound || ev.StatusCode != http.StatusOK {
+		t.Fatalf("inference row = {UsageFound:%v StatusCode:%d}, want {true 200}", ev.UsageFound, ev.StatusCode)
 	}
 }

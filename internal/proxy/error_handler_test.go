@@ -68,7 +68,7 @@ func TestErrorHandlerClassifiesWrappedCancel(t *testing.T) {
 	// cancel must NOT 502 over the already-dead connection. (The abort's
 	// zero-token abort emit is covered by the
 	// dedicated TestPreHeaderAbort* tests, not re-asserted here.)
-	h := srv.errorHandler(upstream.String(), id, "req-1", "logical-1", nil, nil)
+	h := srv.errorHandler(upstream.String(), id, "req-1", "logical-1", true, nil, nil)
 	rr := httptest.NewRecorder()
 	h(rr, httptest.NewRequest(http.MethodPost, "/v1/chat/completions", nil),
 		&url.Error{Op: "Post", URL: upstream.String(), Err: context.Canceled})
@@ -99,7 +99,7 @@ func TestErrorHandlerUpstreamFaultStill502(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			emTC := &recordingEmitter{}
 			srvTC := newTestServerE(t, upstream, emTC)
-			h := srvTC.errorHandler(upstream.String(), id, "req-1", "logical-1", nil, nil)
+			h := srvTC.errorHandler(upstream.String(), id, "req-1", "logical-1", true, nil, nil)
 			rr := httptest.NewRecorder()
 			h(rr, httptest.NewRequest(http.MethodPost, "/v1/chat/completions", nil), tc.err)
 
@@ -144,7 +144,7 @@ func TestErrorHandlerAnswersForwardedOversizeBodyWith413NotUpstreamFault(t *test
 		t.Run(tc.name, func(t *testing.T) {
 			em := &recordingEmitter{}
 			srv := newTestServerE(t, upstream, em)
-			h := srv.errorHandler(upstream.String(), id, "req-1", "logical-1", nil, nil)
+			h := srv.errorHandler(upstream.String(), id, "req-1", "logical-1", true, nil, nil)
 			rr := httptest.NewRecorder()
 			h(rr, httptest.NewRequest(http.MethodGet, "/health", nil), tc.err)
 
@@ -185,7 +185,7 @@ func TestErrorHandlerAnswersForwardedBufferFullWith503NotUpstreamFault(t *testin
 		t.Run(tc.name, func(t *testing.T) {
 			em := &recordingEmitter{}
 			srv := newTestServerE(t, upstream, em)
-			h := srv.errorHandler(upstream.String(), id, "req-1", "logical-1", nil, nil)
+			h := srv.errorHandler(upstream.String(), id, "req-1", "logical-1", true, nil, nil)
 			rr := httptest.NewRecorder()
 			h(rr, httptest.NewRequest(http.MethodPost, "/v1/chat/completions", nil), tc.err)
 
