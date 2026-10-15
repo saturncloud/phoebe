@@ -5,7 +5,6 @@ import (
 	"database/sql"
 	"flag"
 	"os"
-	"strings"
 	"time"
 
 	// pgx stdlib driver: registers "pgx" with database/sql for the gateway
@@ -257,41 +256,19 @@ func buildLegacyPGGateway(s *config.Settings, log *logging.Logger) (gateway.Reso
 	return resolver, func() { _ = db.Close() }
 }
 
-// buildWaker constructs both wake actuators. Shared graphs retain the narrow
-// DGDSA Kubernetes patch. Dedicated disaggregated graphs call Atlas, which
-// validates the endpoint and restores both persisted pool counts. Either side
-// may be unavailable without disabling the other.
+// buildWaker sends shared and dedicated wakes to Atlas, which restores the
+// workers before the Planner (Planner ruling 2026-10-12).
 func buildWaker(s *config.Settings, log *logging.Logger) proxy.Waker {
 	if !s.Wake.Enabled {
 		return nil
 	}
-	var shared proxy.Waker
-	if s.Gateway.Namespace != "" {
-		kubeWaker, err := waker.New(waker.Config{
-			Namespace:  s.Gateway.Namespace,
-			Kubeconfig: s.Wake.Kubeconfig,
-		}, log)
-		if err != nil {
-			log.Error.Printf("wake: kubernetes client unavailable (%v); shared wake-from-zero is disabled", err)
-		} else {
-			shared = kubeWaker
-			log.Info.Printf("wake: shared actuator enabled (DGDSA namespace=%s)", s.Gateway.Namespace)
-		}
-	}
-	var dedicated proxy.Waker
-	if strings.TrimSpace(s.Wake.AtlasURL) != "" {
-		atlasWaker, err := waker.NewAtlas(s.Wake.AtlasURL, os.Getenv(internalWakeTokenEnv), log)
-		if err != nil {
-			log.Error.Printf("wake: Atlas actuator unavailable (%v); dedicated wake-from-zero is disabled", err)
-		} else {
-			dedicated = atlasWaker
-			log.Info.Printf("wake: dedicated actuator enabled (Atlas %s)", s.Wake.AtlasURL)
-		}
-	}
-	if shared == nil && dedicated == nil {
+	atlasWaker, err := waker.NewAtlas(s.Wake.AtlasURL, os.Getenv(internalWakeTokenEnv), log)
+	if err != nil {
+		log.Error.Printf("wake: Atlas actuator unavailable (%v); wake-from-zero is disabled", err)
 		return nil
 	}
-	return waker.ModeWaker{Shared: shared, Dedicated: dedicated}
+	log.Info.Printf("wake: enabled through Atlas %s", s.Wake.AtlasURL)
+	return atlasWaker
 }
 
 // buildEmitter constructs the durable metering emitter. When ValkeyAddr is set

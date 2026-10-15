@@ -429,21 +429,15 @@ type GatewaySettings struct {
 	DatabaseURL string `yaml:"databaseUrl"`
 }
 
-// WakeSettings is the YAML shape for wake-from-zero actuators. Shared graphs
-// use the Kubernetes actuator and require gateway.namespace. Dedicated
-// disaggregated graphs use Atlas and require atlasURL instead.
+// WakeSettings is the YAML shape for wake-from-zero actuation. Both shared
+// and dedicated graphs use Atlas so it can order workers before the Planner.
 type WakeSettings struct {
-	// Enabled turns the proactive DGDSA waker on. Default false: requests
-	// forward directly without a readiness wait.
+	// Enabled turns the wake actuator on. Default false: requests forward
+	// directly without a readiness wait.
 	Enabled bool `yaml:"enabled"`
 
-	// Kubeconfig is a kubeconfig file path for dev/tests. Empty (production)
-	// uses in-cluster config.
-	Kubeconfig string `yaml:"kubeconfig"`
-
-	// AtlasURL is the in-cluster Atlas base URL. Dedicated disaggregated
-	// endpoints wake through Atlas so it can validate the resource and restore
-	// the persisted prefill and decode counts without broader Kubernetes RBAC.
+	// AtlasURL is the in-cluster Atlas base URL. Atlas validates the endpoint
+	// and performs the ordered worker-readiness-Planner transition.
 	AtlasURL string `yaml:"atlasURL"`
 
 	// TimeoutStr bounds how long a single wake may hold the woken request
@@ -523,11 +517,8 @@ func (s *Settings) parse() error {
 		return err
 	}
 	s.Wake.AtlasURL = strings.TrimSpace(s.Wake.AtlasURL)
-	// Shared wake needs the graph namespace. Dedicated wake uses Atlas and does
-	// not need Kubernetes access, so its configured Atlas URL is independently
-	// sufficient to enable the wake dispatcher.
-	if s.Wake.Enabled && s.Gateway.Namespace == "" && s.Wake.AtlasURL == "" {
-		return fmt.Errorf("wake.enabled=true requires gateway.namespace or wake.atlasURL")
+	if s.Wake.Enabled && s.Wake.AtlasURL == "" {
+		return fmt.Errorf("wake.enabled=true requires wake.atlasURL")
 	}
 	if s.Wake.TimeoutStr != "" {
 		if s.Wake.Timeout, err = time.ParseDuration(s.Wake.TimeoutStr); err != nil {

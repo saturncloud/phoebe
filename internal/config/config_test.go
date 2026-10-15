@@ -209,19 +209,12 @@ func TestLoadWakeOffByDefault(t *testing.T) {
 	}
 }
 
-// TestLoadWakeEnabledRequiresGatewayNamespace: shared wake patches DGDSAs in
-// the gateway namespace. With no Atlas URL selecting dedicated-only wake,
-// enabling wake without a namespace is a startup error.
-func TestLoadWakeEnabledRequiresGatewayNamespace(t *testing.T) {
+func TestLoadWakeEnabledRequiresAtlasURL(t *testing.T) {
 	if _, err := Load(writeTemp(t, "wake:\n  enabled: true\n")); err == nil {
-		t.Fatal("expected error: wake.enabled without gateway.namespace")
+		t.Fatal("expected error: wake.enabled without wake.atlasURL")
 	}
-	s, err := Load(writeTemp(t, "wake:\n  enabled: true\ngateway:\n  namespace: \"tf-shared\"\n"))
-	if err != nil {
-		t.Fatalf("wake with gateway.namespace (gateway disabled) must load: %v", err)
-	}
-	if !s.Wake.Enabled || s.Gateway.Enabled {
-		t.Fatalf("settings wrong: wake=%+v gateway=%+v", s.Wake, s.Gateway)
+	if _, err := Load(writeTemp(t, "wake:\n  enabled: true\ngateway:\n  namespace: \"tf-shared\"\n")); err == nil {
+		t.Fatal("expected gateway.namespace without wake.atlasURL to fail")
 	}
 }
 
@@ -244,7 +237,7 @@ func TestLoadDedicatedWakeRejectsWhitespaceOnlyAtlasURL(t *testing.T) {
 // TestLoadWakeTimeout: wake.timeout parses to a duration; empty means "proxy
 // default" (0); garbage and non-positive values are startup errors.
 func TestLoadWakeTimeout(t *testing.T) {
-	base := "gateway:\n  namespace: \"tf-shared\"\nwake:\n  enabled: true\n"
+	base := "wake:\n  enabled: true\n  atlasURL: http://atlas.saturn:8888\n"
 
 	s, err := Load(writeTemp(t, base))
 	if err != nil {
@@ -821,7 +814,7 @@ func TestAdmissionLimitsAnyDoesNotAllocate(t *testing.T) {
 // protection.maxStreamDuration bounds the wake hold too, so with wake enabled
 // it must be longer than the effective wake.timeout (default 300s).
 func TestLoadMaxStreamDurationMustExceedWakeTimeout(t *testing.T) {
-	const wake = "gateway:\n  enabled: true\n  namespace: ns\nwake:\n  enabled: true\n"
+	const wake = "gateway:\n  enabled: true\n  namespace: ns\nwake:\n  enabled: true\n  atlasURL: http://atlas.saturn:8888\n"
 	for _, tc := range []struct {
 		name, yaml string
 		ok         bool
