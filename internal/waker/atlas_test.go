@@ -148,7 +148,10 @@ func TestAtlasWakerTreatsLostWakeResponseAsInProgress(t *testing.T) {
 		return nil, errors.New("response connection lost")
 	})}
 
-	err = waker.Wake(context.Background(), proxy.WakeTarget{
+	waker.pollInterval = time.Millisecond
+	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+	defer cancel()
+	err = waker.Wake(ctx, proxy.WakeTarget{
 		ResourceID: "dep-1", UpstreamHost: "model.example", ServedModel: "model-a",
 	})
 	if !applied.Load() {
@@ -175,7 +178,10 @@ func TestAtlasWakerTreatsServerFailureAfterWakeAsInProgress(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewAtlas: %v", err)
 	}
-	err = waker.Wake(context.Background(), proxy.WakeTarget{
+	waker.pollInterval = time.Millisecond
+	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+	defer cancel()
+	err = waker.Wake(ctx, proxy.WakeTarget{
 		ResourceID: "dep-1", UpstreamHost: "model.example", ServedModel: "model-a",
 	})
 	if !applied.Load() {
@@ -288,47 +294,43 @@ func TestAtlasWakerDoesNotFollowRedirects(t *testing.T) {
 	}
 }
 
-type recordingWaker struct{ calls int }
+// TestAtlasWakerAsksAgainWhileWorkersStart is the regression for a cold wake
+// that outlasts Atlas's own readiness wait: Atlas answers 503 until the
+// workers are ready and only then restores the Planner, so the waker must
+// keep the request held and ask again instead of giving up after one call.
+func TestAtlasWakerAsksAgainWhileWorkersStart(t *testing.T) {
+	var wakeCalls atomic.Int32
+	atlas := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case internalWakePath:
+			if wakeCalls.Add(1) < 3 {
+				http.Error(w, "worker is still starting; retry the request", http.StatusServiceUnavailable)
+				return
+			}
+			_, _ = w.Write([]byte(`{"graph_k8s_name":"g","worker_replicas":1}`))
+		case "/v1/models":
+			_, _ = w.Write([]byte(`{"data":[{"id":"model-a"}]}`))
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer atlas.Close()
+	u, _ := url.Parse(atlas.URL)
 
-func (w *recordingWaker) Wake(context.Context, proxy.WakeTarget) error {
-	w.calls++
-	return nil
-}
-
-func TestModeWakerKeepsSharedAndDedicatedActuatorsSeparate(t *testing.T) {
-	shared := &recordingWaker{}
-	dedicated := &recordingWaker{}
-	w := ModeWaker{Shared: shared, Dedicated: dedicated}
-	if err := w.Wake(context.Background(), proxy.WakeTarget{ServingMode: identity.ServingModeShared}); err != nil {
-		t.Fatal(err)
+	waker, err := NewAtlas(atlas.URL, "secret", logging.New(logging.ERROR))
+	if err != nil {
+		t.Fatalf("NewAtlas: %v", err)
 	}
-	if err := w.Wake(context.Background(), proxy.WakeTarget{ServingMode: identity.ServingModeDedicated}); err != nil {
-		t.Fatal(err)
+	waker.pollInterval = time.Millisecond
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if err := waker.Wake(ctx, proxy.WakeTarget{
+		ResourceID: "tfm-1", UpstreamHost: u.Host, ServedModel: "model-a",
+		ServingMode: identity.ServingModeShared,
+	}); err != nil {
+		t.Fatalf("Wake: %v", err)
 	}
-	if shared.calls != 1 || dedicated.calls != 1 {
-		t.Fatalf("calls shared=%d dedicated=%d, want one each", shared.calls, dedicated.calls)
-	}
-}
-
-func TestModeWakerReportsAvailableActuatorByServingMode(t *testing.T) {
-	shared := &recordingWaker{}
-	dedicated := &recordingWaker{}
-	sharedOnly := ModeWaker{Shared: shared}
-	dedicatedOnly := ModeWaker{Dedicated: dedicated}
-
-	if !sharedOnly.SupportsWake(proxy.WakeTarget{ServingMode: identity.ServingModeShared}) {
-		t.Fatal("shared-only waker does not report shared support")
-	}
-	if sharedOnly.SupportsWake(proxy.WakeTarget{ServingMode: identity.ServingModeDedicated}) {
-		t.Fatal("shared-only waker reports dedicated support")
-	}
-	if !dedicatedOnly.SupportsWake(proxy.WakeTarget{ServingMode: identity.ServingModeDedicated}) {
-		t.Fatal("dedicated-only waker does not report dedicated support")
-	}
-	if dedicatedOnly.SupportsWake(proxy.WakeTarget{ServingMode: identity.ServingModeShared}) {
-		t.Fatal("dedicated-only waker reports shared support")
-	}
-	if dedicatedOnly.SupportsWake(proxy.WakeTarget{ServingMode: "unknown"}) {
-		t.Fatal("waker reports support for an unknown serving mode")
+	if got := wakeCalls.Load(); got != 3 {
+		t.Fatalf("Atlas wake calls = %d, want 3 (two still-starting answers, then success)", got)
 	}
 }

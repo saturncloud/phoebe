@@ -1,3 +1,8 @@
+// Package waker implements the proxy's wake-from-zero seam
+// (internal/proxy/wake.go) by asking Atlas to wake the endpoint. Atlas owns
+// the ordering the Planner ruling requires (workers to one, wait until ready,
+// then the Planner to one) for shared and dedicated graphs alike, so phoebe
+// needs no Kubernetes access to wake a graph.
 package waker
 
 import (
@@ -14,7 +19,6 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/saturncloud/phoebe/internal/identity"
 	"github.com/saturncloud/phoebe/internal/logging"
 	"github.com/saturncloud/phoebe/internal/proxy"
 )
@@ -22,8 +26,8 @@ import (
 const internalWakePath = "/api/internal/token-factory/inference-endpoints/wake"
 const internalWakeHeader = "X-Saturn-Internal-Wake-Token"
 
-// AtlasWaker asks Atlas to restore a dedicated disaggregated graph's persisted
-// prefill and decode counts, then waits until the frontend advertises a model.
+// AtlasWaker asks Atlas to wake a shared or dedicated endpoint, then waits
+// until the frontend advertises the requested model.
 type AtlasWaker struct {
 	baseURL      string
 	token        string
@@ -70,7 +74,34 @@ func (w *AtlasWaker) Wake(ctx context.Context, target proxy.WakeTarget) error {
 	if target.ServedModel == "" {
 		return errors.New("atlas waker: no served model on wake target")
 	}
-	body, err := json.Marshal(map[string]string{"resource_id": target.ResourceID})
+	for {
+		err := w.requestWake(ctx, target.ResourceID)
+		if err == nil {
+			break
+		}
+		if !errors.Is(err, proxy.ErrWakeStatusUnknown) {
+			return err
+		}
+		// Atlas waits for ready workers for less time than a cold start
+		// takes and answers 503 while they are still starting; it restores
+		// the Planner only on the call that sees them ready. Atlas's wake is
+		// idempotent, so ask again until the wake hold expires.
+		timer := time.NewTimer(w.pollInterval)
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			return err
+		case <-timer.C:
+		}
+	}
+	w.log.Info.Printf("waker: Atlas woke graph workers and Planner (resource_id=%s)", target.ResourceID)
+	return w.waitReady(ctx, target.UpstreamHost, target.ServedModel)
+}
+
+// requestWake makes one Atlas wake call. Errors wrapping
+// proxy.ErrWakeStatusUnknown mean Atlas may have started the wake.
+func (w *AtlasWaker) requestWake(ctx context.Context, resourceID string) error {
+	body, err := json.Marshal(map[string]string{"resource_id": resourceID})
 	if err != nil {
 		return fmt.Errorf("atlas waker: marshal request: %w", err)
 	}
@@ -105,8 +136,7 @@ func (w *AtlasWaker) Wake(ctx context.Context, target proxy.WakeTarget) error {
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		return fmt.Errorf("atlas waker: status %d: %s", resp.StatusCode, string(responseBody))
 	}
-	w.log.Info.Printf("waker: Atlas restored dedicated graph workers (resource_id=%s)", target.ResourceID)
-	return w.waitReady(ctx, target.UpstreamHost, target.ServedModel)
+	return nil
 }
 
 func (w *AtlasWaker) waitReady(ctx context.Context, upstreamHost, servedModel string) error {
@@ -154,42 +184,5 @@ func (w *AtlasWaker) waitReady(ctx context.Context, upstreamHost, servedModel st
 				return nil
 			}
 		}
-	}
-}
-
-// ModeWaker preserves the narrow shared-graph Kubernetes actuator and sends
-// dedicated graph wakes to Atlas.
-type ModeWaker struct {
-	Shared    proxy.Waker
-	Dedicated proxy.Waker
-}
-
-// SupportsWake reports whether the actuator for this target's serving mode is
-// available. The proxy uses it before reserving cold-hold capacity.
-func (w ModeWaker) SupportsWake(target proxy.WakeTarget) bool {
-	switch target.ServingMode {
-	case identity.ServingModeShared:
-		return w.Shared != nil
-	case identity.ServingModeDedicated:
-		return w.Dedicated != nil
-	default:
-		return false
-	}
-}
-
-func (w ModeWaker) Wake(ctx context.Context, target proxy.WakeTarget) error {
-	switch target.ServingMode {
-	case identity.ServingModeShared:
-		if w.Shared == nil {
-			return errors.New("waker: shared actuator is unavailable")
-		}
-		return w.Shared.Wake(ctx, target)
-	case identity.ServingModeDedicated:
-		if w.Dedicated == nil {
-			return errors.New("waker: dedicated actuator is unavailable")
-		}
-		return w.Dedicated.Wake(ctx, target)
-	default:
-		return fmt.Errorf("waker: unsupported serving mode %q", target.ServingMode)
 	}
 }

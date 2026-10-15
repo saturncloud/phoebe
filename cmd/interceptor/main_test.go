@@ -103,24 +103,7 @@ func TestBuildAdmissionLogsMeteringStoreFallback(t *testing.T) {
 	}
 }
 
-func TestBuildWakerSharedOnlyDoesNotLogAtlasUnavailable(t *testing.T) {
-	var buf bytes.Buffer
-	logger := &logging.Logger{
-		Debug: log.New(io.Discard, "", 0),
-		Info:  log.New(io.Discard, "", 0),
-		Warn:  log.New(&buf, "", 0),
-		Error: log.New(&buf, "", 0),
-	}
-	s := &config.Settings{}
-	s.Wake.Enabled = true
-	s.Gateway.Namespace = "shared"
-	_ = buildWaker(s, logger)
-	if strings.Contains(buf.String(), "Atlas actuator unavailable") {
-		t.Fatalf("valid shared-only wake logged a false Atlas error: %q", buf.String())
-	}
-}
-
-func TestBuildWakerConnectsDedicatedAtlasActuator(t *testing.T) {
+func TestBuildWakerConnectsBothModesToAtlas(t *testing.T) {
 	var wakeCalls int
 	atlas := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.URL.Path {
@@ -148,7 +131,7 @@ func TestBuildWakerConnectsDedicatedAtlasActuator(t *testing.T) {
 	s.Wake.AtlasURL = atlas.URL
 	built := buildWaker(s, logging.New(logging.ERROR))
 	if built == nil {
-		t.Fatal("buildWaker returned nil for valid dedicated Atlas configuration")
+		t.Fatal("buildWaker returned nil for a valid Atlas configuration")
 	}
 	err = built.Wake(context.Background(), proxy.WakeTarget{
 		ResourceID: "dep-1", UpstreamHost: atlasURL.Host, ServedModel: "model-a",
@@ -159,6 +142,16 @@ func TestBuildWakerConnectsDedicatedAtlasActuator(t *testing.T) {
 	}
 	if wakeCalls != 1 {
 		t.Fatalf("Atlas wake calls = %d, want 1", wakeCalls)
+	}
+	err = built.Wake(context.Background(), proxy.WakeTarget{
+		ResourceID: "model-1", UpstreamHost: atlasURL.Host, ServedModel: "model-a",
+		ServingMode: identity.ServingModeShared,
+	})
+	if err != nil {
+		t.Fatalf("shared Wake: %v", err)
+	}
+	if wakeCalls != 2 {
+		t.Fatalf("Atlas wake calls = %d, want 2", wakeCalls)
 	}
 }
 
