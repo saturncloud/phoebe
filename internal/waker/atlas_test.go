@@ -116,6 +116,7 @@ func TestAtlasWakerAuthenticatesAndSendsOnlyResourceID(t *testing.T) {
 		t.Fatalf("NewAtlas: %v", err)
 	}
 	waker.pollInterval = time.Millisecond
+	waker.loopWindow = 500 * time.Millisecond
 	if err := waker.Wake(context.Background(), proxy.WakeTarget{
 		ResourceID: "dep-1", UpstreamHost: u.Host, ServedModel: "model-a",
 	}); err != nil {
@@ -149,6 +150,7 @@ func TestAtlasWakerTreatsLostWakeResponseAsInProgress(t *testing.T) {
 	})}
 
 	waker.pollInterval = time.Millisecond
+	waker.loopWindow = 500 * time.Millisecond
 	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
 	defer cancel()
 	err = waker.Wake(ctx, proxy.WakeTarget{
@@ -179,6 +181,7 @@ func TestAtlasWakerTreatsServerFailureAfterWakeAsInProgress(t *testing.T) {
 		t.Fatalf("NewAtlas: %v", err)
 	}
 	waker.pollInterval = time.Millisecond
+	waker.loopWindow = 500 * time.Millisecond
 	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
 	defer cancel()
 	err = waker.Wake(ctx, proxy.WakeTarget{
@@ -322,6 +325,7 @@ func TestAtlasWakerAsksAgainWhileWorkersStart(t *testing.T) {
 		t.Fatalf("NewAtlas: %v", err)
 	}
 	waker.pollInterval = time.Millisecond
+	waker.loopWindow = 500 * time.Millisecond
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	if err := waker.Wake(ctx, proxy.WakeTarget{
@@ -359,6 +363,7 @@ func TestAtlasWakerFinishesWakeAfterClientLeaves(t *testing.T) {
 		t.Fatalf("NewAtlas: %v", err)
 	}
 	waker.pollInterval = time.Millisecond
+	waker.loopWindow = 500 * time.Millisecond
 
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	go func() { <-firstCall; cancel() }()
@@ -455,6 +460,7 @@ func TestAtlasWakerKeepsUnknownStatusAfterLaterFailure(t *testing.T) {
 				t.Fatalf("NewAtlas: %v", err)
 			}
 			waker.pollInterval = time.Millisecond
+			waker.loopWindow = 500 * time.Millisecond
 			ctx, cancel := context.WithTimeout(context.Background(), 300*time.Millisecond)
 			defer cancel()
 			err = waker.Wake(ctx, proxy.WakeTarget{ResourceID: "tfm-1", UpstreamHost: "model.example", ServedModel: "m"})
@@ -484,5 +490,42 @@ func TestAtlasWakerFirstRefusalIsDefinite(t *testing.T) {
 	}
 	if got := calls.Load(); got != 1 {
 		t.Fatalf("Atlas wake calls = %d, want 1", got)
+	}
+}
+
+// TestAtlasWakerLoopOutlivesAShortHold is the regression for uk2's 3 s
+// wake.timeout: the client's hold ended long before the worker was ready, the
+// loop ended with it, and the Planner came back only with the reaper's
+// repair pass. The loop's lifetime must not depend on the hold.
+func TestAtlasWakerLoopOutlivesAShortHold(t *testing.T) {
+	start := time.Now()
+	var restored atomic.Bool
+	atlas := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		if time.Since(start) < 200*time.Millisecond {
+			http.Error(w, "worker is still starting", http.StatusServiceUnavailable)
+			return
+		}
+		restored.Store(true)
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer atlas.Close()
+	waker, err := NewAtlas(atlas.URL, "secret", logging.New(logging.ERROR))
+	if err != nil {
+		t.Fatalf("NewAtlas: %v", err)
+	}
+	waker.pollInterval = 5 * time.Millisecond
+
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
+	defer cancel()
+	err = waker.Wake(ctx, proxy.WakeTarget{ResourceID: "tfm-1", UpstreamHost: "model.example", ServedModel: "m"})
+	if !errors.Is(err, proxy.ErrWakeStatusUnknown) {
+		t.Fatalf("Wake error = %v, want ErrWakeStatusUnknown when the hold ends first", err)
+	}
+	deadline := time.Now().Add(3 * time.Second)
+	for !restored.Load() && time.Now().Before(deadline) {
+		time.Sleep(5 * time.Millisecond)
+	}
+	if !restored.Load() {
+		t.Fatal("the wake loop stopped with the client's hold; Atlas never got the call that restores the Planner")
 	}
 }
