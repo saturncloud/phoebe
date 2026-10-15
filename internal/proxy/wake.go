@@ -25,8 +25,8 @@ type WakeTarget struct {
 	// UpstreamHost is the trusted upstream host:port the cold response came
 	// from. The waker also uses it for readiness checks.
 	UpstreamHost string
-	// GraphK8sName is the Dynamo graph (DGD) k8s name whose worker DGDSA the
-	// waker scales. On the gateway path it is the tf_model row's
+	// GraphK8sName is the Dynamo graph (DGD) k8s name, for logs. On the
+	// gateway path it is the tf_model row's
 	// graph_k8s_name, threaded through resolution verbatim; on header-routed
 	// requests it is derived once from the upstream host (see
 	// graphFromUpstreamHost). Never empty for a target the proxy hands to a
@@ -36,21 +36,18 @@ type WakeTarget struct {
 	// wake time + audit).
 	ResourceID string
 	// ServedModel is the trusted deployment-scoped model name Atlas stamped on
-	// the route. Dedicated wake does not report ready until this model appears
-	// in frontend discovery.
+	// the route. A wake does not report ready until this model appears in
+	// frontend discovery.
 	ServedModel string
-	// ServingMode selects the actuator. Shared graphs keep their narrow DGDSA
-	// patch; dedicated disaggregated graphs call Atlas, which validates the
-	// endpoint and restores both persisted worker-pool counts.
+	// ServingMode is the route's serving mode. Shared and dedicated wakes
+	// both go to Atlas; the proxy uses the mode for the dedicated cold-hold cap.
 	ServingMode string
 }
 
-// Waker triggers a shared base graph's 0->1 scale-up and blocks until the
-// graph's worker is ready to serve (or the context/deadline is exceeded).
-// Abstracted so the ACTUATION is pluggable (the concrete client-go DGDSA
-// waker lives in internal/waker; a future actuator could POST to an Atlas
-// wake endpoint instead). The proxy's cold-detect + hold-and-retry logic is
-// identical either way.
+// Waker wakes a graph scaled to zero and blocks until its worker is ready to
+// serve (or the context/deadline is exceeded). The actuator is
+// internal/waker.AtlasWaker: Atlas brings the workers to one and then the
+// Planner (ruling 2026-10-12); phoebe needs no Kubernetes access.
 //
 // Wake returns nil once the worker is ready, or an error if wake could not
 // complete. The caller never hangs forever; what the client then receives
@@ -65,8 +62,8 @@ type WakeTarget struct {
 //   - The wake request may have reached its actuator, but the response does not
 //     prove whether scale-up began: Wake wraps ErrWakeStatusUnknown. The caller
 //     answers a neutral retryable 503 without claiming that workers are starting.
-//   - Any other failure (no scalable adapter for the graph, an RBAC or API
-//     error on the scale patch, a malformed target): Wake returns an error that
+//   - Any other failure (Atlas refused the first wake call with a 4xx, or a
+//     malformed target): Wake returns an error that
 //     does NOT wrap ErrWakeNotReady. Nothing is starting, so telling the client
 //     to retry would be false; the caller returns the original cold upstream
 //     response unchanged.
@@ -149,7 +146,7 @@ func writeRetryLaterAfter(w http.ResponseWriter, requestID, msg string, retryAft
 // a shared base graph's worker is scaled to 0 (by the Atlas reaper), the
 // frontend drops the model and a request for it returns a COLD response. Phoebe
 // — the only actor in the request path — supplies the external wake signal:
-// detect the cold response, trigger a scale 0->1 on the graph's DGDSA, hold the
+// detect the cold response, ask Atlas to wake the graph (0->1), hold the
 // request, and retry once the worker is back.
 //
 // THE COLD SIGNAL (verified against Dynamo v1.4.0): a scaled-to-0 base returns

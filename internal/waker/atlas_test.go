@@ -334,3 +334,155 @@ func TestAtlasWakerAsksAgainWhileWorkersStart(t *testing.T) {
 		t.Fatalf("Atlas wake calls = %d, want 3 (two still-starting answers, then success)", got)
 	}
 }
+
+// TestAtlasWakerFinishesWakeAfterClientLeaves: Atlas restores the Planner
+// only on the call that finds the workers ready. If the only held client
+// disconnects first, the wake loop must keep calling Atlas until that call
+// happens; otherwise the graph serves without its Planner.
+func TestAtlasWakerFinishesWakeAfterClientLeaves(t *testing.T) {
+	var wakeCalls atomic.Int32
+	firstCall := make(chan struct{})
+	atlas := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		n := wakeCalls.Add(1)
+		if n == 1 {
+			close(firstCall)
+		}
+		if n < 3 {
+			http.Error(w, "worker is still starting", http.StatusServiceUnavailable)
+			return
+		}
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer atlas.Close()
+	waker, err := NewAtlas(atlas.URL, "secret", logging.New(logging.ERROR))
+	if err != nil {
+		t.Fatalf("NewAtlas: %v", err)
+	}
+	waker.pollInterval = time.Millisecond
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	go func() { <-firstCall; cancel() }()
+	err = waker.Wake(ctx, proxy.WakeTarget{ResourceID: "tfm-1", UpstreamHost: "model.example", ServedModel: "m"})
+	if !errors.Is(err, proxy.ErrWakeStatusUnknown) {
+		t.Fatalf("Wake error = %v, want ErrWakeStatusUnknown after the client left", err)
+	}
+	deadline := time.Now().Add(3 * time.Second)
+	for wakeCalls.Load() < 3 && time.Now().Before(deadline) {
+		time.Sleep(5 * time.Millisecond)
+	}
+	if got := wakeCalls.Load(); got != 3 {
+		t.Fatalf("Atlas wake calls = %d, want 3: the loop must continue after the client leaves", got)
+	}
+}
+
+// TestAtlasWakerSharesOneCallLoopPerEndpoint: many requests held for one
+// cold endpoint make one Atlas call, not one each.
+func TestAtlasWakerSharesOneCallLoopPerEndpoint(t *testing.T) {
+	var wakeCalls atomic.Int32
+	release := make(chan struct{})
+	atlas := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case internalWakePath:
+			wakeCalls.Add(1)
+			<-release
+			w.WriteHeader(http.StatusOK)
+		case "/v1/models":
+			_, _ = w.Write([]byte(`{"data":[{"id":"m"}]}`))
+		}
+	}))
+	defer atlas.Close()
+	u, _ := url.Parse(atlas.URL)
+	waker, err := NewAtlas(atlas.URL, "secret", logging.New(logging.ERROR))
+	if err != nil {
+		t.Fatalf("NewAtlas: %v", err)
+	}
+
+	const held = 10
+	errs := make(chan error, held)
+	for i := 0; i < held; i++ {
+		go func() {
+			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancel()
+			errs <- waker.Wake(ctx, proxy.WakeTarget{ResourceID: "tfm-1", UpstreamHost: u.Host, ServedModel: "m"})
+		}()
+	}
+	deadline := time.Now().Add(2 * time.Second)
+	for wakeCalls.Load() < 1 && time.Now().Before(deadline) {
+		time.Sleep(5 * time.Millisecond)
+	}
+	time.Sleep(50 * time.Millisecond) // let every request join before Atlas answers
+	close(release)
+	for i := 0; i < held; i++ {
+		if err := <-errs; err != nil {
+			t.Fatalf("Wake: %v", err)
+		}
+	}
+	if got := wakeCalls.Load(); got != 1 {
+		t.Fatalf("Atlas wake calls = %d, want 1 for %d held requests", got, held)
+	}
+}
+
+// TestAtlasWakerKeepsUnknownStatusAfterLaterFailure: once Atlas answered
+// "still starting", a later refusal or an unreachable Atlas must not turn
+// into a definite failure (which would hand the client the cold 404).
+func TestAtlasWakerKeepsUnknownStatusAfterLaterFailure(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		later func(*httptest.Server, http.ResponseWriter)
+	}{
+		{"later 4xx", func(_ *httptest.Server, w http.ResponseWriter) {
+			http.Error(w, "graph assignment changed", http.StatusBadRequest)
+		}},
+		{"Atlas goes away", func(s *httptest.Server, w http.ResponseWriter) {
+			http.Error(w, "still starting", http.StatusServiceUnavailable)
+			go s.CloseClientConnections()
+			go s.Listener.Close()
+		}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var calls atomic.Int32
+			var srv *httptest.Server
+			srv = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				if calls.Add(1) == 1 {
+					http.Error(w, "still starting", http.StatusServiceUnavailable)
+					return
+				}
+				tc.later(srv, w)
+			}))
+			defer srv.Close()
+			waker, err := NewAtlas(srv.URL, "secret", logging.New(logging.ERROR))
+			if err != nil {
+				t.Fatalf("NewAtlas: %v", err)
+			}
+			waker.pollInterval = time.Millisecond
+			ctx, cancel := context.WithTimeout(context.Background(), 300*time.Millisecond)
+			defer cancel()
+			err = waker.Wake(ctx, proxy.WakeTarget{ResourceID: "tfm-1", UpstreamHost: "model.example", ServedModel: "m"})
+			if !errors.Is(err, proxy.ErrWakeStatusUnknown) {
+				t.Fatalf("Wake error = %v, want ErrWakeStatusUnknown", err)
+			}
+		})
+	}
+}
+
+// TestAtlasWakerFirstRefusalIsDefinite: a 4xx on the first call means nothing
+// started; the client gets the cold response after exactly one call.
+func TestAtlasWakerFirstRefusalIsDefinite(t *testing.T) {
+	var calls atomic.Int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		calls.Add(1)
+		http.Error(w, "Inference endpoint not found", http.StatusNotFound)
+	}))
+	defer srv.Close()
+	waker, err := NewAtlas(srv.URL, "secret", logging.New(logging.ERROR))
+	if err != nil {
+		t.Fatalf("NewAtlas: %v", err)
+	}
+	err = waker.Wake(context.Background(), proxy.WakeTarget{ResourceID: "tfm-1", UpstreamHost: "model.example", ServedModel: "m"})
+	if err == nil || errors.Is(err, proxy.ErrWakeStatusUnknown) || errors.Is(err, proxy.ErrWakeNotReady) {
+		t.Fatalf("Wake error = %v, want a definite refusal", err)
+	}
+	if got := calls.Load(); got != 1 {
+		t.Fatalf("Atlas wake calls = %d, want 1", got)
+	}
+}

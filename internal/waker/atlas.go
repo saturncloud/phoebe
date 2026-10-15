@@ -16,6 +16,7 @@ import (
 	"net/http/httptrace"
 	"net/url"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -26,14 +27,36 @@ import (
 const internalWakePath = "/api/internal/token-factory/inference-endpoints/wake"
 const internalWakeHeader = "X-Saturn-Internal-Wake-Token"
 
+// defaultWakeWindow bounds a wake loop started by a caller with no deadline.
+// The proxy always sets one (wake.timeout).
+const defaultWakeWindow = 5 * time.Minute
+
 // AtlasWaker asks Atlas to wake a shared or dedicated endpoint, then waits
 // until the frontend advertises the requested model.
+//
+// Atlas restores the Planner only on the wake call that finds the workers
+// ready, so the call loop must not depend on any one client staying
+// connected. Each endpoint therefore has at most one loop per phoebe
+// replica: it runs detached from the request that started it, and every
+// request held for that endpoint waits on it. This also keeps a burst of
+// cold requests from becoming a burst of Atlas calls, each of which holds a
+// database connection while Atlas waits on the graph's lock.
 type AtlasWaker struct {
 	baseURL      string
 	token        string
 	client       *http.Client
 	pollInterval time.Duration
 	log          *logging.Logger
+
+	mu      sync.Mutex
+	flights map[string]*wakeFlight
+}
+
+// wakeFlight is the running wake loop for one endpoint. err is written
+// before done is closed.
+type wakeFlight struct {
+	done chan struct{}
+	err  error
 }
 
 func NewAtlas(baseURL, token string, log *logging.Logger) (*AtlasWaker, error) {
@@ -64,6 +87,7 @@ func NewAtlas(baseURL, token string, log *logging.Logger) (*AtlasWaker, error) {
 		},
 		pollInterval: 2 * time.Second,
 		log:          log,
+		flights:      map[string]*wakeFlight{},
 	}, nil
 }
 
@@ -74,28 +98,73 @@ func (w *AtlasWaker) Wake(ctx context.Context, target proxy.WakeTarget) error {
 	if target.ServedModel == "" {
 		return errors.New("atlas waker: no served model on wake target")
 	}
-	for {
-		err := w.requestWake(ctx, target.ResourceID)
-		if err == nil {
-			break
+	f := w.joinFlight(ctx, target.ResourceID)
+	select {
+	case <-f.done:
+		if f.err != nil {
+			return f.err
 		}
-		if !errors.Is(err, proxy.ErrWakeStatusUnknown) {
+	case <-ctx.Done():
+		// The loop keeps running, so the Planner is still restored.
+		return fmt.Errorf("%w: atlas waker: hold ended while the wake was running: %v",
+			proxy.ErrWakeStatusUnknown, ctx.Err())
+	}
+	w.log.Info.Printf("waker: Atlas woke graph workers and Planner (resource_id=%s)", target.ResourceID)
+	return w.waitReady(ctx, target.UpstreamHost, target.ServedModel)
+}
+
+// joinFlight returns the running wake loop for resourceID, or starts one
+// bounded by ctx's deadline but not cancelled with ctx.
+func (w *AtlasWaker) joinFlight(ctx context.Context, resourceID string) *wakeFlight {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	if f, ok := w.flights[resourceID]; ok {
+		return f
+	}
+	deadline, ok := ctx.Deadline()
+	if !ok {
+		deadline = time.Now().Add(defaultWakeWindow)
+	}
+	loopCtx, cancel := context.WithDeadline(context.WithoutCancel(ctx), deadline)
+	f := &wakeFlight{done: make(chan struct{})}
+	w.flights[resourceID] = f
+	go func() {
+		defer cancel()
+		f.err = w.callUntilWoken(loopCtx, resourceID)
+		w.mu.Lock()
+		delete(w.flights, resourceID)
+		w.mu.Unlock()
+		close(f.done)
+	}()
+	return f
+}
+
+// callUntilWoken calls Atlas until it reports the wake done, refuses it, or
+// ctx ends. Atlas waits for ready workers for less time than a cold start
+// takes and answers 503 while they are still starting; its wake is
+// idempotent, so the loop asks again. Once a call has left the status
+// unknown, a later failure (Atlas restarting, a 4xx) cannot prove that
+// nothing is starting, so the result stays "status unknown".
+func (w *AtlasWaker) callUntilWoken(ctx context.Context, resourceID string) error {
+	var unknown error
+	for {
+		err := w.requestWake(ctx, resourceID)
+		switch {
+		case err == nil:
+			return nil
+		case errors.Is(err, proxy.ErrWakeStatusUnknown):
+			unknown = err
+		case unknown == nil:
 			return err
 		}
-		// Atlas waits for ready workers for less time than a cold start
-		// takes and answers 503 while they are still starting; it restores
-		// the Planner only on the call that sees them ready. Atlas's wake is
-		// idempotent, so ask again until the wake hold expires.
 		timer := time.NewTimer(w.pollInterval)
 		select {
 		case <-ctx.Done():
 			timer.Stop()
-			return err
+			return unknown
 		case <-timer.C:
 		}
 	}
-	w.log.Info.Printf("waker: Atlas woke graph workers and Planner (resource_id=%s)", target.ResourceID)
-	return w.waitReady(ctx, target.UpstreamHost, target.ServedModel)
 }
 
 // requestWake makes one Atlas wake call. Errors wrapping
