@@ -27,9 +27,12 @@ import (
 const internalWakePath = "/api/internal/token-factory/inference-endpoints/wake"
 const internalWakeHeader = "X-Saturn-Internal-Wake-Token"
 
-// defaultWakeWindow bounds a wake loop started by a caller with no deadline.
-// The proxy always sets one (wake.timeout).
-const defaultWakeWindow = 5 * time.Minute
+// wakeLoopWindow bounds one wake loop. It is independent of the client's
+// hold (wake.timeout), which can be much shorter than a cold start: the loop
+// must outlast the cold start so the call that finds the workers ready, and
+// restores the Planner, still happens. Ten minutes matches the reaper's
+// interval; its repair pass restores a Planner after anything longer.
+const wakeLoopWindow = 10 * time.Minute
 
 // AtlasWaker asks Atlas to wake a shared or dedicated endpoint, then waits
 // until the frontend advertises the requested model.
@@ -46,6 +49,7 @@ type AtlasWaker struct {
 	token        string
 	client       *http.Client
 	pollInterval time.Duration
+	loopWindow   time.Duration
 	log          *logging.Logger
 
 	mu      sync.Mutex
@@ -86,6 +90,7 @@ func NewAtlas(baseURL, token string, log *logging.Logger) (*AtlasWaker, error) {
 			},
 		},
 		pollInterval: 2 * time.Second,
+		loopWindow:   wakeLoopWindow,
 		log:          log,
 		flights:      map[string]*wakeFlight{},
 	}, nil
@@ -114,18 +119,14 @@ func (w *AtlasWaker) Wake(ctx context.Context, target proxy.WakeTarget) error {
 }
 
 // joinFlight returns the running wake loop for resourceID, or starts one
-// bounded by ctx's deadline but not cancelled with ctx.
+// that is not cancelled with ctx and runs for at most loopWindow.
 func (w *AtlasWaker) joinFlight(ctx context.Context, resourceID string) *wakeFlight {
 	w.mu.Lock()
 	defer w.mu.Unlock()
 	if f, ok := w.flights[resourceID]; ok {
 		return f
 	}
-	deadline, ok := ctx.Deadline()
-	if !ok {
-		deadline = time.Now().Add(defaultWakeWindow)
-	}
-	loopCtx, cancel := context.WithDeadline(context.WithoutCancel(ctx), deadline)
+	loopCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), w.loopWindow)
 	f := &wakeFlight{done: make(chan struct{})}
 	w.flights[resourceID] = f
 	go func() {
