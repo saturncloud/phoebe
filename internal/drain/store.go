@@ -3,10 +3,13 @@ package drain
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"fmt"
+	"math"
 	"strings"
 	"time"
 
+	"github.com/jackc/pgx/v5/pgconn"
 	// pgx stdlib driver registers itself as "pgx" with database/sql. We use the
 	// standard library sql package (not the native pgx pool) so the store is a
 	// thin, mockable seam and so connection-pool tuning is the familiar
@@ -30,7 +33,64 @@ type Store interface {
 	Upsert(ctx context.Context, events []metering.Event) error
 	// Ping verifies connectivity (pool_pre_ping equivalent on startup).
 	Ping(ctx context.Context) error
+	// SchemaVersion reports the database schema version (golang-migrate) and
+	// whether it is dirty. The drainer's startup gate reads it; every store
+	// must answer, so the gate can never be skipped by a store that cannot.
+	SchemaVersion(ctx context.Context) (version uint, dirty bool, err error)
 	Close() error
+}
+
+var _ Store = (*PostgresStore)(nil)
+
+// SchemaVersion reads golang-migrate's schema_migrations row: the version the
+// database is at and whether the last migration left it dirty. Only "no
+// migration ever applied" (the table is missing, or holds no row) reads as
+// version 0, not dirty. Any other error, an unexpected table shape (42703)
+// included, is returned so the drainer's wait log shows the real cause. The
+// query has its own deadline so a hung connection becomes an error.
+func (s *PostgresStore) SchemaVersion(ctx context.Context) (uint, bool, error) {
+	ctx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
+	var (
+		version int64
+		dirty   bool
+	)
+	err := s.db.QueryRowContext(ctx, `SELECT version, dirty FROM schema_migrations LIMIT 1`).Scan(&version, &dirty)
+	if errors.Is(err, sql.ErrNoRows) || isUndefinedTable(err) {
+		return 0, false, nil
+	}
+	if err != nil {
+		return 0, false, fmt.Errorf("drain: read schema version: %w", err)
+	}
+	if version < 0 {
+		version = 0
+	}
+	return uint(version), dirty, nil
+}
+
+// isUndefinedTable reports Postgres undefined_table (42P01): schema_migrations
+// does not exist yet because no migration has run.
+func isUndefinedTable(err error) bool {
+	var pgErr *pgconn.PgError
+	return errors.As(err, &pgErr) && pgErr.Code == "42P01"
+}
+
+// isSchemaNotReady reports a Postgres error that means the schema is behind
+// the code (an undefined table or column), not that the row is bad: during an
+// upgrade the new drainer can run before the migration that adds the column it
+// writes. Such a row must be retried, never dropped as poison.
+func isSchemaNotReady(err error) bool {
+	var pgErr *pgconn.PgError
+	if !errors.As(err, &pgErr) {
+		return false
+	}
+	switch pgErr.Code {
+	// undefined_table, undefined_column, and invalid_column_reference (an ON
+	// CONFLICT target whose unique key a pending migration adds).
+	case "42P01", "42703", "42P10":
+		return true
+	}
+	return false
 }
 
 // PostgresStore writes metering events to the billing_event table. It assumes
@@ -100,16 +160,22 @@ var upsertColumns = []string{
 	"cached_tokens",
 	"completion_tokens",
 	"finish_reason",
-	"gpu_type",
 	"aborted",
 	"usage_found",
 	"status_code",
 	"streamed",
 	"graph_k8s_name",
+	"topology_revision",
+	"region",
+	"request_started_at",
+	"serving_duration_ms",
 	"event_ts",
 }
 
-const colsPerRow = 23 // len(upsertColumns); created_at is DB-defaulted.
+// colsPerRow is len(upsertColumns); created_at is DB-defaulted. gpu_type is
+// no longer written (migration 0008): nothing ever filled it, and the
+// topology revision replaces it.
+const colsPerRow = 26
 
 // Upsert writes a batch of events in a single transaction with a multi-row
 // INSERT ... ON CONFLICT (request_id) DO NOTHING.
@@ -178,6 +244,10 @@ func eventArgs(e metering.Event) []any {
 	if e.TimestampUnixMs > 0 {
 		eventTS = time.UnixMilli(e.TimestampUnixMs).UTC()
 	}
+	var requestStartedAt any
+	if e.RequestStartedUnixMs > 0 {
+		requestStartedAt = time.UnixMilli(e.RequestStartedUnixMs).UTC()
+	}
 	return []any{
 		e.RequestID,
 		nullStr(e.ClientRequestID),
@@ -217,18 +287,24 @@ func eventArgs(e metering.Event) []any {
 		e.CachedTokens,
 		e.CompletionTokens,
 		nullStr(e.FinishReason),
-		nullStr(e.GPUType),
 		e.Aborted,
 		e.UsageFound,
 		nullInt(e.StatusCode),
 		e.Streamed,
-		// GraphK8sName is the serving graph (the cost centre) — evidence only, never
-		// part of the billing grain. nullStr so an unresolvable graph stores NULL
-		// rather than '': the rater's MAX(graph_k8s_name) ignores NULLs (so a rollup
-		// whose events partly predate graph propagation still resolves to the one
-		// known graph), whereas a stored '' would read as a DISTINCT second graph and
-		// falsely trip the ambiguous-graph count.
+		// GraphK8sName is the serving graph (the cost centre). nullStr so an
+		// unresolvable graph stores NULL ("not captured") in the evidence ledger;
+		// the rater maps NULL to the '' grain sentinel (migration 0009).
 		nullStr(e.GraphK8sName),
+		// Topology, region and serving time: evidence for margin analysis,
+		// NULL when unknown (no topology entry for the graph, or an event
+		// written before these fields existed). A region the column cannot
+		// store is bound as NULL ("not captured") and never fails the insert.
+		nullRevision(e.TopologyRevision),
+		nullRegion(e.Region),
+		requestStartedAt,
+		// A negative duration is impossible evidence (clock skew or a producer
+		// bug), so it is stored as NULL ("not captured") like a missing start.
+		nullInt64(e.ServingDurationMs, e.RequestStartedUnixMs > 0 && e.ServingDurationMs >= 0),
 		eventTS,
 	}
 }
@@ -252,6 +328,42 @@ func nullStr(s string) any {
 // out-of-range value before it can reach this bind.
 func nullInt(v int) any {
 	if v == 0 {
+		return nil
+	}
+	return v
+}
+
+// nullRevision is nullInt for topology_revision, which is a Postgres INTEGER:
+// a value outside 1..MaxInt32 is stored as NULL ("not captured") so that
+// out-of-range evidence can never fail the insert and drop billable usage as
+// poison. The gateway already rejects such entries; this is the backstop.
+func nullRevision(v int) any {
+	if v < 1 || v > math.MaxInt32 {
+		return nil
+	}
+	return v
+}
+
+// nullRegion returns a driver NULL for a region that billing_event.region
+// cannot store: "", one containing a NUL byte (PostgreSQL text rejects it),
+// invalid UTF-8, or longer than metering.MaxRegionChars (billing_event.region
+// is VARCHAR(64)); the test is metering.StorableRegion, shared with the
+// gateway and recovery. It mirrors nullRevision as the drain-side
+// backstop: a bad region would fail the multi-row insert and drop the whole
+// batch, losing billable usage for unrelated requests. Region is evidence, so
+// NULL ("not captured") is the safe value.
+func nullRegion(s string) any {
+	if s == "" || !metering.StorableRegion(s) {
+		return nil
+	}
+	return s
+}
+
+// nullInt64 returns v when known is true and a driver NULL otherwise. Used
+// where 0 is a valid measured value (a sub-millisecond duration), so the
+// zero check of nullInt would lose it.
+func nullInt64(v int64, known bool) any {
+	if !known {
 		return nil
 	}
 	return v

@@ -12,6 +12,7 @@ package proxy
 // em.waitForEvents(...); go test -race verifies no data races.
 
 import (
+	"bufio"
 	"context"
 	"fmt"
 	"io"
@@ -180,6 +181,77 @@ data: {"choices":[],"usage":{"prompt_tokens":50,"total_tokens":70,"completion_to
 	}
 	if e.PromptTokens != 50 || e.CompletionTokens != 20 {
 		t.Fatalf("wrong token counts: %+v", e)
+	}
+}
+
+// TestAbortWithContinuousUsageKeepsLatestCounts verifies the production abort
+// contract. Dynamo emits cumulative usage on each chunk when Phoebe forces
+// continuous_usage_stats. The capture reader must retain the newest complete
+// count observed before the client disconnects.
+func TestAbortWithContinuousUsageKeepsLatestCounts(t *testing.T) {
+	chunks := []string{
+		`data: {"model":"m","choices":[{"index":0,"delta":{"content":"a"}}],"usage":{"prompt_tokens":40,"completion_tokens":1,"total_tokens":41}}` + "\n\n",
+		`data: {"model":"m","choices":[{"index":0,"delta":{"content":"b"}}],"usage":{"prompt_tokens":40,"completion_tokens":17,"total_tokens":57}}` + "\n\n",
+	}
+	unblock := make(chan struct{})
+	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		fl, _ := w.(http.Flusher)
+		for _, chunk := range chunks {
+			_, _ = io.WriteString(w, chunk)
+			fl.Flush()
+		}
+		select {
+		case <-unblock:
+		case <-r.Context().Done():
+		}
+	}))
+	defer backend.Close()
+	defer close(unblock)
+
+	upstream, _ := url.Parse(backend.URL)
+	em := &recordingEmitter{}
+	srv := newTestServerWithSettings(t, upstream, em)
+	phoebe := httptest.NewServer(srv.Handler())
+	defer phoebe.Close()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, phoebe.URL+"/v1/chat/completions",
+		strings.NewReader(`{"model":"m","stream":true,"messages":[]}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	setUpstream(req, upstream)
+	req.Header.Set(identity.HeaderAuthID, "auth-1")
+	req.Header.Set(identity.HeaderResourceID, "model-abc")
+	req.Header.Set(identity.HeaderGroupID, "org-1")
+	req.Header.Set(identity.HeaderUserID, "user-1")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	scanner := bufio.NewScanner(resp.Body)
+	for scanner.Scan() {
+		if strings.Contains(scanner.Text(), `"content":"b"`) {
+			break
+		}
+	}
+	if !strings.Contains(scanner.Text(), `"content":"b"`) {
+		t.Fatalf("second content chunk did not traverse the proxy: %q", scanner.Text())
+	}
+	cancel()
+	_ = resp.Body.Close()
+
+	events := em.waitForEvents(1, 2*time.Second)
+	if len(events) != 1 {
+		t.Fatalf("abort with continuous usage: expected 1 event, got %d", len(events))
+	}
+	e := events[0]
+	if !e.Aborted || !e.UsageFound {
+		t.Fatalf("abort with continuous usage = %+v, want Aborted and UsageFound", e)
+	}
+	if e.PromptTokens != 40 || e.CompletionTokens != 17 {
+		t.Fatalf("latest cumulative token counts were not retained: %+v", e)
 	}
 }
 

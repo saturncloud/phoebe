@@ -155,6 +155,10 @@ func newHarness(t *testing.T, schema string) *harness {
 	// 0007 makes rated_usage.serving_mode 'shared'/'dedicated' only (CHECK, no
 	// default); the rater's upsert must satisfy it.
 	mustExec(t, db, readMigration(t, "0007_serving_mode_explicit.up.sql"))
+	// 0008 adds the serving fields the drainer inserts; 0009 makes graph and
+	// revision rollup grain keys, which the rater upserts on.
+	mustExec(t, db, readMigration(t, "0008_billing_event_topology.up.sql"))
+	mustExec(t, db, readMigration(t, "0009_rollup_grain_graph_revision.up.sql"))
 
 	mr, err := miniredis.Run()
 	if err != nil {
@@ -402,8 +406,23 @@ func TestE2E_StreamedRequestBecomesMoney(t *testing.T) {
 	if rr.Code != http.StatusOK {
 		t.Fatalf("proxy status = %d, want 200 (body: %s)", rr.Code, rr.Body.String())
 	}
-	if rr.Body.String() != vllmStream {
-		t.Fatalf("client did not receive the SSE stream verbatim:\n%q", rr.Body.String())
+	clientStream := rr.Body.String()
+	var wantClientStream strings.Builder
+	for _, event := range strings.SplitAfter(vllmStream, "\n\n") {
+		if strings.Contains(event, `"usage"`) {
+			// The response filter removes the data line while retaining the
+			// event terminator. An empty SSE event has no client-visible data.
+			wantClientStream.WriteString("\n")
+			continue
+		}
+		wantClientStream.WriteString(event)
+	}
+	if clientStream != wantClientStream.String() {
+		t.Errorf(
+			"client stream differs from the upstream stream after removing unrequested usage:\ngot  %q\nwant %q",
+			clientStream,
+			wantClientStream.String(),
+		)
 	}
 	clientRequestID := rr.Header().Get("X-Request-Id")
 	if !strings.HasPrefix(clientRequestID, "phoebe-") || clientRequestID == "saturn-e2e-streamed-request" {

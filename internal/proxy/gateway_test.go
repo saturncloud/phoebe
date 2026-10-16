@@ -20,6 +20,7 @@ import (
 	"github.com/saturncloud/phoebe/internal/gateway"
 	"github.com/saturncloud/phoebe/internal/identity"
 	"github.com/saturncloud/phoebe/internal/logging"
+	"github.com/saturncloud/phoebe/internal/testutil"
 )
 
 // mapResolver is a fake gateway.Resolver keyed on (org, model). A missing key
@@ -106,7 +107,7 @@ func TestGatewayRequestBodyBoundedBeforeResolution(t *testing.T) {
 		},
 	}}
 	s := newGatewayTestServer(t, &recordingEmitter{}, resolver, up)
-	s.settings.Admission.Platform.MaxPromptBytes = ptr64(limit)
+	s.settings.Protection.MaxRequestBodyBytes = limit
 
 	rr := httptest.NewRecorder()
 	s.Handler().ServeHTTP(rr, gatewayRequestBodyOfSize(t, "org-1", limit))
@@ -335,6 +336,7 @@ func TestGateway_ResolvesFineTune(t *testing.T) {
 			ResourceID:   "tfm-ft-1",
 			BaseModel:    "meta-llama/Llama-3.1-8B-Instruct",
 			Adapter:      "ckpt-42",
+			Ready:        true,
 			ServingMode:  "shared",
 			GraphK8sName: "graph-llama31",
 		},
@@ -354,6 +356,37 @@ func TestGateway_ResolvesFineTune(t *testing.T) {
 	}
 	if e := events[0]; e.Adapter != "ckpt-42" || e.ResourceID != "tfm-ft-1" {
 		t.Fatalf("fine-tune identity wrong: %+v", e)
+	}
+}
+
+func TestGateway_AdapterNotLoaded503(t *testing.T) {
+	var upstreamHits int32
+	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		atomic.AddInt32(&upstreamHits, 1)
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer backend.Close()
+	beURL, _ := url.Parse(backend.URL)
+
+	resolver := &mapResolver{m: map[[2]string]gateway.Resolution{
+		{"org-1", "support-bot"}: {
+			ResourceID: "tfm-ft-1", BaseModel: "base", Adapter: "ckpt-42",
+			ServingMode: "shared", GraphK8sName: "graph", Ready: false,
+		},
+	}}
+	em := &recordingEmitter{}
+	srv := newGatewayTestServer(t, em, resolver, beURL)
+	rr := httptest.NewRecorder()
+	srv.Handler().ServeHTTP(rr, gatewayRequest("org-1", `{"model":"support-bot"}`))
+
+	if rr.Code != http.StatusServiceUnavailable {
+		t.Fatalf("status = %d, want 503", rr.Code)
+	}
+	if strings.TrimSpace(rr.Body.String()) != "adapter_not_loaded" {
+		t.Fatalf("body = %q, want adapter_not_loaded", rr.Body.String())
+	}
+	if atomic.LoadInt32(&upstreamHits) != 0 || em.count() != 0 {
+		t.Fatalf("not-ready adapter reached upstream or billed: hits=%d events=%d", upstreamHits, em.count())
 	}
 }
 
@@ -399,6 +432,65 @@ func TestGateway_CrossTenantModel404(t *testing.T) {
 	}
 	if strings.Contains(rr.Body.String(), "victim-bot") {
 		t.Fatalf("cross-tenant 404 echoes the model: %q", rr.Body.String())
+	}
+}
+
+// The gateway path's fail-closed answers (gateway not configured, missing
+// org) take precedence over the body ceiling: an oversized body gets the same
+// status and body as a small one, never 413, and nothing reaches the upstream.
+func TestGatewayFailClosedAnswersPrecedeBodyCeiling(t *testing.T) {
+	const limit = 128
+	var upstreamHits atomic.Int32
+	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		upstreamHits.Add(1)
+		_, _ = w.Write([]byte(`{"model":"model-a","usage":{"prompt_tokens":1,"completion_tokens":1}}`))
+	}))
+	defer backend.Close()
+	up, _ := url.Parse(backend.URL)
+	prot := config.ProtectionSettings{MaxRequestBodyBytes: limit}
+
+	for _, tc := range []struct {
+		name   string
+		server func() *Server
+		org    string
+		want   int
+	}{
+		{
+			name: "gateway not configured",
+			server: func() *Server {
+				return New(&config.Settings{Protection: prot}, logging.New(logging.ERROR), &recordingEmitter{})
+			},
+			org:  "org-a",
+			want: http.StatusServiceUnavailable,
+		},
+		{
+			name: "missing org",
+			server: func() *Server {
+				s := New(&config.Settings{Protection: prot}, logging.New(logging.ERROR), &recordingEmitter{}).
+					WithGateway(&mapResolver{}, "tf-shared", 8000)
+				s.gateway.upstreamFor = func(string, int) string { return up.Host }
+				return s
+			},
+			org:  "",
+			want: http.StatusForbidden,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			s := tc.server()
+			small := httptest.NewRecorder()
+			s.Handler().ServeHTTP(small, gatewayRequestBodyOfSize(t, tc.org, limit))
+			big := httptest.NewRecorder()
+			s.Handler().ServeHTTP(big, gatewayRequestBodyOfSize(t, tc.org, limit+1))
+			if small.Code != tc.want || big.Code != tc.want {
+				t.Fatalf("small=%d oversized=%d, want both %d (the fail-closed answer, not 413)", small.Code, big.Code, tc.want)
+			}
+			if big.Body.String() != small.Body.String() {
+				t.Fatalf("oversized body=%q, want the same answer as a small request %q", big.Body.String(), small.Body.String())
+			}
+			if upstreamHits.Load() != 0 {
+				t.Fatal("a fail-closed gateway request reached the upstream")
+			}
+		})
 	}
 }
 
@@ -653,19 +745,19 @@ func TestGateway_WakeEligible(t *testing.T) {
 			GraphK8sName: "graph-llama31",
 		},
 	}}
-	// warmsAt: 1 — the backend goes warm after the first wake, so serveWithWake's
-	// re-probe succeeds and the caller performs the real metered forward.
+	// warmsAt: 1 — the backend goes warm after the first wake, so the single
+	// retry succeeds.
 	waker := &fakeWaker{backend: backend, warmsAt: 1}
 	em := &recordingEmitter{}
 	mr := miniredis.RunT(t)
 	cfg := proxyAdmissionConfig(1)
-	cfg.Platform.MaxColdHolds = ptr64(1)
+	cfg.Platform.MaxColdHolds = testutil.Ptr[int64](1)
 	client := redis.NewClient(&redis.Options{Addr: mr.Addr()})
 	t.Cleanup(func() { _ = client.Close() })
 	a := admission.New(client, cfg)
 	srv := newGatewayTestServer(t, em, resolver, beURL)
 	srv.settings.Admission = cfg
-	srv.WithAdmitter(a).WithWaker(waker, 5*time.Second, 0)
+	srv.WithAdmitter(a).WithWaker(waker, 5*time.Second)
 
 	rr := httptest.NewRecorder()
 	srv.Handler().ServeHTTP(rr, gatewayRequest("org-1", `{"model":"sleepy-bot","max_tokens":20}`))
@@ -676,10 +768,10 @@ func TestGateway_WakeEligible(t *testing.T) {
 	if got := atomic.LoadInt32(&waker.calls); got != 1 {
 		t.Fatalf("waker called %d times, want 1 (gateway route must be wakeable)", got)
 	}
-	// serveWithWake costs one readiness probe on the wake path: one cold probe,
-	// one warm re-probe after the wake, then the caller's metered forward.
-	if backend.requests.Load() != 3 || backend.successes.Load() != 2 {
-		t.Fatalf("backend requests=%d successes=%d, want one cold probe, one warm re-probe, one successful inference", backend.requests.Load(), backend.successes.Load())
+	// One cold response is suppressed, then the single bounded retry is the
+	// successful metered inference.
+	if backend.requests.Load() != 2 || backend.successes.Load() != 1 {
+		t.Fatalf("backend requests=%d successes=%d, want one cold attempt and one successful retry", backend.requests.Load(), backend.successes.Load())
 	}
 	events := em.waitForEvents(1, time.Second)
 	if len(events) != 1 || events[0].PromptTokens != 7 || events[0].CachedTokens != 2 || events[0].CompletionTokens != 3 {
@@ -697,7 +789,7 @@ func TestGateway_WakeEligible(t *testing.T) {
 	// separately proves the wake path released its one allowed cold hold as well.
 	next, err := a.Admit(context.Background(), admission.Request{
 		Graph: "graph-llama31", Organization: "org-1", Model: "sleepy-bot",
-		PromptBytes: 1, EstimatedInputTokens: 1, ReservedOutputTokens: 1,
+		PrefillTokens: 1, EstimatedInputTokens: 1, ReservedOutputTokens: 1,
 	})
 	if err != nil {
 		t.Fatalf("cold-to-warm request did not release admission reservations: %v", err)
@@ -744,7 +836,7 @@ func TestGateway_ResolutionWithoutLegalServingModeRefusedAtGate(t *testing.T) {
 			}}
 			em := &recordingEmitter{}
 			waker := &fakeWaker{}
-			srv := newGatewayTestServer(t, em, resolver, beURL).WithWaker(waker, 5*time.Second, 0)
+			srv := newGatewayTestServer(t, em, resolver, beURL).WithWaker(waker, 5*time.Second)
 
 			rr := httptest.NewRecorder()
 			srv.Handler().ServeHTTP(rr, gatewayRequest("org-1", `{"model":"m"}`))
@@ -765,5 +857,23 @@ func TestGateway_ResolutionWithoutLegalServingModeRefusedAtGate(t *testing.T) {
 				t.Fatalf("%d events metered, want 0", em.count())
 			}
 		})
+	}
+}
+
+// The real registry resolver must keep satisfying every capacity source the
+// proxy reads, or WithGateway would silently drop the unscaled per-request
+// capacity source or the one-read pair the 413 fit check relies on.
+var (
+	_ graphCapacitySource     = (*gateway.RegistryResolver)(nil)
+	_ graphCapacityPairSource = (*gateway.RegistryResolver)(nil)
+)
+
+func TestWithGatewayWiresEveryRegistryCapacitySource(t *testing.T) {
+	resolver := gateway.NewRegistryResolver(k8sfake.NewSimpleClientset(), "tf-shared", logging.New(logging.ERROR))
+	s := New(&config.Settings{ListenAddr: ":0"}, logging.New(logging.ERROR), &recordingEmitter{}).
+		WithGateway(resolver, "tf-shared", 8000)
+	if s.graphCapacity == nil || s.graphCapacityPair == nil {
+		t.Fatalf("WithGateway(RegistryResolver) wiring: graphCapacity=%v graphCapacityPair=%v, want both set",
+			s.graphCapacity != nil, s.graphCapacityPair != nil)
 	}
 }

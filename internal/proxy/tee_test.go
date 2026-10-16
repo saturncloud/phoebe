@@ -123,6 +123,33 @@ data: [DONE]
 	}
 }
 
+func TestTeeStreamingRetainsLatestNondecreasingUsage(t *testing.T) {
+	stream := `data: {"choices":[{"delta":{"content":"a"}}],"usage":{"prompt_tokens":40,"completion_tokens":17,"total_tokens":57}}
+
+data: {"choices":[],"usage":{"prompt_tokens":40,"completion_tokens":0,"total_tokens":40}}
+
+`
+	_, res := drain(t, stream, true)
+	if !res.UsageFound || res.Usage.PromptTokens != 40 || res.Usage.CompletionTokens != 17 || res.Usage.TotalTokens != 57 {
+		t.Fatalf("regressing usage replaced the last cumulative report: %+v", res.Usage)
+	}
+}
+
+func TestTeeStreamingCarriesForwardOmittedCacheDetails(t *testing.T) {
+	stream := `data: {"choices":[{"delta":{"content":"a"}}],"usage":{"prompt_tokens":40,"completion_tokens":1,"total_tokens":41,"prompt_tokens_details":{"cached_tokens":16}}}
+
+data: {"choices":[],"usage":{"prompt_tokens":40,"completion_tokens":2,"total_tokens":42}}
+
+`
+	_, res := drain(t, stream, true)
+	if !res.UsageFound || res.Usage.PromptTokens != 40 || res.Usage.CompletionTokens != 2 || res.Usage.TotalTokens != 42 {
+		t.Fatalf("newer cumulative usage was not retained: %+v", res.Usage)
+	}
+	if res.Usage.CachedTokens() != 16 {
+		t.Fatalf("cached tokens = %d, want last known count 16", res.Usage.CachedTokens())
+	}
+}
+
 func TestTeeNonStreaming(t *testing.T) {
 	body := `{"id":"c1","object":"chat.completion","choices":[{"index":0,"message":{"role":"assistant","content":"hi"},"finish_reason":"stop"}],"usage":{"prompt_tokens":10,"total_tokens":15,"completion_tokens":5,"prompt_tokens_details":{"cached_tokens":8}}}`
 	forwarded, res := drain(t, body, false)
@@ -172,6 +199,43 @@ func TestTeeStreamingSplitAcrossReads(t *testing.T) {
 		t.Fatalf("usage lost under fragmented reads: %+v found=%v", got.Usage, got.UsageFound)
 	}
 }
+
+func TestTeeStreamingCapturesCompleteUnterminatedUsageLine(t *testing.T) {
+	line := `data: {"model":"m","choices":[],"usage":{"prompt_tokens":40,"completion_tokens":17,"total_tokens":57}}`
+	for _, tc := range []struct {
+		name string
+		src  io.ReadCloser
+	}{
+		{name: "EOF", src: io.NopCloser(iotest1ByteReader(line))},
+		{name: "bytes and error", src: &bytesAndErrorReadCloser{data: []byte(line), err: io.ErrUnexpectedEOF}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var got capture.Result
+			cr := newCaptureReader(context.Background(), tc.src, true, func(r capture.Result) { got = r })
+			_, _ = io.ReadAll(cr)
+			_ = cr.Close()
+			if !got.UsageFound || got.Usage.PromptTokens != 40 || got.Usage.CompletionTokens != 17 {
+				t.Fatalf("unterminated usage line was not captured: %+v", got)
+			}
+		})
+	}
+}
+
+type bytesAndErrorReadCloser struct {
+	data []byte
+	err  error
+	done bool
+}
+
+func (r *bytesAndErrorReadCloser) Read(p []byte) (int, error) {
+	if r.done {
+		return 0, r.err
+	}
+	r.done = true
+	return copy(p, r.data), r.err
+}
+
+func (r *bytesAndErrorReadCloser) Close() error { return nil }
 
 // TestTeeAbortFinalizes verifies that when the request context is cancelled
 // (client disconnect), Close → finish produces Aborted=true with no usage —

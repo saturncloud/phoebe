@@ -20,11 +20,11 @@ engine-usage metering continues through its Valkey/WAL/log path.
 | --- | --- | --- |
 | Authentication, route authorization, org/model registry | Already implemented | atlas-auth and Atlas decide access; Phoebe only consumes the trusted result. |
 | Platform, graph, org, org×model admission | Saturn-owned, implemented here | Atomic Valkey reservations in Phoebe. |
-| Concurrent prefills and input work | Saturn-owned, implemented conservatively | Phoebe reserves concurrent prefills and complete request-body bytes, then releases those physical guards on the first upstream body byte. Model-specific rendered templates/token counts stay in the engine. |
+| Concurrent prefills and input work | Saturn-owned, implemented conservatively | Phoebe reserves concurrent prefills and an approximate estimated-prompt-token count (message-text characters / 4, a fixed cost per image or media part, and the raw JSON length / 4 of tool, schema, document and chat-template fields), then releases those prefill guards on the first upstream body byte. A separate reserved-KV counter (estimated prompt tokens plus reserved output x output sequences) is held until the request finishes. Model-specific rendered templates/token counts stay in the engine. |
 | Reserved decode slots/streams and output | Saturn-owned, implemented here | A future decode slot and `max_tokens`/`max_completion_tokens` are reserved before forwarding and held until completion, abort, timeout, rejection, or upstream failure. The independent prefill cap still bounds that phase. Reserving decode capacity early avoids attempting to queue after response streaming begins. |
-| Request and token-throughput windows | Saturn-owned, implemented here | Separate request, total-prompt, uncached-prompt, and generated-token windows. Admission reserves `ceil(original JSON bytes / 4)` as fully uncached input plus the declared maximum output; engine usage then reconciles estimates to exact total, cached, uncached, and generated currencies. Concurrent estimates therefore cannot overbook a window, overestimates are refunded, and underestimates create debt for later requests. |
+| Request and token-throughput windows | Saturn-owned, implemented here | Separate request, total-prompt, uncached-prompt, and generated-token windows. Admission reserves the estimated prompt tokens (the same approximate estimate as the prefill counter) as fully uncached input plus the reserved output (`max_tokens` x output sequences); engine usage then reconciles estimates to exact total, cached, uncached, and generated currencies. Concurrent estimates therefore cannot overbook a window, overestimates are refunded, and underestimates create debt for later requests. |
 | Cold holds and wake churn | Partially implemented before; completed here | Phoebe already detected/actuated wake-from-zero. Distributed hold and wake-window admission now surrounds actuation. |
-| Adapter and KV pressure | Layered implementation | Phoebe bounds active adapter-bearing requests and reserved work. Saturn enables backend prefix caches and KV event publication; Dynamo routes on actual cache residency and load, while each engine owns allocation/eviction. |
+| Adapter and KV pressure | Layered implementation | Phoebe bounds active adapter-bearing requests and reserved work. `maxReservedKvTokens` bounds estimated input plus reserved output (x output sequences); that reservation is held until the request finishes. Saturn enables backend prefix caches and KV event publication; Dynamo routes on actual cache residency and load, while each engine owns allocation/eviction. |
 | Operator protected lanes | Layered implementation | An operator-owned organization→lane map partitions capacity. Phoebe replaces client hints with the lane's trusted Dynamo soft and strict priorities. Admission lanes are unrelated to Atlas instance-size tiers and UsageLimits names. |
 | Cache-aware/worker routing and prefill/decode scheduling | Saturn-configured Dynamo capability | Shared graphs enable KV routing, output-block tracking, a capacity-triggered WSPT queue, and backend priority scheduling where supported. |
 | Gang lifecycle and replica topology | Saturn-configured Grove/Dynamo capability | The graph remains the lifecycle and gang unit; request fairness is enforced above and inside it. |
@@ -120,11 +120,17 @@ Only a Phoebe with no Valkey at all (no `admission.valkeyAddr` and no
 Phoebe can reserve generated capacity strictly before dispatch because the
 request declares a maximum output. It cannot derive exact rendered prompt or
 cache-hit counts from raw OpenAI JSON without duplicating Dynamo's model chat
-templates, tokenizer, and live KV lookup. Instead it reserves the cheap JSON
-byte estimate before dispatch, conservatively assigns it to both total and
-uncached prompt currencies, and settles the engine's authoritative usage at
-completion. Request-body bytes remain a separate instantaneous physical guard
-and are never written as billing usage.
+templates, tokenizer, and live KV lookup. Instead it reserves the
+pre-tokenization token estimate (described above) before dispatch,
+conservatively assigns it to both total and uncached prompt currencies, and
+settles the engine's authoritative usage at completion. The
+`maxPrefillTokens` counter is the instantaneous prefill guard and is never
+written as billing usage.
+
+`maxPrefillTokens` replaced the old byte-based `maxPromptBytes` limit and is
+counted in estimated tokens, not bytes. A configuration that still sets
+`maxPromptBytes` at any scope fails startup; convert the value to tokens and
+rename the key to `maxPrefillTokens`.
 
 ## Trusted Dynamo request policy
 
@@ -152,9 +158,9 @@ scheduling.
 
 ## Lifecycle and crash recovery
 
-An admitted request owns a lease. Physical request-byte and concurrent-prefill
+An admitted request owns a lease. Prefill-token and concurrent-prefill
 counters release at the first response body byte. Active request, reserved
-decode slot, output, adapter, estimated-input, and generated-window reservation
+decode slot, output, adapter, kv, estimated-input, and generated-window reservation
 state release at final body completion, when authoritative total-prompt,
 uncached-prompt, and generated counts are atomically settled. The owning proxy
 renews the expiry throughout long streams. Pre-header aborts, upstream errors, ordinary
@@ -266,6 +272,36 @@ than sharing the empty-organization cache namespace. Enabling admission also
 requires a non-empty trusted organization ID and rejects a broken identity
 contract before the Valkey fail-open boundary. Gateway registry entries must
 resolve with `serving_mode: shared`; empty or dedicated entries fail closed.
+
+Rolling back across the versioned lease keys needs one extra step. The
+release that adds the prefill-token and kv counters writes its leases under
+`{<keyPrefix>}:leases:v2` and `{<keyPrefix>}:expiries:v2`, and it also reaps
+expired leases from the previous release's `{<keyPrefix>}:leases` and
+`{<keyPrefix>}:expiries`. That makes a forward rolling deploy safe: no lease
+counter is stranded. The previous release reads only its own keys and never
+reaps the versioned ones. After a rollback, any versioned lease that was still
+held when its replica stopped (a crash, an OOM kill, or termination before the
+in-flight request finished) is never released. Its `active`, `prefills`,
+`reserved_decode_slots`, `kv`, and `prefill_tokens` counters stay incremented
+in the shared `{<keyPrefix>}:counters` hash, and the graph and lane capacity
+scopes under-admit with 503 until something releases them. Replicas that drain
+cleanly release their own leases, so the counters are only stranded for leases
+that were in flight when a replica died.
+
+After a rollback, check whether `{<keyPrefix>}:leases:v2` is empty (`HLEN`).
+If it is not, do one of the following:
+
+- Redeploy the newer release. Its reaper releases every expired versioned
+  lease within one `leaseTtl`, and nothing else is needed.
+- Stay on the older release and, once it is fully rolled out, delete
+  `{<keyPrefix>}:counters`, `{<keyPrefix>}:leases:v2`,
+  `{<keyPrefix>}:expiries:v2`, and `{<keyPrefix>}:window-expiries` together.
+  Delete the versioned lease keys along with the counters. Otherwise a later
+  forward deploy would reap those leases and subtract them from counters that
+  no longer include them. Deleting the counters hash also resets every
+  contract window and briefly under-counts requests that are in flight at that
+  moment. Both effects only loosen the soft fairness limits (ruling R2) and do
+  not affect billing.
 
 ## Enforcement boundaries
 

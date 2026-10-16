@@ -5,26 +5,28 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"net"
 	"net/http"
 	"net/url"
 	"strconv"
 	"strings"
+	"sync"
+	"time"
 
 	"github.com/saturncloud/phoebe/internal/admission"
-	"github.com/saturncloud/phoebe/internal/capture"
 	"github.com/saturncloud/phoebe/internal/identity"
 )
 
-// WakeTarget identifies WHAT a wake actuates, resolved by the proxy ONCE (see
-// serveWithWake) so the actuator never re-parses strings the proxy composed.
+// WakeTarget identifies what a wake actuates. The proxy resolves it once so
+// the actuator never re-parses strings the proxy composed.
 type WakeTarget struct {
 	// UpstreamHost is the trusted upstream host:port the cold response came
-	// from (the readiness-probe address).
+	// from. The waker also uses it for readiness checks.
 	UpstreamHost string
-	// GraphK8sName is the Dynamo graph (DGD) k8s name whose worker DGDSA the
-	// waker scales. On the gateway path it is the tf_model row's
+	// GraphK8sName is the Dynamo graph (DGD) k8s name, for logs. On the
+	// gateway path it is the tf_model row's
 	// graph_k8s_name, threaded through resolution verbatim; on header-routed
 	// requests it is derived once from the upstream host (see
 	// graphFromUpstreamHost). Never empty for a target the proxy hands to a
@@ -33,14 +35,19 @@ type WakeTarget struct {
 	// ResourceID is the atlas-authorized resource id (authorization proof at
 	// wake time + audit).
 	ResourceID string
+	// ServedModel is the trusted deployment-scoped model name Atlas stamped on
+	// the route. A wake does not report ready until this model appears in
+	// frontend discovery.
+	ServedModel string
+	// ServingMode is the route's serving mode. Shared and dedicated wakes
+	// both go to Atlas; the proxy uses the mode for the dedicated cold-hold cap.
+	ServingMode string
 }
 
-// Waker triggers a shared base graph's 0->1 scale-up and blocks until the
-// graph's worker is ready to serve (or the context/deadline is exceeded).
-// Abstracted so the ACTUATION is pluggable (the concrete client-go DGDSA
-// waker lives in internal/waker; a future actuator could POST to an Atlas
-// wake endpoint instead). The proxy's cold-detect + hold-and-retry logic is
-// identical either way.
+// Waker wakes a graph scaled to zero and blocks until its worker is ready to
+// serve (or the context/deadline is exceeded). The actuator is
+// internal/waker.AtlasWaker: Atlas brings the workers to one and then the
+// Planner (ruling 2026-10-12); phoebe needs no Kubernetes access.
 //
 // Wake returns nil once the worker is ready, or an error if wake could not
 // complete. The caller never hangs forever; what the client then receives
@@ -52,13 +59,24 @@ type WakeTarget struct {
 //     Retry-After header and a JSON error body saying the model is starting.
 //     The scale-up keeps going after the hold expires, so a retry is served
 //     once the worker is ready.
-//   - Any other failure (no scalable adapter for the graph, an RBAC or API
-//     error on the scale patch, a malformed target): Wake returns an error that
+//   - The wake request may have reached its actuator, but the response does not
+//     prove whether scale-up began: Wake wraps ErrWakeStatusUnknown. The caller
+//     answers a neutral retryable 503 without claiming that workers are starting.
+//   - Any other failure (Atlas refused the first wake call with a 4xx, or a
+//     malformed target): Wake returns an error that
 //     does NOT wrap ErrWakeNotReady. Nothing is starting, so telling the client
 //     to retry would be false; the caller returns the original cold upstream
 //     response unchanged.
 type Waker interface {
 	Wake(ctx context.Context, target WakeTarget) error
+}
+
+// wakeTargetSupporter lets a composite waker report that one serving mode has
+// no actuator. The check happens before admission starts a cold hold. Simple
+// wakers need not implement it because they support every target handed to
+// them.
+type wakeTargetSupporter interface {
+	SupportsWake(target WakeTarget) bool
 }
 
 // ErrWakeNotReady is the error a Waker wraps when it triggered the 0->1
@@ -67,12 +85,21 @@ type Waker interface {
 // turns the held cold response into a 503 + Retry-After (see Waker).
 var ErrWakeNotReady = errors.New("wake triggered but the worker was not ready before the deadline")
 
+// ErrWakeStatusUnknown marks a wake request whose result is indeterminate. It
+// remains retryable, but unlike ErrWakeNotReady it does not prove that worker
+// restoration began.
+var ErrWakeStatusUnknown = errors.New("wake status is unknown")
+
 // wakeRetryAfterSeconds is the Retry-After value (in seconds) phoebe sends on
 // the 503 it returns when a scale-up from zero is in progress but the worker
 // was not ready within the wake hold (wake.timeout). Long enough not to hammer
 // a graph that is still pulling its image or loading weights, short enough
 // that a client retrying on it is served soon after the worker becomes ready.
 const wakeRetryAfterSeconds = 30
+
+// wakeNeverServedHeader is reserved so an upstream cannot expose the obsolete
+// marker to clients. Settlement uses private wakeRoundTripper state instead.
+const wakeNeverServedHeader = "X-Phoebe-Wake-Never-Served"
 
 // writeWakeStarting answers a held cold request whose scale-up was triggered
 // but whose worker was not ready before the hold expired: 503 + Retry-After +
@@ -81,14 +108,35 @@ const wakeRetryAfterSeconds = 30
 // passed through: a 404 tells API clients the model does not exist and they
 // do not retry it, which is wrong while the model is starting.
 func writeWakeStarting(w http.ResponseWriter, requestID string) {
-	body, _ := json.Marshal(map[string]string{
-		"error": "The model is starting from zero; retry in about " +
-			strconv.Itoa(wakeRetryAfterSeconds) + " seconds.",
-	})
+	writeRetryLater(w, requestID, "The model is starting from zero; retry in about "+
+		strconv.Itoa(wakeRetryAfterSeconds)+" seconds.")
+}
+
+func writeWakeStatusUnknown(w http.ResponseWriter, requestID string) {
+	writeRetryLater(w, requestID, "The wake service could not confirm whether startup began; retry in about "+
+		strconv.Itoa(wakeRetryAfterSeconds)+" seconds.")
+}
+
+// writeRetryLater is phoebe's one retryable 503 answer: Retry-After
+// (wakeRetryAfterSeconds), the request id, and a JSON {"error": msg} body.
+// The wake writers, the dedicated cold-hold overflow (D4) and, through
+// writeRetryLaterAfter, the request-buffer-full refusal (D43) all answer
+// through it so the shape cannot drift between them.
+func writeRetryLater(w http.ResponseWriter, requestID, msg string) {
+	writeRetryLaterAfter(w, requestID, msg, wakeRetryAfterSeconds)
+}
+
+// writeRetryLaterAfter is writeRetryLater with its own Retry-After seconds.
+func writeRetryLaterAfter(w http.ResponseWriter, requestID, msg string, retryAfterSeconds int) {
+	body, _ := json.Marshal(map[string]string{"error": msg})
 	h := w.Header()
-	h.Set(requestIDHeader, requestID)
+	if requestID != "" {
+		// A refusal before the attempt id is minted (the request-buffer
+		// budget at body admission) has none to echo.
+		h.Set(requestIDHeader, requestID)
+	}
 	h.Set("Content-Type", "application/json")
-	h.Set("Retry-After", strconv.Itoa(wakeRetryAfterSeconds))
+	h.Set("Retry-After", strconv.Itoa(retryAfterSeconds))
 	h.Set("Content-Length", strconv.Itoa(len(body)))
 	w.WriteHeader(http.StatusServiceUnavailable)
 	_, _ = w.Write(body)
@@ -98,7 +146,7 @@ func writeWakeStarting(w http.ResponseWriter, requestID string) {
 // a shared base graph's worker is scaled to 0 (by the Atlas reaper), the
 // frontend drops the model and a request for it returns a COLD response. Phoebe
 // — the only actor in the request path — supplies the external wake signal:
-// detect the cold response, trigger a scale 0->1 on the graph's DGDSA, hold the
+// detect the cold response, ask Atlas to wake the graph (0->1), hold the
 // request, and retry once the worker is back.
 //
 // THE COLD SIGNAL (verified against Dynamo v1.4.0): a scaled-to-0 base returns
@@ -117,20 +165,20 @@ func writeWakeStarting(w http.ResponseWriter, requestID string) {
 // generic overload 503 (which comes via a separate queue-rejection path).
 const dynamoNotReadyBodyMarker = "is not ready to serve requests yet"
 
-// isWakeable reports whether a request is eligible for wake-from-zero: it must be
-// a shared-mode route (a served-model allow-list was injected by Atlas) AND carry
-// a valid atlas-authorized resource id. This is what disambiguates "cold parked
-// base, wake it" from "model genuinely doesn't exist" — the latter has no such
-// authorized resource. Dedicated routes also carry a served-model binding now,
-// so ServingMode is the authoritative discriminator; dedicated capacity never
-// scales to zero through this path.
+// isWakeable reports whether a request is eligible for wake-from-zero. Shared
+// routes are eligible under the established behavior. A dedicated route is
+// eligible only when Atlas explicitly stamps it as disaggregated. Both paths
+// also require the Atlas-authorized resource id and served-model binding that
+// distinguish a parked graph from a model that does not exist.
 func isWakeable(id identity.Identity) bool {
-	return id.ServingMode == identity.ServingModeShared && id.ResourceID != "" && id.ServedModel != ""
+	modeWakeable := id.ServingMode == identity.ServingModeShared ||
+		(id.ServingMode == identity.ServingModeDedicated && id.ServingProfile == "disaggregated")
+	return modeWakeable && id.ResourceID != "" && id.ServedModel != ""
 }
 
 // graphFromUpstreamHost derives the Dynamo graph (DGD) k8s name from a
 // trusted upstream host for HEADER-ROUTED wakes (the gateway path threads the
-// graph name from resolution instead — see serveWithWake). The upstream's
+// graph name from resolution instead). The upstream's
 // first DNS label names the graph's Service: for a Dynamo frontend Service
 // that is `<graph>-frontend` (exactly what the gateway's upstreamFor
 // composes, and what Atlas injects for Dynamo-served deployments), so the
@@ -150,14 +198,8 @@ func bodyLooksNotReady(body []byte) bool {
 	return strings.Contains(string(body), dynamoNotReadyBodyMarker)
 }
 
-// bufferingResponseWriter captures an upstream response in memory instead of
-// streaming it to the client, so a wakeable-cold response can be DISCARDED and
-// the request retried after a wake — without the client ever seeing the cold
-// 404/503. Used ONLY on the (rare) wake path; the normal path streams directly.
-//
-// A cold response is small (a JSON error body), so buffering it is cheap. If a
-// response turns out NOT to be a cold-and-wakeable case, its captured bytes are
-// flushed to the real client verbatim (flushTo), preserving status + headers.
+// bufferingResponseWriter constructs local admission and starting responses
+// that the wake transport returns through the normal reverse proxy path.
 type bufferingResponseWriter struct {
 	header http.Header
 	status int
@@ -202,267 +244,387 @@ func (b *bufferingResponseWriter) isColdWakeable() bool {
 	}
 }
 
-// flushTo writes the captured status, headers, and body to the real client.
-// The request-correlation header is never copied from the buffer: the caller
-// Sets the authoritative minted value on w before flushing (an upstream echo
-// must not duplicate it — same "Set, not Add" contract as ModifyResponse).
-func (b *bufferingResponseWriter) flushTo(w http.ResponseWriter) {
-	dst := w.Header()
-	for k, vs := range b.header {
-		if strings.EqualFold(k, requestIDHeader) {
-			continue
-		}
-		for _, v := range vs {
-			dst.Add(k, v)
-		}
-	}
-	w.WriteHeader(b.status)
-	if len(b.body) > 0 {
-		_, _ = w.Write(b.body)
-	}
-}
-
 // wakeEnabled reports whether this request should go through the wake path: a
-// waker is configured AND the route is wakeable (shared-mode + authorized
-// resource id). Everything else streams directly with zero wake overhead.
+// waker is configured and the route is eligible for one of the supported wake
+// modes. Everything else streams directly with zero wake overhead.
 func (s *Server) wakeEnabled(id identity.Identity) bool {
 	return s.waker != nil && isWakeable(id)
 }
 
-// statusRecorder wraps the client ResponseWriter to capture the status code a
-// helper actually writes, so a served response that bypassed the normal
-// metered forward can be recorded at the status the client really received.
-type statusRecorder struct {
-	http.ResponseWriter
-	status int
+type wakeRoundTripper struct {
+	server    *Server
+	base      http.RoundTripper
+	target    WakeTarget
+	requestID string
+	lease     *admission.Lease
+	// neverServed is private per-request state. It must not come from a response
+	// header because the upstream controls those headers.
+	neverServed bool
 }
 
-func (r *statusRecorder) WriteHeader(code int) {
-	if r.status == 0 {
-		r.status = code
+func (t *wakeRoundTripper) RoundTrip(req *http.Request) (*http.Response, error) {
+	if supporter, ok := t.server.waker.(wakeTargetSupporter); ok && !supporter.SupportsWake(t.target) {
+		return t.base.RoundTrip(req)
 	}
-	r.ResponseWriter.WriteHeader(code)
-}
-
-func (r *statusRecorder) Write(p []byte) (int, error) {
-	if r.status == 0 {
-		r.status = http.StatusOK
-	}
-	return r.ResponseWriter.Write(p)
-}
-
-// emitWakeFailureRow records a forwarded-but-unmetered wake attempt. Every
-// exit path below that returns served=true has already forwarded at least one
-// real probe of the customer's request to the upstream (probe.ServeHTTP /
-// last.ServeHTTP) and then serves the response directly, so the normal metered
-// forward — and errorHandler with it — never runs. The merged billing
-// contract (#48) requires exactly one row per forwarded attempt: Aborted=false,
-// UsageFound=false, at the status actually written to the client. Same shape
-// as errorHandler's fall-through row, same WithoutCancel ctx (the emit must
-// survive a cancelled client ctx), and $0 by construction (no authoritative
-// counts). The fall-through (return false) path must NOT call this — the
-// caller's normal forward meters that attempt. clientRequestID is captured by
-// handleProxy BEFORE it replaces the X-Request-Id header with the minted
-// attempt id, so it is threaded in explicitly; the column is forensic only.
-func (s *Server) emitWakeFailureRow(r *http.Request, id identity.Identity, requestID, clientRequestID string, statusCode int) {
-	s.emit(context.WithoutCancel(r.Context()), id, requestID,
-		clientRequestID, statusCode, capture.Result{UsageFound: false})
-}
-
-// serveWithWake probes the upstream and, on a cold (scaled-to-zero) response,
-// triggers a 0->1 wake and retries. Returns true if it produced the client's
-// FINAL response here (a genuine error; a 503 + Retry-After because the
-// scale-up is in progress but the worker was not ready within the hold; or the
-// cold response passed through because the wake failed without starting a
-// scale-up) — the caller then returns. Returns false when
-// the base is warm and the caller should perform the normal metered streaming
-// forward (the request body has been restored for that attempt).
-//
-// Every served=true exit below has already forwarded at least one real probe,
-// so each emits exactly one raw reconciliation row (Aborted=false,
-// UsageFound=false) at the status the client received — see emitWakeFailureRow.
-// The return-false path emits nothing here; the caller's forward meters it.
-//
-// Only the cold-probe attempts are buffered here (a cold body is tiny). The
-// moment a NON-cold response is seen we DON'T serve it from the buffer — we
-// return false so the caller re-forwards it with full streaming + metering
-// intact. Cost: one extra round-trip on the (rare) first-request-after-idle.
-//
-// SETTLEMENT (R1 ruling): when this function returns true with a FINAL
-// answer to a cold probe (the wake-error give-up, or tries exhausted with the
-// final probe STILL cold), the engine provably did no inference work — every
-// dispatch was refused before any token ran — so the admitted lease is settled
-// to zero here (settlementZeroNeverServed), in addition to the 503 (or the
-// passed-through cold response) being written to the client. A tries-exhausted final probe that is NOT cold (warm, or a
-// non-cold transport/overload error) returns false instead: the R1
-// never-served precondition does not hold for it, so the caller's metered
-// forward owns both the metering row and the settlement (actual usage, or
-// conservative-unknown for an indeterminate fault). The rejection path
-// (BeginColdHold error) does NOT settle: the engine answered cold but the
-// request is refused pre-dispatch, and the handler's deferred release fallback
-// owns that lease release. A successful wake returns false without settling:
-// the caller's metered forward owns settlement.
-func (s *Server) serveWithWake(
-	w http.ResponseWriter,
-	r *http.Request,
-	upstream *url.URL,
-	id identity.Identity,
-	requestID, clientRequestID string,
-	lease *admission.Lease,
-) (served bool) {
-	// Snapshot the (already include-usage-rewritten) request body so it can be
-	// replayed on each probe + the final forward. nil body is fine.
-	body, err := readAndRestoreBody(r)
+	resp, err := t.base.RoundTrip(req)
 	if err != nil {
-		s.log.Error.Printf("wake: snapshot request body: %v (request_id=%s)", err, requestID)
-		http.Error(w, "bad request body", http.StatusBadRequest)
-		return true
+		return nil, err
 	}
-	restoreBody := func() {
-		if body != nil {
-			r.Body = io.NopCloser(bytes.NewReader(body))
-			r.ContentLength = int64(len(body))
+	cold, err := bufferColdCandidateWithin(req.Context(), resp, t.candidateReadTimeout())
+	if err != nil || !cold {
+		if err != nil {
+			return nil, err
+		}
+		return resp, nil
+	}
+	if t.lease != nil {
+		if err := t.lease.BeginColdHold(req.Context()); err != nil {
+			_ = resp.Body.Close()
+			t.neverServed = true
+			buf := newBufferingResponseWriter()
+			t.server.writeAdmissionError(buf, t.requestID, err)
+			return bufferedHTTPResponse(req, buf, true), nil
 		}
 	}
 
-	// Resolve the wake target ONCE. The gateway path already knows the graph
-	// (tf_model.graph_k8s_name, carried on the identity by resolveGateway);
-	// header-routed requests derive it from the upstream host here — the
-	// single parse site, never re-parsed by the actuator.
+	// releaseHold ends this request's dedicated cold hold. It runs as soon as
+	// the wake finishes, so the hold covers only the time the endpoint is
+	// starting and not the retried request's wait for headers; the defer is a
+	// backstop for the early returns.
+	releaseHold := func() {}
+	if t.target.ServingMode == identity.ServingModeDedicated {
+		// Dedicated endpoints have no admission lease, so the shared tier's
+		// maxColdHolds never applies to them; this per-endpoint cap bounds how
+		// many requests one cold endpoint can park in this replica.
+		release, ok := t.server.dedicatedHolds.acquire(t.target.ResourceID, t.server.protection().MaxDedicatedColdHoldsPerEndpoint)
+		if !ok {
+			_ = resp.Body.Close()
+			t.neverServed = true
+			t.server.log.Warn.Printf("wake: dedicated cold-hold limit reached request_id=%s resource_id=%s",
+				t.requestID, t.target.ResourceID)
+			buf := newBufferingResponseWriter()
+			writeDedicatedColdHoldsFull(buf, t.requestID)
+			return bufferedHTTPResponse(req, buf, true), nil
+		}
+		releaseHold = release // idempotent (acquire), so the explicit call and the defer are both safe
+		defer releaseHold()
+	}
+
+	ctx := req.Context()
+	if t.server.wakeTimeout > 0 {
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithTimeout(ctx, t.server.wakeTimeout)
+		defer cancel()
+	}
+	wakeErr := t.server.waker.Wake(ctx, t.target)
+	releaseHold()
+	if t.lease != nil {
+		if err := t.lease.EndColdHold(context.WithoutCancel(req.Context())); err != nil {
+			t.server.admissionColdHoldReleaseLog.logf(
+				t.server.log, "admission: cold-hold release failed: %v", err,
+			)
+		}
+	}
+	if wakeErr != nil {
+		t.server.log.Warn.Printf(
+			"wake: could not warm base for request_id=%s resource_id=%s: %v",
+			t.requestID, t.target.ResourceID, wakeErr,
+		)
+		if errors.Is(wakeErr, ErrWakeStatusUnknown) {
+			_ = resp.Body.Close()
+			t.neverServed = true
+			return wakeStatusUnknownResponse(req, t.requestID), nil
+		}
+		if errors.Is(wakeErr, ErrWakeNotReady) {
+			_ = resp.Body.Close()
+			t.neverServed = true
+			return wakeStartingResponse(req, t.requestID), nil
+		}
+		t.neverServed = true
+		return resp, nil
+	}
+
+	_ = resp.Body.Close()
+	retry := req.Clone(req.Context())
+	if req.GetBody != nil {
+		retry.Body, err = req.GetBody()
+		if err != nil {
+			return nil, fmt.Errorf("wake: restore request body: %w", err)
+		}
+	}
+	resp, err = t.base.RoundTrip(retry)
+	if err != nil {
+		return nil, err
+	}
+	cold, err = bufferColdCandidateWithin(req.Context(), resp, t.candidateReadTimeout())
+	if err != nil {
+		return nil, err
+	}
+	if cold {
+		_ = resp.Body.Close()
+		t.neverServed = true
+		return wakeStartingResponse(req, t.requestID), nil
+	}
+	return resp, nil
+}
+
+const (
+	coldCandidatePrefixLimit = 64 << 10
+	coldCandidateReadTimeout = 5 * time.Second
+)
+
+func (t *wakeRoundTripper) candidateReadTimeout() time.Duration {
+	if t.server.wakeTimeout > 0 && t.server.wakeTimeout < coldCandidateReadTimeout {
+		return t.server.wakeTimeout
+	}
+	return coldCandidateReadTimeout
+}
+
+type replayReadCloser struct {
+	io.Reader
+	closer io.Closer
+}
+
+func (r *replayReadCloser) Close() error { return r.closer.Close() }
+
+type terminalErrorReader struct {
+	err error
+}
+
+func (r *terminalErrorReader) Read([]byte) (int, error) {
+	err := r.err
+	r.err = nil
+	if err == nil {
+		return 0, io.EOF
+	}
+	return 0, err
+}
+
+type candidateReadResult struct {
+	data []byte
+	err  error
+}
+
+// candidateBody keeps exactly one goroutine reading the network body. During
+// classification, reads can be abandoned at the inspection deadline without
+// abandoning the in-flight network read. The response consumer then receives
+// that result and all later bytes through the same reader.
+type candidateBody struct {
+	body     io.ReadCloser
+	requests chan int
+	results  chan candidateReadResult
+	done     chan struct{}
+
+	readMu      sync.Mutex
+	pending     bool
+	terminal    bool
+	buffered    []byte
+	bufferedErr error
+	closeOnce   sync.Once
+	closeResult error
+}
+
+func newCandidateBody(body io.ReadCloser) *candidateBody {
+	b := &candidateBody{
+		body:     body,
+		requests: make(chan int),
+		results:  make(chan candidateReadResult, 1),
+		done:     make(chan struct{}),
+	}
+	go b.readNetworkBody()
+	return b
+}
+
+func (b *candidateBody) readNetworkBody() {
+	for {
+		var size int
+		select {
+		case size = <-b.requests:
+		case <-b.done:
+			return
+		}
+		buf := make([]byte, size)
+		n, err := b.body.Read(buf)
+		result := candidateReadResult{data: buf[:n], err: err}
+		select {
+		case b.results <- result:
+		case <-b.done:
+			return
+		}
+		if err != nil {
+			return
+		}
+	}
+}
+
+func (b *candidateBody) Read(p []byte) (int, error) {
+	return b.readWithin(context.Background(), p)
+}
+
+func (b *candidateBody) readWithin(ctx context.Context, p []byte) (int, error) {
+	if len(p) == 0 {
+		return 0, nil
+	}
+	b.readMu.Lock()
+	defer b.readMu.Unlock()
+	if len(b.buffered) > 0 {
+		n := copy(p, b.buffered)
+		b.buffered = b.buffered[n:]
+		if len(b.buffered) > 0 {
+			return n, nil
+		}
+		err := b.bufferedErr
+		b.bufferedErr = nil
+		if err != nil {
+			b.terminal = true
+		}
+		return n, err
+	}
+	if b.terminal {
+		return 0, io.EOF
+	}
+	if !b.pending {
+		select {
+		case b.requests <- len(p):
+			b.pending = true
+		case <-ctx.Done():
+			return 0, ctx.Err()
+		case <-b.done:
+			return 0, io.ErrClosedPipe
+		}
+	}
+	select {
+	case result := <-b.results:
+		b.pending = false
+		n := copy(p, result.data)
+		if n < len(result.data) {
+			b.buffered = result.data[n:]
+			b.bufferedErr = result.err
+			return n, nil
+		}
+		if result.err != nil {
+			b.terminal = true
+		}
+		return n, result.err
+	case <-ctx.Done():
+		return 0, ctx.Err()
+	case <-b.done:
+		return 0, io.ErrClosedPipe
+	}
+}
+
+func (b *candidateBody) Close() error {
+	b.closeOnce.Do(func() {
+		close(b.done)
+		b.closeResult = b.body.Close()
+	})
+	return b.closeResult
+}
+
+// bufferColdCandidate inspects only statuses that can be cold. A response may
+// enter a long wake hold only when its complete body fits within the fixed
+// bound. Then the network body is closed and replaced with an in-memory replay
+// before Wake starts. Oversized candidates are restored and returned as
+// non-cold without waiting. If the inspection deadline expires before the
+// body is complete, the bytes received so far and the still-live body reader
+// are handed to the response consumer. An incomplete candidate is not enough
+// evidence to wake, and the inspection deadline must not truncate or rewrite
+// the upstream response.
+func bufferColdCandidate(resp *http.Response) (bool, error) {
+	return bufferColdCandidateWithin(context.Background(), resp, coldCandidateReadTimeout)
+}
+
+func bufferColdCandidateWithin(ctx context.Context, resp *http.Response, timeout time.Duration) (bool, error) {
+	if resp.StatusCode != http.StatusNotFound && resp.StatusCode != http.StatusServiceUnavailable {
+		return false, nil
+	}
+	body := newCandidateBody(resp.Body)
+	readCtx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
+	prefix := make([]byte, 0, coldCandidatePrefixLimit+1)
+	var readErr error
+	for len(prefix) <= coldCandidatePrefixLimit && readErr == nil {
+		remaining := coldCandidatePrefixLimit + 1 - len(prefix)
+		buf := make([]byte, remaining)
+		var n int
+		n, readErr = body.readWithin(readCtx, buf)
+		prefix = append(prefix, buf[:n]...)
+	}
+	if readCtx.Err() != nil {
+		if ctx.Err() != nil {
+			_ = body.Close()
+			return false, fmt.Errorf("wake: read cold-candidate response body: %w", ctx.Err())
+		}
+		resp.Body = &replayReadCloser{Reader: io.MultiReader(bytes.NewReader(prefix), body), closer: body}
+		return false, nil
+	}
+	if len(prefix) > coldCandidatePrefixLimit {
+		if readErr != nil {
+			_ = body.Close()
+			resp.Body = &replayReadCloser{Reader: io.MultiReader(bytes.NewReader(prefix), &terminalErrorReader{err: readErr}), closer: body}
+			return false, nil
+		}
+		resp.Body = &replayReadCloser{Reader: io.MultiReader(bytes.NewReader(prefix), body), closer: body}
+		return false, nil
+	}
+	_ = body.Close()
+	if readErr != nil {
+		resp.Body = &replayReadCloser{Reader: io.MultiReader(bytes.NewReader(prefix), &terminalErrorReader{err: readErr}), closer: body}
+	} else {
+		resp.Body = &replayReadCloser{Reader: bytes.NewReader(prefix), closer: body}
+	}
+	return resp.StatusCode == http.StatusNotFound || bodyLooksNotReady(prefix), nil
+}
+
+func bufferedHTTPResponse(req *http.Request, buf *bufferingResponseWriter, neverServed bool) *http.Response {
+	header := buf.header.Clone()
+	if neverServed {
+		header.Del(wakeNeverServedHeader)
+	}
+	return &http.Response{
+		StatusCode:    buf.status,
+		Status:        strconv.Itoa(buf.status) + " " + http.StatusText(buf.status),
+		Header:        header,
+		Body:          io.NopCloser(bytes.NewReader(buf.body)),
+		ContentLength: int64(len(buf.body)),
+		Request:       req,
+	}
+}
+
+func wakeStartingResponse(req *http.Request, requestID string) *http.Response {
+	buf := newBufferingResponseWriter()
+	writeWakeStarting(buf, requestID)
+	return bufferedHTTPResponse(req, buf, true)
+}
+
+func wakeStatusUnknownResponse(req *http.Request, requestID string) *http.Response {
+	buf := newBufferingResponseWriter()
+	writeWakeStatusUnknown(buf, requestID)
+	return bufferedHTTPResponse(req, buf, true)
+}
+
+func (s *Server) newWakeTransport(
+	base http.RoundTripper,
+	upstream *url.URL,
+	id identity.Identity,
+	servedModel string,
+	requestID string,
+	lease *admission.Lease,
+) *wakeRoundTripper {
+	if base == nil {
+		base = http.DefaultTransport
+	}
 	target := WakeTarget{
 		UpstreamHost: upstream.Host,
 		GraphK8sName: id.GraphK8sName,
 		ResourceID:   id.ResourceID,
+		ServedModel:  servedModel,
+		ServingMode:  id.ServingMode,
 	}
 	if target.GraphK8sName == "" {
 		target.GraphK8sName = graphFromUpstreamHost(upstream.Host)
 	}
-
-	maxTries := s.wakeMaxTries
-	if maxTries < 1 {
-		maxTries = 1
-	}
-	for attempt := 0; attempt < maxTries; attempt++ {
-		restoreBody()
-		buf := newBufferingResponseWriter()
-		probe := newUpstreamProxy(upstream)
-		// A probe failure (upstream unreachable) is not a cold signal — surface
-		// it as a bad gateway, same as the normal error handler would.
-		probe.ErrorHandler = func(pw http.ResponseWriter, _ *http.Request, e error) {
-			s.log.Warn.Printf("wake: probe upstream error: %v (request_id=%s)", e, requestID)
-			pw.WriteHeader(http.StatusBadGateway)
-		}
-		probe.ServeHTTP(buf, r)
-
-		if !buf.isColdWakeable() {
-			// Warm (or a non-cold error): let the caller do the real metered
-			// streaming forward. Restore the body for that attempt.
-			restoreBody()
-			return false
-		}
-
-		// Cold. Trigger the wake and block until ready (bounded), then retry.
-		if lease != nil {
-			if aerr := lease.BeginColdHold(r.Context()); aerr != nil {
-				// A probe was already forwarded above; this served=true exit
-				// bypasses the normal metered forward, so record the attempt.
-				// The minted id is the client's only correlation handle to the
-				// reconciliation row — same contract as every errorHandler exit
-				// (writeAdmissionError stamps it on the response).
-				//
-				// The cold-hold gate refused to extend the lease for a wake
-				// (capacity rejection or unavailable store). The engine
-				// answered cold — no inference ran — but this is a rejection,
-				// not a completed response: fail closed without usage-settling
-				// here; the handler's deferred release fallback owns the lease
-				// release on this exit path.
-				rec := &statusRecorder{ResponseWriter: w}
-				s.writeAdmissionError(rec, requestID, aerr)
-				s.emitWakeFailureRow(r, id, requestID, clientRequestID, rec.status)
-				return true
-			}
-		}
-		ctx := r.Context()
-		if s.wakeTimeout > 0 {
-			var cancel context.CancelFunc
-			ctx, cancel = context.WithTimeout(ctx, s.wakeTimeout)
-			defer cancel()
-		}
-		werr := s.waker.Wake(ctx, target)
-		if lease != nil {
-			if aerr := lease.EndColdHold(context.WithoutCancel(r.Context())); aerr != nil {
-				s.admissionColdHoldReleaseLog.logf(s.log, "admission: cold-hold release failed: %v", aerr)
-			}
-		}
-		if werr != nil {
-			// Wake couldn't complete: answer now rather than hang. Either way
-			// the outcome is determinate never-served (no inference ran), so
-			// the lease settles zero before the response is written. The probe
-			// above was a real forwarded attempt and this served=true exit
-			// bypasses the normal metered forward, so the attempt is recorded
-			// at the status the client received.
-			s.log.Warn.Printf("wake: could not warm base for request_id=%s resource_id=%s: %v",
-				requestID, id.ResourceID, werr)
-			s.settleFinalColdLease(r, lease)
-			if errors.Is(werr, ErrWakeNotReady) {
-				// The scale-up is in progress but the worker was not ready
-				// within the hold: 503 + Retry-After, never the cold 404.
-				writeWakeStarting(w, requestID)
-				s.emitWakeFailureRow(r, id, requestID, clientRequestID, http.StatusServiceUnavailable)
-				return true
-			}
-			// No scale-up is in progress (no adapter, RBAC/API error): pass
-			// the cold upstream response through unchanged.
-			w.Header().Set(requestIDHeader, requestID)
-			buf.flushTo(w)
-			s.emitWakeFailureRow(r, id, requestID, clientRequestID, buf.status)
-			return true
-		}
-		// Woken: loop and re-probe (the next attempt should be warm).
-	}
-
-	// Tries exhausted — dispatch ONE more buffered probe and classify it.
-	// Still genuinely cold: same determinate never-served axis as the wake-error
-	// give-up — every dispatch was refused before any inference, so the lease
-	// settles zero before the flush.
-	//
-	// NOT cold (a warm response, or a non-cold error such as a transport
-	// 502/500): the R1 "engine provably did no work" precondition does NOT
-	// hold. Serving the buffer here would hand the client a real response
-	// settled Complete(0) and never metered (a billing hole), or an
-	// unclassified 502 settled never-served zero (indeterminate faults must
-	// keep the conservative reservation). Return false so the caller's normal
-	// metered streaming forward classifies the outcome — exactly the in-loop
-	// not-cold handling above.
-	restoreBody()
-	buf := newBufferingResponseWriter()
-	last := newUpstreamProxy(upstream)
-	last.ServeHTTP(buf, r)
-	if !buf.isColdWakeable() {
-		restoreBody()
-		return false
-	}
-	// Still cold after every wake reported success: the scale-up was triggered
-	// (Wake returned nil), so the model is starting, not missing. Same answer
-	// as a wake that ran out of time: 503 + Retry-After, never the cold 404.
-	s.settleFinalColdLease(r, lease)
-	writeWakeStarting(w, requestID)
-	s.emitWakeFailureRow(r, id, requestID, clientRequestID, http.StatusServiceUnavailable)
-	return true
-}
-
-// settleFinalColdLease settles an admitted lease to zero for a final cold
-// response (the engine provably did no work). Settlement is first-writer-wins:
-// the handler's deferred release fallback becomes a no-op once this lands, and
-// vice versa. The context is decoupled from the client request: the settlement
-// must survive a client disconnect racing the cold flush (mirrors the error
-// handler and onDone).
-func (s *Server) settleFinalColdLease(r *http.Request, lease *admission.Lease) {
-	if lease == nil {
-		return
-	}
-	ctx := context.WithoutCancel(r.Context())
-	if err := settleAdmissionLease(ctx, lease, settlementZeroNeverServed, admission.Usage{}); err != nil {
-		s.admissionReleaseFallbackLog.logf(s.log, "admission: release fallback failed: %v", err)
+	return &wakeRoundTripper{
+		server: s, base: base, target: target, requestID: requestID, lease: lease,
 	}
 }
