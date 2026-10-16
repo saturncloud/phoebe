@@ -25,15 +25,14 @@ import (
 	"github.com/saturncloud/phoebe/internal/config"
 	"github.com/saturncloud/phoebe/internal/identity"
 	"github.com/saturncloud/phoebe/internal/logging"
+	"github.com/saturncloud/phoebe/internal/testutil"
 )
-
-func ptr64(v int64) *int64 { return &v }
 
 func proxyAdmissionConfig(active int64) config.AdmissionSettings {
 	return config.AdmissionSettings{Enabled: true, KeyPrefix: "proxy-test", LeaseTTL: time.Minute,
-		DefaultMaxOutputTokens: 20, Platform: config.AdmissionLimits{MaxActiveRequests: ptr64(active),
-			MaxConcurrentPrefills: ptr64(active), MaxReservedDecodeSlots: ptr64(active), MaxPromptBytes: ptr64(1024), MaxReservedOutputTokens: ptr64(100),
-			RequestsPerWindow: ptr64(100), GeneratedTokensPerWindow: ptr64(1000), Window: time.Minute}}
+		DefaultMaxOutputTokens: 20, Platform: config.AdmissionLimits{MaxActiveRequests: testutil.Ptr[int64](active),
+			MaxConcurrentPrefills: testutil.Ptr[int64](active), MaxReservedDecodeSlots: testutil.Ptr[int64](active), MaxPrefillTokens: testutil.Ptr[int64](1024), MaxReservedOutputTokens: testutil.Ptr[int64](100),
+			RequestsPerWindow: testutil.Ptr[int64](100), GeneratedTokensPerWindow: testutil.Ptr[int64](1000), Window: time.Minute}}
 }
 
 // fixedWindowBucket mirrors the admission store's fixed 1-minute window bucket
@@ -65,7 +64,14 @@ func sharedRequest(upstream *url.URL) *http.Request {
 	return r
 }
 
-type countingAdmitter struct{ calls int }
+// countingAdmitter counts Admit calls and admits with no lease, as an
+// unavailable store would. settings is what it reports enforcing.
+type countingAdmitter struct {
+	calls    int
+	settings config.AdmissionSettings
+}
+
+func (a *countingAdmitter) Settings() config.AdmissionSettings { return a.settings }
 
 func (a *countingAdmitter) Admit(context.Context, admission.Request) (*admission.Lease, error) {
 	a.calls++
@@ -97,9 +103,8 @@ func TestSharedRequestBodyBoundariesBeforeAdmission(t *testing.T) {
 
 	newServer := func(a *countingAdmitter) *Server {
 		cfg := proxyAdmissionConfig(2)
-		cfg.Platform.MaxPromptBytes = ptr64(limit)
-		return New(&config.Settings{Admission: cfg}, logging.New(logging.ERROR), &recordingEmitter{}).
-			WithAdmitter(a)
+		return New(&config.Settings{Admission: cfg, Protection: config.ProtectionSettings{MaxRequestBodyBytes: limit}},
+			logging.New(logging.ERROR), &recordingEmitter{}).WithAdmitter(a)
 	}
 
 	t.Run("exact limit reaches admission and upstream", func(t *testing.T) {
@@ -137,7 +142,11 @@ func TestSharedRequestBodyBoundariesBeforeAdmission(t *testing.T) {
 	}
 }
 
-func TestSharedRequestAtExactBodyLimitAdmitsWithRedisAdmitter(t *testing.T) {
+// The body ceiling with the real Redis admitter: a body of exactly
+// protection.maxRequestBodyBytes is admitted and served; one byte more is
+// refused with 413 before admission, so it reserves nothing and the next
+// exact-size request still admits.
+func TestRequestBodyCeilingExactAdmitsOneOverRejects(t *testing.T) {
 	const limit = 128
 	var upstreamHits int
 	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
@@ -147,23 +156,82 @@ func TestSharedRequestAtExactBodyLimitAdmitsWithRedisAdmitter(t *testing.T) {
 	defer backend.Close()
 	up, _ := url.Parse(backend.URL)
 	mr := miniredis.RunT(t)
-	cfg := proxyAdmissionConfig(2)
-	cfg.Platform.MaxPromptBytes = ptr64(limit)
+	// One active request: a leaked reservation from the refused request
+	// would make the follow-up exact-size request fail.
+	cfg := proxyAdmissionConfig(1)
 	client := redis.NewClient(&redis.Options{Addr: mr.Addr()})
 	t.Cleanup(func() { _ = client.Close() })
-	s := New(&config.Settings{Admission: cfg}, logging.New(logging.ERROR), &recordingEmitter{}).
-		WithAdmitter(admission.New(client, cfg))
+	s := New(&config.Settings{Admission: cfg, Protection: config.ProtectionSettings{MaxRequestBodyBytes: limit}},
+		logging.New(logging.ERROR), &recordingEmitter{}).WithAdmitter(admission.New(client, cfg))
 
 	rr := httptest.NewRecorder()
 	s.Handler().ServeHTTP(rr, sharedRequestBodyOfSize(t, up, limit))
 	if rr.Code != http.StatusOK || upstreamHits != 1 {
-		t.Fatalf("status=%d upstream=%d, exact original JSON limit must admit", rr.Code, upstreamHits)
+		t.Fatalf("status=%d upstream=%d, a body exactly at the ceiling must be admitted and served", rr.Code, upstreamHits)
+	}
+
+	rr = httptest.NewRecorder()
+	s.Handler().ServeHTTP(rr, sharedRequestBodyOfSize(t, up, limit+1))
+	if rr.Code != http.StatusRequestEntityTooLarge || upstreamHits != 1 {
+		t.Fatalf("status=%d upstream=%d, a body one byte over the ceiling must be refused with 413 before the upstream", rr.Code, upstreamHits)
+	}
+
+	rr = httptest.NewRecorder()
+	s.Handler().ServeHTTP(rr, sharedRequestBodyOfSize(t, up, limit))
+	if rr.Code != http.StatusOK || upstreamHits != 2 {
+		t.Fatalf("status=%d upstream=%d, the refused request must not hold an admission reservation", rr.Code, upstreamHits)
 	}
 }
 
-func TestSharedRequestBodyLimitUsesSafeUnlimitedFallback(t *testing.T) {
-	if got := sharedRequestBodyLimit(config.AdmissionSettings{}, config.AdmissionLane{}); got != defaultSharedRequestBodyLimit {
-		t.Fatalf("unlimited fallback=%d, want %d", got, defaultSharedRequestBodyLimit)
+// sharedChatRequest is a shared request whose single message has content of
+// contentChars characters, so its prefill estimate is controlled by the test.
+func sharedChatRequest(upstream *url.URL, contentChars int) (*http.Request, []byte) {
+	body := []byte(`{"model":"model-a","max_tokens":20,"messages":[{"role":"user","content":"` +
+		strings.Repeat("x", contentChars) + `"}]}`)
+	req := sharedRequest(upstream)
+	replaceRequestBody(req, body)
+	return req, body
+}
+
+// The prefill-token limit is inclusive with the real Redis admitter: a
+// request whose estimate equals maxPrefillTokens is admitted and served; with
+// the limit one below the estimate it is refused before the upstream.
+func TestSharedPrefillTokensAtExactLimitAdmits(t *testing.T) {
+	var upstreamHits int
+	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		upstreamHits++
+		_, _ = w.Write([]byte(`{"model":"model-a","usage":{"prompt_tokens":1,"completion_tokens":1}}`))
+	}))
+	defer backend.Close()
+	up, _ := url.Parse(backend.URL)
+
+	_, body := sharedChatRequest(up, 4*50)
+	estimate := estimatePromptTokens(body)
+	if estimate < 2 {
+		t.Fatalf("estimate=%d, want a message-driven estimate above the minimum", estimate)
+	}
+
+	serve := func(limit int64) *httptest.ResponseRecorder {
+		mr := miniredis.RunT(t)
+		cfg := proxyAdmissionConfig(2)
+		cfg.Platform.MaxPrefillTokens = testutil.Ptr[int64](limit)
+		client := redis.NewClient(&redis.Options{Addr: mr.Addr()})
+		t.Cleanup(func() { _ = client.Close() })
+		s := New(&config.Settings{Admission: cfg}, logging.New(logging.ERROR), &recordingEmitter{}).
+			WithAdmitter(admission.New(client, cfg))
+		req, _ := sharedChatRequest(up, 4*50)
+		rr := httptest.NewRecorder()
+		s.Handler().ServeHTTP(rr, req)
+		return rr
+	}
+
+	if rr := serve(estimate); rr.Code != http.StatusOK || upstreamHits != 1 {
+		t.Fatalf("status=%d upstream=%d, an estimate exactly at maxPrefillTokens must be admitted", rr.Code, upstreamHits)
+	}
+	// Q24: prefill is a load limit. One request over the whole limit, with
+	// nothing else in flight, is admitted, never refused forever.
+	if rr := serve(estimate - 1); rr.Code != http.StatusOK || upstreamHits != 2 {
+		t.Fatalf("status=%d upstream=%d, an estimate one over maxPrefillTokens with nothing in flight must be admitted", rr.Code, upstreamHits)
 	}
 }
 
@@ -232,6 +300,7 @@ func TestAdmissionStateFailureBypassesGate(t *testing.T) {
 	var hits int
 	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		hits++
+		w.Header().Set(wakeNeverServedHeader, "true")
 		_, _ = w.Write([]byte(`{"model":"model-a","usage":{"prompt_tokens":7,"completion_tokens":3,"prompt_tokens_details":{"cached_tokens":2}}}`))
 	}))
 	defer backend.Close()
@@ -276,16 +345,17 @@ func TestWakeEnabledWarmRequestExecutesMetersAndSettlesOnce(t *testing.T) {
 	waker := &fakeWaker{}
 	s := New(&config.Settings{Admission: cfg}, logging.New(logging.ERROR), em).
 		WithAdmitter(a).
-		WithWaker(waker, time.Second, 3)
+		WithWaker(waker, time.Second)
 
 	rr := httptest.NewRecorder()
 	s.Handler().ServeHTTP(rr, sharedRequest(up))
-	// serveWithWake costs one readiness probe on the wake path (the backend is
-	// warm, so the probe returns not-cold and the caller performs the real
-	// metered forward): two backend hits, one wake-eligible probe and one
-	// inference, zero wakes.
-	if rr.Code != http.StatusOK || hits != 2 || waker.calls != 0 {
+	// The first warm response is the metered response. It is not discarded and
+	// the customer POST is not replayed.
+	if rr.Code != http.StatusOK || hits != 1 || waker.calls != 0 {
 		t.Fatalf("status=%d backend hits=%d wake calls=%d", rr.Code, hits, waker.calls)
+	}
+	if got := rr.Header().Get(wakeNeverServedHeader); got != "" {
+		t.Fatalf("upstream settlement marker reached client: %q", got)
 	}
 	events := em.waitForEvents(1, time.Second)
 	if len(events) != 1 || events[0].PromptTokens != 7 || events[0].CompletionTokens != 3 {
@@ -293,7 +363,7 @@ func TestWakeEnabledWarmRequestExecutesMetersAndSettlesOnce(t *testing.T) {
 	}
 	lease, err := a.Admit(context.Background(), admission.Request{
 		Graph: "graph-a", Organization: "org-b", Model: "model-a",
-		PromptBytes: 1, EstimatedInputTokens: 1, ReservedOutputTokens: 1,
+		PrefillTokens: 1, EstimatedInputTokens: 1, ReservedOutputTokens: 1,
 	})
 	if err != nil {
 		t.Fatalf("warm request did not settle its admission lease: %v", err)
@@ -311,19 +381,19 @@ func TestWakeColdHoldRejectionFailsClosedAndReleasesLease(t *testing.T) {
 	up, _ := url.Parse(be.URL)
 	mr := miniredis.RunT(t)
 	cfg := proxyAdmissionConfig(2)
-	cfg.Platform.MaxColdHolds = ptr64(1)
+	cfg.Platform.MaxColdHolds = testutil.Ptr[int64](1)
 	c := redis.NewClient(&redis.Options{Addr: mr.Addr()})
 	t.Cleanup(func() { _ = c.Close() })
 	a := admission.New(c, cfg)
 	waker := &fakeWaker{}
 	s := New(&config.Settings{Admission: cfg}, logging.New(logging.ERROR), &recordingEmitter{}).
 		WithAdmitter(a).
-		WithWaker(waker, time.Second, 3)
+		WithWaker(waker, time.Second)
 
 	// A contending hold occupies the platform's single cold-hold slot.
 	holder, err := a.Admit(context.Background(), admission.Request{
 		Graph: "graph", Organization: "holder", Model: "m",
-		PromptBytes: 1, EstimatedInputTokens: 1, ReservedOutputTokens: 1,
+		PrefillTokens: 1, EstimatedInputTokens: 1, ReservedOutputTokens: 1,
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -349,20 +419,61 @@ func TestWakeColdHoldRejectionFailsClosedAndReleasesLease(t *testing.T) {
 	// the one after fails. A leaked lease would reject the first.
 	lease, err := a.Admit(context.Background(), admission.Request{
 		Graph: "graph", Organization: "org-b", Model: "m",
-		PromptBytes: 1, EstimatedInputTokens: 1, ReservedOutputTokens: 1,
+		PrefillTokens: 1, EstimatedInputTokens: 1, ReservedOutputTokens: 1,
 	})
 	if err != nil {
 		t.Fatalf("cold-hold rejection leaked its lease: %v", err)
 	}
 	if _, err := a.Admit(context.Background(), admission.Request{
 		Graph: "graph", Organization: "org-c", Model: "m",
-		PromptBytes: 1, EstimatedInputTokens: 1, ReservedOutputTokens: 1,
+		PrefillTokens: 1, EstimatedInputTokens: 1, ReservedOutputTokens: 1,
 	}); err == nil {
 		t.Fatal("platform active limit not enforced after cold-hold rejection")
 	}
 	_ = lease.Complete(context.Background(), 0)
 	_ = holder.EndColdHold(context.Background())
 	_ = holder.Complete(context.Background(), 0)
+}
+
+func TestUnavailableModeActuatorSkipsColdHoldAdmission(t *testing.T) {
+	backend := &coldToWarmBackend{}
+	be := httptest.NewServer(backend)
+	defer be.Close()
+	up, _ := url.Parse(be.URL)
+	mr := miniredis.RunT(t)
+	cfg := proxyAdmissionConfig(2)
+	cfg.Platform.MaxColdHolds = testutil.Ptr[int64](1)
+	c := redis.NewClient(&redis.Options{Addr: mr.Addr()})
+	t.Cleanup(func() { _ = c.Close() })
+	a := admission.New(c, cfg)
+	waker := &unsupportedWaker{}
+	s := New(&config.Settings{Admission: cfg}, logging.New(logging.ERROR), &recordingEmitter{}).
+		WithAdmitter(a).
+		WithWaker(waker, time.Second)
+
+	holder, err := a.Admit(context.Background(), admission.Request{
+		Graph: "graph", Organization: "holder", Model: "m",
+		PrefillTokens: 1, EstimatedInputTokens: 1, ReservedOutputTokens: 1,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := holder.BeginColdHold(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	defer func() {
+		_ = holder.EndColdHold(context.Background())
+		_ = holder.Complete(context.Background(), 0)
+	}()
+
+	rr := httptest.NewRecorder()
+	s.Handler().ServeHTTP(rr, sharedRequest(up))
+	if rr.Code != http.StatusNotFound {
+		t.Fatalf("status=%d, want original cold 404 pass-through", rr.Code)
+	}
+	if calls := atomic.LoadInt32(&waker.calls); calls != 0 {
+		t.Fatalf("unsupported waker invoked %d times", calls)
+	}
 }
 
 // The prefill reservation must release at the first response BODY byte, not at
@@ -397,7 +508,7 @@ func TestPrefillReservationReleasesAtFirstBodyByte(t *testing.T) {
 	up, _ := url.Parse(backend.URL)
 	mr := miniredis.RunT(t)
 	cfg := proxyAdmissionConfig(2)
-	cfg.Platform.MaxConcurrentPrefills = ptr64(1) // prefill is the only binding dimension
+	cfg.Platform.MaxConcurrentPrefills = testutil.Ptr[int64](1) // prefill is the only binding dimension
 	c := redis.NewClient(&redis.Options{Addr: mr.Addr()})
 	t.Cleanup(func() { _ = c.Close() })
 	s := New(&config.Settings{Admission: cfg}, logging.New(logging.ERROR), &recordingEmitter{}).WithAdmitter(admission.New(c, cfg))
@@ -547,7 +658,7 @@ func TestPrefillReleaseOffFirstBytePath(t *testing.T) {
 		up, _ := url.Parse(backend.URL)
 		mr := miniredis.RunT(t)
 		cfg := proxyAdmissionConfig(2)
-		cfg.Platform.MaxConcurrentPrefills = ptr64(1) // prefill is the only binding dimension
+		cfg.Platform.MaxConcurrentPrefills = testutil.Ptr[int64](1) // prefill is the only binding dimension
 		c := redis.NewClient(&redis.Options{Addr: mr.Addr()})
 		t.Cleanup(func() { _ = c.Close() })
 		hook := &prefillTransitionHook{entered: make(chan struct{}), release: make(chan struct{})}
@@ -641,7 +752,7 @@ func TestPrefillReleaseOffFirstBytePath(t *testing.T) {
 		up, _ := url.Parse(backend.URL)
 		mr := miniredis.RunT(t)
 		cfg := proxyAdmissionConfig(2)
-		cfg.Platform.MaxConcurrentPrefills = ptr64(1)
+		cfg.Platform.MaxConcurrentPrefills = testutil.Ptr[int64](1)
 		c := redis.NewClient(&redis.Options{Addr: mr.Addr()})
 		t.Cleanup(func() { _ = c.Close() })
 		hook := &prefillTransitionHook{entered: make(chan struct{}), fail: errors.New("valkey unavailable")}
@@ -678,7 +789,7 @@ func TestPrefillReleaseOffFirstBytePath(t *testing.T) {
 		// releases the prefill reservation itself — capacity cannot leak.
 		lease, err := admission.New(c, cfg).Admit(context.Background(), admission.Request{
 			Graph: "graph", Organization: "org-b", Model: "m",
-			PromptBytes: 1, EstimatedInputTokens: 1, ReservedOutputTokens: 1,
+			PrefillTokens: 1, EstimatedInputTokens: 1, ReservedOutputTokens: 1,
 		})
 		if err != nil {
 			t.Fatalf("failed prefill release leaked the reservation past settlement: %v", err)
@@ -697,14 +808,14 @@ func TestWakeExhaustedReturnsColdAndReleasesCapacity(t *testing.T) {
 	up, _ := url.Parse(be.URL)
 	mr := miniredis.RunT(t)
 	cfg := proxyAdmissionConfig(1)
-	cfg.Platform.MaxColdHolds = ptr64(1)
+	cfg.Platform.MaxColdHolds = testutil.Ptr[int64](1)
 	c := redis.NewClient(&redis.Options{Addr: mr.Addr()})
 	t.Cleanup(func() { _ = c.Close() })
 	a := admission.New(c, cfg)
 	waker := &fakeWaker{warmsAt: 99, backend: backend}
 	s := New(&config.Settings{Admission: cfg}, logging.New(logging.ERROR), &recordingEmitter{}).
 		WithAdmitter(a).
-		WithWaker(waker, time.Second, 2)
+		WithWaker(waker, time.Second)
 
 	rr := httptest.NewRecorder()
 	s.Handler().ServeHTTP(rr, sharedRequest(up))
@@ -712,14 +823,13 @@ func TestWakeExhaustedReturnsColdAndReleasesCapacity(t *testing.T) {
 		t.Fatalf("status=%d Retry-After=%q, want the model-starting 503 + Retry-After after wake exhaustion",
 			rr.Code, rr.Header().Get("Retry-After"))
 	}
-	// serveWithWake wakes once per cold attempt: maxTries=2 means two probes
-	// (both cold) with a wake between them, then the final still-cold probe.
-	if calls := atomic.LoadInt32(&waker.calls); calls != 2 {
-		t.Fatalf("waker calls=%d, want 2 for maxTries=2 (one wake per cold attempt)", calls)
+	// The contract permits one wake and one retry.
+	if calls := atomic.LoadInt32(&waker.calls); calls != 1 {
+		t.Fatalf("waker calls=%d, want 1", calls)
 	}
 	lease, err := a.Admit(context.Background(), admission.Request{
 		Graph: "graph", Organization: "org-b", Model: "m",
-		PromptBytes: 1, EstimatedInputTokens: 1, ReservedOutputTokens: 1,
+		PrefillTokens: 1, EstimatedInputTokens: 1, ReservedOutputTokens: 1,
 	})
 	if err != nil {
 		t.Fatalf("exhausted wake leaked its lease: %v", err)
@@ -727,7 +837,7 @@ func TestWakeExhaustedReturnsColdAndReleasesCapacity(t *testing.T) {
 	_ = lease.Complete(context.Background(), 0)
 }
 
-// A store outage between Admit and the cold probe fails closed at the cold
+// A store outage between Admit and the cold response fails closed at the cold
 // hold: the request gets the admission-unavailable error (503), the waker is
 // never invoked, and the handler's deferred release fallback — not a cold-hold
 // bypass — owns the lease release. (The bypass lives at Admit time: when the
@@ -747,14 +857,14 @@ func TestWakeColdHoldStoreOutageFailsClosed(t *testing.T) {
 	defer backend.Close()
 	up, _ := url.Parse(backend.URL)
 	cfg := proxyAdmissionConfig(1)
-	cfg.Platform.MaxColdHolds = ptr64(1)
+	cfg.Platform.MaxColdHolds = testutil.Ptr[int64](1)
 	c := redis.NewClient(&redis.Options{Addr: mr.Addr()})
 	t.Cleanup(func() { _ = c.Close() })
 	a := admission.New(c, cfg)
 	waker := &fakeWaker{}
 	s := New(&config.Settings{Admission: cfg}, logging.New(logging.ERROR), &recordingEmitter{}).
 		WithAdmitter(a).
-		WithWaker(waker, time.Second, 2)
+		WithWaker(waker, time.Second)
 
 	rr := httptest.NewRecorder()
 	s.Handler().ServeHTTP(rr, sharedRequest(up))
@@ -766,23 +876,22 @@ func TestWakeColdHoldStoreOutageFailsClosed(t *testing.T) {
 	}
 }
 
-func TestAdmissionImpossibleOutputRejectedBeforeUpstream(t *testing.T) {
+// Q24: a reserved-output cap is a load limit. A request whose own output is
+// larger than the whole cap is admitted when nothing else holds output.
+func TestAdmissionOversizedOutputAloneIsAdmitted(t *testing.T) {
 	var hits int
 	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) { hits++; w.WriteHeader(200) }))
 	defer backend.Close()
 	up, _ := url.Parse(backend.URL)
 	mr := miniredis.RunT(t)
 	cfg := proxyAdmissionConfig(2)
-	cfg.Platform.MaxReservedOutputTokens = ptr64(10)
+	cfg.Platform.MaxReservedOutputTokens = testutil.Ptr[int64](10)
 	c := redis.NewClient(&redis.Options{Addr: mr.Addr()})
 	s := New(&config.Settings{Admission: cfg}, logging.New(logging.ERROR), &recordingEmitter{}).WithAdmitter(admission.New(c, cfg))
 	rr := httptest.NewRecorder()
 	s.Handler().ServeHTTP(rr, sharedRequest(up))
-	if rr.Code != http.StatusServiceUnavailable {
-		t.Fatalf("status=%d, want 503", rr.Code)
-	}
-	if hits != 0 {
-		t.Fatal("impossible request reached upstream")
+	if rr.Code != http.StatusOK || hits != 1 {
+		t.Fatalf("status=%d hits=%d, want the lone oversized request admitted", rr.Code, hits)
 	}
 }
 
@@ -1031,8 +1140,8 @@ func TestTrustedRateLimitPolicyParsing(t *testing.T) {
 		OrgRateLimitRequests: "5", OwnerRateLimitGeneratedTokens: "7",
 	})
 	if err != nil ||
-		!rateLimitsEqual(organization, admission.RateLimits{Requests: ptr64(5)}) ||
-		!rateLimitsEqual(owner, admission.RateLimits{GeneratedTokens: ptr64(7)}) {
+		!rateLimitsEqual(organization, admission.RateLimits{Requests: testutil.Ptr[int64](5)}) ||
+		!rateLimitsEqual(owner, admission.RateLimits{GeneratedTokens: testutil.Ptr[int64](7)}) {
 		t.Fatalf("per-field parse = org=%+v owner=%+v, %v; absent fields must be nil (unlimited)", organization, owner, err)
 	}
 
@@ -1046,8 +1155,8 @@ func TestTrustedRateLimitPolicyParsing(t *testing.T) {
 		OwnerRateLimitRequests: "0", OwnerRateLimitTotalPromptTokens: "0",
 		OwnerRateLimitUncachedPromptTokens: "0", OwnerRateLimitGeneratedTokens: "0",
 	})
-	zeroCap := admission.RateLimits{Requests: ptr64(0), TotalPromptTokens: ptr64(0),
-		UncachedPromptTokens: ptr64(0), GeneratedTokens: ptr64(0)}
+	zeroCap := admission.RateLimits{Requests: testutil.Ptr[int64](0), TotalPromptTokens: testutil.Ptr[int64](0),
+		UncachedPromptTokens: testutil.Ptr[int64](0), GeneratedTokens: testutil.Ptr[int64](0)}
 	if err != nil || !rateLimitsEqual(organization, zeroCap) || !rateLimitsEqual(owner, zeroCap) {
 		t.Fatalf("all-zeros envelope must parse as zero-quota: org=%+v owner=%+v, %v", organization, owner, err)
 	}
@@ -1445,7 +1554,7 @@ func TestSharedRequestMissingOrganizationIdentity(t *testing.T) {
 			t.Fatalf("status=%d, want 200", rr.Code)
 		}
 		_, expectedTenant, err := prepareSharedDynamoRequest(
-			[]byte(requestBody), "resource:resource-a", 20, config.AdmissionLane{},
+			[]byte(requestBody), "resource:resource-a", 20, false, config.AdmissionLane{},
 		)
 		if err != nil {
 			t.Fatal(err)
@@ -1477,7 +1586,7 @@ func TestDegenerateUpstreamGraphFailsClosedNoBypass(t *testing.T) {
 	// platform scope (capacity 1) must succeed immediately.
 	lease, err := admission.New(c, cfg).Admit(context.Background(), admission.Request{
 		Graph: "graph-a", Organization: "org-a", Owner: "owner-a", Model: "model-a",
-		PromptBytes: 1, EstimatedInputTokens: 1, ReservedOutputTokens: 1,
+		PrefillTokens: 1, EstimatedInputTokens: 1, ReservedOutputTokens: 1,
 	})
 	if err != nil {
 		t.Fatalf("degenerate upstream request leaked into admission state: %v", err)
@@ -1566,15 +1675,15 @@ func TestAdmissionReleasesAbortedStream(t *testing.T) {
 		{
 			name: "organization contract",
 			req: admission.Request{Graph: "graph", Organization: "org-a", Owner: "other-owner", Model: "m",
-				PromptBytes: 1, EstimatedInputTokens: 1, ReservedOutputTokens: 1,
-				OrganizationLimits: admission.RateLimits{GeneratedTokens: ptr64(20)}},
+				PrefillTokens: 1, EstimatedInputTokens: 1, ReservedOutputTokens: 1,
+				OrganizationLimits: admission.RateLimits{GeneratedTokens: testutil.Ptr[int64](20)}},
 			want: "contract_organization",
 		},
 		{
 			name: "owner contract",
 			req: admission.Request{Graph: "graph", Organization: "other-org", Owner: "owner-a", Model: "m",
-				PromptBytes: 1, EstimatedInputTokens: 1, ReservedOutputTokens: 1,
-				OwnerLimits: admission.RateLimits{GeneratedTokens: ptr64(20)}},
+				PrefillTokens: 1, EstimatedInputTokens: 1, ReservedOutputTokens: 1,
+				OwnerLimits: admission.RateLimits{GeneratedTokens: testutil.Ptr[int64](20)}},
 			want: "contract_owner",
 		},
 	}
@@ -1622,7 +1731,7 @@ func TestAdmissionReleasesAbortedStream(t *testing.T) {
 			t.Errorf("%s: err=%v, want %s generated_tokens rejection", tc.name, errs[i], tc.want)
 		}
 	}
-	lease, err := a.Admit(context.Background(), admission.Request{Graph: "graph", Organization: "other", Model: "m", PromptBytes: 1, EstimatedInputTokens: 1, ReservedOutputTokens: 1})
+	lease, err := a.Admit(context.Background(), admission.Request{Graph: "graph", Organization: "other", Model: "m", PrefillTokens: 1, EstimatedInputTokens: 1, ReservedOutputTokens: 1})
 	if err != nil {
 		t.Fatalf("aborted stream leaked reservation: %v", err)
 	}
@@ -1666,15 +1775,15 @@ func TestAdmissionChargesUnknownUsageOnPreHeaderAbort(t *testing.T) {
 		{
 			name: "organization contract",
 			req: admission.Request{Graph: "graph", Organization: "org-a", Owner: "other-owner", Model: "m",
-				PromptBytes: 1, EstimatedInputTokens: 1, ReservedOutputTokens: 1,
-				OrganizationLimits: admission.RateLimits{GeneratedTokens: ptr64(20)}},
+				PrefillTokens: 1, EstimatedInputTokens: 1, ReservedOutputTokens: 1,
+				OrganizationLimits: admission.RateLimits{GeneratedTokens: testutil.Ptr[int64](20)}},
 			want: "contract_organization",
 		},
 		{
 			name: "owner contract",
 			req: admission.Request{Graph: "graph", Organization: "other-org", Owner: "owner-a", Model: "m",
-				PromptBytes: 1, EstimatedInputTokens: 1, ReservedOutputTokens: 1,
-				OwnerLimits: admission.RateLimits{GeneratedTokens: ptr64(20)}},
+				PrefillTokens: 1, EstimatedInputTokens: 1, ReservedOutputTokens: 1,
+				OwnerLimits: admission.RateLimits{GeneratedTokens: testutil.Ptr[int64](20)}},
 			want: "contract_owner",
 		},
 	}
@@ -1763,15 +1872,15 @@ func TestAdmissionChargesUnknownUsageOnUpstreamReset(t *testing.T) {
 		{
 			name: "organization contract",
 			req: admission.Request{Graph: "graph", Organization: "org-a", Owner: "other-owner", Model: "m",
-				PromptBytes: 1, EstimatedInputTokens: 1, ReservedOutputTokens: 1,
-				OrganizationLimits: admission.RateLimits{GeneratedTokens: ptr64(20)}},
+				PrefillTokens: 1, EstimatedInputTokens: 1, ReservedOutputTokens: 1,
+				OrganizationLimits: admission.RateLimits{GeneratedTokens: testutil.Ptr[int64](20)}},
 			want: "contract_organization",
 		},
 		{
 			name: "owner contract",
 			req: admission.Request{Graph: "graph", Organization: "other-org", Owner: "owner-a", Model: "m",
-				PromptBytes: 1, EstimatedInputTokens: 1, ReservedOutputTokens: 1,
-				OwnerLimits: admission.RateLimits{GeneratedTokens: ptr64(20)}},
+				PrefillTokens: 1, EstimatedInputTokens: 1, ReservedOutputTokens: 1,
+				OwnerLimits: admission.RateLimits{GeneratedTokens: testutil.Ptr[int64](20)}},
 			want: "contract_owner",
 		},
 	}
@@ -1833,7 +1942,7 @@ func TestAdmissionChargesUnknownUsageOnUpstreamReset(t *testing.T) {
 	}
 	// Physical capacity itself is released; only the conservative contract
 	// charges are retained.
-	lease, err := a.Admit(context.Background(), admission.Request{Graph: "graph", Organization: "other", Model: "m", PromptBytes: 1, EstimatedInputTokens: 1, ReservedOutputTokens: 1})
+	lease, err := a.Admit(context.Background(), admission.Request{Graph: "graph", Organization: "other", Model: "m", PrefillTokens: 1, EstimatedInputTokens: 1, ReservedOutputTokens: 1})
 	if err != nil {
 		t.Fatalf("reset upstream leaked physical reservation: %v", err)
 	}
@@ -1918,15 +2027,15 @@ func TestAdmissionDialFailureChargesOnlyRequestsWindow(t *testing.T) {
 		{
 			name: "organization requests window",
 			req: admission.Request{Graph: "graph", Organization: "org-a", Owner: "other-owner", Model: "m",
-				PromptBytes: 1, EstimatedInputTokens: 1, ReservedOutputTokens: 1,
-				OrganizationLimits: admission.RateLimits{Requests: ptr64(1)}},
+				PrefillTokens: 1, EstimatedInputTokens: 1, ReservedOutputTokens: 1,
+				OrganizationLimits: admission.RateLimits{Requests: testutil.Ptr[int64](1)}},
 			want: "contract_organization",
 		},
 		{
 			name: "owner requests window",
 			req: admission.Request{Graph: "graph", Organization: "other-org", Owner: "owner-a", Model: "m",
-				PromptBytes: 1, EstimatedInputTokens: 1, ReservedOutputTokens: 1,
-				OwnerLimits: admission.RateLimits{Requests: ptr64(1)}},
+				PrefillTokens: 1, EstimatedInputTokens: 1, ReservedOutputTokens: 1,
+				OwnerLimits: admission.RateLimits{Requests: testutil.Ptr[int64](1)}},
 			want: "contract_owner",
 		},
 	}
@@ -1991,8 +2100,8 @@ func TestAdmissionDialFailureChargesOnlyRequestsWindow(t *testing.T) {
 	// contract. A phantom conservative charge would have filled the window and
 	// rejected this probe.
 	lease, err := a.Admit(context.Background(), admission.Request{Graph: "graph", Organization: "org-a", Owner: "other-owner", Model: "m",
-		PromptBytes: 1, EstimatedInputTokens: 7, ReservedOutputTokens: 20,
-		OrganizationLimits: admission.RateLimits{GeneratedTokens: ptr64(20), TotalPromptTokens: ptr64(7), UncachedPromptTokens: ptr64(7)}})
+		PrefillTokens: 1, EstimatedInputTokens: 7, ReservedOutputTokens: 20,
+		OrganizationLimits: admission.RateLimits{GeneratedTokens: testutil.Ptr[int64](20), TotalPromptTokens: testutil.Ptr[int64](7), UncachedPromptTokens: testutil.Ptr[int64](7)}})
 	if err != nil {
 		t.Fatalf("dial failure left a phantom prompt/generated charge: %v", err)
 	}
@@ -2227,11 +2336,11 @@ func TestSharedPolicyOverwritesClientPriorityWhenAdmissionDisabled(t *testing.T)
 }
 
 func TestAdmissionWorkRejectsAmbiguousOrImpossibleRequests(t *testing.T) {
-	if _, ok := admissionWork([]byte(`{"model":"m","max_tokens":2,"max_completion_tokens":3}`), 10); ok {
+	if _, ok := admissionWork([]byte(`{"model":"m","max_tokens":2,"max_completion_tokens":3}`), 10, "/v1/chat/completions"); ok {
 		t.Fatal("conflicting output limits accepted")
 	}
 	body := []byte(`{"model":"m"}`)
-	if estimate, ok := admissionWork(body, 10); !ok || estimate.Model != "m" || estimate.OutputTokens != 10 || estimate.InputTokens != int64((len(body)+3)/4) {
+	if estimate, ok := admissionWork(body, 10, "/v1/chat/completions"); !ok || estimate.Model != "m" || estimate.OutputTokens != 10 || estimate.InputTokens != 1 {
 		t.Fatalf("estimate=(%+v,%t)", estimate, ok)
 	}
 	for _, body := range []string{
@@ -2240,16 +2349,42 @@ func TestAdmissionWorkRejectsAmbiguousOrImpossibleRequests(t *testing.T) {
 		`{"model":"m","max_completion_tokens":200,"max_completion_tokens":2}`,
 		`{"model":"m","max_tokens":4294967296}`,
 	} {
-		if _, ok := admissionWork([]byte(body), 10); ok {
+		if _, ok := admissionWork([]byte(body), 10, "/v1/chat/completions"); ok {
 			t.Fatalf("ambiguous admission work accepted: %s", body)
 		}
+	}
+}
+
+// Admission must never estimate one prompt while the engine processes
+// another: a duplicate or case-variant key for any field admission reads is
+// refused (encoding/json matches keys case-insensitively and keeps the last
+// match; the engine frontend matches exactly).
+func TestAdmissionWorkRejectsCaseVariantAndDuplicateInterpretedKeys(t *testing.T) {
+	long := strings.Repeat("x", 4000)
+	for _, body := range []string{
+		`{"model":"m","messages":[{"role":"user","content":"` + long + `"}],"Messages":[]}`,
+		`{"model":"m","messages":[{"role":"user","content":"` + long + `"}],"messages":[]}`,
+		`{"model":"m","prompt":"` + long + `","Prompt":""}`,
+		`{"model":"m","input":"` + long + `","Input":""}`,
+		`{"model":"m","Model":"x"}`,
+		`{"model":"m","MAX_TOKENS":2}`,
+	} {
+		if _, ok := admissionWork([]byte(body), 10, "/v1/chat/completions"); ok {
+			t.Fatalf("ambiguous interpreted key accepted: %.80s", body)
+		}
+	}
+	// An ordinary body is unaffected and keeps its estimate.
+	body := []byte(`{"model":"m","max_tokens":5,"messages":[{"role":"user","content":"` + long + `"}],"Stream":true}`)
+	estimate, ok := admissionWork(body, 10, "/v1/chat/completions")
+	if !ok || estimate.Model != "m" || estimate.OutputTokens != 5 || estimate.InputTokens != estimatePromptTokens(body) || estimate.InputTokens != 1000 {
+		t.Fatalf("estimate=(%+v,%t), want model m, 5 output tokens, 1000 input tokens", estimate, ok)
 	}
 }
 
 func TestPrepareSharedDynamoRequestOverwritesUntrustedHints(t *testing.T) {
 	body := []byte(`{"model":"m","max_tokens":41,"stream":true,"stream_options":{"include_usage":false},"cache_salt":"attacker","nvext":{"cache_salt":"attacker","keep":"yes","backend_instance_id":99,"token_data":[1,2],"agent_hints":{"priority":2147483647,"strict_priority":4294967295,"osl":1,"speculative_prefill":true}}}`)
 	lane := config.AdmissionLane{DynamoPriority: 9, DynamoStrictPriority: 2}
-	out, tenant, err := prepareSharedDynamoRequest(body, "org-a", 41, lane)
+	out, tenant, err := prepareSharedDynamoRequest(body, "org-a", 41, false, lane)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -2283,7 +2418,7 @@ func TestPrepareSharedDynamoRequestOverwritesUntrustedHints(t *testing.T) {
 	if got.Nvext.Keep != "yes" || got.Nvext.BackendInstanceID != nil || got.Nvext.TokenData != nil || got.Nvext.Hints.SpeculativePrefill || !got.StreamOptions.IncludeUsage {
 		t.Fatalf("unrelated extensions or usage flag lost: %+v", got)
 	}
-	_, otherTenant, err := prepareSharedDynamoRequest(body, "org-b", 41, lane)
+	_, otherTenant, err := prepareSharedDynamoRequest(body, "org-b", 41, false, lane)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -2479,7 +2614,7 @@ func TestSampledErrorLogAdmissionReleaseSites(t *testing.T) {
 }
 
 // Real-path proof that the admission bypass site emits through the Server
-// sampler under the merged serveWithWake architecture. With the store dead
+// sampler while wake handling is enabled. With the store dead
 // from the start, every request's Admit fails with ErrUnavailable and the
 // request bypasses the whole gate (admitted == nil) — the wake path then runs
 // with no lease, so the cold-hold sites are never reached. 250 bypassed
@@ -2492,7 +2627,7 @@ func TestWakeColdHoldStoreOutageLogsSampled(t *testing.T) {
 	defer be.Close()
 	up, _ := url.Parse(be.URL)
 	cfg := proxyAdmissionConfig(1)
-	cfg.Platform.MaxColdHolds = ptr64(1)
+	cfg.Platform.MaxColdHolds = testutil.Ptr[int64](1)
 	// MaxRetries=-1: against a dead store every op otherwise pays go-redis's
 	// retry backoff (~85ms), which would stretch this 250-request test to
 	// minutes. The sampling behavior under test is unaffected.
@@ -2504,7 +2639,7 @@ func TestWakeColdHoldStoreOutageLogsSampled(t *testing.T) {
 	// request's Admit fails with ErrUnavailable and bypasses the gate.
 	lease, err := a.Admit(context.Background(), admission.Request{
 		Graph: "graph", Organization: "org-a", Model: "m",
-		PromptBytes: 1, EstimatedInputTokens: 1, ReservedOutputTokens: 1,
+		PrefillTokens: 1, EstimatedInputTokens: 1, ReservedOutputTokens: 1,
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -2518,7 +2653,7 @@ func TestWakeColdHoldStoreOutageLogsSampled(t *testing.T) {
 	logger := &logging.Logger{Error: log.New(&buf, "", 0), Warn: log.New(io.Discard, "", 0)}
 	s := New(&config.Settings{Admission: cfg}, logger, &recordingEmitter{}).
 		WithAdmitter(a).
-		WithWaker(&fakeWaker{}, time.Second, 3)
+		WithWaker(&fakeWaker{}, time.Second)
 
 	const requests = 250
 	for i := 0; i < requests; i++ {
@@ -2842,5 +2977,178 @@ func TestAdmissionRenewalFailureEmitsReconciliationRow(t *testing.T) {
 	if ev.Aborted || !ev.UsageFound || ev.StatusCode != http.StatusOK {
 		t.Fatalf("completion row = {Aborted:%v UsageFound:%v StatusCode:%d}, "+
 			"want {false true 200} (the engine's real usage, recorded by the normal path)", ev.Aborted, ev.UsageFound, ev.StatusCode)
+	}
+}
+
+// Q24/D60: an operator reserved-KV tier is a load limit, not one worker's
+// memory. A request above it with nothing in flight is admitted alone and the
+// engine answers 200; a request exactly at the tier is admitted too. The
+// control: an explicit zero cap stays a retryable 503 with Retry-After.
+func TestOperatorKVTierIsALoadLimit(t *testing.T) {
+	var upstreamHits atomic.Int32
+	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		upstreamHits.Add(1)
+		_, _ = w.Write([]byte(`{"model":"model-a","usage":{"prompt_tokens":1,"completion_tokens":1}}`))
+	}))
+	defer backend.Close()
+	up, _ := url.Parse(backend.URL)
+
+	_, body := sharedChatRequest(up, 4*50)
+	kvNeed := estimatePromptTokens(body) + 20 // sharedChatRequest declares max_tokens=20
+
+	serve := func(kvCap int64) *httptest.ResponseRecorder {
+		mr := miniredis.RunT(t)
+		cfg := proxyAdmissionConfig(2)
+		cfg.Platform.MaxReservedKVTokens = testutil.Ptr[int64](kvCap)
+		client := redis.NewClient(&redis.Options{Addr: mr.Addr()})
+		t.Cleanup(func() { _ = client.Close() })
+		s := New(&config.Settings{Admission: cfg}, logging.New(logging.ERROR), &recordingEmitter{}).
+			WithAdmitter(admission.New(client, cfg))
+		req, _ := sharedChatRequest(up, 4*50)
+		rr := httptest.NewRecorder()
+		s.Handler().ServeHTTP(rr, req)
+		return rr
+	}
+
+	// Q24: an operator KV tier is a graph-wide load limit, not one worker's
+	// memory, so a request over it with nothing in flight is admitted (only
+	// the published per-worker KV answers 413).
+	if rr := serve(kvNeed - 1); rr.Code != http.StatusOK || upstreamHits.Load() != 1 {
+		t.Fatalf("status=%d upstream=%d, want the lone over-tier request admitted", rr.Code, upstreamHits.Load())
+	}
+
+	if rr := serve(0); rr.Code != http.StatusServiceUnavailable || rr.Header().Get("Retry-After") == "" {
+		t.Fatalf("zero KV cap: status=%d retry-after=%q, want a retryable 503", rr.Code, rr.Header().Get("Retry-After"))
+	}
+	if rr := serve(kvNeed); rr.Code != http.StatusOK || upstreamHits.Load() != 2 {
+		t.Fatalf("KV need exactly at the cap: status=%d upstream=%d, want admitted", rr.Code, upstreamHits.Load())
+	}
+}
+
+// A KV 413 names only the terms of the reservation the client controls: an
+// undeclared max_tokens with one sequence and an embeddings request (no
+// client-declared output) blame the prompt alone; an undeclared max_tokens
+// whose n, best_of or batched prompts push the reservation over the cap
+// names the sequence count; a declared max_tokens names max_tokens, times the
+// sequences when there are several. No text mentions a field the client did
+// not send.
+func TestOversizeMessageForUndeclaredOutputDoesNotMentionMaxTokens(t *testing.T) {
+	s := New(&config.Settings{}, logging.New(logging.ERROR), &recordingEmitter{})
+	undeclared := outputShape{hasOutput: true, sequences: 1}
+	embeddings := outputShape{sequences: 1}
+	undeclaredN := outputShape{hasOutput: true, sequences: 16000}
+	declaredN := outputShape{hasOutput: true, declared: true, sequences: 4}
+	for _, c := range []struct {
+		name, scope string
+		out         outputShape
+		want        string
+		mustNot     []string
+	}{
+		{"undeclared", "graph_capacity", undeclared, "estimated prompt tokens exceed this model's KV-cache capacity", []string{"max_tokens", "sequence"}},
+		{"embeddings", "graph_capacity", embeddings, "estimated prompt tokens exceed this model's KV-cache capacity", []string{"max_tokens", "sequence"}},
+		{"undeclared_n_overflow", "graph_capacity", undeclaredN, "estimated prompt tokens plus one output token per requested sequence (n, best_of, or batched prompts) exceed this model's KV-cache capacity", []string{"max_tokens"}},
+		{"declared_n_overflow", "graph_capacity", declaredN, "estimated prompt tokens plus max_tokens times the number of output sequences (n, best_of, or batched prompts) exceed this model's KV-cache capacity", nil},
+		{"declared_single", "graph_capacity", declaredSingleOutput, "estimated prompt tokens plus max_tokens exceed this model's KV-cache capacity", []string{"sequence"}},
+	} {
+		rr := httptest.NewRecorder()
+		s.writeAdmissionErrorOutput(rr, "req-1", &admission.Rejected{Scope: c.scope, Dimension: "kv_exceeds_limit", Unsatisfiable: true}, c.out)
+		body := strings.TrimSpace(rr.Body.String())
+		if rr.Code != http.StatusRequestEntityTooLarge || rr.Header().Get("Retry-After") != "" {
+			t.Errorf("%s: status=%d retry-after=%q, want 413 without Retry-After", c.name, rr.Code, rr.Header().Get("Retry-After"))
+		}
+		if body != c.want {
+			t.Errorf("%s: body=%q, want %q", c.name, body, c.want)
+		}
+		for _, word := range c.mustNot {
+			if strings.Contains(body, word) {
+				t.Errorf("%s: body=%q mentions %q", c.name, body, word)
+			}
+		}
+	}
+}
+
+// Q24: a published prefill capacity is a load limit, so a request larger than
+// it is never answered 413. With the platform's only active slot taken, it is
+// refused as retryable capacity (503 + Retry-After).
+func TestOversizePrefillIsRetryableWhenEarlierScopeFull(t *testing.T) {
+	ctx := context.Background()
+	mr := miniredis.RunT(t)
+	client := redis.NewClient(&redis.Options{Addr: mr.Addr()})
+	t.Cleanup(func() { _ = client.Close() })
+	cfg := config.AdmissionSettings{Enabled: true, KeyPrefix: "proxy-oversize", LeaseTTL: time.Minute,
+		Platform: config.AdmissionLimits{MaxActiveRequests: testutil.Ptr[int64](1)}}
+	a := admission.New(client, cfg)
+	holder, err := a.Admit(ctx, admission.Request{Graph: "g", Organization: "o", Owner: "u", Model: "m",
+		PrefillTokens: 1, EstimatedInputTokens: 1, ReservedOutputTokens: 1})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = holder.Complete(ctx, 0) }()
+	_, err = a.Admit(ctx, admission.Request{Graph: "g", Organization: "o", Owner: "u", Model: "m",
+		PrefillTokens: 100, EstimatedInputTokens: 100, ReservedOutputTokens: 1,
+		GraphCapacity: config.AdmissionLimits{MaxPrefillTokens: testutil.Ptr[int64](64)}})
+	var rejected *admission.Rejected
+	if !errors.As(err, &rejected) || rejected.Unsatisfiable {
+		t.Fatalf("err=%v, want a retryable rejection", err)
+	}
+	s := New(&config.Settings{Admission: cfg}, logging.New(logging.ERROR), &recordingEmitter{}).WithAdmitter(a)
+	rr := httptest.NewRecorder()
+	s.writeAdmissionError(rr, "req-1", err)
+	if rr.Code != http.StatusServiceUnavailable || rr.Header().Get("Retry-After") == "" {
+		t.Fatalf("status=%d retry-after=%q, want 503 with Retry-After", rr.Code, rr.Header().Get("Retry-After"))
+	}
+}
+
+// R4 / D12 for the reserved-KV dimension: an explicit zero platform KV cap
+// is the retryable 503 with Retry-After, never the 413 kv_exceeds_limit
+// answer for a request too large to ever fit.
+func TestZeroPlatformKVCapIsRetryable503Not413(t *testing.T) {
+	var hits atomic.Int32
+	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) { hits.Add(1); w.WriteHeader(200) }))
+	defer backend.Close()
+	up, _ := url.Parse(backend.URL)
+	mr := miniredis.RunT(t)
+	cfg := proxyAdmissionConfig(2)
+	cfg.Platform.MaxReservedKVTokens = testutil.Ptr[int64](0)
+	c := redis.NewClient(&redis.Options{Addr: mr.Addr()})
+	t.Cleanup(func() { _ = c.Close() })
+	s := New(&config.Settings{Admission: cfg}, logging.New(logging.ERROR), &recordingEmitter{}).WithAdmitter(admission.New(c, cfg))
+	rr := httptest.NewRecorder()
+	s.Handler().ServeHTTP(rr, sharedRequest(up))
+	if rr.Code != http.StatusServiceUnavailable || rr.Header().Get("Retry-After") == "" {
+		t.Fatalf("status=%d retry-after=%q, want a retryable 503 at the zero KV cap", rr.Code, rr.Header().Get("Retry-After"))
+	}
+	if n := hits.Load(); n != 0 {
+		t.Fatalf("upstream hits=%d, a zero-capped request must not reach the engine", n)
+	}
+}
+
+// R10: an undeclared max_tokens is capped on the engine at the reservation
+// phoebe admitted against; a declared one is forwarded untouched.
+func TestPrepareSharedDynamoRequestCapsUndeclaredOutput(t *testing.T) {
+	out, _, err := prepareSharedDynamoRequest([]byte(`{"model":"m","messages":[]}`), "org-a", 37, true, config.AdmissionLane{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var got struct {
+		MaxTokens int64 `json:"max_tokens"`
+		Nvext     struct {
+			AgentHints struct {
+				OSL int64 `json:"osl"`
+			} `json:"agent_hints"`
+		} `json:"nvext"`
+	}
+	if err := json.Unmarshal(out, &got); err != nil {
+		t.Fatal(err)
+	}
+	if got.MaxTokens != 37 || got.Nvext.AgentHints.OSL != 37 {
+		t.Fatalf("max_tokens=%d osl=%d, want both 37", got.MaxTokens, got.Nvext.AgentHints.OSL)
+	}
+	out, _, err = prepareSharedDynamoRequest([]byte(`{"model":"m","max_tokens":500,"messages":[]}`), "org-a", 500, false, config.AdmissionLane{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := json.Unmarshal(out, &got); err != nil || got.MaxTokens != 500 {
+		t.Fatalf("declared max_tokens=%d err=%v, want 500 untouched", got.MaxTokens, err)
 	}
 }

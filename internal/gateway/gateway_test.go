@@ -10,7 +10,7 @@ import (
 	sqlmock "github.com/DATA-DOG/go-sqlmock"
 )
 
-var resolveCols = []string{"id", "base_model", "adapter", "serving_mode", "graph_k8s_name"}
+var resolveCols = []string{"id", "base_model", "adapter", "ready", "serving_mode", "graph_k8s_name"}
 
 // TestPGResolver_ResolvesBaseModelRow locks the happy path and the QUERY
 // CONTRACT: the lookup is keyed on org_id ($1, the tenancy boundary) and a
@@ -26,7 +26,7 @@ func TestPGResolver_ResolvesBaseModelRow(t *testing.T) {
 	mock.ExpectQuery(regexp.QuoteMeta(resolveQuery)).
 		WithArgs("org-1", "meta-llama/Llama-3.1-8B-Instruct").
 		WillReturnRows(sqlmock.NewRows(resolveCols).
-			AddRow("tfm-1", "meta-llama/Llama-3.1-8B-Instruct", "", "shared", "graph-llama31"))
+			AddRow("tfm-1", "meta-llama/Llama-3.1-8B-Instruct", "", true, "shared", "graph-llama31"))
 
 	r, err := NewPGResolver(db).Resolve(context.Background(), "org-1", "meta-llama/Llama-3.1-8B-Instruct")
 	if err != nil {
@@ -36,6 +36,7 @@ func TestPGResolver_ResolvesBaseModelRow(t *testing.T) {
 		ResourceID:   "tfm-1",
 		BaseModel:    "meta-llama/Llama-3.1-8B-Instruct",
 		Adapter:      "",
+		Ready:        true,
 		ServingMode:  "shared",
 		GraphK8sName: "graph-llama31",
 	}
@@ -59,7 +60,7 @@ func TestPGResolver_ResolvesFineTuneRow(t *testing.T) {
 	mock.ExpectQuery(regexp.QuoteMeta(resolveQuery)).
 		WithArgs("org-1", "support-bot").
 		WillReturnRows(sqlmock.NewRows(resolveCols).
-			AddRow("tfm-2", "meta-llama/Llama-3.1-8B-Instruct", "ckpt-42", "shared", "graph-llama31"))
+			AddRow("tfm-2", "meta-llama/Llama-3.1-8B-Instruct", "ckpt-42", true, "shared", "graph-llama31"))
 
 	r, err := NewPGResolver(db).Resolve(context.Background(), "org-1", "support-bot")
 	if err != nil {
@@ -101,7 +102,7 @@ func TestPGResolver_GraphlessRowIsNotFound(t *testing.T) {
 	mock.ExpectQuery(regexp.QuoteMeta(resolveQuery)).
 		WithArgs("org-1", "provisioning-bot").
 		WillReturnRows(sqlmock.NewRows(resolveCols).
-			AddRow("tfm-3", "meta-llama/Llama-3.1-8B-Instruct", "", "shared", ""))
+			AddRow("tfm-3", "meta-llama/Llama-3.1-8B-Instruct", "", true, "shared", ""))
 
 	if _, err := NewPGResolver(db).Resolve(context.Background(), "org-1", "provisioning-bot"); !errors.Is(err, ErrNotFound) {
 		t.Fatalf("err = %v, want ErrNotFound for graph-less row", err)
@@ -144,7 +145,7 @@ func TestPGResolver_InvalidServingMode(t *testing.T) {
 			mock.ExpectQuery(regexp.QuoteMeta(resolveQuery)).
 				WithArgs("org-1", "broken-model").
 				WillReturnRows(sqlmock.NewRows(resolveCols).
-					AddRow("tfm-9", "meta-llama/Llama-3.1-8B-Instruct", "", mode, "graph-llama31"))
+					AddRow("tfm-9", "meta-llama/Llama-3.1-8B-Instruct", "", true, mode, "graph-llama31"))
 
 			r, rerr := NewPGResolver(db).Resolve(context.Background(), "org-1", "broken-model")
 			if rerr == nil {
@@ -181,7 +182,7 @@ func TestPGResolver_ValidServingModes(t *testing.T) {
 			mock.ExpectQuery(regexp.QuoteMeta(resolveQuery)).
 				WithArgs("org-1", "m").
 				WillReturnRows(sqlmock.NewRows(resolveCols).
-					AddRow("tfm-1", "meta-llama/Llama-3.1-8B-Instruct", "", mode, "graph-llama31"))
+					AddRow("tfm-1", "meta-llama/Llama-3.1-8B-Instruct", "", true, mode, "graph-llama31"))
 
 			r, err := NewPGResolver(db).Resolve(context.Background(), "org-1", "m")
 			if err != nil {

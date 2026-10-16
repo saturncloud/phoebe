@@ -39,7 +39,9 @@ type cacheEntry struct {
 //   - HIT (positive): the cached Resolution, no inner call.
 //   - HIT (negative): ErrNotFound, no inner call — a burst of requests for an
 //     unknown model costs one DB query per negativeTTL, not one per request.
-//   - MISS: one inner call; the result (found or ErrNotFound) is cached.
+//   - MISS: one inner call; base-model results and ErrNotFound are cached.
+//     Adapter results are not cached because their readiness can change while
+//     the model identity remains stable.
 //   - Inner ERROR (DB down): returned to the caller and NEVER cached — the
 //     next request retries the DB immediately rather than pinning an outage
 //     for a TTL. The caller 503s per request; correctness never degrades to
@@ -95,7 +97,9 @@ func (c *Cache) Resolve(ctx context.Context, orgID, model string) (Resolution, e
 	res, err := c.inner.Resolve(ctx, orgID, model)
 	switch {
 	case err == nil:
-		c.store(k, cacheEntry{res: res, expires: now.Add(c.positiveTTL)})
+		if res.Adapter == "" {
+			c.store(k, cacheEntry{res: res, expires: now.Add(c.positiveTTL)})
+		}
 		return res, nil
 	case errors.Is(err, ErrNotFound):
 		c.store(k, cacheEntry{notFound: true, expires: now.Add(c.negativeTTL)})

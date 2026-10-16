@@ -7,28 +7,46 @@ import (
 
 func TestRewriteIncludeUsage(t *testing.T) {
 	tests := []struct {
-		name        string
-		body        string
-		wantChanged bool
-		wantInclude bool // expected stream_options.include_usage after rewrite
+		name           string
+		body           string
+		wantChanged    bool
+		wantInclude    bool // expected stream_options.include_usage after rewrite
+		wantContinuous bool // expected stream_options.continuous_usage_stats
 	}{
 		{
-			name:        "streaming, no stream_options -> injected",
-			body:        `{"model":"m","stream":true,"messages":[]}`,
-			wantChanged: true,
-			wantInclude: true,
+			name:           "streaming, no stream_options -> injected",
+			body:           `{"model":"m","stream":true,"messages":[]}`,
+			wantChanged:    true,
+			wantInclude:    true,
+			wantContinuous: true,
 		},
 		{
-			name:        "streaming, include_usage already true -> unchanged",
-			body:        `{"stream":true,"stream_options":{"include_usage":true}}`,
-			wantChanged: false,
-			wantInclude: true,
+			name:           "streaming, include_usage already true -> add continuous usage",
+			body:           `{"stream":true,"stream_options":{"include_usage":true}}`,
+			wantChanged:    true,
+			wantInclude:    true,
+			wantContinuous: true,
 		},
 		{
-			name:        "streaming, client set include_usage false -> overwritten to true",
-			body:        `{"stream":true,"stream_options":{"include_usage":false}}`,
-			wantChanged: true,
-			wantInclude: true,
+			name:           "streaming, client set include_usage false -> overwritten to true",
+			body:           `{"stream":true,"stream_options":{"include_usage":false}}`,
+			wantChanged:    true,
+			wantInclude:    true,
+			wantContinuous: true,
+		},
+		{
+			name:           "streaming, continuous usage false -> overwritten to true",
+			body:           `{"stream":true,"stream_options":{"include_usage":true,"continuous_usage_stats":false}}`,
+			wantChanged:    true,
+			wantInclude:    true,
+			wantContinuous: true,
+		},
+		{
+			name:           "streaming, both usage options true -> unchanged",
+			body:           `{"stream":true,"stream_options":{"include_usage":true,"continuous_usage_stats":true}}`,
+			wantChanged:    false,
+			wantInclude:    true,
+			wantContinuous: true,
 		},
 		{
 			name:        "non-streaming -> untouched",
@@ -46,10 +64,11 @@ func TestRewriteIncludeUsage(t *testing.T) {
 			wantChanged: false,
 		},
 		{
-			name:        "streaming with other stream_options preserved",
-			body:        `{"stream":true,"stream_options":{"continuous_usage_stats":true}}`,
-			wantChanged: true,
-			wantInclude: true,
+			name:           "streaming with other stream_options preserved",
+			body:           `{"stream":true,"stream_options":{"continuous_usage_stats":true}}`,
+			wantChanged:    true,
+			wantInclude:    true,
+			wantContinuous: true,
 		},
 	}
 
@@ -67,13 +86,17 @@ func TestRewriteIncludeUsage(t *testing.T) {
 				t.Fatalf("rewritten body not valid JSON: %v", err)
 			}
 			var opts struct {
-				IncludeUsage bool `json:"include_usage"`
+				IncludeUsage         bool `json:"include_usage"`
+				ContinuousUsageStats bool `json:"continuous_usage_stats"`
 			}
 			if err := json.Unmarshal(m["stream_options"], &opts); err != nil {
 				t.Fatalf("stream_options not an object: %v", err)
 			}
 			if opts.IncludeUsage != tt.wantInclude {
 				t.Fatalf("include_usage = %v, want %v", opts.IncludeUsage, tt.wantInclude)
+			}
+			if opts.ContinuousUsageStats != tt.wantContinuous {
+				t.Fatalf("continuous_usage_stats = %v, want %v", opts.ContinuousUsageStats, tt.wantContinuous)
 			}
 		})
 	}
@@ -92,7 +115,7 @@ func TestRewritePreservesOtherStreamOptions(t *testing.T) {
 		t.Fatal(err)
 	}
 	if !m.StreamOptions.ContinuousUsageStats {
-		t.Fatal("continuous_usage_stats was dropped during rewrite")
+		t.Fatal("continuous_usage_stats was not forced during rewrite")
 	}
 	if !m.StreamOptions.IncludeUsage {
 		t.Fatal("include_usage was not set")

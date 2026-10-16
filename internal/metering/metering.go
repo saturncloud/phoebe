@@ -7,6 +7,7 @@ import (
 	"context"
 	"encoding/json"
 	"strings"
+	"unicode/utf8"
 
 	"github.com/saturncloud/phoebe/internal/identity"
 	"github.com/saturncloud/phoebe/internal/logging"
@@ -35,6 +36,25 @@ func (u Usage) CachedTokens() int {
 		return 0
 	}
 	return u.PromptTokensDetails.CachedTokens
+}
+
+// MaxRegionChars is the longest Event.Region that can be stored, counted in
+// characters. It matches billing_event.region VARCHAR(64) and Atlas's
+// Cluster.region Unicode(64). The gateway (topology parse), the drainer
+// (nullRegion) and recovery (validateAndDedupe) all apply it through
+// StorableRegion.
+const MaxRegionChars = 64
+
+// StorableRegion reports whether billing_event.region can store region: it
+// must be valid UTF-8, contain no NUL byte (PostgreSQL text rejects it) and be
+// at most MaxRegionChars characters. "" is storable (it means no region).
+// Region is evidence, so every path that meets an unstorable region drops the
+// region and keeps the event and its topology revision: the gateway clears it
+// at topology parse, the drainer binds NULL, and recovery clears it with a
+// counted warning.
+func StorableRegion(region string) bool {
+	return utf8.ValidString(region) && !strings.ContainsRune(region, 0) &&
+		utf8.RuneCountInString(region) <= MaxRegionChars
 }
 
 // Event is one immutable, idempotent metering record per request. It is keyed
@@ -114,7 +134,8 @@ type Event struct {
 	// Sourced from gateway resolution (tf_model.graph_k8s_name) on the gateway
 	// path, and derived from the upstream host on the header path. Empty is valid
 	// and never withholds money — it only means the cost is not pool-attributable.
-	// EVIDENCE ONLY: never part of the billing grain (see migrations/0006).
+	// A rollup GRAIN key since migration 0009 (with TopologyRevision), so every
+	// rollup names one graph revision; empty is the "unknown" grain value.
 	GraphK8sName string `json:"graph_k8s_name,omitempty"`
 
 	// Token counts (the engine's own usage block; never re-tokenized).
@@ -123,13 +144,47 @@ type Event struct {
 	CompletionTokens int `json:"completion_tokens"`
 
 	FinishReason string `json:"finish_reason,omitempty"`
-	GPUType      string `json:"gpu_type,omitempty"` // for margin; echoed by router/engine
 	Aborted      bool   `json:"aborted,omitempty"`
 	// UsageFound distinguishes a legitimate zero-token engine usage block from a
 	// failed/aborted attempt for which no authoritative counts were available.
 	UsageFound bool `json:"usage_found"`
 	StatusCode int  `json:"status_code,omitempty"`
 	Streamed   bool `json:"streamed,omitempty"`
+
+	// Serving topology, region and serving time (owner ruling 2026-10-12:
+	// usage events record the serving topology by revision). All are
+	// PLATFORM-SET, never taken from the engine's response.
+	//
+	// Region, RequestStartedUnixMs and ServingDurationMs are carried evidence
+	// for margin analysis: they are not rollup keys and do not affect price
+	// (rated_usage copies region as an attribute of the revision).
+	//
+	// TopologyRevision is a rollup GRAIN key since migration 0009: rows with
+	// different revisions roll up separately, and the revision is part of the
+	// rated_usage id. Unknown is 0 (stored NULL). A known value must be within
+	// 1..2147483647 (math.MaxInt32): rated_usage_topology_revision_ck rejects a
+	// negative value and fails rating for the whole window, and the
+	// billing_event INTEGER column cannot hold a value above int32. The range is
+	// enforced at parse (gateway/topology.go rejects the entry), at drain
+	// (drain/store.go binds NULL) and at recovery (recovery.go rejects the row).
+	//
+	// TopologyRevision is the graph's tf_topology_revision number in Atlas,
+	// which holds each pool's role, instance type, GPU type and GPUs per
+	// replica; Region is the graph's cluster region. Both come from the
+	// graph's topology entry Atlas publishes (internal/gateway/topology.go),
+	// looked up by GraphK8sName. 0 / "" = no entry (stored NULL).
+	// A Region longer than MaxRegionChars, with a NUL byte, or not valid UTF-8
+	// cannot be stored (see StorableRegion): the gateway clears it at parse, the
+	// drainer binds NULL, and recovery clears it with a counted warning. The
+	// event and its revision are kept on every path.
+	TopologyRevision int    `json:"topology_revision,omitempty"`
+	Region           string `json:"region,omitempty"`
+	// RequestStartedUnixMs is when phoebe received the request; ServingDurationMs
+	// is the time from then until this attempt's outcome was recorded (the
+	// response finished, the client went away, or the attempt failed). Both
+	// from phoebe's clock. Wake holds and admission waits are included.
+	RequestStartedUnixMs int64 `json:"request_started_unix_ms,omitempty"`
+	ServingDurationMs    int64 `json:"serving_duration_ms,omitempty"`
 
 	// TimestampUnixMs is stamped by the emitter, not in the hot path here.
 	TimestampUnixMs int64 `json:"timestamp_unix_ms"`

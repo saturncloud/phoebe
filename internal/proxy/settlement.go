@@ -2,7 +2,9 @@ package proxy
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"net/http"
 
 	"github.com/saturncloud/phoebe/internal/admission"
 	"github.com/saturncloud/phoebe/internal/capture"
@@ -38,7 +40,8 @@ const (
 	settlementZeroPreWriteDial
 	// settlementZeroNeverServed: determinate never-served — the engine
 	// provably did no work for this request (the cold-hold capacity rejection,
-	// or the cold response served final after the wake gave up). Settles zero.
+	// the cold response served final after the wake gave up, or a forwarded
+	// body the gateway body ceiling cut short). Settles zero.
 	// The requests-window +1 charged at Admit time is KEPT: that window
 	// measures demand, not work.
 	settlementZeroNeverServed
@@ -48,9 +51,8 @@ const (
 // path) to its settlement kind. A captured usage block always settles actual;
 // without one the usage of a dispatched request is indeterminate (engine
 // 4xx/5xx, client abort, mid-stream fault) and settles conservative-unknown.
-// Determinate never-served outcomes (the cold-hold rejection, the final cold
-// response after the wake gave up) never reach this path: serveWithWake serves
-// them itself and settles them to zero directly.
+// The wake transport marks determinate never-served outcomes so its caller can
+// settle them to zero instead of using this classification.
 func classifyCaptureSettlement(res capture.Result) settlementKind {
 	if res.UsageFound {
 		return settlementActual
@@ -73,6 +75,19 @@ func classifyRoundTripSettlement(err error) settlementKind {
 	if isPreWriteDialFailure(err) {
 		// The request never left the process.
 		return settlementZeroPreWriteDial
+	}
+	if errors.Is(err, errRequestBufferFull) {
+		// The request-buffer budget cut the forwarded body short: the
+		// upstream only ever saw an incomplete request (D43). Defensive:
+		// unreachable today, because forceIncludeUsage buffers the whole
+		// budgeted body before the forward; it keeps a future streaming
+		// forward zero-settled.
+		return settlementZeroNeverServed
+	}
+	if tooLarge := (*http.MaxBytesError)(nil); errors.As(err, &tooLarge) {
+		// The body ceiling cut the forwarded body short, so the upstream only
+		// ever saw an incomplete request it cannot have run.
+		return settlementZeroNeverServed
 	}
 	// Any other transport fault is indeterminate: the upstream may have read
 	// the request and consumed engine work before failing.

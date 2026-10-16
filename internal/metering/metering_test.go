@@ -2,6 +2,7 @@ package metering
 
 import (
 	"encoding/json"
+	"strings"
 	"testing"
 )
 
@@ -109,5 +110,41 @@ func TestApplyAbsentServingModeDefault_OnlyAbsentKeyInAnyCasingBecomesDedicated(
 				t.Fatalf("serving_mode = %q, want %q", ev.ServingMode, tc.want)
 			}
 		})
+	}
+}
+
+// TestUnmarshalEvent_OldGPUTypeKeyIsIgnored: events spooled before 0008 still
+// carry gpu_type (always empty); they must decode, with the new serving fields
+// absent.
+func TestUnmarshalEvent_OldGPUTypeKeyIsIgnored(t *testing.T) {
+	ev, err := UnmarshalEvent([]byte(`{"request_id":"r","serving_mode":"shared","gpu_type":"","timestamp_unix_ms":1}`))
+	if err != nil {
+		t.Fatalf("UnmarshalEvent: %v", err)
+	}
+	if ev.RequestID != "r" || ev.TopologyRevision != 0 || ev.Region != "" || ev.RequestStartedUnixMs != 0 {
+		t.Fatalf("decoded %+v", ev)
+	}
+}
+
+// TestStorableRegionMatchesBillingEventColumn pins the one region test that the
+// gateway, the drainer and recovery share: billing_event.region is
+// VARCHAR(64), counted in characters, and PostgreSQL text cannot hold NUL.
+func TestStorableRegionMatchesBillingEventColumn(t *testing.T) {
+	cases := []struct {
+		name   string
+		region string
+		want   bool
+	}{
+		{"empty", "", true},
+		{"exactly max ASCII characters", strings.Repeat("a", MaxRegionChars), true},
+		{"exactly max multibyte characters", strings.Repeat("é", MaxRegionChars), true},
+		{"one over max", strings.Repeat("a", MaxRegionChars+1), false},
+		{"NUL byte", "eu\x00", false},
+		{"invalid UTF-8", "eu-\xff", false},
+	}
+	for _, tc := range cases {
+		if got := StorableRegion(tc.region); got != tc.want {
+			t.Errorf("%s: StorableRegion = %v, want %v", tc.name, got, tc.want)
+		}
 	}
 }

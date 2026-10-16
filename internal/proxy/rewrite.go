@@ -31,8 +31,7 @@ func captureRequestBody(r *http.Request, maxBodyBytes int) (body string, truncat
 	if r.Body == nil {
 		return "", false, 0, nil
 	}
-	raw, err := io.ReadAll(r.Body)
-	_ = r.Body.Close()
+	raw, err := readBody(r)
 	if err != nil {
 		return "", false, 0, err
 	}
@@ -44,16 +43,19 @@ func captureRequestBody(r *http.Request, maxBodyBytes int) (body string, truncat
 	return string(logCopy), truncated, len(raw), nil
 }
 
-// forceIncludeUsage rewrites a request body so that streamed responses carry a
-// usage block. vLLM only emits streaming usage when
-// request.stream_options.include_usage is true; without stream_options it
-// emits NONE, which would silently under-bill every streamed request.
+// forceIncludeUsage rewrites a request body so that streamed responses carry
+// cumulative usage on every chunk. vLLM only emits streaming usage when
+// request.stream_options.include_usage is true, and it waits until the final
+// chunk unless continuous_usage_stats is also true. A client can disconnect
+// before that final chunk, so both values are required to retain the latest
+// engine-reported counts for an aborted stream.
 //
-// We parse → set body["stream_options"]["include_usage"]=true → re-serialize,
+// We parse → set include_usage=true and continuous_usage_stats=true →
+// re-serialize,
 // rather than relying on duplicate-key last-writer-wins (vLLM parses via
 // Pydantic; duplicate-key resolution is not portable). Overwriting a client's
-// explicit include_usage:false is intentional and safe — it mirrors vLLM's own
-// --enable-force-include-usage server flag.
+// explicit false values is intentional: billing requires the engine's
+// cumulative counts even if the caller does not want usage fields.
 //
 // Non-streaming requests are left untouched: their responses always carry
 // usage. A body that isn't JSON, or has no token-bearing shape, is passed
@@ -66,8 +68,7 @@ func readAndRestoreBody(r *http.Request) ([]byte, error) {
 	if r.Body == nil {
 		return nil, nil
 	}
-	body, err := io.ReadAll(r.Body)
-	_ = r.Body.Close()
+	body, err := readBody(r)
 	if err != nil {
 		return nil, err
 	}
@@ -75,8 +76,48 @@ func readAndRestoreBody(r *http.Request) ([]byte, error) {
 	return body, nil
 }
 
+// bufferedBody is a request body phoebe has already read whole and restored.
+// It keeps the buffer so a later full read reuses it (bufferedBytes) instead
+// of copying it again: the request-buffer budget charges each received byte
+// once, so every extra copy is memory the budget does not see.
+//
+// replaceRequestBody installs it in place of whatever r.Body was, including
+// the request-buffer budget wrapper (budgetedBody), so it never sits inside
+// one. The bytes stay charged until the handler's deferred budgeted.release().
+type bufferedBody struct {
+	*bytes.Reader
+	buf []byte
+}
+
+func (*bufferedBody) Close() error { return nil }
+
+// bufferedBytes returns the buffer behind a restored, not yet read body. A
+// body something has partly read is a miss, so a caller never sees bytes the
+// reader already consumed. Callers must not modify the returned slice: it is
+// the same buffer the forwarded request and GetBody read.
+func bufferedBytes(r *http.Request) ([]byte, bool) {
+	buffered, ok := r.Body.(*bufferedBody)
+	if !ok || buffered.Len() != len(buffered.buf) {
+		return nil, false
+	}
+	return buffered.buf, true
+}
+
+// readBody reads the whole request body and closes it, reusing the buffer
+// of a body phoebe already restored. Only the first read off the wire
+// allocates a copy. Callers must not modify the returned slice: for a
+// restored body it is the same buffer the forwarded request and GetBody read.
+func readBody(r *http.Request) ([]byte, error) {
+	if buf, ok := bufferedBytes(r); ok {
+		return buf, nil
+	}
+	body, err := io.ReadAll(r.Body)
+	_ = r.Body.Close()
+	return body, err
+}
+
 func replaceRequestBody(r *http.Request, body []byte) {
-	r.Body = io.NopCloser(bytes.NewReader(body))
+	r.Body = &bufferedBody{Reader: bytes.NewReader(body), buf: body}
 	r.ContentLength = int64(len(body))
 	r.Header.Set("Content-Length", strconv.Itoa(len(body)))
 	r.GetBody = func() (io.ReadCloser, error) {
@@ -89,8 +130,7 @@ func forceIncludeUsage(r *http.Request) error {
 		return nil
 	}
 
-	body, err := io.ReadAll(r.Body)
-	_ = r.Body.Close()
+	body, err := readBody(r)
 	if err != nil {
 		return err
 	}
@@ -112,9 +152,40 @@ func forceIncludeUsage(r *http.Request) error {
 	return nil
 }
 
-// rewriteIncludeUsage returns the body with stream_options.include_usage forced
-// to true for streaming requests, and whether it changed anything. It is a pure
-// function for testability.
+type streamUsagePreference struct {
+	stream          bool
+	includeUsage    bool
+	continuousUsage bool
+}
+
+// clientRequestedStreamUsage reports the caller's original usage preferences
+// and restores the request body byte-for-byte. Phoebe may force both options
+// upstream for billing, but these values control what it exposes to the caller.
+func clientRequestedStreamUsage(r *http.Request) (streamUsagePreference, error) {
+	body, err := readAndRestoreBody(r)
+	if err != nil {
+		return streamUsagePreference{}, err
+	}
+	var request struct {
+		Stream        bool `json:"stream"`
+		StreamOptions struct {
+			IncludeUsage         bool `json:"include_usage"`
+			ContinuousUsageStats bool `json:"continuous_usage_stats"`
+		} `json:"stream_options"`
+	}
+	if json.Unmarshal(body, &request) != nil || !request.Stream {
+		return streamUsagePreference{}, nil
+	}
+	return streamUsagePreference{
+		stream:          true,
+		includeUsage:    request.StreamOptions.IncludeUsage,
+		continuousUsage: request.StreamOptions.IncludeUsage && request.StreamOptions.ContinuousUsageStats,
+	}, nil
+}
+
+// rewriteIncludeUsage returns the body with stream_options.include_usage and
+// stream_options.continuous_usage_stats forced to true for streaming requests,
+// and whether it changed anything. It is a pure function for testability.
 func rewriteIncludeUsage(body []byte) (out []byte, changed bool) {
 	var m map[string]json.RawMessage
 	if err := json.Unmarshal(body, &m); err != nil {
@@ -142,15 +213,20 @@ func rewriteIncludeUsage(body []byte) (out []byte, changed bool) {
 		}
 	}
 
-	// Already true? Then nothing to do.
+	includeUsage := false
 	if raw, ok := opts["include_usage"]; ok {
-		var v bool
-		if json.Unmarshal(raw, &v) == nil && v {
-			return body, false
-		}
+		_ = json.Unmarshal(raw, &includeUsage)
+	}
+	continuousUsage := false
+	if raw, ok := opts["continuous_usage_stats"]; ok {
+		_ = json.Unmarshal(raw, &continuousUsage)
+	}
+	if includeUsage && continuousUsage {
+		return body, false
 	}
 
 	opts["include_usage"] = json.RawMessage("true")
+	opts["continuous_usage_stats"] = json.RawMessage("true")
 	optsBytes, err := json.Marshal(opts)
 	if err != nil {
 		return body, false

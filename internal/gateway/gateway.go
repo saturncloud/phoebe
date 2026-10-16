@@ -56,6 +56,9 @@ type Resolution struct {
 	// endpoint), as X-Saturn-Adapter would carry. Its presence triggers the
 	// fine-tune premium at rating.
 	Adapter string
+	// Ready is Atlas's last observed DynamoModel readiness for an adapter.
+	// Base-model entries are always ready because they have no adapter load.
+	Ready bool
 	// ServingMode is the serving-mode SKU axis ("shared" | "dedicated"), as
 	// X-Saturn-Serving-Mode would carry.
 	ServingMode string
@@ -108,7 +111,9 @@ type Resolver interface {
 // this phoebe's gateway host lives in that namespace; a row whose graph lives
 // elsewhere fails at dial (502), never misroutes to a guessed namespace.
 const resolveQuery = `
-SELECT id, base_model, COALESCE(checkpoint_artifact_id, ''), serving_mode, COALESCE(graph_k8s_name, '')
+SELECT id, base_model, COALESCE(checkpoint_artifact_id, ''),
+       CASE WHEN checkpoint_artifact_id IS NULL THEN true ELSE adapter_ready END,
+       serving_mode, COALESCE(graph_k8s_name, '')
 FROM tf_model
 WHERE org_id = $1 AND served_model_name = $2
 ORDER BY created_at ASC, id ASC
@@ -142,7 +147,7 @@ func NewPGResolver(db *sql.DB) *PGResolver {
 func (p *PGResolver) Resolve(ctx context.Context, orgID, model string) (Resolution, error) {
 	var r Resolution
 	err := p.db.QueryRowContext(ctx, resolveQuery, orgID, model).Scan(
-		&r.ResourceID, &r.BaseModel, &r.Adapter, &r.ServingMode, &r.GraphK8sName,
+		&r.ResourceID, &r.BaseModel, &r.Adapter, &r.Ready, &r.ServingMode, &r.GraphK8sName,
 	)
 	switch {
 	case errors.Is(err, sql.ErrNoRows):

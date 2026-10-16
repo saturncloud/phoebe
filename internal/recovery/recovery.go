@@ -12,6 +12,7 @@ import (
 	"fmt"
 	"io"
 	"io/fs"
+	"math"
 	"os"
 	"path/filepath"
 	"sort"
@@ -31,6 +32,11 @@ type Evidence struct {
 	Events     []metering.Event
 	Records    int
 	Duplicates int
+	// RegionsDropped counts records whose region billing_event.region cannot
+	// store (metering.StorableRegion). Region is evidence, so recovery clears it
+	// and keeps the event and its topology revision, the same as the gateway
+	// and the drainer do. The command prints a warning when it is non-zero.
+	RegionsDropped int
 }
 
 // Digest returns a stable SHA-256 digest binding the COMPLETE validated,
@@ -270,6 +276,10 @@ func validateAndDedupe(events []metering.Event) (Evidence, error) {
 	result := Evidence{Records: len(events)}
 	seen := make(map[string]metering.Event, len(events))
 	for i, ev := range events {
+		if !metering.StorableRegion(ev.Region) {
+			ev.Region = ""
+			result.RegionsDropped++
+		}
 		if err := validate(ev); err != nil {
 			return Evidence{}, fmt.Errorf("record %d: %w", i+1, err)
 		}
@@ -305,7 +315,7 @@ func validate(ev metering.Event) error {
 		{"resource_type", ev.ResourceType, 64}, {"org_id", ev.OrgID, 64},
 		{"model", ev.Model, 255}, {"base_model", ev.BaseModel, 255},
 		{"adapter", ev.Adapter, 255}, {"serving_mode", ev.ServingMode, 32},
-		{"finish_reason", ev.FinishReason, 64}, {"gpu_type", ev.GPUType, 64},
+		{"finish_reason", ev.FinishReason, 64},
 	} {
 		if !utf8.ValidString(field.value) {
 			return fmt.Errorf("%s is not valid UTF-8", field.name)
@@ -334,6 +344,14 @@ func validate(ev metering.Event) error {
 	// here where the failure is still an operator-visible dry-run error.
 	if ev.StatusCode != 0 && (ev.StatusCode < 100 || ev.StatusCode > 599) {
 		return fmt.Errorf("status_code %d is outside the database range 100..599", ev.StatusCode)
+	}
+	// rated_usage_topology_revision_ck requires >= 0 and
+	// billing_event.topology_revision is INTEGER. Zero marshals as the
+	// omitted/NULL case; a negative or overflowing revision would replay into
+	// Valkey and only then be nulled by the drainer, so reject it here where it
+	// is still an operator-visible dry-run error.
+	if ev.TopologyRevision < 0 || ev.TopologyRevision > math.MaxInt32 {
+		return fmt.Errorf("topology_revision %d is outside the database range 0..2147483647", ev.TopologyRevision)
 	}
 	return nil
 }

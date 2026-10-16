@@ -49,12 +49,23 @@ type rollup struct {
 	ServingMode string `json:"serving_mode"`
 	OwnerType   string `json:"owner_type"`
 	OwnerID     string `json:"owner_id"`
-	// GraphK8sName is the serving graph (the cost centre) -- EVIDENCE, not grain.
-	// Carried so shared-mode cost stays attributable: there, many orgs ride one
-	// platform graph that has no database row, so resource_id cannot identify the
-	// hardware. omitempty because absence here is genuinely "unknown", not a
-	// distinct billing state, and it never affects the charge.
-	GraphK8sName          string `json:"graph_k8s_name,omitempty"`
+	// GraphK8sName and TopologyRevision are GRAIN columns since migration 0009
+	// (owner ruling 2026-10-12): every rollup belongs to exactly one serving graph
+	// revision, so the manager can report tokens per graph per hour for margin
+	// analysis. "" / 0 mean unknown (the request named no graph, or no topology
+	// was published) and are real grain values, so neither is omitempty.
+	GraphK8sName     string `json:"graph_k8s_name"`
+	TopologyRevision int    `json:"topology_revision"`
+	// Region is the serving cluster's region (a function of the revision, so not
+	// grain). "" when unknown. This version always sends the key so the wire
+	// shape is stable. The manager (ledger D3) treats the key as optional and
+	// reads an absent key as unknown (""), so older phoebe installs that do not
+	// send it keep working. Do not make it required on the manager side.
+	// topology_revision and request_count follow the same rule.
+	Region string `json:"region"`
+	// RequestCount is the number of rated requests in the rollup
+	// (rated_usage.event_count). Optional on the manager side (ledger D3).
+	RequestCount          int64  `json:"request_count"`
 	Cost                  string `json:"cost"`
 	AppliedPromptRate     string `json:"applied_prompt_rate"`
 	AppliedCachedRate     string `json:"applied_cached_rate"`
@@ -118,9 +129,11 @@ SELECT
     ru.serving_mode,
     ru.owner_type,
     ru.owner_id,
-    -- Evidence, nullable: NULL when no event named a graph, or when the rollup drew
-    -- from more than one (the rater nulls it rather than guessing).
+    -- Grain columns (0009): NOT NULL, '' / 0 = unknown.
     ru.graph_k8s_name,
+    ru.topology_revision,
+    ru.region,                       -- NULL when unknown
+    ru.event_count,
     ru.cost::text,
     ru.applied_prompt_rate::text,
     ru.applied_cached_rate::text,
@@ -155,10 +168,7 @@ func (p *pusher) buildSnapshot(ctx context.Context, windowStart time.Time) (snap
 	for rows.Next() {
 		var r rollup
 		var orgID sql.NullString
-		// Nullable evidence: a NULL graph is normal (no event named one, or the
-		// rollup spanned two and the rater refused to guess). It becomes "" and is
-		// omitted from the wire, which reads as "unknown" -- never withheld money.
-		var graphK8sName sql.NullString
+		var region sql.NullString
 		if err := rows.Scan(
 			&r.RatedUsageID,
 			&r.ResourceID,
@@ -167,7 +177,10 @@ func (p *pusher) buildSnapshot(ctx context.Context, windowStart time.Time) (snap
 			&r.ServingMode,
 			&r.OwnerType,
 			&r.OwnerID,
-			&graphK8sName,
+			&r.GraphK8sName,
+			&r.TopologyRevision,
+			&region,
+			&r.RequestCount,
 			&r.Cost,
 			&r.AppliedPromptRate,
 			&r.AppliedCachedRate,
@@ -192,10 +205,7 @@ func (p *pusher) buildSnapshot(ctx context.Context, windowStart time.Time) (snap
 			continue
 		}
 		r.OrgID = orgID.String
-		// A NULL graph becomes "" and is then omitted from the wire (omitempty), which
-		// the manager reads as "unknown". Evidence only: it never gates the push, so a
-		// rollup with no resolvable graph still bills normally.
-		r.GraphK8sName = graphK8sName.String
+		r.Region = region.String
 		// rev: phoebe's rated_usage carries no re-rate counter yet; the manager's
 		// idempotency is driven by the (rated_usage_id, emitted_cost) delta, not rev, so
 		// 0 is correct here. A real rev counter is a follow-up phoebe schema change.

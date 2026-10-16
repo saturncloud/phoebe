@@ -43,6 +43,23 @@ type Config struct {
 	// returning empty (so the loop can check for shutdown / run reclaim).
 	BlockTimeout time.Duration
 
+	// RequiredSchemaVersion is the database schema version (golang-migrate)
+	// this binary writes; the drainer consumes nothing until the database has
+	// reached it, so an upgrade never writes new columns into an old table.
+	// A dirty schema_migrations row blocks only at or below this version: a
+	// dirty row above it means a LATER migration failed and every version
+	// this binary needs is fully applied (see schemaReady).
+	// main sets it from migrations.LatestVersion() and exits if that fails, so
+	// main never sets 0. 0 disables the gate and is for tests only; the
+	// drainer logs a warning when it runs with the gate disabled.
+	RequiredSchemaVersion uint
+
+	// SchemaWaitTimeout bounds how long the drainer waits for
+	// RequiredSchemaVersion before Run returns an error (the process exits
+	// non-zero and the pod restarts visibly). The wait cannot be unbounded:
+	// the emitter caps the stream, so a silent stall trims un-drained events.
+	SchemaWaitTimeout time.Duration
+
 	// --- Pending-entry reclaim (dead-consumer recovery) ---
 
 	// ClaimMinIdle is the minimum time an entry must sit unacknowledged in
@@ -81,5 +98,7 @@ func DefaultConfig() Config {
 		MaxOpenConns:    90,
 		MaxIdleConns:    20,
 		ConnMaxLifetime: 30 * time.Minute,
+
+		SchemaWaitTimeout: 10 * time.Minute,
 	}
 }

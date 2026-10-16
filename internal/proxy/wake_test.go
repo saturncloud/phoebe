@@ -1,6 +1,7 @@
 package proxy
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -15,10 +16,6 @@ import (
 	"testing"
 	"time"
 
-	"github.com/alicebob/miniredis/v2"
-	"github.com/redis/go-redis/v9"
-
-	"github.com/saturncloud/phoebe/internal/admission"
 	"github.com/saturncloud/phoebe/internal/config"
 	"github.com/saturncloud/phoebe/internal/identity"
 	"github.com/saturncloud/phoebe/internal/logging"
@@ -85,7 +82,13 @@ func TestIsWakeable(t *testing.T) {
 		t.Fatal("empty serving mode is invalid and must NOT be wakeable")
 	}
 	if isWakeable(identity.Identity{ResourceID: "r1", ServedModel: "m", ServingMode: "dedicated"}) {
-		t.Fatal("dedicated route must NOT be wakeable")
+		t.Fatal("dedicated route without a disaggregated profile must NOT be wakeable")
+	}
+	if isWakeable(identity.Identity{ResourceID: "r1", ServedModel: "m", ServingMode: "dedicated", ServingProfile: "aggregated"}) {
+		t.Fatal("aggregated dedicated route must NOT be wakeable")
+	}
+	if !isWakeable(identity.Identity{ResourceID: "r1", ServedModel: "m", ServingMode: "dedicated", ServingProfile: "disaggregated"}) {
+		t.Fatal("disaggregated dedicated route with an authorized resource must be wakeable")
 	}
 }
 
@@ -94,13 +97,135 @@ type fakeWaker struct {
 	err     error
 	warmsAt int32 // after this many wake calls, the upstream goes warm
 	backend *coldToWarmBackend
+	onWake  func()
 
 	mu         sync.Mutex
 	lastTarget WakeTarget
 }
 
+type unsupportedWaker struct {
+	fakeWaker
+}
+
+func (*unsupportedWaker) SupportsWake(WakeTarget) bool { return false }
+
+type roundTripFunc func(*http.Request) (*http.Response, error)
+
+func (f roundTripFunc) RoundTrip(req *http.Request) (*http.Response, error) {
+	return f(req)
+}
+
+type readTrackingBody struct {
+	reads atomic.Int32
+}
+
+func (b *readTrackingBody) Read([]byte) (int, error) {
+	b.reads.Add(1)
+	return 0, io.EOF
+}
+
+func (*readTrackingBody) Close() error { return nil }
+
+type countingReadCloser struct {
+	reader *strings.Reader
+	bytes  atomic.Int64
+	closed atomic.Bool
+}
+
+func (b *countingReadCloser) Read(p []byte) (int, error) {
+	n, err := b.reader.Read(p)
+	b.bytes.Add(int64(n))
+	return n, err
+}
+
+func (b *countingReadCloser) Close() error {
+	b.closed.Store(true)
+	return nil
+}
+
+type bytesAndErrorBody struct {
+	body   []byte
+	err    error
+	offset int
+	done   bool
+	closed atomic.Bool
+}
+
+type closeUnblocksBody struct {
+	prefix []byte
+	sent   bool
+	closed chan struct{}
+	once   sync.Once
+}
+
+type delayedChunksBody struct {
+	chunks  [][]byte
+	release <-chan struct{}
+	chunk   int
+	offset  int
+	waited  bool
+	closed  atomic.Bool
+}
+
+func (b *delayedChunksBody) Read(p []byte) (int, error) {
+	if b.chunk >= len(b.chunks) {
+		return 0, io.EOF
+	}
+	if b.chunk == 1 && !b.waited {
+		<-b.release
+		b.waited = true
+	}
+	n := copy(p, b.chunks[b.chunk][b.offset:])
+	b.offset += n
+	if b.offset == len(b.chunks[b.chunk]) {
+		b.chunk++
+		b.offset = 0
+	}
+	return n, nil
+}
+
+func (b *delayedChunksBody) Close() error {
+	b.closed.Store(true)
+	return nil
+}
+
+func (b *closeUnblocksBody) Read(p []byte) (int, error) {
+	if !b.sent {
+		b.sent = true
+		return copy(p, b.prefix), nil
+	}
+	<-b.closed
+	return 0, errors.New("body closed")
+}
+
+func (b *closeUnblocksBody) Close() error {
+	b.once.Do(func() { close(b.closed) })
+	return nil
+}
+
+func (b *bytesAndErrorBody) Read(p []byte) (int, error) {
+	if b.done {
+		return 0, io.EOF
+	}
+	n := copy(p, b.body[b.offset:])
+	b.offset += n
+	if b.offset == len(b.body) {
+		b.done = true
+		return n, b.err
+	}
+	return n, nil
+}
+
+func (b *bytesAndErrorBody) Close() error {
+	b.closed.Store(true)
+	return nil
+}
+
 func (f *fakeWaker) Wake(_ context.Context, target WakeTarget) error {
 	n := atomic.AddInt32(&f.calls, 1)
+	if f.onWake != nil {
+		f.onWake()
+	}
 	f.mu.Lock()
 	f.lastTarget = target
 	f.mu.Unlock()
@@ -147,392 +272,12 @@ func (c *coldToWarmBackend) ServeHTTP(w http.ResponseWriter, _ *http.Request) {
 // ABOVE vLLM's measured ~2.5min cold reload (a smaller default made every real
 // wake time out and serve the cold response after holding the client anyway).
 func TestWithWakerDefaults(t *testing.T) {
-	s := New(&config.Settings{}, logging.New(logging.ERROR), nil).WithWaker(&fakeWaker{}, 0, 0)
+	s := New(&config.Settings{}, logging.New(logging.ERROR), nil).WithWaker(&fakeWaker{}, 0)
 	if s.wakeTimeout != 300*time.Second {
 		t.Fatalf("default wakeTimeout = %v, want 300s (must exceed the real cold start)", s.wakeTimeout)
 	}
-	if s.wakeMaxTries != 3 {
-		t.Fatalf("default wakeMaxTries = %d, want 3", s.wakeMaxTries)
-	}
 }
 
-func testServerWithWaker(waker Waker) *Server {
-	// A non-nil emitter is required: the served=true wake exits record a raw
-	// reconciliation row, and these legacy tests exercise exactly those exits.
-	s := New(&config.Settings{}, logging.New(logging.ERROR), &recordingEmitter{})
-	return s.WithWaker(waker, 5*time.Second, 3)
-}
-
-func TestServeWithWake_ColdThenWarm(t *testing.T) {
-	backend := &coldToWarmBackend{}
-	be := httptest.NewServer(backend)
-	defer be.Close()
-	up, _ := url.Parse(be.URL)
-
-	waker := &fakeWaker{warmsAt: 1, backend: backend}
-	s := testServerWithWaker(waker)
-
-	req := httptest.NewRequest("POST", "http://x/v1/chat/completions", strings.NewReader(`{"model":"m"}`))
-	id := identity.Identity{ResourceID: "r1", ServedModel: "m"}
-	rec := httptest.NewRecorder()
-
-	served := s.serveWithWake(rec, req, up, id, "req-1", "client-req-1", nil)
-	// Cold-then-warm: serveWithWake wakes, sees warm on re-probe, returns false
-	// (caller does the real forward). Waker called exactly once.
-	if served {
-		t.Fatalf("expected served=false (warm -> caller forwards), got true")
-	}
-	if got := atomic.LoadInt32(&waker.calls); got != 1 {
-		t.Fatalf("waker called %d times, want 1", got)
-	}
-	if backend.requests.Load() != 2 || backend.successes.Load() != 1 {
-		t.Fatalf("backend requests=%d successes=%d, want one cold probe plus one warm re-probe",
-			backend.requests.Load(), backend.successes.Load())
-	}
-}
-
-// errScaleForbidden stands in for a wake failure that never started a
-// scale-up (an RBAC or API error on the DGDSA patch, a missing adapter).
-var errScaleForbidden = errors.New("waker: scale DGDSA tf-shared/g-worker to 1: forbidden")
-
-// TestServeWithWake_HeldColdOutcomes pins what a client receives after its
-// cold request was held for a wake (QA 2026-10-10, uk2: a cold node needed
-// ~6.5 min, the 300 s hold expired, and the client got the cold 404 with no
-// Retry-After — read as "model not found" and never retried).
-func TestServeWithWake_HeldColdOutcomes(t *testing.T) {
-	notReady := fmt.Errorf("waker: upstream h not ready before deadline: %w: %w",
-		ErrWakeNotReady, context.DeadlineExceeded)
-	cases := []struct {
-		name string
-		// waker setup
-		wakeErr  error
-		warmsAt  int32 // 0 = never warms
-		maxTries int
-		// expectations
-		wantServed     bool
-		wantStatus     int
-		wantRetryAfter string
-		wantStarting   bool // JSON "model is starting" body
-		wantColdBody   bool // upstream cold body passed through
-	}{
-		{
-			name:    "wake timed out after scale-up -> 503 + Retry-After, not the cold 404",
-			wakeErr: notReady, maxTries: 3,
-			wantServed: true, wantStatus: http.StatusServiceUnavailable,
-			wantRetryAfter: "30", wantStarting: true,
-		},
-		{
-			name:    "wake ran out of retries but stayed cold -> 503 + Retry-After",
-			warmsAt: 99, maxTries: 2,
-			wantServed: true, wantStatus: http.StatusServiceUnavailable,
-			wantRetryAfter: "30", wantStarting: true,
-		},
-		{
-			name:    "wake failed without starting a scale-up -> cold 404 passed through",
-			wakeErr: errScaleForbidden, maxTries: 3,
-			wantServed: true, wantStatus: http.StatusNotFound, wantColdBody: true,
-		},
-		{
-			name:    "bare deadline error from a waker that never said it scaled -> cold 404 passed through",
-			wakeErr: context.DeadlineExceeded, maxTries: 3,
-			wantServed: true, wantStatus: http.StatusNotFound, wantColdBody: true,
-		},
-		{
-			name:    "wake completes -> caller forwards normally",
-			warmsAt: 1, maxTries: 3,
-			wantServed: false,
-		},
-	}
-	for _, tc := range cases {
-		t.Run(tc.name, func(t *testing.T) {
-			backend := &coldToWarmBackend{}
-			be := httptest.NewServer(backend)
-			defer be.Close()
-			up, _ := url.Parse(be.URL)
-
-			waker := &fakeWaker{err: tc.wakeErr}
-			if tc.warmsAt > 0 {
-				waker.warmsAt, waker.backend = tc.warmsAt, backend
-			}
-			em := &recordingEmitter{}
-			s := New(&config.Settings{}, logging.New(logging.ERROR), em).
-				WithWaker(waker, 5*time.Second, tc.maxTries)
-
-			req := httptest.NewRequest("POST", "http://x/v1/chat/completions", strings.NewReader(`{"model":"m"}`))
-			id := identity.Identity{ResourceID: "r1", ServedModel: "m", ServingMode: "shared"}
-			rec := httptest.NewRecorder()
-
-			served := s.serveWithWake(rec, req, up, id, "req-1", "client-req-1", nil)
-			if served != tc.wantServed {
-				t.Fatalf("served = %v, want %v", served, tc.wantServed)
-			}
-			if !tc.wantServed {
-				if n := len(em.all()); n != 0 {
-					t.Fatalf("wake path emitted %d rows, want 0 (the caller's forward meters it)", n)
-				}
-				return
-			}
-			if rec.Code != tc.wantStatus {
-				t.Fatalf("status = %d, want %d", rec.Code, tc.wantStatus)
-			}
-			if got := rec.Header().Get("Retry-After"); got != tc.wantRetryAfter {
-				t.Fatalf("Retry-After = %q, want %q", got, tc.wantRetryAfter)
-			}
-			if got := rec.Header().Get(requestIDHeader); got != "req-1" {
-				t.Fatalf("X-Request-Id = %q, want the minted attempt id", got)
-			}
-			if tc.wantStarting {
-				if ct := rec.Header().Get("Content-Type"); ct != "application/json" {
-					t.Fatalf("Content-Type = %q, want application/json", ct)
-				}
-				var body map[string]string
-				if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil {
-					t.Fatalf("503 body is not JSON: %q (%v)", rec.Body.String(), err)
-				}
-				if want := "The model is starting from zero; retry in about 30 seconds."; body["error"] != want {
-					t.Fatalf("503 body error = %q, want %q", body["error"], want)
-				}
-				if strings.Contains(rec.Body.String(), "Model not found") {
-					t.Fatalf("503 body leaked the upstream cold body: %q", rec.Body.String())
-				}
-			}
-			if tc.wantColdBody && !strings.Contains(rec.Body.String(), "Model not found") {
-				t.Fatalf("body = %q, want the upstream cold body passed through", rec.Body.String())
-			}
-			events := em.waitForEvents(1, 2*time.Second)
-			if len(events) != 1 {
-				t.Fatalf("emitted %d rows, want exactly 1 raw reconciliation row: %+v", len(events), events)
-			}
-			if ev := events[0]; ev.Aborted || ev.UsageFound || ev.StatusCode != tc.wantStatus {
-				t.Fatalf("row = {Aborted:%v UsageFound:%v StatusCode:%d}, want {false false %d}",
-					ev.Aborted, ev.UsageFound, ev.StatusCode, tc.wantStatus)
-			}
-		})
-	}
-}
-
-// TestNonWakeableColdPassesThrough pins that the 503 rewrite is confined to
-// held wakeable requests: a cold 404 on a route that is not wakeable (a
-// dedicated route, or a shared route with no waker configured) reaches the
-// client unchanged, and the waker is never called.
-func TestNonWakeableColdPassesThrough(t *testing.T) {
-	cases := []struct {
-		name        string
-		servingMode string
-		withWaker   bool
-	}{
-		{"dedicated route with a waker configured", identity.ServingModeDedicated, true},
-		{"shared route with no waker configured", identity.ServingModeShared, false},
-	}
-	for _, tc := range cases {
-		t.Run(tc.name, func(t *testing.T) {
-			backend := &coldToWarmBackend{} // stays cold
-			be := httptest.NewServer(backend)
-			defer be.Close()
-			up, _ := url.Parse(be.URL)
-
-			waker := &fakeWaker{err: fmt.Errorf("x: %w", ErrWakeNotReady)}
-			s := New(&config.Settings{}, logging.New(logging.ERROR), &recordingEmitter{})
-			if tc.withWaker {
-				s = s.WithWaker(waker, 5*time.Second, 3)
-			}
-
-			rr := httptest.NewRecorder()
-			req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions",
-				strings.NewReader(`{"model":"m","messages":[]}`))
-			setUpstream(req, up)
-			req.Header.Set(identity.HeaderAuthID, "auth-1")
-			req.Header.Set(identity.HeaderResourceID, "r1")
-			req.Header.Set(identity.HeaderServedModel, "m")
-			req.Header.Set(identity.HeaderServingMode, tc.servingMode)
-			s.Handler().ServeHTTP(rr, req)
-
-			if rr.Code != http.StatusNotFound {
-				t.Fatalf("status = %d, want the cold 404 passed through", rr.Code)
-			}
-			if got := rr.Header().Get("Retry-After"); got != "" {
-				t.Fatalf("Retry-After = %q on a non-wakeable cold 404, want none", got)
-			}
-			if !strings.Contains(rr.Body.String(), "Model not found") {
-				t.Fatalf("body = %q, want the upstream cold body unchanged", rr.Body.String())
-			}
-			if got := atomic.LoadInt32(&waker.calls); got != 0 {
-				t.Fatalf("waker called %d times on a non-wakeable route", got)
-			}
-		})
-	}
-}
-
-func TestServeWithWake_WarmRequestNotServed(t *testing.T) {
-	backend := &coldToWarmBackend{}
-	backend.warm.Store(true)
-	be := httptest.NewServer(backend)
-	defer be.Close()
-	up, _ := url.Parse(be.URL)
-
-	waker := &fakeWaker{}
-	s := testServerWithWaker(waker)
-
-	req := httptest.NewRequest("POST", "http://x/v1/chat/completions", strings.NewReader(`{"model":"m"}`))
-	id := identity.Identity{ResourceID: "r1", ServedModel: "m"}
-	rec := httptest.NewRecorder()
-
-	served := s.serveWithWake(rec, req, up, id, "req-1", "client-req-1", nil)
-	if served {
-		t.Fatal("warm request must not be served by serveWithWake (caller forwards)")
-	}
-	if backend.requests.Load() != 1 || backend.successes.Load() != 1 {
-		t.Fatalf("backend requests=%d successes=%d, want exactly one probe", backend.requests.Load(), backend.successes.Load())
-	}
-	if waker.calls != 0 {
-		t.Fatalf("waker called %d times for warm request", waker.calls)
-	}
-	// The caller re-forwards the request, so the body must be restored: the
-	// probe consumed it, and serveWithWake returns with it readable.
-	body, err := io.ReadAll(req.Body)
-	if err != nil || string(body) != `{"model":"m"}` {
-		t.Fatalf("request body not restored for the metered forward: %q, %v", body, err)
-	}
-}
-
-func TestWakeErrorColdEmitsReconciliationRow(t *testing.T) {
-	backend := &coldToWarmBackend{} // stays cold
-	be := httptest.NewServer(backend)
-	defer be.Close()
-	up, _ := url.Parse(be.URL)
-
-	em := &recordingEmitter{}
-	s := New(&config.Settings{}, logging.New(logging.ERROR), em).
-		WithWaker(&fakeWaker{err: errScaleForbidden}, 5*time.Second, 3)
-
-	req := httptest.NewRequest("POST", "http://x/v1/chat/completions", strings.NewReader(`{"model":"m"}`))
-	id := identity.Identity{ResourceID: "r1", ServedModel: "m"}
-	rec := httptest.NewRecorder()
-
-	served := s.serveWithWake(rec, req, up, id, "req-1", "client-req-1", nil)
-	if !served {
-		t.Fatal("wake error should serve the cold response (served=true)")
-	}
-	if rec.Code != http.StatusNotFound {
-		t.Fatalf("client got %d, want the cold 404 (no scale-up started, so no 503)", rec.Code)
-	}
-	events := em.waitForEvents(1, 2*time.Second)
-	if len(events) != 1 {
-		t.Fatalf("wake failure emitted %d billing events, want exactly 1 raw reconciliation row: %+v",
-			len(events), events)
-	}
-	ev := events[0]
-	if ev.Aborted || ev.UsageFound || ev.StatusCode != http.StatusNotFound {
-		t.Fatalf("wake-failure row = {Aborted:%v UsageFound:%v StatusCode:%d}, "+
-			"want {false false 404} (visible to reconciliation, charges $0)", ev.Aborted, ev.UsageFound, ev.StatusCode)
-	}
-	if ev.RequestID != "req-1" || ev.ResourceID != "r1" {
-		t.Fatalf("wake-failure row attribution = {RequestID:%q ResourceID:%q}, want {req-1 r1}",
-			ev.RequestID, ev.ResourceID)
-	}
-	if got := rec.Header().Get(requestIDHeader); got != "req-1" {
-		t.Fatalf("wake-failure response X-Request-Id = %q, want the minted attempt id (client correlation handle)", got)
-	}
-}
-
-func TestWakeExhaustedWarmFinalProbeEmitsReconciliationRow(t *testing.T) {
-	backend := &coldToWarmBackend{}
-	be := httptest.NewServer(backend)
-	defer be.Close()
-	up, _ := url.Parse(be.URL)
-
-	// warmsAt=1: the single in-loop wake succeeds and flips the backend warm;
-	// maxTries=1 ends the loop there, so the post-loop final probe sees the 200.
-	em := &recordingEmitter{}
-	s := New(&config.Settings{}, logging.New(logging.ERROR), em).
-		WithWaker(&fakeWaker{warmsAt: 1, backend: backend}, 5*time.Second, 1)
-
-	req := httptest.NewRequest("POST", "http://x/v1/chat/completions", strings.NewReader(`{"model":"m"}`))
-	id := identity.Identity{ResourceID: "r1", ServedModel: "m"}
-	rec := httptest.NewRecorder()
-
-	// Merged #50×#51 contract (decc49b): a tries-exhausted final probe that is
-	// NOT cold must NOT be served from the buffer. Serving it here would hand
-	// the client a real response that the wake path never meters (a billing
-	// hole) — or, for a non-cold error, an unclassified 502 settled
-	// never-served zero. serveWithWake returns false so the caller's normal
-	// metered forward owns the response, the metering row, and the settlement.
-	served := s.serveWithWake(rec, req, up, id, "req-1", "client-req-1", nil)
-	if served {
-		t.Fatal("warm final probe must not be served by serveWithWake (caller forwards and meters)")
-	}
-	if n := len(em.all()); n != 0 {
-		t.Fatalf("warm final probe emitted %d rows from the wake path, want 0 — the caller's metered forward owns the row", n)
-	}
-	body, err := io.ReadAll(req.Body)
-	if err != nil || string(body) != `{"model":"m"}` {
-		t.Fatalf("request body not restored for the metered forward: %q, %v", body, err)
-	}
-}
-func TestWakeColdHoldRejectionEmitsReconciliationRow(t *testing.T) {
-	backend := &coldToWarmBackend{} // stays cold
-	be := httptest.NewServer(backend)
-	defer be.Close()
-	up, _ := url.Parse(be.URL)
-
-	mr := miniredis.RunT(t)
-	cfg := proxyAdmissionConfig(10)
-	cfg.Platform.MaxColdHolds = ptr64(1)
-	c := redis.NewClient(&redis.Options{Addr: mr.Addr()})
-	t.Cleanup(func() { _ = c.Close() })
-	admitter := admission.New(c, cfg)
-
-	// Positive work estimate: #51's admission API validates the request's work
-	// estimate against the configured floors.
-	holdReq := admission.Request{Graph: "g1", Organization: "org-a", Model: "m", PromptBytes: 1, EstimatedInputTokens: 1, ReservedOutputTokens: 1}
-	holder, err := admitter.Admit(context.Background(), holdReq)
-	if err != nil {
-		t.Fatalf("holder admit: %v", err)
-	}
-	t.Cleanup(func() { _ = holder.Complete(context.Background(), 0) })
-	// Consume the single platform cold hold so the request under test is rejected.
-	if err := holder.BeginColdHold(context.Background()); err != nil {
-		t.Fatalf("holder begin cold hold: %v", err)
-	}
-	lease, err := admitter.Admit(context.Background(), holdReq)
-	if err != nil {
-		t.Fatalf("request admit: %v", err)
-	}
-	t.Cleanup(func() { _ = lease.Complete(context.Background(), 0) })
-
-	em := &recordingEmitter{}
-	s := New(&config.Settings{Admission: cfg}, logging.New(logging.ERROR), em).
-		WithWaker(&fakeWaker{}, 5*time.Second, 3)
-
-	req := httptest.NewRequest("POST", "http://x/v1/chat/completions", strings.NewReader(`{"model":"m"}`))
-	id := identity.Identity{ResourceID: "r1", ServedModel: "m", ServingMode: "shared"}
-	rec := httptest.NewRecorder()
-
-	served := s.serveWithWake(rec, req, up, id, "req-1", "client-req-1", lease)
-	if !served {
-		t.Fatal("cold-hold rejection should serve the admission error (served=true)")
-	}
-	if rec.Code != http.StatusServiceUnavailable {
-		t.Fatalf("client got %d, want the admission 503 (platform cold-hold cap is non-contractual)", rec.Code)
-	}
-	if got := rec.Header().Get(requestIDHeader); got != "req-1" {
-		t.Fatalf("cold-hold rejection response X-Request-Id = %q, want the minted attempt id", got)
-	}
-	events := em.waitForEvents(1, 2*time.Second)
-	if len(events) != 1 {
-		t.Fatalf("cold-hold rejection emitted %d billing events, want exactly 1 raw reconciliation row: %+v",
-			len(events), events)
-	}
-	ev := events[0]
-	if ev.Aborted || ev.UsageFound || ev.StatusCode != http.StatusServiceUnavailable {
-		t.Fatalf("cold-hold row = {Aborted:%v UsageFound:%v StatusCode:%d}, "+
-			"want {false false 503} (visible to reconciliation, charges $0)", ev.Aborted, ev.UsageFound, ev.StatusCode)
-	}
-	if ev.RequestID != "req-1" || ev.ResourceID != "r1" {
-		t.Fatalf("cold-hold row attribution = {RequestID:%q ResourceID:%q}, want {req-1 r1}",
-			ev.RequestID, ev.ResourceID)
-	}
-}
 func TestWakeWarmFallThroughMetersNormalRowOnly(t *testing.T) {
 	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		_, _ = w.Write([]byte(`{"model":"m","choices":[{"finish_reason":"stop"}],"usage":{"prompt_tokens":1,"completion_tokens":1}}`))
@@ -542,7 +287,7 @@ func TestWakeWarmFallThroughMetersNormalRowOnly(t *testing.T) {
 
 	em := &recordingEmitter{}
 	s := New(&config.Settings{}, logging.New(logging.ERROR), em).
-		WithWaker(&fakeWaker{}, 5*time.Second, 3)
+		WithWaker(&fakeWaker{}, 5*time.Second)
 
 	rr := httptest.NewRecorder()
 	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions",
@@ -572,6 +317,435 @@ func TestWakeWarmFallThroughMetersNormalRowOnly(t *testing.T) {
 	}
 }
 
+func TestColdWakeRetryPreservesRewrittenStreamingBody(t *testing.T) {
+	var mu sync.Mutex
+	var bodies [][]byte
+	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, err := io.ReadAll(r.Body)
+		if err != nil {
+			t.Errorf("read upstream request body: %v", err)
+		}
+		mu.Lock()
+		bodies = append(bodies, append([]byte(nil), body...))
+		attempt := len(bodies)
+		mu.Unlock()
+		if attempt == 1 {
+			w.WriteHeader(http.StatusNotFound)
+			_, _ = w.Write([]byte(`{"message":"Model not found"}`))
+			return
+		}
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = w.Write([]byte("data: {\"choices\":[],\"usage\":{\"prompt_tokens\":2,\"completion_tokens\":1}}\n\ndata: [DONE]\n\n"))
+	}))
+	defer backend.Close()
+	up, _ := url.Parse(backend.URL)
+
+	em := &recordingEmitter{}
+	s := New(&config.Settings{}, logging.New(logging.ERROR), em).
+		WithWaker(&fakeWaker{}, time.Second)
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions",
+		strings.NewReader(`{"model":"m","stream":true,"messages":[{"role":"user","content":"hello"}]}`))
+	setUpstream(req, up)
+	req.Header.Set(identity.HeaderAuthID, "auth-1")
+	req.Header.Set(identity.HeaderResourceID, "r1")
+	req.Header.Set(identity.HeaderServedModel, "m")
+	req.Header.Set(identity.HeaderServingMode, identity.ServingModeDedicated)
+	req.Header.Set(identity.HeaderServingProfile, "disaggregated")
+
+	rr := httptest.NewRecorder()
+	s.Handler().ServeHTTP(rr, req)
+	if rr.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200: %s", rr.Code, rr.Body.String())
+	}
+	mu.Lock()
+	gotBodies := append([][]byte(nil), bodies...)
+	mu.Unlock()
+	if len(gotBodies) != 2 {
+		t.Fatalf("upstream attempts = %d, want exactly 2", len(gotBodies))
+	}
+	if !bytes.Equal(gotBodies[0], gotBodies[1]) {
+		t.Fatalf("retry body differs from first attempt:\nfirst: %s\nretry: %s", gotBodies[0], gotBodies[1])
+	}
+	var rewritten struct {
+		Model    string `json:"model"`
+		Stream   bool   `json:"stream"`
+		Messages []struct {
+			Content string `json:"content"`
+		} `json:"messages"`
+		StreamOptions struct {
+			IncludeUsage bool `json:"include_usage"`
+		} `json:"stream_options"`
+	}
+	if err := json.Unmarshal(gotBodies[1], &rewritten); err != nil {
+		t.Fatalf("decode retry body: %v", err)
+	}
+	if rewritten.Model != "m" || !rewritten.Stream || len(rewritten.Messages) != 1 ||
+		rewritten.Messages[0].Content != "hello" || !rewritten.StreamOptions.IncludeUsage {
+		t.Fatalf("retry body lost request fields or usage rewrite: %+v", rewritten)
+	}
+	events := em.waitForEvents(1, 2*time.Second)
+	if len(events) != 1 {
+		t.Fatalf("metering events = %d, want exactly 1: %+v", len(events), events)
+	}
+}
+
+func TestWakeTransportDoesNotBufferSuccessfulResponse(t *testing.T) {
+	body := &readTrackingBody{}
+	waker := &fakeWaker{}
+	server := New(&config.Settings{}, logging.New(logging.ERROR), nil).
+		WithWaker(waker, time.Second)
+	transport := server.newWakeTransport(
+		roundTripFunc(func(req *http.Request) (*http.Response, error) {
+			return &http.Response{
+				StatusCode: http.StatusOK,
+				Header:     http.Header{"Content-Type": {"text/event-stream"}},
+				Body:       body,
+				Request:    req,
+			}, nil
+		}),
+		&url.URL{Host: "graph-frontend.default.svc:8000"},
+		identity.Identity{ResourceID: "r1", ServedModel: "m", ServingMode: "shared"},
+		"m",
+		"request-1",
+		nil,
+	)
+
+	resp, err := transport.RoundTrip(httptest.NewRequest(http.MethodPost, "/v1/chat/completions", nil))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	if resp.Body != body || body.reads.Load() != 0 {
+		t.Fatalf("successful response body was replaced or read before streaming: body_same=%v reads=%d", resp.Body == body, body.reads.Load())
+	}
+	if got := waker.calls; got != 0 {
+		t.Fatalf("successful response invoked waker %d times, want 0", got)
+	}
+}
+
+func TestBufferColdCandidateBounds503InspectionAndPreservesBody(t *testing.T) {
+	body404 := &countingReadCloser{reader: strings.NewReader(`{"message":"Model not found"}`)}
+	resp404 := &http.Response{StatusCode: http.StatusNotFound, Body: body404}
+	cold, err := bufferColdCandidate(resp404)
+	if err != nil || !cold || !body404.closed.Load() {
+		t.Fatalf("404 classification: cold=%v err=%v closed=%v, want a closed buffered cold response", cold, err, body404.closed.Load())
+	}
+
+	original := strings.Repeat("x", coldCandidatePrefixLimit*2)
+	body := &countingReadCloser{reader: strings.NewReader(original)}
+	resp503 := &http.Response{StatusCode: http.StatusServiceUnavailable, Body: body}
+	cold, err = bufferColdCandidate(resp503)
+	if err != nil || cold {
+		t.Fatalf("generic 503 classification: cold=%v err=%v", cold, err)
+	}
+	if got := body.bytes.Load(); got > coldCandidatePrefixLimit+1 {
+		t.Fatalf("503 classification read %d bytes, limit is %d", got, coldCandidatePrefixLimit+1)
+	}
+	replayed, err := io.ReadAll(resp503.Body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(replayed) != original {
+		t.Fatalf("restored 503 body length=%d, want %d", len(replayed), len(original))
+	}
+	_ = resp503.Body.Close()
+}
+
+func TestBufferColdCandidatePreserves503BodyReadError(t *testing.T) {
+	readErr := io.ErrUnexpectedEOF
+	for _, tc := range []struct {
+		name string
+		body string
+		cold bool
+	}{
+		{name: "generic", body: `{"error":"partial overload"}`, cold: false},
+		{name: "cold marker", body: "Model X is not ready to serve requests yet", cold: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			original := &bytesAndErrorBody{body: []byte(tc.body), err: readErr}
+			resp := &http.Response{
+				StatusCode: http.StatusServiceUnavailable,
+				Body:       original,
+			}
+			cold, err := bufferColdCandidate(resp)
+			if err != nil || cold != tc.cold {
+				t.Fatalf("classification: cold=%v err=%v, want cold=%v nil", cold, err, tc.cold)
+			}
+			got, err := io.ReadAll(resp.Body)
+			if string(got) != tc.body || !errors.Is(err, readErr) {
+				t.Fatalf("replayed body=%q err=%v, want %q and %v", got, err, tc.body, readErr)
+			}
+			if !original.closed.Load() {
+				t.Fatal("original 503 body was not closed after bounded classification")
+			}
+		})
+	}
+}
+
+func TestBufferColdCandidatePreservesOversized503BodyReadError(t *testing.T) {
+	readErr := io.ErrUnexpectedEOF
+	body := bytes.Repeat([]byte("x"), coldCandidatePrefixLimit+1)
+	original := &bytesAndErrorBody{body: body, err: readErr}
+	resp := &http.Response{
+		StatusCode: http.StatusServiceUnavailable,
+		Body:       original,
+	}
+
+	cold, err := bufferColdCandidate(resp)
+	if err != nil || cold {
+		t.Fatalf("classification: cold=%v err=%v, want false and nil", cold, err)
+	}
+	got, err := io.ReadAll(resp.Body)
+	if !bytes.Equal(got, body) || !errors.Is(err, readErr) {
+		t.Fatalf("replayed body length=%d err=%v, want length=%d and %v", len(got), err, len(body), readErr)
+	}
+	if !original.closed.Load() {
+		t.Fatal("original oversized 503 body was not closed after terminal read error")
+	}
+}
+
+func TestBufferColdCandidateTimesOutIncompleteBody(t *testing.T) {
+	secondChunk := make(chan struct{})
+	delayed := strings.Repeat("x", coldCandidatePrefixLimit+100)
+	body := &delayedChunksBody{
+		chunks:  [][]byte{[]byte(`{"error":"partial"}`), []byte(delayed)},
+		release: secondChunk,
+	}
+	resp := &http.Response{
+		StatusCode: http.StatusServiceUnavailable,
+		Body:       body,
+	}
+	started := time.Now()
+	cold, err := bufferColdCandidateWithin(context.Background(), resp, 20*time.Millisecond)
+	if cold || err != nil {
+		t.Fatalf("classification: cold=%v err=%v, want false and nil", cold, err)
+	}
+	if elapsed := time.Since(started); elapsed > time.Second {
+		t.Fatalf("classification timeout took %s", elapsed)
+	}
+	close(secondChunk)
+	replayed, err := io.ReadAll(resp.Body)
+	want := `{"error":"partial"}` + delayed
+	if err != nil || string(replayed) != want {
+		t.Fatalf("replayed body=%q err=%v, want both chunks", replayed, err)
+	}
+	if err := resp.Body.Close(); err != nil {
+		t.Fatalf("close handed-off body: %v", err)
+	}
+	if !body.closed.Load() {
+		t.Fatal("closing handed-off body did not close the upstream body")
+	}
+}
+
+func TestWakeCandidateInspectionTimeoutPreservesDelayed404StatusAndBody(t *testing.T) {
+	testWakeCandidateInspectionTimeoutPreservesResponse(
+		t,
+		http.StatusNotFound,
+		`{"message":"delayed missing model"}`,
+	)
+}
+
+func TestWakeCandidateInspectionTimeoutPreservesDelayedGeneric503StatusAndBody(t *testing.T) {
+	testWakeCandidateInspectionTimeoutPreservesResponse(
+		t,
+		http.StatusServiceUnavailable,
+		`{"error":"delayed overload"}`,
+	)
+}
+
+func testWakeCandidateInspectionTimeoutPreservesResponse(t *testing.T, status int, responseBody string) {
+	t.Helper()
+	firstChunk := responseBody[:len(responseBody)/2]
+	secondChunk := responseBody[len(responseBody)/2:]
+	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(status)
+		_, _ = io.WriteString(w, firstChunk)
+		w.(http.Flusher).Flush()
+		time.Sleep(150 * time.Millisecond)
+		_, _ = io.WriteString(w, secondChunk)
+	}))
+	defer backend.Close()
+	upstream, _ := url.Parse(backend.URL)
+	waker := &fakeWaker{}
+	server := New(&config.Settings{}, logging.New(logging.ERROR), &recordingEmitter{}).
+		WithWaker(waker, 50*time.Millisecond)
+
+	recorder := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(`{"model":"m","messages":[]}`))
+	setUpstream(req, upstream)
+	req.Header.Set(identity.HeaderAuthID, "auth-1")
+	req.Header.Set(identity.HeaderResourceID, "r1")
+	req.Header.Set(identity.HeaderServedModel, "m")
+	req.Header.Set(identity.HeaderServingMode, identity.ServingModeShared)
+	server.Handler().ServeHTTP(recorder, req)
+
+	if recorder.Code != status || recorder.Body.String() != responseBody {
+		t.Fatalf("response = status %d body %q, want status %d body %q",
+			recorder.Code, recorder.Body.String(), status, responseBody)
+	}
+	if got := atomic.LoadInt32(&waker.calls); got != 0 {
+		t.Fatalf("incomplete candidate invoked the waker %d times, want 0", got)
+	}
+}
+
+func TestWakeUnsupportedModeSlowResponseBypassesInspection(t *testing.T) {
+	body := &closeUnblocksBody{
+		prefix: []byte(`{"error":"slow unsupported mode"}`),
+		closed: make(chan struct{}),
+	}
+	waker := &unsupportedWaker{}
+	server := New(&config.Settings{}, logging.New(logging.ERROR), nil).
+		WithWaker(waker, 20*time.Millisecond)
+	transport := &wakeRoundTripper{
+		server: server,
+		base: roundTripFunc(func(*http.Request) (*http.Response, error) {
+			return &http.Response{StatusCode: http.StatusServiceUnavailable, Body: body}, nil
+		}),
+		target: WakeTarget{ServingMode: identity.ServingModeDedicated},
+	}
+
+	started := time.Now()
+	resp, err := transport.RoundTrip(httptest.NewRequest(http.MethodPost, "/v1/chat/completions", nil))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if elapsed := time.Since(started); elapsed > 100*time.Millisecond {
+		t.Fatalf("unsupported response was held for inspection for %s", elapsed)
+	}
+	if resp.Body != body || body.sent {
+		t.Fatalf("unsupported response body was inspected: same=%v read=%v", resp.Body == body, body.sent)
+	}
+	if got := atomic.LoadInt32(&waker.calls); got != 0 {
+		t.Fatalf("unsupported response invoked the waker %d times, want 0", got)
+	}
+	_ = resp.Body.Close()
+}
+
+func TestWakeCompleted503ColdMarkerStillWakes(t *testing.T) {
+	var requests atomic.Int32
+	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		if requests.Add(1) == 1 {
+			w.WriteHeader(http.StatusServiceUnavailable)
+			_, _ = io.WriteString(w, "Model m is not ready to serve requests yet")
+			return
+		}
+		_, _ = io.WriteString(w, `{"served":true}`)
+	}))
+	defer backend.Close()
+	upstream, _ := url.Parse(backend.URL)
+	waker := &fakeWaker{}
+	server := New(&config.Settings{}, logging.New(logging.ERROR), &recordingEmitter{}).
+		WithWaker(waker, time.Second)
+
+	recorder := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(`{"model":"m","messages":[]}`))
+	setUpstream(req, upstream)
+	req.Header.Set(identity.HeaderAuthID, "auth-1")
+	req.Header.Set(identity.HeaderResourceID, "r1")
+	req.Header.Set(identity.HeaderServedModel, "m")
+	req.Header.Set(identity.HeaderServingMode, identity.ServingModeShared)
+	server.Handler().ServeHTTP(recorder, req)
+
+	if recorder.Code != http.StatusOK || recorder.Body.String() != `{"served":true}` {
+		t.Fatalf("response = status %d body %q, want 200 warm response", recorder.Code, recorder.Body.String())
+	}
+	if got := atomic.LoadInt32(&waker.calls); got != 1 {
+		t.Fatalf("completed marker-bearing 503 invoked the waker %d times, want 1", got)
+	}
+	if got := requests.Load(); got != 2 {
+		t.Fatalf("upstream requests = %d, want cold attempt plus one retry", got)
+	}
+}
+
+func TestWakeClosesFirstColdResponseBeforeWaiting(t *testing.T) {
+	original := &countingReadCloser{reader: strings.NewReader(`{"message":"Model not found"}`)}
+	waker := &fakeWaker{
+		err: errors.New("definite wake failure"),
+		onWake: func() {
+			if !original.closed.Load() {
+				t.Error("cold upstream body remained open when Wake began")
+			}
+		},
+	}
+	server := New(&config.Settings{}, logging.New(logging.ERROR), nil).WithWaker(waker, time.Second)
+	transport := server.newWakeTransport(
+		roundTripFunc(func(req *http.Request) (*http.Response, error) {
+			return &http.Response{StatusCode: http.StatusNotFound, Header: http.Header{}, Body: original, Request: req}, nil
+		}),
+		&url.URL{Host: "graph-frontend.default.svc:8000"},
+		identity.Identity{ResourceID: "r1", ServedModel: "m", ServingMode: "shared"},
+		"m", "request-1", nil,
+	)
+	resp, err := transport.RoundTrip(httptest.NewRequest(http.MethodPost, "/v1/chat/completions", nil))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	body, err := io.ReadAll(resp.Body)
+	if err != nil || string(body) != `{"message":"Model not found"}` {
+		t.Fatalf("returned cold body=%q err=%v", body, err)
+	}
+}
+
+func TestWakeUnknownStatusReturnsNeutralRetryableResponse(t *testing.T) {
+	original := &countingReadCloser{reader: strings.NewReader(`{"message":"Model not found"}`)}
+	waker := &fakeWaker{err: fmt.Errorf("Atlas response unavailable: %w", ErrWakeStatusUnknown)}
+	server := New(&config.Settings{}, logging.New(logging.ERROR), nil).WithWaker(waker, time.Second)
+	transport := server.newWakeTransport(
+		roundTripFunc(func(req *http.Request) (*http.Response, error) {
+			return &http.Response{StatusCode: http.StatusNotFound, Header: http.Header{}, Body: original, Request: req}, nil
+		}),
+		&url.URL{Host: "graph-frontend.default.svc:8000"},
+		identity.Identity{ResourceID: "r1", ServedModel: "m", ServingMode: "dedicated"},
+		"m", "request-1", nil,
+	)
+	resp, err := transport.RoundTrip(httptest.NewRequest(http.MethodPost, "/v1/chat/completions", nil))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if resp.StatusCode != http.StatusServiceUnavailable || resp.Header.Get("Retry-After") == "" {
+		t.Fatalf("status=%d Retry-After=%q, want retryable 503", resp.StatusCode, resp.Header.Get("Retry-After"))
+	}
+	if strings.Contains(string(body), "starting from zero") || !strings.Contains(string(body), "could not confirm") {
+		t.Fatalf("body=%q, want neutral indeterminate-wake guidance", body)
+	}
+	if !original.closed.Load() {
+		t.Fatal("original cold response body was not closed")
+	}
+}
+
+func TestDedicatedWakeTargetsRequestedAllowListMember(t *testing.T) {
+	backend := &coldToWarmBackend{warmBody: `{"model":"adapter-a","usage":{"prompt_tokens":2,"completion_tokens":1}}`}
+	be := httptest.NewServer(backend)
+	defer be.Close()
+	up, _ := url.Parse(be.URL)
+	waker := &fakeWaker{backend: backend, warmsAt: 1}
+	s := New(&config.Settings{}, logging.New(logging.ERROR), &recordingEmitter{}).
+		WithWaker(waker, time.Second)
+
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(`{"model":"adapter-a","messages":[]}`))
+	setUpstream(req, up)
+	req.Header.Set(identity.HeaderAuthID, "auth-1")
+	req.Header.Set(identity.HeaderResourceID, "r1")
+	req.Header.Set(identity.HeaderServedModel, "base-model, adapter-a")
+	req.Header.Set(identity.HeaderServingMode, identity.ServingModeDedicated)
+	req.Header.Set(identity.HeaderServingProfile, "disaggregated")
+	rr := httptest.NewRecorder()
+	s.Handler().ServeHTTP(rr, req)
+
+	if rr.Code != http.StatusOK || backend.requests.Load() != 2 || backend.successes.Load() != 1 || waker.calls != 1 {
+		t.Fatalf("status=%d requests=%d successes=%d wakes=%d, want 200/2/1/1", rr.Code, backend.requests.Load(), backend.successes.Load(), waker.calls)
+	}
+	if got := waker.last().ServedModel; got != "adapter-a" {
+		t.Fatalf("wake target served model=%q, want the requested allow-list member", got)
+	}
+}
+
 // TestWakeSkippedOnControlRoutes (wake-scoping negative pin): the wake path
 // runs ONLY for model-bearing inference requests. A bound shared GET or HEAD
 // on a cold control route (/health, /live, /v1/models) is served by the normal
@@ -589,7 +763,7 @@ func TestWakeSkippedOnControlRoutes(t *testing.T) {
 	em := &recordingEmitter{}
 	waker := &fakeWaker{}
 	s := New(&config.Settings{}, logging.New(logging.ERROR), em).
-		WithWaker(waker, 5*time.Second, 3)
+		WithWaker(waker, 5*time.Second)
 
 	for _, tc := range []struct{ method, path string }{
 		{http.MethodGet, "/health"},

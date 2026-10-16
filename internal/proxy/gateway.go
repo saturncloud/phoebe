@@ -26,6 +26,25 @@ type gatewayRoute struct {
 	upstreamFor func(graphK8sName string, port int) string
 }
 
+// graphCapacitySource is the per-graph admission capacity Atlas publishes in
+// the served-model registry (gateway.RegistryResolver implements it; the
+// deprecated Postgres resolver does not, so it publishes no limits).
+// GraphCapacity is the scaled capacity admission enforces; GraphRequestCapacity
+// is the capacity ONE request is checked against to decide that it can never
+// fit (Q24): the published values, unscaled by ready workers. Both are
+// required, so a resolver that publishes capacity can never leave the 413
+// fit check to fall back to the looser scaled value.
+type graphCapacitySource interface {
+	GraphCapacity(graph string) gateway.GraphCapacity
+	GraphRequestCapacity(graph string) gateway.GraphCapacity
+}
+
+// graphCapacityPairSource returns GraphCapacity and GraphRequestCapacity from
+// one consistent registry read (gateway.RegistryResolver implements it).
+type graphCapacityPairSource interface {
+	GraphCapacities(graph string) (gateway.GraphCapacity, gateway.GraphCapacity)
+}
+
 // WithGateway enables gateway resolution: requests carrying the trusted
 // X-Saturn-Gateway marker resolve their (org, body model=) against Atlas's
 // tf_model via resolver, and forward to the resolved graph's frontend Service
@@ -41,6 +60,12 @@ func (s *Server) WithGateway(resolver gateway.Resolver, namespace string, port i
 	}
 	if port <= 0 {
 		port = 8000
+	}
+	if source, ok := resolver.(graphCapacitySource); ok {
+		s.graphCapacity = source
+	}
+	if source, ok := resolver.(graphCapacityPairSource); ok {
+		s.graphCapacityPair = source
 	}
 	s.gateway = &gatewayRoute{
 		resolver: resolver,
@@ -106,8 +131,8 @@ func (s *Server) resolveGateway(w http.ResponseWriter, r *http.Request, id *iden
 
 	body, err := readAndRestoreBody(r)
 	if err != nil {
-		s.log.Error.Printf("gateway: read request body: %v (request_id=%q)", err, requestID)
-		writeRequestBodyError(w, err)
+		s.logRequestBodyError("gateway: read request body", requestID, err)
+		writeRequestBodyError(w, r, requestID, err)
 		return false
 	}
 	model, ok := extractRequestModel(body)
@@ -168,6 +193,15 @@ func (s *Server) resolveGateway(w http.ResponseWriter, r *http.Request, id *iden
 		s.log.Error.Printf("gateway: resolver returned invalid serving_mode %q org_id=%s request_id=%q",
 			res.ServingMode, id.OrgID, requestID)
 		http.Error(w, "service unavailable", http.StatusServiceUnavailable)
+		return false
+	}
+	if res.Adapter != "" && !res.Ready {
+		// Atlas has registered the endpoint but has not observed its
+		// DynamoModel ready (or has observed a later load failure). Keep this
+		// distinct from 404: the model exists and the caller may retry.
+		s.log.Warn.Printf("gateway: adapter not loaded org_id=%s model=%q request_id=%q",
+			id.OrgID, model, requestID)
+		http.Error(w, "adapter_not_loaded", http.StatusServiceUnavailable)
 		return false
 	}
 	// The resolved model is definitionally the single model this request is
