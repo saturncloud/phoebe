@@ -206,7 +206,12 @@ graph.maxColdHolds: "4"
 - **Reload:** each interceptor replica watches the ConfigMap and swaps the admitter's
   settings atomically; the next admitted request uses them. Leases in flight are
   untouched; a cap lowered below current usage refuses new requests with 503 and
-  Retry-After until usage drops.
+  Retry-After until usage drops. A request keeps the limits that applied when it
+  was admitted. The cold-hold and wake caps (`graph.maxColdHolds`,
+  `organization.maxColdHolds`, `*.wakesPerWindow`) are checked when an admitted
+  request begins a cold hold, against those admit-time limits. A lowered cold-hold
+  or wake cap therefore reaches requests admitted before the change only after they
+  finish, which takes at most one wake timeout.
 - **Fail closed:** a malformed entry (unknown key, a value that is not an integer >= 1)
   keeps the last good value for that key, or the Helm value if there never was one; the
   other entries still apply. The last good values are held in each replica's memory
