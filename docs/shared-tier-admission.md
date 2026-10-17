@@ -177,6 +177,41 @@ Output-limit fields are accepted at most once in the top-level JSON object.
 Ambiguous duplicate keys are rejected before forwarding so Phoebe and the
 downstream JSON stack cannot select different values and under-reserve work.
 
+## Live operator limits from the admin page (admission-policy ConfigMap)
+
+The shared-tier admin page (Atlas) can retune the operator tiers without a phoebe
+restart or a Helm change. Atlas writes one ConfigMap, `phoebe-admission-policy`,
+labelled `saturncloud.io/phoebe-admission-policy=true`, in the gateway namespace
+(where it writes the served-model registry; phoebe's Role already reads
+ConfigMaps there). Its `policy.yaml` key holds:
+
+```yaml
+version: 1
+revision: "<settings revision>"
+platform:          {}   # any AdmissionLimits fields, same names as the Helm values
+graph:             {}
+organization:      {}
+organizationModel: {}
+```
+
+- **Covers** only those four tiers' limit fields and `window`. `admission.enabled`,
+  lanes, store mechanics, `protection.*` and `wake.*` stay Helm-only. With
+  `admission.enabled=false` phoebe does not watch the ConfigMap.
+- **Precedence, per field:** a present field replaces the Helm value; an absent field
+  keeps it. Each update is laid over the Helm values, never over the previous update.
+  A present field must be an integer >= 0 (`window` a positive duration); `null` is
+  refused, so the page can set a cap but not remove one the Helm values set.
+- **Reload:** each interceptor replica watches the ConfigMap and swaps the admitter's
+  settings atomically; the next admitted request uses them. Leases in flight are
+  untouched; a cap lowered below current usage refuses new requests with 503 and
+  Retry-After until usage drops.
+- **Fail closed:** a document that is malformed in any part (unknown version, key or
+  field, wrong type, null, negative, failed tier or lane-share validation) is refused
+  whole and logged with the settings revision in force; phoebe keeps its last good
+  settings. A deleted ConfigMap also keeps the last good settings; Atlas returns to the
+  Helm values by writing a document with no tiers. Each apply or refusal logs one line
+  (`admission policy: applied revision ...` or `... REFUSED, keeping revision ...`).
+
 ## Rollout and rollback
 
 The quota envelope is the scoped contract only: `X-Saturn-Owner-Id` plus
