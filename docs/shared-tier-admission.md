@@ -209,12 +209,26 @@ graph.maxColdHolds: "4"
   Retry-After until usage drops.
 - **Fail closed:** a malformed entry (unknown key, a value that is not an integer >= 1)
   keeps the last good value for that key, or the Helm value if there never was one; the
-  other entries still apply. If the entries are each valid but together fail phoebe's
-  cross-field validation (per-tier rules, lane shares), the whole update is refused and
-  the last applied settings stay. A deleted ConfigMap keeps the last applied settings.
+  other entries still apply. The last good values are held in each replica's memory
+  only and are lost when the pod restarts. A replica that starts while a malformed entry
+  is live has no history, so it enforces the Helm value for that key, and it can differ
+  from replicas that kept a last good value until Atlas writes a valid revision. Atlas
+  must therefore write only valid entries (integers >= 1, known keys): a malformed entry
+  plus a pod restart lets replicas enforce different caps on the shared Valkey counters.
+  A kept last good value never blocks a valid entry of the same revision: if it breaks a
+  per-tier rule against a new value (for example a kept `maxConcurrentPrefills` above a
+  lowered `maxActiveRequests`), the kept value is lowered to that cap and the revision
+  applies; a kept value is only ever lowered. If the entries are each valid but together
+  fail phoebe's cross-field validation (per-tier rules, lane shares), the whole update is
+  refused and the last applied settings stay. A deleted ConfigMap keeps the last applied
+  settings. A ConfigMap with no `revision` key (or an empty one) is applied and logged as
+  a policy with no revision, never as the Helm settings.
   Phoebe has no metrics endpoint: each apply, kept value and refusal is one log line
-  with the revision (`admission policy: applied revision ...`, `... keeping the last good
-  value ...`, `... REFUSED, keeping revision ...`).
+  with the revision (`admission policy: applied revision ...`, `... applied revision ...
+  PARTIALLY from ...` naming the malformed keys when some entries kept their last good
+  or Helm value, `... keeping the last good value ...`, `... no last good value in this
+  process, the Helm value stays ...`, `... kept value(s) for ... were lowered so revision
+  ... could apply`, `... REFUSED, keeping revision ...`, `... has no "revision" key ...`).
   At startup phoebe waits up to 10 s for the first read of the ConfigMap before it
   serves, so a restarted replica enforces the published caps from its first request.
   If the read does not complete in time, phoebe serves on the Helm values and logs an
