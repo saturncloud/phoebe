@@ -14,6 +14,7 @@ import (
 	"math"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/redis/go-redis/v9"
@@ -179,8 +180,10 @@ type Admitter interface {
 }
 
 type RedisAdmitter struct {
-	client                     redis.Cmdable
-	cfg                        config.AdmissionSettings
+	client redis.Cmdable
+	// cfg is swapped whole by Replace (the admission-policy ConfigMap); every
+	// reader loads it once per use.
+	cfg                        atomic.Pointer[config.AdmissionSettings]
 	counters, leases, expiries string
 	windowExpiries             string
 	// legacyLeases and legacyExpiries are the lease keys of the release
@@ -202,12 +205,23 @@ func New(client redis.Cmdable, cfg config.AdmissionSettings) *RedisAdmitter {
 	// One cluster hash slot makes each multi-key Lua operation valid on Redis
 	// Cluster as well as single-node Valkey.
 	tag := "{" + prefix + "}"
-	return &RedisAdmitter{
-		client: client, cfg: cfg, counters: tag + ":counters", leases: tag + ":leases:v2",
+	a := &RedisAdmitter{
+		client: client, counters: tag + ":counters", leases: tag + ":leases:v2",
 		expiries: tag + ":expiries:v2", windowExpiries: tag + ":window-expiries",
 		legacyLeases: tag + ":leases", legacyExpiries: tag + ":expiries",
 	}
+	a.cfg.Store(&cfg)
+	return a
 }
+
+// Replace swaps the settings the admitter enforces from the next admitted
+// request on. Leases already granted are untouched: their counters live in
+// the store keyed by scope, not by limit, so lowering a cap below what is in
+// flight refuses new requests (503 + Retry-After) until usage drops under
+// it. The caller passes a fully validated config (WithAdmissionPolicy); the
+// store settings (address, key prefix) must be the ones the admitter was
+// built with.
+func (a *RedisAdmitter) Replace(cfg config.AdmissionSettings) { a.cfg.Store(&cfg) }
 
 // NewValkeyClient builds the admission-only Valkey client. Metering owns a
 // separate durable client/WAL path and must not inherit these fail-open
@@ -239,7 +253,7 @@ func FromSettings(s *config.Settings) (*RedisAdmitter, *redis.Client, bool) {
 }
 
 // Settings returns the admission settings this admitter enforces.
-func (a *RedisAdmitter) Settings() config.AdmissionSettings { return a.cfg }
+func (a *RedisAdmitter) Settings() config.AdmissionSettings { return *a.cfg.Load() }
 
 func (a *RedisAdmitter) keys() []string {
 	return []string{a.counters, a.leases, a.expiries, a.windowExpiries, a.legacyLeases, a.legacyExpiries}
@@ -275,7 +289,7 @@ func (a *RedisAdmitter) Admit(ctx context.Context, req Request) (*Lease, error) 
 	if err != nil {
 		return nil, fmt.Errorf("%w: lease id: %v", ErrUnavailable, err)
 	}
-	w := wireRequest{ID: id, LeaseMs: a.cfg.LeaseTTL.Milliseconds(), Prefill: req.PrefillTokens,
+	w := wireRequest{ID: id, LeaseMs: a.Settings().LeaseTTL.Milliseconds(), Prefill: req.PrefillTokens,
 		EstimatedInput: req.EstimatedInputTokens, Output: req.ReservedOutputTokens, Scopes: a.scopes(req),
 		Sequences: max(req.OutputSequences, 1)}
 	if req.Adapter {
@@ -445,7 +459,7 @@ func (l RateLimits) Any() bool {
 	return l.Requests != nil || l.TotalPromptTokens != nil || l.UncachedPromptTokens != nil || l.GeneratedTokens != nil
 }
 
-func (a *RedisAdmitter) scopes(r Request) []scope { return scopesFor(a.cfg, r) }
+func (a *RedisAdmitter) scopes(r Request) []scope { return scopesFor(a.Settings(), r) }
 
 // ReservedCaps are the tightest positive per-request-bounding caps among the
 // scopes Admit would check: reserved KV tokens and reserved output tokens.
@@ -603,7 +617,7 @@ func (l *Lease) CompleteUsage(ctx context.Context, usage Usage) error {
 // if renewal fails. The proxy treats distributed-state failure as a temporary
 // bypass of the fairness gate; authorization and independent metering remain.
 func (l *Lease) KeepAlive(ctx context.Context, onError func(error)) {
-	interval := l.owner.cfg.LeaseTTL / 3
+	interval := l.owner.Settings().LeaseTTL / 3
 	if interval < 10*time.Millisecond {
 		interval = 10 * time.Millisecond
 	}
@@ -619,7 +633,7 @@ func (l *Lease) KeepAlive(ctx context.Context, onError func(error)) {
 		if l.settled {
 			return false
 		}
-		res, err := renewScript.Run(ctx, l.owner.client, l.owner.keys(), l.id, l.owner.cfg.LeaseTTL.Milliseconds()).Int64()
+		res, err := renewScript.Run(ctx, l.owner.client, l.owner.keys(), l.id, l.owner.Settings().LeaseTTL.Milliseconds()).Int64()
 		if err != nil {
 			// Request completion normally cancels this context. If cancellation
 			// races the Redis call, it is not evidence that the admission store
