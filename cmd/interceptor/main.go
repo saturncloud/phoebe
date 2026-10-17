@@ -170,10 +170,8 @@ func buildAdmissionPolicy(s *config.Settings, admitter *admission.RedisAdmitter,
 	wctx, wcancel := context.WithTimeout(ctx, admissionPolicySyncWait)
 	if !watcher.WaitSynced(wctx) {
 		log.Error.Printf("admission policy: ConfigMap %s/%s not read within %s; the Helm admission values apply, and any tighter limits set on the admin page are NOT enforced until it syncs", s.Gateway.Namespace, gateway.AdmissionPolicyConfigMap, admissionPolicySyncWait)
-	} else if rev := watcher.Revision(); rev != "" {
-		log.Info.Printf("admission policy: watching ConfigMap %s/%s; revision %q in force", s.Gateway.Namespace, gateway.AdmissionPolicyConfigMap, rev)
 	} else {
-		log.Info.Printf("admission policy: watching ConfigMap %s/%s; Helm values in force (no policy published)", s.Gateway.Namespace, gateway.AdmissionPolicyConfigMap)
+		log.Info.Printf("admission policy: watching ConfigMap %s/%s; %s in force", s.Gateway.Namespace, gateway.AdmissionPolicyConfigMap, watcher.InForce())
 	}
 	wcancel()
 	return cancel
