@@ -16,15 +16,16 @@ import (
 
 const (
 	// AdmissionPolicyConfigMap is the one ConfigMap Atlas writes the shared-tier
-	// admin page's gateway limits to (shared-tier-admin Part B), in the
-	// gateway namespace next to the served-model registry ConfigMaps.
-	AdmissionPolicyConfigMap = "phoebe-admission-policy"
+	// admin page's gateway limits to (shared-tier-admin Part B contracts), in
+	// the gateway namespace next to the served-model registry ConfigMaps.
+	AdmissionPolicyConfigMap = "tf-admission-policy"
 	// AdmissionPolicyLabel selects it server-side. The registry informer's
 	// selector does not match it, so the registry never tries to parse it.
-	AdmissionPolicyLabel = "saturncloud.io/phoebe-admission-policy"
-	// AdmissionPolicyKey is its data key: a YAML document read by
-	// config.AdmissionSettings.WithAdmissionPolicy.
-	AdmissionPolicyKey = "policy.yaml"
+	AdmissionPolicyLabel = "saturncloud.io/tf-admission-policy"
+	// AdmissionPolicyRevisionKey is the data key carrying Atlas's settings
+	// revision; every other key is "<tier>.<field>" with a decimal value
+	// (config.ParseAdmissionPolicyEntry).
+	AdmissionPolicyRevisionKey = "revision"
 )
 
 // PolicyTarget is the admitter an admission policy is applied to.
@@ -36,12 +37,19 @@ type PolicyTarget interface {
 // AdmissionPolicyWatcher applies the Atlas-written admission-policy ConfigMap
 // to the admitter, live and without a restart.
 //
-// Every update is laid over the Helm-rendered settings the admitter started
-// with (never over the previous policy), so a field removed from the policy
-// returns to its Helm value. It fails closed: a malformed document is refused
-// whole and the admitter keeps the last good settings; a deleted ConfigMap
-// also keeps the last good settings (Atlas resets by writing a document with
-// no fields). Each phoebe replica runs its own watcher.
+// Each data key "<tier>.<field>" replaces that Helm value; an absent key keeps
+// the Helm value. Every update is laid over the Helm settings the admitter
+// started with (never over the previous update). It fails closed, never open:
+//   - a malformed entry (unknown key, value not an integer >= 1) keeps the last
+//     good value for that key, or the Helm value if there never was one, and
+//     the other entries still apply;
+//   - if the entries are each valid but the combination fails phoebe's
+//     cross-field validation (per-tier rules, lane shares), the whole update is
+//     refused and the last applied settings stay;
+//   - a deleted ConfigMap keeps the last applied settings (Atlas re-creates it).
+//
+// Each apply, kept value and refusal is logged with the revision. Each phoebe
+// replica runs its own watcher.
 type AdmissionPolicyWatcher struct {
 	log      *logging.Logger
 	target   PolicyTarget
@@ -49,7 +57,8 @@ type AdmissionPolicyWatcher struct {
 	informer cache.SharedIndexInformer
 
 	mu       sync.Mutex
-	revision string // revision in force; "" while the Helm settings apply
+	revision string           // revision in force; "" while the Helm settings apply
+	lastGood map[string]int64 // entries applied by the last good update
 }
 
 // NewAdmissionPolicyWatcher builds the watcher over client in namespace. The
@@ -101,19 +110,33 @@ func (w *AdmissionPolicyWatcher) apply(obj any) {
 	}
 	w.mu.Lock()
 	defer w.mu.Unlock()
-	doc, present := cm.Data[AdmissionPolicyKey]
-	if !present {
-		w.log.Error.Printf("admission policy: %s has no %q key; REFUSED, keeping revision %q", cm.Name, AdmissionPolicyKey, w.revision)
-		return
+	revision := cm.Data[AdmissionPolicyRevisionKey]
+	values := map[string]int64{}
+	for key, raw := range cm.Data {
+		if key == AdmissionPolicyRevisionKey {
+			continue
+		}
+		path, value, err := config.ParseAdmissionPolicyEntry(key, raw)
+		if err != nil {
+			if last, kept := w.lastGood[key]; kept {
+				values[key] = last
+				w.log.Error.Printf("admission policy: revision %q: %v; keeping the last good value %d", revision, err, last)
+			} else {
+				w.log.Error.Printf("admission policy: revision %q: %v; the Helm value stays", revision, err)
+			}
+			continue
+		}
+		values[path] = value
 	}
-	next, revision, err := w.base.WithAdmissionPolicy([]byte(doc))
+	next, err := w.base.WithLimitOverrides(values)
 	if err != nil {
-		w.log.Error.Printf("admission policy: %s (resourceVersion %s) REFUSED, keeping revision %q: %v", cm.Name, cm.ResourceVersion, w.revision, err)
+		w.log.Error.Printf("admission policy: revision %q REFUSED, keeping revision %q: %v", revision, w.revision, err)
 		return
 	}
 	w.target.Replace(next)
 	w.revision = revision
-	w.log.Info.Printf("admission policy: applied revision %q from %s (resourceVersion %s)", revision, cm.Name, cm.ResourceVersion)
+	w.lastGood = values
+	w.log.Info.Printf("admission policy: applied revision %q from %s (%d limits, resourceVersion %s)", revision, cm.Name, len(values), cm.ResourceVersion)
 }
 
 func (w *AdmissionPolicyWatcher) deleted(obj any) {
@@ -121,6 +144,6 @@ func (w *AdmissionPolicyWatcher) deleted(obj any) {
 		obj = tomb.Obj
 	}
 	if cm, ok := obj.(*corev1.ConfigMap); ok && cm.Name == AdmissionPolicyConfigMap {
-		w.log.Warn.Printf("admission policy: %s deleted; keeping revision %q (write a document with no fields to return to the Helm values)", cm.Name, w.Revision())
+		w.log.Warn.Printf("admission policy: %s deleted; keeping revision %q until Atlas writes it again", cm.Name, w.Revision())
 	}
 }

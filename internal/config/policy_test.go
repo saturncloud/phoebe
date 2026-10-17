@@ -24,93 +24,77 @@ func helmAdmission(t *testing.T) AdmissionSettings {
 	return a
 }
 
-func TestAdmissionPolicyOverlaysPresentFieldsAndKeepsHelmValuesForAbsentOnes(t *testing.T) {
-	base := helmAdmission(t)
-	got, revision, err := base.WithAdmissionPolicy([]byte(`
-version: 1
-revision: "rev-7"
-organization:
-  maxActiveRequests: 6
-  wakesPerWindow: 3
-  window: 2m
-organizationModel:
-  maxPrefillTokens: 50000
-`))
-	if err != nil {
-		t.Fatalf("policy refused: %v", err)
-	}
-	if revision != "rev-7" {
-		t.Fatalf("revision = %q", revision)
-	}
-	if *got.Organization.MaxActiveRequests != 6 || *got.Organization.WakesPerWindow != 3 {
-		t.Fatalf("organization overlay not applied: %+v", got.Organization)
-	}
-	if *got.Organization.MaxColdHolds != 4 {
-		t.Fatalf("absent maxColdHolds must keep the Helm value 4, got %d", *got.Organization.MaxColdHolds)
-	}
-	if got.Organization.Window.String() != "2m0s" {
-		t.Fatalf("window = %s", got.Organization.Window)
-	}
-	if *got.Graph.MaxActiveRequests != 40 || *got.OrganizationModel.MaxPrefillTokens != 50000 {
-		t.Fatalf("other tiers wrong: graph %+v orgModel %+v", got.Graph, got.OrganizationModel)
-	}
-	// The baseline is not modified through shared pointers.
-	if *base.Organization.MaxActiveRequests != 10 || base.Organization.WakesPerWindow != nil {
-		t.Fatalf("baseline modified: %+v", base.Organization)
+func TestParseAdmissionPolicyEntryAcceptsTierFieldKeysWithPositiveIntegers(t *testing.T) {
+	path, v, err := ParseAdmissionPolicyEntry("organizationModel.maxReservedKvTokens", " 50000 ")
+	if err != nil || path != "organizationModel.maxReservedKvTokens" || v != 50000 {
+		t.Fatalf("got %q %d %v", path, v, err)
 	}
 }
 
-func TestAdmissionPolicyWithNoTiersReturnsTheHelmSettings(t *testing.T) {
-	base := helmAdmission(t)
-	got, _, err := base.WithAdmissionPolicy([]byte("version: 1\nrevision: reset\n"))
-	if err != nil {
-		t.Fatalf("empty policy refused: %v", err)
+func TestParseAdmissionPolicyEntryRefusesMalformedEntries(t *testing.T) {
+	cases := map[string][2]string{
+		"no dot":        {"maxActiveRequests", "1"},
+		"unknown tier":  {"lanes.maxActiveRequests", "1"},
+		"unknown field": {"organization.maxThings", "1"},
+		"window":        {"organization.window", "2m"},
+		"zero":          {"organization.maxActiveRequests", "0"},
+		"negative":      {"organization.maxActiveRequests", "-1"},
+		"float":         {"organization.maxActiveRequests", "1.5"},
+		"empty":         {"organization.maxActiveRequests", ""},
+		"word":          {"organization.maxActiveRequests", "unlimited"},
+		"overflow":      {"organization.maxActiveRequests", "99999999999999999999"},
 	}
-	if *got.Organization.MaxActiveRequests != 10 || *got.Graph.MaxActiveRequests != 40 {
-		t.Fatalf("empty policy changed limits: %+v %+v", got.Organization, got.Graph)
-	}
-}
-
-func TestAdmissionPolicyRefusesAnythingMalformedWhole(t *testing.T) {
-	cases := map[string]string{
-		"not yaml":             "version: [1",
-		"no version":           "organization:\n  maxActiveRequests: 1\n",
-		"unknown version":      "version: 2\n",
-		"string version":       "version: \"1\"\n",
-		"unknown top key":      "version: 1\nlanes: {}\n",
-		"revision not string":  "version: 1\nrevision: 7\n",
-		"tier not mapping":     "version: 1\norganization: 5\n",
-		"unknown field":        "version: 1\norganization:\n  maxThings: 1\n",
-		"null removes a cap":   "version: 1\norganization:\n  maxActiveRequests: null\n",
-		"float":                "version: 1\norganization:\n  maxActiveRequests: 1.5\n",
-		"string number":        "version: 1\norganization:\n  maxActiveRequests: \"5\"\n",
-		"boolean":              "version: 1\norganization:\n  maxActiveRequests: true\n",
-		"negative":             "version: 1\norganization:\n  maxActiveRequests: -1\n",
-		"bad window":           "version: 1\norganization:\n  window: soon\n",
-		"zero window":          "version: 1\norganization:\n  window: 0s\n",
-		"repeated field":       "version: 1\norganization:\n  maxActiveRequests: 1\n  maxActiveRequests: 2\n",
-		"repeated tier":        "version: 1\ngraph: {}\ngraph: {}\n",
-		"prefills over active": "version: 1\norganization:\n  maxConcurrentPrefills: 20\n",
-		"uncached over total":  "version: 1\nplatform:\n  totalPromptTokensPerWindow: 10\n  uncachedPromptTokensPerWindow: 20\n",
-	}
-	base := helmAdmission(t)
-	for name, doc := range cases {
+	for name, kv := range cases {
 		t.Run(name, func(t *testing.T) {
-			got, revision, err := base.WithAdmissionPolicy([]byte(doc))
-			if err == nil {
-				t.Fatalf("accepted malformed policy: %+v", got.Organization)
-			}
-			if revision != "" {
-				t.Fatalf("refused policy returned revision %q", revision)
-			}
-			if *got.Organization.MaxActiveRequests != 10 {
-				t.Fatalf("refused policy changed the settings: %+v", got.Organization)
+			if _, _, err := ParseAdmissionPolicyEntry(kv[0], kv[1]); err == nil {
+				t.Fatalf("accepted %s=%q", kv[0], kv[1])
 			}
 		})
 	}
 }
 
-func TestAdmissionPolicyRevalidatesLaneShares(t *testing.T) {
+func TestWithLimitOverridesReplacesPresentFieldsAndKeepsHelmValuesForAbsentOnes(t *testing.T) {
+	base := helmAdmission(t)
+	got, err := base.WithLimitOverrides(map[string]int64{
+		"organization.maxActiveRequests":     6,
+		"graph.wakesPerWindow":               3,
+		"organizationModel.maxPrefillTokens": 50000,
+	})
+	if err != nil {
+		t.Fatalf("refused: %v", err)
+	}
+	if *got.Organization.MaxActiveRequests != 6 || *got.Graph.WakesPerWindow != 3 || *got.OrganizationModel.MaxPrefillTokens != 50000 {
+		t.Fatalf("overrides not applied: %+v %+v %+v", got.Organization, got.Graph, got.OrganizationModel)
+	}
+	if *got.Organization.MaxColdHolds != 4 || *got.Graph.MaxActiveRequests != 40 {
+		t.Fatalf("absent fields must keep the Helm values: %+v %+v", got.Organization, got.Graph)
+	}
+	if *base.Organization.MaxActiveRequests != 10 || base.Graph.WakesPerWindow != nil {
+		t.Fatalf("baseline modified through a shared pointer: %+v %+v", base.Organization, base.Graph)
+	}
+}
+
+func TestWithLimitOverridesWithNothingReturnsTheHelmSettings(t *testing.T) {
+	base := helmAdmission(t)
+	got, err := base.WithLimitOverrides(nil)
+	if err != nil || *got.Organization.MaxActiveRequests != 10 || *got.Graph.MaxActiveRequests != 40 {
+		t.Fatalf("got %+v %+v %v", got.Organization, got.Graph, err)
+	}
+}
+
+func TestWithLimitOverridesRefusesACombinationThatFailsCrossFieldValidation(t *testing.T) {
+	base := helmAdmission(t)
+	// Valid alone, but the tier's prefill cap would exceed its active cap.
+	got, err := base.WithLimitOverrides(map[string]int64{"organization.maxConcurrentPrefills": 20})
+	if err == nil {
+		t.Fatalf("accepted maxConcurrentPrefills 20 above maxActiveRequests 10")
+	}
+	if got.Organization.MaxConcurrentPrefills != nil {
+		t.Fatalf("a refused update changed the settings: %+v", got.Organization)
+	}
+}
+
+func TestWithLimitOverridesRevalidatesLaneShares(t *testing.T) {
 	base := AdmissionSettings{
 		Enabled:    true,
 		ValkeyAddr: "valkey:6379",
@@ -122,7 +106,7 @@ func TestAdmissionPolicyRevalidatesLaneShares(t *testing.T) {
 	if err := base.parse(true); err != nil {
 		t.Fatalf("helm settings: %v", err)
 	}
-	_, _, err := base.WithAdmissionPolicy([]byte("version: 1\nplatform:\n  maxActiveRequests: 50\n"))
+	_, err := base.WithLimitOverrides(map[string]int64{"platform.maxActiveRequests": 50})
 	if err == nil || !strings.Contains(err.Error(), "lane shares") {
 		t.Fatalf("lowering the platform cap under the lane shares must be refused, got %v", err)
 	}
@@ -130,8 +114,8 @@ func TestAdmissionPolicyRevalidatesLaneShares(t *testing.T) {
 
 func TestAdmissionPolicyCanSetEveryLimitField(t *testing.T) {
 	for _, field := range LimitFields(AdmissionLimits{}) {
-		if limitField(&AdmissionLimits{}, field.Name) == nil {
-			t.Fatalf("admission policy cannot set limit field %q", field.Name)
+		if _, _, err := ParseAdmissionPolicyEntry("organization."+field.Name, "1"); err != nil {
+			t.Fatalf("admission policy cannot set limit field %q: %v", field.Name, err)
 		}
 	}
 }

@@ -42,13 +42,13 @@ func (f *fakePolicyTarget) orgActive() int64 {
 	return *cfg.Organization.MaxActiveRequests
 }
 
-func policyConfigMap(name, doc string) *corev1.ConfigMap {
+func policyConfigMap(name string, data map[string]string) *corev1.ConfigMap {
 	return &corev1.ConfigMap{
 		ObjectMeta: metav1.ObjectMeta{
 			Name: name, Namespace: policyNS,
 			Labels: map[string]string{AdmissionPolicyLabel: "true"},
 		},
-		Data: map[string]string{AdmissionPolicyKey: doc},
+		Data: data,
 	}
 }
 
@@ -82,48 +82,85 @@ func eventually(t *testing.T, what string, ok func() bool) {
 	}
 }
 
+func (f *fakePolicyTarget) orgColdHolds() int64 {
+	cfg := f.Settings()
+	if cfg.Organization.MaxColdHolds == nil {
+		return -1
+	}
+	return *cfg.Organization.MaxColdHolds
+}
+
 func TestAdmissionPolicyWatcherAppliesUpdatesLiveFromTheHelmBaseline(t *testing.T) {
 	client, target, w := startPolicyWatcher(t)
 	ctx := context.Background()
 	cms := client.CoreV1().ConfigMaps(policyNS)
 
-	cm := policyConfigMap(AdmissionPolicyConfigMap, "version: 1\nrevision: r1\norganization:\n  maxActiveRequests: 4\n")
+	cm := policyConfigMap(AdmissionPolicyConfigMap, map[string]string{
+		"revision": "r1", "organization.maxActiveRequests": "4", "organization.maxColdHolds": "2",
+	})
 	if _, err := cms.Create(ctx, cm, metav1.CreateOptions{}); err != nil {
 		t.Fatal(err)
 	}
-	eventually(t, "revision r1", func() bool { return w.Revision() == "r1" && target.orgActive() == 4 })
+	eventually(t, "revision r1", func() bool {
+		return w.Revision() == "r1" && target.orgActive() == 4 && target.orgColdHolds() == 2
+	})
 
-	// The next update is laid over the Helm baseline, not over r1: removing
-	// the field returns it to the Helm value.
-	cm.Data[AdmissionPolicyKey] = "version: 1\nrevision: r2\n"
+	// The next update is laid over the Helm baseline, not over r1: a removed
+	// key returns to the Helm value (no cold-hold cap in this baseline).
+	cm.Data = map[string]string{"revision": "r2", "organization.maxActiveRequests": "5"}
 	if _, err := cms.Update(ctx, cm, metav1.UpdateOptions{}); err != nil {
 		t.Fatal(err)
 	}
-	eventually(t, "revision r2", func() bool { return w.Revision() == "r2" && target.orgActive() == 10 })
+	eventually(t, "revision r2", func() bool {
+		return w.Revision() == "r2" && target.orgActive() == 5 && target.orgColdHolds() == -1
+	})
 }
 
-func TestAdmissionPolicyWatcherKeepsTheLastGoodSettingsOnAMalformedUpdateOrDelete(t *testing.T) {
+func TestAdmissionPolicyWatcherKeepsTheLastGoodValueOfAMalformedEntry(t *testing.T) {
 	client, target, w := startPolicyWatcher(t)
 	ctx := context.Background()
 	cms := client.CoreV1().ConfigMaps(policyNS)
 
-	cm := policyConfigMap(AdmissionPolicyConfigMap, "version: 1\nrevision: good\norganization:\n  maxActiveRequests: 3\n")
+	cm := policyConfigMap(AdmissionPolicyConfigMap, map[string]string{
+		"revision": "good", "organization.maxActiveRequests": "3",
+	})
+	if _, err := cms.Create(ctx, cm, metav1.CreateOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	eventually(t, "revision good", func() bool { return w.Revision() == "good" && target.orgActive() == 3 })
+
+	// The malformed entry keeps its last good value (3) while the other entry
+	// applies; a malformed entry with no earlier value keeps the Helm value.
+	cm.Data = map[string]string{
+		"revision": "partly-bad", "organization.maxActiveRequests": "unlimited",
+		"organization.maxColdHolds": "2", "organization.maxThings": "1",
+	}
+	if _, err := cms.Update(ctx, cm, metav1.UpdateOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	eventually(t, "revision partly-bad", func() bool {
+		return w.Revision() == "partly-bad" && target.orgActive() == 3 && target.orgColdHolds() == 2
+	})
+}
+
+func TestAdmissionPolicyWatcherKeepsTheLastAppliedSettingsOnAFailedCombinationOrDelete(t *testing.T) {
+	client, target, w := startPolicyWatcher(t)
+	ctx := context.Background()
+	cms := client.CoreV1().ConfigMaps(policyNS)
+
+	cm := policyConfigMap(AdmissionPolicyConfigMap, map[string]string{
+		"revision": "good", "organization.maxActiveRequests": "3",
+	})
 	if _, err := cms.Create(ctx, cm, metav1.CreateOptions{}); err != nil {
 		t.Fatal(err)
 	}
 	eventually(t, "revision good", func() bool { return w.Revision() == "good" })
 
-	for _, bad := range []string{
-		"version: 1\nrevision: bad\norganization:\n  maxActiveRequests: null\n",
-		"version: 9\nrevision: bad\n",
-		"not: [yaml",
-	} {
-		cm.Data[AdmissionPolicyKey] = bad
-		if _, err := cms.Update(ctx, cm, metav1.UpdateOptions{}); err != nil {
-			t.Fatal(err)
-		}
+	// Each entry is valid alone; together the prefill cap exceeds the active cap.
+	cm.Data = map[string]string{
+		"revision": "bad-combination", "organization.maxActiveRequests": "2",
+		"organization.maxConcurrentPrefills": "5",
 	}
-	delete(cm.Data, AdmissionPolicyKey)
 	if _, err := cms.Update(ctx, cm, metav1.UpdateOptions{}); err != nil {
 		t.Fatal(err)
 	}
@@ -132,14 +169,14 @@ func TestAdmissionPolicyWatcherKeepsTheLastGoodSettingsOnAMalformedUpdateOrDelet
 	}
 	time.Sleep(200 * time.Millisecond) // let every event reach the handler
 	if w.Revision() != "good" || target.orgActive() != 3 {
-		t.Fatalf("a bad update or a delete changed the settings in force: revision %q, org cap %d", w.Revision(), target.orgActive())
+		t.Fatalf("a refused combination or a delete changed the settings in force: revision %q, org cap %d", w.Revision(), target.orgActive())
 	}
 }
 
 func TestAdmissionPolicyWatcherIgnoresOtherConfigMaps(t *testing.T) {
 	client, target, w := startPolicyWatcher(t)
 	ctx := context.Background()
-	other := policyConfigMap("someone-else", "version: 1\nrevision: x\norganization:\n  maxActiveRequests: 1\n")
+	other := policyConfigMap("someone-else", map[string]string{"revision": "x", "organization.maxActiveRequests": "1"})
 	if _, err := client.CoreV1().ConfigMaps(policyNS).Create(ctx, other, metav1.CreateOptions{}); err != nil {
 		t.Fatal(err)
 	}
