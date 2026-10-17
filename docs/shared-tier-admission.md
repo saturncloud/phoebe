@@ -177,6 +177,41 @@ Output-limit fields are accepted at most once in the top-level JSON object.
 Ambiguous duplicate keys are rejected before forwarding so Phoebe and the
 downstream JSON stack cannot select different values and under-reserve work.
 
+## Live operator limits from the admin page (admission-policy ConfigMap)
+
+The shared-tier admin page (Atlas) can retune the operator tiers without a phoebe
+restart or a Helm change (shared-tier-admin Part B contracts). Atlas writes one
+ConfigMap, `tf-admission-policy`, labelled `saturncloud.io/tf-admission-policy=true`,
+in the gateway namespace (where it writes the served-model registry; phoebe's Role
+already reads ConfigMaps there). Its data:
+
+```yaml
+revision: "<settings revision>"
+organization.maxActiveRequests: "6"      # <tier>.<field>: a decimal integer >= 1
+organizationModel.maxPrefillTokens: "50000"
+graph.maxColdHolds: "4"
+```
+
+- **Keys:** `<tier>.<field>`, tier one of `platform`, `graph`, `organization`,
+  `organizationModel`, field any AdmissionLimits field by its Helm key. `window`,
+  `admission.enabled`, lanes, store mechanics, `protection.*` and `wake.*` stay
+  Helm-only. With `admission.enabled=false` phoebe does not watch the ConfigMap.
+- **Precedence, per field:** a present key replaces the Helm value; an absent key keeps
+  it. Each update is laid over the Helm values, never over the previous update. Values
+  are integers >= 1, so the page can set a cap but not remove one or zero it.
+- **Reload:** each interceptor replica watches the ConfigMap and swaps the admitter's
+  settings atomically; the next admitted request uses them. Leases in flight are
+  untouched; a cap lowered below current usage refuses new requests with 503 and
+  Retry-After until usage drops.
+- **Fail closed:** a malformed entry (unknown key, a value that is not an integer >= 1)
+  keeps the last good value for that key, or the Helm value if there never was one; the
+  other entries still apply. If the entries are each valid but together fail phoebe's
+  cross-field validation (per-tier rules, lane shares), the whole update is refused and
+  the last applied settings stay. A deleted ConfigMap keeps the last applied settings.
+  Phoebe has no metrics endpoint: each apply, kept value and refusal is one log line
+  with the revision (`admission policy: applied revision ...`, `... keeping the last good
+  value ...`, `... REFUSED, keeping revision ...`).
+
 ## Rollout and rollback
 
 The quota envelope is the scoped contract only: `X-Saturn-Owner-Id` plus
