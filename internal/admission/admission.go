@@ -225,7 +225,7 @@ func New(client redis.Cmdable, cfg config.AdmissionSettings) *RedisAdmitter {
 // request on. Leases already granted are untouched: their counters live in
 // the store keyed by scope, not by limit, so lowering a cap below what is in
 // flight refuses new requests (503 + Retry-After) until usage drops under
-// it. The caller passes a fully validated config (WithAdmissionPolicy); the
+// it. The caller passes a fully validated config (config.AdmissionSettings.WithLimitOverrides); the
 // store settings (address, key prefix) must be the ones the admitter was
 // built with.
 func (a *RedisAdmitter) Replace(cfg config.AdmissionSettings) { a.cfg.Store(&cfg) }
