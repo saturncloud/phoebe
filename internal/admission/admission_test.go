@@ -706,7 +706,9 @@ func TestExpiredLeaseReapingIsBoundedAndConverges(t *testing.T) {
 
 	// Tighten the client-supplied scope contract so stale reservations make the
 	// first two attempts fail closed while each Lua mutation reaps at most 100.
-	a.cfg.Platform.MaxActiveRequests = testutil.Ptr[int64](1)
+	cfg := a.Settings()
+	cfg.Platform.MaxActiveRequests = testutil.Ptr[int64](1)
+	a.Replace(cfg)
 	mr.SetTime(time.UnixMilli(180_001))
 	for attempt, wantRemaining := range []int64{150, 50} {
 		if _, err := a.Admit(ctx, request("live-org", "live-model")); err == nil {
