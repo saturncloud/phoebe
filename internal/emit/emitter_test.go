@@ -931,19 +931,33 @@ func TestEmitter_NonBlocking_ChannelFull(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	// Emit should return immediately even with no workers and zero buffer.
-	start := time.Now()
-	for i := range 20 {
-		em.Emit(context.Background(), makeEvent(fmt.Sprintf("nb-%d", i)))
-	}
-	elapsed := time.Since(start)
-	if elapsed > 200*time.Millisecond {
-		t.Errorf("Emit blocked too long: %v", elapsed)
+	// Emit must never wait for a worker: with no workers and a zero buffer a
+	// blocking send would never return. Each call falls to the WAL, a disk
+	// write, so the bound is generous: it separates "returned" from "blocked
+	// forever" without timing the disk (a 200 ms wall-clock bound flaked on a
+	// loaded CI runner, 2026-10-17).
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		for i := range 20 {
+			em.Emit(context.Background(), makeEvent(fmt.Sprintf("nb-%d", i)))
+		}
+	}()
+	select {
+	case <-done:
+	case <-time.After(10 * time.Second):
+		t.Fatal("Emit blocked with no workers and a full channel")
 	}
 
-	ctx, cancel := context.WithTimeout(context.Background(), 500*time.Millisecond)
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
-	_ = em.Close(ctx)
+	if err := em.Close(ctx); err != nil {
+		t.Fatalf("close: %v", err)
+	}
+	// Every event took the WAL fallback; none was dropped.
+	if got := drainWALEvents(t, cfg.WALPath); len(got) != 20 {
+		t.Fatalf("WAL holds %d events, want all 20", len(got))
+	}
 }
 
 // TestEmitter_ConcurrentEmit verifies no data races under concurrent callers.
