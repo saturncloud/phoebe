@@ -115,6 +115,13 @@ type Request struct {
 	// a rejection is "out of capacity" (503), never a contract 429 — on top
 	// of the install-wide graph tier. Zero value = nothing published.
 	GraphCapacity config.AdmissionLimits
+	// Settings, when non-nil, is the settings snapshot the caller already
+	// sized this request against (the proxy's undeclared max_tokens clamp):
+	// Admit enforces exactly these settings instead of loading the current
+	// ones, so a policy Replace between the clamp and Admit cannot refuse a
+	// default reservation the clamp fitted (D61(a)). Nil means Admit loads
+	// the current settings once.
+	Settings *config.AdmissionSettings
 }
 
 // GroupScope is one group's quota contract within a Request: the group's id
@@ -289,8 +296,12 @@ func (a *RedisAdmitter) Admit(ctx context.Context, req Request) (*Lease, error) 
 	if err != nil {
 		return nil, fmt.Errorf("%w: lease id: %v", ErrUnavailable, err)
 	}
-	w := wireRequest{ID: id, LeaseMs: a.Settings().LeaseTTL.Milliseconds(), Prefill: req.PrefillTokens,
-		EstimatedInput: req.EstimatedInputTokens, Output: req.ReservedOutputTokens, Scopes: a.scopes(req),
+	cfg := a.Settings()
+	if req.Settings != nil {
+		cfg = *req.Settings
+	}
+	w := wireRequest{ID: id, LeaseMs: cfg.LeaseTTL.Milliseconds(), Prefill: req.PrefillTokens,
+		EstimatedInput: req.EstimatedInputTokens, Output: req.ReservedOutputTokens, Scopes: scopesFor(cfg, req),
 		Sequences: max(req.OutputSequences, 1)}
 	if req.Adapter {
 		w.Adapter = 1

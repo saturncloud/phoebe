@@ -1,6 +1,7 @@
 package proxy
 
 import (
+	"context"
 	"encoding/json"
 	"io"
 	"net/http"
@@ -622,5 +623,83 @@ func TestRequestOutputAboveReservedOutputCapIsAdmittedAlone(t *testing.T) {
 	}
 	if hits, _ := be.snapshot(); hits != 2 {
 		t.Fatalf("upstream hits=%d, want 2", hits)
+	}
+}
+
+// replacingAdmitter wraps a real admitter and lowers its policy right after
+// the first Settings() read, as a live admission-policy Replace landing
+// between the undeclared clamp and Admit would.
+type replacingAdmitter struct {
+	inner    *admission.RedisAdmitter
+	after    config.AdmissionSettings
+	reads    int
+	admitted []admission.Request
+}
+
+func (a *replacingAdmitter) Settings() config.AdmissionSettings {
+	a.reads++
+	cfg := a.inner.Settings()
+	if a.reads == 1 {
+		a.inner.Replace(a.after)
+	}
+	return cfg
+}
+
+func (a *replacingAdmitter) Admit(ctx context.Context, req admission.Request) (*admission.Lease, error) {
+	a.admitted = append(a.admitted, req)
+	return a.inner.Admit(ctx, req)
+}
+
+// D61(a): one request uses one admission-settings snapshot from the
+// undeclared max_tokens clamp through Admit. A policy Replace that lowers the
+// KV cap between the two must not refuse (503 while the scope is busy) the
+// default reservation the clamp fitted against the earlier snapshot.
+func TestUndeclaredClampAndAdmitUseOneSettingsSnapshot(t *testing.T) {
+	be := &oslRecordingBackend{}
+	srv := httptest.NewServer(be)
+	defer srv.Close()
+	up, _ := url.Parse(srv.URL)
+
+	before := kvTestConfig()
+	before.Platform = config.AdmissionLimits{MaxReservedKVTokens: testutil.Ptr[int64](5000)}
+	after := before
+	after.Platform = config.AdmissionLimits{MaxReservedKVTokens: testutil.Ptr[int64](3000)}
+
+	mr := miniredis.RunT(t)
+	client := redis.NewClient(&redis.Options{Addr: mr.Addr()})
+	t.Cleanup(func() { _ = client.Close() })
+	inner := admission.New(client, before)
+	ctx := context.Background()
+	// Keep the platform scope busy so the lone-request path cannot mask a
+	// refusal.
+	busy, err := inner.Admit(ctx, admission.Request{Graph: "other", Organization: "other", Model: "m",
+		PrefillTokens: 10, EstimatedInputTokens: 10, ReservedOutputTokens: 20})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = busy.Complete(ctx, 0) }()
+
+	fake := &replacingAdmitter{inner: inner, after: after}
+	s := New(&config.Settings{Admission: before}, logging.New(logging.ERROR), &recordingEmitter{}).WithAdmitter(fake)
+
+	if rr := serveChat(s, up, chatBody(4*200, 0)); rr.Code != http.StatusOK {
+		t.Fatalf("undeclared request status=%d body=%q, want 200 under the snapshot it was clamped against", rr.Code, rr.Body.String())
+	}
+	if fake.reads != 1 {
+		t.Fatalf("Settings() read %d times for one request, want exactly one snapshot", fake.reads)
+	}
+	if len(fake.admitted) != 1 || fake.admitted[0].Settings == nil {
+		t.Fatalf("admitted=%+v, want one Admit carrying the clamp's settings snapshot", fake.admitted)
+	}
+	got := fake.admitted[0]
+	kvCap := *got.Settings.Platform.MaxReservedKVTokens
+	if kvCap != 5000 {
+		t.Fatalf("Admit snapshot KV cap=%d, want the clamp's 5000", kvCap)
+	}
+	if got.ReservedOutputTokens+got.EstimatedInputTokens > kvCap {
+		t.Fatalf("reserved %d output + %d input exceeds the snapshot KV cap %d", got.ReservedOutputTokens, got.EstimatedInputTokens, kvCap)
+	}
+	if _, osl := be.snapshot(); len(osl) != 1 || osl[0] != got.ReservedOutputTokens {
+		t.Fatalf("osl=%v, want the forwarded hint to equal the admitted reservation %d", osl, got.ReservedOutputTokens)
 	}
 }
