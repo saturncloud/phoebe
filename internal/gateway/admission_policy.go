@@ -204,7 +204,7 @@ func (w *AdmissionPolicyWatcher) apply(obj any) {
 		if key == AdmissionPolicyRevisionKey {
 			continue
 		}
-		path, value, err := config.ParseAdmissionPolicyEntry(key, raw)
+		value, err := config.ParseAdmissionPolicyEntry(key, raw)
 		if err != nil {
 			malformed = append(malformed, key)
 			if last, ok := w.lastGood[key]; ok {
@@ -216,7 +216,7 @@ func (w *AdmissionPolicyWatcher) apply(obj any) {
 			}
 			continue
 		}
-		values[path] = value
+		values[key] = value
 	}
 	sort.Strings(malformed)
 	next, err := w.base.WithLimitOverrides(values)
