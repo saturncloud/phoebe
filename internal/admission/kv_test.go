@@ -501,3 +501,37 @@ func TestCapacityExceedsLimitReplyFailsClosedToRetryable(t *testing.T) {
 		})
 	}
 }
+
+// D61(a): Admit enforces the settings snapshot the caller sized the request
+// against (Request.Settings) rather than reloading the current settings, so a
+// policy Replace between the proxy's undeclared clamp and Admit cannot refuse
+// a reservation the clamp fitted. Without the snapshot the same request is
+// checked against the newly lowered cap.
+func TestAdmitEnforcesRequestSettingsSnapshotOverReplacedSettings(t *testing.T) {
+	ctx := context.Background()
+	before := config.AdmissionSettings{Graph: config.AdmissionLimits{MaxReservedKVTokens: testutil.Ptr[int64](100)},
+		KeyPrefix: "snapshot", LeaseTTL: time.Minute}
+	a, _ := testAdmitter(t, before)
+	busy, err := a.Admit(ctx, request("a", "m")) // 30 KV in use
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = busy.Complete(ctx, 0) }()
+
+	after := before
+	after.Graph = config.AdmissionLimits{MaxReservedKVTokens: testutil.Ptr[int64](59)}
+	a.Replace(after)
+
+	snap := request("b", "m")
+	snap.Settings = &before
+	lease, err := a.Admit(ctx, snap)
+	if err != nil {
+		t.Fatalf("request sized against the snapshot (30+30 <= 100) err=%v, want admitted under the snapshot", err)
+	}
+	_ = lease.Complete(ctx, 0)
+
+	var rejected *Rejected
+	if _, err := a.Admit(ctx, request("b", "m")); !errors.As(err, &rejected) || rejected.Dimension != "kv" {
+		t.Fatalf("request without a snapshot err=%v, want a kv rejection under the replaced cap (30+30 > 59)", err)
+	}
+}

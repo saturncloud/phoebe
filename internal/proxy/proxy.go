@@ -861,6 +861,10 @@ func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request) {
 			}
 			estimate.OutputTokens = undeclaredOutputReservation(estimate.OutputTokens, estimate.OutputSequences, contractLimits...)
 		}
+		// One admission-settings snapshot per request: the undeclared clamp
+		// below and Admit both use it, so a live policy Replace between the
+		// two cannot leave the clamped default over a newly lowered cap.
+		admSettings := s.admitterSettings()
 		if routePath != "/v1/embeddings" && enforceAdmission && !estimate.OutputDeclared {
 			// The undeclared reservation must also fit every positive
 			// reserved-KV and reserved-output cap admission will check
@@ -870,7 +874,7 @@ func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request) {
 			// The graph's own cap here is the per-request (per-worker) one
 			// (Q24): one request runs on one worker, so its default must fit
 			// that, not the graph total.
-			caps := admission.TightestReservedCaps(s.admitterSettings(), admission.Request{
+			caps := admission.TightestReservedCaps(admSettings, admission.Request{
 				Graph: graph, Organization: id.OrgID, Model: estimate.Model, GraphCapacity: graphRequestCapacity.Limits(),
 			})
 			estimate.OutputTokens = undeclaredOutputWithinCaps(estimate.OutputTokens, estimate.InputTokens, estimate.OutputSequences, caps.KV, caps.Output)
@@ -927,6 +931,7 @@ func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request) {
 				Adapter: id.Adapter != "", OrganizationLimits: organizationLimits, OwnerLimits: ownerLimits,
 				GroupScopes:   groupScopes,
 				GraphCapacity: graphCapacity.Limits(),
+				Settings:      &admSettings,
 			})
 			if err != nil {
 				if errors.Is(err, admission.ErrInvalidIdentity) {

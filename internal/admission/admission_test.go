@@ -1253,3 +1253,172 @@ func TestBlackholedValkeyReturnsUnavailableWithinAdmissionBudget(t *testing.T) {
 		t.Fatalf("admission took %s against accept/no-reply Valkey", elapsed)
 	}
 }
+
+// retryableRejection asserts err is the capacity rejection the proxy answers
+// with 503 and Retry-After: Rejected, not contractual, not unsatisfiable.
+func retryableRejection(t *testing.T, err error, what string) {
+	t.Helper()
+	var rejected *Rejected
+	if !errors.As(err, &rejected) {
+		t.Fatalf("%s: err=%v, want *Rejected", what, err)
+	}
+	if rejected.Contractual || rejected.Unsatisfiable {
+		t.Fatalf("%s: rejection=%+v, want a retryable capacity rejection (503)", what, rejected)
+	}
+}
+
+func TestReplaceAppliesToNextAdmitAndLeavesInFlightLeasesUntouched(t *testing.T) {
+	ctx := context.Background()
+	a, _ := testAdmitter(t, config.AdmissionSettings{Platform: limits(10), Organization: limits(3)})
+	l1, err := a.Admit(ctx, request("o", "m1"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	l2, err := a.Admit(ctx, request("o", "m2"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	cfg := a.Settings()
+	cfg.Organization.MaxActiveRequests = testutil.Ptr[int64](1)
+	a.Replace(cfg)
+	if got := *a.Settings().Organization.MaxActiveRequests; got != 1 {
+		t.Fatalf("Settings().Organization.MaxActiveRequests=%d after Replace, want 1", got)
+	}
+	_, err = a.Admit(ctx, request("o", "m3"))
+	retryableRejection(t, err, "admit with 2 in flight at cap 1")
+	if err := l1.Complete(ctx, 0); err != nil {
+		t.Fatal(err)
+	}
+	_, err = a.Admit(ctx, request("o", "m3"))
+	retryableRejection(t, err, "admit with 1 in flight at cap 1")
+	if err := l2.Complete(ctx, 0); err != nil {
+		t.Fatal(err)
+	}
+	l3, err := a.Admit(ctx, request("o", "m3"))
+	if err != nil {
+		t.Fatalf("admit with 0 in flight at cap 1: %v", err)
+	}
+	_ = l3.Complete(ctx, 0)
+}
+
+func TestReplaceLowersCapForNewRequestsOnlyAndLeavesLeasesInFlight(t *testing.T) {
+	ctx := context.Background()
+	a, mr := testAdmitter(t, config.AdmissionSettings{Platform: limits(3), LeaseTTL: time.Minute})
+	l1, err := a.Admit(ctx, request("o", "m1"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	l2, err := a.Admit(ctx, request("o", "m2"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	cfg := a.Settings()
+	cfg.Platform.MaxActiveRequests = testutil.Ptr[int64](1)
+	a.Replace(cfg)
+	if got := *a.Settings().Platform.MaxActiveRequests; got != 1 {
+		t.Fatalf("Settings().Platform.MaxActiveRequests=%d after Replace, want 1", got)
+	}
+	_, err = a.Admit(ctx, request("o", "m3"))
+	retryableRejection(t, err, "admit with 2 in flight at cap 1")
+
+	// Both leases granted before the swap still renew: move the store clock
+	// to half the TTL, run one synchronous KeepAlive renewal, and check the
+	// expiry moved forward with no error reported.
+	for i, l := range []*Lease{l1, l2} {
+		before, zerr := a.client.ZScore(ctx, a.expiries, l.id).Result()
+		if zerr != nil {
+			t.Fatalf("lease %d missing after Replace: %v", i+1, zerr)
+		}
+		mr.SetTime(time.UnixMilli(int64(before) - time.Minute.Milliseconds()/2))
+		kctx, cancel := context.WithCancel(ctx)
+		done := make(chan struct{})
+		go func() {
+			defer close(done)
+			l.KeepAlive(kctx, func(e error) { t.Errorf("lease %d keepalive after Replace: %v", i+1, e) })
+		}()
+		deadline := time.Now().Add(time.Second)
+		for {
+			after, zerr := a.client.ZScore(ctx, a.expiries, l.id).Result()
+			if zerr != nil {
+				t.Fatal(zerr)
+			}
+			if after > before {
+				break
+			}
+			if time.Now().After(deadline) {
+				t.Fatalf("lease %d was not renewed after Replace", i+1)
+			}
+			time.Sleep(time.Millisecond)
+		}
+		cancel()
+		<-done
+	}
+
+	if err := l1.Complete(ctx, 0); err != nil {
+		t.Fatal(err)
+	}
+	_, err = a.Admit(ctx, request("o", "m3"))
+	retryableRejection(t, err, "admit with 1 in flight at cap 1")
+	if err := l2.Complete(ctx, 0); err != nil {
+		t.Fatal(err)
+	}
+	l3, err := a.Admit(ctx, request("o", "m3"))
+	if err != nil {
+		t.Fatalf("admit with 0 in flight at cap 1: %v", err)
+	}
+	_ = l3.Complete(ctx, 0)
+}
+
+func TestReplaceConcurrentWithAdmitAndCompleteIsRaceFree(t *testing.T) {
+	ctx := context.Background()
+	a, _ := testAdmitter(t, config.AdmissionSettings{Platform: limits(4)})
+	low, high := a.Settings(), a.Settings()
+	low.Platform.MaxActiveRequests = testutil.Ptr[int64](1)
+	stop := make(chan struct{})
+	swapped := make(chan struct{})
+	go func() {
+		defer close(swapped)
+		for i := 0; ; i++ {
+			select {
+			case <-stop:
+				return
+			default:
+			}
+			if i%2 == 0 {
+				a.Replace(low)
+			} else {
+				a.Replace(high)
+			}
+		}
+	}()
+	var wg sync.WaitGroup
+	for i := 0; i < 8; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			for j := 0; j < 20; j++ {
+				l, err := a.Admit(ctx, request("o", fmt.Sprintf("m%d", i)))
+				if err != nil {
+					var rejected *Rejected
+					if !errors.As(err, &rejected) {
+						t.Errorf("admit during Replace: %v", err)
+					}
+					continue
+				}
+				if err := l.Complete(ctx, 0); err != nil {
+					t.Errorf("complete during Replace: %v", err)
+				}
+			}
+		}(i)
+	}
+	wg.Wait()
+	close(stop)
+	<-swapped
+	// Every lease was released, so the strictest cap admits one request.
+	a.Replace(low)
+	l, err := a.Admit(ctx, request("o", "final"))
+	if err != nil {
+		t.Fatalf("admit after all leases released: %v", err)
+	}
+	_ = l.Complete(ctx, 0)
+}
