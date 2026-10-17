@@ -323,8 +323,8 @@ func TestAdmissionPolicyWatcherIgnoresOtherConfigMaps(t *testing.T) {
 	if _, err := cms.Create(ctx, other, metav1.CreateOptions{}); err != nil {
 		t.Fatal(err)
 	}
-	real := policyConfigMap(AdmissionPolicyConfigMap, map[string]string{"revision": "sentinel", "organization.maxActiveRequests": "7"})
-	if _, err := cms.Create(ctx, real, metav1.CreateOptions{}); err != nil {
+	sentinelCM := policyConfigMap(AdmissionPolicyConfigMap, map[string]string{"revision": "sentinel", "organization.maxActiveRequests": "7"})
+	if _, err := cms.Create(ctx, sentinelCM, metav1.CreateOptions{}); err != nil {
 		t.Fatal(err)
 	}
 	eventually(t, "revision sentinel", func() bool { return w.Revision() == "sentinel" })
