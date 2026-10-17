@@ -195,7 +195,11 @@ graph.maxColdHolds: "4"
 - **Keys:** `<tier>.<field>`, tier one of `platform`, `graph`, `organization`,
   `organizationModel`, field any AdmissionLimits field by its Helm key. `window`,
   `admission.enabled`, lanes, store mechanics, `protection.*` and `wake.*` stay
-  Helm-only. With `admission.enabled=false` phoebe does not watch the ConfigMap.
+  Helm-only. With `admission.enabled=false` phoebe does not watch the ConfigMap. It
+  also does not watch it when `gateway.enabled=false`, `gateway.legacyPostgresResolver=true`
+  or `gateway.namespace` is empty, or when its kubernetes config is unavailable; in
+  those cases the Helm values stay in force and phoebe logs a warning naming the
+  reason (`admission policy: not watching ConfigMap tf-admission-policy (<reason>) ...`).
 - **Precedence, per field:** a present key replaces the Helm value; an absent key keeps
   it. Each update is laid over the Helm values, never over the previous update. Values
   are integers >= 1, so the page can set a cap but not remove one or zero it.
@@ -211,6 +215,10 @@ graph.maxColdHolds: "4"
   Phoebe has no metrics endpoint: each apply, kept value and refusal is one log line
   with the revision (`admission policy: applied revision ...`, `... keeping the last good
   value ...`, `... REFUSED, keeping revision ...`).
+  At startup phoebe waits up to 10 s for the first read of the ConfigMap before it
+  serves, so a restarted replica enforces the published caps from its first request.
+  If the read does not complete in time, phoebe serves on the Helm values and logs an
+  error (`admission policy: ConfigMap ... not read within 10s ...`) until it syncs.
 
 ## Rollout and rollback
 

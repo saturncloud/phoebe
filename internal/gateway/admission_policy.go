@@ -55,6 +55,7 @@ type AdmissionPolicyWatcher struct {
 	target   PolicyTarget
 	base     config.AdmissionSettings
 	informer cache.SharedIndexInformer
+	reg      cache.ResourceEventHandlerRegistration
 
 	mu       sync.Mutex
 	revision string           // revision in force; "" while the Helm settings apply
@@ -81,16 +82,32 @@ func NewAdmissionPolicyWatcher(client kubernetes.Interface, namespace string, ta
 	_ = w.informer.SetWatchErrorHandler(func(_ *cache.Reflector, err error) {
 		w.log.Error.Printf("admission policy: watch failed (%v); keeping the settings in force (revision %q) until it reconnects", err, w.Revision())
 	})
-	_, _ = w.informer.AddEventHandler(cache.ResourceEventHandlerFuncs{
+	reg, err := w.informer.AddEventHandler(cache.ResourceEventHandlerFuncs{
 		AddFunc:    func(obj any) { w.apply(obj) },
 		UpdateFunc: func(_, obj any) { w.apply(obj) },
 		DeleteFunc: func(obj any) { w.deleted(obj) },
 	})
+	if err != nil {
+		w.log.Error.Printf("admission policy: registering the policy handler failed (%v); the Helm admission values stay in force", err)
+	} else {
+		w.reg = reg
+	}
 	return w
 }
 
 // Run starts the informer; it returns when ctx is cancelled.
 func (w *AdmissionPolicyWatcher) Run(ctx context.Context) { w.informer.Run(ctx.Done()) }
+
+// WaitSynced blocks until the event handler has applied the informer's initial
+// list or ctx is done, and reports whether it synced. It waits on the handler
+// registration, not the informer: the informer reports synced once its store
+// is filled, possibly before apply has run for the existing ConfigMap.
+func (w *AdmissionPolicyWatcher) WaitSynced(ctx context.Context) bool {
+	if w.reg == nil {
+		return false
+	}
+	return cache.WaitForCacheSync(ctx.Done(), w.reg.HasSynced)
+}
 
 // Revision is the revision of the policy in force, "" while only the Helm
 // settings apply.

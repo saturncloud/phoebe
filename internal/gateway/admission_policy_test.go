@@ -185,3 +185,33 @@ func TestAdmissionPolicyWatcherIgnoresOtherConfigMaps(t *testing.T) {
 		t.Fatalf("a ConfigMap with another name was applied: revision %q, org cap %d", w.Revision(), target.orgActive())
 	}
 }
+
+// TestAdmissionPolicyWaitSyncedMeansTheExistingPolicyIsApplied guards the
+// startup contract: once WaitSynced returns true, a ConfigMap that already
+// existed has been applied to the target, so a restarted replica serves the
+// admin caps rather than the Helm values. No polling after the wait.
+func TestAdmissionPolicyWaitSyncedMeansTheExistingPolicyIsApplied(t *testing.T) {
+	target := &fakePolicyTarget{cfg: config.AdmissionSettings{
+		Enabled:           true,
+		Organization:      config.AdmissionLimits{MaxActiveRequests: testutil.Ptr[int64](10), WindowStr: "1m", Window: time.Minute},
+		Platform:          config.AdmissionLimits{WindowStr: "1m", Window: time.Minute},
+		Graph:             config.AdmissionLimits{WindowStr: "1m", Window: time.Minute},
+		OrganizationModel: config.AdmissionLimits{WindowStr: "1m", Window: time.Minute},
+	}}
+	client := fake.NewSimpleClientset(policyConfigMap(AdmissionPolicyConfigMap, map[string]string{
+		"revision": "r7", "organization.maxActiveRequests": "4",
+	}))
+	w := NewAdmissionPolicyWatcher(client, policyNS, target, logging.New(logging.ERROR))
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+	go w.Run(ctx)
+
+	wctx, wcancel := context.WithTimeout(ctx, 5*time.Second)
+	defer wcancel()
+	if !w.WaitSynced(wctx) {
+		t.Fatal("WaitSynced returned false with the ConfigMap present")
+	}
+	if got := target.orgActive(); got != 4 || w.Revision() != "r7" {
+		t.Fatalf("after WaitSynced: org maxActiveRequests=%d revision=%q, want 4 and r7", got, w.Revision())
+	}
+}
