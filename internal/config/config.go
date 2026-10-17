@@ -618,13 +618,6 @@ func (a *AdmissionSettings) parse(storeConfigured bool) error {
 	if a.ValkeyAddr == "" {
 		return fmt.Errorf("admission.enabled=true requires admission.valkeyAddr")
 	}
-	limits := []struct {
-		name  string
-		value *AdmissionLimits
-	}{
-		{"platform", &a.Platform}, {"graph", &a.Graph},
-		{"organization", &a.Organization}, {"organizationModel", &a.OrganizationModel},
-	}
 	for name, lane := range a.Lanes {
 		if lane.Weight <= 0 {
 			return fmt.Errorf("admission.lanes.%s.weight must be positive", name)
@@ -634,8 +627,19 @@ func (a *AdmissionSettings) parse(storeConfigured bool) error {
 		}
 		a.Lanes[name] = lane
 	}
-	for _, item := range limits {
-		if err := item.value.parse("admission." + item.name); err != nil {
+	return a.validateOperatorLimits()
+}
+
+// validateOperatorLimits is the single list of checks that depend on the
+// operator tier limits: each tier's own rules (parse), then the lane shares
+// against the platform caps. Both the Helm path (AdmissionSettings.parse) and
+// the admission-policy path (WithLimitOverrides) must call it, so a check
+// added here holds for a policy update exactly as it does for Helm values. It
+// does not write to a.Lanes, so it is safe on settings whose Lanes map the
+// live admitter is reading.
+func (a *AdmissionSettings) validateOperatorLimits() error {
+	for _, tier := range admissionPolicyTiers {
+		if err := tier.limits(a).parse("admission." + tier.name); err != nil {
 			return err
 		}
 	}

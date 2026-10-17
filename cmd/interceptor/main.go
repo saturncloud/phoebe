@@ -130,21 +130,50 @@ func buildAdmission(s *config.Settings, log *logging.Logger) (*admission.RedisAd
 // admission-policy ConfigMap (the shared-tier admin page's gateway limits) to
 // the admitter, live. It runs only where the operator tiers are on
 // (admission.enabled) and the registry resolver runs, because it watches the
-// same gateway namespace with the same access. Anywhere else, or when the
-// kubernetes config is missing, the Helm values stay in force and it logs why.
+// same gateway namespace with the same access. With no admitter or with
+// admission.enabled=false it returns quietly: buildAdmission already logged
+// that mode. In every other case where it does not watch (gateway off, legacy
+// resolver, no namespace, no kubernetes config) it logs a warning naming the
+// reason, because Atlas still publishes caps that this replica then ignores.
+//
+// At startup it waits up to admissionPolicySyncWait for the first read of the
+// ConfigMap, so a restarted replica does not serve on the Helm values while
+// tighter admin caps are already published. It never fails startup: on a
+// timeout it logs an error and serves on the Helm values until the read lands.
+//
+// admissionPolicySyncWait and newAdmissionPolicyKubeClient are variables so
+// tests can shorten the wait and inject a client.
+var (
+	admissionPolicySyncWait      = 10 * time.Second
+	newAdmissionPolicyKubeClient = gateway.NewKubeClient
+)
+
 func buildAdmissionPolicy(s *config.Settings, admitter *admission.RedisAdmitter, log *logging.Logger) func() {
-	if admitter == nil || !s.Admission.Enabled || !s.Gateway.Enabled || s.Gateway.LegacyPostgresResolver {
+	if admitter == nil || !s.Admission.Enabled {
 		return func() {}
 	}
-	client, err := gateway.NewKubeClient(s.Gateway.Kubeconfig)
+	if reason := gatewayWatchDisabledReason(s); reason != "" {
+		log.Warn.Printf("admission policy: not watching ConfigMap %s (%s); admin-page gateway limits are ignored and the Helm admission values stay in force", gateway.AdmissionPolicyConfigMap, reason)
+		return func() {}
+	}
+	client, err := newAdmissionPolicyKubeClient(s.Gateway.Kubeconfig)
 	if err != nil {
-		log.Warn.Printf("admission policy: kubernetes config unavailable (%v); the Helm admission values stay in force", err)
+		log.Warn.Printf("admission policy: kubernetes config unavailable (%v); admin-page gateway limits are ignored and the Helm admission values stay in force", err)
 		return func() {}
 	}
 	watcher := gateway.NewAdmissionPolicyWatcher(client, s.Gateway.Namespace, admitter, log)
 	ctx, cancel := context.WithCancel(context.Background())
 	go watcher.Run(ctx)
-	log.Info.Printf("admission policy: watching ConfigMap %s/%s (Helm values apply until it is read)", s.Gateway.Namespace, gateway.AdmissionPolicyConfigMap)
+	// Bounded wait for the first read so a restarted replica enforces the
+	// admin caps already published, not the Helm values. Keep serving either
+	// way: a failed read leaves the Helm values, which is logged as an error.
+	wctx, wcancel := context.WithTimeout(ctx, admissionPolicySyncWait)
+	if !watcher.WaitSynced(wctx) {
+		log.Error.Printf("admission policy: ConfigMap %s/%s not read within %s; the Helm admission values apply, and any tighter limits set on the admin page are NOT enforced until it syncs", s.Gateway.Namespace, gateway.AdmissionPolicyConfigMap, admissionPolicySyncWait)
+	} else {
+		log.Info.Printf("admission policy: watching ConfigMap %s/%s; %s in force", s.Gateway.Namespace, gateway.AdmissionPolicyConfigMap, watcher.InForce())
+	}
+	wcancel()
 	return cancel
 }
 
@@ -168,7 +197,7 @@ func buildTopology(s *config.Settings, log *logging.Logger) (*gateway.TopologyIn
 	// Each disabled case says so at Warn: without the index every usage
 	// event, dedicated traffic included, records no topology revision or
 	// region, and the margin pipeline sees revision-0 rollups.
-	if reason := topologyDisabledReason(s); reason != "" {
+	if reason := gatewayWatchDisabledReason(s); reason != "" {
 		log.Warn.Printf("gateway: graph topology index disabled (%s); usage events, including dedicated traffic, carry no topology revision or region", reason)
 		return nil, func() {}
 	}
@@ -190,10 +219,11 @@ func buildTopology(s *config.Settings, log *logging.Logger) (*gateway.TopologyIn
 	return index, cancel
 }
 
-// topologyDisabledReason names the setting that keeps the topology index off,
-// or returns "" when the index can run. The index reuses the registry
-// resolver's ConfigMap access, so it runs only where that resolver runs.
-func topologyDisabledReason(s *config.Settings) string {
+// gatewayWatchDisabledReason names the setting that keeps the gateway-namespace
+// ConfigMap watchers (the topology index and the admission-policy watcher)
+// off, or returns "" when they can run. Both reuse the registry resolver's
+// ConfigMap access, so they run only where that resolver runs.
+func gatewayWatchDisabledReason(s *config.Settings) string {
 	switch {
 	case !s.Gateway.Enabled:
 		return "gateway.enabled=false"

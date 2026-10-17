@@ -195,22 +195,49 @@ graph.maxColdHolds: "4"
 - **Keys:** `<tier>.<field>`, tier one of `platform`, `graph`, `organization`,
   `organizationModel`, field any AdmissionLimits field by its Helm key. `window`,
   `admission.enabled`, lanes, store mechanics, `protection.*` and `wake.*` stay
-  Helm-only. With `admission.enabled=false` phoebe does not watch the ConfigMap.
+  Helm-only. With `admission.enabled=false` phoebe does not watch the ConfigMap. It
+  also does not watch it when `gateway.enabled=false`, `gateway.legacyPostgresResolver=true`
+  or `gateway.namespace` is empty, or when its kubernetes config is unavailable; in
+  those cases the Helm values stay in force and phoebe logs a warning naming the
+  reason (`admission policy: not watching ConfigMap tf-admission-policy (<reason>) ...`).
 - **Precedence, per field:** a present key replaces the Helm value; an absent key keeps
   it. Each update is laid over the Helm values, never over the previous update. Values
   are integers >= 1, so the page can set a cap but not remove one or zero it.
 - **Reload:** each interceptor replica watches the ConfigMap and swaps the admitter's
   settings atomically; the next admitted request uses them. Leases in flight are
   untouched; a cap lowered below current usage refuses new requests with 503 and
-  Retry-After until usage drops.
+  Retry-After until usage drops. A request keeps the limits that applied when it
+  was admitted. The cold-hold and wake caps (`graph.maxColdHolds`,
+  `organization.maxColdHolds`, `*.wakesPerWindow`) are checked when an admitted
+  request begins a cold hold, against those admit-time limits. A lowered cold-hold
+  or wake cap therefore reaches requests admitted before the change only after they
+  finish, which takes at most one wake timeout.
 - **Fail closed:** a malformed entry (unknown key, a value that is not an integer >= 1)
   keeps the last good value for that key, or the Helm value if there never was one; the
-  other entries still apply. If the entries are each valid but together fail phoebe's
-  cross-field validation (per-tier rules, lane shares), the whole update is refused and
-  the last applied settings stay. A deleted ConfigMap keeps the last applied settings.
+  other entries still apply. The last good values are held in each replica's memory
+  only and are lost when the pod restarts. A replica that starts while a malformed entry
+  is live has no history, so it enforces the Helm value for that key, and it can differ
+  from replicas that kept a last good value until Atlas writes a valid revision. Atlas
+  must therefore write only valid entries (integers >= 1, known keys): a malformed entry
+  plus a pod restart lets replicas enforce different caps on the shared Valkey counters.
+  A kept last good value never blocks a valid entry of the same revision: if it breaks a
+  per-tier rule against a new value (for example a kept `maxConcurrentPrefills` above a
+  lowered `maxActiveRequests`), the kept value is lowered to that cap and the revision
+  applies; a kept value is only ever lowered. If the entries are each valid but together
+  fail phoebe's cross-field validation (per-tier rules, lane shares), the whole update is
+  refused and the last applied settings stay. A deleted ConfigMap keeps the last applied
+  settings. A ConfigMap with no `revision` key (or an empty one) is applied and logged as
+  a policy with no revision, never as the Helm settings.
   Phoebe has no metrics endpoint: each apply, kept value and refusal is one log line
-  with the revision (`admission policy: applied revision ...`, `... keeping the last good
-  value ...`, `... REFUSED, keeping revision ...`).
+  with the revision (`admission policy: applied revision ...`, `... applied revision ...
+  PARTIALLY from ...` naming the malformed keys when some entries kept their last good
+  or Helm value, `... keeping the last good value ...`, `... no last good value in this
+  process, the Helm value stays ...`, `... kept value(s) for ... were lowered so revision
+  ... could apply`, `... REFUSED, keeping revision ...`, `... has no "revision" key ...`).
+  At startup phoebe waits up to 10 s for the first read of the ConfigMap before it
+  serves, so a restarted replica enforces the published caps from its first request.
+  If the read does not complete in time, phoebe serves on the Helm values and logs an
+  error (`admission policy: ConfigMap ... not read within 10s ...`) until it syncs.
 
 ## Rollout and rollback
 

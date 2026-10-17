@@ -15,6 +15,8 @@ import (
 	"time"
 
 	"github.com/alicebob/miniredis/v2"
+	corev1 "k8s.io/api/core/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/kubernetes/fake"
@@ -268,5 +270,128 @@ func TestBuildTopologySyncTimeoutKeepsServing(t *testing.T) {
 	}
 	if out := buf.String(); !strings.Contains(out, "not synced within 200ms") {
 		t.Fatalf("sync timeout warning does not name the wait: %q", out)
+	}
+}
+
+// policyTestAdmitter builds an admitter with the operator tiers on, over a
+// throwaway Valkey, and settings whose gateway section the caller sets.
+func policyTestAdmitter(t *testing.T) (*config.Settings, *admission.RedisAdmitter) {
+	t.Helper()
+	mr := miniredis.RunT(t)
+	s := loadTestSettings(t, "admission:\n  enabled: true\n  valkeyAddr: "+mr.Addr()+"\n"+
+		"  organization:\n    maxActiveRequests: 20\n    window: 1m\n")
+	client := admission.NewValkeyClient(mr.Addr())
+	t.Cleanup(func() { _ = client.Close() })
+	return s, admission.New(client, s.Admission)
+}
+
+func captureAllLogger(buf *bytes.Buffer) *logging.Logger {
+	return &logging.Logger{Debug: log.New(io.Discard, "", 0), Info: log.New(buf, "", 0), Warn: log.New(buf, "", 0), Error: log.New(buf, "", 0)}
+}
+
+// TestBuildAdmissionPolicyNotWatchedWarnsNamingTheReason: with the operator
+// tiers on, every gateway setting that keeps the policy watcher off is logged
+// at Warn with its name, since Atlas still publishes caps this replica ignores.
+func TestBuildAdmissionPolicyNotWatchedWarnsNamingTheReason(t *testing.T) {
+	cases := []struct {
+		name   string
+		gw     config.GatewaySettings
+		reason string
+	}{
+		{"gateway disabled", config.GatewaySettings{Enabled: false, Namespace: "ns"}, "gateway.enabled=false"},
+		{"legacy resolver", config.GatewaySettings{Enabled: true, LegacyPostgresResolver: true, Namespace: "ns"}, "gateway.legacyPostgresResolver=true"},
+		{"empty namespace", config.GatewaySettings{Enabled: true}, "gateway.namespace is empty"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			s, admitter := policyTestAdmitter(t)
+			s.Gateway = tc.gw
+			var buf bytes.Buffer
+			closePolicy := buildAdmissionPolicy(s, admitter, warnCaptureLogger(&buf))
+			closePolicy()
+			want := "admission policy: not watching ConfigMap " + gateway.AdmissionPolicyConfigMap + " (" + tc.reason + ")"
+			if out := buf.String(); !strings.Contains(out, want) || !strings.Contains(out, "Helm admission values stay in force") {
+				t.Fatalf("warning does not name %q: %q", tc.reason, out)
+			}
+		})
+	}
+}
+
+// TestBuildAdmissionPolicyQuietWhenOperatorTiersOff: admission.enabled=false
+// (and no admitter) are logged by buildAdmission; the policy builder adds
+// nothing.
+func TestBuildAdmissionPolicyQuietWhenOperatorTiersOff(t *testing.T) {
+	s, admitter := policyTestAdmitter(t)
+	s.Admission.Enabled = false
+	var buf bytes.Buffer
+	buildAdmissionPolicy(s, admitter, captureAllLogger(&buf))()
+	buildAdmissionPolicy(s, nil, captureAllLogger(&buf))()
+	if buf.Len() != 0 {
+		t.Fatalf("unexpected log with operator tiers off: %q", buf.String())
+	}
+}
+
+// TestBuildAdmissionPolicyAppliesThePublishedPolicyBeforeServing: the
+// ConfigMap that exists at startup is applied before buildAdmissionPolicy
+// returns, so a restarted replica never serves on the looser Helm values.
+func TestBuildAdmissionPolicyAppliesThePublishedPolicyBeforeServing(t *testing.T) {
+	s, admitter := policyTestAdmitter(t)
+	s.Gateway = config.GatewaySettings{Enabled: true, Namespace: "ns"}
+	client := fake.NewSimpleClientset(&corev1.ConfigMap{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: gateway.AdmissionPolicyConfigMap, Namespace: "ns",
+			Labels: map[string]string{gateway.AdmissionPolicyLabel: "true"},
+		},
+		Data: map[string]string{"revision": "r3", "organization.maxActiveRequests": "4"},
+	})
+	prev := newAdmissionPolicyKubeClient
+	newAdmissionPolicyKubeClient = func(string) (kubernetes.Interface, error) { return client, nil }
+	t.Cleanup(func() { newAdmissionPolicyKubeClient = prev })
+
+	var buf bytes.Buffer
+	closePolicy := buildAdmissionPolicy(s, admitter, captureAllLogger(&buf))
+	defer closePolicy()
+	got := admitter.Settings().Organization.MaxActiveRequests
+	if got == nil || *got != 4 {
+		t.Fatalf("org maxActiveRequests=%v on return, want the published 4", got)
+	}
+	if out := buf.String(); !strings.Contains(out, `revision "r3" in force`) {
+		t.Fatalf("startup log does not name the revision in force: %q", out)
+	}
+}
+
+// TestBuildAdmissionPolicySyncTimeoutLogsErrorAndKeepsServing: when the first
+// read never completes, startup waits only admissionPolicySyncWait, keeps
+// serving on the Helm values and logs an error saying the admin limits are not
+// enforced.
+func TestBuildAdmissionPolicySyncTimeoutLogsErrorAndKeepsServing(t *testing.T) {
+	s, admitter := policyTestAdmitter(t)
+	s.Gateway = config.GatewaySettings{Enabled: true, Namespace: "ns"}
+	block := make(chan struct{})
+	client := fake.NewSimpleClientset()
+	client.PrependReactor("list", "configmaps", func(k8stesting.Action) (bool, runtime.Object, error) {
+		<-block
+		return false, nil, nil
+	})
+	prevWait, prevClient := admissionPolicySyncWait, newAdmissionPolicyKubeClient
+	admissionPolicySyncWait = 200 * time.Millisecond
+	newAdmissionPolicyKubeClient = func(string) (kubernetes.Interface, error) { return client, nil }
+	t.Cleanup(func() { admissionPolicySyncWait, newAdmissionPolicyKubeClient = prevWait, prevClient })
+
+	var buf bytes.Buffer
+	start := time.Now()
+	closePolicy := buildAdmissionPolicy(s, admitter, captureAllLogger(&buf))
+	elapsed := time.Since(start)
+	closePolicy()
+	close(block)
+
+	if elapsed > 2*time.Second {
+		t.Fatalf("buildAdmissionPolicy took %s with a 200ms wait: the wait is not bounded", elapsed)
+	}
+	if got := admitter.Settings().Organization.MaxActiveRequests; got == nil || *got != 20 {
+		t.Fatalf("org maxActiveRequests=%v, want the Helm 20 while unsynced", got)
+	}
+	if out := buf.String(); !strings.Contains(out, "not read within 200ms") || !strings.Contains(out, "NOT enforced until it syncs") {
+		t.Fatalf("sync timeout not logged as an error naming the wait: %q", out)
 	}
 }
