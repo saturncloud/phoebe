@@ -59,6 +59,8 @@ func main() {
 	if admitter != nil {
 		srv = srv.WithAdmitter(admitter)
 	}
+	closePolicy := buildAdmissionPolicy(settings, admitter, log)
+	defer closePolicy()
 	if gwResolver != nil {
 		srv = srv.WithGateway(gwResolver, settings.Gateway.Namespace, settings.Gateway.Port)
 	}
@@ -89,7 +91,7 @@ func main() {
 	}
 }
 
-func buildAdmission(s *config.Settings, log *logging.Logger) (admission.Admitter, func()) {
+func buildAdmission(s *config.Settings, log *logging.Logger) (*admission.RedisAdmitter, func()) {
 	admitter, client, ok := admission.FromSettings(s)
 	if !ok {
 		// No Valkey at all (admission.valkeyAddr and emit.valkeyAddr both
@@ -122,6 +124,28 @@ func buildAdmission(s *config.Settings, log *logging.Logger) (admission.Admitter
 		log.Info.Printf("admission: enforcing %s (valkey %s, lease ttl %s)", mode, cfg.ValkeyAddr, cfg.LeaseTTL)
 	}
 	return admitter, func() { _ = client.Close() }
+}
+
+// buildAdmissionPolicy starts the watcher that applies the Atlas-written
+// admission-policy ConfigMap (the shared-tier admin page's gateway limits) to
+// the admitter, live. It runs only where the operator tiers are on
+// (admission.enabled) and the registry resolver runs, because it watches the
+// same gateway namespace with the same access. Anywhere else, or when the
+// kubernetes config is missing, the Helm values stay in force and it logs why.
+func buildAdmissionPolicy(s *config.Settings, admitter *admission.RedisAdmitter, log *logging.Logger) func() {
+	if admitter == nil || !s.Admission.Enabled || !s.Gateway.Enabled || s.Gateway.LegacyPostgresResolver {
+		return func() {}
+	}
+	client, err := gateway.NewKubeClient(s.Gateway.Kubeconfig)
+	if err != nil {
+		log.Warn.Printf("admission policy: kubernetes config unavailable (%v); the Helm admission values stay in force", err)
+		return func() {}
+	}
+	watcher := gateway.NewAdmissionPolicyWatcher(client, s.Gateway.Namespace, admitter, log)
+	ctx, cancel := context.WithCancel(context.Background())
+	go watcher.Run(ctx)
+	log.Info.Printf("admission policy: watching ConfigMap %s/%s (Helm values apply until it is read)", s.Gateway.Namespace, gateway.AdmissionPolicyConfigMap)
+	return cancel
 }
 
 // buildTopology starts the graph topology index (internal/gateway/topology.go)
