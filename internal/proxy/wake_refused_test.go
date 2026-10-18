@@ -129,3 +129,27 @@ func TestWakeOtherForwardErrorsAreNotRetried(t *testing.T) {
 		t.Fatalf("upstream attempts = %d, want 2 (cold, one failed forward)", got)
 	}
 }
+
+// TestWakeRefusedRetryStopsWhenTheClientGoesAway: a client that disconnects
+// while a refused forward waits to be resent ends the retries at once, without
+// waiting out the hold.
+func TestWakeRefusedRetryStopsWhenTheClientGoesAway(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	transport, calls, _ := wakeTransportWith(t, 10*time.Second, func(int32, *http.Request) (*http.Response, error) {
+		// The client goes away during the first wait between resends.
+		time.AfterFunc(wakeRefusedRetryInterval/5, cancel)
+		return nil, refusedDial()
+	})
+	start := time.Now()
+	_, err := transport.RoundTrip(held(t).WithContext(ctx))
+	if !errors.Is(err, syscall.ECONNREFUSED) {
+		t.Fatalf("RoundTrip error = %v, want the refusal", err)
+	}
+	if got := calls.Load(); got != 2 {
+		t.Fatalf("upstream attempts = %d, want 2 (cold, one refusal, no resend after the client left)", got)
+	}
+	if elapsed := time.Since(start); elapsed >= wakeRefusedRetryInterval {
+		t.Fatalf("returned after %v, want before the %v resend interval", elapsed, wakeRefusedRetryInterval)
+	}
+}
