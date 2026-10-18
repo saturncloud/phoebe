@@ -550,8 +550,9 @@ func isDerivationBase(modelID string, derivedFrom map[string]string) bool {
 // on ALL TF deployments) is the catalog price key, and a non-empty adapter
 // (X-Saturn-Adapter, ONLY on fine-tune checkpoint deployments) marks the event as
 // fine-tune traffic. THE LADDER — precedence a > b > c > d for DEDICATED traffic,
-// and b > c > a > d for SHARED traffic (a shared base endpoint serves under its bare
-// base id, which is the dedicated key; see the function body):
+// and c > a > d for SHARED BASE-MODEL traffic (a shared base endpoint serves under its
+// bare base id, which is the dedicated key; shared fine-tunes keep a > b > d; see the
+// function body):
 //
 //	a. model_id is directly priced (a price-file key: a base model served under its
 //	   HF id, a fine-tune with its own/derived in-file rate, or a per-endpoint
@@ -575,7 +576,8 @@ func (pb *PriceBook) ResolveEvent(modelID, baseModel, adapter, servingMode strin
 	//   - dedicated: (a) the event's own model_id, then the bare-base step (b)/(c).
 	//     A dedicated endpoint serves under its endpoint name, so (a) is the
 	//     per-endpoint override seam. Unchanged.
-	//   - shared: the `shared:<base>` step (b)/(c) FIRST, then (a). A shared
+	//   - shared BASE-MODEL traffic (no adapter, no ft: prefix): the `shared:<base>`
+	//     step (c) FIRST, then (a). Shared fine-tunes keep the dedicated order. A shared
 	//     base-model endpoint serves under its BARE base id, so its model_id IS the
 	//     dedicated key: trying (a) first matched the bare dedicated row (often $0)
 	//     and the shared price was never reached. (a) stays as the fallback, so a
@@ -591,7 +593,11 @@ func (pb *PriceBook) ResolveEvent(modelID, baseModel, adapter, servingMode strin
 		return Rate3{}, ErrInvalidServingMode
 	}
 	skuBase := servingModeKey(servingMode, baseModel)
-	if servingMode == identity.ServingModeShared {
+	// Shared BASE-MODEL traffic only: a shared fine-tune serves under its endpoint
+	// name (never the bare base), so it keeps the dedicated order and an own-rate
+	// entry still wins. Mirrors the SQL's sku_first column.
+	fineTune := adapter != "" || strings.HasPrefix(modelID, fineTunePrefix)
+	if servingMode == identity.ServingModeShared && !fineTune {
 		if r, ok, err := pb.resolveSKU(modelID, baseModel, adapter, skuBase); ok || err != nil {
 			return r, err
 		}

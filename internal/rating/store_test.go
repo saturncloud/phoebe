@@ -128,7 +128,9 @@ func TestRateWindowSQL_Shape(t *testing.T) {
 		"LEFT JOIN rating_derived rd",
 		"rd.base_model = ev.sku_base",
 		// dedicated: derived only after the direct join missed; shared: always first
-		"(rp.model_id IS NULL OR ev.serving_mode = 'shared')",
+		"(rp.model_id IS NULL OR ev.sku_first)",
+		// sku_first: shared BASE-MODEL traffic only (fine-tunes keep the direct model_id first)
+		"COALESCE(serving_mode = 'shared' AND NOT (model LIKE $3 OR adapter IS NOT NULL), false)",
 		// the FINE-TUNE marker (C4): the ft: prefix single-sourced from the Go
 		// fineTunePrefix constant (bound as $3) OR a non-null injected adapter —
 		// the derived join fires on either
@@ -148,6 +150,12 @@ func TestRateWindowSQL_Shape(t *testing.T) {
 		// shared:<base> step first, dedicated keeps the direct model_id first.
 		"THEN COALESCE(rd.prompt_price, rpb.prompt_price, rp.prompt_price)",
 		"ELSE COALESCE(rp.prompt_price, rd.prompt_price, rpb.prompt_price) END",
+		"THEN COALESCE(rd.cached_price, rpb.cached_price, rp.cached_price)",
+		"ELSE COALESCE(rp.cached_price, rd.cached_price, rpb.cached_price) END",
+		"THEN COALESCE(rd.completion_price, rpb.completion_price, rp.completion_price)",
+		"ELSE COALESCE(rp.completion_price, rd.completion_price, rpb.completion_price) END",
+		// a rollup MIXING base-priced and directly priced rows has two rates: ambiguous
+		"OR (bool_or(via_derived OR via_base) AND bool_or(NOT (via_derived OR via_base))))",
 		// Missing authoritative engine usage is excluded from money and counted in
 		// its own strict-partition bucket.
 		"WHERE usage_found",

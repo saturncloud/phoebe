@@ -214,9 +214,9 @@ CREATE TEMP TABLE rating_derived (
 // transient rating_price table (populated from the YAML PriceBook for this run).
 //
 // RESOLUTION (the C4 ladder; the Go mirror is PriceBook.ResolveEvent). Precedence
-// is a > b > c > d for DEDICATED traffic and b > c > a > d for SHARED traffic (a shared
-// base endpoint serves under its bare base id, so (a) would match the dedicated row;
-// 2026-10-18): vLLM serves Token Factory endpoints under the ENDPOINT
+// is a > b > c > d for DEDICATED traffic and shared fine-tunes, and c > a > d for SHARED
+// BASE-MODEL traffic (sku_first: a shared base endpoint serves under its bare base id,
+// so (a) would match the dedicated row; 2026-10-18): vLLM serves Token Factory endpoints under the ENDPOINT
 // NAME, so billing_event.model (aliased to model_id) is usually NOT a price-file
 // key; the event's base_model (X-Saturn-Base-Model, on ALL TF deployments) is the
 // catalog price key and a non-null adapter (X-Saturn-Adapter, ONLY on fine-tune
@@ -335,6 +335,13 @@ WITH ev AS (
         -- adapter: the fine-tune checkpoint artifact id, non-NULL ONLY on fine-tune
         -- checkpoint deployments. Its PRESENCE is the premium trigger (C4).
         adapter,
+        -- sku_first: SHARED BASE-MODEL traffic (shared, and not fine-tune: no adapter,
+        -- no ft: prefix) tries its shared:<base> row BEFORE the direct model_id, because
+        -- such an endpoint serves under its BARE base id, which is the dedicated key
+        -- (2026-10-18). Everything else, shared fine-tunes included, keeps the direct
+        -- model_id first, so an own-rate entry still wins. Mirrors Go ResolveEvent.
+        COALESCE(serving_mode = 'shared' AND NOT (model LIKE $3 OR adapter IS NOT NULL), false)
+            AS sku_first,
         -- OWNER IDENTITY, collapsed from billing_event's two nullable columns into the
         -- single (type, id) pair the upstream model actually has: an identity is a user
         -- XOR a group, never both. NULL/'' on both sides means the producer supplied no
@@ -439,19 +446,20 @@ resolved AS (
         -- the price series is a function of TIME, not of when the rater last ran.
         -- ORDER BY SERVING MODE (2026-10-18; mirrors Go PriceBook.ResolveEvent).
         -- Dedicated: (a) the event's own model_id, then the bare-base step (b)/(c).
-        -- Shared: the shared:<base> step (b)/(c) FIRST, then (a). A shared base-model
+        -- Shared BASE-MODEL traffic (ev.sku_first; shared fine-tunes keep the dedicated
+        -- order, so an own-rate entry still wins): the shared:<base> step FIRST, then (a). A shared base-model
         -- endpoint serves under its BARE base id, so its model_id IS the dedicated key;
         -- trying (a) first matched the bare dedicated row (often $0) and the shared
         -- price was never reached. (a) stays the fallback, so a model with no shared:
         -- row prices as before. Keyed on serving_mode, never on model_id = base_model:
         -- a dedicated endpoint may be named exactly like its base.
-        CASE WHEN ev.serving_mode = 'shared'
+        CASE WHEN ev.sku_first
              THEN COALESCE(rd.prompt_price, rpb.prompt_price, rp.prompt_price)
              ELSE COALESCE(rp.prompt_price, rd.prompt_price, rpb.prompt_price) END     AS prompt_price,
-        CASE WHEN ev.serving_mode = 'shared'
+        CASE WHEN ev.sku_first
              THEN COALESCE(rd.cached_price, rpb.cached_price, rp.cached_price)
              ELSE COALESCE(rp.cached_price, rd.cached_price, rpb.cached_price) END     AS cached_price,
-        CASE WHEN ev.serving_mode = 'shared'
+        CASE WHEN ev.sku_first
              THEN COALESCE(rd.completion_price, rpb.completion_price, rp.completion_price)
              ELSE COALESCE(rp.completion_price, rd.completion_price, rpb.completion_price) END AS completion_price,
         -- Whether this row priced through the DERIVED (base x premium) path (b), or
@@ -473,7 +481,7 @@ resolved AS (
     -- keeps a base-model endpoint from ever resolving through the derived table.
     LEFT JOIN rating_derived rd
         ON rd.base_model = ev.sku_base
-       AND (rp.model_id IS NULL OR ev.serving_mode = 'shared')
+       AND (rp.model_id IS NULL OR ev.sku_first)
        -- The ft: prefix is SINGLE-SOURCED from the Go fineTunePrefix constant, bound as
        -- $3 (ftLikePattern), so the money path has ONE source of truth for what marks a
        -- fine-tune — never a literal 'ft:%' that could drift from the constant. The
@@ -487,7 +495,7 @@ resolved AS (
     -- to an un-premiumed plain-base rate — it must scream as UNPRICED instead.
     LEFT JOIN rating_price rpb
         ON rpb.model_id = ev.sku_base
-       AND (rp.model_id IS NULL OR ev.serving_mode = 'shared')
+       AND (rp.model_id IS NULL OR ev.sku_first)
        AND NOT (ev.model_id LIKE $3 OR ev.adapter IS NOT NULL)
 ),
 -- billable: the events that may enter money, filtered ONCE so the rollup (grouped_raw)
@@ -551,8 +559,10 @@ billable AS (
 --     SINGLE base_model, and MIN() would again silently pick the cheaper.
 -- Both are base_model/adapter PROPAGATION violations: they must SCREAM, not
 -- silently pick a rate. Ambiguous rollups are split out below (counted as an
--- anomaly, never upserted). Direct-priced (via model_id) rows never trip the gate —
--- their base_model/adapter never affected their rate.
+-- anomaly, never upserted). Direct-priced (via model_id) rows alone never trip the
+-- gate (their base_model/adapter never affected their rate); a rollup MIXING direct-
+-- priced and base-priced rows does (two rates; reachable only for shared base traffic,
+-- which tries the base step first).
 gate AS (
     SELECT
         auth_id, owner_type, owner_id, resource_id, model_id, serving_mode, window_start,
@@ -572,7 +582,13 @@ gate AS (
         -- than one rate for the identity → ambiguous. Rows priced directly on
         -- model_id never affect it.
         (COUNT(DISTINCT base_model) FILTER (WHERE via_derived OR via_base) > 1
-         OR (bool_or(via_derived) AND bool_or(via_base)))          AS ambiguous_base,
+         OR (bool_or(via_derived) AND bool_or(via_base))
+         -- A MIX of base-priced and directly priced rows in one rollup: two rates
+         -- (e.g. shared base traffic where some events lack base_model and fall back
+         -- to the bare model_id row). Only reachable for sku_first traffic: for every
+         -- other row a direct hit on the rollup's model_id prices ALL its rows.
+         OR (bool_or(via_derived OR via_base) AND bool_or(NOT (via_derived OR via_base))))
+                                                                   AS ambiguous_base,
         -- > 1 distinct NON-NULL org_id for one identity in one hour → ambiguous org.
         -- Org is a deployment property, so a resource resolving to two distinct orgs
         -- in one window is an attribution PROPAGATION bug (Atlas injected conflicting

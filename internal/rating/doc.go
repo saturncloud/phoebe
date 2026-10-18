@@ -85,8 +85,9 @@
 //
 // Resolution precedence (Go: PriceBook.ResolveEvent; SQL: rateWindowSQL in store.go —
 // kept in exact agreement by the conformance tests): a > b > c > d for DEDICATED
-// traffic; b > c > a > d for SHARED traffic, keyed on serving_mode (a shared base
-// endpoint serves under its bare base id, which is the dedicated key):
+// traffic and shared fine-tunes; c > a > d for SHARED BASE-MODEL traffic, keyed on
+// serving_mode (a shared base endpoint serves under its bare base id, which is the
+// dedicated key):
 //
 //	a. model_id directly priced in the file (a base served under its HF id, an
 //	   own-rate fine-tune, or a per-endpoint override entry) → that rate. The
