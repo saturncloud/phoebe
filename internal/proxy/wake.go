@@ -13,6 +13,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 
 	"github.com/saturncloud/phoebe/internal/admission"
@@ -311,7 +312,10 @@ func (t *wakeRoundTripper) RoundTrip(req *http.Request) (*http.Response, error) 
 	}
 
 	ctx := req.Context()
+	// The wake hold's deadline also bounds forwardAfterWake's retries.
+	var holdDeadline time.Time
 	if t.server.wakeTimeout > 0 {
+		holdDeadline = time.Now().Add(t.server.wakeTimeout)
 		var cancel context.CancelFunc
 		ctx, cancel = context.WithTimeout(ctx, t.server.wakeTimeout)
 		defer cancel()
@@ -345,14 +349,7 @@ func (t *wakeRoundTripper) RoundTrip(req *http.Request) (*http.Response, error) 
 	}
 
 	_ = resp.Body.Close()
-	retry := req.Clone(req.Context())
-	if req.GetBody != nil {
-		retry.Body, err = req.GetBody()
-		if err != nil {
-			return nil, fmt.Errorf("wake: restore request body: %w", err)
-		}
-	}
-	resp, err = t.base.RoundTrip(retry)
+	resp, err = t.forwardAfterWake(req, holdDeadline)
 	if err != nil {
 		return nil, err
 	}
@@ -366,6 +363,49 @@ func (t *wakeRoundTripper) RoundTrip(req *http.Request) (*http.Response, error) 
 		return wakeStartingResponse(req, t.requestID), nil
 	}
 	return resp, nil
+}
+
+// wakeRefusedRetryInterval is the pause between resends of a held request
+// whose upstream refused the connection right after a wake.
+const wakeRefusedRetryInterval = 500 * time.Millisecond
+
+// forwardAfterWake sends the held request again once the wake has finished. A
+// refused connection is retried every wakeRefusedRetryInterval until the wake
+// hold's deadline: right after a wake the frontend can briefly leave its
+// Service (its readiness check fails while the woken worker registers, or the
+// frontend restarts), and kube-proxy then refuses the connection. A refused
+// connection carries no request bytes, so resending is safe for any method
+// (demo-qa, GB300 build 9: a cold wake returned 502 on one refusal and the next
+// try was a 200). Every other error, and a refusal past the deadline or after
+// the client went away, is returned as before. A zero deadline means no hold
+// limit is configured, and nothing is retried.
+func (t *wakeRoundTripper) forwardAfterWake(req *http.Request, deadline time.Time) (*http.Response, error) {
+	for {
+		retry := req.Clone(req.Context())
+		if req.GetBody != nil {
+			body, err := req.GetBody()
+			if err != nil {
+				return nil, fmt.Errorf("wake: restore request body: %w", err)
+			}
+			retry.Body = body
+		}
+		resp, err := t.base.RoundTrip(retry)
+		if err == nil || !errors.Is(err, syscall.ECONNREFUSED) {
+			return resp, err
+		}
+		if deadline.IsZero() || time.Until(deadline) < wakeRefusedRetryInterval {
+			return nil, err
+		}
+		t.server.log.Info.Printf(
+			"wake: upstream refused the connection after the wake; retrying request_id=%s resource_id=%s",
+			t.requestID, t.target.ResourceID,
+		)
+		select {
+		case <-req.Context().Done():
+			return nil, err
+		case <-time.After(wakeRefusedRetryInterval):
+		}
+	}
 }
 
 const (
