@@ -4543,3 +4543,93 @@ func TestIntegration_Migration0009UpNoticesEveryRatedRowWhoseIdItRewrites(t *tes
 		t.Fatalf("0009 up on an empty rated_usage raised %v, want no NOTICE", notices)
 	}
 }
+
+// TestIntegration_LookupOrderKeyedOnServingMode is the SQL twin of the five
+// TestResolveEvent_* order tests in pricebook_test.go (2026-10-18, GB300 $0 shared
+// cost): shared traffic tries shared:<base> first; dedicated keeps model_id first.
+func TestIntegration_LookupOrderKeyedOnServingMode(t *testing.T) {
+	dsn := os.Getenv("PHOEBE_TEST_DATABASE_URL")
+	if dsn == "" {
+		t.Skip("PHOEBE_TEST_DATABASE_URL not set; skipping live-Postgres conformance")
+	}
+	ctx := context.Background()
+	db, err := sql.Open("pgx", dsn)
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	defer db.Close()
+
+	const sch = "phoebe_rating_lookup_order_it"
+	exec(t, db, "DROP SCHEMA IF EXISTS "+sch+" CASCADE")
+	exec(t, db, "CREATE SCHEMA "+sch)
+	exec(t, db, "SET search_path TO "+sch)
+	defer func() { exec(t, db, "DROP SCHEMA IF EXISTS "+sch+" CASCADE") }()
+	exec(t, db, ratingSchemaDDL(t))
+
+	hour := mustTime("2026-10-17T18:00:00Z")
+	const q = "Qwen/Qwen2.5-32B-Instruct"
+	book := newTestBook(
+		map[string]Rate3{
+			q:             rate3("0", "0", "0"),
+			"shared:" + q: rate3("0.0000009", "0.0000009", "0.0000009"),
+			"bare/only":   rate3("0.000002", "0", "0"),
+		},
+		nil, PolicyMultiplier, MustDec("1.5"), Dec{},
+	)
+
+	// One resource per case so each lands in its own rollup.
+	if _, err := db.ExecContext(ctx,
+		`INSERT INTO billing_event (request_id, auth_id, resource_id, org_id, model, base_model, adapter, serving_mode, prompt_tokens, completion_tokens, event_ts)
+		 VALUES ('e1','a','shared-base','org-1',$2,$2,NULL,'shared',1000,0,$1),
+		        ('e2','a','shared-ft','org-1','tf-ep-shared-ft',$2,'ckpt-1','shared',1000,0,$1),
+		        ('e3','a','ded-base','org-1','tf-ep-ded',$2,NULL,'dedicated',1000,0,$1),
+		        ('e4','a','ded-named-like-base','org-1',$2,$2,NULL,'dedicated',1000,0,$1),
+		        ('e5','a','shared-no-shared-row','org-1','bare/only','bare/only',NULL,'shared',1000,0,$1)`,
+		hour.Add(5*time.Minute), q); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+
+	res, err := NewPostgresStore(db).RateWindow(ctx, book, hour, hour.Add(time.Hour))
+	if err != nil {
+		t.Fatalf("RateWindow: %v", err)
+	}
+	if res.EventsRated != 5 || res.UnpricedEvents != 0 || res.AmbiguousBaseEvents != 0 {
+		t.Fatalf("rated/unpriced/ambiguous = %d/%d/%d, want 5/0/0",
+			res.EventsRated, res.UnpricedEvents, res.AmbiguousBaseEvents)
+	}
+
+	for _, want := range []struct{ resource, rate, cost string }{
+		{"shared-base", "0.000000900", "0.000900000"},          // shared base event gets the Fireworks price
+		{"shared-ft", "0.000001350", "0.001350000"},            // shared adapter event: shared price x 1.5 premium
+		{"ded-base", "0.000000000", "0.000000000"},             // dedicated base event stays $0
+		{"ded-named-like-base", "0.000000000", "0.000000000"},  // dedicated endpoint named like its base stays $0
+		{"shared-no-shared-row", "0.000002000", "0.002000000"}, // no shared: row: falls back to the bare row
+	} {
+		var rate, cost string
+		if err := db.QueryRowContext(ctx,
+			`SELECT applied_prompt_rate::text, cost::text FROM rated_usage WHERE resource_id = $1 AND window_start = $2`,
+			want.resource, hour).Scan(&rate, &cost); err != nil {
+			t.Fatalf("read %s: %v", want.resource, err)
+		}
+		if rate != want.rate || cost != want.cost {
+			t.Fatalf("%s: rate/cost = %s/%s, want %s/%s", want.resource, rate, cost, want.rate, want.cost)
+		}
+	}
+
+	// The Go oracle must agree on every case.
+	for _, c := range []struct{ model, base, adapter, mode, rate string }{
+		{q, q, "", "shared", "0.000000900"},
+		{"tf-ep-shared-ft", q, "ckpt-1", "shared", "0.000001350"},
+		{"tf-ep-ded", q, "", "dedicated", "0"},
+		{q, q, "", "dedicated", "0"},
+		{"bare/only", "bare/only", "", "shared", "0.000002000"},
+	} {
+		r, err := book.ResolveEvent(c.model, c.base, c.adapter, c.mode)
+		if err != nil {
+			t.Fatalf("oracle %+v: %v", c, err)
+		}
+		if got := r.Prompt.String(); got != c.rate && !(c.rate == "0" && r.Prompt.IsZero()) {
+			t.Fatalf("oracle %+v: prompt=%s, want %s", c, got, c.rate)
+		}
+	}
+}

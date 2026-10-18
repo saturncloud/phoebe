@@ -213,8 +213,10 @@ CREATE TEMP TABLE rating_derived (
 // rateWindowSQL resolves, sums, upserts, and counts in ONE statement over the
 // transient rating_price table (populated from the YAML PriceBook for this run).
 //
-// RESOLUTION (the C4 ladder, precedence a > b > c > d; the Go mirror is
-// PriceBook.ResolveEvent): vLLM serves Token Factory endpoints under the ENDPOINT
+// RESOLUTION (the C4 ladder; the Go mirror is PriceBook.ResolveEvent). Precedence
+// is a > b > c > d for DEDICATED traffic and b > c > a > d for SHARED traffic (a shared
+// base endpoint serves under its bare base id, so (a) would match the dedicated row;
+// 2026-10-18): vLLM serves Token Factory endpoints under the ENDPOINT
 // NAME, so billing_event.model (aliased to model_id) is usually NOT a price-file
 // key; the event's base_model (X-Saturn-Base-Model, on ALL TF deployments) is the
 // catalog price key and a non-null adapter (X-Saturn-Adapter, ONLY on fine-tune
@@ -435,26 +437,43 @@ resolved AS (
         -- re-rating an old hour resolves the same rates it originally did. There is
         -- no local price-freeze table: "never reprice served traffic" holds because
         -- the price series is a function of TIME, not of when the rater last ran.
-        COALESCE(rp.prompt_price,     rd.prompt_price,     rpb.prompt_price)     AS prompt_price,
-        COALESCE(rp.cached_price,     rd.cached_price,     rpb.cached_price)     AS cached_price,
-        COALESCE(rp.completion_price, rd.completion_price, rpb.completion_price) AS completion_price,
+        -- ORDER BY SERVING MODE (2026-10-18; mirrors Go PriceBook.ResolveEvent).
+        -- Dedicated: (a) the event's own model_id, then the bare-base step (b)/(c).
+        -- Shared: the shared:<base> step (b)/(c) FIRST, then (a). A shared base-model
+        -- endpoint serves under its BARE base id, so its model_id IS the dedicated key;
+        -- trying (a) first matched the bare dedicated row (often $0) and the shared
+        -- price was never reached. (a) stays the fallback, so a model with no shared:
+        -- row prices as before. Keyed on serving_mode, never on model_id = base_model:
+        -- a dedicated endpoint may be named exactly like its base.
+        CASE WHEN ev.serving_mode = 'shared'
+             THEN COALESCE(rd.prompt_price, rpb.prompt_price, rp.prompt_price)
+             ELSE COALESCE(rp.prompt_price, rd.prompt_price, rpb.prompt_price) END     AS prompt_price,
+        CASE WHEN ev.serving_mode = 'shared'
+             THEN COALESCE(rd.cached_price, rpb.cached_price, rp.cached_price)
+             ELSE COALESCE(rp.cached_price, rd.cached_price, rpb.cached_price) END     AS cached_price,
+        CASE WHEN ev.serving_mode = 'shared'
+             THEN COALESCE(rd.completion_price, rpb.completion_price, rp.completion_price)
+             ELSE COALESCE(rp.completion_price, rd.completion_price, rpb.completion_price) END AS completion_price,
         -- Whether this row priced through the DERIVED (base x premium) path (b), or
         -- the PLAIN-BASE path (c). Both key the rate on base_model, so both feed the
-        -- single-rate ambiguity gate below.
-        (rp.model_id IS NULL AND rd.base_model IS NOT NULL) AS via_derived,
-        (rp.model_id IS NULL AND rpb.model_id IS NOT NULL)  AS via_base
+        -- single-rate ambiguity gate below. The rd/rpb joins only match when that step
+        -- is the one that prices the row (dedicated: only after (a) missed; shared:
+        -- always first), so a non-NULL join is exactly "priced via this step".
+        (rd.base_model IS NOT NULL) AS via_derived,
+        (rpb.model_id IS NOT NULL)  AS via_base
     FROM ev
     -- (a) The YAML-projected DIRECT price table (keyed on model_id).
     LEFT JOIN rating_price rp ON rp.model_id = ev.model_id
     -- (b) The DERIVED price table (keyed on base_model): consulted ONLY for
     -- FINE-TUNE traffic — an injected adapter, or the ft: model prefix — that missed
-    -- the direct join; base_model prices the fine-tune at base x premium. The
-    -- rp.model_id-IS-NULL guard keeps direct-over-derived precedence (a fine-tune
-    -- with its own in-file rate is never re-derived); the fine-tune-marker guard
+    -- the direct join; base_model prices the fine-tune at base x premium. For
+    -- DEDICATED traffic the rp.model_id-IS-NULL guard keeps direct-over-derived
+    -- precedence (a fine-tune with its own in-file rate is never re-derived); SHARED
+    -- traffic tries this step first (see the price CASE above); the fine-tune-marker guard
     -- keeps a base-model endpoint from ever resolving through the derived table.
     LEFT JOIN rating_derived rd
         ON rd.base_model = ev.sku_base
-       AND rp.model_id IS NULL
+       AND (rp.model_id IS NULL OR ev.serving_mode = 'shared')
        -- The ft: prefix is SINGLE-SOURCED from the Go fineTunePrefix constant, bound as
        -- $3 (ftLikePattern), so the money path has ONE source of truth for what marks a
        -- fine-tune — never a literal 'ft:%' that could drift from the constant. The
@@ -468,7 +487,7 @@ resolved AS (
     -- to an un-premiumed plain-base rate — it must scream as UNPRICED instead.
     LEFT JOIN rating_price rpb
         ON rpb.model_id = ev.sku_base
-       AND rp.model_id IS NULL
+       AND (rp.model_id IS NULL OR ev.serving_mode = 'shared')
        AND NOT (ev.model_id LIKE $3 OR ev.adapter IS NOT NULL)
 ),
 -- billable: the events that may enter money, filtered ONCE so the rollup (grouped_raw)

@@ -549,7 +549,9 @@ func isDerivationBase(modelID string, derivedFrom map[string]string) bool {
 // NAME, so model_id is usually NOT a price-file key; base_model (X-Saturn-Base-Model,
 // on ALL TF deployments) is the catalog price key, and a non-empty adapter
 // (X-Saturn-Adapter, ONLY on fine-tune checkpoint deployments) marks the event as
-// fine-tune traffic. THE LADDER — precedence exactly a > b > c > d:
+// fine-tune traffic. THE LADDER — precedence a > b > c > d for DEDICATED traffic,
+// and b > c > a > d for SHARED traffic (a shared base endpoint serves under its bare
+// base id, which is the dedicated key; see the function body):
 //
 //	a. model_id is directly priced (a price-file key: a base model served under its
 //	   HF id, a fine-tune with its own/derived in-file rate, or a per-endpoint
@@ -567,10 +569,19 @@ func (pb *PriceBook) ResolveEvent(modelID, baseModel, adapter, servingMode strin
 	// SERVING-MODE AXIS (design D1): shared and dedicated are distinct SKUs priced
 	// from distinct rows. The serving mode is an OUTER prefix on the price key — a
 	// shared base is stored as `shared:<base>`, dedicated as the bare `<base>`.
-	// "dedicated" = the bare key. We resolve the base against its SKU key: for
-	// shared traffic the ladder below keys on `shared:<base>` instead of `<base>`.
-	// (model_id direct hits at (a) are unaffected — an explicit priced model_id
-	// wins regardless of serving mode, the per-endpoint override seam.)
+	//
+	// The serving mode also decides the ORDER of the ladder (2026-10-18, GB300 $0
+	// shared cost):
+	//   - dedicated: (a) the event's own model_id, then the bare-base step (b)/(c).
+	//     A dedicated endpoint serves under its endpoint name, so (a) is the
+	//     per-endpoint override seam. Unchanged.
+	//   - shared: the `shared:<base>` step (b)/(c) FIRST, then (a). A shared
+	//     base-model endpoint serves under its BARE base id, so its model_id IS the
+	//     dedicated key: trying (a) first matched the bare dedicated row (often $0)
+	//     and the shared price was never reached. (a) stays as the fallback, so a
+	//     model with no `shared:` row still prices as it did before.
+	// Keyed on the serving mode, not on model_id == base_model: a dedicated endpoint
+	// may be named exactly like its base, and its order must not change.
 	//
 	// Any other serving mode is refused BEFORE the ladder, even when the model_id
 	// has a direct price: the SQL rater drops such an event per event before
@@ -580,11 +591,30 @@ func (pb *PriceBook) ResolveEvent(modelID, baseModel, adapter, servingMode strin
 		return Rate3{}, ErrInvalidServingMode
 	}
 	skuBase := servingModeKey(servingMode, baseModel)
-
+	if servingMode == identity.ServingModeShared {
+		if r, ok, err := pb.resolveSKU(modelID, baseModel, adapter, skuBase); ok || err != nil {
+			return r, err
+		}
+		if r, err := pb.Resolve(modelID); err == nil {
+			return r, nil
+		}
+		return Rate3{}, ErrNoPrice
+	}
 	// (a) Direct model_id hit: the existing model_id-keyed resolution.
 	if r, err := pb.Resolve(modelID); err == nil {
 		return r, nil
 	}
+	if r, ok, err := pb.resolveSKU(modelID, baseModel, adapter, skuBase); ok || err != nil {
+		return r, err
+	}
+	// (d) fail loud.
+	return Rate3{}, ErrNoPrice
+}
+
+// resolveSKU is the base_model step of the ladder, keyed on the serving-mode SKU key
+// (`shared:<base>` or the bare `<base>`). ok reports a hit; a miss returns ok=false
+// and a nil error so the caller can try (a) or fail loud.
+func (pb *PriceBook) resolveSKU(modelID, baseModel, adapter, skuBase string) (Rate3, bool, error) {
 	// FINE-TUNE marker (C4): an injected adapter id, or the legacy ft: model prefix.
 	fineTune := adapter != "" || strings.HasPrefix(modelID, fineTunePrefix)
 	if fineTune {
@@ -592,29 +622,29 @@ func (pb *PriceBook) ResolveEvent(modelID, baseModel, adapter, servingMode strin
 		// the base_model must be a TRUE base model — never another fine-tune (an ft:
 		// own-rate entry or a file-declared derived id). isDerivationBase enforces the
 		// same rule the SQL projection (derivedRates) does, so the oracle and
-		// production agree on one-hop. An empty/unknown base falls to ErrNoPrice —
-		// NEVER to the plain-base path (c). For shared traffic the base is looked up
-		// under its SKU key (`shared:<base>`), so a shared fine-tune resolves as
-		// (shared base row) x (plan premium).
+		// production agree on one-hop. An empty/unknown base misses — NEVER the
+		// plain-base path (c). For shared traffic the base is looked up under its SKU
+		// key (`shared:<base>`), so a shared fine-tune resolves as (shared base row)
+		// x (plan premium).
 		if baseModel != "" {
 			if base, ok := pb.base[skuBase]; ok && isDerivationBase(skuBase, pb.derivedFrom) {
-				return ApplyPolicy(base, pb.policyFn, pb.policyFactor, pb.policyMarkup)
+				r, err := ApplyPolicy(base, pb.policyFn, pb.policyFactor, pb.policyMarkup)
+				return r, err == nil, err
 			}
 		}
-		return Rate3{}, ErrNoPrice
+		return Rate3{}, false, nil
 	}
 	// (c) a base-model endpoint: no adapter, no ft: prefix, base_model carries the
 	// catalog price key → the plain base rate, NO premium. Resolve (not a bare
 	// pb.base lookup) mirrors the SQL exactly: the direct price table the SQL joins
 	// on ev.base_model is the resolvedRates() projection, which is Resolve() for
-	// every key it carries. Shared traffic keys on the SKU `shared:<base>` row.
+	// every key it carries.
 	if baseModel != "" {
 		if r, err := pb.Resolve(skuBase); err == nil {
-			return r, nil
+			return r, true, nil
 		}
 	}
-	// (d) fail loud.
-	return Rate3{}, ErrNoPrice
+	return Rate3{}, false, nil
 }
 
 // servingModeKey composes the OUTER mode-prefixed price key for a base model id
