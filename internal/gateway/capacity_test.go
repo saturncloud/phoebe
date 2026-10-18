@@ -357,3 +357,66 @@ func TestCapacityFieldsCoverEveryGraphCapacityField(t *testing.T) {
 		}
 	}
 }
+
+func TestParseGraphCapacityTopology(t *testing.T) {
+	base := map[string]string{capacityKeyUnit: capacityUnitPerWorker, capacityKeyMaxActiveRequests: "4"}
+	with := func(topology string) map[string]string {
+		d := map[string]string{}
+		for k, v := range base {
+			d[k] = v
+		}
+		if topology != "" {
+			d[capacityKeyTopology] = topology
+		}
+		return d
+	}
+	for _, tc := range []struct {
+		topology                 string
+		perWorker, disaggregated bool
+		badUnit                  bool
+	}{
+		{"", true, false, false},
+		{capacityTopologyAggregated, true, false, false},
+		{capacityTopologyDisaggregated, true, true, false},
+		// Unknown: enforced as published graph-level values (tighter), reported.
+		{"pipelined", false, false, true},
+	} {
+		c, bad, badUnit := parseGraphCapacity(with(tc.topology))
+		if c.PerWorker != tc.perWorker || c.Disaggregated != tc.disaggregated || (badUnit != "") != tc.badUnit || len(bad) != 0 {
+			t.Fatalf("topology %q: perWorker %v disaggregated %v badUnit %q bad %v", tc.topology, c.PerWorker, c.Disaggregated, badUnit, bad)
+		}
+		if val(c.MaxActiveRequests) != 4 {
+			t.Fatalf("topology %q changed the published value: %d", tc.topology, val(c.MaxActiveRequests))
+		}
+	}
+}
+
+// A disaggregated graph's per-worker entry scales each limit by the pool that
+// bounds it (Q50): active requests and reserved KV by Decode ready + 1, prefill
+// tokens by Prefill ready + 1. The request capacity stays unscaled (one
+// request uses one worker of each pool).
+func TestRegistry_DisaggregatedGraphScalesEachLimitByItsPool(t *testing.T) {
+	r, _, _ := startedRegistry(t, registryCM("tf-model-a", map[string]string{
+		capacityKeyUnit: capacityUnitPerWorker, capacityKeyTopology: capacityTopologyDisaggregated,
+		capacityKeyMaxActiveRequests: "10", capacityKeyMaxReservedKVTokens: "1000", capacityKeyMaxPrefillTokens: "500",
+	}))
+	waitCapacity(t, r, "graph-llama31", func(c GraphCapacity) bool { return c.Any() })
+
+	// No ready-worker source: one worker's worth per pool.
+	c := r.GraphCapacity("graph-llama31")
+	if val(c.MaxActiveRequests) != 10 || val(c.MaxReservedKVTokens) != 1000 || val(c.MaxPrefillTokens) != 500 {
+		t.Fatalf("no workers source: (%d, %d, %d), want one worker's worth (10, 1000, 500)",
+			val(c.MaxActiveRequests), val(c.MaxReservedKVTokens), val(c.MaxPrefillTokens))
+	}
+
+	r.WithReadyWorkers(fixedWorkers{"graph-llama31/" + PoolDecode: 3, "graph-llama31/" + PoolPrefill: 1, "graph-llama31": 7})
+	c = r.GraphCapacity("graph-llama31")
+	if val(c.MaxActiveRequests) != 40 || val(c.MaxReservedKVTokens) != 4000 || val(c.MaxPrefillTokens) != 1000 {
+		t.Fatalf("scaled = (%d, %d, %d), want active/KV x (3+1) and prefill x (1+1): (40, 4000, 1000); the Worker count 7 must not be used",
+			val(c.MaxActiveRequests), val(c.MaxReservedKVTokens), val(c.MaxPrefillTokens))
+	}
+	req := r.GraphRequestCapacity("graph-llama31")
+	if val(req.MaxActiveRequests) != 10 || val(req.MaxReservedKVTokens) != 1000 || val(req.MaxPrefillTokens) != 500 {
+		t.Fatalf("request capacity must stay per worker: (%d, %d, %d)", val(req.MaxActiveRequests), val(req.MaxReservedKVTokens), val(req.MaxPrefillTokens))
+	}
+}

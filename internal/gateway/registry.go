@@ -400,7 +400,11 @@ func (r *RegistryResolver) GraphCapacities(graph string) (scaled, perRequest Gra
 			continue
 		}
 		perRequestWinners[cmName] = c
-		if c.PerWorker {
+		switch {
+		case c.PerWorker && c.Disaggregated:
+			// Each value scales with the pool that bounds it (Q50).
+			c = c.ScaledByPool(func(pool string) int64 { return r.poolMultiplierLocked(graph, pool) })
+		case c.PerWorker:
 			if multiplier < 0 {
 				multiplier = r.graphMultiplierLocked(graph)
 			}
@@ -420,6 +424,24 @@ func (r *RegistryResolver) graphMultiplierLocked(graph string) int64 {
 		return GraphLimitHeadroomWorkers
 	}
 	n := r.workers.Ready(graph)
+	if n < 0 {
+		n = 0
+	}
+	if n > math.MaxInt64-GraphLimitHeadroomWorkers {
+		return math.MaxInt64
+	}
+	return n + GraphLimitHeadroomWorkers
+}
+
+// poolMultiplierLocked is graphMultiplierLocked for one pool of a
+// disaggregated graph: that pool's ready workers plus the headroom (Q4(b)
+// applied per pool, Q50). Without a ready-worker source it is the headroom
+// alone (one worker's worth), the same fail-tight reading.
+func (r *RegistryResolver) poolMultiplierLocked(graph, pool string) int64 {
+	if r.workers == nil {
+		return GraphLimitHeadroomWorkers
+	}
+	n := r.workers.ReadyPool(graph, pool)
 	if n < 0 {
 		n = 0
 	}

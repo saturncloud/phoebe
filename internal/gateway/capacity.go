@@ -23,6 +23,14 @@ type GraphCapacity struct {
 	// before Q22), enforced as they are. Not a limit: tightest and Scaled
 	// leave it false on their results.
 	PerWorker bool
+	// Disaggregated is true when the entry marks its graph as disaggregated
+	// (capacityKeyTopology = capacityTopologyDisaggregated, Q50): each
+	// per-worker value is then per worker of the pool that bounds it (Decode
+	// for active requests and reserved KV, Prefill for prefill tokens), and
+	// the registry scales it by that pool's ready workers plus one. Only
+	// meaningful with PerWorker. Not a limit: tightest and Scaled leave it
+	// false on their results.
+	Disaggregated bool
 }
 
 // The registry data keys carrying GraphCapacity. They are PER-WORKER values
@@ -47,6 +55,15 @@ const (
 	// saturn-k8s RBAC change) first, then Atlas.
 	capacityKeyUnit       = "admission_capacity_unit"
 	capacityUnitPerWorker = "per_worker"
+
+	// capacityKeyTopology says how the graph's workers are pooled (Q50,
+	// 2026-10-17): absent or capacityTopologyAggregated keeps one Worker pool;
+	// capacityTopologyDisaggregated scales each per-worker value by the pool
+	// that bounds it. An internal Atlas-to-phoebe contract; both change in
+	// lockstep.
+	capacityKeyTopology           = "admission_topology"
+	capacityTopologyAggregated    = "aggregated"
+	capacityTopologyDisaggregated = "disaggregated"
 )
 
 // capacityFields is the one list of GraphCapacity fields. Each entry names
@@ -56,18 +73,23 @@ const (
 // published limit is a struct field plus one entry here;
 // TestCapacityFieldsCoverEveryGraphCapacityField fails when the entry is
 // missing.
+//
+// pool is the disaggregated pool whose workers bound the field (Q50): a
+// decode worker holds each sequence and its KV for the whole generation; the
+// prompt tokens in prefill are what the prefill workers process.
 var capacityFields = []struct {
 	key   string
+	pool  string
 	get   func(*GraphCapacity) **int64
 	limit func(*config.AdmissionLimits) **int64
 }{
-	{capacityKeyMaxActiveRequests,
+	{capacityKeyMaxActiveRequests, PoolDecode,
 		func(c *GraphCapacity) **int64 { return &c.MaxActiveRequests },
 		func(l *config.AdmissionLimits) **int64 { return &l.MaxActiveRequests }},
-	{capacityKeyMaxReservedKVTokens,
+	{capacityKeyMaxReservedKVTokens, PoolDecode,
 		func(c *GraphCapacity) **int64 { return &c.MaxReservedKVTokens },
 		func(l *config.AdmissionLimits) **int64 { return &l.MaxReservedKVTokens }},
-	{capacityKeyMaxPrefillTokens,
+	{capacityKeyMaxPrefillTokens, PoolPrefill,
 		func(c *GraphCapacity) **int64 { return &c.MaxPrefillTokens },
 		func(l *config.AdmissionLimits) **int64 { return &l.MaxPrefillTokens }},
 }
@@ -124,6 +146,18 @@ func parseGraphCapacity(d map[string]string) (c GraphCapacity, badValues []strin
 		c.PerWorker = true
 	default:
 		badUnit = capacityKeyUnit + "=" + strconv.Quote(unit)
+	}
+	// An unknown topology is reported like an unknown unit and read the same
+	// tight way: the values are enforced as published, as graph-level limits.
+	switch topology := strings.TrimSpace(d[capacityKeyTopology]); topology {
+	case "", capacityTopologyAggregated:
+	case capacityTopologyDisaggregated:
+		c.Disaggregated = true
+	default:
+		c.PerWorker = false
+		if badUnit == "" {
+			badUnit = capacityKeyTopology + "=" + strconv.Quote(topology)
+		}
 	}
 	return c, badValues, badUnit
 }
