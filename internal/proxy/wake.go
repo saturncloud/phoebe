@@ -268,15 +268,34 @@ func (t *wakeRoundTripper) RoundTrip(req *http.Request) (*http.Response, error) 
 		return t.base.RoundTrip(req)
 	}
 	resp, err := t.base.RoundTrip(req)
+	// refusedErr is set when the first forward was refused. On a wakeable
+	// route that means the frontend is out of its Service: restarting, or its
+	// readiness check failing. Grove recreates a graph's whole replica, frontend
+	// included, when its worker has sat at zero for terminationDelay (demo-qa,
+	// GB300: every 4 h at zero). The request is then treated like a cold
+	// response: it takes a cold hold, the wake brings the graph up, and the
+	// post-wake forward retries refusals until the hold's deadline. resp is an
+	// empty stand-in so the hold and wake paths below are unchanged; when the
+	// wake definitely fails, the refusal itself is returned, as before.
+	var refusedErr error
 	if err != nil {
-		return nil, err
-	}
-	cold, err := bufferColdCandidateWithin(req.Context(), resp, t.candidateReadTimeout())
-	if err != nil || !cold {
-		if err != nil {
+		if !errors.Is(err, syscall.ECONNREFUSED) {
 			return nil, err
 		}
-		return resp, nil
+		refusedErr = err
+		resp = &http.Response{StatusCode: http.StatusBadGateway, Header: http.Header{}, Body: http.NoBody, Request: req}
+		t.server.log.Info.Printf(
+			"wake: upstream refused the first forward; holding for a wake request_id=%s resource_id=%s",
+			t.requestID, t.target.ResourceID,
+		)
+	} else {
+		cold, err := bufferColdCandidateWithin(req.Context(), resp, t.candidateReadTimeout())
+		if err != nil || !cold {
+			if err != nil {
+				return nil, err
+			}
+			return resp, nil
+		}
 	}
 	if t.lease != nil {
 		if err := t.lease.BeginColdHold(req.Context()); err != nil {
@@ -345,6 +364,9 @@ func (t *wakeRoundTripper) RoundTrip(req *http.Request) (*http.Response, error) 
 			return wakeStartingResponse(req, t.requestID), nil
 		}
 		t.neverServed = true
+		if refusedErr != nil {
+			return nil, refusedErr
+		}
 		return resp, nil
 	}
 
@@ -353,7 +375,7 @@ func (t *wakeRoundTripper) RoundTrip(req *http.Request) (*http.Response, error) 
 	if err != nil {
 		return nil, err
 	}
-	cold, err = bufferColdCandidateWithin(req.Context(), resp, t.candidateReadTimeout())
+	cold, err := bufferColdCandidateWithin(req.Context(), resp, t.candidateReadTimeout())
 	if err != nil {
 		return nil, err
 	}
