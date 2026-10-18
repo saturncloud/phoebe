@@ -125,6 +125,9 @@ type fixedWorkers map[string]int64
 
 func (f fixedWorkers) Ready(graph string) int64 { return f[graph] }
 
+// ReadyPool reads the key "<graph>/<pool>" (absent = 0).
+func (f fixedWorkers) ReadyPool(graph, pool string) int64 { return f[graph+"/"+pool] }
+
 // The registry multiplies the per-worker limit Atlas publishes by the graph's
 // ready workers plus one, as reported by a stub worker source (a graph the
 // stub does not know reads 0 workers). The real-informer fail-closed case is
@@ -632,5 +635,44 @@ func TestParseGraphCapacityUnknownUnitKeepsValuesAndReportsOnlyTheUnit(t *testin
 	}
 	if badUnit != capacityKeyUnit+`="per-worker"` {
 		t.Fatalf("badUnit = %q", badUnit)
+	}
+}
+
+// A disaggregated graph's pools are read from its Prefill and Decode
+// components (Q50), with the same rules as Worker; an aggregated graph has
+// neither and reads 0 for both, and a disaggregated graph reads 0 Worker.
+func TestReadyWorkersInformerReadsDisaggregatedPools(t *testing.T) {
+	scheme := runtime.NewScheme()
+	client := dynamicfake.NewSimpleDynamicClientWithCustomListKinds(scheme,
+		map[schema.GroupVersionResource]string{dynamoGraphResource: "DynamoGraphDeploymentList"},
+		dgd("graph-split", map[string]any{
+			"Frontend": map[string]any{"readyReplicas": int64(1)},
+			"Prefill":  map[string]any{"readyReplicas": int64(2)},
+			"decode":   map[string]any{"readyReplicas": int64(3)},
+		}),
+		dgd("graph-agg", map[string]any{"Worker": map[string]any{"readyReplicas": int64(4)}}),
+	)
+	w := NewReadyWorkers(client, registryNS, logging.New(logging.ERROR))
+	if got := w.ReadyPool("graph-split", PoolDecode); got != 0 {
+		t.Fatalf("unsynced ReadyPool = %d, want 0 (one worker's worth)", got)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go w.Run(ctx)
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) && w.ReadyPool("graph-split", PoolDecode) != 3 {
+		time.Sleep(5 * time.Millisecond)
+	}
+	if p, d, wk := w.ReadyPool("graph-split", PoolPrefill), w.ReadyPool("graph-split", PoolDecode), w.Ready("graph-split"); p != 2 || d != 3 || wk != 0 {
+		t.Fatalf("split graph: prefill %d, decode %d, worker %d; want 2, 3, 0", p, d, wk)
+	}
+	for time.Now().Before(deadline) && w.Ready("graph-agg") != 4 {
+		time.Sleep(5 * time.Millisecond)
+	}
+	if p, d, wk := w.ReadyPool("graph-agg", PoolPrefill), w.ReadyPool("graph-agg", PoolDecode), w.Ready("graph-agg"); p != 0 || d != 0 || wk != 4 {
+		t.Fatalf("aggregated graph: prefill %d, decode %d, worker %d; want 0, 0, 4", p, d, wk)
+	}
+	if got := w.ReadyPool("graph-split", "other"); got != 0 {
+		t.Fatalf("unknown pool = %d, want 0", got)
 	}
 }

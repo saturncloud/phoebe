@@ -81,7 +81,13 @@ type ReadyWorkers struct {
 	unreachable   atomic.Bool
 
 	mu    sync.RWMutex
-	ready map[string]int64
+	ready map[string]readyCounts
+}
+
+// readyCounts is one DGD's ready replicas per worker component: Worker for an
+// aggregated graph, Prefill and Decode for a disaggregated one.
+type readyCounts struct {
+	worker, prefill, decode int64
 }
 
 // NewReadyWorkers builds the informer over client in namespace. Call Run.
@@ -93,7 +99,7 @@ func NewReadyWorkers(client dynamic.Interface, namespace string, log *logging.Lo
 	w := &ReadyWorkers{
 		log:        log,
 		informer:   factory.ForResource(dynamoGraphResource).Informer(),
-		ready:      map[string]int64{},
+		ready:      map[string]readyCounts{},
 		client:     client,
 		namespace:  namespace,
 		probeEvery: readyWorkersProbeEvery,
@@ -200,7 +206,26 @@ func (w *ReadyWorkers) Ready(graph string) int64 {
 	}
 	w.mu.RLock()
 	defer w.mu.RUnlock()
-	return w.ready[graph]
+	return w.ready[graph].worker
+}
+
+// ReadyPool is graph's ready worker count in one pool of a disaggregated
+// graph (PoolPrefill or PoolDecode), with the same fail-tight rules as
+// Ready: zero before the first sync, when unknown, and for every graph once
+// no read of the DGDs has succeeded for staleAfter. An unknown pool reads 0.
+func (w *ReadyWorkers) ReadyPool(graph, pool string) int64 {
+	if !w.synced.Load() || w.stale() {
+		return 0
+	}
+	w.mu.RLock()
+	defer w.mu.RUnlock()
+	switch pool {
+	case PoolPrefill:
+		return w.ready[graph].prefill
+	case PoolDecode:
+		return w.ready[graph].decode
+	}
+	return 0
 }
 
 func (w *ReadyWorkers) upsert(obj any) {
@@ -208,9 +233,13 @@ func (w *ReadyWorkers) upsert(obj any) {
 	if !ok {
 		return
 	}
-	n := readyWorkersOf(u.Object)
+	counts := readyCounts{
+		worker:  readyWorkersOf(u.Object),
+		prefill: readyOfComponent(u.Object, []string{PoolPrefill}),
+		decode:  readyOfComponent(u.Object, []string{PoolDecode}),
+	}
 	w.mu.Lock()
-	w.ready[u.GetName()] = n
+	w.ready[u.GetName()] = counts
 	w.mu.Unlock()
 }
 
@@ -237,8 +266,22 @@ func (w *ReadyWorkers) remove(obj any) {
 // "Worker" and "worker"), the smallest ready count among them wins, so the
 // result never depends on map iteration order and fails tight.
 func readyWorkersOf(obj map[string]any) int64 {
+	return readyOfComponent(obj, sharedWorkerComponents)
+}
+
+// The worker pools of a disaggregated graph, by their DGD component names
+// (Atlas's DISAGG_COMPONENT_NAMES), lower-cased.
+const (
+	PoolPrefill = "prefill"
+	PoolDecode  = "decode"
+)
+
+// readyOfComponent is readyWorkersOf's rule over any list of component names
+// in preference order: the first name present decides, the smallest count
+// among case variants wins, and a missing or malformed count reads 0.
+func readyOfComponent(obj map[string]any, wants []string) int64 {
 	components, _, _ := unstructured.NestedMap(obj, "status", "components")
-	for _, want := range sharedWorkerComponents {
+	for _, want := range wants {
 		found := false
 		var minReady int64
 		for name, raw := range components {
@@ -276,6 +319,14 @@ func readyWorkersOf(obj map[string]any) int64 {
 // saturating at the int64 maximum; no limit stays no limit and a zero cap
 // stays zero. A workers value below 1 is treated as 1 (values unchanged).
 func (c GraphCapacity) Scaled(workers int64) GraphCapacity {
+	return c.ScaledByPool(func(string) int64 { return workers })
+}
+
+// ScaledByPool is Scaled with a multiplier per field: each limit is
+// multiplied by workers(pool), where pool is the disaggregated pool that
+// bounds it (capacityFields). Used for a disaggregated graph's per-worker
+// entry (Q50); Scaled passes one multiplier for every field.
+func (c GraphCapacity) ScaledByPool(workersFor func(pool string) int64) GraphCapacity {
 	var out GraphCapacity
 	for _, f := range capacityFields {
 		v := *f.get(&c)
@@ -283,6 +334,7 @@ func (c GraphCapacity) Scaled(workers int64) GraphCapacity {
 			continue
 		}
 		x := *v
+		workers := workersFor(f.pool)
 		if workers > 0 && x > 0 {
 			if x > math.MaxInt64/workers {
 				x = math.MaxInt64
@@ -298,4 +350,5 @@ func (c GraphCapacity) Scaled(workers int64) GraphCapacity {
 // readyWorkerSource is what the registry needs from ReadyWorkers.
 type readyWorkerSource interface {
 	Ready(graph string) int64
+	ReadyPool(graph, pool string) int64
 }
