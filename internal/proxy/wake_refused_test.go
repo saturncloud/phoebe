@@ -153,3 +153,86 @@ func TestWakeRefusedRetryStopsWhenTheClientGoesAway(t *testing.T) {
 		t.Fatalf("returned after %v, want before the %v resend interval", elapsed, wakeRefusedRetryInterval)
 	}
 }
+
+// refusedFirstTransport returns a wake transport whose upstream runs
+// answer(attempt, req) for every attempt (attempt 1 is the first forward) and
+// whose waker is waker. It counts attempts.
+func refusedFirstTransport(t *testing.T, waker *fakeWaker, hold time.Duration, answer func(int32, *http.Request) (*http.Response, error)) (*wakeRoundTripper, *atomic.Int32) {
+	t.Helper()
+	var calls atomic.Int32
+	server := New(&config.Settings{}, logging.New(logging.ERROR), nil).WithWaker(waker, hold)
+	transport := server.newWakeTransport(
+		roundTripFunc(func(req *http.Request) (*http.Response, error) {
+			return answer(calls.Add(1), req)
+		}),
+		&url.URL{Host: "graph-frontend.default.svc:8000"},
+		identity.Identity{ResourceID: "r1", ServedModel: "m", ServingMode: "shared"},
+		"m", "request-1", nil,
+	)
+	return transport, &calls
+}
+
+// TestWakeHoldsARefusedFirstForwardUntilTheFrontendIsBack: Grove recreates a
+// shared graph's whole replica, frontend included, after its worker has sat at
+// zero for terminationDelay (demo-qa, GB300: every 4 h). A request arriving
+// while the frontend is away is refused on its first forward. It is held like a
+// cold response, the graph is woken, and the request is served once the
+// frontend is back, where before it got a 502.
+func TestWakeHoldsARefusedFirstForwardUntilTheFrontendIsBack(t *testing.T) {
+	waker := &fakeWaker{}
+	transport, calls := refusedFirstTransport(t, waker, 10*time.Second, func(n int32, req *http.Request) (*http.Response, error) {
+		if n <= 2 {
+			return nil, refusedDial()
+		}
+		return ok(req), nil
+	})
+	resp, err := transport.RoundTrip(held(t))
+	if err != nil {
+		t.Fatalf("RoundTrip error = %v, want the served response", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d, want 200", resp.StatusCode)
+	}
+	if got := atomic.LoadInt32(&waker.calls); got != 1 {
+		t.Fatalf("wake calls = %d, want 1", got)
+	}
+	if got := calls.Load(); got != 3 {
+		t.Fatalf("upstream attempts = %d, want 3 (refused first forward, refused resend, served)", got)
+	}
+}
+
+// TestWakeRefusedFirstForwardWithADefiniteWakeFailureReturnsTheRefusal: when
+// Atlas definitely refuses the wake, nothing is starting, so the client gets
+// the original refusal, exactly as before this change.
+func TestWakeRefusedFirstForwardWithADefiniteWakeFailureReturnsTheRefusal(t *testing.T) {
+	waker := &fakeWaker{err: errors.New("definite wake failure")}
+	transport, calls := refusedFirstTransport(t, waker, 10*time.Second, func(int32, *http.Request) (*http.Response, error) {
+		return nil, refusedDial()
+	})
+	_, err := transport.RoundTrip(held(t))
+	if !errors.Is(err, syscall.ECONNREFUSED) {
+		t.Fatalf("RoundTrip error = %v, want the refusal", err)
+	}
+	if got := calls.Load(); got != 1 {
+		t.Fatalf("upstream attempts = %d, want 1", got)
+	}
+}
+
+// TestWakeRefusedFirstForwardWhileTheWakeIsStillRunningIsARetryable503: a
+// wake that is still in progress at the end of the hold answers the usual
+// "starting" 503 with Retry-After, not a transport error.
+func TestWakeRefusedFirstForwardWhileTheWakeIsStillRunningIsARetryable503(t *testing.T) {
+	waker := &fakeWaker{err: ErrWakeNotReady}
+	transport, _ := refusedFirstTransport(t, waker, 10*time.Second, func(int32, *http.Request) (*http.Response, error) {
+		return nil, refusedDial()
+	})
+	resp, err := transport.RoundTrip(held(t))
+	if err != nil {
+		t.Fatalf("RoundTrip error = %v, want a 503", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusServiceUnavailable || resp.Header.Get("Retry-After") == "" {
+		t.Fatalf("status = %d Retry-After = %q, want a retryable 503", resp.StatusCode, resp.Header.Get("Retry-After"))
+	}
+}
