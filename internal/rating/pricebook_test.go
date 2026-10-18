@@ -891,3 +891,61 @@ func TestResolveEvent_ServingModeAxis(t *testing.T) {
 		t.Fatalf("direct-priced model with empty serving mode: err=%v, want ErrInvalidServingMode", err)
 	}
 }
+
+// --- Lookup order keyed on serving mode (2026-10-18, GB300 $0 shared cost) -------
+//
+// A shared base-model endpoint serves under its BARE base id, so its model_id IS the
+// dedicated price key. The bare dedicated rows are $0 (dedicated endpoints bill by
+// GPU-hour), so trying the model_id first priced every shared event at $0. Shared
+// traffic now tries shared:<base> first; dedicated keeps model_id first.
+
+const orderBase = "Qwen/Qwen2.5-32B-Instruct"
+
+func orderBook() *PriceBook {
+	return newTestBook(
+		map[string]Rate3{
+			orderBase:             rate3("0", "0", "0"),                         // dedicated: $0 per token
+			"shared:" + orderBase: rate3("0.0000009", "0.0000009", "0.0000009"), // Fireworks shared price
+			"bare/only":           rate3("0.000002", "0", "0"),                  // no shared: row
+		},
+		nil, PolicyMultiplier, MustDec("1.5"), Dec{},
+	)
+}
+
+func TestResolveEvent_SharedBaseEventGetsSharedPriceNotBareRow(t *testing.T) {
+	// The shared event's model_id is the bare base id (what Atlas serves it under).
+	r, err := orderBook().ResolveEvent(orderBase, orderBase, "", "shared")
+	if err != nil || r.Prompt.String() != "0.000000900" || r.Completion.String() != "0.000000900" {
+		t.Fatalf("shared base: r=%v err=%v, want the shared:%s price 0.000000900", r, err, orderBase)
+	}
+}
+
+func TestResolveEvent_SharedAdapterEventGetsSharedPriceTimesPremium(t *testing.T) {
+	// 0.0000009 x 1.5 = 0.00000135, not the bare $0 base x premium.
+	r, err := orderBook().ResolveEvent("tf-ep-shared-ft", orderBase, "ckpt-1", "shared")
+	if err != nil || r.Prompt.String() != "0.000001350" {
+		t.Fatalf("shared fine-tune: r=%v err=%v, want 0.000001350 (shared base x 1.5)", r, err)
+	}
+}
+
+func TestResolveEvent_DedicatedBaseEventStaysZero(t *testing.T) {
+	r, err := orderBook().ResolveEvent("tf-ep-ded", orderBase, "", "dedicated")
+	if err != nil || !r.Prompt.IsZero() || !r.Completion.IsZero() {
+		t.Fatalf("dedicated base: r=%v err=%v, want the bare $0 row", r, err)
+	}
+}
+
+func TestResolveEvent_DedicatedEndpointNamedLikeItsBaseStaysZero(t *testing.T) {
+	// model_id == base_model on DEDICATED traffic must keep the dedicated order.
+	r, err := orderBook().ResolveEvent(orderBase, orderBase, "", "dedicated")
+	if err != nil || !r.Prompt.IsZero() || !r.Completion.IsZero() {
+		t.Fatalf("dedicated endpoint named like its base: r=%v err=%v, want the bare $0 row", r, err)
+	}
+}
+
+func TestResolveEvent_SharedEventWithoutSharedRowFallsBackToBareRow(t *testing.T) {
+	r, err := orderBook().ResolveEvent("bare/only", "bare/only", "", "shared")
+	if err != nil || r.Prompt.String() != "0.000002000" {
+		t.Fatalf("shared, no shared: row: r=%v err=%v, want the bare row 0.000002000 (as before)", r, err)
+	}
+}

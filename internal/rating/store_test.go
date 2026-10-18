@@ -127,7 +127,8 @@ func TestRateWindowSQL_Shape(t *testing.T) {
 		// base_model (E3); direct-over-derived precedence + the ft: prefix guard
 		"LEFT JOIN rating_derived rd",
 		"rd.base_model = ev.sku_base",
-		"rp.model_id IS NULL",
+		// dedicated: derived only after the direct join missed; shared: always first
+		"(rp.model_id IS NULL OR ev.serving_mode = 'shared')",
 		// the FINE-TUNE marker (C4): the ft: prefix single-sourced from the Go
 		// fineTunePrefix constant (bound as $3) OR a non-null injected adapter —
 		// the derived join fires on either
@@ -143,7 +144,10 @@ func TestRateWindowSQL_Shape(t *testing.T) {
 		// joins. There is no local price-freeze table in the chain: the caller rates
 		// each hour against the book effective during that hour, so "never reprice
 		// served traffic" comes from the price series being a function of TIME.
-		"COALESCE(rp.prompt_price,     rd.prompt_price,     rpb.prompt_price)",
+		// The lookup ORDER is keyed on serving_mode (2026-10-18): shared tries the
+		// shared:<base> step first, dedicated keeps the direct model_id first.
+		"THEN COALESCE(rd.prompt_price, rpb.prompt_price, rp.prompt_price)",
+		"ELSE COALESCE(rp.prompt_price, rd.prompt_price, rpb.prompt_price) END",
 		// Missing authoritative engine usage is excluded from money and counted in
 		// its own strict-partition bucket.
 		"WHERE usage_found",

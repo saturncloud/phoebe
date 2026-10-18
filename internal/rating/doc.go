@@ -83,8 +83,10 @@
 //     fine-tune checkpoint deployments. Its PRESENCE is the fine-tune premium
 //     trigger; its value is forensic (which checkpoint served).
 //
-// Resolution precedence, EXACTLY a > b > c > d (Go: PriceBook.ResolveEvent; SQL:
-// rateWindowSQL in store.go — kept in exact agreement by the conformance tests):
+// Resolution precedence (Go: PriceBook.ResolveEvent; SQL: rateWindowSQL in store.go —
+// kept in exact agreement by the conformance tests): a > b > c > d for DEDICATED
+// traffic; b > c > a > d for SHARED traffic, keyed on serving_mode (a shared base
+// endpoint serves under its bare base id, which is the dedicated key):
 //
 //	a. model_id directly priced in the file (a base served under its HF id, an
 //	   own-rate fine-tune, or a per-endpoint override entry) → that rate. The
