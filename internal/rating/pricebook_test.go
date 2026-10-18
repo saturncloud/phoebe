@@ -907,6 +907,7 @@ func orderBook() *PriceBook {
 			orderBase:             rate3("0", "0", "0"),                         // dedicated: $0 per token
 			"shared:" + orderBase: rate3("0.0000009", "0.0000009", "0.0000009"), // Fireworks shared price
 			"bare/only":           rate3("0.000002", "0", "0"),                  // no shared: row
+			"tf-ep-own":           rate3("0.000005", "0", "0"),                  // a shared fine-tune's own rate
 		},
 		nil, PolicyMultiplier, MustDec("1.5"), Dec{},
 	)
@@ -947,5 +948,14 @@ func TestResolveEvent_SharedEventWithoutSharedRowFallsBackToBareRow(t *testing.T
 	r, err := orderBook().ResolveEvent("bare/only", "bare/only", "", "shared")
 	if err != nil || r.Prompt.String() != "0.000002000" {
 		t.Fatalf("shared, no shared: row: r=%v err=%v, want the bare row 0.000002000 (as before)", r, err)
+	}
+}
+
+func TestResolveEvent_SharedFineTuneOwnRateStillWins(t *testing.T) {
+	// A shared fine-tune serves under its endpoint name, never the bare base, so it
+	// keeps the dedicated order: its own in-file rate beats shared:<base> x premium.
+	r, err := orderBook().ResolveEvent("tf-ep-own", orderBase, "ckpt-1", "shared")
+	if err != nil || r.Prompt.String() != "0.000005000" {
+		t.Fatalf("shared fine-tune with an own rate: r=%v err=%v, want its own 0.000005000", r, err)
 	}
 }
