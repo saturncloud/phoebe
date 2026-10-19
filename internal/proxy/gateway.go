@@ -195,15 +195,6 @@ func (s *Server) resolveGateway(w http.ResponseWriter, r *http.Request, id *iden
 		http.Error(w, "service unavailable", http.StatusServiceUnavailable)
 		return false
 	}
-	if res.Adapter != "" && !res.Ready {
-		// Atlas has registered the endpoint but has not observed its
-		// DynamoModel ready (or has observed a later load failure). Keep this
-		// distinct from 404: the model exists and the caller may retry.
-		s.log.Warn.Printf("gateway: adapter not loaded org_id=%s model=%q request_id=%q",
-			id.OrgID, model, requestID)
-		http.Error(w, "adapter_not_loaded", http.StatusServiceUnavailable)
-		return false
-	}
 	// The resolved model is definitionally the single model this request is
 	// bound to — recorded on the identity both as documentation-of-binding and
 	// because wake eligibility (isWakeable) keys on
@@ -220,5 +211,31 @@ func (s *Server) resolveGateway(w http.ResponseWriter, r *http.Request, id *iden
 	// the upstream host composed from it one line below.
 	id.GraphK8sName = res.GraphK8sName
 	id.Upstream = s.gateway.upstreamFor(res.GraphK8sName, res.Port)
+	if res.Adapter != "" && !res.Ready {
+		// Atlas has registered the endpoint but has not observed its
+		// DynamoModel ready: after a reconcile, a new adapter, or a load
+		// failure. On a parked shared graph the adapter cannot load until a
+		// worker runs, and refusing here kept every request away from the
+		// wake path, so the endpoint stayed stuck (gateway-admission Q69).
+		// A wakeable shared route therefore goes down the cold-wake path like
+		// a base-model request: the frontend answers a model it does not list
+		// as cold, the graph is woken, and the waker holds the request until
+		// the upstream's /v1/models lists this endpoint's served name (the
+		// adapter), then forwards it; at the hold deadline the caller gets the
+		// usual retryable "starting" 503. Atlas publishes ready=true at its
+		// next registry sweep. Atlas publishes no separate "failed" state, so
+		// a failed adapter also takes this path, bounded by the wake hold.
+		if id.ServingMode == identity.ServingModeShared && s.wakeEnabled(*id) {
+			s.log.Info.Printf("gateway: adapter not ready; holding for a wake org_id=%s model=%q request_id=%q",
+				id.OrgID, model, requestID)
+			return true
+		}
+		// Not wakeable (a dedicated row, or wake disabled): keep this
+		// distinct from 404: the model exists and the caller may retry.
+		s.log.Warn.Printf("gateway: adapter not loaded org_id=%s model=%q request_id=%q",
+			id.OrgID, model, requestID)
+		http.Error(w, "adapter_not_loaded", http.StatusServiceUnavailable)
+		return false
+	}
 	return true
 }

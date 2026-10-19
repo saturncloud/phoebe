@@ -390,6 +390,157 @@ func TestGateway_AdapterNotLoaded503(t *testing.T) {
 	}
 }
 
+// notReadyAdapterServer is a gateway server whose resolver maps support-bot to
+// a shared fine-tune row that Atlas has not yet seen ready, with admission and
+// the given waker (nil = wake disabled), over backend.
+func notReadyAdapterServer(t *testing.T, backend *url.URL, waker Waker, mode string) (*Server, *recordingEmitter) {
+	t.Helper()
+	resolver := &mapResolver{m: map[[2]string]gateway.Resolution{
+		{"org-1", "support-bot"}: {
+			ResourceID: "tfm-ft-1", BaseModel: "base", Adapter: "ckpt-42",
+			ServingMode: mode, GraphK8sName: "graph-ft", Ready: false,
+		},
+	}}
+	em := &recordingEmitter{}
+	mr := miniredis.RunT(t)
+	cfg := proxyAdmissionConfig(1)
+	client := redis.NewClient(&redis.Options{Addr: mr.Addr()})
+	t.Cleanup(func() { _ = client.Close() })
+	srv := newGatewayTestServer(t, em, resolver, backend)
+	srv.settings.Admission = cfg
+	srv.WithAdmitter(admission.New(client, cfg))
+	if waker != nil {
+		srv.WithWaker(waker, 5*time.Second)
+	}
+	return srv, em
+}
+
+// TestGateway_NotReadyAdapterOnAParkedGraphWakes (Q69): a request for a shared
+// fine-tune whose registry row says not ready, on a parked graph, is held for
+// one wake of the graph and served once the adapter is listed, instead of
+// 503 adapter_not_loaded. The wake target is the graph, and its served model
+// is the adapter's served name (what the Atlas waker waits to see listed in
+// the upstream's /v1/models before it reports ready).
+func TestGateway_NotReadyAdapterOnAParkedGraphWakes(t *testing.T) {
+	backend := &coldToWarmBackend{warmBody: `{"model":"support-bot","usage":{"prompt_tokens":3,"completion_tokens":2}}`}
+	be := httptest.NewServer(backend)
+	defer be.Close()
+	beURL, _ := url.Parse(be.URL)
+	waker := &fakeWaker{backend: backend, warmsAt: 1}
+	srv, _ := notReadyAdapterServer(t, beURL, waker, "shared")
+
+	rr := httptest.NewRecorder()
+	srv.Handler().ServeHTTP(rr, gatewayRequest("org-1", `{"model":"support-bot","max_tokens":10}`))
+
+	if rr.Code != http.StatusOK {
+		t.Fatalf("status = %d (body %q), want 200 after the wake", rr.Code, rr.Body.String())
+	}
+	if got := atomic.LoadInt32(&waker.calls); got != 1 {
+		t.Fatalf("wake calls = %d, want exactly 1", got)
+	}
+	if tgt := waker.last(); tgt.GraphK8sName != "graph-ft" || tgt.ServedModel != "support-bot" || tgt.ResourceID != "tfm-ft-1" {
+		t.Fatalf("wake target = %+v, want the graph with the adapter's served name", tgt)
+	}
+}
+
+// TestGateway_NotReadyAdapterOnAWarmGraphIsHeldUntilListed (Q69): the graph is
+// up but the frontend does not list the adapter yet (still loading, or the
+// registry sweep has not caught up). The frontend answers it as an unknown
+// model, which takes the same wake path: the wake call returns quickly for a
+// warm graph, and the request is forwarded once the adapter is listed.
+func TestGateway_NotReadyAdapterOnAWarmGraphIsHeldUntilListed(t *testing.T) {
+	backend := &coldToWarmBackend{warmBody: `{"model":"support-bot","usage":{"prompt_tokens":1,"completion_tokens":1}}`}
+	be := httptest.NewServer(backend)
+	defer be.Close()
+	beURL, _ := url.Parse(be.URL)
+	// The adapter is listed only after the first wake call returns.
+	waker := &fakeWaker{backend: backend, warmsAt: 1}
+	srv, _ := notReadyAdapterServer(t, beURL, waker, "shared")
+
+	rr := httptest.NewRecorder()
+	srv.Handler().ServeHTTP(rr, gatewayRequest("org-1", `{"model":"support-bot","max_tokens":10}`))
+	if rr.Code != http.StatusOK || backend.requests.Load() != 2 {
+		t.Fatalf("status = %d, upstream requests = %d; want 200 after one unlisted attempt and one forward", rr.Code, backend.requests.Load())
+	}
+}
+
+// TestGateway_NotReadyAdapterAlreadyLoadedIsServedDirectly (Q69): when the
+// registry flag is stale but the adapter is already loaded, the first
+// forward succeeds and nothing is woken.
+func TestGateway_NotReadyAdapterAlreadyLoadedIsServedDirectly(t *testing.T) {
+	backend := &coldToWarmBackend{warmBody: `{"model":"support-bot","usage":{"prompt_tokens":1,"completion_tokens":1}}`}
+	backend.warm.Store(true)
+	be := httptest.NewServer(backend)
+	defer be.Close()
+	beURL, _ := url.Parse(be.URL)
+	waker := &fakeWaker{backend: backend}
+	srv, _ := notReadyAdapterServer(t, beURL, waker, "shared")
+
+	rr := httptest.NewRecorder()
+	srv.Handler().ServeHTTP(rr, gatewayRequest("org-1", `{"model":"support-bot","max_tokens":10}`))
+	if rr.Code != http.StatusOK || atomic.LoadInt32(&waker.calls) != 0 {
+		t.Fatalf("status = %d, wakes = %d; want 200 with no wake", rr.Code, waker.calls)
+	}
+}
+
+// TestGateway_NotReadyAdapterWakeTimeoutIsTheStartingResponse (Q69): if the
+// adapter never appears within the hold, the caller gets the existing
+// retryable "starting" response, not 503 adapter_not_loaded.
+func TestGateway_NotReadyAdapterWakeTimeoutIsTheStartingResponse(t *testing.T) {
+	backend := &coldToWarmBackend{}
+	be := httptest.NewServer(backend)
+	defer be.Close()
+	beURL, _ := url.Parse(be.URL)
+	waker := &fakeWaker{err: ErrWakeNotReady}
+	srv, _ := notReadyAdapterServer(t, beURL, waker, "shared")
+
+	rr := httptest.NewRecorder()
+	srv.Handler().ServeHTTP(rr, gatewayRequest("org-1", `{"model":"support-bot","max_tokens":10}`))
+	if rr.Code != http.StatusServiceUnavailable || rr.Header().Get("Retry-After") == "" {
+		t.Fatalf("status = %d Retry-After = %q, want the retryable starting 503", rr.Code, rr.Header().Get("Retry-After"))
+	}
+	if strings.Contains(rr.Body.String(), "adapter_not_loaded") {
+		t.Fatalf("hold expiry answered adapter_not_loaded: %q", rr.Body.String())
+	}
+}
+
+// TestGateway_NotReadyAdapterNotWakeableStill503 (Q69): with wake disabled, a
+// not-ready adapter is still 503 adapter_not_loaded and nothing reaches the
+// upstream. (A dedicated row never gets this far on the gateway: it is
+// refused earlier as a non-shared resolution, also without a forward; the
+// second case pins that it is not woken either.)
+func TestGateway_NotReadyAdapterNotWakeableStill503(t *testing.T) {
+	for name, tc := range map[string]struct {
+		waker Waker
+		mode  string
+		body  string
+	}{
+		"wake disabled": {nil, "shared", "adapter_not_loaded"},
+		"dedicated row": {&fakeWaker{}, "dedicated", "service unavailable"},
+	} {
+		t.Run(name, func(t *testing.T) {
+			var hits int32
+			be := httptest.NewServer(http.HandlerFunc(func(_ http.ResponseWriter, _ *http.Request) {
+				atomic.AddInt32(&hits, 1)
+			}))
+			defer be.Close()
+			beURL, _ := url.Parse(be.URL)
+			srv, _ := notReadyAdapterServer(t, beURL, tc.waker, tc.mode)
+			rr := httptest.NewRecorder()
+			srv.Handler().ServeHTTP(rr, gatewayRequest("org-1", `{"model":"support-bot","max_tokens":10}`))
+			if rr.Code != http.StatusServiceUnavailable || strings.TrimSpace(rr.Body.String()) != tc.body {
+				t.Fatalf("status = %d body = %q, want 503 %q", rr.Code, rr.Body.String(), tc.body)
+			}
+			if atomic.LoadInt32(&hits) != 0 {
+				t.Fatalf("not-wakeable not-ready adapter reached the upstream")
+			}
+			if w, ok := tc.waker.(*fakeWaker); ok && atomic.LoadInt32(&w.calls) != 0 {
+				t.Fatalf("not-wakeable not-ready adapter was woken")
+			}
+		})
+	}
+}
+
 // TestGateway_UnknownModel404NoEcho: an unresolvable model is a generic 404 —
 // the body must not echo the attempted model (no oracle for probing which
 // models exist) — and nothing is billed.
