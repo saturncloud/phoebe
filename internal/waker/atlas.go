@@ -230,7 +230,9 @@ func (w *AtlasWaker) waitReady(ctx context.Context, upstreamHost, servedModel st
 				ID string `json:"id"`
 			} `json:"data"`
 		}
-		if err := json.NewDecoder(io.LimitReader(resp.Body, 64<<10)).Decode(&body); err != nil {
+		// A shared graph lists every adapter loaded on it; 64 KiB held only a
+		// few hundred names, and a truncated list never shows the model (Q69).
+		if err := json.NewDecoder(io.LimitReader(resp.Body, 4<<20)).Decode(&body); err != nil {
 			return false
 		}
 		for _, model := range body.Data {

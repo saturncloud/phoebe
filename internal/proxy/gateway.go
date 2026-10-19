@@ -225,17 +225,42 @@ func (s *Server) resolveGateway(w http.ResponseWriter, r *http.Request, id *iden
 		// usual retryable "starting" 503. Atlas publishes ready=true at its
 		// next registry sweep. Atlas publishes no separate "failed" state, so
 		// a failed adapter also takes this path, bounded by the wake hold.
-		if id.ServingMode == identity.ServingModeShared && s.wakeEnabled(*id) {
+		// Every outcome other than a served response (hold expiry, a failed
+		// wake, a still-unlisted adapter) answers 503 adapter_not_loaded with
+		// Retry-After, as before (wake.go, AdapterNotReady), so callers that
+		// script against that body keep seeing it.
+		if id.ServingMode == identity.ServingModeShared && s.wakeEnabled(*id) && s.wakerSupports(*id) {
 			s.log.Info.Printf("gateway: adapter not ready; holding for a wake org_id=%s model=%q request_id=%q",
 				id.OrgID, model, requestID)
+			id.AdapterNotReady = true
 			return true
 		}
-		// Not wakeable (a dedicated row, or wake disabled): keep this
-		// distinct from 404: the model exists and the caller may retry.
+		// The graph cannot be woken here (wake disabled, or the waker does not
+		// support this target). Keep this distinct from 404: the model exists
+		// and the caller may retry. A dedicated row never reaches this point:
+		// the non-shared check above refuses it; the ServingMode test in the
+		// condition is defense in depth.
 		s.log.Warn.Printf("gateway: adapter not loaded org_id=%s model=%q request_id=%q",
 			id.OrgID, model, requestID)
 		http.Error(w, "adapter_not_loaded", http.StatusServiceUnavailable)
 		return false
 	}
 	return true
+}
+
+// wakerSupports reports whether the configured waker can wake the graph id
+// resolves to: a waker that declares support per target (SupportsWake) is
+// asked; any other waker supports every target.
+func (s *Server) wakerSupports(id identity.Identity) bool {
+	supporter, ok := s.waker.(wakeTargetSupporter)
+	if !ok {
+		return true
+	}
+	return supporter.SupportsWake(WakeTarget{
+		UpstreamHost: id.Upstream,
+		GraphK8sName: id.GraphK8sName,
+		ResourceID:   id.ResourceID,
+		ServedModel:  id.ServedModel,
+		ServingMode:  id.ServingMode,
+	})
 }
