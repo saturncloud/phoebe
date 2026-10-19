@@ -394,7 +394,6 @@ func (r *RegistryResolver) GraphCapacities(graph string) (scaled, perRequest Gra
 	caps := r.byGraph[graph]
 	scaledWinners := make(map[string]GraphCapacity, len(caps))
 	perRequestWinners := make(map[string]GraphCapacity, len(caps))
-	multiplier := int64(-1) // computed on the first per-worker entry
 	for cmName, c := range caps {
 		if !r.winsClaimLocked(cmName) {
 			continue
@@ -402,13 +401,14 @@ func (r *RegistryResolver) GraphCapacities(graph string) (scaled, perRequest Gra
 		perRequestWinners[cmName] = c
 		switch {
 		case c.PerWorker && c.Disaggregated:
-			// Each value scales with the pool that bounds it (Q50).
-			c = c.ScaledByPool(func(pool string) int64 { return r.poolMultiplierLocked(graph, pool) })
+			// Each value scales with the pool that bounds it (Q50), and the
+			// headroom follows that pool's room to grow (Q63).
+			entry := c
+			c = c.ScaledByPool(func(pool string) int64 {
+				return r.poolMultiplierLocked(graph, pool, entry.growthFor(pool))
+			})
 		case c.PerWorker:
-			if multiplier < 0 {
-				multiplier = r.graphMultiplierLocked(graph)
-			}
-			c = c.Scaled(multiplier)
+			c = c.Scaled(r.graphMultiplierLocked(graph, c.WorkerGrowth))
 		}
 		scaledWinners[cmName] = c
 	}
@@ -416,39 +416,40 @@ func (r *RegistryResolver) GraphCapacities(graph string) (scaled, perRequest Gra
 }
 
 // graphMultiplierLocked is what a per-worker entry of graph is multiplied by:
-// its ready workers plus GraphLimitHeadroomWorkers, or one worker's worth
-// with no ready-worker source. The sum saturates at the int64 maximum
-// instead of wrapping, so a huge ready count cannot turn negative.
-func (r *RegistryResolver) graphMultiplierLocked(graph string) int64 {
+// its ready workers plus the headroom its room to grow allows
+// (growthInfo.headroom, Q63), or one worker's worth with no ready-worker
+// source. The sum saturates at the int64 maximum instead of wrapping, so a
+// huge ready count cannot turn negative.
+func (r *RegistryResolver) graphMultiplierLocked(graph string, growth growthInfo) int64 {
 	if r.workers == nil {
 		return GraphLimitHeadroomWorkers
 	}
-	n := r.workers.Ready(graph)
-	if n < 0 {
-		n = 0
-	}
-	if n > math.MaxInt64-GraphLimitHeadroomWorkers {
-		return math.MaxInt64
-	}
-	return n + GraphLimitHeadroomWorkers
+	return withHeadroom(r.workers.Ready(graph), growth)
 }
 
 // poolMultiplierLocked is graphMultiplierLocked for one pool of a
-// disaggregated graph: that pool's ready workers plus the headroom (Q4(b)
-// applied per pool, Q50). Without a ready-worker source it is the headroom
-// alone (one worker's worth), the same fail-tight reading.
-func (r *RegistryResolver) poolMultiplierLocked(graph, pool string) int64 {
+// disaggregated graph: that pool's ready workers plus the headroom its room
+// to grow allows (Q4(b) applied per pool, Q50, Q63). Without a ready-worker
+// source it is the headroom alone (one worker's worth), the same fail-tight
+// reading.
+func (r *RegistryResolver) poolMultiplierLocked(graph, pool string, growth growthInfo) int64 {
 	if r.workers == nil {
 		return GraphLimitHeadroomWorkers
 	}
-	n := r.workers.ReadyPool(graph, pool)
-	if n < 0 {
-		n = 0
+	return withHeadroom(r.workers.ReadyPool(graph, pool), growth)
+}
+
+// withHeadroom is ready workers (negative read as 0) plus the headroom
+// growth allows, saturating at the int64 maximum.
+func withHeadroom(ready int64, growth growthInfo) int64 {
+	if ready < 0 {
+		ready = 0
 	}
-	if n > math.MaxInt64-GraphLimitHeadroomWorkers {
+	h := growth.headroom(ready)
+	if ready > math.MaxInt64-h {
 		return math.MaxInt64
 	}
-	return n + GraphLimitHeadroomWorkers
+	return ready + h
 }
 
 // winsClaimLocked reports whether cmName is the claimant resolveClaimants
