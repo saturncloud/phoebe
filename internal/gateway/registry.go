@@ -89,6 +89,17 @@ func NewDynamicClient(kubeconfig string) (dynamic.Interface, error) {
 //	                               never defaulted.
 //	           graph_k8s_name    — the serving DGD k8s name
 //	           port              — the graph's OpenAI-compatible serve port
+//	           admission_max_workers, admission_worker_capacity
+//	                             — OPTIONAL room to grow (Q63, D65), per pool
+//	                               (_prefill / _decode suffixes on a
+//	                               disaggregated graph; unsuffixed keys are
+//	                               ignored there): the Planner maximum
+//	                               (integer >= 1) and whether one more worker
+//	                               can be placed now (yes / no). Headroom is 0
+//	                               at or above the maximum or with capacity
+//	                               no, even when the other key is unknown; 1
+//	                               at zero ready workers and otherwise,
+//	                               including absent, empty or malformed keys.
 //	           admission_max_active_requests,
 //	           admission_max_reserved_kv_tokens,
 //	           admission_max_prefill_tokens
@@ -97,7 +108,9 @@ func NewDynamicClient(kubeconfig string) (dynamic.Interface, error) {
 //	                               no limit. With admission_capacity_unit:
 //	                               per_worker (Q22) they are per-worker and
 //	                               phoebe enforces each graph at the value
-//	                               times (ready workers + 1); without the
+//	                               times (ready workers + headroom), the
+//	                               headroom being one worker while the
+//	                               graph can grow (Q63, below); without the
 //	                               marker they are graph-level and enforced
 //	                               as published; see
 //	                               GraphCapacity and ReadyWorkers. The
@@ -162,12 +175,14 @@ type RegistryResolver struct {
 	cmGraph map[string]string
 	// workers, when set, holds each graph's ready workers: Atlas publishes
 	// PER-WORKER limits and GraphCapacity multiplies them by (ready workers +
-	// GraphLimitHeadroomWorkers) (Q4(b), option B).
+	// the headroom the entry's room to grow allows, growthInfo.headroom: one
+	// worker by default, none at max workers or capacity no) (Q4(b), Q63).
 	workers readyWorkerSource
 }
 
 // WithReadyWorkers makes GraphCapacity scale the published per-worker limits
-// by each graph's ready workers plus GraphLimitHeadroomWorkers.
+// by each graph's ready workers plus the headroom its room to grow allows
+// (growthInfo.headroom, Q63).
 func (r *RegistryResolver) WithReadyWorkers(w readyWorkerSource) *RegistryResolver {
 	r.workers = w
 	return r
@@ -290,9 +305,12 @@ func (r *RegistryResolver) upsert(obj any) {
 		r.log.Error.Printf("gateway: ignoring registry ConfigMap %s/%s: %v", cm.Namespace, cm.Name, err)
 		return
 	}
-	capacity, badValues, badUnit := parseGraphCapacity(cm.Data)
+	capacity, badValues, badUnit, badGrowth := parseGraphCapacity(cm.Data)
 	if len(badValues) > 0 {
 		r.log.Error.Printf("gateway: registry ConfigMap %s/%s publishes malformed admission capacity %v — ignoring those limits (no limit)", cm.Namespace, cm.Name, badValues)
+	}
+	if len(badGrowth) > 0 {
+		r.log.Error.Printf("gateway: registry ConfigMap %s/%s publishes malformed admission growth keys %v — room to grow unknown, keeping one worker of headroom (limits still enforced)", cm.Namespace, cm.Name, badGrowth)
 	}
 	if badUnit != "" {
 		r.log.Error.Printf("gateway: registry ConfigMap %s/%s publishes unknown %s — enforcing its admission limits as published, as graph-level values (not multiplied by ready workers)", cm.Namespace, cm.Name, badUnit)
@@ -358,8 +376,10 @@ func (r *RegistryResolver) dropClaimLocked(cmName string, key cacheKey) {
 // GraphCapacity returns the admission capacity phoebe enforces for graph.
 // Each registry entry that wins its (org, served name) key is read in its own
 // unit first. An entry marked admission_capacity_unit: per_worker is
-// multiplied by the graph's ready workers plus GraphLimitHeadroomWorkers, or
-// by GraphLimitHeadroomWorkers alone when no ReadyWorkers source is attached.
+// multiplied by the graph's (or, when disaggregated, the bounding pool's)
+// ready workers plus the headroom its room to grow allows
+// (growthInfo.headroom, Q63), or by GraphLimitHeadroomWorkers alone when no
+// ReadyWorkers source is attached.
 // An unmarked or unknown-unit entry is a graph-level value and is used as
 // published. The tightest value per limit across these entries is returned
 // (Q22, D55a). A ConfigMap that loses a duplicate claim (see
@@ -394,6 +414,9 @@ func (r *RegistryResolver) GraphCapacities(graph string) (scaled, perRequest Gra
 	caps := r.byGraph[graph]
 	scaledWinners := make(map[string]GraphCapacity, len(caps))
 	perRequestWinners := make(map[string]GraphCapacity, len(caps))
+	// One ready-worker read per call, shared by every aggregated entry of the
+	// graph, so the entries are scaled against one count.
+	ready := int64(-1)
 	for cmName, c := range caps {
 		if !r.winsClaimLocked(cmName) {
 			continue
@@ -408,30 +431,28 @@ func (r *RegistryResolver) GraphCapacities(graph string) (scaled, perRequest Gra
 				return r.poolMultiplierLocked(graph, pool, entry.growthFor(pool))
 			})
 		case c.PerWorker:
-			c = c.Scaled(r.graphMultiplierLocked(graph, c.WorkerGrowth))
+			if r.workers == nil {
+				c = c.Scaled(GraphLimitHeadroomWorkers)
+				break
+			}
+			if ready < 0 {
+				ready = r.workers.Ready(graph)
+				if ready < 0 {
+					ready = 0
+				}
+			}
+			c = c.Scaled(withHeadroom(ready, c.WorkerGrowth))
 		}
 		scaledWinners[cmName] = c
 	}
 	return tightest(scaledWinners), tightest(perRequestWinners)
 }
 
-// graphMultiplierLocked is what a per-worker entry of graph is multiplied by:
-// its ready workers plus the headroom its room to grow allows
-// (growthInfo.headroom, Q63), or one worker's worth with no ready-worker
-// source. The sum saturates at the int64 maximum instead of wrapping, so a
-// huge ready count cannot turn negative.
-func (r *RegistryResolver) graphMultiplierLocked(graph string, growth growthInfo) int64 {
-	if r.workers == nil {
-		return GraphLimitHeadroomWorkers
-	}
-	return withHeadroom(r.workers.Ready(graph), growth)
-}
-
-// poolMultiplierLocked is graphMultiplierLocked for one pool of a
-// disaggregated graph: that pool's ready workers plus the headroom its room
-// to grow allows (Q4(b) applied per pool, Q50, Q63). Without a ready-worker
-// source it is the headroom alone (one worker's worth), the same fail-tight
-// reading.
+// poolMultiplierLocked is what a per-worker value of one pool of a
+// disaggregated graph is multiplied by: that pool's ready workers plus the
+// headroom its room to grow allows (Q4(b) applied per pool, Q50, Q63).
+// Without a ready-worker source it is the headroom alone (one worker's
+// worth), the same fail-tight reading.
 func (r *RegistryResolver) poolMultiplierLocked(graph, pool string, growth growthInfo) int64 {
 	if r.workers == nil {
 		return GraphLimitHeadroomWorkers

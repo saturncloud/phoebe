@@ -50,7 +50,7 @@ func TestParseGraphCapacity(t *testing.T) {
 		}, -1, -1, 100, 1},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			c, badValues, badUnit := parseGraphCapacity(tc.data)
+			c, badValues, badUnit, _ := parseGraphCapacity(tc.data)
 			if val(c.MaxActiveRequests) != tc.active || val(c.MaxReservedKVTokens) != tc.kv || val(c.MaxPrefillTokens) != tc.prefill {
 				t.Fatalf("capacity=(%d,%d,%d)", val(c.MaxActiveRequests), val(c.MaxReservedKVTokens), val(c.MaxPrefillTokens))
 			}
@@ -381,7 +381,7 @@ func TestParseGraphCapacityTopology(t *testing.T) {
 		// Unknown: enforced as published graph-level values (tighter), reported.
 		{"pipelined", false, false, true},
 	} {
-		c, bad, badUnit := parseGraphCapacity(with(tc.topology))
+		c, bad, badUnit, _ := parseGraphCapacity(with(tc.topology))
 		if c.PerWorker != tc.perWorker || c.Disaggregated != tc.disaggregated || (badUnit != "") != tc.badUnit || len(bad) != 0 {
 			t.Fatalf("topology %q: perWorker %v disaggregated %v badUnit %q bad %v", tc.topology, c.PerWorker, c.Disaggregated, badUnit, bad)
 		}
@@ -442,6 +442,12 @@ func TestHeadroomDroppedAtMaxWorkers(t *testing.T) {
 	if got := val(r.GraphCapacity("graph-llama31").MaxActiveRequests); got != 30 {
 		t.Fatalf("at max workers = %d, want 30 (no headroom)", got)
 	}
+}
+
+// TestHeadroomKeptBelowMaxWithCapacity: a known maximum the graph is below,
+// with room for one more worker, keeps the worker of headroom.
+func TestHeadroomKeptBelowMaxWithCapacity(t *testing.T) {
+	r := growthCM(t, map[string]string{capacityKeyMaxWorkers: "3", capacityKeyWorkerCapacity: workerCapacityValueYes})
 	r.WithReadyWorkers(fixedWorkers{"graph-llama31": 2})
 	if got := val(r.GraphCapacity("graph-llama31").MaxActiveRequests); got != 30 {
 		t.Fatalf("below max with capacity = %d, want 30 ((2+1) x 10)", got)
@@ -502,5 +508,86 @@ func TestHeadroomPerPoolOnADisaggregatedGraph(t *testing.T) {
 	if val(c.MaxActiveRequests) != 20 || val(c.MaxPrefillTokens) != 1000 {
 		t.Fatalf("got active %d prefill %d, want 20 (decode at max, no headroom) and 1000 ((1+1) x 500)",
 			val(c.MaxActiveRequests), val(c.MaxPrefillTokens))
+	}
+}
+
+// TestGrowthHeadroomRules pins growthInfo.headroom, the decision Q63 (D65)
+// adds to the admission path, input by input.
+func TestGrowthHeadroomRules(t *testing.T) {
+	cases := []struct {
+		name  string
+		g     growthInfo
+		ready int64
+		want  int64
+	}{
+		{"unknown keeps headroom", growthInfo{}, 2, 1},
+		{"yes below max keeps headroom", growthInfo{MaxWorkers: 4, Capacity: workerCapacityYes}, 2, 1},
+		{"at max drops headroom", growthInfo{MaxWorkers: 2, Capacity: workerCapacityYes}, 2, 0},
+		{"above max drops headroom", growthInfo{MaxWorkers: 2}, 3, 0},
+		{"known max drops headroom even with unknown capacity", growthInfo{MaxWorkers: 2}, 2, 0},
+		{"no capacity drops headroom", growthInfo{Capacity: workerCapacityNo}, 1, 0},
+		{"zero ready keeps headroom for the wake", growthInfo{MaxWorkers: 1, Capacity: workerCapacityNo}, 0, 1},
+		{"negative ready reads as zero", growthInfo{Capacity: workerCapacityNo}, -1, 1},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := tc.g.headroom(tc.ready); got != tc.want {
+				t.Fatalf("headroom(%+v, ready %d) = %d, want %d", tc.g, tc.ready, got, tc.want)
+			}
+		})
+	}
+}
+
+// TestParseGraphCapacityReportsMalformedGrowthSeparately: malformed growth
+// keys are reported as growth problems (room to grow unknown, headroom kept),
+// never as malformed limits (which would read as "no limit").
+func TestParseGraphCapacityReportsMalformedGrowthSeparately(t *testing.T) {
+	c, badValues, badUnit, badGrowth := parseGraphCapacity(map[string]string{
+		capacityKeyUnit: capacityUnitPerWorker, capacityKeyMaxActiveRequests: "10",
+		capacityKeyMaxWorkers: "0", capacityKeyMaxWorkers + "_" + PoolDecode: "-1",
+		capacityKeyWorkerCapacity: "maybe",
+	})
+	if len(badValues) != 0 || badUnit != "" {
+		t.Fatalf("growth problems leaked into the limit report: values %v unit %q", badValues, badUnit)
+	}
+	if len(badGrowth) != 3 {
+		t.Fatalf("badGrowth = %v, want the three malformed growth keys", badGrowth)
+	}
+	if val(c.MaxActiveRequests) != 10 || c.WorkerGrowth != (growthInfo{}) || c.DecodeGrowth != (growthInfo{}) {
+		t.Fatalf("limit lost or malformed growth read as known: %+v", c)
+	}
+}
+
+// TestHeadroomDroppedForAPoolWithoutCapacity: on a disaggregated graph a pool
+// Atlas reports no room for loses its headroom; the other pool keeps it.
+func TestHeadroomDroppedForAPoolWithoutCapacity(t *testing.T) {
+	r, _, _ := startedRegistry(t, registryCM("tf-model-a", map[string]string{
+		capacityKeyUnit: capacityUnitPerWorker, capacityKeyTopology: capacityTopologyDisaggregated,
+		capacityKeyMaxActiveRequests: "10", capacityKeyMaxPrefillTokens: "500",
+		capacityKeyWorkerCapacity + "_" + PoolDecode:  workerCapacityValueNo,
+		capacityKeyWorkerCapacity + "_" + PoolPrefill: workerCapacityValueYes,
+	}))
+	waitCapacity(t, r, "graph-llama31", func(c GraphCapacity) bool { return c.Any() })
+	r.WithReadyWorkers(fixedWorkers{"graph-llama31/" + PoolDecode: 2, "graph-llama31/" + PoolPrefill: 1})
+	c := r.GraphCapacity("graph-llama31")
+	if val(c.MaxActiveRequests) != 20 || val(c.MaxPrefillTokens) != 1000 {
+		t.Fatalf("got active %d prefill %d, want 20 (decode: no capacity) and 1000 ((1+1) x 500)",
+			val(c.MaxActiveRequests), val(c.MaxPrefillTokens))
+	}
+}
+
+// TestAggregatedGrowthKeysIgnoredOnADisaggregatedGraph: unsuffixed growth
+// keys describe an aggregated Worker pool; on a disaggregated graph they are
+// ignored, so each pool keeps its own (here unknown) room to grow.
+func TestAggregatedGrowthKeysIgnoredOnADisaggregatedGraph(t *testing.T) {
+	r, _, _ := startedRegistry(t, registryCM("tf-model-a", map[string]string{
+		capacityKeyUnit: capacityUnitPerWorker, capacityKeyTopology: capacityTopologyDisaggregated,
+		capacityKeyMaxActiveRequests: "10",
+		capacityKeyMaxWorkers:        "1", capacityKeyWorkerCapacity: workerCapacityValueNo,
+	}))
+	waitCapacity(t, r, "graph-llama31", func(c GraphCapacity) bool { return c.Any() })
+	r.WithReadyWorkers(fixedWorkers{"graph-llama31/" + PoolDecode: 2})
+	if got := val(r.GraphCapacity("graph-llama31").MaxActiveRequests); got != 30 {
+		t.Fatalf("active = %d, want 30 ((2+1) x 10): aggregated keys must not drop a pool's headroom", got)
 	}
 }

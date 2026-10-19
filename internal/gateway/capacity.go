@@ -18,7 +18,9 @@ type GraphCapacity struct {
 	MaxPrefillTokens    *int64
 	// PerWorker is true when the entry marks its values as per-worker
 	// (capacityKeyUnit = capacityUnitPerWorker, Q22): the registry then
-	// enforces them times the graph's ready workers plus one. An entry
+	// enforces them times the graph's ready workers plus the headroom
+	// growthInfo.headroom allows (one, or zero when the graph cannot grow,
+	// Q63). An entry
 	// without the marker carries graph-level values (what Atlas published
 	// before Q22), enforced as they are. Not a limit: tightest and Scaled
 	// leave it false on their results.
@@ -27,7 +29,8 @@ type GraphCapacity struct {
 	// (capacityKeyTopology = capacityTopologyDisaggregated, Q50): each
 	// per-worker value is then per worker of the pool that bounds it (Decode
 	// for active requests and reserved KV, Prefill for prefill tokens), and
-	// the registry scales it by that pool's ready workers plus one. Only
+	// the registry scales it by that pool's ready workers plus that pool's
+	// headroom (growthInfo.headroom, Q63). Only
 	// meaningful with PerWorker. Not a limit: tightest and Scaled leave it
 	// false on their results.
 	Disaggregated bool
@@ -51,6 +54,10 @@ func (c GraphCapacity) growthFor(pool string) growthInfo {
 		case PoolDecode:
 			return c.DecodeGrowth
 		}
+		// No other pool exists on a disaggregated graph; an unknown one reads
+		// as unknown growth (headroom kept), never as the aggregated keys,
+		// which Atlas does not publish for a disaggregated graph.
+		return growthInfo{}
 	}
 	return c.WorkerGrowth
 }
@@ -243,11 +250,15 @@ func (c GraphCapacity) Any() bool {
 //     because refusing the registration would take the tenant's model
 //     offline over a missing capacity hint (the same direction as having no
 //     profile at all).
+//   - badGrowth lists malformed room-to-grow keys (admission_max_workers*
+//     below 1 or not an integer, admission_worker_capacity* other than yes
+//     or no; Q63). Each reads as unknown, which keeps one worker of
+//     headroom (D65); the limits themselves are still enforced.
 //   - badUnit names an unknown admission_capacity_unit. The entry's values
 //     are kept and enforced as published, as graph-level limits (PerWorker
 //     stays false): that is the tighter reading of a per-worker value and
 //     the published reading of a graph-level one (D55(a)).
-func parseGraphCapacity(d map[string]string) (c GraphCapacity, badValues []string, badUnit string) {
+func parseGraphCapacity(d map[string]string) (c GraphCapacity, badValues []string, badUnit string, badGrowth []string) {
 	for _, f := range capacityFields {
 		key := f.key
 		raw := strings.TrimSpace(d[key])
@@ -261,7 +272,7 @@ func parseGraphCapacity(d map[string]string) (c GraphCapacity, badValues []strin
 		}
 		*f.get(&c) = &v
 	}
-	badValues = append(badValues, parseGrowth(d, &c)...)
+	badGrowth = parseGrowth(d, &c)
 	switch unit := strings.TrimSpace(d[capacityKeyUnit]); unit {
 	case "":
 	case capacityUnitPerWorker:
@@ -281,7 +292,7 @@ func parseGraphCapacity(d map[string]string) (c GraphCapacity, badValues []strin
 			badUnit = capacityKeyTopology + "=" + strconv.Quote(topology)
 		}
 	}
-	return c, badValues, badUnit
+	return c, badValues, badUnit, badGrowth
 }
 
 // tightest combines the capacity published on several entries of one graph:
