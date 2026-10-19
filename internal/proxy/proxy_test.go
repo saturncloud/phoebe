@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"compress/gzip"
 	"context"
+	"encoding/json"
 	"errors"
 	"io"
 	"net/http"
@@ -1931,5 +1932,74 @@ func TestControlRoutesWriteNoBillingRow(t *testing.T) {
 	}
 	if ev := events[0]; !ev.UsageFound || ev.StatusCode != http.StatusOK {
 		t.Fatalf("inference row = {UsageFound:%v StatusCode:%d}, want {true 200}", ev.UsageFound, ev.StatusCode)
+	}
+}
+
+// TestModelBindingRefusalsAreJSONAndNameNoModel pins the dedicated-endpoint
+// model-binding refusals (gateway-admission Q64, approved by Hugo 2026-10-19):
+// a body that is not valid JSON is 400 invalid_json; every other refusal (a
+// wrong model, the base model id, a body without a model, duplicate model
+// keys) stays 403 model_not_authorized. Both are OpenAI-style JSON error
+// objects with the request id, neither names the attempted or the bound
+// model, and nothing reaches the engine.
+func TestModelBindingRefusalsAreJSONAndNameNoModel(t *testing.T) {
+	var upstreamCalls int
+	backend := httptest.NewServer(http.HandlerFunc(func(_ http.ResponseWriter, _ *http.Request) {
+		upstreamCalls++
+	}))
+	defer backend.Close()
+	upstream, _ := url.Parse(backend.URL)
+	srv := newTestServer(t, upstream)
+
+	cases := []struct {
+		name   string
+		body   string
+		status int
+		code   string
+	}{
+		{"wrong model", `{"model":"adapter-b"}`, http.StatusForbidden, "model_not_authorized"},
+		{"base model id", `{"model":"Qwen/Qwen3-8B"}`, http.StatusForbidden, "model_not_authorized"},
+		{"no model field", `{"messages":[]}`, http.StatusForbidden, "model_not_authorized"},
+		{"duplicate model keys", `{"model":"adapter-a","model":"adapter-b"}`, http.StatusForbidden, "model_not_authorized"},
+		{"not valid JSON", `{"model":"adapter-a"`, http.StatusBadRequest, "invalid_json"},
+		{"empty body", ``, http.StatusBadRequest, "invalid_json"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(tc.body))
+			setUpstream(req, upstream)
+			req.Header.Set(identity.HeaderAuthID, "auth-1")
+			req.Header.Set(identity.HeaderResourceID, "deployment-a")
+			req.Header.Set(identity.HeaderServedModel, "adapter-a")
+			rr := httptest.NewRecorder()
+			srv.Handler().ServeHTTP(rr, req)
+
+			if rr.Code != tc.status {
+				t.Fatalf("status = %d, want %d (body %s)", rr.Code, tc.status, rr.Body.String())
+			}
+			if ct := rr.Header().Get("Content-Type"); ct != "application/json" {
+				t.Fatalf("Content-Type = %q, want application/json", ct)
+			}
+			if rr.Header().Get(requestIDHeader) == "" {
+				t.Fatalf("refusal carries no %s", requestIDHeader)
+			}
+			var got struct {
+				Error clientError `json:"error"`
+			}
+			if err := json.Unmarshal(rr.Body.Bytes(), &got); err != nil {
+				t.Fatalf("body is not a JSON error object: %v (%s)", err, rr.Body.String())
+			}
+			if got.Error.Code != tc.code || got.Error.Message == "" || got.Error.Type == "" {
+				t.Fatalf("error = %+v, want code %q with a message and type", got.Error, tc.code)
+			}
+			for _, name := range []string{"adapter-a", "adapter-b", "Qwen"} {
+				if strings.Contains(rr.Body.String(), name) {
+					t.Fatalf("refusal names a model (%q): %s", name, rr.Body.String())
+				}
+			}
+			if upstreamCalls != 0 {
+				t.Fatalf("refused request reached the engine (%d calls)", upstreamCalls)
+			}
+		})
 	}
 }

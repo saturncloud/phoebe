@@ -5,7 +5,9 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net/http"
 	"net/url"
+	"strconv"
 	"strings"
 )
 
@@ -374,3 +376,45 @@ func skipValue(dec *json.Decoder) error {
 	}
 	return nil
 }
+
+// clientError is an OpenAI-style error object, the shape OpenAI clients
+// parse: {"error": {"message", "type", "code"}}.
+type clientError struct {
+	Message string `json:"message"`
+	Type    string `json:"type"`
+	Code    string `json:"code"`
+}
+
+// The model-binding refusals (gateway-admission Q64, approved by Hugo
+// 2026-10-19). Neither message names a model: the attempted one is never
+// echoed and the bound one is never revealed, so a refusal is no oracle for
+// which models exist.
+var (
+	bindingInvalidJSON = clientError{
+		Message: "The request body is not valid JSON.",
+		Type:    "invalid_request_error",
+		Code:    "invalid_json",
+	}
+	bindingModelNotAuthorized = clientError{
+		Message: "The requested model is not served by this endpoint. Set model to this endpoint's model name.",
+		Type:    "permission_error",
+		Code:    "model_not_authorized",
+	}
+)
+
+// writeClientError answers a refusal with a JSON error body and the request id.
+func writeClientError(w http.ResponseWriter, requestID string, status int, e clientError) {
+	body, _ := json.Marshal(map[string]clientError{"error": e})
+	h := w.Header()
+	if requestID != "" {
+		h.Set(requestIDHeader, requestID)
+	}
+	h.Set("Content-Type", "application/json")
+	h.Set("X-Content-Type-Options", "nosniff")
+	h.Set("Content-Length", strconv.Itoa(len(body)))
+	w.WriteHeader(status)
+	_, _ = w.Write(body)
+}
+
+// validJSON reports whether body is one well-formed JSON value.
+func validJSON(body []byte) bool { return json.Valid(body) }
