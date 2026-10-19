@@ -18,9 +18,12 @@ import (
 	"github.com/saturncloud/phoebe/internal/logging"
 )
 
-// GraphLimitHeadroomWorkers is the workers' worth of headroom a shared
+// GraphLimitHeadroomWorkers is the most headroom, in workers, a shared
 // graph's admission limit allows above its ready workers (Q4(b)): the
-// published per-worker limit times (ready workers + this). The extra worker
+// published per-worker limit times (ready workers + this) while the graph can
+// grow. Since Q63 (D65) it applies only while the graph (or pool) can add a
+// worker: growthInfo.headroom is 0 at the Planner maximum or with no room for
+// one more worker. The extra worker
 // lets load build past the running workers, which is what the autoscaler
 // scales out on, and a graph at zero workers still admits one worker's worth
 // for requests held through a wake.

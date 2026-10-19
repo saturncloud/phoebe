@@ -140,7 +140,8 @@ type admissionEstimate struct {
 }
 
 // publishedGraphCapacities is the scaled capacity phoebe enforces
-// (GraphCapacity: per-worker entries times ready workers plus headroom,
+// (GraphCapacity: per-worker entries times ready workers plus the Q63
+// conditional headroom,
 // graph-level entries as published) and the unscaled per-request capacity (GraphRequestCapacity) for graph,
 // read together from one registry state when the resolver can do that, or
 // none.
