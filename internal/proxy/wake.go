@@ -43,6 +43,12 @@ type WakeTarget struct {
 	// ServingMode is the route's serving mode. Shared and dedicated wakes
 	// both go to Atlas; the proxy uses the mode for the dedicated cold-hold cap.
 	ServingMode string
+	// AdapterNotReady marks a held request for a shared fine-tune whose
+	// adapter Atlas has not seen ready (Q69). It changes only the answer when
+	// the request is not served: 503 adapter_not_loaded with Retry-After,
+	// the body callers already script against, instead of the generic
+	// "starting" or status-unknown answer or the upstream's cold 404.
+	AdapterNotReady bool
 }
 
 // Waker wakes a graph scaled to zero and blocks until its worker is ready to
@@ -353,6 +359,11 @@ func (t *wakeRoundTripper) RoundTrip(req *http.Request) (*http.Response, error) 
 			"wake: could not warm base for request_id=%s resource_id=%s: %v",
 			t.requestID, t.target.ResourceID, wakeErr,
 		)
+		if t.target.AdapterNotReady {
+			_ = resp.Body.Close()
+			t.neverServed = true
+			return adapterNotLoadedResponse(req, t.requestID), nil
+		}
 		if errors.Is(wakeErr, ErrWakeStatusUnknown) {
 			_ = resp.Body.Close()
 			t.neverServed = true
@@ -382,6 +393,9 @@ func (t *wakeRoundTripper) RoundTrip(req *http.Request) (*http.Response, error) 
 	if cold {
 		_ = resp.Body.Close()
 		t.neverServed = true
+		if t.target.AdapterNotReady {
+			return adapterNotLoadedResponse(req, t.requestID), nil
+		}
 		return wakeStartingResponse(req, t.requestID), nil
 	}
 	return resp, nil
@@ -659,6 +673,19 @@ func wakeStartingResponse(req *http.Request, requestID string) *http.Response {
 	return bufferedHTTPResponse(req, buf, true)
 }
 
+// adapterNotLoadedResponse is the answer to a held request for a not-ready
+// adapter that was not served (Q69): 503 with the plain "adapter_not_loaded"
+// body the gateway always answered, plus Retry-After and the request id.
+func adapterNotLoadedResponse(req *http.Request, requestID string) *http.Response {
+	buf := newBufferingResponseWriter()
+	buf.Header().Set("Retry-After", strconv.Itoa(wakeRetryAfterSeconds))
+	if requestID != "" {
+		buf.Header().Set(requestIDHeader, requestID)
+	}
+	http.Error(buf, "adapter_not_loaded", http.StatusServiceUnavailable)
+	return bufferedHTTPResponse(req, buf, true)
+}
+
 func wakeStatusUnknownResponse(req *http.Request, requestID string) *http.Response {
 	buf := newBufferingResponseWriter()
 	writeWakeStatusUnknown(buf, requestID)
@@ -682,6 +709,9 @@ func (s *Server) newWakeTransport(
 		ResourceID:   id.ResourceID,
 		ServedModel:  servedModel,
 		ServingMode:  id.ServingMode,
+		// Q69: a held request for a not-ready adapter answers 503
+		// adapter_not_loaded on every outcome other than a served response.
+		AdapterNotReady: id.AdapterNotReady,
 	}
 	if target.GraphK8sName == "" {
 		target.GraphK8sName = graphFromUpstreamHost(upstream.Host)
