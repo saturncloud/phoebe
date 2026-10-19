@@ -610,11 +610,11 @@ func TestRegistryGraphCapacityEnforcesUnknownUnitAsPublished(t *testing.T) {
 }
 
 func TestParseGraphCapacityUnit(t *testing.T) {
-	c, badValues, badUnit := parseGraphCapacity(map[string]string{"admission_max_active_requests": "5", capacityKeyUnit: " per_worker "})
+	c, badValues, badUnit, _ := parseGraphCapacity(map[string]string{"admission_max_active_requests": "5", capacityKeyUnit: " per_worker "})
 	if !c.PerWorker || len(badValues) != 0 || badUnit != "" {
 		t.Fatalf("per_worker marker: PerWorker=%v badValues=%v badUnit=%q", c.PerWorker, badValues, badUnit)
 	}
-	c, badValues, badUnit = parseGraphCapacity(map[string]string{"admission_max_active_requests": "5"})
+	c, badValues, badUnit, _ = parseGraphCapacity(map[string]string{"admission_max_active_requests": "5"})
 	if c.PerWorker || len(badValues) != 0 || badUnit != "" {
 		t.Fatalf("no marker means graph-level: PerWorker=%v badValues=%v badUnit=%q", c.PerWorker, badValues, badUnit)
 	}
@@ -623,7 +623,7 @@ func TestParseGraphCapacityUnit(t *testing.T) {
 // An unknown unit keeps its values as graph-level limits and is reported
 // only through the unit channel, never as an ignored limit value.
 func TestParseGraphCapacityUnknownUnitKeepsValuesAndReportsOnlyTheUnit(t *testing.T) {
-	c, badValues, badUnit := parseGraphCapacity(map[string]string{"admission_max_active_requests": "8", capacityKeyUnit: "per-worker"})
+	c, badValues, badUnit, _ := parseGraphCapacity(map[string]string{"admission_max_active_requests": "8", capacityKeyUnit: "per-worker"})
 	if c.PerWorker {
 		t.Fatal("an unknown unit must not be read as per-worker")
 	}
