@@ -31,6 +31,77 @@ type GraphCapacity struct {
 	// meaningful with PerWorker. Not a limit: tightest and Scaled leave it
 	// false on their results.
 	Disaggregated bool
+	// WorkerGrowth, PrefillGrowth and DecodeGrowth say whether the graph's
+	// (aggregated) Worker pool, or each pool of a disaggregated graph, can
+	// add a worker (Q63, Hugo 2026-10-19). They decide whether the one
+	// worker of headroom applies (growthInfo.headroom). Not limits: tightest
+	// and Scaled leave them zero on their results.
+	WorkerGrowth  growthInfo
+	PrefillGrowth growthInfo
+	DecodeGrowth  growthInfo
+}
+
+// growthFor returns the growth facts of the pool that bounds a field: the
+// disaggregated pool name, or the Worker pool of an aggregated graph.
+func (c GraphCapacity) growthFor(pool string) growthInfo {
+	if c.Disaggregated {
+		switch pool {
+		case PoolPrefill:
+			return c.PrefillGrowth
+		case PoolDecode:
+			return c.DecodeGrowth
+		}
+	}
+	return c.WorkerGrowth
+}
+
+// workerCapacity is Atlas's answer to "can one more worker of this pool's
+// size be placed now" (admission_worker_capacity): unknown (absent, empty or
+// unreadable), yes or no.
+type workerCapacity int8
+
+const (
+	workerCapacityUnknown workerCapacity = iota
+	workerCapacityYes
+	workerCapacityNo
+)
+
+// growthInfo is what Atlas publishes about one pool's room to grow (Q63):
+// the Planner's maximum workers (0 = unknown) and whether one more worker
+// can be placed now.
+type growthInfo struct {
+	MaxWorkers int64
+	Capacity   workerCapacity
+}
+
+// headroom is the workers' worth of headroom a pool with ready workers gets
+// (Q63, amending Q4(b)/D50): GraphLimitHeadroomWorkers while the pool can
+// actually add a worker, else 0, so a graph that cannot grow is never
+// admitted past the slots its workers have.
+//   - ready <= 0 keeps the headroom: a scaled-to-zero graph must let
+//     requests through for the wake (a worker that cannot be placed fails
+//     the wake on its own path).
+//   - at or above the Planner maximum, or with Atlas reporting no room for
+//     one more worker, there is no headroom.
+//   - unknown (a key absent, empty or unreadable) keeps today's headroom:
+//     unknown is a transient read failure, and dropping the headroom then
+//     would also silence the Planner's scale-up signal (ruling: fail open
+//     on quota-state loss).
+//
+// A "yes" is not a reservation: several graphs may each see yes for one
+// free slot and each keep a worker of headroom, at most one worker per
+// graph, the same as before Q63.
+func (g growthInfo) headroom(ready int64) int64 {
+	if ready <= 0 {
+		return GraphLimitHeadroomWorkers
+	}
+	if g.MaxWorkers > 0 && ready >= g.MaxWorkers {
+		return 0
+	}
+	if g.Capacity == workerCapacityNo {
+		return 0
+	}
+	return GraphLimitHeadroomWorkers
 }
 
 // The registry data keys carrying GraphCapacity. They are PER-WORKER values
@@ -64,7 +135,57 @@ const (
 	capacityKeyTopology           = "admission_topology"
 	capacityTopologyAggregated    = "aggregated"
 	capacityTopologyDisaggregated = "disaggregated"
+
+	// Room to grow (Q63, 2026-10-19), per pool: the Planner's maximum workers
+	// and whether one more worker can be placed now ("yes" or "no"; absent or
+	// empty = unknown). The aggregated keys describe the Worker pool; a
+	// disaggregated graph carries the _prefill and _decode pairs. Internal
+	// Atlas-to-phoebe contract; absent keys keep the pre-Q63 headroom, so no
+	// deploy order is needed.
+	capacityKeyMaxWorkers     = "admission_max_workers"
+	capacityKeyWorkerCapacity = "admission_worker_capacity"
+	workerCapacityValueYes    = "yes"
+	workerCapacityValueNo     = "no"
 )
+
+// growthKeySuffixes maps each pool's registry key suffix to its growth field.
+var growthKeySuffixes = []struct {
+	suffix string
+	get    func(*GraphCapacity) *growthInfo
+}{
+	{"", func(c *GraphCapacity) *growthInfo { return &c.WorkerGrowth }},
+	{"_" + PoolPrefill, func(c *GraphCapacity) *growthInfo { return &c.PrefillGrowth }},
+	{"_" + PoolDecode, func(c *GraphCapacity) *growthInfo { return &c.DecodeGrowth }},
+}
+
+// parseGrowth reads the room-to-grow keys of one registry entry. A malformed
+// value reads as unknown (which keeps the headroom) and is reported with the
+// other malformed values.
+func parseGrowth(d map[string]string, c *GraphCapacity) (bad []string) {
+	for _, g := range growthKeySuffixes {
+		info := g.get(c)
+		maxKey := capacityKeyMaxWorkers + g.suffix
+		if raw := strings.TrimSpace(d[maxKey]); raw != "" {
+			v, err := strconv.ParseInt(raw, 10, 64)
+			if err != nil || v < 1 {
+				bad = append(bad, maxKey+"="+strconv.Quote(raw))
+			} else {
+				info.MaxWorkers = v
+			}
+		}
+		capKey := capacityKeyWorkerCapacity + g.suffix
+		switch raw := strings.TrimSpace(d[capKey]); raw {
+		case "":
+		case workerCapacityValueYes:
+			info.Capacity = workerCapacityYes
+		case workerCapacityValueNo:
+			info.Capacity = workerCapacityNo
+		default:
+			bad = append(bad, capKey+"="+strconv.Quote(raw))
+		}
+	}
+	return bad
+}
 
 // capacityFields is the one list of GraphCapacity fields. Each entry names
 // the registry key carrying the field, the field itself, and the
@@ -140,6 +261,7 @@ func parseGraphCapacity(d map[string]string) (c GraphCapacity, badValues []strin
 		}
 		*f.get(&c) = &v
 	}
+	badValues = append(badValues, parseGrowth(d, &c)...)
 	switch unit := strings.TrimSpace(d[capacityKeyUnit]); unit {
 	case "":
 	case capacityUnitPerWorker:
