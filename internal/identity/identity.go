@@ -231,6 +231,12 @@ type Identity struct {
 	// fails closed when it is absent or malformed — the request is refused, never
 	// forwarded to a default or a guess. See HeaderUpstream.
 	Upstream string
+	// AdapterNotReady is set only by gateway resolution (never from a
+	// header): the resolved shared fine-tune's registry row says Atlas has not
+	// seen its adapter ready, and the request is held through a wake instead
+	// of being refused (Q69). Every outcome of that hold other than a served
+	// response answers 503 adapter_not_loaded.
+	AdapterNotReady bool
 	// Gateway reports the request arrived on the TF gateway route
 	// (HeaderGateway == "true", trusted middleware injection): no per-resource
 	// routing headers; phoebe resolves ResourceID / BaseModel / Adapter /
