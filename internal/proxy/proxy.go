@@ -673,15 +673,24 @@ func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request) {
 			writeRequestBodyError(w, r, requestID, rerr)
 			return
 		}
-		switch checkModelBinding(body, id.ServedModel) {
+		switch result := checkModelBinding(body, id.ServedModel); result {
 		case bindingMismatch, bindingUnparseable:
 			// Fail closed: the request names a model this resource is not
 			// authorized to serve (or one we cannot verify). Log with the
 			// resource for forensics; do NOT echo the attempted model to the
 			// caller (no oracle for probing which models exist on the graph).
+			// A body that is not valid JSON at all is answered 400 (it says
+			// nothing about models); every other refusal stays 403 with a
+			// message that names no model (Hugo, gateway-admission Q64).
+			if result == bindingUnparseable && !validJSON(body) {
+				s.log.Warn.Printf("model-binding: refused request_id=%s resource_id=%s (body is not valid JSON)",
+					requestID, id.ResourceID)
+				writeClientError(w, requestID, http.StatusBadRequest, bindingInvalidJSON)
+				return
+			}
 			s.log.Warn.Printf("model-binding: refused request_id=%s resource_id=%s (model not authorized for resource)",
 				requestID, id.ResourceID)
-			http.Error(w, "requested model is not authorized for this endpoint", http.StatusForbidden)
+			writeClientError(w, requestID, http.StatusForbidden, bindingModelNotAuthorized)
 			return
 		case bindingOK:
 			wakeServedModel, _ = extractRequestModel(body)
