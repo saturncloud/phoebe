@@ -420,3 +420,87 @@ func TestRegistry_DisaggregatedGraphScalesEachLimitByItsPool(t *testing.T) {
 		t.Fatalf("request capacity must stay per worker: (%d, %d, %d)", val(req.MaxActiveRequests), val(req.MaxReservedKVTokens), val(req.MaxPrefillTokens))
 	}
 }
+
+// growthCM is a per-worker aggregated entry of 10 active requests per worker
+// with the given room-to-grow keys (Q63).
+func growthCM(t *testing.T, keys map[string]string) *RegistryResolver {
+	t.Helper()
+	data := map[string]string{capacityKeyUnit: capacityUnitPerWorker, capacityKeyMaxActiveRequests: "10"}
+	for k, v := range keys {
+		data[k] = v
+	}
+	r, _, _ := startedRegistry(t, registryCM("tf-model-a", data))
+	waitCapacity(t, r, "graph-llama31", func(c GraphCapacity) bool { return c.Any() })
+	return r
+}
+
+// TestHeadroomDroppedAtMaxWorkers: at the Planner maximum the graph cannot
+// add a worker, so it gets no worker of headroom (Q63): 3 ready x 10, not 40.
+func TestHeadroomDroppedAtMaxWorkers(t *testing.T) {
+	r := growthCM(t, map[string]string{capacityKeyMaxWorkers: "3", capacityKeyWorkerCapacity: workerCapacityValueYes})
+	r.WithReadyWorkers(fixedWorkers{"graph-llama31": 3})
+	if got := val(r.GraphCapacity("graph-llama31").MaxActiveRequests); got != 30 {
+		t.Fatalf("at max workers = %d, want 30 (no headroom)", got)
+	}
+	r.WithReadyWorkers(fixedWorkers{"graph-llama31": 2})
+	if got := val(r.GraphCapacity("graph-llama31").MaxActiveRequests); got != 30 {
+		t.Fatalf("below max with capacity = %d, want 30 ((2+1) x 10)", got)
+	}
+}
+
+// TestHeadroomDroppedWithoutCapacity: Atlas reports no room for one more
+// worker (a fixed-size cluster without free GPUs, a pool in Backoff or at
+// its maximum), so no headroom even below the Planner maximum.
+func TestHeadroomDroppedWithoutCapacity(t *testing.T) {
+	r := growthCM(t, map[string]string{capacityKeyMaxWorkers: "8", capacityKeyWorkerCapacity: workerCapacityValueNo})
+	r.WithReadyWorkers(fixedWorkers{"graph-llama31": 1})
+	if got := val(r.GraphCapacity("graph-llama31").MaxActiveRequests); got != 10 {
+		t.Fatalf("no capacity = %d, want 10 (1 ready, no headroom)", got)
+	}
+}
+
+// TestHeadroomKeptWhenCapacityUnknown: absent, empty or malformed keys read
+// as unknown and keep the pre-Q63 headroom (fail open on quota-state loss).
+func TestHeadroomKeptWhenCapacityUnknown(t *testing.T) {
+	for name, keys := range map[string]map[string]string{
+		"absent":    {},
+		"empty":     {capacityKeyMaxWorkers: "", capacityKeyWorkerCapacity: ""},
+		"malformed": {capacityKeyMaxWorkers: "lots", capacityKeyWorkerCapacity: "maybe"},
+	} {
+		t.Run(name, func(t *testing.T) {
+			r := growthCM(t, keys)
+			r.WithReadyWorkers(fixedWorkers{"graph-llama31": 2})
+			if got := val(r.GraphCapacity("graph-llama31").MaxActiveRequests); got != 30 {
+				t.Fatalf("unknown = %d, want 30 ((2+1) x 10)", got)
+			}
+		})
+	}
+}
+
+// TestHeadroomKeptAtZeroReadyForWake: a scaled-to-zero graph keeps one
+// worker's worth even without capacity, so requests reach the wake path.
+func TestHeadroomKeptAtZeroReadyForWake(t *testing.T) {
+	r := growthCM(t, map[string]string{capacityKeyMaxWorkers: "1", capacityKeyWorkerCapacity: workerCapacityValueNo})
+	r.WithReadyWorkers(fixedWorkers{"graph-llama31": 0})
+	if got := val(r.GraphCapacity("graph-llama31").MaxActiveRequests); got != 10 {
+		t.Fatalf("zero ready = %d, want 10 (one worker's worth for the wake)", got)
+	}
+}
+
+// TestHeadroomPerPoolOnADisaggregatedGraph: each pool's headroom follows that
+// pool's own room to grow: Decode at its maximum gets none, Prefill keeps it.
+func TestHeadroomPerPoolOnADisaggregatedGraph(t *testing.T) {
+	r, _, _ := startedRegistry(t, registryCM("tf-model-a", map[string]string{
+		capacityKeyUnit: capacityUnitPerWorker, capacityKeyTopology: capacityTopologyDisaggregated,
+		capacityKeyMaxActiveRequests: "10", capacityKeyMaxPrefillTokens: "500",
+		capacityKeyMaxWorkers + "_" + PoolDecode: "2", capacityKeyWorkerCapacity + "_" + PoolDecode: workerCapacityValueYes,
+		capacityKeyMaxWorkers + "_" + PoolPrefill: "4", capacityKeyWorkerCapacity + "_" + PoolPrefill: workerCapacityValueYes,
+	}))
+	waitCapacity(t, r, "graph-llama31", func(c GraphCapacity) bool { return c.Any() })
+	r.WithReadyWorkers(fixedWorkers{"graph-llama31/" + PoolDecode: 2, "graph-llama31/" + PoolPrefill: 1})
+	c := r.GraphCapacity("graph-llama31")
+	if val(c.MaxActiveRequests) != 20 || val(c.MaxPrefillTokens) != 1000 {
+		t.Fatalf("got active %d prefill %d, want 20 (decode at max, no headroom) and 1000 ((1+1) x 500)",
+			val(c.MaxActiveRequests), val(c.MaxPrefillTokens))
+	}
+}
