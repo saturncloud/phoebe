@@ -280,6 +280,27 @@ there are no production rows. See the header of
 
 The migration header (`0009_rollup_grain_graph_revision.up.sql`) points here.
 
+### Rollout order for migration 0010
+
+0010 adds three nullable attribute columns to `rated_usage` (`base_model`,
+`adapter`, `price_key`: the usage identity). It is an expand step: the previous
+rater keeps writing, and no id or key changes.
+
+The new token-push sends the three fields, and a saturn-aws-manager older than
+#321 rejects unknown push keys with a 400, which withholds every window. So the
+order is:
+
+1. Deploy saturn-aws-manager with #321 (it accepts the fields as optional).
+2. Deploy phoebe with 0010, the new rater and the new token-push.
+
+Rows rated before the upgrade keep NULL until their hour is re-rated; while
+`billing_event` still holds the events (30 days), a `rater --since ... --until ...`
+re-rate fills them, and the next push carries them to the manager. Older hours
+stay NULL.
+
+Rolling back: deploy the previous rater and token-push, then `migrate down`.
+Nothing is lost but labels.
+
 ## Local dev
 
 ```

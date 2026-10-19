@@ -65,15 +65,24 @@ type rollup struct {
 	Region string `json:"region"`
 	// RequestCount is the number of rated requests in the rollup
 	// (rated_usage.event_count). Optional on the manager side (ledger D3).
-	RequestCount          int64  `json:"request_count"`
-	Cost                  string `json:"cost"`
-	AppliedPromptRate     string `json:"applied_prompt_rate"`
-	AppliedCachedRate     string `json:"applied_cached_rate"`
-	AppliedCompletionRate string `json:"applied_completion_rate"`
-	PromptTokens          int64  `json:"prompt_tokens"`
-	CachedTokens          int64  `json:"cached_tokens"`
-	CompletionTokens      int64  `json:"completion_tokens"`
-	BillablePromptTokens  int64  `json:"billable_prompt_tokens"`
+	RequestCount int64 `json:"request_count"`
+	// BaseModel, Adapter and PriceKey are the usage identity (migration 0010,
+	// usage-identity contract proposal A): what served the rollup, so usage still names a
+	// deleted endpoint's base model and LoRA adapter. Attributes, never grain or money.
+	// JSON null when unknown or (for Adapter) when there is no adapter; never "". The
+	// manager must accept them before this version deploys: its push schema rejected
+	// unknown keys before saturn-aws-manager #321.
+	BaseModel             *string `json:"base_model"`
+	Adapter               *string `json:"adapter"`
+	PriceKey              *string `json:"price_key"`
+	Cost                  string  `json:"cost"`
+	AppliedPromptRate     string  `json:"applied_prompt_rate"`
+	AppliedCachedRate     string  `json:"applied_cached_rate"`
+	AppliedCompletionRate string  `json:"applied_completion_rate"`
+	PromptTokens          int64   `json:"prompt_tokens"`
+	CachedTokens          int64   `json:"cached_tokens"`
+	CompletionTokens      int64   `json:"completion_tokens"`
+	BillablePromptTokens  int64   `json:"billable_prompt_tokens"`
 }
 
 // snapshot is the hourly POST body for one window_start: the COMPLETE current set of
@@ -141,7 +150,11 @@ SELECT
     ru.prompt_tokens,
     ru.cached_tokens,
     ru.completion_tokens,
-    ru.billable_prompt_tokens
+    ru.billable_prompt_tokens,
+    -- Usage identity (0010): NULL when unknown, or for adapter when there is none.
+    ru.base_model,
+    ru.adapter,
+    ru.price_key
 FROM rated_usage ru
 WHERE ru.window_start = $1
 ORDER BY ru.id`
@@ -168,7 +181,7 @@ func (p *pusher) buildSnapshot(ctx context.Context, windowStart time.Time) (snap
 	for rows.Next() {
 		var r rollup
 		var orgID sql.NullString
-		var region sql.NullString
+		var region, baseModel, adapter, priceKey sql.NullString
 		if err := rows.Scan(
 			&r.RatedUsageID,
 			&r.ResourceID,
@@ -189,6 +202,9 @@ func (p *pusher) buildSnapshot(ctx context.Context, windowStart time.Time) (snap
 			&r.CachedTokens,
 			&r.CompletionTokens,
 			&r.BillablePromptTokens,
+			&baseModel,
+			&adapter,
+			&priceKey,
 		); err != nil {
 			return snapshot{}, 0, fmt.Errorf("scan rated_usage row: %w", err)
 		}
@@ -206,6 +222,9 @@ func (p *pusher) buildSnapshot(ctx context.Context, windowStart time.Time) (snap
 		}
 		r.OrgID = orgID.String
 		r.Region = region.String
+		r.BaseModel = nullableString(baseModel)
+		r.Adapter = nullableString(adapter)
+		r.PriceKey = nullableString(priceKey)
 		// rev: phoebe's rated_usage carries no re-rate counter yet; the manager's
 		// idempotency is driven by the (rated_usage_id, emitted_cost) delta, not rev, so
 		// 0 is correct here. A real rev counter is a follow-up phoebe schema change.
@@ -357,4 +376,14 @@ func (p *pusher) postSnapshot(ctx context.Context, snap snapshot) error {
 		return fmt.Errorf("POST %s: status %d: %s", url, resp.StatusCode, string(respBody))
 	}
 	return nil
+}
+
+// nullableString maps a NULL or empty column to JSON null and anything else to its
+// value, so the usage-identity fields never cross the wire as "".
+func nullableString(v sql.NullString) *string {
+	if !v.Valid || v.String == "" {
+		return nil
+	}
+	s := v.String
+	return &s
 }

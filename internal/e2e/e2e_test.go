@@ -159,6 +159,8 @@ func newHarness(t *testing.T, schema string) *harness {
 	// revision rollup grain keys, which the rater upserts on.
 	mustExec(t, db, readMigration(t, "0008_billing_event_topology.up.sql"))
 	mustExec(t, db, readMigration(t, "0009_rollup_grain_graph_revision.up.sql"))
+	// 0010 adds the usage-identity attributes the rater writes.
+	mustExec(t, db, readMigration(t, "0010_rated_usage_identity.up.sql"))
 
 	mr, err := miniredis.Run()
 	if err != nil {
