@@ -246,20 +246,78 @@ func TestAtlasWakerBypassesAmbientHTTPProxy(t *testing.T) {
 	}
 }
 
-func TestAtlasWakerTreatsPreConnectionFailureAsNotStarted(t *testing.T) {
+// TestAtlasWakerRetriesWhileAtlasIsUnreachable (F2): a call that fails before
+// connecting never reached Atlas (restarting during a deploy), so the loop
+// asks again; a hold that ends while Atlas is still unreachable is
+// ErrWakeUnavailable, which is retryable, not a definite "nothing started".
+func TestAtlasWakerRetriesWhileAtlasIsUnreachable(t *testing.T) {
 	waker, err := NewAtlas("http://atlas.example", "secret", logging.New(logging.ERROR))
 	if err != nil {
 		t.Fatalf("NewAtlas: %v", err)
 	}
+	waker.pollInterval = time.Millisecond
+	var calls atomic.Int32
 	waker.client = &http.Client{Transport: roundTripFunc(func(*http.Request) (*http.Response, error) {
+		calls.Add(1)
 		return nil, errors.New("dial refused")
 	})}
 
-	err = waker.Wake(context.Background(), proxy.WakeTarget{
+	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+	defer cancel()
+	err = waker.Wake(ctx, proxy.WakeTarget{
 		ResourceID: "dep-1", UpstreamHost: "model.example", ServedModel: "model-a",
 	})
-	if err == nil || errors.Is(err, proxy.ErrWakeNotReady) {
-		t.Fatalf("Wake error = %v, want a definite pre-connection failure", err)
+	if !errors.Is(err, proxy.ErrWakeUnavailable) || errors.Is(err, proxy.ErrWakeStatusUnknown) {
+		t.Fatalf("Wake error = %v, want ErrWakeUnavailable", err)
+	}
+	if calls.Load() < 2 {
+		t.Fatalf("Atlas was tried %d times, want the loop to ask again", calls.Load())
+	}
+}
+
+// TestAtlasWakerWakesOnceAtlasIsBackWithinTheHold (F2): Atlas refuses
+// connections for the first calls, then comes back; the same hold completes
+// the wake instead of returning the cold response.
+func TestAtlasWakerWakesOnceAtlasIsBackWithinTheHold(t *testing.T) {
+	var atlasUp atomic.Bool
+	var wakeCalls atomic.Int32
+	atlas := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		wakeCalls.Add(1)
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	defer atlas.Close()
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = w.Write([]byte(`{"data":[{"id":"model-a"}]}`))
+	}))
+	defer upstream.Close()
+	upstreamURL, _ := url.Parse(upstream.URL)
+
+	waker, err := NewAtlas(atlas.URL, "secret", logging.New(logging.ERROR))
+	if err != nil {
+		t.Fatalf("NewAtlas: %v", err)
+	}
+	waker.pollInterval = time.Millisecond
+	var refused atomic.Int32
+	base := waker.client.Transport
+	waker.client.Transport = roundTripFunc(func(req *http.Request) (*http.Response, error) {
+		if req.URL.Host == upstreamURL.Host || atlasUp.Load() {
+			return base.RoundTrip(req)
+		}
+		if refused.Add(1) >= 3 {
+			atlasUp.Store(true)
+		}
+		return nil, errors.New("dial refused")
+	})
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if err := waker.Wake(ctx, proxy.WakeTarget{
+		ResourceID: "dep-1", UpstreamHost: upstreamURL.Host, ServedModel: "model-a",
+	}); err != nil {
+		t.Fatalf("Wake error = %v, want the wake to complete once Atlas is back", err)
+	}
+	if wakeCalls.Load() != 1 || refused.Load() < 3 {
+		t.Fatalf("Atlas wake calls = %d after %d refused dials, want 1 after 3", wakeCalls.Load(), refused.Load())
 	}
 }
 
