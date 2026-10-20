@@ -402,6 +402,9 @@ resolved AS (
         ev.org_id,
         ev.model_id,
         ev.base_model,
+        -- adapter: carried for the usage identity (0010); its presence already drove
+        -- the fine-tune marker in the joins below.
+        ev.adapter,
         -- serving_mode: a GRAIN key column from here on (see the grouped_raw GROUP BY).
         -- Carried verbatim, not defaulted: an event without a valid serving mode is
         -- dropped in billable's WHERE, so every row that reaches a rollup carries
@@ -468,7 +471,22 @@ resolved AS (
         -- is the one that prices the row (dedicated: only after (a) missed; shared:
         -- always first), so a non-NULL join is exactly "priced via this step".
         (rd.base_model IS NOT NULL) AS via_derived,
-        (rpb.model_id IS NOT NULL)  AS via_base
+        (rpb.model_id IS NOT NULL)  AS via_base,
+        -- price_key (usage identity, 0010): the key this row was rated at, recorded so
+        -- usage can name its price after billing_event is pruned. Fine-tune premium path
+        -- (b): the mode prefix, then 'ft:', then the base ('shared:ft:<base>' or
+        -- 'ft:<base>'). Plain-base path (c): the mode-prefixed base, sku_base. The
+        -- row's own model_id entry (a): NULL, since model_id already names it. Decided
+        -- with the same precedence as the price CASE above (rd and rpb only match when
+        -- their step is the one that priced the row). An attribute only: never money.
+        CASE
+            WHEN rd.base_model IS NOT NULL
+                THEN CASE WHEN ev.serving_mode = 'shared'
+                          THEN 'shared:ft:' || ev.base_model
+                          ELSE 'ft:' || ev.base_model END
+            WHEN rpb.model_id IS NOT NULL THEN ev.sku_base
+            ELSE NULL
+        END AS price_key
     FROM ev
     -- (a) The YAML-projected DIRECT price table (keyed on model_id).
     LEFT JOIN rating_price rp ON rp.model_id = ev.model_id
@@ -652,7 +670,15 @@ grouped_raw AS (
         -- NOTE: there is deliberately NO owner_conflict aggregate here. Conflicted
         -- events are dropped by billable's WHERE, per event, so none survives to be
         -- aggregated -- see the comment there for why a group-level gate was wrong.
-        CASE WHEN COUNT(DISTINCT region) > 1 THEN NULL ELSE MAX(region) END AS region
+        CASE WHEN COUNT(DISTINCT region) > 1 THEN NULL ELSE MAX(region) END AS region,
+        -- USAGE IDENTITY (0010), attributes like region and decided the same way: when
+        -- the rollup's events disagree, NULL rather than a guess. They cannot disagree
+        -- on a rollup that reaches money through base_model (the single-rate gate
+        -- withholds two bases or two paths), and an endpoint's adapter is fixed at
+        -- create. adapter is NULL for a rollup with no adapter.
+        CASE WHEN COUNT(DISTINCT base_model) > 1 THEN NULL ELSE MAX(base_model) END AS base_model,
+        CASE WHEN COUNT(DISTINCT adapter) > 1 THEN NULL ELSE MAX(adapter) END AS adapter,
+        CASE WHEN COUNT(DISTINCT price_key) > 1 THEN NULL ELSE MAX(price_key) END AS price_key
     FROM billable
     GROUP BY auth_id, owner_type, owner_id, resource_id, model_id, serving_mode,
              graph_k8s_name, topology_revision, window_start
@@ -717,7 +743,7 @@ upserted AS (
         serving_mode, graph_k8s_name, topology_revision, region, window_start, window_end,
         prompt_tokens, cached_tokens, completion_tokens, billable_prompt_tokens,
         cost, applied_prompt_rate, applied_cached_rate, applied_completion_rate,
-        event_count
+        event_count, base_model, adapter, price_key
     )
     SELECT
         -- DETERMINISTIC 32-char hex surrogate: md5 of the natural key, so re-rating
@@ -759,7 +785,7 @@ upserted AS (
         serving_mode, graph_k8s_name, topology_revision, region, window_start, window_end,
         prompt_tokens, cached_tokens, completion_tokens, billable_prompt_tokens,
         cost, applied_prompt_rate, applied_cached_rate, applied_completion_rate,
-        event_count
+        event_count, base_model, adapter, price_key
     FROM priced
     -- Deterministic upsert order so a SINGLE rater never self-deadlocks against its
     -- own rows (it takes row locks in one consistent order). Cross-rater
@@ -799,6 +825,11 @@ upserted AS (
         applied_cached_rate     = EXCLUDED.applied_cached_rate,
         applied_completion_rate = EXCLUDED.applied_completion_rate,
         event_count             = EXCLUDED.event_count,
+        -- Usage identity (0010): plain overwrites, like region. The latest rating of
+        -- the hour says what served it.
+        base_model              = EXCLUDED.base_model,
+        adapter                 = EXCLUDED.adapter,
+        price_key               = EXCLUDED.price_key,
         rated_at                = now()
     RETURNING event_count, cost, graph_k8s_name, topology_revision
 )

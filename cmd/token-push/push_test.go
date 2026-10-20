@@ -26,6 +26,7 @@ var snapshotCols = []string{
 	"topology_revision", "region", "event_count",
 	"cost", "applied_prompt_rate", "applied_cached_rate", "applied_completion_rate",
 	"prompt_tokens", "cached_tokens", "completion_tokens", "billable_prompt_tokens",
+	"base_model", "adapter", "price_key",
 }
 
 func newMockPusher(t *testing.T) (*pusher, sqlmock.Sqlmock) {
@@ -63,7 +64,7 @@ func TestBuildSnapshot_CarriesOrgAndShape(t *testing.T) {
 		"rated-id-1", "res-deploy-1", "org-acme", "meta-llama/Llama-3.1-8B-Instruct",
 		"shared", "user", "usr-17", "dyn-graph-llama31-8b", 7, "eu-north1", int64(42),
 		"0.001234500", "0.000000150", "0.000000075", "0.000000600",
-		int64(8000), int64(2000), int64(500), int64(6000),
+		int64(8000), int64(2000), int64(500), int64(6000), nil, nil, nil,
 	)
 	// No resource_name join — org rides the rollup.
 	mock.ExpectQuery(`SELECT.*FROM rated_usage ru`).
@@ -101,6 +102,53 @@ func TestBuildSnapshot_CarriesOrgAndShape(t *testing.T) {
 	}
 }
 
+// TestBuildSnapshot_CarriesUsageIdentityAsJSONNullWhenUnknown: the usage identity
+// (migration 0010) rides the wire so the manager can name a deleted endpoint's base model
+// and adapter. A NULL or empty column goes out as JSON null, never "", so the manager and
+// Atlas can tell "no adapter" from a value.
+func TestBuildSnapshot_CarriesUsageIdentityAsJSONNullWhenUnknown(t *testing.T) {
+	p, mock := newMockPusher(t)
+	rows := sqlmock.NewRows(snapshotCols).
+		AddRow("rated-ft", "res-ft", "org-acme", "my-ft",
+			"shared", "user", "usr-1", "g", 1, "eu", int64(1),
+			"0.1", "0", "0", "0", int64(1), int64(0), int64(0), int64(1),
+			"Qwen/Qwen2.5-7B-Instruct", "art-1", "shared:ft:Qwen/Qwen2.5-7B-Instruct").
+		AddRow("rated-own", "res-own", "org-acme", "own-rate",
+			"dedicated", "user", "usr-1", "g", 1, "eu", int64(1),
+			"0.1", "0", "0", "0", int64(1), int64(0), int64(0), int64(1),
+			"Qwen/Qwen2.5-7B-Instruct", "", nil)
+	mock.ExpectQuery(`SELECT.*FROM rated_usage ru`).WithArgs(win).WillReturnRows(rows)
+
+	snap, _, err := p.buildSnapshot(context.Background(), win)
+	if err != nil {
+		t.Fatalf("buildSnapshot: %v", err)
+	}
+	body, err := json.Marshal(snap)
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	var wire struct {
+		Rollups []map[string]any `json:"rollups"`
+	}
+	if err := json.Unmarshal(body, &wire); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	ft, own := wire.Rollups[0], wire.Rollups[1]
+	if ft["base_model"] != "Qwen/Qwen2.5-7B-Instruct" || ft["adapter"] != "art-1" ||
+		ft["price_key"] != "shared:ft:Qwen/Qwen2.5-7B-Instruct" {
+		t.Fatalf("fine-tune identity wrong: %v", ft)
+	}
+	for _, key := range []string{"adapter", "price_key"} {
+		v, present := own[key]
+		if !present || v != nil {
+			t.Fatalf("%s = %v (present=%v), want JSON null", key, v, present)
+		}
+	}
+	if own["base_model"] != "Qwen/Qwen2.5-7B-Instruct" {
+		t.Fatalf("own-rate base_model = %v", own["base_model"])
+	}
+}
+
 // TestBuildSnapshot_UnattributableOmitted (token-push-unattributable-omitted): a row
 // carrying a NULL org_id (Atlas didn't inject X-Saturn-Org-Id, or propagation broke) is
 // OMITTED from the snapshot and counted — never pushed with a guessed/empty org (C2/C7).
@@ -109,10 +157,10 @@ func TestBuildSnapshot_UnattributableOmitted(t *testing.T) {
 	rows := sqlmock.NewRows(snapshotCols).
 		AddRow("rated-ok", "res-1", "org-acme", "m",
 			"dedicated", "user", "usr-1", "dyn-graph-1", 1, "eu-north1", int64(1),
-									"0.001", "0.1", "0.05", "0.6", int64(1), int64(0), int64(1), int64(1)).
+									"0.001", "0.1", "0.05", "0.6", int64(1), int64(0), int64(1), int64(1), nil, nil, nil).
 		AddRow("rated-orphan", "res-vanished", nil, "m", // NULL org_id
 			"dedicated", "", "", "", 0, nil, int64(1),
-			"0.002", "0.1", "0.05", "0.6", int64(1), int64(0), int64(1), int64(1))
+			"0.002", "0.1", "0.05", "0.6", int64(1), int64(0), int64(1), int64(1), nil, nil, nil)
 	mock.ExpectQuery(`FROM rated_usage ru`).
 		WithArgs(win).WillReturnRows(rows)
 
@@ -138,7 +186,7 @@ func TestBuildSnapshot_EmptyStringOrgIsOmitted(t *testing.T) {
 	rows := sqlmock.NewRows(snapshotCols).
 		AddRow("rated-blank", "res-1", "", "m", // non-NULL EMPTY-STRING org_id
 			"dedicated", "group", "grp-9", "", 0, nil, int64(1),
-			"0.001", "0.1", "0.05", "0.6", int64(1), int64(0), int64(1), int64(1))
+			"0.001", "0.1", "0.05", "0.6", int64(1), int64(0), int64(1), int64(1), nil, nil, nil)
 	mock.ExpectQuery(`FROM rated_usage ru`).WithArgs(win).WillReturnRows(rows)
 
 	snap, unattributable, err := p.buildSnapshot(context.Background(), win)
@@ -250,8 +298,8 @@ func TestPushWindows_WithholdsWindowWithUnattributable(t *testing.T) {
 	p.managerURL = srv.URL
 	p.token = "t"
 	rows := sqlmock.NewRows(snapshotCols).
-		AddRow("ok", "res-1", "org-acme", "m", "shared", "user", "usr-1", "dyn-graph-1", 1, "eu-north1", int64(1), "0.001", "0.1", "0.05", "0.6", int64(1), int64(0), int64(1), int64(1)).
-		AddRow("orphan", "res-x", nil, "m", "dedicated", "", "", "", 0, nil, int64(1), "0.002", "0.1", "0.05", "0.6", int64(1), int64(0), int64(1), int64(1))
+		AddRow("ok", "res-1", "org-acme", "m", "shared", "user", "usr-1", "dyn-graph-1", 1, "eu-north1", int64(1), "0.001", "0.1", "0.05", "0.6", int64(1), int64(0), int64(1), int64(1), nil, nil, nil).
+		AddRow("orphan", "res-x", nil, "m", "dedicated", "", "", "", 0, nil, int64(1), "0.002", "0.1", "0.05", "0.6", int64(1), int64(0), int64(1), int64(1), nil, nil, nil)
 	expectLiveness(mock, true)
 	mock.ExpectQuery(`FROM rated_usage ru`).WithArgs(win).WillReturnRows(rows)
 
@@ -288,10 +336,10 @@ func TestPushWindows_WithheldWindowDoesNotBlockCleanWindow(t *testing.T) {
 	expectLiveness(mock, true)
 	mock.ExpectQuery(`FROM rated_usage ru`).WithArgs(win).WillReturnRows(
 		sqlmock.NewRows(snapshotCols).
-			AddRow("orphan", "res-x", nil, "m", "dedicated", "", "", "", 0, nil, int64(1), "0.002", "0.1", "0.05", "0.6", int64(1), int64(0), int64(1), int64(1)))
+			AddRow("orphan", "res-x", nil, "m", "dedicated", "", "", "", 0, nil, int64(1), "0.002", "0.1", "0.05", "0.6", int64(1), int64(0), int64(1), int64(1), nil, nil, nil))
 	mock.ExpectQuery(`FROM rated_usage ru`).WithArgs(win2).WillReturnRows(
 		sqlmock.NewRows(snapshotCols).
-			AddRow("ok", "res-1", "org-acme", "m", "shared", "user", "usr-1", "dyn-graph-1", 1, "eu-north1", int64(1), "0.001", "0.1", "0.05", "0.6", int64(1), int64(0), int64(1), int64(1)))
+			AddRow("ok", "res-1", "org-acme", "m", "shared", "user", "usr-1", "dyn-graph-1", 1, "eu-north1", int64(1), "0.001", "0.1", "0.05", "0.6", int64(1), int64(0), int64(1), int64(1), nil, nil, nil))
 
 	code := p.pushWindows(context.Background(), []time.Time{win, win2})
 	if code != exitUnattrib {
@@ -321,7 +369,7 @@ func TestPushWindows_FatalOnPostError(t *testing.T) {
 	expectLiveness(mock, true)
 	mock.ExpectQuery(`FROM rated_usage ru`).WithArgs(win).
 		WillReturnRows(sqlmock.NewRows(snapshotCols).
-			AddRow("ok", "res-1", "org-acme", "m", "shared", "user", "usr-1", "dyn-graph-1", 1, "eu-north1", int64(1), "0.001", "0.1", "0.05", "0.6", int64(1), int64(0), int64(1), int64(1)))
+			AddRow("ok", "res-1", "org-acme", "m", "shared", "user", "usr-1", "dyn-graph-1", 1, "eu-north1", int64(1), "0.001", "0.1", "0.05", "0.6", int64(1), int64(0), int64(1), int64(1), nil, nil, nil))
 
 	code := p.pushWindows(context.Background(), []time.Time{win})
 	if code != exitFatal {
@@ -371,10 +419,10 @@ func TestPushWindows_FatalDominatesWithheld(t *testing.T) {
 	// win: orphan -> withheld (no POST). win2: clean -> POST fails (fatal).
 	mock.ExpectQuery(`FROM rated_usage ru`).WithArgs(win).WillReturnRows(
 		sqlmock.NewRows(snapshotCols).
-			AddRow("orphan", "res-x", nil, "m", "dedicated", "", "", "", 0, nil, int64(1), "0.002", "0.1", "0.05", "0.6", int64(1), int64(0), int64(1), int64(1)))
+			AddRow("orphan", "res-x", nil, "m", "dedicated", "", "", "", 0, nil, int64(1), "0.002", "0.1", "0.05", "0.6", int64(1), int64(0), int64(1), int64(1), nil, nil, nil))
 	mock.ExpectQuery(`FROM rated_usage ru`).WithArgs(win2).WillReturnRows(
 		sqlmock.NewRows(snapshotCols).
-			AddRow("ok", "res-1", "org-acme", "m", "shared", "user", "usr-1", "dyn-graph-1", 1, "eu-north1", int64(1), "0.001", "0.1", "0.05", "0.6", int64(1), int64(0), int64(1), int64(1)))
+			AddRow("ok", "res-1", "org-acme", "m", "shared", "user", "usr-1", "dyn-graph-1", 1, "eu-north1", int64(1), "0.001", "0.1", "0.05", "0.6", int64(1), int64(0), int64(1), int64(1), nil, nil, nil))
 
 	code := p.pushWindows(context.Background(), []time.Time{win, win2})
 	if code != exitFatal {
