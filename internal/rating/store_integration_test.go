@@ -64,6 +64,8 @@ func ratingSchemaDDL(t *testing.T) string {
 		// region); 0009 makes graph and revision rollup grain keys.
 		"../../migrations/0008_billing_event_topology.up.sql",
 		"../../migrations/0009_rollup_grain_graph_revision.up.sql",
+		// 0010 adds the usage-identity attributes the rater writes.
+		"../../migrations/0010_rated_usage_identity.up.sql",
 	} {
 		ddl, err := os.ReadFile(f)
 		if err != nil {
@@ -949,6 +951,7 @@ func TestIntegration_InvalidUsageEvidenceNeverEntersMoney(t *testing.T) {
 		"0006_rollup_grain.up.sql",
 		"0008_billing_event_topology.up.sql",
 		"0009_rollup_grain_graph_revision.up.sql",
+		"0010_rated_usage_identity.up.sql",
 	} {
 		apply(name)
 	}
@@ -2115,6 +2118,7 @@ func TestIntegration_FreshInputTokensSurvivesInt32Overflow(t *testing.T) {
 		"0006_rollup_grain.up.sql",
 		"0008_billing_event_topology.up.sql",
 		"0009_rollup_grain_graph_revision.up.sql",
+		"0010_rated_usage_identity.up.sql",
 	} {
 		ddl, readErr := os.ReadFile("../../migrations/" + name)
 		if readErr != nil {
@@ -2227,6 +2231,7 @@ func TestIntegration_MissingUsagePartitionedByCause(t *testing.T) {
 		"0006_rollup_grain.up.sql",
 		"0008_billing_event_topology.up.sql",
 		"0009_rollup_grain_graph_revision.up.sql",
+		"0010_rated_usage_identity.up.sql",
 	} {
 		ddl, readErr := os.ReadFile("../../migrations/" + name)
 		if readErr != nil {
@@ -3834,6 +3839,7 @@ func TestIntegration_Migration0007BackfillMakesPreCutoverReRateANoOp(t *testing.
 	// 0009 grain.
 	exec(t, db, readMigration(t, "0008_billing_event_topology.up.sql"))
 	exec(t, db, readMigration(t, "0009_rollup_grain_graph_revision.up.sql"))
+	exec(t, db, readMigration(t, "0010_rated_usage_identity.up.sql"))
 
 	var leftover int
 	if err := db.QueryRowContext(ctx,
@@ -3930,7 +3936,8 @@ func TestIntegration_RolloutReRunBackfillLeavesExplicitEmptyServingModeWithheld(
 	defer func() { exec(t, db, "DROP SCHEMA IF EXISTS "+sch+" CASCADE") }()
 	for _, f := range []string{"0001_billing_event", "0002_rating", "0004_billing_event_serving_mode",
 		"0005_invoice_grade_attempts", "0006_rollup_grain", "0007_serving_mode_explicit",
-		"0008_billing_event_topology", "0009_rollup_grain_graph_revision"} {
+		"0008_billing_event_topology", "0009_rollup_grain_graph_revision",
+		"0010_rated_usage_identity"} {
 		exec(t, db, readMigration(t, f+".up.sql"))
 	}
 	exec(t, db, "ALTER TABLE billing_event ALTER COLUMN usage_found SET DEFAULT TRUE")
@@ -4037,6 +4044,7 @@ func TestIntegration_Migration0007TwinHourIsWholeAfterExplicitReRate(t *testing.
 	// 0009 grain.
 	exec(t, db, readMigration(t, "0008_billing_event_topology.up.sql"))
 	exec(t, db, readMigration(t, "0009_rollup_grain_graph_revision.up.sql"))
+	exec(t, db, readMigration(t, "0010_rated_usage_identity.up.sql"))
 
 	var partial int64
 	if err := db.QueryRowContext(ctx, `SELECT SUM(event_count) FROM rated_usage WHERE window_start = $1`, hour).
@@ -4244,6 +4252,8 @@ func TestIntegration_Migration0009GraphRevisionGrain(t *testing.T) {
 
 	exec(t, db, readMigration(t, "0009_rollup_grain_graph_revision.up.sql"))
 
+	exec(t, db, readMigration(t, "0010_rated_usage_identity.up.sql"))
+
 	var graph string
 	var revision int
 	if err := db.QueryRowContext(ctx,
@@ -4344,6 +4354,7 @@ func TestIntegration_Migration0009GraphRevisionGrain(t *testing.T) {
 	// Up again: every surviving row must carry the id the rater's 9-field formula
 	// mints, so a re-rate after a down/up round trip updates rows in place.
 	exec(t, db, readMigration(t, "0009_rollup_grain_graph_revision.up.sql"))
+	exec(t, db, readMigration(t, "0010_rated_usage_identity.up.sql"))
 	id9 := `md5(length(auth_id)::text || ':' || auth_id
 		  || '|' || length(owner_type)::text || ':' || owner_type
 		  || '|' || length(owner_id)::text || ':' || owner_id
@@ -4396,7 +4407,8 @@ func TestIntegration_Migration0009DownNoticesEveryRatedRowItDeletes(t *testing.T
 		exec(t, db, "SET search_path TO "+sch)
 		for _, f := range []string{"0001_billing_event", "0002_rating", "0004_billing_event_serving_mode",
 			"0005_invoice_grade_attempts", "0006_rollup_grain", "0007_serving_mode_explicit",
-			"0008_billing_event_topology", "0009_rollup_grain_graph_revision"} {
+			"0008_billing_event_topology", "0009_rollup_grain_graph_revision",
+			"0010_rated_usage_identity"} {
 			exec(t, db, readMigration(t, f+".up.sql"))
 		}
 	}
@@ -4523,6 +4535,8 @@ func TestIntegration_Migration0009UpNoticesEveryRatedRowWhoseIdItRewrites(t *tes
 
 	exec(t, db, readMigration(t, "0009_rollup_grain_graph_revision.up.sql"))
 
+	exec(t, db, readMigration(t, "0010_rated_usage_identity.up.sql"))
+
 	want := []string{
 		"0009: rewriting the id of 3 rated_usage rows (earliest window_start 2026-06-08T10:00:00Z); " +
 			"saturn-aws-manager bills by rated_usage_id, so an hour it already emitted to Stripe under the old id " +
@@ -4539,6 +4553,7 @@ func TestIntegration_Migration0009UpNoticesEveryRatedRowWhoseIdItRewrites(t *tes
 	setup(clean)
 	defer func() { exec(t, db, "DROP SCHEMA IF EXISTS "+clean+" CASCADE") }()
 	exec(t, db, readMigration(t, "0009_rollup_grain_graph_revision.up.sql"))
+	exec(t, db, readMigration(t, "0010_rated_usage_identity.up.sql"))
 	if len(notices) != 0 {
 		t.Fatalf("0009 up on an empty rated_usage raised %v, want no NOTICE", notices)
 	}
@@ -4697,5 +4712,99 @@ func TestIntegration_SharedRollupMixingBaseAndDirectRatesIsAmbiguous(t *testing.
 	}
 	if n != 0 {
 		t.Fatalf("rated_usage rows for the mixed rollup = %d, want 0 (withheld, never billed at MIN)", n)
+	}
+}
+
+// TestIntegration_RatedUsageCarriesUsageIdentity: every rollup records what served it
+// (migration 0010, usage-identity contract proposal A), so usage still names a deleted
+// endpoint's base model and adapter. price_key follows the step that priced the row:
+// the fine-tune premium path gives "<mode prefix>ft:<base>", the plain-base path the
+// mode-prefixed base, and the rollup's own model_id entry gives NULL.
+func TestIntegration_RatedUsageCarriesUsageIdentity(t *testing.T) {
+	dsn := os.Getenv("PHOEBE_TEST_DATABASE_URL")
+	if dsn == "" {
+		t.Skip("PHOEBE_TEST_DATABASE_URL not set; skipping live-Postgres conformance")
+	}
+	ctx := context.Background()
+	db, err := sql.Open("pgx", dsn)
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	defer db.Close()
+
+	const sch = "phoebe_rating_identity_it"
+	exec(t, db, "DROP SCHEMA IF EXISTS "+sch+" CASCADE")
+	exec(t, db, "CREATE SCHEMA "+sch)
+	exec(t, db, "SET search_path TO "+sch)
+	defer func() { exec(t, db, "DROP SCHEMA IF EXISTS "+sch+" CASCADE") }()
+	exec(t, db, ratingSchemaDDL(t))
+
+	const base = "Qwen/Qwen2.5-7B-Instruct"
+	hour := mustTime("2026-06-08T10:00:00Z")
+	book := newTestBook(
+		map[string]Rate3{
+			base:             rate3("0.000004", "0", "0"),
+			"shared:" + base: rate3("0.000002", "0", "0"),
+			"own-rate-ep":    rate3("0.000009", "0", "0"),
+		},
+		nil, PolicyMultiplier, MustDec("1.5"), Dec{},
+	)
+
+	type seed struct {
+		req, resource, model, mode, adapter string
+	}
+	seeds := []seed{
+		{"dedicated-ft", "r-ded-ft", "my-ft-endpoint", "dedicated", "art-ded"},
+		{"shared-ft", "r-sh-ft", "my-shared-ft", "shared", "art-sh"},
+		{"shared-base", "r-sh-base", base, "shared", ""},
+		{"dedicated-base", "r-ded-base", "my-base-endpoint", "dedicated", ""},
+		{"own-rate", "r-own", "own-rate-ep", "dedicated", ""},
+	}
+	for _, s := range seeds {
+		if _, err := db.ExecContext(ctx,
+			`INSERT INTO billing_event (request_id, auth_id, resource_id, model, base_model, adapter, serving_mode, prompt_tokens, completion_tokens, event_ts)
+			 VALUES ($1,'a',$2,$3,$4,$5,$6,1000,0,$7)`,
+			s.req, s.resource, s.model, base, nullableStr(s.adapter), s.mode, hour.Add(5*time.Minute)); err != nil {
+			t.Fatalf("seed %s: %v", s.req, err)
+		}
+	}
+
+	store := NewPostgresStore(db)
+	res, err := store.RateWindow(ctx, book, hour, hour.Add(time.Hour))
+	if err != nil {
+		t.Fatalf("RateWindow: %v", err)
+	}
+	if res.RollupsWritten != int64(len(seeds)) {
+		t.Fatalf("rollups = %d, want %d", res.RollupsWritten, len(seeds))
+	}
+
+	type identity struct{ baseModel, adapter, priceKey sql.NullString }
+	want := map[string][3]string{
+		// resource -> base_model, adapter ("" = NULL), price_key ("" = NULL)
+		"r-ded-ft":   {base, "art-ded", "ft:" + base},
+		"r-sh-ft":    {base, "art-sh", "shared:ft:" + base},
+		"r-sh-base":  {base, "", "shared:" + base},
+		"r-ded-base": {base, "", base},
+		"r-own":      {base, "", ""},
+	}
+	for resource, w := range want {
+		var got identity
+		if err := db.QueryRowContext(ctx,
+			`SELECT base_model, adapter, price_key FROM rated_usage WHERE resource_id=$1`, resource,
+		).Scan(&got.baseModel, &got.adapter, &got.priceKey); err != nil {
+			t.Fatalf("read %s: %v", resource, err)
+		}
+		for i, pair := range []struct {
+			name string
+			v    sql.NullString
+		}{{"base_model", got.baseModel}, {"adapter", got.adapter}, {"price_key", got.priceKey}} {
+			if w[i] == "" {
+				if pair.v.Valid {
+					t.Errorf("%s %s = %q, want NULL", resource, pair.name, pair.v.String)
+				}
+			} else if !pair.v.Valid || pair.v.String != w[i] {
+				t.Errorf("%s %s = %v, want %q", resource, pair.name, pair.v, w[i])
+			}
+		}
 	}
 }
