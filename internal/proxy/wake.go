@@ -75,10 +75,13 @@ type WakeTarget struct {
 //     answers a retryable 503 saying the wake service is unavailable, never
 //     the cold upstream 404 "Model not found".
 //   - Any other failure (Atlas refused the first wake call with a 4xx, or a
-//     malformed target): Wake returns an error that
-//     does NOT wrap ErrWakeNotReady. Nothing is starting, so telling the client
-//     to retry would be false; the caller returns the original cold upstream
-//     response unchanged.
+//     malformed target): Wake returns an error that wraps none of
+//     ErrWakeNotReady, ErrWakeStatusUnknown or ErrWakeUnavailable. Nothing is
+//     starting, so telling the client to retry would be false; the caller
+//     returns the original cold upstream response unchanged.
+//
+// A not-ready adapter (Q69) answers 503 adapter_not_loaded for every one of
+// these outcomes; that check comes before the wake sentinels.
 type Waker interface {
 	Wake(ctx context.Context, target WakeTarget) error
 }
