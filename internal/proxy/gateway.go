@@ -45,6 +45,14 @@ type graphCapacityPairSource interface {
 	GraphCapacities(graph string) (gateway.GraphCapacity, gateway.GraphCapacity)
 }
 
+// gatewayModelNotFoundMessage answers every unresolvable (org, model): a
+// model nobody serves, a base model the org has no endpoint for, and another
+// org's endpoint name all get these same words, so the answer reveals nothing
+// about which models exist elsewhere. It starts with the old "model not
+// found" text and says what to do (journey-qa, 2026-10-20).
+const gatewayModelNotFoundMessage = "model not found: this organization has no model endpoint with that name. " +
+	"Create an endpoint in Token Factory (Model endpoints), then send its endpoint name as the model."
+
 // WithGateway enables gateway resolution: requests carrying the trusted
 // X-Saturn-Gateway marker resolve their (org, body model=) against Atlas's
 // tf_model via resolver, and forward to the resolved graph's frontend Service
@@ -156,7 +164,7 @@ func (s *Server) resolveGateway(w http.ResponseWriter, r *http.Request, id *iden
 		// logged for ops (a customer's "my model 404s" is undebuggable without
 		// it); logs are not client-visible.
 		s.log.Warn.Printf("gateway: no model for org_id=%s model=%q request_id=%q", id.OrgID, model, requestID)
-		http.Error(w, "model not found", http.StatusNotFound)
+		http.Error(w, gatewayModelNotFoundMessage, http.StatusNotFound)
 		return false
 	case err != nil:
 		// Resolver (DB) failure: fail closed — phoebe must never forward
