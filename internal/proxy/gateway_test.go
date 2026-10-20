@@ -655,6 +655,12 @@ func TestGateway_UnknownModel404NoEcho(t *testing.T) {
 	if strings.Contains(rr.Body.String(), "super-secret-probe") {
 		t.Fatalf("404 body echoes the attempted model: %q", rr.Body.String())
 	}
+	if got := strings.TrimSpace(rr.Body.String()); got != gatewayModelNotFoundMessage {
+		t.Fatalf("404 body = %q, want the generic how-to message", got)
+	}
+	if !strings.HasPrefix(rr.Body.String(), "model not found") {
+		t.Fatalf("404 body lost its \"model not found\" prefix: %q", rr.Body.String())
+	}
 	if em.count() != 0 {
 		t.Fatalf("unresolved request must not bill, emitted %d", em.count())
 	}
@@ -680,6 +686,10 @@ func TestGateway_CrossTenantModel404(t *testing.T) {
 	}
 	if strings.Contains(rr.Body.String(), "victim-bot") {
 		t.Fatalf("cross-tenant 404 echoes the model: %q", rr.Body.String())
+	}
+	// Byte-identical to the unknown-model answer: no oracle.
+	if got := strings.TrimSpace(rr.Body.String()); got != gatewayModelNotFoundMessage {
+		t.Fatalf("cross-tenant 404 body = %q, want the same message as an unknown model", got)
 	}
 }
 
