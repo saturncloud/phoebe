@@ -719,6 +719,42 @@ func TestWakeUnknownStatusReturnsNeutralRetryableResponse(t *testing.T) {
 	}
 }
 
+// TestWakeUnavailableReturnsRetryableResponseNotTheCold404 (F2): Atlas could
+// not be reached for the whole hold (restarting during a deploy). The model
+// exists, so the caller gets a retryable 503 saying the wake service is
+// unavailable, never the frontend's cold 404 "Model not found".
+func TestWakeUnavailableReturnsRetryableResponseNotTheCold404(t *testing.T) {
+	original := &countingReadCloser{reader: strings.NewReader(`{"message":"Model not found"}`)}
+	waker := &fakeWaker{err: fmt.Errorf("atlas unreachable: %w", ErrWakeUnavailable)}
+	server := New(&config.Settings{}, logging.New(logging.ERROR), nil).WithWaker(waker, time.Second)
+	transport := server.newWakeTransport(
+		roundTripFunc(func(req *http.Request) (*http.Response, error) {
+			return &http.Response{StatusCode: http.StatusNotFound, Header: http.Header{}, Body: original, Request: req}, nil
+		}),
+		&url.URL{Host: "graph-frontend.default.svc:8000"},
+		identity.Identity{ResourceID: "r1", ServedModel: "m", ServingMode: "shared"},
+		"m", "request-1", nil,
+	)
+	resp, err := transport.RoundTrip(httptest.NewRequest(http.MethodPost, "/v1/chat/completions", nil))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if resp.StatusCode != http.StatusServiceUnavailable || resp.Header.Get("Retry-After") == "" {
+		t.Fatalf("status=%d Retry-After=%q, want retryable 503", resp.StatusCode, resp.Header.Get("Retry-After"))
+	}
+	if !strings.Contains(string(body), "wake service is unavailable") || strings.Contains(string(body), "Model not found") {
+		t.Fatalf("body=%q, want the wake-unavailable guidance, not the cold 404", body)
+	}
+	if !original.closed.Load() {
+		t.Fatal("original cold response body was not closed")
+	}
+}
+
 func TestDedicatedWakeTargetsRequestedAllowListMember(t *testing.T) {
 	backend := &coldToWarmBackend{warmBody: `{"model":"adapter-a","usage":{"prompt_tokens":2,"completion_tokens":1}}`}
 	be := httptest.NewServer(backend)

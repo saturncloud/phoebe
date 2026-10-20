@@ -555,16 +555,18 @@ func TestGateway_NotReadyAdapterAlreadyLoadedIsServedDirectly(t *testing.T) {
 }
 
 // TestGateway_NotReadyAdapterWakeOutcomesAreAdapterNotLoaded (Q69): a hold that
-// expires (ErrWakeNotReady), a wake whose status is unknown, and a wake that
+// expires (ErrWakeNotReady), a wake whose status is unknown, an unreachable
+// waker (ErrWakeUnavailable; the adapter answer wins), and a wake that
 // fails outright (an Atlas 4xx, a plain error) all answer 503
 // adapter_not_loaded with Retry-After, the body callers already script
 // against, never the generic starting answer or the upstream's 404; the
 // attempt is recorded at zero tokens.
 func TestGateway_NotReadyAdapterWakeOutcomesAreAdapterNotLoaded(t *testing.T) {
 	for name, wakeErr := range map[string]error{
-		"hold expired":   ErrWakeNotReady,
-		"status unknown": ErrWakeStatusUnknown,
-		"wake failed":    errors.New("atlas wake: 404 Inference endpoint not found"),
+		"hold expired":     ErrWakeNotReady,
+		"status unknown":   ErrWakeStatusUnknown,
+		"wake unavailable": ErrWakeUnavailable,
+		"wake failed":      errors.New("atlas wake: 404 Inference endpoint not found"),
 	} {
 		t.Run(name, func(t *testing.T) {
 			backend := &coldToWarmBackend{}

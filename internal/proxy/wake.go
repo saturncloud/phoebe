@@ -69,11 +69,19 @@ type WakeTarget struct {
 //   - The wake request may have reached its actuator, but the response does not
 //     prove whether scale-up began: Wake wraps ErrWakeStatusUnknown. The caller
 //     answers a neutral retryable 503 without claiming that workers are starting.
+//   - The actuator could not be reached at all for the whole hold (Atlas
+//     restarting during a deploy): Wake wraps ErrWakeUnavailable. Nothing was
+//     dispatched, so nothing is starting, but the model exists: the caller
+//     answers a retryable 503 saying the wake service is unavailable, never
+//     the cold upstream 404 "Model not found".
 //   - Any other failure (Atlas refused the first wake call with a 4xx, or a
-//     malformed target): Wake returns an error that
-//     does NOT wrap ErrWakeNotReady. Nothing is starting, so telling the client
-//     to retry would be false; the caller returns the original cold upstream
-//     response unchanged.
+//     malformed target): Wake returns an error that wraps none of
+//     ErrWakeNotReady, ErrWakeStatusUnknown or ErrWakeUnavailable. Nothing is
+//     starting, so telling the client to retry would be false; the caller
+//     returns the original cold upstream response unchanged.
+//
+// A not-ready adapter (Q69) answers 503 adapter_not_loaded for every one of
+// these outcomes; that check comes before the wake sentinels.
 type Waker interface {
 	Wake(ctx context.Context, target WakeTarget) error
 }
@@ -97,6 +105,12 @@ var ErrWakeNotReady = errors.New("wake triggered but the worker was not ready be
 // restoration began.
 var ErrWakeStatusUnknown = errors.New("wake status is unknown")
 
+// ErrWakeUnavailable marks a wake whose actuator could not be reached for the
+// whole hold: every call failed before connecting, so nothing was dispatched.
+// It is retryable (the actuator is usually restarting) and does not claim
+// that workers are starting.
+var ErrWakeUnavailable = errors.New("wake service unavailable")
+
 // wakeRetryAfterSeconds is the Retry-After value (in seconds) phoebe sends on
 // the 503 it returns when a scale-up from zero is in progress but the worker
 // was not ready within the wake hold (wake.timeout). Long enough not to hammer
@@ -116,6 +130,11 @@ const wakeNeverServedHeader = "X-Phoebe-Wake-Never-Served"
 // do not retry it, which is wrong while the model is starting.
 func writeWakeStarting(w http.ResponseWriter, requestID string) {
 	writeRetryLater(w, requestID, "The model is starting from zero; retry in about "+
+		strconv.Itoa(wakeRetryAfterSeconds)+" seconds.")
+}
+
+func writeWakeUnavailable(w http.ResponseWriter, requestID string) {
+	writeRetryLater(w, requestID, "The wake service is unavailable; retry in about "+
 		strconv.Itoa(wakeRetryAfterSeconds)+" seconds.")
 }
 
@@ -363,6 +382,11 @@ func (t *wakeRoundTripper) RoundTrip(req *http.Request) (*http.Response, error) 
 			_ = resp.Body.Close()
 			t.neverServed = true
 			return adapterNotLoadedResponse(req, t.requestID), nil
+		}
+		if errors.Is(wakeErr, ErrWakeUnavailable) {
+			_ = resp.Body.Close()
+			t.neverServed = true
+			return wakeUnavailableResponse(req, t.requestID), nil
 		}
 		if errors.Is(wakeErr, ErrWakeStatusUnknown) {
 			_ = resp.Body.Close()
@@ -683,6 +707,12 @@ func adapterNotLoadedResponse(req *http.Request, requestID string) *http.Respons
 		buf.Header().Set(requestIDHeader, requestID)
 	}
 	http.Error(buf, "adapter_not_loaded", http.StatusServiceUnavailable)
+	return bufferedHTTPResponse(req, buf, true)
+}
+
+func wakeUnavailableResponse(req *http.Request, requestID string) *http.Response {
+	buf := newBufferingResponseWriter()
+	writeWakeUnavailable(buf, requestID)
 	return bufferedHTTPResponse(req, buf, true)
 }
 

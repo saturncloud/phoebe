@@ -8,10 +8,13 @@ package waker
 import (
 	"bytes"
 	"context"
+	"crypto/tls"
+	"crypto/x509"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"net/http/httptrace"
 	"net/url"
@@ -50,7 +53,9 @@ type AtlasWaker struct {
 	client       *http.Client
 	pollInterval time.Duration
 	loopWindow   time.Duration
-	log          *logging.Logger
+	// unreachableBudget bounds a flight that has never reached Atlas.
+	unreachableBudget time.Duration
+	log               *logging.Logger
 
 	mu      sync.Mutex
 	flights map[string]*wakeFlight
@@ -61,7 +66,32 @@ type AtlasWaker struct {
 type wakeFlight struct {
 	done chan struct{}
 	err  error
+	// reachedAtlas is set once any call is known to have reached Atlas (a
+	// fresh connection, or a response byte on a reused one).
+	reachedAtlas atomic.Bool
+	// triedUnreached is set when a call failed without reaching Atlas.
+	triedUnreached atomic.Bool
+	// lastUnreached is the most recent such failure, for the caller's log.
+	lastUnreached atomic.Pointer[error]
 }
+
+// unavailable reports that Atlas was tried and never reached by this flight:
+// nothing was dispatched. It is false before the first call has failed, so a
+// hold that ends while the first call is still dialing is "status unknown".
+func (f *wakeFlight) unavailable() bool {
+	return f.triedUnreached.Load() && !f.reachedAtlas.Load()
+}
+
+func (f *wakeFlight) lastUnreachedError() error {
+	if err := f.lastUnreached.Load(); err != nil {
+		return *err
+	}
+	return nil
+}
+
+// errBeforeConnection marks a wake call that failed before a connection was
+// made, so Atlas never received it. It is safe to retry.
+var errBeforeConnection = errors.New("atlas waker: request failed before connection")
 
 func NewAtlas(baseURL, token string, log *logging.Logger) (*AtlasWaker, error) {
 	if strings.TrimSpace(baseURL) == "" {
@@ -91,8 +121,11 @@ func NewAtlas(baseURL, token string, log *logging.Logger) (*AtlasWaker, error) {
 		},
 		pollInterval: 2 * time.Second,
 		loopWindow:   wakeLoopWindow,
-		log:          log,
-		flights:      map[string]*wakeFlight{},
+		// A rolling Atlas restart takes about a minute; twice that is the most
+		// a wake waits for an Atlas it has never reached.
+		unreachableBudget: 2 * time.Minute,
+		log:               log,
+		flights:           map[string]*wakeFlight{},
 	}, nil
 }
 
@@ -111,6 +144,10 @@ func (w *AtlasWaker) Wake(ctx context.Context, target proxy.WakeTarget) error {
 		}
 	case <-ctx.Done():
 		// The loop keeps running, so the Planner is still restored.
+		if f.unavailable() {
+			return fmt.Errorf("%w: atlas waker: Atlas unreachable for the whole hold: %v (last error: %v)",
+				proxy.ErrWakeUnavailable, ctx.Err(), f.lastUnreachedError())
+		}
 		return fmt.Errorf("%w: atlas waker: hold ended while the wake was running: %v",
 			proxy.ErrWakeStatusUnknown, ctx.Err())
 	}
@@ -119,7 +156,8 @@ func (w *AtlasWaker) Wake(ctx context.Context, target proxy.WakeTarget) error {
 }
 
 // joinFlight returns the running wake loop for resourceID, or starts one
-// that is not cancelled with ctx and runs for at most loopWindow.
+// that is not cancelled with ctx and runs for at most loopWindow (a flight
+// that never reaches Atlas stops sooner, after unreachableBudget).
 func (w *AtlasWaker) joinFlight(ctx context.Context, resourceID string) *wakeFlight {
 	w.mu.Lock()
 	defer w.mu.Unlock()
@@ -131,7 +169,7 @@ func (w *AtlasWaker) joinFlight(ctx context.Context, resourceID string) *wakeFli
 	w.flights[resourceID] = f
 	go func() {
 		defer cancel()
-		f.err = w.callUntilWoken(loopCtx, resourceID)
+		f.err = w.callUntilWoken(loopCtx, resourceID, f)
 		w.mu.Lock()
 		delete(w.flights, resourceID)
 		w.mu.Unlock()
@@ -146,15 +184,43 @@ func (w *AtlasWaker) joinFlight(ctx context.Context, resourceID string) *wakeFli
 // idempotent, so the loop asks again. Once a call has left the status
 // unknown, a later failure (Atlas restarting, a 4xx) cannot prove that
 // nothing is starting, so the result stays "status unknown".
-func (w *AtlasWaker) callUntilWoken(ctx context.Context, resourceID string) error {
+//
+// A call that never reached Atlas (it is restarting, as on every deploy) is
+// asked again, but only within limits, because nothing has been dispatched:
+//   - a failure that looks like misconfiguration (the Atlas host does not
+//     resolve, or its certificate is not trusted) ends the flight at once as
+//     ErrWakeUnavailable, logged at ERROR with the cause;
+//   - a flight that has not reached Atlas within unreachableBudget ends as
+//     ErrWakeUnavailable, so held requests stop pinning cold-hold slots and
+//     no graph is woken minutes after every caller has left.
+func (w *AtlasWaker) callUntilWoken(ctx context.Context, resourceID string, f *wakeFlight) error {
 	var unknown error
+	var unreachedSince time.Time
+	reached := func() { f.reachedAtlas.Store(true) }
 	for {
-		err := w.requestWake(ctx, resourceID)
+		err := w.requestWake(ctx, resourceID, reached)
 		switch {
 		case err == nil:
 			return nil
 		case errors.Is(err, proxy.ErrWakeStatusUnknown):
 			unknown = err
+		case errors.Is(err, errBeforeConnection):
+			f.lastUnreached.Store(&err)
+			f.triedUnreached.Store(true)
+			if f.reachedAtlas.Load() {
+				break // Atlas was reached earlier: keep the loop's earlier verdict
+			}
+			if looksMisconfigured(err) {
+				w.log.Error.Printf("waker: Atlas wake URL looks misconfigured (resource_id=%s): %v", resourceID, err)
+				return fmt.Errorf("%w: %v", proxy.ErrWakeUnavailable, err)
+			}
+			if unreachedSince.IsZero() {
+				unreachedSince = time.Now()
+			} else if time.Since(unreachedSince) >= w.unreachableBudget {
+				w.log.Warn.Printf("waker: Atlas unreachable for %s, giving up this wake (resource_id=%s): %v",
+					w.unreachableBudget, resourceID, err)
+				return fmt.Errorf("%w: %v", proxy.ErrWakeUnavailable, err)
+			}
 		case unknown == nil:
 			return err
 		}
@@ -162,15 +228,38 @@ func (w *AtlasWaker) callUntilWoken(ctx context.Context, resourceID string) erro
 		select {
 		case <-ctx.Done():
 			timer.Stop()
+			if unknown == nil && f.unavailable() {
+				return fmt.Errorf("%w: %v", proxy.ErrWakeUnavailable, f.lastUnreachedError())
+			}
 			return unknown
 		case <-timer.C:
 		}
 	}
 }
 
+// looksMisconfigured reports a failure that a restart does not explain: the
+// Atlas host does not resolve, or its TLS certificate is not trusted.
+func looksMisconfigured(err error) bool {
+	var dnsErr *net.DNSError
+	if errors.As(err, &dnsErr) && dnsErr.IsNotFound {
+		return true
+	}
+	var verifyErr *tls.CertificateVerificationError
+	var unknownAuthority x509.UnknownAuthorityError
+	var hostnameErr x509.HostnameError
+	var invalidErr x509.CertificateInvalidError
+	return errors.As(err, &verifyErr) || errors.As(err, &unknownAuthority) ||
+		errors.As(err, &hostnameErr) || errors.As(err, &invalidErr)
+}
+
 // requestWake makes one Atlas wake call. Errors wrapping
-// proxy.ErrWakeStatusUnknown mean Atlas may have started the wake.
-func (w *AtlasWaker) requestWake(ctx context.Context, resourceID string) error {
+// proxy.ErrWakeStatusUnknown mean Atlas may have started the wake. reached
+// runs once the call is known to have reached Atlas: a fresh connection, or
+// a response byte on a reused keep-alive connection (a pooled connection to
+// an Atlas pod that has since gone away proves nothing). The Idempotency-Key
+// header lets net/http resend the call on a fresh connection when a pooled
+// one turns out to be dead; Atlas's wake is idempotent.
+func (w *AtlasWaker) requestWake(ctx context.Context, resourceID string, reached func()) error {
 	body, err := json.Marshal(map[string]string{"resource_id": resourceID})
 	if err != nil {
 		return fmt.Errorf("atlas waker: marshal request: %w", err)
@@ -181,14 +270,24 @@ func (w *AtlasWaker) requestWake(ctx context.Context, resourceID string) error {
 	}
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set(internalWakeHeader, w.token)
+	req.Header.Set("Idempotency-Key", resourceID)
 	var gotConn atomic.Bool
 	req = req.WithContext(httptrace.WithClientTrace(req.Context(), &httptrace.ClientTrace{
-		GotConn: func(httptrace.GotConnInfo) { gotConn.Store(true) },
+		GotConn: func(info httptrace.GotConnInfo) {
+			if !info.Reused {
+				gotConn.Store(true)
+				reached()
+			}
+		},
+		GotFirstResponseByte: func() {
+			gotConn.Store(true)
+			reached()
+		},
 	}))
 	resp, err := w.client.Do(req)
 	if err != nil {
 		if !gotConn.Load() {
-			return fmt.Errorf("atlas waker: request failed before connection: %w", err)
+			return fmt.Errorf("%w: %w", errBeforeConnection, err)
 		}
 		// Atlas can apply the replica restore before its response is lost.
 		// Treat a transport failure after dispatch as indeterminate so callers
