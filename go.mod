@@ -2,6 +2,8 @@ module github.com/saturncloud/phoebe
 
 go 1.23.0
 
+toolchain go1.26.10
+
 require gopkg.in/yaml.v2 v2.4.0
 
 require (
