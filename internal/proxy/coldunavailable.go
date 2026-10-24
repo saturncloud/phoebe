@@ -104,13 +104,18 @@ func dedicatedColdAnswer(status int, body []byte) bool {
 	case http.StatusNotFound:
 		return len(bytes.TrimSpace(body)) == 0 || bytes.Contains(body, []byte(dynamoModelNotFoundBodyMarker))
 	case http.StatusServiceUnavailable:
-		if bodyLooksNotReady(body) {
+		return bodyLooksNotReady(body) || bodyLooksNoBackend(body)
+	}
+	return false
+}
+
+// bodyLooksNoBackend reports whether a 503 body is one of Dynamo's "no worker
+// can take this request now" answers (dynamoNoBackendBodyMarkers), as opposed
+// to its overload 503.
+func bodyLooksNoBackend(body []byte) bool {
+	for _, marker := range dynamoNoBackendBodyMarkers {
+		if bytes.Contains(body, []byte(marker)) {
 			return true
-		}
-		for _, marker := range dynamoNoBackendBodyMarkers {
-			if bytes.Contains(body, []byte(marker)) {
-				return true
-			}
 		}
 	}
 	return false

@@ -314,11 +314,18 @@ func (t *wakeRoundTripper) RoundTrip(req *http.Request) (*http.Response, error) 
 			t.requestID, t.target.ResourceID,
 		)
 	} else {
-		cold, err := bufferColdCandidateWithin(req.Context(), resp, t.candidateReadTimeout())
-		if err != nil || !cold {
-			if err != nil {
-				return nil, err
-			}
+		cold, noBackend, err := classifyWakeCandidate(req.Context(), resp, t.candidateReadTimeout())
+		if err != nil {
+			return nil, err
+		}
+		if noBackend {
+			// The graph has a worker but none can take the request now (it
+			// just died or the frontend is draining). That is not a graph at
+			// zero, so there is no wake, but the client gets the retryable 503
+			// instead of Dynamo's 503 without Retry-After.
+			return t.noBackendResponse(req, resp), nil
+		}
+		if !cold {
 			return resp, nil
 		}
 	}
@@ -410,7 +417,7 @@ func (t *wakeRoundTripper) RoundTrip(req *http.Request) (*http.Response, error) 
 	if err != nil {
 		return nil, err
 	}
-	cold, err := bufferColdCandidateWithin(req.Context(), resp, t.candidateReadTimeout())
+	cold, noBackend, err := classifyWakeCandidate(req.Context(), resp, t.candidateReadTimeout())
 	if err != nil {
 		return nil, err
 	}
@@ -422,7 +429,41 @@ func (t *wakeRoundTripper) RoundTrip(req *http.Request) (*http.Response, error) 
 		}
 		return wakeStartingResponse(req, t.requestID), nil
 	}
+	if noBackend {
+		return t.noBackendResponse(req, resp), nil
+	}
 	return resp, nil
+}
+
+// noBackendResponse answers a request whose upstream 503 was one of Dynamo's
+// no-backend answers (bodyLooksNoBackend) with phoebe's retryable 503, the
+// same answer a dedicated route without a wake path gives
+// (coldUnavailableRoundTripper). The attempt is marked never-served.
+func (t *wakeRoundTripper) noBackendResponse(req *http.Request, resp *http.Response) *http.Response {
+	_ = resp.Body.Close()
+	t.neverServed = true
+	buf := newBufferingResponseWriter()
+	writeRetryLater(buf, t.requestID, coldUnavailableMessage)
+	return bufferedHTTPResponse(req, buf, true)
+}
+
+// classifyWakeCandidate buffers a 404 or 503 body (bufferCandidateBody) and
+// reports whether it is a wake signal (cold: a 404, or the zero-worker "not
+// ready" 503) or one of Dynamo's no-backend 503s (noBackend). Any other
+// response, and a body that is too large or incomplete, is neither and is
+// returned unchanged by the caller.
+func classifyWakeCandidate(ctx context.Context, resp *http.Response, timeout time.Duration) (cold, noBackend bool, err error) {
+	if resp.StatusCode != http.StatusNotFound && resp.StatusCode != http.StatusServiceUnavailable {
+		return false, false, nil
+	}
+	body, complete, err := bufferCandidateBody(ctx, resp, timeout)
+	if err != nil || !complete {
+		return false, false, err
+	}
+	if resp.StatusCode == http.StatusNotFound || bodyLooksNotReady(body) {
+		return true, false, nil
+	}
+	return false, bodyLooksNoBackend(body), nil
 }
 
 // wakeRefusedRetryInterval is the pause between resends of a held request
