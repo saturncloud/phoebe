@@ -12,7 +12,8 @@
 #   /app/phoebe-prune       — evidence-retention batch job: prunes billing_event
 #                             (30d default, 7d floor) and io_log (7d default) on
 #                             created_at (a CronJob, ships suspended)
-FROM golang:1.23-alpine AS builder
+# Go >= 1.26.10 / 1.27.3 for CVE-2026-111943 (crypto/x509 distrusts the compromised eMudhra intermediates).
+FROM golang:1.26.10-alpine AS builder
 
 WORKDIR /app
 
@@ -38,7 +39,9 @@ RUN go build -o /phoebe ./cmd/interceptor && \
 FROM alpine:latest
 
 # ca-certificates for outbound TLS (Valkey/Postgres/upstreams over TLS).
-RUN apk add --no-cache ca-certificates
+# --upgrade keeps the trust store current (>= 20261020 drops the emSign ECC Root CA - G3,
+# CVE-2026-111943).
+RUN apk add --no-cache --upgrade ca-certificates
 
 COPY --from=builder /phoebe /app/phoebe
 COPY --from=builder /phoebe-drainer /app/phoebe-drainer
