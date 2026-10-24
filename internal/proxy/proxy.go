@@ -1018,6 +1018,18 @@ func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request) {
 		wakeTransport = s.newWakeTransport(rp.Transport, upstream, id, wakeServedModel, requestID, admitted)
 		rp.Transport = wakeTransport
 	}
+	// A bound dedicated route with no wake path answers its cold response as
+	// a retryable 503 instead of Dynamo's 404 (coldunavailable.go). The model
+	// binding above has already accepted the request's model.
+	var coldTransport *coldUnavailableRoundTripper
+	if wakeTransport == nil && s.coldUnavailableEligible(id, r.Method) && inferenceRequestPathAllowed(routePath) {
+		base := rp.Transport
+		if base == nil {
+			base = http.DefaultTransport
+		}
+		coldTransport = &coldUnavailableRoundTripper{base: base, requestID: requestID}
+		rp.Transport = coldTransport
+	}
 
 	// FlushInterval=-1 flushes every write immediately — per-chunk SSE
 	// delivery with no buffering. This is the streaming-correctness linchpin.
@@ -1026,7 +1038,8 @@ func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request) {
 	rp.FlushInterval = -1
 
 	rp.ModifyResponse = func(resp *http.Response) error {
-		wakeNeverServed := wakeTransport != nil && wakeTransport.neverServed
+		wakeNeverServed := (wakeTransport != nil && wakeTransport.neverServed) ||
+			(coldTransport != nil && coldTransport.neverServed)
 		resp.Header.Del(wakeNeverServedHeader)
 		// Dynamo's model-list endpoint is graph-wide. A dedicated subdomain is
 		// deployment-scoped, so expose only the served name Atlas authorized for
