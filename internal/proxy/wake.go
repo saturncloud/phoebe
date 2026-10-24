@@ -638,10 +638,22 @@ func bufferColdCandidateWithin(ctx context.Context, resp *http.Response, timeout
 	if resp.StatusCode != http.StatusNotFound && resp.StatusCode != http.StatusServiceUnavailable {
 		return false, nil
 	}
+	prefix, complete, err := bufferCandidateBody(ctx, resp, timeout)
+	if err != nil || !complete {
+		return false, err
+	}
+	return resp.StatusCode == http.StatusNotFound || bodyLooksNotReady(prefix), nil
+}
+
+// bufferCandidateBody reads up to coldCandidatePrefixLimit bytes of resp's body
+// within timeout and replaces resp.Body with a replay, so the response can
+// still be returned unchanged. complete is true only when the whole body was
+// read within the bound and the deadline; only then is prefix the full body.
+func bufferCandidateBody(ctx context.Context, resp *http.Response, timeout time.Duration) (prefix []byte, complete bool, err error) {
 	body := newCandidateBody(resp.Body)
 	readCtx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
-	prefix := make([]byte, 0, coldCandidatePrefixLimit+1)
+	prefix = make([]byte, 0, coldCandidatePrefixLimit+1)
 	var readErr error
 	for len(prefix) <= coldCandidatePrefixLimit && readErr == nil {
 		remaining := coldCandidatePrefixLimit + 1 - len(prefix)
@@ -653,19 +665,19 @@ func bufferColdCandidateWithin(ctx context.Context, resp *http.Response, timeout
 	if readCtx.Err() != nil {
 		if ctx.Err() != nil {
 			_ = body.Close()
-			return false, fmt.Errorf("wake: read cold-candidate response body: %w", ctx.Err())
+			return nil, false, fmt.Errorf("wake: read cold-candidate response body: %w", ctx.Err())
 		}
 		resp.Body = &replayReadCloser{Reader: io.MultiReader(bytes.NewReader(prefix), body), closer: body}
-		return false, nil
+		return prefix, false, nil
 	}
 	if len(prefix) > coldCandidatePrefixLimit {
 		if readErr != nil {
 			_ = body.Close()
 			resp.Body = &replayReadCloser{Reader: io.MultiReader(bytes.NewReader(prefix), &terminalErrorReader{err: readErr}), closer: body}
-			return false, nil
+			return prefix, false, nil
 		}
 		resp.Body = &replayReadCloser{Reader: io.MultiReader(bytes.NewReader(prefix), body), closer: body}
-		return false, nil
+		return prefix, false, nil
 	}
 	_ = body.Close()
 	if readErr != nil {
@@ -673,7 +685,7 @@ func bufferColdCandidateWithin(ctx context.Context, resp *http.Response, timeout
 	} else {
 		resp.Body = &replayReadCloser{Reader: bytes.NewReader(prefix), closer: body}
 	}
-	return resp.StatusCode == http.StatusNotFound || bodyLooksNotReady(prefix), nil
+	return prefix, true, nil
 }
 
 func bufferedHTTPResponse(req *http.Request, buf *bufferingResponseWriter, neverServed bool) *http.Response {
