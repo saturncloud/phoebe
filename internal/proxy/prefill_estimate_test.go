@@ -180,7 +180,7 @@ func TestEstimatePromptTokensCountsToolAndSchemaDefinitions(t *testing.T) {
 // D36 (extends D33): fields the engine renders into the prompt from outside
 // the messages (chat documents, a client chat template and its kwargs,
 // completions prompt_embeds) and the template-rendered message fields (name,
-// reasoning_content, tool_call_id) count in the estimate, so a request with
+// reasoning_content or reasoning, tool_call_id) count in the estimate, so a request with
 // a tiny message and a large document does not estimate as one token.
 func TestEstimatePromptTokensCountsTemplateRenderedFields(t *testing.T) {
 	msg := `"messages":[{"role":"user","content":"hi"}]`
@@ -195,6 +195,7 @@ func TestEstimatePromptTokensCountsTemplateRenderedFields(t *testing.T) {
 		{"chat_template_kwargs", `{"model":"m",` + msg + `,"chat_template_kwargs":{"x":"` + text4k + `"}}`, 1000},
 		{"prompt_embeds", `{"model":"m","prompt_embeds":"` + text4k + `"}`, 1000},
 		{"message reasoning_content", `{"model":"m","messages":[{"role":"assistant","content":"hi","reasoning_content":"` + text4k + `"}]}`, 1000},
+		{"message reasoning", `{"model":"m","messages":[{"role":"assistant","content":"hi","reasoning":"` + text4k + `"}]}`, 1000},
 		{"message name", `{"model":"m","messages":[{"role":"user","content":"hi","name":"` + text4k + `"}]}`, 1000},
 	} {
 		if got := estimatePromptTokens([]byte(tc.body)); got < tc.min {

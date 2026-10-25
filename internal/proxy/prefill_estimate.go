@@ -39,8 +39,11 @@ const imagePartTokens = 1024
 // completions prompt_embeds, whose base64 length over-counts conservatively
 // (billing reconciles to the engine's counts). A JSON null counts nothing.
 //
-// Each message's name, reasoning_content and tool_call_id strings count as
-// message text too, because chat templates render them.
+// Each message's name, reasoning_content, reasoning and tool_call_id strings
+// count as message text too, because chat templates render them. A prior
+// assistant turn carries its thinking under either name: "reasoning_content"
+// (Dynamo's default response field) or "reasoning" (vLLM 0.31's own server and
+// newer OpenAI-compatible clients).
 //
 // Every field is looked up by its exact key. encoding/json's struct decoding
 // matches keys case-insensitively and keeps the last match, while the engine
@@ -63,7 +66,7 @@ func estimatePromptTokens(body []byte) int64 {
 		c, images := contentText(m["content"])
 		chars += c
 		tokens += images * imagePartTokens
-		for _, key := range []string{"name", "reasoning_content", "tool_call_id"} {
+		for _, key := range []string{"name", "reasoning_content", "reasoning", "tool_call_id"} {
 			chars += jsonStringChars(m[key])
 		}
 		var calls []json.RawMessage
