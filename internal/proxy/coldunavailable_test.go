@@ -19,7 +19,9 @@ func coldDedicated(t *testing.T, status int, body, requestModel string) (*httpte
 	var calls int32
 	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		atomic.AddInt32(&calls, 1)
-		w.Header().Set("Content-Type", "application/json")
+		if body != "" {
+			w.Header().Set("Content-Type", "application/json")
+		}
 		w.WriteHeader(status)
 		_, _ = w.Write([]byte(body))
 	}))
@@ -77,6 +79,73 @@ func TestDedicatedZeroWorker503IsTheStandardRetryable503(t *testing.T) {
 	assertRetryLater(t, rr)
 }
 
+// The bodies below are Dynamo v1.6.0's, as a GB300 dedicated Qwen2.5-0.5B
+// answered while only its engine was killed (demo-qa, 2026-10-24, build 29;
+// /home/hugo/work/gb300-qa/phoebe503/run.log).
+
+func TestDedicatedWorkerGone503IsTheStandardRetryable503(t *testing.T) {
+	// The first answer after the kill, while the model was still registered.
+	rr, calls, em := coldDedicated(t, http.StatusServiceUnavailable,
+		`{"message":"Service temporarily unavailable","type":"Service Unavailable","code":503}`, "endpoint-a")
+
+	assertRetryLater(t, rr)
+	if calls != 1 {
+		t.Fatalf("upstream called %d times, want 1 (no wake, no retry)", calls)
+	}
+	for _, e := range em.waitForEvents(1, time.Second) {
+		if e.PromptTokens != 0 || e.CompletionTokens != 0 {
+			t.Fatalf("a never-served attempt was billed tokens: %+v", e)
+		}
+	}
+}
+
+func TestDedicatedDisabledRouteEmpty404IsARetryable503(t *testing.T) {
+	// Once the model left discovery the frontend turned its chat routes off and
+	// answered a bare 404: no body, no content type. This was 60 of the 64
+	// answers in the outage.
+	rr, calls, _ := coldDedicated(t, http.StatusNotFound, "", "endpoint-a")
+
+	assertRetryLater(t, rr)
+	if calls != 1 {
+		t.Fatalf("upstream called %d times, want 1 (no wake, no retry)", calls)
+	}
+}
+
+func TestDedicatedDrainingFrontend503IsARetryable503(t *testing.T) {
+	rr, _, _ := coldDedicated(t, http.StatusServiceUnavailable,
+		`{"message":"Service is not ready","type":"Service Unavailable","code":503}`, "endpoint-a")
+
+	assertRetryLater(t, rr)
+}
+
+func TestDedicatedUnknownRoute404IsPassedThrough(t *testing.T) {
+	body := `{"message":"Route not found: POST /v1/chat/completions","type":"Not Found","code":404}`
+	rr, _, _ := coldDedicated(t, http.StatusNotFound, body, "endpoint-a")
+
+	if rr.Code != http.StatusNotFound || rr.Body.String() != body {
+		t.Fatalf("status %d body %q, want the upstream 404 unchanged", rr.Code, rr.Body.String())
+	}
+}
+
+func TestDedicatedDynamoOverload503IsPassedThrough(t *testing.T) {
+	body := `{"message":"Service temporarily overloaded","type":"Service Unavailable","code":503}`
+	rr, _, _ := coldDedicated(t, http.StatusServiceUnavailable, body, "endpoint-a")
+
+	if rr.Code != http.StatusServiceUnavailable || rr.Body.String() != body || rr.Header().Get("Retry-After") != "" {
+		t.Fatalf("status %d body %q, want Dynamo's overload 503 unchanged", rr.Code, rr.Body.String())
+	}
+}
+
+func TestDedicatedOversizedNoBackend503IsPassedThrough(t *testing.T) {
+	// Only a complete, bounded body is classified; a larger one streams through.
+	body := `{"message":"Service temporarily unavailable","pad":"` + strings.Repeat("x", coldCandidatePrefixLimit) + `"}`
+	rr, _, _ := coldDedicated(t, http.StatusServiceUnavailable, body, "endpoint-a")
+
+	if rr.Code != http.StatusServiceUnavailable || rr.Body.String() != body {
+		t.Fatalf("status %d (body %d bytes), want the upstream 503 unchanged", rr.Code, rr.Body.Len())
+	}
+}
+
 func TestDedicatedOther404IsPassedThrough(t *testing.T) {
 	rr, _, _ := coldDedicated(t, http.StatusNotFound, `{"message":"no such route"}`, "endpoint-a")
 
@@ -107,7 +176,7 @@ func TestWrongModelStillGets403AndNeverReachesTheEngine(t *testing.T) {
 	// An empty or foreign model fails the binding before any forward, whatever
 	// the engine would have said.
 	for _, model := range []string{"", "endpoint-b"} {
-		rr, calls, _ := coldDedicated(t, http.StatusNotFound, `{"message":"Model not found"}`, model)
+		rr, calls, _ := coldDedicated(t, http.StatusNotFound, "", model)
 		if rr.Code != http.StatusForbidden {
 			t.Fatalf("model %q: status = %d, want 403", model, rr.Code)
 		}
