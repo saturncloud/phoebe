@@ -27,9 +27,13 @@
 //   - owner conflict: an event naming both a user and a group (per event).
 //   - ambiguous org: one identity-hour naming two orgs (the payer).
 //   - ambiguous base: one identity-hour naming two base models or adapters, or
-//     mixing adapter and no adapter (the facts the manager prices by).
-//   - missing base model, unattributable, invalid serving mode, invalid usage:
-//     events that cannot form a valid record (per event).
+//     a value on some events and none on others (the facts the manager prices by).
+//   - unattributable, invalid serving mode, invalid usage: events that cannot
+//     form a valid record (per event).
+//
+// An absent base model is NOT withheld: a dedicated endpoint may serve a model
+// with no catalog base (D3). It is sent as "" with a warning, and the manager
+// prices it.
 //
 // IDEMPOTENT. Re-running any window converges rated_usage to that run's output,
 // and a re-sent hour replaces the manager's copy (usage_id is deterministic), so

@@ -40,6 +40,7 @@ const (
 	groupA   = "2c3d4e5f60718293a4b5c6d7e8f90a1b"
 	deployA  = "3d4e5f60718293a4b5c6d7e8f90a1b2c"
 	tfModelB = "4e5f60718293a4b5c6d7e8f90a1b2c3d"
+	deployC  = "718293a4b5c6d7e8f90a1b2c3d4e5f60"
 	authA    = "5f60718293a4b5c6d7e8f90a1b2c3d4e"
 	authB    = "60718293a4b5c6d7e8f90a1b2c3d4e5f"
 )
@@ -48,7 +49,9 @@ const (
 //   - a dedicated fine-tune endpoint owned by a user, served by graph revision 3;
 //   - the same endpoint in revision 4 (a second record: revision is grain);
 //   - a shared base-model call by a group-owned key, no graph named, revision
-//     unknown, region unknown (NULLs become "").
+//     unknown, region unknown (NULLs become "");
+//   - a dedicated endpoint serving a model outside the catalog: no base model
+//     (sent as ""; the manager prices it at the plan's default dedicated rate).
 func fixtureRows() *sqlmock.Rows {
 	return sqlmock.NewRows(hourCols).
 		AddRow("rid-1", orgA, "user", userA, deployA, authA, "acme-qwen-ft", "dedicated",
@@ -59,7 +62,10 @@ func fixtureRows() *sqlmock.Rows {
 			int64(3000), int64(0), int64(500), int64(2)).
 		AddRow("rid-3", orgA, "group", groupA, tfModelB, authB, "openai/gpt-oss-120b", "shared",
 			"openai/gpt-oss-120b", nil, "", int64(0), nil,
-			int64(5000), int64(1000), int64(700), int64(9))
+			int64(5000), int64(1000), int64(700), int64(9)).
+		AddRow("rid-4", orgA, "user", userA, deployC, authA, "acme-custom-llm", "dedicated",
+			nil, nil, "pd-acme-custom-llm", int64(1), "us-central1",
+			int64(800), int64(0), int64(64), int64(4))
 }
 
 func newMockPusher(t *testing.T, client poster) (*pusher, sqlmock.Sqlmock) {
@@ -139,7 +145,7 @@ func TestBuildRequest_MapsEachRollupToATokenRecord(t *testing.T) {
 	if err != nil || unsendable != 0 {
 		t.Fatalf("buildRequest: unsendable=%d err=%v", unsendable, err)
 	}
-	if req.WindowStart != "2026-10-22T14:00:00+00:00" || len(req.Kinds) != 1 || req.Kinds[0] != "token" || len(req.Records) != 3 {
+	if req.WindowStart != "2026-10-22T14:00:00+00:00" || len(req.Kinds) != 1 || req.Kinds[0] != "token" || len(req.Records) != 4 {
 		t.Fatalf("request header %q %v with %d records", req.WindowStart, req.Kinds, len(req.Records))
 	}
 	shared := req.Records[2]
@@ -278,14 +284,14 @@ func TestPushWindows_WithholdsAnHourWithARollupWithoutOrgButSendsTheOthers(t *te
 	}
 }
 
-// A rollup that would break a wire rule (here an empty base_model, which a
-// pre-aggregator row can carry) withholds the hour instead of earning a 400.
+// A rollup that would break a wire rule (here an owner_id that is not 32 hex)
+// withholds the hour instead of earning a 400.
 func TestPushWindows_WithholdsAnHourThatBreaksAWireRule(t *testing.T) {
 	m := &recordingManager{}
 	p, mock := newMockPusher(t, m.client(t))
 	expectLiveness(mock)
 	mock.ExpectQuery(`FROM rated_usage ru`).WithArgs(win).WillReturnRows(sqlmock.NewRows(hourCols).
-		AddRow("rid-1", orgA, "user", userA, deployA, authA, "m", "dedicated", nil, nil, "", int64(0), nil, int64(1), int64(0), int64(1), int64(1)))
+		AddRow("rid-1", orgA, "user", "not-hex", deployA, authA, "m", "dedicated", "B", nil, "", int64(0), nil, int64(1), int64(0), int64(1), int64(1)))
 	if code := p.pushWindows(context.Background(), []time.Time{win}); code != exitWithheld {
 		t.Fatalf("exit %d, want exitWithheld", code)
 	}
@@ -363,5 +369,29 @@ func TestPushWindows_EmptyTableRefusesToSendAnything(t *testing.T) {
 	}
 	if len(m.bodies) != 0 {
 		t.Fatal("sent a request from an empty table")
+	}
+}
+
+// D3 and the corrected conventions: a dedicated endpoint with no catalog base
+// is sent with base_model "" in the same request as the rest of the hour. It
+// neither withholds itself nor holds back anyone else's records.
+func TestPushWindows_EmptyBaseModelDedicatedRecordIsSentAndDoesNotBlockTheHour(t *testing.T) {
+	m := &recordingManager{}
+	p, mock := newMockPusher(t, m.client(t))
+	expectLiveness(mock)
+	mock.ExpectQuery(`FROM rated_usage ru`).WithArgs(win).WillReturnRows(fixtureRows())
+	if code := p.pushWindows(context.Background(), []time.Time{win}); code != exitOK {
+		t.Fatalf("exit %d, want 0", code)
+	}
+	var sent meteredusage.Request
+	if err := json.Unmarshal(m.bodies[0], &sent); err != nil {
+		t.Fatal(err)
+	}
+	if len(sent.Records) != 4 {
+		t.Fatalf("sent %d records, want all 4", len(sent.Records))
+	}
+	custom := sent.Records[3]
+	if custom.Attributes.ModelID != "acme-custom-llm" || custom.Attributes.BaseModel != "" || custom.Attributes.ServingMode != "dedicated" {
+		t.Fatalf("custom record %+v, want dedicated with base_model \"\"", custom.Attributes)
 	}
 }

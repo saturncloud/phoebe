@@ -46,7 +46,6 @@ func (r Result) HasAnomaly() bool {
 		r.InvalidUsageEvents > 0 ||
 		r.InvalidServingModeEvents > 0 ||
 		r.OwnerConflictEvents > 0 ||
-		r.MissingBaseModelEvents > 0 ||
 		r.AmbiguousBaseEvents > 0 ||
 		r.AmbiguousOrgEvents > 0
 }
@@ -96,11 +95,14 @@ func (a *Aggregator) Run(ctx context.Context, windowStart, windowEnd time.Time, 
 	if ar.OwnerConflictEvents > 0 {
 		a.log.Error.Printf("rating: window %s has %d OWNER-CONFLICT events (both X-Saturn-User-Id and X-Saturn-Group-Id); an identity is a user XOR a group, so the owner cannot be determined and they are not sent. The raw events stay in billing_event. Fix the header producer and re-run this window", w, ar.OwnerConflictEvents)
 	}
-	if ar.MissingBaseModelEvents > 0 {
-		a.log.Error.Printf("rating: window %s has %d MISSING-BASE-MODEL events (no X-Saturn-Base-Model); the manager prices tokens by base_model and the wire requires it, so they are not sent. Atlas stamps it on every Token Factory endpoint, so this is a propagation bug. Fix it and re-run this window", w, ar.MissingBaseModelEvents)
+	if ar.EmptyBaseModelEvents > 0 {
+		// WARN, not ERROR, and not withheld: a dedicated endpoint may serve a model
+		// with no catalog base (D3). The manager prices dedicated + empty base at
+		// the plan's default rate and reports shared + empty base as unpriced.
+		a.log.Warn.Printf("rating: window %s aggregated %d events with no base_model (sent as \"\"); the manager prices dedicated ones at the plan's default dedicated rate and reports shared ones as unpriced. Expected for a dedicated endpoint serving a model outside the catalog; on a shared model it means X-Saturn-Base-Model is not propagating", w, ar.EmptyBaseModelEvents)
 	}
 	if ar.AmbiguousBaseEvents > 0 {
-		a.log.Error.Printf("rating: window %s has %d events under AMBIGUOUS-BASE identities (one auth/owner/resource/model/serving mode in one hour named more than one base_model or adapter, or mixed adapter and no adapter); a record carries one of each and the manager prices by them, so these are not sent. Fix base_model/adapter propagation and re-run this window", w, ar.AmbiguousBaseEvents)
+		a.log.Error.Printf("rating: window %s has %d events under AMBIGUOUS-BASE identities (one auth/owner/resource/model/serving mode in one hour named more than one base_model or adapter, or a value on some events and none on others); a record carries one of each and the manager prices by them, so these are not sent. Fix base_model/adapter propagation and re-run this window", w, ar.AmbiguousBaseEvents)
 	}
 	if ar.AmbiguousOrgEvents > 0 {
 		a.log.Error.Printf("rating: window %s has %d events under AMBIGUOUS-ORG identities (more than one non-NULL org_id); the org pays, so a guess would bill the wrong customer and these are not sent. Fix X-Saturn-Org-Id propagation and re-run this window", w, ar.AmbiguousOrgEvents)

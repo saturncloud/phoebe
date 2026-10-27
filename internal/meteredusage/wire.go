@@ -105,7 +105,9 @@ type TokenAttributes struct {
 	AuthID      string `json:"auth_id"`
 	ModelID     string `json:"model_id"`
 	ServingMode string `json:"serving_mode"`
-	BaseModel   string `json:"base_model"`
+	// BaseModel is the catalog base model; "" when the endpoint has none (a
+	// dedicated endpoint may serve a model outside the catalog, D3).
+	BaseModel string `json:"base_model"`
 	// Adapter is the fine-tune checkpoint artifact id; "" when there is none.
 	Adapter string `json:"adapter"`
 	// GraphK8sName is the serving graph; "" when the requests named none.

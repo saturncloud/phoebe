@@ -14,7 +14,7 @@
 //	1  fatal (config, DB, ...): nothing or partial; safe to re-run
 //	2  window aggregated BUT usage was withheld for a reason that needs a person
 //	   (unattributable, owner conflict, ambiguous org, ambiguous base model or
-//	   adapter, missing base model, invalid serving mode, invalid usage, or a
+//	   adapter, invalid serving mode, invalid usage, or a
 //	   successful attempt with no usage block), OR a ROUTINE run reconcile-deleted
 //	   a rollup an earlier run wrote (usage vanished with no operator behind it).
 //

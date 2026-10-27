@@ -70,7 +70,6 @@ func TestValidate_RefusesWhatTheManagerWouldRejectWith400(t *testing.T) {
 		{"resource empty", validRequest(validRecord(func(r *Record) { r.ResourceID = "" })), "records[0].resource_id"},
 		{"auth_id empty", validRequest(validRecord(func(r *Record) { r.Attributes.AuthID = "" })), "records[0].attributes.auth_id"},
 		{"model_id empty", validRequest(validRecord(func(r *Record) { r.Attributes.ModelID = "" })), "records[0].attributes.model_id"},
-		{"base_model empty", validRequest(validRecord(func(r *Record) { r.Attributes.BaseModel = "" })), "records[0].attributes.base_model"},
 		{"serving mode outside enum", validRequest(validRecord(func(r *Record) { r.Attributes.ServingMode = "SHARED" })), "records[0].attributes.serving_mode"},
 		{"attribute too long", validRequest(validRecord(func(r *Record) { r.Attributes.Region = long })), "records[0].attributes.region"},
 		{"attribute not UTF-8", validRequest(validRecord(func(r *Record) { r.Attributes.ModelID = "m\xff" })), "records[0].attributes.model_id"},
@@ -116,5 +115,14 @@ func TestValidate_RefusesAnHourAboveTheRecordCap(t *testing.T) {
 	var ve *ValidationError
 	if !errors.As(err, &ve) || ve.Path != "records" {
 		t.Fatalf("Validate = %v, want the records cap", err)
+	}
+}
+
+// Corrected conventions (2026-10-27): base_model may be "". A dedicated endpoint
+// may serve a model with no catalog base (D3); the manager prices it.
+func TestValidate_AcceptsAnEmptyBaseModel(t *testing.T) {
+	r := validRecord(func(r *Record) { r.Attributes.BaseModel = "" })
+	if err := Validate(validRequest(r)); err != nil {
+		t.Fatal(err)
 	}
 }

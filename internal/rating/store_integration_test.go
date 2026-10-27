@@ -917,7 +917,7 @@ func aggregate(t *testing.T, db *sql.DB, start, end time.Time) AggregateResult {
 // withheld sums every bucket an event can be kept out in.
 func withheld(r AggregateResult) int64 {
 	return r.MissingUsageEvents + r.InvalidUsageEvents + r.UnattributableEvents + r.InvalidServingModeEvents +
-		r.OwnerConflictEvents + r.MissingBaseModelEvents + r.AmbiguousBaseEvents + r.AmbiguousOrgEvents
+		r.OwnerConflictEvents + r.AmbiguousBaseEvents + r.AmbiguousOrgEvents
 }
 
 // assertPartition: every in-window billing_event row lands in exactly one
@@ -1053,7 +1053,6 @@ func TestIntegration_EveryAttemptRowIsAccountedForExactlyOnce(t *testing.T) {
 		row(func(r *beRow) { r.auth = "" }),         // unattributable
 		row(func(r *beRow) { r.mode = "SHARED" }),   // invalid serving mode
 		row(func(r *beRow) { r.group = "group-1" }), // owner conflict
-		row(func(r *beRow) { r.base = "" }),         // missing base model
 		row(func(r *beRow) { r.resource = "res-amb-base" }), row(func(r *beRow) { r.resource = "res-amb-base"; r.base = "other/base" }),
 		row(func(r *beRow) { r.resource = "res-amb-org" }), row(func(r *beRow) { r.resource = "res-amb-org"; r.org = "org-2" }),
 	}
@@ -1063,7 +1062,7 @@ func TestIntegration_EveryAttemptRowIsAccountedForExactlyOnce(t *testing.T) {
 	want := AggregateResult{
 		RollupsWritten: 1, EventsAggregated: 2, MissingUsageEvents: 2, ExpectedMissingUsageEvents: 1,
 		UnexplainedMissingUsageEvents: 1, InvalidUsageEvents: 1, UnattributableEvents: 1, InvalidServingModeEvents: 1,
-		OwnerConflictEvents: 1, MissingBaseModelEvents: 1, AmbiguousBaseEvents: 2, AmbiguousOrgEvents: 2,
+		OwnerConflictEvents: 1, AmbiguousBaseEvents: 2, AmbiguousOrgEvents: 2,
 	}
 	if res != want {
 		t.Fatalf("got  %+v\nwant %+v", res, want)
@@ -1084,8 +1083,8 @@ func TestIntegration_EmptyStringIdentifiersAreUnattributable(t *testing.T) {
 		('e3','a','res-1','org-1','','B','u','dedicated',5,true,200,'2026-10-22T14:05:00Z'),
 		('e4','a','res-1','org-1','m','','u','dedicated',5,true,200,'2026-10-22T14:05:00Z')`)
 	res := aggregate(t, db, itHour, itHour.Add(time.Hour))
-	if res.UnattributableEvents != 3 || res.MissingBaseModelEvents != 1 || res.RollupsWritten != 0 {
-		t.Fatalf("%+v, want 3 unattributable, 1 missing base model, nothing written", res)
+	if res.UnattributableEvents != 3 || res.RollupsWritten != 1 || res.EmptyBaseModelEvents != 1 {
+		t.Fatalf("%+v, want 3 unattributable and the empty-base-model event aggregated", res)
 	}
 }
 
@@ -1098,6 +1097,7 @@ func TestIntegration_AmbiguousBaseModelOrAdapterWithholdsTheIdentity(t *testing.
 		"two base models":           {row(nil), row(func(r *beRow) { r.base = "other/base" })},
 		"two adapters":              {row(func(r *beRow) { r.adapter = "ckpt-1" }), row(func(r *beRow) { r.adapter = "ckpt-2" })},
 		"adapter and no adapter":    {row(nil), row(func(r *beRow) { r.adapter = "ckpt-1" })},
+		"base model and no base":    {row(nil), row(func(r *beRow) { r.base = "" })},
 		"across topology revisions": {row(func(r *beRow) { r.rev = 3 }), row(func(r *beRow) { r.rev = 4; r.base = "other/base" })},
 	}
 	for name, rows := range cases {
@@ -1330,4 +1330,27 @@ func TestIntegration_Migration0011DownRefusesToInventMoney(t *testing.T) {
 		t.Fatalf("cost nullable = %q (err %v) after down, want NO", nullable, err)
 	}
 	exec(t, db, readMigration(t, "0011_rated_usage_quantities_only.up.sql"))
+}
+
+// D3: a dedicated endpoint may serve a model with no catalog base, and Atlas
+// stamps the header as `base_model | default('')`. Such usage is aggregated
+// (base_model NULL, sent as "") with a warning count, never withheld, and it
+// does not hold back anything else in the hour.
+func TestIntegration_EmptyBaseModelDedicatedEventIsAggregatedNotWithheld(t *testing.T) {
+	db := openRatingSchema(t, "phoebe_agg_emptybase_it")
+	seed(t, db,
+		row(func(r *beRow) { r.resource = "res-custom"; r.model = "my-own-model"; r.base = "" }),
+		row(func(r *beRow) { r.resource = "res-custom"; r.model = "my-own-model"; r.base = "" }),
+		row(nil),
+	)
+	res := aggregate(t, db, itHour, itHour.Add(time.Hour))
+	assertPartition(t, res, 3)
+	if res.RollupsWritten != 2 || res.EventsAggregated != 3 || res.EmptyBaseModelEvents != 2 || withheld(res) != 0 {
+		t.Fatalf("%+v, want both rollups written, 2 empty-base events counted, nothing withheld", res)
+	}
+	for _, r := range readRollups(t, db) {
+		if r.resource == "res-custom" && (r.base.Valid || r.requests != 2) {
+			t.Fatalf("custom rollup %+v, want base_model NULL over 2 requests", r)
+		}
+	}
 }

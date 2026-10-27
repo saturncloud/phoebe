@@ -76,7 +76,6 @@ func TestResult_EachWithheldReasonIsAnAnomalyAndLogsError(t *testing.T) {
 		"invalid usage":        {InvalidUsageEvents: 1},
 		"invalid serving mode": {InvalidServingModeEvents: 1},
 		"owner conflict":       {OwnerConflictEvents: 1},
-		"missing base model":   {MissingBaseModelEvents: 1},
 		"ambiguous base":       {AmbiguousBaseEvents: 1},
 		"ambiguous org":        {AmbiguousOrgEvents: 1},
 	}
@@ -158,5 +157,18 @@ func TestEnsureUTCTimeZone(t *testing.T) {
 		if got := ensureUTCTimeZone(in); got != want {
 			t.Errorf("ensureUTCTimeZone(%q) = %q, want %q", in, got, want)
 		}
+	}
+}
+
+// An empty base model is expected for a dedicated endpoint outside the catalog
+// (D3): it warns, it is not an anomaly, and it never pages.
+func TestResult_EmptyBaseModelWarnsButIsNotAnAnomaly(t *testing.T) {
+	l, info, errBuf := captureLogger()
+	res, err := New(&fakeStore{res: AggregateResult{EventsAggregated: 2, EmptyBaseModelEvents: 2, RollupsWritten: 1}}, l).Run(context.Background(), h0, h1, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res.HasAnomaly() || errBuf.Len() != 0 || !strings.Contains(info.String(), "no base_model") {
+		t.Fatalf("anomaly=%v error=%q info=%q", res.HasAnomaly(), errBuf.String(), info.String())
 	}
 }

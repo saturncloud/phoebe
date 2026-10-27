@@ -28,7 +28,7 @@ type Store interface {
 // why. The event counts partition the window:
 //
 //	EventsAggregated + MissingUsage + InvalidUsage + Unattributable
-//	  + InvalidServingMode + OwnerConflict + MissingBaseModel
+//	  + InvalidServingMode + OwnerConflict
 //	  + AmbiguousBase + AmbiguousOrg == in-window billing_event rows
 //
 // int64 throughout: these are COUNT/SUM over an arbitrary backfill window.
@@ -61,19 +61,24 @@ type AggregateResult struct {
 	// OwnerConflictEvents: the event carried BOTH a user and a group. An identity
 	// is one or the other (Hugo, 2026-09-23: retain raw, exclude, alarm).
 	OwnerConflictEvents int64
-	// MissingBaseModelEvents: no base_model. The manager derives the token price
-	// key from base_model and the wire requires it, so such an event cannot be
-	// sent; Atlas stamps X-Saturn-Base-Model on every Token Factory endpoint, so
-	// a missing one is a propagation bug, not a free model.
-	MissingBaseModelEvents int64
 	// AmbiguousBaseEvents: events of an identity (auth, owner, resource, model,
 	// serving mode, hour) whose events named more than one base_model or adapter,
-	// or mixed adapter and no adapter. A record carries one of each, and the
+	// or mixed a value with none (base model on some events and not others, or
+	// adapter on some and not others). A record carries one of each, and the
 	// manager prices by them, so picking one would misprice the rest.
 	AmbiguousBaseEvents int64
 	// AmbiguousOrgEvents: events of an identity whose events named more than one
 	// non-NULL org. The org is the payer; a guess would bill the wrong customer.
 	AmbiguousOrgEvents int64
+
+	// EmptyBaseModelEvents counts AGGREGATED events with no base_model. Not
+	// withheld and not an anomaly: Atlas stamps X-Saturn-Base-Model as
+	// `base_model | default('')`, and a dedicated endpoint may serve a model with
+	// no catalog base (D3). The record is sent with base_model "" and the manager
+	// prices it (dedicated: the plan's default rate; shared: reported unpriced).
+	// Withholding it would hold back every token record of the hour. Part of
+	// EventsAggregated, so it is not a partition bucket.
+	EmptyBaseModelEvents int64
 
 	// UnknownRevisionRollups counts written rollups that name a graph but carry
 	// topology revision 0. Not an anomaly: the quantities and payer are right;
@@ -175,7 +180,8 @@ WITH ev AS (
         -- billing_event.model is the engine-reported model name: the record's model_id.
         NULLIF(model, '')       AS model_id,
         -- base_model and adapter are the facts the manager prices tokens by (with
-        -- serving_mode). '' means absent, exactly like NULL.
+        -- serving_mode). '' means absent, exactly like NULL. An absent base_model
+        -- is NOT withheld: it is sent as "" and the manager prices it (D3).
         NULLIF(base_model, '')  AS base_model,
         NULLIF(adapter, '')     AS adapter,
         serving_mode,
@@ -230,7 +236,6 @@ billable AS (
       AND model_id    IS NOT NULL
       AND valid_serving_mode
       AND NOT owner_conflict
-      AND base_model  IS NOT NULL
 ),
 -- Gates over the identity WITHOUT graph and revision (see the statement comment).
 gate AS (
@@ -241,10 +246,13 @@ gate AS (
         -- one real org; ambiguous_org guarantees MAX is not hiding a second one.
         MAX(org_id) AS org_id,
         -- A record carries ONE base_model and ONE adapter, and the manager prices
-        -- by them. Two bases, two adapters, or adapter on some events and not on
-        -- others (premium versus no premium) mean the identity's tokens would be
-        -- priced two ways: withheld and counted, never sent with one of them.
+        -- by them. Two bases, two adapters, or a value on some events and none on
+        -- others (catalog base versus default rate; premium versus no premium)
+        -- mean the identity's tokens would be priced two ways: withheld and
+        -- counted, never sent with one of them. A base_model that is absent on
+        -- EVERY event of the identity is not ambiguous; it is sent as "".
         (COUNT(DISTINCT base_model) > 1
+         OR (bool_or(base_model IS NULL) AND bool_or(base_model IS NOT NULL))
          OR COUNT(DISTINCT adapter) > 1
          OR (bool_or(adapter IS NULL) AND bool_or(adapter IS NOT NULL))) AS ambiguous_base,
         -- Two distinct non-NULL orgs for one deployment: an attribution bug. A
@@ -369,7 +377,7 @@ upserted AS (
         applied_completion_rate = NULL,
         price_key               = NULL,
         rated_at                = now()
-    RETURNING event_count, graph_k8s_name, topology_revision
+    RETURNING event_count, graph_k8s_name, topology_revision, base_model
 )
 SELECT
     (SELECT COUNT(*)::bigint                      FROM upserted) AS rollups_written,
@@ -401,18 +409,14 @@ SELECT
         AND auth_id IS NOT NULL AND resource_id IS NOT NULL AND model_id IS NOT NULL
         AND valid_serving_mode
         AND owner_conflict)                                       AS owner_conflict_events,
-    (SELECT COUNT(*)::bigint FROM ev
-      WHERE usage_found AND valid_usage
-        AND auth_id IS NOT NULL AND resource_id IS NOT NULL AND model_id IS NOT NULL
-        AND valid_serving_mode
-        AND NOT owner_conflict
-        AND base_model IS NULL)                                   AS missing_base_model_events,
     -- Event units (SUM(event_count)), so the partition holds. A rollup that is
     -- both base- and org-ambiguous is counted once, as ambiguous_base.
     (SELECT COALESCE(SUM(event_count), 0)::bigint FROM grouped WHERE ambiguous_base)
                                                                   AS ambiguous_base_events,
     (SELECT COALESCE(SUM(event_count), 0)::bigint FROM grouped
       WHERE ambiguous_org AND NOT ambiguous_base)                 AS ambiguous_org_events,
+    (SELECT COALESCE(SUM(event_count), 0)::bigint FROM upserted
+      WHERE base_model IS NULL)                                   AS empty_base_model_events,
     (SELECT COUNT(*)::bigint FROM upserted
       WHERE graph_k8s_name <> '' AND topology_revision = 0)      AS unknown_revision_rollups`
 
@@ -434,8 +438,9 @@ func (s *PostgresStore) AggregateWindow(ctx context.Context, start, end time.Tim
 		Scan(&res.RollupsWritten, &res.EventsAggregated, &res.ReconciledDeletions,
 			&res.MissingUsageEvents, &res.ExpectedMissingUsageEvents, &res.UnexplainedMissingUsageEvents,
 			&res.InvalidUsageEvents, &res.UnattributableEvents, &res.InvalidServingModeEvents,
-			&res.OwnerConflictEvents, &res.MissingBaseModelEvents,
-			&res.AmbiguousBaseEvents, &res.AmbiguousOrgEvents, &res.UnknownRevisionRollups)
+			&res.OwnerConflictEvents,
+			&res.AmbiguousBaseEvents, &res.AmbiguousOrgEvents,
+			&res.EmptyBaseModelEvents, &res.UnknownRevisionRollups)
 	if err != nil {
 		return AggregateResult{}, fmt.Errorf("rating: aggregate window [%s,%s): %w",
 			start.UTC().Format(time.RFC3339), end.UTC().Format(time.RFC3339), err)

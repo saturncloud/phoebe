@@ -645,14 +645,12 @@ func TestE2E_FineTuneCarriesItsBaseModelToTheRollup(t *testing.T) {
 	h.assertNoMoney(t)
 }
 
-// TestE2E_MissingBaseModelHeaderIsWithheldNotSent is the fail-CLOSED end of the
-// fine-tune pipe (the mirror of TestE2E_FineTuneCarriesItsBaseModelToTheRollup). A request to
-// a fine-tune deployment that arrives WITHOUT the X-Saturn-Base-Model header — the
-// propagation seam broken (Traefik not allowlisting it, Atlas not stamping it) — must
-// NOT become a record: the manager prices tokens by base_model and the wire requires
-// it, so the whole pipe must end with the event withheld as MISSING-BASE-MODEL (an
-// anomaly that screams), never sent with a guessed base.
-func TestE2E_MissingBaseModelHeaderIsWithheldNotSent(t *testing.T) {
+// TestE2E_MissingBaseModelHeaderIsSentAsEmpty: a dedicated endpoint may serve a
+// model with no catalog base (D3), and Atlas stamps X-Saturn-Base-Model as
+// `base_model | default('')`. A request without the header must become a record
+// with base_model "" (the manager prices dedicated + empty base at the plan's
+// default rate), never be withheld: withholding would hold back the hour.
+func TestE2E_MissingBaseModelHeaderIsSentAsEmpty(t *testing.T) {
 	h := newHarness(t, "phoebe_e2e_ft_nobase")
 
 	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
@@ -687,7 +685,7 @@ func TestE2E_MissingBaseModelHeaderIsWithheldNotSent(t *testing.T) {
 	// as an owner conflict and withholds from money, so the fixture carries the
 	// realistic user-owned identity.
 	req.Header.Set(identity.HeaderUserID, "user-e2e")
-	// DELIBERATELY no X-Saturn-Base-Model header — the propagation bug under test.
+	// DELIBERATELY no X-Saturn-Base-Model header: an endpoint with no catalog base.
 	srv.Handler().ServeHTTP(rr, req)
 
 	if rr.Code != http.StatusOK {
@@ -707,18 +705,17 @@ func TestE2E_MissingBaseModelHeaderIsWithheldNotSent(t *testing.T) {
 		t.Fatalf("billing_event.base_model = %q, want NULL (no header was sent)", baseModel.String)
 	}
 
-	// The event must FAIL LOUD: withheld, not aggregated.
+	// Aggregated, not withheld: base_model NULL on the rollup (sent as "").
 	res := h.aggregateEventHour(t)
-	if res.MissingBaseModelEvents != 1 || res.EventsAggregated != 0 || res.RollupsWritten != 0 || !res.HasAnomaly() {
-		t.Fatalf("result = %+v, want 1 missing-base-model event withheld, nothing aggregated, and an anomaly", res)
+	if res.EventsAggregated != 1 || res.RollupsWritten != 1 || res.EmptyBaseModelEvents != 1 || res.HasAnomaly() {
+		t.Fatalf("result = %+v, want the event aggregated with an empty base model and no anomaly", res)
 	}
-	// And no rated_usage row was written for it.
-	var nRollups int
-	if err := h.db.QueryRow("SELECT COUNT(*) FROM rated_usage").Scan(&nRollups); err != nil {
-		t.Fatalf("count rated_usage: %v", err)
+	var ruBase sql.NullString
+	if err := h.db.QueryRow("SELECT base_model FROM rated_usage").Scan(&ruBase); err != nil {
+		t.Fatalf("read rated_usage.base_model: %v", err)
 	}
-	if nRollups != 0 {
-		t.Fatalf("rated_usage rows = %d, want 0 (no record without a base model)", nRollups)
+	if ruBase.Valid {
+		t.Fatalf("rated_usage.base_model = %q, want NULL (sent as \"\")", ruBase.String)
 	}
 }
 
@@ -775,9 +772,6 @@ func TestE2E_ModellessEventWithoutUsageIsMissingUsage(t *testing.T) {
 	}
 	if res.UnattributableEvents != 0 {
 		t.Errorf("UnattributableEvents = %d, want 0 — a model-less attempt with no usage is MISSING-USAGE; that bucket is exclusive and more specific than UNATTRIBUTABLE", res.UnattributableEvents)
-	}
-	if res.MissingBaseModelEvents != 0 {
-		t.Errorf("MissingBaseModelEvents = %d, want 0 — a model-less attempt with no usage is MISSING-USAGE (wrong runbook otherwise)", res.MissingBaseModelEvents)
 	}
 	if res.EventsAggregated != 0 || res.RollupsWritten != 0 {
 		t.Errorf("aggregator recorded a model-less event: %+v", res)

@@ -134,7 +134,9 @@ func validateTokenRecord(path, windowStart string, rec Record) error {
 			return invalid(path+".attributes."+kv[0], "%d characters exceed the %d cap", n, MaxAttributeChars)
 		}
 	}
-	for _, kv := range [][2]string{{"auth_id", a.AuthID}, {"model_id", a.ModelID}, {"base_model", a.BaseModel}} {
+	// base_model may be "" (corrected conventions, 2026-10-27): a dedicated
+	// endpoint may serve a model with no catalog base, and the manager prices it.
+	for _, kv := range [][2]string{{"auth_id", a.AuthID}, {"model_id", a.ModelID}} {
 		if kv[1] == "" {
 			return invalid(path+".attributes."+kv[0], "must not be empty")
 		}

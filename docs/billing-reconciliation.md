@@ -34,8 +34,12 @@ central billing service.
    that hour (billing-design.md D1). The rater fetches no prices and writes the
    money columns as NULL. It withholds, counts and pages (exit 2) on evidence that
    cannot become a correct record: unattributable, invalid usage, invalid serving
-   mode, owner conflict, missing base model, ambiguous org, ambiguous base model or
-   adapter, and an UNEXPLAINED missing-usage attempt.
+   mode, owner conflict, ambiguous org, ambiguous base model or adapter, and an
+   UNEXPLAINED missing-usage attempt. An absent base model is NOT withheld: a
+   dedicated endpoint may serve a model outside the catalog (D3), so the record is
+   sent with `base_model ""` and the rater logs a warning; the manager prices
+   dedicated + empty base at the plan's default rate and reports shared + empty
+   base as unpriced.
 6. `token-push` sends each hour to the manager's `POST /customer/metered-usage`
    with `kinds: ["token"]`: the complete set of that hour's token records, each
    keyed by a deterministic `usage_id` (sha256 of the record's grain). The manager
@@ -107,8 +111,8 @@ that was NOT aborted and did NOT fail — a response the engine reported as
 SUCCESSFUL while supplying no usage block, meaning work may have been served that
 cannot be billed. The rater exits non-zero only on that unexplained subset, so
 exit 2 stays reserved for rare, wrong conditions (unattributable, invalid usage,
-ambiguous base/org, invalid serving mode, owner conflict, missing base model)
-rather than firing every hour.
+ambiguous base/org, invalid serving mode, owner conflict) rather than firing
+every hour.
 
 Page on an unexplained missing-usage attempt, rater anomaly/non-zero exit, reconcile
 deletion during a routine run, drainer poison row, `METERING_FLOOR`, WAL corruption,
@@ -129,7 +133,7 @@ first two: (a) the rater deliberately WITHHELD the rollup at an ambiguity gate
 — check `distinct_org_ids > 1` on the row for org-ambiguity, and the same run's
 `ambiguous_base_events` count for base-ambiguity (two base models or adapters, or
 adapter on some events and not others, for one identity in the hour), and its
-`missing_base_model_events` count, neither of which the view surfaces; (b) the rater deliberately
+which the view does not surface; (b) the rater deliberately
 WITHHELD the events because their serving mode is invalid — the run's
 `invalid_serving_mode_events` count. These are events whose
 `billing_event.serving_mode` is NULL, `''` or anything other than `'shared'` or
@@ -212,7 +216,7 @@ Prices and money are the manager's to reconcile.
 4. Restore attribution headers if they were the problem. There are no prices to
    restore: the manager prices each hour as of that hour.
 5. Run the rater explicitly for the complete affected half-open window. Investigate
-   every unattributable, missing-base-model, ambiguous, missing-usage, or
+   every unattributable, ambiguous, missing-usage, or
    reconcile-deletion signal before proceeding.
 6. Re-run the hourly reconciliation view. Then replay `token-push` for every affected
    hour, including empty hours within a non-empty authoritative run.
