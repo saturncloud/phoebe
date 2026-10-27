@@ -222,3 +222,40 @@ func TestParkedRescanReach_StaysInsideThePrunerHardFloor(t *testing.T) {
 		t.Fatalf("ParkedRescanReach %v must be beyond the 24h window and strictly inside the 7-day prune floor", ParkedRescanReach)
 	}
 }
+
+// Hugo, 2026-10-27: billing_event keeps 30 days with no exception for parked
+// usage. A parked hour whose raw events are pruned is never re-aggregated: a
+// window containing it is refused before any statement runs, and the ERROR
+// line carries the manual-settlement marker.
+func TestAggregator_RefusesAWindowContainingAPrunedParkedHour(t *testing.T) {
+	l, _, _ := captureLogger()
+	pruned := Parked{WindowStart: h0, AuthID: "a", ResourceID: "r", ModelID: "m", Reason: "ambiguous_org",
+		EventCount: 3, RawEvents: 0, RawEventsPruned: true}
+	f := &fakeStore{parked: []Parked{pruned}}
+	_, err := New(f, l).Run(context.Background(), h0, h1, true)
+	if err == nil || !strings.Contains(err.Error(), PrunedMarker) {
+		t.Fatalf("err = %v, want a refusal carrying %q", err, PrunedMarker)
+	}
+	if f.calls != 0 {
+		t.Fatalf("aggregated %d times, want 0", f.calls)
+	}
+}
+
+func TestAggregator_PrunedParkedRowIsLoggedWithTheMarkerAndNotRescanned(t *testing.T) {
+	l, _, errBuf := captureLogger()
+	old := h0.Add(-40 * 24 * time.Hour)
+	pruned := Parked{WindowStart: old, AuthID: "a", Reason: "ambiguous_org", EventCount: 3, RawEventsPruned: true}
+	f := &fakeStore{parked: []Parked{pruned}, parkedHours: []time.Time{old}}
+	a := New(f, l)
+	a.now = func() time.Time { return h1 }
+	res, err := a.Run(context.Background(), h0, h1, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res.RescannedParkedHours != 0 || f.calls != 1 {
+		t.Fatalf("rescanned %d, statements %d; want the pruned hour never re-aggregated", res.RescannedParkedHours, f.calls)
+	}
+	if !strings.Contains(errBuf.String(), PrunedMarker) {
+		t.Fatalf("ERROR log lacks the marker:\n%s", errBuf.String())
+	}
+}

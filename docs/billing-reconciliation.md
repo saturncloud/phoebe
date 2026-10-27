@@ -72,7 +72,11 @@ identity is (auth_id, owner, resource_id, model_id, serving_mode) in one hour.
   reason, token counts) and exits `4` (exit `1` and `2` outrank it), so a Job
   alert keeps firing until it is resolved.
 - **Listed.** `phoebe-rater -list-parked` prints the unresolved rows and exits `4`
-  when there are any, `0` when there are none. The same data in SQL:
+  when there are any, `0` when there are none. Its `RAW_EVENTS` column is
+  `present`, or `raw_events: pruned — settle manually via manager credit` when the
+  pruner has removed the hour's raw events (fewer `billing_event` rows remain than
+  were parked); the run's ERROR line carries the same marker. The same data in SQL
+  (without the raw-event check):
 
   ```sql
   SELECT window_start, auth_id, owner_type, owner_id, resource_id, model_id,
@@ -88,8 +92,32 @@ identity is (auth_id, owner, resource_id, model_id, serving_mode) in one hour.
   old it is (any hour with a row resolved after the hour's last accepted push in
   `pushed_hour`). For an older parked hour, confirm `billing_event` still holds its
   events, then run `phoebe-rater -since <hour> -until <hour+1h>`; the same
-  resolution and re-send follow. If the events are already pruned, the parked row
-  is the remaining record: settle it by hand with the manager's credit path.
+  resolution and re-send follow.
+- **Pruned raw events: settle by hand (Hugo, 2026-10-27).** The `billing_event`
+  horizon (30 days by default) has NO exception for parked usage. Once the pruner
+  has removed a parked hour's raw events, the hour can never be re-aggregated:
+  the rater never re-checks it, and refuses (exit `1`) any `--since/--until`
+  window that contains it, so a partial re-run cannot wipe the hour's clean
+  rollups or mark the conflict resolved without evidence. The `parked_usage` row
+  keeps the hour, identity, reason and token counts. Settle it by hand: decide the
+  correct payer and pricing facts from the row and your records, apply the charge
+  or credit through the manager's credit path, and keep the `-list-parked` output
+  as the evidence. Then mark the row settled so it stops paging:
+
+  ```sql
+  UPDATE parked_usage SET resolved_at = now()
+   WHERE window_start = :hour AND auth_id = :auth_id AND resource_id = :resource_id
+     AND model_id = :model_id AND serving_mode = :serving_mode AND reason = :reason
+     AND resolved_at IS NULL;
+  ```
+
+  token-push then re-sends that hour from `rated_usage` (the clean identities
+  only). The settled identity is no longer held, so any record the manager still
+  held for it from before the conflict is deleted by absence: the manual
+  settlement must therefore cover the row's FULL parked counts, which include
+  those earlier events, and nothing is charged twice. If the hour is in a billing period the
+  manager has already settled, that re-send gets `422` (token-push exit `3`); that
+  is expected and needs no further action.
 - **Held ids.** While an identity is parked, every push of its hour lists the
   usage_ids the manager accepted for it earlier in `held`.
 

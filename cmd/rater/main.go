@@ -36,7 +36,11 @@
 // an operator re-runs them with --since/--until.
 //
 // `phoebe-rater -list-parked` prints the unresolved parked usage and exits 0
-// (4 when there is any), without aggregating.
+// (4 when there is any), without aggregating. Its RAW_EVENTS column marks a row
+// whose billing_event rows the pruner has removed (30-day horizon, no exception
+// for parked usage; Hugo, 2026-10-27): "raw_events: pruned — settle manually via
+// manager credit". Such an hour is never re-aggregated; a window containing it is
+// refused.
 //
 // THE DEFAULT WINDOW IS THE TRAILING N COMPLETE HOURS, [floor(now)-N*1h,
 // floor(now)), N = rateTrailingHours (default 24). Events can be drained late (a
@@ -196,15 +200,16 @@ func runWith(argv []string, log *logging.Logger) int {
 // header, for an operator.
 func printParked(w io.Writer, parked []rating.Parked) {
 	tw := tabwriter.NewWriter(w, 0, 0, 2, ' ', 0)
-	fmt.Fprintln(tw, "HOUR\tREASON\tAUTH_ID\tOWNER\tRESOURCE_ID\tMODEL_ID\tMODE\tEVENTS\tPROMPT\tCACHED\tCOMPLETION\tFIRST_PARKED")
+	fmt.Fprintln(tw, "HOUR\tREASON\tAUTH_ID\tOWNER\tRESOURCE_ID\tMODEL_ID\tMODE\tEVENTS\tPROMPT\tCACHED\tCOMPLETION\tFIRST_PARKED\tRAW_EVENTS")
 	for _, p := range parked {
 		owner := p.OwnerType + "/" + p.OwnerID
 		if p.OwnerType == "" {
 			owner = "-"
 		}
-		fmt.Fprintf(tw, "%s\t%s\t%s\t%s\t%s\t%s\t%s\t%d\t%d\t%d\t%d\t%s\n",
+		fmt.Fprintf(tw, "%s\t%s\t%s\t%s\t%s\t%s\t%s\t%d\t%d\t%d\t%d\t%s\t%s\n",
 			p.WindowStart.Format(time.RFC3339), p.Reason, p.AuthID, owner, p.ResourceID, p.ModelID, p.ServingMode,
-			p.EventCount, p.PromptTokens, p.CachedTokens, p.CompletionTokens, p.FirstParkedAt.UTC().Format(time.RFC3339))
+			p.EventCount, p.PromptTokens, p.CachedTokens, p.CompletionTokens, p.FirstParkedAt.UTC().Format(time.RFC3339),
+			p.RawEventsLabel())
 	}
 	_ = tw.Flush()
 	fmt.Fprintf(w, "%d parked identity-hour(s)\n", len(parked))

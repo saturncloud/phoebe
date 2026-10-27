@@ -96,6 +96,22 @@ func (a *Aggregator) Run(ctx context.Context, windowStart, windowEnd time.Time, 
 		return res, fmt.Errorf("rating: window %s is not hour-aligned; rollups bucket by the hour and an upsert REPLACES a bucket, so a partial hour would overwrite a complete rollup", w)
 	}
 
+	// NEVER RE-AGGREGATE A PARKED HOUR WHOSE RAW EVENTS ARE PRUNED. Its events
+	// are gone (or partly gone), so a re-run would read the conflict as
+	// "resolved" with no evidence behind it and replace the hour's rollups with
+	// a partial sum, which token-push would then send. Refuse the whole window;
+	// the hour is settled by hand (Hugo, 2026-10-27).
+	before, err := a.store.ListParked(ctx)
+	if err != nil {
+		return res, err
+	}
+	for _, p := range before {
+		if p.RawEventsPruned && !p.WindowStart.Before(windowStart) && p.WindowStart.Before(windowEnd) {
+			return res, fmt.Errorf("rating: window %s contains parked hour %s (auth_id=%s resource_id=%s model_id=%s reason=%s) whose raw events are pruned (%d of %d remain); it must never be re-aggregated. Narrow the window to exclude it; %s",
+				w, p.WindowStart.Format(time.RFC3339), p.AuthID, p.ResourceID, p.ModelID, p.Reason, p.RawEvents, p.EventCount, PrunedMarker)
+		}
+	}
+
 	ar, err := a.aggregateAndLog(ctx, windowStart, windowEnd, windowExplicit)
 	if err != nil {
 		return res, err
@@ -109,9 +125,18 @@ func (a *Aggregator) Run(ctx context.Context, windowStart, windowEnd time.Time, 
 	if err != nil {
 		return res, err
 	}
+	prunedHour := map[time.Time]bool{}
+	for _, p := range before {
+		if p.RawEventsPruned {
+			prunedHour[p.WindowStart] = true
+		}
+	}
 	for _, h := range hours {
 		if !h.Before(windowStart) && h.Before(windowEnd) {
 			continue // already re-aggregated above
+		}
+		if prunedHour[h] {
+			continue // never re-aggregated (see above)
 		}
 		hr, err := a.aggregateAndLog(ctx, h, h.Add(time.Hour), windowExplicit)
 		if err != nil {
@@ -131,8 +156,11 @@ func (a *Aggregator) Run(ctx context.Context, windowStart, windowEnd time.Time, 
 	reach := a.now().UTC().Add(-ParkedRescanReach)
 	for _, p := range res.Parked {
 		note := ""
-		if p.WindowStart.Before(reach) {
-			note = "; older than the automatic re-check reach (raw events may be pruned): fix the data and re-run this hour with --since/--until"
+		switch {
+		case p.RawEventsPruned:
+			note = fmt.Sprintf("; %s (%d of %d raw events remain)", PrunedMarker, p.RawEvents, p.EventCount)
+		case p.WindowStart.Before(reach):
+			note = "; older than the automatic re-check reach but raw events still present: fix the data and re-run this hour with --since/--until before the prune horizon"
 		}
 		a.log.Error.Printf("rating: PARKED (unbilled) usage hour=%s auth_id=%s owner=%s/%s resource_id=%s model_id=%s serving_mode=%s reason=%s events=%d prompt=%d cached=%d completion=%d first_parked=%s%s",
 			p.WindowStart.Format(time.RFC3339), p.AuthID, p.OwnerType, p.OwnerID, p.ResourceID, p.ModelID, p.ServingMode,

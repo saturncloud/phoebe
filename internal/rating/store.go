@@ -571,6 +571,25 @@ type Parked struct {
 	CompletionTokens int64
 	FirstParkedAt    time.Time
 	LastSeenAt       time.Time
+	// RawEvents is how many of the identity-hour's billing_event rows remain.
+	RawEvents int64
+	// RawEventsPruned: fewer raw events remain than were parked, so the pruner
+	// has removed evidence (30-day horizon, no exception for parked usage; Hugo,
+	// 2026-10-27). The hour is never re-aggregated; settle it by hand through
+	// the manager's credit path using this row's counts.
+	RawEventsPruned bool
+}
+
+// PrunedMarker is the operator-facing note on a parked row whose raw events
+// are gone, in the -list-parked output and the per-run ERROR line.
+const PrunedMarker = "raw_events: pruned — settle manually via manager credit"
+
+// RawEventsLabel is the RAW_EVENTS column value for a parked row.
+func (p Parked) RawEventsLabel() string {
+	if p.RawEventsPruned {
+		return PrunedMarker
+	}
+	return "present"
 }
 
 // ParkedHours implements Store.
@@ -594,11 +613,37 @@ func (s *PostgresStore) ParkedHours(ctx context.Context, notBefore time.Time) ([
 
 // ListParkedSQL is the operator query behind `phoebe-rater -list-parked`
 // (docs/billing-reconciliation.md, "Parked usage").
-const ListParkedSQL = `SELECT window_start, auth_id, owner_type, owner_id, resource_id, model_id, serving_mode,
-       reason, event_count, prompt_tokens, cached_tokens, completion_tokens, first_parked_at, last_seen_at
-  FROM parked_usage
- WHERE resolved_at IS NULL
- ORDER BY window_start, auth_id, owner_type, owner_id, resource_id, model_id, serving_mode, reason`
+//
+// raw_events is the number of billing_event rows of the parked identity-hour
+// still present (counted like the aggregator counts them). When it is below
+// event_count, the pruner has removed raw evidence (billing_event keeps 30 days
+// by default, with no exception for parked usage: Hugo, 2026-10-27), so the
+// hour can never be re-aggregated and the row is settled by hand through the
+// manager's credit path. The row's counts are the remaining record.
+const ListParkedSQL = `SELECT p.window_start, p.auth_id, p.owner_type, p.owner_id, p.resource_id, p.model_id,
+       p.serving_mode, p.reason, p.event_count, p.prompt_tokens, p.cached_tokens, p.completion_tokens,
+       p.first_parked_at, p.last_seen_at, raw.n AS raw_events
+  FROM parked_usage p
+  CROSS JOIN LATERAL (
+      SELECT COUNT(*)::bigint AS n
+        FROM billing_event e
+       WHERE COALESCE(e.event_ts, e.created_at) >= p.window_start
+         AND COALESCE(e.event_ts, e.created_at) <  p.window_start + interval '1 hour'
+         AND e.auth_id = p.auth_id AND e.resource_id = p.resource_id AND e.model = p.model_id
+         AND e.serving_mode = p.serving_mode
+         AND e.usage_found
+         AND (CASE
+              WHEN p.reason = 'owner_conflict'
+                  THEN COALESCE(e.user_id, '') <> '' AND COALESCE(e.group_id, '') <> ''
+              WHEN p.owner_type = 'user'
+                  THEN e.user_id = p.owner_id AND COALESCE(e.group_id, '') = ''
+              WHEN p.owner_type = 'group'
+                  THEN e.group_id = p.owner_id AND COALESCE(e.user_id, '') = ''
+              ELSE COALESCE(e.user_id, '') = '' AND COALESCE(e.group_id, '') = ''
+              END)
+  ) raw
+ WHERE p.resolved_at IS NULL
+ ORDER BY p.window_start, p.auth_id, p.owner_type, p.owner_id, p.resource_id, p.model_id, p.serving_mode, p.reason`
 
 // ListParked implements Store.
 func (s *PostgresStore) ListParked(ctx context.Context) ([]Parked, error) {
@@ -612,10 +657,11 @@ func (s *PostgresStore) ListParked(ctx context.Context) ([]Parked, error) {
 		var p Parked
 		if err := rows.Scan(&p.WindowStart, &p.AuthID, &p.OwnerType, &p.OwnerID, &p.ResourceID, &p.ModelID,
 			&p.ServingMode, &p.Reason, &p.EventCount, &p.PromptTokens, &p.CachedTokens, &p.CompletionTokens,
-			&p.FirstParkedAt, &p.LastSeenAt); err != nil {
+			&p.FirstParkedAt, &p.LastSeenAt, &p.RawEvents); err != nil {
 			return nil, fmt.Errorf("rating: scan parked usage: %w", err)
 		}
 		p.WindowStart = p.WindowStart.UTC()
+		p.RawEventsPruned = p.RawEvents < p.EventCount
 		out = append(out, p)
 	}
 	return out, rows.Err()
