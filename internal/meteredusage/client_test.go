@@ -116,7 +116,7 @@ func TestPost_SendsTheInstallCustomerTokenAndJSON(t *testing.T) {
 // disagree about the wire. That is an error, and not a retryable one.
 func TestPost_AcceptedCountMismatchIsAnErrorNotARetry(t *testing.T) {
 	var calls int32
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		atomic.AddInt32(&calls, 1)
 		_ = json.NewEncoder(w).Encode(Response{Accepted: 7, WindowStart: refWindow})
 	}))
@@ -135,7 +135,7 @@ func TestPost_StopsRetryingWhenTheContextEnds(t *testing.T) {
 	srv, calls := managerStub(t, 503)
 	c := instantClient(srv.URL)
 	ctx, cancel := context.WithCancel(context.Background())
-	c.Sleep = func(ctx context.Context, d time.Duration) error { cancel(); return ctx.Err() }
+	c.Sleep = func(ctx context.Context, _ time.Duration) error { cancel(); return ctx.Err() }
 	_, err := c.Post(ctx, validRequest())
 	var te *TransientError
 	if !errors.As(err, &te) || *calls != 1 {

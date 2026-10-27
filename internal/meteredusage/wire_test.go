@@ -32,7 +32,7 @@ var pythonReference = []struct {
 }{
 	{
 		name: "plain", ownerType: "user", ownerID: strings.Repeat("b", 32),
-		attrs:     refAttrs(func(a *TokenAttributes) {}),
+		attrs:     refAttrs(func(*TokenAttributes) {}),
 		wantUsage: "523e4ca670fea8a74415c4ee1ce845ea9a034ba093ebba1bd2d6f014f6900b4f",
 	},
 	{

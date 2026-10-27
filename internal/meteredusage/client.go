@@ -186,19 +186,19 @@ func checkResponse(req Request, resp Response) error {
 }
 
 func (c *Client) backoff(retry int) time.Duration {
-	base, max := c.BaseBackoff, c.MaxBackoff
+	base, ceiling := c.BaseBackoff, c.MaxBackoff
 	if base <= 0 {
 		base = DefaultBaseBackoff
 	}
-	if max <= 0 {
-		max = DefaultMaxBackoff
+	if ceiling <= 0 {
+		ceiling = DefaultMaxBackoff
 	}
 	d := base
-	for i := 1; i < retry && d < max; i++ {
+	for i := 1; i < retry && d < ceiling; i++ {
 		d *= 2
 	}
-	if d > max {
-		d = max
+	if d > ceiling {
+		d = ceiling
 	}
 	return d
 }
