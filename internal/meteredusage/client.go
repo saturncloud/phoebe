@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -26,8 +27,8 @@ const (
 const maxResponseBody = 64 << 10
 
 // RejectedError is a response the manager will give again for the same
-// request: 4xx. It is never retried. wire-conventions.md names the ones that
-// matter: 400 (the request broke a wire rule; nothing stored), 401 (bad or
+// request: every 4xx except 429, and any other non-200, non-5xx status. It is
+// never retried. wire-conventions.md names the ones that matter: 400 (the request broke a wire rule; nothing stored), 401 (bad or
 // missing token), 409 (the install is recorded on the legacy billing path),
 // 422 (window_start is in a billing period already settled to Stripe; the
 // correction goes to the human credit path). Each needs a person, not a
@@ -41,7 +42,7 @@ func (e *RejectedError) Error() string {
 	return fmt.Sprintf("manager rejected the request with %d (not retried): %s", e.Status, e.Body)
 }
 
-// TransientError is a 5xx or network failure that persisted through every
+// TransientError is a 5xx, 429 or network failure that persisted through every
 // attempt. The hour is safe to re-send later (the request is a snapshot), and
 // the next run's trailing window will do so.
 type TransientError struct {
@@ -76,9 +77,14 @@ type Client struct {
 }
 
 // Post sends one hour. It returns the manager's 200 body, a *RejectedError
-// (4xx, not retried), a *TransientError (5xx or network, retried with
-// exponential backoff until MaxAttempts), or another error (the request could
-// not be built or the 200 body did not match the contract).
+// (4xx other than 429, not retried), a *TransientError (5xx, 429 or network,
+// retried with exponential backoff until MaxAttempts), or another error (the
+// request could not be built or the 200 body did not match the contract).
+//
+// A 429 is "slow down", so the wait before the next attempt is the larger of
+// the backoff and the manager's Retry-After, capped at MaxBackoff: the run's
+// time budget stays bounded however long the manager asks us to wait. (If the
+// manager asks for longer than the cap, the next run re-sends the hour.)
 //
 // Retrying is safe because a request is a snapshot keyed by usage_id: the
 // manager applies it in one transaction, so a re-send after an ambiguous
@@ -96,9 +102,10 @@ func (c *Client) Post(ctx context.Context, req Request) (Response, error) {
 		attempts = DefaultMaxAttempts
 	}
 	var last error
+	var retryAfter time.Duration
 	for attempt := 1; attempt <= attempts; attempt++ {
 		if attempt > 1 {
-			if err := c.sleep(ctx, c.backoff(attempt-1)); err != nil {
+			if err := c.sleep(ctx, c.wait(attempt-1, retryAfter)); err != nil {
 				return Response{}, &TransientError{Attempts: attempt - 1, Last: last}
 			}
 		}
@@ -118,6 +125,11 @@ func (c *Client) Post(ctx context.Context, req Request) (Response, error) {
 			return Response{}, err
 		}
 		last = err
+		retryAfter = 0
+		var slow *tooManyRequestsError
+		if errors.As(err, &slow) {
+			retryAfter = slow.retryAfter
+		}
 		if ctx.Err() != nil {
 			return Response{}, &TransientError{Attempts: attempt, Last: last}
 		}
@@ -131,8 +143,17 @@ type malformedResponseError struct{ msg string }
 
 func (e *malformedResponseError) Error() string { return e.msg }
 
-// once makes a single attempt. A network error or a 5xx comes back as a plain
-// error (retryable); a 4xx as *RejectedError.
+// tooManyRequestsError is a 429: retryable, with the manager's Retry-After
+// (0 when absent or unparseable).
+type tooManyRequestsError struct {
+	retryAfter time.Duration
+	msg        string
+}
+
+func (e *tooManyRequestsError) Error() string { return e.msg }
+
+// once makes a single attempt. A network error, a 5xx or a 429 comes back as a
+// retryable error; any other non-200 as *RejectedError.
 func (c *Client) once(ctx context.Context, url string, body []byte) (Response, error) {
 	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(body))
 	if err != nil {
@@ -161,9 +182,13 @@ func (c *Client) once(ctx context.Context, url string, body []byte) (Response, e
 		return out, nil
 	case resp.StatusCode >= 500:
 		return Response{}, fmt.Errorf("POST %s: status %d: %s", url, resp.StatusCode, respBody)
+	case resp.StatusCode == http.StatusTooManyRequests:
+		ra := parseRetryAfter(resp.Header.Get("Retry-After"), time.Now())
+		return Response{}, &tooManyRequestsError{retryAfter: ra,
+			msg: fmt.Sprintf("POST %s: status 429 (Retry-After %q): %s", url, resp.Header.Get("Retry-After"), respBody)}
 	default:
-		// Every other status, 4xx and unexpected 1xx-3xx alike, is a response
-		// the manager would give again. Retrying it cannot help.
+		// Every other status (400, 401, 409, 422, other 4xx, unexpected 1xx-3xx)
+		// is a response the manager would give again. Retrying cannot help.
 		return Response{}, &RejectedError{Status: resp.StatusCode, Body: string(respBody)}
 	}
 }
@@ -183,6 +208,50 @@ func checkResponse(req Request, resp Response) error {
 		}
 	}
 	return nil
+}
+
+// wait is the pause before retry number `retry`: the exponential backoff, or
+// the manager's Retry-After when that is longer, never above MaxBackoff.
+func (c *Client) wait(retry int, retryAfter time.Duration) time.Duration {
+	d := c.backoff(retry)
+	if retryAfter > d {
+		d = retryAfter
+	}
+	if ceiling := c.ceiling(); d > ceiling {
+		d = ceiling
+	}
+	return d
+}
+
+func (c *Client) ceiling() time.Duration {
+	if c.MaxBackoff > 0 {
+		return c.MaxBackoff
+	}
+	return DefaultMaxBackoff
+}
+
+// parseRetryAfter reads Retry-After as delay-seconds or an HTTP-date (RFC 9110
+// section 10.2.3). Absent, unparseable or in the past means 0 (use the backoff).
+func parseRetryAfter(v string, now time.Time) time.Duration {
+	v = strings.TrimSpace(v)
+	if v == "" {
+		return 0
+	}
+	if secs, err := strconv.ParseInt(v, 10, 64); err == nil {
+		if secs <= 0 {
+			return 0
+		}
+		if secs > int64(24*time.Hour/time.Second) {
+			secs = int64(24 * time.Hour / time.Second) // avoid overflow; the cap applies anyway
+		}
+		return time.Duration(secs) * time.Second
+	}
+	if t, err := http.ParseTime(v); err == nil {
+		if d := t.Sub(now); d > 0 {
+			return d
+		}
+	}
+	return 0
 }
 
 func (c *Client) backoff(retry int) time.Duration {

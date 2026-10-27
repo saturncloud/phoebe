@@ -82,14 +82,14 @@ review.
 ### A manager outage delays sending; it does not lose it
 
 The rater never calls the manager, so a manager outage cannot stop aggregation.
-`token-push` retries 5xx and network errors with capped exponential backoff
-(5 attempts); if they persist it exits `1` and the hour is re-sent by the next run,
+`token-push` retries 5xx, 429 and network errors with capped exponential backoff
+(5 attempts; a 429's `Retry-After` is honoured up to the 30 s cap); if they persist it exits `1` and the hour is re-sent by the next run,
 because each run re-sends the trailing `pushTrailingHours` hours (default 24) and a
 re-send is idempotent. An outage shorter than that window heals with no operator
 action. A longer one moves hours out of every routine run: re-send them explicitly
 with `token-push -since ... -until ...`.
 
-A 4xx is never retried and exits `3`: `400` means the request broke a wire rule
+Any other 4xx is never retried and exits `3`: `400` means the request broke a wire rule
 token-push did not catch (a bug: compare the logged path with the rollup); `401`
 means the customer token; `409` means the manager has this install on the legacy
 billing path (an operator step, billing-design.md section 3a); `422` means the hour

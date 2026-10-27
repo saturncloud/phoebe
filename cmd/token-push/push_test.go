@@ -395,3 +395,16 @@ func TestPushWindows_EmptyBaseModelDedicatedRecordIsSentAndDoesNotBlockTheHour(t
 		t.Fatalf("custom record %+v, want dedicated with base_model \"\"", custom.Attributes)
 	}
 }
+
+func TestPushWindows_Retries429UntilTheManagerAccepts(t *testing.T) {
+	m := &recordingManager{statuses: []int{429, 200}}
+	p, mock := newMockPusher(t, m.client(t))
+	expectLiveness(mock)
+	mock.ExpectQuery(`FROM rated_usage ru`).WithArgs(win).WillReturnRows(fixtureRows())
+	if code := p.pushWindows(context.Background(), []time.Time{win}); code != exitOK {
+		t.Fatalf("exit %d, want 0 after a 429 retry", code)
+	}
+	if len(m.bodies) != 2 {
+		t.Fatalf("%d attempts, want 2", len(m.bodies))
+	}
+}

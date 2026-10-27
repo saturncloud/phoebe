@@ -21,6 +21,7 @@ managerURL: "https://manager.internal.svc.cluster.local"
 # manager. Re-sending an hour is idempotent (deterministic usage_id). Default 24.
 pushTrailingHours: 24
 
-# Timeout for a single POST attempt. 5xx and network errors are retried with
-# backoff (up to 5 attempts); 4xx are never retried. Default 60s.
+# Timeout for a single POST attempt. 5xx, 429 and network errors are retried with
+# backoff (up to 5 attempts; a 429's Retry-After is honoured up to 30s); every
+# other status is final. Default 60s.
 requestTimeout: "60s"

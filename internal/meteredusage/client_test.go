@@ -152,3 +152,67 @@ func TestBackoff_DoublesFromTheBaseAndIsCapped(t *testing.T) {
 		}
 	}
 }
+
+// 429 means "slow down", not "no": it is retried with backoff.
+func TestPost_Retries429ThenSucceeds(t *testing.T) {
+	srv, calls := managerStub(t, 429, 429, 200)
+	if _, err := instantClient(srv.URL).Post(context.Background(), validRequest()); err != nil {
+		t.Fatal(err)
+	}
+	if *calls != 3 {
+		t.Fatalf("%d calls, want 3", *calls)
+	}
+}
+
+// retryAfterStub answers 429 with the given Retry-After once, then 200.
+func retryAfterStub(t *testing.T, retryAfter string) string {
+	t.Helper()
+	var calls int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		if atomic.AddInt32(&calls, 1) == 1 {
+			w.Header().Set("Retry-After", retryAfter)
+			w.WriteHeader(http.StatusTooManyRequests)
+			return
+		}
+		_ = json.NewEncoder(w).Encode(Response{Accepted: 0, WindowStart: refWindow})
+	}))
+	t.Cleanup(srv.Close)
+	return srv.URL
+}
+
+func TestPost_HonoursRetryAfterWithinTheBackoffCap(t *testing.T) {
+	cases := map[string]struct {
+		header string
+		want   time.Duration
+	}{
+		"seconds longer than backoff":  {"7", 7 * time.Second},
+		"seconds shorter than backoff": {"0", time.Second}, // backoff wins
+		"seconds beyond the cap":       {"3600", 30 * time.Second},
+		"http date beyond the cap":     {time.Now().Add(2 * time.Hour).UTC().Format(http.TimeFormat), 30 * time.Second},
+		"unparseable":                  {"soon", time.Second},
+	}
+	for name, tc := range cases {
+		t.Run(name, func(t *testing.T) {
+			var slept []time.Duration
+			c := instantClient(retryAfterStub(t, tc.header))
+			c.BaseBackoff, c.MaxBackoff = time.Second, 30*time.Second
+			c.Sleep = func(_ context.Context, d time.Duration) error { slept = append(slept, d); return nil }
+			if _, err := c.Post(context.Background(), validRequest()); err != nil {
+				t.Fatal(err)
+			}
+			if len(slept) != 1 || slept[0] != tc.want {
+				t.Fatalf("waited %v, want [%v]", slept, tc.want)
+			}
+		})
+	}
+}
+
+func TestParseRetryAfter_HTTPDate(t *testing.T) {
+	now := time.Date(2026, 10, 27, 12, 0, 0, 0, time.UTC)
+	if got := parseRetryAfter(now.Add(90*time.Second).Format(http.TimeFormat), now); got != 90*time.Second {
+		t.Fatalf("got %v, want 90s", got)
+	}
+	if got := parseRetryAfter(now.Add(-time.Minute).Format(http.TimeFormat), now); got != 0 {
+		t.Fatalf("date in the past: got %v, want 0", got)
+	}
+}

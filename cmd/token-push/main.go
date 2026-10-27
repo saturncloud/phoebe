@@ -21,8 +21,9 @@
 //     hour reach the manager on the next run.
 //   - FAIL CLOSED. An hour with a rollup that cannot become a valid record (no
 //     org, or a wire-rule violation) is withheld whole, never sent short.
-//   - RETRIES. 5xx and network errors are retried with capped exponential
-//     backoff; 4xx (400/401/409/422) are never retried.
+//   - RETRIES. 5xx, 429 and network errors are retried with capped exponential
+//     backoff; a 429's Retry-After is honoured up to the backoff cap. Every
+//     other status (400/401/409/422, other 4xx) is final.
 //   - AUTH = the install's existing customer auth token (SATURN_TOKEN env), sent
 //     as "Authorization: token <t>", the same credential and header as the old
 //     push and /customer/usage. No new credential, no new scope.
@@ -31,14 +32,14 @@
 //
 //	0  every hour in the window was accepted by the manager
 //	1  fatal: bad config, no token, DB unreachable, an hour that could not be
-//	   read, a 5xx/network failure that outlasted the retries, a 200 that
+//	   read, a 5xx/429/network failure that outlasted the retries, a 200 that
 //	   disagreed with the request, an entirely empty rated_usage table, or a
 //	   window range wider than the backfill cap
 //	2  some hour was WITHHELD (not sent) because a rollup could not become a
 //	   valid record; every hour that was sent succeeded
-//	3  the manager REJECTED some hour with a 4xx (400 wire rule, 401 token,
-//	   409 install on the legacy billing path, 422 billing period already
-//	   settled). Not retried; needs a person
+//	3  the manager REJECTED some hour with a final status (400 wire rule, 401
+//	   token, 409 install on the legacy billing path, 422 billing period
+//	   already settled, any other non-429 4xx). Not retried; needs a person
 //
 // Precedence when several apply: 1 > 3 > 2.
 package main
