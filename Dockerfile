@@ -2,8 +2,8 @@
 # given workload runs. One image+tag ships the whole system:
 #   /app/phoebe             — the interceptor (the streaming proxy, listens :8080)
 #   /app/phoebe-drainer     — Valkey stream → Postgres billing_event (a Deployment)
-#   /app/phoebe-rater       — batch rating job billing_event → rated_usage (a CronJob)
-#   /app/phoebe-token-push  — push hourly rated_usage snapshots to the central manager
+#   /app/phoebe-rater       — hourly aggregation job billing_event → rated_usage (a CronJob)
+#   /app/phoebe-token-push  — push hourly token records to the manager (/customer/metered-usage)
 #                             for Stripe billing (a CronJob)
 #   /app/phoebe-migrate     — golang-migrate runner: applies the embedded schema
 #                             migrations to phoebe's own Postgres (a one-shot Job /
