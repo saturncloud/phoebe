@@ -1,470 +1,367 @@
 package main
 
 import (
+	"bytes"
 	"context"
-	"database/sql"
 	"encoding/json"
+	"flag"
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
 	"github.com/DATA-DOG/go-sqlmock"
 
 	"github.com/saturncloud/phoebe/internal/logging"
+	"github.com/saturncloud/phoebe/internal/meteredusage"
 )
+
+var updateGolden = flag.Bool("update", false, "rewrite testdata/token-request.json from the current code")
 
 func quietLog() *logging.Logger { return logging.New(logging.ERROR) }
 
-// snapshotCols is the column set snapshotQuery returns, in order. org_id is read
-// directly off rated_usage (captured at meter time), right after resource_id.
-var snapshotCols = []string{
-	"id", "resource_id", "org_id", "model_id",
-	"serving_mode", "owner_type", "owner_id", "graph_k8s_name",
-	"topology_revision", "region", "event_count",
-	"cost", "applied_prompt_rate", "applied_cached_rate", "applied_completion_rate",
-	"prompt_tokens", "cached_tokens", "completion_tokens", "billable_prompt_tokens",
-	"base_model", "adapter", "price_key",
+// hourCols is the column set hourQuery returns, in order.
+var hourCols = []string{
+	"id", "org_id", "owner_type", "owner_id", "resource_id", "auth_id", "model_id", "serving_mode",
+	"base_model", "adapter", "graph_k8s_name", "topology_revision", "region",
+	"prompt_tokens", "cached_tokens", "completion_tokens", "event_count",
 }
 
-func newMockPusher(t *testing.T) (*pusher, sqlmock.Sqlmock) {
+var win = time.Date(2026, 10, 22, 14, 0, 0, 0, time.UTC)
+
+const (
+	orgA     = "0a1b2c3d4e5f60718293a4b5c6d7e8f9"
+	userA    = "1f2e3d4c5b6a79880716a5b4c3d2e1f0"
+	groupA   = "2c3d4e5f60718293a4b5c6d7e8f90a1b"
+	deployA  = "3d4e5f60718293a4b5c6d7e8f90a1b2c"
+	tfModelB = "4e5f60718293a4b5c6d7e8f90a1b2c3d"
+	authA    = "5f60718293a4b5c6d7e8f90a1b2c3d4e"
+	authB    = "60718293a4b5c6d7e8f90a1b2c3d4e5f"
+)
+
+// The fixture hour: three rollups covering the shapes the wire must carry.
+//   - a dedicated fine-tune endpoint owned by a user, served by graph revision 3;
+//   - the same endpoint in revision 4 (a second record: revision is grain);
+//   - a shared base-model call by a group-owned key, no graph named, revision
+//     unknown, region unknown (NULLs become "").
+func fixtureRows() *sqlmock.Rows {
+	return sqlmock.NewRows(hourCols).
+		AddRow("rid-1", orgA, "user", userA, deployA, authA, "acme-qwen-ft", "dedicated",
+			"Qwen/Qwen2.5-32B-Instruct", "ckpt-7a1c", "pd-acme-qwen-ft", int64(3), "us-central1",
+			int64(120000), int64(80000), int64(9000), int64(42)).
+		AddRow("rid-2", orgA, "user", userA, deployA, authA, "acme-qwen-ft", "dedicated",
+			"Qwen/Qwen2.5-32B-Instruct", "ckpt-7a1c", "pd-acme-qwen-ft", int64(4), "us-central1",
+			int64(3000), int64(0), int64(500), int64(2)).
+		AddRow("rid-3", orgA, "group", groupA, tfModelB, authB, "openai/gpt-oss-120b", "shared",
+			"openai/gpt-oss-120b", nil, "", int64(0), nil,
+			int64(5000), int64(1000), int64(700), int64(9))
+}
+
+func newMockPusher(t *testing.T, client poster) (*pusher, sqlmock.Sqlmock) {
 	t.Helper()
 	db, mock, err := sqlmock.New(sqlmock.QueryMatcherOption(sqlmock.QueryMatcherRegexp))
 	if err != nil {
 		t.Fatalf("sqlmock: %v", err)
 	}
 	t.Cleanup(func() { _ = db.Close() })
-	return &pusher{db: db, log: quietLog(), client: &http.Client{Timeout: 5 * time.Second}}, mock
+	return &pusher{db: db, log: quietLog(), client: client}, mock
 }
 
-var win = time.Date(2026, 6, 16, 14, 0, 0, 0, time.UTC)
-
-// TestSnapshotQuery_NoResourceNameJoin pins the load-bearing invariant of this change as
-// an ASSERTION, not just a comment: org_id is read off the rollup, so snapshotQuery must
-// NOT join the Atlas-owned resource_name table (the deleted push-time reconstruction that
-// raced deployment teardown). A future refactor re-adding `LEFT JOIN resource_name` would
-// pass the `FROM rated_usage ru` mock regex; this catches it directly.
-func TestSnapshotQuery_NoResourceNameJoin(t *testing.T) {
-	if strings.Contains(snapshotQuery, "resource_name") {
-		t.Fatalf("snapshotQuery references resource_name — the push-time org join must stay deleted (org rides the rollup): %s", snapshotQuery)
-	}
-	if !strings.Contains(snapshotQuery, "ru.org_id") {
-		t.Fatalf("snapshotQuery must read org_id off rated_usage (ru.org_id): %s", snapshotQuery)
-	}
+func expectLiveness(mock sqlmock.Sqlmock) {
+	mock.ExpectQuery(`SELECT 1 FROM rated_usage LIMIT 1`).WillReturnRows(sqlmock.NewRows([]string{"x"}).AddRow(1))
 }
 
-// TestBuildSnapshot_CarriesOrgAndShape (token-push-snapshot-shape): a row carrying its
-// org_id (captured at meter time, read straight off rated_usage — no resolve step) becomes
-// a wire rollup with org_id attached, money carried as exact-decimal strings, and rev=0.
-func TestBuildSnapshot_CarriesOrgAndShape(t *testing.T) {
-	p, mock := newMockPusher(t)
-	rows := sqlmock.NewRows(snapshotCols).AddRow(
-		"rated-id-1", "res-deploy-1", "org-acme", "meta-llama/Llama-3.1-8B-Instruct",
-		"shared", "user", "usr-17", "dyn-graph-llama31-8b", 7, "eu-north1", int64(42),
-		"0.001234500", "0.000000150", "0.000000075", "0.000000600",
-		int64(8000), int64(2000), int64(500), int64(6000), nil, nil, nil,
-	)
-	// No resource_name join — org rides the rollup.
-	mock.ExpectQuery(`SELECT.*FROM rated_usage ru`).
-		WithArgs(win).WillReturnRows(rows)
+// recordingManager is a stub manager: it answers with the given statuses in
+// order (the last repeats), records every body, and answers 200 with the
+// contract's body.
+type recordingManager struct {
+	mu       sync.Mutex
+	statuses []int
+	bodies   [][]byte
+	auth     []string
+	paths    []string
+}
 
-	snap, unattributable, err := p.buildSnapshot(context.Background(), win)
-	if err != nil {
-		t.Fatalf("buildSnapshot: %v", err)
-	}
-	if unattributable != 0 {
-		t.Fatalf("unattributable = %d, want 0", unattributable)
-	}
-	// Explicit +00:00 offset, not "Z" — Python 3.10 fromisoformat rejects "Z".
-	if snap.WindowStart != "2026-06-16T14:00:00+00:00" {
-		t.Fatalf("window_start = %q", snap.WindowStart)
-	}
-	if len(snap.Rollups) != 1 {
-		t.Fatalf("rollups = %d, want 1", len(snap.Rollups))
-	}
-	r := snap.Rollups[0]
-	if r.OrgID != "org-acme" || r.RatedUsageID != "rated-id-1" || r.Rev != 0 {
-		t.Fatalf("rollup identity wrong: %+v", r)
-	}
-	// Grain (0009) and the request count ride the wire.
-	if r.GraphK8sName != "dyn-graph-llama31-8b" || r.TopologyRevision != 7 || r.Region != "eu-north1" || r.RequestCount != 42 {
-		t.Fatalf("graph/revision/region/request_count wrong: %+v", r)
-	}
-	// Money MUST be the exact strings from the DB (C8) — never reparsed through a float.
-	if r.Cost != "0.001234500" || r.AppliedPromptRate != "0.000000150" ||
-		r.AppliedCachedRate != "0.000000075" || r.AppliedCompletionRate != "0.000000600" {
-		t.Fatalf("money fields altered: %+v", r)
-	}
-	if err := mock.ExpectationsWereMet(); err != nil {
-		t.Fatalf("unmet expectations: %v", err)
+func (m *recordingManager) server(t *testing.T) *httptest.Server {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body)
+		m.mu.Lock()
+		m.bodies = append(m.bodies, body)
+		m.auth = append(m.auth, r.Header.Get("Authorization"))
+		m.paths = append(m.paths, r.URL.Path)
+		n := len(m.bodies)
+		status := http.StatusOK
+		if len(m.statuses) > 0 {
+			status = m.statuses[len(m.statuses)-1]
+			if n <= len(m.statuses) {
+				status = m.statuses[n-1]
+			}
+		}
+		m.mu.Unlock()
+		if status != http.StatusOK {
+			w.WriteHeader(status)
+			_, _ = w.Write([]byte(`{"error":"stub","path":"records[0]"}`))
+			return
+		}
+		var req meteredusage.Request
+		_ = json.Unmarshal(body, &req)
+		_ = json.NewEncoder(w).Encode(meteredusage.Response{Accepted: int64(len(req.Records)), WindowStart: req.WindowStart, Kinds: req.Kinds})
+	}))
+	t.Cleanup(srv.Close)
+	return srv
+}
+
+func (m *recordingManager) client(t *testing.T) *meteredusage.Client {
+	return &meteredusage.Client{
+		BaseURL: m.server(t).URL + "/", Token: "tok-123", HTTP: &http.Client{Timeout: 5 * time.Second},
+		Sleep: func(context.Context, time.Duration) error { return nil },
 	}
 }
 
-// TestBuildSnapshot_CarriesUsageIdentityAsJSONNullWhenUnknown: the usage identity
-// (migration 0010) rides the wire so the manager can name a deleted endpoint's base model
-// and adapter. A NULL or empty column goes out as JSON null, never "", so the manager and
-// Atlas can tell "no adapter" from a value.
-func TestBuildSnapshot_CarriesUsageIdentityAsJSONNullWhenUnknown(t *testing.T) {
-	p, mock := newMockPusher(t)
-	rows := sqlmock.NewRows(snapshotCols).
-		AddRow("rated-ft", "res-ft", "org-acme", "my-ft",
-			"shared", "user", "usr-1", "g", 1, "eu", int64(1),
-			"0.1", "0", "0", "0", int64(1), int64(0), int64(0), int64(1),
-			"Qwen/Qwen2.5-7B-Instruct", "art-1", "shared:ft:Qwen/Qwen2.5-7B-Instruct").
-		AddRow("rated-own", "res-own", "org-acme", "own-rate",
-			"dedicated", "user", "usr-1", "g", 1, "eu", int64(1),
-			"0.1", "0", "0", "0", int64(1), int64(0), int64(0), int64(1),
-			"Qwen/Qwen2.5-7B-Instruct", "", nil)
-	mock.ExpectQuery(`SELECT.*FROM rated_usage ru`).WithArgs(win).WillReturnRows(rows)
-
-	snap, _, err := p.buildSnapshot(context.Background(), win)
-	if err != nil {
-		t.Fatalf("buildSnapshot: %v", err)
-	}
-	body, err := json.Marshal(snap)
-	if err != nil {
-		t.Fatalf("marshal: %v", err)
-	}
-	var wire struct {
-		Rollups []map[string]any `json:"rollups"`
-	}
-	if err := json.Unmarshal(body, &wire); err != nil {
-		t.Fatalf("unmarshal: %v", err)
-	}
-	ft, own := wire.Rollups[0], wire.Rollups[1]
-	if ft["base_model"] != "Qwen/Qwen2.5-7B-Instruct" || ft["adapter"] != "art-1" ||
-		ft["price_key"] != "shared:ft:Qwen/Qwen2.5-7B-Instruct" {
-		t.Fatalf("fine-tune identity wrong: %v", ft)
-	}
-	for _, key := range []string{"adapter", "price_key"} {
-		v, present := own[key]
-		if !present || v != nil {
-			t.Fatalf("%s = %v (present=%v), want JSON null", key, v, present)
+func TestHourQuery_ReadsQuantitiesAndNoMoney(t *testing.T) {
+	for _, money := range []string{"cost", "applied_", "price_key", "resource_name"} {
+		if strings.Contains(hourQuery, money) {
+			t.Fatalf("hourQuery reads %q; the manager prices, phoebe sends quantities only:\n%s", money, hourQuery)
 		}
 	}
-	if own["base_model"] != "Qwen/Qwen2.5-7B-Instruct" {
-		t.Fatalf("own-rate base_model = %v", own["base_model"])
+}
+
+func TestBuildRequest_MapsEachRollupToATokenRecord(t *testing.T) {
+	p, mock := newMockPusher(t, nil)
+	mock.ExpectQuery(`FROM rated_usage ru`).WithArgs(win).WillReturnRows(fixtureRows())
+
+	req, unsendable, err := p.buildRequest(context.Background(), win)
+	if err != nil || unsendable != 0 {
+		t.Fatalf("buildRequest: unsendable=%d err=%v", unsendable, err)
+	}
+	if req.WindowStart != "2026-10-22T14:00:00+00:00" || len(req.Kinds) != 1 || req.Kinds[0] != "token" || len(req.Records) != 3 {
+		t.Fatalf("request header %q %v with %d records", req.WindowStart, req.Kinds, len(req.Records))
+	}
+	shared := req.Records[2]
+	wantAttrs := meteredusage.TokenAttributes{
+		AuthID: authB, ModelID: "openai/gpt-oss-120b", ServingMode: "shared", BaseModel: "openai/gpt-oss-120b",
+		Adapter: "", GraphK8sName: "", TopologyRevision: "", Region: "",
+	}
+	if shared.Attributes != wantAttrs {
+		t.Fatalf("shared attributes %+v, want %+v (NULL adapter/region and revision 0 are sent as \"\")", shared.Attributes, wantAttrs)
+	}
+	if shared.Quantities != (meteredusage.TokenQuantities{PromptTokens: 5000, CachedTokens: 1000, CompletionTokens: 700, RequestCount: 9}) {
+		t.Fatalf("quantities %+v", shared.Quantities)
+	}
+	if req.Records[0].Attributes.TopologyRevision != "3" || req.Records[1].Attributes.TopologyRevision != "4" {
+		t.Fatal("topology revisions not carried as decimal strings")
+	}
+	for i, r := range req.Records {
+		want := meteredusage.TokenUsageID(req.WindowStart, r.OrgID, r.OwnerType, r.OwnerID, r.ResourceID, r.Attributes)
+		if r.UsageID != want {
+			t.Fatalf("records[%d].usage_id %s, want %s", i, r.UsageID, want)
+		}
+	}
+	if req.Records[0].UsageID == req.Records[1].UsageID {
+		t.Fatal("two topology revisions minted the same usage_id")
+	}
+	if err := meteredusage.Validate(req); err != nil {
+		t.Fatalf("built request breaks a wire rule: %v", err)
 	}
 }
 
-// TestBuildSnapshot_UnattributableOmitted (token-push-unattributable-omitted): a row
-// carrying a NULL org_id (Atlas didn't inject X-Saturn-Org-Id, or propagation broke) is
-// OMITTED from the snapshot and counted — never pushed with a guessed/empty org (C2/C7).
-func TestBuildSnapshot_UnattributableOmitted(t *testing.T) {
-	p, mock := newMockPusher(t)
-	rows := sqlmock.NewRows(snapshotCols).
-		AddRow("rated-ok", "res-1", "org-acme", "m",
-			"dedicated", "user", "usr-1", "dyn-graph-1", 1, "eu-north1", int64(1),
-									"0.001", "0.1", "0.05", "0.6", int64(1), int64(0), int64(1), int64(1), nil, nil, nil).
-		AddRow("rated-orphan", "res-vanished", nil, "m", // NULL org_id
-			"dedicated", "", "", "", 0, nil, int64(1),
-			"0.002", "0.1", "0.05", "0.6", int64(1), int64(0), int64(1), int64(1), nil, nil, nil)
-	mock.ExpectQuery(`FROM rated_usage ru`).
-		WithArgs(win).WillReturnRows(rows)
-
-	snap, unattributable, err := p.buildSnapshot(context.Background(), win)
-	if err != nil {
-		t.Fatalf("buildSnapshot: %v", err)
-	}
-	if unattributable != 1 {
-		t.Fatalf("unattributable = %d, want 1", unattributable)
-	}
-	if len(snap.Rollups) != 1 || snap.Rollups[0].RatedUsageID != "rated-ok" {
-		t.Fatalf("unattributable row was not omitted: %+v", snap.Rollups)
-	}
-}
-
-// TestBuildSnapshot_EmptyStringOrgIsOmitted pins the `orgID.String == ""` arm of the
-// omit guard (defense in depth). The drainer's nullStr() writes ""→NULL, so a literal
-// empty-string org should never reach the column — but if a direct backfill or a future
-// producer ever wrote ”, billing it to a blank org would violate C2/C7. A non-NULL
-// empty-string org_id must be treated exactly like NULL: omitted + counted, never pushed.
-func TestBuildSnapshot_EmptyStringOrgIsOmitted(t *testing.T) {
-	p, mock := newMockPusher(t)
-	rows := sqlmock.NewRows(snapshotCols).
-		AddRow("rated-blank", "res-1", "", "m", // non-NULL EMPTY-STRING org_id
-			"dedicated", "group", "grp-9", "", 0, nil, int64(1),
-			"0.001", "0.1", "0.05", "0.6", int64(1), int64(0), int64(1), int64(1), nil, nil, nil)
-	mock.ExpectQuery(`FROM rated_usage ru`).WithArgs(win).WillReturnRows(rows)
-
-	snap, unattributable, err := p.buildSnapshot(context.Background(), win)
-	if err != nil {
-		t.Fatalf("buildSnapshot: %v", err)
-	}
-	if unattributable != 1 {
-		t.Fatalf("unattributable = %d, want 1 (empty-string org must be omitted like NULL)", unattributable)
-	}
-	if len(snap.Rollups) != 0 {
-		t.Fatalf("empty-string-org row was pushed: %+v (must never bill a blank org)", snap.Rollups)
-	}
-}
-
-// TestBuildSnapshot_EmptyWindowMarshalsToEmptyArray (token-push-empty-window-is-delete-all):
-// a window with no rows produces "rollups": [] (a delete-all signal), NEVER null — the
-// manager needs the empty snapshot to reconcile deletes.
-func TestBuildSnapshot_EmptyWindowMarshalsToEmptyArray(t *testing.T) {
-	p, mock := newMockPusher(t)
-	mock.ExpectQuery(`FROM rated_usage ru`).WithArgs(win).
-		WillReturnRows(sqlmock.NewRows(snapshotCols))
-
-	snap, _, err := p.buildSnapshot(context.Background(), win)
-	if err != nil {
-		t.Fatalf("buildSnapshot: %v", err)
-	}
-	b, _ := json.Marshal(snap)
-	// Must contain the empty array, not null.
-	if got := string(b); !containsJSONEmptyRollups(got) {
-		t.Fatalf("empty window did not marshal to an empty rollups array: %s", got)
-	}
-}
-
-func containsJSONEmptyRollups(s string) bool {
-	// the empty-array form, not the null form.
-	return strings.Contains(s, `"rollups":[]`) && !strings.Contains(s, `"rollups":null`)
-}
-
-// expectLiveness queues the rated_usage liveness pre-check (pushWindows runs it before
-// any window). hasRows=true → the table is non-empty (push proceeds).
-func expectLiveness(mock sqlmock.Sqlmock, hasRows bool) {
-	q := mock.ExpectQuery(`SELECT 1 FROM rated_usage LIMIT 1`)
-	if hasRows {
-		q.WillReturnRows(sqlmock.NewRows([]string{"?column?"}).AddRow(1))
-	} else {
-		q.WillReturnError(sql.ErrNoRows)
-	}
-}
-
-// TestPostSnapshot_SendsAuthAndBody (token-push-post-auth-body): the POST carries the
-// auth token and the JSON snapshot to the right path.
-func TestPostSnapshot_SendsAuthAndBody(t *testing.T) {
-	var gotAuth, gotPath, gotBody string
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		gotAuth = r.Header.Get("Authorization")
-		gotPath = r.URL.Path
-		b, _ := io.ReadAll(r.Body)
-		gotBody = string(b)
-		w.WriteHeader(http.StatusOK)
-	}))
-	defer srv.Close()
-
-	p := &pusher{log: quietLog(), managerURL: srv.URL, token: "tok-123", client: &http.Client{Timeout: 5 * time.Second}}
-	snap := snapshot{WindowStart: "2026-06-16T14:00:00Z", Rollups: []rollup{{RatedUsageID: "x", OrgID: "o", Cost: "0.5"}}}
-	if err := p.postSnapshot(context.Background(), snap); err != nil {
-		t.Fatalf("postSnapshot: %v", err)
-	}
-	if gotAuth != "token tok-123" {
-		t.Fatalf("auth = %q, want 'token tok-123'", gotAuth)
-	}
-	if gotPath != tokenUsagePath {
-		t.Fatalf("path = %q, want %q", gotPath, tokenUsagePath)
-	}
-	if !strings.Contains(gotBody, `"rated_usage_id":"x"`) || !strings.Contains(gotBody, `"cost":"0.5"`) {
-		t.Fatalf("body missing expected fields: %s", gotBody)
-	}
-}
-
-// TestPostSnapshot_Non2xxFails (token-push-non2xx-fails): a rejected push is an error,
-// never treated as a successful push.
-func TestPostSnapshot_Non2xxFails(t *testing.T) {
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
-		w.WriteHeader(http.StatusBadRequest)
-		_, _ = w.Write([]byte("malformed snapshot"))
-	}))
-	defer srv.Close()
-
-	p := &pusher{log: quietLog(), managerURL: srv.URL, token: "t", client: &http.Client{Timeout: 5 * time.Second}}
-	err := p.postSnapshot(context.Background(), snapshot{WindowStart: "2026-06-16T14:00:00Z", Rollups: []rollup{}})
-	if err == nil {
-		t.Fatalf("expected an error on a 400, got nil")
-	}
-}
-
-// TestPushWindows_WithholdsWindowWithUnattributable (token-push-withhold-on-orphan):
-// a window containing ANY unattributable row is NOT pushed — pushing the omitted
-// snapshot would delete-by-absence a possibly-billed rollup. The manager is NEVER hit
-// for that window, and the run exits 2 (held, not pushed). This is the money-loss fix:
-// the OLD behavior pushed the window (hits==1), un-billing the orphan's prior charge.
-func TestPushWindows_WithholdsWindowWithUnattributable(t *testing.T) {
-	hits := 0
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
-		hits++
-		w.WriteHeader(http.StatusOK)
-	}))
-	defer srv.Close()
-
-	p, mock := newMockPusher(t)
-	p.managerURL = srv.URL
-	p.token = "t"
-	rows := sqlmock.NewRows(snapshotCols).
-		AddRow("ok", "res-1", "org-acme", "m", "shared", "user", "usr-1", "dyn-graph-1", 1, "eu-north1", int64(1), "0.001", "0.1", "0.05", "0.6", int64(1), int64(0), int64(1), int64(1), nil, nil, nil).
-		AddRow("orphan", "res-x", nil, "m", "dedicated", "", "", "", 0, nil, int64(1), "0.002", "0.1", "0.05", "0.6", int64(1), int64(0), int64(1), int64(1), nil, nil, nil)
-	expectLiveness(mock, true)
-	mock.ExpectQuery(`FROM rated_usage ru`).WithArgs(win).WillReturnRows(rows)
-
-	code := p.pushWindows(context.Background(), []time.Time{win})
-	if code != exitUnattrib {
-		t.Fatalf("exit code = %d, want exitUnattrib(%d)", code, exitUnattrib)
-	}
-	if hits != 0 {
-		t.Fatalf("manager was hit %d times for a window with an unattributable row; it must be WITHHELD (a push would delete-by-absence the orphan's prior charge)", hits)
-	}
-}
-
-// TestPushWindows_WithheldWindowDoesNotBlockCleanWindow (token-push-windows-independent):
-// a withheld (or failed) window does not abort the run — a clean window still pushes.
-// This is the non-atomic-reconciliation fix: one bad hour can't block reconvergence of
-// every other hour.
-func TestPushWindows_WithheldWindowDoesNotBlockCleanWindow(t *testing.T) {
-	pushed := map[string]bool{}
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		b, _ := io.ReadAll(r.Body)
-		var s snapshot
-		_ = json.Unmarshal(b, &s)
-		pushed[s.WindowStart] = true
-		w.WriteHeader(http.StatusOK)
-	}))
-	defer srv.Close()
-
-	p, mock := newMockPusher(t)
-	p.managerURL = srv.URL
-	p.token = "t"
-
-	win2 := win.Add(time.Hour)
-	// win: has an orphan -> withheld. win2: clean -> pushed.
-	expectLiveness(mock, true)
-	mock.ExpectQuery(`FROM rated_usage ru`).WithArgs(win).WillReturnRows(
-		sqlmock.NewRows(snapshotCols).
-			AddRow("orphan", "res-x", nil, "m", "dedicated", "", "", "", 0, nil, int64(1), "0.002", "0.1", "0.05", "0.6", int64(1), int64(0), int64(1), int64(1), nil, nil, nil))
-	mock.ExpectQuery(`FROM rated_usage ru`).WithArgs(win2).WillReturnRows(
-		sqlmock.NewRows(snapshotCols).
-			AddRow("ok", "res-1", "org-acme", "m", "shared", "user", "usr-1", "dyn-graph-1", 1, "eu-north1", int64(1), "0.001", "0.1", "0.05", "0.6", int64(1), int64(0), int64(1), int64(1), nil, nil, nil))
-
-	code := p.pushWindows(context.Background(), []time.Time{win, win2})
-	if code != exitUnattrib {
-		t.Fatalf("exit code = %d, want exitUnattrib(%d)", code, exitUnattrib)
-	}
-	// Keys are the snapshot's WindowStart, formatted with the +00:00 offset (not "Z").
-	const fmtOffset = "2006-01-02T15:04:05+00:00"
-	if pushed[win.UTC().Format(fmtOffset)] {
-		t.Fatalf("the orphan window was pushed; it must be withheld")
-	}
-	if !pushed[win2.UTC().Format(fmtOffset)] {
-		t.Fatalf("the clean window was NOT pushed; a withheld earlier window must not block it")
-	}
-}
-
-// TestPushWindows_FatalOnPostError (token-push-fatal-on-post-error): a failed push
-// returns exitFatal.
-func TestPushWindows_FatalOnPostError(t *testing.T) {
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
-		w.WriteHeader(http.StatusInternalServerError)
-	}))
-	defer srv.Close()
-
-	p, mock := newMockPusher(t)
-	p.managerURL = srv.URL
-	p.token = "t"
-	expectLiveness(mock, true)
-	mock.ExpectQuery(`FROM rated_usage ru`).WithArgs(win).
-		WillReturnRows(sqlmock.NewRows(snapshotCols).
-			AddRow("ok", "res-1", "org-acme", "m", "shared", "user", "usr-1", "dyn-graph-1", 1, "eu-north1", int64(1), "0.001", "0.1", "0.05", "0.6", int64(1), int64(0), int64(1), int64(1), nil, nil, nil))
-
-	code := p.pushWindows(context.Background(), []time.Time{win})
-	if code != exitFatal {
-		t.Fatalf("exit code = %d, want exitFatal(%d)", code, exitFatal)
-	}
-}
-
-// TestPushWindows_EmptyTableRefuses (token-push-empty-table-refuses): an entirely empty
-// rated_usage table (fresh install / DB wipe) makes the liveness guard refuse to push —
-// otherwise every window would signal delete-all and wipe the manager's prior billing.
-func TestPushWindows_EmptyTableRefuses(t *testing.T) {
-	hits := 0
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
-		hits++
-		w.WriteHeader(http.StatusOK)
-	}))
-	defer srv.Close()
-
-	p, mock := newMockPusher(t)
-	p.managerURL = srv.URL
-	p.token = "t"
-	expectLiveness(mock, false) // empty table
-
-	code := p.pushWindows(context.Background(), []time.Time{win, win.Add(time.Hour)})
-	if code != exitFatal {
-		t.Fatalf("exit code = %d, want exitFatal(%d) on an empty table", code, exitFatal)
-	}
-	if hits != 0 {
-		t.Fatalf("manager was hit %d times on an empty table; must refuse to push (delete-all hazard)", hits)
-	}
-}
-
-// TestPushWindows_FatalDominatesWithheld (token-push-fatal-dominates): when one window
-// is withheld (unattributable) AND another fails to push, the run exits FATAL (1), not 2
-// — a broken job is the more urgent signal.
-func TestPushWindows_FatalDominatesWithheld(t *testing.T) {
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
-		w.WriteHeader(http.StatusInternalServerError) // every push fails
-	}))
-	defer srv.Close()
-
-	p, mock := newMockPusher(t)
-	p.managerURL = srv.URL
-	p.token = "t"
-	win2 := win.Add(time.Hour)
-	expectLiveness(mock, true)
-	// win: orphan -> withheld (no POST). win2: clean -> POST fails (fatal).
-	mock.ExpectQuery(`FROM rated_usage ru`).WithArgs(win).WillReturnRows(
-		sqlmock.NewRows(snapshotCols).
-			AddRow("orphan", "res-x", nil, "m", "dedicated", "", "", "", 0, nil, int64(1), "0.002", "0.1", "0.05", "0.6", int64(1), int64(0), int64(1), int64(1), nil, nil, nil))
-	mock.ExpectQuery(`FROM rated_usage ru`).WithArgs(win2).WillReturnRows(
-		sqlmock.NewRows(snapshotCols).
-			AddRow("ok", "res-1", "org-acme", "m", "shared", "user", "usr-1", "dyn-graph-1", 1, "eu-north1", int64(1), "0.001", "0.1", "0.05", "0.6", int64(1), int64(0), int64(1), int64(1), nil, nil, nil))
-
-	code := p.pushWindows(context.Background(), []time.Time{win, win2})
-	if code != exitFatal {
-		t.Fatalf("exit code = %d, want exitFatal(%d) — fatal must dominate withheld", code, exitFatal)
-	}
-}
-
-// TestPostSnapshot_TrimsTrailingSlash (token-push-url-trailing-slash): a managerURL with
-// a trailing slash does not produce a double-slash path that could 404/redirect.
-func TestPostSnapshot_TrimsTrailingSlash(t *testing.T) {
-	var gotPath string
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		gotPath = r.URL.Path
-		w.WriteHeader(http.StatusOK)
-	}))
-	defer srv.Close()
-
-	p := &pusher{log: quietLog(), managerURL: srv.URL + "/", token: "t", client: &http.Client{Timeout: 5 * time.Second}}
-	if err := p.postSnapshot(context.Background(), snapshot{WindowStart: "2026-06-16T14:00:00+00:00", Rollups: []rollup{}}); err != nil {
-		t.Fatalf("postSnapshot: %v", err)
-	}
-	if gotPath != tokenUsagePath {
-		t.Fatalf("path = %q, want %q (trailing slash not trimmed → double-slash)", gotPath, tokenUsagePath)
-	}
-}
-
-// TestRollupWire_UnknownGraphRevisionRegionAreSentAsKeys: since 0009 the graph and
-// revision are grain, and the manager requires every key (its schema has no
-// optional-and-defaulted fields), so the unknown values ” / 0 / ” are sent, not
-// omitted.
-func TestRollupWire_UnknownGraphRevisionRegionAreSentAsKeys(t *testing.T) {
-	b, err := json.Marshal(rollup{RatedUsageID: "x", ServingMode: "shared"})
+// The golden fixture: the full body for the fixture hour, byte for byte. A
+// copy lives in saturn-architecture-docs
+// (agent-wip/evidence/billing-unification/fixtures/token-request.json) so the
+// manager's ingest can be tested against exactly what phoebe sends.
+// Regenerate with: go test ./cmd/token-push -run TestGoldenRequest -update
+func TestGoldenRequest_FullHourBody(t *testing.T) {
+	p, mock := newMockPusher(t, nil)
+	mock.ExpectQuery(`FROM rated_usage ru`).WithArgs(win).WillReturnRows(fixtureRows())
+	req, _, err := p.buildRequest(context.Background(), win)
 	if err != nil {
 		t.Fatal(err)
 	}
-	var m map[string]any
-	if err := json.Unmarshal(b, &m); err != nil {
+	wire, err := json.Marshal(req) // exactly what meteredusage.Client sends
+	if err != nil {
 		t.Fatal(err)
 	}
-	for _, k := range []string{"graph_k8s_name", "topology_revision", "region", "request_count"} {
-		if _, ok := m[k]; !ok {
-			t.Errorf("wire rollup omits %q: %s", k, b)
+	var pretty bytes.Buffer
+	if err := json.Indent(&pretty, wire, "", "  "); err != nil {
+		t.Fatal(err)
+	}
+	pretty.WriteByte('\n')
+
+	path := filepath.Join("testdata", "token-request.json")
+	if *updateGolden {
+		if err := os.WriteFile(path, pretty.Bytes(), 0o644); err != nil {
+			t.Fatal(err)
 		}
+	}
+	golden, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read golden (run with -update to create it): %v", err)
+	}
+	if !bytes.Equal(golden, pretty.Bytes()) {
+		t.Fatalf("request body drifted from %s:\n%s", path, pretty.String())
+	}
+	var compact bytes.Buffer
+	if err := json.Compact(&compact, golden); err != nil || !bytes.Equal(compact.Bytes(), wire) {
+		t.Fatalf("golden compacts to %s, wire is %s (err %v)", compact.Bytes(), wire, err)
+	}
+}
+
+func TestBuildRequest_EmptyHourIsAnEmptyRecordList(t *testing.T) {
+	p, mock := newMockPusher(t, nil)
+	mock.ExpectQuery(`FROM rated_usage ru`).WithArgs(win).WillReturnRows(sqlmock.NewRows(hourCols))
+	req, _, err := p.buildRequest(context.Background(), win)
+	if err != nil {
+		t.Fatal(err)
+	}
+	b, _ := json.Marshal(req)
+	if !strings.Contains(string(b), `"records":[]`) || !strings.Contains(string(b), `"held":[]`) {
+		t.Fatalf("empty hour marshals to %s; want records [] (delete-by-absence), never null", b)
+	}
+}
+
+// An empty hour is still SENT: that is how the manager learns usage it holds for
+// the hour is gone (for example, a rollup that became withheld after a re-run).
+func TestPushWindows_SendsAnEmptyHourSoTheManagerDeletesByAbsence(t *testing.T) {
+	m := &recordingManager{}
+	p, mock := newMockPusher(t, m.client(t))
+	expectLiveness(mock)
+	mock.ExpectQuery(`FROM rated_usage ru`).WithArgs(win).WillReturnRows(sqlmock.NewRows(hourCols))
+	if code := p.pushWindows(context.Background(), []time.Time{win}); code != exitOK {
+		t.Fatalf("exit %d, want 0", code)
+	}
+	if len(m.bodies) != 1 || !strings.Contains(string(m.bodies[0]), `"records":[]`) {
+		t.Fatalf("bodies %q, want one empty-hour request", m.bodies)
+	}
+	if m.auth[0] != "token tok-123" || m.paths[0] != meteredusage.Path {
+		t.Fatalf("auth %q path %q, want the install's customer token on %s", m.auth[0], m.paths[0], meteredusage.Path)
+	}
+}
+
+// Re-sending an hour sends identical bytes (same usage_ids), which is what makes
+// the manager replace rather than duplicate.
+func TestPushWindows_ResendingAnHourIsByteIdentical(t *testing.T) {
+	m := &recordingManager{}
+	p, mock := newMockPusher(t, m.client(t))
+	for i := 0; i < 2; i++ {
+		expectLiveness(mock)
+		mock.ExpectQuery(`FROM rated_usage ru`).WithArgs(win).WillReturnRows(fixtureRows())
+		if code := p.pushWindows(context.Background(), []time.Time{win}); code != exitOK {
+			t.Fatalf("run %d: exit %d", i, code)
+		}
+	}
+	if len(m.bodies) != 2 || !bytes.Equal(m.bodies[0], m.bodies[1]) {
+		t.Fatalf("re-sent hour differs:\n%s\n%s", m.bodies[0], m.bodies[1])
+	}
+}
+
+func TestPushWindows_WithholdsAnHourWithARollupWithoutOrgButSendsTheOthers(t *testing.T) {
+	m := &recordingManager{}
+	p, mock := newMockPusher(t, m.client(t))
+	expectLiveness(mock)
+	bad := sqlmock.NewRows(hourCols).
+		AddRow("rid-1", orgA, "user", userA, deployA, authA, "m", "dedicated", "B", nil, "", int64(0), nil, int64(1), int64(0), int64(1), int64(1)).
+		AddRow("rid-2", nil, "user", userA, deployA, authB, "m", "dedicated", "B", nil, "", int64(0), nil, int64(1), int64(0), int64(1), int64(1))
+	mock.ExpectQuery(`FROM rated_usage ru`).WithArgs(win).WillReturnRows(bad)
+	next := win.Add(time.Hour)
+	mock.ExpectQuery(`FROM rated_usage ru`).WithArgs(next).WillReturnRows(fixtureRows())
+
+	if code := p.pushWindows(context.Background(), []time.Time{win, next}); code != exitWithheld {
+		t.Fatalf("exit %d, want exitWithheld (%d)", code, exitWithheld)
+	}
+	if len(m.bodies) != 1 || !strings.Contains(string(m.bodies[0]), "2026-10-22T15:00:00+00:00") {
+		t.Fatalf("sent %d bodies, want only the clean 15:00 hour", len(m.bodies))
+	}
+}
+
+// A rollup that would break a wire rule (here an empty base_model, which a
+// pre-aggregator row can carry) withholds the hour instead of earning a 400.
+func TestPushWindows_WithholdsAnHourThatBreaksAWireRule(t *testing.T) {
+	m := &recordingManager{}
+	p, mock := newMockPusher(t, m.client(t))
+	expectLiveness(mock)
+	mock.ExpectQuery(`FROM rated_usage ru`).WithArgs(win).WillReturnRows(sqlmock.NewRows(hourCols).
+		AddRow("rid-1", orgA, "user", userA, deployA, authA, "m", "dedicated", nil, nil, "", int64(0), nil, int64(1), int64(0), int64(1), int64(1)))
+	if code := p.pushWindows(context.Background(), []time.Time{win}); code != exitWithheld {
+		t.Fatalf("exit %d, want exitWithheld", code)
+	}
+	if len(m.bodies) != 0 {
+		t.Fatalf("sent %d bodies, want none", len(m.bodies))
+	}
+}
+
+func TestPushWindows_NeverRetries400_409_422AndExits3(t *testing.T) {
+	for _, status := range []int{400, 409, 422} {
+		m := &recordingManager{statuses: []int{status, 200}}
+		p, mock := newMockPusher(t, m.client(t))
+		expectLiveness(mock)
+		mock.ExpectQuery(`FROM rated_usage ru`).WithArgs(win).WillReturnRows(fixtureRows())
+		if code := p.pushWindows(context.Background(), []time.Time{win}); code != exitRejected {
+			t.Fatalf("status %d: exit %d, want exitRejected (%d)", status, code, exitRejected)
+		}
+		if len(m.bodies) != 1 {
+			t.Fatalf("status %d: %d attempts, want exactly 1", status, len(m.bodies))
+		}
+	}
+}
+
+func TestPushWindows_Retries5xxUntilTheManagerAccepts(t *testing.T) {
+	m := &recordingManager{statuses: []int{503, 502, 200}}
+	p, mock := newMockPusher(t, m.client(t))
+	expectLiveness(mock)
+	mock.ExpectQuery(`FROM rated_usage ru`).WithArgs(win).WillReturnRows(fixtureRows())
+	if code := p.pushWindows(context.Background(), []time.Time{win}); code != exitOK {
+		t.Fatalf("exit %d, want 0 after retries", code)
+	}
+	if len(m.bodies) != 3 || !bytes.Equal(m.bodies[0], m.bodies[2]) {
+		t.Fatalf("%d attempts, want 3 identical ones", len(m.bodies))
+	}
+}
+
+func TestPushWindows_Persistent5xxIsFatalAndDominates(t *testing.T) {
+	m := &recordingManager{statuses: []int{503}}
+	p, mock := newMockPusher(t, m.client(t))
+	expectLiveness(mock)
+	mock.ExpectQuery(`FROM rated_usage ru`).WithArgs(win).WillReturnRows(fixtureRows())
+	// A second hour that is withheld: fatal still wins.
+	next := win.Add(time.Hour)
+	mock.ExpectQuery(`FROM rated_usage ru`).WithArgs(next).WillReturnRows(sqlmock.NewRows(hourCols).
+		AddRow("rid-9", nil, "", "", deployA, authA, "m", "dedicated", "B", nil, "", int64(0), nil, int64(1), int64(0), int64(1), int64(1)))
+	if code := p.pushWindows(context.Background(), []time.Time{win, next}); code != exitFatal {
+		t.Fatalf("exit %d, want exitFatal", code)
+	}
+	if len(m.bodies) != meteredusage.DefaultMaxAttempts {
+		t.Fatalf("%d attempts, want %d", len(m.bodies), meteredusage.DefaultMaxAttempts)
+	}
+}
+
+func TestPushWindows_RejectedOutranksWithheld(t *testing.T) {
+	m := &recordingManager{statuses: []int{422}}
+	p, mock := newMockPusher(t, m.client(t))
+	expectLiveness(mock)
+	mock.ExpectQuery(`FROM rated_usage ru`).WithArgs(win).WillReturnRows(fixtureRows())
+	next := win.Add(time.Hour)
+	mock.ExpectQuery(`FROM rated_usage ru`).WithArgs(next).WillReturnRows(sqlmock.NewRows(hourCols).
+		AddRow("rid-9", nil, "", "", deployA, authA, "m", "dedicated", "B", nil, "", int64(0), nil, int64(1), int64(0), int64(1), int64(1)))
+	if code := p.pushWindows(context.Background(), []time.Time{win, next}); code != exitRejected {
+		t.Fatalf("exit %d, want exitRejected", code)
+	}
+}
+
+// An entirely empty table would send every hour as empty and delete the
+// manager's records; refuse instead.
+func TestPushWindows_EmptyTableRefusesToSendAnything(t *testing.T) {
+	m := &recordingManager{}
+	p, mock := newMockPusher(t, m.client(t))
+	mock.ExpectQuery(`SELECT 1 FROM rated_usage LIMIT 1`).WillReturnRows(sqlmock.NewRows([]string{"x"}))
+	if code := p.pushWindows(context.Background(), []time.Time{win}); code != exitFatal {
+		t.Fatalf("exit %d, want exitFatal", code)
+	}
+	if len(m.bodies) != 0 {
+		t.Fatal("sent a request from an empty table")
 	}
 }

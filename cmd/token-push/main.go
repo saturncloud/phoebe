@@ -1,65 +1,46 @@
-// Command token-push is phoebe's install-side hourly billing PUSH job. It reads the
-// rater's rated_usage rollups for a window — each already carrying its billing org
-// (org_id is captured at METER time from X-Saturn-Org-Id and carried onto rated_usage by
-// the rater, so push reads it straight off the rollup, no resource_name join) — and
-// POSTs an hourly SNAPSHOT to the central manager's POST /customer/token-usage. The
-// manager turns those rollups into Stripe charges; this binary is the trust-boundary
-// crossing that gets the priced usage OUT of the install.
+// Command token-push is phoebe's install-side hourly usage PUSH job. For each
+// hour in its window it reads the aggregator's rated_usage rollups and sends the
+// complete set of that hour's token records to the manager's
+// POST /customer/metered-usage with kinds ["token"] (billing-design.md section
+// 3; wire details in internal/meteredusage). The manager prices and settles;
+// phoebe sends quantities and the facts a price depends on, never money.
 //
-// See token-factory-stripe-consumer-design.md (Ben). This binary is that design's
-// "install-side hourly push job" upstream prerequisite. The contract points it must
-// honor:
+// It replaces the old POST /customer/token-usage push outright (section 3: no
+// production phoebe existed, so there is no transition period and no flag).
 //
-//   - SNAPSHOT, not increments (Decision 3). Each push carries the COMPLETE current set
-//     of rated_usage rows for one window_start, across all orgs/resources/models. The
-//     manager treats a rated_usage_id it has on file for that (customer, window) but
-//     that is ABSENT from the snapshot as a reconcile-DELETE. So a re-rate or a
-//     reconcile-delete in phoebe self-corrects across the boundary — a bare incremental
-//     delete would silently keep billing a vanished rollup forever.
-//   - ORG CAPTURED INSTALL-SIDE AT METER TIME (Decision 2 / C1). org_id is captured by
-//     the interceptor from the X-Saturn-Org-Id header (the deployment's saturncloud.io/
-//     org-id label, injected by Atlas) and carried billing_event→rated_usage by the
-//     rater; the manager never reads the install DB. The org_id rides the payload off
-//     the rollup — no push-time resource_name join (which raced deployment teardown). A
-//     rollup with a NULL org_id makes its WHOLE WINDOW be WITHHELD (not pushed) and
-//     screamed about — because the snapshot is delete-by-absence, pushing a window with a
-//     row omitted would silently DELETE that row's prior (possibly already-billed)
-//     charge. Withholding leaves the manager's prior good state for the window standing
-//     (stale-but-billed); the next run re-pushes once org_id propagates (a re-rate also
-//     refreshes a NULL-org rollup to its real org). NEVER pushed with a guessed/empty org
-//     (C2/C7 fail-closed). A NULL org_id means Atlas did not inject X-Saturn-Org-Id for
-//     that deployment (a producer-rollout gap) or propagation broke: a real anomaly
-//     worth a non-zero exit.
-//   - MONEY IS AN EXACT DECIMAL STRING end to end (C8). cost and the applied rates cross
-//     the wire as NUMERIC text, never a float — read as ::text from Postgres, emitted as
-//     JSON strings.
-//   - AUTH = the install's customer auth_token (SATURN_TOKEN env), the same
-//     install→manager direction as /customer/usage and /customer/token-prices. The token
-//     authorizes the install to report its OWN usage; it carries no central authority.
+// The contract points it honors:
 //
-// It is a ONE-SHOT batch job (cron / k8s CronJob), NOT a daemon: it pushes the windows it
-// covers and exits. Exit codes:
+//   - ONE REQUEST PER HOUR, A SNAPSHOT. The manager deletes, by absence, any
+//     token record it holds for this install and hour that the request omits.
+//     So an hour with no usage is sent as records: [] and a re-sent hour
+//     replaces the previous one. usage_id is a deterministic hash of the
+//     record's grain, so re-sending never duplicates.
+//   - THE SETTLE HORIZON IS THE TRAILING WINDOW. Each run re-sends the last
+//     pushTrailingHours complete hours (default 24, matching the rater's
+//     rateTrailingHours), so late-drained events the rater folds into an old
+//     hour reach the manager on the next run.
+//   - FAIL CLOSED. An hour with a rollup that cannot become a valid record (no
+//     org, or a wire-rule violation) is withheld whole, never sent short.
+//   - RETRIES. 5xx and network errors are retried with capped exponential
+//     backoff; 4xx (400/401/409/422) are never retried.
+//   - AUTH = the install's existing customer auth token (SATURN_TOKEN env), sent
+//     as "Authorization: token <t>", the same credential and header as the old
+//     push and /customer/usage. No new credential, no new scope.
 //
-//	0  every covered window's snapshot was accepted by the manager. (An individual
-//	   empty WINDOW on a live table is fine — it snapshots to an empty rollup set, which
-//	   the manager applies as delete-by-absence for that hour. But an entirely empty
-//	   rated_usage TABLE is exit 1, not 0 — see the liveness guard below.)
-//	1  fatal: bad config / no auth token / DB unreachable / a window failed to push /
-//	   an ENTIRELY EMPTY rated_usage table (the liveness guard refuses to push, since an
-//	   all-empty run would signal delete-all for every window and wipe the manager's
-//	   prior billing) / a window range wider than the backfill cap
-//	2  some window was WITHHELD (not pushed) because it contained a rated_usage row
-//	   with a NULL org_id (Atlas didn't inject X-Saturn-Org-Id, or propagation broke);
-//	   every window that WAS pushed succeeded. The withheld window's prior state on the
-//	   manager is left untouched (stale-but-billed). Distinct code so a CronJob alerts on
-//	   "usage we metered and priced but cannot attribute to an org" (held revenue / lost
-//	   attribution) separately from "the job broke".
+// It is a ONE-SHOT batch job (a k8s CronJob). Exit codes:
 //
-// WINDOW SELECTION mirrors the rater: default is the trailing N complete hours, so a
-// rollup the rater re-rated or reconcile-deleted in an already-covered hour is re-
-// snapshotted on a later run and the manager reconverges. A snapshot is idempotent on
-// the manager (UPSERT by (customer_id, rated_usage_id) + delete-by-absence), so
-// re-pushing a window never double-bills.
+//	0  every hour in the window was accepted by the manager
+//	1  fatal: bad config, no token, DB unreachable, an hour that could not be
+//	   read, a 5xx/network failure that outlasted the retries, a 200 that
+//	   disagreed with the request, an entirely empty rated_usage table, or a
+//	   window range wider than the backfill cap
+//	2  some hour was WITHHELD (not sent) because a rollup could not become a
+//	   valid record; every hour that was sent succeeded
+//	3  the manager REJECTED some hour with a 4xx (400 wire rule, 401 token,
+//	   409 install on the legacy billing path, 422 billing period already
+//	   settled). Not retried; needs a person
+//
+// Precedence when several apply: 1 > 3 > 2.
 package main
 
 import (
@@ -72,20 +53,19 @@ import (
 	"time"
 
 	"github.com/saturncloud/phoebe/internal/logging"
+	"github.com/saturncloud/phoebe/internal/meteredusage"
 )
 
-// tokenEnv carries the install's customer auth token (a mounted secret), same as
-// cmd/rater. Never a flag/config — it must not land in logs or a configmap.
+// tokenEnv carries the install's customer auth token (a mounted secret). Never a
+// flag or config value: it must not land in logs or a configmap.
 const tokenEnv = "SATURN_TOKEN"
-
-// tokenUsagePath is the manager endpoint that ingests the hourly snapshot.
-const tokenUsagePath = "/customer/token-usage"
 
 // exit codes (see package doc).
 const (
 	exitOK       = 0
 	exitFatal    = 1
-	exitUnattrib = 2 // a window was WITHHELD (not pushed) — some row had no resolvable org.
+	exitWithheld = 2 // an hour was not sent: a rollup could not become a valid record
+	exitRejected = 3 // the manager answered 4xx for an hour; not retried
 )
 
 // maxPushWindows caps how many hour-windows a single run may enumerate (a backfill
@@ -168,11 +148,14 @@ func runWith(argv []string) int {
 	defer func() { _ = db.Close() }()
 
 	p := &pusher{
-		db:         db,
-		log:        log,
-		managerURL: opts.managerURL,
-		token:      token,
-		client:     &http.Client{Timeout: opts.requestTimeout},
+		db:  db,
+		log: log,
+		client: &meteredusage.Client{
+			BaseURL: opts.managerURL,
+			Token:   token,
+			// One client for every hour of the run, so connections are reused.
+			HTTP: &http.Client{Timeout: opts.requestTimeout},
+		},
 	}
 
 	return p.pushWindows(ctx, windows)
