@@ -26,26 +26,24 @@ central billing service.
    then a structured `METERING_FLOOR` log. The drainer acknowledges Valkey only after
    the Postgres transaction commits and deduplicates redelivery on the server-minted
    attempt id.
-5. The rater resolves prices and writes hourly `rated_usage` rows. Cached input is
-   charged once: `fresh = prompt - cached`. Prices come from the central manager,
-   which owns the effective-dated series: the rater asks for the prices effective
-   during EACH HOUR it rates, so a late or recovered event bills at its own hour's
-   rate however many times the price book has changed since — and a re-rate of that
-   hour is idempotent. phoebe keeps no local price history and no local price file:
-   `managerURL` is REQUIRED, and with it unset the rater logs that the manager is the
-   only price source and exits 1 rather than defaulting to $0. An install that cannot
-   egress to the central manager runs its own manager instance seeded with that
-   deployment's prices. `config/prices.example.yaml` documents the WIRE SHAPE the
-   manager serves and the rater parses — a format reference, not a file anyone
-   authors or the rater reads. The applied rates are
-   frozen onto each `rated_usage` row, so the row stays self-auditing. Attempts
-   without authoritative engine usage are excluded from money, and an UNEXPLAINED
-   missing-usage attempt makes the rater exit non-zero.
-6. `token-push` sends authoritative hourly snapshots keyed by `rated_usage.id` to
-   the central manager. Replays are deterministic; an unattributable window is
-   withheld in full instead of partially deleting or mis-attributing prior billing.
-   The central manager owns invoice-line creation and must expose the same ids for
-   the final rated-row-to-invoice comparison.
+5. The rater (an aggregator since the billing unification) writes hourly
+   `rated_usage` rows at the token grain: (auth_id, owner, resource, model,
+   serving mode, graph, topology revision, hour), carrying org, region, base model
+   and adapter, with prompt, cached and completion token sums and the attempt count.
+   **phoebe prices nothing**: the manager owns every price and rates each hour as of
+   that hour (billing-design.md D1). The rater fetches no prices and writes the
+   money columns as NULL. It withholds, counts and pages (exit 2) on evidence that
+   cannot become a correct record: unattributable, invalid usage, invalid serving
+   mode, owner conflict, missing base model, ambiguous org, ambiguous base model or
+   adapter, and an UNEXPLAINED missing-usage attempt.
+6. `token-push` sends each hour to the manager's `POST /customer/metered-usage`
+   with `kinds: ["token"]`: the complete set of that hour's token records, each
+   keyed by a deterministic `usage_id` (sha256 of the record's grain). The manager
+   deletes, by absence, records it holds for the hour that the request omits, so a
+   re-sent hour replaces the previous one and an empty hour is sent as an empty
+   list. An hour with a rollup that cannot become a valid record is withheld in
+   full instead of partially deleting or mis-attributing prior usage. The manager
+   owns rating, settlement and invoice-line creation.
 
 ## Routine checks and alert conditions
 
@@ -77,25 +75,24 @@ is not automatically revenue loss: it means the engine did
 not provide authoritative counts, so Phoebe charged zero and requires engine-log
 review.
 
-### A pricing-service outage delays rating; it does not lose it
+### A manager outage delays sending; it does not lose it
 
-The rater has no local price book, so an hour whose prices cannot be fetched is
-**skipped, not failed**: the run logs it, continues with the remaining hours, and
-exits `3` (incomplete) rather than `0`. Because each hour is rated in its own
-transaction and the upsert is idempotent, a skipped hour is rated by any later run
-whose trailing window still covers it — the default 24-hour trailing window means
-an outage shorter than a day self-heals with no operator action.
+The rater never calls the manager, so a manager outage cannot stop aggregation.
+`token-push` retries 5xx and network errors with capped exponential backoff
+(5 attempts); if they persist it exits `1` and the hour is re-sent by the next run,
+because each run re-sends the trailing `pushTrailingHours` hours (default 24) and a
+re-send is idempotent. An outage shorter than that window heals with no operator
+action. A longer one moves hours out of every routine run: re-send them explicitly
+with `token-push -since ... -until ...`.
 
-This is the same shape as `token-push`, which withholds a window and lets the next
-run re-push, and as the `usage-patch` reconciler, where an item stays queued until
-it is confirmed filled. Exit `3` is therefore "check the pricing service, then
-confirm a later run caught up", distinct from exit `2` ("the billing evidence is
-wrong; investigate the data").
-
-The bound worth watching: an outage **longer than the trailing window** moves
-hours out of every subsequent run's range, and those hours are then never rated by
-the routine cadence. Alert on a sustained nonzero exit-3 rate, and re-rate the
-affected span explicitly with `--since/--until` once the service is healthy.
+A 4xx is never retried and exits `3`: `400` means the request broke a wire rule
+token-push did not catch (a bug: compare the logged path with the rollup); `401`
+means the customer token; `409` means the manager has this install on the legacy
+billing path (an operator step, billing-design.md section 3a); `422` means the hour
+is in a billing period already settled to Stripe, so its correction goes to the
+manager's human credit path. Exit `2` means an hour was withheld because a rollup
+could not become a valid record (no org, or a wire rule); the manager keeps its
+previous state for that hour until the cause is fixed.
 
 "Failed" means `status_code >= 400` everywhere — the reconciliation view's
 `failed_attempts` and the rater's routine-vs-alarming split use the SAME
@@ -109,13 +106,14 @@ on any install with traffic: they are reported (INFO, and counted in
 that was NOT aborted and did NOT fail — a response the engine reported as
 SUCCESSFUL while supplying no usage block, meaning work may have been served that
 cannot be billed. The rater exits non-zero only on that unexplained subset, so
-exit 2 stays reserved for rare, wrong conditions (unpriced, unattributable,
-invalid-usage, ambiguous base/org, invalid serving mode, owner conflict) rather
-than firing every hour.
+exit 2 stays reserved for rare, wrong conditions (unattributable, invalid usage,
+ambiguous base/org, invalid serving mode, owner conflict, missing base model)
+rather than firing every hour.
 
 Page on an unexplained missing-usage attempt, rater anomaly/non-zero exit, reconcile
 deletion during a routine run, drainer poison row, `METERING_FLOOR`, WAL corruption,
-token-push withheld window, or push failure. Alert separately when the oldest Valkey
+token-push withheld hour (exit 2), manager rejection (exit 3), or push failure
+(exit 1). Alert separately when the oldest Valkey
 pending entry, oldest WAL entry, or oldest unpushed rated hour exceeds two job
 periods. The deployment/chart owns those queue-age metrics.
 
@@ -129,9 +127,9 @@ rating.** It has three very different causes and the view alone cannot tell them
 apart, so never treat the row as a drainer/rating incident before ruling out the
 first two: (a) the rater deliberately WITHHELD the rollup at an ambiguity gate
 — check `distinct_org_ids > 1` on the row for org-ambiguity, and the same run's
-`ambiguous_base_events` count for base-ambiguity, which the view does not surface
-at all (the base gate keys on `rating_price`/`rating_derived` join outcomes that
-exist only inside the rater, not on `billing_event`); (b) the rater deliberately
+`ambiguous_base_events` count for base-ambiguity (two base models or adapters, or
+adapter on some events and not others, for one identity in the hour), and its
+`missing_base_model_events` count, neither of which the view surfaces; (b) the rater deliberately
 WITHHELD the events because their serving mode is invalid — the run's
 `invalid_serving_mode_events` count. These are events whose
 `billing_event.serving_mode` is NULL, `''` or anything other than `'shared'` or
@@ -143,11 +141,12 @@ attempts for the hour and key, with the same predicate the rater uses; or (c) th
 rater has not yet run for that hour. Check the rater's run report for the window
 before escalating.
 
-For the invoice boundary, export `rated_usage.id`, `window_start`, `org_id`, and
-`cost` for the same interval and compare it to the central manager's received-rollup
-and invoice-line exports. Require set equality on id and exact NUMERIC equality on
-cost; compare totals only after the row-level set matches. A total can accidentally
-balance while two customers are mis-attributed.
+For the invoice boundary, compare the records token-push sent for the interval
+(re-derive them with token-push's `-since/-until` against a stub, or from
+`rated_usage`) with the manager's received token records: require set equality on
+`usage_id` and exact equality of the four quantities per record before comparing
+any total. A total can accidentally balance while two customers are mis-attributed.
+Prices and money are the manager's to reconcile.
 
 ## Repair and replay
 
@@ -210,20 +209,18 @@ balance while two customers are mis-attributed.
    appending or auto-draining it.
 3. Run the drainer until the consumer group has no pending/lagging entries. Confirm
    the recovered attempt ids exist once in `billing_event`.
-4. Restore attribution headers if they were the problem. Prices need no restoring:
-   the rater re-resolves each hour against the manager's effective-dated series, so
-   a re-rate of an already-billed hour reproduces its original rates even if
-   reconciliation deleted the corresponding `rated_usage` row.
+4. Restore attribution headers if they were the problem. There are no prices to
+   restore: the manager prices each hour as of that hour.
 5. Run the rater explicitly for the complete affected half-open window. Investigate
-   every unpriced, unattributable, ambiguous, missing-usage, or reconcile-deletion
-   signal before proceeding.
+   every unattributable, missing-base-model, ambiguous, missing-usage, or
+   reconcile-deletion signal before proceeding.
 6. Re-run the hourly reconciliation view. Then replay `token-push` for every affected
    hour, including empty hours within a non-empty authoritative run.
-7. Compare central received rollups and invoice lines by `rated_usage.id` and exact
-   cost, then release the invoice window.
+7. Compare the manager's received token records by `usage_id` and quantities, then
+   release the invoice window.
 
 Endpoint deletion does not remove `billing_event` or `rated_usage`; attribution and
-prices are captured before teardown. Never reconstruct historical ownership by
+the pricing facts (base model, adapter, serving mode) are captured before teardown. Never reconstruct historical ownership by
 joining the current endpoint table.
 
 Migration 0005 is supported as a verified-empty clean cutover with no legacy
@@ -355,8 +352,8 @@ will carry across for you.
 
 The Make suite covers client-id replay, streaming/non-streaming usage, pre/post-header
 abort, upstream failure, duplicate delivery, Valkey outage and recovery, WAL restart
-and corruption, drainer transaction failure/poison isolation, re-rating, price
-change, org ambiguity, and push retry/delete-by-absence behavior. Before a release,
+and corruption, drainer transaction failure/poison isolation, re-aggregation, org
+and base-model ambiguity, and push retry/no-retry and delete-by-absence behavior. Before a release,
 also run the live-Postgres lane and perform chart-level pod-kill tests while Valkey is
 unavailable.
 
@@ -373,10 +370,8 @@ unavailable.
 - Exact counts depend on the deployed engine emitting the OpenAI usage block,
   including cached prompt tokens. Phoebe records missing/invalid usage but never
   invents it.
-- A brand-new rollup whose raw events arrive only after a price change cannot infer
-  an old price from the current YAML file. Effective-dated price-book retention in
-  the price distribution component is required for that case. Existing rollups are
-  protected by their frozen applied rates.
-- Final invoice equality depends on the central manager preserving
-  `rated_usage.id`, exact decimal cost, authoritative snapshot semantics, and an
+- Pricing, including late events priced at their own hour's rate, is the
+  manager's (billing-design.md D1).
+- Final invoice equality depends on the manager preserving `usage_id`, the
+  quantities, delete-by-absence scoped to (install, hour, kind), and an
   invoice-line export/API. Phoebe cannot prove or repair that external state.
