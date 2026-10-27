@@ -1,16 +1,15 @@
 //go:build integration
 
-// Package rating integration test: runs the REAL rating SQL (rateWindowSQL) against
-// a LIVE Postgres, pricing from a YAML PriceBook (E1), then asserts the rated_usage
-// rows the SQL wrote — including the APPLIED per-token rates frozen onto each row —
-// equal the pure Rate() oracle row-for-row over the same fixture. This is the
-// production-path half of the conformance pair (the in-Go oracle self-consistency
-// check lives in rater_test.go's TestOracleModel_SelfConsistent).
+// Package rating integration tests: run the REAL aggregation SQL
+// (aggregateWindowSQL) and the real migrations against a LIVE Postgres.
 //
-// Gated behind the `integration` build tag AND a non-empty PHOEBE_TEST_DATABASE_URL.
-// Run with:
+// Gated behind the `integration` build tag AND a non-empty
+// PHOEBE_TEST_DATABASE_URL. Run with:
 //
 //	PHOEBE_TEST_DATABASE_URL=postgres://... go test -tags=integration ./internal/rating/...
+//
+// `go test ./...` and `go vet ./...` skip this file, so "unit tests green" does
+// not mean this SQL compiles. Run the integration lane for any change here.
 package rating
 
 import (
@@ -19,7 +18,6 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
-	"reflect"
 	"sort"
 	"strings"
 	"testing"
@@ -28,9 +26,15 @@ import (
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/stdlib"
-
-	"github.com/saturncloud/phoebe/internal/logging"
 )
+
+func mustTime(s string) time.Time {
+	t, err := time.Parse(time.RFC3339, s)
+	if err != nil {
+		panic(err)
+	}
+	return t
+}
 
 // ratingSchemaDDL returns the rating schema applied before each integration test
 // (billing_event + rated_usage — prices are a YAML file, not DB tables). It is
@@ -49,13 +53,13 @@ func ratingSchemaDDL(t *testing.T) string {
 	for _, f := range []string{
 		"../../migrations/0001_billing_event.up.sql",
 		"../../migrations/0002_rating.up.sql",
-		// 0004 adds billing_event.serving_mode, which rateWindowSQL reads (the
+		// 0004 adds billing_event.serving_mode, which aggregateWindowSQL reads (the
 		// serving-mode SKU axis). Skipping it reproduces the staging 42703.
 		"../../migrations/0004_billing_event_serving_mode.up.sql",
 		"../../migrations/0005_invoice_grade_attempts.up.sql",
 		// 0006 widens the rated_usage grain (serving_mode/owner_type/owner_id join
 		// the natural key) and adds billing_event.graph_k8s_name, both of which
-		// rateWindowSQL reads and writes.
+		// aggregateWindowSQL reads and writes.
 		"../../migrations/0006_rollup_grain.up.sql",
 		// 0007 makes rated_usage.serving_mode 'shared'/'dedicated' only (CHECK, no
 		// default), which the rater's upsert must satisfy.
@@ -66,6 +70,8 @@ func ratingSchemaDDL(t *testing.T) string {
 		"../../migrations/0009_rollup_grain_graph_revision.up.sql",
 		// 0010 adds the usage-identity attributes the rater writes.
 		"../../migrations/0010_rated_usage_identity.up.sql",
+		// 0011 makes the money columns nullable: the aggregator writes NULL.
+		"../../migrations/0011_rated_usage_quantities_only.up.sql",
 	} {
 		ddl, err := os.ReadFile(f)
 		if err != nil {
@@ -86,1752 +92,6 @@ func ratingSchemaDDL(t *testing.T) string {
 	// NULL/'' pre-cutover evidence, write the column explicitly.
 	b.WriteString("ALTER TABLE billing_event ALTER COLUMN serving_mode SET DEFAULT 'dedicated';\n")
 	return b.String()
-}
-
-// schemaDDLReference is the previously hand-maintained schema, kept ONLY as a
-// readable in-file description of what the loaded migrations produce. It is NOT
-// applied (ratingSchemaDDL loads the real files); if you edit it, you are editing
-// a comment. Drift between this and the migrations is now harmless.
-const schemaDDLReference = `
--- billing_event mirrors the v1 metering schema (migration 0001): the model NAME
--- lives in the model column, which the rater aliases to model_id (the price key).
-CREATE TABLE billing_event (
-    request_id        VARCHAR(255) PRIMARY KEY,
-    auth_id           VARCHAR(64),
-    -- resource_id (the deployment id) is NULLABLE here, mirroring migration 0001: the
-    -- rater fails closed on a NULL (counts it unattributable), it does not reject it.
-    resource_id       VARCHAR(64),
-    -- org_id (the deployment-owning org) is NULLABLE here, mirroring migration
-    -- d3a2b4c5e6f7: captured at meter time, carried onto rated_usage; a NULL is held
-    -- + screamed at push, never billed to a guessed org.
-    org_id            VARCHAR(64),
-    model             VARCHAR(255),
-    base_model        VARCHAR(255),
-    adapter           VARCHAR(255),
-    prompt_tokens     INTEGER NOT NULL DEFAULT 0,
-    cached_tokens     INTEGER NOT NULL DEFAULT 0,
-    completion_tokens INTEGER NOT NULL DEFAULT 0,
-    event_ts          TIMESTAMPTZ,
-    created_at        TIMESTAMPTZ NOT NULL DEFAULT now()
-);
-
-CREATE INDEX billing_event_rating_instant_ix
-    ON billing_event ((COALESCE(event_ts, created_at)));
-
-CREATE TABLE rated_usage (
-    id                      VARCHAR(32) PRIMARY KEY,
-    auth_id                 VARCHAR(64) NOT NULL,
-    resource_id             VARCHAR(64) NOT NULL,
-    -- org_id NULLABLE (unlike resource_id): carried from billing_event by the rater;
-    -- a NULL is the held-not-billed signal at push (migration d3a2b4c5e6f7).
-    org_id                  VARCHAR(64),
-    model_id                VARCHAR(255) NOT NULL,
-    window_start            TIMESTAMPTZ NOT NULL,
-    window_end              TIMESTAMPTZ NOT NULL,
-    prompt_tokens           BIGINT NOT NULL,
-    cached_tokens           BIGINT NOT NULL,
-    completion_tokens       BIGINT NOT NULL,
-    billable_prompt_tokens  BIGINT NOT NULL,
-    cost                    NUMERIC(20,9) NOT NULL,
-    applied_prompt_rate     NUMERIC(20,9) NOT NULL DEFAULT 0,
-    applied_cached_rate     NUMERIC(20,9) NOT NULL DEFAULT 0,
-    applied_completion_rate NUMERIC(20,9) NOT NULL DEFAULT 0,
-    event_count             BIGINT NOT NULL,
-    rated_at                TIMESTAMPTZ NOT NULL DEFAULT now(),
-    CONSTRAINT rated_usage_auth_resource_model_window_uq UNIQUE (auth_id, resource_id, model_id, window_start)
-);
-
--- Mirror the production indexes (migrations/0002_rating.sql): the auth-leading index
--- for billing queries and the window_start-leading index the reconcile DELETE needs (it
--- filters window_start alone; every auth-leading index leaves it trailing). No standalone
--- (resource_id, window_start) index — production ships none until the E2 per-deployment
--- reader exists (see the migration's NOTE), so the fixture omits it too.
-CREATE INDEX rated_usage_auth_id_window_start_ix ON rated_usage (auth_id, window_start);
-CREATE INDEX rated_usage_window_start_ix ON rated_usage (window_start);`
-
-// conformanceBook is the fixture price book shared by the conformance tests: base
-// "b" with its own rate, fine-tune "f" derived from "b", 1.5× premium.
-func conformanceBook() *PriceBook {
-	return newTestBook(
-		map[string]Rate3{"b": rate3("0.000005", "0.0000005", "0.00002")},
-		map[string]string{"f": "b"},
-		PolicyMultiplier, MustDec("1.5"), Dec{},
-	)
-}
-
-func TestIntegration_RateWindow_ConformsToOracle(t *testing.T) {
-	dsn := os.Getenv("PHOEBE_TEST_DATABASE_URL")
-	if dsn == "" {
-		t.Skip("PHOEBE_TEST_DATABASE_URL not set; skipping live-Postgres conformance")
-	}
-	ctx := context.Background()
-	db, err := sql.Open("pgx", dsn)
-	if err != nil {
-		t.Fatalf("open: %v", err)
-	}
-	defer db.Close()
-
-	const sch = "phoebe_rating_it"
-	exec(t, db, "DROP SCHEMA IF EXISTS "+sch+" CASCADE")
-	exec(t, db, "CREATE SCHEMA "+sch)
-	exec(t, db, "SET search_path TO "+sch)
-	defer func() { exec(t, db, "DROP SCHEMA IF EXISTS "+sch+" CASCADE") }()
-	exec(t, db, ratingSchemaDDL(t))
-
-	hour := mustTime("2026-06-08T10:00:00Z")
-	book := conformanceBook()
-
-	// Events: priced aborted base, priced derived, unpriced, unattributable. The
-	// aborted event proves disconnect never removes authoritative usage from
-	// money. Each priced/unpriced event carries a resource_id (E2 grain); the
-	// unattributable one has none.
-	events := []RatedEvent{
-		{ServingMode: "dedicated", AuthID: "a", ResourceID: "r", ModelID: "b", PromptTokens: 100, CachedTokens: 30, CompletionTokens: 50, Aborted: true, At: hour.Add(5 * time.Minute)},
-		{ServingMode: "dedicated", AuthID: "a", ResourceID: "r", ModelID: "f", PromptTokens: 100, CachedTokens: 0, CompletionTokens: 0, At: hour.Add(15 * time.Minute)},
-		{ServingMode: "dedicated", AuthID: "a", ResourceID: "r", ModelID: "unpriced", PromptTokens: 9, At: hour.Add(1 * time.Minute)},
-		{ServingMode: "dedicated", AuthID: "", ResourceID: "r", ModelID: "b", PromptTokens: 9, At: hour.Add(2 * time.Minute)},
-	}
-	for i, e := range events {
-		_, err := db.ExecContext(ctx,
-			`INSERT INTO billing_event (request_id, auth_id, resource_id, model, prompt_tokens, cached_tokens, completion_tokens, aborted, event_ts)
-			 VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)`,
-			fmt.Sprintf("req-%d", i), nullableStr(e.AuthID), nullableStr(e.ResourceID), nullableStr(e.ModelID),
-			e.PromptTokens, e.CachedTokens, e.CompletionTokens, e.Aborted, e.At)
-		if err != nil {
-			t.Fatalf("seed event %d: %v", i, err)
-		}
-	}
-
-	store := NewPostgresStore(db)
-
-	// Run the REAL rating SQL, priced from the YAML PriceBook. The anomaly counts
-	// ride the SAME statement.
-	res, err := store.RateWindow(ctx, book, hour, hour.Add(time.Hour))
-	if err != nil {
-		t.Fatalf("RateWindow: %v", err)
-	}
-	if res.RollupsWritten != 2 {
-		t.Fatalf("rollups = %d, want 2", res.RollupsWritten)
-	}
-	if res.UnpricedEvents != 1 || res.UnattributableEvents != 1 {
-		t.Fatalf("RateWindow anomaly counts = %d/%d, want 1/1 (single-snapshot accounting)", res.UnpricedEvents, res.UnattributableEvents)
-	}
-	// Full 6-bucket partition (ambiguous buckets are 0 in this fixture, but named so the
-	// invariant holds by construction, not by coincidence).
-	if got := res.EventsRated + res.UnpricedEvents + res.UnattributableEvents +
-		res.AmbiguousBaseEvents + res.AmbiguousOrgEvents + res.OwnerConflictEvents; got != int64(len(events)) {
-		t.Fatalf("rated+unpriced+unattr+ambiguous_base+ambiguous_org+owner_conflict = %d, want %d", got, len(events))
-	}
-
-	// Oracle: independent Rate() over the priced+attributable events; also assert the
-	// applied-rate columns equal the resolved rate (applied-rate-stored-on-row).
-	//
-	// QUANTIZE-THEN-MULTIPLY: production bills the 9dp-QUANTIZED per-token rate (the
-	// NUMERIC(20,9) projected into rating_price and frozen onto the row), so the
-	// oracle MUST be fed rate.Quantized() — feeding the un-quantized resolved rate
-	// would silently mis-calibrate the conformance guard against the day a sub-nano
-	// premium residue appears (see TestConformance_PremiumQuantizedBeforeBilling and
-	// the residue fixture below).
-	for _, e := range []RatedEvent{events[0], events[1]} {
-		rate, err := book.Resolve(e.ModelID)
-		if err != nil {
-			t.Fatalf("oracle resolve %s: %v", e.ModelID, err)
-		}
-		billed := rate.Quantized() // the rate production actually bills and stores
-		wantCost := Rate(e, billed).String()
-		var gotCost, gotPrompt, gotCached, gotCompletion string
-		err = db.QueryRowContext(ctx,
-			`SELECT cost::text, applied_prompt_rate::text, applied_cached_rate::text, applied_completion_rate::text
-			   FROM rated_usage WHERE auth_id=$1 AND model_id=$2 AND window_start=$3`,
-			e.AuthID, e.ModelID, hour).Scan(&gotCost, &gotPrompt, &gotCached, &gotCompletion)
-		if err != nil {
-			t.Fatalf("read rated_usage (%s): %v", e.ModelID, err)
-		}
-		if MustDec(gotCost).String() != wantCost {
-			t.Errorf("model %s: SQL cost = %s, oracle Rate() = %s", e.ModelID, gotCost, wantCost)
-		}
-		// The row carries the EXACT 9dp rate it was billed at (premium applied, then
-		// quantized).
-		if MustDec(gotPrompt).String() != billed.Prompt.String() ||
-			MustDec(gotCached).String() != billed.Cached.String() ||
-			MustDec(gotCompletion).String() != billed.Completion.String() {
-			t.Errorf("model %s applied rates = %s/%s/%s, want %s/%s/%s (frozen rate must equal quantized resolved rate)",
-				e.ModelID, gotPrompt, gotCached, gotCompletion,
-				billed.Prompt, billed.Cached, billed.Completion)
-		}
-	}
-
-	// E2 ATTRIBUTION: every written rollup carries the event's resource_id (the
-	// deployment id billing resolves the org from). The two priced rollups were seeded
-	// with resource_id 'r'.
-	var nWithResource, nTotal int
-	if err := db.QueryRowContext(ctx, `SELECT COUNT(*) FILTER (WHERE resource_id = 'r'), COUNT(*) FROM rated_usage`).
-		Scan(&nWithResource, &nTotal); err != nil {
-		t.Fatalf("read resource_id: %v", err)
-	}
-	if nWithResource != nTotal || nTotal != 2 {
-		t.Fatalf("rated_usage resource_id: %d of %d rows carry 'r', want all 2 (E2 attribution must be on every row)", nWithResource, nTotal)
-	}
-
-	// Deterministic surrogate ids: capture before the re-run.
-	idsBefore := readRatedUsageIDs(t, db)
-
-	// Idempotency (idempotent-rerun): re-run, totals unchanged, still 2 rows.
-	res2, err := store.RateWindow(ctx, book, hour, hour.Add(time.Hour))
-	if err != nil {
-		t.Fatalf("RateWindow re-run: %v", err)
-	}
-	if res2.RollupsWritten != 2 || MustDec(res2.TotalCost).String() != MustDec(res.TotalCost).String() {
-		t.Fatalf("re-run not idempotent: %+v vs %+v", res2, res)
-	}
-
-	idsAfter := readRatedUsageIDs(t, db)
-	if len(idsBefore) != len(idsAfter) {
-		t.Fatalf("row count changed across re-run: %d → %d", len(idsBefore), len(idsAfter))
-	}
-	for k, id := range idsBefore {
-		if idsAfter[k] != id {
-			t.Errorf("rollup %s id changed across re-run: %s → %s (id must be deterministic)", k, id, idsAfter[k])
-		}
-	}
-}
-
-// TestIntegration_ResourceIDGrainAndFailClosed runs the REAL SQL to pin the E2
-// resource_id grain in Postgres:
-//   - TWO deployments (distinct resource_id) of the SAME model by the SAME auth in the
-//     SAME hour produce TWO distinct rated_usage rows (NOT one summed row) — they may
-//     bill to different orgs, so collapsing them would mis-attribute revenue;
-//   - a NULL-resource_id event is UNATTRIBUTABLE: counted, never written (a row that
-//     can't name its deployment/org must never be billed). This is the live-Postgres
-//     proof of the fail-closed attribution partition.
-func TestIntegration_ResourceIDGrainAndFailClosed(t *testing.T) {
-	dsn := os.Getenv("PHOEBE_TEST_DATABASE_URL")
-	if dsn == "" {
-		t.Skip("PHOEBE_TEST_DATABASE_URL not set; skipping live-Postgres conformance")
-	}
-	ctx := context.Background()
-	db, err := sql.Open("pgx", dsn)
-	if err != nil {
-		t.Fatalf("open: %v", err)
-	}
-	defer db.Close()
-
-	const sch = "phoebe_rating_resource_it"
-	exec(t, db, "DROP SCHEMA IF EXISTS "+sch+" CASCADE")
-	exec(t, db, "CREATE SCHEMA "+sch)
-	exec(t, db, "SET search_path TO "+sch)
-	defer func() { exec(t, db, "DROP SCHEMA IF EXISTS "+sch+" CASCADE") }()
-	exec(t, db, ratingSchemaDDL(t))
-
-	hour := mustTime("2026-06-08T10:00:00Z")
-	book := newTestBook(
-		map[string]Rate3{"b": rate3("0.000005", "0", "0")},
-		nil, PolicyIdentity, Dec{}, Dec{},
-	)
-
-	// Two deployments of model "b" by auth "a" in the same hour, plus a NULL-resource_id
-	// event that must fail closed.
-	if _, err := db.ExecContext(ctx,
-		`INSERT INTO billing_event (request_id, auth_id, resource_id, model, prompt_tokens, completion_tokens, event_ts)
-		 VALUES ('d1','a','deploy-1','b',100,0,$1),
-		        ('d2','a','deploy-2','b',100,0,$1),
-		        ('dnull','a',NULL,'b',100,0,$1)`, hour.Add(5*time.Minute)); err != nil {
-		t.Fatalf("seed: %v", err)
-	}
-
-	store := NewPostgresStore(db)
-	res, err := store.RateWindow(ctx, book, hour, hour.Add(time.Hour))
-	if err != nil {
-		t.Fatalf("RateWindow: %v", err)
-	}
-
-	// Two deployments → two rollups; the NULL-resource_id event is unattributable.
-	if res.RollupsWritten != 2 || res.EventsRated != 2 {
-		t.Fatalf("rollups/events = %d/%d, want 2/2 (distinct deployments bill separately)", res.RollupsWritten, res.EventsRated)
-	}
-	if res.UnattributableEvents != 1 {
-		t.Fatalf("unattributable = %d, want 1 (the NULL-resource_id event must be counted, never billed)", res.UnattributableEvents)
-	}
-	// PARTITION holds with resource_id in the mix (all five buckets; org is 0 here).
-	if got := res.EventsRated + res.UnpricedEvents + res.UnattributableEvents +
-		res.AmbiguousBaseEvents + res.AmbiguousOrgEvents + res.OwnerConflictEvents; got != 3 {
-		t.Fatalf("rated+unpriced+unattr+ambiguous_base+ambiguous_org = %d, want 3 (all seeded events)", got)
-	}
-
-	// Exactly two rows, one per deployment; NONE with a NULL/empty resource_id.
-	var nRows, nNull int
-	if err := db.QueryRowContext(ctx,
-		`SELECT COUNT(*), COUNT(*) FILTER (WHERE resource_id IS NULL OR resource_id = '') FROM rated_usage`).
-		Scan(&nRows, &nNull); err != nil {
-		t.Fatalf("count rows: %v", err)
-	}
-	if nRows != 2 {
-		t.Fatalf("rated_usage rows = %d, want 2 (one per deployment)", nRows)
-	}
-	if nNull != 0 {
-		t.Fatalf("rated_usage has %d NULL/empty-resource_id rows — a row that can't name its deployment/org must NEVER be written", nNull)
-	}
-	for _, rid := range []string{"deploy-1", "deploy-2"} {
-		var n int
-		if err := db.QueryRowContext(ctx,
-			`SELECT COUNT(*) FROM rated_usage WHERE auth_id='a' AND resource_id=$1 AND model_id='b' AND window_start=$2`,
-			rid, hour).Scan(&n); err != nil {
-			t.Fatalf("count %s: %v", rid, err)
-		}
-		if n != 1 {
-			t.Fatalf("deployment %s rollups = %d, want exactly 1", rid, n)
-		}
-	}
-}
-
-// TestIntegration_AmbiguousOrgFailsLoud is the org twin of the ambiguous_base
-// fail-loud test: it exercises the three net-new org-rollup boundaries against real
-// Postgres (the oracle store can't model org, so this is their only executing coverage):
-//
-//   - TWO DISTINCT non-NULL orgs under one (auth,resource,model,hour) rollup → an E2
-//     attribution propagation bug: the rollup is WITHHELD (never billed to a guessed
-//     MAX org), counted in AmbiguousOrgEvents, and drives HasAnomaly/exit-nonzero.
-//   - PARTIAL-NULL (real org on some events, NULL on others — the header-rollout window)
-//     → MAX(org_id)/COUNT(DISTINCT) ignore the NULL, so the rollup is NOT ambiguous: it
-//     bills, carrying the single real org. This is the precise behavior the PR exists to
-//     make safe.
-//   - A CLEAN single-org rollup rates normally alongside.
-//
-// The base+org BOTH-ambiguous interaction (the strict-partition exclusivity clause) is
-// covered separately by TestIntegration_BothAmbiguousCountedOnceAsBase.
-func TestIntegration_AmbiguousOrgFailsLoud(t *testing.T) {
-	dsn := os.Getenv("PHOEBE_TEST_DATABASE_URL")
-	if dsn == "" {
-		t.Skip("PHOEBE_TEST_DATABASE_URL not set; skipping live-Postgres conformance")
-	}
-	ctx := context.Background()
-	db, err := sql.Open("pgx", dsn)
-	if err != nil {
-		t.Fatalf("open: %v", err)
-	}
-	defer db.Close()
-
-	const sch = "phoebe_rating_ambigorg_it"
-	exec(t, db, "DROP SCHEMA IF EXISTS "+sch+" CASCADE")
-	exec(t, db, "CREATE SCHEMA "+sch)
-	exec(t, db, "SET search_path TO "+sch)
-	defer func() { exec(t, db, "DROP SCHEMA IF EXISTS "+sch+" CASCADE") }()
-	exec(t, db, ratingSchemaDDL(t))
-
-	hour := mustTime("2026-06-08T10:00:00Z")
-	book := newTestBook(
-		map[string]Rate3{"b": rate3("0.000005", "0", "0")},
-		nil, PolicyIdentity, Dec{}, Dec{},
-	)
-
-	// Seed three rollups in one hour, INCLUDING the org_id column (the other tests omit
-	// it, so org is NULL there; here it is load-bearing):
-	//   resource 'amb'   : two events, DISTINCT non-NULL orgs 'org-1'/'org-2' → ambiguous.
-	//   resource 'clean' : one event, org 'org-3' → bills normally.
-	//   resource 'mixed' : two events, org 'org-4' and NULL → partial-NULL, bills as org-4.
-	if _, err := db.ExecContext(ctx,
-		`INSERT INTO billing_event (request_id, auth_id, resource_id, org_id, model, prompt_tokens, completion_tokens, event_ts)
-		 VALUES ('a1','a','amb','org-1','b',100,0,$1),
-		        ('a2','a','amb','org-2','b',100,0,$1),
-		        ('c1','a','clean','org-3','b',100,0,$1),
-		        ('m1','a','mixed','org-4','b',100,0,$1),
-		        ('m2','a','mixed',NULL,'b',100,0,$1)`, hour.Add(5*time.Minute)); err != nil {
-		t.Fatalf("seed: %v", err)
-	}
-
-	store := NewPostgresStore(db)
-	res, err := store.RateWindow(ctx, book, hour, hour.Add(time.Hour))
-	if err != nil {
-		t.Fatalf("RateWindow: %v", err)
-	}
-
-	// The two conflicting-org events are counted ambiguous (a nonzero count is what
-	// drives the rater's exit-nonzero / HasAnomaly path — that predicate wiring is pinned
-	// separately by TestResult_HasAmbiguousOrgDrivesAnomaly; here we assert the count the
-	// SQL produces, since RateWindow returns the store-level RateResult, not Result).
-	if res.AmbiguousOrgEvents != 2 {
-		t.Fatalf("AmbiguousOrgEvents = %d, want 2 (the two distinct-org events)", res.AmbiguousOrgEvents)
-	}
-	// clean (1 event) + mixed (2 events) rate; amb (2 events) is withheld.
-	if res.RollupsWritten != 2 || res.EventsRated != 3 {
-		t.Fatalf("rollups/events = %d/%d, want 2/3 (clean + mixed bill; amb withheld)", res.RollupsWritten, res.EventsRated)
-	}
-	// PARTITION over all five buckets (org now nonzero).
-	if got := res.EventsRated + res.UnpricedEvents + res.UnattributableEvents +
-		res.AmbiguousBaseEvents + res.AmbiguousOrgEvents + res.OwnerConflictEvents; got != 5 {
-		t.Fatalf("partition sum = %d, want 5 (all seeded events accounted exactly once)", got)
-	}
-
-	// The ambiguous rollup must NOT be billed to a guessed org.
-	var nAmb int
-	if err := db.QueryRowContext(ctx,
-		`SELECT COUNT(*) FROM rated_usage WHERE resource_id='amb'`).Scan(&nAmb); err != nil {
-		t.Fatalf("count amb: %v", err)
-	}
-	if nAmb != 0 {
-		t.Fatalf("rated_usage has %d rows for the two-org rollup — it must NEVER be billed to a guessed org", nAmb)
-	}
-
-	// The partial-NULL rollup bills, carrying the single REAL org (MAX ignored the NULL).
-	var mixedOrg sql.NullString
-	if err := db.QueryRowContext(ctx,
-		`SELECT org_id FROM rated_usage WHERE resource_id='mixed'`).Scan(&mixedOrg); err != nil {
-		t.Fatalf("read mixed org: %v", err)
-	}
-	if !mixedOrg.Valid || mixedOrg.String != "org-4" {
-		t.Fatalf("mixed rollup org_id = %v, want 'org-4' (partial-NULL must collapse to the real org, not split or null)", mixedOrg)
-	}
-	// And the clean rollup carries its org.
-	var cleanOrg sql.NullString
-	if err := db.QueryRowContext(ctx,
-		`SELECT org_id FROM rated_usage WHERE resource_id='clean'`).Scan(&cleanOrg); err != nil {
-		t.Fatalf("read clean org: %v", err)
-	}
-	if !cleanOrg.Valid || cleanOrg.String != "org-3" {
-		t.Fatalf("clean rollup org_id = %v, want 'org-3'", cleanOrg)
-	}
-}
-
-// TestIntegration_BothAmbiguousCountedOnceAsBase pins the strict-partition exclusivity
-// clause `WHERE ambiguous_org AND NOT ambiguous_base` (store.go) against real Postgres: a
-// single rollup that is SIMULTANEOUSLY base-ambiguous (one ft: id over two base_models)
-// AND org-ambiguous (two distinct non-NULL orgs) must be counted EXACTLY ONCE — as
-// ambiguous_base (the more specific E3 signal), NOT also as ambiguous_org. Without the
-// exclusivity clause this rollup would be double-counted and the partition identity
-// (rated + unpriced + unattr + ambiguous_base + ambiguous_org == total) would break. The
-// existing single-axis tests can't catch a dropped/inverted exclusivity guard because
-// neither trips both flags at once.
-func TestIntegration_BothAmbiguousCountedOnceAsBase(t *testing.T) {
-	dsn := os.Getenv("PHOEBE_TEST_DATABASE_URL")
-	if dsn == "" {
-		t.Skip("PHOEBE_TEST_DATABASE_URL not set; skipping live-Postgres conformance")
-	}
-	ctx := context.Background()
-	db, err := sql.Open("pgx", dsn)
-	if err != nil {
-		t.Fatalf("open: %v", err)
-	}
-	defer db.Close()
-
-	const sch = "phoebe_rating_bothambig_it"
-	exec(t, db, "DROP SCHEMA IF EXISTS "+sch+" CASCADE")
-	exec(t, db, "CREATE SCHEMA "+sch)
-	exec(t, db, "SET search_path TO "+sch)
-	defer func() { exec(t, db, "DROP SCHEMA IF EXISTS "+sch+" CASCADE") }()
-	exec(t, db, ratingSchemaDDL(t))
-
-	hour := mustTime("2026-06-08T10:00:00Z")
-	book := newTestBook(
-		map[string]Rate3{
-			"cheap/base":     rate3("0.000001", "0", "0"),
-			"expensive/base": rate3("0.000009", "0", "0"),
-		},
-		nil, PolicyMultiplier, MustDec("1.5"), Dec{},
-	)
-
-	// One ft:dupe rollup whose two events disagree on BOTH base_model AND org_id.
-	if _, err := db.ExecContext(ctx,
-		`INSERT INTO billing_event (request_id, auth_id, resource_id, org_id, model, base_model, prompt_tokens, completion_tokens, event_ts)
-		 VALUES ('b1','a','d1','org-1','ft:dupe','cheap/base',1000,0,$1),
-		        ('b2','a','d1','org-2','ft:dupe','expensive/base',1000,0,$1)`, hour.Add(5*time.Minute)); err != nil {
-		t.Fatalf("seed: %v", err)
-	}
-
-	store := NewPostgresStore(db)
-	res, err := store.RateWindow(ctx, book, hour, hour.Add(time.Hour))
-	if err != nil {
-		t.Fatalf("RateWindow: %v", err)
-	}
-
-	// Counted ONCE as base (the more specific signal), NOT also as org.
-	if res.AmbiguousBaseEvents != 2 {
-		t.Fatalf("AmbiguousBaseEvents = %d, want 2 (both events of the dupe rollup)", res.AmbiguousBaseEvents)
-	}
-	if res.AmbiguousOrgEvents != 0 {
-		t.Fatalf("AmbiguousOrgEvents = %d, want 0 (a both-ambiguous rollup counts ONLY as base — the exclusivity clause)", res.AmbiguousOrgEvents)
-	}
-	// Strict partition holds: no double-count.
-	if got := res.EventsRated + res.UnpricedEvents + res.UnattributableEvents +
-		res.AmbiguousBaseEvents + res.AmbiguousOrgEvents + res.OwnerConflictEvents; got != 2 {
-		t.Fatalf("partition sum = %d, want 2 (the rollup must be counted exactly once, not double)", got)
-	}
-	// And nothing was billed (the rollup is withheld).
-	if res.RollupsWritten != 0 {
-		t.Fatalf("RollupsWritten = %d, want 0 (a both-ambiguous rollup is never billed)", res.RollupsWritten)
-	}
-}
-
-// TestIntegration_CleanThenAmbiguousOrgReconciles pins the re-rate path where a rollup
-// billed CLEAN in run A becomes org-ambiguous in run B (a second deployment-org appeared
-// for the same resource in-window). Run B must: (a) reconcile-DELETE the prior clean row
-// (it can no longer be billed to a single org) AND (b) count it as ambiguous_org +
-// exit-nonzero. Both signals fire — the prior bill is removed and the conflict screams.
-// This documents the current "both fire" alert contract (see the open question on whether
-// a reconcile-delete should suppress the anomaly exit).
-func TestIntegration_CleanThenAmbiguousOrgReconciles(t *testing.T) {
-	dsn := os.Getenv("PHOEBE_TEST_DATABASE_URL")
-	if dsn == "" {
-		t.Skip("PHOEBE_TEST_DATABASE_URL not set; skipping live-Postgres conformance")
-	}
-	ctx := context.Background()
-	db, err := sql.Open("pgx", dsn)
-	if err != nil {
-		t.Fatalf("open: %v", err)
-	}
-	defer db.Close()
-
-	const sch = "phoebe_rating_clean2ambig_it"
-	exec(t, db, "DROP SCHEMA IF EXISTS "+sch+" CASCADE")
-	exec(t, db, "CREATE SCHEMA "+sch)
-	exec(t, db, "SET search_path TO "+sch)
-	defer func() { exec(t, db, "DROP SCHEMA IF EXISTS "+sch+" CASCADE") }()
-	exec(t, db, ratingSchemaDDL(t))
-
-	hour := mustTime("2026-06-08T10:00:00Z")
-	book := newTestBook(
-		map[string]Rate3{"b": rate3("0.000005", "0", "0")},
-		nil, PolicyIdentity, Dec{}, Dec{},
-	)
-	store := NewPostgresStore(db)
-
-	// Run A: one clean single-org rollup → billed.
-	if _, err := db.ExecContext(ctx,
-		`INSERT INTO billing_event (request_id, auth_id, resource_id, org_id, model, prompt_tokens, completion_tokens, event_ts)
-		 VALUES ('c1','a','d1','org-1','b',100,0,$1)`, hour.Add(5*time.Minute)); err != nil {
-		t.Fatalf("seed A: %v", err)
-	}
-	resA, err := store.RateWindow(ctx, book, hour, hour.Add(time.Hour))
-	if err != nil {
-		t.Fatalf("RateWindow A: %v", err)
-	}
-	if resA.RollupsWritten != 1 || resA.AmbiguousOrgEvents != 0 {
-		t.Fatalf("run A: rollups=%d ambiguous_org=%d, want 1/0 (clean)", resA.RollupsWritten, resA.AmbiguousOrgEvents)
-	}
-
-	// Run B: a SECOND org appears for the same resource in the same hour → ambiguous.
-	if _, err := db.ExecContext(ctx,
-		`INSERT INTO billing_event (request_id, auth_id, resource_id, org_id, model, prompt_tokens, completion_tokens, event_ts)
-		 VALUES ('c2','a','d1','org-2','b',100,0,$1)`, hour.Add(6*time.Minute)); err != nil {
-		t.Fatalf("seed B: %v", err)
-	}
-	resB, err := store.RateWindow(ctx, book, hour, hour.Add(time.Hour))
-	if err != nil {
-		t.Fatalf("RateWindow B: %v", err)
-	}
-	// The prior clean row is reconcile-DELETED (no longer billable to one org)...
-	if resB.ReconciledDeletions != 1 {
-		t.Fatalf("run B: reconciled deletions = %d, want 1 (the prior clean rollup must be removed)", resB.ReconciledDeletions)
-	}
-	// ...AND the conflict is counted + screams (both signals fire — current contract).
-	if resB.AmbiguousOrgEvents != 2 {
-		t.Fatalf("run B: ambiguous_org = %d, want 2 (the two conflicting-org events)", resB.AmbiguousOrgEvents)
-	}
-	// Nothing remains billed for the now-ambiguous rollup.
-	var n int
-	if err := db.QueryRowContext(ctx, `SELECT COUNT(*) FROM rated_usage WHERE resource_id='d1'`).Scan(&n); err != nil {
-		t.Fatalf("count: %v", err)
-	}
-	if n != 0 {
-		t.Fatalf("rated_usage still has %d rows for the now-ambiguous rollup — it must be un-billed", n)
-	}
-}
-
-// TestIntegration_OrgReRateConvergesNeverErases pins the ON CONFLICT org_id =
-// COALESCE(EXCLUDED.org_id, rated_usage.org_id) behavior against real Postgres — the
-// re-rate one-way-door the battery flagged:
-//
-//   - NULL -> real (CONVERGENCE): a rollup first rated before its org header was wired
-//     (org NULL) picks up the real org on a later re-rate. This is the intended rollout
-//     recovery.
-//   - real -> NULL (NEVER ERASE): a re-rate over a window whose snapshot has since LOST
-//     its org (e.g. a stale/forced replay) must NOT overwrite the prior good org with
-//     NULL — that would silently un-attribute already-billed usage. COALESCE keeps the
-//     existing org.
-func TestIntegration_OrgReRateConvergesNeverErases(t *testing.T) {
-	dsn := os.Getenv("PHOEBE_TEST_DATABASE_URL")
-	if dsn == "" {
-		t.Skip("PHOEBE_TEST_DATABASE_URL not set; skipping live-Postgres conformance")
-	}
-	ctx := context.Background()
-	db, err := sql.Open("pgx", dsn)
-	if err != nil {
-		t.Fatalf("open: %v", err)
-	}
-	defer db.Close()
-
-	const sch = "phoebe_rating_orgrerate_it"
-	exec(t, db, "DROP SCHEMA IF EXISTS "+sch+" CASCADE")
-	exec(t, db, "CREATE SCHEMA "+sch)
-	exec(t, db, "SET search_path TO "+sch)
-	defer func() { exec(t, db, "DROP SCHEMA IF EXISTS "+sch+" CASCADE") }()
-	exec(t, db, ratingSchemaDDL(t))
-
-	hour := mustTime("2026-06-08T10:00:00Z")
-	book := newTestBook(
-		map[string]Rate3{"b": rate3("0.000005", "0", "0")},
-		nil, PolicyIdentity, Dec{}, Dec{},
-	)
-	store := NewPostgresStore(db)
-	orgOf := func() sql.NullString {
-		var o sql.NullString
-		if err := db.QueryRowContext(ctx,
-			`SELECT org_id FROM rated_usage WHERE resource_id='d1'`).Scan(&o); err != nil {
-			t.Fatalf("read org: %v", err)
-		}
-		return o
-	}
-
-	// Run 1: the org header isn't wired yet → org_id NULL on the event.
-	if _, err := db.ExecContext(ctx,
-		`INSERT INTO billing_event (request_id, auth_id, resource_id, org_id, model, prompt_tokens, completion_tokens, event_ts)
-		 VALUES ('r1','a','d1',NULL,'b',100,0,$1)`, hour.Add(5*time.Minute)); err != nil {
-		t.Fatalf("seed run1: %v", err)
-	}
-	if _, err := store.RateWindow(ctx, book, hour, hour.Add(time.Hour)); err != nil {
-		t.Fatalf("RateWindow run1: %v", err)
-	}
-	if o := orgOf(); o.Valid {
-		t.Fatalf("after run1 org_id = %v, want NULL (header not yet wired)", o)
-	}
-
-	// Run 2: the producer is now injecting → the SAME hour re-rates with a real org.
-	// NULL -> real: COALESCE prefers the new non-NULL org.
-	if _, err := db.ExecContext(ctx,
-		`INSERT INTO billing_event (request_id, auth_id, resource_id, org_id, model, prompt_tokens, completion_tokens, event_ts)
-		 VALUES ('r2','a','d1','org-real','b',100,0,$1)`, hour.Add(6*time.Minute)); err != nil {
-		t.Fatalf("seed run2: %v", err)
-	}
-	if _, err := store.RateWindow(ctx, book, hour, hour.Add(time.Hour)); err != nil {
-		t.Fatalf("RateWindow run2: %v", err)
-	}
-	if o := orgOf(); !o.Valid || o.String != "org-real" {
-		t.Fatalf("after run2 org_id = %v, want 'org-real' (NULL->real convergence)", o)
-	}
-
-	// Reconciliation must use the same org-independent grain as the rater. The
-	// rollout-era NULL and real org are one accurately rated rollup, while the
-	// missing header remains visible as evidence rather than a false raw-only row.
-	var viewRows, rawAttempts, ratedAttempts, missingOrg, distinctOrgs int64
-	var attemptDelta, promptDelta, freshDelta, cachedDelta, completionDelta int64
-	if err := db.QueryRowContext(ctx, `
-		SELECT COUNT(*), MAX(raw_attempts), MAX(rated_attempts),
-		       MAX(missing_org_attempts), MAX(distinct_org_ids),
-		       MAX(attempt_delta), MAX(prompt_token_delta),
-		       MAX(fresh_input_token_delta), MAX(cached_token_delta),
-		       MAX(completion_token_delta)
-		FROM billing_reconciliation_hourly
-		WHERE window_start=$1 AND auth_id='a' AND resource_id='d1' AND model_id='b'`, hour).
-		Scan(&viewRows, &rawAttempts, &ratedAttempts, &missingOrg, &distinctOrgs,
-			&attemptDelta, &promptDelta, &freshDelta, &cachedDelta, &completionDelta); err != nil {
-		t.Fatalf("read reconciliation view: %v", err)
-	}
-	if viewRows != 1 || rawAttempts != 2 || ratedAttempts != 2 || missingOrg != 1 || distinctOrgs != 1 {
-		t.Fatalf("reconciliation grain = rows/raw/rated/missing-org/distinct-orgs %d/%d/%d/%d/%d, want 1/2/2/1/1",
-			viewRows, rawAttempts, ratedAttempts, missingOrg, distinctOrgs)
-	}
-	if attemptDelta != 0 || promptDelta != 0 || freshDelta != 0 || cachedDelta != 0 || completionDelta != 0 {
-		t.Fatalf("reconciliation deltas = attempts/prompt/fresh/cached/completion %d/%d/%d/%d/%d, want all zero",
-			attemptDelta, promptDelta, freshDelta, cachedDelta, completionDelta)
-	}
-
-	// Run 3: a stale replay drops the org headers again (only the NULL-org event is in
-	// range). real -> NULL must NOT erase the prior good org. We re-rate with ONLY the
-	// original NULL-org event present for this hour by deleting the real-org event first.
-	if _, err := db.ExecContext(ctx, `DELETE FROM billing_event WHERE request_id='r2'`); err != nil {
-		t.Fatalf("delete r2: %v", err)
-	}
-	if _, err := store.RateWindow(ctx, book, hour, hour.Add(time.Hour)); err != nil {
-		t.Fatalf("RateWindow run3: %v", err)
-	}
-	if o := orgOf(); !o.Valid || o.String != "org-real" {
-		t.Fatalf("after run3 org_id = %v, want 'org-real' preserved (a stale NULL replay must NEVER erase a known org)", o)
-	}
-}
-
-// TestIntegration_ReRatePreservesHistoricalPrice proves the invoice-grade price
-// one-way door: changing the current YAML book after an hour was first rated may
-// incorporate late events, but every token in that existing rollup continues to
-// use the originally applied rates.
-func TestIntegration_ReRatePreservesHistoricalPrice(t *testing.T) {
-	dsn := os.Getenv("PHOEBE_TEST_DATABASE_URL")
-	if dsn == "" {
-		t.Skip("PHOEBE_TEST_DATABASE_URL not set; skipping live-Postgres conformance")
-	}
-	ctx := context.Background()
-	db, err := sql.Open("pgx", dsn)
-	if err != nil {
-		t.Fatalf("open: %v", err)
-	}
-	defer db.Close()
-
-	const sch = "phoebe_rating_hourly_book_it"
-	exec(t, db, "DROP SCHEMA IF EXISTS "+sch+" CASCADE")
-	exec(t, db, "CREATE SCHEMA "+sch)
-	exec(t, db, "SET search_path TO "+sch)
-	defer func() { exec(t, db, "DROP SCHEMA IF EXISTS "+sch+" CASCADE") }()
-	exec(t, db, ratingSchemaDDL(t))
-
-	hour := mustTime("2026-06-08T10:00:00Z")
-	store := NewPostgresStore(db)
-	// The prices EFFECTIVE DURING `hour`. Re-rating that hour always resolves these,
-	// because the caller asks the manager for the book effective during the hour it
-	// is rating — not for today's book. newBook is what the price list says LATER;
-	// it must never touch this hour, and the mechanism that guarantees that is the
-	// per-hour lookup, not a local freeze table (which no longer exists).
-	oldBook := newTestBook(map[string]Rate3{"b": rate3("0.000001", "0", "0")}, nil, PolicyIdentity, Dec{}, Dec{})
-	newBook := newTestBook(map[string]Rate3{"b": rate3("0.000009", "0", "0")}, nil, PolicyIdentity, Dec{}, Dec{})
-
-	// bookForHour models the manager's effective-dated series: this hour always
-	// resolves to the rates in force during it.
-	bookForHour := func(_ context.Context, hourStart time.Time) (*PriceBook, error) {
-		if hourStart.UTC().Equal(hour) {
-			return oldBook, nil
-		}
-		return newBook, nil
-	}
-
-	if _, err := db.ExecContext(ctx,
-		`INSERT INTO billing_event (request_id, auth_id, resource_id, org_id, model, prompt_tokens, event_ts)
-		 VALUES ('p1','a','d1','org-1','b',100,$1)`, hour.Add(5*time.Minute)); err != nil {
-		t.Fatalf("seed first event: %v", err)
-	}
-	if _, err := store.RateWindow(ctx, oldBook, hour, hour.Add(time.Hour)); err != nil {
-		t.Fatalf("initial rate: %v", err)
-	}
-
-	// Price changes, then a delayed event from the already-rated hour arrives.
-	if _, err := db.ExecContext(ctx,
-		`INSERT INTO billing_event (request_id, auth_id, resource_id, org_id, model, prompt_tokens, event_ts)
-		 VALUES ('p2','a','d1','org-1','b',100,$1)`, hour.Add(6*time.Minute)); err != nil {
-		t.Fatalf("seed late event: %v", err)
-	}
-	// Re-rate AFTER the price list changed. The rater asks for this hour's prices,
-	// so the late event bills at the hour's own rate — today's higher rate never
-	// reaches it.
-	rater := New(store, nil, logging.New(logging.ERROR)).WithBookForHour(bookForHour)
-	if _, err := rater.RunWindow(ctx, hour, hour.Add(time.Hour), true); err != nil {
-		t.Fatalf("re-rate after a price change: %v", err)
-	}
-
-	var tokens int64
-	var rate, cost string
-	if err := db.QueryRowContext(ctx,
-		`SELECT prompt_tokens, applied_prompt_rate::text, cost::text
-		 FROM rated_usage WHERE auth_id='a' AND resource_id='d1' AND model_id='b' AND window_start=$1`,
-		hour).Scan(&tokens, &rate, &cost); err != nil {
-		t.Fatalf("read frozen rollup: %v", err)
-	}
-	if tokens != 200 || MustDec(rate).String() != "0.000001000" || MustDec(cost).String() != "0.000200000" {
-		t.Fatalf("frozen rollup tokens/rate/cost = %d/%s/%s, want 200/0.000001000/0.000200000", tokens, rate, cost)
-	}
-
-	// Even a reconcile deletion must not erase the historical price decision.
-	if _, err := db.ExecContext(ctx, `DELETE FROM billing_event WHERE request_id IN ('p1','p2')`); err != nil {
-		t.Fatalf("remove raw events: %v", err)
-	}
-	if res, err := rater.RunWindow(ctx, hour, hour.Add(time.Hour), true); err != nil {
-		t.Fatalf("reconcile delete: %v", err)
-	} else if res.ReconciledDeletions != 1 {
-		t.Fatalf("reconcile deletions = %d, want 1", res.ReconciledDeletions)
-	}
-	if _, err := db.ExecContext(ctx,
-		`INSERT INTO billing_event (request_id, auth_id, resource_id, org_id, model, prompt_tokens, event_ts)
-		 VALUES ('p3','a','d1','org-1','b',100,$1)`, hour.Add(7*time.Minute)); err != nil {
-		t.Fatalf("seed recovered event: %v", err)
-	}
-	// Recreate the rollup after the reconcile delete. Without a local price freeze,
-	// the hour STILL prices at its own rates — the deleted-and-recreated rollup
-	// cannot pick up the newer rate, because the price is a function of the hour.
-	if _, err := rater.RunWindow(ctx, hour, hour.Add(time.Hour), true); err != nil {
-		t.Fatalf("recreate after reconcile delete: %v", err)
-	}
-	if err := db.QueryRowContext(ctx,
-		`SELECT prompt_tokens, applied_prompt_rate::text, cost::text
-		 FROM rated_usage WHERE auth_id='a' AND resource_id='d1' AND model_id='b' AND window_start=$1`,
-		hour).Scan(&tokens, &rate, &cost); err != nil {
-		t.Fatalf("read recreated frozen rollup: %v", err)
-	}
-	if tokens != 100 || MustDec(rate).String() != "0.000001000" || MustDec(cost).String() != "0.000100000" {
-		t.Fatalf("recreated rollup tokens/rate/cost = %d/%s/%s, want 100/0.000001000/0.000100000", tokens, rate, cost)
-	}
-}
-
-// TestIntegration_MissingUsageAttemptIsNeverBilled: a failed attempt with no engine
-// usage is retained for audit, but must never become money — it is counted in the
-// missing-usage partition, not as unattributable, and writes no rollup.
-func TestIntegration_MissingUsageAttemptIsNeverBilled(t *testing.T) {
-	dsn := os.Getenv("PHOEBE_TEST_DATABASE_URL")
-	if dsn == "" {
-		t.Skip("PHOEBE_TEST_DATABASE_URL not set; skipping live-Postgres conformance")
-	}
-	ctx := context.Background()
-	db, err := sql.Open("pgx", dsn)
-	if err != nil {
-		t.Fatalf("open: %v", err)
-	}
-	defer db.Close()
-
-	const sch = "phoebe_rating_missingusage_it"
-	exec(t, db, "DROP SCHEMA IF EXISTS "+sch+" CASCADE")
-	exec(t, db, "CREATE SCHEMA "+sch)
-	exec(t, db, "SET search_path TO "+sch)
-	defer func() { exec(t, db, "DROP SCHEMA IF EXISTS "+sch+" CASCADE") }()
-	exec(t, db, ratingSchemaDDL(t))
-
-	hour := mustTime("2026-06-08T10:00:00Z")
-	store := NewPostgresStore(db)
-	book := newTestBook(map[string]Rate3{"b": rate3("0.000009", "0", "0")}, nil, PolicyIdentity, Dec{}, Dec{})
-
-	// A failed attempt with no engine usage is retained for audit, but is neither
-	// billed as a zero-token rollup nor mislabeled as unattributable when model is
-	// unavailable because no upstream response arrived.
-	if _, err := db.ExecContext(ctx,
-		`INSERT INTO billing_event
-		 (request_id, auth_id, resource_id, org_id, model, usage_found, status_code, event_ts)
-		 VALUES ('failed-no-usage','a','d2','org-1',NULL,FALSE,502,$1)`, hour.Add(8*time.Minute)); err != nil {
-		t.Fatalf("seed missing-usage attempt: %v", err)
-	}
-	missingRes, err := store.RateWindow(ctx, book, hour, hour.Add(time.Hour))
-	if err != nil {
-		t.Fatalf("rate missing-usage attempt: %v", err)
-	}
-	// The anomaly counts strictly PARTITION the window's events (see store.go:
-	// events_rated + missing_usage + ... == total in-window events), and
-	// events_rated sums event_count over the UPSERTED rollups. A missing-usage
-	// attempt writes no rollup, so it is counted ONCE, as missing usage, and
-	// rated is 0. Expecting rated=1 here would double-count the same event in two
-	// buckets and contradict the "no rollups written" assertion just below.
-	if missingRes.MissingUsageEvents != 1 || missingRes.UnattributableEvents != 0 || missingRes.EventsRated != 0 {
-		t.Fatalf("missing-usage partition = missing %d / unattributable %d / rated %d, want 1/0/0",
-			missingRes.MissingUsageEvents, missingRes.UnattributableEvents, missingRes.EventsRated)
-	}
-	var failedRollups int
-	if err := db.QueryRowContext(ctx, `SELECT COUNT(*) FROM rated_usage WHERE resource_id='d2'`).Scan(&failedRollups); err != nil {
-		t.Fatalf("count failed-attempt rollups: %v", err)
-	}
-	if failedRollups != 0 {
-		t.Fatalf("failed-attempt rollups = %d, want 0 (missing usage must not become money)", failedRollups)
-	}
-}
-
-// TestIntegration_InvalidUsageEvidenceNeverEntersMoney proves malformed engine
-// evidence remains insertable and queryable after the invoice-grade migration,
-// while the rater partitions it into InvalidUsageEvents and writes no money.
-func TestIntegration_InvalidUsageEvidenceNeverEntersMoney(t *testing.T) {
-	dsn := os.Getenv("PHOEBE_TEST_DATABASE_URL")
-	if dsn == "" {
-		t.Skip("PHOEBE_TEST_DATABASE_URL not set; skipping live-Postgres conformance")
-	}
-	ctx := context.Background()
-	db, err := sql.Open("pgx", dsn)
-	if err != nil {
-		t.Fatalf("open: %v", err)
-	}
-	defer db.Close()
-
-	const sch = "phoebe_rating_invalid_it"
-	exec(t, db, "DROP SCHEMA IF EXISTS "+sch+" CASCADE")
-	exec(t, db, "CREATE SCHEMA "+sch)
-	exec(t, db, "SET search_path TO "+sch)
-	defer func() { exec(t, db, "DROP SCHEMA IF EXISTS "+sch+" CASCADE") }()
-
-	apply := func(name string) {
-		t.Helper()
-		ddl, readErr := os.ReadFile("../../migrations/" + name)
-		if readErr != nil {
-			t.Fatalf("read migration %s: %v", name, readErr)
-		}
-		exec(t, db, string(ddl))
-	}
-	for _, name := range []string{
-		"0001_billing_event.up.sql",
-		"0002_rating.up.sql",
-		"0004_billing_event_serving_mode.up.sql",
-		"0005_invoice_grade_attempts.up.sql",
-		"0006_rollup_grain.up.sql",
-		"0008_billing_event_topology.up.sql",
-		"0009_rollup_grain_graph_revision.up.sql",
-		"0010_rated_usage_identity.up.sql",
-	} {
-		apply(name)
-	}
-
-	hour := mustTime("2026-06-08T10:00:00Z")
-	// This newly received authoritative row deliberately violates cached <=
-	// prompt. The raw ledger must retain it rather than rejecting the attempt.
-	if _, err := db.ExecContext(ctx,
-		`INSERT INTO billing_event
-		 (request_id, auth_id, resource_id, org_id, model, prompt_tokens, cached_tokens, completion_tokens, usage_found, event_ts)
-		 VALUES ('engine-invalid','a','d1','org-1','b',10,40,0,TRUE,$1)`, hour.Add(5*time.Minute)); err != nil {
-		t.Fatalf("insert invalid engine evidence: %v", err)
-	}
-
-	book := newTestBook(map[string]Rate3{"b": rate3("0.000005", "0.000001", "0")}, nil, PolicyIdentity, Dec{}, Dec{})
-	res, err := NewPostgresStore(db).RateWindow(ctx, book, hour, hour.Add(time.Hour))
-	if err != nil {
-		t.Fatalf("RateWindow: %v", err)
-	}
-	if res.InvalidUsageEvents != 1 || res.EventsRated != 0 || res.RollupsWritten != 0 {
-		t.Fatalf("invalid result = invalid/rated/rollups %d/%d/%d, want 1/0/0",
-			res.InvalidUsageEvents, res.EventsRated, res.RollupsWritten)
-	}
-	var rawRows, invalidAttempts, ratedRows int64
-	if err := db.QueryRowContext(ctx, `SELECT COUNT(*) FROM billing_event`).Scan(&rawRows); err != nil {
-		t.Fatalf("count raw evidence: %v", err)
-	}
-	if err := db.QueryRowContext(ctx, `SELECT COALESCE(SUM(invalid_usage_attempts),0) FROM billing_reconciliation_hourly`).Scan(&invalidAttempts); err != nil {
-		t.Fatalf("read invalid reconciliation evidence: %v", err)
-	}
-	if err := db.QueryRowContext(ctx, `SELECT COUNT(*) FROM rated_usage`).Scan(&ratedRows); err != nil {
-		t.Fatalf("count rated rows: %v", err)
-	}
-	if rawRows != 1 || invalidAttempts != 1 || ratedRows != 0 {
-		t.Fatalf("invalid persistence = raw/invalid/rated %d/%d/%d, want 1/1/0", rawRows, invalidAttempts, ratedRows)
-	}
-}
-
-// readRatedUsageIDs returns natural-key → id for every rated_usage row.
-func readRatedUsageIDs(t *testing.T, db *sql.DB) map[string]string {
-	t.Helper()
-	rows, err := db.Query(`SELECT auth_id || '|' || owner_type || '|' || owner_id || '|' || resource_id || '|' || model_id || '|' || serving_mode || '|' || extract(epoch FROM window_start)::bigint::text, id FROM rated_usage`)
-	if err != nil {
-		t.Fatalf("read rated_usage ids: %v", err)
-	}
-	defer rows.Close()
-	out := map[string]string{}
-	for rows.Next() {
-		var k, id string
-		if err := rows.Scan(&k, &id); err != nil {
-			t.Fatalf("scan: %v", err)
-		}
-		out[k] = id
-	}
-	if err := rows.Err(); err != nil {
-		t.Fatalf("rows: %v", err)
-	}
-	return out
-}
-
-// TestConformance_PremiumQuantizedBeforeBilling is the applied-rate self-audit
-// guard. The fine-tune premium is applied to the EXACT base rate, then the FINAL
-// per-token rate is quantized to 9dp (the NUMERIC(20,9) the row can store and bills
-// from) — there is no sub-nano residue left to diverge on. This fixture uses a base
-// 1-nano rate × 1.5 = 0.0000000015 → rounds to 0.000000002, the rate that bills.
-//
-// It asserts three things that together mean the row is self-auditing:
-//   - the APPLIED rate stored on the row is the 9dp-quantized premium rate
-//     (0.000000002), NOT the un-storable exact 0.0000000015;
-//   - the cost equals that stored rate × tokens (reconstructable from the row);
-//   - the oracle (premium-then-quantize) matches the SQL row-for-row.
-func TestConformance_PremiumQuantizedBeforeBilling(t *testing.T) {
-	dsn := os.Getenv("PHOEBE_TEST_DATABASE_URL")
-	if dsn == "" {
-		t.Skip("PHOEBE_TEST_DATABASE_URL not set; skipping live-Postgres conformance")
-	}
-	ctx := context.Background()
-	db, err := sql.Open("pgx", dsn)
-	if err != nil {
-		t.Fatalf("open: %v", err)
-	}
-	defer db.Close()
-
-	const sch = "phoebe_rating_quant_it"
-	exec(t, db, "DROP SCHEMA IF EXISTS "+sch+" CASCADE")
-	exec(t, db, "CREATE SCHEMA "+sch)
-	exec(t, db, "SET search_path TO "+sch)
-	defer func() { exec(t, db, "DROP SCHEMA IF EXISTS "+sch+" CASCADE") }()
-	exec(t, db, ratingSchemaDDL(t))
-
-	hour := mustTime("2026-06-08T10:00:00Z")
-
-	// Base "b": prompt_price = 1 nano. Derived "f": 1.5× → exact 0.0000000015 per
-	// prompt token, which quantizes to 0.000000002 (half-up) before billing.
-	book := newTestBook(
-		map[string]Rate3{"b": rate3("0.000000001", "0", "0")},
-		map[string]string{"f": "b"},
-		PolicyMultiplier, MustDec("1.5"), Dec{},
-	)
-
-	// Three single-prompt-token events for "f" in ONE rollup. Cost = stored rate
-	// (0.000000002) × 3 = 0.000000006 — exact, reconstructable from the row.
-	events := []RatedEvent{
-		{ServingMode: "dedicated", AuthID: "a", ModelID: "f", PromptTokens: 1, At: hour.Add(1 * time.Minute)},
-		{ServingMode: "dedicated", AuthID: "a", ModelID: "f", PromptTokens: 1, At: hour.Add(2 * time.Minute)},
-		{ServingMode: "dedicated", AuthID: "a", ModelID: "f", PromptTokens: 1, At: hour.Add(3 * time.Minute)},
-	}
-	for i, e := range events {
-		if _, err := db.ExecContext(ctx,
-			`INSERT INTO billing_event (request_id, auth_id, resource_id, model, prompt_tokens, cached_tokens, completion_tokens, event_ts)
-			 VALUES ($1,$2,'r',$3,$4,$5,$6,$7)`,
-			fmt.Sprintf("q-req-%d", i), e.AuthID, e.ModelID,
-			e.PromptTokens, e.CachedTokens, e.CompletionTokens, e.At); err != nil {
-			t.Fatalf("seed event %d: %v", i, err)
-		}
-	}
-
-	store := NewPostgresStore(db)
-	if _, err := store.RateWindow(ctx, book, hour, hour.Add(time.Hour)); err != nil {
-		t.Fatalf("RateWindow: %v", err)
-	}
-
-	var gotCost, gotAppliedPrompt string
-	if err := db.QueryRowContext(ctx,
-		`SELECT cost::text, applied_prompt_rate::text FROM rated_usage WHERE auth_id='a' AND model_id='f' AND window_start=$1`,
-		hour).Scan(&gotCost, &gotAppliedPrompt); err != nil {
-		t.Fatalf("read rated_usage: %v", err)
-	}
-
-	// Oracle: premium-then-quantize is what bills.
-	resolved, err := book.Resolve("f")
-	if err != nil {
-		t.Fatalf("oracle resolve: %v", err)
-	}
-	billed := resolved.Quantized()
-	if billed.Prompt.String() != "0.000000002" {
-		t.Fatalf("quantized premium rate = %s, want 0.000000002 (exact 0.0000000015 rounds half-up)", billed.Prompt)
-	}
-	// Applied rate frozen on the row must be the 9dp-quantized rate.
-	if MustDec(gotAppliedPrompt).String() != "0.000000002" {
-		t.Errorf("applied_prompt_rate = %s, want 0.000000002 (the rate that bills, stored on the row)", gotAppliedPrompt)
-	}
-	// Cost = stored rate × 3 tokens = 0.000000006, reconstructable from the row.
-	wantCost := billed.Prompt.MulInt(3).Round(moneyScale).String()
-	if MustDec(gotCost).String() != wantCost {
-		t.Errorf("SQL cost = %s, want %s (stored 9dp rate × tokens)", gotCost, wantCost)
-	}
-}
-
-// TestConformance_OracleQuantizesBeforeMultiply_OnResidue is the proven-teeth guard
-// for the ratified quantize-then-multiply spec. It rates a sub-nano-residue
-// fine-tune through the REAL SQL, then asserts the SQL cost equals the QUANTIZED
-// oracle — AND demonstrates the test has teeth by computing the UN-quantized oracle
-// cost the same way the old (mis-calibrated) oracle did and proving it DISAGREES
-// with what the SQL bills. If the oracle ever reverts to feeding Rate() the
-// un-quantized rate, this test goes RED, so the latent miscalibration can never be
-// reintroduced silently.
-//
-// Residue: base prompt 0.000000001 (1 nano) × 1.5 premium = 0.0000000015 (exact).
-//   - quantize-then-multiply (production + ratified oracle): rate → 0.000000002,
-//     cost over N tokens = 0.000000002 × N.
-//   - sum-then-round (the OLD oracle, un-quantized rate): cost = 0.0000000015 × N
-//     rounded once. For N=3: 0.0000000045 → 0.000000005 (rounds DOWN to 5 nano),
-//     vs production's 0.000000006 (6 nano). They DIFFER — that gap is the teeth.
-func TestConformance_OracleQuantizesBeforeMultiply_OnResidue(t *testing.T) {
-	dsn := os.Getenv("PHOEBE_TEST_DATABASE_URL")
-	if dsn == "" {
-		t.Skip("PHOEBE_TEST_DATABASE_URL not set; skipping live-Postgres conformance")
-	}
-	ctx := context.Background()
-	db, err := sql.Open("pgx", dsn)
-	if err != nil {
-		t.Fatalf("open: %v", err)
-	}
-	defer db.Close()
-
-	const sch = "phoebe_rating_residue_it"
-	exec(t, db, "DROP SCHEMA IF EXISTS "+sch+" CASCADE")
-	exec(t, db, "CREATE SCHEMA "+sch)
-	exec(t, db, "SET search_path TO "+sch)
-	defer func() { exec(t, db, "DROP SCHEMA IF EXISTS "+sch+" CASCADE") }()
-	exec(t, db, ratingSchemaDDL(t))
-
-	hour := mustTime("2026-06-08T10:00:00Z")
-	book := newTestBook(
-		map[string]Rate3{"b": rate3("0.000000001", "0", "0")},
-		map[string]string{"f": "b"},
-		PolicyMultiplier, MustDec("1.5"), Dec{},
-	)
-
-	// Three single-prompt-token "f" events in one rollup (N=3, where the two
-	// rounding models DIVERGE: 6 nano vs 5 nano).
-	events := []RatedEvent{
-		{ServingMode: "dedicated", AuthID: "a", ModelID: "f", PromptTokens: 1, At: hour.Add(1 * time.Minute)},
-		{ServingMode: "dedicated", AuthID: "a", ModelID: "f", PromptTokens: 1, At: hour.Add(2 * time.Minute)},
-		{ServingMode: "dedicated", AuthID: "a", ModelID: "f", PromptTokens: 1, At: hour.Add(3 * time.Minute)},
-	}
-	for i, e := range events {
-		if _, err := db.ExecContext(ctx,
-			`INSERT INTO billing_event (request_id, auth_id, resource_id, model, prompt_tokens, cached_tokens, completion_tokens, event_ts)
-			 VALUES ($1,$2,'r',$3,$4,$5,$6,$7)`,
-			fmt.Sprintf("res-req-%d", i), e.AuthID, e.ModelID,
-			e.PromptTokens, e.CachedTokens, e.CompletionTokens, e.At); err != nil {
-			t.Fatalf("seed event %d: %v", i, err)
-		}
-	}
-
-	store := NewPostgresStore(db)
-	if _, err := store.RateWindow(ctx, book, hour, hour.Add(time.Hour)); err != nil {
-		t.Fatalf("RateWindow: %v", err)
-	}
-
-	var gotCost string
-	if err := db.QueryRowContext(ctx,
-		`SELECT cost::text FROM rated_usage WHERE auth_id='a' AND model_id='f' AND window_start=$1`,
-		hour).Scan(&gotCost); err != nil {
-		t.Fatalf("read rated_usage: %v", err)
-	}
-
-	resolved, err := book.Resolve("f")
-	if err != nil {
-		t.Fatalf("oracle resolve: %v", err)
-	}
-
-	// The RATIFIED oracle: quantize the per-token rate, THEN multiply. This is what
-	// the SQL must match.
-	quantized := Rate(events[0], resolved.Quantized()).
-		Add(Rate(events[1], resolved.Quantized())).
-		Add(Rate(events[2], resolved.Quantized())).String()
-	if quantized != "0.000000006" {
-		t.Fatalf("quantized oracle cost = %s, want 0.000000006 (0.000000002 × 3)", quantized)
-	}
-	if MustDec(gotCost).String() != quantized {
-		t.Errorf("SQL cost = %s, quantized oracle = %s — production and the ratified oracle must agree", gotCost, quantized)
-	}
-
-	// TEETH: the OLD, mis-calibrated oracle fed Rate() the UN-quantized resolved
-	// rate (sum-then-round). Recompute it that way and prove it DISAGREES with what
-	// the SQL bills — so a revert to the un-quantized oracle would flip this test RED.
-	unquantized := rateExact(events[0], resolved).
-		Add(rateExact(events[1], resolved)).
-		Add(rateExact(events[2], resolved)).Round(moneyScale).String()
-	if unquantized != "0.000000005" {
-		t.Fatalf("un-quantized oracle cost = %s, want 0.000000005 (0.0000000045 rounds half-up to 5 nano)", unquantized)
-	}
-	if unquantized == MustDec(gotCost).String() {
-		t.Fatal("un-quantized oracle MATCHES the SQL on a residue fixture — the conformance guard has no teeth (the spec divergence is undetectable)")
-	}
-}
-
-// TestIntegration_FineTunePricesViaBaseModel runs the REAL SQL over fine-tune events
-// that price through the event-carried base_model (E3): an ft:<checkpoint> model the
-// price file never names, but whose base_model IS a priced base, bills at base ×
-// premium. It also pins the fail-loud invariant in SQL — an ft: event with a NULL
-// base_model lands in UNPRICED (never $0). This is the production fine-tune path now
-// that base_model rides on billing_event.
-func TestIntegration_FineTunePricesViaBaseModel(t *testing.T) {
-	dsn := os.Getenv("PHOEBE_TEST_DATABASE_URL")
-	if dsn == "" {
-		t.Skip("PHOEBE_TEST_DATABASE_URL not set; skipping live-Postgres conformance")
-	}
-	ctx := context.Background()
-	db, err := sql.Open("pgx", dsn)
-	if err != nil {
-		t.Fatalf("open: %v", err)
-	}
-	defer db.Close()
-
-	const sch = "phoebe_rating_basemodel_it"
-	exec(t, db, "DROP SCHEMA IF EXISTS "+sch+" CASCADE")
-	exec(t, db, "CREATE SCHEMA "+sch)
-	exec(t, db, "SET search_path TO "+sch)
-	defer func() { exec(t, db, "DROP SCHEMA IF EXISTS "+sch+" CASCADE") }()
-	exec(t, db, ratingSchemaDDL(t))
-
-	hour := mustTime("2026-06-08T10:00:00Z")
-	// File declares ONLY the base; the ft: checkpoint id is not listed. 1.5× premium.
-	book := newTestBook(
-		map[string]Rate3{"meta-llama/Llama-3.1-8B-Instruct": rate3("0.000004", "0", "0")},
-		nil, PolicyMultiplier, MustDec("1.5"), Dec{},
-	)
-
-	type seed struct {
-		req, model, baseModel string
-		prompt                int64
-	}
-	seeds := []seed{
-		// Priced via base_model: ft: id + a known base → base × 1.5.
-		{"ft-ok", "ft:9f8e7d6c5b4a", "meta-llama/Llama-3.1-8B-Instruct", 1000},
-		// FAIL LOUD: ft: id with NULL base_model → unpriced (propagation bug, never $0).
-		{"ft-nobase", "ft:cafebabe", "", 1000},
-		// FAIL LOUD: ft: id with an unknown base_model → unpriced.
-		{"ft-badbase", "ft:0badf00d", "some/unpriced-base", 1000},
-	}
-	for _, s := range seeds {
-		if _, err := db.ExecContext(ctx,
-			`INSERT INTO billing_event (request_id, auth_id, resource_id, model, base_model, prompt_tokens, completion_tokens, event_ts)
-			 VALUES ($1,'a','r',$2,$3,$4,0,$5)`,
-			s.req, s.model, nullableStr(s.baseModel), s.prompt, hour.Add(5*time.Minute)); err != nil {
-			t.Fatalf("seed %s: %v", s.req, err)
-		}
-	}
-
-	store := NewPostgresStore(db)
-	res, err := store.RateWindow(ctx, book, hour, hour.Add(time.Hour))
-	if err != nil {
-		t.Fatalf("RateWindow: %v", err)
-	}
-
-	// Exactly one rollup (the priced fine-tune); two unpriced (no/unknown base_model).
-	if res.RollupsWritten != 1 || res.EventsRated != 1 {
-		t.Fatalf("rollups/events = %d/%d, want 1/1 (only ft-ok prices)", res.RollupsWritten, res.EventsRated)
-	}
-	if res.UnpricedEvents != 2 {
-		t.Fatalf("unpriced = %d, want 2 (ft-nobase + ft-badbase must scream, never $0)", res.UnpricedEvents)
-	}
-
-	// The priced fine-tune billed at base × premium, with the derived rate on the row.
-	var gotCost, gotApplied string
-	if err := db.QueryRowContext(ctx,
-		`SELECT cost::text, applied_prompt_rate::text FROM rated_usage WHERE model_id='ft:9f8e7d6c5b4a' AND window_start=$1`,
-		hour).Scan(&gotCost, &gotApplied); err != nil {
-		t.Fatalf("read rated_usage: %v", err)
-	}
-	if MustDec(gotApplied).String() != "0.000006000" {
-		t.Errorf("applied_prompt_rate = %s, want 0.000006000 (0.000004 × 1.5)", gotApplied)
-	}
-	// 1000 × 0.000006 = 0.006.
-	if MustDec(gotCost).String() != "0.006000000" {
-		t.Errorf("cost = %s, want 0.006000000 (base × premium via base_model)", gotCost)
-	}
-
-	// Cross-check against the oracle (ResolveEvent → quantize → Rate).
-	rate, err := book.ResolveEvent("ft:9f8e7d6c5b4a", "meta-llama/Llama-3.1-8B-Instruct", "", "dedicated")
-	if err != nil {
-		t.Fatalf("oracle ResolveEvent: %v", err)
-	}
-	wantCost := Rate(RatedEvent{ServingMode: "dedicated", PromptTokens: 1000}, rate.Quantized()).String()
-	if MustDec(gotCost).String() != wantCost {
-		t.Errorf("SQL cost %s != oracle %s (base_model derived path must conform)", gotCost, wantCost)
-	}
-}
-
-// TestIntegration_FineTuneAmbiguousBaseModelFailsLoud runs the REAL SQL over the E3
-// ft-uniqueness violation (FIX 2): a single ft: model_id resolving through TWO distinct
-// base_models in one window. E3 mints ft:<checkpoint_artifact_id> as a globally-unique
-// uuid4, so this can't happen legitimately; if it does, a blind MIN()-applied-rate would
-// silently bill the rollup at the cheaper base. The SQL must instead SPLIT the ambiguous
-// rollup out: not upsert it, and count its events as ambiguous_base_events. A clean
-// single-base ft: rollup in the same window must still rate normally.
-func TestIntegration_FineTuneAmbiguousBaseModelFailsLoud(t *testing.T) {
-	dsn := os.Getenv("PHOEBE_TEST_DATABASE_URL")
-	if dsn == "" {
-		t.Skip("PHOEBE_TEST_DATABASE_URL not set; skipping live-Postgres conformance")
-	}
-	ctx := context.Background()
-	db, err := sql.Open("pgx", dsn)
-	if err != nil {
-		t.Fatalf("open: %v", err)
-	}
-	defer db.Close()
-
-	const sch = "phoebe_rating_ambig_it"
-	exec(t, db, "DROP SCHEMA IF EXISTS "+sch+" CASCADE")
-	exec(t, db, "CREATE SCHEMA "+sch)
-	exec(t, db, "SET search_path TO "+sch)
-	defer func() { exec(t, db, "DROP SCHEMA IF EXISTS "+sch+" CASCADE") }()
-	exec(t, db, ratingSchemaDDL(t))
-
-	hour := mustTime("2026-06-08T10:00:00Z")
-	book := newTestBook(
-		map[string]Rate3{
-			"cheap/base":     rate3("0.000001", "0", "0"),
-			"expensive/base": rate3("0.000009", "0", "0"),
-		},
-		nil, PolicyMultiplier, MustDec("1.5"), Dec{},
-	)
-
-	type seed struct {
-		req, model, baseModel string
-		prompt                int64
-	}
-	seeds := []seed{
-		// SAME ft: id, TWO different base_models → ambiguous (must NOT bill at MIN rate).
-		{"ambig-1", "ft:dupe", "cheap/base", 1000},
-		{"ambig-2", "ft:dupe", "expensive/base", 1000},
-		// A clean single-base ft: rollup that MUST still rate.
-		{"clean", "ft:clean", "cheap/base", 1000},
-	}
-	for _, s := range seeds {
-		if _, err := db.ExecContext(ctx,
-			`INSERT INTO billing_event (request_id, auth_id, resource_id, model, base_model, prompt_tokens, completion_tokens, event_ts)
-			 VALUES ($1,'a','r',$2,$3,$4,0,$5)`,
-			s.req, s.model, nullableStr(s.baseModel), s.prompt, hour.Add(5*time.Minute)); err != nil {
-			t.Fatalf("seed %s: %v", s.req, err)
-		}
-	}
-
-	store := NewPostgresStore(db)
-	res, err := store.RateWindow(ctx, book, hour, hour.Add(time.Hour))
-	if err != nil {
-		t.Fatalf("RateWindow: %v", err)
-	}
-
-	// Only the clean rollup rated; the two ambiguous events are counted, not billed.
-	if res.RollupsWritten != 1 || res.EventsRated != 1 {
-		t.Fatalf("rollups/events = %d/%d, want 1/1 (only the single-base ft: rollup)", res.RollupsWritten, res.EventsRated)
-	}
-	if res.AmbiguousBaseEvents != 2 {
-		t.Fatalf("ambiguous = %d, want 2 (the two-base ft: rollup must scream, never MIN-billed)", res.AmbiguousBaseEvents)
-	}
-	// NO rated_usage row for the ambiguous ft: id (not even at the cheaper rate).
-	var nDupe int
-	if err := db.QueryRowContext(ctx,
-		`SELECT COUNT(*) FROM rated_usage WHERE model_id='ft:dupe'`).Scan(&nDupe); err != nil {
-		t.Fatalf("count ft:dupe rollups: %v", err)
-	}
-	if nDupe != 0 {
-		t.Fatalf("rated_usage has %d rows for the ambiguous ft:dupe — it must NOT be billed (silent MIN under-charge)", nDupe)
-	}
-	// The clean fine-tune billed normally at its base × premium.
-	var cost string
-	if err := db.QueryRowContext(ctx,
-		`SELECT cost::text FROM rated_usage WHERE model_id='ft:clean'`).Scan(&cost); err != nil {
-		t.Fatalf("read ft:clean rollup: %v", err)
-	}
-	if MustDec(cost).String() != "0.001500000" { // 1000 × (0.000001 × 1.5)
-		t.Errorf("ft:clean cost = %s, want 0.001500000 (base × premium)", cost)
-	}
-}
-
-// TestIntegration_ReRateReconciles runs the REAL SQL to pin the reconcile semantics:
-// re-rate RECONCILES (deletes superseded rollups), it is NOT upsert-only. Run A bills a CLEAN single-base
-// ft: rollup. Then a second, distinct base_model arrives for the SAME ft: id in the same
-// window, making it ambiguous; run B excludes it from priced and must DELETE the stale
-// rated_usage row in the SAME statement — never leave it billing at its run-A cost. A
-// third, identical re-run must be a no-op (deletes nothing). This is the live-Postgres
-// proof that the `deleted` CTE fires atomically with the upsert.
-func TestIntegration_ReRateReconciles(t *testing.T) {
-	dsn := os.Getenv("PHOEBE_TEST_DATABASE_URL")
-	if dsn == "" {
-		t.Skip("PHOEBE_TEST_DATABASE_URL not set; skipping live-Postgres conformance")
-	}
-	ctx := context.Background()
-	db, err := sql.Open("pgx", dsn)
-	if err != nil {
-		t.Fatalf("open: %v", err)
-	}
-	defer db.Close()
-
-	const sch = "phoebe_rating_reconcile_it"
-	exec(t, db, "DROP SCHEMA IF EXISTS "+sch+" CASCADE")
-	exec(t, db, "CREATE SCHEMA "+sch)
-	exec(t, db, "SET search_path TO "+sch)
-	defer func() { exec(t, db, "DROP SCHEMA IF EXISTS "+sch+" CASCADE") }()
-	exec(t, db, ratingSchemaDDL(t))
-
-	hour := mustTime("2026-06-08T10:00:00Z")
-	book := newTestBook(
-		map[string]Rate3{
-			"cheap/base":     rate3("0.000001", "0", "0"),
-			"expensive/base": rate3("0.000009", "0", "0"),
-		},
-		nil, PolicyMultiplier, MustDec("1.5"), Dec{},
-	)
-	store := NewPostgresStore(db)
-
-	// Run A: a single-base ft: rollup (ft:dupe) PLUS a co-window survivor (ft:keep).
-	// Both clean → billed. ft:keep must survive run B's reconcile untouched.
-	if _, err := db.ExecContext(ctx,
-		`INSERT INTO billing_event (request_id, auth_id, resource_id, model, base_model, prompt_tokens, completion_tokens, event_ts)
-		 VALUES ('rc-1','a','r','ft:dupe','cheap/base',1000,0,$1),
-		        ('rc-keep','a','r','ft:keep','cheap/base',1000,0,$1)`, hour.Add(5*time.Minute)); err != nil {
-		t.Fatalf("seed rc-1/rc-keep: %v", err)
-	}
-	resA, err := store.RateWindow(ctx, book, hour, hour.Add(time.Hour))
-	if err != nil {
-		t.Fatalf("run A: %v", err)
-	}
-	if resA.RollupsWritten != 2 || resA.ReconciledDeletions != 0 {
-		t.Fatalf("run A: rollups=%d deletions=%d, want 2/0", resA.RollupsWritten, resA.ReconciledDeletions)
-	}
-	var nA int
-	if err := db.QueryRowContext(ctx, `SELECT COUNT(*) FROM rated_usage WHERE model_id='ft:dupe'`).Scan(&nA); err != nil {
-		t.Fatalf("count after A: %v", err)
-	}
-	if nA != 1 {
-		t.Fatalf("after run A, ft:dupe rollups = %d, want 1 (clean rollup must bill)", nA)
-	}
-
-	// Mutate: a SECOND base_model for the SAME ft: id → ambiguous.
-	if _, err := db.ExecContext(ctx,
-		`INSERT INTO billing_event (request_id, auth_id, resource_id, model, base_model, prompt_tokens, completion_tokens, event_ts)
-		 VALUES ('rc-2','a','r','ft:dupe','expensive/base',1000,0,$1)`, hour.Add(10*time.Minute)); err != nil {
-		t.Fatalf("seed rc-2: %v", err)
-	}
-	resB, err := store.RateWindow(ctx, book, hour, hour.Add(time.Hour))
-	if err != nil {
-		t.Fatalf("run B: %v", err)
-	}
-	if resB.AmbiguousBaseEvents != 2 {
-		t.Fatalf("run B: ambiguous = %d, want 2 (two-base ft:dupe)", resB.AmbiguousBaseEvents)
-	}
-	if resB.ReconciledDeletions != 1 {
-		t.Fatalf("run B: reconciled deletions = %d, want 1 (the stale clean rollup must be deleted)", resB.ReconciledDeletions)
-	}
-	// THE INVARIANT: NO rated_usage row survives for the now-ambiguous ft:dupe.
-	var nB int
-	if err := db.QueryRowContext(ctx, `SELECT COUNT(*) FROM rated_usage WHERE model_id='ft:dupe'`).Scan(&nB); err != nil {
-		t.Fatalf("count after B: %v", err)
-	}
-	if nB != 0 {
-		t.Fatalf("after run B, ft:dupe rollups = %d, want 0 — the stale rollup is STILL BILLING (upsert-only bug; reconcile must delete it)", nB)
-	}
-	// The co-window ft:keep rollup must SURVIVE run B (delete-set and upsert-set are
-	// disjoint — the two modifying CTEs must not clobber a surviving co-window row).
-	var nKeep int
-	if err := db.QueryRowContext(ctx, `SELECT COUNT(*) FROM rated_usage WHERE model_id='ft:keep'`).Scan(&nKeep); err != nil {
-		t.Fatalf("count ft:keep after B: %v", err)
-	}
-	if nKeep != 1 {
-		t.Fatalf("after run B, ft:keep rollups = %d, want 1 (a surviving co-window rollup must be UPDATED, not deleted)", nKeep)
-	}
-
-	// Run C: re-run with IDENTICAL data → no-op (deletes nothing; nothing to reconcile).
-	resC, err := store.RateWindow(ctx, book, hour, hour.Add(time.Hour))
-	if err != nil {
-		t.Fatalf("run C: %v", err)
-	}
-	if resC.ReconciledDeletions != 0 {
-		t.Fatalf("run C (identical re-run): deletions = %d, want 0 (no spurious deletes)", resC.ReconciledDeletions)
-	}
-}
-
-// TestIntegration_ReRateReconcileLeavesOtherWindowsUntouched proves the reconcile's
-// window predicate is correct: a re-rate of ONE hour must DELETE only superseded rollups
-// IN that hour, never touch a clean rollup in an adjacent hour. Guards the [start,end)
-// half-open window_start predicate against deleting out-of-scope billing.
-func TestIntegration_ReRateReconcileLeavesOtherWindowsUntouched(t *testing.T) {
-	dsn := os.Getenv("PHOEBE_TEST_DATABASE_URL")
-	if dsn == "" {
-		t.Skip("PHOEBE_TEST_DATABASE_URL not set; skipping live-Postgres conformance")
-	}
-	ctx := context.Background()
-	db, err := sql.Open("pgx", dsn)
-	if err != nil {
-		t.Fatalf("open: %v", err)
-	}
-	defer db.Close()
-
-	const sch = "phoebe_rating_reconcile_win_it"
-	exec(t, db, "DROP SCHEMA IF EXISTS "+sch+" CASCADE")
-	exec(t, db, "CREATE SCHEMA "+sch)
-	exec(t, db, "SET search_path TO "+sch)
-	defer func() { exec(t, db, "DROP SCHEMA IF EXISTS "+sch+" CASCADE") }()
-	exec(t, db, ratingSchemaDDL(t))
-
-	hour10 := mustTime("2026-06-08T10:00:00Z")
-	hour12 := mustTime("2026-06-08T12:00:00Z")
-	book := newTestBook(
-		map[string]Rate3{"b": rate3("0.000005", "0", "0")},
-		nil, PolicyIdentity, Dec{}, Dec{},
-	)
-	store := NewPostgresStore(db)
-
-	// Seed a clean rollup in BOTH the 10:00 and 12:00 hours; rate each window.
-	if _, err := db.ExecContext(ctx,
-		`INSERT INTO billing_event (request_id, auth_id, resource_id, model, prompt_tokens, completion_tokens, event_ts)
-		 VALUES ('w10','a','r','b',100,0,$1), ('w12','a','r','b',100,0,$2)`,
-		hour10.Add(5*time.Minute), hour12.Add(5*time.Minute)); err != nil {
-		t.Fatalf("seed windows: %v", err)
-	}
-	if _, err := store.RateWindow(ctx, book, hour10, hour10.Add(time.Hour)); err != nil {
-		t.Fatalf("rate 10:00: %v", err)
-	}
-	if _, err := store.RateWindow(ctx, book, hour12, hour12.Add(time.Hour)); err != nil {
-		t.Fatalf("rate 12:00: %v", err)
-	}
-
-	// Now DELETE the 10:00 event upstream so a re-rate of [10:00,11:00) supersedes its
-	// rollup, and re-rate ONLY that window.
-	if _, err := db.ExecContext(ctx, `DELETE FROM billing_event WHERE request_id='w10'`); err != nil {
-		t.Fatalf("delete w10: %v", err)
-	}
-	resRe, err := store.RateWindow(ctx, book, hour10, hour10.Add(time.Hour))
-	if err != nil {
-		t.Fatalf("re-rate 10:00: %v", err)
-	}
-	if resRe.ReconciledDeletions != 1 {
-		t.Fatalf("re-rate 10:00: deletions = %d, want 1 (the vanished 10:00 rollup)", resRe.ReconciledDeletions)
-	}
-	// The 12:00 rollup must be UNTOUCHED.
-	var n12, n10 int
-	if err := db.QueryRowContext(ctx, `SELECT COUNT(*) FROM rated_usage WHERE window_start=$1`, hour12).Scan(&n12); err != nil {
-		t.Fatalf("count 12:00: %v", err)
-	}
-	if err := db.QueryRowContext(ctx, `SELECT COUNT(*) FROM rated_usage WHERE window_start=$1`, hour10).Scan(&n10); err != nil {
-		t.Fatalf("count 10:00: %v", err)
-	}
-	if n10 != 0 {
-		t.Fatalf("10:00 rollups = %d, want 0 (superseded)", n10)
-	}
-	if n12 != 1 {
-		t.Fatalf("12:00 rollups = %d, want 1 (an adjacent-window rollup must NOT be deleted by a 10:00 re-rate)", n12)
-	}
-}
-
-// TestIntegration_OneHopFineTuneCannotDeriveFromFineTune runs the REAL SQL to pin E3's
-// one-hop rule (FIX 3): an own-rate fine-tune is NOT a derivation base. An ft: event
-// whose base_model points at another own-rate ft: must NOT price (a second hop) — it
-// lands UNPRICED, matching the oracle's ResolveEvent. Proves the SQL projection
-// (rating_derived) excludes ft:-prefixed own-rate entries, so SQL and oracle agree.
-func TestIntegration_OneHopFineTuneCannotDeriveFromFineTune(t *testing.T) {
-	dsn := os.Getenv("PHOEBE_TEST_DATABASE_URL")
-	if dsn == "" {
-		t.Skip("PHOEBE_TEST_DATABASE_URL not set; skipping live-Postgres conformance")
-	}
-	ctx := context.Background()
-	db, err := sql.Open("pgx", dsn)
-	if err != nil {
-		t.Fatalf("open: %v", err)
-	}
-	defer db.Close()
-
-	const sch = "phoebe_rating_onehop_it"
-	exec(t, db, "DROP SCHEMA IF EXISTS "+sch+" CASCADE")
-	exec(t, db, "CREATE SCHEMA "+sch)
-	exec(t, db, "SET search_path TO "+sch)
-	defer func() { exec(t, db, "DROP SCHEMA IF EXISTS "+sch+" CASCADE") }()
-	exec(t, db, ratingSchemaDDL(t))
-
-	hour := mustTime("2026-06-08T10:00:00Z")
-	// A true base AND an own-rate fine-tune (ft:ownrate) priced directly in the file.
-	book := newTestBook(
-		map[string]Rate3{
-			"meta-llama/Llama-3.1-8B-Instruct": rate3("0.000004", "0", "0"),
-			"ft:ownrate":                       rate3("0.00001", "0", "0"),
-		},
-		nil, PolicyMultiplier, MustDec("1.5"), Dec{},
-	)
-
-	type seed struct {
-		req, model, baseModel string
-	}
-	seeds := []seed{
-		// One legitimate hop: ft: deriving from the TRUE base → priced.
-		{"hop-ok", "ft:abc", "meta-llama/Llama-3.1-8B-Instruct"},
-		// SECOND hop forbidden: ft: whose base_model is the own-rate fine-tune → UNPRICED.
-		{"hop-bad", "ft:def", "ft:ownrate"},
-	}
-	for _, s := range seeds {
-		if _, err := db.ExecContext(ctx,
-			`INSERT INTO billing_event (request_id, auth_id, resource_id, model, base_model, prompt_tokens, completion_tokens, event_ts)
-			 VALUES ($1,'a','r',$2,$3,1000,0,$4)`,
-			s.req, s.model, s.baseModel, hour.Add(5*time.Minute)); err != nil {
-			t.Fatalf("seed %s: %v", s.req, err)
-		}
-	}
-
-	store := NewPostgresStore(db)
-	res, err := store.RateWindow(ctx, book, hour, hour.Add(time.Hour))
-	if err != nil {
-		t.Fatalf("RateWindow: %v", err)
-	}
-
-	// hop-ok prices (one rollup); hop-bad is UNPRICED (the second hop is forbidden).
-	if res.RollupsWritten != 1 || res.EventsRated != 1 {
-		t.Fatalf("rollups/events = %d/%d, want 1/1 (only the one-hop ft: prices)", res.RollupsWritten, res.EventsRated)
-	}
-	if res.UnpricedEvents != 1 {
-		t.Fatalf("unpriced = %d, want 1 (ft deriving from an own-rate ft: must fail loud — no second hop)", res.UnpricedEvents)
-	}
-	// Cross-check the oracle agrees: ResolveEvent fails for the second hop.
-	if _, err := book.ResolveEvent("ft:def", "ft:ownrate", "", "dedicated"); err == nil {
-		t.Fatal("oracle ResolveEvent priced a fine-tune-of-fine-tune — SQL and oracle must BOTH forbid the second hop")
-	}
-}
-
-// TestIntegration_UTCBucketing_SessionTZIndependent: the hour bucket must NOT depend
-// on the session TimeZone. A fractional-offset session (Asia/Kolkata, +05:30) must
-// produce window_start on EXACT UTC hour boundaries, and a re-run from a UTC session
-// must hit the SAME ON CONFLICT keys — no duplicate/overlapping rollups.
-func TestIntegration_UTCBucketing_SessionTZIndependent(t *testing.T) {
-	dsn := os.Getenv("PHOEBE_TEST_DATABASE_URL")
-	if dsn == "" {
-		t.Skip("PHOEBE_TEST_DATABASE_URL not set; skipping live-Postgres conformance")
-	}
-	ctx := context.Background()
-	db, err := sql.Open("pgx", dsn)
-	if err != nil {
-		t.Fatalf("open: %v", err)
-	}
-	defer db.Close()
-	db.SetMaxOpenConns(1) // One connection so SET TIME ZONE / search_path stick.
-
-	const sch = "phoebe_rating_tz_it"
-	exec(t, db, "DROP SCHEMA IF EXISTS "+sch+" CASCADE")
-	exec(t, db, "CREATE SCHEMA "+sch)
-	exec(t, db, "SET search_path TO "+sch)
-	defer func() { exec(t, db, "DROP SCHEMA IF EXISTS "+sch+" CASCADE") }()
-	exec(t, db, ratingSchemaDDL(t))
-
-	hour := mustTime("2026-06-08T10:00:00Z")
-	book := newTestBook(
-		map[string]Rate3{"b": rate3("0.000005", "0.0000005", "0.00002")},
-		nil, PolicyIdentity, Dec{}, Dec{},
-	)
-	if _, err := db.ExecContext(ctx,
-		`INSERT INTO billing_event (request_id, auth_id, resource_id, model, prompt_tokens, cached_tokens, completion_tokens, event_ts)
-		 VALUES ('tz-req-0','a','r','b',100,0,50,$1)`, hour.Add(30*time.Minute)); err != nil {
-		t.Fatalf("seed event: %v", err)
-	}
-
-	store := NewPostgresStore(db)
-
-	// Rate from a FRACTIONAL-OFFSET session.
-	exec(t, db, "SET TIME ZONE 'Asia/Kolkata'")
-	if _, err := store.RateWindow(ctx, book, hour, hour.Add(time.Hour)); err != nil {
-		t.Fatalf("RateWindow (IST session): %v", err)
-	}
-
-	var ws time.Time
-	if err := db.QueryRowContext(ctx,
-		`SELECT window_start FROM rated_usage WHERE auth_id='a' AND model_id='b'`).Scan(&ws); err != nil {
-		t.Fatalf("read window_start: %v", err)
-	}
-	if !ws.UTC().Equal(hour) {
-		t.Fatalf("window_start = %s, want exact UTC hour boundary %s (session-TZ leaked into bucketing)",
-			ws.UTC().Format(time.RFC3339), hour.Format(time.RFC3339))
-	}
-
-	idsIST := readRatedUsageIDs(t, db)
-	exec(t, db, "SET TIME ZONE 'UTC'")
-	if _, err := store.RateWindow(ctx, book, hour, hour.Add(time.Hour)); err != nil {
-		t.Fatalf("RateWindow (UTC session): %v", err)
-	}
-	var n int
-	if err := db.QueryRowContext(ctx, `SELECT COUNT(*) FROM rated_usage`).Scan(&n); err != nil {
-		t.Fatalf("count rated_usage: %v", err)
-	}
-	if n != 1 {
-		t.Fatalf("rated_usage has %d rows after IST-then-UTC re-rate, want 1 (duplicate buckets double-bill)", n)
-	}
-	idsUTC := readRatedUsageIDs(t, db)
-	for k, id := range idsIST {
-		if idsUTC[k] != id {
-			t.Errorf("rollup %s id changed across sessions: %s → %s", k, id, idsUTC[k])
-		}
-	}
-}
-
-// TestIntegration_RatingInstantIndexServesScan: the expression index on
-// COALESCE(event_ts, created_at) must actually serve the rater's window predicate.
-func TestIntegration_RatingInstantIndexServesScan(t *testing.T) {
-	dsn := os.Getenv("PHOEBE_TEST_DATABASE_URL")
-	if dsn == "" {
-		t.Skip("PHOEBE_TEST_DATABASE_URL not set; skipping live-Postgres conformance")
-	}
-	db, err := sql.Open("pgx", dsn)
-	if err != nil {
-		t.Fatalf("open: %v", err)
-	}
-	defer db.Close()
-	db.SetMaxOpenConns(1)
-
-	const sch = "phoebe_rating_ix_it"
-	exec(t, db, "DROP SCHEMA IF EXISTS "+sch+" CASCADE")
-	exec(t, db, "CREATE SCHEMA "+sch)
-	exec(t, db, "SET search_path TO "+sch)
-	defer func() { exec(t, db, "DROP SCHEMA IF EXISTS "+sch+" CASCADE") }()
-	exec(t, db, ratingSchemaDDL(t))
-
-	exec(t, db, "SET enable_seqscan = off")
-	plan := explainPlan(t, db, `EXPLAIN SELECT * FROM billing_event
-		WHERE COALESCE(event_ts, created_at) >= '2026-06-08T10:00:00Z'
-		  AND COALESCE(event_ts, created_at) <  '2026-06-08T11:00:00Z'`)
-	if !strings.Contains(plan, "billing_event_rating_instant_ix") {
-		t.Fatalf("plan does not use billing_event_rating_instant_ix:\n%s", plan)
-	}
-}
-
-// TestIntegration_ReconcileDeleteCanUseWindowStartIndex pins ONE structural
-// invariant: the reconcile DELETE's window_start-only predicate CAN be served by
-// rated_usage_window_start_ix (rather than falling back to a seqscan or to the
-// auth-leading composite index, neither of which can serve a window_start-only
-// range as a tight slice — every other index leads with auth_id).
-//
-// This is an index-USABILITY sanity check, NOT a money assertion and NOT a
-// planner-cost-preference or performance guarantee. Whether the planner PREFERS
-// this index at default cost is a version- and GUC-fragile cost-model decision
-// whose failure mode is a slow reconcile, not a wrong bill — so we deliberately do
-// NOT gate on it. We force the planner's hand with `enable_seqscan=off` and assert
-// only that the dedicated index CAN serve the predicate at all.
-//
-// The single hard assertion accepts ANY plan node that uses the index by NAME —
-// Index Scan / Index Only Scan / Bitmap Index Scan — since all of those prove the
-// invariant; matching only the `using …` forms would flake when Postgres renders a
-// bitmap index scan ("Bitmap Index Scan on rated_usage_window_start_ix"). We
-// EXPLAIN the ACTUAL reconcile DELETE from store.go (the `deleted` CTE's rated_usage
-// table-access: the window_start range plus the NOT EXISTS anti-join against this
-// run's priced rows) against an ANALYZE'd population so it is a real plan, not a
-// vacuous SELECT against an empty table.
-func TestIntegration_ReconcileDeleteCanUseWindowStartIndex(t *testing.T) {
-	dsn := os.Getenv("PHOEBE_TEST_DATABASE_URL")
-	if dsn == "" {
-		t.Skip("PHOEBE_TEST_DATABASE_URL not set; skipping live-Postgres conformance")
-	}
-	db, err := sql.Open("pgx", dsn)
-	if err != nil {
-		t.Fatalf("open: %v", err)
-	}
-	defer db.Close()
-	db.SetMaxOpenConns(1)
-
-	const sch = "phoebe_rating_winix_it"
-	exec(t, db, "DROP SCHEMA IF EXISTS "+sch+" CASCADE")
-	exec(t, db, "CREATE SCHEMA "+sch)
-	exec(t, db, "SET search_path TO "+sch)
-	defer func() { exec(t, db, "DROP SCHEMA IF EXISTS "+sch+" CASCADE") }()
-	exec(t, db, ratingSchemaDDL(t))
-
-	// POPULATE a small, ANALYZE'd population: 10 distinct auth_ids × 24 hours = 240
-	// rated_usage rows across a couple dozen windows. That is enough for the
-	// window_start range predicate to be a genuine, non-trivial index-served slice
-	// (the reconcile targets a single hour → ~10 rows), so the EXPLAIN'd plan is real
-	// rather than a degenerate seqscan-an-empty-table. We do NOT need 10k rows: we
-	// only prove the index CAN serve the predicate under seqscan-off, not that the
-	// planner prefers it at default cost, so a large population would back nothing.
-	exec(t, db, `INSERT INTO rated_usage
-		(id, auth_id, resource_id, model_id, window_start, window_end,
-		 prompt_tokens, cached_tokens, completion_tokens, billable_prompt_tokens,
-		 cost, applied_prompt_rate, applied_cached_rate, applied_completion_rate, event_count,
-		 serving_mode)
-		SELECT
-		    md5(a::text || ':' || h::text),
-		    'auth' || a::text,
-		    'deploy' || a::text,
-		    'm',
-		    '2026-01-01T00:00:00Z'::timestamptz + (h || ' hours')::interval,
-		    '2026-01-01T01:00:00Z'::timestamptz + (h || ' hours')::interval,
-		    100, 0, 0, 100, 0.001, 0.00001, 0, 0, 1,
-		    'dedicated'
-		FROM generate_series(0, 9) AS a, generate_series(0, 23) AS h`)
-	// ANALYZE so the planner has row-count + distribution stats rather than defaults,
-	// making the EXPLAIN'd plan a real plan over the populated table.
-	exec(t, db, "ANALYZE rated_usage")
-
-	// EXPLAIN the ACTUAL reconcile DELETE statement (store.go's `deleted` CTE shape):
-	// the rated_usage range on window_start, anti-joined against this run's priced
-	// rows. `priced` is empty here (a re-run that reproduces nothing for this hour →
-	// the whole slice is deleted), which is exactly the worst-case reconcile that
-	// must still go through the index rather than seqscanning the whole table.
-	const reconcileDelete = `EXPLAIN
-		WITH priced AS (
-		    SELECT auth_id, resource_id, model_id, window_start FROM rated_usage WHERE false
-		)
-		DELETE FROM rated_usage ru
-		WHERE ru.window_start >= '2026-01-01T04:00:00Z'
-		  AND ru.window_start <  '2026-01-01T05:00:00Z'
-		  AND NOT EXISTS (
-		      SELECT 1 FROM priced p
-		      WHERE p.auth_id      = ru.auth_id
-		        AND p.resource_id  = ru.resource_id
-		        AND p.model_id     = ru.model_id
-		        AND p.window_start = ru.window_start
-		  )`
-
-	// The ONE hard gate: with seqscan forbidden, the plan MUST reach rated_usage
-	// through rated_usage_window_start_ix. That proves the dedicated index CAN serve
-	// the window_start-only predicate at all (a remaining seqscan or a fall-through to
-	// the auth-leading composite would mean no usable index for the reconcile's exact
-	// predicate — a real defect). We accept any node that names the index — Index Scan,
-	// Index Only Scan, or Bitmap Index Scan — because all three satisfy the invariant;
-	// requiring the "using …" rendering alone would flake on the bitmap form.
-	exec(t, db, "SET enable_seqscan = off")
-	plan := explainPlan(t, db, reconcileDelete)
-	if !strings.Contains(plan, "using rated_usage_window_start_ix") &&
-		!strings.Contains(plan, "on rated_usage_window_start_ix") {
-		t.Fatalf("reconcile DELETE predicate cannot be served by rated_usage_window_start_ix even with seqscan off (no usable window_start index for the window-only predicate):\n%s", plan)
-	}
 }
 
 // explainPlan runs an EXPLAIN query and returns the joined plan text.
@@ -1870,1155 +130,6 @@ func nullableStr(s string) any {
 	return s
 }
 
-// TestIntegration_C4ResolutionLadderConformsToOracle runs the REAL rating SQL over
-// one fixture per rung of the C4 resolution ladder and pins it to the Go oracle
-// (ResolveEvent → Quantized → Rate) case by case. The contract under test: vLLM
-// serves under the ENDPOINT NAME, X-Saturn-Base-Model (billing_event.base_model) is
-// the catalog price key, and X-Saturn-Adapter (billing_event.adapter) presence is
-// the fine-tune premium trigger. Precedence a > b > c > d:
-//
-//	base-endpoint-no-premium            (c) base_model set, no adapter, non-ft name → plain base rate
-//	adapter-triggers-premium            (b) endpoint name + adapter + base_model → base x premium
-//	ft-prefix-still-premium             (b) ft: model_id + base_model → base x premium (unchanged)
-//	direct-entry-wins-over-derivation   (a) model_id in the file + base_model + adapter → the direct rate
-//	adapter-with-empty-base-model-unpriced (d) adapter, NULL base_model → UNPRICED (fail closed)
-//	plain-unknown-model-unpriced        (d) nothing resolves → UNPRICED (unchanged)
-func TestIntegration_C4ResolutionLadderConformsToOracle(t *testing.T) {
-	dsn := os.Getenv("PHOEBE_TEST_DATABASE_URL")
-	if dsn == "" {
-		t.Skip("PHOEBE_TEST_DATABASE_URL not set; skipping live-Postgres conformance")
-	}
-	ctx := context.Background()
-	db, err := sql.Open("pgx", dsn)
-	if err != nil {
-		t.Fatalf("open: %v", err)
-	}
-	defer db.Close()
-
-	const sch = "phoebe_rating_c4_it"
-	exec(t, db, "DROP SCHEMA IF EXISTS "+sch+" CASCADE")
-	exec(t, db, "CREATE SCHEMA "+sch)
-	exec(t, db, "SET search_path TO "+sch)
-	defer func() { exec(t, db, "DROP SCHEMA IF EXISTS "+sch+" CASCADE") }()
-	exec(t, db, ratingSchemaDDL(t))
-
-	hour := mustTime("2026-06-08T10:00:00Z")
-	// One priced base (the catalog key), one direct per-endpoint override entry,
-	// 1.5x premium. Endpoint names are deliberately NOT file keys.
-	book := newTestBook(
-		map[string]Rate3{
-			"meta-llama/Llama-3.1-8B-Instruct": rate3("0.000004", "0.0000004", "0.00001"),
-			"tf-ep-override":                   rate3("0.000099", "0", "0"),
-		},
-		nil, PolicyMultiplier, MustDec("1.5"), Dec{},
-	)
-
-	const base = "meta-llama/Llama-3.1-8B-Instruct"
-	cases := []struct {
-		name              string
-		model, baseModel  string
-		adapter           string
-		prompt            int64
-		priced            bool
-		wantAppliedPrompt string // the 9dp rate that must be frozen on the row
-	}{
-		{"base-endpoint-no-premium", "tf-ep-base", base, "", 100, true, "0.000004000"},
-		{"adapter-triggers-premium", "tf-ep-ft", base, "ckpt-artifact-1", 200, true, "0.000006000"},
-		{"ft-prefix-still-premium", "ft:9f8e7d6c5b4a", base, "", 300, true, "0.000006000"},
-		{"direct-entry-wins-over-derivation", "tf-ep-override", base, "ckpt-artifact-2", 400, true, "0.000099000"},
-		{"adapter-with-empty-base-model-unpriced", "tf-ep-orphan", "", "ckpt-artifact-3", 500, false, ""},
-		{"plain-unknown-model-unpriced", "tf-ep-unknown", "", "", 600, false, ""},
-	}
-	for i, c := range cases {
-		if _, err := db.ExecContext(ctx,
-			`INSERT INTO billing_event (request_id, auth_id, resource_id, model, base_model, adapter, prompt_tokens, completion_tokens, event_ts)
-			 VALUES ($1,'a','r',$2,$3,$4,$5,0,$6)`,
-			fmt.Sprintf("c4-req-%d", i), c.model, nullableStr(c.baseModel), nullableStr(c.adapter),
-			c.prompt, hour.Add(5*time.Minute)); err != nil {
-			t.Fatalf("seed %s: %v", c.name, err)
-		}
-	}
-
-	store := NewPostgresStore(db)
-	res, err := store.RateWindow(ctx, book, hour, hour.Add(time.Hour))
-	if err != nil {
-		t.Fatalf("RateWindow: %v", err)
-	}
-	if res.RollupsWritten != 4 || res.EventsRated != 4 {
-		t.Fatalf("rollups/events = %d/%d, want 4/4 (the four priced rungs)", res.RollupsWritten, res.EventsRated)
-	}
-	if res.UnpricedEvents != 2 {
-		t.Fatalf("unpriced = %d, want 2 (the two fail-closed rungs must scream, never $0)", res.UnpricedEvents)
-	}
-
-	for _, c := range cases {
-		t.Run(c.name, func(t *testing.T) {
-			rate, oerr := book.ResolveEvent(c.model, c.baseModel, c.adapter, "dedicated")
-			if !c.priced {
-				// Oracle agrees it is unpriced, and the SQL wrote NO rollup for it.
-				if oerr == nil {
-					t.Fatalf("oracle priced %s — SQL and oracle must BOTH refuse", c.name)
-				}
-				var n int
-				if err := db.QueryRowContext(ctx,
-					`SELECT COUNT(*) FROM rated_usage WHERE model_id=$1`, c.model).Scan(&n); err != nil {
-					t.Fatalf("count: %v", err)
-				}
-				if n != 0 {
-					t.Fatalf("rated_usage has %d rows for %s — an unpriced event must never be billed", n, c.model)
-				}
-				return
-			}
-			if oerr != nil {
-				t.Fatalf("oracle ResolveEvent(%s): %v", c.name, oerr)
-			}
-			billed := rate.Quantized()
-			wantCost := Rate(RatedEvent{ServingMode: "dedicated", PromptTokens: c.prompt}, billed).String()
-			var gotCost, gotApplied string
-			if err := db.QueryRowContext(ctx,
-				`SELECT cost::text, applied_prompt_rate::text FROM rated_usage WHERE model_id=$1 AND window_start=$2`,
-				c.model, hour).Scan(&gotCost, &gotApplied); err != nil {
-				t.Fatalf("read rated_usage (%s): %v", c.model, err)
-			}
-			if MustDec(gotCost).String() != wantCost {
-				t.Errorf("SQL cost = %s, oracle = %s (SQL and Go must agree on the C4 ladder)", gotCost, wantCost)
-			}
-			if MustDec(gotApplied).String() != c.wantAppliedPrompt {
-				t.Errorf("applied_prompt_rate = %s, want %s (the ladder rung's rate frozen on the row)", gotApplied, c.wantAppliedPrompt)
-			}
-			if MustDec(gotApplied).String() != billed.Prompt.String() {
-				t.Errorf("applied_prompt_rate = %s != oracle quantized rate %s", gotApplied, billed.Prompt)
-			}
-		})
-	}
-}
-
-// TestIntegration_C4AmbiguityFailsLoud runs the REAL SQL over the two NEW single-rate
-// violations C4's plain-base path makes possible, proving the extended gate splits
-// them out (counted ambiguous, never MIN-billed) while a clean endpoint still rates:
-//
-//   - an endpoint-name model_id resolving through TWO distinct base_models on the
-//     PLAIN-BASE path (an endpoint name reused over a different base in one window);
-//   - ONE endpoint name whose adapter FLAPS (some events premium-derived, some
-//     plain-base) — two rates even on a single base_model.
-func TestIntegration_C4AmbiguityFailsLoud(t *testing.T) {
-	dsn := os.Getenv("PHOEBE_TEST_DATABASE_URL")
-	if dsn == "" {
-		t.Skip("PHOEBE_TEST_DATABASE_URL not set; skipping live-Postgres conformance")
-	}
-	ctx := context.Background()
-	db, err := sql.Open("pgx", dsn)
-	if err != nil {
-		t.Fatalf("open: %v", err)
-	}
-	defer db.Close()
-
-	const sch = "phoebe_rating_c4ambig_it"
-	exec(t, db, "DROP SCHEMA IF EXISTS "+sch+" CASCADE")
-	exec(t, db, "CREATE SCHEMA "+sch)
-	exec(t, db, "SET search_path TO "+sch)
-	defer func() { exec(t, db, "DROP SCHEMA IF EXISTS "+sch+" CASCADE") }()
-	exec(t, db, ratingSchemaDDL(t))
-
-	hour := mustTime("2026-06-08T10:00:00Z")
-	book := newTestBook(
-		map[string]Rate3{
-			"cheap/base":     rate3("0.000001", "0", "0"),
-			"expensive/base": rate3("0.000009", "0", "0"),
-		},
-		nil, PolicyMultiplier, MustDec("1.5"), Dec{},
-	)
-
-	type seed struct {
-		req, model, baseModel, adapter string
-	}
-	seeds := []seed{
-		// Two distinct bases on the PLAIN-BASE path for one endpoint name → ambiguous.
-		{"pb-1", "tf-ep-reused", "cheap/base", ""},
-		{"pb-2", "tf-ep-reused", "expensive/base", ""},
-		// Adapter FLAP on one endpoint name (same base): premium vs plain → ambiguous.
-		{"flap-1", "tf-ep-flap", "cheap/base", "ckpt-artifact-9"},
-		{"flap-2", "tf-ep-flap", "cheap/base", ""},
-		// A clean single-base, no-adapter endpoint that MUST still rate (plain rate).
-		{"clean", "tf-ep-clean", "cheap/base", ""},
-	}
-	for _, s := range seeds {
-		if _, err := db.ExecContext(ctx,
-			`INSERT INTO billing_event (request_id, auth_id, resource_id, model, base_model, adapter, prompt_tokens, completion_tokens, event_ts)
-			 VALUES ($1,'a','r',$2,$3,$4,1000,0,$5)`,
-			s.req, s.model, s.baseModel, nullableStr(s.adapter), hour.Add(5*time.Minute)); err != nil {
-			t.Fatalf("seed %s: %v", s.req, err)
-		}
-	}
-
-	store := NewPostgresStore(db)
-	res, err := store.RateWindow(ctx, book, hour, hour.Add(time.Hour))
-	if err != nil {
-		t.Fatalf("RateWindow: %v", err)
-	}
-	if res.RollupsWritten != 1 || res.EventsRated != 1 {
-		t.Fatalf("rollups/events = %d/%d, want 1/1 (only tf-ep-clean bills)", res.RollupsWritten, res.EventsRated)
-	}
-	if res.AmbiguousBaseEvents != 4 {
-		t.Fatalf("ambiguous = %d, want 4 (two-base reuse + adapter flap must scream, never MIN-bill)", res.AmbiguousBaseEvents)
-	}
-	var nAmbig int
-	if err := db.QueryRowContext(ctx,
-		`SELECT COUNT(*) FROM rated_usage WHERE model_id IN ('tf-ep-reused','tf-ep-flap')`).Scan(&nAmbig); err != nil {
-		t.Fatalf("count ambiguous rollups: %v", err)
-	}
-	if nAmbig != 0 {
-		t.Fatalf("rated_usage has %d rows for ambiguous endpoints — they must NOT be billed", nAmbig)
-	}
-	// The clean endpoint billed at its PLAIN base rate: 1000 x 0.000001 = 0.001.
-	var cost string
-	if err := db.QueryRowContext(ctx,
-		`SELECT cost::text FROM rated_usage WHERE model_id='tf-ep-clean'`).Scan(&cost); err != nil {
-		t.Fatalf("read tf-ep-clean rollup: %v", err)
-	}
-	if MustDec(cost).String() != "0.001000000" {
-		t.Errorf("tf-ep-clean cost = %s, want 0.001000000 (plain base rate, no premium)", cost)
-	}
-}
-
-// TestIntegration_FreshInputTokensSurvivesInt32Overflow pins the generated
-// fresh_input_tokens column against int32 overflow of its own subtraction.
-//
-// prompt_tokens and cached_tokens are INTEGER, so each value below is
-// individually valid engine evidence, but `prompt_tokens - cached_tokens`
-// exceeds int32 range. Declared as INTEGER over unwidened operands, PostgreSQL
-// raises 22003 and rejects the INSERT — destroying the raw invalid evidence the
-// ledger exists to retain, and turning an engine bug into lost billing
-// forensics. Declared BIGINT over explicitly cast BIGINT operands, the row
-// persists, reconciliation counts it as an invalid-usage attempt, and it still
-// never reaches money.
-func TestIntegration_FreshInputTokensSurvivesInt32Overflow(t *testing.T) {
-	dsn := os.Getenv("PHOEBE_TEST_DATABASE_URL")
-	if dsn == "" {
-		t.Skip("PHOEBE_TEST_DATABASE_URL not set; skipping live-Postgres conformance")
-	}
-	ctx := context.Background()
-	db, err := sql.Open("pgx", dsn)
-	if err != nil {
-		t.Fatalf("open: %v", err)
-	}
-	defer db.Close()
-
-	const sch = "phoebe_rating_overflow_it"
-	exec(t, db, "DROP SCHEMA IF EXISTS "+sch+" CASCADE")
-	exec(t, db, "CREATE SCHEMA "+sch)
-	exec(t, db, "SET search_path TO "+sch)
-	defer func() { exec(t, db, "DROP SCHEMA IF EXISTS "+sch+" CASCADE") }()
-
-	for _, name := range []string{
-		"0001_billing_event.up.sql",
-		"0002_rating.up.sql",
-		"0004_billing_event_serving_mode.up.sql",
-		"0005_invoice_grade_attempts.up.sql",
-		"0006_rollup_grain.up.sql",
-		"0008_billing_event_topology.up.sql",
-		"0009_rollup_grain_graph_revision.up.sql",
-		"0010_rated_usage_identity.up.sql",
-	} {
-		ddl, readErr := os.ReadFile("../../migrations/" + name)
-		if readErr != nil {
-			t.Fatalf("read migration %s: %v", name, readErr)
-		}
-		exec(t, db, string(ddl))
-	}
-
-	// The generated column must be wide enough to hold the difference.
-	var dataType string
-	if err := db.QueryRowContext(ctx,
-		`SELECT data_type FROM information_schema.columns
-		 WHERE table_schema = $1 AND table_name = 'billing_event'
-		   AND column_name = 'fresh_input_tokens'`, sch).Scan(&dataType); err != nil {
-		t.Fatalf("read fresh_input_tokens type: %v", err)
-	}
-	if dataType != "bigint" {
-		t.Fatalf("fresh_input_tokens is %s, want bigint: an INTEGER generated column "+
-			"overflows on valid int32 operands and rejects raw evidence", dataType)
-	}
-
-	hour := mustTime("2026-06-08T10:00:00Z")
-	const (
-		maxInt32 = 2147483647
-		minInt32 = -2147483648
-	)
-	// Each operand is a valid INTEGER; both differences exceed int32 range.
-	cases := []struct {
-		requestID string
-		prompt    int64
-		cached    int64
-		wantFresh int64
-	}{
-		{"engine-overflow-positive", maxInt32, minInt32, int64(maxInt32) - int64(minInt32)},
-		{"engine-overflow-negative", minInt32, maxInt32, int64(minInt32) - int64(maxInt32)},
-	}
-	for _, tc := range cases {
-		if _, err := db.ExecContext(ctx,
-			`INSERT INTO billing_event
-			 (request_id, auth_id, resource_id, org_id, model, prompt_tokens, cached_tokens, completion_tokens, usage_found, event_ts)
-			 VALUES ($1,'a','d1','org-1','b',$2,$3,0,TRUE,$4)`,
-			tc.requestID, tc.prompt, tc.cached, hour.Add(5*time.Minute)); err != nil {
-			t.Fatalf("insert %s: %v (raw invalid evidence must remain persistable)", tc.requestID, err)
-		}
-		var fresh int64
-		if err := db.QueryRowContext(ctx,
-			`SELECT fresh_input_tokens FROM billing_event WHERE request_id = $1`, tc.requestID).Scan(&fresh); err != nil {
-			t.Fatalf("read fresh_input_tokens for %s: %v", tc.requestID, err)
-		}
-		if fresh != tc.wantFresh {
-			t.Fatalf("%s fresh_input_tokens = %d, want %d", tc.requestID, fresh, tc.wantFresh)
-		}
-	}
-
-	// Both rows are invalid evidence (cached > prompt, or negative counts), so
-	// they are reported for repair and excluded from money.
-	book := newTestBook(map[string]Rate3{"b": rate3("0.000005", "0.000001", "0")}, nil, PolicyIdentity, Dec{}, Dec{})
-	res, err := NewPostgresStore(db).RateWindow(ctx, book, hour, hour.Add(time.Hour))
-	if err != nil {
-		t.Fatalf("RateWindow: %v", err)
-	}
-	if res.InvalidUsageEvents != 2 || res.EventsRated != 0 || res.RollupsWritten != 0 {
-		t.Fatalf("overflow result = invalid/rated/rollups %d/%d/%d, want 2/0/0",
-			res.InvalidUsageEvents, res.EventsRated, res.RollupsWritten)
-	}
-	var rawRows, invalidAttempts, ratedRows int64
-	if err := db.QueryRowContext(ctx, `SELECT COUNT(*) FROM billing_event`).Scan(&rawRows); err != nil {
-		t.Fatalf("count raw evidence: %v", err)
-	}
-	if err := db.QueryRowContext(ctx,
-		`SELECT COALESCE(SUM(invalid_usage_attempts),0) FROM billing_reconciliation_hourly`).Scan(&invalidAttempts); err != nil {
-		t.Fatalf("read invalid reconciliation evidence: %v", err)
-	}
-	if err := db.QueryRowContext(ctx, `SELECT COUNT(*) FROM rated_usage`).Scan(&ratedRows); err != nil {
-		t.Fatalf("count rated rows: %v", err)
-	}
-	if rawRows != 2 || invalidAttempts != 2 || ratedRows != 0 {
-		t.Fatalf("overflow persistence = raw/invalid/rated %d/%d/%d, want 2/2/0", rawRows, invalidAttempts, ratedRows)
-	}
-}
-
-// TestIntegration_MissingUsagePartitionedByCause proves the paging partition
-// against live Postgres: routine zero-usage attempts (client abort, upstream
-// failure) are counted as EXPECTED and must not page, while a SUCCESSFUL response
-// carrying no usage block is counted as UNEXPLAINED and must page. Ratified with
-// Hugo 2026-09-21 — paging on the cause-blind total fired hourly on any install
-// with real traffic and buried the rare anomalies sharing the exit-2 channel.
-func TestIntegration_MissingUsagePartitionedByCause(t *testing.T) {
-	dsn := os.Getenv("PHOEBE_TEST_DATABASE_URL")
-	if dsn == "" {
-		t.Skip("PHOEBE_TEST_DATABASE_URL not set; skipping live-Postgres conformance")
-	}
-	ctx := context.Background()
-	db, err := sql.Open("pgx", dsn)
-	if err != nil {
-		t.Fatalf("open: %v", err)
-	}
-	defer db.Close()
-
-	const sch = "phoebe_rating_missing_cause_it"
-	exec(t, db, "DROP SCHEMA IF EXISTS "+sch+" CASCADE")
-	exec(t, db, "CREATE SCHEMA "+sch)
-	exec(t, db, "SET search_path TO "+sch)
-	defer func() { exec(t, db, "DROP SCHEMA IF EXISTS "+sch+" CASCADE") }()
-	for _, name := range []string{
-		"0001_billing_event.up.sql",
-		"0002_rating.up.sql",
-		"0004_billing_event_serving_mode.up.sql",
-		"0005_invoice_grade_attempts.up.sql",
-		"0006_rollup_grain.up.sql",
-		"0008_billing_event_topology.up.sql",
-		"0009_rollup_grain_graph_revision.up.sql",
-		"0010_rated_usage_identity.up.sql",
-	} {
-		ddl, readErr := os.ReadFile("../../migrations/" + name)
-		if readErr != nil {
-			t.Fatalf("read migration %s: %v", name, readErr)
-		}
-		exec(t, db, string(ddl))
-	}
-
-	hour := mustTime("2026-06-08T10:00:00Z")
-	insert := func(id string, aborted bool, status any) {
-		t.Helper()
-		if _, err := db.ExecContext(ctx,
-			`INSERT INTO billing_event
-			 (request_id, auth_id, resource_id, org_id, model, prompt_tokens, cached_tokens,
-			  completion_tokens, usage_found, aborted, status_code, event_ts)
-			 VALUES ($1,'a','d1','org-1','b',0,0,0,FALSE,$2,$3,$4)`,
-			id, aborted, status, hour.Add(5*time.Minute)); err != nil {
-			t.Fatalf("insert %s: %v", id, err)
-		}
-	}
-	// Routine: a client disconnect (499) and an upstream failure (502).
-	insert("abort-499", true, 499)
-	insert("upstream-502", false, 502)
-	// Alarming: the engine returned 200 and reported no tokens.
-	insert("success-no-usage", false, 200)
-
-	book := newTestBook(map[string]Rate3{"b": rate3("0.000005", "0.000001", "0")}, nil, PolicyIdentity, Dec{}, Dec{})
-	res, err := NewPostgresStore(db).RateWindow(ctx, book, hour, hour.Add(time.Hour))
-	if err != nil {
-		t.Fatalf("RateWindow: %v", err)
-	}
-	if res.MissingUsageEvents != 3 {
-		t.Fatalf("missing-usage total = %d, want 3", res.MissingUsageEvents)
-	}
-	if res.ExpectedMissingUsageEvents != 2 {
-		t.Fatalf("expected(routine) missing-usage = %d, want 2 (the 499 abort and the 502)",
-			res.ExpectedMissingUsageEvents)
-	}
-	if res.UnexplainedMissingUsageEvents != 1 {
-		t.Fatalf("unexplained missing-usage = %d, want 1 (the 200 with no usage block)",
-			res.UnexplainedMissingUsageEvents)
-	}
-	if res.ExpectedMissingUsageEvents+res.UnexplainedMissingUsageEvents != res.MissingUsageEvents {
-		t.Fatalf("causes %d+%d do not partition the total %d",
-			res.ExpectedMissingUsageEvents, res.UnexplainedMissingUsageEvents, res.MissingUsageEvents)
-	}
-	// None of them is money.
-	if res.EventsRated != 0 || res.RollupsWritten != 0 {
-		t.Fatalf("rated/rollups = %d/%d, want 0/0: zero-usage attempts never become money",
-			res.EventsRated, res.RollupsWritten)
-	}
-
-	// A window of ONLY routine attempts must not page.
-	if _, err := db.ExecContext(ctx, `DELETE FROM billing_event WHERE request_id = 'success-no-usage'`); err != nil {
-		t.Fatalf("delete unexplained row: %v", err)
-	}
-	routine, err := NewPostgresStore(db).RateWindow(ctx, book, hour, hour.Add(time.Hour))
-	if err != nil {
-		t.Fatalf("RateWindow (routine only): %v", err)
-	}
-	if routine.UnexplainedMissingUsageEvents != 0 {
-		t.Fatalf("unexplained = %d on a routine-only window, want 0", routine.UnexplainedMissingUsageEvents)
-	}
-	rr := Result{
-		MissingUsageEvents:            routine.MissingUsageEvents,
-		ExpectedMissingUsageEvents:    routine.ExpectedMissingUsageEvents,
-		UnexplainedMissingUsageEvents: routine.UnexplainedMissingUsageEvents,
-	}
-	if rr.HasAnomaly() {
-		t.Fatal("a window of only client aborts and upstream failures must NOT page")
-	}
-}
-
-// TestIntegration_AmbiguousBaseIsIndistinguishableFromUnratedInTheView pins the
-// blind spot that docs/billing-reconciliation.md warns about, so the warning can
-// never silently drift from what the view actually exposes.
-//
-// THE INVARIANT: a rollup WITHHELD by the rater's ambiguous_base gate appears in
-// billing_reconciliation_hourly as raw_attempts > 0 with rated_attempts = 0 and
-// rated_cost = 0 — byte-identical in shape to an hour the rater never rated — and
-// the view carries NO column that distinguishes the two. The base gate keys on
-// rating_price/rating_derived join outcomes (via_derived/via_base) that exist only
-// inside the rater, not as billing_event columns, so the view CANNOT compute it;
-// the only signal is the run report's AmbiguousBaseEvents. An operator auditing
-// deltas must therefore consult the run report before calling such a row lost
-// rating. If a future migration ever DOES surface an ambiguous/withheld column,
-// this test fails and the doc paragraph must be rewritten to point at it.
-//
-// This is deliberately asymmetric with the org case, which the view DOES explain
-// via distinct_org_ids > 1 (asserted below as the contrast).
-func TestIntegration_AmbiguousBaseIsIndistinguishableFromUnratedInTheView(t *testing.T) {
-	dsn := os.Getenv("PHOEBE_TEST_DATABASE_URL")
-	if dsn == "" {
-		t.Skip("PHOEBE_TEST_DATABASE_URL not set; skipping live-Postgres conformance")
-	}
-	ctx := context.Background()
-	db, err := sql.Open("pgx", dsn)
-	if err != nil {
-		t.Fatalf("open: %v", err)
-	}
-	defer db.Close()
-
-	const sch = "phoebe_rating_ambig_view_it"
-	exec(t, db, "DROP SCHEMA IF EXISTS "+sch+" CASCADE")
-	exec(t, db, "CREATE SCHEMA "+sch)
-	exec(t, db, "SET search_path TO "+sch)
-	defer func() { exec(t, db, "DROP SCHEMA IF EXISTS "+sch+" CASCADE") }()
-	exec(t, db, ratingSchemaDDL(t))
-
-	hour := mustTime("2026-06-08T10:00:00Z")
-	book := newTestBook(
-		map[string]Rate3{
-			"cheap/base":     rate3("0.000001", "0", "0"),
-			"expensive/base": rate3("0.000009", "0", "0"),
-		},
-		nil, PolicyMultiplier, MustDec("1.5"), Dec{},
-	)
-
-	// One ft: id under TWO base_models in one hour → the base gate withholds it.
-	for _, s := range []struct{ req, base string }{
-		{"ab-1", "cheap/base"}, {"ab-2", "expensive/base"},
-	} {
-		if _, err := db.ExecContext(ctx,
-			`INSERT INTO billing_event (request_id, auth_id, resource_id, org_id, model, base_model, prompt_tokens, completion_tokens, event_ts)
-			 VALUES ($1,'a','r-ambig','org-1','ft:dupe',$2,1000,0,$3)`,
-			s.req, s.base, hour.Add(5*time.Minute)); err != nil {
-			t.Fatalf("seed %s: %v", s.req, err)
-		}
-	}
-	// A second resource the rater is simply never asked to rate: the "rater has not
-	// run for this hour" cause, seeded in an hour outside the rated window.
-	unratedHour := hour.Add(time.Hour)
-	if _, err := db.ExecContext(ctx,
-		`INSERT INTO billing_event (request_id, auth_id, resource_id, org_id, model, base_model, prompt_tokens, completion_tokens, event_ts)
-		 VALUES ('ur-1','a','r-unrated','org-1','ft:clean','cheap/base',1000,0,$1)`,
-		unratedHour.Add(5*time.Minute)); err != nil {
-		t.Fatalf("seed unrated: %v", err)
-	}
-
-	store := NewPostgresStore(db)
-	res, err := store.RateWindow(ctx, book, hour, hour.Add(time.Hour))
-	if err != nil {
-		t.Fatalf("RateWindow: %v", err)
-	}
-	if res.AmbiguousBaseEvents != 2 {
-		t.Fatalf("AmbiguousBaseEvents = %d, want 2 — the run report is the ONLY place this cause is visible",
-			res.AmbiguousBaseEvents)
-	}
-
-	type viewRow struct {
-		raw, rated, distinctOrgs, delta int64
-		cost                            string
-	}
-	read := func(resource string, win time.Time) viewRow {
-		var r viewRow
-		if err := db.QueryRowContext(ctx, `
-			SELECT raw_attempts, rated_attempts, distinct_org_ids, attempt_delta, rated_cost::text
-			FROM billing_reconciliation_hourly
-			WHERE window_start=$1 AND auth_id='a' AND resource_id=$2`, win, resource).
-			Scan(&r.raw, &r.rated, &r.distinctOrgs, &r.delta, &r.cost); err != nil {
-			t.Fatalf("read view for %s: %v", resource, err)
-		}
-		return r
-	}
-
-	withheld := read("r-ambig", hour)
-	neverRated := read("r-unrated", unratedHour)
-
-	// The withheld rollup looks exactly like lost rating.
-	if withheld.raw != 2 || withheld.rated != 0 || withheld.delta != 2 || MustDec(withheld.cost).String() != "0.000000000" {
-		t.Fatalf("withheld row = raw/rated/delta/cost %d/%d/%d/%s, want 2/0/2/0 (the gate excludes it from rated_usage entirely)",
-			withheld.raw, withheld.rated, withheld.delta, withheld.cost)
-	}
-	// And the never-rated hour is the SAME shape, per raw attempt — that sameness
-	// IS the blind spot the docs tell the operator to resolve via the run report.
-	if neverRated.rated != 0 || neverRated.delta != neverRated.raw {
-		t.Fatalf("never-rated row = raw/rated/delta %d/%d/%d, want rated 0 and delta == raw",
-			neverRated.raw, neverRated.rated, neverRated.delta)
-	}
-	// Neither row carries an org-ambiguity signal, so distinct_org_ids cannot be
-	// mistaken for a base-ambiguity explanation.
-	if withheld.distinctOrgs != 1 || neverRated.distinctOrgs != 1 {
-		t.Fatalf("distinct_org_ids withheld/never-rated = %d/%d, want 1/1 (single org on both; base ambiguity is invisible here)",
-			withheld.distinctOrgs, neverRated.distinctOrgs)
-	}
-
-	// The view exposes NO ambiguous/withheld column. If one is ever added, the
-	// documented "the view does not surface it" guidance is stale — fail here.
-	var explanatory int64
-	if err := db.QueryRowContext(ctx, `
-		SELECT COUNT(*) FROM information_schema.columns
-		WHERE table_name='billing_reconciliation_hourly'
-		  AND (column_name LIKE '%ambiguous%' OR column_name LIKE '%withheld%'
-		       OR column_name LIKE '%distinct_base%')`).Scan(&explanatory); err != nil {
-		t.Fatalf("inspect view columns: %v", err)
-	}
-	if explanatory != 0 {
-		t.Fatalf("billing_reconciliation_hourly now has %d ambiguity/withheld column(s); docs/billing-reconciliation.md still tells operators the view does not surface base ambiguity — update the doc", explanatory)
-	}
-}
-
-// TestIntegration_MigrationsCreateOrgGrainViewWithoutReplacement guards the
-// invariant that the ENTIRE embedded migration set, applied in version order
-// exactly as cmd/migrate applies it, creates billing_reconciliation_hourly ONCE
-// at the rated natural grain — it is never created in a known-wrong org-grouped
-// shape and then dropped and replaced by a later migration. The reconciliation
-// view's shape is the operator's audit contract; an operator applying the
-// migrations must never materialize a view shape nobody intends to run.
-//
-// It asserts three things: exactly one CREATE VIEW of that name exists across
-// every up migration and no up migration DROPs it; the applied view exposes the
-// org-evidence columns (missing_org_attempts, distinct_org_ids); and raw
-// evidence is grouped at the rater's grain, so a rollout-era NULL org_id and a
-// real org_id on the same (hour, auth, resource, model) collapse into ONE row
-// rather than two false mismatch rows.
-func TestIntegration_MigrationsCreateOrgGrainViewWithoutReplacement(t *testing.T) {
-	dsn := os.Getenv("PHOEBE_TEST_DATABASE_URL")
-	if dsn == "" {
-		t.Skip("PHOEBE_TEST_DATABASE_URL not set; skipping live-Postgres conformance")
-	}
-
-	ups, err := filepath.Glob("../../migrations/*.up.sql")
-	if err != nil || len(ups) == 0 {
-		t.Fatalf("glob up migrations: %v (found %d)", err, len(ups))
-	}
-	sort.Strings(ups)
-	creates, drops := 0, 0
-	for _, f := range ups {
-		body, readErr := os.ReadFile(f)
-		if readErr != nil {
-			t.Fatalf("read %s: %v", f, readErr)
-		}
-		creates += strings.Count(string(body), "CREATE VIEW billing_reconciliation_hourly")
-		drops += strings.Count(string(body), "DROP VIEW billing_reconciliation_hourly")
-		drops += strings.Count(string(body), "DROP VIEW IF EXISTS billing_reconciliation_hourly")
-	}
-	if creates != 1 || drops != 0 {
-		t.Fatalf("up migrations CREATE billing_reconciliation_hourly %d time(s) and DROP it %d time(s); want exactly 1 create and 0 drops — operators must not apply a view shape that a later migration immediately replaces", creates, drops)
-	}
-
-	ctx := context.Background()
-	db, err := sql.Open("pgx", dsn)
-	if err != nil {
-		t.Fatalf("open: %v", err)
-	}
-	defer db.Close()
-
-	const sch = "phoebe_migration_view_it"
-	exec(t, db, "DROP SCHEMA IF EXISTS "+sch+" CASCADE")
-	exec(t, db, "CREATE SCHEMA "+sch)
-	exec(t, db, "SET search_path TO "+sch)
-	defer func() { exec(t, db, "DROP SCHEMA IF EXISTS "+sch+" CASCADE") }()
-
-	// Apply EVERY up migration in version order — the real cmd/migrate sequence,
-	// io_log included, so nothing about the ordering is hand-curated here.
-	for _, f := range ups {
-		ddl, readErr := os.ReadFile(f)
-		if readErr != nil {
-			t.Fatalf("read %s: %v", f, readErr)
-		}
-		exec(t, db, string(ddl))
-	}
-
-	for _, col := range []string{"missing_org_attempts", "distinct_org_ids"} {
-		var n int64
-		if err := db.QueryRowContext(ctx, `
-			SELECT COUNT(*) FROM information_schema.columns
-			WHERE table_schema=$1 AND table_name='billing_reconciliation_hourly'
-			  AND column_name=$2`, sch, col).Scan(&n); err != nil {
-			t.Fatalf("inspect view column %s: %v", col, err)
-		}
-		if n != 1 {
-			t.Fatalf("billing_reconciliation_hourly is missing %s after applying all migrations; the org-grain view did not survive the migration set", col)
-		}
-	}
-
-	// Two attempts on the same natural key, one carrying a rollout-era NULL org.
-	// At the rater's grain they are ONE reconciliation row; grouping raw by
-	// org_id would split them into two rows that each look like a mismatch.
-	hour := mustTime("2026-06-08T10:00:00Z")
-	for i, org := range []interface{}{nil, "org-1"} {
-		if _, err := db.ExecContext(ctx,
-			`INSERT INTO billing_event
-			 (request_id, auth_id, resource_id, org_id, model, prompt_tokens, cached_tokens, completion_tokens, usage_found, event_ts)
-			 VALUES ($1,'a','d1',$2,'b',10,0,5,TRUE,$3)`,
-			fmt.Sprintf("org-grain-%d", i), org, hour.Add(time.Duration(i)*time.Minute)); err != nil {
-			t.Fatalf("insert attempt %d: %v", i, err)
-		}
-	}
-	var rows, rawAttempts, missingOrg, distinctOrgs int64
-	if err := db.QueryRowContext(ctx, `
-		SELECT COUNT(*), COALESCE(MAX(raw_attempts),0), COALESCE(MAX(missing_org_attempts),0),
-		       COALESCE(MAX(distinct_org_ids),0)
-		FROM billing_reconciliation_hourly`).Scan(&rows, &rawAttempts, &missingOrg, &distinctOrgs); err != nil {
-		t.Fatalf("query view: %v", err)
-	}
-	if rows != 1 || rawAttempts != 2 {
-		t.Fatalf("view has %d row(s) with max raw_attempts=%d, want 1 row of 2 attempts — a NULL org and a real org on one natural key must not split into false mismatch rows", rows, rawAttempts)
-	}
-	if missingOrg != 1 || distinctOrgs != 1 {
-		t.Fatalf("missing_org_attempts/distinct_org_ids = %d/%d, want 1/1 — the org evidence the grain change replaced org grouping with", missingOrg, distinctOrgs)
-	}
-}
-
-// TestIntegration_ServingModeSplitsRollupAndPricesEachMode is THE regression test for
-// the defect migration 0006 exists to fix, against real Postgres.
-//
-// THE BUG (pre-0006): serving_mode was NOT part of the rollup grain, but it IS part of
-// the price key — shared traffic prices from 'shared:'||base_model, dedicated from the
-// bare base_model. So a bucket containing both modes collapsed into ONE rollup, and
-// MIN(prompt_price) applied the CHEAPER of the two rates to ALL of it. Silent
-// under-billing (or over-billing, depending which way the rates differ).
-//
-// The pre-existing ambiguous_base gate could not catch it: BOTH rows carry the SAME
-// base_model and BOTH resolve via the same pricing path, so COUNT(DISTINCT base_model)
-// is 1 and bool_or(via_derived)/bool_or(via_base) never mix. The gate stays false.
-//
-// REACHABILITY: serving_mode is a deploy-time property (a tf_model column, or the
-// anti-spoof X-Saturn-Serving-Mode header), so it cannot vary per request. But it CAN
-// change across an hour: Atlas flipping a deployment's mode, or the header rollout
-// landing mid-hour — an ABSENT header (header-routed path only) reads as dedicated, so pre-rollout events on an
-// already-shared deployment price as dedicated. That is the scenario seeded below.
-//
-// WHAT THIS PINS: one resource, one model, one hour, both modes → TWO rollups, each
-// priced at ITS OWN rate, with no withholding and no anomaly. Deliberately asserts the
-// per-row cost, not just the row count: a split that still priced both rows the same
-// would pass a count-only test while leaving the money wrong.
-func TestIntegration_ServingModeSplitsRollupAndPricesEachMode(t *testing.T) {
-	dsn := os.Getenv("PHOEBE_TEST_DATABASE_URL")
-	if dsn == "" {
-		t.Skip("PHOEBE_TEST_DATABASE_URL not set; skipping live-Postgres conformance")
-	}
-	ctx := context.Background()
-	db, err := sql.Open("pgx", dsn)
-	if err != nil {
-		t.Fatalf("open: %v", err)
-	}
-	defer db.Close()
-
-	const sch = "phoebe_rating_servingmode_it"
-	exec(t, db, "DROP SCHEMA IF EXISTS "+sch+" CASCADE")
-	exec(t, db, "CREATE SCHEMA "+sch)
-	exec(t, db, "SET search_path TO "+sch)
-	defer func() { exec(t, db, "DROP SCHEMA IF EXISTS "+sch+" CASCADE") }()
-	exec(t, db, ratingSchemaDDL(t))
-
-	hour := mustTime("2026-06-08T10:00:00Z")
-	// Two DISTINCT rates for one base: the bare key (dedicated) and the mode-prefixed
-	// key (shared). Shared is 10x cheaper here, so a collapse would be visible as
-	// under-billing — and MIN() would pick the shared rate for the dedicated traffic.
-	book := newTestBook(
-		map[string]Rate3{
-			"b":        rate3("0.000010", "0", "0"),
-			"shared:b": rate3("0.000001", "0", "0"),
-		},
-		nil, PolicyIdentity, Dec{}, Dec{},
-	)
-
-	// ONE resource, ONE model, ONE hour, both modes — the mid-hour flip. 'd1'/'d2' are
-	// dedicated; 's1'/'s2' are shared.
-	if _, err := db.ExecContext(ctx,
-		`INSERT INTO billing_event (request_id, auth_id, resource_id, org_id, model, base_model, serving_mode, prompt_tokens, completion_tokens, event_ts)
-		 VALUES ('d1','a','res','org-1','m','b','dedicated',100,0,$1),
-		        ('d2','a','res','org-1','m','b','dedicated',100,0,$1),
-		        ('s1','a','res','org-1','m','b','shared',100,0,$1),
-		        ('s2','a','res','org-1','m','b','shared',100,0,$1)`, hour.Add(5*time.Minute)); err != nil {
-		t.Fatalf("seed: %v", err)
-	}
-
-	store := NewPostgresStore(db)
-	res, err := store.RateWindow(ctx, book, hour, hour.Add(time.Hour))
-	if err != nil {
-		t.Fatalf("RateWindow: %v", err)
-	}
-
-	// TWO rollups from one (auth, resource, model, hour) — the split. All four events
-	// rate; nothing is withheld, because differing modes are now a legitimate split
-	// rather than an ambiguity.
-	if res.RollupsWritten != 2 || res.EventsRated != 4 {
-		t.Fatalf("rollups/events = %d/%d, want 2/4 (one rollup per serving mode, all events rated)",
-			res.RollupsWritten, res.EventsRated)
-	}
-	if res.AmbiguousBaseEvents != 0 {
-		t.Fatalf("AmbiguousBaseEvents = %d, want 0 (a mode split is not a base ambiguity)", res.AmbiguousBaseEvents)
-	}
-
-	// THE MONEY. Each rollup must carry ITS OWN rate:
-	//   dedicated: 200 prompt tokens x 0.000010 = 0.002000000
-	//   shared   : 200 prompt tokens x 0.000001 = 0.000200000
-	// Pre-0006 this was ONE row of 400 tokens at MIN() = 0.000001 → 0.000400000,
-	// i.e. the dedicated traffic billed at the shared rate.
-	for _, want := range []struct {
-		mode string
-		cost string
-		rate string
-	}{
-		{"dedicated", "0.002000000", "0.000010000"},
-		{"shared", "0.000200000", "0.000001000"},
-	} {
-		var cost, rate string
-		var tokens int64
-		if err := db.QueryRowContext(ctx,
-			`SELECT cost::text, applied_prompt_rate::text, prompt_tokens
-			   FROM rated_usage
-			  WHERE resource_id = 'res' AND serving_mode = $1 AND window_start = $2`,
-			want.mode, hour).Scan(&cost, &rate, &tokens); err != nil {
-			t.Fatalf("read serving_mode=%q rollup: %v", want.mode, err)
-		}
-		if cost != want.cost || rate != want.rate || tokens != 200 {
-			t.Fatalf("serving_mode=%q: cost/rate/tokens = %s/%s/%d, want %s/%s/200",
-				want.mode, cost, rate, tokens, want.cost, want.rate)
-		}
-	}
-
-	// The two rollups must have DISTINCT ids: rated_usage_id is an md5 over the grain,
-	// so if serving_mode had not entered the hash they would collide and the second
-	// upsert would overwrite the first — the split would be undone at the id level even
-	// with a correct GROUP BY.
-	var distinctIDs int
-	if err := db.QueryRowContext(ctx,
-		`SELECT COUNT(DISTINCT id) FROM rated_usage WHERE resource_id = 'res' AND window_start = $1`,
-		hour).Scan(&distinctIDs); err != nil {
-		t.Fatalf("count distinct ids: %v", err)
-	}
-	if distinctIDs != 2 {
-		t.Fatalf("distinct rated_usage ids = %d, want 2 (serving_mode must be in the md5 grain)", distinctIDs)
-	}
-}
-
-// TestIntegration_OwnerConflictWithheldAndGraphSplits pins the owner behaviours of
-// 0006 and the graph grain of 0009 against real Postgres:
-//
-//   - OWNER CONFLICT: an event carrying BOTH user_id and group_id contradicts the
-//     upstream user-XOR-group model. The owner cannot be determined, so the event is
-//     WITHHELD (never billed to a guessed owner) and counted. auth-server emits these
-//     headers under an else-if and so cannot produce this today; the gate guards
-//     against a FUTURE producer regression.
-//   - OWNER SPLITS the grain: two different owners on one (auth, resource, model, hour)
-//     are two rollups, so per-person charges are presentable.
-//   - GRAPH SPLITS the grain (0009, owner ruling 2026-10-12): traffic served by two
-//     graphs in one hour is two rollups, each naming its graph, both billed. An event
-//     that named no graph is its own rollup under the ” sentinel, never merged into a
-//     named graph's rollup.
-func TestIntegration_OwnerConflictWithheldAndGraphSplits(t *testing.T) {
-	dsn := os.Getenv("PHOEBE_TEST_DATABASE_URL")
-	if dsn == "" {
-		t.Skip("PHOEBE_TEST_DATABASE_URL not set; skipping live-Postgres conformance")
-	}
-	ctx := context.Background()
-	db, err := sql.Open("pgx", dsn)
-	if err != nil {
-		t.Fatalf("open: %v", err)
-	}
-	defer db.Close()
-
-	const sch = "phoebe_rating_owner_it"
-	exec(t, db, "DROP SCHEMA IF EXISTS "+sch+" CASCADE")
-	exec(t, db, "CREATE SCHEMA "+sch)
-	exec(t, db, "SET search_path TO "+sch)
-	defer func() { exec(t, db, "DROP SCHEMA IF EXISTS "+sch+" CASCADE") }()
-	exec(t, db, ratingSchemaDDL(t))
-
-	hour := mustTime("2026-06-08T10:00:00Z")
-	book := newTestBook(
-		map[string]Rate3{"b": rate3("0.000005", "0", "0")},
-		nil, PolicyIdentity, Dec{}, Dec{},
-	)
-
-	//   'bad'   : one event with BOTH user and group  → withheld.
-	//   'split' : two events, different owners        → TWO rollups.
-	//   'graph' : two events, TWO distinct graphs     → TWO rollups, both billed.
-	//   'one'   : one event on a graph, one with none → TWO rollups ('dgd-c' and '').
-	if _, err := db.ExecContext(ctx,
-		`INSERT INTO billing_event (request_id, auth_id, user_id, group_id, resource_id, org_id, model, base_model, graph_k8s_name, prompt_tokens, completion_tokens, event_ts)
-		 VALUES ('b1','a','u-1','g-1','bad',  'org-1','m','b',NULL,     100,0,$1),
-		        ('p1','a','u-1',NULL, 'split','org-1','m','b',NULL,     100,0,$1),
-		        ('p2','a',NULL, 'g-2','split','org-1','m','b',NULL,     100,0,$1),
-		        ('g1','a','u-3',NULL, 'graph','org-1','m','b','dgd-a',  100,0,$1),
-		        ('g2','a','u-3',NULL, 'graph','org-1','m','b','dgd-b',  100,0,$1),
-		        ('o1','a','u-4',NULL, 'one',  'org-1','m','b','dgd-c',  100,0,$1),
-		        ('o2','a','u-4',NULL, 'one',  'org-1','m','b',NULL,     100,0,$1)`,
-		hour.Add(5*time.Minute)); err != nil {
-		t.Fatalf("seed: %v", err)
-	}
-
-	store := NewPostgresStore(db)
-	res, err := store.RateWindow(ctx, book, hour, hour.Add(time.Hour))
-	if err != nil {
-		t.Fatalf("RateWindow: %v", err)
-	}
-
-	if res.OwnerConflictEvents != 1 {
-		t.Fatalf("OwnerConflictEvents = %d, want 1 (the both-owner event)", res.OwnerConflictEvents)
-	}
-	// split(2) + graph(2) + one(2) = 6 rated, each its own rollup; bad(1) withheld.
-	if res.RollupsWritten != 6 || res.EventsRated != 6 {
-		t.Fatalf("rollups/events = %d/%d, want 6/6 (owner and graph each split their resource; 'bad' withheld)",
-			res.RollupsWritten, res.EventsRated)
-	}
-
-	var badRows int
-	if err := db.QueryRowContext(ctx,
-		`SELECT COUNT(*) FROM rated_usage WHERE resource_id = 'bad'`).Scan(&badRows); err != nil {
-		t.Fatalf("count bad: %v", err)
-	}
-	if badRows != 0 {
-		t.Fatalf("rated_usage rows for the owner-conflict resource = %d, want 0 (withheld, never billed to a guessed owner)", badRows)
-	}
-
-	readStrings := func(q string) []string {
-		t.Helper()
-		rows, err := db.QueryContext(ctx, q)
-		if err != nil {
-			t.Fatalf("query %q: %v", q, err)
-		}
-		defer func() { _ = rows.Close() }()
-		var out []string
-		for rows.Next() {
-			var v string
-			if err := rows.Scan(&v); err != nil {
-				t.Fatalf("scan: %v", err)
-			}
-			out = append(out, v)
-		}
-		return out
-	}
-
-	owners := readStrings(`SELECT owner_type || ':' || owner_id FROM rated_usage WHERE resource_id = 'split' ORDER BY 1`)
-	if len(owners) != 2 || owners[0] != "group:g-2" || owners[1] != "user:u-1" {
-		t.Fatalf("split owners = %v, want [group:g-2 user:u-1] (one rollup per owner)", owners)
-	}
-	graphs := readStrings(`SELECT graph_k8s_name || '@' || cost::text FROM rated_usage WHERE resource_id = 'graph' ORDER BY 1`)
-	if len(graphs) != 2 || graphs[0] != "dgd-a@0.000500000" || graphs[1] != "dgd-b@0.000500000" {
-		t.Fatalf("graph rollups = %v, want one billed rollup per graph", graphs)
-	}
-	oneGraphs := readStrings(`SELECT graph_k8s_name FROM rated_usage WHERE resource_id = 'one' ORDER BY 1`)
-	if len(oneGraphs) != 2 || oneGraphs[0] != "" || oneGraphs[1] != "dgd-c" {
-		t.Fatalf("one rollups = %q, want ['' dgd-c] (an unnamed graph is its own rollup)", oneGraphs)
-	}
-}
-
-// TestIntegration_NullGraphEventsFormSeparateUnknownGraphRollup pins ledger D9: since
-// 0009 made the graph a grain key, events of one hour that carry no graph (the header
-// path before graph propagation, or events from before 0008) are NOT merged into the
-// rollup of the graph the other events name. Before 0009 the graph was evidence carried
-// via MAX, which ignores NULL, so the two groups formed ONE rollup under the known
-// graph. Now they form two: one under the empty-string (unknown graph) key and one under the
-// named graph. Merging would put tokens under a graph the events did not name. The
-// split must not lose or duplicate anything: the two rollups' token, event and cost
-// totals add up to the events' totals, and each part bills at the same rate.
-func TestIntegration_NullGraphEventsFormSeparateUnknownGraphRollup(t *testing.T) {
-	db := openRatingSchema(t, "phoebe_rating_null_graph_it")
-	ctx := context.Background()
-	hour := mustTime("2026-06-08T10:00:00Z")
-	book := newTestBook(map[string]Rate3{"b": rate3("0.000005", "0", "0.00001")}, nil, PolicyIdentity, Dec{}, Dec{})
-
-	// One identity (auth, resource, model, serving mode, owner) in one hour: two
-	// events with no graph, three on graph dgd-a revision 1.
-	if _, err := db.ExecContext(ctx,
-		`INSERT INTO billing_event (request_id, auth_id, resource_id, org_id, model, base_model, graph_k8s_name, topology_revision, prompt_tokens, completion_tokens, event_ts)
-		 VALUES ('n1','a','res','org-1','m','b',NULL,   NULL,100,10,$1),
-		        ('n2','a','res','org-1','m','b',NULL,   NULL, 50, 5,$2),
-		        ('k1','a','res','org-1','m','b','dgd-a',1,   200,20,$1),
-		        ('k2','a','res','org-1','m','b','dgd-a',1,   300,30,$2),
-		        ('k3','a','res','org-1','m','b','dgd-a',1,   400,40,$3)`,
-		hour.Add(5*time.Minute), hour.Add(20*time.Minute), hour.Add(50*time.Minute)); err != nil {
-		t.Fatalf("seed: %v", err)
-	}
-
-	res, err := NewPostgresStore(db).RateWindow(ctx, book, hour, hour.Add(time.Hour))
-	if err != nil {
-		t.Fatalf("RateWindow: %v", err)
-	}
-	if res.RollupsWritten != 2 || res.EventsRated != 5 {
-		t.Fatalf("rollups/events = %d/%d, want 2/5 (no-graph events form their own '' rollup beside the named graph's)",
-			res.RollupsWritten, res.EventsRated)
-	}
-	// The '' rollup is not a named-graph revision-0 rollup, so D1's warning ignores it.
-	if res.UnknownRevisionRollups != 0 {
-		t.Fatalf("UnknownRevisionRollups = %d, want 0 (the count looks only at rollups that name a graph)", res.UnknownRevisionRollups)
-	}
-
-	type rollup struct {
-		graph      string
-		rev        int
-		prompt     int64
-		completion int64
-		events     int64
-		cost       string
-	}
-	rows, err := db.QueryContext(ctx,
-		`SELECT graph_k8s_name, topology_revision, prompt_tokens, completion_tokens, event_count, cost::text
-		   FROM rated_usage ORDER BY graph_k8s_name`)
-	if err != nil {
-		t.Fatalf("read rollups: %v", err)
-	}
-	defer func() { _ = rows.Close() }()
-	var got []rollup
-	for rows.Next() {
-		var r rollup
-		if err := rows.Scan(&r.graph, &r.rev, &r.prompt, &r.completion, &r.events, &r.cost); err != nil {
-			t.Fatalf("scan: %v", err)
-		}
-		got = append(got, r)
-	}
-	if err := rows.Err(); err != nil {
-		t.Fatalf("rows: %v", err)
-	}
-
-	// '' : 150 prompt x 0.000005 + 15 completion x 0.00001 = 0.00075 + 0.00015.
-	// dgd-a: 900 prompt x 0.000005 + 90 completion x 0.00001 = 0.0045 + 0.0009.
-	want := []rollup{
-		{graph: "", rev: 0, prompt: 150, completion: 15, events: 2, cost: "0.000900000"},
-		{graph: "dgd-a", rev: 1, prompt: 900, completion: 90, events: 3, cost: "0.005400000"},
-	}
-	if !reflect.DeepEqual(got, want) {
-		t.Fatalf("rollups = %+v, want %+v (no-graph events must form a separate '' rollup, never merge into dgd-a)", got, want)
-	}
-
-	// The split loses and duplicates nothing: the rollups add up to the events.
-	var evPrompt, evCompletion, ruPrompt, ruCompletion, ruEvents int64
-	var ruCost string
-	if err := db.QueryRowContext(ctx,
-		`SELECT SUM(prompt_tokens), SUM(completion_tokens) FROM billing_event`).Scan(&evPrompt, &evCompletion); err != nil {
-		t.Fatalf("sum events: %v", err)
-	}
-	if err := db.QueryRowContext(ctx,
-		`SELECT SUM(prompt_tokens), SUM(completion_tokens), SUM(event_count), SUM(cost)::text FROM rated_usage`).
-		Scan(&ruPrompt, &ruCompletion, &ruEvents, &ruCost); err != nil {
-		t.Fatalf("sum rollups: %v", err)
-	}
-	if ruPrompt != evPrompt || ruCompletion != evCompletion || ruEvents != 5 || ruCost != "0.006300000" {
-		t.Fatalf("rollup totals prompt/completion/events/cost = %d/%d/%d/%s, want %d/%d/5/0.006300000 (the events' totals)",
-			ruPrompt, ruCompletion, ruEvents, ruCost, evPrompt, evCompletion)
-	}
-}
-
-// TestIntegration_TopologyRevisionSplitsRollupsAndKeepsIDsStable pins the 0009 grain
-// across re-rates against real Postgres: a graph that changes topology revision
-// inside an hour is two rollups (one per revision, each carrying its region), a
-// re-rate that adds an event on the second revision leaves the first revision's
-// rollup and id untouched, an identical re-rate reproduces the same ids and values
-// for every rollup, and a re-rate whose events lost their region sets the stored
-// region to NULL instead of keeping the stale one.
-func TestIntegration_TopologyRevisionSplitsRollupsAndKeepsIDsStable(t *testing.T) {
-	dsn := os.Getenv("PHOEBE_TEST_DATABASE_URL")
-	if dsn == "" {
-		t.Skip("PHOEBE_TEST_DATABASE_URL not set; skipping live-Postgres conformance")
-	}
-	ctx := context.Background()
-	db, err := sql.Open("pgx", dsn)
-	if err != nil {
-		t.Fatalf("open: %v", err)
-	}
-	defer db.Close()
-
-	const sch = "phoebe_rating_revision_it"
-	exec(t, db, "DROP SCHEMA IF EXISTS "+sch+" CASCADE")
-	exec(t, db, "CREATE SCHEMA "+sch)
-	exec(t, db, "SET search_path TO "+sch)
-	defer func() { exec(t, db, "DROP SCHEMA IF EXISTS "+sch+" CASCADE") }()
-	exec(t, db, ratingSchemaDDL(t))
-
-	hour := mustTime("2026-06-08T10:00:00Z")
-	book := newTestBook(
-		map[string]Rate3{"b": rate3("0.000005", "0", "0")},
-		nil, PolicyIdentity, Dec{}, Dec{},
-	)
-	store := NewPostgresStore(db)
-
-	// RUN A: one event on revision 1, and one from before 0008 (no revision).
-	if _, err := db.ExecContext(ctx,
-		`INSERT INTO billing_event (request_id, auth_id, resource_id, org_id, model, base_model, graph_k8s_name, topology_revision, region, prompt_tokens, completion_tokens, event_ts)
-		 VALUES ('e1','a','res','org-1','m','b','dgd-a',1,'eu-north1',100,0,$1),
-		        ('e0','a','res','org-1','m','b','dgd-a',NULL,NULL,100,0,$1)`, hour.Add(5*time.Minute)); err != nil {
-		t.Fatalf("seed run A: %v", err)
-	}
-	if _, err := store.RateWindow(ctx, book, hour, hour.Add(time.Hour)); err != nil {
-		t.Fatalf("RateWindow A: %v", err)
-	}
-	var idRev1 string
-	if err := db.QueryRowContext(ctx,
-		`SELECT id FROM rated_usage WHERE topology_revision = 1`).Scan(&idRev1); err != nil {
-		t.Fatalf("read revision 1 rollup: %v", err)
-	}
-
-	// RUN B: the graph restarted on revision 2 in the same hour.
-	if _, err := db.ExecContext(ctx,
-		`INSERT INTO billing_event (request_id, auth_id, resource_id, org_id, model, base_model, graph_k8s_name, topology_revision, region, prompt_tokens, completion_tokens, event_ts)
-		 VALUES ('e2','a','res','org-1','m','b','dgd-a',2,'eu-north1',300,0,$1)`, hour.Add(40*time.Minute)); err != nil {
-		t.Fatalf("seed run B: %v", err)
-	}
-	resB, err := store.RateWindow(ctx, book, hour, hour.Add(time.Hour))
-	if err != nil {
-		t.Fatalf("RateWindow B: %v", err)
-	}
-	// e0 names graph dgd-a but carries no revision: billed normally, counted.
-	if resB.UnknownRevisionRollups != 1 {
-		t.Fatalf("UnknownRevisionRollups = %d, want 1 (the named-graph, revision-0 rollup)", resB.UnknownRevisionRollups)
-	}
-	if resB.RollupsWritten != 3 || resB.EventsRated != 3 || resB.ReconciledDeletions != 0 {
-		t.Fatalf("run B rollups/events/deletions = %d/%d/%d, want 3/3/0", resB.RollupsWritten, resB.EventsRated, resB.ReconciledDeletions)
-	}
-
-	type got struct {
-		rev    int
-		region string
-		prompt int64
-		events int64
-		cost   string
-		id     string
-	}
-	readRollups := func() []got {
-		t.Helper()
-		rows, err := db.QueryContext(ctx,
-			`SELECT topology_revision, COALESCE(region, ''), prompt_tokens, event_count, cost::text, id
-			   FROM rated_usage ORDER BY topology_revision`)
-		if err != nil {
-			t.Fatalf("read rollups: %v", err)
-		}
-		defer func() { _ = rows.Close() }()
-		var all []got
-		for rows.Next() {
-			var g got
-			if err := rows.Scan(&g.rev, &g.region, &g.prompt, &g.events, &g.cost, &g.id); err != nil {
-				t.Fatalf("scan: %v", err)
-			}
-			all = append(all, g)
-		}
-		if err := rows.Err(); err != nil {
-			t.Fatalf("rows: %v", err)
-		}
-		return all
-	}
-	snapB := readRollups()
-	if len(snapB) != 3 {
-		t.Fatalf("rollups = %+v, want 3 (unknown, rev 1, rev 2)", snapB)
-	}
-	if snapB[0].rev != 0 || snapB[0].region != "" || snapB[0].prompt != 100 {
-		t.Fatalf("unknown-revision rollup = %+v, want rev 0, no region, 100 prompt tokens", snapB[0])
-	}
-	if snapB[1].rev != 1 || snapB[1].region != "eu-north1" || snapB[1].id != idRev1 {
-		t.Fatalf("revision 1 rollup = %+v, want region eu-north1 and its run A id %s (a re-rate must not re-mint it)", snapB[1], idRev1)
-	}
-	if snapB[2].rev != 2 || snapB[2].prompt != 300 || snapB[2].region != "eu-north1" {
-		t.Fatalf("revision 2 rollup = %+v, want 300 prompt tokens and region eu-north1 (each revision rollup carries its region)", snapB[2])
-	}
-	if snapB[0].id == snapB[1].id || snapB[1].id == snapB[2].id || snapB[0].id == snapB[2].id {
-		t.Fatalf("rollup ids not pairwise distinct: %+v (each revision is its own rollup)", snapB)
-	}
-
-	// An identical re-rate reproduces the same ids and values and deletes nothing.
-	resC, err := store.RateWindow(ctx, book, hour, hour.Add(time.Hour))
-	if err != nil {
-		t.Fatalf("RateWindow C: %v", err)
-	}
-	if resC.RollupsWritten != 3 || resC.ReconciledDeletions != 0 {
-		t.Fatalf("idempotent re-rate rollups/deletions = %d/%d, want 3/0", resC.RollupsWritten, resC.ReconciledDeletions)
-	}
-	if snapC := readRollups(); !reflect.DeepEqual(snapB, snapC) {
-		t.Fatalf("identical re-rate must not change any rollup (ids, regions, values):\n after B: %+v\n after C: %+v", snapB, snapC)
-	}
-
-	// A re-rate whose events no longer carry a region must overwrite the stored region
-	// with NULL. region is a PLAIN overwrite in the upsert (store.go, ON CONFLICT
-	// `region = EXCLUDED.region`), unlike org_id one line above it, which COALESCEs to
-	// the stored value so a known org is never erased. COALESCE-restoring a region would
-	// keep a stale value on a rollup whose evidence no longer supports it.
-	exec(t, db, "UPDATE billing_event SET region = NULL WHERE request_id = 'e1'")
-	if _, err := store.RateWindow(ctx, book, hour, hour.Add(time.Hour)); err != nil {
-		t.Fatalf("RateWindow D: %v", err)
-	}
-	var regionD sql.NullString
-	var idD string
-	if err := db.QueryRowContext(ctx,
-		`SELECT region, id FROM rated_usage WHERE topology_revision = 1`).Scan(&regionD, &idD); err != nil {
-		t.Fatalf("read revision 1 rollup after run D: %v", err)
-	}
-	if regionD.Valid {
-		t.Fatalf("revision 1 region after re-rate = %q, want NULL: a re-rate whose events no longer carry a region "+
-			"must overwrite the stored region (plain region = EXCLUDED.region), never COALESCE-restore the stale value", regionD.String)
-	}
-	if idD != idRev1 {
-		t.Fatalf("revision 1 id after run D = %s, want %s (region is not a key; it must not re-mint the id)", idD, idRev1)
-	}
-}
-
 // openRatingSchema opens the integration database with the rating schema applied in
 // a fresh schema named sch, dropped again when the test ends. It skips the test when
 // PHOEBE_TEST_DATABASE_URL is unset.
@@ -3043,486 +154,107 @@ func openRatingSchema(t *testing.T, sch string) *sql.DB {
 	return db
 }
 
-// TestIntegration_ConflictingRegionsInOneRollupRateToNull pins that a rollup whose
-// events disagree on the region stores NULL rather than a guess. region is the
-// cluster's operator-editable region, so it can change inside one topology revision
-// (a region relabel without a revision bump); MAX would silently pick the lexically
-// larger value and push it to the manager as if it were known. A rollup with some
-// NULL regions and one known region still resolves to that known region, because
-// COUNT(DISTINCT) ignores NULLs.
-func TestIntegration_ConflictingRegionsInOneRollupRateToNull(t *testing.T) {
-	db := openRatingSchema(t, "phoebe_rating_region_conflict_it")
-	ctx := context.Background()
-	hour := mustTime("2026-06-08T10:00:00Z")
-	book := newTestBook(map[string]Rate3{"b": rate3("0.000005", "0", "0")}, nil, PolicyIdentity, Dec{}, Dec{})
-
-	// Same auth, resource, model, graph, revision and hour: one rollup each.
-	if _, err := db.ExecContext(ctx,
-		`INSERT INTO billing_event (request_id, auth_id, resource_id, org_id, model, base_model, graph_k8s_name, topology_revision, region, prompt_tokens, completion_tokens, event_ts)
-		 VALUES ('c1','a','conflict','org-1','m','b','dgd-a',1,'a', 100,0,$1),
-		        ('c2','a','conflict','org-1','m','b','dgd-a',1,'b', 100,0,$1),
-		        ('p1','a','partial', 'org-1','m','b','dgd-a',1,'a', 100,0,$1),
-		        ('p2','a','partial', 'org-1','m','b','dgd-a',1,NULL,100,0,$1)`, hour.Add(5*time.Minute)); err != nil {
-		t.Fatalf("seed: %v", err)
-	}
-	res, err := NewPostgresStore(db).RateWindow(ctx, book, hour, hour.Add(time.Hour))
+// readMigration returns the text of one real migration file.
+func readMigration(t *testing.T, name string) string {
+	t.Helper()
+	b, err := os.ReadFile(filepath.Join("../../migrations", name))
 	if err != nil {
-		t.Fatalf("RateWindow: %v", err)
+		t.Fatalf("read migration %s: %v", name, err)
 	}
-	if res.RollupsWritten != 2 || res.EventsRated != 4 {
-		t.Fatalf("rollups/events = %d/%d, want 2/4 (a disputed region never withholds money)", res.RollupsWritten, res.EventsRated)
-	}
-	var conflict, partial sql.NullString
-	if err := db.QueryRowContext(ctx, `SELECT region FROM rated_usage WHERE resource_id = 'conflict'`).Scan(&conflict); err != nil {
-		t.Fatalf("read conflict rollup: %v", err)
-	}
-	if conflict.Valid {
-		t.Fatalf("conflicting-region rollup region = %q, want NULL (an unknown region must not look known)", conflict.String)
-	}
-	if err := db.QueryRowContext(ctx, `SELECT region FROM rated_usage WHERE resource_id = 'partial'`).Scan(&partial); err != nil {
-		t.Fatalf("read partial rollup: %v", err)
-	}
-	if !partial.Valid || partial.String != "a" {
-		t.Fatalf("partial-NULL region rollup region = %v, want 'a' (NULL regions are not a conflict)", partial)
-	}
+	return string(b)
 }
 
-// TestIntegration_ReRateNullsARegionThatBecameAmbiguous pins that a re-rate never
-// COALESCE-restores a region the evidence no longer supports: a rollup first rated
-// with one region, which then gains a same-grain event with a different region, must
-// end with region NULL, not the first run's value.
-func TestIntegration_ReRateNullsARegionThatBecameAmbiguous(t *testing.T) {
-	db := openRatingSchema(t, "phoebe_rating_region_rerate_it")
-	ctx := context.Background()
-	hour := mustTime("2026-06-08T10:00:00Z")
-	book := newTestBook(map[string]Rate3{"b": rate3("0.000005", "0", "0")}, nil, PolicyIdentity, Dec{}, Dec{})
-	store := NewPostgresStore(db)
-
-	if _, err := db.ExecContext(ctx,
-		`INSERT INTO billing_event (request_id, auth_id, resource_id, org_id, model, base_model, graph_k8s_name, topology_revision, region, prompt_tokens, completion_tokens, event_ts)
-		 VALUES ('e1','a','res','org-1','m','b','dgd-a',1,'eu-north1',100,0,$1)`, hour.Add(5*time.Minute)); err != nil {
-		t.Fatalf("seed run A: %v", err)
-	}
-	if _, err := store.RateWindow(ctx, book, hour, hour.Add(time.Hour)); err != nil {
-		t.Fatalf("RateWindow A: %v", err)
-	}
-	var regionA sql.NullString
-	if err := db.QueryRowContext(ctx, `SELECT region FROM rated_usage`).Scan(&regionA); err != nil {
-		t.Fatalf("read run A: %v", err)
-	}
-	if !regionA.Valid || regionA.String != "eu-north1" {
-		t.Fatalf("run A region = %v, want eu-north1", regionA)
-	}
-
-	if _, err := db.ExecContext(ctx,
-		`INSERT INTO billing_event (request_id, auth_id, resource_id, org_id, model, base_model, graph_k8s_name, topology_revision, region, prompt_tokens, completion_tokens, event_ts)
-		 VALUES ('e2','a','res','org-1','m','b','dgd-a',1,'eu-north-1',100,0,$1)`, hour.Add(30*time.Minute)); err != nil {
-		t.Fatalf("seed run B: %v", err)
-	}
-	if _, err := store.RateWindow(ctx, book, hour, hour.Add(time.Hour)); err != nil {
-		t.Fatalf("RateWindow B: %v", err)
-	}
-	var n int
-	var regionB sql.NullString
-	if err := db.QueryRowContext(ctx, `SELECT COUNT(*), MAX(region) FROM rated_usage`).Scan(&n, &regionB); err != nil {
-		t.Fatalf("read run B: %v", err)
-	}
-	if n != 1 || regionB.Valid {
-		t.Fatalf("run B rows/region = %d/%v, want 1/NULL (a re-rate must NULL a disputed region, never keep the stale one)", n, regionB)
-	}
-}
-
-// TestIntegration_OrgResolvedAcrossGraphRevisions pins that org is resolved per
-// (auth, owner, resource, model, serving mode, hour) identity, spanning graph and
-// revision. Events from before the Atlas/phoebe rollout carry no org and no revision
-// (stored as revision 0); the same resource's later events carry org and a revision.
-// The 0009 grain puts them in two rollups, and both must carry the one known org:
-// a NULL-org rollup is withheld at push for the whole hour, for every customer, and
-// no re-rate could fix it because the evidence never changes.
-func TestIntegration_OrgResolvedAcrossGraphRevisions(t *testing.T) {
-	db := openRatingSchema(t, "phoebe_rating_org_across_rev_it")
-	ctx := context.Background()
-	hour := mustTime("2026-06-08T10:00:00Z")
-	book := newTestBook(map[string]Rate3{"b": rate3("0.000005", "0", "0")}, nil, PolicyIdentity, Dec{}, Dec{})
-
-	if _, err := db.ExecContext(ctx,
-		`INSERT INTO billing_event (request_id, auth_id, resource_id, org_id, model, base_model, graph_k8s_name, topology_revision, prompt_tokens, completion_tokens, event_ts)
-		 VALUES ('old','a','res',NULL,   'm','b','dgd-a',NULL,100,0,$1),
-		        ('new','a','res','org-4','m','b','dgd-a',3,   100,0,$1)`, hour.Add(5*time.Minute)); err != nil {
-		t.Fatalf("seed: %v", err)
-	}
-	res, err := NewPostgresStore(db).RateWindow(ctx, book, hour, hour.Add(time.Hour))
-	if err != nil {
-		t.Fatalf("RateWindow: %v", err)
-	}
-	if res.RollupsWritten != 2 || res.EventsRated != 2 || res.UnattributableEvents != 0 || res.AmbiguousOrgEvents != 0 {
-		t.Fatalf("rollups/events/unattributable/ambiguous_org = %d/%d/%d/%d, want 2/2/0/0",
-			res.RollupsWritten, res.EventsRated, res.UnattributableEvents, res.AmbiguousOrgEvents)
-	}
-	var total, withOrg4 int
-	if err := db.QueryRowContext(ctx,
-		`SELECT COUNT(*), COUNT(*) FILTER (WHERE org_id = 'org-4') FROM rated_usage`).Scan(&total, &withOrg4); err != nil {
-		t.Fatalf("read rollups: %v", err)
-	}
-	if total != 2 || withOrg4 != 2 {
-		t.Fatalf("rollups/with org-4 = %d/%d, want 2/2 (the revision-0 rollup must inherit its identity's org, not be NULL)", total, withOrg4)
-	}
-}
-
-// TestIntegration_AmbiguousOrgAcrossGraphRevisionsFailsLoud pins that the org gate
-// spans every graph revision of one identity: a resource served by revision 1 with
-// org A and by revision 2 with org B in the same hour is an attribution propagation
-// bug, so neither half bills and every event is counted ambiguous_org. Per-revision
-// gates would see one org in each sub-rollup and bill part to A and part to B.
-func TestIntegration_AmbiguousOrgAcrossGraphRevisionsFailsLoud(t *testing.T) {
-	db := openRatingSchema(t, "phoebe_rating_ambigorg_rev_it")
-	ctx := context.Background()
-	hour := mustTime("2026-06-08T10:00:00Z")
-	book := newTestBook(map[string]Rate3{"b": rate3("0.000005", "0", "0")}, nil, PolicyIdentity, Dec{}, Dec{})
-
-	if _, err := db.ExecContext(ctx,
-		`INSERT INTO billing_event (request_id, auth_id, resource_id, org_id, model, base_model, graph_k8s_name, topology_revision, prompt_tokens, completion_tokens, event_ts)
-		 VALUES ('r1','a','res','org-A','m','b','dgd-1',1,100,0,$1),
-		        ('r2','a','res','org-B','m','b','dgd-2',2,100,0,$1)`, hour.Add(5*time.Minute)); err != nil {
-		t.Fatalf("seed: %v", err)
-	}
-	res, err := NewPostgresStore(db).RateWindow(ctx, book, hour, hour.Add(time.Hour))
-	if err != nil {
-		t.Fatalf("RateWindow: %v", err)
-	}
-	if res.RollupsWritten != 0 || res.AmbiguousOrgEvents != 2 {
-		t.Fatalf("rollups/ambiguous_org = %d/%d, want 0/2 (two orgs across revisions must scream, never bill both)",
-			res.RollupsWritten, res.AmbiguousOrgEvents)
-	}
-}
-
-// TestIntegration_AmbiguousBaseAcrossGraphRevisionsFailsLoud is the single-rate gate
-// counterpart: an endpoint priced through the derived (premium) path in one revision
-// and the plain-base path in the next, in one hour, is an adapter flap that happens to
-// coincide with a revision boundary. It must be withheld and counted ambiguous_base,
-// not billed at two different rates.
-func TestIntegration_AmbiguousBaseAcrossGraphRevisionsFailsLoud(t *testing.T) {
-	db := openRatingSchema(t, "phoebe_rating_ambigbase_rev_it")
-	ctx := context.Background()
-	hour := mustTime("2026-06-08T10:00:00Z")
-	book := newTestBook(
-		map[string]Rate3{"cheap/base": rate3("0.000001", "0", "0")},
-		nil, PolicyMultiplier, MustDec("1.5"), Dec{},
-	)
-
-	if _, err := db.ExecContext(ctx,
-		`INSERT INTO billing_event (request_id, auth_id, resource_id, org_id, model, base_model, adapter, graph_k8s_name, topology_revision, prompt_tokens, completion_tokens, event_ts)
-		 VALUES ('d1','a','r','org-1','tf-ep','cheap/base','ckpt-9','dgd-a',1,1000,0,$1),
-		        ('p1','a','r','org-1','tf-ep','cheap/base',NULL,    'dgd-a',2,1000,0,$1)`, hour.Add(5*time.Minute)); err != nil {
-		t.Fatalf("seed: %v", err)
-	}
-	res, err := NewPostgresStore(db).RateWindow(ctx, book, hour, hour.Add(time.Hour))
-	if err != nil {
-		t.Fatalf("RateWindow: %v", err)
-	}
-	if res.RollupsWritten != 0 || res.AmbiguousBaseEvents != 2 || res.AmbiguousOrgEvents != 0 {
-		t.Fatalf("rollups/ambiguous_base/ambiguous_org = %d/%d/%d, want 0/2/0 (premium and plain-base across revisions must scream)",
-			res.RollupsWritten, res.AmbiguousBaseEvents, res.AmbiguousOrgEvents)
-	}
-}
-
-// TestIntegration_OwnerConflictDoesNotPoisonItsBucket is the regression test for a bug
-// the FIRST owner-conflict test missed, because that test isolated the malformed event
-// on its own resource_id and so never made it share a bucket with anyone.
-//
-// THE BUG: a both-owner event has nowhere to go in the owner CASE, so it collapses to
-// owner_type=” / owner_id=” -- the SAME bucket as genuine no-owner traffic. The gate
-// was a group-level bool_or(owner_conflict) in `grouped`, which therefore withheld
-// EVERY legitimate no-owner rollup that merely shared a bucket with one malformed
-// event. One bad row zeroed other people's revenue, and the alarm counted the whole
-// group's events as conflicted, over-reporting the blast radius 3x on this fixture.
-//
-// THE FIX: drop conflicted events PER EVENT in grouped's WHERE (like the
-// unattributable filters) and count them from `ev`, so the damage is exactly the
-// offending event and the count names only it.
-//
-// Note this is a FUTURE-producer guard, not a live one: auth-server emits the two
-// identity headers under an else-if and structurally cannot send both. That is
-// precisely why the gate must not over-withhold -- when a new producer does regress,
-// the blast radius should be one event, not everyone who shared its hour.
-func TestIntegration_OwnerConflictDoesNotPoisonItsBucket(t *testing.T) {
+// TestIntegration_Migration0007NoticesEveryRatedRowItDeletes pins the audit trail
+// for the two rated_usage clean-ups in 0007 up: before deleting a ” row that has a
+// 'dedicated' twin, or a row with an unknown serving_mode, the migration must RAISE
+// NOTICE with the row count, SUM(cost), SUM(event_count) and earliest window_start
+// of exactly the rows it deletes; the twin NOTICE must also say the hours MUST be
+// re-rated. A clean database (nothing to delete) must produce no such NOTICE.
+func TestIntegration_Migration0007NoticesEveryRatedRowItDeletes(t *testing.T) {
 	dsn := os.Getenv("PHOEBE_TEST_DATABASE_URL")
 	if dsn == "" {
 		t.Skip("PHOEBE_TEST_DATABASE_URL not set; skipping live-Postgres conformance")
 	}
 	ctx := context.Background()
-	db, err := sql.Open("pgx", dsn)
+	cfg, err := pgx.ParseConfig(dsn)
 	if err != nil {
-		t.Fatalf("open: %v", err)
+		t.Fatalf("parse dsn: %v", err)
 	}
+	var notices []string
+	cfg.OnNotice = func(_ *pgconn.PgConn, n *pgconn.Notice) {
+		if strings.HasPrefix(n.Message, "0007:") {
+			notices = append(notices, n.Message)
+		}
+	}
+	db := stdlib.OpenDB(*cfg)
 	defer db.Close()
-
-	const sch = "phoebe_rating_conflictbucket_it"
-	exec(t, db, "DROP SCHEMA IF EXISTS "+sch+" CASCADE")
-	exec(t, db, "CREATE SCHEMA "+sch)
-	exec(t, db, "SET search_path TO "+sch)
-	defer func() { exec(t, db, "DROP SCHEMA IF EXISTS "+sch+" CASCADE") }()
-	exec(t, db, ratingSchemaDDL(t))
-
-	hour := mustTime("2026-06-08T10:00:00Z")
-	book := newTestBook(
-		map[string]Rate3{"b": rate3("0.000005", "0", "0")},
-		nil, PolicyIdentity, Dec{}, Dec{},
-	)
-
-	// ALL THREE share one (auth, resource, model, serving_mode, hour) bucket, and the
-	// two good ones have NO owner -- so they land in the same '' / '' owner bucket the
-	// conflicted event collapses into. That collision is the whole point of the test.
-	if _, err := db.ExecContext(ctx,
-		`INSERT INTO billing_event (request_id, auth_id, user_id, group_id, resource_id, org_id, model, base_model, prompt_tokens, completion_tokens, event_ts)
-		 VALUES ('ok1','a',NULL, NULL, 'res','org-1','m','b',100,0,$1),
-		        ('ok2','a',NULL, NULL, 'res','org-1','m','b',100,0,$1),
-		        ('bad','a','u-1','g-1','res','org-1','m','b',100,0,$1)`,
-		hour.Add(5*time.Minute)); err != nil {
-		t.Fatalf("seed: %v", err)
-	}
-
-	store := NewPostgresStore(db)
-	res, err := store.RateWindow(ctx, book, hour, hour.Add(time.Hour))
-	if err != nil {
-		t.Fatalf("RateWindow: %v", err)
-	}
-
-	// The two legitimate events STILL BILL. Under the old group-level gate this was 0.
-	if res.EventsRated != 2 || res.RollupsWritten != 1 {
-		t.Fatalf("events/rollups = %d/%d, want 2/1 — one malformed event must not withhold the revenue of legitimate events sharing its bucket",
-			res.EventsRated, res.RollupsWritten)
-	}
-	// 200 tokens x 0.000005. The conflicted event contributes nothing.
-	if res.TotalCost != "0.001000000" {
-		t.Fatalf("TotalCost = %s, want 0.001000000 (the two good events only)", res.TotalCost)
-	}
-	// EXACTLY the offending event — not its innocent neighbours. Under the old gate
-	// this reported 3, sending an operator after 3x the real blast radius.
-	if res.OwnerConflictEvents != 1 {
-		t.Fatalf("OwnerConflictEvents = %d, want 1 (only one event carried both owners)", res.OwnerConflictEvents)
-	}
-
-	// The surviving rollup is the no-owner one, carrying only the good events.
-	var ownerType, ownerID string
-	var events int64
-	if err := db.QueryRowContext(ctx,
-		`SELECT owner_type, owner_id, event_count FROM rated_usage WHERE resource_id = 'res'`).
-		Scan(&ownerType, &ownerID, &events); err != nil {
-		t.Fatalf("read rollup: %v", err)
-	}
-	if ownerType != "" || ownerID != "" || events != 2 {
-		t.Fatalf("rollup = (%q,%q) with %d events, want ('','') with 2 (the conflicted event must not be counted into it)",
-			ownerType, ownerID, events)
-	}
-}
-
-// TestIntegration_InvalidServingModeWithheldAndCounted pins the rater side of the
-// 2026-09-29 serving-mode ruling against real Postgres. In one (auth, resource,
-// model, hour) bucket:
-//   - 'ded' is dedicated and bills;
-//   - 'nul' (NULL) and 'emp' (”) are how dedicated was stored before the cutover;
-//     'bad' is an unknown spelling. All three are withheld from money and counted
-//     ONLY as invalid_serving_mode_events (not as unpriced, even though 'unp'
-//     below shows an unpriced model is reported separately);
-//   - 'both' is invalid AND owner-conflicted: counted once, as invalid serving mode;
-//   - 'nulunp' (NULL) and 'empunp' (”) are invalid AND unpriced (neither model
-//     'm3' nor base 'nobase' has a price row): counted ONLY as invalid serving
-//     mode, never also as unpriced. They are what lets the "not unpriced" claim
-//     fail if the valid_serving_mode filter is dropped from the unpriced count;
-//   - 'unp' is a valid dedicated event for an unpriced model: counted as unpriced.
-//
-// The partition identity must hold, the one rollup written must carry
-// 'dedicated', and billing_event must keep every raw row.
-func TestIntegration_InvalidServingModeWithheldAndCounted(t *testing.T) {
-	dsn := os.Getenv("PHOEBE_TEST_DATABASE_URL")
-	if dsn == "" {
-		t.Skip("PHOEBE_TEST_DATABASE_URL not set; skipping live-Postgres conformance")
-	}
-	ctx := context.Background()
-	db, err := sql.Open("pgx", dsn)
-	if err != nil {
-		t.Fatalf("open: %v", err)
-	}
-	defer db.Close()
-
-	const sch = "phoebe_rating_invalid_mode_it"
-	exec(t, db, "DROP SCHEMA IF EXISTS "+sch+" CASCADE")
-	exec(t, db, "CREATE SCHEMA "+sch)
-	exec(t, db, "SET search_path TO "+sch)
-	defer func() { exec(t, db, "DROP SCHEMA IF EXISTS "+sch+" CASCADE") }()
-	exec(t, db, ratingSchemaDDL(t))
-
-	hour := mustTime("2026-06-08T10:00:00Z")
-	book := newTestBook(map[string]Rate3{"b": rate3("0.000010", "0", "0")}, nil, PolicyIdentity, Dec{}, Dec{})
-
-	if _, err := db.ExecContext(ctx,
-		`INSERT INTO billing_event (request_id, auth_id, user_id, group_id, resource_id, org_id, model, base_model, serving_mode, prompt_tokens, completion_tokens, event_ts)
-		 VALUES ('ded', 'a', NULL,  NULL,  'res','org-1','m',  'b',        'dedicated',100,0,$1),
-		        ('nul', 'a', NULL,  NULL,  'res','org-1','m',  'b',        NULL,       100,0,$1),
-		        ('emp', 'a', NULL,  NULL,  'res','org-1','m',  'b',        '',         100,0,$1),
-		        ('bad', 'a', NULL,  NULL,  'res','org-1','m',  'b',        'Dedicated',100,0,$1),
-		        ('both','a', 'u-1', 'g-1', 'res','org-1','m',  'b',        NULL,       100,0,$1),
-		        ('nulunp','a', NULL, NULL, 'res','org-1','m3', 'nobase',   NULL,       100,0,$1),
-		        ('empunp','a', NULL, NULL, 'res','org-1','m3', 'nobase',   '',         100,0,$1),
-		        ('unp', 'a', NULL,  NULL,  'res','org-1','m2', 'unpriced', 'dedicated',100,0,$1)`,
-		hour.Add(5*time.Minute)); err != nil {
-		t.Fatalf("seed: %v", err)
-	}
-
-	res, err := NewPostgresStore(db).RateWindow(ctx, book, hour, hour.Add(time.Hour))
-	if err != nil {
-		t.Fatalf("RateWindow: %v", err)
-	}
-	if res.EventsRated != 1 || res.RollupsWritten != 1 {
-		t.Fatalf("rated/rollups = %d/%d, want 1/1 (only 'ded' bills)", res.EventsRated, res.RollupsWritten)
-	}
-	if res.InvalidServingModeEvents != 6 {
-		t.Fatalf("InvalidServingModeEvents = %d, want 6 (nul, emp, bad, both, nulunp, empunp)", res.InvalidServingModeEvents)
-	}
-	if res.UnpricedEvents != 1 || res.OwnerConflictEvents != 0 {
-		t.Fatalf("unpriced/owner-conflict = %d/%d, want 1/0 (only 'unp' is unpriced; nulunp/empunp are invalid only)",
-			res.UnpricedEvents, res.OwnerConflictEvents)
-	}
-	if got := res.EventsRated + res.MissingUsageEvents + res.InvalidUsageEvents + res.UnpricedEvents +
-		res.UnattributableEvents + res.InvalidServingModeEvents + res.AmbiguousBaseEvents +
-		res.AmbiguousOrgEvents + res.OwnerConflictEvents; got != 8 {
-		t.Fatalf("partition sums to %d, want 8 (every event in exactly one bucket)", got)
-	}
-
-	var mode string
-	var events int64
-	if err := db.QueryRowContext(ctx, `SELECT serving_mode, event_count FROM rated_usage`).Scan(&mode, &events); err != nil {
-		t.Fatalf("read rollup: %v", err)
-	}
-	if mode != "dedicated" || events != 1 {
-		t.Fatalf("rollup = (%q, %d events), want ('dedicated', 1)", mode, events)
-	}
-	var raw int
-	if err := db.QueryRowContext(ctx, `SELECT COUNT(*) FROM billing_event`).Scan(&raw); err != nil {
-		t.Fatalf("count billing_event: %v", err)
-	}
-	if raw != 8 {
-		t.Fatalf("billing_event rows = %d, want 8 (withheld evidence is retained)", raw)
-	}
-}
-
-// TestIntegration_ReconciliationViewExplainsInvalidServingModeDelta guards the
-// invariant that every attempt the rater withholds for an invalid serving mode is
-// explained by a column of billing_reconciliation_hourly. One NULL-serving-mode
-// attempt (how dedicated was stored before the 2026-09-29 cutover) and one
-// 'dedicated' attempt share an hour and key. The rater bills only the dedicated
-// one, so attempt_delta is 1, and invalid_serving_mode_attempts must be 1 so the
-// operator can see the delta is a deliberate withholding, not lost revenue.
-func TestIntegration_ReconciliationViewExplainsInvalidServingModeDelta(t *testing.T) {
-	dsn := os.Getenv("PHOEBE_TEST_DATABASE_URL")
-	if dsn == "" {
-		t.Skip("PHOEBE_TEST_DATABASE_URL not set; skipping live-Postgres conformance")
-	}
-	ctx := context.Background()
-	db, err := sql.Open("pgx", dsn)
-	if err != nil {
-		t.Fatalf("open: %v", err)
-	}
-	defer db.Close()
+	// One pooled connection so SET search_path sticks and every NOTICE reaches
+	// the callback above.
 	db.SetMaxOpenConns(1)
 
-	const sch = "phoebe_rating_invalid_mode_view_it"
-	exec(t, db, "DROP SCHEMA IF EXISTS "+sch+" CASCADE")
-	exec(t, db, "CREATE SCHEMA "+sch)
-	exec(t, db, "SET search_path TO "+sch)
-	defer func() { exec(t, db, "DROP SCHEMA IF EXISTS "+sch+" CASCADE") }()
-	exec(t, db, ratingSchemaDDL(t))
-
+	setup := func(sch string) {
+		t.Helper()
+		exec(t, db, "DROP SCHEMA IF EXISTS "+sch+" CASCADE")
+		exec(t, db, "CREATE SCHEMA "+sch)
+		exec(t, db, "SET search_path TO "+sch)
+		for _, f := range []string{"0001_billing_event", "0002_rating", "0004_billing_event_serving_mode",
+			"0005_invoice_grade_attempts", "0006_rollup_grain"} {
+			exec(t, db, readMigration(t, f+".up.sql"))
+		}
+	}
 	hour := mustTime("2026-06-08T10:00:00Z")
-	book := newTestBook(map[string]Rate3{"m": rate3("0.000010", "0", "0")}, nil, PolicyIdentity, Dec{}, Dec{})
-	if _, err := db.ExecContext(ctx,
-		`INSERT INTO billing_event (request_id, auth_id, resource_id, org_id, model, serving_mode, prompt_tokens, completion_tokens, event_ts)
-		 VALUES ('nul', 'a', 'res', 'org-1', 'm', NULL,        100, 0, $1),
-		        ('ded', 'a', 'res', 'org-1', 'm', 'dedicated', 100, 0, $1)`,
-		hour.Add(5*time.Minute)); err != nil {
-		t.Fatalf("seed: %v", err)
+	seed := func(auth, mode, cost string, events int) {
+		t.Helper()
+		if _, err := db.ExecContext(ctx, `INSERT INTO rated_usage
+			(id, auth_id, resource_id, org_id, model_id, serving_mode, window_start, window_end,
+			 prompt_tokens, cached_tokens, completion_tokens, billable_prompt_tokens,
+			 cost, applied_prompt_rate, applied_cached_rate, applied_completion_rate, event_count)
+			VALUES (md5($1 || $2), $1, 'res', 'org-1', 'm', $2, $3::timestamptz, $3::timestamptz + interval '1 hour',
+			        100, 0, 0, 100, $4::numeric, 0.00001, 0, 0, $5)`, auth, mode, hour, cost, events); err != nil {
+			t.Fatalf("seed rated_usage (%s, %q): %v", auth, mode, err)
+		}
 	}
 
-	res, err := NewPostgresStore(db).RateWindow(ctx, book, hour, hour.Add(time.Hour))
-	if err != nil {
-		t.Fatalf("RateWindow: %v", err)
-	}
-	if res.EventsRated != 1 || res.InvalidServingModeEvents != 1 {
-		t.Fatalf("rated/invalid-serving-mode = %d/%d, want 1/1", res.EventsRated, res.InvalidServingModeEvents)
-	}
-
-	var invalidMode, delta, missingUsage, invalidUsage, failed int64
-	if err := db.QueryRowContext(ctx, `
-		SELECT invalid_serving_mode_attempts, attempt_delta,
-		       missing_usage_attempts, invalid_usage_attempts, failed_attempts
-		FROM billing_reconciliation_hourly
-		WHERE window_start=$1 AND auth_id='a' AND resource_id='res' AND model_id='m'`, hour).
-		Scan(&invalidMode, &delta, &missingUsage, &invalidUsage, &failed); err != nil {
-		t.Fatalf("read view: %v", err)
-	}
-	if invalidMode != 1 || delta != 1 {
-		t.Fatalf("invalid_serving_mode_attempts/attempt_delta = %d/%d, want 1/1 — the withheld attempt must be explained by the view", invalidMode, delta)
-	}
-	if missingUsage != 0 || invalidUsage != 0 || failed != 0 {
-		t.Fatalf("missing_usage/invalid_usage/failed = %d/%d/%d, want 0/0/0 (only the serving-mode column explains this delta)", missingUsage, invalidUsage, failed)
-	}
-}
-
-// TestIntegration_ReconciliationViewInvalidServingModeDoesNotDoubleCountMissingUsage
-// guards the invariant that billing_reconciliation_hourly explains each withheld
-// attempt with exactly one cause column, using the rater's precedence. A
-// NULL-serving-mode attempt that ALSO has no usage block is withheld by the rater
-// as missing usage (the invalid_serving_mode_events bucket only counts
-// authoritative, valid-usage, attributable events), so the view must count it in
-// missing_usage_attempts and NOT in invalid_serving_mode_attempts.
-func TestIntegration_ReconciliationViewInvalidServingModeDoesNotDoubleCountMissingUsage(t *testing.T) {
-	dsn := os.Getenv("PHOEBE_TEST_DATABASE_URL")
-	if dsn == "" {
-		t.Skip("PHOEBE_TEST_DATABASE_URL not set; skipping live-Postgres conformance")
-	}
-	ctx := context.Background()
-	db, err := sql.Open("pgx", dsn)
-	if err != nil {
-		t.Fatalf("open: %v", err)
-	}
-	defer db.Close()
-	db.SetMaxOpenConns(1)
-
-	const sch = "phoebe_rating_invalid_mode_missing_usage_it"
-	exec(t, db, "DROP SCHEMA IF EXISTS "+sch+" CASCADE")
-	exec(t, db, "CREATE SCHEMA "+sch)
-	exec(t, db, "SET search_path TO "+sch)
+	const sch = "phoebe_migration_0007_notice_it"
+	setup(sch)
 	defer func() { exec(t, db, "DROP SCHEMA IF EXISTS "+sch+" CASCADE") }()
-	exec(t, db, ratingSchemaDDL(t))
+	seed("a-ded", "", "0.500000000", 7)       // renamed, not deleted: no NOTICE
+	seed("a-shr", "shared", "0.250000000", 3) // untouched
+	seed("a-twin", "", "1.250000000", 4)      // deleted: 'dedicated' twin exists
+	seed("a-twin2", "", "0.750000000", 6)     // deleted: 'dedicated' twin exists
+	seed("a-twin", "dedicated", "9.000000000", 9)
+	seed("a-twin2", "dedicated", "9.000000000", 9)
+	seed("a-bogus", "bogus", "2.000000000", 5)   // deleted: unknown value
+	seed("a-bogus2", "Shared", "0.125000000", 1) // deleted: unknown value (case matters)
 
-	hour := mustTime("2026-06-08T10:00:00Z")
-	book := newTestBook(map[string]Rate3{"m": rate3("0.000010", "0", "0")}, nil, PolicyIdentity, Dec{}, Dec{})
-	if _, err := db.ExecContext(ctx,
-		`INSERT INTO billing_event (request_id, auth_id, resource_id, org_id, model, serving_mode, usage_found, prompt_tokens, completion_tokens, event_ts)
-		 VALUES ('nul-nousage', 'a', 'res', 'org-1', 'm', NULL, false, 0, 0, $1)`,
-		hour.Add(5*time.Minute)); err != nil {
-		t.Fatalf("seed: %v", err)
+	exec(t, db, readMigration(t, "0007_serving_mode_explicit.up.sql"))
+
+	want := []string{
+		"0007: deleting 2 rated_usage rows with serving_mode '' that have a 'dedicated' twin (sum cost 2.000000000, sum event_count 10, earliest window_start 2026-06-08T10:00:00Z); " +
+			"the 'dedicated' twins are partial until re-rated, so every affected hour MUST be re-rated: rater --since <earliest window_start> --until <now>, then token-push over the same window",
+		"0007: deleting 2 rated_usage rows with an unknown serving_mode (sum cost 2.125000000, sum event_count 6, earliest window_start 2026-06-08T10:00:00Z)",
+	}
+	if strings.Join(notices, "\n") != strings.Join(want, "\n") {
+		t.Fatalf("0007 notices =\n%s\nwant\n%s", strings.Join(notices, "\n"), strings.Join(want, "\n"))
+	}
+	var left int64
+	if err := db.QueryRowContext(ctx, `SELECT COUNT(*) FROM rated_usage`).Scan(&left); err != nil {
+		t.Fatalf("count after up: %v", err)
+	}
+	if left != 4 {
+		t.Fatalf("rated_usage rows after up = %d, want 4 (a-ded, a-shr and the two 'dedicated' twins)", left)
 	}
 
-	res, err := NewPostgresStore(db).RateWindow(ctx, book, hour, hour.Add(time.Hour))
-	if err != nil {
-		t.Fatalf("RateWindow: %v", err)
-	}
-	if res.MissingUsageEvents != 1 || res.InvalidServingModeEvents != 0 {
-		t.Fatalf("rater missing-usage/invalid-serving-mode = %d/%d, want 1/0", res.MissingUsageEvents, res.InvalidServingModeEvents)
-	}
-
-	var invalidMode, missingUsage, delta int64
-	if err := db.QueryRowContext(ctx, `
-		SELECT invalid_serving_mode_attempts, missing_usage_attempts, attempt_delta
-		FROM billing_reconciliation_hourly
-		WHERE window_start=$1 AND auth_id='a' AND resource_id='res' AND model_id='m'`, hour).
-		Scan(&invalidMode, &missingUsage, &delta); err != nil {
-		t.Fatalf("read view: %v", err)
-	}
-	if delta != 1 || missingUsage != 1 || invalidMode != 0 {
-		t.Fatalf("attempt_delta/missing_usage/invalid_serving_mode = %d/%d/%d, want 1/1/0 — the view must explain the delta once, with the rater's precedence", delta, missingUsage, invalidMode)
+	// Nothing to delete: no audit NOTICE at all.
+	notices = nil
+	const clean = "phoebe_migration_0007_notice_clean_it"
+	setup(clean)
+	defer func() { exec(t, db, "DROP SCHEMA IF EXISTS "+clean+" CASCADE") }()
+	seed("a-ded", "", "0.500000000", 7)
+	seed("a-shr", "shared", "0.250000000", 3)
+	exec(t, db, readMigration(t, "0007_serving_mode_explicit.up.sql"))
+	if len(notices) != 0 {
+		t.Fatalf("0007 on a database with nothing to delete raised %v, want no NOTICE", notices)
 	}
 }
 
@@ -3671,13 +403,13 @@ func TestIntegration_Migration0007ServingModeExplicit(t *testing.T) {
 		VALUES ('x3', 'z', 'res', 'm', '2026-06-08T10:00:00Z', '2026-06-08T11:00:00Z', 0, 0, 0, 0, 0, 0)`)
 }
 
-// TestIntegration_Migration0007NoticesEveryRatedRowItDeletes pins the audit trail
-// for the two rated_usage clean-ups in 0007 up: before deleting a ” row that has a
-// 'dedicated' twin, or a row with an unknown serving_mode, the migration must RAISE
-// NOTICE with the row count, SUM(cost), SUM(event_count) and earliest window_start
-// of exactly the rows it deletes; the twin NOTICE must also say the hours MUST be
-// re-rated. A clean database (nothing to delete) must produce no such NOTICE.
-func TestIntegration_Migration0007NoticesEveryRatedRowItDeletes(t *testing.T) {
+// TestIntegration_Migration0009DownNoticesEveryRatedRowItDeletes pins the audit
+// trail for 0009 down's lossy DELETE: before removing the rollups that differ from a
+// kept row only in graph or topology revision, the migration must RAISE NOTICE with
+// the row count, SUM(cost), SUM(event_count) and earliest window_start of exactly the
+// rows it deletes, and say the hours MUST be re-rated. A database with nothing to
+// delete must produce no such NOTICE.
+func TestIntegration_Migration0009DownNoticesEveryRatedRowItDeletes(t *testing.T) {
 	dsn := os.Getenv("PHOEBE_TEST_DATABASE_URL")
 	if dsn == "" {
 		t.Skip("PHOEBE_TEST_DATABASE_URL not set; skipping live-Postgres conformance")
@@ -3689,7 +421,7 @@ func TestIntegration_Migration0007NoticesEveryRatedRowItDeletes(t *testing.T) {
 	}
 	var notices []string
 	cfg.OnNotice = func(_ *pgconn.PgConn, n *pgconn.Notice) {
-		if strings.HasPrefix(n.Message, "0007:") {
+		if strings.HasPrefix(n.Message, "0009 down:") {
 			notices = append(notices, n.Message)
 		}
 	}
@@ -3705,81 +437,182 @@ func TestIntegration_Migration0007NoticesEveryRatedRowItDeletes(t *testing.T) {
 		exec(t, db, "CREATE SCHEMA "+sch)
 		exec(t, db, "SET search_path TO "+sch)
 		for _, f := range []string{"0001_billing_event", "0002_rating", "0004_billing_event_serving_mode",
-			"0005_invoice_grade_attempts", "0006_rollup_grain"} {
+			"0005_invoice_grade_attempts", "0006_rollup_grain", "0007_serving_mode_explicit",
+			"0008_billing_event_topology", "0009_rollup_grain_graph_revision",
+			"0010_rated_usage_identity"} {
 			exec(t, db, readMigration(t, f+".up.sql"))
 		}
 	}
 	hour := mustTime("2026-06-08T10:00:00Z")
-	seed := func(auth, mode, cost string, events int) {
+	// idKey fixes which row survives: down keeps the lowest id per 0007 key.
+	seed := func(idKey, auth, graph string, revision int, at time.Time, cost string, events int) {
 		t.Helper()
 		if _, err := db.ExecContext(ctx, `INSERT INTO rated_usage
-			(id, auth_id, resource_id, org_id, model_id, serving_mode, window_start, window_end,
+			(id, auth_id, resource_id, org_id, model_id, serving_mode, graph_k8s_name, topology_revision, window_start, window_end,
 			 prompt_tokens, cached_tokens, completion_tokens, billable_prompt_tokens,
 			 cost, applied_prompt_rate, applied_cached_rate, applied_completion_rate, event_count)
-			VALUES (md5($1 || $2), $1, 'res', 'org-1', 'm', $2, $3::timestamptz, $3::timestamptz + interval '1 hour',
-			        100, 0, 0, 100, $4::numeric, 0.00001, 0, 0, $5)`, auth, mode, hour, cost, events); err != nil {
-			t.Fatalf("seed rated_usage (%s, %q): %v", auth, mode, err)
+			VALUES ($1, $2, 'res', 'org-1', 'm', 'dedicated', $3, $4, $5::timestamptz, $5::timestamptz + interval '1 hour',
+			        100, 0, 0, 100, $6::numeric, 0.00001, 0, 0, $7)`, idKey, auth, graph, revision, at, cost, events); err != nil {
+			t.Fatalf("seed rated_usage %s: %v", idKey, err)
 		}
 	}
 
-	const sch = "phoebe_migration_0007_notice_it"
+	const sch = "phoebe_migration_0009_down_notice_it"
 	setup(sch)
 	defer func() { exec(t, db, "DROP SCHEMA IF EXISTS "+sch+" CASCADE") }()
-	seed("a-ded", "", "0.500000000", 7)       // renamed, not deleted: no NOTICE
-	seed("a-shr", "shared", "0.250000000", 3) // untouched
-	seed("a-twin", "", "1.250000000", 4)      // deleted: 'dedicated' twin exists
-	seed("a-twin2", "", "0.750000000", 6)     // deleted: 'dedicated' twin exists
-	seed("a-twin", "dedicated", "9.000000000", 9)
-	seed("a-twin2", "dedicated", "9.000000000", 9)
-	seed("a-bogus", "bogus", "2.000000000", 5)   // deleted: unknown value
-	seed("a-bogus2", "Shared", "0.125000000", 1) // deleted: unknown value (case matters)
+	// Same hour, same 0007 key, differ only in graph: 'b' is deleted.
+	seed("g-a", "a-graph", "dgd-a", 0, hour, "0.500000000", 5)
+	seed("g-b", "a-graph", "dgd-b", 0, hour, "1.250000000", 4)
+	// Next hour, differ only in revision: 'r2' is deleted.
+	seed("r-1", "a-rev", "dgd-a", 1, hour.Add(time.Hour), "0.100000000", 1)
+	seed("r-2", "a-rev", "dgd-a", 2, hour.Add(time.Hour), "0.750000000", 6)
+	// Alone in its 0007 key: untouched.
+	seed("solo", "a-solo", "dgd-c", 3, hour, "9.000000000", 9)
 
-	exec(t, db, readMigration(t, "0007_serving_mode_explicit.up.sql"))
+	exec(t, db, readMigration(t, "0009_rollup_grain_graph_revision.down.sql"))
 
 	want := []string{
-		"0007: deleting 2 rated_usage rows with serving_mode '' that have a 'dedicated' twin (sum cost 2.000000000, sum event_count 10, earliest window_start 2026-06-08T10:00:00Z); " +
-			"the 'dedicated' twins are partial until re-rated, so every affected hour MUST be re-rated: rater --since <earliest window_start> --until <now>, then token-push over the same window",
-		"0007: deleting 2 rated_usage rows with an unknown serving_mode (sum cost 2.125000000, sum event_count 6, earliest window_start 2026-06-08T10:00:00Z)",
+		"0009 down: deleting 2 rated_usage rows that differ from a kept row only in graph or topology revision " +
+			"(sum cost 2.000000000, sum event_count 10, earliest window_start 2026-06-08T10:00:00Z); " +
+			"the kept rows are partial until re-rated, so every affected hour MUST be re-rated: " +
+			"rater --since <earliest window_start> --until <now>, then token-push over the same window",
 	}
 	if strings.Join(notices, "\n") != strings.Join(want, "\n") {
-		t.Fatalf("0007 notices =\n%s\nwant\n%s", strings.Join(notices, "\n"), strings.Join(want, "\n"))
+		t.Fatalf("0009 down notices =\n%s\nwant\n%s", strings.Join(notices, "\n"), strings.Join(want, "\n"))
 	}
 	var left int64
-	if err := db.QueryRowContext(ctx, `SELECT COUNT(*) FROM rated_usage`).Scan(&left); err != nil {
-		t.Fatalf("count after up: %v", err)
+	var leftCost string
+	if err := db.QueryRowContext(ctx, `SELECT COUNT(*), SUM(cost)::text FROM rated_usage`).Scan(&left, &leftCost); err != nil {
+		t.Fatalf("count after down: %v", err)
 	}
-	if left != 4 {
-		t.Fatalf("rated_usage rows after up = %d, want 4 (a-ded, a-shr and the two 'dedicated' twins)", left)
+	// The NOTICE must describe exactly the rows removed: 12.6 seeded - 2.0 noticed.
+	if left != 3 || leftCost != "9.600000000" {
+		t.Fatalf("rated_usage after down = %d rows, sum cost %s; want 3 rows, 9.600000000", left, leftCost)
 	}
 
 	// Nothing to delete: no audit NOTICE at all.
 	notices = nil
-	const clean = "phoebe_migration_0007_notice_clean_it"
+	const clean = "phoebe_migration_0009_down_notice_clean_it"
 	setup(clean)
 	defer func() { exec(t, db, "DROP SCHEMA IF EXISTS "+clean+" CASCADE") }()
-	seed("a-ded", "", "0.500000000", 7)
-	seed("a-shr", "shared", "0.250000000", 3)
-	exec(t, db, readMigration(t, "0007_serving_mode_explicit.up.sql"))
+	seed("g-a", "a-graph", "dgd-a", 0, hour, "0.500000000", 5)
+	seed("solo", "a-solo", "dgd-c", 3, hour, "9.000000000", 9)
+	exec(t, db, readMigration(t, "0009_rollup_grain_graph_revision.down.sql"))
 	if len(notices) != 0 {
-		t.Fatalf("0007 on a database with nothing to delete raised %v, want no NOTICE", notices)
+		t.Fatalf("0009 down on a database with nothing to delete raised %v, want no NOTICE", notices)
 	}
 }
 
-// TestIntegration_Migration0007BackfillMakesPreCutoverReRateANoOp pins Hugo's
-// 2026-09-30 ruling ("assume it's all dedicated (which is true)"): 0007 backfills
-// pre-cutover billing_event rows (NULL and ”) to 'dedicated', so the trailing
-// re-rate after the deploy REPRODUCES the rated_usage rows 0007 renamed — same
-// ids, zero reconcile deletions, zero invalid-serving-mode events — instead of
-// withholding the evidence and deleting the rows. It also pins the rollout
-// follow-up: a NULL event metered by an old pod after the migration is withheld
-// until the same idempotent backfill statement is re-run, and then rates. Down
-// maps billing_event 'dedicated' back to NULL (the pre-0007 dedicated spelling).
-func TestIntegration_Migration0007BackfillMakesPreCutoverReRateANoOp(t *testing.T) {
+// TestIntegration_MigrationsCreateOrgGrainViewWithoutReplacement guards the
+// invariant that the ENTIRE embedded migration set, applied in version order
+// exactly as cmd/migrate applies it, creates billing_reconciliation_hourly ONCE
+// at the rated natural grain — it is never created in a known-wrong org-grouped
+// shape and then dropped and replaced by a later migration. The reconciliation
+// view's shape is the operator's audit contract; an operator applying the
+// migrations must never materialize a view shape nobody intends to run.
+//
+// It asserts three things: exactly one CREATE VIEW of that name exists across
+// every up migration and no up migration DROPs it; the applied view exposes the
+// org-evidence columns (missing_org_attempts, distinct_org_ids); and raw
+// evidence is grouped at the rater's grain, so a rollout-era NULL org_id and a
+// real org_id on the same (hour, auth, resource, model) collapse into ONE row
+// rather than two false mismatch rows.
+func TestIntegration_MigrationsCreateOrgGrainViewWithoutReplacement(t *testing.T) {
 	dsn := os.Getenv("PHOEBE_TEST_DATABASE_URL")
 	if dsn == "" {
 		t.Skip("PHOEBE_TEST_DATABASE_URL not set; skipping live-Postgres conformance")
 	}
+
+	ups, err := filepath.Glob("../../migrations/*.up.sql")
+	if err != nil || len(ups) == 0 {
+		t.Fatalf("glob up migrations: %v (found %d)", err, len(ups))
+	}
+	sort.Strings(ups)
+	creates, drops := 0, 0
+	for _, f := range ups {
+		body, readErr := os.ReadFile(f)
+		if readErr != nil {
+			t.Fatalf("read %s: %v", f, readErr)
+		}
+		creates += strings.Count(string(body), "CREATE VIEW billing_reconciliation_hourly")
+		drops += strings.Count(string(body), "DROP VIEW billing_reconciliation_hourly")
+		drops += strings.Count(string(body), "DROP VIEW IF EXISTS billing_reconciliation_hourly")
+	}
+	if creates != 1 || drops != 0 {
+		t.Fatalf("up migrations CREATE billing_reconciliation_hourly %d time(s) and DROP it %d time(s); want exactly 1 create and 0 drops — operators must not apply a view shape that a later migration immediately replaces", creates, drops)
+	}
+
 	ctx := context.Background()
+	db, err := sql.Open("pgx", dsn)
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	defer db.Close()
+
+	const sch = "phoebe_migration_view_it"
+	exec(t, db, "DROP SCHEMA IF EXISTS "+sch+" CASCADE")
+	exec(t, db, "CREATE SCHEMA "+sch)
+	exec(t, db, "SET search_path TO "+sch)
+	defer func() { exec(t, db, "DROP SCHEMA IF EXISTS "+sch+" CASCADE") }()
+
+	// Apply EVERY up migration in version order — the real cmd/migrate sequence,
+	// io_log included, so nothing about the ordering is hand-curated here.
+	for _, f := range ups {
+		ddl, readErr := os.ReadFile(f)
+		if readErr != nil {
+			t.Fatalf("read %s: %v", f, readErr)
+		}
+		exec(t, db, string(ddl))
+	}
+
+	for _, col := range []string{"missing_org_attempts", "distinct_org_ids"} {
+		var n int64
+		if err := db.QueryRowContext(ctx, `
+			SELECT COUNT(*) FROM information_schema.columns
+			WHERE table_schema=$1 AND table_name='billing_reconciliation_hourly'
+			  AND column_name=$2`, sch, col).Scan(&n); err != nil {
+			t.Fatalf("inspect view column %s: %v", col, err)
+		}
+		if n != 1 {
+			t.Fatalf("billing_reconciliation_hourly is missing %s after applying all migrations; the org-grain view did not survive the migration set", col)
+		}
+	}
+
+	// Two attempts on the same natural key, one carrying a rollout-era NULL org.
+	// At the rater's grain they are ONE reconciliation row; grouping raw by
+	// org_id would split them into two rows that each look like a mismatch.
+	hour := mustTime("2026-06-08T10:00:00Z")
+	for i, org := range []interface{}{nil, "org-1"} {
+		if _, err := db.ExecContext(ctx,
+			`INSERT INTO billing_event
+			 (request_id, auth_id, resource_id, org_id, model, prompt_tokens, cached_tokens, completion_tokens, usage_found, event_ts)
+			 VALUES ($1,'a','d1',$2,'b',10,0,5,TRUE,$3)`,
+			fmt.Sprintf("org-grain-%d", i), org, hour.Add(time.Duration(i)*time.Minute)); err != nil {
+			t.Fatalf("insert attempt %d: %v", i, err)
+		}
+	}
+	var rows, rawAttempts, missingOrg, distinctOrgs int64
+	if err := db.QueryRowContext(ctx, `
+		SELECT COUNT(*), COALESCE(MAX(raw_attempts),0), COALESCE(MAX(missing_org_attempts),0),
+		       COALESCE(MAX(distinct_org_ids),0)
+		FROM billing_reconciliation_hourly`).Scan(&rows, &rawAttempts, &missingOrg, &distinctOrgs); err != nil {
+		t.Fatalf("query view: %v", err)
+	}
+	if rows != 1 || rawAttempts != 2 {
+		t.Fatalf("view has %d row(s) with max raw_attempts=%d, want 1 row of 2 attempts — a NULL org and a real org on one natural key must not split into false mismatch rows", rows, rawAttempts)
+	}
+	if missingOrg != 1 || distinctOrgs != 1 {
+		t.Fatalf("missing_org_attempts/distinct_org_ids = %d/%d, want 1/1 — the org evidence the grain change replaced org grouping with", missingOrg, distinctOrgs)
+	}
+}
+
+// TestIntegration_RatingInstantIndexServesScan: the expression index on
+// COALESCE(event_ts, created_at) must actually serve the rater's window predicate.
+func TestIntegration_RatingInstantIndexServesScan(t *testing.T) {
+	dsn := os.Getenv("PHOEBE_TEST_DATABASE_URL")
+	if dsn == "" {
+		t.Skip("PHOEBE_TEST_DATABASE_URL not set; skipping live-Postgres conformance")
+	}
 	db, err := sql.Open("pgx", dsn)
 	if err != nil {
 		t.Fatalf("open: %v", err)
@@ -3787,141 +620,48 @@ func TestIntegration_Migration0007BackfillMakesPreCutoverReRateANoOp(t *testing.
 	defer db.Close()
 	db.SetMaxOpenConns(1)
 
-	const sch = "phoebe_migration_0007_backfill_it"
+	const sch = "phoebe_rating_ix_it"
 	exec(t, db, "DROP SCHEMA IF EXISTS "+sch+" CASCADE")
 	exec(t, db, "CREATE SCHEMA "+sch)
 	exec(t, db, "SET search_path TO "+sch)
 	defer func() { exec(t, db, "DROP SCHEMA IF EXISTS "+sch+" CASCADE") }()
-	for _, f := range []string{"0001_billing_event", "0002_rating", "0004_billing_event_serving_mode",
-		"0005_invoice_grade_attempts", "0006_rollup_grain"} {
-		exec(t, db, readMigration(t, f+".up.sql"))
-	}
-	exec(t, db, "ALTER TABLE billing_event ALTER COLUMN usage_found SET DEFAULT TRUE")
+	exec(t, db, ratingSchemaDDL(t))
 
-	hour := mustTime("2026-06-08T10:00:00Z")
-	// Pre-cutover evidence exactly as the pre-0007 proxy/drainer stored it:
-	// dedicated as NULL (and the other historical spelling ''), shared as 'shared'.
-	if _, err := db.ExecContext(ctx,
-		`INSERT INTO billing_event (request_id, auth_id, resource_id, org_id, model, base_model, serving_mode, prompt_tokens, event_ts)
-		 VALUES ('d-null', 'a', 'res', 'org-1', 'm', 'b', NULL,     100, $1),
-		        ('d-empty','a', 'res', 'org-1', 'm', 'b', '',       100, $1),
-		        ('s1',     'a', 'res', 'org-1', 'm', 'b', 'shared', 100, $1)`, hour.Add(time.Minute)); err != nil {
-		t.Fatalf("seed billing_event: %v", err)
-	}
-	// The rollups the pre-0007 rater wrote for that evidence: dedicated as '' with
-	// its old-formula id, shared as 'shared'.
-	book := newTestBook(map[string]Rate3{
-		"b":        rate3("0.000010", "0", "0"),
-		"shared:b": rate3("0.000001", "0", "0"),
-	}, nil, PolicyIdentity, Dec{}, Dec{})
-	for _, row := range []struct {
-		mode, cost string
-		events     int
-	}{{"", "0.002000000", 2}, {"shared", "0.000100000", 1}} {
-		if _, err := db.ExecContext(ctx, `INSERT INTO rated_usage
-			(id, auth_id, owner_type, owner_id, resource_id, org_id, model_id, serving_mode,
-			 window_start, window_end, prompt_tokens, cached_tokens, completion_tokens,
-			 billable_prompt_tokens, cost, applied_prompt_rate, applied_cached_rate,
-			 applied_completion_rate, event_count)
-			VALUES (md5(length('a')::text || ':' || 'a' || '|0:|0:|' || length('res')::text || ':' || 'res'
-			            || '|' || length('m')::text || ':' || 'm'
-			            || '|' || length($1::text)::text || ':' || $1::text
-			            || '|' || extract(epoch FROM $2::timestamptz)::bigint::text),
-			        'a', '', '', 'res', 'org-1', 'm', $1::text, $2::timestamptz,
-			        $2::timestamptz + interval '1 hour', $3, 0, 0, $3, $4::numeric, 0, 0, 0, $5)`,
-			row.mode, hour, 100*row.events, row.cost, row.events); err != nil {
-			t.Fatalf("seed rated_usage %q: %v", row.mode, err)
-		}
-	}
-
-	exec(t, db, readMigration(t, "0007_serving_mode_explicit.up.sql"))
-	// The rater under test is today's: it needs the 0008 serving fields and the
-	// 0009 grain.
-	exec(t, db, readMigration(t, "0008_billing_event_topology.up.sql"))
-	exec(t, db, readMigration(t, "0009_rollup_grain_graph_revision.up.sql"))
-	exec(t, db, readMigration(t, "0010_rated_usage_identity.up.sql"))
-
-	var leftover int
-	if err := db.QueryRowContext(ctx,
-		`SELECT COUNT(*) FROM billing_event WHERE serving_mode IS NULL OR serving_mode NOT IN ('shared','dedicated')`).
-		Scan(&leftover); err != nil {
-		t.Fatalf("count leftover: %v", err)
-	}
-	if leftover != 0 {
-		t.Fatalf("%d billing_event rows still lack an explicit serving mode after 0007, want 0", leftover)
-	}
-	idsBefore := readRatedUsageIDs(t, db)
-
-	// The routine re-rate of the pre-cutover hour must be a no-op on identity.
-	store := NewPostgresStore(db)
-	res, err := store.RateWindow(ctx, book, hour, hour.Add(time.Hour))
-	if err != nil {
-		t.Fatalf("RateWindow: %v", err)
-	}
-	if res.ReconciledDeletions != 0 || res.InvalidServingModeEvents != 0 || res.EventsRated != 3 || res.RollupsWritten != 2 {
-		t.Fatalf("re-rate after 0007: deletions=%d invalid=%d rated=%d rollups=%d, want 0/0/3/2",
-			res.ReconciledDeletions, res.InvalidServingModeEvents, res.EventsRated, res.RollupsWritten)
-	}
-	idsAfter := readRatedUsageIDs(t, db)
-	if len(idsAfter) != 2 {
-		t.Fatalf("rated_usage after re-rate = %v, want 2 rows", idsAfter)
-	}
-	for k, id := range idsBefore {
-		if idsAfter[k] != id {
-			t.Fatalf("rollup %s: id %s after re-rate, %s after migration — the re-rate re-cut an id", k, idsAfter[k], id)
-		}
-	}
-
-	// Rollout follow-up: an old pod metering after the migration writes NULL. The
-	// rater withholds it until the idempotent backfill is re-run.
-	if _, err := db.ExecContext(ctx,
-		`INSERT INTO billing_event (request_id, auth_id, resource_id, org_id, model, base_model, serving_mode, prompt_tokens, event_ts)
-		 VALUES ('d-rollout', 'a', 'res', 'org-1', 'm', 'b', NULL, 100, $1)`, hour.Add(2*time.Minute)); err != nil {
-		t.Fatalf("seed rollout event: %v", err)
-	}
-	if res, err = store.RateWindow(ctx, book, hour, hour.Add(time.Hour)); err != nil || res.InvalidServingModeEvents != 1 {
-		t.Fatalf("before re-running the backfill: invalid=%d err=%v, want 1", res.InvalidServingModeEvents, err)
-	}
-	exec(t, db, rolloutReRunBackfill)
-	if res, err = store.RateWindow(ctx, book, hour, hour.Add(time.Hour)); err != nil ||
-		res.InvalidServingModeEvents != 0 || res.EventsRated != 4 || res.ReconciledDeletions != 0 {
-		t.Fatalf("after re-running the backfill: invalid=%d rated=%d deletions=%d err=%v, want 0/4/0",
-			res.InvalidServingModeEvents, res.EventsRated, res.ReconciledDeletions, err)
-	}
-
-	// Down: billing_event goes back to the pre-0007 dedicated spelling (NULL).
-	exec(t, db, readMigration(t, "0007_serving_mode_explicit.down.sql"))
-	var nulls, shared, explicitDedicated int
-	if err := db.QueryRowContext(ctx, `SELECT
-		COUNT(*) FILTER (WHERE serving_mode IS NULL),
-		COUNT(*) FILTER (WHERE serving_mode = 'shared'),
-		COUNT(*) FILTER (WHERE serving_mode = 'dedicated') FROM billing_event`).
-		Scan(&nulls, &shared, &explicitDedicated); err != nil {
-		t.Fatalf("read billing_event after down: %v", err)
-	}
-	if nulls != 3 || shared != 1 || explicitDedicated != 0 {
-		t.Fatalf("billing_event after down: NULL=%d shared=%d dedicated=%d, want 3/1/0", nulls, shared, explicitDedicated)
+	exec(t, db, "SET enable_seqscan = off")
+	plan := explainPlan(t, db, `EXPLAIN SELECT * FROM billing_event
+		WHERE COALESCE(event_ts, created_at) >= '2026-06-08T10:00:00Z'
+		  AND COALESCE(event_ts, created_at) <  '2026-06-08T11:00:00Z'`)
+	if !strings.Contains(plan, "billing_event_rating_instant_ix") {
+		t.Fatalf("plan does not use billing_event_rating_instant_ix:\n%s", plan)
 	}
 }
 
-// rolloutReRunBackfill is the statement the 0007 runbook (docs/billing-reconciliation.md
-// and migrations/README.md step 3) tells operators to re-run after the rollout. It
-// covers only NULL, which only an old drainer writes; it must not touch the empty string.
-const rolloutReRunBackfill = `UPDATE billing_event SET serving_mode = 'dedicated' WHERE serving_mode IS NULL`
-
-// TestIntegration_RolloutReRunBackfillLeavesExplicitEmptyServingModeWithheld pins
-// the drainer/metering contract against the runbook's post-rollout re-run. After
-// the cutover the new drainer stores an explicit "serving_mode":"" as the empty string because it
-// is a producer bug, and the rater withholds it as invalid_serving_mode_events.
-// The re-run must backfill only the NULL rows an old drainer wrote during the
-// rollout, and leave the empty-string row withheld so it still pages and is investigated
-// instead of being billed at the dedicated price.
-func TestIntegration_RolloutReRunBackfillLeavesExplicitEmptyServingModeWithheld(t *testing.T) {
+// TestIntegration_ReconcileDeleteCanUseWindowStartIndex pins ONE structural
+// invariant: the reconcile DELETE's window_start-only predicate CAN be served by
+// rated_usage_window_start_ix (rather than falling back to a seqscan or to the
+// auth-leading composite index, neither of which can serve a window_start-only
+// range as a tight slice — every other index leads with auth_id).
+//
+// This is an index-USABILITY sanity check, NOT a money assertion and NOT a
+// planner-cost-preference or performance guarantee. Whether the planner PREFERS
+// this index at default cost is a version- and GUC-fragile cost-model decision
+// whose failure mode is a slow reconcile, not a wrong bill — so we deliberately do
+// NOT gate on it. We force the planner's hand with `enable_seqscan=off` and assert
+// only that the dedicated index CAN serve the predicate at all.
+//
+// The single hard assertion accepts ANY plan node that uses the index by NAME —
+// Index Scan / Index Only Scan / Bitmap Index Scan — since all of those prove the
+// invariant; matching only the `using …` forms would flake when Postgres renders a
+// bitmap index scan ("Bitmap Index Scan on rated_usage_window_start_ix"). We
+// EXPLAIN the ACTUAL reconcile DELETE from store.go (the `deleted` CTE's rated_usage
+// table-access: the window_start range plus the NOT EXISTS anti-join against this
+// run's priced rows) against an ANALYZE'd population so it is a real plan, not a
+// vacuous SELECT against an empty table.
+func TestIntegration_ReconcileDeleteCanUseWindowStartIndex(t *testing.T) {
 	dsn := os.Getenv("PHOEBE_TEST_DATABASE_URL")
 	if dsn == "" {
 		t.Skip("PHOEBE_TEST_DATABASE_URL not set; skipping live-Postgres conformance")
 	}
-	ctx := context.Background()
 	db, err := sql.Open("pgx", dsn)
 	if err != nil {
 		t.Fatalf("open: %v", err)
@@ -3929,146 +669,71 @@ func TestIntegration_RolloutReRunBackfillLeavesExplicitEmptyServingModeWithheld(
 	defer db.Close()
 	db.SetMaxOpenConns(1)
 
-	const sch = "phoebe_rollout_rerun_backfill_it"
+	const sch = "phoebe_rating_winix_it"
 	exec(t, db, "DROP SCHEMA IF EXISTS "+sch+" CASCADE")
 	exec(t, db, "CREATE SCHEMA "+sch)
 	exec(t, db, "SET search_path TO "+sch)
 	defer func() { exec(t, db, "DROP SCHEMA IF EXISTS "+sch+" CASCADE") }()
-	for _, f := range []string{"0001_billing_event", "0002_rating", "0004_billing_event_serving_mode",
-		"0005_invoice_grade_attempts", "0006_rollup_grain", "0007_serving_mode_explicit",
-		"0008_billing_event_topology", "0009_rollup_grain_graph_revision",
-		"0010_rated_usage_identity"} {
-		exec(t, db, readMigration(t, f+".up.sql"))
-	}
-	exec(t, db, "ALTER TABLE billing_event ALTER COLUMN usage_found SET DEFAULT TRUE")
+	exec(t, db, ratingSchemaDDL(t))
 
-	hour := mustTime("2026-06-08T10:00:00Z")
-	// After 0007: an old drainer still running during the rollout stores NULL; the
-	// new drainer stores an explicit "" from a post-cutover producer bug as ''.
-	if _, err := db.ExecContext(ctx,
-		`INSERT INTO billing_event (request_id, auth_id, resource_id, org_id, model, base_model, serving_mode, prompt_tokens, event_ts)
-		 VALUES ('old-drainer-null', 'a', 'res', 'org-1', 'm', 'b', NULL, 100, $1),
-		        ('producer-bug',     'a', 'res', 'org-1', 'm', 'b', '',   100, $1)`, hour.Add(time.Minute)); err != nil {
-		t.Fatalf("seed billing_event: %v", err)
-	}
-	book := newTestBook(map[string]Rate3{
-		"b":        rate3("0.000010", "0", "0"),
-		"shared:b": rate3("0.000001", "0", "0"),
-	}, nil, PolicyIdentity, Dec{}, Dec{})
-	store := NewPostgresStore(db)
+	// POPULATE a small, ANALYZE'd population: 10 distinct auth_ids × 24 hours = 240
+	// rated_usage rows across a couple dozen windows. That is enough for the
+	// window_start range predicate to be a genuine, non-trivial index-served slice
+	// (the reconcile targets a single hour → ~10 rows), so the EXPLAIN'd plan is real
+	// rather than a degenerate seqscan-an-empty-table. We do NOT need 10k rows: we
+	// only prove the index CAN serve the predicate under seqscan-off, not that the
+	// planner prefers it at default cost, so a large population would back nothing.
+	exec(t, db, `INSERT INTO rated_usage
+		(id, auth_id, resource_id, model_id, window_start, window_end,
+		 prompt_tokens, cached_tokens, completion_tokens, billable_prompt_tokens,
+		 cost, applied_prompt_rate, applied_cached_rate, applied_completion_rate, event_count,
+		 serving_mode)
+		SELECT
+		    md5(a::text || ':' || h::text),
+		    'auth' || a::text,
+		    'deploy' || a::text,
+		    'm',
+		    '2026-01-01T00:00:00Z'::timestamptz + (h || ' hours')::interval,
+		    '2026-01-01T01:00:00Z'::timestamptz + (h || ' hours')::interval,
+		    100, 0, 0, 100, 0.001, 0.00001, 0, 0, 1,
+		    'dedicated'
+		FROM generate_series(0, 9) AS a, generate_series(0, 23) AS h`)
+	// ANALYZE so the planner has row-count + distribution stats rather than defaults,
+	// making the EXPLAIN'd plan a real plan over the populated table.
+	exec(t, db, "ANALYZE rated_usage")
 
-	res, err := store.RateWindow(ctx, book, hour, hour.Add(time.Hour))
-	if err != nil || res.InvalidServingModeEvents != 2 || res.EventsRated != 0 {
-		t.Fatalf("before the re-run: invalid=%d rated=%d err=%v, want 2/0", res.InvalidServingModeEvents, res.EventsRated, err)
-	}
+	// EXPLAIN the ACTUAL reconcile DELETE statement (store.go's `deleted` CTE shape):
+	// the rated_usage range on window_start, anti-joined against this run's priced
+	// rows. `priced` is empty here (a re-run that reproduces nothing for this hour →
+	// the whole slice is deleted), which is exactly the worst-case reconcile that
+	// must still go through the index rather than seqscanning the whole table.
+	const reconcileDelete = `EXPLAIN
+		WITH priced AS (
+		    SELECT auth_id, resource_id, model_id, window_start FROM rated_usage WHERE false
+		)
+		DELETE FROM rated_usage ru
+		WHERE ru.window_start >= '2026-01-01T04:00:00Z'
+		  AND ru.window_start <  '2026-01-01T05:00:00Z'
+		  AND NOT EXISTS (
+		      SELECT 1 FROM priced p
+		      WHERE p.auth_id      = ru.auth_id
+		        AND p.resource_id  = ru.resource_id
+		        AND p.model_id     = ru.model_id
+		        AND p.window_start = ru.window_start
+		  )`
 
-	exec(t, db, rolloutReRunBackfill)
-
-	var empty int
-	if err := db.QueryRowContext(ctx, `SELECT COUNT(*) FROM billing_event WHERE serving_mode = ''`).Scan(&empty); err != nil {
-		t.Fatalf("count '' rows: %v", err)
-	}
-	if empty != 1 {
-		t.Fatalf("'' rows after the re-run = %d, want 1 (the producer-bug row must not be backfilled)", empty)
-	}
-	res, err = store.RateWindow(ctx, book, hour, hour.Add(time.Hour))
-	if err != nil || res.InvalidServingModeEvents != 1 || res.EventsRated != 1 {
-		t.Fatalf("after the re-run: invalid=%d rated=%d err=%v, want 1/1 (NULL rated, '' still withheld)",
-			res.InvalidServingModeEvents, res.EventsRated, err)
-	}
-}
-
-// TestIntegration_Migration0007TwinHourIsWholeAfterExplicitReRate pins the rollout
-// step for the ” / 'dedicated' twins 0007 deletes. Atlas #6709 ships first and
-// stamps 'dedicated' while the old phoebe runs, so the old rater writes two rollups
-// for one hour: ” for the NULL (pre-stamp) events and 'dedicated' for the stamped
-// ones. 0007 deletes the ” row, which leaves the 'dedicated' row covering only
-// part of the hour. An explicit re-rate of that hour (`rater --since <hour>`) must
-// leave exactly one row whose event_count is every event of the hour.
-func TestIntegration_Migration0007TwinHourIsWholeAfterExplicitReRate(t *testing.T) {
-	dsn := os.Getenv("PHOEBE_TEST_DATABASE_URL")
-	if dsn == "" {
-		t.Skip("PHOEBE_TEST_DATABASE_URL not set; skipping live-Postgres conformance")
-	}
-	ctx := context.Background()
-	db, err := sql.Open("pgx", dsn)
-	if err != nil {
-		t.Fatalf("open: %v", err)
-	}
-	defer db.Close()
-	db.SetMaxOpenConns(1)
-
-	const sch = "phoebe_migration_0007_twin_rerate_it"
-	exec(t, db, "DROP SCHEMA IF EXISTS "+sch+" CASCADE")
-	exec(t, db, "CREATE SCHEMA "+sch)
-	exec(t, db, "SET search_path TO "+sch)
-	defer func() { exec(t, db, "DROP SCHEMA IF EXISTS "+sch+" CASCADE") }()
-	for _, f := range []string{"0001_billing_event", "0002_rating", "0004_billing_event_serving_mode",
-		"0005_invoice_grade_attempts", "0006_rollup_grain"} {
-		exec(t, db, readMigration(t, f+".up.sql"))
-	}
-	exec(t, db, "ALTER TABLE billing_event ALTER COLUMN usage_found SET DEFAULT TRUE")
-
-	// An hour older than the rater's trailing window: the routine run never
-	// revisits it, so only the explicit re-rate can repair it.
-	hour := mustTime("2026-06-08T10:00:00Z")
-	// Two NULL events before Atlas started stamping, three stamped 'dedicated' after.
-	if _, err := db.ExecContext(ctx,
-		`INSERT INTO billing_event (request_id, auth_id, resource_id, org_id, model, serving_mode, prompt_tokens, event_ts)
-		 VALUES ('n1', 'a', 'res', 'org-1', 'm', NULL,        100, $1),
-		        ('n2', 'a', 'res', 'org-1', 'm', NULL,        100, $1),
-		        ('d1', 'a', 'res', 'org-1', 'm', 'dedicated', 100, $2),
-		        ('d2', 'a', 'res', 'org-1', 'm', 'dedicated', 100, $2),
-		        ('d3', 'a', 'res', 'org-1', 'm', 'dedicated', 100, $2)`,
-		hour.Add(5*time.Minute), hour.Add(40*time.Minute)); err != nil {
-		t.Fatalf("seed billing_event: %v", err)
-	}
-	// The two rollups the old rater wrote for that hour.
-	for _, row := range []struct {
-		mode   string
-		events int
-	}{{"", 2}, {"dedicated", 3}} {
-		if _, err := db.ExecContext(ctx, `INSERT INTO rated_usage
-			(id, auth_id, resource_id, org_id, model_id, serving_mode, window_start, window_end,
-			 prompt_tokens, cached_tokens, completion_tokens, billable_prompt_tokens,
-			 cost, applied_prompt_rate, applied_cached_rate, applied_completion_rate, event_count)
-			VALUES (md5('a' || $1::text), 'a', 'res', 'org-1', 'm', $1::text, $2::timestamptz,
-			        $2::timestamptz + interval '1 hour', $3, 0, 0, $3, 0.001, 0.00001, 0, 0, $4)`,
-			row.mode, hour, 100*row.events, row.events); err != nil {
-			t.Fatalf("seed rated_usage %q: %v", row.mode, err)
-		}
-	}
-
-	exec(t, db, readMigration(t, "0007_serving_mode_explicit.up.sql"))
-	// The rater under test is today's: it needs the 0008 serving fields and the
-	// 0009 grain.
-	exec(t, db, readMigration(t, "0008_billing_event_topology.up.sql"))
-	exec(t, db, readMigration(t, "0009_rollup_grain_graph_revision.up.sql"))
-	exec(t, db, readMigration(t, "0010_rated_usage_identity.up.sql"))
-
-	var partial int64
-	if err := db.QueryRowContext(ctx, `SELECT SUM(event_count) FROM rated_usage WHERE window_start = $1`, hour).
-		Scan(&partial); err != nil {
-		t.Fatalf("read after up: %v", err)
-	}
-	if partial != 3 {
-		t.Fatalf("event_count after 0007 = %d, want 3 (the surviving 'dedicated' twin is partial until re-rated)", partial)
-	}
-
-	// The runbook step: rater --since <hour> --until <hour+1h>.
-	book := newTestBook(map[string]Rate3{"m": rate3("0.000010", "0", "0")}, nil, PolicyIdentity, Dec{}, Dec{})
-	if _, err := NewPostgresStore(db).RateWindow(ctx, book, hour, hour.Add(time.Hour)); err != nil {
-		t.Fatalf("RateWindow: %v", err)
-	}
-	var rows, events int64
-	var mode string
-	if err := db.QueryRowContext(ctx,
-		`SELECT COUNT(*), COALESCE(SUM(event_count), 0), MAX(serving_mode) FROM rated_usage WHERE window_start = $1`, hour).
-		Scan(&rows, &events, &mode); err != nil {
-		t.Fatalf("read after re-rate: %v", err)
-	}
-	if rows != 1 || events != 5 || mode != "dedicated" {
-		t.Fatalf("after re-rate: rows=%d event_count=%d mode=%q, want 1 row, 5 events, 'dedicated'", rows, events, mode)
+	// The ONE hard gate: with seqscan forbidden, the plan MUST reach rated_usage
+	// through rated_usage_window_start_ix. That proves the dedicated index CAN serve
+	// the window_start-only predicate at all (a remaining seqscan or a fall-through to
+	// the auth-leading composite would mean no usable index for the reconcile's exact
+	// predicate — a real defect). We accept any node that names the index — Index Scan,
+	// Index Only Scan, or Bitmap Index Scan — because all three satisfy the invariant;
+	// requiring the "using …" rendering alone would flake on the bitmap form.
+	exec(t, db, "SET enable_seqscan = off")
+	plan := explainPlan(t, db, reconcileDelete)
+	if !strings.Contains(plan, "using rated_usage_window_start_ix") &&
+		!strings.Contains(plan, "on rated_usage_window_start_ix") {
+		t.Fatalf("reconcile DELETE predicate cannot be served by rated_usage_window_start_ix even with seqscan off (no usable window_start index for the window-only predicate):\n%s", plan)
 	}
 }
 
@@ -4178,633 +843,491 @@ func TestIntegration_ReconciliationViewOneRowPerGrainAcrossServingModes(t *testi
 	check("after 0007 down")
 }
 
-// readMigration returns the text of one real migration file.
-func readMigration(t *testing.T, name string) string {
+// ---------------------------------------------------------------------------
+// Aggregator behaviour (billing unification: quantities only, no money).
+// ---------------------------------------------------------------------------
+
+var itHour = mustTime("2026-10-22T14:00:00Z")
+
+// beRow is one billing_event row. Empty strings are written as NULL; the
+// defaults (see row) describe one clean dedicated attempt.
+type beRow struct {
+	id                                        string
+	auth, resource, org, model, base, adapter string
+	user, group, mode, graph, region          string
+	rev                                       int
+	prompt, cached, completion                int
+	usageFound                                bool
+	aborted                                   bool
+	status                                    int // 0 = NULL
+	at                                        time.Time
+}
+
+var rowSeq int
+
+func row(mod func(*beRow)) beRow {
+	rowSeq++
+	r := beRow{
+		id: fmt.Sprintf("req-%d", rowSeq), auth: "auth-a", resource: "res-1", org: "org-1",
+		model: "qwen-ep", base: "Qwen/Qwen2.5-32B-Instruct", user: "user-1", mode: "dedicated",
+		graph: "pd-qwen", region: "us-central1", rev: 3,
+		prompt: 100, cached: 10, completion: 20, usageFound: true, status: 200,
+		at: itHour.Add(5 * time.Minute),
+	}
+	if mod != nil {
+		mod(&r)
+	}
+	return r
+}
+
+func seed(t *testing.T, db *sql.DB, rows ...beRow) {
 	t.Helper()
-	b, err := os.ReadFile(filepath.Join("../../migrations", name))
-	if err != nil {
-		t.Fatalf("read migration %s: %v", name, err)
-	}
-	return string(b)
-}
-
-// TestIntegration_Migration0009GraphRevisionGrain applies the real 0001–0008 DDL,
-// seeds rated_usage the way the 0007-era rater wrote it (graph as nullable evidence),
-// then runs 0009 up and down.
-//
-// Up must: turn a NULL graph into the ” key sentinel, give every row revision 0,
-// and rewrite each id so the CURRENT rater mints the same id for the same rollup
-// (otherwise the first re-rate after the migration deletes and re-mints every
-// row). Down must keep exactly one row per 0007 key when rollups differ only in graph
-// or revision (its DELETE is lossy by design), restore the 0007 key and the 7-field
-// ids, and turn the ” graph sentinel back into NULL. Up again must reproduce the
-// rater's 9-field ids.
-func TestIntegration_Migration0009GraphRevisionGrain(t *testing.T) {
-	dsn := os.Getenv("PHOEBE_TEST_DATABASE_URL")
-	if dsn == "" {
-		t.Skip("PHOEBE_TEST_DATABASE_URL not set; skipping live-Postgres conformance")
-	}
-	ctx := context.Background()
-	db, err := sql.Open("pgx", dsn)
-	if err != nil {
-		t.Fatalf("open: %v", err)
-	}
-	defer db.Close()
-
-	const sch = "phoebe_migration_0009_it"
-	exec(t, db, "DROP SCHEMA IF EXISTS "+sch+" CASCADE")
-	exec(t, db, "CREATE SCHEMA "+sch)
-	exec(t, db, "SET search_path TO "+sch)
-	defer func() { exec(t, db, "DROP SCHEMA IF EXISTS "+sch+" CASCADE") }()
-	for _, f := range []string{"0001_billing_event", "0002_rating", "0004_billing_event_serving_mode",
-		"0005_invoice_grade_attempts", "0006_rollup_grain", "0007_serving_mode_explicit",
-		"0008_billing_event_topology"} {
-		exec(t, db, readMigration(t, f+".up.sql"))
-	}
-	exec(t, db, "ALTER TABLE billing_event ALTER COLUMN usage_found SET DEFAULT TRUE")
-
-	hour := mustTime("2026-06-08T10:00:00Z")
-	id7 := `md5(length(auth_id)::text || ':' || auth_id
-		  || '|' || length(owner_type)::text || ':' || owner_type
-		  || '|' || length(owner_id)::text || ':' || owner_id
-		  || '|' || length(resource_id)::text || ':' || resource_id
-		  || '|' || length(model_id)::text || ':' || model_id
-		  || '|' || length(serving_mode)::text || ':' || serving_mode
-		  || '|' || extract(epoch FROM window_start)::bigint::text)`
-	seed := func(auth string, graph any) {
-		t.Helper()
-		if _, err := db.ExecContext(ctx, `INSERT INTO rated_usage
-			(id, auth_id, resource_id, org_id, model_id, serving_mode, graph_k8s_name, window_start, window_end,
-			 prompt_tokens, cached_tokens, completion_tokens, billable_prompt_tokens,
-			 cost, applied_prompt_rate, applied_cached_rate, applied_completion_rate, event_count)
-			VALUES (md5($1), $1, 'res', 'org-1', 'm', 'dedicated', $2, $3::timestamptz, $3::timestamptz + interval '1 hour',
-			        100, 0, 0, 100, 0.001, 0.00001, 0, 0, 1)`, auth, graph, hour); err != nil {
-			t.Fatalf("seed rated_usage %s: %v", auth, err)
+	for _, r := range rows {
+		var status any
+		if r.status != 0 {
+			status = r.status
 		}
-	}
-	seed("a-nograph", nil)
-	seed("a-graph", "dgd-a")
-	exec(t, db, "UPDATE rated_usage SET id = "+id7)
-	var oldID string
-	if err := db.QueryRowContext(ctx, `SELECT id FROM rated_usage WHERE auth_id = 'a-graph'`).Scan(&oldID); err != nil {
-		t.Fatalf("read pre-0009 id: %v", err)
-	}
-
-	exec(t, db, readMigration(t, "0009_rollup_grain_graph_revision.up.sql"))
-
-	exec(t, db, readMigration(t, "0010_rated_usage_identity.up.sql"))
-
-	var graph string
-	var revision int
-	if err := db.QueryRowContext(ctx,
-		`SELECT graph_k8s_name, topology_revision FROM rated_usage WHERE auth_id = 'a-nograph'`).Scan(&graph, &revision); err != nil {
-		t.Fatalf("read migrated row: %v", err)
-	}
-	if graph != "" || revision != 0 {
-		t.Fatalf("migrated unknown graph/revision = %q/%d, want ''/0", graph, revision)
-	}
-	var migratedID string
-	if err := db.QueryRowContext(ctx, `SELECT id FROM rated_usage WHERE auth_id = 'a-graph'`).Scan(&migratedID); err != nil {
-		t.Fatalf("read migrated id: %v", err)
-	}
-	if migratedID == oldID {
-		t.Fatal("0009 kept the 7-field id; the rater now mints a 9-field id")
-	}
-
-	// The current rater, re-rating the same evidence, mints the migrated id and
-	// therefore updates the row in place instead of deleting and re-minting it.
-	if _, err := db.ExecContext(ctx,
-		`INSERT INTO billing_event (request_id, auth_id, resource_id, org_id, model, serving_mode, graph_k8s_name, prompt_tokens, event_ts)
-		 VALUES ('e1', 'a-graph', 'res', 'org-1', 'm', 'dedicated', 'dgd-a', 100, $1)`, hour.Add(time.Minute)); err != nil {
-		t.Fatalf("seed billing_event: %v", err)
-	}
-	book := newTestBook(map[string]Rate3{"m": rate3("0.000010", "0", "0")}, nil, PolicyIdentity, Dec{}, Dec{})
-	if _, err := NewPostgresStore(db).RateWindow(ctx, book, hour, hour.Add(time.Hour)); err != nil {
-		t.Fatalf("RateWindow: %v", err)
-	}
-	var raterID string
-	if err := db.QueryRowContext(ctx, `SELECT id FROM rated_usage WHERE auth_id = 'a-graph'`).Scan(&raterID); err != nil {
-		t.Fatalf("read re-rated row: %v", err)
-	}
-	if raterID != migratedID {
-		t.Fatalf("rater minted id %s, migration wrote %s — the migration's id formula drifted from the rater's", raterID, migratedID)
-	}
-
-	// Rollups that the 0009 key keeps apart but the 0007 key merges, so the down
-	// migration's lossy DELETE runs against real rows: 'a-dup' differs only in
-	// revision, 'a-dupg' only in graph. 'a-empty' carries the '' graph sentinel that
-	// down must turn back into NULL (the 0007-era rater treats '' as a distinct graph).
-	seed9 := func(idKey, auth, graph string, revision int) {
-		t.Helper()
-		if _, err := db.ExecContext(ctx, `INSERT INTO rated_usage
-			(id, auth_id, resource_id, org_id, model_id, serving_mode, graph_k8s_name, topology_revision, window_start, window_end,
-			 prompt_tokens, cached_tokens, completion_tokens, billable_prompt_tokens,
-			 cost, applied_prompt_rate, applied_cached_rate, applied_completion_rate, event_count)
-			VALUES (md5($1), $2, 'res', 'org-1', 'm', 'dedicated', $3, $4, $5::timestamptz, $5::timestamptz + interval '1 hour',
-			        100, 0, 0, 100, 0.001, 0.00001, 0, 0, 1)`, idKey, auth, graph, revision, hour); err != nil {
-			t.Fatalf("seed 0009-shape rated_usage %s: %v", idKey, err)
+		var rev any
+		if r.rev != 0 {
+			rev = r.rev
 		}
-	}
-	seed9("a-dup-r1", "a-dup", "dgd-b", 1)
-	seed9("a-dup-r2", "a-dup", "dgd-b", 2)
-	seed9("a-dupg-b", "a-dupg", "dgd-b", 0)
-	seed9("a-dupg-c", "a-dupg", "dgd-c", 0)
-	seed9("a-empty", "a-empty", "", 0)
-	count := func(q string) int {
-		t.Helper()
-		var n int
-		if err := db.QueryRowContext(ctx, q).Scan(&n); err != nil {
-			t.Fatalf("count %q: %v", q, err)
-		}
-		return n
-	}
-
-	exec(t, db, readMigration(t, "0009_rollup_grain_graph_revision.down.sql"))
-	// Reaching here means down re-added the 7-column UNIQUE constraint with the
-	// duplicates present, so its DELETE removed them.
-	for _, auth := range []string{"a-dup", "a-dupg"} {
-		if n := count(`SELECT count(*) FROM rated_usage WHERE auth_id = '` + auth + `'`); n != 1 {
-			t.Fatalf("after down, %s rows = %d, want 1 (one survivor per 0007 key)", auth, n)
-		}
-	}
-	if n := count(`SELECT count(*) FROM rated_usage WHERE id <> ` + id7); n != 0 {
-		t.Fatalf("after down, %d rows do not carry the 0007 7-field id", n)
-	}
-	var emptyGraph sql.NullString
-	if err := db.QueryRowContext(ctx,
-		`SELECT graph_k8s_name FROM rated_usage WHERE auth_id = 'a-empty'`).Scan(&emptyGraph); err != nil {
-		t.Fatalf("read a-empty after down: %v", err)
-	}
-	if emptyGraph.Valid {
-		t.Fatalf("after down, a-empty graph = %q, want NULL (down must turn the '' sentinel back into NULL)", emptyGraph.String)
-	}
-	if n := count(`SELECT count(*) FROM rated_usage WHERE graph_k8s_name = ''`); n != 0 {
-		t.Fatalf("after down, %d rows still carry the '' graph sentinel", n)
-	}
-	var downID string
-	var downGraph sql.NullString
-	if err := db.QueryRowContext(ctx,
-		`SELECT id, graph_k8s_name FROM rated_usage WHERE auth_id = 'a-graph'`).Scan(&downID, &downGraph); err != nil {
-		t.Fatalf("read after down: %v", err)
-	}
-	if downID != oldID || !downGraph.Valid || downGraph.String != "dgd-a" {
-		t.Fatalf("after down id/graph = %s/%v, want %s/dgd-a", downID, downGraph, oldID)
-	}
-
-	// Up again: every surviving row must carry the id the rater's 9-field formula
-	// mints, so a re-rate after a down/up round trip updates rows in place.
-	exec(t, db, readMigration(t, "0009_rollup_grain_graph_revision.up.sql"))
-	exec(t, db, readMigration(t, "0010_rated_usage_identity.up.sql"))
-	id9 := `md5(length(auth_id)::text || ':' || auth_id
-		  || '|' || length(owner_type)::text || ':' || owner_type
-		  || '|' || length(owner_id)::text || ':' || owner_id
-		  || '|' || length(resource_id)::text || ':' || resource_id
-		  || '|' || length(model_id)::text || ':' || model_id
-		  || '|' || length(serving_mode)::text || ':' || serving_mode
-		  || '|' || length(graph_k8s_name)::text || ':' || graph_k8s_name
-		  || '|' || topology_revision::text
-		  || '|' || extract(epoch FROM window_start)::bigint::text)`
-	if n := count(`SELECT count(*) FROM rated_usage WHERE id <> ` + id9); n != 0 {
-		t.Fatalf("after down then up, %d rows do not carry the 9-field id", n)
-	}
-	if n := count(`SELECT count(*) FROM rated_usage WHERE id = ` + id9 + ` AND auth_id = 'a-graph' AND id = '` + raterID + `'`); n != 1 {
-		t.Fatalf("after down then up, a-graph id is not the id the rater minted (%s)", raterID)
-	}
-}
-
-// TestIntegration_Migration0009DownNoticesEveryRatedRowItDeletes pins the audit
-// trail for 0009 down's lossy DELETE: before removing the rollups that differ from a
-// kept row only in graph or topology revision, the migration must RAISE NOTICE with
-// the row count, SUM(cost), SUM(event_count) and earliest window_start of exactly the
-// rows it deletes, and say the hours MUST be re-rated. A database with nothing to
-// delete must produce no such NOTICE.
-func TestIntegration_Migration0009DownNoticesEveryRatedRowItDeletes(t *testing.T) {
-	dsn := os.Getenv("PHOEBE_TEST_DATABASE_URL")
-	if dsn == "" {
-		t.Skip("PHOEBE_TEST_DATABASE_URL not set; skipping live-Postgres conformance")
-	}
-	ctx := context.Background()
-	cfg, err := pgx.ParseConfig(dsn)
-	if err != nil {
-		t.Fatalf("parse dsn: %v", err)
-	}
-	var notices []string
-	cfg.OnNotice = func(_ *pgconn.PgConn, n *pgconn.Notice) {
-		if strings.HasPrefix(n.Message, "0009 down:") {
-			notices = append(notices, n.Message)
-		}
-	}
-	db := stdlib.OpenDB(*cfg)
-	defer db.Close()
-	// One pooled connection so SET search_path sticks and every NOTICE reaches
-	// the callback above.
-	db.SetMaxOpenConns(1)
-
-	setup := func(sch string) {
-		t.Helper()
-		exec(t, db, "DROP SCHEMA IF EXISTS "+sch+" CASCADE")
-		exec(t, db, "CREATE SCHEMA "+sch)
-		exec(t, db, "SET search_path TO "+sch)
-		for _, f := range []string{"0001_billing_event", "0002_rating", "0004_billing_event_serving_mode",
-			"0005_invoice_grade_attempts", "0006_rollup_grain", "0007_serving_mode_explicit",
-			"0008_billing_event_topology", "0009_rollup_grain_graph_revision",
-			"0010_rated_usage_identity"} {
-			exec(t, db, readMigration(t, f+".up.sql"))
-		}
-	}
-	hour := mustTime("2026-06-08T10:00:00Z")
-	// idKey fixes which row survives: down keeps the lowest id per 0007 key.
-	seed := func(idKey, auth, graph string, revision int, at time.Time, cost string, events int) {
-		t.Helper()
-		if _, err := db.ExecContext(ctx, `INSERT INTO rated_usage
-			(id, auth_id, resource_id, org_id, model_id, serving_mode, graph_k8s_name, topology_revision, window_start, window_end,
-			 prompt_tokens, cached_tokens, completion_tokens, billable_prompt_tokens,
-			 cost, applied_prompt_rate, applied_cached_rate, applied_completion_rate, event_count)
-			VALUES ($1, $2, 'res', 'org-1', 'm', 'dedicated', $3, $4, $5::timestamptz, $5::timestamptz + interval '1 hour',
-			        100, 0, 0, 100, $6::numeric, 0.00001, 0, 0, $7)`, idKey, auth, graph, revision, at, cost, events); err != nil {
-			t.Fatalf("seed rated_usage %s: %v", idKey, err)
-		}
-	}
-
-	const sch = "phoebe_migration_0009_down_notice_it"
-	setup(sch)
-	defer func() { exec(t, db, "DROP SCHEMA IF EXISTS "+sch+" CASCADE") }()
-	// Same hour, same 0007 key, differ only in graph: 'b' is deleted.
-	seed("g-a", "a-graph", "dgd-a", 0, hour, "0.500000000", 5)
-	seed("g-b", "a-graph", "dgd-b", 0, hour, "1.250000000", 4)
-	// Next hour, differ only in revision: 'r2' is deleted.
-	seed("r-1", "a-rev", "dgd-a", 1, hour.Add(time.Hour), "0.100000000", 1)
-	seed("r-2", "a-rev", "dgd-a", 2, hour.Add(time.Hour), "0.750000000", 6)
-	// Alone in its 0007 key: untouched.
-	seed("solo", "a-solo", "dgd-c", 3, hour, "9.000000000", 9)
-
-	exec(t, db, readMigration(t, "0009_rollup_grain_graph_revision.down.sql"))
-
-	want := []string{
-		"0009 down: deleting 2 rated_usage rows that differ from a kept row only in graph or topology revision " +
-			"(sum cost 2.000000000, sum event_count 10, earliest window_start 2026-06-08T10:00:00Z); " +
-			"the kept rows are partial until re-rated, so every affected hour MUST be re-rated: " +
-			"rater --since <earliest window_start> --until <now>, then token-push over the same window",
-	}
-	if strings.Join(notices, "\n") != strings.Join(want, "\n") {
-		t.Fatalf("0009 down notices =\n%s\nwant\n%s", strings.Join(notices, "\n"), strings.Join(want, "\n"))
-	}
-	var left int64
-	var leftCost string
-	if err := db.QueryRowContext(ctx, `SELECT COUNT(*), SUM(cost)::text FROM rated_usage`).Scan(&left, &leftCost); err != nil {
-		t.Fatalf("count after down: %v", err)
-	}
-	// The NOTICE must describe exactly the rows removed: 12.6 seeded - 2.0 noticed.
-	if left != 3 || leftCost != "9.600000000" {
-		t.Fatalf("rated_usage after down = %d rows, sum cost %s; want 3 rows, 9.600000000", left, leftCost)
-	}
-
-	// Nothing to delete: no audit NOTICE at all.
-	notices = nil
-	const clean = "phoebe_migration_0009_down_notice_clean_it"
-	setup(clean)
-	defer func() { exec(t, db, "DROP SCHEMA IF EXISTS "+clean+" CASCADE") }()
-	seed("g-a", "a-graph", "dgd-a", 0, hour, "0.500000000", 5)
-	seed("solo", "a-solo", "dgd-c", 3, hour, "9.000000000", 9)
-	exec(t, db, readMigration(t, "0009_rollup_grain_graph_revision.down.sql"))
-	if len(notices) != 0 {
-		t.Fatalf("0009 down on a database with nothing to delete raised %v, want no NOTICE", notices)
-	}
-}
-
-// TestIntegration_Migration0009UpNoticesEveryRatedRowWhoseIdItRewrites pins the audit
-// trail for 0009 up's id rewrite. saturn-aws-manager bills by rated_usage_id and its
-// delete-by-absence does not reverse an emitted cost, so a rewritten id of an hour
-// already emitted to Stripe is billed again after the next token-push. Before the
-// rewrite, the migration must RAISE NOTICE with the number of rows whose id changes
-// and the earliest window_start among them, pointing the operator at the README
-// precondition. A database with no rated_usage rows must produce no such NOTICE.
-func TestIntegration_Migration0009UpNoticesEveryRatedRowWhoseIdItRewrites(t *testing.T) {
-	dsn := os.Getenv("PHOEBE_TEST_DATABASE_URL")
-	if dsn == "" {
-		t.Skip("PHOEBE_TEST_DATABASE_URL not set; skipping live-Postgres conformance")
-	}
-	ctx := context.Background()
-	cfg, err := pgx.ParseConfig(dsn)
-	if err != nil {
-		t.Fatalf("parse dsn: %v", err)
-	}
-	var notices []string
-	cfg.OnNotice = func(_ *pgconn.PgConn, n *pgconn.Notice) {
-		if strings.HasPrefix(n.Message, "0009:") {
-			notices = append(notices, n.Message)
-		}
-	}
-	db := stdlib.OpenDB(*cfg)
-	defer db.Close()
-	// One pooled connection so SET search_path sticks and every NOTICE reaches
-	// the callback above.
-	db.SetMaxOpenConns(1)
-
-	setup := func(sch string) {
-		t.Helper()
-		exec(t, db, "DROP SCHEMA IF EXISTS "+sch+" CASCADE")
-		exec(t, db, "CREATE SCHEMA "+sch)
-		exec(t, db, "SET search_path TO "+sch)
-		for _, f := range []string{"0001_billing_event", "0002_rating", "0004_billing_event_serving_mode",
-			"0005_invoice_grade_attempts", "0006_rollup_grain", "0007_serving_mode_explicit",
-			"0008_billing_event_topology"} {
-			exec(t, db, readMigration(t, f+".up.sql"))
-		}
-	}
-	hour := mustTime("2026-06-08T10:00:00Z")
-	// Pre-0009 rows: graph_k8s_name nullable, no topology_revision column.
-	seed := func(auth string, graph any, at time.Time) {
-		t.Helper()
-		if _, err := db.ExecContext(ctx, `INSERT INTO rated_usage
-			(id, auth_id, resource_id, org_id, model_id, serving_mode, graph_k8s_name, window_start, window_end,
-			 prompt_tokens, cached_tokens, completion_tokens, billable_prompt_tokens,
-			 cost, applied_prompt_rate, applied_cached_rate, applied_completion_rate, event_count)
-			VALUES (md5($1), $1, 'res', 'org-1', 'm', 'dedicated', $2, $3::timestamptz, $3::timestamptz + interval '1 hour',
-			        100, 0, 0, 100, 0.001, 0.00001, 0, 0, 1)`, auth, graph, at); err != nil {
-			t.Fatalf("seed rated_usage %s: %v", auth, err)
-		}
-	}
-
-	const sch = "phoebe_migration_0009_up_notice_it"
-	setup(sch)
-	defer func() { exec(t, db, "DROP SCHEMA IF EXISTS "+sch+" CASCADE") }()
-	seed("a-later", "dgd-a", hour.Add(2*time.Hour))
-	seed("a-earliest", nil, hour)
-	seed("a-mid", "dgd-b", hour.Add(time.Hour))
-
-	exec(t, db, readMigration(t, "0009_rollup_grain_graph_revision.up.sql"))
-
-	exec(t, db, readMigration(t, "0010_rated_usage_identity.up.sql"))
-
-	want := []string{
-		"0009: rewriting the id of 3 rated_usage rows (earliest window_start 2026-06-08T10:00:00Z); " +
-			"saturn-aws-manager bills by rated_usage_id, so an hour it already emitted to Stripe under the old id " +
-			"is billed again under the new id after the next token-push. " +
-			"Confirm step 0 of \"Rollout order for migration 0009\" in migrations/README.md before resuming token-push",
-	}
-	if strings.Join(notices, "\n") != strings.Join(want, "\n") {
-		t.Fatalf("0009 up notices =\n%s\nwant\n%s", strings.Join(notices, "\n"), strings.Join(want, "\n"))
-	}
-
-	// No rows: no id is rewritten, so no NOTICE at all.
-	notices = nil
-	const clean = "phoebe_migration_0009_up_notice_clean_it"
-	setup(clean)
-	defer func() { exec(t, db, "DROP SCHEMA IF EXISTS "+clean+" CASCADE") }()
-	exec(t, db, readMigration(t, "0009_rollup_grain_graph_revision.up.sql"))
-	exec(t, db, readMigration(t, "0010_rated_usage_identity.up.sql"))
-	if len(notices) != 0 {
-		t.Fatalf("0009 up on an empty rated_usage raised %v, want no NOTICE", notices)
-	}
-}
-
-// TestIntegration_LookupOrderKeyedOnServingMode is the SQL twin of the five
-// TestResolveEvent_* order tests in pricebook_test.go (2026-10-18, GB300 $0 shared
-// cost): shared traffic tries shared:<base> first; dedicated keeps model_id first.
-func TestIntegration_LookupOrderKeyedOnServingMode(t *testing.T) {
-	dsn := os.Getenv("PHOEBE_TEST_DATABASE_URL")
-	if dsn == "" {
-		t.Skip("PHOEBE_TEST_DATABASE_URL not set; skipping live-Postgres conformance")
-	}
-	ctx := context.Background()
-	db, err := sql.Open("pgx", dsn)
-	if err != nil {
-		t.Fatalf("open: %v", err)
-	}
-	defer db.Close()
-
-	const sch = "phoebe_rating_lookup_order_it"
-	exec(t, db, "DROP SCHEMA IF EXISTS "+sch+" CASCADE")
-	exec(t, db, "CREATE SCHEMA "+sch)
-	exec(t, db, "SET search_path TO "+sch)
-	defer func() { exec(t, db, "DROP SCHEMA IF EXISTS "+sch+" CASCADE") }()
-	exec(t, db, ratingSchemaDDL(t))
-
-	hour := mustTime("2026-10-17T18:00:00Z")
-	const q = "Qwen/Qwen2.5-32B-Instruct"
-	book := newTestBook(
-		map[string]Rate3{
-			q:             rate3("0", "0", "0"),
-			"shared:" + q: rate3("0.0000009", "0.0000009", "0.0000009"),
-			"bare/only":   rate3("0.000002", "0", "0"),
-			"tf-ep-own":   rate3("0.000005", "0", "0"),
-		},
-		nil, PolicyMultiplier, MustDec("1.5"), Dec{},
-	)
-
-	// One resource per case so each lands in its own rollup.
-	if _, err := db.ExecContext(ctx,
-		`INSERT INTO billing_event (request_id, auth_id, resource_id, org_id, model, base_model, adapter, serving_mode, prompt_tokens, completion_tokens, event_ts)
-		 VALUES ('e1','a','shared-base','org-1',$2,$2,NULL,'shared',1000,0,$1),
-		        ('e2','a','shared-ft','org-1','tf-ep-shared-ft',$2,'ckpt-1','shared',1000,0,$1),
-		        ('e3','a','ded-base','org-1','tf-ep-ded',$2,NULL,'dedicated',1000,0,$1),
-		        ('e4','a','ded-named-like-base','org-1',$2,$2,NULL,'dedicated',1000,0,$1),
-		        ('e5','a','shared-no-shared-row','org-1','bare/only','bare/only',NULL,'shared',1000,0,$1),
-		        ('e6','a','shared-ft-own-rate','org-1','tf-ep-own',$2,'ckpt-1','shared',1000,0,$1)`,
-		hour.Add(5*time.Minute), q); err != nil {
-		t.Fatalf("seed: %v", err)
-	}
-
-	res, err := NewPostgresStore(db).RateWindow(ctx, book, hour, hour.Add(time.Hour))
-	if err != nil {
-		t.Fatalf("RateWindow: %v", err)
-	}
-	if res.EventsRated != 6 || res.UnpricedEvents != 0 || res.AmbiguousBaseEvents != 0 {
-		t.Fatalf("rated/unpriced/ambiguous = %d/%d/%d, want 6/0/0",
-			res.EventsRated, res.UnpricedEvents, res.AmbiguousBaseEvents)
-	}
-
-	for _, want := range []struct{ resource, rate, cost string }{
-		{"shared-base", "0.000000900", "0.000900000"},          // shared base event gets the Fireworks price
-		{"shared-ft", "0.000001350", "0.001350000"},            // shared adapter event: shared price x 1.5 premium
-		{"ded-base", "0.000000000", "0.000000000"},             // dedicated base event stays $0
-		{"ded-named-like-base", "0.000000000", "0.000000000"},  // dedicated endpoint named like its base stays $0
-		{"shared-no-shared-row", "0.000002000", "0.002000000"}, // no shared: row: falls back to the bare row
-		{"shared-ft-own-rate", "0.000005000", "0.005000000"},   // a shared fine-tune's own rate still wins
-	} {
-		var rate, cost string
-		if err := db.QueryRowContext(ctx,
-			`SELECT applied_prompt_rate::text, cost::text FROM rated_usage WHERE resource_id = $1 AND window_start = $2`,
-			want.resource, hour).Scan(&rate, &cost); err != nil {
-			t.Fatalf("read %s: %v", want.resource, err)
-		}
-		if rate != want.rate || cost != want.cost {
-			t.Fatalf("%s: rate/cost = %s/%s, want %s/%s", want.resource, rate, cost, want.rate, want.cost)
-		}
-	}
-
-	// The Go oracle must agree with the SQL on every case, all three rates.
-	for _, c := range []struct{ resource, model, base, adapter, mode string }{
-		{"shared-base", q, q, "", "shared"},
-		{"shared-ft", "tf-ep-shared-ft", q, "ckpt-1", "shared"},
-		{"ded-base", "tf-ep-ded", q, "", "dedicated"},
-		{"ded-named-like-base", q, q, "", "dedicated"},
-		{"shared-no-shared-row", "bare/only", "bare/only", "", "shared"},
-		{"shared-ft-own-rate", "tf-ep-own", q, "ckpt-1", "shared"},
-	} {
-		r, err := book.ResolveEvent(c.model, c.base, c.adapter, c.mode)
+		_, err := db.Exec(`INSERT INTO billing_event (request_id, auth_id, resource_id, org_id, model, base_model, adapter,
+			user_id, group_id, serving_mode, graph_k8s_name, topology_revision, region,
+			prompt_tokens, cached_tokens, completion_tokens, usage_found, aborted, status_code, event_ts)
+			VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20)`,
+			r.id, nullableStr(r.auth), nullableStr(r.resource), nullableStr(r.org), nullableStr(r.model),
+			nullableStr(r.base), nullableStr(r.adapter), nullableStr(r.user), nullableStr(r.group),
+			nullableStr(r.mode), nullableStr(r.graph), rev, nullableStr(r.region),
+			r.prompt, r.cached, r.completion, r.usageFound, r.aborted, status, r.at)
 		if err != nil {
-			t.Fatalf("oracle %+v: %v", c, err)
-		}
-		var p, ca, co string
-		if err := db.QueryRowContext(ctx,
-			`SELECT applied_prompt_rate::text, applied_cached_rate::text, applied_completion_rate::text
-			   FROM rated_usage WHERE resource_id = $1 AND window_start = $2`,
-			c.resource, hour).Scan(&p, &ca, &co); err != nil {
-			t.Fatalf("read %s: %v", c.resource, err)
-		}
-		got := [3]string{r.Prompt.StringScale(9), r.Cached.StringScale(9), r.Completion.StringScale(9)}
-		if want := [3]string{p, ca, co}; got != want {
-			t.Fatalf("%s: oracle %v != SQL %v", c.resource, got, want)
+			t.Fatalf("seed %s: %v", r.id, err)
 		}
 	}
 }
 
-// TestIntegration_SharedRollupMixingBaseAndDirectRatesIsAmbiguous: shared base
-// traffic tries shared:<base> first, so one rollup can mix events priced from that
-// row with events that fell back to the direct model_id row (here: one event with no
-// base_model). Two rates in one rollup must be withheld as ambiguous, never billed at
-// MIN() (which would pick the bare $0 row).
-func TestIntegration_SharedRollupMixingBaseAndDirectRatesIsAmbiguous(t *testing.T) {
-	dsn := os.Getenv("PHOEBE_TEST_DATABASE_URL")
-	if dsn == "" {
-		t.Skip("PHOEBE_TEST_DATABASE_URL not set; skipping live-Postgres conformance")
-	}
-	ctx := context.Background()
-	db, err := sql.Open("pgx", dsn)
+func aggregate(t *testing.T, db *sql.DB, start, end time.Time) AggregateResult {
+	t.Helper()
+	res, err := NewPostgresStore(db).AggregateWindow(context.Background(), start, end)
 	if err != nil {
-		t.Fatalf("open: %v", err)
+		t.Fatalf("AggregateWindow: %v", err)
 	}
-	defer db.Close()
+	return res
+}
 
-	const sch = "phoebe_rating_mixed_rate_it"
-	exec(t, db, "DROP SCHEMA IF EXISTS "+sch+" CASCADE")
-	exec(t, db, "CREATE SCHEMA "+sch)
-	exec(t, db, "SET search_path TO "+sch)
-	defer func() { exec(t, db, "DROP SCHEMA IF EXISTS "+sch+" CASCADE") }()
-	exec(t, db, ratingSchemaDDL(t))
+// withheld sums every bucket an event can be kept out in.
+func withheld(r AggregateResult) int64 {
+	return r.MissingUsageEvents + r.InvalidUsageEvents + r.UnattributableEvents + r.InvalidServingModeEvents +
+		r.OwnerConflictEvents + r.MissingBaseModelEvents + r.AmbiguousBaseEvents + r.AmbiguousOrgEvents
+}
 
-	hour := mustTime("2026-10-17T19:00:00Z")
-	const q = "Qwen/Qwen2.5-32B-Instruct"
-	book := newTestBook(
-		map[string]Rate3{q: rate3("0", "0", "0"), "shared:" + q: rate3("0.0000009", "0", "0")},
-		nil, PolicyIdentity, Dec{}, Dec{},
-	)
-	if _, err := db.ExecContext(ctx,
-		`INSERT INTO billing_event (request_id, auth_id, resource_id, org_id, model, base_model, serving_mode, prompt_tokens, completion_tokens, event_ts)
-		 VALUES ('m1','a','mixed','org-1',$2,$2,'shared',1000,0,$1),
-		        ('m2','a','mixed','org-1',$2,NULL,'shared',1000,0,$1)`,
-		hour.Add(5*time.Minute), q); err != nil {
-		t.Fatalf("seed: %v", err)
-	}
-	res, err := NewPostgresStore(db).RateWindow(ctx, book, hour, hour.Add(time.Hour))
-	if err != nil {
-		t.Fatalf("RateWindow: %v", err)
-	}
-	if res.AmbiguousBaseEvents != 2 || res.EventsRated != 0 {
-		t.Fatalf("ambiguous/rated = %d/%d, want 2/0 (a two-rate shared rollup is withheld)",
-			res.AmbiguousBaseEvents, res.EventsRated)
-	}
-	var n int
-	if err := db.QueryRowContext(ctx, `SELECT count(*) FROM rated_usage WHERE resource_id = 'mixed'`).Scan(&n); err != nil {
-		t.Fatalf("count: %v", err)
-	}
-	if n != 0 {
-		t.Fatalf("rated_usage rows for the mixed rollup = %d, want 0 (withheld, never billed at MIN)", n)
+// assertPartition: every in-window billing_event row lands in exactly one
+// place, aggregated or one withheld bucket.
+func assertPartition(t *testing.T, r AggregateResult, total int) {
+	t.Helper()
+	if got := r.EventsAggregated + withheld(r); got != int64(total) {
+		t.Fatalf("aggregated %d + withheld %d = %d, want every one of the %d events exactly once (%+v)",
+			r.EventsAggregated, withheld(r), got, total, r)
 	}
 }
 
-// TestIntegration_RatedUsageCarriesUsageIdentity: every rollup records what served it
-// (migration 0010, usage-identity contract proposal A), so usage still names a deleted
-// endpoint's base model and adapter. price_key follows the step that priced the row:
-// the fine-tune premium path gives "<mode prefix>ft:<base>", the plain-base path the
-// mode-prefixed base, and the rollup's own model_id entry gives NULL.
-func TestIntegration_RatedUsageCarriesUsageIdentity(t *testing.T) {
-	dsn := os.Getenv("PHOEBE_TEST_DATABASE_URL")
-	if dsn == "" {
-		t.Skip("PHOEBE_TEST_DATABASE_URL not set; skipping live-Postgres conformance")
-	}
-	ctx := context.Background()
-	db, err := sql.Open("pgx", dsn)
+type rollupRow struct {
+	auth, ownerType, ownerID, resource, model, mode, graph string
+	rev                                                    int
+	org, region, base, adapter                             sql.NullString
+	prompt, cached, completion, billablePrompt, requests   int64
+	cost, priceKey                                         sql.NullString
+}
+
+func readRollups(t *testing.T, db *sql.DB) []rollupRow {
+	t.Helper()
+	rows, err := db.Query(`SELECT auth_id, owner_type, owner_id, resource_id, model_id, serving_mode, graph_k8s_name,
+		topology_revision, org_id, region, base_model, adapter, prompt_tokens, cached_tokens, completion_tokens,
+		billable_prompt_tokens, event_count, cost::text, price_key
+		FROM rated_usage ORDER BY auth_id, owner_id, resource_id, model_id, serving_mode, graph_k8s_name, topology_revision`)
 	if err != nil {
-		t.Fatalf("open: %v", err)
+		t.Fatalf("read rollups: %v", err)
 	}
-	defer db.Close()
+	defer rows.Close()
+	var out []rollupRow
+	for rows.Next() {
+		var r rollupRow
+		if err := rows.Scan(&r.auth, &r.ownerType, &r.ownerID, &r.resource, &r.model, &r.mode, &r.graph, &r.rev,
+			&r.org, &r.region, &r.base, &r.adapter, &r.prompt, &r.cached, &r.completion, &r.billablePrompt,
+			&r.requests, &r.cost, &r.priceKey); err != nil {
+			t.Fatalf("scan: %v", err)
+		}
+		out = append(out, r)
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatal(err)
+	}
+	return out
+}
 
-	const sch = "phoebe_rating_identity_it"
-	exec(t, db, "DROP SCHEMA IF EXISTS "+sch+" CASCADE")
-	exec(t, db, "CREATE SCHEMA "+sch)
-	exec(t, db, "SET search_path TO "+sch)
-	defer func() { exec(t, db, "DROP SCHEMA IF EXISTS "+sch+" CASCADE") }()
-	exec(t, db, ratingSchemaDDL(t))
-
-	const base = "Qwen/Qwen2.5-7B-Instruct"
-	hour := mustTime("2026-06-08T10:00:00Z")
-	book := newTestBook(
-		map[string]Rate3{
-			base:             rate3("0.000004", "0", "0"),
-			"shared:" + base: rate3("0.000002", "0", "0"),
-			"own-rate-ep":    rate3("0.000009", "0", "0"),
-		},
-		nil, PolicyMultiplier, MustDec("1.5"), Dec{},
+func TestIntegration_AggregatorSumsQuantitiesPerRollupAndWritesNoMoney(t *testing.T) {
+	db := openRatingSchema(t, "phoebe_agg_sums_it")
+	seed(t, db,
+		row(func(r *beRow) { r.prompt, r.cached, r.completion = 100, 10, 20 }),
+		row(func(r *beRow) { r.prompt, r.cached, r.completion = 50, 50, 5; r.at = itHour.Add(59 * time.Minute) }),
+		row(func(r *beRow) { r.prompt, r.cached, r.completion = 7, 0, 3; r.adapter = "ckpt-1"; r.model = "ft-ep" }),
 	)
-
-	type seed struct {
-		req, resource, model, mode, adapter string
+	res := aggregate(t, db, itHour, itHour.Add(time.Hour))
+	assertPartition(t, res, 3)
+	if res.RollupsWritten != 2 || res.EventsAggregated != 3 || withheld(res) != 0 {
+		t.Fatalf("result %+v, want 2 rollups from 3 events and nothing withheld", res)
 	}
-	seeds := []seed{
-		{"dedicated-ft", "r-ded-ft", "my-ft-endpoint", "dedicated", "art-ded"},
-		{"shared-ft", "r-sh-ft", "my-shared-ft", "shared", "art-sh"},
-		{"shared-base", "r-sh-base", base, "shared", ""},
-		{"dedicated-base", "r-ded-base", "my-base-endpoint", "dedicated", ""},
-		{"own-rate", "r-own", "own-rate-ep", "dedicated", ""},
+	got := readRollups(t, db)
+	if len(got) != 2 {
+		t.Fatalf("%d rollups, want 2", len(got))
 	}
-	for _, s := range seeds {
-		if _, err := db.ExecContext(ctx,
-			`INSERT INTO billing_event (request_id, auth_id, resource_id, model, base_model, adapter, serving_mode, prompt_tokens, completion_tokens, event_ts)
-			 VALUES ($1,'a',$2,$3,$4,$5,$6,1000,0,$7)`,
-			s.req, s.resource, s.model, base, nullableStr(s.adapter), s.mode, hour.Add(5*time.Minute)); err != nil {
-			t.Fatalf("seed %s: %v", s.req, err)
+	ft, qwen := got[0], got[1]
+	if qwen.model != "qwen-ep" || qwen.prompt != 150 || qwen.cached != 60 || qwen.completion != 25 || qwen.requests != 2 {
+		t.Fatalf("qwen rollup %+v, want prompt 150 cached 60 completion 25 over 2 requests", qwen)
+	}
+	if qwen.billablePrompt != 90 {
+		t.Fatalf("billable prompt %d, want 90 (100-10 + 50-50)", qwen.billablePrompt)
+	}
+	if ft.adapter.String != "ckpt-1" || qwen.adapter.Valid {
+		t.Fatalf("adapters ft=%v qwen=%v, want ckpt-1 and NULL", ft.adapter, qwen.adapter)
+	}
+	for _, r := range got {
+		if r.cost.Valid || r.priceKey.Valid {
+			t.Fatalf("rollup %s carries money (cost %v, price_key %v); the manager prices, phoebe must write NULL", r.model, r.cost, r.priceKey)
+		}
+		if r.org.String != "org-1" || r.base.String != "Qwen/Qwen2.5-32B-Instruct" || r.region.String != "us-central1" ||
+			r.ownerType != "user" || r.ownerID != "user-1" || r.mode != "dedicated" || r.graph != "pd-qwen" || r.rev != 3 {
+			t.Fatalf("rollup carries the wrong identity: %+v", r)
 		}
 	}
+}
 
-	store := NewPostgresStore(db)
-	res, err := store.RateWindow(ctx, book, hour, hour.Add(time.Hour))
-	if err != nil {
-		t.Fatalf("RateWindow: %v", err)
+// The task's grain test: the topology revision is a grain key, so one
+// deployment's hour served by two revisions is two records.
+func TestIntegration_TwoTopologyRevisionsAreTwoRollups(t *testing.T) {
+	db := openRatingSchema(t, "phoebe_agg_rev_it")
+	seed(t, db,
+		row(func(r *beRow) { r.rev = 3 }),
+		row(func(r *beRow) { r.rev = 4 }),
+		row(func(r *beRow) { r.rev = 4 }),
+	)
+	res := aggregate(t, db, itHour, itHour.Add(time.Hour))
+	got := readRollups(t, db)
+	if res.RollupsWritten != 2 || len(got) != 2 || got[0].rev != 3 || got[1].rev != 4 || got[0].requests != 1 || got[1].requests != 2 {
+		t.Fatalf("rollups %+v, want revision 3 (1 request) and revision 4 (2 requests)", got)
 	}
-	if res.RollupsWritten != int64(len(seeds)) {
-		t.Fatalf("rollups = %d, want %d", res.RollupsWritten, len(seeds))
-	}
+}
 
-	type identity struct{ baseModel, adapter, priceKey sql.NullString }
-	want := map[string][3]string{
-		// resource -> base_model, adapter ("" = NULL), price_key ("" = NULL)
-		"r-ded-ft":   {base, "art-ded", "ft:" + base},
-		"r-sh-ft":    {base, "art-sh", "shared:ft:" + base},
-		"r-sh-base":  {base, "", "shared:" + base},
-		"r-ded-base": {base, "", base},
-		"r-own":      {base, "", ""},
+// Every other grain key also splits: auth (API key), owner, resource, model,
+// serving mode, graph and hour.
+func TestIntegration_EachGrainKeySplitsTheRollup(t *testing.T) {
+	db := openRatingSchema(t, "phoebe_agg_grain_it")
+	seed(t, db,
+		row(nil),
+		row(func(r *beRow) { r.auth = "auth-b" }),
+		row(func(r *beRow) { r.user, r.group = "", "group-1" }),
+		row(func(r *beRow) { r.user = "" }),
+		row(func(r *beRow) { r.resource = "res-2" }),
+		row(func(r *beRow) { r.model = "other-ep" }),
+		row(func(r *beRow) { r.mode = "shared" }),
+		row(func(r *beRow) { r.graph = "pd-other" }),
+		row(func(r *beRow) { r.at = itHour.Add(time.Hour + time.Minute) }),
+	)
+	res := aggregate(t, db, itHour, itHour.Add(2*time.Hour))
+	assertPartition(t, res, 9)
+	if res.RollupsWritten != 9 {
+		t.Fatalf("%d rollups, want 9 (one per distinct grain)", res.RollupsWritten)
 	}
-	for resource, w := range want {
-		var got identity
-		if err := db.QueryRowContext(ctx,
-			`SELECT base_model, adapter, price_key FROM rated_usage WHERE resource_id=$1`, resource,
-		).Scan(&got.baseModel, &got.adapter, &got.priceKey); err != nil {
-			t.Fatalf("read %s: %v", resource, err)
-		}
-		for i, pair := range []struct {
-			name string
-			v    sql.NullString
-		}{{"base_model", got.baseModel}, {"adapter", got.adapter}, {"price_key", got.priceKey}} {
-			if w[i] == "" {
-				if pair.v.Valid {
-					t.Errorf("%s %s = %q, want NULL", resource, pair.name, pair.v.String)
-				}
-			} else if !pair.v.Valid || pair.v.String != w[i] {
-				t.Errorf("%s %s = %v, want %q", resource, pair.name, pair.v, w[i])
+}
+
+// Ruling 2026-10-15: every forwarded inference attempt emits exactly one
+// billing row (enforced in internal/proxy, TestControlRoutesWriteNoBillingRow).
+// The aggregator's half of that invariant: every row is accounted for exactly
+// once, and request_count is the number of attempt rows aggregated.
+func TestIntegration_EveryAttemptRowIsAccountedForExactlyOnce(t *testing.T) {
+	db := openRatingSchema(t, "phoebe_agg_partition_it")
+	rows := []beRow{
+		row(nil), row(nil), // aggregated
+		row(func(r *beRow) { r.usageFound, r.aborted, r.prompt, r.cached, r.completion = false, true, 0, 0, 0 }), // expected missing
+		row(func(r *beRow) { r.usageFound, r.prompt, r.cached, r.completion = false, 0, 0, 0 }),                  // unexplained missing
+		row(func(r *beRow) { r.cached = 500 }),      // invalid usage
+		row(func(r *beRow) { r.auth = "" }),         // unattributable
+		row(func(r *beRow) { r.mode = "SHARED" }),   // invalid serving mode
+		row(func(r *beRow) { r.group = "group-1" }), // owner conflict
+		row(func(r *beRow) { r.base = "" }),         // missing base model
+		row(func(r *beRow) { r.resource = "res-amb-base" }), row(func(r *beRow) { r.resource = "res-amb-base"; r.base = "other/base" }),
+		row(func(r *beRow) { r.resource = "res-amb-org" }), row(func(r *beRow) { r.resource = "res-amb-org"; r.org = "org-2" }),
+	}
+	seed(t, db, rows...)
+	res := aggregate(t, db, itHour, itHour.Add(time.Hour))
+	assertPartition(t, res, len(rows))
+	want := AggregateResult{
+		RollupsWritten: 1, EventsAggregated: 2, MissingUsageEvents: 2, ExpectedMissingUsageEvents: 1,
+		UnexplainedMissingUsageEvents: 1, InvalidUsageEvents: 1, UnattributableEvents: 1, InvalidServingModeEvents: 1,
+		OwnerConflictEvents: 1, MissingBaseModelEvents: 1, AmbiguousBaseEvents: 2, AmbiguousOrgEvents: 2,
+	}
+	if res != want {
+		t.Fatalf("got  %+v\nwant %+v", res, want)
+	}
+	if got := readRollups(t, db); got[0].requests != 2 {
+		t.Fatalf("request_count %d, want 2 (one per aggregated attempt row)", got[0].requests)
+	}
+}
+
+// The wire requires auth_id, resource_id and model_id to be non-empty, so ”
+// is as unattributable as NULL.
+func TestIntegration_EmptyStringIdentifiersAreUnattributable(t *testing.T) {
+	db := openRatingSchema(t, "phoebe_agg_emptyid_it")
+	exec(t, db, `INSERT INTO billing_event (request_id, auth_id, resource_id, org_id, model, base_model, user_id,
+		serving_mode, prompt_tokens, usage_found, status_code, event_ts) VALUES
+		('e1','','res-1','org-1','m','B','u','dedicated',5,true,200,'2026-10-22T14:05:00Z'),
+		('e2','a','','org-1','m','B','u','dedicated',5,true,200,'2026-10-22T14:05:00Z'),
+		('e3','a','res-1','org-1','','B','u','dedicated',5,true,200,'2026-10-22T14:05:00Z'),
+		('e4','a','res-1','org-1','m','','u','dedicated',5,true,200,'2026-10-22T14:05:00Z')`)
+	res := aggregate(t, db, itHour, itHour.Add(time.Hour))
+	if res.UnattributableEvents != 3 || res.MissingBaseModelEvents != 1 || res.RollupsWritten != 0 {
+		t.Fatalf("%+v, want 3 unattributable, 1 missing base model, nothing written", res)
+	}
+}
+
+// A record carries one base_model and one adapter, and the manager prices by
+// them. Two of either, or adapter on some events and not others, withholds
+// the identity's hour, even across a graph-revision boundary; a neighbouring
+// identity is untouched.
+func TestIntegration_AmbiguousBaseModelOrAdapterWithholdsTheIdentity(t *testing.T) {
+	cases := map[string][]beRow{
+		"two base models":           {row(nil), row(func(r *beRow) { r.base = "other/base" })},
+		"two adapters":              {row(func(r *beRow) { r.adapter = "ckpt-1" }), row(func(r *beRow) { r.adapter = "ckpt-2" })},
+		"adapter and no adapter":    {row(nil), row(func(r *beRow) { r.adapter = "ckpt-1" })},
+		"across topology revisions": {row(func(r *beRow) { r.rev = 3 }), row(func(r *beRow) { r.rev = 4; r.base = "other/base" })},
+	}
+	for name, rows := range cases {
+		t.Run(name, func(t *testing.T) {
+			db := openRatingSchema(t, "phoebe_agg_ambbase_it")
+			clean := row(func(r *beRow) { r.resource = "res-clean" })
+			seed(t, db, append(rows, clean)...)
+			res := aggregate(t, db, itHour, itHour.Add(time.Hour))
+			assertPartition(t, res, len(rows)+1)
+			if res.AmbiguousBaseEvents != int64(len(rows)) || res.RollupsWritten != 1 {
+				t.Fatalf("%+v, want %d ambiguous-base events withheld and only the clean neighbour written", res, len(rows))
 			}
+			if got := readRollups(t, db); got[0].resource != "res-clean" {
+				t.Fatalf("written %+v, want only res-clean", got)
+			}
+		})
+	}
+}
+
+// The org pays. Two non-NULL orgs for one identity-hour withhold it (even
+// across revisions); a partial NULL (events from before the org header) is not
+// ambiguous and resolves to the one real org.
+func TestIntegration_AmbiguousOrgWithholdsButAPartialNullOrgResolves(t *testing.T) {
+	db := openRatingSchema(t, "phoebe_agg_org_it")
+	seed(t, db,
+		row(func(r *beRow) { r.resource = "res-two-orgs"; r.rev = 3 }),
+		row(func(r *beRow) { r.resource = "res-two-orgs"; r.rev = 4; r.org = "org-2" }),
+		row(func(r *beRow) { r.resource = "res-partial"; r.org = "" }),
+		row(func(r *beRow) { r.resource = "res-partial"; r.rev = 4 }),
+	)
+	res := aggregate(t, db, itHour, itHour.Add(time.Hour))
+	assertPartition(t, res, 4)
+	if res.AmbiguousOrgEvents != 2 || res.RollupsWritten != 2 {
+		t.Fatalf("%+v, want 2 ambiguous-org events and the 2 partial-org rollups written", res)
+	}
+	for _, r := range readRollups(t, db) {
+		if r.resource != "res-partial" || r.org.String != "org-1" {
+			t.Fatalf("rollup %+v, want res-partial carrying org-1 in both revisions", r)
 		}
 	}
+}
+
+// Both-owner events are withheld per event: an innocent no-owner event in the
+// same (”, ”) bucket still aggregates (one bad row must not zero someone
+// else's usage).
+func TestIntegration_OwnerConflictIsWithheldPerEventWithoutPoisoningItsBucket(t *testing.T) {
+	db := openRatingSchema(t, "phoebe_agg_owner_it")
+	seed(t, db,
+		row(func(r *beRow) { r.user, r.group = "user-1", "group-1" }),
+		row(func(r *beRow) { r.user = "" }),
+	)
+	res := aggregate(t, db, itHour, itHour.Add(time.Hour))
+	assertPartition(t, res, 2)
+	got := readRollups(t, db)
+	if res.OwnerConflictEvents != 1 || len(got) != 1 || got[0].ownerType != "" || got[0].requests != 1 {
+		t.Fatalf("%+v rollups %+v, want 1 conflict withheld and the no-owner event aggregated alone", res, got)
+	}
+}
+
+func TestIntegration_ConflictingRegionsAggregateToNullNotAGuess(t *testing.T) {
+	db := openRatingSchema(t, "phoebe_agg_region_it")
+	seed(t, db,
+		row(func(r *beRow) { r.region = "us-central1" }),
+		row(func(r *beRow) { r.region = "eu-west1" }),
+		row(func(r *beRow) { r.resource = "res-2"; r.region = "" }),
+		row(func(r *beRow) { r.resource = "res-2"; r.region = "us-central1" }),
+	)
+	aggregate(t, db, itHour, itHour.Add(time.Hour))
+	got := readRollups(t, db)
+	if got[0].region.Valid || got[1].region.String != "us-central1" {
+		t.Fatalf("regions %v / %v, want NULL for the disagreeing rollup and us-central1 where only NULLs disagree", got[0].region, got[1].region)
+	}
+}
+
+// Re-running an hour is idempotent: same rows, same ids, nothing deleted.
+func TestIntegration_ReRunningAnHourIsIdempotent(t *testing.T) {
+	db := openRatingSchema(t, "phoebe_agg_idem_it")
+	seed(t, db, row(nil), row(func(r *beRow) { r.rev = 4 }), row(func(r *beRow) { r.mode = "shared" }))
+	first := aggregate(t, db, itHour, itHour.Add(time.Hour))
+	ids := map[string]bool{}
+	rows, _ := db.Query(`SELECT id FROM rated_usage`)
+	for rows.Next() {
+		var id string
+		_ = rows.Scan(&id)
+		ids[id] = true
+	}
+	rows.Close()
+	before := readRollups(t, db)
+
+	second := aggregate(t, db, itHour, itHour.Add(time.Hour))
+	if second.ReconciledDeletions != 0 || second.RollupsWritten != first.RollupsWritten {
+		t.Fatalf("re-run %+v after %+v, want the same rollups and no deletions", second, first)
+	}
+	after := readRollups(t, db)
+	if fmt.Sprint(before) != fmt.Sprint(after) {
+		t.Fatalf("re-run changed rollups:\n%v\n%v", before, after)
+	}
+	var same int
+	if err := db.QueryRow(`SELECT COUNT(*) FROM rated_usage WHERE id = ANY($1)`, keys(ids)).Scan(&same); err != nil || same != len(ids) {
+		t.Fatalf("ids changed across the re-run (%d of %d kept, err %v)", same, len(ids), err)
+	}
+}
+
+func keys(m map[string]bool) []string {
+	var out []string
+	for k := range m {
+		out = append(out, k)
+	}
+	sort.Strings(out)
+	return out
+}
+
+// A late event is folded into its hour on the next run, and a rollup that
+// becomes withheld is DELETED (so token-push stops sending it and the manager
+// deletes it by absence). Hours outside the window are never touched.
+func TestIntegration_ReRunFoldsLateEventsAndDeletesARollupThatBecameWithheld(t *testing.T) {
+	db := openRatingSchema(t, "phoebe_agg_reconcile_it")
+	seed(t, db,
+		row(nil),
+		row(func(r *beRow) { r.resource = "res-2" }),
+		row(func(r *beRow) { r.at = itHour.Add(-30 * time.Minute) }), // previous hour, outside the window
+	)
+	aggregate(t, db, itHour.Add(-time.Hour), itHour.Add(time.Hour))
+	if n := len(readRollups(t, db)); n != 3 {
+		t.Fatalf("%d rollups after the first run, want 3", n)
+	}
+
+	seed(t, db,
+		row(func(r *beRow) { r.prompt = 1000 }),                       // late event, folded in
+		row(func(r *beRow) { r.resource = "res-2"; r.org = "org-2" }), // res-2 becomes ambiguous
+	)
+	res := aggregate(t, db, itHour, itHour.Add(time.Hour))
+	if res.ReconciledDeletions != 1 || res.AmbiguousOrgEvents != 2 {
+		t.Fatalf("%+v, want res-2 deleted as ambiguous", res)
+	}
+	got := readRollups(t, db)
+	if len(got) != 2 {
+		t.Fatalf("%d rollups, want the previous hour's and res-1's", len(got))
+	}
+	for _, r := range got {
+		if r.resource == "res-2" {
+			t.Fatal("res-2 still present after becoming ambiguous")
+		}
+	}
+	var prompt int64
+	if err := db.QueryRow(`SELECT prompt_tokens FROM rated_usage WHERE resource_id='res-1' AND window_start=$1`, itHour).Scan(&prompt); err != nil || prompt != 1100 {
+		t.Fatalf("res-1 prompt %d (err %v), want 1100 with the late event folded in", prompt, err)
+	}
+}
+
+// An org already recorded is never erased by a re-run whose events lost the
+// header; a NULL org converges to the real one when it arrives.
+func TestIntegration_ReRunConvergesOrgAndNeverErasesIt(t *testing.T) {
+	db := openRatingSchema(t, "phoebe_agg_orgconv_it")
+	seed(t, db, row(func(r *beRow) { r.org = "" }))
+	aggregate(t, db, itHour, itHour.Add(time.Hour))
+	if got := readRollups(t, db); got[0].org.Valid {
+		t.Fatalf("org %v, want NULL before the header arrives", got[0].org)
+	}
+	seed(t, db, row(nil))
+	aggregate(t, db, itHour, itHour.Add(time.Hour))
+	if got := readRollups(t, db); got[0].org.String != "org-1" {
+		t.Fatalf("org %v, want org-1 once an event carries it", got[0].org)
+	}
+	exec(t, db, `UPDATE billing_event SET org_id = NULL`)
+	aggregate(t, db, itHour, itHour.Add(time.Hour))
+	if got := readRollups(t, db); got[0].org.String != "org-1" {
+		t.Fatalf("org %v, want org-1 kept (a re-run must not erase a known payer)", got[0].org)
+	}
+}
+
+// The upgrade path: rows the previous rater priced lose their money the first
+// time the aggregator re-runs their hour, so no stale price lingers.
+func TestIntegration_ReAggregatingAPricedRowClearsItsMoney(t *testing.T) {
+	db := openRatingSchema(t, "phoebe_agg_upgrade_it")
+	seed(t, db, row(nil))
+	aggregate(t, db, itHour, itHour.Add(time.Hour))
+	exec(t, db, `UPDATE rated_usage SET cost = 1.5, applied_prompt_rate = 0.1, applied_cached_rate = 0.01,
+		applied_completion_rate = 0.2, price_key = 'Qwen/Qwen2.5-32B-Instruct'`)
+	aggregate(t, db, itHour, itHour.Add(time.Hour))
+	var priced int
+	if err := db.QueryRow(`SELECT COUNT(*) FROM rated_usage WHERE cost IS NOT NULL OR applied_prompt_rate IS NOT NULL
+		OR applied_cached_rate IS NOT NULL OR applied_completion_rate IS NOT NULL OR price_key IS NOT NULL`).Scan(&priced); err != nil || priced != 0 {
+		t.Fatalf("%d rows still carry money after re-aggregation (err %v)", priced, err)
+	}
+}
+
+// Hour buckets do not depend on the session time zone.
+func TestIntegration_HourBucketsAreSessionTimeZoneIndependent(t *testing.T) {
+	db := openRatingSchema(t, "phoebe_agg_tz_it")
+	seed(t, db, row(func(r *beRow) { r.at = itHour.Add(59*time.Minute + 59*time.Second) }))
+	exec(t, db, `SET TIME ZONE 'Asia/Kolkata'`) // +05:30: a half-hour offset
+	aggregate(t, db, itHour, itHour.Add(time.Hour))
+	var ws time.Time
+	if err := db.QueryRow(`SELECT window_start FROM rated_usage`).Scan(&ws); err != nil || !ws.Equal(itHour) {
+		t.Fatalf("window_start %v (err %v), want %v", ws, err, itHour)
+	}
+}
+
+// Individually valid INTEGER counts can overflow int32 on prompt - cached;
+// that must not fail the whole hour.
+func TestIntegration_Int32OverflowOnFreshInputDoesNotFailTheHour(t *testing.T) {
+	db := openRatingSchema(t, "phoebe_agg_overflow_it")
+	seed(t, db,
+		row(func(r *beRow) { r.prompt, r.cached = 2147483647, -2147483648 }),
+		row(func(r *beRow) { r.resource = "res-2" }),
+	)
+	res := aggregate(t, db, itHour, itHour.Add(time.Hour))
+	if res.InvalidUsageEvents != 1 || res.RollupsWritten != 1 {
+		t.Fatalf("%+v, want the malformed row withheld as invalid and the neighbour aggregated", res)
+	}
+}
+
+// 0011 down refuses while rows without money exist (it will not invent $0),
+// and succeeds once none are left.
+func TestIntegration_Migration0011DownRefusesToInventMoney(t *testing.T) {
+	db := openRatingSchema(t, "phoebe_agg_m0011_it")
+	seed(t, db, row(nil))
+	aggregate(t, db, itHour, itHour.Add(time.Hour))
+
+	down := readMigration(t, "0011_rated_usage_quantities_only.down.sql")
+	if _, err := db.Exec(down); err == nil || !strings.Contains(err.Error(), "will not invent a $0 cost") {
+		t.Fatalf("down with unpriced rows: err = %v, want the refusal", err)
+	}
+	exec(t, db, `UPDATE rated_usage SET cost = 1, applied_prompt_rate = 0, applied_cached_rate = 0, applied_completion_rate = 0`)
+	exec(t, db, down)
+	var nullable string
+	if err := db.QueryRow(`SELECT is_nullable FROM information_schema.columns
+		WHERE table_schema = current_schema() AND table_name = 'rated_usage' AND column_name = 'cost'`).Scan(&nullable); err != nil || nullable != "NO" {
+		t.Fatalf("cost nullable = %q (err %v) after down, want NO", nullable, err)
+	}
+	exec(t, db, readMigration(t, "0011_rated_usage_quantities_only.up.sql"))
 }

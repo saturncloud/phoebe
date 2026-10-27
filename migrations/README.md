@@ -18,24 +18,22 @@ with the Atlas schema; they live in phoebe's own database.
   ONE horizon for every row class, withheld/invalid rows included; the durable
   records are the manager's money rollup (stored upstream) and the rater's hourly
   anomaly counts/logs, not the raw rows. `rated_usage` below is never pruned.
-- **`rated_usage`** — the rating (E1) revenue rollup: per-(auth_id, resource_id,
-  model_id, hour) cost, carrying the applied per-token rates frozen onto each row.
-  `org_id` is carried from `billing_event` so `cmd/token-push` reads org straight
-  off the rollup. **Money is `NUMERIC(20,9)` — exact decimal, never float; all
-  money math happens in SQL, not Go.**
+- **`rated_usage`** — the hourly token usage rollup, one row per (auth_id, owner,
+  resource_id, model_id, serving_mode, graph_k8s_name, topology_revision, hour),
+  carrying `org_id`, `region`, `base_model` and `adapter`. Since 0011 it holds
+  **quantities only**: the manager prices usage (billing-design.md D1), the rater
+  aggregates, and `cmd/token-push` sends each hour to
+  `POST /customer/metered-usage`. The money columns (`cost`, `applied_*_rate`,
+  `price_key`) are NULL on rows the aggregator writes and are dropped in a later
+  release.
 - **`io_log`** — optional, sampled, short-retention request/response body capture
   (M5 I/O logging). Written by the interceptor's iolog sink; OFF by default.
   `cmd/prune` enforces the short retention: rows older than 7 days on `created_at`
   are deleted (its OWN period, independent of billing_event's 30 days) — the
   retention job this table's 0003 migration index always promised.
 
-**The price catalog is not a DB table here (E1).** There is no `model_price` table
-and no local price history. The manager owns the effective-dated price series; the
-rater obtains the prices effective during EACH HOUR it rates, projects that book
-into a transient TEMP table, and persists the applied rates onto the self-auditing
-`rated_usage` row. "Never reprice served traffic" therefore holds because the price
-series is a function of TIME, not because phoebe froze a rate locally: re-rating an
-old hour resolves the same rates it originally did.
+**phoebe holds no prices.** The manager owns every price and rates each hour as of
+that hour (billing-design.md D1, ruled by Hugo 2026-10-22).
 
 ## The migration files
 
@@ -52,6 +50,8 @@ golang-migrate up/down pairs, applied in version order:
 | 0007 | `0007_serving_mode_explicit.{up,down}.sql` | `rated_usage.serving_mode` becomes `'shared'`/`'dedicated'` only (CHECK, no default; dedicated rows renamed from `''` with their ids recomputed) |
 | 0008 | `0008_billing_event_topology.{up,down}.sql` | `billing_event.topology_revision`, `region`, `request_started_at`, `serving_duration_ms` (platform-set margin evidence); `gpu_type` no longer written |
 | 0009 | `0009_rollup_grain_graph_revision.{up,down}.sql` | `rated_usage` grain gains `graph_k8s_name` ('' = unknown) and `topology_revision` (0 = unknown); `region` attribute; every id recomputed |
+| 0010 | `0010_rated_usage_identity.{up,down}.sql` | `rated_usage` attributes `base_model`, `adapter`, `price_key` (usage identity) |
+| 0011 | `0011_rated_usage_quantities_only.{up,down}.sql` | `rated_usage` money columns become nullable with no `$0` default (expand step: the aggregator writes NULL; dropped one release later) |
 
 `embed.go` embeds these into the `migrations` package; `cmd/migrate` applies them.
 
@@ -300,6 +300,30 @@ stay NULL.
 
 Rolling back: deploy the previous rater and token-push, then `migrate down`.
 Nothing is lost but labels.
+
+### Rollout order for migration 0011
+
+0011 makes `rated_usage.cost` and the `applied_*_rate` columns nullable and drops
+their `$0` defaults. It is an expand step: the previous rater keeps writing money,
+the new rater (an aggregator) writes NULL, and no id or key changes.
+
+The new token-push sends `POST /customer/metered-usage` instead of
+`/customer/token-usage`, so the order is:
+
+1. Deploy the saturn-aws-manager release that serves `/customer/metered-usage`,
+   and record this install on the new billing path (billing-design.md section 3a).
+   Until then the push gets a 404 (or a 409 on the legacy path), exits 3 and
+   sends nothing; the trailing window re-sends those hours once the manager is
+   ready, as long as they are within `pushTrailingHours`.
+2. Deploy phoebe with 0011, the new rater and the new token-push.
+
+The first aggregator run re-aggregates the trailing window and clears the money
+columns on those rows; older rows keep the money the previous rater wrote until
+the contract migration drops the columns.
+
+Rolling back: `0011 down` refuses while any row has NULL money (it will not invent
+a `$0` cost). Deploy the previous rater and token-push, re-rate the affected hours
+with `--since/--until`, then run `migrate down`.
 
 ## Local dev
 

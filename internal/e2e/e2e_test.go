@@ -1,12 +1,12 @@
 //go:build integration
 
 // Package e2e wires the REAL pipeline components together, in one process, and
-// proves a token stream becomes money:
+// proves a token stream becomes a usage record:
 //
 //	httptest fake vLLM → proxy.Server (real tee/rewrite/identity gates)
 //	  → emit.DurableEmitter (real, async, WAL-backed) → miniredis stream
 //	  → drain.Drainer (real consumer group) → Postgres billing_event
-//	  → rating.Rater (real single-statement SQL rater) → rated_usage
+//	  → rating.Aggregator (real single-statement SQL aggregator) → rated_usage
 //
 // WHY THIS TEST EXISTS: the three worst bugs found in review were
 // producer/consumer CONTRACT mismatches between components whose unit tests
@@ -78,6 +78,7 @@ const (
 	testModelName  = "llama-3-8b"
 	testAuthID     = "auth-key-e2e"
 	testOrgID      = "org-e2e"
+	testBaseModel  = "meta-llama/Meta-Llama-3-8B-Instruct"
 
 	streamName = "phoebe:metering:e2e"
 )
@@ -161,6 +162,8 @@ func newHarness(t *testing.T, schema string) *harness {
 	mustExec(t, db, readMigration(t, "0009_rollup_grain_graph_revision.up.sql"))
 	// 0010 adds the usage-identity attributes the rater writes.
 	mustExec(t, db, readMigration(t, "0010_rated_usage_identity.up.sql"))
+	// 0011: the money columns are nullable; the aggregator writes NULL.
+	mustExec(t, db, readMigration(t, "0011_rated_usage_quantities_only.up.sql"))
 
 	mr, err := miniredis.Run()
 	if err != nil {
@@ -272,34 +275,10 @@ func (h *harness) drainUntilRows(t *testing.T, n int, timeout time.Duration) {
 	}
 }
 
-// priceBookYAML is the YAML price file for the e2e rater (E1): prices are a config
-// file now, not DB rows. It prices the ENGINE model name with the same rates the
-// old model_price seed used, so the expected cost is unchanged.
-const priceBookYAML = `
-version: 1
-base_models:
-  "llama-3-8b":
-    prompt:     "0.000005"
-    cached:     "0.0000005"
-    completion: "0.00002"
-`
-
-// priceBook parses the e2e YAML price file into a PriceBook (fail-closed if the
-// fixture is malformed).
-func (h *harness) priceBook(t *testing.T) *rating.PriceBook {
-	t.Helper()
-	pb, err := rating.ParsePriceBook([]byte(priceBookYAML))
-	if err != nil {
-		t.Fatalf("parse e2e price book: %v", err)
-	}
-	return pb
-}
-
-// rateEventHour reads the stored event's rating instant back from billing_event,
-// truncates it to its UTC hour, and runs a real rating.Rater (priced from the YAML
-// PriceBook) over exactly that hour window — so the test never races a wall-clock
-// hour boundary.
-func (h *harness) rateEventHour(t *testing.T, book *rating.PriceBook) rating.Result {
+// aggregateEventHour reads the stored event's instant back from billing_event,
+// truncates it to its UTC hour, and runs the real rating.Aggregator over exactly
+// that hour, so the test never races a wall-clock hour boundary.
+func (h *harness) aggregateEventHour(t *testing.T) rating.Result {
 	t.Helper()
 	var evTS time.Time
 	if err := h.db.QueryRow(
@@ -308,24 +287,24 @@ func (h *harness) rateEventHour(t *testing.T, book *rating.PriceBook) rating.Res
 	}
 	hour := evTS.UTC().Truncate(time.Hour)
 
-	rater := rating.New(rating.NewPostgresStore(h.db), book, h.log)
-	res, err := rater.Run(context.Background(), hour, hour.Add(time.Hour), false)
+	res, err := rating.New(rating.NewPostgresStore(h.db), h.log).Run(context.Background(), hour, hour.Add(time.Hour), false)
 	if err != nil {
-		t.Fatalf("rater.Run: %v", err)
+		t.Fatalf("aggregator.Run: %v", err)
 	}
 	return res
 }
 
-// assertNumericEqual compares two NUMERIC values IN Postgres — money never
-// becomes a Go number, so equality is delegated to the database too.
-func (h *harness) assertNumericEqual(t *testing.T, got, want, what string) {
+// assertNoMoney fails if any rollup carries a price: the manager prices usage
+// (billing-design.md D1) and phoebe must write NULL.
+func (h *harness) assertNoMoney(t *testing.T) {
 	t.Helper()
-	var equal bool
-	if err := h.db.QueryRow("SELECT $1::numeric = $2::numeric", got, want).Scan(&equal); err != nil {
-		t.Fatalf("numeric compare %s: %v", what, err)
+	var priced int
+	if err := h.db.QueryRow(`SELECT COUNT(*) FROM rated_usage WHERE cost IS NOT NULL OR applied_prompt_rate IS NOT NULL
+		OR applied_cached_rate IS NOT NULL OR applied_completion_rate IS NOT NULL OR price_key IS NOT NULL`).Scan(&priced); err != nil {
+		t.Fatalf("read money columns: %v", err)
 	}
-	if !equal {
-		t.Errorf("%s = %s, want %s", what, got, want)
+	if priced != 0 {
+		t.Fatalf("%d rollups carry money; phoebe no longer prices", priced)
 	}
 }
 
@@ -349,7 +328,7 @@ func readMigration(t *testing.T, name string) string {
 	return string(b)
 }
 
-// TestE2E_StreamedRequestBecomesMoney is THE pipeline test: one streamed
+// TestE2E_StreamedRequestBecomesAUsageRecord is THE pipeline test: one streamed
 // request through the real proxy → real emitter → miniredis → real drainer →
 // real Postgres → real rater, asserting at the end that the money is right and
 // every cross-component contract held:
@@ -361,9 +340,9 @@ func readMigration(t *testing.T, name string) string {
 //   - request_id contract: Phoebe's internal attempt id survives to billing_event verbatim —
 //     the empty-request_id bug had the drainer poison-dropping such events
 //     (served-but-never-billed);
-//   - the money: cost equals the independently hand-computed NUMERIC, with
-//     zero unpriced and zero unattributable events.
-func TestE2E_StreamedRequestBecomesMoney(t *testing.T) {
+//   - the quantities: the rollup carries the engine's exact token counts, the
+//     payer, owner, serving mode and base model, and no money (the manager prices).
+func TestE2E_StreamedRequestBecomesAUsageRecord(t *testing.T) {
 	h := newHarness(t, "phoebe_e2e_pipeline")
 
 	// 1. Upstream: a fake vLLM streaming the SSE fixture chunk by chunk.
@@ -402,6 +381,9 @@ func TestE2E_StreamedRequestBecomesMoney(t *testing.T) {
 	// realistic user-owned identity.
 	req.Header.Set(identity.HeaderUserID, "user-e2e")
 	req.Header.Set(identity.HeaderOrgID, testOrgID)
+	// Atlas stamps the base model on every Token Factory endpoint; the manager
+	// prices tokens by it, so a record cannot be sent without it.
+	req.Header.Set(identity.HeaderBaseModel, testBaseModel)
 	req.Header.Set("X-Request-Id", "saturn-e2e-streamed-request")
 	srv.Handler().ServeHTTP(rr, req)
 
@@ -491,32 +473,15 @@ func TestE2E_StreamedRequestBecomesMoney(t *testing.T) {
 		t.Error("billing_event.aborted = true for a completed stream")
 	}
 
-	// 4. Rater: price the ENGINE name from the YAML price file, rate the event's hour.
-	res := h.rateEventHour(t, h.priceBook(t))
-
-	// 5. The money. Expected cost, hand-derived from the fixture and the seeded
-	//    prices (mirrors the Rate() oracle's billable-prompt formula, computed
-	//    independently here since the oracle is test-only inside package rating):
-	//
-	//	billable_prompt = prompt - cached = 2006 - 1920 = 86
-	//	cost = 86   * 0.000005  = 0.000430   (non-cached prompt)
-	//	     + 1920 * 0.0000005 = 0.000960   (cached prompt)
-	//	     + 300  * 0.00002   = 0.006000   (completion)
-	//	     = 0.007390
-	const wantCost = "0.00739"
-
-	if res.EventsRated != 1 || res.RollupsWritten != 1 {
-		t.Fatalf("rater Result = %+v, want exactly 1 event rated into 1 rollup", res)
+	// 4. Aggregator: roll the event's hour into rated_usage.
+	res := h.aggregateEventHour(t)
+	if res.EventsAggregated != 1 || res.RollupsWritten != 1 || res.HasAnomaly() {
+		t.Fatalf("aggregator Result = %+v, want exactly 1 event aggregated into 1 rollup and nothing withheld", res)
 	}
-	if res.UnpricedEvents != 0 || res.UnattributableEvents != 0 {
-		t.Fatalf("rater anomalies = %d unpriced / %d unattributable, want 0/0 — the pipeline leaked the price key or identity",
-			res.UnpricedEvents, res.UnattributableEvents)
-	}
-	h.assertNumericEqual(t, res.TotalCost, wantCost, "Result.TotalCost")
 
 	var (
 		nRollups                                     int
-		ruAuthID, ruResourceID, ruModelID, cost      string
+		ruAuthID, ruResourceID, ruModelID, ruBase    string
 		ruOrgID                                      sql.NullString // nullable column; a NULL must surface as a clear assertion, not a scan error
 		ruPrompt, ruCached, ruCompletion, ruBillable int64
 		eventCount                                   int64 // BIGINT column
@@ -528,9 +493,9 @@ func TestE2E_StreamedRequestBecomesMoney(t *testing.T) {
 		t.Fatalf("rated_usage rows = %d, want exactly 1", nRollups)
 	}
 	if err := h.db.QueryRow(
-		`SELECT auth_id, resource_id, org_id, model_id, prompt_tokens, cached_tokens, completion_tokens, billable_prompt_tokens, cost::text, event_count
+		`SELECT auth_id, resource_id, org_id, model_id, prompt_tokens, cached_tokens, completion_tokens, billable_prompt_tokens, base_model, event_count
 		 FROM rated_usage`).
-		Scan(&ruAuthID, &ruResourceID, &ruOrgID, &ruModelID, &ruPrompt, &ruCached, &ruCompletion, &ruBillable, &cost, &eventCount); err != nil {
+		Scan(&ruAuthID, &ruResourceID, &ruOrgID, &ruModelID, &ruPrompt, &ruCached, &ruCompletion, &ruBillable, &ruBase, &eventCount); err != nil {
 		t.Fatalf("read rated_usage: %v", err)
 	}
 	if ruAuthID != testAuthID {
@@ -575,7 +540,10 @@ func TestE2E_StreamedRequestBecomesMoney(t *testing.T) {
 	if eventCount != 1 {
 		t.Errorf("rated_usage.event_count = %d, want 1", eventCount)
 	}
-	h.assertNumericEqual(t, cost, wantCost, "rated_usage.cost")
+	if ruBase != testBaseModel {
+		t.Errorf("rated_usage.base_model = %q, want %q (the pricing fact the manager needs)", ruBase, testBaseModel)
+	}
+	h.assertNoMoney(t)
 }
 
 // ftVllmStream is the vLLM SSE fixture for a FINE-TUNE deployment: the engine reports
@@ -590,31 +558,17 @@ data: [DONE]
 
 `
 
-// ftPriceBookYAML prices ONLY the base model + a 1.5× premium. The fine-tune's
-// ft:<checkpoint> id is NOT listed — it prices through the event-carried base_model.
-const ftPriceBookYAML = `
-version: 1
-base_models:
-  "meta-llama/Llama-3.1-8B-Instruct":
-    prompt:     "0.000004"
-    cached:     "0"
-    completion: "0"
-fine_tune_premium:
-  policy: multiplier
-  factor: "1.5"
-`
-
-// TestE2E_FineTuneBillsAtBaseTimesPremium is the fine-tune pipeline test: a request to
+// TestE2E_FineTuneCarriesItsBaseModelToTheRollup is the fine-tune pipeline test: a request to
 // a fine-tune deployment carries the X-Saturn-Base-Model header (as Atlas injects it
 // at deploy), the engine reports the ft:<checkpoint> id as its model, and the whole
-// pipe must end with the fine-tune billed at base × premium — proving base_model rides
+// pipe must end with the base model on the rollup, where the manager prices from it — proving base_model rides
 // end to end (proxy → emit → drain → billing_event.base_model → rater derived join).
 //
 //   - base_model contract: billing_event.base_model is the HF base id from the header,
 //     NOT empty — the propagation seam the rater needs to price an ft: id;
 //   - the money: the ft: id (absent from the price file) bills at base × 1.5 via its
 //     base_model, with zero unpriced events.
-func TestE2E_FineTuneBillsAtBaseTimesPremium(t *testing.T) {
+func TestE2E_FineTuneCarriesItsBaseModelToTheRollup(t *testing.T) {
 	h := newHarness(t, "phoebe_e2e_finetune")
 
 	const (
@@ -677,46 +631,28 @@ func TestE2E_FineTuneBillsAtBaseTimesPremium(t *testing.T) {
 		t.Fatalf("billing_event.base_model = %v, want %q — the header must ride to billing_event for the rater to price the fine-tune", baseModel, ftBaseModel)
 	}
 
-	// Rate from the YAML book that prices ONLY the base; the ft: id must resolve via
-	// base_model at base × premium.
-	book, err := rating.ParsePriceBook([]byte(ftPriceBookYAML))
-	if err != nil {
-		t.Fatalf("parse ft price book: %v", err)
+	res := h.aggregateEventHour(t)
+	if res.EventsAggregated != 1 || res.RollupsWritten != 1 || res.HasAnomaly() {
+		t.Fatalf("aggregator Result = %+v, want 1 event / 1 rollup and nothing withheld", res)
 	}
-	res := h.rateEventHour(t, book)
-
-	if res.UnpricedEvents != 0 || res.UnattributableEvents != 0 {
-		t.Fatalf("anomalies = %d unpriced / %d unattributable, want 0/0 — base_model failed to plumb the fine-tune's price", res.UnpricedEvents, res.UnattributableEvents)
-	}
-	if res.EventsRated != 1 || res.RollupsWritten != 1 {
-		t.Fatalf("rater Result = %+v, want 1 event / 1 rollup", res)
-	}
-	// 1000 prompt tokens × (0.000004 base × 1.5 premium) = 0.006.
-	const wantCost = "0.006"
-	h.assertNumericEqual(t, res.TotalCost, wantCost, "Result.TotalCost (base × premium)")
-
-	var ruModelID, cost, appliedPrompt string
-	if err := h.db.QueryRow(
-		`SELECT model_id, cost::text, applied_prompt_rate::text FROM rated_usage`).
-		Scan(&ruModelID, &cost, &appliedPrompt); err != nil {
+	var ruModelID, ruBase string
+	if err := h.db.QueryRow(`SELECT model_id, base_model FROM rated_usage`).Scan(&ruModelID, &ruBase); err != nil {
 		t.Fatalf("read rated_usage: %v", err)
 	}
-	if ruModelID != ftModelName {
-		t.Errorf("rated_usage.model_id = %q, want %q (the fine-tune's ft: id)", ruModelID, ftModelName)
+	if ruModelID != ftModelName || ruBase != ftBaseModel {
+		t.Errorf("rated_usage model/base = %q/%q, want %q/%q", ruModelID, ruBase, ftModelName, ftBaseModel)
 	}
-	h.assertNumericEqual(t, appliedPrompt, "0.000006", "rated_usage.applied_prompt_rate (base × premium frozen on row)")
-	h.assertNumericEqual(t, cost, wantCost, "rated_usage.cost")
+	h.assertNoMoney(t)
 }
 
-// TestE2E_FineTuneWithoutBaseModelHeaderIsUnpriced is the fail-CLOSED end of the
-// fine-tune pipe (the mirror of TestE2E_FineTuneBillsAtBaseTimesPremium). A request to
+// TestE2E_MissingBaseModelHeaderIsWithheldNotSent is the fail-CLOSED end of the
+// fine-tune pipe (the mirror of TestE2E_FineTuneCarriesItsBaseModelToTheRollup). A request to
 // a fine-tune deployment that arrives WITHOUT the X-Saturn-Base-Model header — the
 // propagation seam broken (Traefik not allowlisting it, Atlas not stamping it) — must
-// NOT be silently rated: the ft:<checkpoint> id is absent from the price file and has
-// no base_model to derive through, so the whole pipe must end with the event UNPRICED
-// (an anomaly that screams), never $0-billed and never rated. A silent $0 here would
-// lose ALL fine-tune revenue the moment the header stopped propagating.
-func TestE2E_FineTuneWithoutBaseModelHeaderIsUnpriced(t *testing.T) {
+// NOT become a record: the manager prices tokens by base_model and the wire requires
+// it, so the whole pipe must end with the event withheld as MISSING-BASE-MODEL (an
+// anomaly that screams), never sent with a guessed base.
+func TestE2E_MissingBaseModelHeaderIsWithheldNotSent(t *testing.T) {
 	h := newHarness(t, "phoebe_e2e_ft_nobase")
 
 	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
@@ -771,16 +707,10 @@ func TestE2E_FineTuneWithoutBaseModelHeaderIsUnpriced(t *testing.T) {
 		t.Fatalf("billing_event.base_model = %q, want NULL (no header was sent)", baseModel.String)
 	}
 
-	// The ft: event must FAIL LOUD: unpriced, not rated, not $0-billed.
-	res := h.rateEventHour(t, h.priceBook(t))
-	if res.UnpricedEvents != 1 {
-		t.Fatalf("UnpricedEvents = %d, want 1 (an ft: event with no base_model must scream)", res.UnpricedEvents)
-	}
-	if res.EventsRated != 0 || res.RollupsWritten != 0 {
-		t.Fatalf("result = %+v, want 0 rated / 0 rollups (a base_model-less fine-tune must NEVER be rated or $0-billed)", res)
-	}
-	if !res.HasUnpriced() || !res.HasAnomaly() {
-		t.Fatal("HasUnpriced/HasAnomaly = false, want true (the propagation bug must drive exit-nonzero)")
+	// The event must FAIL LOUD: withheld, not aggregated.
+	res := h.aggregateEventHour(t)
+	if res.MissingBaseModelEvents != 1 || res.EventsAggregated != 0 || res.RollupsWritten != 0 || !res.HasAnomaly() {
+		t.Fatalf("result = %+v, want 1 missing-base-model event withheld, nothing aggregated, and an anomaly", res)
 	}
 	// And no rated_usage row was written for it.
 	var nRollups int
@@ -788,7 +718,7 @@ func TestE2E_FineTuneWithoutBaseModelHeaderIsUnpriced(t *testing.T) {
 		t.Fatalf("count rated_usage: %v", err)
 	}
 	if nRollups != 0 {
-		t.Fatalf("rated_usage rows = %d, want 0 (no $0 row for the unpriced fine-tune)", nRollups)
+		t.Fatalf("rated_usage rows = %d, want 0 (no record without a base model)", nRollups)
 	}
 }
 
@@ -829,9 +759,7 @@ func TestE2E_ModellessEventWithoutUsageIsMissingUsage(t *testing.T) {
 		t.Fatal("billing_event.model is not NULL for a model-less event — '' dodges the rater's unattributable predicate")
 	}
 
-	// Price book loaded so an event misfiled as "unpriced" could only mean the
-	// bucket logic itself is wrong, not a missing price.
-	res := h.rateEventHour(t, h.priceBook(t))
+	res := h.aggregateEventHour(t)
 
 	if res.MissingUsageEvents != 1 {
 		t.Errorf("MissingUsageEvents = %d, want 1 (the no-usage attempt)", res.MissingUsageEvents)
@@ -848,11 +776,11 @@ func TestE2E_ModellessEventWithoutUsageIsMissingUsage(t *testing.T) {
 	if res.UnattributableEvents != 0 {
 		t.Errorf("UnattributableEvents = %d, want 0 — a model-less attempt with no usage is MISSING-USAGE; that bucket is exclusive and more specific than UNATTRIBUTABLE", res.UnattributableEvents)
 	}
-	if res.UnpricedEvents != 0 {
-		t.Errorf("UnpricedEvents = %d, want 0 — a model-less attempt with no usage is MISSING-USAGE, not UNPRICED; UNPRICED means a usage-bearing event whose price lookup failed (wrong runbook)", res.UnpricedEvents)
+	if res.MissingBaseModelEvents != 0 {
+		t.Errorf("MissingBaseModelEvents = %d, want 0 — a model-less attempt with no usage is MISSING-USAGE (wrong runbook otherwise)", res.MissingBaseModelEvents)
 	}
-	if res.EventsRated != 0 || res.RollupsWritten != 0 {
-		t.Errorf("rater billed a model-less event: %+v (must never be rated, let alone $0-billed)", res)
+	if res.EventsAggregated != 0 || res.RollupsWritten != 0 {
+		t.Errorf("aggregator recorded a model-less event: %+v", res)
 	}
 	// An aborted attempt is correctly billed zero and is NOT a pageable anomaly:
 	// exit 2 is reserved for rare, wrong conditions. The attempt is still fully
@@ -860,7 +788,6 @@ func TestE2E_ModellessEventWithoutUsageIsMissingUsage(t *testing.T) {
 	if res.HasAnomaly() {
 		t.Error("Result.HasAnomaly() = true for a routine client abort — exit 2 must stay reserved for rare, wrong conditions")
 	}
-	h.assertNumericEqual(t, res.TotalCost, "0", "Result.TotalCost")
 }
 
 // TestE2E_SuccessWithoutUsagePages is the other half of the missing-usage cause
@@ -888,7 +815,7 @@ func TestE2E_SuccessWithoutUsagePages(t *testing.T) {
 	h.waitForStreamLen(t, 1, 5*time.Second)
 	h.drainUntilRows(t, 1, 10*time.Second)
 
-	res := h.rateEventHour(t, h.priceBook(t))
+	res := h.aggregateEventHour(t)
 
 	if res.MissingUsageEvents != 1 {
 		t.Errorf("MissingUsageEvents = %d, want 1", res.MissingUsageEvents)
@@ -899,13 +826,12 @@ func TestE2E_SuccessWithoutUsagePages(t *testing.T) {
 	if res.ExpectedMissingUsageEvents != 0 {
 		t.Errorf("ExpectedMissingUsageEvents = %d, want 0 (neither aborted nor failed)", res.ExpectedMissingUsageEvents)
 	}
-	if res.EventsRated != 0 || res.RollupsWritten != 0 {
-		t.Errorf("rater billed an attempt with no authoritative usage: %+v", res)
+	if res.EventsAggregated != 0 || res.RollupsWritten != 0 {
+		t.Errorf("aggregator recorded an attempt with no authoritative usage: %+v", res)
 	}
 	if !res.HasAnomaly() {
 		t.Error("Result.HasAnomaly() = false — a success with no usage block must drive the exit-nonzero path")
 	}
-	h.assertNumericEqual(t, res.TotalCost, "0", "Result.TotalCost")
 }
 
 // TestE2E_InvalidEngineEvidenceIsRetainedButNeverRated proves an authoritative
@@ -930,10 +856,10 @@ func TestE2E_InvalidEngineEvidenceIsRetainedButNeverRated(t *testing.T) {
 	h.waitForStreamLen(t, 1, 5*time.Second)
 	h.drainUntilRows(t, 1, 10*time.Second) // also asserts drainer Poisoned() == 0
 
-	res := h.rateEventHour(t, h.priceBook(t))
-	if res.InvalidUsageEvents != 1 || res.EventsRated != 0 || res.RollupsWritten != 0 {
-		t.Fatalf("invalid evidence result = invalid/rated/rollups %d/%d/%d, want 1/0/0",
-			res.InvalidUsageEvents, res.EventsRated, res.RollupsWritten)
+	res := h.aggregateEventHour(t)
+	if res.InvalidUsageEvents != 1 || res.EventsAggregated != 0 || res.RollupsWritten != 0 {
+		t.Fatalf("invalid evidence result = invalid/aggregated/rollups %d/%d/%d, want 1/0/0",
+			res.InvalidUsageEvents, res.EventsAggregated, res.RollupsWritten)
 	}
 	if !res.HasAnomaly() {
 		t.Fatal("invalid engine evidence must drive the fail-loud anomaly path")
@@ -968,7 +894,7 @@ data: [DONE]
 
 `
 
-// TestE2E_AdapterHeaderLandsInBillingEventAndTriggersPremium is the C4 fine-tune
+// TestE2E_AdapterHeaderRidesToTheRollup is the C4 fine-tune
 // pipeline test: a request to a fine-tune checkpoint endpoint carries BOTH
 // per-deployment headers the Atlas-rendered Traefik middleware injects —
 // X-Saturn-Base-Model (the catalog price key) and X-Saturn-Adapter (the checkpoint
@@ -977,9 +903,9 @@ data: [DONE]
 //
 //   - adapter contract: billing_event.adapter is the checkpoint artifact id from the
 //     header, stored VERBATIM (forensic: which checkpoint served the request);
-//   - the money: the endpoint-name model (absent from the price file, no ft: prefix)
-//     bills at base x premium — the adapter presence alone triggered the premium.
-func TestE2E_AdapterHeaderLandsInBillingEventAndTriggersPremium(t *testing.T) {
+//   - the rollup: the endpoint-name model carries both the base model and the
+//     adapter, the facts the manager prices a fine-tune by (base x premium).
+func TestE2E_AdapterHeaderRidesToTheRollup(t *testing.T) {
 	h := newHarness(t, "phoebe_e2e_adapter")
 
 	const (
@@ -1051,35 +977,18 @@ func TestE2E_AdapterHeaderLandsInBillingEventAndTriggersPremium(t *testing.T) {
 		t.Fatalf("billing_event.adapter = %v, want %q — X-Saturn-Adapter must land in billing_event.adapter (the premium trigger + checkpoint forensics)", adapter, epAdapter)
 	}
 
-	// Rate from a book that prices ONLY the base with a 1.5x premium: the
-	// endpoint-name model must bill at base x premium via adapter + base_model.
-	book, err := rating.ParsePriceBook([]byte(ftPriceBookYAML))
-	if err != nil {
-		t.Fatalf("parse ft price book: %v", err)
+	res := h.aggregateEventHour(t)
+	if res.EventsAggregated != 1 || res.RollupsWritten != 1 || res.HasAnomaly() {
+		t.Fatalf("aggregator Result = %+v, want 1 event / 1 rollup and nothing withheld", res)
 	}
-	res := h.rateEventHour(t, book)
-
-	if res.UnpricedEvents != 0 || res.UnattributableEvents != 0 {
-		t.Fatalf("anomalies = %d unpriced / %d unattributable, want 0/0 — the adapter/base_model seam failed to price the fine-tune",
-			res.UnpricedEvents, res.UnattributableEvents)
-	}
-	if res.EventsRated != 1 || res.RollupsWritten != 1 {
-		t.Fatalf("rater Result = %+v, want 1 event / 1 rollup", res)
-	}
-	// 1000 prompt tokens x (0.000004 base x 1.5 premium) = 0.006. If the adapter
-	// failed to trigger the premium this would be 0.004 (plain base rate).
-	const wantCost = "0.006"
-	h.assertNumericEqual(t, res.TotalCost, wantCost, "Result.TotalCost (adapter-triggered premium)")
-
-	var ruModelID, cost, appliedPrompt string
-	if err := h.db.QueryRow(
-		`SELECT model_id, cost::text, applied_prompt_rate::text FROM rated_usage`).
-		Scan(&ruModelID, &cost, &appliedPrompt); err != nil {
+	// The adapter is the manager's fine-tune premium trigger: it must reach the
+	// rollup next to the base model.
+	var ruModelID, ruBase, ruAdapter string
+	if err := h.db.QueryRow(`SELECT model_id, base_model, adapter FROM rated_usage`).Scan(&ruModelID, &ruBase, &ruAdapter); err != nil {
 		t.Fatalf("read rated_usage: %v", err)
 	}
-	if ruModelID != epModelName {
-		t.Errorf("rated_usage.model_id = %q, want %q (billed under the endpoint name)", ruModelID, epModelName)
+	if ruModelID != epModelName || ruBase != epBaseModel || ruAdapter != epAdapter {
+		t.Errorf("rated_usage model/base/adapter = %q/%q/%q, want %q/%q/%q", ruModelID, ruBase, ruAdapter, epModelName, epBaseModel, epAdapter)
 	}
-	h.assertNumericEqual(t, appliedPrompt, "0.000006", "rated_usage.applied_prompt_rate (base x premium frozen on row)")
-	h.assertNumericEqual(t, cost, wantCost, "rated_usage.cost")
+	h.assertNoMoney(t)
 }
