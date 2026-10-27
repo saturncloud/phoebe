@@ -59,20 +59,16 @@ type raterSettings struct {
 	// silently meaning "default".
 	RateTrailingHours *int `yaml:"rateTrailingHours"`
 
-	// ManagerURL is no longer read: the aggregator never calls the manager. The
-	// key is still accepted so a chart that sets it keeps working; run() logs a
-	// warning so the operator removes it.
+	// ManagerURL is not used: the aggregator never calls the manager (Hugo
+	// approved its removal from the rater, 2026-10-27). The key is still parsed
+	// only so an old ConfigMap that carries it during an upgrade (chart and image
+	// do not roll out at the same instant) gets one warning, never a failure.
 	ManagerURL string `yaml:"managerURL"`
 
 	MaxOpenConns    int    `yaml:"maxOpenConns"`
 	MaxIdleConns    int    `yaml:"maxIdleConns"`
 	ConnMaxLifetime string `yaml:"connMaxLifetime"`
 }
-
-// legacyTokenEnv is the customer auth token the rater needed to fetch prices.
-// It no longer uses it; run() warns if it is still mounted, because a pod
-// should not hold a credential it does not use.
-const legacyTokenEnv = "SATURN_TOKEN"
 
 // defaultRateTrailingHours is the default N for the trailing window.
 const defaultRateTrailingHours = 24
@@ -104,15 +100,20 @@ func main() {
 
 // run is main's body returning an exit code, so deferred Close runs before exit.
 func run() int {
-	settingsFile := flag.String("f", "/etc/saturn/config/rater.yaml", "Settings YAML file path")
-	// -manager-url is accepted and ignored, for the same reason as the managerURL
-	// settings key: an older CronJob spec that passes it must not crash-loop.
-	managerFlag := flag.String("manager-url", "", "Ignored: the aggregator no longer calls the manager")
-	since := flag.String("since", "", "Window start, RFC3339 (default: floor(now) minus rateTrailingHours)")
-	until := flag.String("until", "", "Window end, RFC3339 (default: start of the current hour)")
-	flag.Parse()
+	return runWith(os.Args[1:], logging.New(logging.INFO))
+}
 
-	log := logging.New(logging.INFO)
+// runWith parses argv and runs one aggregation; tests drive it directly. The
+// rater reads no credential: it makes no manager call, so SATURN_TOKEN is not
+// read from the environment at all.
+func runWith(argv []string, log *logging.Logger) int {
+	fs := flag.NewFlagSet("rater", flag.ContinueOnError)
+	settingsFile := fs.String("f", "/etc/saturn/config/rater.yaml", "Settings YAML file path")
+	since := fs.String("since", "", "Window start, RFC3339 (default: floor(now) minus rateTrailingHours)")
+	until := fs.String("until", "", "Window end, RFC3339 (default: start of the current hour)")
+	if err := fs.Parse(argv); err != nil {
+		return exitFatal
+	}
 
 	cfg, opts, err := loadConfig(*settingsFile)
 	if err != nil {
@@ -122,11 +123,8 @@ func run() int {
 	if opts.debug {
 		log.SetLevel(logging.DEBUG)
 	}
-	if opts.managerURL != "" || *managerFlag != "" {
-		log.Warn.Printf("rater: managerURL is set but no longer used (the manager prices usage; the rater only aggregates); remove it from the rater settings")
-	}
-	if os.Getenv(legacyTokenEnv) != "" {
-		log.Warn.Printf("rater: %s is set but no longer used (the rater makes no manager calls); remove it from the rater pod so it does not hold an unused credential", legacyTokenEnv)
+	if opts.managerURL != "" {
+		log.Warn.Printf("rater: ignoring managerURL in %s; the rater no longer calls the manager (an old ConfigMap during an upgrade; the current chart does not set it)", *settingsFile)
 	}
 
 	windowStart, windowEnd, windowExplicit, err := resolveWindow(*since, *until, opts.trailingHours, time.Now())
