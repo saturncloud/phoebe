@@ -33,9 +33,11 @@ central billing service.
    **phoebe prices nothing**: the manager owns every price and rates each hour as of
    that hour (billing-design.md D1). The rater fetches no prices and writes the
    money columns as NULL. It withholds, counts and pages (exit 2) on evidence that
-   cannot become a correct record: unattributable, invalid usage, invalid serving
-   mode, owner conflict, ambiguous org, ambiguous base model or adapter, and an
-   UNEXPLAINED missing-usage attempt. An absent base model is NOT withheld: a
+   cannot become any record: unattributable, invalid usage, invalid serving mode,
+   and an UNEXPLAINED missing-usage attempt. CONFLICTS (owner conflict, ambiguous
+   org, ambiguous base model or adapter, missing org) are PARKED per identity
+   (see "Parked usage" below): only the conflicted identity is held back, never the
+   rest of the hour, and the run exits 4 while any parked usage is unresolved. An absent base model is NOT withheld: a
    dedicated endpoint may serve a model outside the catalog (D3), so the record is
    sent with `base_model ""` and the rater logs a warning; the manager prices
    dedicated + empty base at the plan's default rate and reports shared + empty
@@ -45,9 +47,51 @@ central billing service.
    keyed by a deterministic `usage_id` (sha256 of the record's grain). The manager
    deletes, by absence, records it holds for the hour that the request omits, so a
    re-sent hour replaces the previous one and an empty hour is sent as an empty
-   list. An hour with a rollup that cannot become a valid record is withheld in
-   full instead of partially deleting or mis-attributing prior usage. The manager
-   owns rating, settlement and invoice-line creation.
+   list. A parked identity, or a rollup token-push cannot turn into a valid record,
+   is left out of the request while the rest of the hour is sent; usage_ids the
+   manager already holds for that identity (recorded in `pushed_usage`) are listed
+   in `held`, so delete-by-absence cannot remove usage the manager accepted. The
+   manager owns rating, settlement and invoice-line creation.
+
+### Parked usage
+
+A conflict holds back only the conflicted identity, never the whole hour. The
+identity is (auth_id, owner, resource_id, model_id, serving_mode) in one hour.
+
+| reason | meaning |
+|---|---|
+| `owner_conflict` | events carried both `X-Saturn-User-Id` and `X-Saturn-Group-Id` (parked under owner `''`) |
+| `ambiguous_org` | the identity's events named more than one org (the payer) |
+| `ambiguous_base` | more than one base model or adapter, or a value on some events and none on others |
+| `missing_org` | no event of the identity named an org |
+
+- **Recorded, never dropped.** The rater writes one `parked_usage` row per
+  identity, hour and reason, with event and token counts. The row is never pruned,
+  so the record of unbilled usage outlives `billing_event`'s 30-day horizon.
+- **Loud.** Every rater run logs each unresolved row at ERROR (hour, identity,
+  reason, token counts) and exits `4` (exit `1` and `2` outrank it), so a Job
+  alert keeps firing until it is resolved.
+- **Listed.** `phoebe-rater -list-parked` prints the unresolved rows and exits `4`
+  when there are any, `0` when there are none. The same data in SQL:
+
+  ```sql
+  SELECT window_start, auth_id, owner_type, owner_id, resource_id, model_id,
+         serving_mode, reason, event_count, prompt_tokens, cached_tokens,
+         completion_tokens, first_parked_at, last_seen_at
+    FROM parked_usage WHERE resolved_at IS NULL ORDER BY window_start;
+  ```
+- **Resolution.** Fix the cause (header propagation, or correct the evidence in
+  `billing_event`). Every rater run re-checks unresolved parked hours from the last
+  ~7 days (`ParkedRescanReach`, inside the pruner's hard floor, so the raw events
+  are guaranteed complete); when the conflict is gone it sets `resolved_at`, writes
+  the identity's rollup, and token-push re-sends that hour on its next run however
+  old it is (any hour with a row resolved after the hour's last accepted push in
+  `pushed_hour`). For an older parked hour, confirm `billing_event` still holds its
+  events, then run `phoebe-rater -since <hour> -until <hour+1h>`; the same
+  resolution and re-send follow. If the events are already pruned, the parked row
+  is the remaining record: settle it by hand with the manager's credit path.
+- **Held ids.** While an identity is parked, every push of its hour lists the
+  usage_ids the manager accepted for it earlier in `held`.
 
 ## Routine checks and alert conditions
 
@@ -94,9 +138,11 @@ token-push did not catch (a bug: compare the logged path with the rollup); `401`
 means the customer token; `409` means the manager has this install on the legacy
 billing path (an operator step, billing-design.md section 3a); `422` means the hour
 is in a billing period already settled to Stripe, so its correction goes to the
-manager's human credit path. Exit `2` means an hour was withheld because a rollup
-could not become a valid record (no org, or a wire rule); the manager keeps its
-previous state for that hour until the cause is fixed.
+manager's human credit path. Exit `2` means token-push held back a rollup it could
+not turn into a valid record (a wire rule, or a row without an org written before
+the rater parked missing orgs); the rest of that hour was sent and the rollup's
+earlier usage_ids were held. Parked usage is reported by the rater (exit `4`), not
+by token-push.
 
 "Failed" means `status_code >= 400` everywhere — the reconciliation view's
 `failed_attempts` and the rater's routine-vs-alarming split use the SAME
@@ -114,7 +160,7 @@ exit 2 stays reserved for rare, wrong conditions (unattributable, invalid usage,
 ambiguous base/org, invalid serving mode, owner conflict) rather than firing
 every hour.
 
-Page on an unexplained missing-usage attempt, rater anomaly/non-zero exit, reconcile
+Page on parked usage (rater exit 4), an unexplained missing-usage attempt, rater anomaly/non-zero exit, reconcile
 deletion during a routine run, drainer poison row, `METERING_FLOOR`, WAL corruption,
 token-push withheld hour (exit 2), manager rejection (exit 3), or push failure
 (exit 1). Alert separately when the oldest Valkey

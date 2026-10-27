@@ -17,15 +17,23 @@ type fakeStore struct {
 	gotStart     time.Time
 	gotEnd       time.Time
 	returnsError error
+	parkedHours  []time.Time
+	parked       []Parked
+	windows      [][2]time.Time
 }
 
 func (f *fakeStore) AggregateWindow(_ context.Context, start, end time.Time) (AggregateResult, error) {
 	f.calls++
 	f.gotStart, f.gotEnd = start, end
+	f.windows = append(f.windows, [2]time.Time{start, end})
 	return f.res, f.returnsError
 }
-func (f *fakeStore) Ping(context.Context) error { return nil }
-func (f *fakeStore) Close() error               { return nil }
+func (f *fakeStore) ParkedHours(context.Context, time.Time) ([]time.Time, error) {
+	return f.parkedHours, nil
+}
+func (f *fakeStore) ListParked(context.Context) ([]Parked, error) { return f.parked, nil }
+func (f *fakeStore) Ping(context.Context) error                   { return nil }
+func (f *fakeStore) Close() error                                 { return nil }
 
 func captureLogger() (*logging.Logger, *bytes.Buffer, *bytes.Buffer) {
 	var info, errBuf bytes.Buffer
@@ -75,9 +83,6 @@ func TestResult_EachWithheldReasonIsAnAnomalyAndLogsError(t *testing.T) {
 		"unexplained missing":  {MissingUsageEvents: 1, UnexplainedMissingUsageEvents: 1},
 		"invalid usage":        {InvalidUsageEvents: 1},
 		"invalid serving mode": {InvalidServingModeEvents: 1},
-		"owner conflict":       {OwnerConflictEvents: 1},
-		"ambiguous base":       {AmbiguousBaseEvents: 1},
-		"ambiguous org":        {AmbiguousOrgEvents: 1},
 	}
 	for name, ar := range cases {
 		t.Run(name, func(t *testing.T) {
@@ -170,5 +175,50 @@ func TestResult_EmptyBaseModelWarnsButIsNotAnAnomaly(t *testing.T) {
 	}
 	if res.HasAnomaly() || errBuf.Len() != 0 || !strings.Contains(info.String(), "no base_model") {
 		t.Fatalf("anomaly=%v error=%q info=%q", res.HasAnomaly(), errBuf.String(), info.String())
+	}
+}
+
+// Conflicts are parked, not anomalies: each logs at ERROR, and the run reports
+// the parked rows (cmd/rater exit 4), not HasAnomaly (exit 2).
+func TestResult_ConflictsAreParkedAndLoggedNotAnomalies(t *testing.T) {
+	cases := map[string]AggregateResult{
+		"owner conflict": {OwnerConflictEvents: 1, ParkedWritten: 1},
+		"ambiguous base": {AmbiguousBaseEvents: 1, ParkedWritten: 1},
+		"ambiguous org":  {AmbiguousOrgEvents: 1, ParkedWritten: 1},
+		"missing org":    {MissingOrgEvents: 1, ParkedWritten: 1},
+	}
+	for name, ar := range cases {
+		l, _, errBuf := captureLogger()
+		parked := []Parked{{WindowStart: h0, AuthID: "a", ResourceID: "r", ModelID: "m", ServingMode: "dedicated", Reason: "x", PromptTokens: 7}}
+		res, err := New(&fakeStore{res: ar, parked: parked}, l).Run(context.Background(), h0, h1, false)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if res.HasAnomaly() || !res.HasParked() || !strings.Contains(errBuf.String(), "PARKED (unbilled) usage hour=2026-10-22T14:00:00Z") || !strings.Contains(errBuf.String(), "prompt=7") {
+			t.Fatalf("%s: anomaly=%v parked=%v error log %q", name, res.HasAnomaly(), res.HasParked(), errBuf.String())
+		}
+	}
+}
+
+// Parked hours outside the window but inside the re-check reach are
+// re-aggregated one hour at a time; hours inside the window are not run twice.
+func TestAggregator_RechecksParkedHoursOutsideTheWindow(t *testing.T) {
+	l, _, _ := captureLogger()
+	old := h0.Add(-72 * time.Hour)
+	f := &fakeStore{parkedHours: []time.Time{old, h0}}
+	a := New(f, l)
+	a.now = func() time.Time { return h1.Add(time.Hour) }
+	res, err := a.Run(context.Background(), h0, h1, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res.RescannedParkedHours != 1 || len(f.windows) != 2 || !f.windows[1][0].Equal(old) || !f.windows[1][1].Equal(old.Add(time.Hour)) {
+		t.Fatalf("rescanned %d, windows %v; want the window then [old, old+1h)", res.RescannedParkedHours, f.windows)
+	}
+}
+
+func TestParkedRescanReach_StaysInsideThePrunerHardFloor(t *testing.T) {
+	if ParkedRescanReach >= 7*24*time.Hour || ParkedRescanReach <= 24*time.Hour {
+		t.Fatalf("ParkedRescanReach %v must be beyond the 24h window and strictly inside the 7-day prune floor", ParkedRescanReach)
 	}
 }

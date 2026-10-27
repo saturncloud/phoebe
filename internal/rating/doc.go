@@ -20,16 +20,19 @@
 //
 // THE CHECKS THAT NEED RAW EVENTS STAY HERE (D1). Only the install sees single
 // events, so only it can tell a clean rollup from one assembled out of
-// contradictory evidence. Each is fail closed: the event (or the identity's
-// whole hour) is withheld from rated_usage, counted, logged at ERROR, and
-// drives cmd/rater's exit 2; the raw events stay in billing_event.
+// contradictory evidence. All fail closed, in two ways:
 //
-//   - owner conflict: an event naming both a user and a group (per event).
-//   - ambiguous org: one identity-hour naming two orgs (the payer).
-//   - ambiguous base: one identity-hour naming two base models or adapters, or
-//     a value on some events and none on others (the facts the manager prices by).
-//   - unattributable, invalid serving mode, invalid usage: events that cannot
-//     form a valid record (per event).
+//   - Evidence that cannot become any record (unattributable, invalid serving
+//     mode, invalid usage) is withheld per event, counted, logged at ERROR, and
+//     drives cmd/rater's exit 2. The raw events stay in billing_event.
+//   - CONFLICTS are PARKED per identity (auth, owner, resource, model, serving
+//     mode) and hour in parked_usage, with their token counts: an owner conflict
+//     (per event), an ambiguous org or ambiguous base model / adapter (across
+//     graph revisions), and a missing org. Only the conflicted identity is held
+//     back; the rest of the hour is aggregated and sent on time. Parked usage is
+//     never dropped: it is logged at ERROR every run (cmd/rater exit 4), parked
+//     hours from the last ParkedRescanReach are re-checked every run, and a
+//     resolved one is aggregated and re-sent by token-push however old.
 //
 // An absent base model is NOT withheld: a dedicated endpoint may serve a model
 // with no catalog base (D3). It is sent as "" with a warning, and the manager

@@ -26,6 +26,12 @@ with the Atlas schema; they live in phoebe's own database.
   `POST /customer/metered-usage`. The money columns (`cost`, `applied_*_rate`,
   `price_key`) are NULL on rows the aggregator writes and are dropped in a later
   release.
+- **`parked_usage`** — conflicted usage (owner conflict, ambiguous org, ambiguous
+  base model or adapter, missing org) parked per (hour, identity, reason) with its
+  token counts. Written by the rater; never pruned. See "Parked usage" in
+  docs/billing-reconciliation.md.
+- **`pushed_usage`, `pushed_hour`** — token-push's record of which usage_ids the
+  manager holds per hour and when the hour was last accepted.
 - **`io_log`** — optional, sampled, short-retention request/response body capture
   (M5 I/O logging). Written by the interceptor's iolog sink; OFF by default.
   `cmd/prune` enforces the short retention: rows older than 7 days on `created_at`
@@ -52,6 +58,7 @@ golang-migrate up/down pairs, applied in version order:
 | 0009 | `0009_rollup_grain_graph_revision.{up,down}.sql` | `rated_usage` grain gains `graph_k8s_name` ('' = unknown) and `topology_revision` (0 = unknown); `region` attribute; every id recomputed |
 | 0010 | `0010_rated_usage_identity.{up,down}.sql` | `rated_usage` attributes `base_model`, `adapter`, `price_key` (usage identity) |
 | 0011 | `0011_rated_usage_quantities_only.{up,down}.sql` | `rated_usage` money columns become nullable with no `$0` default (expand step: the aggregator writes NULL; dropped one release later) |
+| 0012 | `0012_parked_and_pushed_usage.{up,down}.sql` | `parked_usage` (conflicted usage parked per identity-hour by the rater, never pruned), `pushed_usage` and `pushed_hour` (what token-push last had accepted per hour, for `held` and re-sending resolved hours). Down refuses while unresolved parked rows exist |
 
 `embed.go` embeds these into the `migrations` package; `cmd/migrate` applies them.
 

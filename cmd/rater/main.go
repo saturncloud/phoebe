@@ -12,14 +12,31 @@
 //
 //	0  window aggregated, nothing withheld
 //	1  fatal (config, DB, ...): nothing or partial; safe to re-run
-//	2  window aggregated BUT usage was withheld for a reason that needs a person
-//	   (unattributable, owner conflict, ambiguous org, ambiguous base model or
-//	   adapter, invalid serving mode, invalid usage, or a
-//	   successful attempt with no usage block), OR a ROUTINE run reconcile-deleted
-//	   a rollup an earlier run wrote (usage vanished with no operator behind it).
+//	2  window aggregated BUT evidence could not become any record (unattributable,
+//	   invalid serving mode, invalid usage, or a successful attempt with no usage
+//	   block), OR a ROUTINE run reconcile-deleted a rollup an earlier run wrote
+//	   for a reason other than parking (usage vanished with no operator behind it).
+//	4  window aggregated, nothing in exit 2's list, BUT unbilled usage is PARKED
+//	   (owner conflict, ambiguous org, ambiguous base model or adapter, missing
+//	   org; any hour, any age). Returned by EVERY run until the parked usage is
+//	   resolved, so a Job alert keeps firing. List it with -list-parked.
 //
-// Exit 3 (an hour skipped because its prices were unavailable) no longer exists:
-// there are no prices to wait for.
+// Precedence: 1 > 2 > 4 > 0. Exit 3 (an hour skipped because its prices were
+// unavailable) no longer exists: there are no prices to wait for.
+//
+// PARKED USAGE. A conflict holds back only the conflicted identity (auth,
+// owner, resource, model, serving mode) in that hour: its usage is recorded in
+// parked_usage with the reason and token counts, every other identity of the
+// hour is aggregated and sent on time, and token-push lists the conflicted
+// identity's already-sent usage_ids in `held` so the manager keeps them.
+// Parked usage is never dropped: every run re-checks parked hours from the last
+// ParkedRescanReach (about 7 days, inside the pruner's hard floor), logs every
+// unresolved row at ERROR, and when a conflict is gone the hour is aggregated
+// and token-push re-sends it, however old. Older parked hours are listed until
+// an operator re-runs them with --since/--until.
+//
+// `phoebe-rater -list-parked` prints the unresolved parked usage and exits 0
+// (4 when there is any), without aggregating.
 //
 // THE DEFAULT WINDOW IS THE TRAILING N COMPLETE HOURS, [floor(now)-N*1h,
 // floor(now)), N = rateTrailingHours (default 24). Events can be drained late (a
@@ -40,7 +57,10 @@ package main
 import (
 	"context"
 	"flag"
+	"fmt"
+	"io"
 	"os"
+	"text/tabwriter"
 	"time"
 
 	"gopkg.in/yaml.v2"
@@ -78,18 +98,23 @@ const (
 	exitOK      = 0
 	exitFatal   = 1
 	exitAnomaly = 2
+	exitParked  = 4
 )
 
 // exitCode maps a completed run to its exit code. Withheld usage always exits
 // exitAnomaly. A reconcile-delete exits exitAnomaly only on a ROUTINE run
 // (windowExplicit == false); on an explicit --since/--until backfill it is
 // the convergence the operator asked for. Only cmd/rater knows which it was.
-func exitCode(reconciledDeletions int64, windowExplicit, hasAnomaly bool) int {
+// Parked usage exits exitParked when nothing outranks it.
+func exitCode(reconciledDeletions int64, windowExplicit, hasAnomaly, hasParked bool) int {
 	if hasAnomaly {
 		return exitAnomaly
 	}
 	if reconciledDeletions > 0 && !windowExplicit {
 		return exitAnomaly
+	}
+	if hasParked {
+		return exitParked
 	}
 	return exitOK
 }
@@ -111,6 +136,7 @@ func runWith(argv []string, log *logging.Logger) int {
 	settingsFile := fs.String("f", "/etc/saturn/config/rater.yaml", "Settings YAML file path")
 	since := fs.String("since", "", "Window start, RFC3339 (default: floor(now) minus rateTrailingHours)")
 	until := fs.String("until", "", "Window end, RFC3339 (default: start of the current hour)")
+	listParked := fs.Bool("list-parked", false, "Print the unresolved parked (unbilled) usage and exit; no aggregation")
 	if err := fs.Parse(argv); err != nil {
 		return exitFatal
 	}
@@ -145,12 +171,43 @@ func runWith(argv []string, log *logging.Logger) int {
 	}
 	defer func() { _ = store.Close() }()
 
+	if *listParked {
+		parked, err := store.ListParked(ctx)
+		if err != nil {
+			log.Error.Printf("rater: %v", err)
+			return exitFatal
+		}
+		printParked(os.Stdout, parked)
+		if len(parked) > 0 {
+			return exitParked
+		}
+		return exitOK
+	}
+
 	res, err := rating.New(store, log).Run(ctx, windowStart, windowEnd, windowExplicit)
 	if err != nil {
 		log.Error.Printf("rater: run: %v", err)
 		return exitFatal
 	}
-	return exitCode(res.ReconciledDeletions, windowExplicit, res.HasAnomaly())
+	return exitCode(res.ReconciledDeletions, windowExplicit, res.HasAnomaly(), res.HasParked())
+}
+
+// printParked writes one tab-separated line per parked identity-hour, with a
+// header, for an operator.
+func printParked(w io.Writer, parked []rating.Parked) {
+	tw := tabwriter.NewWriter(w, 0, 0, 2, ' ', 0)
+	fmt.Fprintln(tw, "HOUR\tREASON\tAUTH_ID\tOWNER\tRESOURCE_ID\tMODEL_ID\tMODE\tEVENTS\tPROMPT\tCACHED\tCOMPLETION\tFIRST_PARKED")
+	for _, p := range parked {
+		owner := p.OwnerType + "/" + p.OwnerID
+		if p.OwnerType == "" {
+			owner = "-"
+		}
+		fmt.Fprintf(tw, "%s\t%s\t%s\t%s\t%s\t%s\t%s\t%d\t%d\t%d\t%d\t%s\n",
+			p.WindowStart.Format(time.RFC3339), p.Reason, p.AuthID, owner, p.ResourceID, p.ModelID, p.ServingMode,
+			p.EventCount, p.PromptTokens, p.CachedTokens, p.CompletionTokens, p.FirstParkedAt.UTC().Format(time.RFC3339))
+	}
+	_ = tw.Flush()
+	fmt.Fprintf(w, "%d parked identity-hour(s)\n", len(parked))
 }
 
 // resolveWindow computes [start, end). Defaults (both flags empty) cover the

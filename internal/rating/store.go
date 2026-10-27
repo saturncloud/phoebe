@@ -19,6 +19,11 @@ type Store interface {
 	// AggregateWindow rolls billing_event in [start, end) into rated_usage and
 	// reports the rollups and the anomaly counts, all from one statement.
 	AggregateWindow(ctx context.Context, start, end time.Time) (AggregateResult, error)
+	// ParkedHours lists the hours with unresolved parked usage at or after
+	// notBefore, so the aggregator can re-check them outside its window.
+	ParkedHours(ctx context.Context, notBefore time.Time) ([]time.Time, error)
+	// ListParked lists every unresolved parked row, oldest hour first.
+	ListParked(ctx context.Context) ([]Parked, error)
 	Ping(ctx context.Context) error
 	Close() error
 }
@@ -29,16 +34,25 @@ type Store interface {
 //
 //	EventsAggregated + MissingUsage + InvalidUsage + Unattributable
 //	  + InvalidServingMode + OwnerConflict
-//	  + AmbiguousBase + AmbiguousOrg == in-window billing_event rows
+//	  + AmbiguousBase + AmbiguousOrg + MissingOrg == in-window billing_event rows
+//
+// The last four buckets are CONFLICTS: their usage is parked per identity in
+// parked_usage (never dropped, never holding back other identities), and the
+// rest of the hour is aggregated and sent on time.
 //
 // int64 throughout: these are COUNT/SUM over an arbitrary backfill window.
 type AggregateResult struct {
 	RollupsWritten   int64
 	EventsAggregated int64
 	// ReconciledDeletions counts in-window rated_usage rows this run DELETED
-	// because it no longer produces them (they became withheld, or their events
-	// vanished). "What the latest run says is what bills."
+	// because it no longer produces them and NOT because their identity is now
+	// parked: their events vanished, or became unattributable or invalid. "What
+	// the latest run says is what bills." On a routine run this pages.
 	ReconciledDeletions int64
+	// ParkedDeletions counts rated_usage rows deleted because their identity is
+	// now parked (a conflict appeared). Explained by the parked row; token-push
+	// holds their usage_ids if it already sent them.
+	ParkedDeletions int64
 
 	// MissingUsageEvents are attempts for which the engine supplied no usage
 	// block; zero-quantity audit evidence, never aggregated. The TOTAL is
@@ -70,6 +84,17 @@ type AggregateResult struct {
 	// AmbiguousOrgEvents: events of an identity whose events named more than one
 	// non-NULL org. The org is the payer; a guess would bill the wrong customer.
 	AmbiguousOrgEvents int64
+	// MissingOrgEvents: events of an identity none of whose events named an org.
+	// The payer is unknown, so the identity is parked, not sent.
+	MissingOrgEvents int64
+
+	// ParkedWritten counts parked_usage rows this run wrote or refreshed (one
+	// per conflicted identity, hour and reason). ParkedResolved counts
+	// previously parked rows in the window this run found no longer
+	// conflicting; their usage is in rated_usage again and token-push re-sends
+	// the hour, however old.
+	ParkedWritten  int64
+	ParkedResolved int64
 
 	// EmptyBaseModelEvents counts AGGREGATED events with no base_model. Not
 	// withheld and not an anomaly: Atlas stamps X-Saturn-Base-Model as
@@ -300,7 +325,67 @@ grouped AS (
 ),
 kept AS (
     SELECT * FROM grouped
-    WHERE NOT ambiguous_base AND NOT ambiguous_org
+    WHERE NOT ambiguous_base AND NOT ambiguous_org AND org_id IS NOT NULL
+),
+-- CONFLICTS are parked per identity, never dropped: the identity's usage stays
+-- out of rated_usage (so token-push neither sends it nor lets it hold back the
+-- rest of the hour), and parked_usage records it with its counts until a later
+-- run finds the conflict gone. One reason per identity-hour, most specific
+-- first. Owner-conflict events have no owner, so they park under owner ('', '').
+conflicts AS (
+    SELECT window_start, auth_id, owner_type, owner_id, resource_id, model_id, serving_mode,
+        CASE WHEN bool_or(ambiguous_base) THEN 'ambiguous_base'
+             WHEN bool_or(ambiguous_org)  THEN 'ambiguous_org'
+             ELSE 'missing_org' END              AS reason,
+        SUM(event_count)::bigint                 AS event_count,
+        SUM(prompt_tokens)::bigint               AS prompt_tokens,
+        SUM(cached_tokens)::bigint               AS cached_tokens,
+        SUM(completion_tokens)::bigint           AS completion_tokens
+    FROM grouped
+    WHERE ambiguous_base OR ambiguous_org OR org_id IS NULL
+    GROUP BY window_start, auth_id, owner_type, owner_id, resource_id, model_id, serving_mode
+    UNION ALL
+    SELECT date_trunc('hour', ev_ts AT TIME ZONE 'UTC') AT TIME ZONE 'UTC',
+        auth_id, '', '', resource_id, model_id, serving_mode, 'owner_conflict',
+        COUNT(*)::bigint, SUM(prompt_tokens)::bigint, SUM(cached_tokens)::bigint,
+        SUM(completion_tokens)::bigint
+    FROM ev
+    WHERE owner_conflict AND usage_found AND valid_usage AND valid_serving_mode
+      AND auth_id IS NOT NULL AND resource_id IS NOT NULL AND model_id IS NOT NULL
+    GROUP BY 1, auth_id, resource_id, model_id, serving_mode
+),
+parked_upsert AS (
+    INSERT INTO parked_usage (window_start, auth_id, owner_type, owner_id, resource_id, model_id,
+        serving_mode, reason, event_count, prompt_tokens, cached_tokens, completion_tokens)
+    SELECT window_start, auth_id, owner_type, owner_id, resource_id, model_id, serving_mode, reason,
+        event_count, prompt_tokens, cached_tokens, completion_tokens
+    FROM conflicts
+    ON CONFLICT ON CONSTRAINT parked_usage_pk DO UPDATE SET
+        event_count       = EXCLUDED.event_count,
+        prompt_tokens     = EXCLUDED.prompt_tokens,
+        cached_tokens     = EXCLUDED.cached_tokens,
+        completion_tokens = EXCLUDED.completion_tokens,
+        last_seen_at      = now(),
+        -- A conflict that comes back after being resolved is parked again.
+        resolved_at       = NULL
+    RETURNING 1
+),
+-- RESOLUTION: a row parked for an hour in this window that this run no longer
+-- finds conflicting. Kept as history; its usage is now in kept (if clean) and
+-- token-push re-sends the hour because resolved_at is after its last push.
+parked_resolved AS (
+    UPDATE parked_usage p SET resolved_at = now()
+    WHERE p.window_start >= $1
+      AND p.window_start <  $2
+      AND p.resolved_at IS NULL
+      AND NOT EXISTS (
+          SELECT 1 FROM conflicts c
+          WHERE c.window_start = p.window_start AND c.auth_id = p.auth_id
+            AND c.owner_type = p.owner_type AND c.owner_id = p.owner_id
+            AND c.resource_id = p.resource_id AND c.model_id = p.model_id
+            AND c.serving_mode = p.serving_mode AND c.reason = p.reason
+      )
+    RETURNING 1
 ),
 deleted AS (
     DELETE FROM rated_usage ru
@@ -318,7 +403,8 @@ deleted AS (
             AND k.topology_revision = ru.topology_revision
             AND k.window_start      = ru.window_start
       )
-    RETURNING ru.id
+    RETURNING ru.window_start, ru.auth_id, ru.owner_type, ru.owner_id, ru.resource_id,
+              ru.model_id, ru.serving_mode
 ),
 upserted AS (
     INSERT INTO rated_usage (
@@ -355,10 +441,9 @@ upserted AS (
              graph_k8s_name, topology_revision, window_start
     ON CONFLICT (auth_id, owner_type, owner_id, resource_id, model_id, serving_mode,
                  graph_k8s_name, topology_revision, window_start) DO UPDATE SET
-        -- Never erase a known org: a re-run whose events lost their org header
-        -- keeps the org already recorded. A real org CHANGE is ambiguous_org and
-        -- never reaches here.
-        org_id                  = COALESCE(EXCLUDED.org_id, rated_usage.org_id),
+        -- kept rows always carry an org (an identity with none is parked as
+        -- missing_org), and a real org CHANGE is ambiguous_org and is parked.
+        org_id                  = EXCLUDED.org_id,
         -- Plain overwrites: the latest run says what served the hour.
         region                  = EXCLUDED.region,
         window_end              = EXCLUDED.window_end,
@@ -382,7 +467,18 @@ upserted AS (
 SELECT
     (SELECT COUNT(*)::bigint                      FROM upserted) AS rollups_written,
     (SELECT COALESCE(SUM(event_count), 0)::bigint FROM upserted) AS events_aggregated,
-    (SELECT COUNT(*)::bigint                      FROM deleted)  AS reconciled_deletions,
+    (SELECT COUNT(*)::bigint FROM deleted d WHERE NOT EXISTS (
+        SELECT 1 FROM conflicts c
+        WHERE c.window_start = d.window_start AND c.auth_id = d.auth_id
+          AND c.owner_type = d.owner_type AND c.owner_id = d.owner_id
+          AND c.resource_id = d.resource_id AND c.model_id = d.model_id
+          AND c.serving_mode = d.serving_mode))                   AS reconciled_deletions,
+    (SELECT COUNT(*)::bigint FROM deleted d WHERE EXISTS (
+        SELECT 1 FROM conflicts c
+        WHERE c.window_start = d.window_start AND c.auth_id = d.auth_id
+          AND c.owner_type = d.owner_type AND c.owner_id = d.owner_id
+          AND c.resource_id = d.resource_id AND c.model_id = d.model_id
+          AND c.serving_mode = d.serving_mode))                   AS parked_deletions,
     -- The withheld buckets, in precedence order so they PARTITION the window
     -- (see AggregateResult): each event is counted in the first bucket it fits.
     (SELECT COUNT(*)::bigint FROM ev WHERE NOT usage_found)       AS missing_usage_events,
@@ -415,6 +511,11 @@ SELECT
                                                                   AS ambiguous_base_events,
     (SELECT COALESCE(SUM(event_count), 0)::bigint FROM grouped
       WHERE ambiguous_org AND NOT ambiguous_base)                 AS ambiguous_org_events,
+    (SELECT COALESCE(SUM(event_count), 0)::bigint FROM grouped
+      WHERE org_id IS NULL AND NOT ambiguous_base AND NOT ambiguous_org)
+                                                                  AS missing_org_events,
+    (SELECT COUNT(*)::bigint FROM parked_upsert)                  AS parked_written,
+    (SELECT COUNT(*)::bigint FROM parked_resolved)                AS parked_resolved,
     (SELECT COALESCE(SUM(event_count), 0)::bigint FROM upserted
       WHERE base_model IS NULL)                                   AS empty_base_model_events,
     (SELECT COUNT(*)::bigint FROM upserted
@@ -435,11 +536,12 @@ func (s *PostgresStore) AggregateWindow(ctx context.Context, start, end time.Tim
 
 	var res AggregateResult
 	err = tx.QueryRowContext(ctx, aggregateWindowSQL, start.UTC(), end.UTC()).
-		Scan(&res.RollupsWritten, &res.EventsAggregated, &res.ReconciledDeletions,
+		Scan(&res.RollupsWritten, &res.EventsAggregated, &res.ReconciledDeletions, &res.ParkedDeletions,
 			&res.MissingUsageEvents, &res.ExpectedMissingUsageEvents, &res.UnexplainedMissingUsageEvents,
 			&res.InvalidUsageEvents, &res.UnattributableEvents, &res.InvalidServingModeEvents,
 			&res.OwnerConflictEvents,
-			&res.AmbiguousBaseEvents, &res.AmbiguousOrgEvents,
+			&res.AmbiguousBaseEvents, &res.AmbiguousOrgEvents, &res.MissingOrgEvents,
+			&res.ParkedWritten, &res.ParkedResolved,
 			&res.EmptyBaseModelEvents, &res.UnknownRevisionRollups)
 	if err != nil {
 		return AggregateResult{}, fmt.Errorf("rating: aggregate window [%s,%s): %w",
@@ -450,4 +552,71 @@ func (s *PostgresStore) AggregateWindow(ctx context.Context, start, end time.Tim
 	}
 	committed = true
 	return res, nil
+}
+
+// Parked is one unresolved parked_usage row: usage of one identity in one hour
+// that is not billed because of a conflict, with the counts it holds back.
+type Parked struct {
+	WindowStart      time.Time
+	AuthID           string
+	OwnerType        string
+	OwnerID          string
+	ResourceID       string
+	ModelID          string
+	ServingMode      string
+	Reason           string
+	EventCount       int64
+	PromptTokens     int64
+	CachedTokens     int64
+	CompletionTokens int64
+	FirstParkedAt    time.Time
+	LastSeenAt       time.Time
+}
+
+// ParkedHours implements Store.
+func (s *PostgresStore) ParkedHours(ctx context.Context, notBefore time.Time) ([]time.Time, error) {
+	rows, err := s.db.QueryContext(ctx, `SELECT DISTINCT window_start FROM parked_usage
+		WHERE resolved_at IS NULL AND window_start >= $1 ORDER BY window_start`, notBefore.UTC())
+	if err != nil {
+		return nil, fmt.Errorf("rating: list parked hours: %w", err)
+	}
+	defer func() { _ = rows.Close() }()
+	var out []time.Time
+	for rows.Next() {
+		var h time.Time
+		if err := rows.Scan(&h); err != nil {
+			return nil, fmt.Errorf("rating: scan parked hour: %w", err)
+		}
+		out = append(out, h.UTC())
+	}
+	return out, rows.Err()
+}
+
+// ListParkedSQL is the operator query behind `phoebe-rater -list-parked`
+// (docs/billing-reconciliation.md, "Parked usage").
+const ListParkedSQL = `SELECT window_start, auth_id, owner_type, owner_id, resource_id, model_id, serving_mode,
+       reason, event_count, prompt_tokens, cached_tokens, completion_tokens, first_parked_at, last_seen_at
+  FROM parked_usage
+ WHERE resolved_at IS NULL
+ ORDER BY window_start, auth_id, owner_type, owner_id, resource_id, model_id, serving_mode, reason`
+
+// ListParked implements Store.
+func (s *PostgresStore) ListParked(ctx context.Context) ([]Parked, error) {
+	rows, err := s.db.QueryContext(ctx, ListParkedSQL)
+	if err != nil {
+		return nil, fmt.Errorf("rating: list parked usage: %w", err)
+	}
+	defer func() { _ = rows.Close() }()
+	var out []Parked
+	for rows.Next() {
+		var p Parked
+		if err := rows.Scan(&p.WindowStart, &p.AuthID, &p.OwnerType, &p.OwnerID, &p.ResourceID, &p.ModelID,
+			&p.ServingMode, &p.Reason, &p.EventCount, &p.PromptTokens, &p.CachedTokens, &p.CompletionTokens,
+			&p.FirstParkedAt, &p.LastSeenAt); err != nil {
+			return nil, fmt.Errorf("rating: scan parked usage: %w", err)
+		}
+		p.WindowStart = p.WindowStart.UTC()
+		out = append(out, p)
+	}
+	return out, rows.Err()
 }

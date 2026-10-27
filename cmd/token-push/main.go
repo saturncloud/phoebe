@@ -19,8 +19,15 @@
 //     pushTrailingHours complete hours (default 24, matching the rater's
 //     rateTrailingHours), so late-drained events the rater folds into an old
 //     hour reach the manager on the next run.
-//   - FAIL CLOSED. An hour with a rollup that cannot become a valid record (no
-//     org, or a wire-rule violation) is withheld whole, never sent short.
+//   - CONFLICTS HOLD BACK ONE IDENTITY, NEVER THE HOUR. A rollup that cannot
+//     become a valid record (no org, or a wire-rule violation), and any identity
+//     the rater has parked (cmd/rater), is left out of the request; every other
+//     record of the hour is sent on time. The usage_ids the manager already
+//     holds for that identity (recorded in pushed_usage) are listed in `held`,
+//     so delete-by-absence cannot remove usage the manager accepted.
+//   - RESOLVED HOURS ARE RE-SENT. Besides the trailing window, each run sends
+//     every hour with parked usage resolved since that hour's last accepted push
+//     (pushed_hour), however old.
 //   - RETRIES. 5xx, 429 and network errors are retried with capped exponential
 //     backoff; a 429's Retry-After is honoured up to the backoff cap. Every
 //     other status (400/401/409/422, other 4xx) is final.
@@ -35,8 +42,9 @@
 //	   read, a 5xx/429/network failure that outlasted the retries, a 200 that
 //	   disagreed with the request, an entirely empty rated_usage table, or a
 //	   window range wider than the backfill cap
-//	2  some hour was WITHHELD (not sent) because a rollup could not become a
-//	   valid record; every hour that was sent succeeded
+//	2  token-push HELD BACK a rollup it could not turn into a valid record (no
+//	   org, or a wire rule); the rest of its hour was sent. Parked usage is
+//	   the rater's signal (its exit 4), not this one
 //	3  the manager REJECTED some hour with a final status (400 wire rule, 401
 //	   token, 409 install on the legacy billing path, 422 billing period
 //	   already settled, any other non-429 4xx). Not retried; needs a person
@@ -65,7 +73,7 @@ const tokenEnv = "SATURN_TOKEN"
 const (
 	exitOK       = 0
 	exitFatal    = 1
-	exitWithheld = 2 // an hour was not sent: a rollup could not become a valid record
+	exitWithheld = 2 // token-push held back a rollup it could not turn into a valid record
 	exitRejected = 3 // the manager answered 4xx for an hour; not retried
 )
 
@@ -149,8 +157,8 @@ func runWith(argv []string) int {
 	defer func() { _ = db.Close() }()
 
 	p := &pusher{
-		db:  db,
-		log: log,
+		store: pgStore{db: db},
+		log:   log,
 		client: &meteredusage.Client{
 			BaseURL: opts.managerURL,
 			Token:   token,
@@ -159,7 +167,7 @@ func runWith(argv []string) int {
 		},
 	}
 
-	return p.pushWindows(ctx, windows)
+	return p.pushWindows(ctx, windows, time.Now())
 }
 
 // signalContext returns a context cancelled on SIGTERM/SIGINT so a CronJob pod

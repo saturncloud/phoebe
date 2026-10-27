@@ -164,6 +164,8 @@ func newHarness(t *testing.T, schema string) *harness {
 	mustExec(t, db, readMigration(t, "0010_rated_usage_identity.up.sql"))
 	// 0011: the money columns are nullable; the aggregator writes NULL.
 	mustExec(t, db, readMigration(t, "0011_rated_usage_quantities_only.up.sql"))
+	// 0012: parked_usage, pushed_usage, pushed_hour.
+	mustExec(t, db, readMigration(t, "0012_parked_and_pushed_usage.up.sql"))
 
 	mr, err := miniredis.Run()
 	if err != nil {
@@ -608,6 +610,9 @@ func TestE2E_FineTuneCarriesItsBaseModelToTheRollup(t *testing.T) {
 	// as an owner conflict and withholds from money, so the fixture carries the
 	// realistic user-owned identity.
 	req.Header.Set(identity.HeaderUserID, "user-e2e")
+	// Atlas stamps the owning org on every endpoint; without it the usage parks
+	// as missing_org (the payer is unknown).
+	req.Header.Set(identity.HeaderOrgID, testOrgID)
 	// The base_model header Atlas injects at deploy for a fine-tune endpoint.
 	req.Header.Set(identity.HeaderBaseModel, ftBaseModel)
 	srv.Handler().ServeHTTP(rr, req)
@@ -647,7 +652,7 @@ func TestE2E_FineTuneCarriesItsBaseModelToTheRollup(t *testing.T) {
 
 // TestE2E_MissingBaseModelHeaderIsSentAsEmpty: a dedicated endpoint may serve a
 // model with no catalog base (D3), and Atlas stamps X-Saturn-Base-Model as
-// `base_model | default('')`. A request without the header must become a record
+// `base_model | default(”)`. A request without the header must become a record
 // with base_model "" (the manager prices dedicated + empty base at the plan's
 // default rate), never be withheld: withholding would hold back the hour.
 func TestE2E_MissingBaseModelHeaderIsSentAsEmpty(t *testing.T) {
@@ -685,6 +690,9 @@ func TestE2E_MissingBaseModelHeaderIsSentAsEmpty(t *testing.T) {
 	// as an owner conflict and withholds from money, so the fixture carries the
 	// realistic user-owned identity.
 	req.Header.Set(identity.HeaderUserID, "user-e2e")
+	// Atlas stamps the owning org on every endpoint; without it the usage parks
+	// as missing_org (the payer is unknown).
+	req.Header.Set(identity.HeaderOrgID, testOrgID)
 	// DELIBERATELY no X-Saturn-Base-Model header: an endpoint with no catalog base.
 	srv.Handler().ServeHTTP(rr, req)
 
@@ -942,6 +950,9 @@ func TestE2E_AdapterHeaderRidesToTheRollup(t *testing.T) {
 	// as an owner conflict and withholds from money, so the fixture carries the
 	// realistic user-owned identity.
 	req.Header.Set(identity.HeaderUserID, "user-e2e")
+	// Atlas stamps the owning org on every endpoint; without it the usage parks
+	// as missing_org (the payer is unknown).
+	req.Header.Set(identity.HeaderOrgID, testOrgID)
 	// The two per-deployment headers the Atlas middleware injects on a fine-tune
 	// checkpoint endpoint (C4).
 	req.Header.Set(identity.HeaderBaseModel, epBaseModel)

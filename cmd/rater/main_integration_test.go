@@ -115,3 +115,80 @@ func TestRater_RunsWithNoSaturnTokenAndNoManagerURL(t *testing.T) {
 		})
 	}
 }
+
+// Parked usage is never dropped after the 24-hour window. A conflict parked
+// three days ago (inside the automatic re-check reach) and one parked ten days
+// ago (beyond it) are both still listed on a routine run today, the run exits
+// exitParked (4), and `-list-parked` prints both with their token counts.
+func TestRater_ParkedUsageSurvivesPast24HoursAndIsListed(t *testing.T) {
+	base := os.Getenv("PHOEBE_TEST_DATABASE_URL")
+	if base == "" {
+		t.Skip("PHOEBE_TEST_DATABASE_URL not set")
+	}
+	const sch = "phoebe_rater_parked_it"
+	applyMigrations(t, base, sch)
+	sep := "?"
+	if strings.Contains(base, "?") {
+		sep = "&"
+	}
+	dsn := base + sep + "search_path=" + sch
+	t.Setenv("DATABASE_URL", dsn)
+	db, err := sql.Open("pgx", dsn)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+
+	now := time.Now().UTC().Truncate(time.Hour)
+	for i, h := range []time.Time{now.Add(-72 * time.Hour), now.Add(-240 * time.Hour)} {
+		for j, org := range []string{"org-1", "org-2"} {
+			if _, err := db.Exec(`INSERT INTO billing_event (request_id, auth_id, resource_id, org_id, model, base_model,
+				user_id, serving_mode, prompt_tokens, completion_tokens, usage_found, status_code, event_ts)
+				VALUES ($1,'a','res','`+org+`','m','B','u','dedicated',100,20,true,200,$2)`,
+				"p"+string(rune('0'+i))+string(rune('0'+j)), h.Add(time.Minute)); err != nil {
+				t.Fatal(err)
+			}
+		}
+		// The run that covered that hour at the time parked it.
+		path := filepath.Join(t.TempDir(), "rater.yaml")
+		_ = os.WriteFile(path, []byte("rateTrailingHours: 1\n"), 0o600)
+		if code := runWith([]string{"-f", path, "-since", h.Format(time.RFC3339), "-until", h.Add(time.Hour).Format(time.RFC3339)},
+			logging.New(logging.ERROR)); code != exitParked {
+			t.Fatalf("parking run for %s: exit %d, want exitParked", h, code)
+		}
+	}
+
+	path := filepath.Join(t.TempDir(), "rater.yaml")
+	_ = os.WriteFile(path, []byte("rateTrailingHours: 24\n"), 0o600)
+	var errLog bytes.Buffer
+	l := logging.New(logging.INFO)
+	l.Error = log.New(&errLog, "", 0)
+	if code := runWith([]string{"-f", path}, l); code != exitParked {
+		t.Fatalf("routine run today: exit %d, want exitParked (%d)", code, exitParked)
+	}
+	if n := strings.Count(errLog.String(), "PARKED (unbilled) usage"); n != 2 {
+		t.Fatalf("%d PARKED lines, want 2 (one per parked identity-hour):\n%s", n, errLog.String())
+	}
+	if !strings.Contains(errLog.String(), "reason=ambiguous_org events=2 prompt=200") {
+		t.Fatalf("parked line lacks the reason and token counts:\n%s", errLog.String())
+	}
+
+	var unresolved int
+	if err := db.QueryRow(`SELECT COUNT(*) FROM parked_usage WHERE resolved_at IS NULL`).Scan(&unresolved); err != nil || unresolved != 2 {
+		t.Fatalf("%d unresolved parked rows (err %v), want 2", unresolved, err)
+	}
+
+	// The operator listing.
+	r, w, _ := os.Pipe()
+	stdout := os.Stdout
+	os.Stdout = w
+	code := runWith([]string{"-f", path, "-list-parked"}, logging.New(logging.ERROR))
+	_ = w.Close()
+	os.Stdout = stdout
+	var out bytes.Buffer
+	_, _ = out.ReadFrom(r)
+	if code != exitParked || !strings.Contains(out.String(), "2 parked identity-hour(s)") ||
+		!strings.Contains(out.String(), now.Add(-240*time.Hour).Format(time.RFC3339)) {
+		t.Fatalf("-list-parked exit %d output:\n%s", code, out.String())
+	}
+}

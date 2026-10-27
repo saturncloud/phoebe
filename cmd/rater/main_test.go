@@ -127,15 +127,15 @@ func TestRater_RoutineRunReconcileDeleteExitsNonzero(t *testing.T) {
 		windowExplicit = false // routine default trailing-hours window
 		hasAnomaly     = false // ONLY a reconcile-delete; no unpriced/unattributable/ambiguous
 	)
-	if got := exitCode(1, windowExplicit, hasAnomaly); got != exitAnomaly {
+	if got := exitCode(1, windowExplicit, hasAnomaly, false); got != exitAnomaly {
 		t.Fatalf("routine run with a reconcile-delete: exit = %d, want exitAnomaly (%d) — a prior bill vanished on a routine cadence; page someone", got, exitAnomaly)
 	}
 	// And with MORE than one delete (count is just a signal, not a threshold).
-	if got := exitCode(7, windowExplicit, hasAnomaly); got != exitAnomaly {
+	if got := exitCode(7, windowExplicit, hasAnomaly, false); got != exitAnomaly {
 		t.Fatalf("routine run with 7 reconcile-deletes: exit = %d, want exitAnomaly (%d)", got, exitAnomaly)
 	}
 	// Sanity: a routine run with NO reconcile-delete and no anomaly is the clean path.
-	if got := exitCode(0, windowExplicit, hasAnomaly); got != exitOK {
+	if got := exitCode(0, windowExplicit, hasAnomaly, false); got != exitOK {
 		t.Fatalf("clean routine run: exit = %d, want exitOK (%d)", got, exitOK)
 	}
 }
@@ -149,16 +149,16 @@ func TestRater_RoutineRunReconcileDeleteExitsNonzero(t *testing.T) {
 func TestRater_BackfillReconcileDeleteExitsZero(t *testing.T) {
 	const windowExplicit = true // operator named the window
 	// Reconcile-delete on an explicit backfill, nothing else leaked → exit 0.
-	if got := exitCode(3, windowExplicit, false); got != exitOK {
+	if got := exitCode(3, windowExplicit, false, false); got != exitOK {
 		t.Fatalf("explicit backfill with a reconcile-delete: exit = %d, want exitOK (%d) — convergence the operator asked for", got, exitOK)
 	}
 	// But a real anomaly during a backfill STILL exits nonzero (the flag never
 	// suppresses unpriced/unattributable/ambiguous).
-	if got := exitCode(3, windowExplicit, true); got != exitAnomaly {
+	if got := exitCode(3, windowExplicit, true, false); got != exitAnomaly {
 		t.Fatalf("explicit backfill that ALSO leaked an anomaly: exit = %d, want exitAnomaly (%d) — --since must not mask a real anomaly", got, exitAnomaly)
 	}
 	// A clean explicit backfill (no deletes, no anomaly) is exit 0.
-	if got := exitCode(0, windowExplicit, false); got != exitOK {
+	if got := exitCode(0, windowExplicit, false, false); got != exitOK {
 		t.Fatalf("clean explicit backfill: exit = %d, want exitOK (%d)", got, exitOK)
 	}
 }
@@ -218,8 +218,22 @@ func TestRaterSettings_ChartSettingsStillLoadWithoutAManager(t *testing.T) {
 // routine run and on an explicit backfill alike.
 func TestExitCode_WithheldUsageAlwaysPages(t *testing.T) {
 	for _, explicit := range []bool{false, true} {
-		if got := exitCode(0, explicit, true); got != exitAnomaly {
+		if got := exitCode(0, explicit, true, false); got != exitAnomaly {
 			t.Fatalf("explicit=%v: exit = %d, want exitAnomaly (%d)", explicit, got, exitAnomaly)
 		}
+	}
+}
+
+// Parked usage persists across runs; it must keep a Job alert firing with its
+// own code, below the evidence anomalies and above a clean run.
+func TestExitCode_ParkedUsageHasItsOwnNonZeroCode(t *testing.T) {
+	if got := exitCode(0, false, false, true); got != exitParked {
+		t.Fatalf("parked only: exit %d, want exitParked (%d)", got, exitParked)
+	}
+	if got := exitCode(0, false, true, true); got != exitAnomaly {
+		t.Fatalf("parked + anomaly: exit %d, want exitAnomaly", got)
+	}
+	if exitParked == exitOK || exitParked == exitFatal || exitParked == exitAnomaly || exitParked == 3 {
+		t.Fatal("exitParked must be distinct, and not reuse the retired exit 3")
 	}
 }

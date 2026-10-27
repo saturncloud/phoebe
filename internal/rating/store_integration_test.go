@@ -72,6 +72,8 @@ func ratingSchemaDDL(t *testing.T) string {
 		"../../migrations/0010_rated_usage_identity.up.sql",
 		// 0011 makes the money columns nullable: the aggregator writes NULL.
 		"../../migrations/0011_rated_usage_quantities_only.up.sql",
+		// 0012: parked_usage (the rater parks conflicts), pushed_usage, pushed_hour.
+		"../../migrations/0012_parked_and_pushed_usage.up.sql",
 	} {
 		ddl, err := os.ReadFile(f)
 		if err != nil {
@@ -917,7 +919,7 @@ func aggregate(t *testing.T, db *sql.DB, start, end time.Time) AggregateResult {
 // withheld sums every bucket an event can be kept out in.
 func withheld(r AggregateResult) int64 {
 	return r.MissingUsageEvents + r.InvalidUsageEvents + r.UnattributableEvents + r.InvalidServingModeEvents +
-		r.OwnerConflictEvents + r.AmbiguousBaseEvents + r.AmbiguousOrgEvents
+		r.OwnerConflictEvents + r.AmbiguousBaseEvents + r.AmbiguousOrgEvents + r.MissingOrgEvents
 }
 
 // assertPartition: every in-window billing_event row lands in exactly one
@@ -1055,6 +1057,7 @@ func TestIntegration_EveryAttemptRowIsAccountedForExactlyOnce(t *testing.T) {
 		row(func(r *beRow) { r.group = "group-1" }), // owner conflict
 		row(func(r *beRow) { r.resource = "res-amb-base" }), row(func(r *beRow) { r.resource = "res-amb-base"; r.base = "other/base" }),
 		row(func(r *beRow) { r.resource = "res-amb-org" }), row(func(r *beRow) { r.resource = "res-amb-org"; r.org = "org-2" }),
+		row(func(r *beRow) { r.resource = "res-no-org"; r.org = "" }), // missing org
 	}
 	seed(t, db, rows...)
 	res := aggregate(t, db, itHour, itHour.Add(time.Hour))
@@ -1062,7 +1065,8 @@ func TestIntegration_EveryAttemptRowIsAccountedForExactlyOnce(t *testing.T) {
 	want := AggregateResult{
 		RollupsWritten: 1, EventsAggregated: 2, MissingUsageEvents: 2, ExpectedMissingUsageEvents: 1,
 		UnexplainedMissingUsageEvents: 1, InvalidUsageEvents: 1, UnattributableEvents: 1, InvalidServingModeEvents: 1,
-		OwnerConflictEvents: 1, AmbiguousBaseEvents: 2, AmbiguousOrgEvents: 2,
+		OwnerConflictEvents: 1, AmbiguousBaseEvents: 2, AmbiguousOrgEvents: 2, MissingOrgEvents: 1,
+		ParkedWritten: 4, // one per conflicted identity-hour: owner conflict, ambiguous base, ambiguous org, missing org
 	}
 	if res != want {
 		t.Fatalf("got  %+v\nwant %+v", res, want)
@@ -1230,8 +1234,8 @@ func TestIntegration_ReRunFoldsLateEventsAndDeletesARollupThatBecameWithheld(t *
 		row(func(r *beRow) { r.resource = "res-2"; r.org = "org-2" }), // res-2 becomes ambiguous
 	)
 	res := aggregate(t, db, itHour, itHour.Add(time.Hour))
-	if res.ReconciledDeletions != 1 || res.AmbiguousOrgEvents != 2 {
-		t.Fatalf("%+v, want res-2 deleted as ambiguous", res)
+	if res.ParkedDeletions != 1 || res.ReconciledDeletions != 0 || res.AmbiguousOrgEvents != 2 || res.ParkedWritten != 1 {
+		t.Fatalf("%+v, want res-2 deleted because it is now parked as ambiguous, not as an unexplained deletion", res)
 	}
 	got := readRollups(t, db)
 	if len(got) != 2 {
@@ -1248,24 +1252,26 @@ func TestIntegration_ReRunFoldsLateEventsAndDeletesARollupThatBecameWithheld(t *
 	}
 }
 
-// An org already recorded is never erased by a re-run whose events lost the
-// header; a NULL org converges to the real one when it arrives.
-func TestIntegration_ReRunConvergesOrgAndNeverErasesIt(t *testing.T) {
+// No event names an org: the payer is unknown, so the identity is PARKED as
+// missing_org (not written to rated_usage, so never sent with a blank payer).
+// When an event with the org arrives, the next run resolves the parked row and
+// aggregates the identity, carrying the org.
+func TestIntegration_MissingOrgIsParkedThenAggregatedWhenTheOrgArrives(t *testing.T) {
 	db := openRatingSchema(t, "phoebe_agg_orgconv_it")
-	seed(t, db, row(func(r *beRow) { r.org = "" }))
-	aggregate(t, db, itHour, itHour.Add(time.Hour))
-	if got := readRollups(t, db); got[0].org.Valid {
-		t.Fatalf("org %v, want NULL before the header arrives", got[0].org)
+	seed(t, db, row(func(r *beRow) { r.org = "" }), row(func(r *beRow) { r.resource = "res-2" }))
+	res := aggregate(t, db, itHour, itHour.Add(time.Hour))
+	if res.MissingOrgEvents != 1 || res.ParkedWritten != 1 || res.RollupsWritten != 1 {
+		t.Fatalf("%+v, want the org-less identity parked and its neighbour written", res)
 	}
 	seed(t, db, row(nil))
-	aggregate(t, db, itHour, itHour.Add(time.Hour))
-	if got := readRollups(t, db); got[0].org.String != "org-1" {
-		t.Fatalf("org %v, want org-1 once an event carries it", got[0].org)
+	res = aggregate(t, db, itHour, itHour.Add(time.Hour))
+	if res.ParkedResolved != 1 || res.RollupsWritten != 2 {
+		t.Fatalf("%+v, want the parked row resolved and both identities written", res)
 	}
-	exec(t, db, `UPDATE billing_event SET org_id = NULL`)
-	aggregate(t, db, itHour, itHour.Add(time.Hour))
-	if got := readRollups(t, db); got[0].org.String != "org-1" {
-		t.Fatalf("org %v, want org-1 kept (a re-run must not erase a known payer)", got[0].org)
+	for _, r := range readRollups(t, db) {
+		if r.org.String != "org-1" {
+			t.Fatalf("rollup %+v, want org-1", r)
+		}
 	}
 }
 
@@ -1333,7 +1339,7 @@ func TestIntegration_Migration0011DownRefusesToInventMoney(t *testing.T) {
 }
 
 // D3: a dedicated endpoint may serve a model with no catalog base, and Atlas
-// stamps the header as `base_model | default('')`. Such usage is aggregated
+// stamps the header as `base_model | default(”)`. Such usage is aggregated
 // (base_model NULL, sent as "") with a warning count, never withheld, and it
 // does not hold back anything else in the hour.
 func TestIntegration_EmptyBaseModelDedicatedEventIsAggregatedNotWithheld(t *testing.T) {
@@ -1353,4 +1359,21 @@ func TestIntegration_EmptyBaseModelDedicatedEventIsAggregatedNotWithheld(t *test
 			t.Fatalf("custom rollup %+v, want base_model NULL over 2 requests", r)
 		}
 	}
+}
+
+// 0012 down refuses while unresolved parked usage exists: parked_usage is the
+// only record of that unbilled usage.
+func TestIntegration_Migration0012DownRefusesWhileUsageIsParked(t *testing.T) {
+	db := openRatingSchema(t, "phoebe_agg_m0012_it")
+	seed(t, db, row(nil), row(func(r *beRow) { r.org = "org-2" }))
+	if res := aggregate(t, db, itHour, itHour.Add(time.Hour)); res.ParkedWritten != 1 {
+		t.Fatalf("%+v, want one parked row", res)
+	}
+	down := readMigration(t, "0012_parked_and_pushed_usage.down.sql")
+	if _, err := db.Exec(down); err == nil || !strings.Contains(err.Error(), "unresolved") {
+		t.Fatalf("down with parked usage: err = %v, want the refusal", err)
+	}
+	exec(t, db, `UPDATE parked_usage SET resolved_at = now()`)
+	exec(t, db, down)
+	exec(t, db, readMigration(t, "0012_parked_and_pushed_usage.up.sql"))
 }

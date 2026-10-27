@@ -101,6 +101,16 @@ func Validate(req Request) error {
 	return nil
 }
 
+// ValidateTokenRecord applies the per-record rules of Validate to one token
+// record of the hour windowStart (already spelled by FormatWindowStart). A
+// producer uses it to hold back one bad record instead of the whole hour.
+func ValidateTokenRecord(windowStart string, rec Record) error {
+	if rec.Kind != KindToken {
+		return invalid("kind", "phoebe only produces %q records, got %q", KindToken, rec.Kind)
+	}
+	return validateTokenRecord("record", windowStart, rec)
+}
+
 func validateTokenRecord(path, windowStart string, rec Record) error {
 	if !hex64.MatchString(rec.UsageID) {
 		return invalid(path+".usage_id", "not 64 lowercase hex")

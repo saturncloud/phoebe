@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"sort"
 	"time"
 
 	_ "github.com/jackc/pgx/v5/stdlib"
@@ -22,13 +23,13 @@ type poster interface {
 
 // pusher holds the dependencies for building and sending hourly requests.
 type pusher struct {
-	db     *sql.DB
+	store  pushStore
 	log    *logging.Logger
 	client poster
 }
 
 // openDB opens phoebe's Postgres the same way the rater does (pgx stdlib,
-// UTC-pinned DSN, small batch-job pool). token-push only reads rated_usage.
+// UTC-pinned DSN, small batch-job pool).
 func openDB(ctx context.Context, cfg rating.Config) (*sql.DB, error) {
 	if cfg.DatabaseURL == "" {
 		return nil, fmt.Errorf("token-push: DATABASE_URL is empty (Postgres holds rated_usage; the pusher cannot run without it)")
@@ -47,171 +48,163 @@ func openDB(ctx context.Context, cfg rating.Config) (*sql.DB, error) {
 	return db, nil
 }
 
-// hourQuery reads every rollup of one hour: the record's grain, its payer and
-// pricing facts, and its quantities. No money: the manager prices.
-//
-// org_id, region, base_model and adapter are nullable. A NULL org means the
-// payer is unknown and the hour is withheld (see buildRequest); NULL region and
-// adapter are sent as "" (unknown / none), which the wire allows.
-const hourQuery = `
-SELECT
-    ru.id,
-    ru.org_id,
-    ru.owner_type,
-    ru.owner_id,
-    ru.resource_id,
-    ru.auth_id,
-    ru.model_id,
-    ru.serving_mode,
-    ru.base_model,
-    ru.adapter,
-    ru.graph_k8s_name,
-    ru.topology_revision,
-    ru.region,
-    ru.prompt_tokens,
-    ru.cached_tokens,
-    ru.completion_tokens,
-    ru.event_count
-FROM rated_usage ru
-WHERE ru.window_start = $1
-ORDER BY ru.id`
+// hourPlan is one hour's request and the bookkeeping that goes with it.
+type hourPlan struct {
+	req meteredusage.Request
+	// sent is what the manager will hold for the hour once it accepts req: the
+	// records plus the held ids.
+	sent []pushedRow
+	// heldBack counts rollups token-push itself could not turn into a record
+	// (no org, or a wire rule). Parked identities are the rater's to report.
+	heldBack int
+}
 
-// buildRequest reads one hour's rollups and turns them into the complete token
-// request for that hour. It returns the request and the number of rollups it
-// could NOT turn into a record (no org, or a record that would break a wire
-// rule). If that number is nonzero the caller must not send the request: it
-// is a snapshot, and the manager would delete the missing records by absence.
-func (p *pusher) buildRequest(ctx context.Context, windowStart time.Time) (meteredusage.Request, int, error) {
-	ws := meteredusage.FormatWindowStart(windowStart)
-	req := meteredusage.Request{
+// buildHour turns one hour's rollups into the hour's request.
+//
+// A rollup that cannot become a valid record holds back ONLY its own identity
+// (coordination 2026-10-27): every other record of the hour is sent. The same
+// goes for identities the rater has parked. For each held-back or parked
+// identity, the usage_ids the manager already holds for it (pushed_usage) go
+// into `held`, so delete-by-absence cannot remove usage the manager accepted.
+func (p *pusher) buildHour(ctx context.Context, hour time.Time) (hourPlan, error) {
+	ws := meteredusage.FormatWindowStart(hour)
+	plan := hourPlan{req: meteredusage.Request{
 		WindowStart: ws,
 		Kinds:       []string{meteredusage.KindToken},
 		// Non-nil: an hour with no usage is [] (delete-by-absence), never null.
 		Records: make([]meteredusage.Record, 0),
 		Held:    make([]string, 0),
-	}
+	}}
 
-	rows, err := p.db.QueryContext(ctx, hourQuery, windowStart)
+	rollups, err := p.store.Rollups(ctx, hour)
 	if err != nil {
-		return req, 0, fmt.Errorf("query rated_usage for %s: %w", ws, err)
+		return plan, err
 	}
-	defer func() { _ = rows.Close() }()
-
-	unsendable := 0
-	for rows.Next() {
-		var (
-			id                       string
-			org, base, adapter, regn sql.NullString
-			rev                      int64
-			rec                      = meteredusage.Record{Kind: meteredusage.KindToken}
-			a                        = &rec.Attributes
-			q                        = &rec.Quantities
-		)
-		if err := rows.Scan(&id, &org, &rec.OwnerType, &rec.OwnerID, &rec.ResourceID,
-			&a.AuthID, &a.ModelID, &a.ServingMode, &base, &adapter, &a.GraphK8sName, &rev, &regn,
-			&q.PromptTokens, &q.CachedTokens, &q.CompletionTokens, &q.RequestCount); err != nil {
-			return req, 0, fmt.Errorf("scan rated_usage row: %w", err)
+	holdIdentity := map[identity]bool{}
+	live := map[string]bool{}
+	for _, r := range rollups {
+		rec := meteredusage.Record{
+			Kind: meteredusage.KindToken, OrgID: r.OrgID.String, OwnerType: r.OwnerType, OwnerID: r.OwnerID,
+			ResourceID: r.ResourceID,
+			Attributes: meteredusage.TokenAttributes{
+				AuthID: r.AuthID, ModelID: r.ModelID, ServingMode: r.ServingMode,
+				BaseModel: r.BaseModel.String, Adapter: r.Adapter.String, GraphK8sName: r.GraphK8sName,
+				TopologyRevision: meteredusage.TopologyRevisionAttr(r.TopologyRevision), Region: r.Region.String,
+			},
+			Quantities: meteredusage.TokenQuantities{PromptTokens: r.Prompt, CachedTokens: r.Cached,
+				CompletionTokens: r.Completion, RequestCount: r.Requests},
 		}
-		if !org.Valid || org.String == "" {
-			// The org pays. Never sent with a guessed or empty payer.
-			p.log.Error.Printf("token-push: rated_usage %s (resource_id=%s, model_id=%s) has no org_id; Atlas did not inject X-Saturn-Org-Id for this deployment or its propagation broke. The hour is withheld",
-				id, rec.ResourceID, a.ModelID)
-			unsendable++
+		rec.UsageID = meteredusage.TokenUsageID(ws, rec.OrgID, rec.OwnerType, rec.OwnerID, rec.ResourceID, rec.Attributes)
+		if err := meteredusage.ValidateTokenRecord(ws, rec); err != nil {
+			// A NULL org lands here too (org_id must be 32 hex): a row written
+			// before the rater parked missing orgs.
+			p.log.Error.Printf("token-push: HOLDING BACK rated_usage %s (hour %s, auth_id=%s, resource_id=%s, model_id=%s): %v. Only this identity is held back; the rest of the hour is sent",
+				r.ID, ws, r.AuthID, r.ResourceID, r.ModelID, err)
+			holdIdentity[r.identity] = true
+			plan.heldBack++
 			continue
 		}
-		rec.OrgID = org.String
-		a.BaseModel = base.String
-		a.Adapter = adapter.String
-		a.Region = regn.String
-		a.TopologyRevision = meteredusage.TopologyRevisionAttr(rev)
-		rec.UsageID = meteredusage.TokenUsageID(ws, rec.OrgID, rec.OwnerType, rec.OwnerID, rec.ResourceID, *a)
-		req.Records = append(req.Records, rec)
+		plan.req.Records = append(plan.req.Records, rec)
+		plan.sent = append(plan.sent, pushedRow{UsageID: rec.UsageID, identity: r.identity})
+		live[rec.UsageID] = true
 	}
-	if err := rows.Err(); err != nil {
-		return req, 0, fmt.Errorf("iterate rated_usage rows: %w", err)
-	}
-	return req, unsendable, nil
-}
 
-// ratedUsageHasAnyRow reports whether rated_usage contains at least one row.
-func (p *pusher) ratedUsageHasAnyRow(ctx context.Context) (bool, error) {
-	var one int
-	err := p.db.QueryRowContext(ctx, `SELECT 1 FROM rated_usage LIMIT 1`).Scan(&one)
-	if err == sql.ErrNoRows {
-		return false, nil
-	}
+	parked, err := p.store.ParkedIdentities(ctx, hour)
 	if err != nil {
-		return false, err
+		return plan, err
 	}
-	return true, nil
+	for _, id := range parked {
+		holdIdentity[id] = true
+	}
+	if len(holdIdentity) > 0 {
+		pushed, err := p.store.Pushed(ctx, hour)
+		if err != nil {
+			return plan, err
+		}
+		for _, pr := range pushed {
+			if holdIdentity[pr.identity] && !live[pr.UsageID] {
+				plan.req.Held = append(plan.req.Held, pr.UsageID)
+				plan.sent = append(plan.sent, pr)
+			}
+		}
+	}
+	return plan, nil
 }
 
-// pushWindows builds and sends one request per hour and returns the exit code.
-// Hours are independent: a withheld, rejected or failed hour does not stop the
-// others, so one bad hour cannot block every other hour from converging.
+// pushWindows sends one request per hour and returns the exit code. The hours
+// are the trailing window plus every hour with parked usage resolved since its
+// last accepted push (however old). Hours are independent: a failed or rejected
+// hour does not stop the others.
 //
-// WITHHOLDING (fail closed). An hour with a rollup that cannot become a valid
-// record is NOT sent. A request is the complete snapshot of the hour, so
-// sending it without that rollup would make the manager delete the record it
-// already holds for it (possibly already settled). Withholding leaves the
-// manager's previous state for the hour standing; the next run re-sends the hour
-// once the cause is fixed. Over-holding is the safe direction. (Ben's ruling on
-// the previous push; unchanged by the new wire.)
-//
-// Exit code precedence: fatal (1) > rejected (3) > withheld (2) > ok (0).
-func (p *pusher) pushWindows(ctx context.Context, windows []time.Time) int {
+// Exit code precedence: fatal (1) > rejected (3) > held back (2) > ok (0).
+func (p *pusher) pushWindows(ctx context.Context, windows []time.Time, now time.Time) int {
 	// LIVENESS GUARD. An empty hour is sent as records: [], which deletes the
-	// manager's records for that hour. If the whole table is empty (fresh
-	// install, wiped database), every hour would be a delete-all, so refuse.
-	hasAny, err := p.ratedUsageHasAnyRow(ctx)
+	// manager's records for that hour. If the database holds no usage at all
+	// (fresh install, wiped database), every hour would be a delete-all.
+	hasAny, err := p.store.HasAnyUsage(ctx)
 	if err != nil {
-		p.log.Error.Printf("token-push: liveness check on rated_usage: %v", err)
+		p.log.Error.Printf("token-push: liveness check: %v", err)
 		return exitFatal
 	}
 	if !hasAny {
-		p.log.Error.Printf("token-push: rated_usage is EMPTY; refusing to push (every hour would be sent as empty and delete the manager's records). If this install genuinely has no usage there is nothing to push; if the table was wiped, restore it first")
+		p.log.Error.Printf("token-push: rated_usage and parked_usage are EMPTY; refusing to push (every hour would be sent as empty and delete the manager's records). If this install genuinely has no usage there is nothing to push; if the database was wiped, restore it first")
 		return exitFatal
 	}
 
-	withheld, rejected, failed := 0, 0, 0
-	for _, w := range windows {
-		req, unsendable, err := p.buildRequest(ctx, w)
+	resolved, err := p.store.ResolvedHours(ctx, now.UTC().Truncate(time.Hour))
+	if err != nil {
+		p.log.Error.Printf("token-push: list resolved parked hours: %v", err)
+		return exitFatal
+	}
+	hours := mergeHours(windows, resolved)
+
+	heldBack, rejected, failed := 0, 0, 0
+	for _, h := range hours {
+		plan, err := p.buildHour(ctx, h)
 		if err != nil {
-			p.log.Error.Printf("token-push: build request for %s: %v", w.Format(time.RFC3339), err)
+			p.log.Error.Printf("token-push: build request for %s: %v", h.Format(time.RFC3339), err)
 			failed++
 			continue
 		}
-		if unsendable > 0 {
-			p.log.Error.Printf("token-push: WITHHOLDING %s: %d rollup(s) cannot become a record; sending the rest would delete their records on the manager. The manager keeps its previous state for this hour; the next run re-sends it once fixed",
-				req.WindowStart, unsendable)
-			withheld++
+		heldBack += plan.heldBack
+		if err := meteredusage.Validate(plan.req); err != nil {
+			// Every record passed on its own, so this is a request-level rule
+			// (for instance a duplicate usage_id): a bug. Send nothing for the
+			// hour rather than earn a 400.
+			p.log.Error.Printf("token-push: NOT SENDING %s: the request breaks a wire rule (%v)", plan.req.WindowStart, err)
+			heldBack++
 			continue
 		}
-		if err := meteredusage.Validate(req); err != nil {
-			// The manager would answer 400 and store nothing; refuse here, where
-			// the evidence is. Same withholding rule as above.
-			p.log.Error.Printf("token-push: WITHHOLDING %s: the request breaks a wire rule the manager enforces (%v). Fix the rollup and re-run", req.WindowStart, err)
-			withheld++
+		if err := p.store.RecordIntent(ctx, h, plan.sent); err != nil {
+			p.log.Error.Printf("token-push: record intent for %s: %v (not sent)", plan.req.WindowStart, err)
+			failed++
 			continue
 		}
 
-		resp, err := p.client.Post(ctx, req)
+		resp, err := p.client.Post(ctx, plan.req)
 		var rej *meteredusage.RejectedError
 		switch {
 		case err == nil:
-			p.log.Info.Printf("token-push: sent %s: %d token records (manager accepted %d, deleted %d)",
-				req.WindowStart, len(req.Records), resp.Accepted, resp.Deleted)
+			if err := p.store.RecordAccepted(ctx, h, plan.sent); err != nil {
+				// The manager has the hour; our bookkeeping keeps a superset
+				// (RecordIntent), which is the safe direction. The next run
+				// re-sends and records it.
+				p.log.Error.Printf("token-push: sent %s but could not record it: %v", plan.req.WindowStart, err)
+				failed++
+				continue
+			}
+			p.log.Info.Printf("token-push: sent %s: %d token records, %d held (manager accepted %d, deleted %d)",
+				plan.req.WindowStart, len(plan.req.Records), len(plan.req.Held), resp.Accepted, resp.Deleted)
 		case errors.As(err, &rej):
-			// Not retried: the manager would answer the same. 400 = a wire rule
-			// we did not catch; 401 = the customer token; 409 = this install is
-			// on the legacy billing path; 422 = the hour is in a billing period
-			// already settled to Stripe (correction goes to the human credit
-			// path). Each needs a person.
+			// Final: 400 = a wire rule we did not catch; 401 = the customer
+			// token; 409 = this install is on the legacy billing path; 422 = the
+			// hour is in a billing period already settled to Stripe (correction
+			// goes to the human credit path). Each needs a person.
 			p.log.Error.Printf("token-push: manager REJECTED %s with %d (not retried; needs a person): %s",
-				req.WindowStart, rej.Status, rej.Body)
+				plan.req.WindowStart, rej.Status, rej.Body)
 			rejected++
 		default:
-			p.log.Error.Printf("token-push: send %s: %v (the next run re-sends this hour)", req.WindowStart, err)
+			p.log.Error.Printf("token-push: send %s: %v (the next run re-sends this hour)", plan.req.WindowStart, err)
 			failed++
 		}
 	}
@@ -221,9 +214,26 @@ func (p *pusher) pushWindows(ctx context.Context, windows []time.Time) int {
 		return exitFatal
 	case rejected > 0:
 		return exitRejected
-	case withheld > 0:
+	case heldBack > 0:
 		return exitWithheld
 	default:
 		return exitOK
 	}
+}
+
+// mergeHours returns the sorted union of two hour lists.
+func mergeHours(a, b []time.Time) []time.Time {
+	seen := map[time.Time]bool{}
+	var out []time.Time
+	for _, l := range [][]time.Time{a, b} {
+		for _, h := range l {
+			h = h.UTC()
+			if !seen[h] {
+				seen[h] = true
+				out = append(out, h)
+			}
+		}
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].Before(out[j]) })
+	return out
 }
