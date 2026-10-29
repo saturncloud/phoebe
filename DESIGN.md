@@ -180,8 +180,10 @@ Phoebe.Emit (non-blocking, off hot path)
     upgrade. See `internal/emit/wal.go` `append`/`pending`/`markShipped`.
 
 **Status:** Valkey emit + persistent-chart WAL + log floor, Postgres drainer,
-raw-to-rated hourly reconciliation view, rater, and push are built. The external
-invoice-line comparison remains a billing-system dependency.
+raw-to-rated hourly reconciliation view, rater (an hourly aggregator; the manager
+prices, billing-design.md D1), and push (`POST /customer/metered-usage`, kind
+`token`) are built. The external invoice-line comparison remains a billing-system
+dependency.
 
 ---
 

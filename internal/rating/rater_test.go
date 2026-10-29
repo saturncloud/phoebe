@@ -3,8 +3,7 @@ package rating
 import (
 	"bytes"
 	"context"
-	"errors"
-	"fmt"
+	"log"
 	"strings"
 	"testing"
 	"time"
@@ -12,1672 +11,251 @@ import (
 	"github.com/saturncloud/phoebe/internal/logging"
 )
 
-// TestResult_HasAmbiguousOrgDrivesAnomaly locks the exit-2 contract for the new E2
-// attribution anomaly by name (mirroring the HasAmbiguousBase/HasUnpriced predicate
-// assertions): a Result carrying ambiguous-org events must report HasAmbiguousOrg AND
-// HasAnomaly (so cmd/rater exits non-zero and the CronJob alerts), and a clean Result
-// must report neither. This pins the HasAmbiguousOrg disjunct in HasAnomaly() — a
-// refactor that drops it would let an ambiguous-org-only window exit 0 (mis-attributable
-// metered usage passing silently), which this test turns RED. The org anomaly is
-// otherwise reachable only via live Postgres (the oracle store can't model org), so this
-// pure-Go predicate test is the cheapest guard on the loud-path wiring.
-func TestResult_HasAmbiguousOrgDrivesAnomaly(t *testing.T) {
-	ambiguous := Result{AmbiguousOrgEvents: 1}
-	if !ambiguous.HasAmbiguousOrg() {
-		t.Fatal("HasAmbiguousOrg() = false with AmbiguousOrgEvents=1, want true")
-	}
-	if !ambiguous.HasAnomaly() {
-		t.Fatal("HasAnomaly() = false for an ambiguous-org Result, want true (must drive exit-nonzero)")
-	}
-	clean := Result{}
-	if clean.HasAmbiguousOrg() {
-		t.Fatal("HasAmbiguousOrg() = true for a zero Result, want false")
-	}
-	if clean.HasAnomaly() {
-		t.Fatal("HasAnomaly() = true for a zero Result, want false (no anomaly, no exit-nonzero)")
-	}
+type fakeStore struct {
+	res          AggregateResult
+	calls        int
+	gotStart     time.Time
+	gotEnd       time.Time
+	returnsError error
+	parkedHours  []time.Time
+	parked       []Parked
+	windows      [][2]time.Time
 }
 
-// TestResult_MissingUsagePagesOnlyWhenUnexplained pins the paging contract for
-// missing engine usage (ratified with Hugo, 2026-09-21).
-//
-// Zero-usage rows are ROUTINE: every client abort and every upstream failure emits
-// one. Paging on the total would fire hourly on any install with real traffic and
-// bury the rare anomalies that share the exit-2 channel (unpriced, unattributable,
-// ambiguous). Only a SUCCESSFUL response carrying no usage block means work may
-// have been served that cannot be billed — that is the alarming case.
-func TestResult_MissingUsagePagesOnlyWhenUnexplained(t *testing.T) {
-	// Routine: aborts/upstream failures. Reported, NOT paged.
-	routine := Result{MissingUsageEvents: 12, ExpectedMissingUsageEvents: 12}
-	if !routine.HasMissingUsage() {
-		t.Fatal("HasMissingUsage() must still report the total for reconciliation")
-	}
-	if routine.HasUnexplainedMissingUsage() {
-		t.Fatal("wholly-expected missing usage must not be classed unexplained")
-	}
-	if routine.HasAnomaly() {
-		t.Fatal("routine aborts/failures must NOT page: exit 2 is reserved for rare, wrong conditions")
-	}
-
-	// A success with no usage block: work possibly served, unbillable. Pages.
-	unexplained := Result{MissingUsageEvents: 1, UnexplainedMissingUsageEvents: 1}
-	if !unexplained.HasUnexplainedMissingUsage() {
-		t.Fatal("a success with no usage block must be classed unexplained")
-	}
-	if !unexplained.HasAnomaly() {
-		t.Fatal("unexplained missing usage must be a fail-loud billing anomaly")
-	}
-
-	// Mixed window: the routine share must not mask the unexplained one.
-	mixed := Result{MissingUsageEvents: 50, ExpectedMissingUsageEvents: 49, UnexplainedMissingUsageEvents: 1}
-	if !mixed.HasAnomaly() {
-		t.Fatal("one unexplained attempt among many routine ones must still page")
-	}
+func (f *fakeStore) AggregateWindow(_ context.Context, start, end time.Time) (AggregateResult, error) {
+	f.calls++
+	f.gotStart, f.gotEnd = start, end
+	f.windows = append(f.windows, [2]time.Time{start, end})
+	return f.res, f.returnsError
 }
-
-func TestResult_InvalidServingModeDrivesAnomaly(t *testing.T) {
-	res := Result{InvalidServingModeEvents: 1}
-	if !res.HasInvalidServingMode() || !res.HasAnomaly() {
-		t.Fatal("an event without a legal serving mode must be a fail-loud billing anomaly")
-	}
+func (f *fakeStore) ParkedHours(context.Context, time.Time) ([]time.Time, error) {
+	return f.parkedHours, nil
 }
+func (f *fakeStore) ListParked(context.Context) ([]Parked, error) { return f.parked, nil }
+func (f *fakeStore) Ping(context.Context) error                   { return nil }
+func (f *fakeStore) Close() error                                 { return nil }
 
-// TestRater_InvalidServingModeWithheldNotUnpriced: through the Rater and the
-// oracle store, an event carrying the retired empty serving mode (or any other
-// non-"shared"/"dedicated" value) is withheld and counted as an invalid serving
-// mode — not billed as dedicated and not misreported as unpriced — while its
-// dedicated neighbour in the same hour still bills. The "unpriced-model" rows have
-// NO price in bookM() and no base, so they would ALSO be unpriced if the serving
-// mode were valid: they are what makes the "not unpriced" half of the claim able
-// to fail (an invalid mode is counted ONLY as invalid, never also as unpriced).
-func TestRater_InvalidServingModeWithheldNotUnpriced(t *testing.T) {
-	at := mustTime("2026-06-08T10:05:00Z")
-	events := []RatedEvent{
-		{ServingMode: "dedicated", AuthID: "k", ResourceID: "d", ModelID: "m", PromptTokens: 100, At: at},
-		{ServingMode: "", AuthID: "k", ResourceID: "d", ModelID: "m", PromptTokens: 100, At: at},
-		{ServingMode: "bogus", AuthID: "k", ResourceID: "d", ModelID: "m", PromptTokens: 100, At: at},
-		{ServingMode: "", AuthID: "k", ResourceID: "d", ModelID: "unpriced-model", PromptTokens: 100, At: at},
-		{ServingMode: "bogus", AuthID: "k", ResourceID: "d", ModelID: "unpriced-model", PromptTokens: 100, At: at},
-	}
-	store := newOracleStore(bookM(), events)
-	r := New(store, bookM(), testLogger())
-	res, err := r.Run(context.Background(), mustTime("2026-06-08T10:00:00Z"), mustTime("2026-06-08T11:00:00Z"), false)
-	if err != nil {
-		t.Fatalf("Run: %v", err)
-	}
-	if res.EventsRated != 1 || res.InvalidServingModeEvents != 4 || res.UnpricedEvents != 0 {
-		t.Fatalf("rated/invalid-mode/unpriced = %d/%d/%d, want 1/4/0",
-			res.EventsRated, res.InvalidServingModeEvents, res.UnpricedEvents)
-	}
-	// Partition identity: every in-window event lands in exactly one bucket.
-	sum := res.EventsRated + res.UnpricedEvents + res.UnattributableEvents +
-		res.MissingUsageEvents + res.InvalidUsageEvents + res.AmbiguousBaseEvents +
-		res.AmbiguousOrgEvents + res.OwnerConflictEvents + res.InvalidServingModeEvents
-	if sum != int64(len(events)) {
-		t.Fatalf("bucket sum = %d, want %d (one bucket per event)", sum, len(events))
-	}
-	if !res.HasAnomaly() {
-		t.Fatal("withheld invalid-serving-mode events must drive the fail-loud exit")
-	}
-}
-
-func TestResult_InvalidUsageDrivesAnomaly(t *testing.T) {
-	res := Result{InvalidUsageEvents: 1}
-	if !res.HasInvalidUsage() || !res.HasAnomaly() {
-		t.Fatal("invalid usage must be a fail-loud billing anomaly")
-	}
-}
-
-// oracleStore is an in-memory Store that models EXACTLY what the SQL rater does,
-// using the production PriceBook (PriceBook.Resolve) + the Rate() oracle. It exists
-// so the Rater orchestration AND the money rules can be exercised without Postgres,
-// and so the conformance test has a faithful reference of the SQL's resolve→cost→sum.
-//
-// It models rated_usage as a map keyed by the natural key, REPLACING on upsert
-// (mirroring ON CONFLICT DO UPDATE), so idempotency is observable. Like the
-// production statement, RateWindow returns the anomaly counts from the SAME resolve
-// pass as the rollups (one snapshot). The book passed to RateWindow is ignored in
-// favour of the store's own (they are the same book the Rater holds).
-type oracleStore struct {
-	book   *PriceBook
-	events []RatedEvent
-
-	table     map[rollupKey]oracleRollup // natural key → row
-	rateCalls int
-}
-
-type rollupKey struct {
-	authID      string
-	resourceID  string
-	modelID     string
-	windowStart time.Time
-}
-
-type oracleRollup struct {
-	prompt, cached, completion, billable int64
-	cost                                 Dec
-	appliedRate                          Rate3
-	eventCount                           int
-	// pricedBases is the set of distinct base_models the events in this rollup priced
-	// THROUGH — via the derived (base x premium) path or the plain-base path. >1 →
-	// more than one rate in the rollup: ambiguous, must NOT be billed. Mirrors the
-	// SQL's COUNT(DISTINCT base_model) FILTER (WHERE via_derived OR via_base).
-	pricedBases map[string]struct{}
-	// viaDerived / viaBase record which base_model paths this rollup's events priced
-	// through. BOTH → mixed premium/plain-base pricing on one model_id (the adapter
-	// flapping): also ambiguous. Mirrors bool_or(via_derived) AND bool_or(via_base).
-	viaDerived, viaBase bool
-}
-
-func newOracleStore(book *PriceBook, events []RatedEvent) *oracleStore {
-	return &oracleStore{book: book, events: events, table: map[rollupKey]oracleRollup{}}
-}
-
-func (s *oracleStore) Ping(_ context.Context) error { return nil }
-func (s *oracleStore) Close() error                 { return nil }
-
-// resolveWindow walks the events in [start,end) exactly as the SQL CTE does:
-// unattributable (empty auth/model) and unpriced (no resolvable rate) are counted
-// and EXCLUDED; the rest are priced via Rate() and summed, with the applied rate
-// frozen onto the rollup.
-func (s *oracleStore) resolveWindow(start, end time.Time) (map[rollupKey]oracleRollup, Anomalies) {
-	out := map[rollupKey]oracleRollup{}
-	var an Anomalies
-	for _, e := range s.events {
-		if e.At.Before(start) || !e.At.Before(end) {
-			continue
-		}
-		// EMPTY-STRING MODELS A NULL IDENTITY COLUMN. The Go oracle has no separate
-		// NULL, so "" stands in for a NULL auth_id/resource_id/model_id; production SQL
-		// instead filters `... IS NULL`. The two agree ONLY because of two production
-		// guarantees that ensure a literal '' never reaches billing_event: the drainer's
-		// nullStr maps ''→NULL on write (internal/drain/store.go) and the proxy billing
-		// gate fails closed on an empty ResourceID before metering. With '' impossible in
-		// the column, `== ""` here faithfully mirrors SQL's `IS NULL`, so the oracle's
-		// unattributable partition matches the rater's `resource_id IS NULL` count. Do not
-		// "fix" this to also test '' — '' is out of the modeled domain by construction.
-		if e.AuthID == "" || e.ResourceID == "" || e.ModelID == "" {
-			an.UnattributableEvents++
-			continue
-		}
-		resolved, err := s.book.ResolveEvent(e.ModelID, e.BaseModel, e.Adapter, e.ServingMode)
-		if errors.Is(err, ErrInvalidServingMode) {
-			// Mirrors the SQL's per-event valid_serving_mode drop and its exclusive
-			// invalid_serving_mode_events bucket (checked after unattributable,
-			// before unpriced).
-			an.InvalidServingModeEvents++
-			continue
-		}
-		if err != nil {
-			an.UnpricedEvents++ // ErrNoPrice: never $0-billed
-			continue
-		}
-		// The rate that ACTUALLY bills is the 9dp-quantized rate — the one projected
-		// into the SQL price table (NUMERIC(20,9)) and frozen onto the row. Cost is
-		// computed from THAT rate, so the row's cost is reconstructable from its
-		// applied rate (self-auditing). Mirrors the production SQL exactly.
-		rate := resolved.Quantized()
-		cost := rateExact(e, rate)
-		hour := e.At.UTC().Truncate(time.Hour)
-		k := rollupKey{authID: e.AuthID, resourceID: e.ResourceID, modelID: e.ModelID, windowStart: hour}
-		ru := out[k]
-		ru.prompt += e.PromptTokens
-		ru.cached += e.CachedTokens
-		ru.completion += e.CompletionTokens
-		ru.billable += BillablePromptTokens(e.PromptTokens, e.CachedTokens)
-		ru.cost = ru.cost.Add(cost)
-		ru.appliedRate = rate // single-model rollup → one applied rate
-		ru.eventCount++
-		// Track any event that priced THROUGH its base_model (it resolved, but not
-		// directly on model_id): record the base and which path it took. Mirrors the
-		// SQL's via_derived / via_base flags.
-		if _, direct := s.book.Resolve(e.ModelID); direct != nil {
-			if e.Adapter != "" || strings.HasPrefix(e.ModelID, fineTunePrefix) {
-				ru.viaDerived = true // fine-tune traffic: base x premium
-			} else {
-				ru.viaBase = true // base-model endpoint: plain base rate
-			}
-			if ru.pricedBases == nil {
-				ru.pricedBases = map[string]struct{}{}
-			}
-			ru.pricedBases[e.BaseModel] = struct{}{}
-		}
-		out[k] = ru
-	}
-	// Split out AMBIGUOUS rollups (the single-rate gate): a model_id whose
-	// base_model-priced events carried more than one rate in the window — >1 distinct
-	// base_model, or a MIX of derived and plain-base pricing — is NOT billed (a blind
-	// MIN()-rate would silently under-charge). Its events are counted as the
-	// ambiguous-base anomaly and the rollup is dropped. Mirrors store.go's
-	// grouped→priced split.
-	for k, ru := range out {
-		if len(ru.pricedBases) > 1 || (ru.viaDerived && ru.viaBase) {
-			an.AmbiguousBaseEvents += int64(ru.eventCount)
-			delete(out, k)
-			continue
-		}
-		ru.cost = ru.cost.Round(moneyScale)
-		out[k] = ru
-	}
-	return out, an
-}
-
-func (s *oracleStore) RateWindow(_ context.Context, _ *PriceBook, start, end time.Time) (RateResult, error) {
-	s.rateCalls++
-	start, end = start.UTC(), end.UTC()
-	rollups, an := s.resolveWindow(start, end)
-
-	// RECONCILE (mirror store.go's `deleted` CTE): DELETE any in-window rollup this run
-	// did NOT reproduce in priced — it billed in a prior run but fell out (became
-	// ambiguous/unpriced, or its events vanished). "What the latest run says is what
-	// bills." The window predicate is the same half-open [start,end) on window_start.
-	var deletions int64
-	for k := range s.table {
-		if k.windowStart.Before(start) || !k.windowStart.Before(end) {
-			continue // out of this run's window — untouched
-		}
-		if _, survives := rollups[k]; !survives {
-			delete(s.table, k)
-			deletions++
-		}
-	}
-
-	total := Dec{}
-	var rated int64
-	for k, ru := range rollups {
-		s.table[k] = ru // REPLACE — ON CONFLICT DO UPDATE
-		total = total.Add(ru.cost)
-		rated += int64(ru.eventCount)
-	}
-	res := RateResult{
-		RollupsWritten:           int64(len(rollups)),
-		EventsRated:              rated,
-		ReconciledDeletions:      deletions,
-		UnpricedEvents:           an.UnpricedEvents,
-		UnattributableEvents:     an.UnattributableEvents,
-		AmbiguousBaseEvents:      an.AmbiguousBaseEvents,
-		InvalidServingModeEvents: an.InvalidServingModeEvents,
-		// The oracle does NOT model org attribution: RatedEvent has no OrgID (org doesn't
-		// affect the money rules the oracle exists to mirror — it's carried, not priced).
-		// So AmbiguousOrgEvents is always 0 here, set EXPLICITLY (not left as a zero-value
-		// gap) so this struct is field-complete vs the production RateResult and the
-		// partition sum is honest. The ambiguous_org / partial-NULL SQL behaviors are
-		// covered by the live-Postgres TestIntegration_AmbiguousOrgFailsLoud instead.
-		AmbiguousOrgEvents: 0,
-	}
-	if len(rollups) > 0 {
-		res.TotalCost = total.String()
-	} else {
-		res.TotalCost = "0.000000000"
-	}
-	return res, nil
-}
-
-func testLogger() *logging.Logger { return logging.New(logging.ERROR) }
-
-// TestRater_MultiEventAggregation: many events for one (auth,model,hour) sum into
-// ONE rollup with summed tokens and summed cost — the aggregation grain.
-func TestRater_MultiEventAggregation(t *testing.T) {
-	at := mustTime("2026-06-08T10:15:00Z")
-	events := []RatedEvent{
-		{ServingMode: "dedicated", AuthID: "a", ResourceID: "r", ModelID: "m", PromptTokens: 100, CachedTokens: 30, CompletionTokens: 50, At: at},
-		{ServingMode: "dedicated", AuthID: "a", ResourceID: "r", ModelID: "m", PromptTokens: 10, CachedTokens: 0, CompletionTokens: 5, At: at.Add(20 * time.Minute)},
-	}
-	store := newOracleStore(bookM(), events)
-	r := New(store, bookM(), testLogger())
-
-	res, err := r.Run(context.Background(), mustTime("2026-06-08T10:00:00Z"), mustTime("2026-06-08T11:00:00Z"), false)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if res.EventsRated != 2 || res.RollupsWritten != 1 {
-		t.Fatalf("rated=%d rollups=%d, want 2 and 1", res.EventsRated, res.RollupsWritten)
-	}
-	// event1: 70*0.000003 + 30*0.0000003 + 50*0.00001 = 0.000719
-	// event2: 10*0.000003 + 0 + 5*0.00001 = 0.00008
-	// total = 0.000799
-	if res.TotalCost != "0.000799000" {
-		t.Fatalf("total = %s, want 0.000799000", res.TotalCost)
-	}
-	k := rollupKey{authID: "a", resourceID: "r", modelID: "m", windowStart: mustTime("2026-06-08T10:00:00Z")}
-	ru := store.table[k]
-	if ru.prompt != 110 || ru.cached != 30 || ru.completion != 55 || ru.billable != 80 {
-		t.Fatalf("token sums = p%d c%d comp%d bill%d, want 110/30/55/80", ru.prompt, ru.cached, ru.completion, ru.billable)
-	}
-	if ru.cost.String() != "0.000799000" || ru.eventCount != 2 {
-		t.Fatalf("rollup cost=%s count=%d, want 0.000799000/2", ru.cost, ru.eventCount)
-	}
-}
-
-// TestRater_IdempotentRerunNoDoubling (idempotent-rerun): rating the SAME window
-// twice produces identical totals — no doubling.
-func TestRater_IdempotentRerunNoDoubling(t *testing.T) {
-	at := mustTime("2026-06-08T10:15:00Z")
-	events := []RatedEvent{
-		{ServingMode: "dedicated", AuthID: "a", ResourceID: "r", ModelID: "m", PromptTokens: 100, CachedTokens: 30, CompletionTokens: 50, At: at},
-	}
-	store := newOracleStore(bookM(), events)
-	r := New(store, bookM(), testLogger())
-	ws, we := mustTime("2026-06-08T10:00:00Z"), mustTime("2026-06-08T11:00:00Z")
-
-	res1, err := r.Run(context.Background(), ws, we, false)
-	if err != nil {
-		t.Fatal(err)
-	}
-	res2, err := r.Run(context.Background(), ws, we, false)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if res1.TotalCost != res2.TotalCost {
-		t.Fatalf("re-run total changed: %s → %s (must be identical)", res1.TotalCost, res2.TotalCost)
-	}
-	if len(store.table) != 1 {
-		t.Fatalf("table has %d rows after re-run, want 1 (no duplication)", len(store.table))
-	}
-	if store.rateCalls != 2 {
-		t.Fatalf("RateWindow called %d times, want 2", store.rateCalls)
-	}
-}
-
-// TestRater_ReRateDeletesSupersededRollup (re-rate-reconciles-deletes-superseded):
-// FIX 2 — re-rate RECONCILES, not upsert-only (Hugo's decision). Run A bills an ft:
-// rollup CLEAN (one base in the window). Then data mutates so run B makes that same ft:
-// id AMBIGUOUS (a second, distinct base_model arrives in the window) — it falls out of
-// priced. The stale rollup from run A must be DELETED by run B, not left billing at its
-// old cost. "What the latest run says is what bills."
-func TestRater_ReRateDeletesSupersededRollup(t *testing.T) {
-	book := newTestBook(
-		map[string]Rate3{
-			"cheap/base":     rate3("0.000001", "0", "0"),
-			"expensive/base": rate3("0.000009", "0", "0"),
-		},
-		nil, PolicyMultiplier, MustDec("1.5"), Dec{},
-	)
-	at := mustTime("2026-06-08T10:15:00Z")
-	ws, we := mustTime("2026-06-08T10:00:00Z"), mustTime("2026-06-08T11:00:00Z")
-
-	// Run A: a single-base ft: rollup — CLEAN, bills.
-	store := newOracleStore(book, []RatedEvent{
-		{ServingMode: "dedicated", AuthID: "a", ResourceID: "r", ModelID: "ft:dupe", BaseModel: "cheap/base", PromptTokens: 1000, At: at},
-	})
-	r := New(store, book, testLogger())
-	resA, err := r.Run(context.Background(), ws, we, false)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if resA.RollupsWritten != 1 || resA.ReconciledDeletions != 0 {
-		t.Fatalf("run A: rollups=%d deletions=%d, want 1/0", resA.RollupsWritten, resA.ReconciledDeletions)
-	}
-	dupeKey := rollupKey{authID: "a", resourceID: "r", modelID: "ft:dupe", windowStart: ws}
-	if _, ok := store.table[dupeKey]; !ok {
-		t.Fatal("run A: clean ft:dupe rollup must exist before re-rate")
-	}
-
-	// Mutate data: a SECOND, distinct base_model arrives for the SAME ft: id in the same
-	// window → ambiguous. Run B excludes it from priced.
-	store.events = append(store.events,
-		RatedEvent{ServingMode: "dedicated", AuthID: "a", ResourceID: "r", ModelID: "ft:dupe", BaseModel: "expensive/base", PromptTokens: 1000, At: at.Add(5 * time.Minute)})
-	resB, err := r.Run(context.Background(), ws, we, false)
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	// THE INVARIANT: the stale ft:dupe rollup is GONE, not stale-billing at its run-A cost.
-	if _, ok := store.table[dupeKey]; ok {
-		t.Fatal("run B: ft:dupe became ambiguous but its stale rollup SURVIVED — upsert-only leaves it billing forever (reconcile must delete it)")
-	}
-	if resB.ReconciledDeletions != 1 {
-		t.Fatalf("run B: reconciled deletions = %d, want 1 (the superseded rollup)", resB.ReconciledDeletions)
-	}
-	if !resB.HasAmbiguousBase() {
-		t.Fatal("run B: the two-base ft:dupe must be flagged ambiguous")
-	}
-	if len(store.table) != 0 {
-		t.Fatalf("run B: table has %d rows, want 0 (the only rollup was superseded)", len(store.table))
-	}
-}
-
-// TestRater_ReRateSupersedesOneKeepsAnotherSameWindow: in ONE window, a re-rate must
-// DELETE a superseded rollup while UPDATING a surviving one — the delete-set and
-// upsert-set are disjoint, so the reconcile must touch only the superseded key. Guards
-// the SQL's two modifying CTEs (deleted + upserted) against clobbering a co-window row.
-func TestRater_ReRateSupersedesOneKeepsAnotherSameWindow(t *testing.T) {
-	book := newTestBook(
-		map[string]Rate3{
-			"cheap/base":     rate3("0.000001", "0", "0"),
-			"expensive/base": rate3("0.000009", "0", "0"),
-		},
-		nil, PolicyMultiplier, MustDec("1.5"), Dec{},
-	)
-	at := mustTime("2026-06-08T10:15:00Z")
-	ws, we := mustTime("2026-06-08T10:00:00Z"), mustTime("2026-06-08T11:00:00Z")
-	// Run A: TWO clean single-base ft: rollups (ft:keep and ft:gone).
-	store := newOracleStore(book, []RatedEvent{
-		{ServingMode: "dedicated", AuthID: "a", ResourceID: "r", ModelID: "ft:keep", BaseModel: "cheap/base", PromptTokens: 1000, At: at},
-		{ServingMode: "dedicated", AuthID: "a", ResourceID: "r", ModelID: "ft:gone", BaseModel: "cheap/base", PromptTokens: 1000, At: at},
-	})
-	r := New(store, book, testLogger())
-	if _, err := r.Run(context.Background(), ws, we, false); err != nil {
-		t.Fatal(err)
-	}
-	if len(store.table) != 2 {
-		t.Fatalf("run A: table=%d, want 2", len(store.table))
-	}
-	// Run B: ft:gone gains a second base (ambiguous → superseded); ft:keep unchanged.
-	store.events = append(store.events,
-		RatedEvent{ServingMode: "dedicated", AuthID: "a", ResourceID: "r", ModelID: "ft:gone", BaseModel: "expensive/base", PromptTokens: 1000, At: at.Add(5 * time.Minute)})
-	resB, err := r.Run(context.Background(), ws, we, false)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if resB.ReconciledDeletions != 1 {
-		t.Fatalf("run B: deletions = %d, want 1 (only ft:gone superseded)", resB.ReconciledDeletions)
-	}
-	if _, gone := store.table[rollupKey{authID: "a", resourceID: "r", modelID: "ft:gone", windowStart: ws}]; gone {
-		t.Fatal("ft:gone rollup survived — it became ambiguous and must be deleted")
-	}
-	if _, keep := store.table[rollupKey{authID: "a", resourceID: "r", modelID: "ft:keep", windowStart: ws}]; !keep {
-		t.Fatal("ft:keep rollup was deleted — a surviving co-window rollup must be UPDATED, not clobbered")
-	}
-	if len(store.table) != 1 {
-		t.Fatalf("run B: table=%d, want 1 (ft:keep only)", len(store.table))
-	}
-}
-
-// TestRater_ReRateDeletesVanishedRollup: the other supersede path — a rollup whose
-// events vanish entirely on re-rate (e.g. an event was deleted/corrected upstream) is
-// also DELETED, not left billing. Confirms the reconcile keys on "not reproduced by
-// this run," not specifically on ambiguity.
-func TestRater_ReRateDeletesVanishedRollup(t *testing.T) {
-	at := mustTime("2026-06-08T10:15:00Z")
-	ws, we := mustTime("2026-06-08T10:00:00Z"), mustTime("2026-06-08T11:00:00Z")
-	store := newOracleStore(bookM(), []RatedEvent{
-		{ServingMode: "dedicated", AuthID: "a", ResourceID: "r", ModelID: "m", PromptTokens: 100, CompletionTokens: 50, At: at},
-	})
-	r := New(store, bookM(), testLogger())
-	if _, err := r.Run(context.Background(), ws, we, false); err != nil {
-		t.Fatal(err)
-	}
-	if len(store.table) != 1 {
-		t.Fatalf("run A: table=%d, want 1", len(store.table))
-	}
-	// All events for the window vanish.
-	store.events = nil
-	resB, err := r.Run(context.Background(), ws, we, false)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if resB.ReconciledDeletions != 1 || len(store.table) != 0 {
-		t.Fatalf("run B: deletions=%d table=%d, want 1/0 (vanished rollup must be deleted)", resB.ReconciledDeletions, len(store.table))
-	}
-}
-
-// TestRater_ReRateIdenticalDataIsNoOp (re-rate-identical-data-no-op): the idempotency
-// floor of the reconcile. Re-running with IDENTICAL data deletes NOTHING (every prior
-// rollup is reproduced in priced) and upserts the same rows — the reconcile must not
-// spuriously delete-then-reinsert or churn. Also guards a SECOND window's rollup from
-// being touched by a re-rate scoped to the FIRST window.
-func TestRater_ReRateIdenticalDataIsNoOp(t *testing.T) {
-	at := mustTime("2026-06-08T10:15:00Z")
-	ws, we := mustTime("2026-06-08T10:00:00Z"), mustTime("2026-06-08T11:00:00Z")
-	store := newOracleStore(bookM(), []RatedEvent{
-		{ServingMode: "dedicated", AuthID: "a", ResourceID: "r", ModelID: "m", PromptTokens: 100, CachedTokens: 30, CompletionTokens: 50, At: at},
-		{ServingMode: "dedicated", AuthID: "b", ResourceID: "r", ModelID: "m", PromptTokens: 200, At: at.Add(10 * time.Minute)},
-	})
-	r := New(store, bookM(), testLogger())
-
-	res1, err := r.Run(context.Background(), ws, we, false)
-	if err != nil {
-		t.Fatal(err)
-	}
-	res2, err := r.Run(context.Background(), ws, we, false)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if res1.ReconciledDeletions != 0 || res2.ReconciledDeletions != 0 {
-		t.Fatalf("identical re-run deleted rows: A=%d B=%d, want 0/0 (no spurious deletes)", res1.ReconciledDeletions, res2.ReconciledDeletions)
-	}
-	if res1.TotalCost != res2.TotalCost {
-		t.Fatalf("identical re-run total changed: %s → %s", res1.TotalCost, res2.TotalCost)
-	}
-	if len(store.table) != 2 {
-		t.Fatalf("table has %d rows after identical re-run, want 2 (no churn)", len(store.table))
-	}
-
-	// A rollup in a DIFFERENT (adjacent) window must NOT be touched by a re-rate scoped to
-	// [ws,we): the reconcile's window predicate is half-open and hour-scoped.
-	otherHour := mustTime("2026-06-08T12:00:00Z")
-	store.events = append(store.events,
-		RatedEvent{ServingMode: "dedicated", AuthID: "a", ResourceID: "r", ModelID: "m", PromptTokens: 5, At: otherHour.Add(5 * time.Minute)})
-	if _, err := r.Run(context.Background(), otherHour, otherHour.Add(time.Hour), false); err != nil {
-		t.Fatal(err)
-	}
-	// Now re-rate ONLY the first window again: the 12:00 rollup must survive untouched.
-	resFirst, err := r.Run(context.Background(), ws, we, false)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if resFirst.ReconciledDeletions != 0 {
-		t.Fatalf("re-rate of [10:00,11:00) deleted %d rows, want 0 (must not touch the 12:00 rollup)", resFirst.ReconciledDeletions)
-	}
-	otherKey := rollupKey{authID: "a", resourceID: "r", modelID: "m", windowStart: otherHour}
-	if _, ok := store.table[otherKey]; !ok {
-		t.Fatal("a re-rate of the first window deleted an out-of-window (12:00) rollup — the window predicate leaked")
-	}
-}
-
-// captureLogger builds a Logger whose INFO and ERROR streams are redirected to the
-// returned buffers, so a test can assert WHICH severity a reconcile-delete fired at.
-// It starts at DEBUG so neither stream is discarded by the level filter — the test
-// is asserting the call site's chosen level, not the logger's threshold.
 func captureLogger() (*logging.Logger, *bytes.Buffer, *bytes.Buffer) {
-	log := logging.New(logging.DEBUG)
-	var infoBuf, errBuf bytes.Buffer
-	log.Info.SetOutput(&infoBuf)
-	log.Error.SetOutput(&errBuf)
-	return log, &infoBuf, &errBuf
+	var info, errBuf bytes.Buffer
+	l := logging.New(logging.DEBUG)
+	l.Info = log.New(&info, "", 0)
+	l.Warn = log.New(&info, "", 0)
+	l.Error = log.New(&errBuf, "", 0)
+	return l, &info, &errBuf
 }
 
-// supersededReconcileStore returns an oracleStore whose first Run produces ONE clean
-// rollup and whose second Run (after the events vanish) reconcile-DELETES it with NO
-// other anomaly — the minimal reconcile-delete (HasAnomaly stays false), so a test can
-// attribute the resulting log line purely to the reconcile path, not the anomaly path.
-func supersededReconcileStore() (*oracleStore, time.Time, time.Time) {
-	at := mustTime("2026-06-08T10:15:00Z")
-	ws, we := mustTime("2026-06-08T10:00:00Z"), mustTime("2026-06-08T11:00:00Z")
-	store := newOracleStore(bookM(), []RatedEvent{
-		{ServingMode: "dedicated", AuthID: "a", ResourceID: "r", ModelID: "m", PromptTokens: 100, CompletionTokens: 50, At: at},
-	})
-	return store, ws, we
-}
+var (
+	h0 = time.Date(2026, 10, 22, 14, 0, 0, 0, time.UTC)
+	h1 = h0.Add(time.Hour)
+)
 
-// TestRater_RoutineReconcileDeleteLogsError pins the LOUD half of the reconcile
-// observability contract (option (c)): a ROUTINE run (windowExplicit == false) that
-// reconcile-DELETES a previously-billed rollup must emit an ERROR line (page someone),
-// even with NO other anomaly. It uses captureLogger() (which buffers BOTH the INFO and
-// ERROR streams, so the assertion is on WHICH severity the line was emitted at — not on
-// a level filter discarding it). RED before FIX 1: the old code logged the
-// reconcile-delete UNCONDITIONALLY at INFO, so the captured ERROR stream stayed empty
-// and the errBuf.Len()==0 assertion failed — the page never fired on a routine bill
-// rewrite.
-func TestRater_RoutineReconcileDeleteLogsError(t *testing.T) {
-	store, ws, we := supersededReconcileStore()
-	log, infoBuf, errBuf := captureLogger()
-	r := New(store, bookM(), log)
-
-	// Run A: one clean rollup, no reconcile-delete.
-	if _, err := r.Run(context.Background(), ws, we, false); err != nil {
-		t.Fatal(err)
+func TestAggregator_RefusesAnUnalignedWindowWithoutTouchingTheStore(t *testing.T) {
+	l, _, _ := captureLogger()
+	f := &fakeStore{}
+	if _, err := New(f, l).Run(context.Background(), h0.Add(30*time.Minute), h1, false); err == nil {
+		t.Fatal("want an error for a half-hour window start")
 	}
-	infoBuf.Reset()
-	errBuf.Reset()
-
-	// Run B (routine): the events vanish → the rollup is reconcile-deleted with no anomaly.
-	store.events = nil
-	resB, err := r.Run(context.Background(), ws, we, false)
-	if err != nil {
-		t.Fatal(err)
+	if _, err := New(f, l).Run(context.Background(), h1, h0, false); err == nil {
+		t.Fatal("want an error for an inverted window")
 	}
-	if resB.ReconciledDeletions != 1 {
-		t.Fatalf("setup: deletions=%d, want 1", resB.ReconciledDeletions)
-	}
-	if resB.HasAnomaly() {
-		t.Fatalf("setup: a clean reconcile-delete must NOT flip HasAnomaly (got %+v) — else the ERROR could come from the anomaly path, not the reconcile path", resB)
-	}
-	// THE INVARIANT: a routine reconcile-delete fires an ERROR (the page).
-	if errBuf.Len() == 0 {
-		t.Fatal("routine reconcile-delete emitted NO ERROR line — a prior bill was rewritten with no operator behind it (data loss / upstream regression); it MUST log at ERROR so a CronJob pages")
-	}
-	if !strings.Contains(errBuf.String(), "ROUTINE") || !strings.Contains(errBuf.String(), "reconcile") {
-		t.Fatalf("routine reconcile-delete ERROR line lacks the routine-rewrite wording: %q", errBuf.String())
-	}
-	// The deletion count and window must be present in the loud line.
-	if !strings.Contains(errBuf.String(), "[2026-06-08T10:00:00Z,2026-06-08T11:00:00Z)") {
-		t.Fatalf("ERROR line is missing the window: %q", errBuf.String())
+	if f.calls != 0 {
+		t.Fatalf("store called %d times, want 0", f.calls)
 	}
 }
 
-// TestRater_BackfillReconcileDeleteLogsInfoNoError pins the QUIET half: an EXPLICIT
-// operator backfill (windowExplicit == true) that reconcile-deletes the SAME rollup is
-// intended convergence — it logs at INFO and emits NO ERROR (no page). The flag flips
-// ONLY the reconcile-delete severity; identical data, identical reconcile, opposite level.
-func TestRater_BackfillReconcileDeleteLogsInfoNoError(t *testing.T) {
-	store, ws, we := supersededReconcileStore()
-	log, infoBuf, errBuf := captureLogger()
-	r := New(store, bookM(), log)
-
-	// Run A (explicit backfill): one clean rollup.
-	if _, err := r.Run(context.Background(), ws, we, true); err != nil {
+func TestAggregator_PassesTheWindowInUTC(t *testing.T) {
+	l, _, _ := captureLogger()
+	f := &fakeStore{}
+	loc := time.FixedZone("x", 3*3600)
+	if _, err := New(f, l).Run(context.Background(), h0.In(loc), h1.In(loc), false); err != nil {
 		t.Fatal(err)
 	}
-	infoBuf.Reset()
-	errBuf.Reset()
-
-	// Run B (explicit backfill): the events vanish → reconcile-delete, but operator-chosen.
-	store.events = nil
-	resB, err := r.Run(context.Background(), ws, we, true)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if resB.ReconciledDeletions != 1 {
-		t.Fatalf("setup: deletions=%d, want 1", resB.ReconciledDeletions)
-	}
-	// THE INVARIANT: a backfill reconcile-delete is INFO, never ERROR.
-	if errBuf.Len() != 0 {
-		t.Fatalf("explicit backfill reconcile-delete emitted an ERROR line (it must be INFO — the operator asked for this convergence): %q", errBuf.String())
-	}
-	if !strings.Contains(infoBuf.String(), "reconcile DELETED") {
-		t.Fatalf("explicit backfill reconcile-delete did not log the convergence INFO line: %q", infoBuf.String())
-	}
-	if !strings.Contains(infoBuf.String(), "[2026-06-08T10:00:00Z,2026-06-08T11:00:00Z)") {
-		t.Fatalf("INFO line is missing the window: %q", infoBuf.String())
+	if f.gotStart.Location() != time.UTC || !f.gotStart.Equal(h0) || !f.gotEnd.Equal(h1) {
+		t.Fatalf("store got [%v,%v)", f.gotStart, f.gotEnd)
 	}
 }
 
-// TestRater_LateArrivalRatedByTrailingWindow: an event whose event_ts falls in hour
-// H but which is DRAINED only after H was rated is picked up by a later run whose
-// window still covers H — the trailing-window contract. The re-rate REPLACES H's
-// bucket (never doubles).
-func TestRater_LateArrivalRatedByTrailingWindow(t *testing.T) {
-	hourH := mustTime("2026-06-08T10:00:00Z")
-	store := newOracleStore(bookM(), nil)
-	r := New(store, bookM(), testLogger())
-
-	res1, err := r.Run(context.Background(), hourH, hourH.Add(time.Hour), false)
-	if err != nil {
-		t.Fatal(err)
+// Every reason usage is withheld from rated_usage needs a person, so each one
+// alone must make the run an anomaly (cmd/rater exit 2) and log at ERROR.
+func TestResult_EachWithheldReasonIsAnAnomalyAndLogsError(t *testing.T) {
+	cases := map[string]AggregateResult{
+		"unattributable":       {UnattributableEvents: 1},
+		"unexplained missing":  {MissingUsageEvents: 1, UnexplainedMissingUsageEvents: 1},
+		"invalid usage":        {InvalidUsageEvents: 1},
+		"invalid serving mode": {InvalidServingModeEvents: 1},
 	}
-	if res1.EventsRated != 0 || res1.RollupsWritten != 0 {
-		t.Fatalf("run1 rated=%d rollups=%d, want 0/0 (event not drained yet)", res1.EventsRated, res1.RollupsWritten)
-	}
-
-	store.events = append(store.events, RatedEvent{ServingMode: "dedicated",
-		AuthID: "a", ResourceID: "r", ModelID: "m", PromptTokens: 100, CompletionTokens: 50, At: hourH.Add(15 * time.Minute),
-	})
-
-	res2, err := r.Run(context.Background(), hourH.Add(-23*time.Hour), hourH.Add(2*time.Hour), false)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if res2.EventsRated != 1 || res2.RollupsWritten != 1 {
-		t.Fatalf("run2 rated=%d rollups=%d, want 1/1 (late event caught by trailing window)", res2.EventsRated, res2.RollupsWritten)
-	}
-	k := rollupKey{authID: "a", resourceID: "r", modelID: "m", windowStart: hourH}
-	if _, ok := store.table[k]; !ok {
-		t.Fatal("no rollup for hour H — the late-drained event was lost")
+	for name, ar := range cases {
+		t.Run(name, func(t *testing.T) {
+			l, _, errBuf := captureLogger()
+			res, err := New(&fakeStore{res: ar}, l).Run(context.Background(), h0, h1, false)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !res.HasAnomaly() {
+				t.Fatalf("%s: HasAnomaly = false", name)
+			}
+			if errBuf.Len() == 0 {
+				t.Fatalf("%s: nothing logged at ERROR", name)
+			}
+		})
 	}
 }
 
-// TestRater_MissingPriceFailsLoudNotZero (missing-price-fails-loud-not-zero): an
-// event for a model absent from the price file is counted unpriced and EXCLUDED from
-// the rollups — never a $0 row.
-func TestRater_MissingPriceFailsLoudNotZero(t *testing.T) {
-	at := mustTime("2026-06-08T10:15:00Z")
-	events := []RatedEvent{
-		{ServingMode: "dedicated", AuthID: "a", ResourceID: "r", ModelID: "m", PromptTokens: 100, CompletionTokens: 50, At: at},        // priced
-		{ServingMode: "dedicated", AuthID: "a", ResourceID: "r", ModelID: "unpriced", PromptTokens: 100, CompletionTokens: 50, At: at}, // NO price
-	}
-	store := newOracleStore(bookM(), events)
-	r := New(store, bookM(), testLogger())
-	res, err := r.Run(context.Background(), mustTime("2026-06-08T10:00:00Z"), mustTime("2026-06-08T11:00:00Z"), false)
+// Client aborts and upstream failures produce zero-usage rows on every install
+// with traffic; paging on them would bury the real signals.
+func TestResult_ExpectedMissingUsageIsReportedNotPaged(t *testing.T) {
+	l, info, errBuf := captureLogger()
+	res, err := New(&fakeStore{res: AggregateResult{MissingUsageEvents: 4, ExpectedMissingUsageEvents: 4}}, l).
+		Run(context.Background(), h0, h1, false)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if res.UnpricedEvents != 1 {
-		t.Fatalf("unpriced = %d, want 1", res.UnpricedEvents)
+	if res.HasAnomaly() || errBuf.Len() != 0 {
+		t.Fatalf("anomaly=%v error log=%q, want neither", res.HasAnomaly(), errBuf.String())
 	}
-	if res.EventsRated != 1 || res.RollupsWritten != 1 || len(store.table) != 1 {
-		t.Fatalf("rated=%d rollups=%d table=%d, want 1/1/1 (no $0 row for unpriced)", res.EventsRated, res.RollupsWritten, len(store.table))
+	if !strings.Contains(info.String(), "expected missing-usage") {
+		t.Fatalf("info log %q does not report the expected missing usage", info.String())
 	}
-	if !res.HasUnpriced() {
-		t.Fatal("HasUnpriced() = false, want true (lost-revenue signal)")
+}
+
+func TestAggregator_RoutineReconcileDeleteLogsError(t *testing.T) {
+	l, _, errBuf := captureLogger()
+	if _, err := New(&fakeStore{res: AggregateResult{ReconciledDeletions: 2}}, l).Run(context.Background(), h0, h1, false); err != nil {
+		t.Fatal(err)
 	}
-	for k := range store.table {
-		if k.modelID == "unpriced" {
-			t.Fatal("a rollup exists for the unpriced model — must NOT be $0-billed")
+	if !strings.Contains(errBuf.String(), "ROUTINE") {
+		t.Fatalf("error log %q, want the routine reconcile-delete page", errBuf.String())
+	}
+}
+
+func TestAggregator_BackfillReconcileDeleteLogsInfoNotError(t *testing.T) {
+	l, info, errBuf := captureLogger()
+	if _, err := New(&fakeStore{res: AggregateResult{ReconciledDeletions: 2}}, l).Run(context.Background(), h0, h1, true); err != nil {
+		t.Fatal(err)
+	}
+	if errBuf.Len() != 0 || !strings.Contains(info.String(), "EXPLICIT") {
+		t.Fatalf("error=%q info=%q, want only the explicit-window info line", errBuf.String(), info.String())
+	}
+}
+
+// An unknown topology revision loses margin attribution only; the record is
+// still right, so it warns and is not an anomaly.
+func TestResult_UnknownRevisionWarnsButIsNotAnAnomaly(t *testing.T) {
+	l, info, errBuf := captureLogger()
+	res, err := New(&fakeStore{res: AggregateResult{UnknownRevisionRollups: 1, RollupsWritten: 1}}, l).Run(context.Background(), h0, h1, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res.HasAnomaly() || errBuf.Len() != 0 || !strings.Contains(info.String(), "topology revision 0") {
+		t.Fatalf("anomaly=%v error=%q info=%q", res.HasAnomaly(), errBuf.String(), info.String())
+	}
+}
+
+func TestEnsureUTCTimeZone(t *testing.T) {
+	cases := map[string]string{
+		"postgres://u@h/db":                  "postgres://u@h/db?timezone=UTC",
+		"postgres://u@h/db?sslmode=disable":  "postgres://u@h/db?sslmode=disable&timezone=UTC",
+		"host=h dbname=db":                   "host=h dbname=db timezone=UTC",
+		"postgres://u@h/db?TimeZone=Etc/UTC": "postgres://u@h/db?TimeZone=Etc/UTC",
+	}
+	for in, want := range cases {
+		if got := ensureUTCTimeZone(in); got != want {
+			t.Errorf("ensureUTCTimeZone(%q) = %q, want %q", in, got, want)
 		}
 	}
 }
 
-// TestRater_UnattributableCountedNotSilent: rows with NULL auth_id, NULL resource_id,
-// and/or NULL model_id must NOT be rated, MUST be counted, and MUST trigger the loud
-// anomaly / exit-2 path. resource_id joins the key columns (E2): a row that can't name
-// its deployment/org is unattributable exactly like a NULL auth_id/model_id.
-func TestRater_UnattributableCountedNotSilent(t *testing.T) {
-	at := mustTime("2026-06-08T10:15:00Z")
-	events := []RatedEvent{
-		{ServingMode: "dedicated", AuthID: "a", ResourceID: "r", ModelID: "m", PromptTokens: 100, CompletionTokens: 50, At: at}, // ok
-		{ServingMode: "dedicated", AuthID: "", ResourceID: "r", ModelID: "m", PromptTokens: 100, CompletionTokens: 50, At: at},  // NULL auth_id
-		{ServingMode: "dedicated", AuthID: "a", ResourceID: "", ModelID: "m", PromptTokens: 100, CompletionTokens: 50, At: at},  // NULL resource_id
-		{ServingMode: "dedicated", AuthID: "a", ResourceID: "r", ModelID: "", PromptTokens: 100, CompletionTokens: 50, At: at},  // NULL model_id
-	}
-	store := newOracleStore(bookM(), events)
-	r := New(store, bookM(), testLogger())
-	res, err := r.Run(context.Background(), mustTime("2026-06-08T10:00:00Z"), mustTime("2026-06-08T11:00:00Z"), false)
+// An empty base model is expected for a dedicated endpoint outside the catalog
+// (D3): it warns, it is not an anomaly, and it never pages.
+func TestResult_EmptyBaseModelWarnsButIsNotAnAnomaly(t *testing.T) {
+	l, info, errBuf := captureLogger()
+	res, err := New(&fakeStore{res: AggregateResult{EventsAggregated: 2, EmptyBaseModelEvents: 2, RollupsWritten: 1}}, l).Run(context.Background(), h0, h1, false)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if res.UnattributableEvents != 3 {
-		t.Fatalf("unattributable = %d, want 3 (NULL auth_id, NULL resource_id, NULL model_id)", res.UnattributableEvents)
-	}
-	if res.EventsRated != 1 || res.RollupsWritten != 1 || len(store.table) != 1 {
-		t.Fatalf("rated=%d rollups=%d table=%d, want 1/1/1", res.EventsRated, res.RollupsWritten, len(store.table))
-	}
-	if !res.HasUnattributable() || !res.HasAnomaly() {
-		t.Fatal("HasUnattributable/HasAnomaly = false, want true (drives exit 2)")
+	if res.HasAnomaly() || errBuf.Len() != 0 || !strings.Contains(info.String(), "no base_model") {
+		t.Fatalf("anomaly=%v error=%q info=%q", res.HasAnomaly(), errBuf.String(), info.String())
 	}
 }
 
-// TestRater_DistinctDeploymentsBillSeparately (E2 grain — the negative invariant):
-// TWO deployments (distinct resource_id) of the SAME model by the SAME auth in the
-// SAME hour produce TWO distinct rated_usage rows, NOT one summed row. resource_id is
-// part of the grain precisely because the two deployments may bill to different orgs
-// (resource_id→org_id), so collapsing them would mis-attribute revenue. The two rows
-// share (auth_id, model_id, window_start) and differ ONLY in resource_id.
-func TestRater_DistinctDeploymentsBillSeparately(t *testing.T) {
-	at := mustTime("2026-06-08T10:15:00Z")
-	ws := mustTime("2026-06-08T10:00:00Z")
-	events := []RatedEvent{
-		{ServingMode: "dedicated", AuthID: "a", ResourceID: "deploy-1", ModelID: "m", PromptTokens: 100, CompletionTokens: 50, At: at},
-		{ServingMode: "dedicated", AuthID: "a", ResourceID: "deploy-2", ModelID: "m", PromptTokens: 100, CompletionTokens: 50, At: at.Add(5 * time.Minute)},
+// Conflicts are parked, not anomalies: each logs at ERROR, and the run reports
+// the parked rows (cmd/rater exit 4), not HasAnomaly (exit 2).
+func TestResult_ConflictsAreParkedAndLoggedNotAnomalies(t *testing.T) {
+	cases := map[string]AggregateResult{
+		"owner conflict": {OwnerConflictEvents: 1, ParkedWritten: 1},
+		"ambiguous base": {AmbiguousBaseEvents: 1, ParkedWritten: 1},
+		"ambiguous org":  {AmbiguousOrgEvents: 1, ParkedWritten: 1},
+		"missing org":    {MissingOrgEvents: 1, ParkedWritten: 1},
 	}
-	store := newOracleStore(bookM(), events)
-	r := New(store, bookM(), testLogger())
-	res, err := r.Run(context.Background(), ws, mustTime("2026-06-08T11:00:00Z"), false)
-	if err != nil {
-		t.Fatal(err)
-	}
-	// TWO rollups, one per deployment — NOT one summed row.
-	if res.EventsRated != 2 || res.RollupsWritten != 2 || len(store.table) != 2 {
-		t.Fatalf("rated=%d rollups=%d table=%d, want 2/2/2 (distinct resource_id must NOT collapse into one row)",
-			res.EventsRated, res.RollupsWritten, len(store.table))
-	}
-	// Each deployment has its OWN row under the same (auth, model, hour).
-	for _, rid := range []string{"deploy-1", "deploy-2"} {
-		k := rollupKey{authID: "a", resourceID: rid, modelID: "m", windowStart: ws}
-		ru, ok := store.table[k]
-		if !ok {
-			t.Fatalf("no rollup for deployment %q — distinct deployments must each bill", rid)
-		}
-		if ru.eventCount != 1 {
-			t.Fatalf("deployment %q event_count = %d, want 1 (one event per deployment)", rid, ru.eventCount)
-		}
-	}
-}
-
-// TestRater_NullResourceIdIsUnattributable (fail-closed attribution): an event with a
-// NULL resource_id CANNOT name its deployment/org (E2 resolves the org via
-// resource_id→org_id), so it must be counted UNATTRIBUTABLE and EXCLUDED from billing —
-// never $0-billed, never billed to a NULL org. It pins the partition invariant with
-// resource_id in the mix: rated + unpriced + unattributable + ambiguous_base +
-// ambiguous_org == total (the oracle sets ambiguous_org to 0; it's a true partition cell).
-func TestRater_NullResourceIdIsUnattributable(t *testing.T) {
-	at := mustTime("2026-06-08T10:15:00Z")
-	events := []RatedEvent{
-		{ServingMode: "dedicated", AuthID: "a", ResourceID: "r", ModelID: "m", PromptTokens: 100, CompletionTokens: 50, At: at}, // attributable
-		{ServingMode: "dedicated", AuthID: "a", ResourceID: "", ModelID: "m", PromptTokens: 100, CompletionTokens: 50, At: at},  // NULL resource_id → unattributable
-	}
-	store := newOracleStore(bookM(), events)
-	r := New(store, bookM(), testLogger())
-	res, err := r.Run(context.Background(), mustTime("2026-06-08T10:00:00Z"), mustTime("2026-06-08T11:00:00Z"), false)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if res.UnattributableEvents != 1 {
-		t.Fatalf("unattributable = %d, want 1 (the NULL-resource_id event must be counted, never billed)", res.UnattributableEvents)
-	}
-	if res.EventsRated != 1 || res.RollupsWritten != 1 || len(store.table) != 1 {
-		t.Fatalf("rated=%d rollups=%d table=%d, want 1/1/1 (no row for the unattributable event)", res.EventsRated, res.RollupsWritten, len(store.table))
-	}
-	// No rollup carries an empty resource_id — the fail-closed row is never written.
-	for k := range store.table {
-		if k.resourceID == "" {
-			t.Fatal("a rollup exists with an empty resource_id — a row that can't name its deployment/org must NEVER be billed")
-		}
-	}
-	if !res.HasUnattributable() || !res.HasAnomaly() {
-		t.Fatal("HasUnattributable/HasAnomaly = false, want true (NULL resource_id must drive exit-nonzero)")
-	}
-	// PARTITION with resource_id in the mix.
-	if got := res.EventsRated + res.UnpricedEvents + res.UnattributableEvents + res.AmbiguousBaseEvents + res.AmbiguousOrgEvents; got != int64(len(events)) {
-		t.Fatalf("rated(%d)+unpriced(%d)+unattr(%d)+ambiguous_base(%d)+ambiguous_org(%d) = %d, want %d",
-			res.EventsRated, res.UnpricedEvents, res.UnattributableEvents, res.AmbiguousBaseEvents, res.AmbiguousOrgEvents, got, len(events))
-	}
-}
-
-// TestRater_DerivedFineTuneRatedViaPolicy: end-to-end, a fine-tune (derived_from a
-// base) is rated at base × premium — exercising derivation in the run.
-func TestRater_DerivedFineTuneRatedViaPolicy(t *testing.T) {
-	book := newTestBook(
-		map[string]Rate3{"base": rate3("0.000004", "0", "0")},
-		map[string]string{"ft": "base"},
-		PolicyMultiplier, MustDec("1.5"), Dec{},
-	)
-	events := []RatedEvent{
-		{ServingMode: "dedicated", AuthID: "a", ResourceID: "r", ModelID: "ft", PromptTokens: 1000, At: mustTime("2026-06-08T10:15:00Z")},
-	}
-	store := newOracleStore(book, events)
-	r := New(store, book, testLogger())
-	res, err := r.Run(context.Background(), mustTime("2026-06-08T10:00:00Z"), mustTime("2026-06-08T11:00:00Z"), false)
-	if err != nil {
-		t.Fatal(err)
-	}
-	// 1000 * (0.000004 * 1.5) = 0.006
-	if res.TotalCost != "0.006000000" {
-		t.Fatalf("total = %s, want 0.006000000 (base×1.5 fine-tune)", res.TotalCost)
-	}
-}
-
-// TestRater_FineTunePricesViaBaseModelOnEvent (fine-tune-prices-via-base-model-on-event):
-// a real fine-tune event — an ft:<checkpoint> model_id the file never names, carrying
-// its base_model (E3, stamped by Atlas at deploy) — prices at base × premium by
-// resolving through the event's base_model. This is the primary production fine-tune
-// path: the file declares only the BASE; the ft: checkpoint id is minted per deployment.
-func TestRater_FineTunePricesViaBaseModelOnEvent(t *testing.T) {
-	book := newTestBook(
-		map[string]Rate3{"meta-llama/Llama-3.1-8B-Instruct": rate3("0.000004", "0", "0")},
-		nil, // NO in-file fine-tune linkage — the ft: id is unknown at file-authoring
-		PolicyMultiplier, MustDec("1.5"), Dec{},
-	)
-	events := []RatedEvent{{ServingMode: "dedicated",
-		AuthID: "a", ResourceID: "r",
-		ModelID:      "ft:9f8e7d6c5b4a", // a checkpoint id the file does not list
-		BaseModel:    "meta-llama/Llama-3.1-8B-Instruct",
-		PromptTokens: 1000,
-		At:           mustTime("2026-06-08T10:15:00Z"),
-	}}
-	store := newOracleStore(book, events)
-	r := New(store, book, testLogger())
-	res, err := r.Run(context.Background(), mustTime("2026-06-08T10:00:00Z"), mustTime("2026-06-08T11:00:00Z"), false)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if res.UnpricedEvents != 0 {
-		t.Fatalf("unpriced = %d, want 0 (the ft: event prices via its base_model)", res.UnpricedEvents)
-	}
-	// 1000 * (0.000004 * 1.5) = 0.006 — the fine-tune billed at base × premium.
-	if res.EventsRated != 1 || res.RollupsWritten != 1 || res.TotalCost != "0.006000000" {
-		t.Fatalf("result = %+v, want 1 event / 1 rollup / 0.006000000 (base×1.5 via base_model)", res)
-	}
-	// The applied rate frozen on the row is the derived (base × premium) rate.
-	hour := mustTime("2026-06-08T10:00:00Z")
-	row := store.table[rollupKey{"a", "r", "ft:9f8e7d6c5b4a", hour}]
-	if row.appliedRate.Prompt.String() != "0.000006000" {
-		t.Fatalf("ft applied prompt rate = %s, want 0.000006000 (0.000004 × 1.5)", row.appliedRate.Prompt)
-	}
-}
-
-// TestRater_FineTuneWithoutBaseModelFailsLoud (fine-tune-without-base-model-fails-loud):
-// the fail-closed invariant. An ft:<checkpoint> model_id with an EMPTY base_model is a
-// PROPAGATION BUG (Atlas guarantees base_model is present to deploy a fine-tune), NOT a
-// free model. It must be counted UNPRICED (ErrNoPrice) and EXCLUDED from the rollups —
-// never silently mis-priced or $0-billed. A silent $0 here would lose all fine-tune
-// revenue the moment the base_model header stopped propagating.
-func TestRater_FineTuneWithoutBaseModelFailsLoud(t *testing.T) {
-	book := newTestBook(
-		map[string]Rate3{"meta-llama/Llama-3.1-8B-Instruct": rate3("0.000004", "0", "0")},
-		nil, PolicyMultiplier, MustDec("1.5"), Dec{},
-	)
-	events := []RatedEvent{{ServingMode: "dedicated",
-		AuthID: "a", ResourceID: "r",
-		ModelID:      "ft:9f8e7d6c5b4a",
-		BaseModel:    "", // THE BUG: base_model never propagated to the event
-		PromptTokens: 1000,
-		At:           mustTime("2026-06-08T10:15:00Z"),
-	}}
-	store := newOracleStore(book, events)
-	r := New(store, book, testLogger())
-	res, err := r.Run(context.Background(), mustTime("2026-06-08T10:00:00Z"), mustTime("2026-06-08T11:00:00Z"), false)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if res.UnpricedEvents != 1 {
-		t.Fatalf("unpriced = %d, want 1 (ft: with empty base_model must scream)", res.UnpricedEvents)
-	}
-	if res.EventsRated != 0 || res.RollupsWritten != 0 || len(store.table) != 0 {
-		t.Fatalf("result = %+v, table=%d — an ft: with no base_model must NEVER be rated or $0-billed", res, len(store.table))
-	}
-	if !res.HasUnpriced() || !res.HasAnomaly() {
-		t.Fatal("HasUnpriced/HasAnomaly = false, want true (the propagation bug must drive exit-nonzero)")
-	}
-}
-
-// TestRater_FineTuneAmbiguousBaseModelFailsLoud (fine-tune-ambiguous-base-model-fails-loud):
-// the E3 ft-uniqueness invariant (FIX 2). E3 mints ft:<checkpoint_artifact_id> as a
-// globally-unique uuid4, so a single ft: model_id can NEVER legitimately carry two
-// different base_models. If it does (a base_model propagation bug), the derived rates
-// differ and a blind MIN()-applied-rate would silently bill the rollup at the CHEAPER
-// base — under-billing, counted as rated. The invariant converts that into a SCREAM:
-// the ambiguous rollup is NOT billed, its events are counted ambiguous, and the run
-// fails loud. (The same ft: id with the SAME base across events is fine — one rollup.)
-func TestRater_FineTuneAmbiguousBaseModelFailsLoud(t *testing.T) {
-	book := newTestBook(
-		map[string]Rate3{
-			"cheap/base":     rate3("0.000001", "0", "0"),
-			"expensive/base": rate3("0.000009", "0", "0"),
-		},
-		nil, PolicyMultiplier, MustDec("1.5"), Dec{},
-	)
-	at := mustTime("2026-06-08T10:15:00Z")
-	events := []RatedEvent{
-		// SAME ft: model_id, TWO different base_models in the same window → ambiguous.
-		{ServingMode: "dedicated", AuthID: "a", ResourceID: "r", ModelID: "ft:dupe", BaseModel: "cheap/base", PromptTokens: 1000, At: at},
-		{ServingMode: "dedicated", AuthID: "a", ResourceID: "r", ModelID: "ft:dupe", BaseModel: "expensive/base", PromptTokens: 1000, At: at.Add(5 * time.Minute)},
-		// THE LEGITIMATE CASE the gate must NOT trip: the same ft: id with the SAME base
-		// across MULTIPLE events is one clean rollup (COUNT(DISTINCT base_model)=1), and
-		// MUST still rate normally alongside the ambiguous one. Two events prove the gate
-		// keys on DISTINCT bases, not on event count.
-		{ServingMode: "dedicated", AuthID: "a", ResourceID: "r", ModelID: "ft:clean", BaseModel: "cheap/base", PromptTokens: 1000, At: at},
-		{ServingMode: "dedicated", AuthID: "a", ResourceID: "r", ModelID: "ft:clean", BaseModel: "cheap/base", PromptTokens: 1000, At: at.Add(7 * time.Minute)},
-	}
-	store := newOracleStore(book, events)
-	r := New(store, book, testLogger())
-	res, err := r.Run(context.Background(), mustTime("2026-06-08T10:00:00Z"), mustTime("2026-06-08T11:00:00Z"), false)
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	// The two ambiguous events are counted, NOT rated, NOT $0-billed.
-	if res.AmbiguousBaseEvents != 2 {
-		t.Fatalf("ambiguous-base events = %d, want 2 (the two-base ft: rollup must scream)", res.AmbiguousBaseEvents)
-	}
-	if !res.HasAmbiguousBase() || !res.HasAnomaly() {
-		t.Fatal("HasAmbiguousBase/HasAnomaly = false, want true (the uniqueness violation must drive exit-nonzero)")
-	}
-	// The clean ft: rollup (both same-base events) still rated as ONE rollup; the
-	// ambiguous one did not. 2 events rated into 1 rollup.
-	if res.EventsRated != 2 || res.RollupsWritten != 1 {
-		t.Fatalf("rated=%d rollups=%d, want 2/1 (the same-ft-same-base multi-event rollup must rate as one)", res.EventsRated, res.RollupsWritten)
-	}
-	for k := range store.table {
-		if k.modelID == "ft:dupe" {
-			t.Fatal("a rollup exists for the ambiguous ft: id — it must NOT be billed (silent MIN-rate under-charge)")
-		}
-	}
-	// SINGLE-SNAPSHOT PARTITION: rated + unpriced + unattributable + ambiguous_base +
-	// ambiguous_org == total (org bucket is 0 in the oracle; still a true partition cell).
-	if got := res.EventsRated + res.UnpricedEvents + res.UnattributableEvents + res.AmbiguousBaseEvents + res.AmbiguousOrgEvents; got != int64(len(events)) {
-		t.Fatalf("rated(%d)+unpriced(%d)+unattr(%d)+ambiguous_base(%d)+ambiguous_org(%d) = %d, want %d",
-			res.EventsRated, res.UnpricedEvents, res.UnattributableEvents, res.AmbiguousBaseEvents, res.AmbiguousOrgEvents, got, len(events))
-	}
-}
-
-// TestRater_RollupCostSelfAudits (rollup-cost-self-audits): the persona-pass invariant —
-// every written rollup's cost EXACTLY equals its applied per-token rate × its token
-// counts (cost == applied_prompt_rate × billable + applied_cached_rate × cached +
-// applied_completion_rate × completion). Because the applied rate is the 9dp value
-// frozen on the row, the cost is fully reconstructable from the row ALONE — no hidden
-// second rate.
-//
-// SCOPE: the fixture has a base rollup and a DERIVED rollup, which carry DIFFERENT
-// applied rates, and asserts EACH reconstructs from its OWN frozen rate — so the
-// self-audit is exercised across heterogeneous rate kinds, not just one rate. It does
-// NOT exercise MIN() masking a divergent rate WITHIN a rollup: that can only arise when
-// one ft: id resolves through >1 base in a window, which the ambiguity gate excludes
-// from billing entirely — proven by TestRater_FineTuneAmbiguousBaseModelFailsLoud (and
-// its live-PG twin), where the ambiguous rollup is NOT written at all. So within any
-// WRITTEN rollup the rate is uniform by construction and MIN() has nothing to mask.
-func TestRater_RollupCostSelfAudits(t *testing.T) {
-	book := newTestBook(
-		map[string]Rate3{"base": rate3("0.000004", "0.0000004", "0.00001")},
-		map[string]string{"ft": "base"},
-		PolicyMultiplier, MustDec("1.5"), Dec{},
-	)
-	at := mustTime("2026-06-08T10:15:00Z")
-	events := []RatedEvent{
-		{ServingMode: "dedicated", AuthID: "a", ResourceID: "r", ModelID: "base", PromptTokens: 100, CachedTokens: 30, CompletionTokens: 50, At: at},
-		{ServingMode: "dedicated", AuthID: "a", ResourceID: "r", ModelID: "base", PromptTokens: 200, CachedTokens: 0, CompletionTokens: 10, At: at.Add(10 * time.Minute)},
-		{ServingMode: "dedicated", AuthID: "a", ResourceID: "r", ModelID: "ft", PromptTokens: 100, CachedTokens: 0, CompletionTokens: 0, At: at},
-	}
-	store := newOracleStore(book, events)
-	r := New(store, book, testLogger())
-	if _, err := r.Run(context.Background(), mustTime("2026-06-08T10:00:00Z"), mustTime("2026-06-08T11:00:00Z"), false); err != nil {
-		t.Fatal(err)
-	}
-	if len(store.table) == 0 {
-		t.Fatal("no rollups written")
-	}
-	for k, ru := range store.table {
-		want := ru.appliedRate.Prompt.MulInt(ru.billable).
-			Add(ru.appliedRate.Cached.MulInt(ru.cached)).
-			Add(ru.appliedRate.Completion.MulInt(ru.completion)).
-			Round(moneyScale)
-		if ru.cost.String() != want.String() {
-			t.Errorf("rollup (%s,%s) cost = %s, but applied_rate × tokens = %s (self-audit broken)",
-				k.authID, k.modelID, ru.cost, want)
-		}
-	}
-}
-
-// TestRater_AppliedRateStoredOnRow (applied-rate-stored-on-row): the rollup carries
-// the exact per-token rate it was billed at, for both base and derived models.
-func TestRater_AppliedRateStoredOnRow(t *testing.T) {
-	book := newTestBook(
-		map[string]Rate3{"base": rate3("0.000004", "0.0000004", "0.00001")},
-		map[string]string{"ft": "base"},
-		PolicyMultiplier, MustDec("1.5"), Dec{},
-	)
-	at := mustTime("2026-06-08T10:15:00Z")
-	events := []RatedEvent{
-		{ServingMode: "dedicated", AuthID: "a", ResourceID: "r", ModelID: "base", PromptTokens: 10, At: at},
-		{ServingMode: "dedicated", AuthID: "a", ResourceID: "r", ModelID: "ft", PromptTokens: 10, At: at},
-	}
-	store := newOracleStore(book, events)
-	r := New(store, book, testLogger())
-	if _, err := r.Run(context.Background(), mustTime("2026-06-08T10:00:00Z"), mustTime("2026-06-08T11:00:00Z"), false); err != nil {
-		t.Fatal(err)
-	}
-	hour := mustTime("2026-06-08T10:00:00Z")
-	baseRow := store.table[rollupKey{"a", "r", "base", hour}]
-	if baseRow.appliedRate.Prompt.String() != "0.000004000" {
-		t.Fatalf("base applied prompt rate = %s, want 0.000004000", baseRow.appliedRate.Prompt)
-	}
-	ftRow := store.table[rollupKey{"a", "r", "ft", hour}]
-	// premium applied: 0.000004 × 1.5 = 0.000006
-	if ftRow.appliedRate.Prompt.String() != "0.000006000" {
-		t.Fatalf("ft applied prompt rate = %s, want 0.000006000 (premium frozen on row)", ftRow.appliedRate.Prompt)
-	}
-}
-
-// TestRater_InvertedWindow rejects an empty/inverted window before any SQL.
-func TestRater_InvertedWindow(t *testing.T) {
-	store := newOracleStore(bookM(), nil)
-	r := New(store, bookM(), testLogger())
-	if _, err := r.Run(context.Background(), mustTime("2026-06-08T11:00:00Z"), mustTime("2026-06-08T10:00:00Z"), false); err == nil {
-		t.Fatal("expected error for inverted window")
-	}
-}
-
-// TestOracleModel_SelfConsistent checks the in-Go oracle's INTERNAL consistency — it
-// runs NO SQL. Over a fixture mixing base, derived (multiplier), cached-subset, and
-// unpriced/unattributable rows, the rollup the oracleStore builds
-// (resolve→quantize→exact-cost→sum→round-once) equals an independent recomputation,
-// row-for-row. The REAL SQL-vs-oracle conformance is the //go:build integration test
-// TestIntegration_RateWindow_ConformsToOracle in store_integration_test.go; this one
-// only pins that the oracle agrees with itself (so a faithful reference exists to pin
-// the SQL against).
-func TestOracleModel_SelfConsistent(t *testing.T) {
-	book := newTestBook(
-		map[string]Rate3{"b": rate3("0.000005", "0.0000005", "0.00002")},
-		map[string]string{"f": "b"},
-		PolicyMultiplier, MustDec("1.5"), Dec{},
-	)
-	hour := mustTime("2026-06-08T10:00:00Z")
-	events := []RatedEvent{
-		{ServingMode: "dedicated", AuthID: "a", ResourceID: "r", ModelID: "b", PromptTokens: 100, CachedTokens: 30, CompletionTokens: 50, At: hour.Add(5 * time.Minute)},
-		{ServingMode: "dedicated", AuthID: "a", ResourceID: "r", ModelID: "b", PromptTokens: 200, CachedTokens: 0, CompletionTokens: 10, At: hour.Add(40 * time.Minute)},
-		{ServingMode: "dedicated", AuthID: "a", ResourceID: "r", ModelID: "f", PromptTokens: 100, CachedTokens: 0, CompletionTokens: 0, At: hour.Add(15 * time.Minute)},
-		{ServingMode: "dedicated", AuthID: "b", ResourceID: "r", ModelID: "b", PromptTokens: 1000, CachedTokens: 1000, CompletionTokens: 0, At: hour.Add(20 * time.Minute)}, // all-cached
-		{ServingMode: "dedicated", AuthID: "a", ResourceID: "r", ModelID: "unpriced", PromptTokens: 9, At: hour.Add(1 * time.Minute)},                                       // unpriced
-		{ServingMode: "dedicated", AuthID: "", ModelID: "b", PromptTokens: 9, At: hour.Add(2 * time.Minute)},                                                                // unattributable
-	}
-	store := newOracleStore(book, events)
-	r := New(store, book, testLogger())
-	res, err := r.Run(context.Background(), hour, hour.Add(time.Hour), false)
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	type key struct{ auth, model string }
-	want := map[key]Dec{}
-	for _, e := range events {
-		if e.AuthID == "" || e.ModelID == "" {
-			continue
-		}
-		resolved, err := book.Resolve(e.ModelID)
+	for name, ar := range cases {
+		l, _, errBuf := captureLogger()
+		parked := []Parked{{WindowStart: h0, AuthID: "a", ResourceID: "r", ModelID: "m", ServingMode: "dedicated", Reason: "x", PromptTokens: 7}}
+		res, err := New(&fakeStore{res: ar, parked: parked}, l).Run(context.Background(), h0, h1, false)
 		if err != nil {
-			continue
+			t.Fatal(err)
 		}
-		k := key{e.AuthID, e.ModelID}
-		want[k] = want[k].Add(Rate(e, resolved.Quantized()))
-	}
-	if res.UnpricedEvents != 1 || res.UnattributableEvents != 1 {
-		t.Fatalf("anomalies = unpriced %d / unattr %d, want 1/1", res.UnpricedEvents, res.UnattributableEvents)
-	}
-	// SINGLE-SNAPSHOT ACCOUNTING INVARIANT: the FULL 5-bucket partition must account for
-	// every in-window event (the ambiguous buckets are 0 in this fixture, but naming all
-	// five keeps the invariant honest — a regression that leaks into an ambiguous bucket
-	// would break the sum instead of passing coincidentally).
-	if got := res.EventsRated + res.UnpricedEvents + res.UnattributableEvents +
-		res.AmbiguousBaseEvents + res.AmbiguousOrgEvents; got != int64(len(events)) {
-		t.Fatalf("rated(%d)+unpriced(%d)+unattr(%d)+ambiguous_base(%d)+ambiguous_org(%d) = %d, want %d",
-			res.EventsRated, res.UnpricedEvents, res.UnattributableEvents,
-			res.AmbiguousBaseEvents, res.AmbiguousOrgEvents, got, len(events))
-	}
-	if res.RollupsWritten != int64(len(want)) {
-		t.Fatalf("rollups = %d, want %d", res.RollupsWritten, len(want))
-	}
-	for k, w := range want {
-		rk := rollupKey{authID: k.auth, resourceID: "r", modelID: k.model, windowStart: hour}
-		got := store.table[rk].cost
-		if got.String() != w.String() {
-			t.Errorf("rollup (%s,%s) cost = %s, oracle wants %s", k.auth, k.model, got, w)
+		if res.HasAnomaly() || !res.HasParked() || !strings.Contains(errBuf.String(), "PARKED (unbilled) usage hour=2026-10-22T14:00:00Z") || !strings.Contains(errBuf.String(), "prompt=7") {
+			t.Fatalf("%s: anomaly=%v parked=%v error log %q", name, res.HasAnomaly(), res.HasParked(), errBuf.String())
 		}
 	}
 }
 
-// TestRater_BaseEndpointPricesAtPlainBaseRate (base-endpoint-no-premium): the C4
-// base-model endpoint path through a full rating run. The event's model_id is the
-// ENDPOINT NAME (not a file key, no ft: prefix), there is NO adapter, and base_model
-// carries the catalog price key: it bills at the PLAIN base rate — no premium — with
-// that plain rate frozen onto the row.
-func TestRater_BaseEndpointPricesAtPlainBaseRate(t *testing.T) {
-	book := newTestBook(
-		map[string]Rate3{"meta-llama/Llama-3.1-8B-Instruct": rate3("0.000004", "0", "0")},
-		nil, PolicyMultiplier, MustDec("1.5"), Dec{},
-	)
-	events := []RatedEvent{{ServingMode: "dedicated",
-		AuthID:       "a",
-		ResourceID:   "r",
-		ModelID:      "tf-ep-my-llama", // the endpoint name vLLM serves under (C4)
-		BaseModel:    "meta-llama/Llama-3.1-8B-Instruct",
-		Adapter:      "", // a base-model endpoint: no adapter header
-		PromptTokens: 1000,
-		At:           mustTime("2026-06-08T10:15:00Z"),
-	}}
-	store := newOracleStore(book, events)
-	r := New(store, book, testLogger())
-	res, err := r.Run(context.Background(), mustTime("2026-06-08T10:00:00Z"), mustTime("2026-06-08T11:00:00Z"), false)
+// Parked hours outside the window but inside the re-check reach are
+// re-aggregated one hour at a time; hours inside the window are not run twice.
+func TestAggregator_RechecksParkedHoursOutsideTheWindow(t *testing.T) {
+	l, _, _ := captureLogger()
+	old := h0.Add(-72 * time.Hour)
+	f := &fakeStore{parkedHours: []time.Time{old, h0}}
+	a := New(f, l)
+	a.now = func() time.Time { return h1.Add(time.Hour) }
+	res, err := a.Run(context.Background(), h0, h1, false)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if res.UnpricedEvents != 0 {
-		t.Fatalf("unpriced = %d, want 0 (a base endpoint prices via its base_model)", res.UnpricedEvents)
-	}
-	// 1000 x 0.000004 = 0.004 — the PLAIN base rate; 0.006 here would mean the
-	// premium leaked onto a base-model endpoint (over-billing).
-	if res.EventsRated != 1 || res.RollupsWritten != 1 || res.TotalCost != "0.004000000" {
-		t.Fatalf("result = %+v, want 1 event / 1 rollup / 0.004000000 (plain base rate, NO premium)", res)
-	}
-	row := store.table[rollupKey{"a", "r", "tf-ep-my-llama", mustTime("2026-06-08T10:00:00Z")}]
-	if row.appliedRate.Prompt.String() != "0.000004000" {
-		t.Fatalf("applied prompt rate = %s, want 0.000004000 (the un-premiumed base rate frozen on the row)", row.appliedRate.Prompt)
+	if res.RescannedParkedHours != 1 || len(f.windows) != 2 || !f.windows[1][0].Equal(old) || !f.windows[1][1].Equal(old.Add(time.Hour)) {
+		t.Fatalf("rescanned %d, windows %v; want the window then [old, old+1h)", res.RescannedParkedHours, f.windows)
 	}
 }
 
-// TestRater_AdapterTriggersPremium (adapter-triggers-premium): the C4 fine-tune
-// checkpoint endpoint path through a full rating run. The event's model_id is the
-// ENDPOINT NAME (not ft:-prefixed), the injected adapter is present, and base_model
-// carries the base: it bills at base x premium, with the derived rate on the row.
-func TestRater_AdapterTriggersPremium(t *testing.T) {
-	book := newTestBook(
-		map[string]Rate3{"meta-llama/Llama-3.1-8B-Instruct": rate3("0.000004", "0", "0")},
-		nil, PolicyMultiplier, MustDec("1.5"), Dec{},
-	)
-	events := []RatedEvent{{ServingMode: "dedicated",
-		AuthID:       "a",
-		ResourceID:   "r",
-		ModelID:      "tf-ep-my-finetune", // endpoint name — nothing marks it ft: but the adapter
-		BaseModel:    "meta-llama/Llama-3.1-8B-Instruct",
-		Adapter:      "ckpt-artifact-42",
-		PromptTokens: 1000,
-		At:           mustTime("2026-06-08T10:15:00Z"),
-	}}
-	store := newOracleStore(book, events)
-	r := New(store, book, testLogger())
-	res, err := r.Run(context.Background(), mustTime("2026-06-08T10:00:00Z"), mustTime("2026-06-08T11:00:00Z"), false)
+func TestParkedRescanReach_StaysInsideThePrunerHardFloor(t *testing.T) {
+	if ParkedRescanReach >= 7*24*time.Hour || ParkedRescanReach <= 24*time.Hour {
+		t.Fatalf("ParkedRescanReach %v must be beyond the 24h window and strictly inside the 7-day prune floor", ParkedRescanReach)
+	}
+}
+
+// Hugo, 2026-10-27: billing_event keeps 30 days with no exception for parked
+// usage. A parked hour whose raw events are pruned is never re-aggregated: a
+// window containing it is refused before any statement runs, and the ERROR
+// line carries the manual-settlement marker.
+func TestAggregator_RefusesAWindowContainingAPrunedParkedHour(t *testing.T) {
+	l, _, _ := captureLogger()
+	pruned := Parked{WindowStart: h0, AuthID: "a", ResourceID: "r", ModelID: "m", Reason: "ambiguous_org",
+		EventCount: 3, RawEvents: 0, RawEventsPruned: true}
+	f := &fakeStore{parked: []Parked{pruned}}
+	_, err := New(f, l).Run(context.Background(), h0, h1, true)
+	if err == nil || !strings.Contains(err.Error(), PrunedMarker) {
+		t.Fatalf("err = %v, want a refusal carrying %q", err, PrunedMarker)
+	}
+	if f.calls != 0 {
+		t.Fatalf("aggregated %d times, want 0", f.calls)
+	}
+}
+
+func TestAggregator_PrunedParkedRowIsLoggedWithTheMarkerAndNotRescanned(t *testing.T) {
+	l, _, errBuf := captureLogger()
+	old := h0.Add(-40 * 24 * time.Hour)
+	pruned := Parked{WindowStart: old, AuthID: "a", Reason: "ambiguous_org", EventCount: 3, RawEventsPruned: true}
+	f := &fakeStore{parked: []Parked{pruned}, parkedHours: []time.Time{old}}
+	a := New(f, l)
+	a.now = func() time.Time { return h1 }
+	res, err := a.Run(context.Background(), h0, h1, false)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if res.UnpricedEvents != 0 {
-		t.Fatalf("unpriced = %d, want 0 (the adapter marks the event fine-tune; it prices via base_model)", res.UnpricedEvents)
+	if res.RescannedParkedHours != 0 || f.calls != 1 {
+		t.Fatalf("rescanned %d, statements %d; want the pruned hour never re-aggregated", res.RescannedParkedHours, f.calls)
 	}
-	// 1000 x (0.000004 x 1.5) = 0.006 — 0.004 here would mean the adapter failed to
-	// trigger the premium (under-billing every fine-tune served under an endpoint name).
-	if res.EventsRated != 1 || res.RollupsWritten != 1 || res.TotalCost != "0.006000000" {
-		t.Fatalf("result = %+v, want 1 event / 1 rollup / 0.006000000 (base x premium via adapter)", res)
-	}
-	row := store.table[rollupKey{"a", "r", "tf-ep-my-finetune", mustTime("2026-06-08T10:00:00Z")}]
-	if row.appliedRate.Prompt.String() != "0.000006000" {
-		t.Fatalf("applied prompt rate = %s, want 0.000006000 (base x premium frozen on the row)", row.appliedRate.Prompt)
-	}
-}
-
-// TestRater_AdapterWithEmptyBaseModelFailsLoud (adapter-with-empty-base-model-unpriced):
-// the C4 fail-closed case. Fine-tune traffic (adapter present) whose base_model never
-// propagated is a PROPAGATION BUG, not a free model: counted UNPRICED, excluded from
-// the rollups, never $0-billed — and never silently priced at a plain-base rate.
-func TestRater_AdapterWithEmptyBaseModelFailsLoud(t *testing.T) {
-	book := newTestBook(
-		map[string]Rate3{"meta-llama/Llama-3.1-8B-Instruct": rate3("0.000004", "0", "0")},
-		nil, PolicyMultiplier, MustDec("1.5"), Dec{},
-	)
-	events := []RatedEvent{{ServingMode: "dedicated",
-		AuthID:       "a",
-		ResourceID:   "r",
-		ModelID:      "tf-ep-my-finetune",
-		BaseModel:    "", // THE BUG: base_model never propagated
-		Adapter:      "ckpt-artifact-42",
-		PromptTokens: 1000,
-		At:           mustTime("2026-06-08T10:15:00Z"),
-	}}
-	store := newOracleStore(book, events)
-	r := New(store, book, testLogger())
-	res, err := r.Run(context.Background(), mustTime("2026-06-08T10:00:00Z"), mustTime("2026-06-08T11:00:00Z"), false)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if res.UnpricedEvents != 1 {
-		t.Fatalf("unpriced = %d, want 1 (adapter with empty base_model must scream)", res.UnpricedEvents)
-	}
-	if res.EventsRated != 0 || res.RollupsWritten != 0 || len(store.table) != 0 {
-		t.Fatalf("result = %+v, table=%d — adapter traffic with no base_model must NEVER be rated or $0-billed", res, len(store.table))
-	}
-	if !res.HasUnpriced() || !res.HasAnomaly() {
-		t.Fatal("HasUnpriced/HasAnomaly = false, want true (the propagation bug must drive exit-nonzero)")
-	}
-}
-
-// TestRater_MixedAdapterPresenceFailsLoud: the C4 extension of the single-rate gate.
-// ONE endpoint-name model_id whose adapter header FLAPS within a window — some events
-// derived-priced (premium), some plain-base-priced — carries TWO different rates in
-// one rollup; a blind MIN() would silently bill the whole rollup at the cheaper
-// (plain) rate. The rollup must be excluded and counted ambiguous, never MIN-billed.
-func TestRater_MixedAdapterPresenceFailsLoud(t *testing.T) {
-	book := newTestBook(
-		map[string]Rate3{"meta-llama/Llama-3.1-8B-Instruct": rate3("0.000004", "0", "0")},
-		nil, PolicyMultiplier, MustDec("1.5"), Dec{},
-	)
-	at := mustTime("2026-06-08T10:15:00Z")
-	events := []RatedEvent{
-		// SAME model_id and base_model; adapter present on one, absent on the other.
-		{ServingMode: "dedicated", AuthID: "a", ResourceID: "r", ModelID: "tf-ep-flap", BaseModel: "meta-llama/Llama-3.1-8B-Instruct", Adapter: "ckpt-artifact-42", PromptTokens: 1000, At: at},
-		{ServingMode: "dedicated", AuthID: "a", ResourceID: "r", ModelID: "tf-ep-flap", BaseModel: "meta-llama/Llama-3.1-8B-Instruct", Adapter: "", PromptTokens: 1000, At: at.Add(5 * time.Minute)},
-	}
-	store := newOracleStore(book, events)
-	r := New(store, book, testLogger())
-	res, err := r.Run(context.Background(), mustTime("2026-06-08T10:00:00Z"), mustTime("2026-06-08T11:00:00Z"), false)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if res.AmbiguousBaseEvents != 2 {
-		t.Fatalf("ambiguous = %d, want 2 (premium/plain flap on one endpoint must scream, never MIN-bill)", res.AmbiguousBaseEvents)
-	}
-	if res.EventsRated != 0 || res.RollupsWritten != 0 || len(store.table) != 0 {
-		t.Fatalf("result = %+v, table=%d — a mixed-rate rollup must NOT be billed", res, len(store.table))
-	}
-	if !res.HasAmbiguousBase() || !res.HasAnomaly() {
-		t.Fatal("HasAmbiguousBase/HasAnomaly = false, want true")
-	}
-}
-
-// TestRater_BaseEndpointAmbiguousBaseModelFailsLoud: the single-rate gate on the
-// PLAIN-BASE path. One endpoint-name model_id resolving through TWO distinct
-// base_models in a window (e.g. an endpoint name deleted and recreated over a
-// different base inside one hour) carries two plain rates; MIN() would silently
-// under-bill at the cheaper base. Excluded and counted ambiguous — same invariant the
-// ft: path has always enforced, extended to C4's plain-base resolution.
-func TestRater_BaseEndpointAmbiguousBaseModelFailsLoud(t *testing.T) {
-	book := newTestBook(
-		map[string]Rate3{
-			"cheap/base":     rate3("0.000001", "0", "0"),
-			"expensive/base": rate3("0.000009", "0", "0"),
-		},
-		nil, PolicyMultiplier, MustDec("1.5"), Dec{},
-	)
-	at := mustTime("2026-06-08T10:15:00Z")
-	events := []RatedEvent{
-		{ServingMode: "dedicated", AuthID: "a", ResourceID: "r", ModelID: "tf-ep-reused", BaseModel: "cheap/base", PromptTokens: 1000, At: at},
-		{ServingMode: "dedicated", AuthID: "a", ResourceID: "r", ModelID: "tf-ep-reused", BaseModel: "expensive/base", PromptTokens: 1000, At: at.Add(5 * time.Minute)},
-		// A clean single-base endpoint in the same window must still rate.
-		{ServingMode: "dedicated", AuthID: "a", ResourceID: "r", ModelID: "tf-ep-clean", BaseModel: "cheap/base", PromptTokens: 1000, At: at},
-	}
-	store := newOracleStore(book, events)
-	r := New(store, book, testLogger())
-	res, err := r.Run(context.Background(), mustTime("2026-06-08T10:00:00Z"), mustTime("2026-06-08T11:00:00Z"), false)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if res.AmbiguousBaseEvents != 2 {
-		t.Fatalf("ambiguous = %d, want 2 (two-base endpoint name must scream)", res.AmbiguousBaseEvents)
-	}
-	// The clean endpoint billed at its plain base rate: 1000 x 0.000001 = 0.001.
-	if res.EventsRated != 1 || res.RollupsWritten != 1 || res.TotalCost != "0.001000000" {
-		t.Fatalf("result = %+v, want 1 event / 1 rollup / 0.001000000 (the clean plain-base rollup)", res)
-	}
-	for k := range store.table {
-		if k.modelID == "tf-ep-reused" {
-			t.Fatal("a rollup exists for the two-base endpoint name — it must NOT be billed (silent MIN under-charge)")
-		}
-	}
-}
-
-// recordingStore captures the (book, start, end) of every RateWindow call so a test
-// can assert WHICH price book each hour was rated against — the property per-hour
-// pricing exists to guarantee.
-type recordingStore struct {
-	calls []recordedCall
-	err   error
-}
-
-type recordedCall struct {
-	book  *PriceBook
-	start time.Time
-	end   time.Time
-}
-
-func (s *recordingStore) RateWindow(_ context.Context, book *PriceBook, start, end time.Time) (RateResult, error) {
-	s.calls = append(s.calls, recordedCall{book: book, start: start.UTC(), end: end.UTC()})
-	if s.err != nil {
-		return RateResult{}, s.err
-	}
-	// One rated event per hour, costing 1 unit, plus one of each anomaly every
-	// hour so the aggregate's summing is observable.
-	return RateResult{
-		EventsRated:                   1,
-		RollupsWritten:                1,
-		TotalCost:                     "1.000000000",
-		ReconciledDeletions:           1,
-		UnpricedEvents:                1,
-		UnattributableEvents:          1,
-		MissingUsageEvents:            2,
-		ExpectedMissingUsageEvents:    1,
-		UnexplainedMissingUsageEvents: 1,
-		InvalidUsageEvents:            1,
-		AmbiguousBaseEvents:           1,
-		AmbiguousOrgEvents:            1,
-	}, nil
-}
-
-func (s *recordingStore) Ping(context.Context) error { return nil }
-func (s *recordingStore) Close() error               { return nil }
-
-// TestRunWindow_PricesEachHourFromItsOwnBook is the core per-hour-pricing contract:
-// a multi-hour window must rate each hour against the prices EFFECTIVE DURING THAT
-// HOUR, not one snapshot for the whole span. Pricing a 24-hour window from a single
-// book silently misprices every hour on the far side of a mid-window price change.
-func TestRunWindow_PricesEachHourFromItsOwnBook(t *testing.T) {
-	start := mustTime("2026-06-08T10:00:00Z")
-	end := start.Add(3 * time.Hour)
-
-	// A distinct book per hour, so a test can tell them apart by identity.
-	books := map[time.Time]*PriceBook{
-		start:                    newTestBook(map[string]Rate3{"m": rate3("0.000001", "0", "0")}, nil, PolicyIdentity, Dec{}, Dec{}),
-		start.Add(time.Hour):     newTestBook(map[string]Rate3{"m": rate3("0.000002", "0", "0")}, nil, PolicyIdentity, Dec{}, Dec{}),
-		start.Add(2 * time.Hour): newTestBook(map[string]Rate3{"m": rate3("0.000003", "0", "0")}, nil, PolicyIdentity, Dec{}, Dec{}),
-	}
-	var asked []time.Time
-	store := &recordingStore{}
-	r := New(store, nil, logging.New(logging.ERROR)).
-		WithBookForHour(func(_ context.Context, hourStart time.Time) (*PriceBook, error) {
-			asked = append(asked, hourStart.UTC())
-			b, ok := books[hourStart.UTC()]
-			if !ok {
-				return nil, fmt.Errorf("no book for %s", hourStart)
-			}
-			return b, nil
-		})
-
-	res, err := r.RunWindow(context.Background(), start, end, false)
-	if err != nil {
-		t.Fatalf("RunWindow: %v", err)
-	}
-
-	// One call per hour, each covering exactly that hour.
-	if len(store.calls) != 3 {
-		t.Fatalf("RateWindow calls = %d, want 3 (one per hour)", len(store.calls))
-	}
-	for i, c := range store.calls {
-		wantStart := start.Add(time.Duration(i) * time.Hour)
-		if !c.start.Equal(wantStart) || !c.end.Equal(wantStart.Add(time.Hour)) {
-			t.Fatalf("call %d rated [%s,%s), want [%s,%s)", i,
-				c.start.Format(time.RFC3339), c.end.Format(time.RFC3339),
-				wantStart.Format(time.RFC3339), wantStart.Add(time.Hour).Format(time.RFC3339))
-		}
-		// THE POINT: the book handed to each hour is that hour's book.
-		if c.book != books[wantStart] {
-			t.Fatalf("hour %s was rated against the wrong price book — a mid-window price change would misprice it",
-				wantStart.Format(time.RFC3339))
-		}
-	}
-	if len(asked) != 3 {
-		t.Fatalf("asked for %d hourly books, want 3", len(asked))
-	}
-
-	// Aggregate: counts SUM across hours so the exit-code contract still sees any
-	// hour's leak, and cost sums as exact decimal.
-	if res.EventsRated != 3 || res.RollupsWritten != 3 || res.ReconciledDeletions != 3 {
-		t.Fatalf("aggregate rated/rollups/deletions = %d/%d/%d, want 3/3/3",
-			res.EventsRated, res.RollupsWritten, res.ReconciledDeletions)
-	}
-	if res.UnpricedEvents != 3 || res.UnattributableEvents != 3 || res.InvalidUsageEvents != 3 ||
-		res.AmbiguousBaseEvents != 3 || res.AmbiguousOrgEvents != 3 {
-		t.Fatalf("anomaly counts did not sum across hours: %+v", res)
-	}
-	if res.MissingUsageEvents != 6 || res.ExpectedMissingUsageEvents != 3 || res.UnexplainedMissingUsageEvents != 3 {
-		t.Fatalf("missing-usage counts did not sum: total=%d expected=%d unexplained=%d",
-			res.MissingUsageEvents, res.ExpectedMissingUsageEvents, res.UnexplainedMissingUsageEvents)
-	}
-	if !res.HasAnomaly() {
-		t.Fatal("aggregate must report an anomaly when any hour leaked one (exit-code contract)")
-	}
-	if got := MustDec(res.TotalCost); !got.Equal(MustDec("3.000000000")) {
-		t.Fatalf("aggregate TotalCost = %s, want 3.000000000", res.TotalCost)
-	}
-	if !res.WindowStart.Equal(start) || !res.WindowEnd.Equal(end) {
-		t.Fatalf("aggregate window = [%s,%s), want the REQUESTED window", res.WindowStart, res.WindowEnd)
-	}
-}
-
-// TestRunWindow_SkipsAnHourWhosePricesAreUnavailable: an hour whose prices cannot
-// be obtained is SKIPPED, not rated at the previous hour's prices or at $0 — and it
-// does not abort the rest of the window. Each hour is independent and the upsert is
-// idempotent, so the skipped hour converges on a later run whose trailing window
-// still covers it. Aborting would mean one transient blip on hour 19 discards every
-// remaining hour too. Same shape as cmd/token-push, which withholds a window and
-// lets the next run re-push.
-func TestRunWindow_SkipsAnHourWhosePricesAreUnavailable(t *testing.T) {
-	start := mustTime("2026-06-08T10:00:00Z")
-	unavailable := start.Add(time.Hour)
-	store := &recordingStore{}
-	r := New(store, nil, logging.New(logging.ERROR)).
-		WithBookForHour(func(_ context.Context, hourStart time.Time) (*PriceBook, error) {
-			if hourStart.UTC().Equal(unavailable) {
-				return nil, fmt.Errorf("manager unreachable")
-			}
-			return newTestBook(map[string]Rate3{"m": rate3("0.000001", "0", "0")}, nil, PolicyIdentity, Dec{}, Dec{}), nil
-		})
-
-	res, err := r.RunWindow(context.Background(), start, start.Add(3*time.Hour), false)
-	if err != nil {
-		t.Fatalf("a skipped hour must not fail the window: %v", err)
-	}
-	// The two available hours ARE rated; only the unavailable one is skipped.
-	if len(store.calls) != 2 {
-		t.Fatalf("RateWindow calls = %d, want 2 (the window continues past the bad hour)", len(store.calls))
-	}
-	for _, c := range store.calls {
-		if c.start.Equal(unavailable) {
-			t.Fatal("the unavailable hour was rated — it must never be rated at another hour's prices")
-		}
-	}
-	if res.UnratedHours != 1 {
-		t.Fatalf("UnratedHours = %d, want 1", res.UnratedHours)
-	}
-	if !res.HasUnratedHours() {
-		t.Fatal("HasUnratedHours() must report the partial window so the run exits non-zero")
-	}
-	// The run is incomplete, but skipping an hour does not BY ITSELF create an
-	// evidence anomaly: they are different operator actions (check the pricing
-	// service vs investigate the data). Asserted on a Result carrying only the
-	// skip, since recordingStore's rated hours deliberately emit every anomaly.
-	skipOnly := Result{UnratedHours: res.UnratedHours}
-	if skipOnly.HasAnomaly() {
-		t.Fatal("a skipped hour must not masquerade as an evidence anomaly")
-	}
-	if !skipOnly.HasUnratedHours() {
-		t.Fatal("the skip must be reported on its own signal")
-	}
-}
-
-// TestRunWindow_SkippedHourStillReportsCommittedCost: the hours that DID rate keep
-// their cost and counters, so a partial run reports what it actually committed
-// rather than zero.
-func TestRunWindow_SkippedHourStillReportsCommittedCost(t *testing.T) {
-	start := mustTime("2026-06-08T10:00:00Z")
-	store := &recordingStore{}
-	r := New(store, nil, logging.New(logging.ERROR)).
-		WithBookForHour(func(_ context.Context, hourStart time.Time) (*PriceBook, error) {
-			if hourStart.UTC().Equal(start) {
-				return nil, fmt.Errorf("manager unreachable")
-			}
-			return newTestBook(map[string]Rate3{"m": rate3("0.000001", "0", "0")}, nil, PolicyIdentity, Dec{}, Dec{}), nil
-		})
-
-	res, err := r.RunWindow(context.Background(), start, start.Add(3*time.Hour), false)
-	if err != nil {
-		t.Fatalf("RunWindow: %v", err)
-	}
-	// recordingStore bills 1.000000000 per rated hour; 2 of 3 hours rated.
-	if got := MustDec(res.TotalCost); !got.Equal(MustDec("2.000000000")) {
-		t.Fatalf("TotalCost = %s, want 2.000000000 (the cost actually committed)", res.TotalCost)
-	}
-	if res.EventsRated != 2 || res.RollupsWritten != 2 {
-		t.Fatalf("rated/rollups = %d/%d, want 2/2", res.EventsRated, res.RollupsWritten)
-	}
-	if res.UnratedHours != 1 {
-		t.Fatalf("UnratedHours = %d, want 1", res.UnratedHours)
-	}
-}
-
-// TestRunWindow_NilBookIsRefused: a provider returning (nil, nil) must not rate at
-// $0. The hour is SKIPPED (counted in UnratedHours) rather than rated — the
-// invariant is "never bill at a price we do not have", not "abort the window".
-func TestRunWindow_NilBookIsRefused(t *testing.T) {
-	start := mustTime("2026-06-08T10:00:00Z")
-	store := &recordingStore{}
-	r := New(store, nil, logging.New(logging.ERROR)).
-		WithBookForHour(func(context.Context, time.Time) (*PriceBook, error) { return nil, nil })
-	res, err := r.RunWindow(context.Background(), start, start.Add(time.Hour), false)
-	if err != nil {
-		t.Fatalf("a skipped hour must not fail the window: %v", err)
-	}
-	if res.UnratedHours != 1 || !res.HasUnratedHours() {
-		t.Fatalf("UnratedHours = %d, want 1 (the hour must be reported as unrated)", res.UnratedHours)
-	}
-	if len(store.calls) != 0 {
-		t.Fatal("nothing may be rated without a price book")
-	}
-}
-
-// TestRunWindow_WithoutProviderIsRefused: the manager is the only price source, so
-// a rater with no per-hour provider must refuse rather than rate a whole window
-// from one snapshot (the mispricing RunWindow exists to prevent).
-func TestRunWindow_WithoutProviderIsRefused(t *testing.T) {
-	start := mustTime("2026-06-08T10:00:00Z")
-	book := newTestBook(map[string]Rate3{"m": rate3("0.000001", "0", "0")}, nil, PolicyIdentity, Dec{}, Dec{})
-	store := &recordingStore{}
-	r := New(store, book, logging.New(logging.ERROR))
-
-	_, err := r.RunWindow(context.Background(), start, start.Add(5*time.Hour), false)
-	if err == nil || !strings.Contains(err.Error(), "no per-hour price provider") {
-		t.Fatalf("RunWindow without a provider must fail closed, got %v", err)
-	}
-	if len(store.calls) != 0 {
-		t.Fatalf("RateWindow calls = %d, want 0 (nothing may be rated from a single snapshot)", len(store.calls))
-	}
-}
-
-// TestRunWindow_RefusesUnalignedWindow: the rating SQL buckets on
-// date_trunc('hour') and REPLACES a bucket, so a partial hour would overwrite a
-// complete rollup (and its reconcile-delete would erase a neighbouring hour's
-// rows). Unaligned bounds must be refused before anything is rated, never clamped.
-func TestRunWindow_RefusesUnalignedWindow(t *testing.T) {
-	aligned := mustTime("2026-06-08T10:00:00Z")
-	for _, tc := range []struct {
-		name       string
-		start, end time.Time
-	}{
-		{"unaligned end", aligned, aligned.Add(90 * time.Minute)},
-		{"unaligned start", aligned.Add(30 * time.Minute), aligned.Add(2 * time.Hour)},
-	} {
-		t.Run(tc.name, func(t *testing.T) {
-			book := newTestBook(map[string]Rate3{"m": rate3("0.000001", "0", "0")}, nil, PolicyIdentity, Dec{}, Dec{})
-			store := &recordingStore{}
-			r := New(store, nil, logging.New(logging.ERROR)).
-				WithBookForHour(func(context.Context, time.Time) (*PriceBook, error) { return book, nil })
-
-			_, err := r.RunWindow(context.Background(), tc.start, tc.end, false)
-			if err == nil || !strings.Contains(err.Error(), "not hour-aligned") {
-				t.Fatalf("an unaligned window must be refused, got %v", err)
-			}
-			if len(store.calls) != 0 {
-				t.Fatalf("RateWindow calls = %d, want 0 (refuse before rating anything)", len(store.calls))
-			}
-		})
-	}
-}
-
-// TestRunWindow_PartialWindowReportsCommittedCost: when a later hour fails, the
-// hours already committed to rated_usage keep their rollups — so the returned
-// aggregate's TotalCost must describe the SAME set of hours as its counters, never
-// a self-contradicting "0" alongside a nonzero RollupsWritten/EventsRated.
-func TestRunWindow_PartialWindowReportsCommittedCost(t *testing.T) {
-	start := mustTime("2026-06-08T10:00:00Z")
-	bookFor := func(_ context.Context, hourStart time.Time) (*PriceBook, error) {
-		if hourStart.UTC().Before(start.Add(2 * time.Hour)) {
-			return newTestBook(map[string]Rate3{"m": rate3("0.000001", "0", "0")}, nil, PolicyIdentity, Dec{}, Dec{}), nil
-		}
-		return nil, fmt.Errorf("manager unreachable")
-	}
-
-	// Reference: the same first two hours rated on their own.
-	refStore := &recordingStore{}
-	ref := New(refStore, nil, logging.New(logging.ERROR)).WithBookForHour(bookFor)
-	want, err := ref.RunWindow(context.Background(), start, start.Add(2*time.Hour), false)
-	if err != nil {
-		t.Fatalf("reference two-hour run: %v", err)
-	}
-	if want.RollupsWritten == 0 || MustDec(want.TotalCost).IsZero() {
-		t.Fatalf("reference run must commit a nonzero cost, got %+v", want)
-	}
-
-	store := &recordingStore{}
-	r := New(store, nil, logging.New(logging.ERROR)).WithBookForHour(bookFor)
-	res, err := r.RunWindow(context.Background(), start, start.Add(4*time.Hour), false)
-	if err != nil {
-		t.Fatalf("unavailable hours are skipped, not fatal: %v", err)
-	}
-	// Hours 3 and 4 had no prices: skipped, and reported as such.
-	if res.UnratedHours != 2 {
-		t.Fatalf("UnratedHours = %d, want 2", res.UnratedHours)
-	}
-	if res.EventsRated != want.EventsRated || res.RollupsWritten != want.RollupsWritten {
-		t.Fatalf("counters = %d events / %d rollups, want the committed hours' %d/%d",
-			res.EventsRated, res.RollupsWritten, want.EventsRated, want.RollupsWritten)
-	}
-	if !MustDec(res.TotalCost).Equal(MustDec(want.TotalCost)) {
-		t.Fatalf("partial-window TotalCost = %s, want the committed hours' %s (counters and cost must describe the same hours)",
-			res.TotalCost, want.TotalCost)
-	}
-}
-
-// TestRunWindow_PricesFromTheHourStartInstant pins the pricing quantum (Hugo,
-// 2026-09-22): each hour is priced from the book effective at its START, so a
-// price change takes effect at the next hour boundary rather than part-way
-// through an hour. A reprice at 10:30 must not touch the 10:00 hour.
-func TestRunWindow_PricesFromTheHourStartInstant(t *testing.T) {
-	start := mustTime("2026-06-08T10:00:00Z")
-	var asked []time.Time
-	store := &recordingStore{}
-	book := newTestBook(map[string]Rate3{"m": rate3("0.000001", "0", "0")}, nil, PolicyIdentity, Dec{}, Dec{})
-	r := New(store, nil, logging.New(logging.ERROR)).
-		WithBookForHour(func(_ context.Context, hourStart time.Time) (*PriceBook, error) {
-			asked = append(asked, hourStart.UTC())
-			return book, nil
-		})
-
-	if _, err := r.RunWindow(context.Background(), start, start.Add(3*time.Hour), false); err != nil {
-		t.Fatalf("RunWindow: %v", err)
-	}
-	for i, got := range asked {
-		want := start.Add(time.Duration(i) * time.Hour)
-		if !got.Equal(want) {
-			t.Fatalf("asked for prices at %s, want the HOUR START %s", got.Format(time.RFC3339Nano), want.Format(time.RFC3339Nano))
-		}
-		// Explicitly: never a mid-hour instant.
-		if got.Truncate(time.Hour) != got {
-			t.Fatalf("asked for prices at a non-hour-boundary instant %s", got.Format(time.RFC3339Nano))
-		}
+	if !strings.Contains(errBuf.String(), PrunedMarker) {
+		t.Fatalf("ERROR log lacks the marker:\n%s", errBuf.String())
 	}
 }
