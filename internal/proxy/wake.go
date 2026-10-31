@@ -371,7 +371,9 @@ func (t *wakeRoundTripper) RoundTrip(req *http.Request) (*http.Response, error) 
 		ctx, cancel = context.WithTimeout(ctx, t.server.wakeTimeout)
 		defer cancel()
 	}
+	wakeStart := time.Now()
 	wakeErr := t.server.waker.Wake(ctx, t.target)
+	recordFrom(req.Context()).observeWake(time.Since(wakeStart), wakeOutcome(ctx, wakeErr))
 	releaseHold()
 	if t.lease != nil {
 		if err := t.lease.EndColdHold(context.WithoutCancel(req.Context())); err != nil {
@@ -801,5 +803,23 @@ func (s *Server) newWakeTransport(
 	}
 	return &wakeRoundTripper{
 		server: s, base: base, target: target, requestID: requestID, lease: lease,
+	}
+}
+
+// wakeOutcome maps a Wake result to phoebe_wake_hold_seconds' outcome label.
+func wakeOutcome(ctx context.Context, err error) string {
+	switch {
+	case err == nil:
+		return wakeOutcomeOK
+	case errors.Is(err, ErrWakeUnavailable):
+		return wakeOutcomeUnavailable
+	case errors.Is(err, ErrWakeStatusUnknown):
+		return wakeOutcomeStatusUnknown
+	case errors.Is(err, ErrWakeNotReady):
+		return wakeOutcomeNotReady
+	case errors.Is(err, context.DeadlineExceeded) || errors.Is(ctx.Err(), context.DeadlineExceeded):
+		return wakeOutcomeTimeout
+	default:
+		return wakeOutcomeError
 	}
 }

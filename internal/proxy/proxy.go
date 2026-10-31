@@ -189,6 +189,9 @@ type Server struct {
 	// topology annotates usage events with the graph's published topology
 	// revision and region (WithTopology). nil = not annotated.
 	topology TopologyLookup
+
+	// metrics is non-nil only when settings.MetricsAddr is set (metrics.go).
+	metrics *metrics
 }
 
 func (s *Server) WithAdmitter(a admission.Admitter) *Server { s.admitter = a; return s }
@@ -197,7 +200,12 @@ func (s *Server) WithAdmitter(a admission.Admitter) *Server { s.admitter = a; re
 // denies every request and the sink is a NopSink, so no bodies are buffered.
 // Use NewWithIOLog to enable M5 body capture.
 func New(s *config.Settings, log *logging.Logger, emitter metering.Emitter) *Server {
+	var m *metrics
+	if s.MetricsAddr != "" {
+		m = newMetrics()
+	}
 	return &Server{
+		metrics:  m,
 		settings: s,
 		log:      log,
 		emitter:  emitter,
@@ -258,7 +266,11 @@ func (denyAllPolicy) ShouldLog(identity.Identity, string) bool { return false }
 func (s *Server) Handler() http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/healthz", s.handleHealth)
-	mux.HandleFunc("/", s.handleProxy)
+	if s.metrics != nil {
+		mux.HandleFunc("/", s.metrics.instrument(s.handleProxy))
+	} else {
+		mux.HandleFunc("/", s.handleProxy)
+	}
 	return mux
 }
 
@@ -486,6 +498,10 @@ func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request) {
 			http.StatusBadRequest)
 		return
 	}
+	// The identity is now complete and trusted (header-routed: stamped by Atlas
+	// and the edge; gateway: resolved above), so its resource id and serving
+	// mode are safe metric labels. Nothing earlier is.
+	recordFrom(r.Context()).bind(id)
 
 	// Never use the public X-Request-Id as billing_event's primary key: clients
 	// can replay it. Mint a fresh attempt id after the billing identity gate and
