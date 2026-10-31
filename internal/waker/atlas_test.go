@@ -10,6 +10,7 @@ import (
 	"net/http/httptrace"
 	"net/url"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -735,5 +736,127 @@ func TestAtlasWakerLoopOutlivesAShortHold(t *testing.T) {
 	}
 	if !restored.Load() {
 		t.Fatal("the wake loop stopped with the client's hold; Atlas never got the call that restores the Planner")
+	}
+}
+
+// graphWakeServers is an Atlas that records which endpoints it was asked to
+// wake (refusing those in refuse with a 404, after delay) and an upstream that
+// lists every model, so a successful wake is immediately ready.
+func graphWakeServers(t *testing.T, refuse map[string]bool, delay time.Duration) (*AtlasWaker, string, *sync.Map) {
+	t.Helper()
+	var calls sync.Map // resource id -> *atomic.Int32
+	atlas := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var body struct {
+			ResourceID string `json:"resource_id"`
+		}
+		_ = json.NewDecoder(r.Body).Decode(&body)
+		counter, _ := calls.LoadOrStore(body.ResourceID, &atomic.Int32{})
+		counter.(*atomic.Int32).Add(1)
+		time.Sleep(delay)
+		if refuse[body.ResourceID] {
+			http.Error(w, "Inference endpoint not found", http.StatusNotFound)
+			return
+		}
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	t.Cleanup(atlas.Close)
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = w.Write([]byte(`{"data":[{"id":"ep-a"},{"id":"ep-b"}]}`))
+	}))
+	t.Cleanup(upstream.Close)
+	upstreamURL, _ := url.Parse(upstream.URL)
+	waker, err := NewAtlas(atlas.URL, "secret", logging.New(logging.ERROR))
+	if err != nil {
+		t.Fatalf("NewAtlas: %v", err)
+	}
+	waker.pollInterval = time.Millisecond
+	return waker, upstreamURL.Host, &calls
+}
+
+func wakeCalls(calls *sync.Map, resourceID string) int32 {
+	if counter, ok := calls.Load(resourceID); ok {
+		return counter.(*atomic.Int32).Load()
+	}
+	return 0
+}
+
+// TestAtlasWakerSharesOneLoopPerGraph (F1): two endpoints on one shared graph
+// waking at once share one Atlas loop (each Atlas call holds a database
+// connection under the graph's lock), and both are served.
+func TestAtlasWakerSharesOneLoopPerGraph(t *testing.T) {
+	waker, host, calls := graphWakeServers(t, nil, 50*time.Millisecond)
+	var wg sync.WaitGroup
+	errs := make([]error, 2)
+	for i, ep := range []string{"ep-a", "ep-b"} {
+		wg.Add(1)
+		go func(i int, ep string) {
+			defer wg.Done()
+			errs[i] = waker.Wake(context.Background(), proxy.WakeTarget{
+				GraphK8sName: "tf-shared-g", ResourceID: ep, UpstreamHost: host, ServedModel: ep,
+			})
+		}(i, ep)
+		time.Sleep(10 * time.Millisecond) // the second joins the first's flight
+	}
+	wg.Wait()
+	if errs[0] != nil || errs[1] != nil {
+		t.Fatalf("Wake errors = %v, want both served", errs)
+	}
+	if got := wakeCalls(calls, "ep-a") + wakeCalls(calls, "ep-b"); got != 1 {
+		t.Fatalf("Atlas wake calls = %d (a=%d b=%d), want 1 shared loop", got, wakeCalls(calls, "ep-a"), wakeCalls(calls, "ep-b"))
+	}
+}
+
+// TestAtlasWakerJoinerDoesNotInheritAnotherEndpointsRefusal (F1): Atlas
+// refuses the leader's endpoint (deleted, or moved off the graph). That
+// refusal is about the leader, so a joiner for another endpoint on the same
+// graph runs its own loop and is served.
+func TestAtlasWakerJoinerDoesNotInheritAnotherEndpointsRefusal(t *testing.T) {
+	waker, host, calls := graphWakeServers(t, map[string]bool{"ep-a": true}, 50*time.Millisecond)
+	var wg sync.WaitGroup
+	errs := make([]error, 2)
+	for i, ep := range []string{"ep-a", "ep-b"} {
+		wg.Add(1)
+		go func(i int, ep string) {
+			defer wg.Done()
+			errs[i] = waker.Wake(context.Background(), proxy.WakeTarget{
+				GraphK8sName: "tf-shared-g", ResourceID: ep, UpstreamHost: host, ServedModel: ep,
+			})
+		}(i, ep)
+		time.Sleep(10 * time.Millisecond)
+	}
+	wg.Wait()
+	if errs[0] == nil || errors.Is(errs[0], proxy.ErrWakeStatusUnknown) || errors.Is(errs[0], proxy.ErrWakeUnavailable) {
+		t.Fatalf("leader Wake error = %v, want the definite refusal", errs[0])
+	}
+	if errs[1] != nil {
+		t.Fatalf("joiner Wake error = %v, want served by its own loop", errs[1])
+	}
+	if wakeCalls(calls, "ep-a") != 1 || wakeCalls(calls, "ep-b") != 1 {
+		t.Fatalf("Atlas wake calls a=%d b=%d, want one each", wakeCalls(calls, "ep-a"), wakeCalls(calls, "ep-b"))
+	}
+}
+
+// TestAtlasWakerSameEndpointJoinerSharesTheRefusal (F1): a joiner for the
+// SAME refused endpoint takes the refusal; it does not ask Atlas again.
+func TestAtlasWakerSameEndpointJoinerSharesTheRefusal(t *testing.T) {
+	waker, host, calls := graphWakeServers(t, map[string]bool{"ep-a": true}, 50*time.Millisecond)
+	var wg sync.WaitGroup
+	errs := make([]error, 2)
+	for i := range errs {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			errs[i] = waker.Wake(context.Background(), proxy.WakeTarget{
+				GraphK8sName: "tf-shared-g", ResourceID: "ep-a", UpstreamHost: host, ServedModel: "ep-a",
+			})
+		}(i)
+		time.Sleep(10 * time.Millisecond)
+	}
+	wg.Wait()
+	if errs[0] == nil || errs[1] == nil {
+		t.Fatalf("Wake errors = %v, want both refused", errs)
+	}
+	if got := wakeCalls(calls, "ep-a"); got != 1 {
+		t.Fatalf("Atlas wake calls = %d, want 1", got)
 	}
 }
