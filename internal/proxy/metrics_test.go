@@ -304,7 +304,7 @@ func TestMetricsPathRefusedAtBillingGateOnProxyPort(t *testing.T) {
 // served-model binding.
 func TestMetricsPathNotExposedToIdentifiedCallerOnProxyPort(t *testing.T) {
 	var backendHits atomic.Int64
-	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+	backend := httptest.NewServer(http.HandlerFunc(func(_ http.ResponseWriter, _ *http.Request) {
 		backendHits.Add(1)
 	}))
 	defer backend.Close()
@@ -357,7 +357,7 @@ func TestMetricsServedOnlyOnMetricsListener(t *testing.T) {
 		t.Helper()
 		deadline := time.Now().Add(5 * time.Second)
 		for {
-			req, _ := http.NewRequest(http.MethodGet, "http://"+addr+"/metrics", nil)
+			req, _ := http.NewRequestWithContext(context.Background(), http.MethodGet, "http://"+addr+"/metrics", nil)
 			if identified {
 				setMetricsTestIdentity(req)
 			}
@@ -542,7 +542,7 @@ func TestMetricsResourceLabelRejectsMalformedIds(t *testing.T) {
 
 // serveInstrumented runs handler through instrument with a context the test
 // controls. The handler binds res-1 the way handleProxy does.
-func serveInstrumented(m *metrics, ctx context.Context, handler http.HandlerFunc) {
+func serveInstrumented(ctx context.Context, m *metrics, handler http.HandlerFunc) {
 	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", nil).WithContext(ctx)
 	m.instrument(func(w http.ResponseWriter, r *http.Request) {
 		recordFrom(r.Context()).bind(identity.Identity{ResourceID: "res-1", ServingMode: identity.ServingModeDedicated})
@@ -631,7 +631,7 @@ func TestInstrumentRecordsAbortedOnCancelledContext(t *testing.T) {
 			m := newMetrics()
 			ctx, cancel := context.WithCancel(context.Background())
 			defer cancel()
-			serveInstrumented(m, ctx, func(w http.ResponseWriter, _ *http.Request) {
+			serveInstrumented(ctx, m, func(w http.ResponseWriter, _ *http.Request) {
 				w.WriteHeader(c.status)
 				if c.cancel {
 					cancel()
@@ -656,7 +656,7 @@ func TestInstrumentRecordsPanicAbort(t *testing.T) {
 	var recovered any
 	func() {
 		defer func() { recovered = recover() }()
-		serveInstrumented(m, context.Background(), func(w http.ResponseWriter, _ *http.Request) {
+		serveInstrumented(context.Background(), m, func(w http.ResponseWriter, _ *http.Request) {
 			w.WriteHeader(http.StatusOK)
 			panic(http.ErrAbortHandler)
 		})
@@ -736,7 +736,7 @@ func exposedSeries(f *dto.MetricFamily) int {
 // maxMetricResources. Changing a bucket list, an outcome or the cap fails this
 // until that comment is updated.
 func TestMetricsTotalSeriesStayWithinDocumentedBound(t *testing.T) {
-	const documentedWorstCase = 1_435_434
+	const documentedWorstCase = 359934
 
 	modes := []string{identity.ServingModeShared, identity.ServingModeDedicated, ""}
 	requestOutcomes := []string{outcomeOK, outcomeClientError, outcomeServerError, outcomeAborted}

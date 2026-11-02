@@ -45,16 +45,19 @@ const (
 	// With ids = maxMetricResources + 2 (resourceOverflow, resourceUnresolved),
 	// the worst case per process is:
 	//
-	//	request_duration: ids x 3 modes x 4 outcomes x 28 (25 buckets, +Inf, _sum, _count) =   672,672
-	//	wake_hold:        ids x 3 modes x 7 outcomes x 18 (15 buckets, +Inf, _sum, _count) =   756,756
-	//	in_flight:        ids x 3 modes                                                    =     6,006
-	//	total                                                                              = 1,435,434
+	//	request_duration: ids x 3 modes x 4 outcomes x 28 (25 buckets, +Inf, _sum, _count) = 168,672
+	//	wake_hold:        ids x 3 modes x 7 outcomes x 18 (15 buckets, +Inf, _sum, _count) = 189,756
+	//	in_flight:        ids x 3 modes                                                    =   1,506
+	//	total                                                                              = 359,934
 	//
-	// An id has one serving mode in practice, so a pod that has seen every
-	// outcome on every id exposes 478,478 series. Series exist only for label
-	// combinations a request actually produced, so a typical pod is far below
-	// that. TestMetricsTotalSeriesStayWithinDocumentedBound pins this arithmetic.
-	maxMetricResources = 2000
+	// An id has one serving mode in practice, and series exist only for label
+	// combinations a request actually produced. A typical id (ok and client_error
+	// requests, wake holds that succeed) exposes 75 series, in line with the
+	// roughly 110 per router accepted for Traefik in saturn-k8s#1166, so about
+	// 37,500 per pod at the cap. Endpoints past the cap have no per-endpoint
+	// phoebe series until the pod restarts; they still count under "other".
+	// TestMetricsTotalSeriesStayWithinDocumentedBound pins this arithmetic.
+	maxMetricResources = 500
 
 	// maxResourceLabelLen matches the VARCHAR(64) resource_id column in
 	// billing_event. Atlas's ids are shorter (Unicode(32)).
