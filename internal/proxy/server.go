@@ -17,6 +17,13 @@ import (
 // may run far longer than any fixed deadline, and a WriteTimeout would sever
 // it mid-stream. IdleTimeout bounds idle keep-alive connections.
 func (s *Server) Run() error {
+	stop := make(chan os.Signal, 1)
+	signal.Notify(stop, os.Interrupt, syscall.SIGTERM)
+	return s.serve(stop)
+}
+
+// serve runs the proxy and metrics listeners until one fails or stop fires.
+func (s *Server) serve(stop <-chan os.Signal) error {
 	srv := &http.Server{
 		Addr:              s.settings.ListenAddr,
 		Handler:           s.Handler(),
@@ -53,9 +60,6 @@ func (s *Server) Run() error {
 			}
 		}()
 	}
-
-	stop := make(chan os.Signal, 1)
-	signal.Notify(stop, os.Interrupt, syscall.SIGTERM)
 
 	select {
 	case err := <-errCh:

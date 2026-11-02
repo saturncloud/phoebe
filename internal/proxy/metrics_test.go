@@ -5,10 +5,14 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"os"
 	"strings"
+	"sync/atomic"
+	"syscall"
 	"testing"
 	"time"
 
@@ -40,6 +44,23 @@ func phoebeFamilies(t *testing.T, m *metrics) map[string]*dto.MetricFamily {
 		}
 	}
 	return out
+}
+
+// setMetricsTestIdentity sets the headers that pass the billing-identity gate.
+func setMetricsTestIdentity(req *http.Request) {
+	req.Header.Set(identity.HeaderAuthID, "auth-1")
+	req.Header.Set(identity.HeaderResourceID, "res-1")
+	req.Header.Set(identity.HeaderServingMode, identity.ServingModeDedicated)
+}
+
+func freeLocalAddr(t *testing.T) string {
+	t.Helper()
+	l, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer l.Close()
+	return l.Addr().String()
 }
 
 func labelMap(m *dto.Metric) map[string]string {
@@ -174,9 +195,10 @@ func TestMetricsRequestRefusedBeforeBillingGateIsUnresolved(t *testing.T) {
 	}
 }
 
-// TestMetricsResourceLabelIsCapped: distinct resource ids beyond
-// maxMetricResources fold into one overflow value, so series stay bounded.
-func TestMetricsResourceLabelIsCapped(t *testing.T) {
+// TestMetricsResourceLabelFoldsToOverflow: distinct resource ids beyond
+// maxMetricResources fold into one overflow value. The end-to-end series bound
+// is TestMetricsSeriesStayBoundedPastResourceCap.
+func TestMetricsResourceLabelFoldsToOverflow(t *testing.T) {
 	m := newMetrics()
 	for i := 0; i < maxMetricResources; i++ {
 		if got := m.resourceLabel(fmt.Sprintf("r%d", i)); got != fmt.Sprintf("r%d", i) {
@@ -219,6 +241,7 @@ func TestMetricsRequestOutcome(t *testing.T) {
 		{429, false, outcomeClientError},
 		{503, false, outcomeServerError},
 		{200, true, outcomeAborted},
+		{503, true, outcomeAborted},
 	}
 	for _, c := range cases {
 		if got := requestOutcome(c.status, c.aborted); got != c.want {
@@ -230,6 +253,8 @@ func TestMetricsRequestOutcome(t *testing.T) {
 func TestWakeOutcome(t *testing.T) {
 	expired, cancel := context.WithTimeout(context.Background(), 0)
 	defer cancel()
+	cancelled, cancelNow := context.WithCancel(context.Background())
+	cancelNow()
 	cases := []struct {
 		name string
 		ctx  context.Context
@@ -240,7 +265,13 @@ func TestWakeOutcome(t *testing.T) {
 		{"unavailable", context.Background(), fmt.Errorf("x: %w", ErrWakeUnavailable), wakeOutcomeUnavailable},
 		{"status unknown", context.Background(), ErrWakeStatusUnknown, wakeOutcomeStatusUnknown},
 		{"not ready", context.Background(), ErrWakeNotReady, wakeOutcomeNotReady},
+		{"wrapped not ready", context.Background(), fmt.Errorf("x: %w", ErrWakeNotReady), wakeOutcomeNotReady},
 		{"hold deadline", expired, errors.New("wait aborted"), wakeOutcomeTimeout},
+		{"hold deadline with its own error", expired, fmt.Errorf("x: %w", context.DeadlineExceeded), wakeOutcomeTimeout},
+		{"client cancelled the hold", cancelled, context.Canceled, wakeOutcomeCanceled},
+		{"client cancelled the hold, wrapped", cancelled, fmt.Errorf("x: %w", context.Canceled), wakeOutcomeCanceled},
+		{"inner deadline with the hold still live", context.Background(), fmt.Errorf("x: %w", context.DeadlineExceeded), wakeOutcomeError},
+		{"inner cancel with the hold still live", context.Background(), context.Canceled, wakeOutcomeError},
 		{"other", context.Background(), errors.New("boom"), wakeOutcomeError},
 	}
 	for _, c := range cases {
@@ -250,16 +281,107 @@ func TestWakeOutcome(t *testing.T) {
 	}
 }
 
-// TestMetricsNotServedOnProxyPort: the proxy handler has no /metrics route; a
-// GET /metrics through it is an ordinary proxied request (here refused at the
-// billing gate), never the exposition.
-func TestMetricsNotServedOnProxyPort(t *testing.T) {
+// TestMetricsPathRefusedAtBillingGateOnProxyPort: an unidentified GET /metrics
+// through the proxy handler stops at the billing gate. It proves nothing about
+// routing behind the gate; TestMetricsPathNotExposedToIdentifiedCallerOnProxyPort
+// and TestMetricsServedOnlyOnMetricsListener cover that.
+func TestMetricsPathRefusedAtBillingGateOnProxyPort(t *testing.T) {
 	srv := newMetricsTestServer(t)
 	rr := httptest.NewRecorder()
 	srv.Handler().ServeHTTP(rr, httptest.NewRequest(http.MethodGet, "/metrics", nil))
+	if rr.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400 from the billing gate", rr.Code)
+	}
 	body, _ := io.ReadAll(rr.Body)
 	if strings.Contains(string(body), "phoebe_") || strings.Contains(string(body), "# HELP") {
 		t.Fatalf("the proxy port served metrics: %d %q", rr.Code, body)
+	}
+}
+
+// TestMetricsPathNotExposedToIdentifiedCallerOnProxyPort: a caller past the
+// billing gate gets neither phoebe's exposition nor the upstream's /metrics.
+// The route allow-list refuses the path whether or not the route carries a
+// served-model binding.
+func TestMetricsPathNotExposedToIdentifiedCallerOnProxyPort(t *testing.T) {
+	var backendHits atomic.Int64
+	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		backendHits.Add(1)
+	}))
+	defer backend.Close()
+	upstream, _ := url.Parse(backend.URL)
+
+	for name, servedModel := range map[string]string{"no allow-list": "", "bound route": "m"} {
+		t.Run(name, func(t *testing.T) {
+			srv := newMetricsTestServer(t)
+			srv.metrics.inFlight.WithLabelValues("res-1", "shared").Set(0)
+			req := httptest.NewRequest(http.MethodGet, "/metrics", nil)
+			setUpstream(req, upstream)
+			setMetricsTestIdentity(req)
+			if servedModel != "" {
+				req.Header.Set(identity.HeaderServedModel, servedModel)
+			}
+			rr := httptest.NewRecorder()
+			srv.Handler().ServeHTTP(rr, req)
+			if rr.Code != http.StatusNotFound {
+				t.Fatalf("status = %d, want the allow-list's 404", rr.Code)
+			}
+			if body := rr.Body.String(); strings.Contains(body, "phoebe_") || strings.Contains(body, "# HELP") {
+				t.Fatalf("the proxy port served metrics: %q", body)
+			}
+			if got := backendHits.Load(); got != 0 {
+				t.Fatalf("upstream reached %d times for /metrics", got)
+			}
+		})
+	}
+}
+
+// TestMetricsServedOnlyOnMetricsListener runs both real listeners: /metrics
+// answers with the phoebe families on the metrics port, and the proxy port does
+// not expose them even to an identified caller.
+func TestMetricsServedOnlyOnMetricsListener(t *testing.T) {
+	proxyAddr, metricsAddr := freeLocalAddr(t), freeLocalAddr(t)
+	srv := New(&config.Settings{ListenAddr: proxyAddr, MetricsAddr: metricsAddr}, logging.New(logging.ERROR), &recordingEmitter{})
+	srv.metrics.inFlight.WithLabelValues("res-1", "shared").Set(0)
+
+	stop := make(chan os.Signal, 1)
+	done := make(chan error, 1)
+	go func() { done <- srv.serve(stop) }()
+	defer func() {
+		stop <- syscall.SIGTERM
+		if err := <-done; err != nil {
+			t.Errorf("serve: %v", err)
+		}
+	}()
+
+	get := func(addr string, identified bool) (int, string) {
+		t.Helper()
+		deadline := time.Now().Add(5 * time.Second)
+		for {
+			req, _ := http.NewRequest(http.MethodGet, "http://"+addr+"/metrics", nil)
+			if identified {
+				setMetricsTestIdentity(req)
+			}
+			resp, err := http.DefaultClient.Do(req)
+			if err == nil {
+				defer resp.Body.Close()
+				body, _ := io.ReadAll(resp.Body)
+				return resp.StatusCode, string(body)
+			}
+			if time.Now().After(deadline) {
+				t.Fatalf("GET %s: %v", addr, err)
+			}
+			time.Sleep(10 * time.Millisecond)
+		}
+	}
+
+	if code, body := get(metricsAddr, false); code != http.StatusOK || !strings.Contains(body, "phoebe_requests_in_flight") {
+		t.Fatalf("metrics port: %d %q", code, body)
+	}
+	for _, identified := range []bool{false, true} {
+		code, body := get(proxyAddr, identified)
+		if code == http.StatusOK || strings.Contains(body, "phoebe_") || strings.Contains(body, "# HELP") {
+			t.Fatalf("proxy port (identified=%v) served metrics: %d %q", identified, code, body)
+		}
 	}
 }
 
@@ -326,5 +448,292 @@ func TestMetricsWakeHoldIsRecorded(t *testing.T) {
 	served := map[string]string{"resource_id": "r1", "serving_mode": "dedicated", "outcome": outcomeOK}
 	if got := histogramCount(t, s.metrics, "phoebe_request_duration_seconds", served); got != 1 {
 		t.Fatalf("requests for %v = %d, want 1", served, got)
+	}
+}
+
+// TestMetricsResourceLabelRejectsMalformedIds: an id that is too long or uses
+// characters outside the allowed set counts as "other" and is never stored, so
+// a bad edge value can neither bloat a scrape nor use up the cap.
+func TestMetricsResourceLabelRejectsMalformedIds(t *testing.T) {
+	m := newMetrics()
+	for name, id := range map[string]string{
+		"65 bytes":     strings.Repeat("a", maxResourceLabelLen+1),
+		"10 KB":        strings.Repeat("a", 10*1024),
+		"space":        "res 123",
+		"newline":      "res\n123",
+		"quote":        `res"123`,
+		"slash":        "res/123",
+		"invalid utf8": "res\xff",
+	} {
+		if got := m.resourceLabel(id); got != resourceOverflow {
+			t.Errorf("%s: label = %q, want %q", name, got, resourceOverflow)
+		}
+		if _, stored := m.resources[id]; stored {
+			t.Errorf("%s: a rejected id was stored", name)
+		}
+	}
+	if len(m.resources) != 0 {
+		t.Fatalf("rejected ids used up the cap: %d stored", len(m.resources))
+	}
+	for _, id := range []string{
+		"res-123",
+		"0123456789abcdef0123456789abcdef",
+		"123e4567-e89b-12d3-a456-426614174000",
+		"a_b.c:d-e",
+		strings.Repeat("a", maxResourceLabelLen),
+	} {
+		if got := m.resourceLabel(id); got != id {
+			t.Errorf("legitimate id %q became %q", id, got)
+		}
+	}
+}
+
+// serveInstrumented runs handler through instrument with a context the test
+// controls. The handler binds res-1 the way handleProxy does.
+func serveInstrumented(m *metrics, ctx context.Context, handler http.HandlerFunc) {
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", nil).WithContext(ctx)
+	m.instrument(func(w http.ResponseWriter, r *http.Request) {
+		recordFrom(r.Context()).bind(identity.Identity{ResourceID: "res-1", ServingMode: identity.ServingModeDedicated})
+		handler(w, r)
+	})(httptest.NewRecorder(), req)
+}
+
+func requestsWithOutcome(t *testing.T, m *metrics, outcome string) int64 {
+	t.Helper()
+	return histogramCount(t, m, "phoebe_request_duration_seconds",
+		map[string]string{"resource_id": "res-1", "serving_mode": identity.ServingModeDedicated, "outcome": outcome})
+}
+
+// TestStatusRecorderRecordsOnlyFinalStatus: informational codes are forwarded
+// but not recorded; 101 is final; the first final status stays recorded.
+func TestStatusRecorderRecordsOnlyFinalStatus(t *testing.T) {
+	cases := []struct {
+		name    string
+		codes   []int
+		status  int
+		outcome string
+	}{
+		{"103 then 500", []int{103, 500}, 500, outcomeServerError},
+		{"103 then 502", []int{103, 502}, 502, outcomeServerError},
+		{"100 and 103 then 200", []int{100, 103, 200}, 200, outcomeOK},
+		{"103 alone leaves status unset, which instrument maps to 200", []int{103}, 0, outcomeOK},
+		{"101 is final", []int{101}, 101, outcomeOK},
+		{"first final status wins", []int{200, 500}, 200, outcomeOK},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			sw := &statusRecorder{ResponseWriter: httptest.NewRecorder()}
+			for _, code := range c.codes {
+				sw.WriteHeader(code)
+			}
+			if sw.status != c.status {
+				t.Fatalf("status = %d, want %d", sw.status, c.status)
+			}
+			if got := requestOutcome(sw.status, false); got != c.outcome {
+				t.Fatalf("outcome = %q, want %q", got, c.outcome)
+			}
+		})
+	}
+}
+
+// TestInstrumentRecordsFinalStatusAfter103: an upstream's 103 Early Hints
+// forwarded through the real proxy path does not hide the 5xx that follows.
+func TestInstrumentRecordsFinalStatusAfter103(t *testing.T) {
+	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusEarlyHints)
+		w.WriteHeader(http.StatusBadGateway)
+	}))
+	defer backend.Close()
+	upstream, _ := url.Parse(backend.URL)
+	srv := newMetricsTestServer(t)
+	sendIdentified(t, srv, upstream, "res-1")
+
+	labels := func(outcome string) map[string]string {
+		return map[string]string{"resource_id": "res-1", "serving_mode": identity.ServingModeDedicated, "outcome": outcome}
+	}
+	if got := histogramCount(t, srv.metrics, "phoebe_request_duration_seconds", labels(outcomeServerError)); got != 1 {
+		t.Fatalf("server_error count = %d, want 1", got)
+	}
+	if got := histogramCount(t, srv.metrics, "phoebe_request_duration_seconds", labels(outcomeOK)); got != -1 {
+		t.Fatalf("ok count = %d, want no such series", got)
+	}
+}
+
+// TestInstrumentRecordsAbortedOnCancelledContext: a request whose context ends
+// before the handler returns is aborted, even over a written 502 (abort takes
+// precedence over status). An uncancelled 502 stays a server error.
+func TestInstrumentRecordsAbortedOnCancelledContext(t *testing.T) {
+	cases := []struct {
+		name   string
+		status int
+		cancel bool
+		want   string
+		absent string
+	}{
+		{"cancelled 200", http.StatusOK, true, outcomeAborted, outcomeOK},
+		{"cancelled 502", http.StatusBadGateway, true, outcomeAborted, outcomeServerError},
+		{"uncancelled 502", http.StatusBadGateway, false, outcomeServerError, outcomeAborted},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			m := newMetrics()
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+			serveInstrumented(m, ctx, func(w http.ResponseWriter, _ *http.Request) {
+				w.WriteHeader(c.status)
+				if c.cancel {
+					cancel()
+				}
+			})
+			if got := requestsWithOutcome(t, m, c.want); got != 1 {
+				t.Fatalf("outcome %s count = %d, want 1", c.want, got)
+			}
+			if got := requestsWithOutcome(t, m, c.absent); got != -1 {
+				t.Fatalf("outcome %s count = %d, want no such series", c.absent, got)
+			}
+		})
+	}
+}
+
+// TestInstrumentRecordsPanicAbort: a handler that panics with
+// http.ErrAbortHandler after sending 200 headers (an upstream failure
+// mid-stream, with the client still connected) counts as aborted, is no longer
+// in flight, and the panic still reaches net/http.
+func TestInstrumentRecordsPanicAbort(t *testing.T) {
+	m := newMetrics()
+	var recovered any
+	func() {
+		defer func() { recovered = recover() }()
+		serveInstrumented(m, context.Background(), func(w http.ResponseWriter, _ *http.Request) {
+			w.WriteHeader(http.StatusOK)
+			panic(http.ErrAbortHandler)
+		})
+	}()
+	if recovered != http.ErrAbortHandler {
+		t.Fatalf("recovered %v, want http.ErrAbortHandler", recovered)
+	}
+	if got := requestsWithOutcome(t, m, outcomeAborted); got != 1 {
+		t.Fatalf("aborted count = %d, want 1", got)
+	}
+	if got := requestsWithOutcome(t, m, outcomeOK); got != -1 {
+		t.Fatalf("ok count = %d, want no such series", got)
+	}
+	var out dto.Metric
+	_ = m.inFlight.WithLabelValues("res-1", identity.ServingModeDedicated).Write(&out)
+	if v := out.GetGauge().GetValue(); v != 0 {
+		t.Fatalf("in flight after the panic = %v, want 0", v)
+	}
+}
+
+// TestMetricsSeriesStayBoundedPastResourceCap: requests through instrument with
+// more distinct ids than the cap leave every phoebe_* family with at most the
+// cap plus "other" and "unresolved" as resource_id values, and later ids appear
+// only as "other".
+func TestMetricsSeriesStayBoundedPastResourceCap(t *testing.T) {
+	m := newMetrics()
+	for i := 0; i < maxMetricResources+50; i++ {
+		id := identity.Identity{ResourceID: fmt.Sprintf("r%d", i), ServingMode: identity.ServingModeDedicated}
+		m.instrument(func(_ http.ResponseWriter, r *http.Request) {
+			rec := recordFrom(r.Context())
+			rec.bind(id)
+			rec.observeWake(time.Millisecond, wakeOutcomeOK)
+		})(httptest.NewRecorder(), httptest.NewRequest(http.MethodPost, "/", nil))
+	}
+	// A request refused at the gate never binds.
+	m.instrument(func(http.ResponseWriter, *http.Request) {})(httptest.NewRecorder(), httptest.NewRequest(http.MethodPost, "/", nil))
+
+	pastCap := fmt.Sprintf("r%d", maxMetricResources+10)
+	fams := phoebeFamilies(t, m)
+	for _, name := range []string{"phoebe_request_duration_seconds", "phoebe_wake_hold_seconds", "phoebe_requests_in_flight"} {
+		f, ok := fams[name]
+		if !ok {
+			t.Fatalf("metric family %s missing", name)
+		}
+		ids := map[string]bool{}
+		for _, s := range f.GetMetric() {
+			ids[labelMap(s)["resource_id"]] = true
+		}
+		if len(ids) > maxMetricResources+2 {
+			t.Errorf("%s has %d resource ids, want at most %d", name, len(ids), maxMetricResources+2)
+		}
+		if !ids[resourceOverflow] {
+			t.Errorf("%s has no %q series", name, resourceOverflow)
+		}
+		if ids[pastCap] {
+			t.Errorf("%s has a series for %s, which is past the cap", name, pastCap)
+		}
+	}
+}
+
+// exposedSeries counts the lines a family exposes: a histogram exposes its
+// finite buckets plus +Inf, _sum and _count; a gauge exposes one line.
+func exposedSeries(f *dto.MetricFamily) int {
+	n := 0
+	for _, s := range f.GetMetric() {
+		if h := s.GetHistogram(); h != nil {
+			n += len(h.GetBucket()) + 3
+			continue
+		}
+		n++
+	}
+	return n
+}
+
+// TestMetricsTotalSeriesStayWithinDocumentedBound drives every label combination
+// past the cap and pins the worst-case arithmetic in the comment on
+// maxMetricResources. Changing a bucket list, an outcome or the cap fails this
+// until that comment is updated.
+func TestMetricsTotalSeriesStayWithinDocumentedBound(t *testing.T) {
+	const documentedWorstCase = 1_435_434
+
+	modes := []string{identity.ServingModeShared, identity.ServingModeDedicated, ""}
+	requestOutcomes := []string{outcomeOK, outcomeClientError, outcomeServerError, outcomeAborted}
+	wakeOutcomes := []string{
+		wakeOutcomeOK, wakeOutcomeUnavailable, wakeOutcomeStatusUnknown, wakeOutcomeNotReady,
+		wakeOutcomeTimeout, wakeOutcomeCanceled, wakeOutcomeError,
+	}
+	ids := []string{""} // resourceUnresolved
+	for i := 0; i < maxMetricResources+10; i++ {
+		ids = append(ids, fmt.Sprintf("r%d", i))
+	}
+
+	m := newMetrics()
+	for _, id := range ids {
+		for _, mode := range modes {
+			rec := &requestRecord{m: m}
+			rec.bind(identity.Identity{ResourceID: id, ServingMode: mode})
+			resource, label := rec.labels()
+			for _, outcome := range requestOutcomes {
+				m.requestDuration.WithLabelValues(resource, label, outcome).Observe(0)
+			}
+			for _, outcome := range wakeOutcomes {
+				rec.observeWake(0, outcome)
+			}
+		}
+	}
+
+	labelIDs := maxMetricResources + 2 // resourceOverflow and resourceUnresolved
+	bound := labelIDs*len(modes)*len(requestOutcomes)*(len(requestDurationBuckets)+3) +
+		labelIDs*len(modes)*len(wakeOutcomes)*(len(wakeHoldBuckets)+3) +
+		labelIDs*len(modes)
+	if bound != documentedWorstCase {
+		t.Fatalf("computed bound %d differs from the %d in the comment on maxMetricResources; update the comment", bound, documentedWorstCase)
+	}
+
+	total, overflowSeen := 0, false
+	for _, f := range phoebeFamilies(t, m) {
+		total += exposedSeries(f)
+		for _, s := range f.GetMetric() {
+			overflowSeen = overflowSeen || labelMap(s)["resource_id"] == resourceOverflow
+		}
+	}
+	if total > bound {
+		t.Fatalf("%d series exposed, above the bound of %d", total, bound)
+	}
+	if total != bound {
+		t.Fatalf("%d series exposed, want the worst case %d: the driver missed a label combination", total, bound)
+	}
+	if !overflowSeen {
+		t.Fatalf("no %q series", resourceOverflow)
 	}
 }
