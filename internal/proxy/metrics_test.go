@@ -385,6 +385,58 @@ func TestMetricsServedOnlyOnMetricsListener(t *testing.T) {
 	}
 }
 
+// TestMetricsMuxServesOnlyMetrics: the metrics listener answers /metrics and
+// returns 404 for every other path, so adding a route to it fails this test.
+func TestMetricsMuxServesOnlyMetrics(t *testing.T) {
+	srv := newMetricsTestServer(t)
+	metricsSrv := newMetricsServer(":0", srv.metrics.Handler())
+
+	cases := []struct {
+		path string
+		want int
+	}{
+		{"/metrics", http.StatusOK},
+		{"/", http.StatusNotFound},
+		{"/metrics/", http.StatusNotFound},
+		{"/debug/pprof", http.StatusNotFound},
+		{"/debug/pprof/", http.StatusNotFound},
+		{"/healthz", http.StatusNotFound},
+		{"/other", http.StatusNotFound},
+	}
+	for _, c := range cases {
+		rr := httptest.NewRecorder()
+		metricsSrv.Handler.ServeHTTP(rr, httptest.NewRequest(http.MethodGet, c.path, nil))
+		if rr.Code != c.want {
+			t.Errorf("GET %s = %d, want %d", c.path, rr.Code, c.want)
+		}
+	}
+}
+
+// TestRunStopsWhenMetricsPortInUse: a failure to bind the metrics port stops
+// phoebe with that error. Without this, phoebe would keep serving with no
+// metrics, which looks the same as an idle install.
+func TestRunStopsWhenMetricsPortInUse(t *testing.T) {
+	occupied, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer occupied.Close()
+
+	srv := New(&config.Settings{ListenAddr: "127.0.0.1:0", MetricsAddr: occupied.Addr().String()}, logging.New(logging.ERROR), &recordingEmitter{})
+
+	done := make(chan error, 1)
+	go func() { done <- srv.serve(make(chan os.Signal)) }()
+
+	select {
+	case err := <-done:
+		if !errors.Is(err, syscall.EADDRINUSE) {
+			t.Fatalf("serve returned %v, want the metrics port's address-in-use error", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("serve kept running after the metrics port failed to bind")
+	}
+}
+
 // TestMetricsExpositionOnMetricsHandler: the metrics listener's handler serves
 // the phoebe families.
 func TestMetricsExpositionOnMetricsHandler(t *testing.T) {
