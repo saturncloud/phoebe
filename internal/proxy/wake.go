@@ -807,6 +807,10 @@ func (s *Server) newWakeTransport(
 }
 
 // wakeOutcome maps a Wake result to phoebe_wake_hold_seconds' outcome label.
+// Only the hold's own context counts as a timeout or a cancellation; a stray
+// deadline or cancel error from an inner call with the hold still live is an
+// error. A Wake error carrying an ErrWake* sentinel keeps that sentinel's
+// outcome even if the hold has ended.
 func wakeOutcome(ctx context.Context, err error) string {
 	switch {
 	case err == nil:
@@ -817,7 +821,9 @@ func wakeOutcome(ctx context.Context, err error) string {
 		return wakeOutcomeStatusUnknown
 	case errors.Is(err, ErrWakeNotReady):
 		return wakeOutcomeNotReady
-	case errors.Is(err, context.DeadlineExceeded) || errors.Is(ctx.Err(), context.DeadlineExceeded):
+	case errors.Is(err, context.Canceled) && ctx.Err() != nil && !errors.Is(ctx.Err(), context.DeadlineExceeded):
+		return wakeOutcomeCanceled
+	case errors.Is(ctx.Err(), context.DeadlineExceeded):
 		return wakeOutcomeTimeout
 	default:
 		return wakeOutcomeError
