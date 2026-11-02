@@ -2003,3 +2003,61 @@ func TestModelBindingRefusalsAreJSONAndNameNoModel(t *testing.T) {
 		})
 	}
 }
+
+// TestEndpointScopedBaseRouteServesOnlyTheBaseModel pins the rule that an
+// endpoint-scoped token (endpoint:<deployment_id>:*:view) calls only its
+// deployment's base model (Hugo, 2026-10-31). Atlas stamps the base route's
+// X-Saturn-Served-Model with the base endpoint's name alone (a sibling adapter
+// on the same graph is its own deployment with its own route), and phoebe
+// binds the body's model= to it for every caller. So on the base route the
+// base passes and an adapter name, a missing model or a non-JSON body is
+// refused without reaching the engine. A client cannot supply the allow-list:
+// the edge strip and Atlas's per-deployment middleware overwrite it.
+func TestEndpointScopedBaseRouteServesOnlyTheBaseModel(t *testing.T) {
+	var upstreamCalls int
+	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		upstreamCalls++
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"choices":[],"usage":{"prompt_tokens":1,"completion_tokens":1,"total_tokens":2}}`))
+	}))
+	defer backend.Close()
+	upstream, _ := url.Parse(backend.URL)
+	srv := newTestServer(t, upstream)
+
+	request := func(body string) *httptest.ResponseRecorder {
+		req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(body))
+		setUpstream(req, upstream)
+		req.Header.Set(identity.HeaderAuthID, "endpoint-token")
+		req.Header.Set(identity.HeaderResourceID, "base-deployment")
+		req.Header.Set(identity.HeaderServedModel, "base-ep")
+		rr := httptest.NewRecorder()
+		srv.Handler().ServeHTTP(rr, req)
+		return rr
+	}
+
+	refusals := []struct {
+		name   string
+		body   string
+		status int
+	}{
+		{"adapter on the same graph", `{"model":"adapter-ep"}`, http.StatusForbidden},
+		{"missing model", `{"messages":[]}`, http.StatusForbidden},
+		{"not JSON", `model=base-ep`, http.StatusBadRequest},
+	}
+	for _, tc := range refusals {
+		t.Run(tc.name, func(t *testing.T) {
+			if rr := request(tc.body); rr.Code != tc.status {
+				t.Fatalf("status = %d, want %d (body %s)", rr.Code, tc.status, rr.Body.String())
+			}
+			if upstreamCalls != 0 {
+				t.Fatalf("refused request reached the engine (%d calls)", upstreamCalls)
+			}
+		})
+	}
+	if rr := request(`{"model":"base-ep"}`); rr.Code != http.StatusOK {
+		t.Fatalf("base model status = %d, want 200 (body %s)", rr.Code, rr.Body.String())
+	}
+	if upstreamCalls != 1 {
+		t.Fatalf("base model request reached the engine %d times, want 1", upstreamCalls)
+	}
+}
