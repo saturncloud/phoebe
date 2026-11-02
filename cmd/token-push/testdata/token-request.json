@@ -1,0 +1,105 @@
+{
+  "window_start": "2026-10-22T14:00:00+00:00",
+  "kinds": [
+    "token"
+  ],
+  "records": [
+    {
+      "usage_id": "cdb258448f4432e44d3dc3da88425edbd2f9b860314d4909faa2470c31db1a6b",
+      "kind": "token",
+      "org_id": "0a1b2c3d4e5f60718293a4b5c6d7e8f9",
+      "owner_type": "user",
+      "owner_id": "1f2e3d4c5b6a79880716a5b4c3d2e1f0",
+      "resource_id": "3d4e5f60718293a4b5c6d7e8f90a1b2c",
+      "attributes": {
+        "auth_id": "5f60718293a4b5c6d7e8f90a1b2c3d4e",
+        "model_id": "acme-qwen-ft",
+        "serving_mode": "dedicated",
+        "base_model": "Qwen/Qwen2.5-32B-Instruct",
+        "adapter": "ckpt-7a1c",
+        "graph_k8s_name": "pd-acme-qwen-ft",
+        "topology_revision": "3",
+        "region": "us-central1"
+      },
+      "quantities": {
+        "prompt_tokens": 120000,
+        "cached_tokens": 80000,
+        "completion_tokens": 9000,
+        "request_count": 42
+      }
+    },
+    {
+      "usage_id": "a7210cf38b24eaa20bc3d4d2268e87c59af6c78fac0a48923ac391d38d4ce8d3",
+      "kind": "token",
+      "org_id": "0a1b2c3d4e5f60718293a4b5c6d7e8f9",
+      "owner_type": "user",
+      "owner_id": "1f2e3d4c5b6a79880716a5b4c3d2e1f0",
+      "resource_id": "3d4e5f60718293a4b5c6d7e8f90a1b2c",
+      "attributes": {
+        "auth_id": "5f60718293a4b5c6d7e8f90a1b2c3d4e",
+        "model_id": "acme-qwen-ft",
+        "serving_mode": "dedicated",
+        "base_model": "Qwen/Qwen2.5-32B-Instruct",
+        "adapter": "ckpt-7a1c",
+        "graph_k8s_name": "pd-acme-qwen-ft",
+        "topology_revision": "4",
+        "region": "us-central1"
+      },
+      "quantities": {
+        "prompt_tokens": 3000,
+        "cached_tokens": 0,
+        "completion_tokens": 500,
+        "request_count": 2
+      }
+    },
+    {
+      "usage_id": "7c7102846afa9aea344c2847c520460a36e93270197fcfa062303d738310751b",
+      "kind": "token",
+      "org_id": "0a1b2c3d4e5f60718293a4b5c6d7e8f9",
+      "owner_type": "group",
+      "owner_id": "2c3d4e5f60718293a4b5c6d7e8f90a1b",
+      "resource_id": "4e5f60718293a4b5c6d7e8f90a1b2c3d",
+      "attributes": {
+        "auth_id": "60718293a4b5c6d7e8f90a1b2c3d4e5f",
+        "model_id": "openai/gpt-oss-120b",
+        "serving_mode": "shared",
+        "base_model": "openai/gpt-oss-120b",
+        "adapter": "",
+        "graph_k8s_name": "",
+        "topology_revision": "",
+        "region": ""
+      },
+      "quantities": {
+        "prompt_tokens": 5000,
+        "cached_tokens": 1000,
+        "completion_tokens": 700,
+        "request_count": 9
+      }
+    },
+    {
+      "usage_id": "503b0d7900543017cc08e724f20754bf14cec8a589154bee337d9bfba0084311",
+      "kind": "token",
+      "org_id": "0a1b2c3d4e5f60718293a4b5c6d7e8f9",
+      "owner_type": "user",
+      "owner_id": "1f2e3d4c5b6a79880716a5b4c3d2e1f0",
+      "resource_id": "718293a4b5c6d7e8f90a1b2c3d4e5f60",
+      "attributes": {
+        "auth_id": "5f60718293a4b5c6d7e8f90a1b2c3d4e",
+        "model_id": "acme-custom-llm",
+        "serving_mode": "dedicated",
+        "base_model": "",
+        "adapter": "",
+        "graph_k8s_name": "pd-acme-custom-llm",
+        "topology_revision": "1",
+        "region": "us-central1"
+      },
+      "quantities": {
+        "prompt_tokens": 800,
+        "cached_tokens": 0,
+        "completion_tokens": 64,
+        "request_count": 4
+      }
+    }
+  ],
+  "held": []
+}

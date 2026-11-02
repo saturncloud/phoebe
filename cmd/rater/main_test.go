@@ -189,154 +189,51 @@ func TestResolveWindow_RejectsUnaligned(t *testing.T) {
 	}
 }
 
-// TestRaterSettings_ManagerURLIsTheOnlyPriceSource pins the settings contract after
-// the mandatory-manager collapse (Hugo, 2026-09-22): the rater reads managerURL out
-// of the file the chart renders, and there is no priceFile key to fall back to.
-//
-// The chart writes this settings file, so a key the rater silently ignored would
-// make the whole price path inert with nothing to notice it — the exact failure
-// mode a cross-repo review missed on the previous wiring.
-func TestRaterSettings_ManagerURLIsTheOnlyPriceSource(t *testing.T) {
+// TestRaterSettings_ChartSettingsStillLoadWithoutAManager pins chart
+// compatibility after the rater stopped pricing: the saturn-k8s chart still
+// renders managerURL into rater.yaml. The aggregator must load that file (the
+// key is read only to warn it is unused), and it must also load a file without
+// it, because nothing about aggregation needs the manager.
+func TestRaterSettings_ChartSettingsStillLoadWithoutAManager(t *testing.T) {
 	dir := t.TempDir()
-	path := filepath.Join(dir, "rater.yaml")
-	// Exactly the shape charts/phoebe/templates/configmap.yaml renders.
-	settings := "debug: false\n" +
-		"rateTrailingHours: 24\n" +
-		"managerURL: \"https://manager.example\"\n"
-	if err := os.WriteFile(path, []byte(settings), 0o600); err != nil {
-		t.Fatal(err)
-	}
-
-	_, opts, err := loadConfig(path)
-	if err != nil {
-		t.Fatalf("loadConfig: %v", err)
-	}
-	if opts.managerURL != "https://manager.example" {
-		t.Fatalf("managerURL = %q, want the configured URL — the chart key would be inert", opts.managerURL)
-	}
-}
-
-// TestRaterSettings_PriceFileKeyIsInertAndFailsClosed pins what actually happens to a
-// leftover priceFile key from the price-file world: loadConfig uses plain
-// yaml.Unmarshal (not UnmarshalStrict), so priceFile is an UNKNOWN key and is
-// silently DROPPED — it is ignored, not rejected. The guarantee this test holds is
-// therefore not "the key errors" but "the key is inert": it cannot stand in for
-// managerURL, so an operator whose settings file carries only priceFile gets an
-// empty managerURL and run() exits fatal (main.go:201) rather than pricing from a
-// stale local file or defaulting to $0. The positive control below proves the
-// assertion is not vacuous — the loader really does read the file, and priceFile
-// sitting next to managerURL does not disturb it.
-func TestRaterSettings_PriceFileKeyIsInertAndFailsClosed(t *testing.T) {
-	dir := t.TempDir()
-
-	// Case 1: priceFile ONLY — the migration hazard. Ignored, not an error, and it
-	// leaves managerURL empty so run() fails closed.
-	stalePath := filepath.Join(dir, "stale.yaml")
-	stale := "debug: false\n" +
-		"priceFile: /etc/saturn/prices/prices.yaml\n"
-	if err := os.WriteFile(stalePath, []byte(stale), 0o600); err != nil {
-		t.Fatal(err)
-	}
-	_, opts, err := loadConfig(stalePath)
-	if err != nil {
-		t.Fatalf("loadConfig: %v, want nil — an unknown priceFile key is ignored by the non-strict loader, not an error", err)
-	}
-	if opts.managerURL != "" {
-		t.Fatalf("managerURL = %q, want empty — a priceFile key must not stand in for one", opts.managerURL)
-	}
-
-	// Case 2 (positive control): priceFile ALONGSIDE managerURL. Proves the loader
-	// reads the file at all — so case 1's empty managerURL means "dropped", not
-	// "nothing was parsed" — and that the stale key does not clobber the real one.
-	bothPath := filepath.Join(dir, "both.yaml")
-	both := "debug: false\n" +
-		"priceFile: /etc/saturn/prices/prices.yaml\n" +
-		"managerURL: \"https://manager.example\"\n"
-	if err := os.WriteFile(bothPath, []byte(both), 0o600); err != nil {
-		t.Fatal(err)
-	}
-	_, opts, err = loadConfig(bothPath)
-	if err != nil {
-		t.Fatalf("loadConfig: %v", err)
-	}
-	if opts.managerURL != "https://manager.example" {
-		t.Fatalf("managerURL = %q, want the configured URL — a leftover priceFile must not disturb the real price source", opts.managerURL)
-	}
-}
-
-// TestReconciliationDoc_DocumentsNoLocalPriceFileFallback guards the operator doc
-// against drifting back to the price-file world the rater no longer supports.
-// docs/billing-reconciliation.md is what an operator reads when an invoice does not
-// tie out; if it describes a no-managerURL local-price-file mode, an operator will
-// try to configure one and the rater will simply exit 1 (see run(): an empty
-// managerURL is FATAL because the manager is the only price source). The doc must
-// therefore state the rule the binary enforces — managerURL is required, and the
-// egress-less install runs its own manager — and may cite config/prices.example.yaml
-// only as the served WIRE SHAPE, never as a file the rater reads.
-func TestReconciliationDoc_DocumentsNoLocalPriceFileFallback(t *testing.T) {
-	data, err := os.ReadFile("../../docs/billing-reconciliation.md")
-	if err != nil {
-		t.Fatalf("read reconciliation doc: %v", err)
-	}
-	doc := string(data)
-
-	for _, want := range []string{
-		// The enforced rule: required, and fatal when unset.
-		"`managerURL` is REQUIRED",
-		"exits 1",
-		// The supported answer for an install that cannot reach the central manager.
-		"runs its own manager instance seeded with that\n   deployment's prices",
-		// The example file, framed as the wire shape only.
-		"`config/prices.example.yaml` documents the WIRE SHAPE",
+	for name, settings := range map[string]string{
+		"chart as rendered today": "debug: false\nrateTrailingHours: 6\nmanagerURL: \"https://manager.example\"\n",
+		"no managerURL":           "debug: false\nrateTrailingHours: 6\n",
 	} {
-		if !strings.Contains(doc, want) {
-			t.Errorf("reconciliation doc is missing %q — it must state the price-source rule the rater enforces", want)
+		path := filepath.Join(dir, strings.ReplaceAll(name, " ", "_")+".yaml")
+		if err := os.WriteFile(path, []byte(settings), 0o600); err != nil {
+			t.Fatal(err)
 		}
-	}
-
-	// No resurrected fallback language. These are the AFFIRMATIVE forms — an
-	// install being offered a price file as a mode. The doc's own negative
-	// statement ("keeps ... no local price file") is the rule, not a violation of
-	// it, so the patterns below are written to miss it.
-	for _, forbidden := range []string{
-		"uses the operator-authored price file",
-		"operator-authored price file for every hour",
-		"no `managerURL` uses",
-		"falls back to the price file",
-	} {
-		if strings.Contains(doc, forbidden) {
-			t.Errorf("reconciliation doc mentions %q — there is no local-price-file mode; the manager is the only price source", forbidden)
+		_, opts, err := loadConfig(path)
+		if err != nil {
+			t.Fatalf("%s: loadConfig: %v", name, err)
+		}
+		if opts.trailingHours != 6 {
+			t.Fatalf("%s: trailingHours = %d, want 6", name, opts.trailingHours)
 		}
 	}
 }
 
-// TestExitCode_UnratedHoursIsItsOwnSignal: a run that SKIPPED an hour (prices
-// unavailable, or rating it failed) did not cover its whole window, so it must not
-// exit 0 — but it is a different operator action from an evidence anomaly ("check
-// the pricing service and confirm a later run caught up" vs "investigate the
-// data"), so it gets its own code. An anomaly outranks it: bad evidence is the more
-// urgent signal, and a run can be both.
-func TestExitCode_UnratedHoursIsItsOwnSignal(t *testing.T) {
-	const (
-		noDeletes     = int64(0)
-		routine       = false
-		noAnomaly     = false
-		anomaly       = true
-		unrated       = true
-		allHoursRated = false
-	)
-	if got := exitCode(noDeletes, routine, noAnomaly, unrated); got != exitIncomplete {
-		t.Fatalf("skipped hour: exit = %d, want exitIncomplete (%d) — the window was not fully rated", got, exitIncomplete)
+// TestExitCode_WithheldUsageAlwaysPages: any withheld usage exits 2, on a
+// routine run and on an explicit backfill alike.
+func TestExitCode_WithheldUsageAlwaysPages(t *testing.T) {
+	for _, explicit := range []bool{false, true} {
+		if got := exitCode(0, explicit, true, false); got != exitAnomaly {
+			t.Fatalf("explicit=%v: exit = %d, want exitAnomaly (%d)", explicit, got, exitAnomaly)
+		}
 	}
-	if got := exitCode(noDeletes, routine, noAnomaly, allHoursRated); got != exitOK {
-		t.Fatalf("fully rated clean run: exit = %d, want exitOK (%d)", got, exitOK)
+}
+
+// Parked usage persists across runs; it must keep a Job alert firing with its
+// own code, below the evidence anomalies and above a clean run.
+func TestExitCode_ParkedUsageHasItsOwnNonZeroCode(t *testing.T) {
+	if got := exitCode(0, false, false, true); got != exitParked {
+		t.Fatalf("parked only: exit %d, want exitParked (%d)", got, exitParked)
 	}
-	// An anomaly wins when both are present.
-	if got := exitCode(noDeletes, routine, anomaly, unrated); got != exitAnomaly {
-		t.Fatalf("anomaly + skipped hour: exit = %d, want exitAnomaly (%d) — bad evidence outranks an incomplete run", got, exitAnomaly)
+	if got := exitCode(0, false, true, true); got != exitAnomaly {
+		t.Fatalf("parked + anomaly: exit %d, want exitAnomaly", got)
 	}
-	// The codes must be distinguishable, else the distinction is decorative.
-	if exitIncomplete == exitAnomaly || exitIncomplete == exitOK || exitIncomplete == exitFatal {
-		t.Fatal("exitIncomplete must be distinct from the other exit codes")
+	if exitParked == exitOK || exitParked == exitFatal || exitParked == exitAnomaly || exitParked == 3 {
+		t.Fatal("exitParked must be distinct, and not reuse the retired exit 3")
 	}
 }
