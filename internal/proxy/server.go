@@ -17,6 +17,13 @@ import (
 // may run far longer than any fixed deadline, and a WriteTimeout would sever
 // it mid-stream. IdleTimeout bounds idle keep-alive connections.
 func (s *Server) Run() error {
+	stop := make(chan os.Signal, 1)
+	signal.Notify(stop, os.Interrupt, syscall.SIGTERM)
+	return s.serve(stop)
+}
+
+// serve runs the proxy and metrics listeners until one fails or stop fires.
+func (s *Server) serve(stop <-chan os.Signal) error {
 	srv := &http.Server{
 		Addr:              s.settings.ListenAddr,
 		Handler:           s.Handler(),
@@ -38,14 +45,7 @@ func (s *Server) Run() error {
 	// look like an idle install.
 	var metricsSrv *http.Server
 	if s.metrics != nil {
-		mux := http.NewServeMux()
-		mux.Handle("/metrics", s.metrics.Handler())
-		metricsSrv = &http.Server{
-			Addr:              s.settings.MetricsAddr,
-			Handler:           mux,
-			ReadHeaderTimeout: 10 * time.Second,
-			WriteTimeout:      30 * time.Second,
-		}
+		metricsSrv = newMetricsServer(s.settings.MetricsAddr, s.metrics.Handler())
 		go func() {
 			s.log.Info.Printf("metrics listening on %s", s.settings.MetricsAddr)
 			if err := metricsSrv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
@@ -53,9 +53,6 @@ func (s *Server) Run() error {
 			}
 		}()
 	}
-
-	stop := make(chan os.Signal, 1)
-	signal.Notify(stop, os.Interrupt, syscall.SIGTERM)
 
 	select {
 	case err := <-errCh:
@@ -70,4 +67,17 @@ func (s *Server) Run() error {
 		defer func() { _ = metricsSrv.Shutdown(ctx) }()
 	}
 	return srv.Shutdown(ctx)
+}
+
+// newMetricsServer builds the metrics listener's server. Its mux registers only
+// /metrics, so nothing else (pprof, health checks) is reachable on this port.
+func newMetricsServer(addr string, metricsHandler http.Handler) *http.Server {
+	mux := http.NewServeMux()
+	mux.Handle("/metrics", metricsHandler)
+	return &http.Server{
+		Addr:              addr,
+		Handler:           mux,
+		ReadHeaderTimeout: 10 * time.Second,
+		WriteTimeout:      30 * time.Second,
+	}
 }

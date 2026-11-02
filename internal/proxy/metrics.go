@@ -28,7 +28,10 @@ import (
 // client string; a request refused before that gate is counted under
 // resourceUnresolved. Distinct resource ids are capped per process at
 // maxMetricResources; later ids fold into resourceOverflow, so a pod that
-// outlives many endpoint creations cannot grow without bound.
+// outlives many endpoint creations cannot grow without bound. An id that does
+// not look like a resource id (too long, or outside the allowed characters)
+// also counts as resourceOverflow and does not use up the cap, so the bound
+// does not depend entirely on the edge stripping the header.
 
 const (
 	metricsNamespace = "phoebe"
@@ -37,7 +40,28 @@ const (
 	resourceOverflow   = "other"
 	servingModeUnknown = "unknown"
 
-	maxMetricResources = 2000
+	// maxMetricResources bounds distinct resource ids, not series. Each id
+	// multiplies by the other labels and by the lines one histogram exposes.
+	// With ids = maxMetricResources + 2 (resourceOverflow, resourceUnresolved),
+	// the worst case per process is:
+	//
+	//	request_duration: ids x 3 modes x 4 outcomes x 28 (25 buckets, +Inf, _sum, _count) = 168,672
+	//	wake_hold:        ids x 3 modes x 7 outcomes x 18 (15 buckets, +Inf, _sum, _count) = 189,756
+	//	in_flight:        ids x 3 modes                                                    =   1,506
+	//	total                                                                              = 359,934
+	//
+	// An id has one serving mode in practice, and series exist only for label
+	// combinations a request actually produced. A typical id (ok and client_error
+	// requests, wake holds that succeed) exposes 75 series, in line with the
+	// roughly 110 per router accepted for Traefik in saturn-k8s#1166, so about
+	// 37,500 per pod at the cap. Endpoints past the cap have no per-endpoint
+	// phoebe series until the pod restarts; they still count under "other".
+	// TestMetricsTotalSeriesStayWithinDocumentedBound pins this arithmetic.
+	maxMetricResources = 500
+
+	// maxResourceLabelLen matches the VARCHAR(64) resource_id column in
+	// billing_event. Atlas's ids are shorter (Unicode(32)).
+	maxResourceLabelLen = 64
 )
 
 // outcome label values for phoebe_request_duration_seconds.
@@ -45,7 +69,7 @@ const (
 	outcomeOK          = "ok"           // 1xx-3xx
 	outcomeClientError = "client_error" // 4xx
 	outcomeServerError = "server_error" // 5xx
-	outcomeAborted     = "aborted"      // the client went away before the response finished
+	outcomeAborted     = "aborted"      // the response did not finish: the client went away, or the handler aborted mid-stream
 )
 
 // outcome label values for phoebe_wake_hold_seconds.
@@ -55,6 +79,7 @@ const (
 	wakeOutcomeStatusUnknown = "status_unknown"
 	wakeOutcomeNotReady      = "not_ready"
 	wakeOutcomeTimeout       = "timeout"
+	wakeOutcomeCanceled      = "canceled"
 	wakeOutcomeError         = "error"
 )
 
@@ -124,10 +149,14 @@ func (m *metrics) Handler() http.Handler {
 }
 
 // resourceLabel returns id unchanged while fewer than maxMetricResources
-// distinct ids have been seen, and resourceOverflow after that.
+// distinct ids have been seen, and resourceOverflow after that. A malformed id
+// is resourceOverflow at once and is never stored, so it cannot use up the cap.
 func (m *metrics) resourceLabel(id string) string {
 	if id == "" {
 		return resourceUnresolved
+	}
+	if !validResourceLabel(id) {
+		return resourceOverflow
 	}
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -141,6 +170,25 @@ func (m *metrics) resourceLabel(id string) string {
 	return id
 }
 
+// validResourceLabel reports whether id fits maxResourceLabelLen and uses only
+// [A-Za-z0-9._:-]. This also keeps invalid UTF-8 away from WithLabelValues,
+// which panics on it.
+func validResourceLabel(id string) bool {
+	if len(id) > maxResourceLabelLen {
+		return false
+	}
+	for i := 0; i < len(id); i++ {
+		c := id[i]
+		switch {
+		case c >= 'a' && c <= 'z', c >= 'A' && c <= 'Z', c >= '0' && c <= '9':
+		case c == '.', c == '_', c == ':', c == '-':
+		default:
+			return false
+		}
+	}
+	return true
+}
+
 func servingModeLabel(mode string) string {
 	if identity.ValidServingMode(mode) {
 		return mode
@@ -148,6 +196,9 @@ func servingModeLabel(mode string) string {
 	return servingModeUnknown
 }
 
+// requestOutcome maps a finished request to its outcome label. An abort takes
+// precedence over the status: a 5xx written to a client that has already gone
+// counts as aborted, not server_error.
 func requestOutcome(status int, aborted bool) string {
 	switch {
 	case aborted:
@@ -207,7 +258,7 @@ func (rec *requestRecord) observeWake(d time.Duration, outcome string) {
 	rec.m.wakeHold.WithLabelValues(resource, mode, outcome).Observe(d.Seconds())
 }
 
-// statusRecorder captures the status code a handler writes. Unwrap lets
+// statusRecorder captures the final status code a handler writes. Unwrap lets
 // http.ResponseController (which ReverseProxy uses to flush a stream) reach the
 // underlying writer, so wrapping never breaks streaming.
 type statusRecorder struct {
@@ -216,6 +267,13 @@ type statusRecorder struct {
 }
 
 func (w *statusRecorder) WriteHeader(code int) {
+	// An informational response (ReverseProxy forwards 100 and 103 from the
+	// upstream) precedes the final status, so it is forwarded and not recorded.
+	// 101 is final: net/http sends nothing after it.
+	if code >= 100 && code < 200 && code != http.StatusSwitchingProtocols {
+		w.ResponseWriter.WriteHeader(code)
+		return
+	}
 	if w.status == 0 {
 		w.status = code
 	}
@@ -248,6 +306,10 @@ func (m *metrics) instrument(next http.HandlerFunc) http.HandlerFunc {
 		rec := &requestRecord{m: m, start: time.Now()}
 		sw := &statusRecorder{ResponseWriter: w}
 		r = r.WithContext(context.WithValue(r.Context(), requestRecordKey{}, rec))
+		// Cleared only if next returns. On a panic (ReverseProxy raises
+		// http.ErrAbortHandler when an upstream fails mid-stream) it stays true
+		// and the panic keeps propagating to net/http; nothing recovers it here.
+		panicked := true
 		defer func() {
 			resource, mode := rec.labels()
 			if rec.bound {
@@ -257,9 +319,10 @@ func (m *metrics) instrument(next http.HandlerFunc) http.HandlerFunc {
 			if status == 0 {
 				status = http.StatusOK
 			}
-			outcome := requestOutcome(status, r.Context().Err() != nil)
+			outcome := requestOutcome(status, r.Context().Err() != nil || panicked)
 			m.requestDuration.WithLabelValues(resource, mode, outcome).Observe(time.Since(rec.start).Seconds())
 		}()
 		next(sw, r)
+		panicked = false
 	}
 }
