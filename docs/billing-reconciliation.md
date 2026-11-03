@@ -256,6 +256,36 @@ that emitters can write and the group can be created, and then fix the store. Do
 restart Valkey to clear it: it keeps nothing on disk, so a restart loses every entry
 that is not yet stored.
 
+### A metering outage longer than a day
+
+The routine rater and token-push runs cover only the trailing 24 hours. Events that
+reach Postgres later than that, for example after a long time in a WAL or a full
+Valkey, are in `billing_event`, but no routine run aggregates them or sends them. If
+this step is missed, the manager never receives those hours and the customer is
+undercharged.
+
+1. Wait until the backlog has cleared: `phoebe_metering_wal_pending_events` is 0 on
+   every replica, and `phoebe_metering_stream_undelivered_entries` is near 0.
+2. Find the true start of the outage. Do not use the time someone noticed it: check
+   the earliest late event, the `event_ts` of rows inserted long after their
+   timestamp. On GB300 in November 2026 events began diverting about 26 hours before
+   the drainer's last successful read.
+3. Round that start down to the hour, then run these in this order:
+
+   ```
+   phoebe-rater -since <hour> -until <start of the current hour>
+   phoebe-token-push -since <hour> -until <start of the current hour>
+   ```
+
+4. Check the exit codes. token-push exit `3` is explained under "A manager outage
+   delays sending": a `404` means the manager is too old for `/customer/metered-usage`,
+   so deploy it and run step 3's token-push again. A `422` on an hour goes to the
+   manager's human credit path. Then compare the hours with the reconciliation view.
+
+An hour already pushed is replaced by its new snapshot, so re-running is safe. A window
+that contains a parked hour with pruned raw events makes the rater exit `1`; see
+"Pruned raw events" above.
+
 ## Repair and replay
 
 1. Quiesce the affected invoice window in the central manager. Do not delete local
