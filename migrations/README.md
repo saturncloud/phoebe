@@ -402,10 +402,12 @@ so every version below it is applied, and because migrations are expand-only, a
 failed later migration does not stop the drainer of the running release (it
 logs a warning and consumes).
 
-The wait is not free. Events wait in the Valkey stream, which the emitter caps
-at about 1,000,000 entries (`MAXLEN ~`), so if the migration does not run the
-oldest unconsumed events are trimmed and lost. The drainer therefore waits at
-most `schemaWaitTimeout` (default 10 minutes; it cannot be disabled) and then
-exits non-zero, so the pod goes into CrashLoopBackOff, which is visible and
-alertable, instead of idling silently. Fix the migration (or run
+The wait is not free. Events wait in the Valkey stream, which is held in memory
+and bounded only by Valkey's `maxmemory` (the emitter sets no `MAXLEN`). If the
+migration does not run, Valkey fills and refuses new writes, which then wait in
+each interceptor's WAL, and every event in the stream is lost if Valkey restarts.
+The drainer therefore waits at most `schemaWaitTimeout` (default 10 minutes; it
+cannot be disabled) and then exits non-zero, so the pod goes into
+CrashLoopBackOff, which is visible and alertable, instead of idling silently.
+Fix the migration (or run
 `migrate force` on a dirty row) promptly.

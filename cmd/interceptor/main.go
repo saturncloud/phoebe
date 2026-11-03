@@ -355,6 +355,15 @@ func buildEmitter(s *config.Settings, log *logging.Logger) (metering.Emitter, fu
 		return &metering.LogEmitter{Log: log}, func() {}
 	}
 
+	if rdb != nil {
+		// In the background, so a slow Valkey cannot delay serving.
+		go func() {
+			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancel()
+			em.CheckBufferBound(ctx)
+		}()
+	}
+
 	return em, func() {
 		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 		defer cancel()

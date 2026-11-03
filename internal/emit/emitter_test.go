@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -86,7 +87,7 @@ func openTestWAL(t *testing.T, dir string) *wal {
 // unshipped returns every event the wal still considers unshipped.
 func unshipped(t *testing.T, w *wal) []metering.Event {
 	t.Helper()
-	events, _, _, err := w.pending(0)
+	events, _, _, _, err := w.pending(0)
 	if err != nil {
 		t.Fatalf("wal pending: %v", err)
 	}
@@ -202,7 +203,7 @@ func TestWAL_MarkShippedReclaims(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	events, through, skipped, err := w.pending(0)
+	events, _, through, skipped, err := w.pending(0)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -243,7 +244,7 @@ func TestWAL_ConcurrentAppendDuringDrain(t *testing.T) {
 	}
 
 	// Start a drain: read the unshipped batch (ship window opens here).
-	events, through, _, err := w.pending(0)
+	events, _, through, _, err := w.pending(0)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -333,7 +334,7 @@ func TestWAL_CorruptEntrySkipped(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	events, through, skipped, err := w.pending(0)
+	events, _, through, skipped, err := w.pending(0)
 	if err != nil {
 		t.Fatalf("pending: %v", err)
 	}
@@ -787,15 +788,15 @@ func TestEmitter_PartialBatchProgress(t *testing.T) {
 
 	var shipped []string
 	calls := 0
-	em.shipFn = func(events []metering.Event) bool {
+	em.shipFn = func(events []metering.Event) int {
 		calls++
 		if calls > 1 {
-			return false // batch 2 fails
+			return 0 // batch 2 fails
 		}
 		for _, ev := range events {
 			shipped = append(shipped, ev.RequestID)
 		}
-		return true
+		return len(events)
 	}
 
 	em.drainWAL()
@@ -818,11 +819,11 @@ func TestEmitter_PartialBatchProgress(t *testing.T) {
 	}
 
 	// Next tick: ship recovers; batch 2 goes out exactly once.
-	em.shipFn = func(events []metering.Event) bool {
+	em.shipFn = func(events []metering.Event) int {
 		for _, ev := range events {
 			shipped = append(shipped, ev.RequestID)
 		}
-		return true
+		return len(events)
 	}
 	em.drainWAL()
 
@@ -1299,7 +1300,7 @@ func TestEmit_XAddNeverCapsTheStream(t *testing.T) {
 		t.Fatal(err)
 	}
 	em.xadd(metering.Event{RequestID: "worker-path"})
-	if !em.shipBatch([]metering.Event{{RequestID: "wal-path"}}) {
+	if em.shipBatch([]metering.Event{{RequestID: "wal-path"}}) != 1 {
 		t.Fatal("shipBatch failed")
 	}
 	if err := em.Close(context.Background()); err != nil {
@@ -1330,24 +1331,24 @@ func TestWALPending_CountsUntilShipped(t *testing.T) {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { _ = em.Close(context.Background()) })
-	if got := em.WALPending(); got != 0 {
-		t.Fatalf("empty WAL pending = %d", got)
+	if got, ok := em.WALPending(); got != 0 || !ok {
+		t.Fatalf("empty WAL pending = %d, %v", got, ok)
 	}
 	for i := range 5 {
 		em.walOrLog(metering.Event{RequestID: fmt.Sprintf("r-%d", i)})
 	}
-	if got := em.WALPending(); got != 5 {
-		t.Fatalf("pending after 5 appends = %d", got)
+	if got, ok := em.WALPending(); got != 5 || !ok {
+		t.Fatalf("pending after 5 appends = %d, %v", got, ok)
 	}
-	_, through, _, err := em.wal.pending(3)
+	_, _, through, _, err := em.wal.pending(3)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if err := em.wal.markShipped(through); err != nil {
 		t.Fatal(err)
 	}
-	if got := em.WALPending(); got != 2 {
-		t.Fatalf("pending after shipping 3 = %d", got)
+	if got, ok := em.WALPending(); got != 2 || !ok {
+		t.Fatalf("pending after shipping 3 = %d, %v", got, ok)
 	}
 }
 
@@ -1362,5 +1363,387 @@ func TestProbe_NoValkeyFails(t *testing.T) {
 	t.Cleanup(func() { _ = em.Close(context.Background()) })
 	if _, err := em.Probe(context.Background()); err == nil {
 		t.Fatal("Probe with no Valkey returned nil")
+	}
+}
+
+// ---- partial batch progress --------------------------------------------------
+
+// oomAfterXAdd is a Cmdable whose XAdd accepts a set number of commands and then
+// refuses like a Valkey at maxmemory. It records each accepted request_id.
+type oomAfterXAdd struct {
+	redis.Cmdable
+	allowed int
+	ids     []string
+}
+
+func (c *oomAfterXAdd) XAdd(ctx context.Context, a *redis.XAddArgs) *redis.StringCmd {
+	cmd := redis.NewStringCmd(ctx)
+	if c.allowed <= 0 {
+		cmd.SetErr(errors.New("OOM command not allowed when used memory > 'maxmemory'."))
+		return cmd
+	}
+	c.allowed--
+	values, _ := a.Values.(map[string]interface{})
+	ev, err := metering.UnmarshalEvent([]byte(values["event"].(string)))
+	if err != nil {
+		cmd.SetErr(err)
+		return cmd
+	}
+	c.ids = append(c.ids, ev.RequestID)
+	cmd.SetVal("1-0")
+	return cmd
+}
+
+func walPendingCount(t *testing.T, em *DurableEmitter) uint64 {
+	t.Helper()
+	n, ok := em.WALPending()
+	if !ok {
+		t.Fatal("WALPending reports the count as unknown")
+	}
+	return n
+}
+
+// TestDrainWAL_RefusedXAddKeepsShippedPrefix: when XADD starts refusing partway
+// through a batch, the events before the refusal are recorded, so the next tick
+// does not send them again. A corrupt entry inside the prefix must not shift the
+// watermark: an event's position in the batch is not its WAL index.
+func TestDrainWAL_RefusedXAddKeepsShippedPrefix(t *testing.T) {
+	cfg := testConfig(t, nil)
+	cfg.ShipInterval = time.Hour
+	cfg.ShipBatchSize = 256
+	rdb := &oomAfterXAdd{}
+	em, err := New(cfg, testLogger(), rdb)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = em.Close(context.Background()) })
+
+	for i := range 300 {
+		if i == 50 {
+			appendRaw(t, em.wal, []byte("\x00 not json"))
+		}
+		if err := em.wal.append(makeEvent(fmt.Sprintf("r-%d", i))); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// 301 entries: the corrupt one is covered by the first watermark.
+	for _, want := range []uint64{200, 100, 0} {
+		rdb.allowed = 100
+		em.drainWAL()
+		if got := walPendingCount(t, em); got != want {
+			t.Fatalf("WALPending = %d, want %d", got, want)
+		}
+	}
+	if len(rdb.ids) != 300 {
+		t.Fatalf("XADDed %d events, want 300", len(rdb.ids))
+	}
+	seen := map[string]bool{}
+	for _, id := range rdb.ids {
+		if seen[id] {
+			t.Fatalf("%s XADDed more than once", id)
+		}
+		seen[id] = true
+	}
+	if got := em.WALSkippedEntries(); got != 1 {
+		t.Fatalf("WALSkippedEntries = %d, want 1", got)
+	}
+}
+
+// oomAfterHook refuses XADD through a real client once its allowance is spent.
+type oomAfterHook struct {
+	recordXAddHook
+	allowed atomic.Int64
+}
+
+func (h *oomAfterHook) ProcessHook(next redis.ProcessHook) redis.ProcessHook {
+	return func(ctx context.Context, cmd redis.Cmder) error {
+		if cmd.Name() == "xadd" && h.allowed.Add(-1) < 0 {
+			err := errors.New("OOM command not allowed when used memory > 'maxmemory'.")
+			cmd.SetErr(err)
+			return err
+		}
+		return next(ctx, cmd)
+	}
+}
+
+// TestDrainWAL_PartialBatchKeepsProgress: on a nearly full Valkey the WAL shrinks
+// by exactly what was accepted, spanning batch boundaries, and the stream receives
+// no duplicates.
+func TestDrainWAL_PartialBatchKeepsProgress(t *testing.T) {
+	mr := miniredis.RunT(t)
+	cfg := testConfig(t, mr)
+	cfg.ShipInterval = time.Hour
+	rdb := redisClient(mr.Addr())
+	t.Cleanup(func() { _ = rdb.Close() })
+	hook := &oomAfterHook{}
+	rdb.AddHook(hook)
+	em, err := New(cfg, testLogger(), rdb)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = em.Close(context.Background()) })
+
+	for i := range 1000 {
+		if err := em.wal.append(makeEvent(fmt.Sprintf("r-%d", i))); err != nil {
+			t.Fatal(err)
+		}
+	}
+	hook.allowed.Store(100)
+	em.drainWAL()
+	if got := walPendingCount(t, em); got != 900 {
+		t.Fatalf("after first drain WALPending = %d, want 900", got)
+	}
+	hook.allowed.Store(100)
+	em.drainWAL()
+	if got := walPendingCount(t, em); got != 800 {
+		t.Fatalf("after second drain WALPending = %d, want 800", got)
+	}
+
+	hook.allowed.Store(1 << 30)
+	entries, err := rdb.XRange(context.Background(), cfg.StreamName, "-", "+").Result()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(entries) != 200 {
+		t.Fatalf("stream length = %d, want 200", len(entries))
+	}
+	seen := map[string]bool{}
+	for _, entry := range entries {
+		ev, err := metering.UnmarshalEvent([]byte(entry.Values["event"].(string)))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if seen[ev.RequestID] {
+			t.Fatalf("%s is in the stream twice", ev.RequestID)
+		}
+		seen[ev.RequestID] = true
+	}
+}
+
+// TestDrainWAL_NothingShippedMarksNothing: a batch refused at its first event
+// leaves the watermark where it was.
+func TestDrainWAL_NothingShippedMarksNothing(t *testing.T) {
+	cfg := testConfig(t, nil)
+	cfg.ShipInterval = time.Hour
+	rdb := &oomAfterXAdd{}
+	em, err := New(cfg, testLogger(), rdb)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = em.Close(context.Background()) })
+	for i := range 3 {
+		if err := em.wal.append(makeEvent(fmt.Sprintf("r-%d", i))); err != nil {
+			t.Fatal(err)
+		}
+	}
+	em.drainWAL()
+	if got := walPendingCount(t, em); got != 3 {
+		t.Fatalf("WALPending = %d, want 3", got)
+	}
+}
+
+// TestWALSkippedEntries_CountsEachEntryOnce: a corrupt entry the shipper reads on
+// every failed tick is counted once, when the watermark passes it. Counting per
+// read would make the counter climb for as long as Valkey refuses writes.
+func TestWALSkippedEntries_CountsEachEntryOnce(t *testing.T) {
+	cfg := testConfig(t, nil)
+	cfg.ShipInterval = time.Hour
+	rdb := &oomAfterXAdd{}
+	em, err := New(cfg, testLogger(), rdb)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = em.Close(context.Background()) })
+
+	if err := em.wal.append(makeEvent("first")); err != nil {
+		t.Fatal(err)
+	}
+	appendRaw(t, em.wal, []byte("\x00 not json"))
+	if err := em.wal.append(makeEvent("second")); err != nil {
+		t.Fatal(err)
+	}
+
+	for range 3 {
+		em.drainWAL() // refused at "first"; the corrupt entry is read and retained
+	}
+	if got := em.WALSkippedEntries(); got != 0 {
+		t.Fatalf("WALSkippedEntries while nothing shipped = %d, want 0", got)
+	}
+	rdb.allowed = 1
+	em.drainWAL() // ships "first", stops before passing the corrupt entry
+	em.drainWAL()
+	if got := em.WALSkippedEntries(); got != 0 {
+		t.Fatalf("WALSkippedEntries before the watermark passes the entry = %d, want 0", got)
+	}
+	rdb.allowed = 1
+	em.drainWAL()
+	if got := em.WALSkippedEntries(); got != 1 {
+		t.Fatalf("WALSkippedEntries after the watermark passes the entry = %d, want 1", got)
+	}
+	if got := walPendingCount(t, em); got != 0 {
+		t.Fatalf("WALPending = %d, want 0", got)
+	}
+}
+
+// TestWALSkippedEntries_CountsAllCorruptBatch: a batch with no decodable event
+// ships nothing and is still truncated past, so it must be counted.
+func TestWALSkippedEntries_CountsAllCorruptBatch(t *testing.T) {
+	mr := miniredis.RunT(t)
+	cfg := testConfig(t, mr)
+	cfg.ShipInterval = time.Hour
+	rdb := redisClient(mr.Addr())
+	t.Cleanup(func() { _ = rdb.Close() })
+	em, err := New(cfg, testLogger(), rdb)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = em.Close(context.Background()) })
+	appendRaw(t, em.wal, []byte("\x00 not json"))
+	appendRaw(t, em.wal, []byte("\x00 also not json"))
+	em.drainWAL()
+	if got := em.WALSkippedEntries(); got != 2 {
+		t.Fatalf("WALSkippedEntries = %d, want 2", got)
+	}
+}
+
+// ---- floor counter -----------------------------------------------------------
+
+// TestFloorEvents_CountsEachFloorEvent: every event that reaches the log floor is
+// counted on the real emitter; that counter is what the floor alert reads. A
+// closed WAL reports a trusted zero, since it only occurs during shutdown.
+func TestFloorEvents_CountsEachFloorEvent(t *testing.T) {
+	em, err := New(testConfig(t, nil), testLogger(), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := em.FloorEvents(); got != 0 {
+		t.Fatalf("FloorEvents at start = %d", got)
+	}
+	if err := em.wal.close(); err != nil {
+		t.Fatal(err)
+	}
+	em.walOrLog(makeEvent("a"))
+	em.walOrLog(makeEvent("b"))
+	if got := em.FloorEvents(); got != 2 {
+		t.Fatalf("FloorEvents = %d, want 2", got)
+	}
+	if got, ok := em.WALPending(); got != 0 || !ok {
+		t.Fatalf("WALPending on a closed WAL = %d, %v, want 0, true", got, ok)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 500*time.Millisecond)
+	defer cancel()
+	_ = em.Close(ctx)
+}
+
+// ---- memory bound check ------------------------------------------------------
+
+// fakeValkeyState is a Cmdable that answers the commands Probe and
+// CheckBufferBound run.
+type fakeValkeyState struct {
+	redis.Cmdable
+	info    string
+	infoErr error
+	entries int64
+	groups  []redis.XInfoGroup
+}
+
+func (f *fakeValkeyState) Info(ctx context.Context, _ ...string) *redis.StringCmd {
+	cmd := redis.NewStringCmd(ctx)
+	if f.infoErr != nil {
+		cmd.SetErr(f.infoErr)
+		return cmd
+	}
+	cmd.SetVal(f.info)
+	return cmd
+}
+
+func (f *fakeValkeyState) XLen(ctx context.Context, _ string) *redis.IntCmd {
+	cmd := redis.NewIntCmd(ctx)
+	cmd.SetVal(f.entries)
+	return cmd
+}
+
+func (f *fakeValkeyState) XInfoGroups(ctx context.Context, _ string) *redis.XInfoGroupsCmd {
+	cmd := redis.NewXInfoGroupsCmd(ctx, "s")
+	cmd.SetVal(f.groups)
+	return cmd
+}
+
+// TestCheckBufferBound_WarnsWhenNothingBoundsTheStream: XADD has no MAXLEN, so a
+// Valkey without maxmemory and noeviction must be reported at startup.
+func TestCheckBufferBound_WarnsWhenNothingBoundsTheStream(t *testing.T) {
+	for _, tc := range []struct {
+		name, info, want string
+		infoErr          error
+	}{
+		{name: "bounded", info: "# Memory\r\nmaxmemory:134217728\r\nmaxmemory_policy:noeviction\r\n"},
+		{name: "no cap", info: "maxmemory:0\r\nmaxmemory_policy:noeviction\r\n", want: "no cap"},
+		{name: "evicting", info: "maxmemory:134217728\r\nmaxmemory_policy:allkeys-lru\r\n", want: "evict the metering stream"},
+		{name: "policy missing", info: "maxmemory:134217728\r\n", want: "could not read valkey maxmemory_policy"},
+		{name: "info error", infoErr: errors.New("boom"), want: "skipped"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var warn bytes.Buffer
+			logger := logging.New(logging.ERROR)
+			logger.Warn.SetOutput(&warn)
+			cfg := testConfig(t, nil)
+			cfg.ShipInterval = time.Hour
+			em, err := New(cfg, logger, &fakeValkeyState{info: tc.info, infoErr: tc.infoErr})
+			if err != nil {
+				t.Fatal(err)
+			}
+			t.Cleanup(func() { _ = em.Close(context.Background()) })
+			em.CheckBufferBound(context.Background())
+			if tc.want == "" && warn.Len() != 0 {
+				t.Fatalf("unexpected warning: %s", warn.String())
+			}
+			if !strings.Contains(warn.String(), tc.want) {
+				t.Fatalf("warnings %q do not contain %q", warn.String(), tc.want)
+			}
+		})
+	}
+}
+
+// TestCheckBufferBound_NoValkeyIsANoOp: a WAL-only emitter has nothing to check.
+func TestCheckBufferBound_NoValkeyIsANoOp(t *testing.T) {
+	cfg := testConfig(t, nil)
+	em, err := New(cfg, testLogger(), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = em.Close(context.Background()) })
+	em.CheckBufferBound(context.Background())
+}
+
+// TestProbe_UnknownLagReadsAsWholeStream: go-redis reports -1 when Valkey cannot
+// compute a group's lag. That must not read as caught up. The group furthest behind
+// still wins.
+func TestProbe_UnknownLagReadsAsWholeStream(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		groups []redis.XInfoGroup
+		want   int64
+	}{
+		{"unknown lag", []redis.XInfoGroup{{Pending: 2, Lag: -1}}, 100},
+		{"known lag", []redis.XInfoGroup{{Pending: 2, Lag: 3}}, 5},
+		{"caught up", []redis.XInfoGroup{{Pending: 0, Lag: 0}}, 0},
+		{"unknown beside known", []redis.XInfoGroup{{Pending: 1, Lag: 1}, {Pending: 0, Lag: -1}}, 100},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg := testConfig(t, nil)
+			cfg.ShipInterval = time.Hour
+			em, err := New(cfg, testLogger(), &fakeValkeyState{entries: 100, groups: tc.groups})
+			if err != nil {
+				t.Fatal(err)
+			}
+			t.Cleanup(func() { _ = em.Close(context.Background()) })
+			p, err := em.Probe(context.Background())
+			if err != nil {
+				t.Fatal(err)
+			}
+			if p.Undelivered != tc.want {
+				t.Fatalf("Undelivered = %d, want %d", p.Undelivered, tc.want)
+			}
+		})
 	}
 }

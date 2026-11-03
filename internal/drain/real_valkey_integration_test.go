@@ -162,7 +162,7 @@ func TestRealValkeyDrainerRecoversFromOOM(t *testing.T) {
 	for i := range 20 {
 		em.Emit(ctx, metering.Event{RequestID: fmt.Sprintf("emitted-%d", i)})
 	}
-	if !pollUntil(time.Now().Add(2*time.Second), func() bool { return em.WALPending() > 0 }) {
+	if !pollUntil(time.Now().Add(2*time.Second), func() bool { n, _ := em.WALPending(); return n > 0 }) {
 		t.Fatal("the emitter's events did not reach its WAL while Valkey was full")
 	}
 
@@ -173,11 +173,14 @@ func TestRealValkeyDrainerRecoversFromOOM(t *testing.T) {
 	go func() { done <- restarted.Run(runCtx) }()
 
 	deadline := time.Now().Add(20 * time.Second)
+	var pending uint64
 	if !pollUntil(deadline, func() bool {
-		return store.distinctWithPrefix("undelivered") == 100 && store.distinctWithPrefix("emitted") == 20 && em.WALPending() == 0
+		var ok bool
+		pending, ok = em.WALPending()
+		return store.distinctWithPrefix("undelivered") == 100 && store.distinctWithPrefix("emitted") == 20 && ok && pending == 0
 	}) {
 		t.Fatalf("stored %d of 100 undelivered and %d of 20 emitted events, WAL pending %d",
-			store.distinctWithPrefix("undelivered"), store.distinctWithPrefix("emitted"), em.WALPending())
+			store.distinctWithPrefix("undelivered"), store.distinctWithPrefix("emitted"), pending)
 	}
 	if !pollUntil(deadline, func() bool {
 		n, _ := rdb.XLen(ctx, cfg.StreamName).Result()
