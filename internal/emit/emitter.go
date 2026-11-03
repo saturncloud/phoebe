@@ -258,8 +258,7 @@ func (e *DurableEmitter) walOrLog(ev metering.Event) {
 // It is parseable by a log-pipeline scraper for manual recovery.
 func (e *DurableEmitter) logFloor(ev metering.Event) {
 	e.floorEvents.Add(1)
-	data, _ := json.Marshal(ev)
-	e.log.Error.Printf("METERING_FLOOR request_id=%s event=%s", ev.RequestID, data)
+	logFloorEvent(e.log, ev)
 }
 
 // shipper periodically drains the WAL into Valkey on recovery.

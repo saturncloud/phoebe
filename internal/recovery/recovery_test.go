@@ -1,9 +1,12 @@
 package recovery
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
+	"log"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -15,6 +18,8 @@ import (
 	"github.com/redis/go-redis/v9"
 	tidwall "github.com/tidwall/wal"
 
+	"github.com/saturncloud/phoebe/internal/emit"
+	"github.com/saturncloud/phoebe/internal/logging"
 	"github.com/saturncloud/phoebe/internal/metering"
 )
 
@@ -605,5 +610,52 @@ func TestDigestPreCutoverAbsentModeEqualsExplicitDedicated(t *testing.T) {
 	}
 	if absent.Digest() != explicit.Digest() {
 		t.Fatalf("absent serving_mode digest %s != explicit dedicated digest %s", absent.Digest(), explicit.Digest())
+	}
+}
+
+// TestFloorEmitterEventsRecoverWithTimestampAndServingMode: when the durable
+// emitter failed to start, the log line is the only copy of a billing record, so
+// recovery must read it back with the fields rating depends on.
+func TestFloorEmitterEventsRecoverWithTimestampAndServingMode(t *testing.T) {
+	var logged bytes.Buffer
+	logger := &logging.Logger{
+		Debug: log.New(io.Discard, "", 0),
+		Info:  log.New(io.Discard, "", 0),
+		Warn:  log.New(io.Discard, "", 0),
+		Error: log.New(&logged, "ERROR: ", log.LstdFlags), // the shape a log export holds
+	}
+	before := time.Now().UnixMilli()
+	em := emit.NewFloorEmitter(logger)
+	for _, ev := range []metering.Event{
+		{RequestID: "phoebe-shared", AuthID: "auth-1", PromptTokens: 11, UsageFound: true, ServingMode: "shared"},
+		{RequestID: "phoebe-dedicated", AuthID: "auth-1", PromptTokens: 22, UsageFound: true, ServingMode: "dedicated"},
+	} {
+		em.Emit(context.Background(), ev)
+	}
+	after := time.Now().UnixMilli()
+
+	path := filepath.Join(t.TempDir(), "floor.log")
+	if err := os.WriteFile(path, logged.Bytes(), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	evidence, err := Load(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(evidence.Events) != 2 {
+		t.Fatalf("recovered %d events, want 2; log:\n%s", len(evidence.Events), logged.String())
+	}
+	got := map[string]metering.Event{}
+	for _, ev := range evidence.Events {
+		got[ev.RequestID] = ev
+	}
+	for id, wantMode := range map[string]string{"phoebe-shared": "shared", "phoebe-dedicated": "dedicated"} {
+		ev := got[id]
+		if ev.ServingMode != wantMode {
+			t.Errorf("%s serving mode = %q, want %q", id, ev.ServingMode, wantMode)
+		}
+		if ev.TimestampUnixMs < before || ev.TimestampUnixMs > after {
+			t.Errorf("%s timestamp = %d, want within [%d, %d]", id, ev.TimestampUnixMs, before, after)
+		}
 	}
 }

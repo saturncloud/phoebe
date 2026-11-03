@@ -213,8 +213,9 @@ func requestOutcome(status int, aborted bool) string {
 	}
 }
 
-// MeteringHealth is what the metering buffer metrics read. The durable emitter
-// implements it; a log-only emitter does not, and those metrics are then absent.
+// MeteringHealth is what the metering buffer metrics read. Both emitters
+// cmd/interceptor can build implement it, so these metrics are present on every
+// production replica, including one whose durable emitter failed to start.
 type MeteringHealth interface {
 	// WALPending also reports whether the count can be trusted.
 	WALPending() (uint64, bool)
@@ -227,7 +228,10 @@ type MeteringHealth interface {
 
 // cmd/interceptor finds this interface with a type assertion, so a renamed method
 // would otherwise make every metering metric vanish without a build error.
-var _ MeteringHealth = (*emit.DurableEmitter)(nil)
+var (
+	_ MeteringHealth = (*emit.DurableEmitter)(nil)
+	_ MeteringHealth = (*emit.FloorEmitter)(nil)
+)
 
 // meteringProbeTimeout bounds the Valkey read a scrape makes. A slow Valkey must
 // report as down, not hold up the scrape.

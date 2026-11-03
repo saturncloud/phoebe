@@ -23,6 +23,7 @@ import (
 	"github.com/saturncloud/phoebe/internal/emit"
 	"github.com/saturncloud/phoebe/internal/identity"
 	"github.com/saturncloud/phoebe/internal/logging"
+	"github.com/saturncloud/phoebe/internal/metering"
 )
 
 func newMetricsTestServer(t *testing.T) *Server {
@@ -911,5 +912,47 @@ func TestMeteringWALFamiliesServedOnRealEmitter(t *testing.T) {
 		if got := m.GetGauge().GetValue() + m.GetCounter().GetValue(); got != want {
 			t.Errorf("%s = %v, want %v", name, got, want)
 		}
+	}
+}
+
+// TestMeteringFamiliesReportFloorEmitterAsFailure: a replica whose durable emitter
+// failed to start must report that through the metrics the alerts read. Each value
+// below is what makes one alert fire, and a missing series would keep it silent.
+func TestMeteringFamiliesReportFloorEmitterAsFailure(t *testing.T) {
+	em := emit.NewFloorEmitter(logging.New(logging.ERROR))
+	srv := newMetricsTestServer(t).WithMeteringHealth(em)
+
+	value := func(fams map[string]*dto.MetricFamily, name string) float64 {
+		t.Helper()
+		f, ok := fams[name]
+		if !ok {
+			t.Fatalf("%s missing", name)
+		}
+		m := f.GetMetric()[0]
+		return m.GetGauge().GetValue() + m.GetCounter().GetValue()
+	}
+
+	fams := phoebeFamilies(t, srv.metrics)
+	if got := value(fams, "phoebe_metering_floor_events_total"); got != 0 {
+		t.Errorf("floor events before any Emit = %v, want 0", got)
+	}
+	for name, want := range map[string]float64{
+		"phoebe_metering_valkey_up":    0,
+		"phoebe_metering_wal_healthy":  0,
+		"phoebe_metering_wal_poisoned": 1,
+	} {
+		if got := value(fams, name); got != want {
+			t.Errorf("%s = %v, want %v", name, got, want)
+		}
+	}
+	// No WAL is open and events may be on disk, so the count must not read as 0.
+	if _, ok := fams["phoebe_metering_wal_pending_events"]; ok {
+		t.Error("wal pending exported with no open WAL")
+	}
+
+	em.Emit(context.Background(), metering.Event{RequestID: "phoebe-1"})
+	em.Emit(context.Background(), metering.Event{RequestID: "phoebe-2"})
+	if got := value(phoebeFamilies(t, srv.metrics), "phoebe_metering_floor_events_total"); got != 2 {
+		t.Errorf("floor events after two Emits = %v, want 2", got)
 	}
 }
