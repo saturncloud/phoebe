@@ -1379,7 +1379,7 @@ type oomAfterXAdd struct {
 func (c *oomAfterXAdd) XAdd(ctx context.Context, a *redis.XAddArgs) *redis.StringCmd {
 	cmd := redis.NewStringCmd(ctx)
 	if c.allowed <= 0 {
-		cmd.SetErr(errors.New("OOM command not allowed when used memory > 'maxmemory'."))
+		cmd.SetErr(errors.New("OOM command not allowed when used memory > 'maxmemory'"))
 		return cmd
 	}
 	c.allowed--
@@ -1458,7 +1458,7 @@ type oomAfterHook struct {
 func (h *oomAfterHook) ProcessHook(next redis.ProcessHook) redis.ProcessHook {
 	return func(ctx context.Context, cmd redis.Cmder) error {
 		if cmd.Name() == "xadd" && h.allowed.Add(-1) < 0 {
-			err := errors.New("OOM command not allowed when used memory > 'maxmemory'.")
+			err := errors.New("OOM command not allowed when used memory > 'maxmemory'")
 			cmd.SetErr(err)
 			return err
 		}
