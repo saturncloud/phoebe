@@ -123,7 +123,7 @@ func TestDrain_SchemaGapRetriesInsteadOfPoisoning(t *testing.T) {
 	if err := d.ensureGroup(ctx); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := d.readAndStore(ctx); err == nil {
+	if _, err := d.readAndStore(ctx, cfg.BlockTimeout); err == nil {
 		t.Fatal("a schema gap must surface as a store error, not succeed")
 	}
 	if d.Poisoned() != 0 {
@@ -313,11 +313,12 @@ func TestWaitForSchema_HungProbeTimesOutAndIsLogged(t *testing.T) {
 // (main exits non-zero, the pod restarts visibly) instead of idling while the
 // un-drained events wait in a Valkey that keeps nothing on disk.
 func TestDrain_RunFailsWhenSchemaNeverArrives(t *testing.T) {
-	cfg := DefaultConfig()
+	_, rdb := startMiniredis(t)
+	cfg := testConfig(rdb.Options().Addr)
 	cfg.RequiredSchemaVersion = 9
 	cfg.SchemaWaitTimeout = 10 * time.Minute
 	store := &schemaGapStore{fakeStore: newFakeStore(), version: 8}
-	d := newGatedDrainer(cfg, testLogger(), nil, store)
+	d := newGatedDrainer(cfg, testLogger(), rdb, store)
 	d.schemaPoll = time.Millisecond
 	var clock atomic.Int64
 	base := time.Unix(1_700_000_000, 0)
@@ -332,6 +333,75 @@ func TestDrain_RunFailsWhenSchemaNeverArrives(t *testing.T) {
 	if !strings.Contains(err.Error(), "not at version 9") {
 		t.Fatalf("Run error = %q, want it to name the missing schema version", err)
 	}
+}
+
+// Trimming needs no database, and acknowledged entries are already stored, so a
+// drainer blocked at the schema gate still frees them before it exits. Pending and
+// unread entries stay, and nothing is written.
+func TestRun_TrimsAcknowledgedEntriesBeforeTheSchemaGate(t *testing.T) {
+	for _, c := range []struct {
+		name     string
+		schema   *schemaGapStore
+		ack      func(read []string) []string
+		wantFrom int
+	}{
+		{"schema behind, all acknowledged", &schemaGapStore{fakeStore: newFakeStore(), version: 8},
+			func(read []string) []string { return read }, 3},
+		{"schema unreadable, all acknowledged", &schemaGapStore{fakeStore: newFakeStore(), err: errors.New("connection refused")},
+			func(read []string) []string { return read }, 3},
+		{"schema behind, one left pending", &schemaGapStore{fakeStore: newFakeStore(), version: 8},
+			func(read []string) []string { return []string{read[0], read[1], read[3]} }, 2},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancel()
+			_, rdb := startMiniredis(t)
+			cfg := testConfig(rdb.Options().Addr)
+			cfg.RequiredSchemaVersion = 9
+			cfg.SchemaWaitTimeout = 10 * time.Minute
+			d := newGatedDrainer(cfg, testLogger(), rdb, c.schema)
+			d.schemaPoll = time.Millisecond
+			var clock atomic.Int64
+			base := time.Unix(1_700_000_000, 0)
+			d.now = func() time.Time { return base.Add(time.Duration(clock.Add(int64(time.Minute)))) }
+			if err := d.ensureGroup(ctx); err != nil {
+				t.Fatal(err)
+			}
+			ids := addEntries(t, rdb, cfg.StreamName, 6)
+			read := readEntries(t, rdb, cfg, cfg.Group, 4) // ids[4] and ids[5] stay unread
+			if err := rdb.XAck(ctx, cfg.StreamName, cfg.Group, c.ack(read)...).Err(); err != nil {
+				t.Fatal(err)
+			}
+
+			err := d.Run(ctx)
+
+			if err == nil || !strings.Contains(err.Error(), "not at version 9") {
+				t.Fatalf("Run = %v, want the schema-timeout error", err)
+			}
+			assertEntries(t, remainingEntries(t, rdb, cfg.StreamName), ids[c.wantFrom:])
+			if n := c.schema.attemptCount(); n != 0 {
+				t.Fatalf("upsert attempts = %d, want none: the gate stayed shut", n)
+			}
+		})
+	}
+}
+
+// main trims with a Drainer that has no store, before Postgres is open, so a pod
+// crash-looping on an unreachable database still frees acknowledged entries.
+func TestTrimDelivered_NeedsNoStore(t *testing.T) {
+	ctx := context.Background()
+	_, rdb := startMiniredis(t)
+	cfg := testConfig(rdb.Options().Addr)
+	d := New(cfg, testLogger(), rdb, nil)
+	if err := d.ensureGroup(ctx); err != nil {
+		t.Fatal(err)
+	}
+	ids := addEntries(t, rdb, cfg.StreamName, 3)
+	if err := rdb.XAck(ctx, cfg.StreamName, cfg.Group, readEntries(t, rdb, cfg, cfg.Group, 3)...).Err(); err != nil {
+		t.Fatal(err)
+	}
+	d.TrimDelivered(ctx)
+	assertEntries(t, remainingEntries(t, rdb, cfg.StreamName), ids[2:])
 }
 
 // Every Store reports a schema version (it is part of the interface), so the
@@ -369,12 +439,12 @@ func TestDrain_RecreatedGroupDrainsEventsEmittedDuringTheWipe(t *testing.T) {
 	mr.Del(cfg.StreamName) // the wipe: stream and group gone
 	xaddEvent(t, rdb, cfg.StreamName, sampleEvent("during-wipe"))
 
-	if _, err := d.readAndStore(ctx); err != nil {
+	if _, err := d.readAndStore(ctx, cfg.BlockTimeout); err != nil {
 		t.Fatalf("readAndStore after the wipe = %v, want the group recreated", err)
 	}
 	xaddEvent(t, rdb, cfg.StreamName, sampleEvent("after-recreate"))
 	for i := 0; i < 3 && store.rowCount() < 2; i++ {
-		if _, err := d.readAndStore(ctx); err != nil {
+		if _, err := d.readAndStore(ctx, cfg.BlockTimeout); err != nil {
 			t.Fatal(err)
 		}
 	}

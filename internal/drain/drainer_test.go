@@ -5,7 +5,9 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -742,9 +744,10 @@ func TestTrimDelivered_KeepsUndeliveredAndPending(t *testing.T) {
 	assertEntries(t, remainingEntries(t, rdb, cfg.StreamName), ids[2:])
 }
 
-// TestTrimDelivered_RemovesEverythingAcknowledged: with nothing pending, the
-// stream shrinks to the last delivered entry plus anything unread.
-func TestTrimDelivered_RemovesEverythingAcknowledged(t *testing.T) {
+// TestTrimDelivered_AllAcknowledgedKeepsLastDeliveredAndUnread: with nothing
+// pending, the stream shrinks to the last delivered entry, which MINID keeps, plus
+// anything unread. It does not empty the stream.
+func TestTrimDelivered_AllAcknowledgedKeepsLastDeliveredAndUnread(t *testing.T) {
 	ctx := context.Background()
 	_, rdb := startMiniredis(t)
 	cfg := testConfig(rdb.Options().Addr)
@@ -858,11 +861,134 @@ func TestEnsureGroup_ExistingGroupStartsWhenValkeyIsFull(t *testing.T) {
 	}
 }
 
+// switchableOOMHook is oomHook with a switch, because go-redis hooks cannot be
+// removed, and with counts of the commands the tests below reason about.
+type switchableOOMHook struct {
+	on          *atomic.Bool
+	xgroupCalls *atomic.Int64
+	xreadCalls  *atomic.Int64
+}
+
+func newSwitchableOOMHook() switchableOOMHook {
+	h := switchableOOMHook{on: &atomic.Bool{}, xgroupCalls: &atomic.Int64{}, xreadCalls: &atomic.Int64{}}
+	h.on.Store(true)
+	return h
+}
+
+func (h switchableOOMHook) DialHook(next redis.DialHook) redis.DialHook { return next }
+func (h switchableOOMHook) ProcessPipelineHook(next redis.ProcessPipelineHook) redis.ProcessPipelineHook {
+	return next
+}
+func (h switchableOOMHook) ProcessHook(next redis.ProcessHook) redis.ProcessHook {
+	return func(ctx context.Context, cmd redis.Cmder) error {
+		name := cmd.Name()
+		if name == "xgroup" {
+			h.xgroupCalls.Add(1)
+		}
+		if name == "xreadgroup" {
+			h.xreadCalls.Add(1)
+		}
+		if h.on.Load() && (name == "xgroup" || name == "xadd") {
+			err := errors.New("OOM command not allowed when used memory > 'maxmemory'.") //nolint:revive // verbatim
+			cmd.SetErr(err)
+			return err
+		}
+		return next(ctx, cmd)
+	}
+}
+
+// funcHook adapts a function to a redis.Hook.
+type funcHook func(ctx context.Context, cmd redis.Cmder, next redis.ProcessHook) error
+
+func (h funcHook) DialHook(next redis.DialHook) redis.DialHook { return next }
+func (h funcHook) ProcessPipelineHook(next redis.ProcessPipelineHook) redis.ProcessPipelineHook {
+	return next
+}
+func (h funcHook) ProcessHook(next redis.ProcessHook) redis.ProcessHook {
+	return func(ctx context.Context, cmd redis.Cmder) error { return h(ctx, cmd, next) }
+}
+
+// countCommand adds a hook counting one command.
+func countCommand(rdb *redis.Client, name string) *atomic.Int64 {
+	var n atomic.Int64
+	rdb.AddHook(funcHook(func(ctx context.Context, cmd redis.Cmder, next redis.ProcessHook) error {
+		if cmd.Name() == name {
+			n.Add(1)
+		}
+		return next(ctx, cmd)
+	}))
+	return &n
+}
+
+func groupNames(t *testing.T, rdb *redis.Client, stream string) []string {
+	t.Helper()
+	groups, err := rdb.XInfoGroups(context.Background(), stream).Result()
+	if err != nil {
+		if strings.Contains(err.Error(), "no such key") {
+			return nil
+		}
+		t.Fatalf("xinfo groups: %v", err)
+	}
+	names := make([]string, 0, len(groups))
+	for _, g := range groups {
+		names = append(names, g.Name)
+	}
+	return names
+}
+
+func waitFor(t *testing.T, what string, timeout time.Duration, cond func() bool) {
+	t.Helper()
+	deadline := time.Now().Add(timeout)
+	for !cond() {
+		if time.Now().After(deadline) {
+			t.Fatalf("timed out waiting for %s", what)
+		}
+		time.Sleep(time.Millisecond)
+	}
+}
+
 // TestRun_MissingGroupOnFullValkeyWaitsInsteadOfExiting: with no group to read,
-// the drainer keeps retrying and exits cleanly on shutdown, rather than failing.
+// the drainer stays in the wait, retrying XGROUP CREATE and reading nothing through
+// the group. Once the refusal lifts it creates the group and consumes.
 func TestRun_MissingGroupOnFullValkeyWaitsInsteadOfExiting(t *testing.T) {
 	_, rdb := startMiniredis(t)
-	rdb.AddHook(oomHook{})
+	cfg := testConfig(rdb.Options().Addr)
+	store := newFakeStore()
+	xaddEvent(t, rdb, cfg.StreamName, sampleEvent("before"))
+	hook := newSwitchableOOMHook()
+	rdb.AddHook(hook)
+	d := New(cfg, testLogger(), rdb, store)
+	d.groupRetry = time.Millisecond
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	done := make(chan error, 1)
+	go func() { done <- d.Run(ctx) }()
+
+	waitFor(t, "XGROUP CREATE to be retried", 5*time.Second, func() bool { return hook.xgroupCalls.Load() >= 2 })
+	if names := groupNames(t, rdb, cfg.StreamName); len(names) != 0 {
+		t.Fatalf("groups = %v while XGROUP CREATE is refused, want none", names)
+	}
+	if n := hook.xreadCalls.Load(); n != 0 {
+		t.Fatalf("XREADGROUP ran %d times with no group, want the drainer still waiting", n)
+	}
+
+	hook.on.Store(false)
+	waitFor(t, "the group to be created", 5*time.Second, func() bool { return len(groupNames(t, rdb, cfg.StreamName)) == 1 })
+	xaddEvent(t, rdb, cfg.StreamName, sampleEvent("after"))
+	waitFor(t, "both events to be stored", 5*time.Second, func() bool { return store.rowCount() == 2 })
+	cancel()
+	if err := <-done; err != nil {
+		t.Fatalf("Run on a full Valkey with no group: %v", err)
+	}
+}
+
+// TestRun_MissingGroupOnFullValkeyRetriesUntilShutdown: Run returns only because
+// the context ended, and returns nil rather than failing.
+func TestRun_MissingGroupOnFullValkeyRetriesUntilShutdown(t *testing.T) {
+	_, rdb := startMiniredis(t)
+	hook := newSwitchableOOMHook()
+	rdb.AddHook(hook)
 	cfg := testConfig(rdb.Options().Addr)
 	d := New(cfg, testLogger(), rdb, newFakeStore())
 	d.groupRetry = time.Millisecond
@@ -871,15 +997,590 @@ func TestRun_MissingGroupOnFullValkeyWaitsInsteadOfExiting(t *testing.T) {
 	if err := d.Run(ctx); err != nil {
 		t.Fatalf("Run on a full Valkey with no group: %v", err)
 	}
+	if ctx.Err() == nil {
+		t.Fatal("Run returned before its context ended, want it to keep retrying")
+	}
+	if n := hook.xgroupCalls.Load(); n < 2 {
+		t.Fatalf("XGROUP CREATE ran %d times, want it retried", n)
+	}
+	if n := hook.xreadCalls.Load(); n != 0 {
+		t.Fatalf("XREADGROUP ran %d times with no group, want none", n)
+	}
 }
 
-// TestEnsureGroup_OtherErrorsStillFail: a bad address must not retry forever.
-func TestEnsureGroup_OtherErrorsStillFail(t *testing.T) {
+// TestRun_GroupLostWhileRunningOnFullValkeyIsRecreated: a running drainer gets
+// NOGROUP (Valkey restarted) and XGROUP CREATE is refused. It keeps running, and
+// recreates the group and consumes once the refusal lifts.
+func TestRun_GroupLostWhileRunningOnFullValkeyIsRecreated(t *testing.T) {
+	mr, rdb := startMiniredis(t)
+	cfg := testConfig(rdb.Options().Addr)
+	store := newFakeStore()
+	hook := newSwitchableOOMHook()
+	hook.on.Store(false)
+	rdb.AddHook(hook)
+	d := New(cfg, testLogger(), rdb, store)
+	d.groupRetry = time.Millisecond
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	done := make(chan error, 1)
+	go func() { done <- d.Run(ctx) }()
+	waitFor(t, "the group to exist", 5*time.Second, func() bool { return len(groupNames(t, rdb, cfg.StreamName)) == 1 })
+
+	hook.on.Store(true)
+	before := hook.xgroupCalls.Load()
+	mr.Del(cfg.StreamName)
+	waitFor(t, "XGROUP CREATE to be retried", 5*time.Second, func() bool { return hook.xgroupCalls.Load() >= before+2 })
+	if names := groupNames(t, rdb, cfg.StreamName); len(names) != 0 {
+		t.Fatalf("groups = %v while XGROUP CREATE is refused, want none", names)
+	}
+	select {
+	case err := <-done:
+		t.Fatalf("Run returned %v while the group was missing, want it still running", err)
+	default:
+	}
+
+	hook.on.Store(false)
+	waitFor(t, "the group to be recreated", 5*time.Second, func() bool { return len(groupNames(t, rdb, cfg.StreamName)) == 1 })
+	xaddEvent(t, rdb, cfg.StreamName, sampleEvent("after-recreate"))
+	waitFor(t, "the new event to be stored", 5*time.Second, func() bool { return store.rowCount() == 1 })
+	cancel()
+	if err := <-done; err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+}
+
+// TestRun_FullValkeyWithNoGroupFreesItselfAndLosesNothing is the way out: XGROUP
+// CREATE stays refused until the drainer has stored and trimmed enough, as on a real
+// full Valkey. Every event reaches the store, the group ends up existing, and the
+// recovery is counted. A malformed entry does not stop it.
+func TestRun_FullValkeyWithNoGroupFreesItselfAndLosesNothing(t *testing.T) {
+	_, rdb := startMiniredis(t)
+	cfg := testConfig(rdb.Options().Addr)
+	cfg.BatchSize = 10
+	store := newFakeStore()
+	if err := rdb.XAdd(context.Background(), &redis.XAddArgs{Stream: cfg.StreamName, Values: map[string]any{"event": "{not valid json"}}).Err(); err != nil {
+		t.Fatal(err)
+	}
+	const total = 35
+	for i := range total {
+		xaddEvent(t, rdb, cfg.StreamName, sampleEvent(fmt.Sprintf("full-%d", i)))
+	}
+	rdb.AddHook(funcHook(func(ctx context.Context, cmd redis.Cmder, next redis.ProcessHook) error {
+		if cmd.Name() == "xgroup" {
+			if n := rdb.XLen(ctx, cfg.StreamName).Val(); n > 10 { // over maxmemory until trimmed
+				err := errors.New("OOM command not allowed when used memory > 'maxmemory'.") //nolint:revive // verbatim
+				cmd.SetErr(err)
+				return err
+			}
+		}
+		return next(ctx, cmd)
+	}))
+	d := New(cfg, testLogger(), rdb, store)
+	d.groupRetry = time.Hour // retrying must come from progress, not from the sleep
+
+	runUntil(t, d, func() bool {
+		return store.rowCount() == total && len(groupNames(t, rdb, cfg.StreamName)) == 1 &&
+			pendingCount(t, rdb, cfg.StreamName, cfg.Group) == 0
+	}, 5*time.Second)
+	if d.DrainedWithoutGroup() == 0 {
+		t.Fatal("DrainedWithoutGroup() = 0, want the recovery counted")
+	}
+	if d.Malformed() == 0 {
+		t.Fatal("Malformed() = 0, want the malformed entry counted")
+	}
+}
+
+// TestDrainWithoutGroup_StoreFailureTrimsNothing: an entry is removed only once it
+// is stored, whether the store is down or the schema is behind.
+func TestDrainWithoutGroup_StoreFailureTrimsNothing(t *testing.T) {
+	down := newFakeStore()
+	down.failAll = true
+	down.pingErr = errors.New("store down")
+	for name, store := range map[string]Store{
+		"store down":    down,
+		"schema behind": &schemaGapStore{fakeStore: newFakeStore()},
+	} {
+		t.Run(name, func(t *testing.T) {
+			_, rdb := startMiniredis(t)
+			cfg := testConfig(rdb.Options().Addr)
+			for i := range 5 {
+				xaddEvent(t, rdb, cfg.StreamName, sampleEvent(fmt.Sprintf("e-%d", i)))
+			}
+			ids := remainingEntries(t, rdb, cfg.StreamName)
+			d := New(cfg, testLogger(), rdb, store)
+			n, err := d.drainWithoutGroup(context.Background())
+			if err == nil || n != 0 {
+				t.Fatalf("drainWithoutGroup = %d, %v, want 0 and an error", n, err)
+			}
+			assertEntries(t, remainingEntries(t, rdb, cfg.StreamName), ids)
+		})
+	}
+}
+
+// TestDrainWithoutGroup_GroupAppearingBeforeTheTrimKeepsEntries: a group created
+// while the batch is being stored owns the entries from then on, so normal trim
+// rules apply. A group existing from the start means nothing is read at all.
+func TestDrainWithoutGroup_GroupAppearingBeforeTheTrimKeepsEntries(t *testing.T) {
+	ctx := context.Background()
+	_, rdb := startMiniredis(t)
+	cfg := testConfig(rdb.Options().Addr)
+	for i := range 5 {
+		xaddEvent(t, rdb, cfg.StreamName, sampleEvent(fmt.Sprintf("e-%d", i)))
+	}
+	ids := remainingEntries(t, rdb, cfg.StreamName)
+	other := redis.NewClient(&redis.Options{Addr: rdb.Options().Addr})
+	t.Cleanup(func() { _ = other.Close() })
+	created := false
+	rdb.AddHook(funcHook(func(ctx context.Context, cmd redis.Cmder, next redis.ProcessHook) error {
+		err := next(ctx, cmd)
+		if cmd.Name() == "xrange" && !created {
+			created = true
+			if gerr := other.XGroupCreate(ctx, cfg.StreamName, "appeared", "0").Err(); gerr != nil {
+				t.Errorf("create group: %v", gerr)
+			}
+		}
+		return err
+	}))
+	store := newFakeStore()
+	d := New(cfg, testLogger(), rdb, store)
+
+	if n, err := d.drainWithoutGroup(ctx); err != nil || n != 0 {
+		t.Fatalf("drainWithoutGroup = %d, %v, want nothing trimmed", n, err)
+	}
+	assertEntries(t, remainingEntries(t, rdb, cfg.StreamName), ids)
+
+	calls := store.calls
+	if n, err := d.drainWithoutGroup(ctx); err != nil || n != 0 {
+		t.Fatalf("drainWithoutGroup with a group = %d, %v, want nothing trimmed", n, err)
+	}
+	if store.calls != calls {
+		t.Fatal("drainWithoutGroup stored entries although a group exists")
+	}
+}
+
+// TestWaitForGroup_NonOOMErrorFailsFast: a bad address must not retry forever. The
+// context outlives the call, which proves it returned by itself.
+func TestWaitForGroup_NonOOMErrorFailsFast(t *testing.T) {
 	mr, rdb := startMiniredis(t)
 	cfg := testConfig(rdb.Options().Addr)
 	d := New(cfg, testLogger(), rdb, newFakeStore())
+	d.groupRetry = time.Millisecond
 	mr.Close()
-	if err := d.waitForGroup(context.Background()); err == nil {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	err := d.waitForGroup(ctx)
+	if err == nil {
 		t.Fatal("waitForGroup against a dead Valkey returned nil")
+	}
+	if errors.Is(err, context.DeadlineExceeded) || errors.Is(err, context.Canceled) || ctx.Err() != nil {
+		t.Fatalf("waitForGroup = %v (ctx: %v), want it to fail without waiting for the context", err, ctx.Err())
+	}
+}
+
+// seedDeadConsumerPending leaves n events in another consumer's pending list, idle
+// long enough to reclaim.
+func seedDeadConsumerPending(t *testing.T, rdb *redis.Client, cfg Config, n int) {
+	t.Helper()
+	ctx := context.Background()
+	if err := rdb.XGroupCreateMkStream(ctx, cfg.StreamName, cfg.Group, "0").Err(); err != nil {
+		t.Fatal(err)
+	}
+	for i := range n {
+		xaddEvent(t, rdb, cfg.StreamName, sampleEvent(fmt.Sprintf("pending-%d", i)))
+	}
+	if err := rdb.XReadGroup(ctx, &redis.XReadGroupArgs{
+		Group: cfg.Group, Consumer: "dead-consumer", Streams: []string{cfg.StreamName, ">"}, Count: int64(n), Block: -1,
+	}).Err(); err != nil {
+		t.Fatal(err)
+	}
+	time.Sleep(cfg.ClaimMinIdle + 5*time.Millisecond) // miniredis measures idle time in real time
+}
+
+// TestRun_ReclaimClearsBacklogWithoutWaitingForClaimInterval: after an outage the
+// pending list sets the trim boundary, so it must clear at store speed, not at one
+// batch per ClaimInterval and not at one batch per XREADGROUP block. New entries
+// keep being read meanwhile.
+func TestRun_ReclaimClearsBacklogWithoutWaitingForClaimInterval(t *testing.T) {
+	_, rdb := startMiniredis(t)
+	cfg := testConfig(rdb.Options().Addr)
+	cfg.BatchSize = 10
+	cfg.ClaimInterval = time.Hour
+	cfg.BlockTimeout = 2 * time.Second // a blocking read per batch would take 4s or more
+	const backlog = 35
+	seedDeadConsumerPending(t, rdb, cfg, backlog)
+	xaddEvent(t, rdb, cfg.StreamName, sampleEvent("new"))
+	store := newFakeStore()
+	d := New(cfg, testLogger(), rdb, store)
+
+	runUntil(t, d, func() bool {
+		return store.rowCount() == backlog+1 && pendingCount(t, rdb, cfg.StreamName, cfg.Group) == 0
+	}, 1500*time.Millisecond)
+}
+
+// TestReclaim_ReportsMoreOnlyForAFullStoredBatch: more drives Run's immediate retry,
+// so a short batch or a store failure must not report it. The cursor continues the
+// walk after a success and goes back to the start after a failure, where the failed
+// entries still are.
+func TestReclaim_ReportsMoreOnlyForAFullStoredBatch(t *testing.T) {
+	_, rdb := startMiniredis(t)
+	cfg := testConfig(rdb.Options().Addr)
+	cfg.BatchSize = 2
+	cfg.ClaimMinIdle = 0
+	seedDeadConsumerPending(t, rdb, cfg, 5)
+	store := &schemaGapStore{fakeStore: newFakeStore()}
+	d := New(cfg, testLogger(), rdb, store)
+	ctx := context.Background()
+
+	if d.reclaim(ctx) {
+		t.Fatal("reclaim reported more after a store failure")
+	}
+	if !d.storeDown || d.claimCursor != "0" {
+		t.Fatalf("after a store failure storeDown=%v cursor=%q, want true and 0", d.storeDown, d.claimCursor)
+	}
+
+	store.migrate(0)
+	if !d.reclaim(ctx) {
+		t.Fatal("reclaim did not report more after a full batch")
+	}
+	if d.claimCursor == "0" {
+		t.Fatal("reclaim discarded the returned cursor after a full batch with more waiting")
+	}
+	if !d.reclaim(ctx) {
+		t.Fatal("reclaim did not report more after the second full batch")
+	}
+	if d.reclaim(ctx) {
+		t.Fatal("reclaim reported more after a short batch")
+	}
+	if d.claimCursor != "0" {
+		t.Fatalf("cursor = %q at the end of the pending list, want 0", d.claimCursor)
+	}
+	if got := store.rowCount(); got != 5 {
+		t.Fatalf("rows = %d, want 5", got)
+	}
+}
+
+// TestRun_FailingStoreKeepsReclaimAtClaimIntervalPace: a store failure must not turn
+// the immediate retry into a hot loop, whether Ping fails or not.
+func TestRun_FailingStoreKeepsReclaimAtClaimIntervalPace(t *testing.T) {
+	down := newFakeStore()
+	down.failAll = true
+	down.pingErr = errors.New("store down")
+	for name, store := range map[string]Store{
+		"outage":        down,
+		"schema behind": &schemaGapStore{fakeStore: newFakeStore()},
+	} {
+		t.Run(name, func(t *testing.T) {
+			_, rdb := startMiniredis(t)
+			cfg := testConfig(rdb.Options().Addr)
+			cfg.BatchSize = 5
+			cfg.ClaimInterval = time.Hour
+			seedDeadConsumerPending(t, rdb, cfg, 20)
+			claims := countCommand(rdb, "xautoclaim")
+			d := New(cfg, testLogger(), rdb, store)
+			ctx, cancel := context.WithTimeout(context.Background(), 300*time.Millisecond)
+			defer cancel()
+			if err := d.Run(ctx); err != nil {
+				t.Fatal(err)
+			}
+			if n := claims.Load(); n > 1 {
+				t.Fatalf("XAUTOCLAIM ran %d times with a one-hour ClaimInterval, want at most 1", n)
+			}
+		})
+	}
+}
+
+// TestRun_NoNewReadsWhileStoreDown: during an outage the entries stay undelivered,
+// so they do not all move into the pending list, while acknowledged entries are
+// still trimmed. Once the store answers everything drains.
+func TestRun_NoNewReadsWhileStoreDown(t *testing.T) {
+	ctx := context.Background()
+	_, rdb := startMiniredis(t)
+	cfg := testConfig(rdb.Options().Addr)
+	cfg.BatchSize = 1
+	cfg.TrimInterval = 5 * time.Millisecond
+	cfg.ClaimInterval = time.Hour // only the read path can notice the outage here
+	store := newFakeStore()
+	store.failAll = true
+	store.pingErr = errors.New("store down")
+	d := New(cfg, testLogger(), rdb, store)
+	if err := d.ensureGroup(ctx); err != nil {
+		t.Fatal(err)
+	}
+	addEntries(t, rdb, cfg.StreamName, 3)
+	read := readEntries(t, rdb, cfg, cfg.Group, 3)
+	if err := rdb.XAck(ctx, cfg.StreamName, cfg.Group, read...).Err(); err != nil {
+		t.Fatal(err)
+	}
+	for i := range 4 {
+		xaddEvent(t, rdb, cfg.StreamName, sampleEvent(fmt.Sprintf("outage-%d", i)))
+	}
+
+	runCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	done := make(chan error, 1)
+	go func() { done <- d.Run(runCtx) }()
+
+	// Longer than the 500ms back-off, so a second read would have happened.
+	time.Sleep(800 * time.Millisecond)
+	if p := pendingCount(t, rdb, cfg.StreamName, cfg.Group); p != 1 {
+		t.Fatalf("pending = %d during the outage, want only the one batch read before the store failed", p)
+	}
+	// The boundary is the pending entry, the first event, so every acknowledged
+	// entry below it goes.
+	entries := remainingEntries(t, rdb, cfg.StreamName)
+	if len(entries) != 4 {
+		t.Fatalf("stream = %v during the outage, want the 3 acknowledged entries trimmed and the 4 events kept", entries)
+	}
+
+	store.mu.Lock()
+	store.failAll, store.pingErr = false, nil
+	store.mu.Unlock()
+	waitFor(t, "reading to resume after the outage", 5*time.Second, func() bool { return store.rowCount() == 3 })
+	cancel()
+	if err := <-done; err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+
+	// The batch that failed is still pending, and reclaim stores it.
+	cfg.ClaimInterval = 10 * time.Millisecond
+	runUntil(t, New(cfg, testLogger(), rdb, store), func() bool {
+		return store.rowCount() == 4 && pendingCount(t, rdb, cfg.StreamName, cfg.Group) == 0
+	}, 5*time.Second)
+}
+
+// TestDrain_MalformedEntryIsLoggedCountedAndTrimmed: the trim removes a dropped
+// entry, so the log line must carry its raw values on one line, and the drop must
+// be counted apart from store poison.
+func TestDrain_MalformedEntryIsLoggedCountedAndTrimmed(t *testing.T) {
+	ctx := context.Background()
+	_, rdb := startMiniredis(t)
+	cfg := testConfig(rdb.Options().Addr)
+	cfg.TrimInterval = 5 * time.Millisecond
+	store := newFakeStore()
+	payloads := []string{`{"request_id":"lost-1","prompt_tokens":"100"}`, "{\"request_id\":\"\",\n\"model\":\"lost-2\"}"}
+	for _, raw := range payloads {
+		if err := rdb.XAdd(ctx, &redis.XAddArgs{Stream: cfg.StreamName, Values: map[string]any{"event": raw}}).Err(); err != nil {
+			t.Fatal(err)
+		}
+	}
+	xaddEvent(t, rdb, cfg.StreamName, sampleEvent("good"))
+	logger, logs := capturingLogger()
+	d := New(cfg, logger, rdb, store)
+
+	runUntil(t, d, func() bool {
+		return store.rowCount() == 1 && rdb.XLen(ctx, cfg.StreamName).Val() == 1
+	}, 5*time.Second)
+
+	if got := d.Malformed(); got != 2 {
+		t.Fatalf("Malformed() = %d, want 2", got)
+	}
+	if got := d.Poisoned(); got != 0 {
+		t.Fatalf("Poisoned() = %d, want 0: a decode failure is not store poison", got)
+	}
+	var dropLines []string
+	for _, line := range strings.Split(logs.String(), "\n") {
+		if strings.Contains(line, "drop malformed entry") {
+			dropLines = append(dropLines, line)
+		}
+	}
+	if len(dropLines) != 2 {
+		t.Fatalf("drop lines = %q, want one line per entry", dropLines)
+	}
+	for i, raw := range payloads {
+		want, err := json.Marshal(map[string]any{"event": raw})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !strings.Contains(dropLines[i], string(want)) {
+			t.Errorf("drop line %q does not hold the raw values %s", dropLines[i], want)
+		}
+	}
+}
+
+// TestTrimDelivered_FailsClosed: any doubt about the boundary trims nothing, because
+// a wrong trim loses a billing record. In the fixture read[2] is pending in both
+// groups, so a check that merely skipped one read would leave a usable boundary from
+// the other group and trim the entries below it.
+func TestTrimDelivered_FailsClosed(t *testing.T) {
+	failCommand := func(name string) func(cmd redis.Cmder) error {
+		return func(cmd redis.Cmder) error {
+			if cmd.Name() == name {
+				return fmt.Errorf("induced %s failure", name)
+			}
+			return nil
+		}
+	}
+	for _, c := range []struct {
+		name    string
+		before  func(cmd redis.Cmder) error
+		rewrite func(cmd redis.Cmder, first *bool)
+	}{
+		{name: "xpending fails", before: failCommand("xpending")},
+		{name: "xinfo fails", before: failCommand("xinfo")},
+		{name: "last-delivered id does not parse", rewrite: func(cmd redis.Cmder, _ *bool) {
+			if c, ok := cmd.(*redis.XInfoGroupsCmd); ok {
+				c.Val()[0].LastDeliveredID = "garbage"
+			}
+		}},
+		{name: "pending lower id does not parse", rewrite: func(cmd redis.Cmder, first *bool) {
+			if c, ok := cmd.(*redis.XPendingCmd); ok && *first && c.Val().Count > 0 {
+				*first = false
+				v := *c.Val()
+				v.Lower = "garbage"
+				c.SetVal(&v)
+			}
+		}},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			ctx := context.Background()
+			_, rdb := startMiniredis(t)
+			cfg := testConfig(rdb.Options().Addr)
+			logger, _ := capturingLogger()
+			d := New(cfg, logger, rdb, newFakeStore())
+			if err := d.ensureGroup(ctx); err != nil {
+				t.Fatal(err)
+			}
+			if err := rdb.XGroupCreate(ctx, cfg.StreamName, "other", "0").Err(); err != nil {
+				t.Fatal(err)
+			}
+			ids := addEntries(t, rdb, cfg.StreamName, 5)
+			for _, group := range []string{cfg.Group, "other"} {
+				read := readEntries(t, rdb, cfg, group, 3)
+				if err := rdb.XAck(ctx, cfg.StreamName, group, read[:2]...).Err(); err != nil {
+					t.Fatal(err)
+				}
+			}
+			var trims atomic.Int64
+			first := true
+			rdb.AddHook(funcHook(func(ctx context.Context, cmd redis.Cmder, next redis.ProcessHook) error {
+				if cmd.Name() == "xtrim" {
+					trims.Add(1)
+				}
+				if c.before != nil {
+					if err := c.before(cmd); err != nil {
+						cmd.SetErr(err)
+						return err
+					}
+				}
+				err := next(ctx, cmd)
+				if err == nil && c.rewrite != nil {
+					c.rewrite(cmd, &first)
+				}
+				return err
+			}))
+
+			d.trimDelivered(ctx)
+
+			if n := trims.Load(); n != 0 {
+				t.Fatalf("XTRIM ran %d times, want none", n)
+			}
+			clean := redis.NewClient(&redis.Options{Addr: rdb.Options().Addr})
+			defer func() { _ = clean.Close() }()
+			assertEntries(t, remainingEntries(t, clean, cfg.StreamName), ids)
+		})
+	}
+}
+
+// TestTrimDelivered_EntriesDeliveredBetweenTheTwoReadsStay pins the read order:
+// XINFO GROUPS before XPENDING. Entries delivered between the two are above the
+// last-delivered id already captured. Read the other way round, XPENDING would see
+// nothing pending and XINFO a newer last-delivered id, and the first of those
+// entries would be trimmed while still unacknowledged.
+func TestTrimDelivered_EntriesDeliveredBetweenTheTwoReadsStay(t *testing.T) {
+	ctx := context.Background()
+	_, rdb := startMiniredis(t)
+	cfg := testConfig(rdb.Options().Addr)
+	d := New(cfg, testLogger(), rdb, newFakeStore())
+	if err := d.ensureGroup(ctx); err != nil {
+		t.Fatal(err)
+	}
+	ids := addEntries(t, rdb, cfg.StreamName, 5)
+	read := readEntries(t, rdb, cfg, cfg.Group, 3)
+	if err := rdb.XAck(ctx, cfg.StreamName, cfg.Group, read...).Err(); err != nil {
+		t.Fatal(err)
+	}
+	other := redis.NewClient(&redis.Options{Addr: rdb.Options().Addr})
+	t.Cleanup(func() { _ = other.Close() })
+	fired := false
+	rdb.AddHook(funcHook(func(ctx context.Context, cmd redis.Cmder, next redis.ProcessHook) error {
+		err := next(ctx, cmd)
+		if name := cmd.Name(); !fired && (name == "xinfo" || name == "xpending") {
+			fired = true // after the first of the two reads has its answer
+			if got := readEntries(t, other, cfg, cfg.Group, 2); len(got) != 2 {
+				t.Errorf("delivered %d entries between the reads, want 2", len(got))
+			}
+		}
+		return err
+	}))
+
+	d.trimDelivered(ctx)
+
+	if !fired {
+		t.Fatal("the hook never fired")
+	}
+	assertEntries(t, remainingEntries(t, other, cfg.StreamName), ids[2:])
+}
+
+// TestTrimBoundary_LogsGroupThatStopsTheTrim: a group holding the trim back keeps
+// Valkey filling up, so it is logged. A new install and the drainer's own group
+// stay quiet.
+func TestTrimBoundary_LogsGroupThatStopsTheTrim(t *testing.T) {
+	ctx := context.Background()
+	for _, c := range []struct {
+		name  string
+		setup func(t *testing.T, rdb *redis.Client, cfg Config, d *Drainer)
+		want  string
+	}{
+		{name: "no stream"},
+		{name: "empty stream, group has delivered nothing", setup: func(t *testing.T, _ *redis.Client, _ Config, d *Drainer) {
+			if err := d.ensureGroup(ctx); err != nil {
+				t.Fatal(err)
+			}
+		}},
+		{name: "own group holds the boundary", setup: func(t *testing.T, rdb *redis.Client, cfg Config, d *Drainer) {
+			if err := d.ensureGroup(ctx); err != nil {
+				t.Fatal(err)
+			}
+			addEntries(t, rdb, cfg.StreamName, 3)
+			readEntries(t, rdb, cfg, cfg.Group, 2)
+		}},
+		{name: "group has delivered nothing and entries wait", want: `consumer group "other" has delivered nothing`, setup: func(t *testing.T, rdb *redis.Client, cfg Config, _ *Drainer) {
+			if err := rdb.XGroupCreateMkStream(ctx, cfg.StreamName, "other", "0").Err(); err != nil {
+				t.Fatal(err)
+			}
+			addEntries(t, rdb, cfg.StreamName, 3)
+		}},
+		{name: "another group holds the boundary", want: `consumer group "other" holds the trim boundary`, setup: func(t *testing.T, rdb *redis.Client, cfg Config, d *Drainer) {
+			if err := d.ensureGroup(ctx); err != nil {
+				t.Fatal(err)
+			}
+			if err := rdb.XGroupCreate(ctx, cfg.StreamName, "other", "0").Err(); err != nil {
+				t.Fatal(err)
+			}
+			addEntries(t, rdb, cfg.StreamName, 4)
+			if err := rdb.XAck(ctx, cfg.StreamName, cfg.Group, readEntries(t, rdb, cfg, cfg.Group, 3)...).Err(); err != nil {
+				t.Fatal(err)
+			}
+			readEntries(t, rdb, cfg, "other", 1)
+		}},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			_, rdb := startMiniredis(t)
+			cfg := testConfig(rdb.Options().Addr)
+			logger, logs := capturingLogger()
+			d := New(cfg, logger, rdb, newFakeStore())
+			if c.setup != nil {
+				c.setup(t, rdb, cfg, d)
+			}
+			d.trimDelivered(ctx)
+			got := logs.String()
+			if c.want == "" && strings.Contains(got, "WARN") {
+				t.Fatalf("logs = %q, want no warning", got)
+			}
+			if c.want != "" && !strings.Contains(got, "WARN: drainer: ") || !strings.Contains(got, c.want) {
+				t.Fatalf("logs = %q, want a warning containing %q", got, c.want)
+			}
+		})
 	}
 }

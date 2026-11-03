@@ -189,7 +189,11 @@ ambiguous base/org, invalid serving mode, owner conflict) rather than firing
 every hour.
 
 Page on parked usage (rater exit 4), an unexplained missing-usage attempt, rater anomaly/non-zero exit, reconcile
-deletion during a routine run, drainer poison row, `METERING_FLOOR`, WAL corruption,
+deletion during a routine run, drainer poison row, the drainer log line
+`drop malformed entry` (an entry that could not be decoded, whose logged values are
+the only copy left once the trim passes it, so it needs repair by hand), the drainer
+log line `valkey is full with no consumer group` (see "A full Valkey" below),
+`METERING_FLOOR`, WAL corruption,
 token-push withheld hour (exit 2), manager rejection (exit 3), or push failure
 (exit 1). Alert separately when the oldest Valkey
 pending entry, oldest WAL entry, or oldest unpushed rated hour exceeds two job
@@ -225,6 +229,32 @@ For the invoice boundary, compare the records token-push sent for the interval
 `usage_id` and exact equality of the four quantities per record before comparing
 any total. A total can accidentally balance while two customers are mis-attributed.
 Prices and money are the manager's to reconcile.
+
+### A full Valkey
+
+Past `maxmemory` Valkey refuses `XADD` and `XGROUP CREATE`, and emitters fall back
+to their WALs. Reads, `XACK` and `XTRIM` still work, so the drainer recovers by
+itself in the states below. Trimming removes only delivered and acknowledged
+entries, and it runs at drainer startup before the Postgres connection and the
+schema gate, and every `trimInterval` after that.
+
+- **No consumer group.** Valkey restarted empty while the drainer was down, the
+  emitters filled a new stream, and `XGROUP CREATE` is refused. After the schema gate
+  the drainer reads the oldest batch with `XRANGE`, stores it, trims it, and tries
+  again until the group can be created. The log line is
+  `valkey is full with no consumer group`, and it should stop once the group exists.
+  If Postgres is failing, or the gate has not opened, nothing is trimmed, because an
+  entry is removed only once it is stored.
+- **After a Postgres outage.** The drainer stops reading new entries while the store
+  is failing, so at most one batch per replica is left pending. Once the store
+  answers, reclaim works through any pending entries without waiting for
+  `claimInterval` while each batch comes back full.
+
+**Manual relief.** If Postgres or the schema stays broken, the drainer cannot free
+undelivered entries. Raise `maxmemory` on Valkey (`CONFIG SET maxmemory <bytes>`) so
+that emitters can write and the group can be created, and then fix the store. Do not
+restart Valkey to clear it: it keeps nothing on disk, so a restart loses every entry
+that is not yet stored.
 
 ## Repair and replay
 
