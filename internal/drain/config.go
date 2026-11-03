@@ -71,6 +71,11 @@ type Config struct {
 	// attempted. Reclaim runs opportunistically; it need not be on every pass.
 	ClaimInterval time.Duration
 
+	// TrimInterval is how often delivered entries are trimmed from the stream.
+	// Acknowledging an entry does not delete it, so without this the stream grows
+	// until Valkey refuses writes.
+	TrimInterval time.Duration
+
 	// --- Postgres ---
 
 	// DatabaseURL is the Postgres DSN. Read from the DATABASE_URL env var by the
@@ -95,6 +100,7 @@ func DefaultConfig() Config {
 		BlockTimeout:    5 * time.Second,
 		ClaimMinIdle:    30 * time.Second,
 		ClaimInterval:   15 * time.Second,
+		TrimInterval:    30 * time.Second,
 		MaxOpenConns:    90,
 		MaxIdleConns:    20,
 		ConnMaxLifetime: 30 * time.Minute,

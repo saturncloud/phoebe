@@ -1262,3 +1262,105 @@ func TestNew_InvalidWALPath_ReturnsError(t *testing.T) {
 		t.Fatal("expected error for unwritable WAL path, got nil")
 	}
 }
+
+type recordXAddHook struct {
+	mu   sync.Mutex
+	args [][]any
+}
+
+func (*recordXAddHook) DialHook(next redis.DialHook) redis.DialHook { return next }
+func (*recordXAddHook) ProcessPipelineHook(next redis.ProcessPipelineHook) redis.ProcessPipelineHook {
+	return next
+}
+func (h *recordXAddHook) ProcessHook(next redis.ProcessHook) redis.ProcessHook {
+	return func(ctx context.Context, cmd redis.Cmder) error {
+		if cmd.Name() == "xadd" {
+			h.mu.Lock()
+			h.args = append(h.args, cmd.Args())
+			h.mu.Unlock()
+		}
+		return next(ctx, cmd)
+	}
+}
+
+// TestEmit_XAddNeverCapsTheStream pins the removal of MAXLEN on both XADD paths:
+// a length cap removes the oldest entries whether or not they were delivered.
+func TestEmit_XAddNeverCapsTheStream(t *testing.T) {
+	mr := miniredis.RunT(t)
+	rdb := redis.NewClient(&redis.Options{Addr: mr.Addr()})
+	t.Cleanup(func() { _ = rdb.Close() })
+	hook := &recordXAddHook{}
+	rdb.AddHook(hook)
+	cfg := DefaultConfig()
+	cfg.WALPath = filepath.Join(t.TempDir(), "wal")
+	cfg.ShipInterval = time.Hour
+	em, err := New(cfg, logging.New(logging.ERROR), rdb)
+	if err != nil {
+		t.Fatal(err)
+	}
+	em.xadd(metering.Event{RequestID: "worker-path"})
+	if !em.shipBatch([]metering.Event{{RequestID: "wal-path"}}) {
+		t.Fatal("shipBatch failed")
+	}
+	if err := em.Close(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	hook.mu.Lock()
+	defer hook.mu.Unlock()
+	if len(hook.args) < 2 {
+		t.Fatalf("saw %d XADDs, want at least 2", len(hook.args))
+	}
+	for _, args := range hook.args {
+		for _, a := range args {
+			if s, ok := a.(string); ok && (strings.EqualFold(s, "maxlen") || strings.EqualFold(s, "minid")) {
+				t.Fatalf("XADD carries a cap: %v", args)
+			}
+		}
+	}
+}
+
+// TestWALPending_CountsUntilShipped: the backlog metric rises with appends and
+// falls when a batch is confirmed shipped.
+func TestWALPending_CountsUntilShipped(t *testing.T) {
+	cfg := DefaultConfig()
+	cfg.WALPath = filepath.Join(t.TempDir(), "wal")
+	cfg.ShipInterval = time.Hour
+	em, err := New(cfg, logging.New(logging.ERROR), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = em.Close(context.Background()) })
+	if got := em.WALPending(); got != 0 {
+		t.Fatalf("empty WAL pending = %d", got)
+	}
+	for i := range 5 {
+		em.walOrLog(metering.Event{RequestID: fmt.Sprintf("r-%d", i)})
+	}
+	if got := em.WALPending(); got != 5 {
+		t.Fatalf("pending after 5 appends = %d", got)
+	}
+	_, through, _, err := em.wal.pending(3)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := em.wal.markShipped(through); err != nil {
+		t.Fatal(err)
+	}
+	if got := em.WALPending(); got != 2 {
+		t.Fatalf("pending after shipping 3 = %d", got)
+	}
+}
+
+// TestProbe_NoValkeyFails: a WAL-only emitter reports Valkey as down, not as empty.
+func TestProbe_NoValkeyFails(t *testing.T) {
+	cfg := DefaultConfig()
+	cfg.WALPath = filepath.Join(t.TempDir(), "wal")
+	em, err := New(cfg, logging.New(logging.ERROR), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = em.Close(context.Background()) })
+	if _, err := em.Probe(context.Background()); err == nil {
+		t.Fatal("Probe with no Valkey returned nil")
+	}
+}

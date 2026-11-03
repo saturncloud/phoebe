@@ -49,10 +49,12 @@ type drainSettings struct {
 
 	ClaimMinIdle  string `yaml:"claimMinIdle"`
 	ClaimInterval string `yaml:"claimInterval"`
+	// TrimInterval is how often delivered entries are trimmed; "" uses the default.
+	TrimInterval string `yaml:"trimInterval"`
 
 	// SchemaWaitTimeout bounds the startup wait for the database schema; ""
 	// or "0" uses the default. It cannot be disabled: an unbounded wait would
-	// let the emitter's stream cap trim un-drained events silently.
+	// leave un-drained events in a Valkey that keeps nothing on disk, silently.
 	SchemaWaitTimeout string `yaml:"schemaWaitTimeout"`
 
 	MaxOpenConns    int    `yaml:"maxOpenConns"`
@@ -157,6 +159,7 @@ func loadConfig(path string) (drain.Config, bool, error) {
 		{s.BlockTimeout, &cfg.BlockTimeout, "blockTimeout"},
 		{s.ClaimMinIdle, &cfg.ClaimMinIdle, "claimMinIdle"},
 		{s.ClaimInterval, &cfg.ClaimInterval, "claimInterval"},
+		{s.TrimInterval, &cfg.TrimInterval, "trimInterval"},
 		{s.ConnMaxLifetime, &cfg.ConnMaxLifetime, "connMaxLifetime"},
 	} {
 		if d.raw == "" {

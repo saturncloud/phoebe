@@ -4,7 +4,10 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"strconv"
+	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/redis/go-redis/v9"
@@ -26,6 +29,11 @@ import (
 // the log if the WAL fails too).
 //
 // Close drains in-flight events and flushes the WAL on graceful shutdown.
+//
+// XADD carries no MAXLEN: a length cap removes the oldest entries whether or not
+// they were delivered, so it could only ever lose billing records. The drainer
+// trims what it has delivered (internal/drain), and Valkey's maxmemory bounds the
+// rest: a refused XADD falls to the WAL.
 type DurableEmitter struct {
 	cfg    Config
 	log    *logging.Logger
@@ -47,7 +55,17 @@ type DurableEmitter struct {
 	// Defaults to shipBatch; tests inject failures here to exercise the
 	// drain's partial-progress behaviour without timing games.
 	shipFn func([]metering.Event) bool
+
+	// floorEvents counts events that reached the log floor: the log line is then
+	// the only copy of that billing record.
+	floorEvents atomic.Uint64
 }
+
+// WALPending returns how many events wait in this replica's WAL for Valkey.
+func (e *DurableEmitter) WALPending() uint64 { return e.wal.pendingCount() }
+
+// FloorEvents returns how many events reached the log floor since start.
+func (e *DurableEmitter) FloorEvents() uint64 { return e.floorEvents.Load() }
 
 // New creates and starts a DurableEmitter.
 //
@@ -194,10 +212,6 @@ func (e *DurableEmitter) xadd(ev metering.Event) {
 		Stream: e.cfg.StreamName,
 		Values: map[string]interface{}{"event": string(data)},
 	}
-	if e.cfg.StreamMaxLen > 0 {
-		args.MaxLen = e.cfg.StreamMaxLen
-		args.Approx = true
-	}
 
 	timeout := e.cfg.XADDTimeout
 	if timeout <= 0 {
@@ -224,6 +238,7 @@ func (e *DurableEmitter) walOrLog(ev metering.Event) {
 // logFloor is the absolute last resort: a structured log line.
 // It is parseable by a log-pipeline scraper for manual recovery.
 func (e *DurableEmitter) logFloor(ev metering.Event) {
+	e.floorEvents.Add(1)
 	data, _ := json.Marshal(ev)
 	e.log.Error.Printf("METERING_FLOOR request_id=%s event=%s", ev.RequestID, data)
 }
@@ -308,10 +323,6 @@ func (e *DurableEmitter) shipBatch(events []metering.Event) bool {
 			Stream: e.cfg.StreamName,
 			Values: map[string]interface{}{"event": string(data)},
 		}
-		if e.cfg.StreamMaxLen > 0 {
-			args.MaxLen = e.cfg.StreamMaxLen
-			args.Approx = true
-		}
 
 		timeout := e.cfg.XADDTimeout
 		if timeout <= 0 {
@@ -327,4 +338,65 @@ func (e *DurableEmitter) shipBatch(events []metering.Event) bool {
 		}
 	}
 	return true
+}
+
+// MeteringProbe is one read of the metering buffer's health.
+type MeteringProbe struct {
+	StreamEntries int64 // entries in the stream, delivered or not
+	Undelivered   int64 // entries not yet stored: pending plus not yet read
+	UsedMemory    int64 // Valkey used_memory, bytes
+	MaxMemory     int64 // Valkey maxmemory, bytes; 0 means no cap
+}
+
+// Probe reads the stream and Valkey's memory. Every command it runs still works
+// when Valkey is full. It fails when no Valkey is configured or reachable.
+func (e *DurableEmitter) Probe(ctx context.Context) (MeteringProbe, error) {
+	var p MeteringProbe
+	if e.rdb == nil {
+		return p, fmt.Errorf("emit: no valkey configured")
+	}
+	var err error
+	if p.StreamEntries, err = e.rdb.XLen(ctx, e.cfg.StreamName).Result(); err != nil {
+		return p, fmt.Errorf("xlen: %w", err)
+	}
+	groups, err := e.rdb.XInfoGroups(ctx, e.cfg.StreamName).Result()
+	if err != nil {
+		if !strings.Contains(err.Error(), "no such key") {
+			return p, fmt.Errorf("xinfo groups: %w", err)
+		}
+		groups = nil
+	}
+	if len(groups) == 0 {
+		p.Undelivered = p.StreamEntries // no consumer yet: nothing has been read
+	}
+	for _, g := range groups {
+		undelivered := g.Pending
+		if g.Lag > 0 {
+			undelivered += g.Lag
+		}
+		if undelivered > p.Undelivered {
+			p.Undelivered = undelivered // the group furthest behind
+		}
+	}
+	info, err := e.rdb.Info(ctx, "memory").Result()
+	if err != nil {
+		return p, fmt.Errorf("info memory: %w", err)
+	}
+	p.UsedMemory = infoInt(info, "used_memory")
+	p.MaxMemory = infoInt(info, "maxmemory")
+	return p, nil
+}
+
+// infoInt reads one integer field from an INFO reply. Missing reads as 0.
+func infoInt(info, field string) int64 {
+	for _, line := range strings.Split(info, "\n") {
+		key, value, ok := strings.Cut(strings.TrimSpace(line), ":")
+		if ok && key == field {
+			v, err := strconv.ParseInt(value, 10, 64)
+			if err == nil {
+				return v
+			}
+		}
+	}
+	return 0
 }

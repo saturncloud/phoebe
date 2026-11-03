@@ -19,6 +19,7 @@ import (
 	dto "github.com/prometheus/client_model/go"
 
 	"github.com/saturncloud/phoebe/internal/config"
+	"github.com/saturncloud/phoebe/internal/emit"
 	"github.com/saturncloud/phoebe/internal/identity"
 	"github.com/saturncloud/phoebe/internal/logging"
 )
@@ -787,5 +788,65 @@ func TestMetricsTotalSeriesStayWithinDocumentedBound(t *testing.T) {
 	}
 	if !overflowSeen {
 		t.Fatalf("no %q series", resourceOverflow)
+	}
+}
+
+type fakeMeteringHealth struct {
+	probe emit.MeteringProbe
+	err   error
+}
+
+func (fakeMeteringHealth) WALPending() uint64  { return 7 }
+func (fakeMeteringHealth) FloorEvents() uint64 { return 2 }
+func (f fakeMeteringHealth) Probe(context.Context) (emit.MeteringProbe, error) {
+	return f.probe, f.err
+}
+
+// TestMeteringHealthMetricsHaveNoLabels: these families describe the replica and
+// Valkey, so they carry no labels at all, and the request families keep theirs.
+func TestMeteringHealthMetricsHaveNoLabels(t *testing.T) {
+	srv := newMetricsTestServer(t).WithMeteringHealth(fakeMeteringHealth{probe: emit.MeteringProbe{
+		StreamEntries: 10, Undelivered: 3, UsedMemory: 100, MaxMemory: 200,
+	}})
+	want := map[string]float64{
+		"phoebe_metering_wal_pending_events":         7,
+		"phoebe_metering_floor_events_total":         2,
+		"phoebe_metering_valkey_up":                  1,
+		"phoebe_metering_stream_entries":             10,
+		"phoebe_metering_stream_undelivered_entries": 3,
+		"phoebe_valkey_used_memory_bytes":            100,
+		"phoebe_valkey_maxmemory_bytes":              200,
+	}
+	fams := phoebeFamilies(t, srv.metrics)
+	for name, value := range want {
+		f, ok := fams[name]
+		if !ok {
+			t.Errorf("%s missing", name)
+			continue
+		}
+		m := f.GetMetric()[0]
+		if len(m.GetLabel()) != 0 {
+			t.Errorf("%s has labels %v", name, m.GetLabel())
+		}
+		got := m.GetGauge().GetValue() + m.GetCounter().GetValue()
+		if got != value {
+			t.Errorf("%s = %v, want %v", name, got, value)
+		}
+	}
+}
+
+// TestMeteringHealthProbeFailureReportsValkeyDown: an unreachable Valkey is
+// visible as up=0, the WAL backlog still reports, and the scrape still succeeds.
+func TestMeteringHealthProbeFailureReportsValkeyDown(t *testing.T) {
+	srv := newMetricsTestServer(t).WithMeteringHealth(fakeMeteringHealth{err: errors.New("down")})
+	fams := phoebeFamilies(t, srv.metrics)
+	if got := fams["phoebe_metering_valkey_up"].GetMetric()[0].GetGauge().GetValue(); got != 0 {
+		t.Fatalf("valkey_up = %v, want 0", got)
+	}
+	if _, ok := fams["phoebe_metering_stream_entries"]; ok {
+		t.Fatal("stream_entries reported from a failed probe")
+	}
+	if got := fams["phoebe_metering_wal_pending_events"].GetMetric()[0].GetGauge().GetValue(); got != 7 {
+		t.Fatalf("wal_pending = %v, want 7", got)
 	}
 }

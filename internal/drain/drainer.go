@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"strconv"
 	"strings"
 	"sync/atomic"
 	"time"
@@ -26,7 +27,10 @@ type Drainer struct {
 	// lastClaim throttles XAUTOCLAIM so reclaim runs ~every ClaimInterval rather
 	// than on every loop pass.
 	lastClaim time.Time
-	now       func() time.Time
+	// lastTrim throttles trimming the same way; its zero value makes the first
+	// pass trim at once, which is what frees a full Valkey after a restart.
+	lastTrim time.Time
+	now      func() time.Time
 
 	// poisoned counts events that could not be stored even row-at-a-time
 	// against a healthy store and were dropped (logged + ACK'd). A non-zero
@@ -37,6 +41,8 @@ type Drainer struct {
 	// and schemaProbeTimeout bounds each probe. Tests shorten them.
 	schemaPoll         time.Duration
 	schemaProbeTimeout time.Duration
+	// groupRetry is the pause between attempts in waitForGroup. Tests shorten it.
+	groupRetry time.Duration
 }
 
 // Poisoned returns the number of events dropped as store-poison (failed their
@@ -56,6 +62,7 @@ func New(cfg Config, log *logging.Logger, rdb redis.Cmdable, store Store) *Drain
 
 		schemaPoll:         2 * time.Second,
 		schemaProbeTimeout: 10 * time.Second,
+		groupRetry:         5 * time.Second,
 	}
 }
 
@@ -66,7 +73,18 @@ func New(cfg Config, log *logging.Logger, rdb redis.Cmdable, store Store) *Drain
 //
 // BUSYGROUP (group already exists) is the normal steady-state case and is not
 // an error.
+//
+// An existing group is checked for first, with a read: past maxmemory Valkey
+// refuses XGROUP CREATE with OOM even when the group already exists, and that
+// must not stop the one process that can free the memory.
 func (d *Drainer) ensureGroup(ctx context.Context) error {
+	if groups, err := d.rdb.XInfoGroups(ctx, d.cfg.StreamName).Result(); err == nil {
+		for _, g := range groups {
+			if g.Name == d.cfg.Group {
+				return nil
+			}
+		}
+	}
 	err := d.rdb.XGroupCreateMkStream(ctx, d.cfg.StreamName, d.cfg.Group, "0").Err()
 	if err != nil && !isBusyGroup(err) {
 		return fmt.Errorf("drain: create group %q on %q: %w", d.cfg.Group, d.cfg.StreamName, err)
@@ -79,6 +97,135 @@ func (d *Drainer) ensureGroup(ctx context.Context) error {
 // is recreated instead of failing every read until a pod restart.
 func isNoGroup(err error) bool {
 	return err != nil && strings.HasPrefix(err.Error(), "NOGROUP")
+}
+
+// isValkeyOOM reports Valkey's refusal of a write past maxmemory under noeviction.
+func isValkeyOOM(err error) bool {
+	for ; err != nil; err = errors.Unwrap(err) {
+		if strings.HasPrefix(err.Error(), "OOM ") {
+			return true
+		}
+	}
+	return false
+}
+
+// waitForGroup retries ensureGroup while Valkey is full and the group does not
+// exist yet. Crashing would not free anything, and the emitter is already safe on
+// its WAL. Any other error is returned, so a bad address still fails fast.
+func (d *Drainer) waitForGroup(ctx context.Context) error {
+	var lastLog time.Time
+	for {
+		err := d.ensureGroup(ctx)
+		if !isValkeyOOM(err) || ctx.Err() != nil {
+			return err
+		}
+		if lastLog.IsZero() || d.now().Sub(lastLog) >= 30*time.Second {
+			lastLog = d.now()
+			d.log.Error.Printf("drainer: valkey is full and consumer group %q does not exist yet; retrying: %v", d.cfg.Group, err)
+		}
+		d.sleep(ctx, d.groupRetry)
+	}
+}
+
+// trimDelivered removes entries every consumer group has delivered and
+// acknowledged, and nothing else. The boundary is the oldest of each group's
+// last-delivered id and oldest pending id: everything below it was delivered,
+// and is no longer pending, so it is durable in the store. MINID keeps the
+// boundary entry itself.
+//
+// XINFO GROUPS is read before XPENDING on purpose. An entry delivered between the
+// two reads is above the last-delivered id already captured, and one acknowledged
+// between them only makes the boundary lower than it could be. Any doubt, such as
+// a read that fails or an id that does not parse, skips the trim: the cost of not
+// trimming is a Valkey that fills up and an emitter on its WAL, and the cost of
+// trimming wrongly is a lost billing record.
+func (d *Drainer) trimDelivered(ctx context.Context) {
+	boundary, ok, err := d.trimBoundary(ctx)
+	if err != nil {
+		d.log.Warn.Printf("drainer: skip trim: %v", err)
+		return
+	}
+	if !ok {
+		return
+	}
+	n, err := d.rdb.XTrimMinID(ctx, d.cfg.StreamName, boundary).Result()
+	if err != nil {
+		d.log.Warn.Printf("drainer: xtrim minid %s: %v", boundary, err)
+		return
+	}
+	if n > 0 {
+		d.log.Info.Printf("drainer: trimmed %d delivered entr(ies) below %s", n, boundary)
+	}
+}
+
+// trimBoundary returns the MINID to trim to. ok is false when nothing can be
+// trimmed: no group exists, or a group has delivered nothing yet.
+func (d *Drainer) trimBoundary(ctx context.Context) (string, bool, error) {
+	groups, err := d.rdb.XInfoGroups(ctx, d.cfg.StreamName).Result()
+	if err != nil {
+		return "", false, fmt.Errorf("xinfo groups: %w", err)
+	}
+	if len(groups) == 0 {
+		return "", false, nil
+	}
+	boundary := ""
+	lower := func(id string) error {
+		older, err := olderStreamID(boundary, id)
+		boundary = older
+		return err
+	}
+	for _, g := range groups {
+		if g.LastDeliveredID == "" || g.LastDeliveredID == "0-0" {
+			return "", false, nil
+		}
+		if err := lower(g.LastDeliveredID); err != nil {
+			return "", false, err
+		}
+		pending, err := d.rdb.XPending(ctx, d.cfg.StreamName, g.Name).Result()
+		if err != nil {
+			return "", false, fmt.Errorf("xpending %s: %w", g.Name, err)
+		}
+		if pending.Count > 0 {
+			if err := lower(pending.Lower); err != nil {
+				return "", false, err
+			}
+		}
+	}
+	return boundary, true, nil
+}
+
+// olderStreamID returns the older of two stream ids ("ms-seq"). An empty a means
+// "no boundary yet" and returns b. An id that does not parse is an error.
+func olderStreamID(a, b string) (string, error) {
+	bm, bs, err := parseStreamID(b)
+	if err != nil {
+		return "", err
+	}
+	if a == "" {
+		return b, nil
+	}
+	am, as, err := parseStreamID(a)
+	if err != nil {
+		return "", err
+	}
+	if am < bm || (am == bm && as <= bs) {
+		return a, nil
+	}
+	return b, nil
+}
+
+func parseStreamID(id string) (ms, seq uint64, err error) {
+	left, right, ok := strings.Cut(id, "-")
+	if !ok {
+		return 0, 0, fmt.Errorf("stream id %q has no sequence", id)
+	}
+	if ms, err = strconv.ParseUint(left, 10, 64); err != nil {
+		return 0, 0, fmt.Errorf("stream id %q: %w", id, err)
+	}
+	if seq, err = strconv.ParseUint(right, 10, 64); err != nil {
+		return 0, 0, fmt.Errorf("stream id %q: %w", id, err)
+	}
+	return ms, seq, nil
 }
 
 // schemaReady reports whether a database at version (dirty or not) has every
@@ -102,11 +249,11 @@ func schemaReady(version uint, dirty bool, required uint) bool {
 // the migrate job has run; writing then would put new columns into the old
 // table.
 //
-// Waiting is not free: the emitter caps the stream (MAXLEN ~1M entries,
-// internal/emit), so a long wait trims the oldest un-drained events. The wait
-// is therefore bounded by SchemaWaitTimeout, after which waitForSchema returns
-// an error so Run fails, the process exits non-zero and the pod restarts
-// visibly (CrashLoopBackOff) instead of idling silently. Each probe has its own
+// Waiting is not free: events stay in Valkey meanwhile, and they are lost if its
+// pod restarts, because Valkey keeps nothing on disk. The wait is therefore
+// bounded by SchemaWaitTimeout, after which waitForSchema returns an error so
+// Run fails, the process exits non-zero and the pod restarts visibly
+// (CrashLoopBackOff) instead of idling silently. Each probe has its own
 // deadline (schemaProbeTimeout) so a hung query surfaces as an error in the
 // warning log rather than a silent stall.
 //
@@ -143,8 +290,8 @@ func (d *Drainer) waitForSchema(ctx context.Context) error {
 		}
 		if lastLog.IsZero() || d.now().Sub(lastLog) >= 30*time.Second {
 			lastLog = d.now()
-			d.log.Warn.Printf("drainer: waiting for database schema version %d (at %d, dirty=%v, err=%v); events wait in the stream, which the emitter caps at about %d entries (MAXLEN ~), so the oldest unconsumed events are trimmed if the migration does not run; exiting after %s",
-				required, version, dirty, err, streamMaxLenHint, d.cfg.SchemaWaitTimeout)
+			d.log.Warn.Printf("drainer: waiting for database schema version %d (at %d, dirty=%v, err=%v); events wait in the stream and are lost if Valkey restarts; exiting after %s",
+				required, version, dirty, err, d.cfg.SchemaWaitTimeout)
 		}
 		d.sleep(ctx, d.schemaPoll)
 		if ctx.Err() != nil {
@@ -152,10 +299,6 @@ func (d *Drainer) waitForSchema(ctx context.Context) error {
 		}
 	}
 }
-
-// streamMaxLenHint is the emitter's default stream cap (emit.Config
-// StreamMaxLen), quoted in the schema-wait warning. It is a log hint only.
-const streamMaxLenHint = 1_000_000
 
 func isBusyGroup(err error) bool {
 	// go-redis surfaces the BUSYGROUP reply as a plain error string.
@@ -167,6 +310,7 @@ func isBusyGroup(err error) bool {
 //  2. blocks on XREADGROUP for a batch of new entries,
 //  3. stores the batch durably, THEN
 //  4. XACKs the batch (never before the store commits).
+//  5. every TrimInterval, trims entries that are delivered and acknowledged.
 //
 // On ctx cancellation it returns after finishing any in-flight batch — an entry
 // that was read but not yet stored is simply left un-ACK'd and redelivers to the
@@ -178,7 +322,10 @@ func (d *Drainer) Run(ctx context.Context) error {
 		}
 		return err
 	}
-	if err := d.ensureGroup(ctx); err != nil {
+	if err := d.waitForGroup(ctx); err != nil {
+		if ctx.Err() != nil {
+			return nil
+		}
 		return err
 	}
 	d.log.Info.Printf("drainer: consuming stream=%s group=%s consumer=%s batch=%d",
@@ -194,6 +341,11 @@ func (d *Drainer) Run(ctx context.Context) error {
 		if d.now().Sub(d.lastClaim) >= d.cfg.ClaimInterval {
 			d.reclaim(ctx)
 			d.lastClaim = d.now()
+		}
+
+		if d.now().Sub(d.lastTrim) >= d.cfg.TrimInterval {
+			d.trimDelivered(ctx)
+			d.lastTrim = d.now()
 		}
 
 		n, err := d.readAndStore(ctx)

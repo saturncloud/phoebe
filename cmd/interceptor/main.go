@@ -55,6 +55,9 @@ func main() {
 	ioPolicy, ioSink, ioMaxBody, closeIOLog := buildIOLog(settings, log)
 
 	srv := proxy.NewWithIOLog(settings, log, emitter, ioPolicy, ioSink, ioMaxBody)
+	if health, ok := emitter.(proxy.MeteringHealth); ok {
+		srv = srv.WithMeteringHealth(health)
+	}
 	admitter, closeAdmission := buildAdmission(settings, log)
 	if admitter != nil {
 		srv = srv.WithAdmitter(admitter)
