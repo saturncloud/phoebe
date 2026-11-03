@@ -421,6 +421,27 @@ func (w *wal) pending(limit int) (events []metering.Event, through uint64, skipp
 	return events, end, skipped, nil
 }
 
+// pendingCount returns how many entries have not been confirmed shipped. A
+// poisoned or closed wal reports 0: there is no log to count.
+func (w *wal) pendingCount() uint64 {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	if w.log == nil {
+		return 0
+	}
+	first, err := w.log.FirstIndex()
+	if err != nil {
+		return 0
+	}
+	if w.shippedThrough+1 > first {
+		first = w.shippedThrough + 1
+	}
+	if first == 0 || w.nextIndex <= first {
+		return 0
+	}
+	return w.nextIndex - first
+}
+
 // markShipped records that every entry up to and including through has been
 // delivered, and reclaims their disk space. See the type comment for why the
 // last entry is retained on disk and tracked by the in-memory watermark.

@@ -196,6 +196,14 @@ type Server struct {
 
 func (s *Server) WithAdmitter(a admission.Admitter) *Server { s.admitter = a; return s }
 
+// WithMeteringHealth adds the metering buffer metrics. A no-op with metrics off.
+func (s *Server) WithMeteringHealth(h MeteringHealth) *Server {
+	if s.metrics != nil {
+		s.metrics.registry.MustRegister(newMeteringCollector(h))
+	}
+	return s
+}
+
 // New constructs a Server from its dependencies. I/O logging is OFF: the policy
 // denies every request and the sink is a NopSink, so no bodies are buffered.
 // Use NewWithIOLog to enable M5 body capture.

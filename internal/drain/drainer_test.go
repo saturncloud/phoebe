@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"sync"
 	"testing"
 	"time"
@@ -646,5 +647,239 @@ func TestDecodeEvent_OnlyAbsentServingModeStoredAsDedicated(t *testing.T) {
 				t.Fatalf("stored serving_mode = %v, want %v", got, tc.want)
 			}
 		})
+	}
+}
+
+// oomHook refuses the write commands Valkey refuses past maxmemory. XGROUP CREATE
+// is refused even when the group exists, which is what caused the crash loop.
+type oomHook struct{}
+
+func (oomHook) DialHook(next redis.DialHook) redis.DialHook { return next }
+func (oomHook) ProcessPipelineHook(next redis.ProcessPipelineHook) redis.ProcessPipelineHook {
+	return next
+}
+func (oomHook) ProcessHook(next redis.ProcessHook) redis.ProcessHook {
+	return func(ctx context.Context, cmd redis.Cmder) error {
+		if name := cmd.Name(); name == "xgroup" || name == "xadd" {
+			err := errors.New("OOM command not allowed when used memory > 'maxmemory'.") //nolint:revive // verbatim
+			cmd.SetErr(err)
+			return err
+		}
+		return next(ctx, cmd)
+	}
+}
+
+func addEntries(t *testing.T, rdb *redis.Client, stream string, n int) []string {
+	t.Helper()
+	ids := make([]string, 0, n)
+	for i := range n {
+		id, err := rdb.XAdd(context.Background(), &redis.XAddArgs{Stream: stream, Values: map[string]any{"event": fmt.Sprint(i)}}).Result()
+		if err != nil {
+			t.Fatal(err)
+		}
+		ids = append(ids, id)
+	}
+	return ids
+}
+
+func readEntries(t *testing.T, rdb *redis.Client, cfg Config, group string, n int64) []string {
+	t.Helper()
+	res, err := rdb.XReadGroup(context.Background(), &redis.XReadGroupArgs{
+		Group: group, Consumer: "c", Streams: []string{cfg.StreamName, ">"}, Count: n, Block: -1,
+	}).Result()
+	if err != nil {
+		t.Fatal(err)
+	}
+	var ids []string
+	for _, st := range res {
+		for _, m := range st.Messages {
+			ids = append(ids, m.ID)
+		}
+	}
+	return ids
+}
+
+func remainingEntries(t *testing.T, rdb *redis.Client, stream string) []string {
+	t.Helper()
+	msgs, err := rdb.XRange(context.Background(), stream, "-", "+").Result()
+	if err != nil {
+		t.Fatal(err)
+	}
+	ids := make([]string, 0, len(msgs))
+	for _, m := range msgs {
+		ids = append(ids, m.ID)
+	}
+	return ids
+}
+
+func assertEntries(t *testing.T, got, want []string) {
+	t.Helper()
+	if fmt.Sprint(got) != fmt.Sprint(want) {
+		t.Fatalf("stream holds %v, want %v", got, want)
+	}
+}
+
+// TestTrimDelivered_KeepsUndeliveredAndPending is the invariant: only entries
+// delivered AND acknowledged go. The oldest pending entry and everything newer
+// stay, including entries never read, and an acknowledged entry newer than a
+// pending one stays too.
+func TestTrimDelivered_KeepsUndeliveredAndPending(t *testing.T) {
+	ctx := context.Background()
+	_, rdb := startMiniredis(t)
+	cfg := testConfig(rdb.Options().Addr)
+	d := New(cfg, testLogger(), rdb, newFakeStore())
+	if err := d.ensureGroup(ctx); err != nil {
+		t.Fatal(err)
+	}
+	ids := addEntries(t, rdb, cfg.StreamName, 6)
+	read := readEntries(t, rdb, cfg, cfg.Group, 4) // ids[4] and ids[5] stay unread
+	if err := rdb.XAck(ctx, cfg.StreamName, cfg.Group, read[0], read[1], read[3]).Err(); err != nil {
+		t.Fatal(err)
+	} // read[2] stays pending
+
+	d.trimDelivered(ctx)
+
+	assertEntries(t, remainingEntries(t, rdb, cfg.StreamName), ids[2:])
+}
+
+// TestTrimDelivered_RemovesEverythingAcknowledged: with nothing pending, the
+// stream shrinks to the last delivered entry plus anything unread.
+func TestTrimDelivered_RemovesEverythingAcknowledged(t *testing.T) {
+	ctx := context.Background()
+	_, rdb := startMiniredis(t)
+	cfg := testConfig(rdb.Options().Addr)
+	d := New(cfg, testLogger(), rdb, newFakeStore())
+	if err := d.ensureGroup(ctx); err != nil {
+		t.Fatal(err)
+	}
+	ids := addEntries(t, rdb, cfg.StreamName, 5)
+	read := readEntries(t, rdb, cfg, cfg.Group, 3)
+	if err := rdb.XAck(ctx, cfg.StreamName, cfg.Group, read...).Err(); err != nil {
+		t.Fatal(err)
+	}
+
+	d.trimDelivered(ctx)
+
+	assertEntries(t, remainingEntries(t, rdb, cfg.StreamName), ids[2:])
+}
+
+// TestTrimDelivered_NothingDeliveredTrimsNothing: a new group has read nothing,
+// so the whole backlog is undelivered.
+func TestTrimDelivered_NothingDeliveredTrimsNothing(t *testing.T) {
+	ctx := context.Background()
+	_, rdb := startMiniredis(t)
+	cfg := testConfig(rdb.Options().Addr)
+	d := New(cfg, testLogger(), rdb, newFakeStore())
+	if err := d.ensureGroup(ctx); err != nil {
+		t.Fatal(err)
+	}
+	ids := addEntries(t, rdb, cfg.StreamName, 3)
+
+	d.trimDelivered(ctx)
+
+	assertEntries(t, remainingEntries(t, rdb, cfg.StreamName), ids)
+}
+
+// TestTrimDelivered_NoGroupTrimsNothing: with no consumer group nothing is known
+// to be delivered.
+func TestTrimDelivered_NoGroupTrimsNothing(t *testing.T) {
+	_, rdb := startMiniredis(t)
+	cfg := testConfig(rdb.Options().Addr)
+	d := New(cfg, testLogger(), rdb, newFakeStore())
+	ids := addEntries(t, rdb, cfg.StreamName, 3)
+
+	d.trimDelivered(context.Background())
+
+	assertEntries(t, remainingEntries(t, rdb, cfg.StreamName), ids)
+}
+
+// TestTrimDelivered_SlowestGroupSetsTheBoundary: a second group behind the
+// drainer's keeps its entries.
+func TestTrimDelivered_SlowestGroupSetsTheBoundary(t *testing.T) {
+	ctx := context.Background()
+	_, rdb := startMiniredis(t)
+	cfg := testConfig(rdb.Options().Addr)
+	d := New(cfg, testLogger(), rdb, newFakeStore())
+	if err := d.ensureGroup(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if err := rdb.XGroupCreate(ctx, cfg.StreamName, "other", "0").Err(); err != nil {
+		t.Fatal(err)
+	}
+	ids := addEntries(t, rdb, cfg.StreamName, 5)
+	read := readEntries(t, rdb, cfg, cfg.Group, 4)
+	if err := rdb.XAck(ctx, cfg.StreamName, cfg.Group, read...).Err(); err != nil {
+		t.Fatal(err)
+	}
+	other := readEntries(t, rdb, cfg, "other", 1)
+	if err := rdb.XAck(ctx, cfg.StreamName, "other", other...).Err(); err != nil {
+		t.Fatal(err)
+	}
+
+	d.trimDelivered(ctx)
+
+	assertEntries(t, remainingEntries(t, rdb, cfg.StreamName), ids)
+}
+
+func TestOlderStreamID(t *testing.T) {
+	for _, c := range []struct{ a, b, want string }{
+		{"", "5-0", "5-0"},
+		{"5-0", "6-0", "5-0"},
+		{"6-0", "5-0", "5-0"},
+		{"5-2", "5-10", "5-2"}, // numeric, not lexical
+		{"10-0", "9-0", "9-0"}, // numeric, not lexical
+		{"5-1", "5-1", "5-1"},
+	} {
+		got, err := olderStreamID(c.a, c.b)
+		if err != nil || got != c.want {
+			t.Errorf("olderStreamID(%q, %q) = %q, %v; want %q", c.a, c.b, got, err, c.want)
+		}
+	}
+	for _, bad := range []string{"", "5", "x-1", "1-x"} {
+		if _, err := olderStreamID("1-0", bad); err == nil {
+			t.Errorf("olderStreamID accepted %q", bad)
+		}
+	}
+}
+
+// TestEnsureGroup_ExistingGroupStartsWhenValkeyIsFull is the crash loop: past
+// maxmemory XGROUP CREATE is refused even for a group that exists.
+func TestEnsureGroup_ExistingGroupStartsWhenValkeyIsFull(t *testing.T) {
+	ctx := context.Background()
+	_, rdb := startMiniredis(t)
+	cfg := testConfig(rdb.Options().Addr)
+	d := New(cfg, testLogger(), rdb, newFakeStore())
+	if err := d.ensureGroup(ctx); err != nil {
+		t.Fatal(err)
+	}
+	rdb.AddHook(oomHook{})
+	if err := d.ensureGroup(ctx); err != nil {
+		t.Fatalf("ensureGroup with an existing group on a full Valkey: %v", err)
+	}
+}
+
+// TestRun_MissingGroupOnFullValkeyWaitsInsteadOfExiting: with no group to read,
+// the drainer keeps retrying and exits cleanly on shutdown, rather than failing.
+func TestRun_MissingGroupOnFullValkeyWaitsInsteadOfExiting(t *testing.T) {
+	_, rdb := startMiniredis(t)
+	rdb.AddHook(oomHook{})
+	cfg := testConfig(rdb.Options().Addr)
+	d := New(cfg, testLogger(), rdb, newFakeStore())
+	d.groupRetry = time.Millisecond
+	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+	defer cancel()
+	if err := d.Run(ctx); err != nil {
+		t.Fatalf("Run on a full Valkey with no group: %v", err)
+	}
+}
+
+// TestEnsureGroup_OtherErrorsStillFail: a bad address must not retry forever.
+func TestEnsureGroup_OtherErrorsStillFail(t *testing.T) {
+	mr, rdb := startMiniredis(t)
+	cfg := testConfig(rdb.Options().Addr)
+	d := New(cfg, testLogger(), rdb, newFakeStore())
+	mr.Close()
+	if err := d.waitForGroup(context.Background()); err == nil {
+		t.Fatal("waitForGroup against a dead Valkey returned nil")
 	}
 }

@@ -311,7 +311,7 @@ func TestWaitForSchema_HungProbeTimesOutAndIsLogged(t *testing.T) {
 
 // The wait is bounded: once SchemaWaitTimeout passes, Run returns an error
 // (main exits non-zero, the pod restarts visibly) instead of idling while the
-// emitter's stream cap trims un-drained events.
+// un-drained events wait in a Valkey that keeps nothing on disk.
 func TestDrain_RunFailsWhenSchemaNeverArrives(t *testing.T) {
 	cfg := DefaultConfig()
 	cfg.RequiredSchemaVersion = 9
