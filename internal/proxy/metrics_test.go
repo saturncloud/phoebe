@@ -815,7 +815,7 @@ func (f fakeMeteringHealth) Probe(context.Context) (emit.MeteringProbe, error) {
 }
 
 // TestMeteringHealthMetricsHaveNoLabels: these families describe the replica and
-// Valkey, so they carry no labels at all, and the request families keep theirs.
+// Valkey, so they carry no labels at all.
 func TestMeteringHealthMetricsHaveNoLabels(t *testing.T) {
 	srv := newMetricsTestServer(t).WithMeteringHealth(fakeMeteringHealth{probe: emit.MeteringProbe{
 		StreamEntries: 10, Undelivered: 3, UsedMemory: 100, MaxMemory: 200,
