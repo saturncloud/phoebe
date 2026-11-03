@@ -870,3 +870,46 @@ func TestLoadRequestBufferTotalDefaultsToAtLeastOneBody(t *testing.T) {
 		t.Fatalf("effective total=%d, want one body at the limit (536870912)", got)
 	}
 }
+
+// TestLoadMetricsOffByDefault: with no metricsPort, phoebe serves no /metrics
+// listener at all.
+func TestLoadMetricsOffByDefault(t *testing.T) {
+	s, err := Load(writeTemp(t, "debug: false\n"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if s.MetricsAddr != "" {
+		t.Fatalf("MetricsAddr = %q, want empty (metrics off)", s.MetricsAddr)
+	}
+}
+
+func TestLoadMetricsPort(t *testing.T) {
+	s, err := Load(writeTemp(t, "metricsPort: 9091\n"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if s.MetricsAddr != ":9091" {
+		t.Fatalf("MetricsAddr = %q, want :9091", s.MetricsAddr)
+	}
+}
+
+// TestLoadMetricsPortOnProxyPortIsRefused: /metrics must never share the port
+// Traefik forwards to, so that configuration fails startup.
+func TestLoadMetricsPortOnProxyPortIsRefused(t *testing.T) {
+	for _, yaml := range []string{
+		"metricsPort: 8080\n",                   // the default listenPort
+		"listenPort: 9000\nmetricsPort: 9000\n", // an explicit listenPort
+	} {
+		if _, err := Load(writeTemp(t, yaml)); err == nil || !strings.Contains(err.Error(), "must differ from listenPort") {
+			t.Fatalf("%q: err = %v, want the proxy-port refusal", yaml, err)
+		}
+	}
+}
+
+func TestLoadMetricsPortOutOfRangeIsRefused(t *testing.T) {
+	for _, yaml := range []string{"metricsPort: -1\n", "metricsPort: 70000\n"} {
+		if _, err := Load(writeTemp(t, yaml)); err == nil {
+			t.Fatalf("%q: want an error", yaml)
+		}
+	}
+}

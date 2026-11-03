@@ -41,8 +41,8 @@ type pushOptions struct {
 type pushSettings struct {
 	Debug bool `yaml:"debug"`
 
-	// ManagerURL is the base URL of the central manager. The endpoint path
-	// (/customer/token-usage) is appended by this binary.
+	// ManagerURL is the base URL of the manager. The endpoint path
+	// (/customer/metered-usage) is appended by this binary.
 	ManagerURL string `yaml:"managerURL"`
 
 	// PushTrailingHours is N in the default window: how many complete trailing hours

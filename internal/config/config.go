@@ -23,6 +23,12 @@ type Settings struct {
 	// Port the interceptor listens on for inbound (post-Traefik) traffic.
 	ListenPort int `yaml:"listenPort"`
 
+	// MetricsPort serves Prometheus /metrics on its own listener. 0 (the
+	// default) turns metrics off. It must differ from ListenPort: the metrics
+	// port is cluster-internal and admitted only from Prometheus, so it must
+	// never be reachable through the proxy port that Traefik forwards to.
+	MetricsPort int `yaml:"metricsPort"`
+
 	// IdleTimeout bounds how long an idle keep-alive connection may stay open
 	// BETWEEN requests (http.Server.IdleTimeout). It does not bound a request
 	// in flight: a client that stops reading a stream is ended by
@@ -66,6 +72,7 @@ type Settings struct {
 	// --- Parsed settings (populated by parse) ---
 
 	ListenAddr  string        `yaml:"-"`
+	MetricsAddr string        `yaml:"-"` // empty when metrics are off
 	IdleTimeout time.Duration `yaml:"-"`
 
 	// configDir is the directory the settings file was loaded from; relative
@@ -505,6 +512,16 @@ func (s *Settings) parse() error {
 	}
 
 	s.ListenAddr = fmt.Sprintf(":%d", s.ListenPort)
+	switch {
+	case s.MetricsPort < 0 || s.MetricsPort > 65535:
+		return fmt.Errorf("invalid metricsPort %d", s.MetricsPort)
+	case s.MetricsPort == 0:
+		s.MetricsAddr = ""
+	case s.MetricsPort == s.ListenPort:
+		return fmt.Errorf("metricsPort %d must differ from listenPort: /metrics must never be served on the proxy port", s.MetricsPort)
+	default:
+		s.MetricsAddr = fmt.Sprintf(":%d", s.MetricsPort)
+	}
 
 	if err := s.Protection.parse(); err != nil {
 		return err

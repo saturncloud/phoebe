@@ -61,11 +61,14 @@ type AtlasWaker struct {
 	flights map[string]*wakeFlight
 }
 
-// wakeFlight is the running wake loop for one endpoint. err is written
+// wakeFlight is the running wake loop for one graph. err is written
 // before done is closed.
 type wakeFlight struct {
 	done chan struct{}
 	err  error
+	// resourceID is the endpoint whose request started the loop: Atlas
+	// validates the wake per endpoint, so a refusal is about this endpoint.
+	resourceID string
 	// reachedAtlas is set once any call is known to have reached Atlas (a
 	// fresh connection, or a response byte on a reused one).
 	reachedAtlas atomic.Bool
@@ -88,6 +91,10 @@ func (f *wakeFlight) lastUnreachedError() error {
 	}
 	return nil
 }
+
+// errAtlasRefused marks a definite Atlas refusal (a 4xx): about the endpoint
+// in the call, not about the graph.
+var errAtlasRefused = errors.New("atlas waker: Atlas refused the wake")
 
 // errBeforeConnection marks a wake call that failed before a connection was
 // made, so Atlas never received it. It is safe to retry.
@@ -136,7 +143,25 @@ func (w *AtlasWaker) Wake(ctx context.Context, target proxy.WakeTarget) error {
 	if target.ServedModel == "" {
 		return errors.New("atlas waker: no served model on wake target")
 	}
-	f := w.joinFlight(ctx, target.ResourceID)
+	// One loop per GRAPH (F1): a shared graph carries many endpoints, and
+	// each Atlas call holds a database connection while it waits on the
+	// graph's lock, so K endpoints waking one graph share one loop instead
+	// of running K. A refusal is about the endpoint that made the call, so a
+	// joiner for another endpoint never inherits it: it runs its own loop.
+	f := w.joinFlight(ctx, "graph/"+target.GraphK8sName, target.ResourceID)
+	err := w.waitFlight(ctx, f)
+	if errors.Is(err, errAtlasRefused) && f.resourceID != target.ResourceID {
+		err = w.waitFlight(ctx, w.joinFlight(ctx, "resource/"+target.ResourceID, target.ResourceID))
+	}
+	if err != nil {
+		return err
+	}
+	w.log.Info.Printf("waker: Atlas woke graph workers and Planner (resource_id=%s)", target.ResourceID)
+	return w.waitReady(ctx, target.UpstreamHost, target.ServedModel)
+}
+
+// waitFlight waits for f's loop or for the hold to end.
+func (w *AtlasWaker) waitFlight(ctx context.Context, f *wakeFlight) error {
 	select {
 	case <-f.done:
 		if f.err != nil {
@@ -151,29 +176,33 @@ func (w *AtlasWaker) Wake(ctx context.Context, target proxy.WakeTarget) error {
 		return fmt.Errorf("%w: atlas waker: hold ended while the wake was running: %v",
 			proxy.ErrWakeStatusUnknown, ctx.Err())
 	}
-	w.log.Info.Printf("waker: Atlas woke graph workers and Planner (resource_id=%s)", target.ResourceID)
-	return w.waitReady(ctx, target.UpstreamHost, target.ServedModel)
+	return nil
 }
 
-// joinFlight returns the running wake loop for resourceID, or starts one
-// that is not cancelled with ctx and runs for at most loopWindow (a flight
-// that never reaches Atlas stops sooner, after unreachableBudget).
-func (w *AtlasWaker) joinFlight(ctx context.Context, resourceID string) *wakeFlight {
+// joinFlight returns the running wake loop under key, or starts one for
+// resourceID that is not cancelled with ctx and runs for at most loopWindow
+// (a flight that never reaches Atlas stops sooner, after
+// unreachableBudget).
+//
+// The loop closes done BEFORE it leaves the map (F4): a request arriving in
+// between joins the finished flight and takes its fresh result, instead of
+// starting a second loop.
+func (w *AtlasWaker) joinFlight(ctx context.Context, key, resourceID string) *wakeFlight {
 	w.mu.Lock()
 	defer w.mu.Unlock()
-	if f, ok := w.flights[resourceID]; ok {
+	if f, ok := w.flights[key]; ok {
 		return f
 	}
 	loopCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), w.loopWindow)
-	f := &wakeFlight{done: make(chan struct{})}
-	w.flights[resourceID] = f
+	f := &wakeFlight{done: make(chan struct{}), resourceID: resourceID}
+	w.flights[key] = f
 	go func() {
 		defer cancel()
 		f.err = w.callUntilWoken(loopCtx, resourceID, f)
-		w.mu.Lock()
-		delete(w.flights, resourceID)
-		w.mu.Unlock()
 		close(f.done)
+		w.mu.Lock()
+		delete(w.flights, key)
+		w.mu.Unlock()
 	}()
 	return f
 }
@@ -303,7 +332,7 @@ func (w *AtlasWaker) requestWake(ctx context.Context, resourceID string, reached
 		return fmt.Errorf("%w: atlas waker: status %d: %s", proxy.ErrWakeStatusUnknown, resp.StatusCode, string(responseBody))
 	}
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		return fmt.Errorf("atlas waker: status %d: %s", resp.StatusCode, string(responseBody))
+		return fmt.Errorf("%w: status %d: %s", errAtlasRefused, resp.StatusCode, string(responseBody))
 	}
 	return nil
 }
