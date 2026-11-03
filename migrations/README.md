@@ -402,10 +402,16 @@ so every version below it is applied, and because migrations are expand-only, a
 failed later migration does not stop the drainer of the running release (it
 logs a warning and consumes).
 
-The wait is not free. Events wait in the Valkey stream, which is held in memory
-and bounded only by Valkey's `maxmemory` (the emitter sets no `MAXLEN`). If the
-migration does not run, Valkey fills and refuses new writes, which then wait in
-each interceptor's WAL, and every event in the stream is lost if Valkey restarts.
+The wait is not free. Events wait in the Valkey stream while the drainer waits.
+Nothing undelivered is trimmed: the emitter sets no length cap on the stream, and
+the drainer trims only entries that are delivered and acknowledged, and it does
+not trim during this wait. Valkey keeps nothing on disk, so undelivered events in
+the stream are lost if the Valkey pod restarts. Do not restart Valkey to clear a
+full state. If the stream reaches Valkey's `maxmemory` (chart default 128mb,
+`noeviction`), Valkey refuses `XADD`, new events go to each interceptor replica's
+WAL, and admission on a shared Valkey fails open, so contract limits are bypassed
+until the drainer frees memory (see
+[shared-tier admission](../docs/shared-tier-admission.md)).
 The drainer therefore waits at most `schemaWaitTimeout` (default 10 minutes; it
 cannot be disabled) and then exits non-zero, so the pod goes into
 CrashLoopBackOff, which is visible and alertable, instead of idling silently.
