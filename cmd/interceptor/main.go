@@ -332,16 +332,28 @@ func buildWaker(s *config.Settings, log *logging.Logger) proxy.Waker {
 // it dials Valkey for the hot path; the WAL fallback and log floor are always
 // active. Returns a close function for graceful shutdown.
 func buildEmitter(s *config.Settings, log *logging.Logger) (metering.Emitter, func()) {
+	return buildEmitterWithClient(s, log, func(addr string) *redis.Client {
+		return redis.NewClient(&redis.Options{Addr: addr})
+	})
+}
+
+// buildEmitterWithClient is buildEmitter with the Valkey client constructor
+// injected, so a test can see what happens to the client it hands out.
+func buildEmitterWithClient(s *config.Settings, log *logging.Logger, newClient func(addr string) *redis.Client) (metering.Emitter, func()) {
 	cfg := emit.DefaultConfig()
 	cfg.StreamName = s.Emit.StreamName
 	if s.Emit.WALPath != "" {
 		cfg.WALPath = s.Emit.WALPath
 	}
 
+	// rc is the concrete client, kept so it can be closed. rdb stays a nil
+	// interface when no address is configured, which emit.New relies on.
+	var rc *redis.Client
 	var rdb redis.Cmdable
 	if s.Emit.ValkeyAddr != "" {
 		cfg.ValkeyAddr = s.Emit.ValkeyAddr
-		rdb = redis.NewClient(&redis.Options{Addr: s.Emit.ValkeyAddr})
+		rc = newClient(s.Emit.ValkeyAddr)
+		rdb = rc
 		log.Info.Printf("emitter: durable (valkey %s, stream %s, wal %s)", cfg.ValkeyAddr, cfg.StreamName, cfg.WALPath)
 	} else {
 		log.Warn.Printf("emitter: WAL-only (no valkeyAddr configured), wal %s", cfg.WALPath)
@@ -353,6 +365,10 @@ func buildEmitter(s *config.Settings, log *logging.Logger) (metering.Emitter, fu
 		// log floor, so events are recoverable from logs and the metering metrics
 		// report the failure.
 		log.Error.Printf("durable emitter init failed (%v); falling back to log floor", err)
+		// The floor emitter never uses Valkey, so nothing else will close this client.
+		if rc != nil {
+			_ = rc.Close()
+		}
 		return emit.NewFloorEmitter(log), func() {}
 	}
 
