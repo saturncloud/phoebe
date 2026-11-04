@@ -270,8 +270,37 @@ Valkey, are in `billing_event`, but no routine run aggregates them or sends them
 this step is missed, the manager never receives those hours and the customer is
 undercharged.
 
-1. Wait until the backlog has cleared: `phoebe_metering_wal_pending_events` is 0 on
-   every replica, and `phoebe_metering_stream_undelivered_entries` is near 0.
+1. Wait until the backlog has cleared. Do not run the later steps until all of these
+   hold on every replica, and `phoebe_metering_stream_undelivered_entries` is near 0:
+
+   - `phoebe_metering_wal_healthy` is 1 and `phoebe_metering_wal_poisoned` is 0. A
+     replica with `phoebe_metering_wal_healthy` at 0 may have unshipped events on disk.
+   - `phoebe_metering_wal_pending_events` is 0. A missing series is not zero. It means
+     the count is unknown, so check the two metrics above before treating the backlog
+     as cleared. The number of replicas reporting this series must also equal the
+     number of `phoebe-interceptor` replicas running.
+   - `phoebe_metering_wal_quarantined_dirs` is 0. The pending count leaves out these
+     `<dir>.corrupt.<ts>` directories, and their events are not billed. Recover them
+     manually or accept them as lost before running the rater and token-push. This
+     metric counts the directories on disk, so it stays above 0 until they are moved
+     away from the WAL path.
+
+   This query returns a sample only when the conditions above hold across the replicas
+   that Prometheus scrapes. An empty result means the backlog has not cleared. The
+   query cannot see a replica that is down or not scraped, so compare its replica count
+   by hand as well.
+
+   ```promql
+   min(phoebe_metering_wal_healthy) == 1
+     and count(phoebe_metering_wal_pending_events) == count(phoebe_metering_wal_healthy)
+     and sum(phoebe_metering_wal_pending_events) == 0
+     and sum(phoebe_metering_wal_poisoned) == 0
+     and sum(phoebe_metering_wal_quarantined_dirs) == 0
+   ```
+
+   Also read `phoebe_metering_wal_skipped_entries_total`. It counts records lost from
+   the WAL, so the rater and token-push cannot bill them. An increase during the outage
+   is a known under-billing to record, and it does not block the later steps.
 2. Find the true start of the outage. Do not use the time someone noticed it: check
    the earliest late event, the `event_ts` of rows inserted long after their
    timestamp. On GB300 in November 2026 events began diverting about 26 hours before
