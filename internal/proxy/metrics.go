@@ -213,13 +213,25 @@ func requestOutcome(status int, aborted bool) string {
 	}
 }
 
-// MeteringHealth is what the metering buffer metrics read. The durable emitter
-// implements it; a log-only emitter does not, and those metrics are then absent.
+// MeteringHealth is what the metering buffer metrics read. Both emitters
+// cmd/interceptor can build implement it, so these metrics are present on every
+// production replica, including one whose durable emitter failed to start.
 type MeteringHealth interface {
-	WALPending() uint64
+	// WALPending also reports whether the count can be trusted.
+	WALPending() (uint64, bool)
+	WALPoisoned() bool
+	WALQuarantinedDirs() int
+	WALSkippedEntries() uint64
 	FloorEvents() uint64
 	Probe(ctx context.Context) (emit.MeteringProbe, error)
 }
+
+// cmd/interceptor finds this interface with a type assertion, so a renamed method
+// would otherwise make every metering metric vanish without a build error.
+var (
+	_ MeteringHealth = (*emit.DurableEmitter)(nil)
+	_ MeteringHealth = (*emit.FloorEmitter)(nil)
+)
 
 // meteringProbeTimeout bounds the Valkey read a scrape makes. A slow Valkey must
 // report as down, not hold up the scrape.
@@ -230,7 +242,9 @@ const meteringProbeTimeout = 2 * time.Second
 type meteringCollector struct {
 	health MeteringHealth
 
-	walPending, floorEvents, valkeyUp         *prometheus.Desc
+	walPending, walHealthy, walPoisoned       *prometheus.Desc
+	walQuarantinedDirs, walSkippedEntries     *prometheus.Desc
+	floorEvents, valkeyUp                     *prometheus.Desc
 	streamEntries, undelivered, used, maxUsed *prometheus.Desc
 }
 
@@ -239,25 +253,36 @@ func newMeteringCollector(h MeteringHealth) *meteringCollector {
 		return prometheus.NewDesc(metricsNamespace+"_"+name, help, nil, nil)
 	}
 	return &meteringCollector{
-		health:        h,
-		walPending:    desc("metering_wal_pending_events", "Metering events in this replica's WAL, waiting for Valkey."),
-		floorEvents:   desc("metering_floor_events_total", "Metering events that reached the log floor: the log line is the only copy."),
-		valkeyUp:      desc("metering_valkey_up", "1 when this replica could read the metering stream and Valkey's memory at scrape time."),
-		streamEntries: desc("metering_stream_entries", "Entries in the metering stream, delivered or not."),
-		undelivered:   desc("metering_stream_undelivered_entries", "Stream entries not yet stored in Postgres: lost if Valkey restarts."),
-		used:          desc("valkey_used_memory_bytes", "Valkey used_memory."),
-		maxUsed:       desc("valkey_maxmemory_bytes", "Valkey maxmemory. At this level Valkey refuses metering writes and admission."),
+		health:             h,
+		walPending:         desc("metering_wal_pending_events", "Metering events in this replica's WAL, waiting for Valkey. Absent when the count is unknown, see metering_wal_healthy. 0 does not cover events in quarantined directories or skipped entries."),
+		walHealthy:         desc("metering_wal_healthy", "1 when this replica's WAL is open and countable; 0 means unshipped events may be on disk and the pending count is unknown."),
+		walPoisoned:        desc("metering_wal_poisoned", "1 when this replica's WAL has no open log because the recovery reopen is failing: new events reach the log floor and events on disk are not shipped."),
+		walQuarantinedDirs: desc("metering_wal_quarantined_dirs", "Corrupt WAL directories moved aside on this replica's disk. Their unshipped events are not billed until manually recovered."),
+		walSkippedEntries:  desc("metering_wal_skipped_entries_total", "Undecodable WAL entries the shipper truncated past: those billing records are lost from the WAL."),
+		floorEvents:        desc("metering_floor_events_total", "Metering events that reached the log floor: the log line is the only copy."),
+		valkeyUp:           desc("metering_valkey_up", "1 when this replica could read the metering stream and Valkey's memory at scrape time."),
+		streamEntries:      desc("metering_stream_entries", "Entries in the metering stream, delivered or not."),
+		undelivered:        desc("metering_stream_undelivered_entries", "Stream entries not yet stored in Postgres: lost if Valkey restarts."),
+		used:               desc("valkey_used_memory_bytes", "Valkey used_memory."),
+		maxUsed:            desc("valkey_maxmemory_bytes", "Valkey maxmemory. At this level Valkey refuses metering writes and admission."),
 	}
 }
 
 func (c *meteringCollector) Describe(ch chan<- *prometheus.Desc) {
-	for _, d := range []*prometheus.Desc{c.walPending, c.floorEvents, c.valkeyUp, c.streamEntries, c.undelivered, c.used, c.maxUsed} {
+	for _, d := range []*prometheus.Desc{c.walPending, c.walHealthy, c.walPoisoned, c.walQuarantinedDirs, c.walSkippedEntries, c.floorEvents, c.valkeyUp, c.streamEntries, c.undelivered, c.used, c.maxUsed} {
 		ch <- d
 	}
 }
 
 func (c *meteringCollector) Collect(ch chan<- prometheus.Metric) {
-	ch <- prometheus.MustNewConstMetric(c.walPending, prometheus.GaugeValue, float64(c.health.WALPending()))
+	pending, countable := c.health.WALPending()
+	if countable {
+		ch <- prometheus.MustNewConstMetric(c.walPending, prometheus.GaugeValue, float64(pending))
+	}
+	ch <- prometheus.MustNewConstMetric(c.walHealthy, prometheus.GaugeValue, boolGauge(countable))
+	ch <- prometheus.MustNewConstMetric(c.walPoisoned, prometheus.GaugeValue, boolGauge(c.health.WALPoisoned()))
+	ch <- prometheus.MustNewConstMetric(c.walQuarantinedDirs, prometheus.GaugeValue, float64(c.health.WALQuarantinedDirs()))
+	ch <- prometheus.MustNewConstMetric(c.walSkippedEntries, prometheus.CounterValue, float64(c.health.WALSkippedEntries()))
 	ch <- prometheus.MustNewConstMetric(c.floorEvents, prometheus.CounterValue, float64(c.health.FloorEvents()))
 	ctx, cancel := context.WithTimeout(context.Background(), meteringProbeTimeout)
 	defer cancel()
@@ -271,6 +296,13 @@ func (c *meteringCollector) Collect(ch chan<- prometheus.Metric) {
 	ch <- prometheus.MustNewConstMetric(c.undelivered, prometheus.GaugeValue, float64(p.Undelivered))
 	ch <- prometheus.MustNewConstMetric(c.used, prometheus.GaugeValue, float64(p.UsedMemory))
 	ch <- prometheus.MustNewConstMetric(c.maxUsed, prometheus.GaugeValue, float64(p.MaxMemory))
+}
+
+func boolGauge(b bool) float64 {
+	if b {
+		return 1
+	}
+	return 0
 }
 
 // requestRecord is one proxied request's metric state. handleProxy binds the

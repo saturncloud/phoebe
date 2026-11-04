@@ -57,7 +57,8 @@ type Config struct {
 	// SchemaWaitTimeout bounds how long the drainer waits for
 	// RequiredSchemaVersion before Run returns an error (the process exits
 	// non-zero and the pod restarts visibly). The wait cannot be unbounded:
-	// the emitter caps the stream, so a silent stall trims un-drained events.
+	// a silent stall leaves un-drained events in a Valkey that keeps nothing on
+	// disk, and fills it until new events fall to the WAL.
 	SchemaWaitTimeout time.Duration
 
 	// --- Pending-entry reclaim (dead-consumer recovery) ---

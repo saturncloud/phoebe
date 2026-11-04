@@ -84,6 +84,16 @@ func main() {
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGTERM, syscall.SIGINT)
 	defer stop()
 
+	rdb := redis.NewClient(&redis.Options{Addr: cfg.ValkeyAddr})
+	defer func() { _ = rdb.Close() }()
+
+	// Trim before anything that depends on Postgres, so a pod crash-looping on an
+	// unreachable database still frees acknowledged entries on each restart.
+	// Trimming uses only Valkey, so this Drainer needs no store.
+	trimCtx, cancelTrim := context.WithTimeout(ctx, 10*time.Second)
+	drain.New(cfg, log, rdb, nil).TrimDelivered(trimCtx)
+	cancelTrim()
+
 	// Postgres: open + Ping (pool_pre_ping equivalent) before consuming, so a
 	// bad DSN fails fast rather than after we've claimed stream entries.
 	pingCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
@@ -94,9 +104,6 @@ func main() {
 	}
 	defer func() { _ = store.Close() }()
 	log.Info.Printf("drainer: postgres connected (maxOpen=%d maxIdle=%d)", cfg.MaxOpenConns, cfg.MaxIdleConns)
-
-	rdb := redis.NewClient(&redis.Options{Addr: cfg.ValkeyAddr})
-	defer func() { _ = rdb.Close() }()
 
 	// The schema gate must never be off in a real binary: 0 disables it, so an
 	// unreadable or unparseable migration set is fatal rather than silently
