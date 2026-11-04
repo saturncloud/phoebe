@@ -369,7 +369,7 @@ func buildEmitterWithClient(s *config.Settings, log *logging.Logger, newClient f
 		if rc != nil {
 			_ = rc.Close()
 		}
-		return emit.NewFloorEmitter(log), func() {}
+		return emit.NewFloorEmitter(log, cfg.WALPath), func() {}
 	}
 
 	if rdb != nil {

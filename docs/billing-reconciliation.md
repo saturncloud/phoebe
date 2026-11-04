@@ -283,7 +283,8 @@ undercharged.
      `<dir>.corrupt.<ts>` directories, and their events are not billed. Recover them
      manually or accept them as lost before running the rater and token-push. This
      metric counts the directories on disk, so it stays above 0 until they are moved
-     away from the WAL path.
+     away from the WAL path. A missing series means the replica could not read the
+     directory, so the count is unknown and must not be treated as 0.
 
    This query returns a sample only when the conditions above hold across the replicas
    that Prometheus scrapes. An empty result means the backlog has not cleared. The
@@ -295,12 +296,15 @@ undercharged.
      and count(phoebe_metering_wal_pending_events) == count(phoebe_metering_wal_healthy)
      and sum(phoebe_metering_wal_pending_events) == 0
      and sum(phoebe_metering_wal_poisoned) == 0
+     and count(phoebe_metering_wal_quarantined_dirs) == count(phoebe_metering_wal_healthy)
      and sum(phoebe_metering_wal_quarantined_dirs) == 0
    ```
 
    Also read `phoebe_metering_wal_skipped_entries_total`. It counts records lost from
    the WAL, so the rater and token-push cannot bill them. An increase during the outage
-   is a known under-billing to record, and it does not block the later steps.
+   is a known under-billing to record, and it does not block the later steps. Each
+   skipped record was logged at ERROR with its raw bytes, as `undecodable wal entry
+   index=<n>`, so it can be repaired by hand from the logs.
 2. Find the true start of the outage. Do not use the time someone noticed it: check
    the earliest late event, the `event_ts` of rows inserted long after their
    timestamp. On GB300 in November 2026 events began diverting about 26 hours before

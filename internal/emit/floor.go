@@ -25,12 +25,17 @@ var errNoDurableEmitter = errors.New("emit: durable emitter failed to initialise
 // would make those alerts silent during this failure.
 type FloorEmitter struct {
 	log         *logging.Logger
+	walPath     string
 	floorEvents atomic.Uint64
 }
 
-// NewFloorEmitter returns a FloorEmitter that writes to log.
-func NewFloorEmitter(log *logging.Logger) *FloorEmitter {
-	return &FloorEmitter{log: log}
+var _ metering.Emitter = (*FloorEmitter)(nil)
+
+// NewFloorEmitter returns a FloorEmitter that writes to log. walPath is the WAL
+// path the durable emitter failed to open, or "" if there is none; it is only read
+// to count the corrupt directories moved aside from it.
+func NewFloorEmitter(log *logging.Logger, walPath string) *FloorEmitter {
+	return &FloorEmitter{log: log, walPath: walPath}
 }
 
 // Emit satisfies metering.Emitter. It stamps TimestampUnixMs as DurableEmitter
@@ -50,8 +55,16 @@ func (f *FloorEmitter) WALPending() (uint64, bool) { return 0, false }
 // and events on disk are not shipped.
 func (f *FloorEmitter) WALPoisoned() bool { return true }
 
-// WALQuarantinedDirs returns 0 because this emitter does not know the WAL path.
-func (f *FloorEmitter) WALQuarantinedDirs() int { return 0 }
+// WALQuarantinedDirs reads the disk on each scrape and counts the corrupt WAL
+// directories moved aside, by the failed start or an earlier run. They hold unbilled
+// events whether or not a durable emitter is running. A negative result means the
+// directory could not be read and the count is unknown. With no WAL path it is 0.
+func (f *FloorEmitter) WALQuarantinedDirs() int {
+	if f.walPath == "" {
+		return 0
+	}
+	return quarantinedDirsOrUnknown(f.walPath, f.log)
+}
 
 // WALSkippedEntries returns 0: this emitter reads no WAL entries.
 func (f *FloorEmitter) WALSkippedEntries() uint64 { return 0 }

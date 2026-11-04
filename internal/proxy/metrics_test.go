@@ -798,6 +798,8 @@ type fakeMeteringHealth struct {
 	err        error
 	walUnknown bool
 	poisoned   bool
+
+	quarantineUnknown bool
 }
 
 func (f fakeMeteringHealth) WALPending() (uint64, bool) {
@@ -806,8 +808,13 @@ func (f fakeMeteringHealth) WALPending() (uint64, bool) {
 	}
 	return 7, true
 }
-func (f fakeMeteringHealth) WALPoisoned() bool       { return f.poisoned }
-func (fakeMeteringHealth) WALQuarantinedDirs() int   { return 3 }
+func (f fakeMeteringHealth) WALPoisoned() bool { return f.poisoned }
+func (f fakeMeteringHealth) WALQuarantinedDirs() int {
+	if f.quarantineUnknown {
+		return -1
+	}
+	return 3
+}
 func (fakeMeteringHealth) WALSkippedEntries() uint64 { return 4 }
 func (fakeMeteringHealth) FloorEvents() uint64       { return 2 }
 func (f fakeMeteringHealth) Probe(context.Context) (emit.MeteringProbe, error) {
@@ -932,6 +939,30 @@ func TestMeteringHealthUnknownWALCountIsNotZero(t *testing.T) {
 	}
 }
 
+// TestMeteringQuarantinedDirsOmittedWhenUnknown: an unknown count must not reach the
+// scrape as a number. A sum over replicas would read -1 as fewer directories, and 0
+// would tell an operator nothing is set aside.
+func TestMeteringQuarantinedDirsOmittedWhenUnknown(t *testing.T) {
+	srv := newMetricsTestServer(t).WithMeteringHealth(fakeMeteringHealth{quarantineUnknown: true})
+	if _, ok := phoebeFamilies(t, srv.metrics)["phoebe_metering_wal_quarantined_dirs"]; ok {
+		t.Fatal("quarantined dirs exported with an unknown count")
+	}
+}
+
+// TestMeteringFloorEmitterReportsQuarantinedDirs: the floor emitter's count reaches
+// the scrape, so an alert on it fires on a replica whose durable emitter failed.
+func TestMeteringFloorEmitterReportsQuarantinedDirs(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "wal")
+	if err := os.Mkdir(path+".corrupt.123", 0o755); err != nil {
+		t.Fatal(err)
+	}
+	srv := newMetricsTestServer(t).WithMeteringHealth(emit.NewFloorEmitter(logging.New(logging.ERROR), path))
+	fams := phoebeFamilies(t, srv.metrics)
+	if got := meteringSingleValue(t, fams, "phoebe_metering_wal_quarantined_dirs"); got != 1 {
+		t.Fatalf("wal_quarantined_dirs = %v, want 1", got)
+	}
+}
+
 // TestMeteringWALFamiliesServedOnRealEmitter: the real emitter reaches the scrape,
 // not only the fake.
 func TestMeteringWALFamiliesServedOnRealEmitter(t *testing.T) {
@@ -967,7 +998,7 @@ func TestMeteringWALFamiliesServedOnRealEmitter(t *testing.T) {
 // failed to start must report that through the metrics the alerts read. Each value
 // below is what makes one alert fire, and a missing series would keep it silent.
 func TestMeteringFamiliesReportFloorEmitterAsFailure(t *testing.T) {
-	em := emit.NewFloorEmitter(logging.New(logging.ERROR))
+	em := emit.NewFloorEmitter(logging.New(logging.ERROR), "")
 	srv := newMetricsTestServer(t).WithMeteringHealth(em)
 
 	value := func(fams map[string]*dto.MetricFamily, name string) float64 {
