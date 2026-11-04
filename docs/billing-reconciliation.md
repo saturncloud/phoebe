@@ -244,10 +244,16 @@ schema gate, and every `trimInterval` after that.
   again until the group can be created. The log line is
   `valkey is full with no consumer group`, and it should stop once the group exists.
   If Postgres is failing, or the gate has not opened, nothing is trimmed, because an
-  entry is removed only once it is stored.
-- **After a Postgres outage.** The drainer stops reading new entries while the store
-  is failing, so at most one batch per replica is left pending. Once the store
-  answers, reclaim works through any pending entries without waiting for
+  entry is removed only once it is stored. If another consumer group is on the stream,
+  the trim stops at what that group has read and acknowledged. When that frees nothing,
+  the drainer logs `holds the stream` with the group's name: let that group read
+  further, or delete it with `XGROUP DESTROY` if nothing uses it.
+- **After a Postgres outage.** The drainer stops reading new entries after a failed
+  store write, so at most one batch per replica is left pending. It retries by writing
+  that same batch, waiting 500ms after the first failure and twice as long after each
+  later one, up to 30s. A store that answers `Ping` but rejects writes (a schema gap)
+  therefore stays in this state. After a successful write the drainer reads new entries
+  again, and reclaim works through any other pending entries without waiting for
   `claimInterval` while each batch comes back full.
 
 **Manual relief.** If Postgres or the schema stays broken, the drainer cannot free
