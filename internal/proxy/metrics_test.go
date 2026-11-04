@@ -814,9 +814,24 @@ func (f fakeMeteringHealth) Probe(context.Context) (emit.MeteringProbe, error) {
 	return f.probe, f.err
 }
 
-// TestMeteringHealthMetricsHaveNoLabels: these families describe the replica and
-// Valkey, so they carry no labels at all.
-func TestMeteringHealthMetricsHaveNoLabels(t *testing.T) {
+// meteringSingleValue returns the value of a family that must have exactly one series.
+func meteringSingleValue(t *testing.T, fams map[string]*dto.MetricFamily, name string) float64 {
+	t.Helper()
+	f, ok := fams[name]
+	if !ok {
+		t.Fatalf("%s missing", name)
+	}
+	if len(f.GetMetric()) != 1 {
+		t.Fatalf("%s has %d series, want 1", name, len(f.GetMetric()))
+	}
+	m := f.GetMetric()[0]
+	return m.GetGauge().GetValue() + m.GetCounter().GetValue()
+}
+
+// TestMeteringHealthMetricsValuesAndNoLabels: each family reports the value from the
+// health source. These families describe the replica and Valkey, so they also carry
+// no labels at all.
+func TestMeteringHealthMetricsValuesAndNoLabels(t *testing.T) {
 	srv := newMetricsTestServer(t).WithMeteringHealth(fakeMeteringHealth{probe: emit.MeteringProbe{
 		StreamEntries: 10, Undelivered: 3, UsedMemory: 100, MaxMemory: 200,
 	}})
@@ -840,6 +855,10 @@ func TestMeteringHealthMetricsHaveNoLabels(t *testing.T) {
 			t.Errorf("%s missing", name)
 			continue
 		}
+		if len(f.GetMetric()) != 1 {
+			t.Errorf("%s has %d series, want 1", name, len(f.GetMetric()))
+			continue
+		}
 		m := f.GetMetric()[0]
 		if len(m.GetLabel()) != 0 {
 			t.Errorf("%s has labels %v", name, m.GetLabel())
@@ -851,18 +870,47 @@ func TestMeteringHealthMetricsHaveNoLabels(t *testing.T) {
 	}
 }
 
+// TestMeteringHealthUnhealthyWALMetricsHaveNoLabels: the unknown-count path carries
+// no labels either, and it leaves out only the pending series.
+func TestMeteringHealthUnhealthyWALMetricsHaveNoLabels(t *testing.T) {
+	srv := newMetricsTestServer(t).WithMeteringHealth(fakeMeteringHealth{walUnknown: true, poisoned: true})
+	fams := phoebeFamilies(t, srv.metrics)
+	if _, ok := fams["phoebe_metering_wal_pending_events"]; ok {
+		t.Error("pending reported while the count is unknown")
+	}
+	for _, name := range []string{
+		"phoebe_metering_wal_healthy",
+		"phoebe_metering_wal_poisoned",
+		"phoebe_metering_wal_quarantined_dirs",
+		"phoebe_metering_wal_skipped_entries_total",
+		"phoebe_metering_floor_events_total",
+		"phoebe_metering_valkey_up",
+	} {
+		f, ok := fams[name]
+		if !ok {
+			t.Errorf("%s missing", name)
+			continue
+		}
+		for _, m := range f.GetMetric() {
+			if len(m.GetLabel()) != 0 {
+				t.Errorf("%s has labels %v", name, m.GetLabel())
+			}
+		}
+	}
+}
+
 // TestMeteringHealthProbeFailureReportsValkeyDown: an unreachable Valkey is
 // visible as up=0, the WAL backlog still reports, and the scrape still succeeds.
 func TestMeteringHealthProbeFailureReportsValkeyDown(t *testing.T) {
 	srv := newMetricsTestServer(t).WithMeteringHealth(fakeMeteringHealth{err: errors.New("down")})
 	fams := phoebeFamilies(t, srv.metrics)
-	if got := fams["phoebe_metering_valkey_up"].GetMetric()[0].GetGauge().GetValue(); got != 0 {
+	if got := meteringSingleValue(t, fams, "phoebe_metering_valkey_up"); got != 0 {
 		t.Fatalf("valkey_up = %v, want 0", got)
 	}
 	if _, ok := fams["phoebe_metering_stream_entries"]; ok {
 		t.Fatal("stream_entries reported from a failed probe")
 	}
-	if got := fams["phoebe_metering_wal_pending_events"].GetMetric()[0].GetGauge().GetValue(); got != 7 {
+	if got := meteringSingleValue(t, fams, "phoebe_metering_wal_pending_events"); got != 7 {
 		t.Fatalf("wal_pending = %v, want 7", got)
 	}
 }
@@ -876,10 +924,10 @@ func TestMeteringHealthUnknownWALCountIsNotZero(t *testing.T) {
 	if f, ok := fams["phoebe_metering_wal_pending_events"]; ok {
 		t.Fatalf("pending reported while the count is unknown: %v", f)
 	}
-	if got := fams["phoebe_metering_wal_healthy"].GetMetric()[0].GetGauge().GetValue(); got != 0 {
+	if got := meteringSingleValue(t, fams, "phoebe_metering_wal_healthy"); got != 0 {
 		t.Fatalf("wal_healthy = %v, want 0", got)
 	}
-	if got := fams["phoebe_metering_wal_poisoned"].GetMetric()[0].GetGauge().GetValue(); got != 1 {
+	if got := meteringSingleValue(t, fams, "phoebe_metering_wal_poisoned"); got != 1 {
 		t.Fatalf("wal_poisoned = %v, want 1", got)
 	}
 }
