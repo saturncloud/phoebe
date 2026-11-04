@@ -198,7 +198,11 @@ func TestDrain_BatchConsumeStoreAck(t *testing.T) {
 	}
 
 	d := New(cfg, testLogger(), rdb, store)
-	runUntil(t, d, func() bool { return store.rowCount() == 5 }, 2*time.Second)
+	// Wait for the ACK as well: stopping right after the store cancels the ACK,
+	// and the entries correctly stay pending to redeliver.
+	runUntil(t, d, func() bool {
+		return store.rowCount() == 5 && pendingCount(t, rdb, cfg.StreamName, cfg.Group) == 0
+	}, 2*time.Second)
 
 	if got := store.rowCount(); got != 5 {
 		t.Fatalf("rows = %d, want 5", got)
@@ -362,7 +366,11 @@ func TestDrain_ReclaimsStalePending(t *testing.T) {
 
 	// The live drainer must reclaim, store, and ACK the stranded entry.
 	d := New(cfg, testLogger(), rdb, store)
-	runUntil(t, d, func() bool { return store.rowCount() == 1 }, 2*time.Second)
+	// Wait for the ACK as well: stopping right after the store cancels the ACK,
+	// and the entries correctly stay pending to redeliver.
+	runUntil(t, d, func() bool {
+		return store.rowCount() == 1 && pendingCount(t, rdb, cfg.StreamName, cfg.Group) == 0
+	}, 2*time.Second)
 
 	if got := store.rowCount(); got != 1 {
 		t.Fatalf("rows = %d, want 1 (reclaimed)", got)
