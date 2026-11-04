@@ -48,7 +48,9 @@ import (
 // reopen itself fails the wal is "poisoned": append errors immediately (the
 // emitter floors the event) and retries the reopen on every call — it is
 // already the failure path, so the extra open attempt is cheap relative to
-// the loss it can stop — while pending/markShipped no-op cleanly.
+// the loss it can stop. pending, which the shipper calls every tick, retries it
+// too, so a replica that is no longer appending still heals and ships what is on
+// disk. While the reopen keeps failing, pending/markShipped no-op cleanly.
 //
 // All methods are safe for concurrent use.
 type wal struct {
@@ -70,8 +72,8 @@ type wal struct {
 	closed bool
 
 	// poisoned marks a failed recovery reopen: the underlying log is nil and
-	// unusable. append retries the reopen; pending/markShipped no-op. See the
-	// type comment.
+	// unusable. append and pending retry the reopen; markShipped no-ops. See
+	// the type comment.
 	poisoned bool
 
 	// failNextWrite, when non-nil, intercepts the next library Write call and
@@ -316,7 +318,7 @@ func (w *wal) append(e metering.Event) error {
 // reopen it (via openLog, which quarantines if the on-disk state is corrupt),
 // rebuilding in-memory state from disk and resyncing nextIndex. Reports
 // whether the wal is usable afterwards; on failure the wal is poisoned and
-// the next append retries. Caller must hold w.mu — no append or drain may
+// the next append or pending call retries. Caller must hold w.mu — no append or drain may
 // observe the log mid-swap.
 func (w *wal) recoverLocked() bool {
 	if w.log != nil {
@@ -328,7 +330,7 @@ func (w *wal) recoverLocked() bool {
 	l, last, err := openLog(w.dir, w.logger)
 	if err != nil {
 		if !w.poisoned {
-			w.logger.Error.Printf("emit: WAL POISONED at %s: recovery reopen failed: %v — events fall to the log floor; the reopen is retried on every append", w.dir, err)
+			w.logger.Error.Printf("emit: WAL POISONED at %s: recovery reopen failed: %v — events fall to the log floor; the reopen is retried on every append and shipper tick", w.dir, err)
 		}
 		w.poisoned = true
 		return false
@@ -361,34 +363,43 @@ func (w *wal) recoverIfCorruptLocked(err error) {
 // pending returns the next batch of unshipped events in index order, at most
 // limit (limit <= 0 means unbounded). through is the index of the last entry
 // examined — the caller passes it to markShipped after delivering the batch.
-// through == 0 means there is nothing unshipped.
+// through == 0 means there is nothing unshipped. indexes is parallel to events
+// and holds each event's WAL index: corrupt entries are skipped, so an event's
+// position in events does not map to an index by arithmetic.
 //
 // A corrupt entry (undecodable JSON) is SKIPPED and counted in skipped, never
 // aborts the drain, and is still covered by through so markShipped truncates
 // past it — one bad entry must not wedge the billing buffer forever.
-func (w *wal) pending(limit int) (events []metering.Event, through uint64, skipped int, err error) {
+//
+// A poisoned wal retries the reopen here: without that, a replica with no new
+// appends would leave its entries on disk unshipped, because append was the only
+// other caller that retries.
+func (w *wal) pending(limit int) (events []metering.Event, indexes []uint64, through uint64, skipped int, err error) {
 	w.mu.Lock()
 	defer w.mu.Unlock()
 
-	// Closed: shutting down. Poisoned: nothing to drain until an append's
-	// reopen succeeds. Either way a clean no-op, never a nil-log panic.
-	if w.closed || w.poisoned {
-		return nil, 0, 0, nil
+	// Closed: shutting down. Poisoned with a failing reopen: nothing to drain
+	// yet. Either way a clean no-op, never a nil-log panic.
+	if w.closed {
+		return nil, nil, 0, 0, nil
+	}
+	if w.poisoned && !w.recoverLocked() {
+		return nil, nil, 0, 0, nil
 	}
 
 	first, err := w.log.FirstIndex()
 	if err != nil {
 		w.recoverIfCorruptLocked(err)
-		return nil, 0, 0, fmt.Errorf("wal first index: %w", err)
+		return nil, nil, 0, 0, fmt.Errorf("wal first index: %w", err)
 	}
 	last, err := w.log.LastIndex()
 	if err != nil {
 		w.recoverIfCorruptLocked(err)
-		return nil, 0, 0, fmt.Errorf("wal last index: %w", err)
+		return nil, nil, 0, 0, fmt.Errorf("wal last index: %w", err)
 	}
 	// Empty log, or everything through the retained tail entry already shipped.
 	if last == 0 || last <= w.shippedThrough {
-		return nil, 0, 0, nil
+		return nil, nil, 0, 0, nil
 	}
 
 	start := first
@@ -407,7 +418,7 @@ func (w *wal) pending(limit int) (events []metering.Event, through uint64, skipp
 			// through=0 means nothing gets truncated this pass. On ErrCorrupt
 			// the reopen rebuilds state; the next tick resumes from disk.
 			w.recoverIfCorruptLocked(rerr)
-			return nil, 0, skipped, fmt.Errorf("wal read index %d: %w", i, rerr)
+			return nil, nil, 0, skipped, fmt.Errorf("wal read index %d: %w", i, rerr)
 		}
 		// UnmarshalEvent: see readLegacyJSONL. A spool written by a pre-cutover
 		// pod and shipped by a post-cutover pod must keep the dedicated default.
@@ -417,8 +428,60 @@ func (w *wal) pending(limit int) (events []metering.Event, through uint64, skipp
 			continue
 		}
 		events = append(events, ev)
+		indexes = append(indexes, i)
 	}
-	return events, end, skipped, nil
+	return events, indexes, end, skipped, nil
+}
+
+// pendingCount returns how many entries have not been confirmed shipped, and
+// whether that count can be trusted. ok is false when the wal is poisoned or the
+// log cannot be read: entries may still be on disk, so the caller must not report
+// the count as zero. A closed wal is (0, true), since it only occurs during a
+// deliberate shutdown.
+//
+// Zero does not mean nothing is stranded. Entries in a quarantined directory and
+// corrupt entries the shipper truncated past are no longer counted here; see
+// metering_wal_poisoned, metering_wal_quarantined_dirs and
+// metering_wal_skipped_entries_total.
+func (w *wal) pendingCount() (count uint64, ok bool) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	if w.closed {
+		return 0, true
+	}
+	if w.log == nil {
+		return 0, false
+	}
+	first, err := w.log.FirstIndex()
+	if err != nil {
+		return 0, false
+	}
+	if w.shippedThrough+1 > first {
+		first = w.shippedThrough + 1
+	}
+	if first == 0 || w.nextIndex <= first {
+		return 0, true
+	}
+	return w.nextIndex - first, true
+}
+
+// isPoisoned reports whether the last recovery reopen failed.
+func (w *wal) isPoisoned() bool {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	return w.poisoned
+}
+
+// quarantinedDirs counts the corrupt directories moved aside by openLog. It reads
+// the disk rather than a counter: a quarantine at startup happens before the first
+// scrape, and these directories hold unbilled data that is never auto-deleted, so
+// the count stays nonzero until an operator recovers them.
+func (w *wal) quarantinedDirs() int {
+	matches, err := filepath.Glob(w.dir + ".corrupt.*")
+	if err != nil {
+		return 0
+	}
+	return len(matches)
 }
 
 // markShipped records that every entry up to and including through has been

@@ -2,6 +2,7 @@ package emit
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -10,6 +11,7 @@ import (
 	"sort"
 	"strings"
 	"testing"
+	"time"
 
 	tidwall "github.com/tidwall/wal"
 
@@ -171,6 +173,9 @@ func TestWAL_PoisonedFloorsAndRecovers(t *testing.T) {
 	if err := w.append(makeEvent("pre")); err != nil {
 		t.Fatal(err)
 	}
+	if got, ok := w.pendingCount(); got != 1 || !ok {
+		t.Fatalf("pendingCount before poisoning = %d, %v, want 1, true", got, ok)
+	}
 
 	// Make the recovery reopen fail: the torn tail forces ErrCorrupt at Open,
 	// and the read-only parent blocks the quarantine rename.
@@ -187,12 +192,21 @@ func TestWAL_PoisonedFloorsAndRecovers(t *testing.T) {
 		t.Fatal("append triggering a failed recovery should error")
 	}
 
-	// Poisoned: appends keep erroring (→ floor), pending/markShipped no-op.
+	// Poisoned: appends keep erroring (→ floor), pending/markShipped no-op while
+	// the reopen keeps failing.
 	if err := w.append(makeEvent("while-poisoned")); err == nil {
 		t.Fatal("append on poisoned wal should error (event must floor)")
 	}
-	events, through, skipped, err := w.pending(0)
-	if err != nil || events != nil || through != 0 || skipped != 0 {
+	if !w.isPoisoned() {
+		t.Fatal("isPoisoned = false while the reopen is failing")
+	}
+	// A poisoned wal has no open log to count, and entries may be on disk, so it
+	// reports the count as unknown rather than as an empty WAL.
+	if got, ok := w.pendingCount(); got != 0 || ok {
+		t.Fatalf("pendingCount while poisoned = %d, %v, want 0, false", got, ok)
+	}
+	events, indexes, through, skipped, err := w.pending(0)
+	if err != nil || events != nil || indexes != nil || through != 0 || skipped != 0 {
 		t.Fatalf("pending on poisoned wal = (%v, %d, %d, %v), want clean no-op", events, through, skipped, err)
 	}
 	if err := w.markShipped(99); err != nil {
@@ -209,6 +223,163 @@ func TestWAL_PoisonedFloorsAndRecovers(t *testing.T) {
 	got := unshipped(t, w)
 	if len(got) != 1 || got[0].RequestID != "healed" {
 		t.Fatalf("after heal: unshipped = %+v, want exactly [healed]", got)
+	}
+	if got, ok := w.pendingCount(); got != 1 || !ok {
+		t.Fatalf("pendingCount after heal = %d, %v, want 1, true", got, ok)
+	}
+	if w.isPoisoned() {
+		t.Fatal("isPoisoned = true after heal")
+	}
+}
+
+// poisonWAL makes the recovery reopen fail: the torn tail forces ErrCorrupt at
+// Open, and the read-only parent blocks the quarantine rename. The caller restores
+// the parent's permissions to heal.
+func poisonWAL(t *testing.T, w *wal, parent, path string) {
+	t.Helper()
+	w.failNextWrite = func(_ *tidwall.Log, _ uint64, _ []byte) error {
+		tearTailSegment(t, path)
+		if err := os.Chmod(parent, 0o500); err != nil {
+			t.Fatalf("chmod parent: %v", err)
+		}
+		return errors.New("injected write failure")
+	}
+	t.Cleanup(func() { _ = os.Chmod(parent, 0o755) })
+	if err := w.append(makeEvent("poisoning")); err == nil {
+		t.Fatal("append triggering a failed recovery should error")
+	}
+}
+
+// TestWAL_PoisonedRecoversFromShipperWithoutAppend: a replica with no new traffic
+// must still heal, so the shipper's pending call retries the reopen too.
+func TestWAL_PoisonedRecoversFromShipperWithoutAppend(t *testing.T) {
+	if os.Geteuid() == 0 {
+		t.Skip("permission-based test is meaningless as root")
+	}
+	parent := t.TempDir()
+	path := filepath.Join(parent, "wal.jsonl")
+	w := openTestWAL(t, path)
+	defer w.close() //nolint:errcheck
+	if err := w.append(makeEvent("pre")); err != nil {
+		t.Fatal(err)
+	}
+	poisonWAL(t, w, parent, path)
+
+	if events, _, through, _, err := w.pending(0); err != nil || events != nil || through != 0 {
+		t.Fatalf("pending with the reopen still failing = (%v, %d, %v), want a clean no-op", events, through, err)
+	}
+	if !w.isPoisoned() {
+		t.Fatal("pending healed a wal whose reopen still fails")
+	}
+
+	if err := os.Chmod(parent, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, _, _, err := w.pending(0); err != nil {
+		t.Fatalf("pending after restoring permissions: %v", err)
+	}
+	if w.isPoisoned() {
+		t.Fatal("pending did not heal the wal once the reopen could succeed")
+	}
+	if _, ok := w.pendingCount(); !ok {
+		t.Fatal("pendingCount still unknown after pending healed the wal")
+	}
+}
+
+// TestWALPoisoned_ReportedByEmitter: the emitter exports the poisoned state and an
+// unknown count, which is what the metrics read.
+func TestWALPoisoned_ReportedByEmitter(t *testing.T) {
+	if os.Geteuid() == 0 {
+		t.Skip("permission-based test is meaningless as root")
+	}
+	parent := t.TempDir()
+	cfg := testConfig(t, nil)
+	cfg.WALPath = filepath.Join(parent, "wal.jsonl")
+	cfg.ShipInterval = time.Hour
+	em, err := New(cfg, testLogger(), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = em.Close(context.Background()) })
+	if em.WALPoisoned() {
+		t.Fatal("WALPoisoned = true on a healthy WAL")
+	}
+	if err := em.wal.append(makeEvent("pre")); err != nil {
+		t.Fatal(err)
+	}
+	poisonWAL(t, em.wal, parent, cfg.WALPath)
+	if !em.WALPoisoned() {
+		t.Fatal("WALPoisoned = false on a poisoned WAL")
+	}
+	if got, ok := em.WALPending(); got != 0 || ok {
+		t.Fatalf("WALPending while poisoned = %d, %v, want 0, false", got, ok)
+	}
+}
+
+// TestWALPending_ReadErrorIsUnknown: an unreadable log reports an unknown count,
+// not an empty WAL.
+func TestWALPending_ReadErrorIsUnknown(t *testing.T) {
+	w := openTestWAL(t, tmpWALPath(t))
+	defer w.close() //nolint:errcheck
+	if err := w.append(makeEvent("pre")); err != nil {
+		t.Fatal(err)
+	}
+	// Closing the library log underneath the wrapper makes FirstIndex fail.
+	if err := w.log.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if got, ok := w.pendingCount(); got != 0 || ok {
+		t.Fatalf("pendingCount on a read error = %d, %v, want 0, false", got, ok)
+	}
+}
+
+// TestWALQuarantinedDirs_CountsAfterTornWrite: a torn write moves the buffer aside
+// with its unbilled events, and the count must show that.
+func TestWALQuarantinedDirs_CountsAfterTornWrite(t *testing.T) {
+	path := tmpWALPath(t)
+	w := openTestWAL(t, path)
+	defer w.close() //nolint:errcheck
+	if got := w.quarantinedDirs(); got != 0 {
+		t.Fatalf("quarantinedDirs on a fresh wal = %d", got)
+	}
+	if err := w.append(makeEvent("pre")); err != nil {
+		t.Fatal(err)
+	}
+	w.failNextWrite = func(_ *tidwall.Log, _ uint64, _ []byte) error {
+		tearTailSegment(t, path)
+		return errors.New("injected ENOSPC partial write")
+	}
+	if err := w.append(makeEvent("torn")); err == nil {
+		t.Fatal("torn write should error")
+	}
+	if got := w.quarantinedDirs(); got != 1 {
+		t.Fatalf("quarantinedDirs after a torn write = %d, want 1", got)
+	}
+}
+
+// TestWALQuarantinedDirs_CountsAfterRestartOnTornTail: the count reads the disk, so
+// a quarantine that happened at startup, before any scrape, is still visible.
+func TestWALQuarantinedDirs_CountsAfterRestartOnTornTail(t *testing.T) {
+	path := tmpWALPath(t)
+	w := openTestWAL(t, path)
+	if err := w.append(makeEvent("pre")); err != nil {
+		t.Fatal(err)
+	}
+	if err := w.close(); err != nil {
+		t.Fatal(err)
+	}
+	tearTailSegment(t, path)
+
+	cfg := testConfig(t, nil)
+	cfg.WALPath = path
+	cfg.ShipInterval = time.Hour
+	em, err := New(cfg, testLogger(), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = em.Close(context.Background()) })
+	if got := em.WALQuarantinedDirs(); got != 1 {
+		t.Fatalf("WALQuarantinedDirs after a restart on a torn tail = %d, want 1", got)
 	}
 }
 

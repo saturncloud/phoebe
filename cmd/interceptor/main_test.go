@@ -27,6 +27,7 @@ import (
 	"github.com/saturncloud/phoebe/internal/gateway"
 	"github.com/saturncloud/phoebe/internal/identity"
 	"github.com/saturncloud/phoebe/internal/logging"
+	"github.com/saturncloud/phoebe/internal/metering"
 	"github.com/saturncloud/phoebe/internal/proxy"
 )
 
@@ -393,5 +394,37 @@ func TestBuildAdmissionPolicySyncTimeoutLogsErrorAndKeepsServing(t *testing.T) {
 	}
 	if out := buf.String(); !strings.Contains(out, "not read within 200ms") || !strings.Contains(out, "NOT enforced until it syncs") {
 		t.Fatalf("sync timeout not logged as an error naming the wait: %q", out)
+	}
+}
+
+// TestBuildEmitterFailedWALKeepsMeteringHealthAndFloorFormat: when the WAL cannot
+// open, the emitter buildEmitter falls back to must still reach the metrics through
+// main's type assertion, and its events must be in the format recovery parses.
+func TestBuildEmitterFailedWALKeepsMeteringHealthAndFloorFormat(t *testing.T) {
+	notADir := filepath.Join(t.TempDir(), "file")
+	if err := os.WriteFile(notADir, nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	s := &config.Settings{}
+	s.Emit.WALPath = filepath.Join(notADir, "wal") // beneath a regular file, so emit.New fails
+
+	var buf bytes.Buffer
+	emitter, closeEmitter := buildEmitter(s, captureAllLogger(&buf))
+	defer closeEmitter()
+
+	health, ok := emitter.(proxy.MeteringHealth)
+	if !ok {
+		t.Fatalf("fallback emitter %T does not implement proxy.MeteringHealth, so every metering metric would vanish", emitter)
+	}
+	if _, err := health.Probe(context.Background()); err == nil {
+		t.Error("Probe succeeded on the fallback emitter, want an error so metering_valkey_up reads 0")
+	}
+
+	emitter.Emit(context.Background(), metering.Event{RequestID: "phoebe-floor"})
+	if got := health.FloorEvents(); got != 1 {
+		t.Errorf("FloorEvents = %d, want 1", got)
+	}
+	if out := buf.String(); !strings.Contains(out, "METERING_FLOOR request_id=phoebe-floor event={") {
+		t.Errorf("no METERING_FLOOR line for the event: %q", out)
 	}
 }

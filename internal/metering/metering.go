@@ -10,7 +10,6 @@ import (
 	"unicode/utf8"
 
 	"github.com/saturncloud/phoebe/internal/identity"
-	"github.com/saturncloud/phoebe/internal/logging"
 )
 
 // Usage mirrors the OpenAI-compatible usage block that vLLM/SGLang/TRT-LLM
@@ -194,19 +193,6 @@ type Event struct {
 // MUST be asynchronous / non-blocking with respect to the client response.
 type Emitter interface {
 	Emit(ctx context.Context, e Event)
-}
-
-// LogEmitter is a placeholder Emitter that writes events to the logger. It
-// stands in for the real durable queue (Kafka / Redis Streams) during the
-// walking-skeleton phase.
-type LogEmitter struct {
-	Log *logging.Logger
-}
-
-func (l *LogEmitter) Emit(_ context.Context, e Event) {
-	l.Log.Info.Printf("metering event: request_id=%s client_request_id=%s auth_id=%s org=%s group=%s user=%s resource=%s/%s model=%s prompt=%d cached=%d completion=%d finish=%s aborted=%t usage_found=%t status=%d streamed=%t",
-		e.RequestID, e.ClientRequestID, e.AuthID, e.OrgID, e.GroupID, e.UserID, e.ResourceType, e.ResourceID, e.Model,
-		e.PromptTokens, e.CachedTokens, e.CompletionTokens, e.FinishReason, e.Aborted, e.UsageFound, e.StatusCode, e.Streamed)
 }
 
 // UnmarshalEvent decodes one event's JSON, the shape written by the emitter to

@@ -4,7 +4,10 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"strconv"
+	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/redis/go-redis/v9"
@@ -26,6 +29,12 @@ import (
 // the log if the WAL fails too).
 //
 // Close drains in-flight events and flushes the WAL on graceful shutdown.
+//
+// XADD carries no MAXLEN: a length cap removes the oldest entries whether or not
+// they were delivered, so it could only ever lose billing records. The drainer
+// trims what it has delivered (internal/drain), and Valkey's maxmemory bounds the
+// rest: a refused XADD falls to the WAL. CheckBufferBound warns when a Valkey does
+// not enforce that bound.
 type DurableEmitter struct {
 	cfg    Config
 	log    *logging.Logger
@@ -43,11 +52,39 @@ type DurableEmitter struct {
 	closeMu sync.RWMutex
 	closed  bool
 
-	// shipFn ships one batch to Valkey, returning true iff ALL events landed.
-	// Defaults to shipBatch; tests inject failures here to exercise the
-	// drain's partial-progress behaviour without timing games.
-	shipFn func([]metering.Event) bool
+	// shipFn ships one batch to Valkey, returning how many leading events are
+	// handled; len(events) means all of them. Defaults to shipBatch; tests inject
+	// failures here to exercise the drain's partial-progress behaviour without
+	// timing games.
+	shipFn func([]metering.Event) int
+
+	// floorEvents counts events that reached the log floor: the log line is then
+	// the only copy of that billing record.
+	floorEvents atomic.Uint64
+
+	// skippedEntries counts undecodable WAL entries the shipper truncated past:
+	// those billing records are gone from the WAL.
+	skippedEntries atomic.Uint64
 }
+
+// WALPending returns how many events wait in this replica's WAL for Valkey, and
+// whether that count can be trusted. See wal.pendingCount.
+func (e *DurableEmitter) WALPending() (uint64, bool) { return e.wal.pendingCount() }
+
+// WALPoisoned reports whether this replica's WAL has no open log because the
+// recovery reopen is failing.
+func (e *DurableEmitter) WALPoisoned() bool { return e.wal.isPoisoned() }
+
+// WALQuarantinedDirs returns how many corrupt WAL directories were moved aside
+// and are waiting for manual recovery.
+func (e *DurableEmitter) WALQuarantinedDirs() int { return e.wal.quarantinedDirs() }
+
+// WALSkippedEntries returns how many undecodable WAL entries the shipper has
+// truncated past since start.
+func (e *DurableEmitter) WALSkippedEntries() uint64 { return e.skippedEntries.Load() }
+
+// FloorEvents returns how many events reached the log floor since start.
+func (e *DurableEmitter) FloorEvents() uint64 { return e.floorEvents.Load() }
 
 // New creates and starts a DurableEmitter.
 //
@@ -194,10 +231,6 @@ func (e *DurableEmitter) xadd(ev metering.Event) {
 		Stream: e.cfg.StreamName,
 		Values: map[string]interface{}{"event": string(data)},
 	}
-	if e.cfg.StreamMaxLen > 0 {
-		args.MaxLen = e.cfg.StreamMaxLen
-		args.Approx = true
-	}
 
 	timeout := e.cfg.XADDTimeout
 	if timeout <= 0 {
@@ -224,8 +257,8 @@ func (e *DurableEmitter) walOrLog(ev metering.Event) {
 // logFloor is the absolute last resort: a structured log line.
 // It is parseable by a log-pipeline scraper for manual recovery.
 func (e *DurableEmitter) logFloor(ev metering.Event) {
-	data, _ := json.Marshal(ev)
-	e.log.Error.Printf("METERING_FLOOR request_id=%s event=%s", ev.RequestID, data)
+	e.floorEvents.Add(1)
+	logFloorEvent(e.log, ev)
 }
 
 // shipper periodically drains the WAL into Valkey on recovery.
@@ -252,14 +285,16 @@ func (e *DurableEmitter) shipper() {
 	}
 }
 
-// drainWAL ships the WAL's unshipped entries to Valkey in ShipBatchSize
-// batches, truncating after EACH successfully shipped batch — so progress made
-// before a mid-drain failure is retained, never re-done wholesale. On a ship
-// failure it stops: the remaining entries stay in the log and the next tick
-// resumes from the watermark. Entries are only ever reclaimed after their
-// batch is confirmed shipped, and concurrent appends land at higher indexes
-// that truncation never touches — loss during a drain is structurally
-// impossible. Delivery is at-least-once; the drainer dedups on request_id.
+// drainWAL ships the WAL's unshipped entries to Valkey in ShipBatchSize batches,
+// keeping progress per event: everything confirmed shipped is marked before the
+// next attempt, including the leading events of a batch that failed partway, so
+// shipped events are not sent again. This matters on a full Valkey, where a
+// refused XADD is the normal outcome and a resend would spend freed memory on
+// duplicates. On a ship failure it stops: the remaining entries stay in the log
+// and the next tick resumes from the watermark. Entries are only ever reclaimed
+// after they are confirmed shipped, and concurrent appends land at higher indexes
+// that truncation never touches — loss during a drain is structurally impossible.
+// Delivery is at-least-once; the drainer dedups on request_id.
 func (e *DurableEmitter) drainWAL() {
 	if e.rdb == nil {
 		return
@@ -271,7 +306,7 @@ func (e *DurableEmitter) drainWAL() {
 	}
 
 	for {
-		events, through, skipped, err := e.wal.pending(batchSize)
+		events, indexes, through, skipped, err := e.wal.pending(batchSize)
 		if err != nil {
 			e.log.Error.Printf("emit: wal read for drain: %v", err)
 			return
@@ -282,22 +317,44 @@ func (e *DurableEmitter) drainWAL() {
 		if through == 0 {
 			return // nothing unshipped
 		}
-		if len(events) > 0 && !e.shipFn(events) {
-			return // ship failed — entries remain; next tick resumes here
+		if len(events) > 0 {
+			if n := e.shipFn(events); n < len(events) {
+				if n > 0 {
+					e.markPartialBatch(indexes[n-1], through, n, len(events)+skipped)
+				}
+				return // ship failed — the rest remains; next tick resumes here
+			}
 		}
 		if err := e.wal.markShipped(through); err != nil {
 			e.log.Error.Printf("emit: wal truncate after ship: %v", err)
 			return
 		}
+		e.skippedEntries.Add(uint64(skipped))
 		if len(events) > 0 {
 			e.log.Info.Printf("emit: wal drained batch (%d events shipped)", len(events))
 		}
 	}
 }
 
-// shipBatch ships a slice of events to Valkey. Returns true iff ALL succeeded.
-func (e *DurableEmitter) shipBatch(events []metering.Event) bool {
-	for _, ev := range events {
+// markPartialBatch records a batch that stopped after n events, the last of them
+// at WAL index shippedThrough. through and examined describe the whole batch, and
+// give its first index. The skip counter only takes the corrupt entries the
+// watermark passes: the rest are read again next tick and must not count twice.
+func (e *DurableEmitter) markPartialBatch(shippedThrough, through uint64, n, examined int) {
+	if err := e.wal.markShipped(shippedThrough); err != nil {
+		e.log.Error.Printf("emit: wal truncate after partial ship: %v", err)
+		return
+	}
+	first := through - uint64(examined) + 1
+	e.skippedEntries.Add(shippedThrough - first + 1 - uint64(n))
+	e.log.Info.Printf("emit: wal drained partial batch (%d events shipped)", n)
+}
+
+// shipBatch ships a slice of events to Valkey and returns how many leading events
+// are handled, stopping at the first refused XADD. An event that cannot be
+// marshaled counts as handled: retrying cannot make it succeed.
+func (e *DurableEmitter) shipBatch(events []metering.Event) int {
+	for i, ev := range events {
 		data, err := json.Marshal(ev)
 		if err != nil {
 			e.log.Error.Printf("emit: shipper marshal request_id=%s: %v", ev.RequestID, err)
@@ -307,10 +364,6 @@ func (e *DurableEmitter) shipBatch(events []metering.Event) bool {
 		args := &redis.XAddArgs{
 			Stream: e.cfg.StreamName,
 			Values: map[string]interface{}{"event": string(data)},
-		}
-		if e.cfg.StreamMaxLen > 0 {
-			args.MaxLen = e.cfg.StreamMaxLen
-			args.Approx = true
 		}
 
 		timeout := e.cfg.XADDTimeout
@@ -323,8 +376,106 @@ func (e *DurableEmitter) shipBatch(events []metering.Event) bool {
 
 		if shipErr != nil {
 			e.log.Warn.Printf("emit: shipper xadd request_id=%s: %v", ev.RequestID, shipErr)
-			return false
+			return i
 		}
 	}
-	return true
+	return len(events)
+}
+
+// MeteringProbe is one read of the metering buffer's health.
+type MeteringProbe struct {
+	StreamEntries int64 // entries in the stream, delivered or not
+	Undelivered   int64 // entries not yet stored: pending plus not yet read
+	UsedMemory    int64 // Valkey used_memory, bytes
+	MaxMemory     int64 // Valkey maxmemory, bytes; 0 means no cap
+}
+
+// Probe reads the stream and Valkey's memory. Every command it runs still works
+// when Valkey is full. It fails when no Valkey is configured or reachable.
+func (e *DurableEmitter) Probe(ctx context.Context) (MeteringProbe, error) {
+	var p MeteringProbe
+	if e.rdb == nil {
+		return p, fmt.Errorf("emit: no valkey configured")
+	}
+	var err error
+	if p.StreamEntries, err = e.rdb.XLen(ctx, e.cfg.StreamName).Result(); err != nil {
+		return p, fmt.Errorf("xlen: %w", err)
+	}
+	groups, err := e.rdb.XInfoGroups(ctx, e.cfg.StreamName).Result()
+	if err != nil {
+		if !strings.Contains(err.Error(), "no such key") {
+			return p, fmt.Errorf("xinfo groups: %w", err)
+		}
+		groups = nil
+	}
+	if len(groups) == 0 {
+		p.Undelivered = p.StreamEntries // no consumer yet: nothing has been read
+	}
+	for _, g := range groups {
+		undelivered := g.Pending + g.Lag
+		if g.Lag < 0 {
+			// Valkey could not compute the lag (go-redis reports -1). Unknown must
+			// not read as caught up, because this number feeds
+			// PhoebeMeteringDrainerBehind, so use the upper bound.
+			undelivered = p.StreamEntries
+		}
+		if undelivered > p.Undelivered {
+			p.Undelivered = undelivered // the group furthest behind
+		}
+	}
+	info, err := e.rdb.Info(ctx, "memory").Result()
+	if err != nil {
+		return p, fmt.Errorf("info memory: %w", err)
+	}
+	p.UsedMemory = infoInt(info, "used_memory")
+	p.MaxMemory = infoInt(info, "maxmemory")
+	return p, nil
+}
+
+// CheckBufferBound warns when Valkey does not enforce the bound this emitter
+// relies on: XADD carries no MAXLEN, so maxmemory with noeviction is what stops the
+// stream growing and makes a full Valkey refuse writes instead of dropping entries.
+// It only warns, and never stops startup.
+func (e *DurableEmitter) CheckBufferBound(ctx context.Context) {
+	if e.rdb == nil {
+		return
+	}
+	info, err := e.rdb.Info(ctx, "memory").Result()
+	if err != nil {
+		e.log.Warn.Printf("emit: skipped the valkey memory limit check: %v", err)
+		return
+	}
+	if infoInt(info, "maxmemory") == 0 {
+		e.log.Warn.Printf("emit: valkey maxmemory is 0: the metering stream has no cap, and an undrained backlog can grow until Valkey is OOM-killed, losing events")
+	}
+	switch policy, ok := infoString(info, "maxmemory_policy"); {
+	case !ok:
+		e.log.Warn.Printf("emit: could not read valkey maxmemory_policy: confirm it is noeviction, or Valkey can evict the metering stream")
+	case policy != "noeviction":
+		e.log.Warn.Printf("emit: valkey maxmemory_policy is %s, not noeviction: Valkey can evict the metering stream", policy)
+	}
+}
+
+// infoInt reads one integer field from an INFO reply. Missing reads as 0.
+func infoInt(info, field string) int64 {
+	value, ok := infoString(info, field)
+	if !ok {
+		return 0
+	}
+	v, err := strconv.ParseInt(value, 10, 64)
+	if err != nil {
+		return 0
+	}
+	return v
+}
+
+// infoString reads one field from an INFO reply.
+func infoString(info, field string) (string, bool) {
+	for _, line := range strings.Split(info, "\n") {
+		key, value, ok := strings.Cut(strings.TrimSpace(line), ":")
+		if ok && key == field {
+			return value, true
+		}
+	}
+	return "", false
 }
