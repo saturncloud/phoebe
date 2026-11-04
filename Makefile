@@ -30,13 +30,16 @@ integration-test:
 race-test:
 	go test -race -count=1 ./internal/proxy/... ./internal/waker/...
 
-# Exercises admission Lua atomics against a real Valkey/Redis-compatible server.
+# Runs every real-Valkey test (admission, drain, emit) against a real
+# Valkey/Redis-compatible server. -p 1 is required because the drain and emit
+# tests change the server-wide maxmemory setting, so test packages must not run
+# in parallel against the same server.
 # Example: PHOEBE_TEST_ADMISSION_VALKEY_ADDR=127.0.0.1:16379 make admission-integration-test
 .PHONY: admission-integration-test
 admission-integration-test:
 	@test -n "$$PHOEBE_TEST_ADMISSION_VALKEY_ADDR" || \
 		( echo "PHOEBE_TEST_ADMISSION_VALKEY_ADDR is required"; exit 1 )
-	go test -tags=admissionintegration ./internal/admission -run '^TestRealValkey' -count=1
+	go test -p 1 -tags=admissionintegration ./internal/admission ./internal/drain ./internal/emit -run '^TestRealValkey' -count=1
 
 .PHONY: vet
 vet:

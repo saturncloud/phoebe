@@ -17,9 +17,8 @@ import "time"
 // global settings struct.
 type Config struct {
 	// Valkey / Redis settings
-	ValkeyAddr   string // e.g. "localhost:6379"
-	StreamName   string // XADD target key, e.g. "phoebe:metering"
-	StreamMaxLen int64  // MAXLEN trim (0 = no trim)
+	ValkeyAddr string // e.g. "localhost:6379"
+	StreamName string // XADD target key, e.g. "phoebe:metering"
 
 	// Worker pool
 	WorkerCount int // number of goroutines draining the event channel
@@ -41,11 +40,10 @@ type Config struct {
 // DefaultConfig returns a Config with safe, production-ready defaults.
 func DefaultConfig() Config {
 	return Config{
-		ValkeyAddr:   "localhost:6379",
-		StreamName:   "phoebe:metering",
-		StreamMaxLen: 1_000_000,
-		WorkerCount:  4,
-		ChanBuf:      8192,
+		ValkeyAddr:  "localhost:6379",
+		StreamName:  "phoebe:metering",
+		WorkerCount: 4,
+		ChanBuf:     8192,
 		// Kept at the historical file path on purpose: it is now the WAL
 		// directory, and a pre-upgrade JSONL file found here is auto-imported.
 		WALPath:       "/tmp/phoebe-metering-wal.jsonl",

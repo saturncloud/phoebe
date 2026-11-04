@@ -57,7 +57,8 @@ type Config struct {
 	// SchemaWaitTimeout bounds how long the drainer waits for
 	// RequiredSchemaVersion before Run returns an error (the process exits
 	// non-zero and the pod restarts visibly). The wait cannot be unbounded:
-	// the emitter caps the stream, so a silent stall trims un-drained events.
+	// a silent stall leaves un-drained events in a Valkey that keeps nothing on
+	// disk, and fills it until new events fall to the WAL.
 	SchemaWaitTimeout time.Duration
 
 	// --- Pending-entry reclaim (dead-consumer recovery) ---
@@ -70,6 +71,11 @@ type Config struct {
 	// ClaimInterval is how often (in drain-loop iterations elapsed) reclaim is
 	// attempted. Reclaim runs opportunistically; it need not be on every pass.
 	ClaimInterval time.Duration
+
+	// TrimInterval is how often delivered entries are trimmed from the stream.
+	// Acknowledging an entry does not delete it, so without this the stream grows
+	// until Valkey refuses writes.
+	TrimInterval time.Duration
 
 	// --- Postgres ---
 
@@ -95,6 +101,7 @@ func DefaultConfig() Config {
 		BlockTimeout:    5 * time.Second,
 		ClaimMinIdle:    30 * time.Second,
 		ClaimInterval:   15 * time.Second,
+		TrimInterval:    30 * time.Second,
 		MaxOpenConns:    90,
 		MaxIdleConns:    20,
 		ConnMaxLifetime: 30 * time.Minute,

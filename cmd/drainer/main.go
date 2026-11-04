@@ -49,10 +49,12 @@ type drainSettings struct {
 
 	ClaimMinIdle  string `yaml:"claimMinIdle"`
 	ClaimInterval string `yaml:"claimInterval"`
+	// TrimInterval is how often delivered entries are trimmed; "" uses the default.
+	TrimInterval string `yaml:"trimInterval"`
 
 	// SchemaWaitTimeout bounds the startup wait for the database schema; ""
 	// or "0" uses the default. It cannot be disabled: an unbounded wait would
-	// let the emitter's stream cap trim un-drained events silently.
+	// leave un-drained events in a Valkey that keeps nothing on disk, silently.
 	SchemaWaitTimeout string `yaml:"schemaWaitTimeout"`
 
 	MaxOpenConns    int    `yaml:"maxOpenConns"`
@@ -82,6 +84,16 @@ func main() {
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGTERM, syscall.SIGINT)
 	defer stop()
 
+	rdb := redis.NewClient(&redis.Options{Addr: cfg.ValkeyAddr})
+	defer func() { _ = rdb.Close() }()
+
+	// Trim before anything that depends on Postgres, so a pod crash-looping on an
+	// unreachable database still frees acknowledged entries on each restart.
+	// Trimming uses only Valkey, so this Drainer needs no store.
+	trimCtx, cancelTrim := context.WithTimeout(ctx, 10*time.Second)
+	drain.New(cfg, log, rdb, nil).TrimDelivered(trimCtx)
+	cancelTrim()
+
 	// Postgres: open + Ping (pool_pre_ping equivalent) before consuming, so a
 	// bad DSN fails fast rather than after we've claimed stream entries.
 	pingCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
@@ -92,9 +104,6 @@ func main() {
 	}
 	defer func() { _ = store.Close() }()
 	log.Info.Printf("drainer: postgres connected (maxOpen=%d maxIdle=%d)", cfg.MaxOpenConns, cfg.MaxIdleConns)
-
-	rdb := redis.NewClient(&redis.Options{Addr: cfg.ValkeyAddr})
-	defer func() { _ = rdb.Close() }()
 
 	// The schema gate must never be off in a real binary: 0 disables it, so an
 	// unreadable or unparseable migration set is fatal rather than silently
@@ -157,6 +166,7 @@ func loadConfig(path string) (drain.Config, bool, error) {
 		{s.BlockTimeout, &cfg.BlockTimeout, "blockTimeout"},
 		{s.ClaimMinIdle, &cfg.ClaimMinIdle, "claimMinIdle"},
 		{s.ClaimInterval, &cfg.ClaimInterval, "claimInterval"},
+		{s.TrimInterval, &cfg.TrimInterval, "trimInterval"},
 		{s.ConnMaxLifetime, &cfg.ConnMaxLifetime, "connMaxLifetime"},
 	} {
 		if d.raw == "" {
