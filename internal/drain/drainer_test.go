@@ -221,8 +221,13 @@ func TestDrain_IdempotentRedelivery(t *testing.T) {
 
 	d := New(cfg, testLogger(), rdb, store)
 	// Both entries get consumed; dedup happens in the store.
+	// Check the store first: the group does not exist until Run creates it, and
+	// asking for the pending count before then fails the test.
 	runUntil(t, d, func() bool {
-		return pendingCount(t, rdb, cfg.StreamName, cfg.Group) == 0 && store.calls >= 1
+		store.mu.Lock()
+		called := store.calls >= 1
+		store.mu.Unlock()
+		return called && pendingCount(t, rdb, cfg.StreamName, cfg.Group) == 0
 	}, 2*time.Second)
 
 	if got := store.rowCount(); got != 1 {
