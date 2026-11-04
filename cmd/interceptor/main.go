@@ -350,9 +350,19 @@ func buildEmitter(s *config.Settings, log *logging.Logger) (metering.Emitter, fu
 	em, err := emit.New(cfg, log, rdb)
 	if err != nil {
 		// A failed durable emitter must not take down serving. Fall back to the
-		// log emitter so events are at least recoverable from logs.
-		log.Error.Printf("durable emitter init failed (%v); falling back to log emitter", err)
-		return &metering.LogEmitter{Log: log}, func() {}
+		// log floor, so events are recoverable from logs and the metering metrics
+		// report the failure.
+		log.Error.Printf("durable emitter init failed (%v); falling back to log floor", err)
+		return emit.NewFloorEmitter(log), func() {}
+	}
+
+	if rdb != nil {
+		// In the background, so a slow Valkey cannot delay serving.
+		go func() {
+			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancel()
+			em.CheckBufferBound(ctx)
+		}()
 	}
 
 	return em, func() {

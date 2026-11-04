@@ -10,6 +10,7 @@ import (
 	"net/http/httptest"
 	"net/url"
 	"os"
+	"path/filepath"
 	"strings"
 	"sync/atomic"
 	"syscall"
@@ -22,6 +23,7 @@ import (
 	"github.com/saturncloud/phoebe/internal/emit"
 	"github.com/saturncloud/phoebe/internal/identity"
 	"github.com/saturncloud/phoebe/internal/logging"
+	"github.com/saturncloud/phoebe/internal/metering"
 )
 
 func newMetricsTestServer(t *testing.T) *Server {
@@ -792,24 +794,38 @@ func TestMetricsTotalSeriesStayWithinDocumentedBound(t *testing.T) {
 }
 
 type fakeMeteringHealth struct {
-	probe emit.MeteringProbe
-	err   error
+	probe      emit.MeteringProbe
+	err        error
+	walUnknown bool
+	poisoned   bool
 }
 
-func (fakeMeteringHealth) WALPending() uint64  { return 7 }
-func (fakeMeteringHealth) FloorEvents() uint64 { return 2 }
+func (f fakeMeteringHealth) WALPending() (uint64, bool) {
+	if f.walUnknown {
+		return 0, false
+	}
+	return 7, true
+}
+func (f fakeMeteringHealth) WALPoisoned() bool       { return f.poisoned }
+func (fakeMeteringHealth) WALQuarantinedDirs() int   { return 3 }
+func (fakeMeteringHealth) WALSkippedEntries() uint64 { return 4 }
+func (fakeMeteringHealth) FloorEvents() uint64       { return 2 }
 func (f fakeMeteringHealth) Probe(context.Context) (emit.MeteringProbe, error) {
 	return f.probe, f.err
 }
 
 // TestMeteringHealthMetricsHaveNoLabels: these families describe the replica and
-// Valkey, so they carry no labels at all, and the request families keep theirs.
+// Valkey, so they carry no labels at all.
 func TestMeteringHealthMetricsHaveNoLabels(t *testing.T) {
 	srv := newMetricsTestServer(t).WithMeteringHealth(fakeMeteringHealth{probe: emit.MeteringProbe{
 		StreamEntries: 10, Undelivered: 3, UsedMemory: 100, MaxMemory: 200,
 	}})
 	want := map[string]float64{
 		"phoebe_metering_wal_pending_events":         7,
+		"phoebe_metering_wal_healthy":                1,
+		"phoebe_metering_wal_poisoned":               0,
+		"phoebe_metering_wal_quarantined_dirs":       3,
+		"phoebe_metering_wal_skipped_entries_total":  4,
 		"phoebe_metering_floor_events_total":         2,
 		"phoebe_metering_valkey_up":                  1,
 		"phoebe_metering_stream_entries":             10,
@@ -848,5 +864,95 @@ func TestMeteringHealthProbeFailureReportsValkeyDown(t *testing.T) {
 	}
 	if got := fams["phoebe_metering_wal_pending_events"].GetMetric()[0].GetGauge().GetValue(); got != 7 {
 		t.Fatalf("wal_pending = %v, want 7", got)
+	}
+}
+
+// TestMeteringHealthUnknownWALCountIsNotZero: a broken WAL may hold unshipped
+// events, so it reports healthy=0 and no pending sample, never a pending of 0 that
+// would look like a drained WAL and clear PhoebeMeteringOnWAL.
+func TestMeteringHealthUnknownWALCountIsNotZero(t *testing.T) {
+	srv := newMetricsTestServer(t).WithMeteringHealth(fakeMeteringHealth{walUnknown: true, poisoned: true})
+	fams := phoebeFamilies(t, srv.metrics)
+	if f, ok := fams["phoebe_metering_wal_pending_events"]; ok {
+		t.Fatalf("pending reported while the count is unknown: %v", f)
+	}
+	if got := fams["phoebe_metering_wal_healthy"].GetMetric()[0].GetGauge().GetValue(); got != 0 {
+		t.Fatalf("wal_healthy = %v, want 0", got)
+	}
+	if got := fams["phoebe_metering_wal_poisoned"].GetMetric()[0].GetGauge().GetValue(); got != 1 {
+		t.Fatalf("wal_poisoned = %v, want 1", got)
+	}
+}
+
+// TestMeteringWALFamiliesServedOnRealEmitter: the real emitter reaches the scrape,
+// not only the fake.
+func TestMeteringWALFamiliesServedOnRealEmitter(t *testing.T) {
+	cfg := emit.DefaultConfig()
+	cfg.WALPath = filepath.Join(t.TempDir(), "wal")
+	cfg.ShipInterval = time.Hour
+	em, err := emit.New(cfg, logging.New(logging.ERROR), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = em.Close(context.Background()) })
+	fams := phoebeFamilies(t, newMetricsTestServer(t).WithMeteringHealth(em).metrics)
+	for name, want := range map[string]float64{
+		"phoebe_metering_wal_pending_events":        0,
+		"phoebe_metering_wal_healthy":               1,
+		"phoebe_metering_wal_poisoned":              0,
+		"phoebe_metering_wal_quarantined_dirs":      0,
+		"phoebe_metering_wal_skipped_entries_total": 0,
+	} {
+		f, ok := fams[name]
+		if !ok {
+			t.Errorf("%s missing", name)
+			continue
+		}
+		m := f.GetMetric()[0]
+		if got := m.GetGauge().GetValue() + m.GetCounter().GetValue(); got != want {
+			t.Errorf("%s = %v, want %v", name, got, want)
+		}
+	}
+}
+
+// TestMeteringFamiliesReportFloorEmitterAsFailure: a replica whose durable emitter
+// failed to start must report that through the metrics the alerts read. Each value
+// below is what makes one alert fire, and a missing series would keep it silent.
+func TestMeteringFamiliesReportFloorEmitterAsFailure(t *testing.T) {
+	em := emit.NewFloorEmitter(logging.New(logging.ERROR))
+	srv := newMetricsTestServer(t).WithMeteringHealth(em)
+
+	value := func(fams map[string]*dto.MetricFamily, name string) float64 {
+		t.Helper()
+		f, ok := fams[name]
+		if !ok {
+			t.Fatalf("%s missing", name)
+		}
+		m := f.GetMetric()[0]
+		return m.GetGauge().GetValue() + m.GetCounter().GetValue()
+	}
+
+	fams := phoebeFamilies(t, srv.metrics)
+	if got := value(fams, "phoebe_metering_floor_events_total"); got != 0 {
+		t.Errorf("floor events before any Emit = %v, want 0", got)
+	}
+	for name, want := range map[string]float64{
+		"phoebe_metering_valkey_up":    0,
+		"phoebe_metering_wal_healthy":  0,
+		"phoebe_metering_wal_poisoned": 1,
+	} {
+		if got := value(fams, name); got != want {
+			t.Errorf("%s = %v, want %v", name, got, want)
+		}
+	}
+	// No WAL is open and events may be on disk, so the count must not read as 0.
+	if _, ok := fams["phoebe_metering_wal_pending_events"]; ok {
+		t.Error("wal pending exported with no open WAL")
+	}
+
+	em.Emit(context.Background(), metering.Event{RequestID: "phoebe-1"})
+	em.Emit(context.Background(), metering.Event{RequestID: "phoebe-2"})
+	if got := value(phoebeFamilies(t, srv.metrics), "phoebe_metering_floor_events_total"); got != 2 {
+		t.Errorf("floor events after two Emits = %v, want 2", got)
 	}
 }
