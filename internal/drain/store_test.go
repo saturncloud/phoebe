@@ -2,6 +2,7 @@ package drain
 
 import (
 	"context"
+	"database/sql/driver"
 	"errors"
 	"regexp"
 	"strings"
@@ -398,5 +399,91 @@ func TestPostgresStore_SchemaVersionClampsNegativeToZero(t *testing.T) {
 	}
 	if err := mock.ExpectationsWereMet(); err != nil {
 		t.Fatal(err)
+	}
+}
+
+// probeIDArg matches a probe event's request_id.
+type probeIDArg struct{}
+
+func (probeIDArg) Match(v driver.Value) bool {
+	s, ok := v.(string)
+	return ok && strings.HasPrefix(s, ProbeRequestIDPrefix) && len(s) == len(ProbeRequestIDPrefix)+32
+}
+
+// probeArgs is the probe event's 26 column values with a matcher for its
+// random request_id.
+func probeArgs() []driver.Value {
+	return []driver.Value{
+		probeIDArg{}, nil, "phoebe-probe", nil, nil, "phoebe-probe", "deployment", "phoebe-probe", "phoebe-probe", nil, nil, "dedicated",
+		1, 0, 1, "stop", false, true, 200, false, nil, nil, nil, nil, nil, sqlmock.AnyArg(),
+	}
+}
+
+// TestPostgresStore_ProbeWriteRunsUpsertStatementAndRollsBack: the probe runs the
+// same INSERT real rows use, for one synthetic event with a probe request id, and
+// always rolls the transaction back, never commits.
+func TestPostgresStore_ProbeWriteRunsUpsertStatementAndRollsBack(t *testing.T) {
+	db, mock, err := sqlmock.New()
+	if err != nil {
+		t.Fatalf("sqlmock: %v", err)
+	}
+	defer db.Close()
+	store := NewPostgresStore(db)
+	stmt, _ := upsertStatement([]metering.Event{{}})
+
+	mock.ExpectBegin()
+	mock.ExpectExec(regexp.QuoteMeta(stmt)).WithArgs(probeArgs()...).WillReturnResult(sqlmock.NewResult(0, 1))
+	mock.ExpectRollback()
+
+	if err := store.ProbeWrite(context.Background()); err != nil {
+		t.Fatalf("ProbeWrite: %v", err)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Fatalf("unmet expectations: %v", err)
+	}
+}
+
+// TestPostgresStore_ProbeWriteFails: an INSERT error, an INSERT that reports no
+// row (a rule or trigger skipping it), or a failed rollback each fail the probe.
+func TestPostgresStore_ProbeWriteFails(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		setup func(mock sqlmock.Sqlmock)
+		want  string
+	}{
+		{"insert error", func(mock sqlmock.Sqlmock) {
+			mock.ExpectBegin()
+			mock.ExpectExec("INSERT INTO billing_event").WillReturnError(&pgconn.PgError{Code: "23514"})
+			mock.ExpectRollback()
+		}, "SQLSTATE 23514"},
+		{"no row inserted", func(mock sqlmock.Sqlmock) {
+			mock.ExpectBegin()
+			mock.ExpectExec("INSERT INTO billing_event").WillReturnResult(sqlmock.NewResult(0, 0))
+			mock.ExpectRollback()
+		}, "inserted 0 rows"},
+		{"rollback error", func(mock sqlmock.Sqlmock) {
+			mock.ExpectBegin()
+			mock.ExpectExec("INSERT INTO billing_event").WillReturnResult(sqlmock.NewResult(0, 1))
+			mock.ExpectRollback().WillReturnError(errors.New("connection reset"))
+		}, "rollback"},
+		{"begin error", func(mock sqlmock.Sqlmock) {
+			mock.ExpectBegin().WillReturnError(errors.New("no connection"))
+		}, "begin tx"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			db, mock, err := sqlmock.New()
+			if err != nil {
+				t.Fatalf("sqlmock: %v", err)
+			}
+			defer db.Close()
+			tc.setup(mock)
+			err = NewPostgresStore(db).ProbeWrite(context.Background())
+			if err == nil || !strings.Contains(err.Error(), tc.want) {
+				t.Fatalf("ProbeWrite = %v, want an error containing %q", err, tc.want)
+			}
+			if err := mock.ExpectationsWereMet(); err != nil {
+				t.Fatalf("unmet expectations: %v", err)
+			}
+		})
 	}
 }

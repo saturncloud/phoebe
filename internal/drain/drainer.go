@@ -62,10 +62,26 @@ type Drainer struct {
 	// lastGroupHoldLog throttles the log line about another consumer group holding
 	// the stream during drainWithoutGroup.
 	lastGroupHoldLog time.Time
+	// pausedSince is when the current pause began, that is when storeDown last went
+	// from false to true; zero while not paused. Only the Run goroutine touches it.
+	pausedSince time.Time
+
+	// State published to Valkey (see publishState). Only the Run goroutine
+	// touches these. sentPoisoned and sentMalformed are the parts of poisoned and
+	// malformed already added to the shared counters; the rest is sent by the
+	// next publish that succeeds, so a refused write loses no counts.
+	lastPublish          time.Time
+	publishedPausedSince time.Time
+	publishedOnce        bool
+	sentPoisoned         uint64
+	sentMalformed        uint64
+	lastPublishWarn      time.Time
+	lastPublishFailed    bool
 
 	// poisoned counts events that could not be stored even row-at-a-time
-	// against a healthy store and were dropped (logged + ACK'd). A non-zero
-	// value means billing rows were lost to the log; see upsertRowAtATime.
+	// against a store that accepts writes and were dropped (logged + ACK'd). A
+	// non-zero value means billing rows were lost to the log; see
+	// upsertRowAtATime.
 	poisoned atomic.Uint64
 	// malformed counts entries that could not be decoded and were dropped; see
 	// decodeBatch. The log line is the only copy left once the entry is trimmed.
@@ -96,7 +112,7 @@ func (d *Drainer) storeRetryCap() time.Duration {
 }
 
 // Poisoned returns the number of events dropped as store-poison (failed their
-// own single-row INSERT while the store was reachable) since start. Entries that
+// own single-row INSERT while the store accepted writes) since start. Entries that
 // could not even be decoded are counted by Malformed, not here.
 func (d *Drainer) Poisoned() uint64 { return d.poisoned.Load() }
 
@@ -623,6 +639,9 @@ func (d *Drainer) Run(ctx context.Context) error {
 
 	for {
 		if ctx.Err() != nil {
+			// One last publish, on its own short deadline, so counts from the
+			// final passes are not lost with the process.
+			d.publishState(context.WithoutCancel(ctx))
 			d.log.Info.Printf("drainer: context cancelled, shutting down cleanly")
 			return nil
 		}
@@ -647,6 +666,8 @@ func (d *Drainer) Run(ctx context.Context) error {
 //     doubles the wait from where it was. Reading nothing there clears storeDown but
 //     keeps the wait, because nothing showed the store accepts writes.
 func (d *Drainer) pass(ctx context.Context) {
+	d.publishIfDue(ctx)
+
 	// While the store is failing, reading would only move more entries into
 	// the pending list, which trimming must not pass. They wait unread in the
 	// stream instead. Only a write shows that the store accepts writes, so when
@@ -703,7 +724,7 @@ func (d *Drainer) pass(ctx context.Context) {
 		}
 		d.log.Error.Printf("drainer: drain pass: %v", err)
 		if errors.Is(err, errStoreFailed) {
-			d.noteStoreFailed() // the check at the top of the loop waits
+			d.noteStoreFailed(err) // the check at the top of the loop waits
 			return
 		}
 		if stored > 0 {
@@ -730,8 +751,14 @@ func (d *Drainer) trimIfDue(ctx context.Context) {
 }
 
 // noteStoreFailed records a failed store write: reads stop, and the wait before the
-// next attempt doubles, from storeRetryBase up to storeRetryCap.
-func (d *Drainer) noteStoreFailed() {
+// next attempt doubles, from storeRetryBase up to storeRetryCap. The start of a
+// pause is logged once at ERROR; while it lasts, the throttled lines in pass and
+// storeAnswers say it is still failing.
+func (d *Drainer) noteStoreFailed(err error) {
+	if !d.storeDown {
+		d.pausedSince = d.now()
+		d.log.Error.Printf("drainer: paused: store write failed: %v; billing events stay in Valkey and none are dropped; retrying with backoff (see docs/billing-reconciliation.md, \"Drainer paused\")", err)
+	}
 	d.storeDown = true
 	d.lastStoreFail = d.now()
 	d.storeRetryDelay = min(max(2*d.storeRetryDelay, d.storeRetryBase), d.storeRetryCap())
@@ -743,15 +770,25 @@ func (d *Drainer) noteStoreFailed() {
 // store accepts writes, so the wait is kept and a store that is still failing
 // doubles it from there instead of starting again at storeRetryBase.
 func (d *Drainer) noteStoreWorking(stored int) {
+	paused := d.pauseLength()
 	if stored > 0 {
 		d.storeRetryDelay = 0
 		if d.storeDown {
-			d.log.Info.Printf("drainer: store accepting writes again; resuming")
+			d.log.Info.Printf("drainer: store accepting writes again; resuming after a pause of %s", paused)
 		}
 	} else if d.storeDown {
-		d.log.Info.Printf("drainer: no pending entries left to retry; resuming reads (the store has not yet accepted a write)")
+		d.log.Info.Printf("drainer: no pending entries left to retry; resuming reads after a pause of %s (the store has not yet accepted a write)", paused)
 	}
 	d.storeDown = false
+	d.pausedSince = time.Time{}
+}
+
+// pauseLength is how long the current pause has lasted, rounded to the second.
+func (d *Drainer) pauseLength() time.Duration {
+	if d.pausedSince.IsZero() {
+		return 0
+	}
+	return d.now().Sub(d.pausedSince).Round(time.Second)
 }
 
 // noteRetryProgress records a retry that reread a full batch of this consumer's
@@ -919,24 +956,37 @@ func (d *Drainer) storeBatch(ctx context.Context, events []metering.Event, ids [
 
 // upsertRowAtATime is the poison-isolation slow path, taken only after a batch
 // Upsert failed. Each event is retried in its own statement: rows that succeed
-// are durable as usual; a row that fails ON ITS OWN while the store is
-// otherwise healthy can never be stored, so it is POISON — logged loudly (the
-// full event JSON at ERROR, same spirit as the decode-poison path in process:
-// the log line becomes the only remaining copy of a billing record), counted,
-// and included in the returned ack set so the stream keeps draining instead of
-// redelivering it forever.
+// are durable as usual. A row that fails ON ITS OWN while the store accepts
+// writes can never be stored, so it is POISON: logged loudly (the full event
+// JSON at ERROR, same spirit as the decode-poison path in process: the log line
+// becomes the only remaining copy of a billing record), counted, and included in
+// the returned ack set so the stream keeps draining instead of redelivering it
+// forever.
 //
-// "Otherwise healthy" is the fail-closed guard: a store OUTAGE also fails
-// every individual row, and declaring those poison would ACK-and-drop an
-// entire batch of good billing data. So after an individual failure we Ping;
-// if the store is unreachable we abort the walk and return an error — the
-// caller ACKs only the rows already stored and the remainder redelivers.
+// "Accepts writes" is the fail-closed guard: a store OUTAGE also fails every
+// individual row, and declaring those poison would ACK-and-drop an entire batch
+// of good billing data. So after an individual failure we Ping, and check for a
+// schema gap and for errors that mean the whole store refuses writes; any of
+// those aborts the walk with an error, the caller ACKs only the rows already
+// stored, and the remainder redelivers.
+//
+// A row that failed for any other reason is not dropped during the walk. If at
+// least one row of the batch was stored, the store plainly accepts writes and
+// the failed rows are poison. If NO row was stored, a failure the checks above
+// do not recognise could still be the store's, so a probe write
+// (Store.ProbeWrite) decides: if it fails, the batch is a store failure and
+// nothing is ACK'd, so the drainer pauses with the rows still pending; if it
+// succeeds, the rows are poison. Without the probe a batch of one (the usual
+// size at low traffic) could not be told apart from a broken store.
 //
 // Returns the stream ids safe to ACK (stored rows + poison rows), the number
 // of rows actually stored, and a non-nil error only for an outage, a schema gap,
-// a store that refuses writes (isStoreNotWritable), or cancellation.
+// a store that refuses writes (isStoreNotWritable), a failed probe, or
+// cancellation.
 func (d *Drainer) upsertRowAtATime(ctx context.Context, events []metering.Event, ids []string) (ackable []string, stored int, err error) {
 	ackable = make([]string, 0, len(events))
+	var failed []int // indexes of rows that failed on their own
+	rowErrs := make(map[int]error)
 	for i := range events {
 		uerr := d.store.Upsert(ctx, events[i:i+1])
 		if uerr == nil {
@@ -964,15 +1014,32 @@ func (d *Drainer) upsertRowAtATime(ctx context.Context, events []metering.Event,
 			// store takes writes again.
 			return ackable, stored, fmt.Errorf("store not writable (row error): %w", uerr)
 		}
-		// POISON: the store is up but this row cannot be inserted. Log the
-		// full event so it is recoverable from logs, count it, ACK it.
+		failed = append(failed, i)
+		rowErrs[i] = uerr
+	}
+	if len(failed) == 0 {
+		return ackable, stored, nil
+	}
+	if stored == 0 {
+		// Every row failed. Ask the store whether it takes a write at all.
+		first := rowErrs[failed[0]]
+		if perr := d.store.ProbeWrite(ctx); perr != nil {
+			d.log.Warn.Printf("drainer: all %d row(s) of the batch failed and the probe write failed too, so this is a store failure: keeping the rows and pausing: %v", len(events), perr)
+			return ackable, 0, fmt.Errorf("all %d row(s) failed (first row id=%s request_id=%s: %v) and the probe write failed: %w",
+				len(events), ids[failed[0]], events[failed[0]].RequestID, first, perr)
+		}
+		d.log.Warn.Printf("drainer: all %d row(s) of the batch failed but the probe write succeeded, so the store accepts writes: dropping the rows as poison (first row error: %v)", len(events), first)
+	}
+	for _, i := range failed {
+		// POISON: the store accepts writes but this row cannot be inserted.
+		// Log the full event so it is recoverable from logs, count it, ACK it.
 		raw, merr := json.Marshal(events[i])
 		if merr != nil {
 			raw = []byte(fmt.Sprintf("%+v", events[i]))
 		}
 		n := d.poisoned.Add(1)
 		d.log.Error.Printf("drainer: drop poison row id=%s request_id=%s (total poisoned=%d): %v event=%s",
-			ids[i], events[i].RequestID, n, uerr, raw)
+			ids[i], events[i].RequestID, n, rowErrs[i], raw)
 		ackable = append(ackable, ids[i])
 	}
 	return ackable, stored, nil
@@ -1024,7 +1091,7 @@ func (d *Drainer) reclaim(ctx context.Context) (more bool) {
 		d.log.Error.Printf("drainer: reclaim process: %v", err)
 		d.claimCursor = "0"
 		if errors.Is(err, errStoreFailed) {
-			d.noteStoreFailed()
+			d.noteStoreFailed(err)
 		}
 		return false
 	}
