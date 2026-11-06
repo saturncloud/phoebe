@@ -192,7 +192,8 @@ Page on parked usage (rater exit 4), an unexplained missing-usage attempt, rater
 deletion during a routine run, drainer poison row, the drainer log line
 `drop malformed entry` (an entry that could not be decoded, whose logged values are
 the only copy left once the trim passes it, so it needs repair by hand), the drainer
-log line `valkey is full with no consumer group` (see "A full Valkey" below),
+log line `valkey is full and consumer group "<group>" does not exist; stored and trimmed`
+(see "A full Valkey" below),
 `METERING_FLOOR`, WAL corruption,
 token-push withheld hour (exit 2), manager rejection (exit 3), or push failure
 (exit 1). Alert separately when the oldest Valkey
@@ -242,19 +243,28 @@ schema gate, and every `trimInterval` after that.
   emitters filled a new stream, and `XGROUP CREATE` is refused. After the schema gate
   the drainer reads the oldest batch with `XRANGE`, stores it, trims it, and tries
   again until the group can be created. The log line is
-  `valkey is full with no consumer group`, and it should stop once the group exists.
+  `valkey is full and consumer group "<group>" does not exist; stored and trimmed`,
+  naming the drainer's own group (`group`, `phoebe-drainer` by default). It should
+  stop once that group exists. Other groups, such as a debug consumer, may still be
+  listed by `XINFO GROUPS` while it is logged; its `other groups=` count says how many.
   If Postgres is failing, or the gate has not opened, nothing is trimmed, because an
   entry is removed only once it is stored. If another consumer group is on the stream,
-  the trim stops at what that group has read and acknowledged. When that frees nothing,
+  the trim stops at what that group has read and acknowledged, and only entries below
+  that point are stored. When that frees nothing,
   the drainer logs `holds the stream` with the group's name: let that group read
   further, or delete it with `XGROUP DESTROY` if nothing uses it.
 - **After a Postgres outage.** The drainer stops reading new entries after a failed
   store write, so at most one batch per replica is left pending. It retries by writing
-  that same batch, waiting 500ms after the first failure and twice as long after each
-  later one, up to 30s. A store that answers `Ping` but rejects writes (a schema gap)
-  therefore stays in this state. After a successful write the drainer reads new entries
-  again, and reclaim works through any other pending entries without waiting for
-  `claimInterval` while each batch comes back full.
+  the entries that replica holds, waiting 500ms after the first failure and twice as
+  long after each later one, up to 30s or half of `claimMinIdle`, whichever is shorter
+  (15s with the default 30s `claimMinIdle`), so another replica does not reclaim a
+  batch that is still being retried. A store that answers `Ping` but rejects writes (a
+  schema gap) therefore stays in this state. Once a retry writes successfully, the
+  replica writes the rest of what it holds before it reads new entries. If its entries
+  were reclaimed by another replica, it reads one new batch to test the store, and a
+  failure there keeps the wait growing rather than starting again at 500ms. Reclaim
+  then works through any other pending entries without waiting for `claimInterval`
+  while each batch comes back full.
 
 **Manual relief.** If Postgres or the schema stays broken, the drainer cannot free
 undelivered entries. Raise `maxmemory` on Valkey (`CONFIG SET maxmemory <bytes>`) so

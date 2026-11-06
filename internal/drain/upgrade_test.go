@@ -123,7 +123,7 @@ func TestDrain_SchemaGapRetriesInsteadOfPoisoning(t *testing.T) {
 	if err := d.ensureGroup(ctx); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := d.readAndStore(ctx, cfg.BlockTimeout); err == nil {
+	if _, _, err := d.readAndStore(ctx, ">", cfg.BlockTimeout); err == nil {
 		t.Fatal("a schema gap must surface as a store error, not succeed")
 	}
 	if d.Poisoned() != 0 {
@@ -439,12 +439,12 @@ func TestDrain_RecreatedGroupDrainsEventsEmittedDuringTheWipe(t *testing.T) {
 	mr.Del(cfg.StreamName) // the wipe: stream and group gone
 	xaddEvent(t, rdb, cfg.StreamName, sampleEvent("during-wipe"))
 
-	if _, err := d.readAndStore(ctx, cfg.BlockTimeout); err != nil {
+	if _, _, err := d.readAndStore(ctx, ">", cfg.BlockTimeout); err != nil {
 		t.Fatalf("readAndStore after the wipe = %v, want the group recreated", err)
 	}
 	xaddEvent(t, rdb, cfg.StreamName, sampleEvent("after-recreate"))
 	for i := 0; i < 3 && store.rowCount() < 2; i++ {
-		if _, err := d.readAndStore(ctx, cfg.BlockTimeout); err != nil {
+		if _, _, err := d.readAndStore(ctx, ">", cfg.BlockTimeout); err != nil {
 			t.Fatal(err)
 		}
 	}
