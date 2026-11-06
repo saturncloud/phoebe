@@ -13,6 +13,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/alicebob/miniredis/v2"
 	tidwall "github.com/tidwall/wal"
 
 	"github.com/saturncloud/phoebe/internal/logging"
@@ -206,8 +207,8 @@ func TestWAL_PoisonedFloorsAndRecovers(t *testing.T) {
 		t.Fatalf("pendingCount while poisoned = %d, %v, want 0, false", got, ok)
 	}
 	events, indexes, through, skipped, err := w.pending(0)
-	if err != nil || events != nil || indexes != nil || through != 0 || skipped != 0 {
-		t.Fatalf("pending on poisoned wal = (%v, %d, %d, %v), want clean no-op", events, through, skipped, err)
+	if err != nil || events != nil || indexes != nil || through != 0 || skipped != nil {
+		t.Fatalf("pending on poisoned wal = (%v, %d, %v, %v), want clean no-op", events, through, skipped, err)
 	}
 	if err := w.markShipped(99); err != nil {
 		t.Fatalf("markShipped on poisoned wal should no-op, got %v", err)
@@ -568,5 +569,386 @@ func TestWAL_PreCutoverSpoolReplaysAsDedicated(t *testing.T) {
 		if shipped.ServingMode != want[ev.RequestID] {
 			t.Errorf("request %s serving_mode after re-marshal = %q, want %q", ev.RequestID, shipped.ServingMode, want[ev.RequestID])
 		}
+	}
+}
+
+// ---- undecodable entries: logged raw, counted once ----------------------------
+
+// walWithCapturedErrors opens a WAL whose ERROR log is returned for assertions.
+func walWithCapturedErrors(t *testing.T) (*wal, *bytes.Buffer) {
+	t.Helper()
+	var logged bytes.Buffer
+	logger := logging.New(logging.ERROR)
+	logger.Error.SetOutput(&logged)
+	w, err := openWAL(tmpWALPath(t), logger)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = w.close() })
+	return w, &logged
+}
+
+// TestWAL_UndecodableEntryIsLoggedWithRawBytes: the shipper truncates past an entry
+// it cannot decode, so the log line must hold the raw bytes before the truncate. The
+// wrongly typed field is the case a rolling upgrade produces: valid JSON that still
+// fails to decode.
+func TestWAL_UndecodableEntryIsLoggedWithRawBytes(t *testing.T) {
+	for _, tc := range []struct {
+		name, raw, want string
+	}{
+		{"garbage bytes", "\x00 not json", `\x00 not json`},
+		{"wrongly typed field", `{"request_id":"r-lost","prompt_tokens":"eleven"}`, `r-lost`},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			w, logged := walWithCapturedErrors(t)
+			if err := w.append(makeEvent("ok")); err != nil {
+				t.Fatal(err)
+			}
+			appendRaw(t, w, []byte(tc.raw))
+
+			events, _, through, skipped, err := w.pending(0)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if len(events) != 1 || len(skipped) != 1 || skipped[0] != 2 || through != 2 {
+				t.Fatalf("pending = %d events, skipped %v, through %d", len(events), skipped, through)
+			}
+			// Asserted before markShipped: the copy must exist before the truncate.
+			for _, want := range []string{"index=2", tc.want} {
+				if !strings.Contains(logged.String(), want) {
+					t.Fatalf("log %q does not contain %q", logged.String(), want)
+				}
+			}
+		})
+	}
+}
+
+// TestWAL_UndecodableEntryLogLineIsBounded: one oversized entry must not produce an
+// unbounded log line, and the line records the full length so a cut copy is obvious.
+func TestWAL_UndecodableEntryLogLineIsBounded(t *testing.T) {
+	w, logged := walWithCapturedErrors(t)
+	appendRaw(t, w, []byte(strings.Repeat("x", 3*maxLoggedRawEntry)))
+	if _, _, _, _, err := w.pending(0); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(logged.String(), fmt.Sprintf("(%d bytes)", 3*maxLoggedRawEntry)) {
+		t.Fatalf("log does not record the full length: %.200q", logged.String())
+	}
+	if got := strings.Count(logged.String(), "x"); got > maxLoggedRawEntry+10 {
+		t.Fatalf("log holds %d bytes of the entry, limit %d", got, maxLoggedRawEntry)
+	}
+}
+
+// TestWAL_UndecodableEntryIsLoggedOncePerProcess: while Valkey refuses writes the
+// shipper re-reads the same entry on every tick, and a reopen re-reads it again.
+// Neither may repeat the raw line.
+func TestWAL_UndecodableEntryIsLoggedOncePerProcess(t *testing.T) {
+	w, logged := walWithCapturedErrors(t)
+	appendRaw(t, w, []byte("\x00 not json"))
+	for range 3 {
+		if _, _, _, _, err := w.pending(0); err != nil {
+			t.Fatal(err)
+		}
+	}
+	w.mu.Lock()
+	w.recoverLocked()
+	w.mu.Unlock()
+	if _, _, _, _, err := w.pending(0); err != nil {
+		t.Fatal(err)
+	}
+	if got := strings.Count(logged.String(), "undecodable wal entry"); got != 1 {
+		t.Fatalf("raw line logged %d times, want 1: %s", got, logged.String())
+	}
+}
+
+// TestWAL_ReopenDoesNotRecountSkippedEntries: the log retains its tail entry and a
+// reopen forgets the shipped watermark, so a corrupt tail entry is read again. The
+// counter says how many records were lost, and this is still one.
+func TestWAL_ReopenDoesNotRecountSkippedEntries(t *testing.T) {
+	mr := miniredis.RunT(t)
+	cfg := testConfig(t, mr)
+	cfg.ShipInterval = time.Hour
+	rdb := redisClient(mr.Addr())
+	t.Cleanup(func() { _ = rdb.Close() })
+	em, err := New(cfg, testLogger(), rdb)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = em.Close(context.Background()) })
+
+	appendRaw(t, em.wal, []byte("\x00 not json"))
+	em.drainWAL()
+	if got := em.WALSkippedEntries(); got != 1 {
+		t.Fatalf("WALSkippedEntries after the first drain = %d, want 1", got)
+	}
+	em.wal.mu.Lock()
+	em.wal.recoverLocked()
+	em.wal.mu.Unlock()
+	em.drainWAL()
+	if got := em.WALSkippedEntries(); got != 1 {
+		t.Fatalf("WALSkippedEntries after a reopen = %d, want 1", got)
+	}
+	// A later corrupt entry is a new loss and must still count.
+	appendRaw(t, em.wal, []byte("\x00 also not json"))
+	em.drainWAL()
+	if got := em.WALSkippedEntries(); got != 2 {
+		t.Fatalf("WALSkippedEntries after a new corrupt entry = %d, want 2", got)
+	}
+}
+
+// TestWAL_QuarantineClearsSkipWatermarks: a quarantine replaces the log and indexes
+// restart from 1, so a watermark from the old log would hide new corrupt entries from
+// both the counter and the raw log line.
+func TestWAL_QuarantineClearsSkipWatermarks(t *testing.T) {
+	w, logged := walWithCapturedErrors(t)
+	appendRaw(t, w, []byte("\x00 old 1"))
+	appendRaw(t, w, []byte("\x00 old 2"))
+	_, _, through, _, err := w.pending(0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := w.markShipped(through); err != nil {
+		t.Fatal(err)
+	}
+
+	w.mu.Lock()
+	_ = w.log.Close()
+	w.log = nil
+	tearTailSegment(t, w.dir)
+	if !w.recoverLocked() {
+		w.mu.Unlock()
+		t.Fatal("recovery failed")
+	}
+	w.mu.Unlock()
+	if got := w.quarantinedDirs(); got != 1 {
+		t.Fatalf("quarantinedDirs = %d, want 1", got)
+	}
+
+	logged.Reset()
+	appendRaw(t, w, []byte("\x00 new"))
+	_, _, _, skipped, err := w.pending(0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(skipped) != 1 || skipped[0] != 1 {
+		t.Fatalf("skipped on the new log = %v, want [1]", skipped)
+	}
+	if !strings.Contains(logged.String(), "new") {
+		t.Fatalf("new corrupt entry not logged: %q", logged.String())
+	}
+}
+
+// TestMarkPartialBatch_TruncateFailureKeepsEntriesAndDoesNotCountSkips: when the
+// truncate fails after a partial ship, the watermark must not move, so nothing is
+// lost, and the corrupt entry the prefix covered is counted once, on the retry.
+func TestMarkPartialBatch_TruncateFailureKeepsEntriesAndDoesNotCountSkips(t *testing.T) {
+	cfg := testConfig(t, nil)
+	cfg.ShipInterval = time.Hour
+	var logged bytes.Buffer
+	logger := logging.New(logging.ERROR)
+	logger.Error.SetOutput(&logged)
+	rdb := &oomAfterXAdd{allowed: 1 << 30}
+	em, err := New(cfg, logger, rdb)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = em.Close(context.Background()) })
+
+	if err := em.wal.append(makeEvent("r-0")); err != nil {
+		t.Fatal(err)
+	}
+	appendRaw(t, em.wal, []byte("\x00 not json"))
+	for _, id := range []string{"r-1", "r-2"} {
+		if err := em.wal.append(makeEvent(id)); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	// Ship two events, passing the corrupt entry, and close the log underneath so
+	// that the truncate after them fails.
+	em.shipFn = func([]metering.Event) int {
+		em.wal.mu.Lock()
+		defer em.wal.mu.Unlock()
+		if err := em.wal.log.Close(); err != nil {
+			t.Error(err)
+		}
+		return 2
+	}
+	em.drainWAL()
+	if !strings.Contains(logged.String(), "wal truncate after partial ship") {
+		t.Fatalf("truncate failure not logged: %q", logged.String())
+	}
+	if got := em.WALSkippedEntries(); got != 0 {
+		t.Fatalf("WALSkippedEntries after a failed truncate = %d, want 0", got)
+	}
+
+	// Clear the failure. Every event must still be there to read.
+	em.wal.mu.Lock()
+	em.wal.recoverLocked()
+	em.wal.mu.Unlock()
+	events, _, _, _, err := em.wal.pending(0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(events) != 3 {
+		t.Fatalf("pending after a failed truncate = %d events, want 3", len(events))
+	}
+
+	em.shipFn = em.shipBatch
+	em.drainWAL()
+	if got := strings.Join(rdb.ids, ","); got != "r-0,r-1,r-2" {
+		t.Fatalf("shipped %s, want every event", got)
+	}
+	if got := walPendingCount(t, em); got != 0 {
+		t.Fatalf("WALPending after the retry = %d, want 0", got)
+	}
+	if got := em.WALSkippedEntries(); got != 1 {
+		t.Fatalf("WALSkippedEntries after the retry = %d, want 1", got)
+	}
+}
+
+// ---- quarantine only on corruption, and an honest count of it -----------------
+
+// TestOpenLog_TransientErrorDoesNotQuarantine: an open error that says nothing about
+// the data must leave the directory in place, because it holds valid unshipped
+// events. The wal stays poisoned and heals when the error clears.
+func TestOpenLog_TransientErrorDoesNotQuarantine(t *testing.T) {
+	if os.Geteuid() == 0 {
+		t.Skip("root ignores directory permissions")
+	}
+	path := tmpWALPath(t)
+	w := openTestWAL(t, path)
+	defer w.close() //nolint:errcheck
+	if err := w.append(makeEvent("unshipped")); err != nil {
+		t.Fatal(err)
+	}
+
+	w.mu.Lock()
+	_ = w.log.Close()
+	w.log = nil
+	w.mu.Unlock()
+	if err := os.Chmod(path, 0); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.Chmod(path, 0o755) })
+
+	if _, _, err := openLog(path, testLogger()); err == nil {
+		t.Fatal("openLog on an unreadable directory should error")
+	}
+	w.mu.Lock()
+	recovered := w.recoverLocked()
+	w.mu.Unlock()
+	if recovered || !w.isPoisoned() {
+		t.Fatalf("recovered = %v, poisoned = %v, want a poisoned wal", recovered, w.isPoisoned())
+	}
+	if got := corruptDirCount(t, path); got != 0 {
+		t.Fatalf(".corrupt dirs after a transient error = %d, want 0", got)
+	}
+
+	if err := os.Chmod(path, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	events, _, _, _, err := w.pending(0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(events) != 1 || events[0].RequestID != "unshipped" {
+		t.Fatalf("events after the error cleared = %+v, want the unshipped one", events)
+	}
+	if w.isPoisoned() {
+		t.Fatal("wal still poisoned after the error cleared")
+	}
+}
+
+// TestOpenLog_DamagedSegmentIsQuarantined: real damage must still move aside, or a
+// corrupt buffer would block the WAL forever.
+func TestOpenLog_DamagedSegmentIsQuarantined(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		segment string
+		content []byte
+	}{
+		{"garbage segment (ErrCorrupt)", "00000000000000000001", []byte{0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF}},
+		{"empty tail segment past index 1 (ErrEmptyLog)", "00000000000000000005", nil},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			path := tmpWALPath(t)
+			if err := os.MkdirAll(path, 0o755); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(filepath.Join(path, tc.segment), tc.content, 0o644); err != nil {
+				t.Fatal(err)
+			}
+			l, _, err := openLog(path, testLogger())
+			if err != nil {
+				t.Fatalf("openLog: %v", err)
+			}
+			defer l.Close() //nolint:errcheck
+			if got := corruptDirCount(t, path); got != 1 {
+				t.Fatalf(".corrupt dirs = %d, want 1", got)
+			}
+		})
+	}
+}
+
+// TestQuarantinedDirs_PathWithGlobMetacharacters: the WAL path is configuration, so a
+// '[' in it must not make the count fail or read 0.
+func TestQuarantinedDirs_PathWithGlobMetacharacters(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "wal[x")
+	w := openTestWAL(t, path)
+	defer w.close() //nolint:errcheck
+	if err := os.Mkdir(path+".corrupt.1", 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if got := w.quarantinedDirs(); got != 1 {
+		t.Fatalf("quarantinedDirs = %d, want 1", got)
+	}
+}
+
+// TestQuarantinedDirs_UnreadableIsUnknownNotZero: zero tells an operator that no
+// unbilled data is set aside, so a count that could not be taken must not read 0.
+func TestQuarantinedDirs_UnreadableIsUnknownNotZero(t *testing.T) {
+	parent := filepath.Join(t.TempDir(), "gone")
+	if err := os.Mkdir(parent, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	var logged bytes.Buffer
+	logger := logging.New(logging.ERROR)
+	logger.Error.SetOutput(&logged)
+	w, err := openWAL(filepath.Join(parent, "wal"), logger)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer w.close() //nolint:errcheck
+	if err := os.RemoveAll(parent); err != nil {
+		t.Fatal(err)
+	}
+	if got := w.quarantinedDirs(); got != quarantinedDirsUnknown {
+		t.Fatalf("quarantinedDirs = %d, want the unknown value", got)
+	}
+	if !strings.Contains(logged.String(), "cannot count quarantined") {
+		t.Fatalf("failed count not logged: %q", logged.String())
+	}
+}
+
+// TestFloorEmitter_ReportsQuarantinedDirsOnDisk: a failed start can leave corrupt
+// directories holding unbilled events. The replica running the floor emitter is the
+// one an operator most needs this count from.
+func TestFloorEmitter_ReportsQuarantinedDirsOnDisk(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "wal")
+	for _, name := range []string{".corrupt.1", ".corrupt.2", "-other"} {
+		if err := os.Mkdir(path+name, 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if got := NewFloorEmitter(testLogger(), path).WALQuarantinedDirs(); got != 2 {
+		t.Fatalf("WALQuarantinedDirs = %d, want 2", got)
+	}
+	if got := NewFloorEmitter(testLogger(), "").WALQuarantinedDirs(); got != 0 {
+		t.Fatalf("WALQuarantinedDirs with no WAL path = %d, want 0", got)
+	}
+	missing := filepath.Join(path+"-absent", "wal")
+	if got := NewFloorEmitter(testLogger(), missing).WALQuarantinedDirs(); got != quarantinedDirsUnknown {
+		t.Fatalf("WALQuarantinedDirs on an unreadable parent = %d, want the unknown value", got)
 	}
 }

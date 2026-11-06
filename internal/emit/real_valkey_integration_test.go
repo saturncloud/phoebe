@@ -188,9 +188,10 @@ func TestRealValkeyRefusedXAddGoesToWALAndShipsOnce(t *testing.T) {
 	}
 }
 
-// TestRealValkeyProbeUnknownLagReadsAsWholeStream: deleting an entry above a group's
-// position makes real Valkey report nil lag, which must not read as caught up.
-func TestRealValkeyProbeUnknownLagReadsAsWholeStream(t *testing.T) {
+// TestRealValkeyProbeUnknownLagCountsEntriesAfterPosition: deleting an entry above a
+// group's position makes real Valkey report nil lag, which must not read as caught
+// up. Acked entries the trim has not reached yet must not read as undelivered.
+func TestRealValkeyProbeUnknownLagCountsEntriesAfterPosition(t *testing.T) {
 	addr := os.Getenv("PHOEBE_TEST_ADMISSION_VALKEY_ADDR")
 	if addr == "" {
 		t.Fatal("PHOEBE_TEST_ADMISSION_VALKEY_ADDR is required")
@@ -238,7 +239,26 @@ func TestRealValkeyProbeUnknownLagReadsAsWholeStream(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	// Two pending, plus ids[2], ids[4] and ids[5] after the group's position.
 	if p.StreamEntries != 5 || p.Undelivered != 5 {
-		t.Fatalf("%+v, want Undelivered equal to XLEN (5)", p)
+		t.Fatalf("%+v, want 5 entries and 5 undelivered", p)
+	}
+
+	if err := rdb.XAck(ctx, cfg.StreamName, "g", ids[0], ids[1]).Err(); err != nil {
+		t.Fatal(err)
+	}
+	groups, err = rdb.XInfoGroups(ctx, cfg.StreamName).Result()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(groups) != 1 || groups[0].Lag != -1 {
+		t.Fatalf("setup after ack: groups = %+v, want one group with unknown lag", groups)
+	}
+	p, err = em.Probe(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if p.StreamEntries != 5 || p.Undelivered != 3 {
+		t.Fatalf("%+v, want 5 entries and 3 undelivered: the acked two are stored", p)
 	}
 }
