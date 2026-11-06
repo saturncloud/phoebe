@@ -73,8 +73,8 @@ var _ metering.Emitter = (*DurableEmitter)(nil)
 // whether that count can be trusted. See wal.pendingCount.
 func (e *DurableEmitter) WALPending() (uint64, bool) { return e.wal.pendingCount() }
 
-// WALPoisoned reports whether this replica's WAL has no open log because the
-// recovery reopen is failing.
+// WALPoisoned reports whether this replica's WAL has no open log because its
+// open, at startup or in a recovery reopen, is failing.
 func (e *DurableEmitter) WALPoisoned() bool { return e.wal.isPoisoned() }
 
 // WALQuarantinedDirs returns how many corrupt WAL directories were moved aside

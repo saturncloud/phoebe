@@ -16,7 +16,9 @@ import (
 var errNoDurableEmitter = errors.New("emit: durable emitter failed to initialise")
 
 // FloorEmitter is the metering emitter a replica runs when the durable emitter
-// could not start, for example because the WAL cannot be opened. Serving
+// could not start: a corrupt WAL that cannot be quarantined, or a legacy WAL import
+// that fails. (A WAL that cannot be opened for any other reason does not land here:
+// the durable emitter starts with a poisoned wal and retries the open.) Serving
 // continues, so every event goes straight to the log floor, in the same format
 // DurableEmitter uses and internal/recovery parses.
 //
@@ -27,6 +29,9 @@ type FloorEmitter struct {
 	log         *logging.Logger
 	walPath     string
 	floorEvents atomic.Uint64
+
+	// quarantineLog throttles the log line of a failed WALQuarantinedDirs count.
+	quarantineLog quarantineCountLog
 }
 
 var _ metering.Emitter = (*FloorEmitter)(nil)
@@ -63,7 +68,7 @@ func (f *FloorEmitter) WALQuarantinedDirs() int {
 	if f.walPath == "" {
 		return 0
 	}
-	return quarantinedDirsOrUnknown(f.walPath, f.log)
+	return quarantinedDirsOrUnknown(f.walPath, f.log, &f.quarantineLog)
 }
 
 // WALSkippedEntries returns 0: this emitter reads no WAL entries.

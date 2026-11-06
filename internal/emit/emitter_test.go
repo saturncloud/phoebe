@@ -1238,16 +1238,29 @@ func TestEmitter_RaceStress(t *testing.T) {
 	t.Logf("total emits: %d, stream len: %d", total.Load(), streamLen(t, rdb, cfg.StreamName))
 }
 
-// ---- File-not-writable: New returns error, not panic -----------------------
+// ---- File-not-writable: New starts poisoned, not panicking or failing ------
 
-func TestNew_InvalidWALPath_ReturnsError(t *testing.T) {
+// TestNew_UnwritableWALPathStartsPoisonedAndFloors: a WAL path that cannot be
+// opened for a reason other than corruption must not fail New (which would leave
+// the process on the floor emitter with no retry) or panic. The emitter starts with
+// a poisoned wal, and an event it cannot write reaches the log floor.
+func TestNew_UnwritableWALPathStartsPoisonedAndFloors(t *testing.T) {
 	cfg := DefaultConfig()
 	cfg.WALPath = "/proc/not-writable/wal.jsonl"
 	cfg.ValkeyAddr = "localhost:0"
+	cfg.ShipInterval = time.Hour
 
-	_, err := New(cfg, testLogger(), nil)
-	if err == nil {
-		t.Fatal("expected error for unwritable WAL path, got nil")
+	em, err := New(cfg, testLogger(), nil)
+	if err != nil {
+		t.Fatalf("New on an unwritable WAL path = %v, want a poisoned wal", err)
+	}
+	t.Cleanup(func() { _ = em.Close(context.Background()) })
+	if !em.WALPoisoned() {
+		t.Fatal("WALPoisoned = false on an unwritable WAL path")
+	}
+	em.walOrLog(makeEvent("floored"))
+	if got := em.FloorEvents(); got != 1 {
+		t.Fatalf("FloorEvents = %d, want 1", got)
 	}
 }
 
