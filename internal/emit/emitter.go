@@ -397,6 +397,74 @@ type MeteringProbe struct {
 	Undelivered   int64 // entries not yet stored: pending plus not yet read
 	UsedMemory    int64 // Valkey used_memory, bytes
 	MaxMemory     int64 // Valkey maxmemory, bytes; 0 means no cap
+
+	// Drainer is the state the drainer publishes to Valkey, or nil when it is
+	// unknown: the read failed, or no drainer has published yet (no key).
+	Drainer *DrainerState
+}
+
+// DrainerFreshWindow is how recently a drainer consumer must have published for
+// its pause state to count. A drainer publishes at least every 15 s while it
+// runs, so a consumer older than this has stopped, or is stuck before its loop.
+const DrainerFreshWindow = 120 * time.Second
+
+// DrainerState is the drainer state read from its hash (metering.DrainerStateKey).
+type DrainerState struct {
+	// PoisonDropped and UndecodableDropped are the shared drop counters; 0 when
+	// the key exists but no drop has been counted.
+	PoisonDropped      int64
+	UndecodableDropped int64
+	// AnySeen reports whether any consumer has a seen time; LastSeenAge is the
+	// age of the newest one.
+	AnySeen     bool
+	LastSeenAge time.Duration
+	// Fresh reports whether any consumer published within DrainerFreshWindow.
+	// Paused and PausedFor describe only those consumers: Paused is true when any
+	// of them is paused, and PausedFor is the longest current pause among them.
+	Fresh     bool
+	Paused    bool
+	PausedFor time.Duration
+}
+
+// parseDrainerState reads the drainer hash's fields as of now. A field whose
+// value does not parse is ignored. A seen or pause time in the future (clock
+// skew between pods) reads as an age of 0.
+func parseDrainerState(fields map[string]string, now time.Time) DrainerState {
+	var st DrainerState
+	num := func(f string) (int64, bool) {
+		v, ok := fields[f]
+		if !ok {
+			return 0, false
+		}
+		n, err := strconv.ParseInt(v, 10, 64)
+		return n, err == nil
+	}
+	st.PoisonDropped, _ = num(metering.DrainerFieldDroppedPoison)
+	st.UndecodableDropped, _ = num(metering.DrainerFieldDroppedUndecodable)
+	for f := range fields {
+		consumer, ok := strings.CutSuffix(f, metering.DrainerFieldSeen)
+		if !ok {
+			continue
+		}
+		seen, ok := num(f)
+		if !ok {
+			continue
+		}
+		age := max(now.Sub(time.Unix(seen, 0)), 0)
+		if !st.AnySeen || age < st.LastSeenAge {
+			st.LastSeenAge = age
+		}
+		st.AnySeen = true
+		if age > DrainerFreshWindow {
+			continue
+		}
+		st.Fresh = true
+		if since, ok := num(consumer + metering.DrainerFieldPausedSince); ok && since > 0 {
+			st.Paused = true
+			st.PausedFor = max(st.PausedFor, now.Sub(time.Unix(since, 0)))
+		}
+	}
+	return st
 }
 
 // Probe reads the stream and Valkey's memory. Every command it runs still works
@@ -418,6 +486,13 @@ func (e *DurableEmitter) Probe(ctx context.Context) (MeteringProbe, error) {
 	}
 	p.UsedMemory = infoInt(info, "used_memory")
 	p.MaxMemory = infoInt(info, "maxmemory")
+	// The drainer's state is read next, before the groups for the same reason.
+	// A failed read leaves it unknown and does not fail the probe: the stream
+	// and memory numbers are still good.
+	if fields, err := e.rdb.HGetAll(ctx, metering.DrainerStateKey(e.cfg.StreamName)).Result(); err == nil && len(fields) > 0 {
+		st := parseDrainerState(fields, e.now())
+		p.Drainer = &st
+	}
 	groups, err := e.rdb.XInfoGroups(ctx, e.cfg.StreamName).Result()
 	if err != nil {
 		if !strings.Contains(err.Error(), "no such key") {
