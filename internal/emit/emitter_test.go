@@ -1633,26 +1633,57 @@ type fakeValkeyState struct {
 	entries int64
 	groups  []redis.XInfoGroup
 
-	// afterPosition answers XRangeN, as the entries after a group's position, and
-	// scanStart records the start ID it was asked for.
+	// afterPosition answers XRangeN as the entries after a group's position, in
+	// order. A scan that starts after one of these entries' IDs gets the entries
+	// that follow it, so a paged scan walks the slice. scanStart records the start
+	// ID of the first call, and scanCalls counts the calls.
 	afterPosition []redis.XMessage
 	scanErr       error
 	scanStart     string
+	scanCalls     int
+	// scanBlocks makes XRangeN wait until its context ends, like a slow Valkey.
+	scanBlocks bool
 }
 
 func (f *fakeValkeyState) XRangeN(ctx context.Context, _, start, _ string, count int64) *redis.XMessageSliceCmd {
-	f.scanStart = start
+	f.scanCalls++
+	if f.scanCalls == 1 {
+		f.scanStart = start
+	}
 	cmd := redis.NewXMessageSliceCmd(ctx)
+	if f.scanBlocks {
+		<-ctx.Done()
+		cmd.SetErr(ctx.Err())
+		return cmd
+	}
 	if f.scanErr != nil {
 		cmd.SetErr(f.scanErr)
 		return cmd
 	}
 	msgs := f.afterPosition
+	if start != f.scanStart {
+		for i, m := range msgs {
+			if "("+m.ID == start {
+				msgs = msgs[i+1:]
+				break
+			}
+		}
+	}
 	if int64(len(msgs)) > count {
 		msgs = msgs[:count]
 	}
 	cmd.SetVal(msgs)
 	return cmd
+}
+
+// entriesAfterPosition builds n stream entries with increasing IDs, as the
+// entries after a group whose last delivered ID is 7-0.
+func entriesAfterPosition(n int) []redis.XMessage {
+	msgs := make([]redis.XMessage, n)
+	for i := range msgs {
+		msgs[i].ID = fmt.Sprintf("%d-0", 8+i)
+	}
+	return msgs
 }
 
 func (f *fakeValkeyState) Info(ctx context.Context, _ ...string) *redis.StringCmd {
@@ -1768,6 +1799,8 @@ func TestProbe_UnknownLagAfterTrimDoesNotCountAckedEntries(t *testing.T) {
 	}{
 		{"all stored", 0, 0, 0},
 		{"pending and unread", 2, 3, 5},
+		{"exactly one page", 1, unknownLagScanPage, unknownLagScanPage + 1},
+		{"spans pages under the limit", 0, unknownLagScanPage + 7, unknownLagScanPage + 7},
 		{"scan reaches its limit: upper bound", 0, unknownLagScanLimit, 100},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
@@ -1776,7 +1809,7 @@ func TestProbe_UnknownLagAfterTrimDoesNotCountAckedEntries(t *testing.T) {
 			fake := &fakeValkeyState{
 				entries:       100,
 				groups:        []redis.XInfoGroup{{Pending: tc.pending, Lag: -1, LastDeliveredID: "7-0"}},
-				afterPosition: make([]redis.XMessage, tc.after),
+				afterPosition: entriesAfterPosition(tc.after),
 			}
 			em, err := New(cfg, testLogger(), fake)
 			if err != nil {
@@ -1794,5 +1827,101 @@ func TestProbe_UnknownLagAfterTrimDoesNotCountAckedEntries(t *testing.T) {
 				t.Fatalf("scan started at %q, want exclusive of the last delivered ID", fake.scanStart)
 			}
 		})
+	}
+}
+
+// TestProbe_UnknownLagScanPagesBoundEachReply: no single XRANGE reply may carry
+// more than one page of entries, so a scan of a backlog under the limit takes
+// several small replies instead of one large one.
+func TestProbe_UnknownLagScanPagesBoundEachReply(t *testing.T) {
+	cfg := testConfig(t, nil)
+	cfg.ShipInterval = time.Hour
+	fake := &fakeValkeyState{
+		entries:       unknownLagScanLimit - 1,
+		groups:        []redis.XInfoGroup{{Lag: -1, LastDeliveredID: "7-0"}},
+		afterPosition: entriesAfterPosition(2 * unknownLagScanPage),
+	}
+	em, err := New(cfg, testLogger(), fake)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = em.Close(context.Background()) })
+	p, err := em.Probe(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Two full pages reach the limit, so the stream length is the upper bound.
+	if p.Undelivered != unknownLagScanLimit-1 {
+		t.Fatalf("Undelivered = %d, want the stream length %d", p.Undelivered, unknownLagScanLimit-1)
+	}
+	if fake.scanCalls != 2 {
+		t.Fatalf("scan made %d XRANGE calls, want 2 pages", fake.scanCalls)
+	}
+}
+
+// TestProbe_UnknownLagSkipsScanWhenStreamAtLimit: when the stream already holds
+// at least the scan limit, a scan could only end at the upper bound, so the probe
+// reports the stream length without sending any XRANGE.
+func TestProbe_UnknownLagSkipsScanWhenStreamAtLimit(t *testing.T) {
+	for _, entries := range []int64{unknownLagScanLimit, 10 * unknownLagScanLimit} {
+		t.Run(fmt.Sprint(entries), func(t *testing.T) {
+			cfg := testConfig(t, nil)
+			cfg.ShipInterval = time.Hour
+			fake := &fakeValkeyState{
+				entries:       entries,
+				groups:        []redis.XInfoGroup{{Lag: -1, LastDeliveredID: "7-0"}},
+				afterPosition: entriesAfterPosition(3),
+			}
+			em, err := New(cfg, testLogger(), fake)
+			if err != nil {
+				t.Fatal(err)
+			}
+			t.Cleanup(func() { _ = em.Close(context.Background()) })
+			p, err := em.Probe(context.Background())
+			if err != nil {
+				t.Fatal(err)
+			}
+			if p.Undelivered != entries {
+				t.Fatalf("Undelivered = %d, want the stream length %d", p.Undelivered, entries)
+			}
+			if fake.scanCalls != 0 {
+				t.Fatalf("probe sent %d XRANGE calls, want none", fake.scanCalls)
+			}
+		})
+	}
+}
+
+// TestProbe_SlowUnknownLagScanStillReportsMemory: a slow scan must not use up the
+// probe's context and fail the memory read. The probe still succeeds, reports the
+// stream length as the upper bound, and fills the memory fields.
+func TestProbe_SlowUnknownLagScanStillReportsMemory(t *testing.T) {
+	cfg := testConfig(t, nil)
+	cfg.ShipInterval = time.Hour
+	fake := &fakeValkeyState{
+		info:       "used_memory:1234\r\nmaxmemory:5678\r\n",
+		entries:    100,
+		groups:     []redis.XInfoGroup{{Pending: 2, Lag: -1, LastDeliveredID: "7-0"}},
+		scanBlocks: true,
+	}
+	em, err := New(cfg, testLogger(), fake)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = em.Close(context.Background()) })
+	// A probe deadline longer than the scan's own timeout, as in production.
+	ctx, cancel := context.WithTimeout(context.Background(), 4*unknownLagScanTimeout)
+	defer cancel()
+	p, err := em.Probe(ctx)
+	if err != nil {
+		t.Fatalf("Probe: %v", err)
+	}
+	if ctx.Err() != nil {
+		t.Fatal("the scan used up the probe's context; it must stop at its own timeout")
+	}
+	if p.Undelivered != p.StreamEntries {
+		t.Fatalf("Undelivered = %d, want the stream length %d", p.Undelivered, p.StreamEntries)
+	}
+	if p.UsedMemory != 1234 || p.MaxMemory != 5678 {
+		t.Fatalf("memory = %d/%d, want 1234/5678", p.UsedMemory, p.MaxMemory)
 	}
 }
