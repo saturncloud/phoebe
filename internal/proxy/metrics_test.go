@@ -878,31 +878,56 @@ func TestMeteringHealthMetricsValuesAndNoLabels(t *testing.T) {
 }
 
 // TestMeteringHealthUnhealthyWALMetricsHaveNoLabels: the unknown-count path carries
-// no labels either, and it leaves out only the pending series.
+// no labels either, and it leaves out only the pending series. The probe families
+// stay, so PhoebeMeteringDrainerBehind still reads them on an unhealthy replica.
 func TestMeteringHealthUnhealthyWALMetricsHaveNoLabels(t *testing.T) {
-	srv := newMetricsTestServer(t).WithMeteringHealth(fakeMeteringHealth{walUnknown: true, poisoned: true})
+	srv := newMetricsTestServer(t).WithMeteringHealth(fakeMeteringHealth{walUnknown: true, poisoned: true, probe: emit.MeteringProbe{
+		StreamEntries: 10, Undelivered: 3, UsedMemory: 100, MaxMemory: 200,
+	}})
 	fams := phoebeFamilies(t, srv.metrics)
 	if _, ok := fams["phoebe_metering_wal_pending_events"]; ok {
 		t.Error("pending reported while the count is unknown")
 	}
-	for _, name := range []string{
-		"phoebe_metering_wal_healthy",
-		"phoebe_metering_wal_poisoned",
-		"phoebe_metering_wal_quarantined_dirs",
-		"phoebe_metering_wal_skipped_entries_total",
-		"phoebe_metering_floor_events_total",
-		"phoebe_metering_valkey_up",
-	} {
+	want := map[string]float64{
+		"phoebe_metering_wal_healthy":                0,
+		"phoebe_metering_wal_poisoned":               1,
+		"phoebe_metering_wal_quarantined_dirs":       3,
+		"phoebe_metering_wal_skipped_entries_total":  4,
+		"phoebe_metering_floor_events_total":         2,
+		"phoebe_metering_valkey_up":                  1,
+		"phoebe_metering_stream_entries":             10,
+		"phoebe_metering_stream_undelivered_entries": 3,
+		"phoebe_valkey_used_memory_bytes":            100,
+		"phoebe_valkey_maxmemory_bytes":              200,
+	}
+	for name, value := range want {
 		f, ok := fams[name]
 		if !ok {
 			t.Errorf("%s missing", name)
 			continue
 		}
-		for _, m := range f.GetMetric() {
-			if len(m.GetLabel()) != 0 {
-				t.Errorf("%s has labels %v", name, m.GetLabel())
-			}
+		if len(f.GetMetric()) != 1 {
+			t.Errorf("%s has %d series, want 1", name, len(f.GetMetric()))
+			continue
 		}
+		m := f.GetMetric()[0]
+		if len(m.GetLabel()) != 0 {
+			t.Errorf("%s has labels %v", name, m.GetLabel())
+		}
+		got := m.GetGauge().GetValue() + m.GetCounter().GetValue()
+		if got != value {
+			t.Errorf("%s = %v, want %v", name, got, value)
+		}
+	}
+	// Only the pending series is left out: every other metering family is served.
+	var served []string
+	for name := range fams {
+		if strings.HasPrefix(name, "phoebe_metering_") || strings.HasPrefix(name, "phoebe_valkey_") {
+			served = append(served, name)
+		}
+	}
+	if len(served) != len(want) {
+		t.Errorf("served %d metering families %v, want %d", len(served), served, len(want))
 	}
 }
 
@@ -987,6 +1012,10 @@ func TestMeteringWALFamiliesServedOnRealEmitter(t *testing.T) {
 			t.Errorf("%s missing", name)
 			continue
 		}
+		if len(f.GetMetric()) != 1 {
+			t.Errorf("%s has %d series, want 1", name, len(f.GetMetric()))
+			continue
+		}
 		m := f.GetMetric()[0]
 		if got := m.GetGauge().GetValue() + m.GetCounter().GetValue(); got != want {
 			t.Errorf("%s = %v, want %v", name, got, want)
@@ -1001,18 +1030,8 @@ func TestMeteringFamiliesReportFloorEmitterAsFailure(t *testing.T) {
 	em := emit.NewFloorEmitter(logging.New(logging.ERROR), "")
 	srv := newMetricsTestServer(t).WithMeteringHealth(em)
 
-	value := func(fams map[string]*dto.MetricFamily, name string) float64 {
-		t.Helper()
-		f, ok := fams[name]
-		if !ok {
-			t.Fatalf("%s missing", name)
-		}
-		m := f.GetMetric()[0]
-		return m.GetGauge().GetValue() + m.GetCounter().GetValue()
-	}
-
 	fams := phoebeFamilies(t, srv.metrics)
-	if got := value(fams, "phoebe_metering_floor_events_total"); got != 0 {
+	if got := meteringSingleValue(t, fams, "phoebe_metering_floor_events_total"); got != 0 {
 		t.Errorf("floor events before any Emit = %v, want 0", got)
 	}
 	for name, want := range map[string]float64{
@@ -1020,7 +1039,7 @@ func TestMeteringFamiliesReportFloorEmitterAsFailure(t *testing.T) {
 		"phoebe_metering_wal_healthy":  0,
 		"phoebe_metering_wal_poisoned": 1,
 	} {
-		if got := value(fams, name); got != want {
+		if got := meteringSingleValue(t, fams, name); got != want {
 			t.Errorf("%s = %v, want %v", name, got, want)
 		}
 	}
@@ -1031,7 +1050,7 @@ func TestMeteringFamiliesReportFloorEmitterAsFailure(t *testing.T) {
 
 	em.Emit(context.Background(), metering.Event{RequestID: "phoebe-1"})
 	em.Emit(context.Background(), metering.Event{RequestID: "phoebe-2"})
-	if got := value(phoebeFamilies(t, srv.metrics), "phoebe_metering_floor_events_total"); got != 2 {
+	if got := meteringSingleValue(t, phoebeFamilies(t, srv.metrics), "phoebe_metering_floor_events_total"); got != 2 {
 		t.Errorf("floor events after two Emits = %v, want 2", got)
 	}
 }
