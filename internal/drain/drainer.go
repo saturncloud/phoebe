@@ -933,7 +933,8 @@ func (d *Drainer) storeBatch(ctx context.Context, events []metering.Event, ids [
 // caller ACKs only the rows already stored and the remainder redelivers.
 //
 // Returns the stream ids safe to ACK (stored rows + poison rows), the number
-// of rows actually stored, and a non-nil error only for outage/cancellation.
+// of rows actually stored, and a non-nil error only for an outage, a schema gap,
+// a store that refuses writes (isStoreNotWritable), or cancellation.
 func (d *Drainer) upsertRowAtATime(ctx context.Context, events []metering.Event, ids []string) (ackable []string, stored int, err error) {
 	ackable = make([]string, 0, len(events))
 	for i := range events {
@@ -955,6 +956,13 @@ func (d *Drainer) upsertRowAtATime(ctx context.Context, events []metering.Event,
 			// outage, ACK only what is stored; the rest redelivers once the
 			// migration has run. Never drop billing data over a schema gap.
 			return ackable, stored, fmt.Errorf("database schema not ready (row error): %w", uerr)
+		}
+		if isStoreNotWritable(uerr) {
+			// The store answers Ping but refuses every write (a read-only
+			// replica, missing privileges, a full disk, a shutdown). Like an
+			// outage, ACK only what is stored; the rest redelivers once the
+			// store takes writes again.
+			return ackable, stored, fmt.Errorf("store not writable (row error): %w", uerr)
 		}
 		// POISON: the store is up but this row cannot be inserted. Log the
 		// full event so it is recoverable from logs, count it, ACK it.

@@ -258,8 +258,18 @@ schema gate, and every `trimInterval` after that.
   the entries that replica holds, waiting 500ms after the first failure and twice as
   long after each later one, up to 30s or half of `claimMinIdle`, whichever is shorter
   (15s with the default 30s `claimMinIdle`), so another replica does not reclaim a
-  batch that is still being retried. A store that answers `Ping` but rejects writes (a
-  schema gap) therefore stays in this state. Once a retry writes successfully, the
+  batch that is still being retried. A store that answers `Ping` but rejects every
+  write also stays in this state when the error is one of these: a schema gap
+  (SQLSTATE `42P01`, `42703` or `42P10`), a read-only replica (`25006`), missing
+  privileges (`42501`), a full disk or other insufficient resources (class `53`), an
+  admin shutdown or a server that cannot accept connections yet (class `57P`), a
+  connection exception (class `08`), or a serialization failure or deadlock (`40001`,
+  `40P01`). Any other error on a single row from a store that answers `Ping` is
+  treated as a bad row: the drainer logs `drop poison row` with the full event and a
+  `total poisoned=` count, and acknowledges and drops the row. That count is kept in
+  the drainer process only and is not exported as a metric, so search the drainer
+  logs for `drop poison row` and recover any such event from the logged JSON.
+  Once a retry writes successfully, the
   replica writes the rest of what it holds before it reads new entries. If its entries
   were reclaimed by another replica, it reads one new batch to test the store, and a
   failure there keeps the wait growing rather than starting again at 500ms. Reclaim

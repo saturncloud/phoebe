@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/alicebob/miniredis/v2"
+	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/redis/go-redis/v9"
 
 	"github.com/saturncloud/phoebe/internal/logging"
@@ -2425,4 +2426,44 @@ func TestDrainWithoutGroup_ForeignBoundaryInsideBatchStoresOnlyTrimmableEntries(
 		t.Fatalf("Malformed() = %d, want 0: the undecodable entry is above the limit and was never read", got)
 	}
 	assertEntries(t, remainingEntries(t, rdb, cfg.StreamName), ids[2:])
+}
+
+// notWritableStore answers Ping but fails every Upsert with the given Postgres
+// SQLSTATE, like a read-only replica after a failover, a role without INSERT,
+// or a full disk.
+type notWritableStore struct {
+	*fakeStore
+	code string
+}
+
+func (s *notWritableStore) Upsert(_ context.Context, events []metering.Event) error {
+	return fmt.Errorf("drain: upsert %d events: %w", len(events), &pgconn.PgError{Code: s.code})
+}
+
+// TestRowAtATime_StoreNotWritableRetriesNotPoison: a store that answers Ping but
+// refuses every write must not have its rows dropped as poison. Nothing is ACK'd,
+// nothing is counted as poisoned, and storeDown is set so the drainer waits.
+func TestRowAtATime_StoreNotWritableRetriesNotPoison(t *testing.T) {
+	for _, code := range []string{"25006", "42501", "53100"} {
+		t.Run(code, func(t *testing.T) {
+			_, rdb := startMiniredis(t)
+			cfg := testConfig(rdb.Options().Addr)
+			cfg.BatchSize = 3
+			cfg.ClaimMinIdle = 0
+			seedDeadConsumerPending(t, rdb, cfg, 3)
+			store := &notWritableStore{fakeStore: newFakeStore(), code: code}
+			d := New(cfg, testLogger(), rdb, store)
+
+			d.reclaim(context.Background())
+			if p := pendingCount(t, rdb, cfg.StreamName, cfg.Group); p != 3 {
+				t.Fatalf("pending = %d, want 3: no row may be ACK'd while the store refuses writes", p)
+			}
+			if got := d.Poisoned(); got != 0 {
+				t.Fatalf("Poisoned() = %d, want 0: a store that refuses writes is not row poison", got)
+			}
+			if !d.storeDown {
+				t.Fatal("storeDown not set after the store refused every write")
+			}
+		})
+	}
 }

@@ -93,6 +93,29 @@ func isSchemaNotReady(err error) bool {
 	return false
 }
 
+// isStoreNotWritable reports a Postgres error that means the store as a whole
+// cannot take writes right now, not that the row is bad: a read-only replica
+// after a failover (25006), missing privileges (42501), insufficient resources
+// such as a full disk (class 53), an admin shutdown or a server that cannot
+// accept connections yet (class 57P), a connection exception (class 08), or a
+// serialization failure or deadlock (40001, 40P01). Ping can still succeed in
+// all of these, so the row-at-a-time walk must not read them as poison: every
+// row would fail the same way and the whole stream would be dropped.
+func isStoreNotWritable(err error) bool {
+	var pgErr *pgconn.PgError
+	if !errors.As(err, &pgErr) {
+		return false
+	}
+	code := pgErr.Code
+	switch {
+	case code == "25006", code == "42501", code == "40001", code == "40P01":
+		return true
+	case strings.HasPrefix(code, "53"), strings.HasPrefix(code, "57P"), strings.HasPrefix(code, "08"):
+		return true
+	}
+	return false
+}
+
 // PostgresStore writes metering events to the billing_event table. It assumes
 // the table already exists — the drainer does NOT run migrations (the schema is
 // owned by the shared Atlas Alembic chain; see migrations/README.md). Upsert

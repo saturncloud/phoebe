@@ -567,3 +567,19 @@ func TestIsSchemaNotReady(t *testing.T) {
 		t.Error("a non-Postgres error is not a schema gap")
 	}
 }
+
+func TestIsStoreNotWritable(t *testing.T) {
+	for code, want := range map[string]bool{
+		"25006": true, "42501": true, "53100": true, "53200": true, "57P01": true, "57P03": true,
+		"08006": true, "40001": true, "40P01": true,
+		"23505": false, "22001": false, "42703": false, "57014": false,
+	} {
+		err := fmt.Errorf("drain: upsert 1 events: %w", &pgconn.PgError{Code: code})
+		if got := isStoreNotWritable(err); got != want {
+			t.Errorf("code %s: isStoreNotWritable = %v, want %v", code, got, want)
+		}
+	}
+	if isStoreNotWritable(errors.New("plain")) {
+		t.Error("a non-Postgres error is not a store that refuses writes")
+	}
+}
