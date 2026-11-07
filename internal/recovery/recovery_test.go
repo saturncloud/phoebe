@@ -625,7 +625,7 @@ func TestFloorEmitterEventsRecoverWithTimestampAndServingMode(t *testing.T) {
 		Error: log.New(&logged, "ERROR: ", log.LstdFlags), // the shape a log export holds
 	}
 	before := time.Now().UnixMilli()
-	em := emit.NewFloorEmitter(logger)
+	em := emit.NewFloorEmitter(logger, "")
 	for _, ev := range []metering.Event{
 		{RequestID: "phoebe-shared", AuthID: "auth-1", PromptTokens: 11, UsageFound: true, ServingMode: "shared"},
 		{RequestID: "phoebe-dedicated", AuthID: "auth-1", PromptTokens: 22, UsageFound: true, ServingMode: "dedicated"},
