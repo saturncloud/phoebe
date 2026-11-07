@@ -207,8 +207,8 @@ func TestWAL_MarkShippedReclaims(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(events) != 5 || skipped != 0 {
-		t.Fatalf("pending = %d events (%d skipped), want 5 (0)", len(events), skipped)
+	if len(events) != 5 || len(skipped) != 0 {
+		t.Fatalf("pending = %d events (%d skipped), want 5 (0)", len(events), len(skipped))
 	}
 	if err := w.markShipped(through); err != nil {
 		t.Fatalf("markShipped: %v", err)
@@ -338,8 +338,8 @@ func TestWAL_CorruptEntrySkipped(t *testing.T) {
 	if err != nil {
 		t.Fatalf("pending: %v", err)
 	}
-	if skipped != 1 {
-		t.Errorf("skipped = %d, want 1", skipped)
+	if len(skipped) != 1 {
+		t.Errorf("skipped = %v, want one index", skipped)
 	}
 	if len(events) != 2 || events[0].RequestID != "ok-1" || events[1].RequestID != "ok-2" {
 		t.Fatalf("events = %+v, want [ok-1 ok-2]", events)
@@ -1194,19 +1194,6 @@ func TestEmitter_EmitAfterClose_NotLost(t *testing.T) {
 	}
 }
 
-// ---- DurableEmitter: satisfies metering.Emitter interface -------------------
-
-func TestEmitter_ImplementsInterface(t *testing.T) {
-	mr := miniredis.RunT(t)
-	cfg := testConfig(t, mr)
-	em, err := New(cfg, testLogger(), redisClient(mr.Addr()))
-	if err != nil {
-		t.Fatal(err)
-	}
-	var _ metering.Emitter = em // compile-time interface check
-	_ = em.Close(context.Background())
-}
-
 // ---- stress: many goroutines, no race detector findings ---------------------
 
 func TestEmitter_RaceStress(t *testing.T) {
@@ -1645,6 +1632,27 @@ type fakeValkeyState struct {
 	infoErr error
 	entries int64
 	groups  []redis.XInfoGroup
+
+	// afterPosition answers XRangeN, as the entries after a group's position, and
+	// scanStart records the start ID it was asked for.
+	afterPosition []redis.XMessage
+	scanErr       error
+	scanStart     string
+}
+
+func (f *fakeValkeyState) XRangeN(ctx context.Context, _, start, _ string, count int64) *redis.XMessageSliceCmd {
+	f.scanStart = start
+	cmd := redis.NewXMessageSliceCmd(ctx)
+	if f.scanErr != nil {
+		cmd.SetErr(f.scanErr)
+		return cmd
+	}
+	msgs := f.afterPosition
+	if int64(len(msgs)) > count {
+		msgs = msgs[:count]
+	}
+	cmd.SetVal(msgs)
+	return cmd
 }
 
 func (f *fakeValkeyState) Info(ctx context.Context, _ ...string) *redis.StringCmd {
@@ -1715,10 +1723,10 @@ func TestCheckBufferBound_NoValkeyIsANoOp(t *testing.T) {
 	em.CheckBufferBound(context.Background())
 }
 
-// TestProbe_UnknownLagReadsAsWholeStream: go-redis reports -1 when Valkey cannot
-// compute a group's lag. That must not read as caught up. The group furthest behind
-// still wins.
-func TestProbe_UnknownLagReadsAsWholeStream(t *testing.T) {
+// TestProbe_UnknownLagReadsAsWholeStreamWhenScanFails: go-redis reports -1 when
+// Valkey cannot compute a group's lag. That must not read as caught up, even if the
+// scan that replaces it fails. The group furthest behind still wins.
+func TestProbe_UnknownLagReadsAsWholeStreamWhenScanFails(t *testing.T) {
 	for _, tc := range []struct {
 		name   string
 		groups []redis.XInfoGroup
@@ -1732,7 +1740,7 @@ func TestProbe_UnknownLagReadsAsWholeStream(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			cfg := testConfig(t, nil)
 			cfg.ShipInterval = time.Hour
-			em, err := New(cfg, testLogger(), &fakeValkeyState{entries: 100, groups: tc.groups})
+			em, err := New(cfg, testLogger(), &fakeValkeyState{entries: 100, groups: tc.groups, scanErr: errors.New("boom")})
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -1743,6 +1751,47 @@ func TestProbe_UnknownLagReadsAsWholeStream(t *testing.T) {
 			}
 			if p.Undelivered != tc.want {
 				t.Fatalf("Undelivered = %d, want %d", p.Undelivered, tc.want)
+			}
+		})
+	}
+}
+
+// TestProbe_UnknownLagAfterTrimDoesNotCountAckedEntries: the drainer's own trim
+// makes the lag unknown, and the stream still holds entries delivered and acked but
+// not yet trimmed. They are stored, so they must not read as undelivered.
+func TestProbe_UnknownLagAfterTrimDoesNotCountAckedEntries(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		pending int64
+		after   int
+		want    int64
+	}{
+		{"all stored", 0, 0, 0},
+		{"pending and unread", 2, 3, 5},
+		{"scan reaches its limit: upper bound", 0, unknownLagScanLimit, 100},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg := testConfig(t, nil)
+			cfg.ShipInterval = time.Hour
+			fake := &fakeValkeyState{
+				entries:       100,
+				groups:        []redis.XInfoGroup{{Pending: tc.pending, Lag: -1, LastDeliveredID: "7-0"}},
+				afterPosition: make([]redis.XMessage, tc.after),
+			}
+			em, err := New(cfg, testLogger(), fake)
+			if err != nil {
+				t.Fatal(err)
+			}
+			t.Cleanup(func() { _ = em.Close(context.Background()) })
+			p, err := em.Probe(context.Background())
+			if err != nil {
+				t.Fatal(err)
+			}
+			if p.Undelivered != tc.want {
+				t.Fatalf("Undelivered = %d, want %d", p.Undelivered, tc.want)
+			}
+			if fake.scanStart != "(7-0" {
+				t.Fatalf("scan started at %q, want exclusive of the last delivered ID", fake.scanStart)
 			}
 		})
 	}

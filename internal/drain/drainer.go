@@ -5,6 +5,8 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"math"
+	"slices"
 	"strconv"
 	"strings"
 	"sync/atomic"
@@ -36,12 +38,24 @@ type Drainer struct {
 	lastTrim time.Time
 	now      func() time.Time
 
-	// storeDown is set when a store write fails and cleared by a successful Ping.
-	// While it is set the loop reads nothing, so an outage does not move the whole
-	// stream into the pending list. Only the Run goroutine touches it.
+	// storeDown is set when a store write fails and cleared only by a read pass
+	// that writes successfully or finds nothing to write, never by Ping alone: a
+	// store can answer Ping and still reject every write (a schema gap). While it
+	// is set the loop reads no new entries, so a failing store does not move the
+	// whole stream into the pending list. Only the Run goroutine touches it.
 	storeDown bool
+	// storeRetryDelay is how long to wait after a failed store write before trying
+	// again. It doubles with each failure, and is zero while the store is healthy.
+	storeRetryDelay time.Duration
+	// lastStoreFail is when the last store write failed.
+	lastStoreFail time.Time
+	// storeRetryBase is the first value of storeRetryDelay. Tests shorten it.
+	storeRetryBase time.Duration
 	// lastStoreDownLog throttles the log line while storeDown stays set.
 	lastStoreDownLog time.Time
+	// lastGroupHoldLog throttles the log line about another consumer group holding
+	// the stream during drainWithoutGroup.
+	lastGroupHoldLog time.Time
 
 	// poisoned counts events that could not be stored even row-at-a-time
 	// against a healthy store and were dropped (logged + ACK'd). A non-zero
@@ -60,6 +74,10 @@ type Drainer struct {
 	// groupRetry is the pause between attempts in waitForGroup. Tests shorten it.
 	groupRetry time.Duration
 }
+
+// maxStoreRetryDelay caps storeRetryDelay, so a store that recovers after a long
+// failure is noticed within this long.
+const maxStoreRetryDelay = 30 * time.Second
 
 // Poisoned returns the number of events dropped as store-poison (failed their
 // own single-row INSERT while the store was reachable) since start. Entries that
@@ -95,6 +113,7 @@ func New(cfg Config, log *logging.Logger, rdb redis.Cmdable, store Store) *Drain
 		schemaPoll:         2 * time.Second,
 		schemaProbeTimeout: 10 * time.Second,
 		groupRetry:         5 * time.Second,
+		storeRetryBase:     500 * time.Millisecond,
 	}
 }
 
@@ -172,19 +191,26 @@ func (d *Drainer) waitForGroup(ctx context.Context) error {
 	}
 }
 
-// drainWithoutGroup is the way out of a full Valkey with no consumer group. It
-// reads the oldest batch with XRANGE and removes it with XTRIM, neither of which
-// Valkey refuses past maxmemory, and stores the batch first. It returns the number
-// of entries removed.
+// drainWithoutGroup is the way out of a full Valkey without the drainer's consumer
+// group. It reads the oldest batch with XRANGE and removes it with XTRIM, neither
+// of which Valkey refuses past maxmemory, and stores the batch first. It returns
+// the number of entries removed.
 //
 // An entry is removed only if it is stored or logged as undecodable or poison, so
-// any store failure trims nothing. XTRIM MINID keeps the batch's last entry, which
-// the group, created at "0", redelivers; the upsert is idempotent. A group that
-// appears before the trim hands the entries back to the normal trim rules. One
-// appearing between that check and the XTRIM can only lose entries that are
-// already stored.
+// any store failure trims nothing. MINID is the id just after the batch's last
+// entry, so the whole batch goes and a batch of one still makes progress.
+//
+// If the drainer's own group exists, the normal trim rules apply and nothing is
+// done here. Another group on the stream (a debug consumer, say) does not stop the
+// recovery, but its entries are its own: the trim stops at the oldest of its
+// last-delivered and oldest pending ids, as trimBoundary does. If that leaves
+// nothing to remove, nothing is stored or trimmed, and the group is logged so the
+// operator can see what holds the stream. A group appearing before the trim is
+// read again and counts the same way. One appearing between that read and the
+// XTRIM can only lose entries that are already stored.
 func (d *Drainer) drainWithoutGroup(ctx context.Context) (int64, error) {
-	if exists, err := d.anyGroupExists(ctx); err != nil || exists {
+	others, own, err := d.readGroups(ctx)
+	if err != nil || own {
 		return 0, err
 	}
 	msgs, err := d.rdb.XRangeN(ctx, d.cfg.StreamName, "-", "+", int64(d.cfg.BatchSize)).Result()
@@ -194,38 +220,96 @@ func (d *Drainer) drainWithoutGroup(ctx context.Context) (int64, error) {
 	if len(msgs) == 0 {
 		return 0, nil
 	}
+	oldest := msgs[0].ID
+	if _, held, err := d.otherGroupsLimit(ctx, others, oldest); err != nil || held {
+		return 0, err
+	}
 	events, ids, _ := d.decodeBatch(msgs)
 	if len(events) > 0 {
 		if _, _, err := d.storeBatch(ctx, events, ids); err != nil {
 			return 0, fmt.Errorf("store %d entries: %w", len(events), err)
 		}
 	}
-	if exists, err := d.anyGroupExists(ctx); err != nil || exists {
+	if others, own, err = d.readGroups(ctx); err != nil || own {
 		return 0, err
 	}
-	last := msgs[len(msgs)-1].ID
-	n, err := d.rdb.XTrimMinID(ctx, d.cfg.StreamName, last).Result()
+	limit, held, err := d.otherGroupsLimit(ctx, others, oldest)
+	if err != nil || held {
+		return 0, err
+	}
+	minID, err := nextStreamID(msgs[len(msgs)-1].ID)
 	if err != nil {
-		return 0, fmt.Errorf("xtrim minid %s: %w", last, err)
+		return 0, err
+	}
+	if minID, err = olderStreamID(limit, minID); err != nil {
+		return 0, err
+	}
+	n, err := d.rdb.XTrimMinID(ctx, d.cfg.StreamName, minID).Result()
+	if err != nil {
+		return 0, fmt.Errorf("xtrim minid %s: %w", minID, err)
 	}
 	if n > 0 {
 		total := d.drainedWithoutGroup.Add(uint64(n))
-		d.log.Error.Printf("drainer: valkey is full with no consumer group; stored and trimmed %d entr(ies) below %s (total=%d)", n, last, total)
+		d.log.Error.Printf("drainer: valkey is full with no consumer group; stored and trimmed %d entr(ies) below %s (total=%d)", n, minID, total)
 	}
 	return n, nil
 }
 
-// anyGroupExists reports whether the stream has any consumer group. A read that
-// fails is an error, so the caller trims nothing.
-func (d *Drainer) anyGroupExists(ctx context.Context) (bool, error) {
+// readGroups returns the stream's consumer groups other than the drainer's own,
+// and whether its own exists. A read that fails is an error, so the caller trims
+// nothing.
+func (d *Drainer) readGroups(ctx context.Context) (others []redis.XInfoGroup, own bool, err error) {
 	groups, err := d.rdb.XInfoGroups(ctx, d.cfg.StreamName).Result()
 	if isNoSuchKey(err) {
-		return false, nil
+		return nil, false, nil
 	}
 	if err != nil {
-		return false, fmt.Errorf("xinfo groups: %w", err)
+		return nil, false, fmt.Errorf("xinfo groups: %w", err)
 	}
-	return len(groups) > 0, nil
+	for _, g := range groups {
+		if g.Name == d.cfg.Group {
+			own = true
+			continue
+		}
+		others = append(others, g)
+	}
+	return others, own, nil
+}
+
+// otherGroupsLimit returns the MINID drainWithoutGroup may not pass because of the
+// given groups, or "" if there are none. held is true, and logged, when those
+// groups leave nothing at or above oldest (the stream's oldest entry) to remove.
+func (d *Drainer) otherGroupsLimit(ctx context.Context, groups []redis.XInfoGroup, oldest string) (limit string, held bool, err error) {
+	if len(groups) == 0 {
+		return "", false, nil
+	}
+	boundary, holder, stopped, err := d.groupsBoundary(ctx, groups)
+	if err != nil {
+		return "", false, err
+	}
+	if stopped != nil {
+		d.logGroupHold(stopped.Name, "0-0")
+		return "", true, nil
+	}
+	older, err := olderStreamID(boundary, oldest)
+	if err != nil {
+		return "", false, err
+	}
+	if older == boundary { // MINID keeps the boundary entry, so nothing would go
+		d.logGroupHold(holder, boundary)
+		return "", true, nil
+	}
+	return boundary, false, nil
+}
+
+// logGroupHold says which group stops the recovery from a full Valkey.
+func (d *Drainer) logGroupHold(group, at string) {
+	if !d.lastGroupHoldLog.IsZero() && d.now().Sub(d.lastGroupHoldLog) < 30*time.Second {
+		return
+	}
+	d.lastGroupHoldLog = d.now()
+	d.log.Warn.Printf("drainer: valkey is full and consumer group %q holds the stream at %s; nothing can be freed until it reads further or is deleted, and consumer group %q cannot be created until then",
+		group, at, d.cfg.Group)
 }
 
 // trimDelivered removes entries every consumer group has delivered and
@@ -260,7 +344,8 @@ func (d *Drainer) trimDelivered(ctx context.Context) {
 }
 
 // trimBoundary returns the MINID to trim to. ok is false when nothing can be
-// trimmed: no stream or group exists, or a group has delivered nothing yet. A
+// trimmed: no stream or group exists, a group has delivered nothing yet, or the
+// drainer's own group is missing, so nothing shows the entries are stored. A
 // group that stops the trim while entries wait, or that holds the boundary back
 // for the drainer's own group, is logged, because it keeps Valkey filling up.
 func (d *Drainer) trimBoundary(ctx context.Context) (string, bool, error) {
@@ -274,7 +359,31 @@ func (d *Drainer) trimBoundary(ctx context.Context) (string, bool, error) {
 	if len(groups) == 0 {
 		return "", false, nil
 	}
-	boundary, holder := "", ""
+	boundary, holder, stopped, err := d.groupsBoundary(ctx, groups)
+	if err != nil {
+		return "", false, err
+	}
+	if stopped != nil {
+		if stopped.Lag != 0 {
+			d.log.Warn.Printf("drainer: skip trim: consumer group %q has delivered nothing and %d entr(ies) wait for it", stopped.Name, stopped.Lag)
+		}
+		return "", false, nil
+	}
+	if !slices.ContainsFunc(groups, func(g redis.XInfoGroup) bool { return g.Name == d.cfg.Group }) {
+		// Another group having read an entry says nothing about the store.
+		d.log.Warn.Printf("drainer: skip trim: consumer group %q does not exist, so entries below %s may not be stored", d.cfg.Group, boundary)
+		return "", false, nil
+	}
+	if holder != d.cfg.Group {
+		d.log.Warn.Printf("drainer: consumer group %q holds the trim boundary at %s", holder, boundary)
+	}
+	return boundary, true, nil
+}
+
+// groupsBoundary returns the oldest of the given groups' last-delivered and oldest
+// pending ids, and the group holding it. stopped is set instead when a group has
+// delivered nothing yet, so there is no boundary. groups must not be empty.
+func (d *Drainer) groupsBoundary(ctx context.Context, groups []redis.XInfoGroup) (boundary, holder string, stopped *redis.XInfoGroup, err error) {
 	lower := func(id, group string) error {
 		older, err := olderStreamID(boundary, id)
 		if err != nil {
@@ -287,30 +396,40 @@ func (d *Drainer) trimBoundary(ctx context.Context) (string, bool, error) {
 		boundary = older
 		return nil
 	}
-	for _, g := range groups {
+	for i := range groups {
+		g := &groups[i]
 		if g.LastDeliveredID == "" || g.LastDeliveredID == "0-0" || g.LastDeliveredID == "0" {
-			if g.Lag != 0 {
-				d.log.Warn.Printf("drainer: skip trim: consumer group %q has delivered nothing and %d entr(ies) wait for it", g.Name, g.Lag)
-			}
-			return "", false, nil
+			return "", "", g, nil
 		}
 		if err := lower(g.LastDeliveredID, g.Name); err != nil {
-			return "", false, err
+			return "", "", nil, err
 		}
 		pending, err := d.rdb.XPending(ctx, d.cfg.StreamName, g.Name).Result()
 		if err != nil {
-			return "", false, fmt.Errorf("xpending %s: %w", g.Name, err)
+			return "", "", nil, fmt.Errorf("xpending %s: %w", g.Name, err)
 		}
 		if pending.Count > 0 {
 			if err := lower(pending.Lower, g.Name); err != nil {
-				return "", false, err
+				return "", "", nil, err
 			}
 		}
 	}
-	if holder != d.cfg.Group {
-		d.log.Warn.Printf("drainer: consumer group %q holds the trim boundary at %s", holder, boundary)
+	return boundary, holder, nil, nil
+}
+
+// nextStreamID returns the smallest id after id, which need not exist in the stream.
+func nextStreamID(id string) (string, error) {
+	ms, seq, err := parseStreamID(id)
+	if err != nil {
+		return "", err
 	}
-	return boundary, true, nil
+	if seq < math.MaxUint64 {
+		return fmt.Sprintf("%d-%d", ms, seq+1), nil
+	}
+	if ms == math.MaxUint64 {
+		return "", fmt.Errorf("stream id %q has no successor", id)
+	}
+	return fmt.Sprintf("%d-0", ms+1), nil
 }
 
 // olderStreamID returns the older of two stream ids ("ms-seq"). An empty a means
@@ -436,7 +555,9 @@ func isBusyGroup(err error) bool {
 //  4. stores the batch durably, THEN
 //  5. XACKs the batch (never before the store commits).
 //
-// While the store is failing it skips reclaiming and reading, and keeps trimming.
+// While the store is failing it skips reclaiming and reading new entries, and keeps
+// trimming. It waits longer after each failed write, and each retry writes the
+// entries this consumer already holds, so the pending list does not grow.
 //
 // On ctx cancellation it returns after finishing any in-flight batch — an entry
 // that was read but not yet stored is simply left un-ACK'd and redelivers to the
@@ -468,11 +589,14 @@ func (d *Drainer) Run(ctx context.Context) error {
 		}
 
 		// While the store is failing, reading would only move more entries into
-		// the pending list, which trimming must not pass and which only reclaim
-		// can empty. They wait unread in the stream instead.
-		if d.storeDown && !d.storeRecovered(ctx) {
+		// the pending list, which trimming must not pass. They wait unread in the
+		// stream instead. Only a write shows that the store accepts writes, so when
+		// the wait is over and it answers Ping, this pass retries with
+		// readAndStore, which rereads this consumer's pending entries.
+		retrying := d.storeDown
+		if retrying && (d.now().Sub(d.lastStoreFail) < d.storeRetryDelay || !d.storeAnswers(ctx)) {
 			d.trimIfDue(ctx)
-			d.sleep(ctx, 500*time.Millisecond)
+			d.sleep(ctx, d.storeRetryDelay)
 			continue
 		}
 
@@ -481,7 +605,7 @@ func (d *Drainer) Run(ctx context.Context) error {
 		// store outage the pending list sets the trim boundary, and one batch per
 		// ClaimInterval would keep a full Valkey full for hours.
 		more := false
-		if d.now().Sub(d.lastClaim) >= d.cfg.ClaimInterval {
+		if !retrying && d.now().Sub(d.lastClaim) >= d.cfg.ClaimInterval {
 			more = d.reclaim(ctx)
 			if !more {
 				d.lastClaim = d.now()
@@ -490,7 +614,7 @@ func (d *Drainer) Run(ctx context.Context) error {
 
 		d.trimIfDue(ctx)
 
-		if d.storeDown {
+		if d.storeDown && !retrying {
 			continue // reclaim just found the store failing
 		}
 
@@ -498,7 +622,7 @@ func (d *Drainer) Run(ctx context.Context) error {
 		// waiting for BlockTimeout would cap reclaim at one batch per block. A
 		// negative Block omits BLOCK; zero would block forever.
 		block := d.cfg.BlockTimeout
-		if more {
+		if more || retrying {
 			block = -1
 		}
 		n, err := d.readAndStore(ctx, block)
@@ -508,14 +632,20 @@ func (d *Drainer) Run(ctx context.Context) error {
 			if ctx.Err() != nil {
 				return nil
 			}
-			d.storeDown = errors.Is(err, errStoreFailed)
 			d.log.Error.Printf("drainer: drain pass: %v", err)
+			if errors.Is(err, errStoreFailed) {
+				d.noteStoreFailed() // the check at the top of the loop waits
+				continue
+			}
+			if n > 0 {
+				d.noteStoreWorking() // stored, and only the ACK failed
+			}
 			d.sleep(ctx, 500*time.Millisecond)
 			continue
 		}
 		// If we got a full batch there may be more backlog — loop immediately
 		// without re-blocking. An empty/partial read means we've caught up.
-		_ = n
+		d.noteStoreWorking()
 	}
 }
 
@@ -527,10 +657,27 @@ func (d *Drainer) trimIfDue(ctx context.Context) {
 	}
 }
 
-// storeRecovered pings the store and clears storeDown if it answers. A store that
-// answers Ping but still rejects writes (a schema gap) sets storeDown again on the
-// next failed write, so it keeps the 500ms back-off of a failed pass.
-func (d *Drainer) storeRecovered(ctx context.Context) bool {
+// noteStoreFailed records a failed store write: reads stop, and the wait before the
+// next attempt doubles, from storeRetryBase up to maxStoreRetryDelay.
+func (d *Drainer) noteStoreFailed() {
+	d.storeDown = true
+	d.lastStoreFail = d.now()
+	d.storeRetryDelay = min(max(2*d.storeRetryDelay, d.storeRetryBase), maxStoreRetryDelay)
+}
+
+// noteStoreWorking records a read pass with no store failure, and ends any wait.
+func (d *Drainer) noteStoreWorking() {
+	if d.storeDown {
+		d.log.Info.Printf("drainer: store accepting writes again; resuming")
+	}
+	d.storeDown = false
+	d.storeRetryDelay = 0
+}
+
+// storeAnswers pings the store. An answer is not enough to clear storeDown, because
+// a store that answers Ping can still reject writes (a schema gap). It only makes a
+// retry worth trying; a failure there lengthens the wait through noteStoreFailed.
+func (d *Drainer) storeAnswers(ctx context.Context) bool {
 	pctx, cancel := context.WithTimeout(ctx, 5*time.Second)
 	defer cancel()
 	if err := d.store.Ping(pctx); err != nil {
@@ -540,19 +687,23 @@ func (d *Drainer) storeRecovered(ctx context.Context) bool {
 		}
 		return false
 	}
-	d.storeDown = false
-	d.log.Info.Printf("drainer: store answering again; resuming")
 	return true
 }
 
 // readAndStore performs one XREADGROUP → store → XACK cycle for NEW entries
-// (the ">" ID). block is XREADGROUP's BLOCK; a negative value does not block.
+// (the ">" ID). While storeDown is set it rereads the entries this consumer already
+// holds (the "0" ID) instead, so a retry that fails adds nothing to the pending list.
+// block is XREADGROUP's BLOCK; a negative value does not block.
 // Returns the number of entries processed.
 func (d *Drainer) readAndStore(ctx context.Context, block time.Duration) (int, error) {
+	start := ">"
+	if d.storeDown {
+		start = "0"
+	}
 	res, err := d.rdb.XReadGroup(ctx, &redis.XReadGroupArgs{
 		Group:    d.cfg.Group,
 		Consumer: d.cfg.Consumer,
-		Streams:  []string{d.cfg.StreamName, ">"},
+		Streams:  []string{d.cfg.StreamName, start},
 		Count:    int64(d.cfg.BatchSize),
 		Block:    block,
 	}).Result()
@@ -775,7 +926,9 @@ func (d *Drainer) reclaim(ctx context.Context) (more bool) {
 	if err != nil {
 		d.log.Error.Printf("drainer: reclaim process: %v", err)
 		d.claimCursor = "0"
-		d.storeDown = errors.Is(err, errStoreFailed)
+		if errors.Is(err, errStoreFailed) {
+			d.noteStoreFailed()
+		}
 		return false
 	}
 	if n > 0 {

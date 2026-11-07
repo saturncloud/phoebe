@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"context"
+	"errors"
 	"io"
 	"log"
 	"net/http"
@@ -15,6 +16,7 @@ import (
 	"time"
 
 	"github.com/alicebob/miniredis/v2"
+	"github.com/redis/go-redis/v9"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
@@ -24,6 +26,7 @@ import (
 
 	"github.com/saturncloud/phoebe/internal/admission"
 	"github.com/saturncloud/phoebe/internal/config"
+	"github.com/saturncloud/phoebe/internal/emit"
 	"github.com/saturncloud/phoebe/internal/gateway"
 	"github.com/saturncloud/phoebe/internal/identity"
 	"github.com/saturncloud/phoebe/internal/logging"
@@ -394,6 +397,61 @@ func TestBuildAdmissionPolicySyncTimeoutLogsErrorAndKeepsServing(t *testing.T) {
 	}
 	if out := buf.String(); !strings.Contains(out, "not read within 200ms") || !strings.Contains(out, "NOT enforced until it syncs") {
 		t.Fatalf("sync timeout not logged as an error naming the wait: %q", out)
+	}
+}
+
+// TestBuildEmitterFailedWALClosesValkeyClient: when the WAL cannot open, the
+// fallback floor emitter never uses Valkey, so the client built for the durable
+// emitter must be closed instead of holding its connection pool open for the
+// life of the process. The serving fallback itself must stay in place.
+func TestBuildEmitterFailedWALClosesValkeyClient(t *testing.T) {
+	mr := miniredis.RunT(t)
+	notADir := filepath.Join(t.TempDir(), "file")
+	if err := os.WriteFile(notADir, nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	s := &config.Settings{}
+	s.Emit.ValkeyAddr = mr.Addr()
+	s.Emit.WALPath = filepath.Join(notADir, "wal") // beneath a regular file, so emit.New fails
+
+	var client *redis.Client
+	var buf bytes.Buffer
+	emitter, closeEmitter := buildEmitterWithClient(s, captureAllLogger(&buf), func(addr string) *redis.Client {
+		client = redis.NewClient(&redis.Options{Addr: addr})
+		return client
+	})
+	defer closeEmitter()
+
+	if client == nil {
+		t.Fatal("the Valkey client constructor was not called, so this test proves nothing")
+	}
+	if err := client.Ping(context.Background()).Err(); !errors.Is(err, redis.ErrClosed) {
+		t.Errorf("Ping on the client after the fallback = %v, want redis.ErrClosed", err)
+	}
+	if _, ok := emitter.(*emit.FloorEmitter); !ok {
+		t.Errorf("fallback emitter is %T, want *emit.FloorEmitter so serving continues", emitter)
+	}
+}
+
+// TestBuildEmitterHealthyWALKeepsValkeyClientOpen: only the failure path may
+// close the client, because the durable emitter ships through it.
+func TestBuildEmitterHealthyWALKeepsValkeyClientOpen(t *testing.T) {
+	mr := miniredis.RunT(t)
+	s := &config.Settings{}
+	s.Emit.ValkeyAddr = mr.Addr()
+	s.Emit.WALPath = filepath.Join(t.TempDir(), "wal")
+
+	var client *redis.Client
+	var buf bytes.Buffer
+	_, closeEmitter := buildEmitterWithClient(s, captureAllLogger(&buf), func(addr string) *redis.Client {
+		client = redis.NewClient(&redis.Options{Addr: addr})
+		return client
+	})
+	defer closeEmitter()
+	t.Cleanup(func() { _ = client.Close() })
+
+	if err := client.Ping(context.Background()).Err(); err != nil {
+		t.Errorf("Ping on the durable emitter's client = %v, want it open", err)
 	}
 }
 

@@ -380,8 +380,9 @@ func TestDrain_ReclaimsStalePending(t *testing.T) {
 	}
 }
 
-// TestDrain_PoisonEntryIsDropped proves a malformed stream entry (cannot be
-// decoded into an Event) is ACK'd and dropped rather than wedging the group.
+// TestDrain_PoisonEntryIsDropped proves a stream entry that is not JSON at all is
+// logged with its raw value, counted as malformed and ACK'd rather than wedging the
+// group, and that a good entry behind it is still stored.
 func TestDrain_PoisonEntryIsDropped(t *testing.T) {
 	_, rdb := startMiniredis(t)
 	cfg := testConfig(rdb.Options().Addr)
@@ -397,7 +398,8 @@ func TestDrain_PoisonEntryIsDropped(t *testing.T) {
 	// A good entry behind it must still be processed.
 	xaddEvent(t, rdb, cfg.StreamName, sampleEvent("good-req"))
 
-	d := New(cfg, testLogger(), rdb, store)
+	logger, logs := capturingLogger()
+	d := New(cfg, logger, rdb, store)
 	// Wait for BOTH the good row stored AND the group fully drained (poison
 	// ACK'd) — the poison ACK happens after the good-batch store/ACK.
 	runUntil(t, d, func() bool {
@@ -406,6 +408,21 @@ func TestDrain_PoisonEntryIsDropped(t *testing.T) {
 
 	if p := pendingCount(t, rdb, cfg.StreamName, cfg.Group); p != 0 {
 		t.Fatalf("pending = %d, want 0 (poison must be ACK'd, not stuck)", p)
+	}
+	if got := d.Malformed(); got != 1 {
+		t.Fatalf("Malformed() = %d, want 1", got)
+	}
+	if got := d.Poisoned(); got != 0 {
+		t.Fatalf("Poisoned() = %d, want 0: a decode failure is not store poison", got)
+	}
+	var dropLines []string
+	for _, line := range strings.Split(logs.String(), "\n") {
+		if strings.Contains(line, "drop malformed entry") {
+			dropLines = append(dropLines, line)
+		}
+	}
+	if len(dropLines) != 1 || !strings.Contains(dropLines[0], "{not valid json") {
+		t.Fatalf("drop lines = %q, want one line holding the raw value", dropLines)
 	}
 }
 
@@ -1132,8 +1149,9 @@ func TestDrainWithoutGroup_StoreFailureTrimsNothing(t *testing.T) {
 }
 
 // TestDrainWithoutGroup_GroupAppearingBeforeTheTrimKeepsEntries: a group created
-// while the batch is being stored owns the entries from then on, so normal trim
-// rules apply. A group existing from the start means nothing is read at all.
+// while the batch is being stored has a claim on the entries from then on, so
+// nothing is trimmed. If it has delivered nothing by the next pass, nothing is stored
+// either, because nothing could be removed.
 func TestDrainWithoutGroup_GroupAppearingBeforeTheTrimKeepsEntries(t *testing.T) {
 	ctx := context.Background()
 	_, rdb := startMiniredis(t)
@@ -1168,7 +1186,7 @@ func TestDrainWithoutGroup_GroupAppearingBeforeTheTrimKeepsEntries(t *testing.T)
 		t.Fatalf("drainWithoutGroup with a group = %d, %v, want nothing trimmed", n, err)
 	}
 	if store.calls != calls {
-		t.Fatal("drainWithoutGroup stored entries although a group exists")
+		t.Fatal("drainWithoutGroup stored entries although a group holds all of them")
 	}
 }
 
@@ -1349,17 +1367,14 @@ func TestRun_NoNewReadsWhileStoreDown(t *testing.T) {
 	store.mu.Lock()
 	store.failAll, store.pingErr = false, nil
 	store.mu.Unlock()
-	waitFor(t, "reading to resume after the outage", 5*time.Second, func() bool { return store.rowCount() == 3 })
+	// The batch that failed is retried first, so reclaim is not needed for it.
+	waitFor(t, "every event stored after the outage", 5*time.Second, func() bool {
+		return store.rowCount() == 4 && pendingCount(t, rdb, cfg.StreamName, cfg.Group) == 0
+	})
 	cancel()
 	if err := <-done; err != nil {
 		t.Fatalf("Run: %v", err)
 	}
-
-	// The batch that failed is still pending, and reclaim stores it.
-	cfg.ClaimInterval = 10 * time.Millisecond
-	runUntil(t, New(cfg, testLogger(), rdb, store), func() bool {
-		return store.rowCount() == 4 && pendingCount(t, rdb, cfg.StreamName, cfg.Group) == 0
-	}, 5*time.Second)
 }
 
 // TestDrain_MalformedEntryIsLoggedCountedAndTrimmed: the trim removes a dropped
@@ -1595,5 +1610,349 @@ func TestTrimBoundary_LogsGroupThatStopsTheTrim(t *testing.T) {
 				t.Fatalf("logs = %q, want a warning containing %q", got, c.want)
 			}
 		})
+	}
+}
+
+// oomOnGroupCreate refuses XGROUP CREATE as a full Valkey does. Add it after the
+// test has made the groups it wants.
+func oomOnGroupCreate(rdb *redis.Client) {
+	rdb.AddHook(funcHook(func(ctx context.Context, cmd redis.Cmder, next redis.ProcessHook) error {
+		if cmd.Name() == "xgroup" {
+			err := errors.New("OOM command not allowed when used memory > 'maxmemory'.") //nolint:revive // verbatim
+			cmd.SetErr(err)
+			return err
+		}
+		return next(ctx, cmd)
+	}))
+}
+
+// assertStoredBeforeTrim fails the test if an XTRIM runs before want rows are stored.
+func assertStoredBeforeTrim(t *testing.T, rdb *redis.Client, store *fakeStore, want func() int) {
+	t.Helper()
+	rdb.AddHook(funcHook(func(ctx context.Context, cmd redis.Cmder, next redis.ProcessHook) error {
+		if cmd.Name() == "xtrim" {
+			if got, w := store.rowCount(), want(); got < w {
+				t.Errorf("XTRIM ran with %d rows stored, want at least %d", got, w)
+			}
+		}
+		return next(ctx, cmd)
+	}))
+}
+
+// TestDrainWithoutGroup_ForeignGroupDoesNotBlockRecovery: another group on the stream
+// does not stop a full Valkey from recovering. The batch is stored first, and the
+// trim stops at the oldest of that group's last-delivered and oldest pending ids.
+func TestDrainWithoutGroup_ForeignGroupDoesNotBlockRecovery(t *testing.T) {
+	ctx := context.Background()
+	for name, c := range map[string]struct {
+		pendingAt int // index of the foreign group's oldest pending entry, or -1
+		keepFrom  int // index of the oldest entry that must stay
+	}{
+		"fully acknowledged up to X": {pendingAt: -1, keepFrom: 5},
+		"pending entry below X":      {pendingAt: 3, keepFrom: 3},
+	} {
+		t.Run(name, func(t *testing.T) {
+			_, rdb := startMiniredis(t)
+			cfg := testConfig(rdb.Options().Addr)
+			store := newFakeStore()
+			for i := range 8 {
+				xaddEvent(t, rdb, cfg.StreamName, sampleEvent(fmt.Sprintf("e-%d", i)))
+			}
+			ids := remainingEntries(t, rdb, cfg.StreamName)
+			if err := rdb.XGroupCreate(ctx, cfg.StreamName, "foreign", "0").Err(); err != nil {
+				t.Fatal(err)
+			}
+			for i, id := range readEntries(t, rdb, cfg, "foreign", 6) {
+				if i != c.pendingAt {
+					if err := rdb.XAck(ctx, cfg.StreamName, "foreign", id).Err(); err != nil {
+						t.Fatal(err)
+					}
+				}
+			}
+			oomOnGroupCreate(rdb)
+			assertStoredBeforeTrim(t, rdb, store, func() int { return len(ids) })
+			d := New(cfg, testLogger(), rdb, store)
+
+			n, err := d.drainWithoutGroup(ctx)
+			if err != nil || n != int64(c.keepFrom) {
+				t.Fatalf("drainWithoutGroup = %d, %v, want %d removed", n, err, c.keepFrom)
+			}
+			assertEntries(t, remainingEntries(t, rdb, cfg.StreamName), ids[c.keepFrom:])
+			if got := store.rowCount(); got != len(ids) {
+				t.Fatalf("rows = %d, want the whole batch of %d stored", got, len(ids))
+			}
+		})
+	}
+}
+
+// TestDrainWithoutGroup_ForeignGroupLimitIsReadAgainBeforeTheTrim: a foreign group that
+// appears while the batch is being stored, having read only part of it, limits the
+// trim. The entries it has not read stay.
+func TestDrainWithoutGroup_ForeignGroupLimitIsReadAgainBeforeTheTrim(t *testing.T) {
+	ctx := context.Background()
+	_, rdb := startMiniredis(t)
+	cfg := testConfig(rdb.Options().Addr)
+	for i := range 6 {
+		xaddEvent(t, rdb, cfg.StreamName, sampleEvent(fmt.Sprintf("e-%d", i)))
+	}
+	ids := remainingEntries(t, rdb, cfg.StreamName)
+	other := redis.NewClient(&redis.Options{Addr: rdb.Options().Addr})
+	t.Cleanup(func() { _ = other.Close() })
+	created := false
+	rdb.AddHook(funcHook(func(ctx context.Context, cmd redis.Cmder, next redis.ProcessHook) error {
+		err := next(ctx, cmd)
+		if cmd.Name() == "xrange" && !created {
+			created = true
+			if gerr := other.XGroupCreate(ctx, cfg.StreamName, "foreign", ids[2]).Err(); gerr != nil {
+				t.Errorf("create group: %v", gerr)
+			}
+		}
+		return err
+	}))
+	d := New(cfg, testLogger(), rdb, newFakeStore())
+
+	if n, err := d.drainWithoutGroup(ctx); err != nil || n != 2 {
+		t.Fatalf("drainWithoutGroup = %d, %v, want 2 removed", n, err)
+	}
+	assertEntries(t, remainingEntries(t, rdb, cfg.StreamName), ids[2:])
+}
+
+// TestWaitForGroup_ForeignGroupThatReadNothingHoldsTheStreamAndIsNamed: a foreign group
+// that has consumed nothing has a claim on every entry. The drainer loses nothing, and
+// the operator can see from one log line which group is the cause.
+func TestWaitForGroup_ForeignGroupThatReadNothingHoldsTheStreamAndIsNamed(t *testing.T) {
+	_, rdb := startMiniredis(t)
+	cfg := testConfig(rdb.Options().Addr)
+	store := newFakeStore()
+	for i := range 5 {
+		xaddEvent(t, rdb, cfg.StreamName, sampleEvent(fmt.Sprintf("e-%d", i)))
+	}
+	ids := remainingEntries(t, rdb, cfg.StreamName)
+	if err := rdb.XGroupCreate(context.Background(), cfg.StreamName, "debug-tap", "0").Err(); err != nil {
+		t.Fatal(err)
+	}
+	oomOnGroupCreate(rdb)
+	logger, logs := capturingLogger()
+	d := New(cfg, logger, rdb, store)
+	d.groupRetry = time.Millisecond
+
+	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+	defer cancel()
+	_ = d.waitForGroup(ctx) // returns when the timeout ends the wait
+
+	assertEntries(t, remainingEntries(t, rdb, cfg.StreamName), ids)
+	if got := d.DrainedWithoutGroup(); got != 0 {
+		t.Fatalf("DrainedWithoutGroup() = %d, want 0", got)
+	}
+	if got := strings.Count(logs.String(), `consumer group "debug-tap" holds the stream`); got != 1 {
+		t.Fatalf("log names the holding group %d times, want once per 30s: %s", got, logs.String())
+	}
+}
+
+// TestWaitForGroup_FullValkeyRecoversPastAForeignGroup is the same recovery end to end:
+// the drainer trims up to what the foreign group has acknowledged, the freed memory
+// lets the group be created, and no event is lost.
+func TestWaitForGroup_FullValkeyRecoversPastAForeignGroup(t *testing.T) {
+	_, rdb := startMiniredis(t)
+	cfg := testConfig(rdb.Options().Addr)
+	cfg.BatchSize = 4
+	store := newFakeStore()
+	const total = 20
+	for i := range total {
+		xaddEvent(t, rdb, cfg.StreamName, sampleEvent(fmt.Sprintf("e-%d", i)))
+	}
+	ctx := context.Background()
+	if err := rdb.XGroupCreate(ctx, cfg.StreamName, "foreign", "0").Err(); err != nil {
+		t.Fatal(err)
+	}
+	if err := rdb.XAck(ctx, cfg.StreamName, "foreign", readEntries(t, rdb, cfg, "foreign", total)...).Err(); err != nil {
+		t.Fatal(err)
+	}
+	rdb.AddHook(funcHook(func(ctx context.Context, cmd redis.Cmder, next redis.ProcessHook) error {
+		if cmd.Name() == "xgroup" {
+			if n := rdb.XLen(ctx, cfg.StreamName).Val(); n > 5 { // over maxmemory until trimmed
+				err := errors.New("OOM command not allowed when used memory > 'maxmemory'.") //nolint:revive // verbatim
+				cmd.SetErr(err)
+				return err
+			}
+		}
+		return next(ctx, cmd)
+	}))
+	d := New(cfg, testLogger(), rdb, store)
+	d.groupRetry = time.Hour // retrying must come from progress, not from the sleep
+
+	runUntil(t, d, func() bool {
+		return store.rowCount() == total && pendingCount(t, rdb, cfg.StreamName, cfg.Group) == 0
+	}, 5*time.Second)
+	if d.DrainedWithoutGroup() == 0 {
+		t.Fatal("DrainedWithoutGroup() = 0, want the recovery counted")
+	}
+}
+
+// TestDrainWithoutGroup_BatchSizeOneMakesProgress: with a batch of one, the entry read
+// is also the batch's last, so the trim must remove it or recovery never moves.
+func TestDrainWithoutGroup_BatchSizeOneMakesProgress(t *testing.T) {
+	ctx := context.Background()
+	_, rdb := startMiniredis(t)
+	cfg := testConfig(rdb.Options().Addr)
+	cfg.BatchSize = 1
+	store := newFakeStore()
+	for i := range 3 {
+		xaddEvent(t, rdb, cfg.StreamName, sampleEvent(fmt.Sprintf("e-%d", i)))
+	}
+	ids := remainingEntries(t, rdb, cfg.StreamName)
+	stored := 0
+	assertStoredBeforeTrim(t, rdb, store, func() int { return stored })
+	d := New(cfg, testLogger(), rdb, store)
+
+	for i := range ids {
+		stored = i + 1
+		n, err := d.drainWithoutGroup(ctx)
+		if err != nil || n != 1 {
+			t.Fatalf("pass %d: drainWithoutGroup = %d, %v, want 1 removed", i, n, err)
+		}
+		assertEntries(t, remainingEntries(t, rdb, cfg.StreamName), ids[i+1:])
+		if got := store.rowCount(); got != i+1 {
+			t.Fatalf("pass %d: rows = %d, want %d", i, got, i+1)
+		}
+	}
+	if got := d.DrainedWithoutGroup(); got != uint64(len(ids)) {
+		t.Fatalf("DrainedWithoutGroup() = %d, want %d", got, len(ids))
+	}
+}
+
+func TestNextStreamID(t *testing.T) {
+	for id, want := range map[string]string{
+		"5-3":                    "5-4",
+		"5-18446744073709551615": "6-0",
+		"not-an-id":              "",
+		"18446744073709551615-18446744073709551615": "",
+	} {
+		got, err := nextStreamID(id)
+		if got != want || (err != nil) != (want == "") {
+			t.Errorf("nextStreamID(%q) = %q, %v, want %q", id, got, err, want)
+		}
+	}
+}
+
+// TestDrain_PingOKButWriteFailsKeepsReadPaused: a store that answers Ping and rejects
+// every write must not read the stream into the pending list. Reads back off and stay
+// on the batch this consumer already holds. The delay is shortened 100 times, so the
+// 100ms run stands for 10s.
+func TestDrain_PingOKButWriteFailsKeepsReadPaused(t *testing.T) {
+	_, rdb := startMiniredis(t)
+	cfg := testConfig(rdb.Options().Addr)
+	cfg.BatchSize = 5
+	cfg.ClaimInterval = time.Hour
+	store := &schemaGapStore{fakeStore: newFakeStore()}
+	for i := range 50 {
+		xaddEvent(t, rdb, cfg.StreamName, sampleEvent(fmt.Sprintf("e-%d", i)))
+	}
+	reads := countCommand(rdb, "xreadgroup")
+	d := New(cfg, testLogger(), rdb, store)
+	d.storeRetryBase = 5 * time.Millisecond
+
+	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+	defer cancel()
+	if err := d.Run(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if n := reads.Load(); n < 1 || n >= 6 {
+		t.Fatalf("XREADGROUP ran %d times in the simulated 10s, want 1 to 5", n)
+	}
+	if p := pendingCount(t, rdb, cfg.StreamName, cfg.Group); p != int64(cfg.BatchSize) {
+		t.Fatalf("pending = %d, want only the one batch of %d", p, cfg.BatchSize)
+	}
+	if !d.storeDown {
+		t.Fatal("storeDown cleared although no write has succeeded")
+	}
+}
+
+// TestStoreRetryDelay_DoublesToCapAndOnlyAWorkingPassResetsIt: the wait grows with each
+// failed write up to the cap, and a Ping answer does not shorten it.
+func TestStoreRetryDelay_DoublesToCapAndOnlyAWorkingPassResetsIt(t *testing.T) {
+	_, rdb := startMiniredis(t)
+	d := New(testConfig(rdb.Options().Addr), testLogger(), rdb, newFakeStore())
+	want := []time.Duration{500 * time.Millisecond, time.Second, 2 * time.Second, 4 * time.Second, 8 * time.Second, 16 * time.Second, 30 * time.Second, 30 * time.Second}
+	for i, w := range want {
+		d.noteStoreFailed()
+		if d.storeRetryDelay != w {
+			t.Fatalf("failure %d: delay = %s, want %s", i+1, d.storeRetryDelay, w)
+		}
+	}
+	if !d.storeAnswers(context.Background()) {
+		t.Fatal("storeAnswers = false with a healthy Ping")
+	}
+	if !d.storeDown || d.storeRetryDelay != maxStoreRetryDelay {
+		t.Fatalf("after Ping storeDown=%v delay=%s, want both unchanged", d.storeDown, d.storeRetryDelay)
+	}
+	d.noteStoreWorking()
+	d.noteStoreFailed()
+	if d.storeRetryDelay != want[0] {
+		t.Fatalf("first failure after recovery: delay = %s, want %s", d.storeRetryDelay, want[0])
+	}
+}
+
+// TestRun_RecoversOnceWritesSucceed: when a store that was rejecting writes starts
+// accepting them, the held batch is written and reading resumes without reclaim.
+func TestRun_RecoversOnceWritesSucceed(t *testing.T) {
+	_, rdb := startMiniredis(t)
+	cfg := testConfig(rdb.Options().Addr)
+	cfg.BatchSize = 5
+	cfg.ClaimInterval = time.Hour
+	gap := &schemaGapStore{fakeStore: newFakeStore()}
+	switchable := &switchableWriteStore{Store: gap, healthy: newFakeStore()}
+	for i := range 12 {
+		xaddEvent(t, rdb, cfg.StreamName, sampleEvent(fmt.Sprintf("e-%d", i)))
+	}
+	d := New(cfg, testLogger(), rdb, switchable)
+	d.storeRetryBase = time.Millisecond
+	claims := countCommand(rdb, "xautoclaim")
+	time.AfterFunc(30*time.Millisecond, func() { switchable.fixed.Store(true) })
+
+	runUntil(t, d, func() bool {
+		return switchable.healthy.rowCount() == 12 && pendingCount(t, rdb, cfg.StreamName, cfg.Group) == 0
+	}, 5*time.Second)
+	if n := claims.Load(); n > 1 {
+		t.Fatalf("XAUTOCLAIM ran %d times with a one-hour ClaimInterval", n)
+	}
+}
+
+// switchableWriteStore sends writes to Store until fixed is set, then to healthy.
+type switchableWriteStore struct {
+	Store
+	healthy *fakeStore
+	fixed   atomic.Bool
+}
+
+func (s *switchableWriteStore) Upsert(ctx context.Context, events []metering.Event) error {
+	if s.fixed.Load() {
+		return s.healthy.Upsert(ctx, events)
+	}
+	return s.Store.Upsert(ctx, events)
+}
+
+// TestTrimDelivered_OwnGroupMissingTrimsNothing: an entry acknowledged by another group
+// is not stored in Postgres, so without the drainer's own group the normal trim, which
+// removes entries without storing them, must remove nothing.
+func TestTrimDelivered_OwnGroupMissingTrimsNothing(t *testing.T) {
+	ctx := context.Background()
+	_, rdb := startMiniredis(t)
+	cfg := testConfig(rdb.Options().Addr)
+	ids := addEntries(t, rdb, cfg.StreamName, 4)
+	if err := rdb.XGroupCreate(ctx, cfg.StreamName, "foreign", "0").Err(); err != nil {
+		t.Fatal(err)
+	}
+	if err := rdb.XAck(ctx, cfg.StreamName, "foreign", readEntries(t, rdb, cfg, "foreign", 4)...).Err(); err != nil {
+		t.Fatal(err)
+	}
+	logger, logs := capturingLogger()
+	d := New(cfg, logger, rdb, newFakeStore())
+
+	d.trimDelivered(ctx)
+
+	assertEntries(t, remainingEntries(t, rdb, cfg.StreamName), ids)
+	if !strings.Contains(logs.String(), `consumer group "test-group" does not exist`) {
+		t.Fatalf("logs = %q, want the missing group named", logs.String())
 	}
 }
