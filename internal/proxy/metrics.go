@@ -220,6 +220,7 @@ type MeteringHealth interface {
 	// WALPending also reports whether the count can be trusted.
 	WALPending() (uint64, bool)
 	WALPoisoned() bool
+	// WALQuarantinedDirs is negative when the count is unknown.
 	WALQuarantinedDirs() int
 	WALSkippedEntries() uint64
 	FloorEvents() uint64
@@ -257,7 +258,7 @@ func newMeteringCollector(h MeteringHealth) *meteringCollector {
 		walPending:         desc("metering_wal_pending_events", "Metering events in this replica's WAL, waiting for Valkey. Absent when the count is unknown, see metering_wal_healthy. 0 does not cover events in quarantined directories or skipped entries."),
 		walHealthy:         desc("metering_wal_healthy", "1 when this replica's WAL is open and countable; 0 means unshipped events may be on disk and the pending count is unknown."),
 		walPoisoned:        desc("metering_wal_poisoned", "1 when this replica's WAL has no open log because the recovery reopen is failing: new events reach the log floor and events on disk are not shipped."),
-		walQuarantinedDirs: desc("metering_wal_quarantined_dirs", "Corrupt WAL directories moved aside on this replica's disk. Their unshipped events are not billed until manually recovered."),
+		walQuarantinedDirs: desc("metering_wal_quarantined_dirs", "Corrupt WAL directories moved aside on this replica's disk. Their unshipped events are not billed until manually recovered. Absent when the directory cannot be read."),
 		walSkippedEntries:  desc("metering_wal_skipped_entries_total", "Undecodable WAL entries the shipper truncated past: those billing records are lost from the WAL."),
 		floorEvents:        desc("metering_floor_events_total", "Metering events that reached the log floor: the log line is the only copy."),
 		valkeyUp:           desc("metering_valkey_up", "1 when this replica could read the metering stream and Valkey's memory at scrape time."),
@@ -281,7 +282,10 @@ func (c *meteringCollector) Collect(ch chan<- prometheus.Metric) {
 	}
 	ch <- prometheus.MustNewConstMetric(c.walHealthy, prometheus.GaugeValue, boolGauge(countable))
 	ch <- prometheus.MustNewConstMetric(c.walPoisoned, prometheus.GaugeValue, boolGauge(c.health.WALPoisoned()))
-	ch <- prometheus.MustNewConstMetric(c.walQuarantinedDirs, prometheus.GaugeValue, float64(c.health.WALQuarantinedDirs()))
+	// Like the pending count, an unknown value is left out rather than reported as a number.
+	if dirs := c.health.WALQuarantinedDirs(); dirs >= 0 {
+		ch <- prometheus.MustNewConstMetric(c.walQuarantinedDirs, prometheus.GaugeValue, float64(dirs))
+	}
 	ch <- prometheus.MustNewConstMetric(c.walSkippedEntries, prometheus.CounterValue, float64(c.health.WALSkippedEntries()))
 	ch <- prometheus.MustNewConstMetric(c.floorEvents, prometheus.CounterValue, float64(c.health.FloorEvents()))
 	ctx, cancel := context.WithTimeout(context.Background(), meteringProbeTimeout)

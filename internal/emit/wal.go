@@ -9,6 +9,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"time"
 
@@ -45,7 +46,8 @@ import (
 // prescription (documented on TruncateFront's error path) is to recover by
 // Close() followed by Open(); recoverLocked implements exactly that and is
 // invoked on any Write failure and on ErrCorrupt from reads/truncates. If the
-// reopen itself fails the wal is "poisoned": append errors immediately (the
+// reopen itself fails (a transient open error, or a quarantine that cannot
+// complete) the wal is "poisoned": append errors immediately (the
 // emitter floors the event) and retries the reopen on every call — it is
 // already the failure path, so the extra open attempt is cheap relative to
 // the loss it can stop. pending, which the shipper calls every tick, retries it
@@ -65,6 +67,16 @@ type wal struct {
 	// shippedThrough is the highest index confirmed shipped. In-memory only —
 	// see the type comment for the restart/at-least-once contract.
 	shippedThrough uint64
+
+	// skipCountedThrough is the highest index a corrupt entry can no longer be
+	// counted at: markShipped has passed it, so the caller has counted it.
+	// rawLoggedThrough is the highest corrupt index whose raw bytes are logged.
+	// Unlike shippedThrough, both survive a reopen of the same log, which re-reads
+	// the retained entries: one lost record must count and log once per process.
+	// recoverLocked clears them only when a quarantine replaced the log, because
+	// the new log restarts from index 1.
+	skipCountedThrough uint64
+	rawLoggedThrough   uint64
 
 	// closed marks a deliberate close(): appends fail (→ log floor) and no
 	// recovery reopen is attempted — reopening after shutdown would leak a
@@ -100,10 +112,12 @@ type wal struct {
 //     trade: the old rename-first order parked events invisibly (silent
 //     revenue loss) if the process died before the appends.
 //
-//   - Corrupt-log quarantine: if tidwall refuses to open the directory (e.g.
-//     ErrCorrupt), the directory is moved aside to "<dir>.corrupt.<unix-ns>"
-//     for forensics and a fresh log is created. Serving must not be blocked by
-//     a corrupt billing buffer; the loss is bounded and loudly visible.
+//   - Corrupt-log quarantine: if tidwall reports that the on-disk data is damaged
+//     (see isCorruptOpenError), the directory is moved aside to
+//     "<dir>.corrupt.<unix-ns>" for forensics and a fresh log is created. Serving
+//     must not be blocked by a corrupt billing buffer; the loss is bounded and
+//     loudly visible. Any other open error (EACCES, EMFILE, EIO, ...) says nothing
+//     about the data, so it is returned and the directory stays where it is.
 func openWAL(dir string, logger *logging.Logger) (*wal, error) {
 	// A parked .imported file is forensic data from a previous upgrade that
 	// nobody has recovered or removed. Warn on every startup so it cannot be
@@ -145,23 +159,37 @@ func openWAL(dir string, logger *logging.Logger) (*wal, error) {
 	return w, nil
 }
 
+// isCorruptOpenError reports whether an error from tidwall.Open means the data on
+// disk is damaged. In tidwall v1.2.1 those are ErrCorrupt (an unparseable segment,
+// or START and END segments together) and ErrEmptyLog (a tail segment holding too
+// few entries for its name). Every other error comes from the filesystem and may
+// clear, and the valid unshipped events in the directory must wait for that.
+func isCorruptOpenError(err error) bool {
+	return errors.Is(err, tidwall.ErrCorrupt) || errors.Is(err, tidwall.ErrEmptyLog)
+}
+
 // openLog opens (or creates) the tidwall log at dir, quarantining a corrupt
-// directory aside and starting fresh — see openWAL. Returns the log and its
-// last index (0 if empty).
+// directory aside and starting fresh — see openWAL. A non-corruption open error is
+// returned with the directory untouched: recoverLocked then poisons the wal and
+// retries on the next append or shipper tick. Returns the log and its last index
+// (0 if empty).
 func openLog(dir string, logger *logging.Logger) (*tidwall.Log, uint64, error) {
 	l, err := tidwall.Open(dir, nil)
 	if err != nil {
+		if !isCorruptOpenError(err) {
+			return nil, 0, fmt.Errorf("open wal %s: %w", dir, err)
+		}
 		// UnixNano, not Unix: in-process write-failure recovery can quarantine
 		// more than once per second, and rename onto an existing dir fails.
 		quarantine := fmt.Sprintf("%s.corrupt.%d", dir, time.Now().UnixNano())
 		// Count prior quarantines so a flapping pod's disk growth is visible
 		// in the logs. Never auto-deleted: these are unbilled operator data.
-		siblings, _ := filepath.Glob(dir + ".corrupt.*")
+		siblings, _ := countQuarantinedDirs(dir)
 		logger.Error.Printf(
 			"emit: WAL OPEN FAILED at %s: %v — moving aside to %s and starting fresh "+
 				"(%d prior .corrupt dir(s) already present); any unshipped events in the "+
 				"quarantined dir are NOT billed until manually recovered",
-			dir, err, quarantine, len(siblings))
+			dir, err, quarantine, siblings)
 		if rerr := os.Rename(dir, quarantine); rerr != nil {
 			return nil, 0, fmt.Errorf("open wal %s: %w (and quarantine rename failed: %v)", dir, err, rerr)
 		}
@@ -344,6 +372,14 @@ func (w *wal) recoverLocked() bool {
 	// the alternative (trusting a stale watermark against a rebuilt log)
 	// risks truncating entries that never shipped.
 	w.shippedThrough = 0
+	// The same log keeps every index, so last cannot fall below a watermark. If it
+	// has, a quarantine replaced the log and those indexes now mean new entries.
+	if last < w.skipCountedThrough {
+		w.skipCountedThrough = 0
+	}
+	if last < w.rawLoggedThrough {
+		w.rawLoggedThrough = 0
+	}
 	w.poisoned = false
 	w.logger.Warn.Printf("emit: wal recovered by close-and-reopen at %s (next index %d; retained entries will be re-shipped)", w.dir, w.nextIndex)
 	return true
@@ -367,39 +403,43 @@ func (w *wal) recoverIfCorruptLocked(err error) {
 // and holds each event's WAL index: corrupt entries are skipped, so an event's
 // position in events does not map to an index by arithmetic.
 //
-// A corrupt entry (undecodable JSON) is SKIPPED and counted in skipped, never
-// aborts the drain, and is still covered by through so markShipped truncates
-// past it — one bad entry must not wedge the billing buffer forever.
+// A corrupt entry (undecodable JSON) is SKIPPED, never aborts the drain, and is
+// still covered by through so markShipped truncates past it — one bad entry must
+// not wedge the billing buffer forever. It may be a real billing record, and after
+// that truncate the log line written here is the only copy, so the first read in
+// this process logs its index and raw bytes. skipped holds the indexes of corrupt
+// entries in this batch not yet counted: a reopen re-reads the retained tail entry
+// after markShipped has passed it, and that entry must not count again.
 //
 // A poisoned wal retries the reopen here: without that, a replica with no new
 // appends would leave its entries on disk unshipped, because append was the only
 // other caller that retries.
-func (w *wal) pending(limit int) (events []metering.Event, indexes []uint64, through uint64, skipped int, err error) {
+func (w *wal) pending(limit int) (events []metering.Event, indexes []uint64, through uint64, skipped []uint64, err error) {
 	w.mu.Lock()
 	defer w.mu.Unlock()
 
 	// Closed: shutting down. Poisoned with a failing reopen: nothing to drain
 	// yet. Either way a clean no-op, never a nil-log panic.
 	if w.closed {
-		return nil, nil, 0, 0, nil
+		return nil, nil, 0, nil, nil
 	}
 	if w.poisoned && !w.recoverLocked() {
-		return nil, nil, 0, 0, nil
+		return nil, nil, 0, nil, nil
 	}
 
 	first, err := w.log.FirstIndex()
 	if err != nil {
 		w.recoverIfCorruptLocked(err)
-		return nil, nil, 0, 0, fmt.Errorf("wal first index: %w", err)
+		return nil, nil, 0, nil, fmt.Errorf("wal first index: %w", err)
 	}
 	last, err := w.log.LastIndex()
 	if err != nil {
 		w.recoverIfCorruptLocked(err)
-		return nil, nil, 0, 0, fmt.Errorf("wal last index: %w", err)
+		return nil, nil, 0, nil, fmt.Errorf("wal last index: %w", err)
 	}
 	// Empty log, or everything through the retained tail entry already shipped.
 	if last == 0 || last <= w.shippedThrough {
-		return nil, nil, 0, 0, nil
+		return nil, nil, 0, nil, nil
 	}
 
 	start := first
@@ -418,19 +458,37 @@ func (w *wal) pending(limit int) (events []metering.Event, indexes []uint64, thr
 			// through=0 means nothing gets truncated this pass. On ErrCorrupt
 			// the reopen rebuilds state; the next tick resumes from disk.
 			w.recoverIfCorruptLocked(rerr)
-			return nil, nil, 0, skipped, fmt.Errorf("wal read index %d: %w", i, rerr)
+			return nil, nil, 0, nil, fmt.Errorf("wal read index %d: %w", i, rerr)
 		}
 		// UnmarshalEvent: see readLegacyJSONL. A spool written by a pre-cutover
 		// pod and shipped by a post-cutover pod must keep the dedicated default.
 		ev, jerr := metering.UnmarshalEvent(data)
 		if jerr != nil {
-			skipped++
+			if i > w.rawLoggedThrough {
+				w.logger.Error.Printf("emit: undecodable wal entry index=%d (%d bytes): %v; the shipper truncates past it, so this line is the only copy; raw=%q",
+					i, len(data), jerr, capRawEntry(data))
+				w.rawLoggedThrough = i
+			}
+			if i > w.skipCountedThrough {
+				skipped = append(skipped, i)
+			}
 			continue
 		}
 		events = append(events, ev)
 		indexes = append(indexes, i)
 	}
 	return events, indexes, end, skipped, nil
+}
+
+// maxLoggedRawEntry bounds one raw-entry log line. Metering events are well under
+// it, so in practice the logged copy is complete; the line records the full length.
+const maxLoggedRawEntry = 4096
+
+func capRawEntry(data []byte) []byte {
+	if len(data) > maxLoggedRawEntry {
+		return data[:maxLoggedRawEntry]
+	}
+	return data
 }
 
 // pendingCount returns how many entries have not been confirmed shipped, and
@@ -475,13 +533,42 @@ func (w *wal) isPoisoned() bool {
 // quarantinedDirs counts the corrupt directories moved aside by openLog. It reads
 // the disk rather than a counter: a quarantine at startup happens before the first
 // scrape, and these directories hold unbilled data that is never auto-deleted, so
-// the count stays nonzero until an operator recovers them.
+// the count stays nonzero until an operator recovers them. A negative result means
+// the count is unknown; see quarantinedDirsOrUnknown.
 func (w *wal) quarantinedDirs() int {
-	matches, err := filepath.Glob(w.dir + ".corrupt.*")
+	return quarantinedDirsOrUnknown(w.dir, w.logger)
+}
+
+// quarantinedDirsUnknown is what the WALQuarantinedDirs methods return when the
+// directory cannot be read. It must not be 0: these directories hold unbilled data.
+const quarantinedDirsUnknown = -1
+
+// quarantinedDirsOrUnknown logs a failed count and reports it as unknown.
+func quarantinedDirsOrUnknown(dir string, logger *logging.Logger) int {
+	n, err := countQuarantinedDirs(dir)
 	if err != nil {
-		return 0
+		logger.Error.Printf("emit: cannot count quarantined wal directories for %s: %v", dir, err)
+		return quarantinedDirsUnknown
 	}
-	return len(matches)
+	return n
+}
+
+// countQuarantinedDirs counts the "<dir>.corrupt.*" siblings of dir. It compares
+// names rather than using filepath.Glob, because the WAL path is configuration and
+// may contain glob metacharacters such as '['.
+func countQuarantinedDirs(dir string) (int, error) {
+	entries, err := os.ReadDir(filepath.Dir(dir))
+	if err != nil {
+		return 0, err
+	}
+	prefix := filepath.Base(dir) + ".corrupt."
+	n := 0
+	for _, entry := range entries {
+		if strings.HasPrefix(entry.Name(), prefix) {
+			n++
+		}
+	}
+	return n, nil
 }
 
 // markShipped records that every entry up to and including through has been
@@ -492,7 +579,13 @@ func (w *wal) markShipped(through uint64) error {
 	defer w.mu.Unlock()
 
 	if w.closed || w.poisoned {
-		return nil // no-op; see pending
+		// No-op, see pending. The caller still counts this batch's skips on a nil
+		// return, so the watermark moves; recoverLocked clears it if the log is
+		// replaced.
+		if through > w.skipCountedThrough {
+			w.skipCountedThrough = through
+		}
+		return nil
 	}
 
 	last, err := w.log.LastIndex()
@@ -520,6 +613,9 @@ func (w *wal) markShipped(through uint64) error {
 	}
 	if through > w.shippedThrough {
 		w.shippedThrough = through
+	}
+	if tf > w.skipCountedThrough {
+		w.skipCountedThrough = tf
 	}
 	return nil
 }

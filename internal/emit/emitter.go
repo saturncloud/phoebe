@@ -67,6 +67,8 @@ type DurableEmitter struct {
 	skippedEntries atomic.Uint64
 }
 
+var _ metering.Emitter = (*DurableEmitter)(nil)
+
 // WALPending returns how many events wait in this replica's WAL for Valkey, and
 // whether that count can be trusted. See wal.pendingCount.
 func (e *DurableEmitter) WALPending() (uint64, bool) { return e.wal.pendingCount() }
@@ -76,7 +78,8 @@ func (e *DurableEmitter) WALPending() (uint64, bool) { return e.wal.pendingCount
 func (e *DurableEmitter) WALPoisoned() bool { return e.wal.isPoisoned() }
 
 // WALQuarantinedDirs returns how many corrupt WAL directories were moved aside
-// and are waiting for manual recovery.
+// and are waiting for manual recovery. A negative value means the directory could
+// not be read and the count is unknown.
 func (e *DurableEmitter) WALQuarantinedDirs() int { return e.wal.quarantinedDirs() }
 
 // WALSkippedEntries returns how many undecodable WAL entries the shipper has
@@ -311,8 +314,8 @@ func (e *DurableEmitter) drainWAL() {
 			e.log.Error.Printf("emit: wal read for drain: %v", err)
 			return
 		}
-		if skipped > 0 {
-			e.log.Error.Printf("emit: wal drain: skipped %d corrupt entries (undecodable; truncating past them)", skipped)
+		if len(skipped) > 0 {
+			e.log.Error.Printf("emit: wal drain: skipped %d corrupt entries (undecodable; truncating past them)", len(skipped))
 		}
 		if through == 0 {
 			return // nothing unshipped
@@ -320,7 +323,7 @@ func (e *DurableEmitter) drainWAL() {
 		if len(events) > 0 {
 			if n := e.shipFn(events); n < len(events) {
 				if n > 0 {
-					e.markPartialBatch(indexes[n-1], through, n, len(events)+skipped)
+					e.markPartialBatch(indexes[n-1], n, skipped)
 				}
 				return // ship failed — the rest remains; next tick resumes here
 			}
@@ -329,7 +332,7 @@ func (e *DurableEmitter) drainWAL() {
 			e.log.Error.Printf("emit: wal truncate after ship: %v", err)
 			return
 		}
-		e.skippedEntries.Add(uint64(skipped))
+		e.skippedEntries.Add(uint64(len(skipped)))
 		if len(events) > 0 {
 			e.log.Info.Printf("emit: wal drained batch (%d events shipped)", len(events))
 		}
@@ -337,16 +340,22 @@ func (e *DurableEmitter) drainWAL() {
 }
 
 // markPartialBatch records a batch that stopped after n events, the last of them
-// at WAL index shippedThrough. through and examined describe the whole batch, and
-// give its first index. The skip counter only takes the corrupt entries the
-// watermark passes: the rest are read again next tick and must not count twice.
-func (e *DurableEmitter) markPartialBatch(shippedThrough, through uint64, n, examined int) {
+// at WAL index shippedThrough. skipped holds the batch's uncounted corrupt indexes.
+// The skip counter only takes the ones the watermark passes: the rest are read again
+// next tick and must not count twice.
+func (e *DurableEmitter) markPartialBatch(shippedThrough uint64, n int, skipped []uint64) {
 	if err := e.wal.markShipped(shippedThrough); err != nil {
+		// The watermark did not move, so the next tick re-reads these entries and
+		// counts them then. Re-shipping the prefix is safe: the drainer dedups on
+		// request_id. Counting here would count them twice.
 		e.log.Error.Printf("emit: wal truncate after partial ship: %v", err)
 		return
 	}
-	first := through - uint64(examined) + 1
-	e.skippedEntries.Add(shippedThrough - first + 1 - uint64(n))
+	for _, index := range skipped {
+		if index <= shippedThrough {
+			e.skippedEntries.Add(1)
+		}
+	}
 	e.log.Info.Printf("emit: wal drained partial batch (%d events shipped)", n)
 }
 
@@ -414,10 +423,7 @@ func (e *DurableEmitter) Probe(ctx context.Context) (MeteringProbe, error) {
 	for _, g := range groups {
 		undelivered := g.Pending + g.Lag
 		if g.Lag < 0 {
-			// Valkey could not compute the lag (go-redis reports -1). Unknown must
-			// not read as caught up, because this number feeds
-			// PhoebeMeteringDrainerBehind, so use the upper bound.
-			undelivered = p.StreamEntries
+			undelivered = e.undeliveredWithUnknownLag(ctx, g, p.StreamEntries)
 		}
 		if undelivered > p.Undelivered {
 			p.Undelivered = undelivered // the group furthest behind
@@ -430,6 +436,30 @@ func (e *DurableEmitter) Probe(ctx context.Context) (MeteringProbe, error) {
 	p.UsedMemory = infoInt(info, "used_memory")
 	p.MaxMemory = infoInt(info, "maxmemory")
 	return p, nil
+}
+
+// unknownLagScanLimit bounds the XRANGE that replaces an unknown lag. The reply
+// carries whole entries, so this limits what one scrape can pull from Valkey. A
+// backlog this large is reported through the upper bound, which still fires
+// PhoebeMeteringDrainerBehind.
+const unknownLagScanLimit = 10000
+
+// undeliveredWithUnknownLag handles a group whose lag Valkey could not compute
+// (go-redis reports -1, for example after XDEL or XTRIM MINID). Unknown must not
+// read as caught up, because this number feeds PhoebeMeteringDrainerBehind. The
+// stream length overstates it, since it includes entries delivered and acked but not
+// yet trimmed, so this counts the entries after the group's last delivered ID. It
+// uses the stream length as an upper bound when that scan fails or reaches the limit.
+func (e *DurableEmitter) undeliveredWithUnknownLag(ctx context.Context, g redis.XInfoGroup, streamEntries int64) int64 {
+	after, err := e.rdb.XRangeN(ctx, e.cfg.StreamName, "("+g.LastDeliveredID, "+", unknownLagScanLimit).Result()
+	if err != nil {
+		e.log.Warn.Printf("emit: count entries after group %s position %s: %v; reporting the stream length", g.Name, g.LastDeliveredID, err)
+		return streamEntries
+	}
+	if len(after) >= unknownLagScanLimit {
+		return streamEntries
+	}
+	return g.Pending + int64(len(after))
 }
 
 // CheckBufferBound warns when Valkey does not enforce the bound this emitter
