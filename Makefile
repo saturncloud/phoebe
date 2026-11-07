@@ -10,25 +10,43 @@ build:
 run: build
 	./bin/$(BINARY) -f config/settings.example.yaml
 
+# promtool evaluates the runbook's drain query in TestRunbookDrainQueryTreatsAbsentPendingAsNotDrained.
+# It is downloaded at a pinned version, checked against the release checksum, and
+# put on PATH for every target that runs internal/proxy tests, so CI runs that test
+# instead of skipping it (in CI the test fails when promtool is missing).
+PROMETHEUS_VERSION := 2.53.4
+PROMETHEUS_SHA256 := b8b497c4610d1b93208252b60c8f20f6b2e78596ae8df43397a2e805aa53d475
+PROMETHEUS_TARBALL := prometheus-$(PROMETHEUS_VERSION).linux-amd64.tar.gz
+
+.PHONY: promtool
+promtool: bin/promtool
+
+bin/promtool:
+	mkdir -p bin
+	curl -fsSL -o bin/$(PROMETHEUS_TARBALL) https://github.com/prometheus/prometheus/releases/download/v$(PROMETHEUS_VERSION)/$(PROMETHEUS_TARBALL)
+	echo "$(PROMETHEUS_SHA256)  bin/$(PROMETHEUS_TARBALL)" | sha256sum -c -
+	tar -xzf bin/$(PROMETHEUS_TARBALL) -C bin --strip-components=1 prometheus-$(PROMETHEUS_VERSION).linux-amd64/promtool
+	rm bin/$(PROMETHEUS_TARBALL)
+
 .PHONY: test
-test:
-	go test -race ./...
+test: bin/promtool
+	PATH="$(CURDIR)/bin:$$PATH" go test -race ./...
 
 # Runs the live-Postgres conformance tests (the `integration` build tag). These
 # prove the production SQL rater computes the same money as the Rate() oracle —
 # including the sum-then-round behavior a unit test can't exercise. Requires
 # PHOEBE_TEST_DATABASE_URL pointing at a Postgres with btree_gist available.
 .PHONY: integration-test
-integration-test:
-	go test -tags=integration ./...
+integration-test: bin/promtool
+	PATH="$(CURDIR)/bin:$$PATH" go test -tags=integration ./...
 
 # Race-detector gate for the concurrency-sensitive billing paths. `make test`
 # does not enable -race (it would slow the whole suite), but proxy and waker
 # decide whether a billable attempt is emitted exactly once under concurrent
 # aborts, so a data race there is a money bug. Run this in CI alongside `test`.
 .PHONY: race-test
-race-test:
-	go test -race -count=1 ./internal/proxy/... ./internal/waker/...
+race-test: bin/promtool
+	PATH="$(CURDIR)/bin:$$PATH" go test -race -count=1 ./internal/proxy/... ./internal/waker/...
 
 # Runs every real-Valkey test (admission, drain, emit) against a real
 # Valkey/Redis-compatible server. -p 1 is required because the drain and emit

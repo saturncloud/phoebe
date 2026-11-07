@@ -73,8 +73,8 @@ var _ metering.Emitter = (*DurableEmitter)(nil)
 // whether that count can be trusted. See wal.pendingCount.
 func (e *DurableEmitter) WALPending() (uint64, bool) { return e.wal.pendingCount() }
 
-// WALPoisoned reports whether this replica's WAL has no open log because the
-// recovery reopen is failing.
+// WALPoisoned reports whether this replica's WAL has no open log because its
+// open, at startup or in a recovery reopen, is failing.
 func (e *DurableEmitter) WALPoisoned() bool { return e.wal.isPoisoned() }
 
 // WALQuarantinedDirs returns how many corrupt WAL directories were moved aside
@@ -410,6 +410,14 @@ func (e *DurableEmitter) Probe(ctx context.Context) (MeteringProbe, error) {
 	if p.StreamEntries, err = e.rdb.XLen(ctx, e.cfg.StreamName).Result(); err != nil {
 		return p, fmt.Errorf("xlen: %w", err)
 	}
+	// Memory is read before the groups, so a slow unknown-lag scan cannot use up
+	// the context INFO needs and turn the whole probe into an error.
+	info, err := e.rdb.Info(ctx, "memory").Result()
+	if err != nil {
+		return p, fmt.Errorf("info memory: %w", err)
+	}
+	p.UsedMemory = infoInt(info, "used_memory")
+	p.MaxMemory = infoInt(info, "maxmemory")
 	groups, err := e.rdb.XInfoGroups(ctx, e.cfg.StreamName).Result()
 	if err != nil {
 		if !strings.Contains(err.Error(), "no such key") {
@@ -429,37 +437,61 @@ func (e *DurableEmitter) Probe(ctx context.Context) (MeteringProbe, error) {
 			p.Undelivered = undelivered // the group furthest behind
 		}
 	}
-	info, err := e.rdb.Info(ctx, "memory").Result()
-	if err != nil {
-		return p, fmt.Errorf("info memory: %w", err)
-	}
-	p.UsedMemory = infoInt(info, "used_memory")
-	p.MaxMemory = infoInt(info, "maxmemory")
 	return p, nil
 }
 
-// unknownLagScanLimit bounds the XRANGE that replaces an unknown lag. The reply
-// carries whole entries, so this limits what one scrape can pull from Valkey. A
-// backlog this large is reported through the upper bound, which still fires
-// PhoebeMeteringDrainerBehind.
-const unknownLagScanLimit = 10000
+// The scan that replaces an unknown lag runs on every metrics scrape of every
+// replica, against a Valkey that may already be near maxmemory, and its replies
+// carry whole entries. Client output buffers count toward used_memory, so the scan
+// is kept small:
+//   - unknownLagScanLimit bounds the total. The scan runs only when the stream
+//     holds fewer entries than this; otherwise the stream length is reported as
+//     the upper bound without scanning. A backlog at or over the limit therefore
+//     reads as the stream length, which still fires PhoebeMeteringDrainerBehind.
+//   - unknownLagScanPage bounds what one reply carries.
+//   - unknownLagScanTimeout bounds how long the scan may take, separately from the
+//     probe's own deadline.
+const (
+	unknownLagScanLimit   = 1000
+	unknownLagScanPage    = 500
+	unknownLagScanTimeout = 500 * time.Millisecond
+)
 
 // undeliveredWithUnknownLag handles a group whose lag Valkey could not compute
 // (go-redis reports -1, for example after XDEL or XTRIM MINID). Unknown must not
 // read as caught up, because this number feeds PhoebeMeteringDrainerBehind. The
 // stream length overstates it, since it includes entries delivered and acked but not
-// yet trimmed, so this counts the entries after the group's last delivered ID. It
-// uses the stream length as an upper bound when that scan fails or reaches the limit.
+// yet trimmed, so when the stream is shorter than unknownLagScanLimit this counts
+// the entries after the group's last delivered ID, one page at a time. It reports
+// the stream length as the upper bound when the stream is at or over the limit
+// (without scanning), or when the scan fails, times out, or reaches the limit.
 func (e *DurableEmitter) undeliveredWithUnknownLag(ctx context.Context, g redis.XInfoGroup, streamEntries int64) int64 {
-	after, err := e.rdb.XRangeN(ctx, e.cfg.StreamName, "("+g.LastDeliveredID, "+", unknownLagScanLimit).Result()
-	if err != nil {
-		e.log.Warn.Printf("emit: count entries after group %s position %s: %v; reporting the stream length", g.Name, g.LastDeliveredID, err)
+	if streamEntries >= unknownLagScanLimit {
 		return streamEntries
 	}
-	if len(after) >= unknownLagScanLimit {
-		return streamEntries
+	scanCtx, cancel := context.WithTimeout(ctx, unknownLagScanTimeout)
+	defer cancel()
+	start := "(" + g.LastDeliveredID
+	var count int64
+	for {
+		if err := scanCtx.Err(); err != nil {
+			e.log.Warn.Printf("emit: count entries after group %s position %s: %v; reporting the stream length", g.Name, g.LastDeliveredID, err)
+			return streamEntries
+		}
+		page, err := e.rdb.XRangeN(scanCtx, e.cfg.StreamName, start, "+", unknownLagScanPage).Result()
+		if err != nil {
+			e.log.Warn.Printf("emit: count entries after group %s position %s: %v; reporting the stream length", g.Name, g.LastDeliveredID, err)
+			return streamEntries
+		}
+		count += int64(len(page))
+		if len(page) < unknownLagScanPage {
+			return g.Pending + count
+		}
+		if count >= unknownLagScanLimit {
+			return streamEntries
+		}
+		start = "(" + page[len(page)-1].ID
 	}
-	return g.Pending + int64(len(after))
 }
 
 // CheckBufferBound warns when Valkey does not enforce the bound this emitter

@@ -48,16 +48,20 @@ func TestRunbookDrainQueryNamesServedMetrics(t *testing.T) {
 
 // TestRunbookDrainQueryTreatsAbsentPendingAsNotDrained evaluates the runbook's query
 // with promtool: it returns a sample only for a cleared backlog, and a missing pending
-// series or an unknown count gives an empty result. Skipped without promtool.
+// series or an unknown count gives an empty result. Outside CI it is skipped without
+// promtool; in CI (`make test` installs promtool) a missing promtool fails the test.
 func TestRunbookDrainQueryTreatsAbsentPendingAsNotDrained(t *testing.T) {
 	promtool, err := exec.LookPath("promtool")
 	if err != nil {
+		if os.Getenv("CI") != "" {
+			t.Fatal("promtool not on PATH in CI; run the tests through `make test`, which installs it")
+		}
 		t.Skip("promtool not on PATH")
 	}
 	query := runbookDrainQuery(t)
 
-	// replica holds the values of one replica's series; a negative pending means the
-	// series is absent.
+	// replica holds the values of one replica's series; a negative value for any field
+	// means that series is absent.
 	type replica struct{ healthy, pending, poisoned, quarantined int }
 	cleared := replica{healthy: 1}
 	cases := []struct {
@@ -72,6 +76,9 @@ func TestRunbookDrainQueryTreatsAbsentPendingAsNotDrained(t *testing.T) {
 		{"events pending", []replica{cleared, {healthy: 1, pending: 5}}, false},
 		{"poisoned", []replica{cleared, {healthy: 1, poisoned: 1}}, false},
 		{"quarantined directory", []replica{cleared, {healthy: 1, quarantined: 1}}, false},
+		// The exporter omits quarantined_dirs when the directory cannot be read (an
+		// unknown count, -1 from WALQuarantinedDirs), so the operator must not read it as 0.
+		{"quarantined missing while healthy", []replica{cleared, {healthy: 1, quarantined: -1}}, false},
 	}
 
 	var cfg strings.Builder

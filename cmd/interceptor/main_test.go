@@ -400,19 +400,31 @@ func TestBuildAdmissionPolicySyncTimeoutLogsErrorAndKeepsServing(t *testing.T) {
 	}
 }
 
+// walPathThatFailsNew returns a WAL path that emit.New refuses, even as root. A
+// transient open error no longer fails New (the wal starts poisoned and retries), so
+// this uses a case that still does: a legacy WAL file whose staging rename is blocked
+// by a non-empty directory at "<path>.importing".
+func walPathThatFailsNew(t *testing.T) string {
+	t.Helper()
+	path := filepath.Join(t.TempDir(), "wal")
+	if err := os.WriteFile(path, []byte("{}\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(filepath.Join(path+".importing", "blocker"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	return path
+}
+
 // TestBuildEmitterFailedWALClosesValkeyClient: when the WAL cannot open, the
 // fallback floor emitter never uses Valkey, so the client built for the durable
 // emitter must be closed instead of holding its connection pool open for the
 // life of the process. The serving fallback itself must stay in place.
 func TestBuildEmitterFailedWALClosesValkeyClient(t *testing.T) {
 	mr := miniredis.RunT(t)
-	notADir := filepath.Join(t.TempDir(), "file")
-	if err := os.WriteFile(notADir, nil, 0o600); err != nil {
-		t.Fatal(err)
-	}
 	s := &config.Settings{}
 	s.Emit.ValkeyAddr = mr.Addr()
-	s.Emit.WALPath = filepath.Join(notADir, "wal") // beneath a regular file, so emit.New fails
+	s.Emit.WALPath = walPathThatFailsNew(t)
 
 	var client *redis.Client
 	var buf bytes.Buffer
@@ -459,12 +471,8 @@ func TestBuildEmitterHealthyWALKeepsValkeyClientOpen(t *testing.T) {
 // open, the emitter buildEmitter falls back to must still reach the metrics through
 // main's type assertion, and its events must be in the format recovery parses.
 func TestBuildEmitterFailedWALKeepsMeteringHealthAndFloorFormat(t *testing.T) {
-	notADir := filepath.Join(t.TempDir(), "file")
-	if err := os.WriteFile(notADir, nil, 0o600); err != nil {
-		t.Fatal(err)
-	}
 	s := &config.Settings{}
-	s.Emit.WALPath = filepath.Join(notADir, "wal") // beneath a regular file, so emit.New fails
+	s.Emit.WALPath = walPathThatFailsNew(t)
 
 	var buf bytes.Buffer
 	emitter, closeEmitter := buildEmitter(s, captureAllLogger(&buf))

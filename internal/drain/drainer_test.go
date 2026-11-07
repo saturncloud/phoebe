@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/alicebob/miniredis/v2"
+	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/redis/go-redis/v9"
 
 	"github.com/saturncloud/phoebe/internal/logging"
@@ -1640,8 +1641,8 @@ func assertStoredBeforeTrim(t *testing.T, rdb *redis.Client, store *fakeStore, w
 }
 
 // TestDrainWithoutGroup_ForeignGroupDoesNotBlockRecovery: another group on the stream
-// does not stop a full Valkey from recovering. The batch is stored first, and the
-// trim stops at the oldest of that group's last-delivered and oldest pending ids.
+// does not stop a full Valkey from recovering. The entries below the oldest of that
+// group's last-delivered and oldest pending ids are stored first, then trimmed.
 func TestDrainWithoutGroup_ForeignGroupDoesNotBlockRecovery(t *testing.T) {
 	ctx := context.Background()
 	for name, c := range map[string]struct {
@@ -1670,7 +1671,7 @@ func TestDrainWithoutGroup_ForeignGroupDoesNotBlockRecovery(t *testing.T) {
 				}
 			}
 			oomOnGroupCreate(rdb)
-			assertStoredBeforeTrim(t, rdb, store, func() int { return len(ids) })
+			assertStoredBeforeTrim(t, rdb, store, func() int { return c.keepFrom })
 			d := New(cfg, testLogger(), rdb, store)
 
 			n, err := d.drainWithoutGroup(ctx)
@@ -1678,8 +1679,8 @@ func TestDrainWithoutGroup_ForeignGroupDoesNotBlockRecovery(t *testing.T) {
 				t.Fatalf("drainWithoutGroup = %d, %v, want %d removed", n, err, c.keepFrom)
 			}
 			assertEntries(t, remainingEntries(t, rdb, cfg.StreamName), ids[c.keepFrom:])
-			if got := store.rowCount(); got != len(ids) {
-				t.Fatalf("rows = %d, want the whole batch of %d stored", got, len(ids))
+			if got := store.rowCount(); got != c.keepFrom {
+				t.Fatalf("rows = %d, want only the %d entries below the foreign group's limit stored", got, c.keepFrom)
 			}
 		})
 	}
@@ -1844,6 +1845,7 @@ func TestDrain_PingOKButWriteFailsKeepsReadPaused(t *testing.T) {
 	cfg := testConfig(rdb.Options().Addr)
 	cfg.BatchSize = 5
 	cfg.ClaimInterval = time.Hour
+	cfg.ClaimMinIdle = time.Hour // so storeRetryCap does not shorten the simulated wait
 	store := &schemaGapStore{fakeStore: newFakeStore()}
 	for i := range 50 {
 		xaddEvent(t, rdb, cfg.StreamName, sampleEvent(fmt.Sprintf("e-%d", i)))
@@ -1868,11 +1870,15 @@ func TestDrain_PingOKButWriteFailsKeepsReadPaused(t *testing.T) {
 	}
 }
 
-// TestStoreRetryDelay_DoublesToCapAndOnlyAWorkingPassResetsIt: the wait grows with each
-// failed write up to the cap, and a Ping answer does not shorten it.
-func TestStoreRetryDelay_DoublesToCapAndOnlyAWorkingPassResetsIt(t *testing.T) {
+// TestStoreRetryDelay_DoublesToCapAndOnlyAStoredWriteResetsIt: the wait grows with
+// each failed write up to the cap, a Ping answer does not shorten it, a pass that
+// stored nothing keeps it, and only a pass that stored a row resets it. The Run-level
+// cases are in TestRun_RetryPassClearsStoreDownOnlyAfterAWrite.
+func TestStoreRetryDelay_DoublesToCapAndOnlyAStoredWriteResetsIt(t *testing.T) {
 	_, rdb := startMiniredis(t)
-	d := New(testConfig(rdb.Options().Addr), testLogger(), rdb, newFakeStore())
+	cfg := testConfig(rdb.Options().Addr)
+	cfg.ClaimMinIdle = 2 * time.Minute // so maxStoreRetryDelay is the cap
+	d := New(cfg, testLogger(), rdb, newFakeStore())
 	want := []time.Duration{500 * time.Millisecond, time.Second, 2 * time.Second, 4 * time.Second, 8 * time.Second, 16 * time.Second, 30 * time.Second, 30 * time.Second}
 	for i, w := range want {
 		d.noteStoreFailed()
@@ -1886,7 +1892,15 @@ func TestStoreRetryDelay_DoublesToCapAndOnlyAWorkingPassResetsIt(t *testing.T) {
 	if !d.storeDown || d.storeRetryDelay != maxStoreRetryDelay {
 		t.Fatalf("after Ping storeDown=%v delay=%s, want both unchanged", d.storeDown, d.storeRetryDelay)
 	}
-	d.noteStoreWorking()
+	d.noteStoreWorking(0)
+	if d.storeDown || d.storeRetryDelay != maxStoreRetryDelay {
+		t.Fatalf("after a pass that stored nothing storeDown=%v delay=%s, want reads resumed and the delay kept", d.storeDown, d.storeRetryDelay)
+	}
+	d.noteStoreFailed()
+	if d.storeRetryDelay != maxStoreRetryDelay {
+		t.Fatalf("failure after a pass that stored nothing: delay = %s, want %s", d.storeRetryDelay, maxStoreRetryDelay)
+	}
+	d.noteStoreWorking(1)
 	d.noteStoreFailed()
 	if d.storeRetryDelay != want[0] {
 		t.Fatalf("first failure after recovery: delay = %s, want %s", d.storeRetryDelay, want[0])
@@ -1954,5 +1968,502 @@ func TestTrimDelivered_OwnGroupMissingTrimsNothing(t *testing.T) {
 	assertEntries(t, remainingEntries(t, rdb, cfg.StreamName), ids)
 	if !strings.Contains(logs.String(), `consumer group "test-group" does not exist`) {
 		t.Fatalf("logs = %q, want the missing group named", logs.String())
+	}
+}
+
+// countingStore counts every Upsert call, including the ones that fail.
+type countingStore struct {
+	Store
+	upserts atomic.Int64
+}
+
+func (s *countingStore) Upsert(ctx context.Context, events []metering.Event) error {
+	s.upserts.Add(1)
+	return s.Store.Upsert(ctx, events)
+}
+
+// consumerPending returns how many entries the drainer's own consumer holds.
+func consumerPending(t *testing.T, rdb *redis.Client, cfg Config) int {
+	t.Helper()
+	res, err := rdb.XPendingExt(context.Background(), &redis.XPendingExtArgs{
+		Stream: cfg.StreamName, Group: cfg.Group, Start: "-", End: "+", Count: 1000, Consumer: cfg.Consumer,
+	}).Result()
+	if err != nil {
+		t.Fatalf("xpending: %v", err)
+	}
+	return len(res)
+}
+
+// readAsConsumer delivers n new entries to the drainer's own consumer, as a pass
+// that then failed to store them would have.
+func readAsConsumer(t *testing.T, rdb *redis.Client, cfg Config, n int64) []string {
+	t.Helper()
+	res, err := rdb.XReadGroup(context.Background(), &redis.XReadGroupArgs{
+		Group: cfg.Group, Consumer: cfg.Consumer, Streams: []string{cfg.StreamName, ">"}, Count: n, Block: -1,
+	}).Result()
+	if err != nil {
+		t.Fatal(err)
+	}
+	var ids []string
+	for _, st := range res {
+		for _, m := range st.Messages {
+			ids = append(ids, m.ID)
+		}
+	}
+	return ids
+}
+
+// retryConfig is a config where only the read path runs and the retry wait is not
+// shortened by storeRetryCap.
+func retryConfig(addr string) Config {
+	cfg := testConfig(addr)
+	cfg.BatchSize = 5
+	cfg.ClaimInterval = time.Hour
+	cfg.ClaimMinIdle = 2 * time.Minute
+	cfg.TrimInterval = time.Hour
+	return cfg
+}
+
+// putInRetry leaves d as a failed store write does, with the wait already over.
+func putInRetry(d *Drainer, delay time.Duration) {
+	d.storeDown = true
+	d.storeRetryDelay = delay
+	d.lastStoreFail = time.Time{}
+}
+
+// TestRun_RetryPassClearsStoreDownOnlyAfterAWrite: a retry pass that writes nothing
+// has not shown that the store accepts writes. When this consumer has nothing left
+// to retry (its entries were reclaimed elsewhere, the group was recreated, or they
+// were all undecodable), the pass reads one new batch as the test of the store, so a
+// store that still fails keeps storeDown set and doubles the wait from where it was,
+// instead of resetting it and moving one more batch into the pending list each
+// cycle. Only a stored row resets the wait.
+func TestRun_RetryPassClearsStoreDownOnlyAfterAWrite(t *testing.T) {
+	const before = 4 * time.Second
+	ctx := context.Background()
+	for _, c := range []struct {
+		name        string
+		failing     bool
+		setup       func(t *testing.T, rdb *redis.Client, cfg Config)
+		wantDown    bool
+		wantDelay   time.Duration
+		wantUpserts bool
+		wantPending int
+		wantRows    int
+		wantLog     bool // "store accepting writes again"
+	}{
+		{name: "pending list reclaimed by another replica, store failing", failing: true,
+			setup: func(t *testing.T, rdb *redis.Client, cfg Config) {
+				for i := range 8 {
+					xaddEvent(t, rdb, cfg.StreamName, sampleEvent(fmt.Sprintf("e-%d", i)))
+				}
+				held := readAsConsumer(t, rdb, cfg, 5)
+				if err := rdb.XClaim(ctx, &redis.XClaimArgs{Stream: cfg.StreamName, Group: cfg.Group, Consumer: "replica-b", Messages: held}).Err(); err != nil {
+					t.Fatal(err)
+				}
+			},
+			wantDown: true, wantDelay: 2 * before, wantUpserts: true, wantPending: 3},
+		{name: "group recreated after NOGROUP, store failing", failing: true,
+			setup: func(t *testing.T, rdb *redis.Client, cfg Config) {
+				for i := range 8 {
+					xaddEvent(t, rdb, cfg.StreamName, sampleEvent(fmt.Sprintf("e-%d", i)))
+				}
+				failed := false
+				rdb.AddHook(funcHook(func(ctx context.Context, cmd redis.Cmder, next redis.ProcessHook) error {
+					if cmd.Name() == "xreadgroup" && !failed {
+						failed = true
+						err := errors.New("NOGROUP No such key or consumer group")
+						cmd.SetErr(err)
+						return err
+					}
+					return next(ctx, cmd)
+				}))
+			},
+			wantDown: true, wantDelay: 2 * before, wantUpserts: true, wantPending: 5},
+		{name: "only undecodable entries pending, store failing", failing: true,
+			setup: func(t *testing.T, rdb *redis.Client, cfg Config) {
+				addEntries(t, rdb, cfg.StreamName, 2) // not JSON
+				readAsConsumer(t, rdb, cfg, 2)
+				for i := range 6 {
+					xaddEvent(t, rdb, cfg.StreamName, sampleEvent(fmt.Sprintf("e-%d", i)))
+				}
+			},
+			wantDown: true, wantDelay: 2 * before, wantUpserts: true, wantPending: 5},
+		{name: "pending list reclaimed by another replica, store working",
+			setup: func(t *testing.T, rdb *redis.Client, cfg Config) {
+				for i := range 8 {
+					xaddEvent(t, rdb, cfg.StreamName, sampleEvent(fmt.Sprintf("e-%d", i)))
+				}
+				held := readAsConsumer(t, rdb, cfg, 5)
+				if err := rdb.XClaim(ctx, &redis.XClaimArgs{Stream: cfg.StreamName, Group: cfg.Group, Consumer: "replica-b", Messages: held}).Err(); err != nil {
+					t.Fatal(err)
+				}
+			},
+			wantDown: false, wantDelay: 0, wantUpserts: true, wantRows: 3, wantLog: true},
+		{name: "nothing pending and nothing new", failing: true,
+			setup:    func(*testing.T, *redis.Client, Config) {},
+			wantDown: false, wantDelay: before},
+		{name: "short pending batch stored",
+			setup: func(t *testing.T, rdb *redis.Client, cfg Config) {
+				for i := range 2 {
+					xaddEvent(t, rdb, cfg.StreamName, sampleEvent(fmt.Sprintf("e-%d", i)))
+				}
+				readAsConsumer(t, rdb, cfg, 2)
+			},
+			wantDown: false, wantDelay: 0, wantUpserts: true, wantRows: 2, wantLog: true},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			_, rdb := startMiniredis(t)
+			cfg := retryConfig(rdb.Options().Addr)
+			healthy := newFakeStore()
+			var inner Store = healthy
+			if c.failing {
+				inner = &schemaGapStore{fakeStore: healthy}
+			}
+			store := &countingStore{Store: inner}
+			logger, logs := capturingLogger()
+			d := New(cfg, logger, rdb, store)
+			if err := d.ensureGroup(ctx); err != nil {
+				t.Fatal(err)
+			}
+			c.setup(t, rdb, cfg)
+			putInRetry(d, before)
+
+			d.pass(ctx)
+
+			if d.storeDown != c.wantDown || d.storeRetryDelay != c.wantDelay {
+				t.Fatalf("storeDown=%v delay=%s, want %v and %s", d.storeDown, d.storeRetryDelay, c.wantDown, c.wantDelay)
+			}
+			if got := store.upserts.Load() > 0; got != c.wantUpserts {
+				t.Fatalf("store.Upsert called=%v, want %v", got, c.wantUpserts)
+			}
+			if got := consumerPending(t, rdb, cfg); got != c.wantPending {
+				t.Fatalf("this consumer holds %d entries, want %d", got, c.wantPending)
+			}
+			if got := healthy.rowCount(); got != c.wantRows {
+				t.Fatalf("rows = %d, want %d", got, c.wantRows)
+			}
+			if got := strings.Contains(logs.String(), "store accepting writes again"); got != c.wantLog {
+				t.Fatalf("logged that the store accepts writes = %v, want %v: %s", got, c.wantLog, logs.String())
+			}
+		})
+	}
+}
+
+// TestRun_EmptyRetryPassKeepsBackoffAtCap: a retry that finds this consumer's pending
+// list empty (another replica took it) against a store that answers Ping but rejects
+// writes stays at the capped wait, and the pending list holds one batch, pass after
+// pass, instead of the wait dropping to 500ms and the list growing by a batch a cycle.
+func TestRun_EmptyRetryPassKeepsBackoffAtCap(t *testing.T) {
+	ctx := context.Background()
+	_, rdb := startMiniredis(t)
+	cfg := retryConfig(rdb.Options().Addr)
+	for i := range 20 {
+		xaddEvent(t, rdb, cfg.StreamName, sampleEvent(fmt.Sprintf("e-%d", i)))
+	}
+	d := New(cfg, testLogger(), rdb, &schemaGapStore{fakeStore: newFakeStore()})
+	if err := d.ensureGroup(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if d.storeRetryCap() != maxStoreRetryDelay {
+		t.Fatalf("storeRetryCap = %s, want %s with this ClaimMinIdle", d.storeRetryCap(), maxStoreRetryDelay)
+	}
+	for i := range 3 {
+		putInRetry(d, maxStoreRetryDelay)
+		d.lastStoreFail = time.Time{}
+		d.pass(ctx)
+		if d.storeRetryDelay != maxStoreRetryDelay {
+			t.Fatalf("pass %d: delay = %s, want %s", i, d.storeRetryDelay, maxStoreRetryDelay)
+		}
+		if got := consumerPending(t, rdb, cfg); got != cfg.BatchSize {
+			t.Fatalf("pass %d: this consumer holds %d entries, want one batch of %d", i, got, cfg.BatchSize)
+		}
+		if !d.storeDown {
+			t.Fatalf("pass %d: storeDown cleared although no write succeeded", i)
+		}
+		// Another replica takes the idle batch, as XAUTOCLAIM would.
+		pending, err := rdb.XPendingExt(ctx, &redis.XPendingExtArgs{Stream: cfg.StreamName, Group: cfg.Group, Start: "-", End: "+", Count: 100, Consumer: cfg.Consumer}).Result()
+		if err != nil {
+			t.Fatal(err)
+		}
+		held := make([]string, 0, len(pending))
+		for _, p := range pending {
+			held = append(held, p.ID)
+		}
+		if err := rdb.XClaim(ctx, &redis.XClaimArgs{Stream: cfg.StreamName, Group: cfg.Group, Consumer: "replica-b", Messages: held}).Err(); err != nil {
+			t.Fatal(err)
+		}
+	}
+}
+
+// TestRun_RetryRereadsWholePendingListBeforeNewReads: after a store failure, a
+// consumer that holds more than one batch writes all of it through "0" rereads,
+// one pass after another, before it reads a new entry. Clearing storeDown after the
+// first batch would leave the rest for reclaim, holding back the trim meanwhile.
+func TestRun_RetryRereadsWholePendingListBeforeNewReads(t *testing.T) {
+	ctx := context.Background()
+	_, rdb := startMiniredis(t)
+	cfg := retryConfig(rdb.Options().Addr)
+	held := 2*cfg.BatchSize + 1
+	for i := range held + 3 {
+		xaddEvent(t, rdb, cfg.StreamName, sampleEvent(fmt.Sprintf("e-%d", i)))
+	}
+	store := newFakeStore()
+	d := New(cfg, testLogger(), rdb, store)
+	if err := d.ensureGroup(ctx); err != nil {
+		t.Fatal(err)
+	}
+	readAsConsumer(t, rdb, cfg, int64(held))
+	d.noteStoreFailed() // the write of those entries failed; the store is now back
+	d.lastStoreFail = time.Time{}
+
+	clean := redis.NewClient(&redis.Options{Addr: rdb.Options().Addr})
+	t.Cleanup(func() { _ = clean.Close() })
+	var starts []string
+	rowsAtFirstNew, pendingAtFirstNew := -1, -1
+	rdb.AddHook(funcHook(func(ctx context.Context, cmd redis.Cmder, next redis.ProcessHook) error {
+		if cmd.Name() == "xreadgroup" {
+			args := cmd.Args()
+			start := fmt.Sprint(args[len(args)-1])
+			if start == ">" && rowsAtFirstNew < 0 {
+				rowsAtFirstNew = store.rowCount()
+				pendingAtFirstNew = consumerPending(t, clean, cfg)
+			}
+			starts = append(starts, start)
+			err := next(ctx, cmd)
+			// miniredis ignores COUNT when rereading pending entries ("0"); Valkey
+			// honours it, so the reply is cut to COUNT as Valkey would send it.
+			if c, ok := cmd.(*redis.XStreamSliceCmd); ok && err == nil {
+				for i := range c.Val() {
+					if msgs := c.Val()[i].Messages; len(msgs) > cfg.BatchSize {
+						c.Val()[i].Messages = msgs[:cfg.BatchSize]
+					}
+				}
+			}
+			return err
+		}
+		return next(ctx, cmd)
+	}))
+
+	for i := 0; i < 10 && rowsAtFirstNew < 0; i++ {
+		d.pass(ctx)
+	}
+
+	if want := []string{"0", "0", "0", ">"}; fmt.Sprint(starts) != fmt.Sprint(want) {
+		t.Fatalf("XREADGROUP starts = %v, want %v", starts, want)
+	}
+	if rowsAtFirstNew != held || pendingAtFirstNew != 0 {
+		t.Fatalf("at the first new read rows=%d pending=%d, want %d stored and nothing pending", rowsAtFirstNew, pendingAtFirstNew, held)
+	}
+	if d.storeDown {
+		t.Fatal("storeDown still set after the pending list was written")
+	}
+}
+
+// TestStoreRetryCap_BelowClaimMinIdle: the retry wait stays below the idle time at
+// which another replica's XAUTOCLAIM may take a batch this consumer still retries.
+func TestStoreRetryCap_BelowClaimMinIdle(t *testing.T) {
+	for _, idle := range []time.Duration{DefaultConfig().ClaimMinIdle, 5 * time.Second, 45 * time.Second, 10 * time.Minute} {
+		cfg := DefaultConfig()
+		cfg.ClaimMinIdle = idle
+		d := New(cfg, testLogger(), nil, newFakeStore())
+		for range 20 {
+			d.noteStoreFailed()
+		}
+		if d.storeRetryDelay != d.storeRetryCap() || d.storeRetryDelay >= idle || d.storeRetryDelay > maxStoreRetryDelay {
+			t.Errorf("ClaimMinIdle=%s: delay after many failures = %s (cap %s), want below ClaimMinIdle and at most %s",
+				idle, d.storeRetryDelay, d.storeRetryCap(), maxStoreRetryDelay)
+		}
+	}
+	if got := New(DefaultConfig(), testLogger(), nil, newFakeStore()).storeRetryCap(); got != 15*time.Second {
+		t.Errorf("default storeRetryCap = %s, want 15s (half of the 30s ClaimMinIdle)", got)
+	}
+}
+
+// TestDrainWithoutGroup_ForeignGroupFailsClosed: when the foreign group's limit cannot
+// be read, before or after the batch is stored, nothing is trimmed. Treating the
+// failure as "no limit" would trim past entries that group has not acknowledged.
+func TestDrainWithoutGroup_ForeignGroupFailsClosed(t *testing.T) {
+	failCommand := func(name string) func(cmd redis.Cmder) error {
+		return func(cmd redis.Cmder) error {
+			if cmd.Name() == name {
+				return fmt.Errorf("induced %s failure", name)
+			}
+			return nil
+		}
+	}
+	type failure struct {
+		name    string
+		before  func(cmd redis.Cmder) error
+		rewrite func(cmd redis.Cmder)
+	}
+	failures := []failure{
+		{name: "xpending fails", before: failCommand("xpending")},
+		{name: "xinfo groups fails", before: failCommand("xinfo")},
+		{name: "last-delivered id does not parse", rewrite: func(cmd redis.Cmder) {
+			if c, ok := cmd.(*redis.XInfoGroupsCmd); ok {
+				for i := range c.Val() {
+					if c.Val()[i].Name == "other" {
+						c.Val()[i].LastDeliveredID = "garbage"
+					}
+				}
+			}
+		}},
+		{name: "pending lower id does not parse", rewrite: func(cmd redis.Cmder) {
+			if c, ok := cmd.(*redis.XPendingCmd); ok && c.Val().Count > 0 {
+				v := *c.Val()
+				v.Lower = "garbage"
+				c.SetVal(&v)
+			}
+		}},
+	}
+	for _, f := range failures {
+		for _, afterStore := range []bool{false, true} {
+			stage := "before the store"
+			if afterStore {
+				stage = "after the store"
+			}
+			t.Run(f.name+" "+stage, func(t *testing.T) {
+				ctx := context.Background()
+				_, rdb := startMiniredis(t)
+				cfg := testConfig(rdb.Options().Addr)
+				store := newFakeStore()
+				d := New(cfg, testLogger(), rdb, store)
+				if err := rdb.XGroupCreateMkStream(ctx, cfg.StreamName, "other", "0").Err(); err != nil {
+					t.Fatal(err)
+				}
+				for i := range 5 {
+					xaddEvent(t, rdb, cfg.StreamName, sampleEvent(fmt.Sprintf("e-%d", i)))
+				}
+				ids := remainingEntries(t, rdb, cfg.StreamName)
+				read := readEntries(t, rdb, cfg, "other", 3)
+				if err := rdb.XAck(ctx, cfg.StreamName, "other", read[:2]...).Err(); err != nil {
+					t.Fatal(err)
+				}
+				var trims atomic.Int64
+				rdb.AddHook(funcHook(func(ctx context.Context, cmd redis.Cmder, next redis.ProcessHook) error {
+					if cmd.Name() == "xtrim" {
+						trims.Add(1)
+					}
+					active := !afterStore || store.rowCount() > 0
+					if active && f.before != nil {
+						if err := f.before(cmd); err != nil {
+							cmd.SetErr(err)
+							return err
+						}
+					}
+					err := next(ctx, cmd)
+					if err == nil && active && f.rewrite != nil {
+						f.rewrite(cmd)
+					}
+					return err
+				}))
+
+				n, err := d.drainWithoutGroup(ctx)
+
+				if n != 0 || err == nil {
+					t.Fatalf("drainWithoutGroup = %d, %v, want 0 and an error", n, err)
+				}
+				if afterStore && store.rowCount() == 0 {
+					t.Fatal("nothing was stored, so the failure after the store was not reached")
+				}
+				if got := trims.Load(); got != 0 {
+					t.Fatalf("XTRIM ran %d times, want none", got)
+				}
+				if got := d.DrainedWithoutGroup(); got != 0 {
+					t.Fatalf("DrainedWithoutGroup() = %d, want 0", got)
+				}
+				clean := redis.NewClient(&redis.Options{Addr: rdb.Options().Addr})
+				defer func() { _ = clean.Close() }()
+				assertEntries(t, remainingEntries(t, clean, cfg.StreamName), ids)
+			})
+		}
+	}
+}
+
+// TestDrainWithoutGroup_ForeignBoundaryInsideBatchStoresOnlyTrimmableEntries: with a
+// foreign group's limit inside the batch, only the entries below it are stored, so a
+// later pass with the limit unchanged stores nothing again and logs no undecodable
+// entry again.
+func TestDrainWithoutGroup_ForeignBoundaryInsideBatchStoresOnlyTrimmableEntries(t *testing.T) {
+	ctx := context.Background()
+	_, rdb := startMiniredis(t)
+	cfg := testConfig(rdb.Options().Addr)
+	cfg.BatchSize = 5
+	for i := range 3 {
+		xaddEvent(t, rdb, cfg.StreamName, sampleEvent(fmt.Sprintf("e-%d", i)))
+	}
+	if err := rdb.XAdd(ctx, &redis.XAddArgs{Stream: cfg.StreamName, Values: map[string]any{"event": "not json"}}).Err(); err != nil {
+		t.Fatal(err)
+	}
+	xaddEvent(t, rdb, cfg.StreamName, sampleEvent("e-4"))
+	ids := remainingEntries(t, rdb, cfg.StreamName)
+	if err := rdb.XGroupCreate(ctx, cfg.StreamName, "foreign", "0").Err(); err != nil {
+		t.Fatal(err)
+	}
+	if err := rdb.XAck(ctx, cfg.StreamName, "foreign", readEntries(t, rdb, cfg, "foreign", 3)...).Err(); err != nil {
+		t.Fatal(err)
+	}
+	inner := newFakeStore()
+	store := &countingStore{Store: inner}
+	d := New(cfg, testLogger(), rdb, store)
+
+	if n, err := d.drainWithoutGroup(ctx); err != nil || n != 2 {
+		t.Fatalf("pass 1: drainWithoutGroup = %d, %v, want 2 removed", n, err)
+	}
+	if got := inner.rowCount(); got != 2 {
+		t.Fatalf("pass 1: rows = %d, want only the 2 entries below the foreign limit", got)
+	}
+	assertEntries(t, remainingEntries(t, rdb, cfg.StreamName), ids[2:])
+
+	if n, err := d.drainWithoutGroup(ctx); err != nil || n != 0 {
+		t.Fatalf("pass 2: drainWithoutGroup = %d, %v, want nothing removed", n, err)
+	}
+	if got := store.upserts.Load(); got != 1 {
+		t.Fatalf("Upsert ran %d times over two passes, want once", got)
+	}
+	if got := d.Malformed(); got != 0 {
+		t.Fatalf("Malformed() = %d, want 0: the undecodable entry is above the limit and was never read", got)
+	}
+	assertEntries(t, remainingEntries(t, rdb, cfg.StreamName), ids[2:])
+}
+
+// notWritableStore answers Ping but fails every Upsert with the given Postgres
+// SQLSTATE, like a read-only replica after a failover, a role without INSERT,
+// or a full disk.
+type notWritableStore struct {
+	*fakeStore
+	code string
+}
+
+func (s *notWritableStore) Upsert(_ context.Context, events []metering.Event) error {
+	return fmt.Errorf("drain: upsert %d events: %w", len(events), &pgconn.PgError{Code: s.code})
+}
+
+// TestRowAtATime_StoreNotWritableRetriesNotPoison: a store that answers Ping but
+// refuses every write must not have its rows dropped as poison. Nothing is ACK'd,
+// nothing is counted as poisoned, and storeDown is set so the drainer waits.
+func TestRowAtATime_StoreNotWritableRetriesNotPoison(t *testing.T) {
+	for _, code := range []string{"25006", "42501", "53100"} {
+		t.Run(code, func(t *testing.T) {
+			_, rdb := startMiniredis(t)
+			cfg := testConfig(rdb.Options().Addr)
+			cfg.BatchSize = 3
+			cfg.ClaimMinIdle = 0
+			seedDeadConsumerPending(t, rdb, cfg, 3)
+			store := &notWritableStore{fakeStore: newFakeStore(), code: code}
+			d := New(cfg, testLogger(), rdb, store)
+
+			d.reclaim(context.Background())
+			if p := pendingCount(t, rdb, cfg.StreamName, cfg.Group); p != 3 {
+				t.Fatalf("pending = %d, want 3: no row may be ACK'd while the store refuses writes", p)
+			}
+			if got := d.Poisoned(); got != 0 {
+				t.Fatalf("Poisoned() = %d, want 0: a store that refuses writes is not row poison", got)
+			}
+			if !d.storeDown {
+				t.Fatal("storeDown not set after the store refused every write")
+			}
+		})
 	}
 }
