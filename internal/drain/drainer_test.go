@@ -30,6 +30,8 @@ type fakeStore struct {
 	failIDs  map[string]bool           // poison: any batch containing one of these request_ids fails
 	failAll  bool                      // outage: every Upsert fails
 	pingErr  error                     // outage: Ping result
+	probeErr error                     // what ProbeWrite returns (failAll also fails it)
+	probes   int                       // number of ProbeWrite invocations
 
 	schemaVersion uint // what SchemaVersion reports (never dirty)
 }
@@ -60,6 +62,20 @@ func (f *fakeStore) Upsert(_ context.Context, events []metering.Event) error {
 		if _, ok := f.rows[e.RequestID]; !ok {
 			f.rows[e.RequestID] = e
 		}
+	}
+	return nil
+}
+
+// ProbeWrite stores nothing. It fails when probeErr is set or the store is down.
+func (f *fakeStore) ProbeWrite(context.Context) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.probes++
+	if f.probeErr != nil {
+		return f.probeErr
+	}
+	if f.failAll {
+		return errors.New("fakeStore: store down")
 	}
 	return nil
 }
@@ -1881,7 +1897,7 @@ func TestStoreRetryDelay_DoublesToCapAndOnlyAStoredWriteResetsIt(t *testing.T) {
 	d := New(cfg, testLogger(), rdb, newFakeStore())
 	want := []time.Duration{500 * time.Millisecond, time.Second, 2 * time.Second, 4 * time.Second, 8 * time.Second, 16 * time.Second, 30 * time.Second, 30 * time.Second}
 	for i, w := range want {
-		d.noteStoreFailed()
+		d.noteStoreFailed(errStoreFailed)
 		if d.storeRetryDelay != w {
 			t.Fatalf("failure %d: delay = %s, want %s", i+1, d.storeRetryDelay, w)
 		}
@@ -1896,12 +1912,12 @@ func TestStoreRetryDelay_DoublesToCapAndOnlyAStoredWriteResetsIt(t *testing.T) {
 	if d.storeDown || d.storeRetryDelay != maxStoreRetryDelay {
 		t.Fatalf("after a pass that stored nothing storeDown=%v delay=%s, want reads resumed and the delay kept", d.storeDown, d.storeRetryDelay)
 	}
-	d.noteStoreFailed()
+	d.noteStoreFailed(errStoreFailed)
 	if d.storeRetryDelay != maxStoreRetryDelay {
 		t.Fatalf("failure after a pass that stored nothing: delay = %s, want %s", d.storeRetryDelay, maxStoreRetryDelay)
 	}
 	d.noteStoreWorking(1)
-	d.noteStoreFailed()
+	d.noteStoreFailed(errStoreFailed)
 	if d.storeRetryDelay != want[0] {
 		t.Fatalf("first failure after recovery: delay = %s, want %s", d.storeRetryDelay, want[0])
 	}
@@ -2214,7 +2230,7 @@ func TestRun_RetryRereadsWholePendingListBeforeNewReads(t *testing.T) {
 		t.Fatal(err)
 	}
 	readAsConsumer(t, rdb, cfg, int64(held))
-	d.noteStoreFailed() // the write of those entries failed; the store is now back
+	d.noteStoreFailed(errStoreFailed) // the write of those entries failed; the store is now back
 	d.lastStoreFail = time.Time{}
 
 	clean := redis.NewClient(&redis.Options{Addr: rdb.Options().Addr})
@@ -2268,7 +2284,7 @@ func TestStoreRetryCap_BelowClaimMinIdle(t *testing.T) {
 		cfg.ClaimMinIdle = idle
 		d := New(cfg, testLogger(), nil, newFakeStore())
 		for range 20 {
-			d.noteStoreFailed()
+			d.noteStoreFailed(errStoreFailed)
 		}
 		if d.storeRetryDelay != d.storeRetryCap() || d.storeRetryDelay >= idle || d.storeRetryDelay > maxStoreRetryDelay {
 			t.Errorf("ClaimMinIdle=%s: delay after many failures = %s (cap %s), want below ClaimMinIdle and at most %s",

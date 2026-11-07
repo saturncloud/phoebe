@@ -1656,6 +1656,9 @@ type fakeValkeyState struct {
 	scanCalls     int
 	// scanBlocks makes XRangeN wait until its context ends, like a slow Valkey.
 	scanBlocks bool
+
+	hash    map[string]string
+	hashErr error
 }
 
 func (f *fakeValkeyState) XRangeN(ctx context.Context, _, start, _ string, count int64) *redis.XMessageSliceCmd {
@@ -1706,6 +1709,18 @@ func (f *fakeValkeyState) Info(ctx context.Context, _ ...string) *redis.StringCm
 		return cmd
 	}
 	cmd.SetVal(f.info)
+	return cmd
+}
+
+// HGetAll answers the drainer state read: hashErr, or hash (empty by default,
+// as for a key that does not exist).
+func (f *fakeValkeyState) HGetAll(ctx context.Context, _ string) *redis.MapStringStringCmd {
+	cmd := redis.NewMapStringStringCmd(ctx)
+	if f.hashErr != nil {
+		cmd.SetErr(f.hashErr)
+		return cmd
+	}
+	cmd.SetVal(f.hash)
 	return cmd
 }
 
