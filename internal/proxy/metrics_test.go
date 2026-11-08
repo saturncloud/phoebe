@@ -841,19 +841,28 @@ func meteringSingleValue(t *testing.T, fams map[string]*dto.MetricFamily, name s
 func TestMeteringHealthMetricsValuesAndNoLabels(t *testing.T) {
 	srv := newMetricsTestServer(t).WithMeteringHealth(fakeMeteringHealth{probe: emit.MeteringProbe{
 		StreamEntries: 10, Undelivered: 3, UsedMemory: 100, MaxMemory: 200,
+		Drainer: &emit.DrainerState{
+			PoisonDropped: 5, UndecodableDropped: 6, AnySeen: true, LastSeenAge: 4 * time.Second,
+			Fresh: true, Paused: true, PausedFor: 90 * time.Second,
+		},
 	}})
 	want := map[string]float64{
-		"phoebe_metering_wal_pending_events":         7,
-		"phoebe_metering_wal_healthy":                1,
-		"phoebe_metering_wal_poisoned":               0,
-		"phoebe_metering_wal_quarantined_dirs":       3,
-		"phoebe_metering_wal_skipped_entries_total":  4,
-		"phoebe_metering_floor_events_total":         2,
-		"phoebe_metering_valkey_up":                  1,
-		"phoebe_metering_stream_entries":             10,
-		"phoebe_metering_stream_undelivered_entries": 3,
-		"phoebe_valkey_used_memory_bytes":            100,
-		"phoebe_valkey_maxmemory_bytes":              200,
+		"phoebe_metering_drainer_paused":                    1,
+		"phoebe_metering_drainer_paused_seconds":            90,
+		"phoebe_metering_drainer_last_seen_age_seconds":     4,
+		"phoebe_metering_drainer_poison_dropped_total":      5,
+		"phoebe_metering_drainer_undecodable_dropped_total": 6,
+		"phoebe_metering_wal_pending_events":                7,
+		"phoebe_metering_wal_healthy":                       1,
+		"phoebe_metering_wal_poisoned":                      0,
+		"phoebe_metering_wal_quarantined_dirs":              3,
+		"phoebe_metering_wal_skipped_entries_total":         4,
+		"phoebe_metering_floor_events_total":                2,
+		"phoebe_metering_valkey_up":                         1,
+		"phoebe_metering_stream_entries":                    10,
+		"phoebe_metering_stream_undelivered_entries":        3,
+		"phoebe_valkey_used_memory_bytes":                   100,
+		"phoebe_valkey_maxmemory_bytes":                     200,
 	}
 	fams := phoebeFamilies(t, srv.metrics)
 	for name, value := range want {
@@ -878,31 +887,56 @@ func TestMeteringHealthMetricsValuesAndNoLabels(t *testing.T) {
 }
 
 // TestMeteringHealthUnhealthyWALMetricsHaveNoLabels: the unknown-count path carries
-// no labels either, and it leaves out only the pending series.
+// no labels either, and it leaves out only the pending series. The probe families
+// stay, so PhoebeMeteringDrainerBehind still reads them on an unhealthy replica.
 func TestMeteringHealthUnhealthyWALMetricsHaveNoLabels(t *testing.T) {
-	srv := newMetricsTestServer(t).WithMeteringHealth(fakeMeteringHealth{walUnknown: true, poisoned: true})
+	srv := newMetricsTestServer(t).WithMeteringHealth(fakeMeteringHealth{walUnknown: true, poisoned: true, probe: emit.MeteringProbe{
+		StreamEntries: 10, Undelivered: 3, UsedMemory: 100, MaxMemory: 200,
+	}})
 	fams := phoebeFamilies(t, srv.metrics)
 	if _, ok := fams["phoebe_metering_wal_pending_events"]; ok {
 		t.Error("pending reported while the count is unknown")
 	}
-	for _, name := range []string{
-		"phoebe_metering_wal_healthy",
-		"phoebe_metering_wal_poisoned",
-		"phoebe_metering_wal_quarantined_dirs",
-		"phoebe_metering_wal_skipped_entries_total",
-		"phoebe_metering_floor_events_total",
-		"phoebe_metering_valkey_up",
-	} {
+	want := map[string]float64{
+		"phoebe_metering_wal_healthy":                0,
+		"phoebe_metering_wal_poisoned":               1,
+		"phoebe_metering_wal_quarantined_dirs":       3,
+		"phoebe_metering_wal_skipped_entries_total":  4,
+		"phoebe_metering_floor_events_total":         2,
+		"phoebe_metering_valkey_up":                  1,
+		"phoebe_metering_stream_entries":             10,
+		"phoebe_metering_stream_undelivered_entries": 3,
+		"phoebe_valkey_used_memory_bytes":            100,
+		"phoebe_valkey_maxmemory_bytes":              200,
+	}
+	for name, value := range want {
 		f, ok := fams[name]
 		if !ok {
 			t.Errorf("%s missing", name)
 			continue
 		}
-		for _, m := range f.GetMetric() {
-			if len(m.GetLabel()) != 0 {
-				t.Errorf("%s has labels %v", name, m.GetLabel())
-			}
+		if len(f.GetMetric()) != 1 {
+			t.Errorf("%s has %d series, want 1", name, len(f.GetMetric()))
+			continue
 		}
+		m := f.GetMetric()[0]
+		if len(m.GetLabel()) != 0 {
+			t.Errorf("%s has labels %v", name, m.GetLabel())
+		}
+		got := m.GetGauge().GetValue() + m.GetCounter().GetValue()
+		if got != value {
+			t.Errorf("%s = %v, want %v", name, got, value)
+		}
+	}
+	// Only the pending series is left out: every other metering family is served.
+	var served []string
+	for name := range fams {
+		if strings.HasPrefix(name, "phoebe_metering_") || strings.HasPrefix(name, "phoebe_valkey_") {
+			served = append(served, name)
+		}
+	}
+	if len(served) != len(want) {
+		t.Errorf("served %d metering families %v, want %d", len(served), served, len(want))
 	}
 }
 
@@ -987,6 +1021,10 @@ func TestMeteringWALFamiliesServedOnRealEmitter(t *testing.T) {
 			t.Errorf("%s missing", name)
 			continue
 		}
+		if len(f.GetMetric()) != 1 {
+			t.Errorf("%s has %d series, want 1", name, len(f.GetMetric()))
+			continue
+		}
 		m := f.GetMetric()[0]
 		if got := m.GetGauge().GetValue() + m.GetCounter().GetValue(); got != want {
 			t.Errorf("%s = %v, want %v", name, got, want)
@@ -1001,18 +1039,8 @@ func TestMeteringFamiliesReportFloorEmitterAsFailure(t *testing.T) {
 	em := emit.NewFloorEmitter(logging.New(logging.ERROR), "")
 	srv := newMetricsTestServer(t).WithMeteringHealth(em)
 
-	value := func(fams map[string]*dto.MetricFamily, name string) float64 {
-		t.Helper()
-		f, ok := fams[name]
-		if !ok {
-			t.Fatalf("%s missing", name)
-		}
-		m := f.GetMetric()[0]
-		return m.GetGauge().GetValue() + m.GetCounter().GetValue()
-	}
-
 	fams := phoebeFamilies(t, srv.metrics)
-	if got := value(fams, "phoebe_metering_floor_events_total"); got != 0 {
+	if got := meteringSingleValue(t, fams, "phoebe_metering_floor_events_total"); got != 0 {
 		t.Errorf("floor events before any Emit = %v, want 0", got)
 	}
 	for name, want := range map[string]float64{
@@ -1020,7 +1048,7 @@ func TestMeteringFamiliesReportFloorEmitterAsFailure(t *testing.T) {
 		"phoebe_metering_wal_healthy":  0,
 		"phoebe_metering_wal_poisoned": 1,
 	} {
-		if got := value(fams, name); got != want {
+		if got := meteringSingleValue(t, fams, name); got != want {
 			t.Errorf("%s = %v, want %v", name, got, want)
 		}
 	}
@@ -1031,7 +1059,96 @@ func TestMeteringFamiliesReportFloorEmitterAsFailure(t *testing.T) {
 
 	em.Emit(context.Background(), metering.Event{RequestID: "phoebe-1"})
 	em.Emit(context.Background(), metering.Event{RequestID: "phoebe-2"})
-	if got := value(phoebeFamilies(t, srv.metrics), "phoebe_metering_floor_events_total"); got != 2 {
+	if got := meteringSingleValue(t, phoebeFamilies(t, srv.metrics), "phoebe_metering_floor_events_total"); got != 2 {
 		t.Errorf("floor events after two Emits = %v, want 2", got)
+	}
+}
+
+// drainerFamilies are the families read from the drainer's state hash.
+var drainerFamilies = []string{
+	"phoebe_metering_drainer_paused",
+	"phoebe_metering_drainer_paused_seconds",
+	"phoebe_metering_drainer_last_seen_age_seconds",
+	"phoebe_metering_drainer_poison_dropped_total",
+	"phoebe_metering_drainer_undecodable_dropped_total",
+}
+
+// TestMeteringDrainerMetricsPresentAbsentAndValues: each drainer family is
+// present only when its value is known. A missing paused series means "unknown",
+// never "not paused", so it is left out when no drainer reported within 120 s or
+// the state could not be read.
+func TestMeteringDrainerMetricsPresentAbsentAndValues(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		probe emit.MeteringProbe
+		err   error
+		want  map[string]float64 // families not listed must be absent
+	}{
+		{name: "probe failed", err: errors.New("down")},
+		{name: "drainer state unknown (read failed or no key)", probe: emit.MeteringProbe{}},
+		{name: "key with counters only, no consumer seen", probe: emit.MeteringProbe{Drainer: &emit.DrainerState{PoisonDropped: 2}},
+			want: map[string]float64{
+				"phoebe_metering_drainer_poison_dropped_total":      2,
+				"phoebe_metering_drainer_undecodable_dropped_total": 0,
+			}},
+		{name: "consumer seen but stale", probe: emit.MeteringProbe{Drainer: &emit.DrainerState{AnySeen: true, LastSeenAge: 300 * time.Second}},
+			want: map[string]float64{
+				"phoebe_metering_drainer_last_seen_age_seconds":     300,
+				"phoebe_metering_drainer_poison_dropped_total":      0,
+				"phoebe_metering_drainer_undecodable_dropped_total": 0,
+			}},
+		{name: "fresh and running", probe: emit.MeteringProbe{Drainer: &emit.DrainerState{AnySeen: true, LastSeenAge: 3 * time.Second, Fresh: true}},
+			want: map[string]float64{
+				"phoebe_metering_drainer_paused":                    0,
+				"phoebe_metering_drainer_paused_seconds":            0,
+				"phoebe_metering_drainer_last_seen_age_seconds":     3,
+				"phoebe_metering_drainer_poison_dropped_total":      0,
+				"phoebe_metering_drainer_undecodable_dropped_total": 0,
+			}},
+		{name: "fresh and paused", probe: emit.MeteringProbe{Drainer: &emit.DrainerState{
+			UndecodableDropped: 1, AnySeen: true, LastSeenAge: time.Second, Fresh: true, Paused: true, PausedFor: 42 * time.Second}},
+			want: map[string]float64{
+				"phoebe_metering_drainer_paused":                    1,
+				"phoebe_metering_drainer_paused_seconds":            42,
+				"phoebe_metering_drainer_last_seen_age_seconds":     1,
+				"phoebe_metering_drainer_poison_dropped_total":      0,
+				"phoebe_metering_drainer_undecodable_dropped_total": 1,
+			}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			srv := newMetricsTestServer(t).WithMeteringHealth(fakeMeteringHealth{probe: tc.probe, err: tc.err})
+			fams := phoebeFamilies(t, srv.metrics)
+			for _, name := range drainerFamilies {
+				want, present := tc.want[name]
+				f, ok := fams[name]
+				if ok != present {
+					t.Errorf("%s present=%v, want %v", name, ok, present)
+					continue
+				}
+				if !ok {
+					continue
+				}
+				if len(f.GetMetric()) != 1 || len(f.GetMetric()[0].GetLabel()) != 0 {
+					t.Errorf("%s = %v, want one series with no labels", name, f.GetMetric())
+					continue
+				}
+				m := f.GetMetric()[0]
+				if got := m.GetGauge().GetValue() + m.GetCounter().GetValue(); got != want {
+					t.Errorf("%s = %v, want %v", name, got, want)
+				}
+			}
+		})
+	}
+}
+
+// TestMeteringDrainerMetricsAbsentOnFloorEmitter: a replica without a durable
+// emitter cannot read Valkey, so it reports no drainer state at all.
+func TestMeteringDrainerMetricsAbsentOnFloorEmitter(t *testing.T) {
+	srv := newMetricsTestServer(t).WithMeteringHealth(emit.NewFloorEmitter(logging.New(logging.ERROR), ""))
+	fams := phoebeFamilies(t, srv.metrics)
+	for _, name := range drainerFamilies {
+		if _, ok := fams[name]; ok {
+			t.Errorf("%s exported by the floor emitter", name)
+		}
 	}
 }

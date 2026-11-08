@@ -2,7 +2,9 @@ package drain
 
 import (
 	"context"
+	"crypto/rand"
 	"database/sql"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"math"
@@ -31,6 +33,13 @@ import (
 //     withhold the XACK and let the whole batch redeliver.
 type Store interface {
 	Upsert(ctx context.Context, events []metering.Event) error
+	// ProbeWrite tests whether the store accepts writes at all, by writing one
+	// synthetic event through the same statement Upsert uses and then undoing
+	// it, so nothing is left behind. The drainer calls it when every row of a
+	// batch failed on its own: a failing probe means the store is the problem
+	// (pause and keep the rows), a passing one means the rows are (drop them as
+	// poison). Any error, a context error included, counts as a failed probe.
+	ProbeWrite(ctx context.Context) error
 	// Ping verifies connectivity (pool_pre_ping equivalent on startup).
 	Ping(ctx context.Context) error
 	// SchemaVersion reports the database schema version (golang-migrate) and
@@ -88,6 +97,29 @@ func isSchemaNotReady(err error) bool {
 	// undefined_table, undefined_column, and invalid_column_reference (an ON
 	// CONFLICT target whose unique key a pending migration adds).
 	case "42P01", "42703", "42P10":
+		return true
+	}
+	return false
+}
+
+// isStoreNotWritable reports a Postgres error that means the store as a whole
+// cannot take writes right now, not that the row is bad: a read-only replica
+// after a failover (25006), missing privileges (42501), insufficient resources
+// such as a full disk (class 53), an admin shutdown or a server that cannot
+// accept connections yet (class 57P), a connection exception (class 08), or a
+// serialization failure or deadlock (40001, 40P01). Ping can still succeed in
+// all of these, so the row-at-a-time walk must not read them as poison: every
+// row would fail the same way and the whole stream would be dropped.
+func isStoreNotWritable(err error) bool {
+	var pgErr *pgconn.PgError
+	if !errors.As(err, &pgErr) {
+		return false
+	}
+	code := pgErr.Code
+	switch {
+	case code == "25006", code == "42501", code == "40001", code == "40P01":
+		return true
+	case strings.HasPrefix(code, "53"), strings.HasPrefix(code, "57P"), strings.HasPrefix(code, "08"):
 		return true
 	}
 	return false
@@ -193,28 +225,7 @@ func (s *PostgresStore) Upsert(ctx context.Context, events []metering.Event) err
 	if len(events) == 0 {
 		return nil
 	}
-
-	// Build a parameterised multi-row VALUES clause: ($1,...,$17),($18,...),...
-	// (colsPerRow params per row).
-	// Parameterised (never string-interpolated) to avoid any injection via the
-	// engine-supplied request_id / model strings.
-	placeholders := make([]string, 0, len(events))
-	args := make([]any, 0, len(events)*colsPerRow)
-	p := 1
-	for i := range events {
-		marks := make([]string, colsPerRow)
-		for c := 0; c < colsPerRow; c++ {
-			marks[c] = fmt.Sprintf("$%d", p)
-			p++
-		}
-		placeholders = append(placeholders, "("+strings.Join(marks, ",")+")")
-		args = append(args, eventArgs(events[i])...)
-	}
-
-	stmt := "INSERT INTO billing_event (" +
-		strings.Join(upsertColumns, ", ") +
-		") VALUES " + strings.Join(placeholders, ", ") +
-		" ON CONFLICT (request_id) DO NOTHING"
+	stmt, args := upsertStatement(events)
 
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
@@ -228,6 +239,102 @@ func (s *PostgresStore) Upsert(ctx context.Context, events []metering.Event) err
 	}
 	if err := tx.Commit(); err != nil {
 		return fmt.Errorf("drain: commit %d events: %w", len(events), err)
+	}
+	return nil
+}
+
+// upsertStatement builds the multi-row INSERT ... ON CONFLICT (request_id) DO
+// NOTHING for events, with a parameterised VALUES clause: ($1,...,$26),($27,...),...
+// (colsPerRow params per row). Parameterised (never string-interpolated) to avoid
+// any injection via the engine-supplied request_id / model strings. Upsert and
+// ProbeWrite share it, so the probe tests the statement real rows go through.
+func upsertStatement(events []metering.Event) (string, []any) {
+	placeholders := make([]string, 0, len(events))
+	args := make([]any, 0, len(events)*colsPerRow)
+	p := 1
+	for i := range events {
+		marks := make([]string, colsPerRow)
+		for c := 0; c < colsPerRow; c++ {
+			marks[c] = fmt.Sprintf("$%d", p)
+			p++
+		}
+		placeholders = append(placeholders, "("+strings.Join(marks, ",")+")")
+		args = append(args, eventArgs(events[i])...)
+	}
+	stmt := "INSERT INTO billing_event (" +
+		strings.Join(upsertColumns, ", ") +
+		") VALUES " + strings.Join(placeholders, ", ") +
+		" ON CONFLICT (request_id) DO NOTHING"
+	return stmt, args
+}
+
+// ProbeRequestIDPrefix starts the request_id of every probe event, so a probe
+// can never conflict with a real row and is easy to recognise in a log or a
+// query. Real request ids are minted by the interceptor and never start with it.
+const ProbeRequestIDPrefix = "phoebe-probe-"
+
+// probeWriteTimeout bounds one probe, so a hung connection reads as a failed
+// probe (a store failure) rather than stalling the drainer.
+const probeWriteTimeout = 10 * time.Second
+
+// probeEvent is the synthetic event ProbeWrite inserts. Every field holds a value
+// a real, ordinary event would carry, so the row meets today's schema and
+// constraints: a 200 status, valid token counts, a serving mode the rater
+// accepts, and short identity strings that fit every column.
+func probeEvent(now time.Time) (metering.Event, error) {
+	var b [16]byte
+	if _, err := rand.Read(b[:]); err != nil {
+		return metering.Event{}, fmt.Errorf("drain: probe request id: %w", err)
+	}
+	return metering.Event{
+		RequestID:        ProbeRequestIDPrefix + hex.EncodeToString(b[:]),
+		AuthID:           "phoebe-probe",
+		ResourceID:       "phoebe-probe",
+		ResourceType:     "deployment",
+		OrgID:            "phoebe-probe",
+		Model:            "phoebe-probe",
+		ServingMode:      "dedicated",
+		PromptTokens:     1,
+		CompletionTokens: 1,
+		FinishReason:     "stop",
+		UsageFound:       true,
+		StatusCode:       200,
+		TimestampUnixMs:  now.UnixMilli(),
+	}, nil
+}
+
+// ProbeWrite runs Upsert's statement for one probe event inside a transaction
+// that it always rolls back, so the probe leaves no row behind and nothing reads
+// it (an uncommitted row is visible to no other session). It fails unless the
+// INSERT reports exactly one row, so a rule or trigger that silently skips rows
+// does not pass, and it fails if the rollback fails.
+func (s *PostgresStore) ProbeWrite(ctx context.Context) error {
+	ctx, cancel := context.WithTimeout(ctx, probeWriteTimeout)
+	defer cancel()
+	ev, err := probeEvent(time.Now())
+	if err != nil {
+		return err
+	}
+	stmt, args := upsertStatement([]metering.Event{ev})
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("drain: probe write: begin tx: %w", err)
+	}
+	res, err := tx.ExecContext(ctx, stmt, args...)
+	if err != nil {
+		_ = tx.Rollback()
+		return fmt.Errorf("drain: probe write: %w", err)
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		_ = tx.Rollback()
+		return fmt.Errorf("drain: probe write: rows affected: %w", err)
+	}
+	if err := tx.Rollback(); err != nil {
+		return fmt.Errorf("drain: probe write: rollback: %w", err)
+	}
+	if n != 1 {
+		return fmt.Errorf("drain: probe write inserted %d rows, want 1", n)
 	}
 	return nil
 }

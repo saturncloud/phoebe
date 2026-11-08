@@ -189,10 +189,13 @@ ambiguous base/org, invalid serving mode, owner conflict) rather than firing
 every hour.
 
 Page on parked usage (rater exit 4), an unexplained missing-usage attempt, rater anomaly/non-zero exit, reconcile
-deletion during a routine run, drainer poison row, the drainer log line
+deletion during a routine run, drainer poison row (an increase in
+`phoebe_metering_drainer_poison_dropped_total`, or the log line `drop poison row`), a
+drainer pause that lasts (see "Drainer paused" below), the drainer log line
 `drop malformed entry` (an entry that could not be decoded, whose logged values are
 the only copy left once the trim passes it, so it needs repair by hand), the drainer
-log line `valkey is full with no consumer group` (see "A full Valkey" below),
+log line `valkey is full and consumer group "<group>" does not exist; stored and trimmed`
+(see "A full Valkey" below),
 `METERING_FLOOR`, WAL corruption,
 token-push withheld hour (exit 2), manager rejection (exit 3), or push failure
 (exit 1). Alert separately when the oldest Valkey
@@ -242,25 +245,178 @@ schema gate, and every `trimInterval` after that.
   emitters filled a new stream, and `XGROUP CREATE` is refused. After the schema gate
   the drainer reads the oldest batch with `XRANGE`, stores it, trims it, and tries
   again until the group can be created. The log line is
-  `valkey is full with no consumer group`, and it should stop once the group exists.
+  `valkey is full and consumer group "<group>" does not exist; stored and trimmed`,
+  naming the drainer's own group (`group`, `phoebe-drainer` by default). It should
+  stop once that group exists. Other groups, such as a debug consumer, may still be
+  listed by `XINFO GROUPS` while it is logged; its `other groups=` count says how many.
   If Postgres is failing, or the gate has not opened, nothing is trimmed, because an
   entry is removed only once it is stored. If another consumer group is on the stream,
-  the trim stops at what that group has read and acknowledged. When that frees nothing,
+  the trim stops at what that group has read and acknowledged, and only entries below
+  that point are stored. When that frees nothing,
   the drainer logs `holds the stream` with the group's name: let that group read
   further, or delete it with `XGROUP DESTROY` if nothing uses it.
 - **After a Postgres outage.** The drainer stops reading new entries after a failed
   store write, so at most one batch per replica is left pending. It retries by writing
-  that same batch, waiting 500ms after the first failure and twice as long after each
-  later one, up to 30s. A store that answers `Ping` but rejects writes (a schema gap)
-  therefore stays in this state. After a successful write the drainer reads new entries
-  again, and reclaim works through any other pending entries without waiting for
-  `claimInterval` while each batch comes back full.
+  the entries that replica holds, waiting 500ms after the first failure and twice as
+  long after each later one, up to 30s or half of `claimMinIdle`, whichever is shorter
+  (15s with the default 30s `claimMinIdle`), so another replica does not reclaim a
+  batch that is still being retried. A store that answers `Ping` but rejects every
+  write also stays in this state when the error is one of these: a schema gap
+  (SQLSTATE `42P01`, `42703` or `42P10`), a read-only replica (`25006`), missing
+  privileges (`42501`), a full disk or other insufficient resources (class `53`), an
+  admin shutdown or a server that cannot accept connections yet (class `57P`), a
+  connection exception (class `08`), or a serialization failure or deadlock (`40001`,
+  `40P01`). Any other error on a single row from a store that answers `Ping` is
+  treated as a bad row when the store shows it accepts writes: another row of the
+  same batch was stored, or, when no row of the batch was, a probe write succeeded
+  (see "Drainer paused" below). The drainer then logs `drop poison row` with the
+  full event and a `total poisoned=` count, and acknowledges and drops the row.
+  `phoebe_metering_drainer_poison_dropped_total` counts these drops across all
+  drainers; recover any such event from the logged JSON. If the probe write fails
+  too, the batch is a store failure and the drainer pauses with the rows kept.
+  Once a retry writes successfully, the
+  replica writes the rest of what it holds before it reads new entries. If its entries
+  were reclaimed by another replica, it reads one new batch to test the store, and a
+  failure there keeps the wait growing rather than starting again at 500ms. Reclaim
+  then works through any other pending entries without waiting for `claimInterval`
+  while each batch comes back full.
 
 **Manual relief.** If Postgres or the schema stays broken, the drainer cannot free
 undelivered entries. Raise `maxmemory` on Valkey (`CONFIG SET maxmemory <bytes>`) so
 that emitters can write and the group can be created, and then fix the store. Do not
 restart Valkey to clear it: it keeps nothing on disk, so a restart loses every entry
 that is not yet stored.
+
+### Drainer paused
+
+The drainer pauses when it cannot write to Postgres. While paused it reads no new
+entries from Valkey, and it retries the entries it already holds with backoff
+(500ms, doubling up to 30s or half of `claimMinIdle`). A pause starts on:
+
+- a store outage (Postgres does not answer `Ping`);
+- a store that answers `Ping` but refuses writes with one of the SQLSTATEs listed
+  under "After a Postgres outage" above (a schema gap, a read-only replica, missing
+  privileges, a full disk, and so on);
+- a batch in which every row failed, for another reason, and the probe write failed
+  too.
+
+**The probe write.** When no row of a batch can be stored, the drainer cannot tell
+from the row errors alone whether the rows are bad or the store is. So it makes one
+probe write: the same `INSERT` real rows use, for one synthetic but valid event
+whose `request_id` starts with `phoebe-probe-`, inside a transaction that is always
+rolled back. The probe leaves no row behind, and no other session can see it. If the
+probe fails, the store is the problem and the drainer pauses with the rows kept. If
+it succeeds, the store accepts writes, so the rows themselves are bad and are
+dropped as poison (`drop poison row`, with the full event). A batch in which at
+least one row was stored makes no probe: its failed rows are dropped as poison. The
+drainer logs the probe's outcome at WARN, as `probe write failed too, so this is a
+store failure` or `probe write succeeded ... dropping the rows as poison`.
+
+One case still drops rows that a person might want kept: a constraint or trigger
+that rejects real rows but accepts the probe's synthetic row (for example a new
+CHECK on a column the probe leaves NULL). The probe succeeds, so those rows are
+dropped as poison. Each one is in the drainer log in full, with its stream id and
+`request_id`, and `phoebe_metering_drainer_poison_dropped_total` rises, so it can
+be repaired by hand as described below.
+
+**Nothing is dropped during a pause.** The rows the drainer was writing stay in its
+pending list, and new entries stay unread in the stream. The trim removes only
+entries that every consumer group has delivered and acknowledged, so it never
+removes a pending or unread entry, however long the pause lasts.
+
+**A long pause fills Valkey.** The stream keeps growing while the interceptors keep
+serving. Once Valkey reaches `maxmemory` it refuses `XADD`, and each interceptor
+writes its events to its WAL on its own PVC instead
+(`phoebe_metering_wal_pending_events` rises). If a WAL cannot be written (its disk
+is full or it is broken), events go to the `METERING_FLOOR` log line, which is then
+the only copy. Do not restart Valkey during a pause: it keeps nothing on disk, so a
+restart loses every entry that is not yet in Postgres. See "Manual relief" above
+for raising `maxmemory`.
+
+**What shows a pause.**
+
+- The drainer logs one ERROR line when a pause starts:
+  `drainer: paused: store write failed: <error>; billing events stay in Valkey and
+  none are dropped; retrying with backoff (see docs/billing-reconciliation.md,
+  "Drainer paused")`. While it lasts, each failed retry logs `drainer: drain pass:
+  ...` at ERROR, and `store still failing` (at most every 30s) while Postgres does
+  not answer `Ping`. When it ends it logs `resuming after a pause of <duration>` at
+  INFO.
+- The drainer publishes its state to the Valkey hash `<stream>:drainer`
+  (`phoebe:metering:drainer` by default), and every interceptor exports it from its
+  metrics port, with no labels:
+  - `phoebe_metering_drainer_paused`: 1 when a drainer that reported within the
+    last 120s is paused, 0 when none of them is. Absent when no drainer reported
+    within 120s or the hash could not be read.
+  - `phoebe_metering_drainer_paused_seconds`: how long the longest current pause
+    has lasted (0 when none). Absent under the same conditions.
+  - `phoebe_metering_drainer_last_seen_age_seconds`: seconds since a drainer last
+    reported. A running drainer reports at least every 15s.
+  - `phoebe_metering_drainer_poison_dropped_total` and
+    `phoebe_metering_drainer_undecodable_dropped_total`: rows dropped as poison and
+    entries dropped as undecodable, across all drainers.
+
+  Every interceptor replica reports the same values, because they read the same
+  hash; aggregate with `max`, not `sum`. Once Valkey is full the drainer's own
+  reports are refused too, so after 120s the paused series disappears and
+  `phoebe_metering_drainer_last_seen_age_seconds` keeps growing. An alert should
+  therefore fire on any of: `max(phoebe_metering_drainer_paused) == 1` for some
+  minutes, `min(phoebe_metering_drainer_last_seen_age_seconds) > 120`, or the
+  paused series being absent while `phoebe_metering_valkey_up` is 1. The drop
+  counters are not lost while reports are refused: each drainer keeps the counts it
+  has not sent and adds them once a report succeeds. The counters start from 0 when
+  the hash is created, so read them with `increase()`.
+
+**Clearing a row that pauses the drainer.** If the pause does not end and the
+ERROR lines name the same row each time (`all <n> row(s) failed (first row id=<id>
+request_id=<request_id>: <error>) and the probe write failed`), fix the cause in
+Postgres first if you can: the drainer resumes by itself once a write succeeds.
+If the row must be set aside so the rest of billing can move, do it without
+losing it:
+
+1. Find the entry. The ERROR line gives its stream id. The pending list shows
+   every entry the drainer holds:
+
+   ```console
+   valkey-cli XPENDING phoebe:metering phoebe-drainer - + 20
+   ```
+
+2. Save its JSON before you touch it, somewhere outside Valkey:
+
+   ```console
+   valkey-cli --raw XRANGE phoebe:metering <id> <id>
+   ```
+
+   The value after the `event` field is the event JSON. Save it as one line in a
+   file, for example `held-<request_id>.jsonl`, and keep the file with the incident.
+3. Acknowledge only that entry, so the drainer stops retrying it. Once acknowledged
+   the trim may remove it, so step 2 must be done first:
+
+   ```console
+   valkey-cli XACK phoebe:metering phoebe-drainer <id>
+   ```
+
+   The drainer retries what it still holds. Once nothing of its own is pending, it
+   reads a new batch to test the store. If the next ERROR line names another row,
+   repeat these steps for it.
+4. Re-insert the row once the cause is fixed. Use `phoebe-recover` with the saved
+   file, which validates the event and checks it again on apply (see "Repair and
+   replay" step 2):
+
+   ```console
+   /app/phoebe-recover -input held-<request_id>.jsonl
+   /app/phoebe-recover -input held-<request_id>.jsonl \
+     -valkey-addr valkey:6379 -stream phoebe:metering \
+     -apply -expected-count 1 -expected-digest <digest from the dry run>
+   ```
+
+   The drainer deduplicates on `request_id`, so a repeated replay is harmless. If
+   `phoebe-recover` refuses the event, its message names the value the database
+   cannot store: correct that value in the saved file (never the `request_id`),
+   note the change in the incident, and run the dry run again. If the event is for
+   an hour older than the routine rater window, follow "A metering outage longer
+   than a day" for that hour. A row already dropped as poison can be re-inserted
+   the same way: the `event=` part of its `drop poison row` line is the JSON to save.
 
 ### A metering outage longer than a day
 
@@ -529,7 +685,8 @@ will carry across for you.
 
 The Make suite covers client-id replay, streaming/non-streaming usage, pre/post-header
 abort, upstream failure, duplicate delivery, Valkey outage and recovery, WAL restart
-and corruption, drainer transaction failure/poison isolation, re-aggregation, org
+and corruption, drainer transaction failure/poison isolation and the probe write that
+decides between poison and a pause, re-aggregation, org
 and base-model ambiguity, and push retry/no-retry and delete-by-absence behavior. Before a release,
 also run the live-Postgres lane and perform chart-level pod-kill tests while Valkey is
 unavailable.

@@ -374,7 +374,10 @@ is `version >= RequiredSchemaVersion`, not equality):
   `23514` (check violation), `23502` (not-null violation) or `23505` (unique
   violation). `isSchemaNotReady` (`internal/drain/store.go`) does not classify
   those codes as "schema behind", so the drainer drops those rows as poison and
-  they are lost from billing.
+  they are lost from billing. (When a whole batch fails, the drainer first makes
+  a probe write with a synthetic row; only if the new constraint also rejects
+  that row does it pause instead. See "Drainer paused" in
+  `docs/billing-reconciliation.md`.)
 - **Data backfills.** A backfill that normalizes values the previous drainer
   still writes must wait one release, or be repeated in the contract release.
   Under pre-upgrade ordering the old drainer can write rows with the old values

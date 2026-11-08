@@ -47,7 +47,8 @@ import (
 // Close() followed by Open(); recoverLocked implements exactly that and is
 // invoked on any Write failure and on ErrCorrupt from reads/truncates. If the
 // reopen itself fails (a transient open error, or a quarantine that cannot
-// complete) the wal is "poisoned": append errors immediately (the
+// complete) the wal is "poisoned", as it is when the first open at startup
+// fails with a non-corruption error: append errors immediately (the
 // emitter floors the event) and retries the reopen on every call — it is
 // already the failure path, so the extra open attempt is cheap relative to
 // the loss it can stop. pending, which the shipper calls every tick, retries it
@@ -83,9 +84,9 @@ type wal struct {
 	// live log and divert post-Close events away from the floor.
 	closed bool
 
-	// poisoned marks a failed recovery reopen: the underlying log is nil and
-	// unusable. append and pending retry the reopen; markShipped no-ops. See
-	// the type comment.
+	// poisoned marks a failed open, at startup (see openWAL) or in a recovery
+	// reopen: the underlying log is nil and unusable. append and pending retry
+	// the reopen; markShipped no-ops. See the type comment.
 	poisoned bool
 
 	// failNextWrite, when non-nil, intercepts the next library Write call and
@@ -94,6 +95,9 @@ type wal struct {
 	// failure modes (e.g. perform the real write, then report the fsync as
 	// failed; or tear bytes onto the tail segment, then report ENOSPC).
 	failNextWrite func(log *tidwall.Log, index uint64, data []byte) error
+
+	// quarantineLog throttles the log line of a failed quarantinedDirs count.
+	quarantineLog quarantineCountLog
 
 	logger *logging.Logger
 }
@@ -116,8 +120,15 @@ type wal struct {
 //     (see isCorruptOpenError), the directory is moved aside to
 //     "<dir>.corrupt.<unix-ns>" for forensics and a fresh log is created. Serving
 //     must not be blocked by a corrupt billing buffer; the loss is bounded and
-//     loudly visible. Any other open error (EACCES, EMFILE, EIO, ...) says nothing
-//     about the data, so it is returned and the directory stays where it is.
+//     loudly visible.
+//
+// Any other open error (EACCES, EMFILE, EIO, ...) says nothing about the data, so
+// the directory stays where it is and openWAL returns a poisoned wal instead of an
+// error: events fall to the log floor, and append and pending retry the open on
+// every call, so the wal heals when the filesystem does. Returning the error would
+// leave the process on the floor emitter for its whole life, with nothing retrying.
+// Two cases still fail: a corrupt directory that cannot be quarantined, and any open
+// error while legacy events are staged, because the import needs an open log.
 func openWAL(dir string, logger *logging.Logger) (*wal, error) {
 	// A parked .imported file is forensic data from a previous upgrade that
 	// nobody has recovered or removed. Warn on every startup so it cannot be
@@ -135,7 +146,11 @@ func openWAL(dir string, logger *logging.Logger) (*wal, error) {
 
 	l, last, err := openLog(dir, logger)
 	if err != nil {
-		return nil, err
+		if staged || isCorruptOpenError(err) {
+			return nil, err
+		}
+		logger.Error.Printf("emit: WAL POISONED at startup at %s: %v — events fall to the log floor; the open is retried on every append and shipper tick", dir, err)
+		return &wal{dir: dir, poisoned: true, logger: logger}, nil
 	}
 
 	w := &wal{dir: dir, log: l, nextIndex: last + 1, logger: logger}
@@ -170,9 +185,10 @@ func isCorruptOpenError(err error) bool {
 
 // openLog opens (or creates) the tidwall log at dir, quarantining a corrupt
 // directory aside and starting fresh — see openWAL. A non-corruption open error is
-// returned with the directory untouched: recoverLocked then poisons the wal and
-// retries on the next append or shipper tick. Returns the log and its last index
-// (0 if empty).
+// returned with the directory untouched, and the caller poisons the wal: at
+// startup openWAL returns a poisoned wal, and at runtime recoverLocked poisons it.
+// Either way the open is retried on the next append or shipper tick. Returns the
+// log and its last index (0 if empty).
 func openLog(dir string, logger *logging.Logger) (*tidwall.Log, uint64, error) {
 	l, err := tidwall.Open(dir, nil)
 	if err != nil {
@@ -523,7 +539,7 @@ func (w *wal) pendingCount() (count uint64, ok bool) {
 	return w.nextIndex - first, true
 }
 
-// isPoisoned reports whether the last recovery reopen failed.
+// isPoisoned reports whether the last open, at startup or in recovery, failed.
 func (w *wal) isPoisoned() bool {
 	w.mu.Lock()
 	defer w.mu.Unlock()
@@ -536,21 +552,63 @@ func (w *wal) isPoisoned() bool {
 // the count stays nonzero until an operator recovers them. A negative result means
 // the count is unknown; see quarantinedDirsOrUnknown.
 func (w *wal) quarantinedDirs() int {
-	return quarantinedDirsOrUnknown(w.dir, w.logger)
+	return quarantinedDirsOrUnknown(w.dir, w.logger, &w.quarantineLog)
 }
 
 // quarantinedDirsUnknown is what the WALQuarantinedDirs methods return when the
 // directory cannot be read. It must not be 0: these directories hold unbilled data.
 const quarantinedDirsUnknown = -1
 
-// quarantinedDirsOrUnknown logs a failed count and reports it as unknown.
-func quarantinedDirsOrUnknown(dir string, logger *logging.Logger) int {
+// quarantinedDirsOrUnknown reports a failed count as unknown on every call, and
+// logs the failure through throttle.
+func quarantinedDirsOrUnknown(dir string, logger *logging.Logger, throttle *quarantineCountLog) int {
 	n, err := countQuarantinedDirs(dir)
 	if err != nil {
-		logger.Error.Printf("emit: cannot count quarantined wal directories for %s: %v", dir, err)
+		throttle.report(dir, err, logger)
 		return quarantinedDirsUnknown
 	}
+	throttle.reset(dir, logger)
 	return n
+}
+
+// quarantineCountLogInterval is how often a count that keeps failing with the same
+// error is logged again.
+const quarantineCountLogInterval = 5 * time.Minute
+
+// quarantineCountLog throttles the error a failed quarantine count logs. The count
+// runs on every metrics scrape, and an unthrottled ERROR line per scrape per
+// replica would bury the METERING_FLOOR lines, which may be the only copy of a
+// billing event. It logs the first failure, a changed error, and the same error
+// again after quarantineCountLogInterval, and logs once when the count recovers.
+// Prometheus can collect concurrently, so it holds a mutex.
+type quarantineCountLog struct {
+	mu      sync.Mutex
+	last    time.Time
+	lastErr string
+}
+
+func (q *quarantineCountLog) report(dir string, err error, logger *logging.Logger) {
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	now := time.Now()
+	msg := err.Error()
+	if q.lastErr != "" && msg == q.lastErr && now.Sub(q.last) < quarantineCountLogInterval {
+		return
+	}
+	q.last = now
+	q.lastErr = msg
+	logger.Error.Printf("emit: cannot count quarantined wal directories for %s: %v", dir, err)
+}
+
+// reset records a successful count, so the next failure logs at once.
+func (q *quarantineCountLog) reset(dir string, logger *logging.Logger) {
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	if q.lastErr == "" {
+		return
+	}
+	q.lastErr = ""
+	logger.Info.Printf("emit: counting quarantined wal directories for %s works again", dir)
 }
 
 // countQuarantinedDirs counts the "<dir>.corrupt.*" siblings of dir. It compares
