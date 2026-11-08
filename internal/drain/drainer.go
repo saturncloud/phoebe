@@ -38,14 +38,20 @@ type Drainer struct {
 	lastTrim time.Time
 	now      func() time.Time
 
-	// storeDown is set when a store write fails and cleared only by a read pass
-	// that writes successfully or finds nothing to write, never by Ping alone: a
-	// store can answer Ping and still reject every write (a schema gap). While it
-	// is set the loop reads no new entries, so a failing store does not move the
-	// whole stream into the pending list. Only the Run goroutine touches it.
+	// storeDown is set when a store write fails. While it is set the loop reads no
+	// new entries, so a failing store does not move the whole stream into the
+	// pending list; each retry rereads the entries this consumer holds instead.
+	// Ping alone never clears it, because a store can answer Ping and still reject
+	// every write (a schema gap). It is cleared by a retry that stores at least one
+	// row and leaves this consumer's pending list empty, or, when there is nothing
+	// left to write at all (no pending entries and no new ones), by a pass that read
+	// nothing. That last case resumes reading but keeps storeRetryDelay, so a store
+	// that is still failing goes on doubling the wait instead of starting again at
+	// storeRetryBase. Only the Run goroutine touches it.
 	storeDown bool
 	// storeRetryDelay is how long to wait after a failed store write before trying
-	// again. It doubles with each failure, and is zero while the store is healthy.
+	// again. It doubles with each failure up to storeRetryCap, and only a pass that
+	// stores a row sets it back to zero.
 	storeRetryDelay time.Duration
 	// lastStoreFail is when the last store write failed.
 	lastStoreFail time.Time
@@ -56,10 +62,26 @@ type Drainer struct {
 	// lastGroupHoldLog throttles the log line about another consumer group holding
 	// the stream during drainWithoutGroup.
 	lastGroupHoldLog time.Time
+	// pausedSince is when the current pause began, that is when storeDown last went
+	// from false to true; zero while not paused. Only the Run goroutine touches it.
+	pausedSince time.Time
+
+	// State published to Valkey (see publishState). Only the Run goroutine
+	// touches these. sentPoisoned and sentMalformed are the parts of poisoned and
+	// malformed already added to the shared counters; the rest is sent by the
+	// next publish that succeeds, so a refused write loses no counts.
+	lastPublish          time.Time
+	publishedPausedSince time.Time
+	publishedOnce        bool
+	sentPoisoned         uint64
+	sentMalformed        uint64
+	lastPublishWarn      time.Time
+	lastPublishFailed    bool
 
 	// poisoned counts events that could not be stored even row-at-a-time
-	// against a healthy store and were dropped (logged + ACK'd). A non-zero
-	// value means billing rows were lost to the log; see upsertRowAtATime.
+	// against a store that accepts writes and were dropped (logged + ACK'd). A
+	// non-zero value means billing rows were lost to the log; see
+	// upsertRowAtATime.
 	poisoned atomic.Uint64
 	// malformed counts entries that could not be decoded and were dropped; see
 	// decodeBatch. The log line is the only copy left once the entry is trimmed.
@@ -76,11 +98,21 @@ type Drainer struct {
 }
 
 // maxStoreRetryDelay caps storeRetryDelay, so a store that recovers after a long
-// failure is noticed within this long.
+// failure is noticed within this long. storeRetryCap lowers it further when
+// ClaimMinIdle is short.
 const maxStoreRetryDelay = 30 * time.Second
 
+// storeRetryCap is the longest wait between store retries: maxStoreRetryDelay, or
+// half of ClaimMinIdle if that is shorter, and never less than storeRetryBase. Each
+// retry rereads this consumer's pending entries, which resets their idle time, so
+// while the wait stays below ClaimMinIdle another replica's XAUTOCLAIM cannot take
+// a batch this consumer is still retrying.
+func (d *Drainer) storeRetryCap() time.Duration {
+	return max(min(maxStoreRetryDelay, d.cfg.ClaimMinIdle/2), d.storeRetryBase)
+}
+
 // Poisoned returns the number of events dropped as store-poison (failed their
-// own single-row INSERT while the store was reachable) since start. Entries that
+// own single-row INSERT while the store accepted writes) since start. Entries that
 // could not even be decoded are counted by Malformed, not here.
 func (d *Drainer) Poisoned() uint64 { return d.poisoned.Load() }
 
@@ -203,9 +235,10 @@ func (d *Drainer) waitForGroup(ctx context.Context) error {
 // If the drainer's own group exists, the normal trim rules apply and nothing is
 // done here. Another group on the stream (a debug consumer, say) does not stop the
 // recovery, but its entries are its own: the trim stops at the oldest of its
-// last-delivered and oldest pending ids, as trimBoundary does. If that leaves
-// nothing to remove, nothing is stored or trimmed, and the group is logged so the
-// operator can see what holds the stream. A group appearing before the trim is
+// last-delivered and oldest pending ids, as trimBoundary does, and only entries
+// below that limit are read and stored. If that leaves nothing to remove, nothing
+// is stored or trimmed, and the group is logged so the operator can see what holds
+// the stream. A group appearing before the trim is
 // read again and counts the same way. One appearing between that read and the
 // XTRIM can only lose entries that are already stored.
 func (d *Drainer) drainWithoutGroup(ctx context.Context) (int64, error) {
@@ -213,7 +246,27 @@ func (d *Drainer) drainWithoutGroup(ctx context.Context) (int64, error) {
 	if err != nil || own {
 		return 0, err
 	}
-	msgs, err := d.rdb.XRangeN(ctx, d.cfg.StreamName, "-", "+", int64(d.cfg.BatchSize)).Result()
+	// With another group on the stream, only entries below its limit can be
+	// trimmed, so only those are read. Storing the rest would store, and log as
+	// undecodable, the same entries again on every pass until that group moves.
+	end := "+"
+	if len(others) > 0 {
+		first, err := d.rdb.XRangeN(ctx, d.cfg.StreamName, "-", "+", 1).Result()
+		if err != nil {
+			return 0, fmt.Errorf("xrange: %w", err)
+		}
+		if len(first) == 0 {
+			return 0, nil
+		}
+		limit, held, err := d.otherGroupsLimit(ctx, others, first[0].ID)
+		if err != nil || held {
+			return 0, err
+		}
+		if limit != "" {
+			end = "(" + limit // exclusive: MINID keeps the limit entry
+		}
+	}
+	msgs, err := d.rdb.XRangeN(ctx, d.cfg.StreamName, "-", end, int64(d.cfg.BatchSize)).Result()
 	if err != nil {
 		return 0, fmt.Errorf("xrange: %w", err)
 	}
@@ -221,9 +274,6 @@ func (d *Drainer) drainWithoutGroup(ctx context.Context) (int64, error) {
 		return 0, nil
 	}
 	oldest := msgs[0].ID
-	if _, held, err := d.otherGroupsLimit(ctx, others, oldest); err != nil || held {
-		return 0, err
-	}
 	events, ids, _ := d.decodeBatch(msgs)
 	if len(events) > 0 {
 		if _, _, err := d.storeBatch(ctx, events, ids); err != nil {
@@ -250,7 +300,8 @@ func (d *Drainer) drainWithoutGroup(ctx context.Context) (int64, error) {
 	}
 	if n > 0 {
 		total := d.drainedWithoutGroup.Add(uint64(n))
-		d.log.Error.Printf("drainer: valkey is full with no consumer group; stored and trimmed %d entr(ies) below %s (total=%d)", n, minID, total)
+		d.log.Error.Printf("drainer: valkey is full and consumer group %q does not exist; stored and trimmed %d entr(ies) below %s (total=%d, other groups=%d)",
+			d.cfg.Group, n, minID, total, len(others))
 	}
 	return n, nil
 }
@@ -557,7 +608,11 @@ func isBusyGroup(err error) bool {
 //
 // While the store is failing it skips reclaiming and reading new entries, and keeps
 // trimming. It waits longer after each failed write, and each retry writes the
-// entries this consumer already holds, so the pending list does not grow.
+// entries this consumer already holds, one batch per pass, until that pending list
+// is empty. Only when a retry finds nothing of its own left to write (another
+// replica reclaimed it, the group was recreated, or every entry was undecodable or
+// poison) does it read one new batch as the test of the store, so the pending list
+// holds at most one batch per replica. See pass for the rules.
 //
 // On ctx cancellation it returns after finishing any in-flight batch — an entry
 // that was read but not yet stored is simply left un-ACK'd and redelivers to the
@@ -584,69 +639,107 @@ func (d *Drainer) Run(ctx context.Context) error {
 
 	for {
 		if ctx.Err() != nil {
+			// One last publish, on its own short deadline, so counts from the
+			// final passes are not lost with the process.
+			d.publishState(context.WithoutCancel(ctx))
 			d.log.Info.Printf("drainer: context cancelled, shutting down cleanly")
 			return nil
 		}
-
-		// While the store is failing, reading would only move more entries into
-		// the pending list, which trimming must not pass. They wait unread in the
-		// stream instead. Only a write shows that the store accepts writes, so when
-		// the wait is over and it answers Ping, this pass retries with
-		// readAndStore, which rereads this consumer's pending entries.
-		retrying := d.storeDown
-		if retrying && (d.now().Sub(d.lastStoreFail) < d.storeRetryDelay || !d.storeAnswers(ctx)) {
-			d.trimIfDue(ctx)
-			d.sleep(ctx, d.storeRetryDelay)
-			continue
-		}
-
-		// Opportunistic reclaim of dead-consumer pending entries. A full batch
-		// means more may be waiting, so the next pass reclaims again: after a
-		// store outage the pending list sets the trim boundary, and one batch per
-		// ClaimInterval would keep a full Valkey full for hours.
-		more := false
-		if !retrying && d.now().Sub(d.lastClaim) >= d.cfg.ClaimInterval {
-			more = d.reclaim(ctx)
-			if !more {
-				d.lastClaim = d.now()
-			}
-		}
-
-		d.trimIfDue(ctx)
-
-		if d.storeDown && !retrying {
-			continue // reclaim just found the store failing
-		}
-
-		// New entries keep flowing during a long reclaim, but without blocking:
-		// waiting for BlockTimeout would cap reclaim at one batch per block. A
-		// negative Block omits BLOCK; zero would block forever.
-		block := d.cfg.BlockTimeout
-		if more || retrying {
-			block = -1
-		}
-		n, err := d.readAndStore(ctx, block)
-		if err != nil {
-			// On a transient error, log and back off briefly rather than spin.
-			// A cancelled context surfaces here too; the top-of-loop check exits.
-			if ctx.Err() != nil {
-				return nil
-			}
-			d.log.Error.Printf("drainer: drain pass: %v", err)
-			if errors.Is(err, errStoreFailed) {
-				d.noteStoreFailed() // the check at the top of the loop waits
-				continue
-			}
-			if n > 0 {
-				d.noteStoreWorking() // stored, and only the ACK failed
-			}
-			d.sleep(ctx, 500*time.Millisecond)
-			continue
-		}
-		// If we got a full batch there may be more backlog — loop immediately
-		// without re-blocking. An empty/partial read means we've caught up.
-		d.noteStoreWorking()
+		d.pass(ctx)
 	}
+}
+
+// pass runs one iteration of the Run loop.
+//
+// While the store is failing (storeDown), a pass waits out storeRetryDelay and then
+// retries by rereading this consumer's pending entries (the "0" id). The outcome
+// decides what happens to storeDown, because only a stored row shows that the store
+// accepts writes:
+//   - a full batch came back, so more may be pending: storeDown stays set and the
+//     next pass rereads again at once (noteRetryProgress), so this consumer's whole
+//     pending list is written before any new entry is read;
+//   - a short batch with at least one row stored: the pending list is drained and
+//     the store works, so storeDown and the wait are cleared (noteStoreWorking);
+//   - nothing stored and the pending list drained (an empty reread, a group
+//     recreated after NOGROUP, or only undecodable or poison entries): the same pass
+//     reads one new batch with ">" as the test of the store. A failure there
+//     doubles the wait from where it was. Reading nothing there clears storeDown but
+//     keeps the wait, because nothing showed the store accepts writes.
+func (d *Drainer) pass(ctx context.Context) {
+	d.publishIfDue(ctx)
+
+	// While the store is failing, reading would only move more entries into
+	// the pending list, which trimming must not pass. They wait unread in the
+	// stream instead. Only a write shows that the store accepts writes, so when
+	// the wait is over and it answers Ping, this pass retries.
+	retrying := d.storeDown
+	if retrying && (d.now().Sub(d.lastStoreFail) < d.storeRetryDelay || !d.storeAnswers(ctx)) {
+		d.trimIfDue(ctx)
+		d.sleep(ctx, d.storeRetryDelay)
+		return
+	}
+
+	// Opportunistic reclaim of dead-consumer pending entries. A full batch
+	// means more may be waiting, so the next pass reclaims again: after a
+	// store outage the pending list sets the trim boundary, and one batch per
+	// ClaimInterval would keep a full Valkey full for hours.
+	more := false
+	if !retrying && d.now().Sub(d.lastClaim) >= d.cfg.ClaimInterval {
+		more = d.reclaim(ctx)
+		if !more {
+			d.lastClaim = d.now()
+		}
+	}
+
+	d.trimIfDue(ctx)
+
+	if d.storeDown && !retrying {
+		return // reclaim just found the store failing
+	}
+
+	// New entries keep flowing during a long reclaim, but without blocking:
+	// waiting for BlockTimeout would cap reclaim at one batch per block. A
+	// negative Block omits BLOCK; zero would block forever.
+	block := d.cfg.BlockTimeout
+	start := ">"
+	if more || retrying {
+		block = -1
+	}
+	if retrying {
+		start = "0" // this consumer's own pending entries
+	}
+	stored, read, err := d.readAndStore(ctx, start, block)
+	probed := false
+	if err == nil && retrying && stored == 0 && read < d.cfg.BatchSize {
+		// Nothing of this consumer's is left to retry and nothing was written, so
+		// one new batch is the test of the store.
+		probed = true
+		stored, read, err = d.readAndStore(ctx, ">", -1)
+	}
+	if err != nil {
+		// On a transient error, log and back off briefly rather than spin.
+		// A cancelled context surfaces here too; the top-of-loop check exits.
+		if ctx.Err() != nil {
+			return
+		}
+		d.log.Error.Printf("drainer: drain pass: %v", err)
+		if errors.Is(err, errStoreFailed) {
+			d.noteStoreFailed(err) // the check at the top of the loop waits
+			return
+		}
+		if stored > 0 {
+			d.noteStoreWorking(stored) // rows were stored, and only the ACK failed
+		}
+		d.sleep(ctx, 500*time.Millisecond)
+		return
+	}
+	if retrying && !probed && read >= d.cfg.BatchSize {
+		d.noteRetryProgress(stored)
+		return
+	}
+	// If we got a full batch there may be more backlog — loop immediately
+	// without re-blocking. An empty/partial read means we've caught up.
+	d.noteStoreWorking(stored)
 }
 
 // trimIfDue trims when TrimInterval has passed since the last pass of the loop.
@@ -658,20 +751,54 @@ func (d *Drainer) trimIfDue(ctx context.Context) {
 }
 
 // noteStoreFailed records a failed store write: reads stop, and the wait before the
-// next attempt doubles, from storeRetryBase up to maxStoreRetryDelay.
-func (d *Drainer) noteStoreFailed() {
+// next attempt doubles, from storeRetryBase up to storeRetryCap. The start of a
+// pause is logged once at ERROR; while it lasts, the throttled lines in pass and
+// storeAnswers say it is still failing.
+func (d *Drainer) noteStoreFailed(err error) {
+	if !d.storeDown {
+		d.pausedSince = d.now()
+		d.log.Error.Printf("drainer: paused: store write failed: %v; billing events stay in Valkey and none are dropped; retrying with backoff (see docs/billing-reconciliation.md, \"Drainer paused\")", err)
+	}
 	d.storeDown = true
 	d.lastStoreFail = d.now()
-	d.storeRetryDelay = min(max(2*d.storeRetryDelay, d.storeRetryBase), maxStoreRetryDelay)
+	d.storeRetryDelay = min(max(2*d.storeRetryDelay, d.storeRetryBase), d.storeRetryCap())
 }
 
-// noteStoreWorking records a read pass with no store failure, and ends any wait.
-func (d *Drainer) noteStoreWorking() {
-	if d.storeDown {
-		d.log.Info.Printf("drainer: store accepting writes again; resuming")
+// noteStoreWorking records a pass with no store failure, which stored the given
+// number of rows, and ends the stop on reading new entries. Only a pass that
+// stored a row resets the wait: a pass that wrote nothing has not shown that the
+// store accepts writes, so the wait is kept and a store that is still failing
+// doubles it from there instead of starting again at storeRetryBase.
+func (d *Drainer) noteStoreWorking(stored int) {
+	paused := d.pauseLength()
+	if stored > 0 {
+		d.storeRetryDelay = 0
+		if d.storeDown {
+			d.log.Info.Printf("drainer: store accepting writes again; resuming after a pause of %s", paused)
+		}
+	} else if d.storeDown {
+		d.log.Info.Printf("drainer: no pending entries left to retry; resuming reads after a pause of %s (the store has not yet accepted a write)", paused)
 	}
 	d.storeDown = false
-	d.storeRetryDelay = 0
+	d.pausedSince = time.Time{}
+}
+
+// pauseLength is how long the current pause has lasted, rounded to the second.
+func (d *Drainer) pauseLength() time.Duration {
+	if d.pausedSince.IsZero() {
+		return 0
+	}
+	return d.now().Sub(d.pausedSince).Round(time.Second)
+}
+
+// noteRetryProgress records a retry that reread a full batch of this consumer's
+// pending entries without a store failure. More may be pending, so storeDown stays
+// set and the next pass rereads at once. A stored row also resets the wait.
+func (d *Drainer) noteRetryProgress(stored int) {
+	d.lastStoreFail = time.Time{}
+	if stored > 0 {
+		d.storeRetryDelay = 0
+	}
 }
 
 // storeAnswers pings the store. An answer is not enough to clear storeDown, because
@@ -690,16 +817,13 @@ func (d *Drainer) storeAnswers(ctx context.Context) bool {
 	return true
 }
 
-// readAndStore performs one XREADGROUP → store → XACK cycle for NEW entries
-// (the ">" ID). While storeDown is set it rereads the entries this consumer already
-// holds (the "0" ID) instead, so a retry that fails adds nothing to the pending list.
-// block is XREADGROUP's BLOCK; a negative value does not block.
-// Returns the number of entries processed.
-func (d *Drainer) readAndStore(ctx context.Context, block time.Duration) (int, error) {
-	start := ">"
-	if d.storeDown {
-		start = "0"
-	}
+// readAndStore performs one XREADGROUP → store → XACK cycle from start: ">" for
+// new entries, or "0" to reread the entries this consumer already holds, so a
+// retry that fails adds nothing to the pending list. block is XREADGROUP's BLOCK;
+// a negative value does not block. It returns the number of rows the store
+// committed and the number of entries read. A group recreated after NOGROUP reads
+// nothing.
+func (d *Drainer) readAndStore(ctx context.Context, start string, block time.Duration) (stored, read int, err error) {
 	res, err := d.rdb.XReadGroup(ctx, &redis.XReadGroupArgs{
 		Group:    d.cfg.Group,
 		Consumer: d.cfg.Consumer,
@@ -711,7 +835,7 @@ func (d *Drainer) readAndStore(ctx context.Context, block time.Duration) (int, e
 	if err != nil {
 		// redis.Nil means the block elapsed with no new entries — normal idle.
 		if errors.Is(err, redis.Nil) {
-			return 0, nil
+			return 0, 0, nil
 		}
 		if isNoGroup(err) {
 			// The stream or group vanished (Valkey restarted without
@@ -719,12 +843,12 @@ func (d *Drainer) readAndStore(ctx context.Context, block time.Duration) (int, e
 			// exists so nothing emitted since is skipped (QA B22 drill). On a full
 			// Valkey this frees memory until the group can be created.
 			if gerr := d.waitForGroup(ctx); gerr != nil {
-				return 0, fmt.Errorf("xreadgroup: %w; recreate group: %v", err, gerr)
+				return 0, 0, fmt.Errorf("xreadgroup: %w; recreate group: %v", err, gerr)
 			}
 			d.log.Warn.Printf("drainer: consumer group %q on %q was missing (%v); recreated", d.cfg.Group, d.cfg.StreamName, err)
-			return 0, nil
+			return 0, 0, nil
 		}
-		return 0, fmt.Errorf("xreadgroup: %w", err)
+		return 0, 0, fmt.Errorf("xreadgroup: %w", err)
 	}
 
 	var msgs []redis.XMessage
@@ -732,14 +856,16 @@ func (d *Drainer) readAndStore(ctx context.Context, block time.Duration) (int, e
 		msgs = append(msgs, st.Messages...)
 	}
 	if len(msgs) == 0 {
-		return 0, nil
+		return 0, 0, nil
 	}
-	return d.process(ctx, msgs)
+	stored, err = d.process(ctx, msgs)
+	return stored, len(msgs), err
 }
 
 // process decodes, stores, and ACKs a batch of stream messages. It is shared by
 // the new-entry path and the reclaim path so both honour the
-// store-before-ACK invariant identically.
+// store-before-ACK invariant identically. It returns the number of rows the store
+// committed, which excludes undecodable and poison entries.
 func (d *Drainer) process(ctx context.Context, msgs []redis.XMessage) (int, error) {
 	events, ackIDs, poison := d.decodeBatch(msgs)
 
@@ -830,23 +956,37 @@ func (d *Drainer) storeBatch(ctx context.Context, events []metering.Event, ids [
 
 // upsertRowAtATime is the poison-isolation slow path, taken only after a batch
 // Upsert failed. Each event is retried in its own statement: rows that succeed
-// are durable as usual; a row that fails ON ITS OWN while the store is
-// otherwise healthy can never be stored, so it is POISON — logged loudly (the
-// full event JSON at ERROR, same spirit as the decode-poison path in process:
-// the log line becomes the only remaining copy of a billing record), counted,
-// and included in the returned ack set so the stream keeps draining instead of
-// redelivering it forever.
+// are durable as usual. A row that fails ON ITS OWN while the store accepts
+// writes can never be stored, so it is POISON: logged loudly (the full event
+// JSON at ERROR, same spirit as the decode-poison path in process: the log line
+// becomes the only remaining copy of a billing record), counted, and included in
+// the returned ack set so the stream keeps draining instead of redelivering it
+// forever.
 //
-// "Otherwise healthy" is the fail-closed guard: a store OUTAGE also fails
-// every individual row, and declaring those poison would ACK-and-drop an
-// entire batch of good billing data. So after an individual failure we Ping;
-// if the store is unreachable we abort the walk and return an error — the
-// caller ACKs only the rows already stored and the remainder redelivers.
+// "Accepts writes" is the fail-closed guard: a store OUTAGE also fails every
+// individual row, and declaring those poison would ACK-and-drop an entire batch
+// of good billing data. So after an individual failure we Ping, and check for a
+// schema gap and for errors that mean the whole store refuses writes; any of
+// those aborts the walk with an error, the caller ACKs only the rows already
+// stored, and the remainder redelivers.
+//
+// A row that failed for any other reason is not dropped during the walk. If at
+// least one row of the batch was stored, the store plainly accepts writes and
+// the failed rows are poison. If NO row was stored, a failure the checks above
+// do not recognise could still be the store's, so a probe write
+// (Store.ProbeWrite) decides: if it fails, the batch is a store failure and
+// nothing is ACK'd, so the drainer pauses with the rows still pending; if it
+// succeeds, the rows are poison. Without the probe a batch of one (the usual
+// size at low traffic) could not be told apart from a broken store.
 //
 // Returns the stream ids safe to ACK (stored rows + poison rows), the number
-// of rows actually stored, and a non-nil error only for outage/cancellation.
+// of rows actually stored, and a non-nil error only for an outage, a schema gap,
+// a store that refuses writes (isStoreNotWritable), a failed probe, or
+// cancellation.
 func (d *Drainer) upsertRowAtATime(ctx context.Context, events []metering.Event, ids []string) (ackable []string, stored int, err error) {
 	ackable = make([]string, 0, len(events))
+	var failed []int // indexes of rows that failed on their own
+	rowErrs := make(map[int]error)
 	for i := range events {
 		uerr := d.store.Upsert(ctx, events[i:i+1])
 		if uerr == nil {
@@ -867,15 +1007,39 @@ func (d *Drainer) upsertRowAtATime(ctx context.Context, events []metering.Event,
 			// migration has run. Never drop billing data over a schema gap.
 			return ackable, stored, fmt.Errorf("database schema not ready (row error): %w", uerr)
 		}
-		// POISON: the store is up but this row cannot be inserted. Log the
-		// full event so it is recoverable from logs, count it, ACK it.
+		if isStoreNotWritable(uerr) {
+			// The store answers Ping but refuses every write (a read-only
+			// replica, missing privileges, a full disk, a shutdown). Like an
+			// outage, ACK only what is stored; the rest redelivers once the
+			// store takes writes again.
+			return ackable, stored, fmt.Errorf("store not writable (row error): %w", uerr)
+		}
+		failed = append(failed, i)
+		rowErrs[i] = uerr
+	}
+	if len(failed) == 0 {
+		return ackable, stored, nil
+	}
+	if stored == 0 {
+		// Every row failed. Ask the store whether it takes a write at all.
+		first := rowErrs[failed[0]]
+		if perr := d.store.ProbeWrite(ctx); perr != nil {
+			d.log.Warn.Printf("drainer: all %d row(s) of the batch failed and the probe write failed too, so this is a store failure: keeping the rows and pausing: %v", len(events), perr)
+			return ackable, 0, fmt.Errorf("all %d row(s) failed (first row id=%s request_id=%s: %v) and the probe write failed: %w",
+				len(events), ids[failed[0]], events[failed[0]].RequestID, first, perr)
+		}
+		d.log.Warn.Printf("drainer: all %d row(s) of the batch failed but the probe write succeeded, so the store accepts writes: dropping the rows as poison (first row error: %v)", len(events), first)
+	}
+	for _, i := range failed {
+		// POISON: the store accepts writes but this row cannot be inserted.
+		// Log the full event so it is recoverable from logs, count it, ACK it.
 		raw, merr := json.Marshal(events[i])
 		if merr != nil {
 			raw = []byte(fmt.Sprintf("%+v", events[i]))
 		}
 		n := d.poisoned.Add(1)
 		d.log.Error.Printf("drainer: drop poison row id=%s request_id=%s (total poisoned=%d): %v event=%s",
-			ids[i], events[i].RequestID, n, uerr, raw)
+			ids[i], events[i].RequestID, n, rowErrs[i], raw)
 		ackable = append(ackable, ids[i])
 	}
 	return ackable, stored, nil
@@ -927,7 +1091,7 @@ func (d *Drainer) reclaim(ctx context.Context) (more bool) {
 		d.log.Error.Printf("drainer: reclaim process: %v", err)
 		d.claimCursor = "0"
 		if errors.Is(err, errStoreFailed) {
-			d.noteStoreFailed()
+			d.noteStoreFailed(err)
 		}
 		return false
 	}

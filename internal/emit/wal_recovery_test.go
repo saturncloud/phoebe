@@ -931,6 +931,146 @@ func TestQuarantinedDirs_UnreadableIsUnknownNotZero(t *testing.T) {
 	}
 }
 
+// TestQuarantinedDirs_FailedCountLogsOncePerError: the count runs on every scrape, so
+// a parent directory that stays unreadable must log once, not once per scrape, while
+// every call still reports the count as unknown. A count that works again resets the
+// throttle, so the next failure logs at once.
+func TestQuarantinedDirs_FailedCountLogsOncePerError(t *testing.T) {
+	var logged bytes.Buffer
+	logger := logging.New(logging.ERROR)
+	logger.Error.SetOutput(&logged)
+	parent := filepath.Join(t.TempDir(), "absent")
+	f := NewFloorEmitter(logger, filepath.Join(parent, "wal"))
+	for i := range 3 {
+		if got := f.WALQuarantinedDirs(); got != quarantinedDirsUnknown {
+			t.Fatalf("call %d: WALQuarantinedDirs = %d, want the unknown value", i, got)
+		}
+	}
+	if got := strings.Count(logged.String(), "cannot count quarantined"); got != 1 {
+		t.Fatalf("failed count logged %d times over 3 calls, want 1: %q", got, logged.String())
+	}
+
+	if err := os.Mkdir(parent, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if got := f.WALQuarantinedDirs(); got != 0 {
+		t.Fatalf("WALQuarantinedDirs after the parent exists = %d, want 0", got)
+	}
+	if err := os.Remove(parent); err != nil {
+		t.Fatal(err)
+	}
+	if got := f.WALQuarantinedDirs(); got != quarantinedDirsUnknown {
+		t.Fatalf("WALQuarantinedDirs after the parent is gone again = %d, want the unknown value", got)
+	}
+	if got := strings.Count(logged.String(), "cannot count quarantined"); got != 2 {
+		t.Fatalf("a failure after a successful count logged %d lines in total, want 2", got)
+	}
+}
+
+// TestQuarantineCountLog_SameErrorLogsAgainAfterInterval: a failure that never clears
+// must still show up in the logs from time to time, and a different error logs at once.
+func TestQuarantineCountLog_SameErrorLogsAgainAfterInterval(t *testing.T) {
+	var logged bytes.Buffer
+	logger := logging.New(logging.ERROR)
+	logger.Error.SetOutput(&logged)
+	var q quarantineCountLog
+	q.report("d", errors.New("eacces"), logger)
+	q.report("d", errors.New("eacces"), logger)
+	q.mu.Lock()
+	q.last = q.last.Add(-quarantineCountLogInterval)
+	q.mu.Unlock()
+	q.report("d", errors.New("eacces"), logger)
+	q.report("d", errors.New("eio"), logger)
+	if got := strings.Count(logged.String(), "cannot count quarantined"); got != 3 {
+		t.Fatalf("logged %d lines, want 3 (first, after the interval, changed error): %q", got, logged.String())
+	}
+}
+
+// TestOpenWAL_TransientStartupErrorStartsPoisonedAndRecovers: a non-corruption open
+// error at startup must not fail emit.New, or the process would stay on the floor
+// emitter for its whole life with nothing retrying the open. The wal starts
+// poisoned, leaves the directory in place, and heals on the next append once the
+// filesystem does.
+func TestOpenWAL_TransientStartupErrorStartsPoisonedAndRecovers(t *testing.T) {
+	if os.Geteuid() == 0 {
+		t.Skip("root ignores directory permissions")
+	}
+	path := tmpWALPath(t)
+	w := openTestWAL(t, path)
+	if err := w.append(makeEvent("before-restart")); err != nil {
+		t.Fatal(err)
+	}
+	if err := w.close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(path, 0); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.Chmod(path, 0o755) })
+
+	cfg := testConfig(t, nil)
+	cfg.WALPath = path
+	cfg.ShipInterval = time.Hour
+	em, err := New(cfg, testLogger(), nil)
+	if err != nil {
+		t.Fatalf("emit.New on an unreadable WAL directory = %v, want a poisoned wal", err)
+	}
+	t.Cleanup(func() { _ = em.Close(context.Background()) })
+	if !em.WALPoisoned() {
+		t.Fatal("WALPoisoned = false after a failed startup open")
+	}
+	if _, ok := em.WALPending(); ok {
+		t.Fatal("WALPending reports a trusted count while the wal is poisoned")
+	}
+	if got := corruptDirCount(t, path); got != 0 {
+		t.Fatalf(".corrupt dirs after a transient startup error = %d, want 0", got)
+	}
+
+	if err := os.Chmod(path, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := em.wal.append(makeEvent("after-recovery")); err != nil {
+		t.Fatalf("append after the error cleared: %v", err)
+	}
+	if em.WALPoisoned() {
+		t.Fatal("wal still poisoned after the error cleared")
+	}
+	if got := em.FloorEvents(); got != 0 {
+		t.Fatalf("FloorEvents = %d, want 0: the event belongs in the wal", got)
+	}
+	ids := map[string]bool{}
+	for _, ev := range unshipped(t, em.wal) {
+		ids[ev.RequestID] = true
+	}
+	if !ids["before-restart"] || !ids["after-recovery"] {
+		t.Fatalf("wal events after recovery = %v, want the pre-restart and new events", ids)
+	}
+}
+
+// TestOpenWAL_CorruptStartupDirIsStillQuarantined: starting poisoned is only for
+// errors that say nothing about the data. A damaged directory is still moved aside
+// at startup and a fresh, usable log opened.
+func TestOpenWAL_CorruptStartupDirIsStillQuarantined(t *testing.T) {
+	path := tmpWALPath(t)
+	if err := os.MkdirAll(path, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(path, "00000000000000000001"), []byte{0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF}, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	w := openTestWAL(t, path)
+	defer w.close() //nolint:errcheck
+	if w.isPoisoned() {
+		t.Fatal("wal poisoned after quarantining a corrupt directory, want a fresh log")
+	}
+	if got := corruptDirCount(t, path); got != 1 {
+		t.Fatalf(".corrupt dirs = %d, want 1", got)
+	}
+	if err := w.append(makeEvent("fresh")); err != nil {
+		t.Fatalf("append to the fresh log: %v", err)
+	}
+}
+
 // TestFloorEmitter_ReportsQuarantinedDirsOnDisk: a failed start can leave corrupt
 // directories holding unbilled events. The replica running the floor emitter is the
 // one an operator most needs this count from.

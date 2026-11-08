@@ -123,7 +123,7 @@ func TestDrain_SchemaGapRetriesInsteadOfPoisoning(t *testing.T) {
 	if err := d.ensureGroup(ctx); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := d.readAndStore(ctx, cfg.BlockTimeout); err == nil {
+	if _, _, err := d.readAndStore(ctx, ">", cfg.BlockTimeout); err == nil {
 		t.Fatal("a schema gap must surface as a store error, not succeed")
 	}
 	if d.Poisoned() != 0 {
@@ -439,12 +439,12 @@ func TestDrain_RecreatedGroupDrainsEventsEmittedDuringTheWipe(t *testing.T) {
 	mr.Del(cfg.StreamName) // the wipe: stream and group gone
 	xaddEvent(t, rdb, cfg.StreamName, sampleEvent("during-wipe"))
 
-	if _, err := d.readAndStore(ctx, cfg.BlockTimeout); err != nil {
+	if _, _, err := d.readAndStore(ctx, ">", cfg.BlockTimeout); err != nil {
 		t.Fatalf("readAndStore after the wipe = %v, want the group recreated", err)
 	}
 	xaddEvent(t, rdb, cfg.StreamName, sampleEvent("after-recreate"))
 	for i := 0; i < 3 && store.rowCount() < 2; i++ {
-		if _, err := d.readAndStore(ctx, cfg.BlockTimeout); err != nil {
+		if _, _, err := d.readAndStore(ctx, ">", cfg.BlockTimeout); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -565,5 +565,21 @@ func TestIsSchemaNotReady(t *testing.T) {
 	}
 	if isSchemaNotReady(errors.New("plain")) {
 		t.Error("a non-Postgres error is not a schema gap")
+	}
+}
+
+func TestIsStoreNotWritable(t *testing.T) {
+	for code, want := range map[string]bool{
+		"25006": true, "42501": true, "53100": true, "53200": true, "57P01": true, "57P03": true,
+		"08006": true, "40001": true, "40P01": true,
+		"23505": false, "22001": false, "42703": false, "57014": false,
+	} {
+		err := fmt.Errorf("drain: upsert 1 events: %w", &pgconn.PgError{Code: code})
+		if got := isStoreNotWritable(err); got != want {
+			t.Errorf("code %s: isStoreNotWritable = %v, want %v", code, got, want)
+		}
+	}
+	if isStoreNotWritable(errors.New("plain")) {
+		t.Error("a non-Postgres error is not a store that refuses writes")
 	}
 }
