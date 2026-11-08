@@ -277,3 +277,61 @@ func TestRealValkeyDrainerRecoversFromOOMWithNoGroup(t *testing.T) {
 		t.Fatalf("Run: %v", err)
 	}
 }
+
+// TestRealValkeyDrainerStatePublishUnderOOMKeepsCounts: past maxmemory real
+// Valkey refuses the publish's writes and discards the whole MULTI/EXEC, so no
+// part of it lands. The drops counted meanwhile are sent once by the first
+// publish after memory is freed, and none is counted twice.
+func TestRealValkeyDrainerStatePublishUnderOOMKeepsCounts(t *testing.T) {
+	ctx := context.Background()
+	rdb := realValkey(t)
+	cfg := testConfig(rdb.Options().Addr)
+	cfg.StreamName = fmt.Sprintf("test:drain-state:%d", time.Now().UnixNano())
+	key := metering.DrainerStateKey(cfg.StreamName)
+	t.Cleanup(func() {
+		_ = rdb.ConfigSet(ctx, "maxmemory", "0").Err()
+		_ = rdb.Del(ctx, key).Err()
+	})
+	logger, logs := capturingLogger()
+	d := New(cfg, logger, rdb, newFakeStore())
+
+	d.poisoned.Add(2)
+	d.publishState(ctx)
+	if v, _ := rdb.HGet(ctx, key, metering.DrainerFieldDroppedPoison).Result(); v != "2" {
+		t.Fatalf("dropped_poison = %q, want 2", v)
+	}
+
+	if err := rdb.ConfigSet(ctx, "maxmemory", "1").Err(); err != nil {
+		t.Fatal(err)
+	}
+	d.poisoned.Add(3)
+	d.malformed.Add(1)
+	d.pausedSince = time.Now()
+	d.publishState(ctx)
+	if !strings.Contains(logs.String(), "could not publish drainer state") {
+		t.Fatalf("logs = %q, want the refused publish logged", logs.String())
+	}
+	if err := rdb.ConfigSet(ctx, "maxmemory", "0").Err(); err != nil {
+		t.Fatal(err)
+	}
+	h, err := rdb.HGetAll(ctx, key).Result()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if h[metering.DrainerFieldDroppedPoison] != "2" || h[cfg.Consumer+metering.DrainerFieldPausedSince] != "0" {
+		t.Fatalf("hash after a refused publish = %v, want it unchanged", h)
+	}
+
+	d.publishState(ctx)
+	d.publishState(ctx)
+	h, err = rdb.HGetAll(ctx, key).Result()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if h[metering.DrainerFieldDroppedPoison] != "5" || h[metering.DrainerFieldDroppedUndecodable] != "1" {
+		t.Fatalf("counters = %v, want 5 and 1", h)
+	}
+	if h[cfg.Consumer+metering.DrainerFieldPausedSince] == "0" {
+		t.Fatalf("paused_since not published: %v", h)
+	}
+}

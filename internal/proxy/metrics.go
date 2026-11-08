@@ -247,6 +247,9 @@ type meteringCollector struct {
 	walQuarantinedDirs, walSkippedEntries     *prometheus.Desc
 	floorEvents, valkeyUp                     *prometheus.Desc
 	streamEntries, undelivered, used, maxUsed *prometheus.Desc
+
+	drainerPaused, drainerPausedSeconds, drainerLastSeenAge *prometheus.Desc
+	drainerPoisonDropped, drainerUndecodableDropped         *prometheus.Desc
 }
 
 func newMeteringCollector(h MeteringHealth) *meteringCollector {
@@ -266,11 +269,20 @@ func newMeteringCollector(h MeteringHealth) *meteringCollector {
 		undelivered:        desc("metering_stream_undelivered_entries", "Stream entries not yet stored in Postgres: lost if Valkey restarts."),
 		used:               desc("valkey_used_memory_bytes", "Valkey used_memory."),
 		maxUsed:            desc("valkey_maxmemory_bytes", "Valkey maxmemory. At this level Valkey refuses metering writes and admission."),
+
+		drainerPaused:             desc("metering_drainer_paused", "1 when a drainer that reported within the last 120 s has stopped writing to Postgres because the store is failing: billing events wait in Valkey and none are dropped. Absent when no drainer reported within 120 s or its state could not be read."),
+		drainerPausedSeconds:      desc("metering_drainer_paused_seconds", "How long the longest current drainer pause has lasted, among drainers that reported within the last 120 s; 0 when none is paused. Absent like metering_drainer_paused."),
+		drainerLastSeenAge:        desc("metering_drainer_last_seen_age_seconds", "Seconds since a drainer last reported its state. A drainer reports at least every 15 s while it runs. Absent when no drainer has reported or its state could not be read."),
+		drainerPoisonDropped:      desc("metering_drainer_poison_dropped_total", "Billing rows the drainers dropped because Postgres rejected the row itself while accepting other writes. Each was logged in full at ERROR (drop poison row). Absent when the drainer state could not be read or no drainer has reported."),
+		drainerUndecodableDropped: desc("metering_drainer_undecodable_dropped_total", "Stream entries the drainers dropped because they could not be decoded. Each was logged at ERROR with its raw values (drop malformed entry). Absent when the drainer state could not be read or no drainer has reported."),
 	}
 }
 
 func (c *meteringCollector) Describe(ch chan<- *prometheus.Desc) {
-	for _, d := range []*prometheus.Desc{c.walPending, c.walHealthy, c.walPoisoned, c.walQuarantinedDirs, c.walSkippedEntries, c.floorEvents, c.valkeyUp, c.streamEntries, c.undelivered, c.used, c.maxUsed} {
+	for _, d := range []*prometheus.Desc{
+		c.walPending, c.walHealthy, c.walPoisoned, c.walQuarantinedDirs, c.walSkippedEntries, c.floorEvents, c.valkeyUp, c.streamEntries, c.undelivered, c.used, c.maxUsed,
+		c.drainerPaused, c.drainerPausedSeconds, c.drainerLastSeenAge, c.drainerPoisonDropped, c.drainerUndecodableDropped,
+	} {
 		ch <- d
 	}
 }
@@ -300,6 +312,25 @@ func (c *meteringCollector) Collect(ch chan<- prometheus.Metric) {
 	ch <- prometheus.MustNewConstMetric(c.undelivered, prometheus.GaugeValue, float64(p.Undelivered))
 	ch <- prometheus.MustNewConstMetric(c.used, prometheus.GaugeValue, float64(p.UsedMemory))
 	ch <- prometheus.MustNewConstMetric(c.maxUsed, prometheus.GaugeValue, float64(p.MaxMemory))
+	c.collectDrainer(ch, p.Drainer)
+}
+
+// collectDrainer reports the state the drainer publishes to Valkey. An unknown
+// value is left out, never reported as 0: a missing paused series must not read
+// as "not paused".
+func (c *meteringCollector) collectDrainer(ch chan<- prometheus.Metric, st *emit.DrainerState) {
+	if st == nil {
+		return
+	}
+	ch <- prometheus.MustNewConstMetric(c.drainerPoisonDropped, prometheus.CounterValue, float64(st.PoisonDropped))
+	ch <- prometheus.MustNewConstMetric(c.drainerUndecodableDropped, prometheus.CounterValue, float64(st.UndecodableDropped))
+	if st.AnySeen {
+		ch <- prometheus.MustNewConstMetric(c.drainerLastSeenAge, prometheus.GaugeValue, st.LastSeenAge.Seconds())
+	}
+	if st.Fresh {
+		ch <- prometheus.MustNewConstMetric(c.drainerPaused, prometheus.GaugeValue, boolGauge(st.Paused))
+		ch <- prometheus.MustNewConstMetric(c.drainerPausedSeconds, prometheus.GaugeValue, st.PausedFor.Seconds())
+	}
 }
 
 func boolGauge(b bool) float64 {
