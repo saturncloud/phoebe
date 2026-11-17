@@ -48,6 +48,14 @@ type pushStore interface {
 	// ResolvedHours lists hours before `before` with a parked row resolved after
 	// the hour's last accepted push: they must be re-sent however old.
 	ResolvedHours(ctx context.Context, before time.Time) ([]time.Time, error)
+	// EverPushed reports whether the manager has ever accepted an hour from
+	// this install (pushed_hour has a row). With no usage at all, it tells a
+	// fresh install (false) from a wiped one (true).
+	EverPushed(ctx context.Context) (bool, error)
+	// UnsentHours lists, oldest first and at most limit, the hours before
+	// `before` that have rated_usage, come after the first hour the manager ever
+	// accepted, and were never accepted (no pushed_hour row).
+	UnsentHours(ctx context.Context, before time.Time, limit int) ([]time.Time, error)
 	// RecordIntent adds rows to pushed_usage BEFORE the request is sent. If the
 	// manager commits and token-push dies before RecordAccepted, the ids are
 	// still known as sent; listing an id the manager does not have in `held` is
@@ -150,6 +158,41 @@ func (s pgStore) ResolvedHours(ctx context.Context, before time.Time) ([]time.Ti
 		ORDER BY p.window_start`, before)
 	if err != nil {
 		return nil, fmt.Errorf("query resolved parked hours: %w", err)
+	}
+	defer func() { _ = rows.Close() }()
+	var out []time.Time
+	for rows.Next() {
+		var h time.Time
+		if err := rows.Scan(&h); err != nil {
+			return nil, err
+		}
+		out = append(out, h.UTC())
+	}
+	return out, rows.Err()
+}
+
+func (s pgStore) EverPushed(ctx context.Context) (bool, error) {
+	var found bool
+	err := s.db.QueryRowContext(ctx, `SELECT EXISTS (SELECT 1 FROM pushed_hour)`).Scan(&found)
+	return found, err
+}
+
+// unsentHoursQuery: an hour before the first accepted push is usage from
+// before the install was connected; min() over an empty pushed_hour is NULL,
+// so nothing qualifies until the first push is accepted.
+const unsentHoursQuery = `
+SELECT DISTINCT ru.window_start
+  FROM rated_usage ru
+ WHERE ru.window_start < $1
+   AND ru.window_start > (SELECT min(window_start) FROM pushed_hour)
+   AND NOT EXISTS (SELECT 1 FROM pushed_hour h WHERE h.window_start = ru.window_start)
+ ORDER BY ru.window_start
+ LIMIT $2`
+
+func (s pgStore) UnsentHours(ctx context.Context, before time.Time, limit int) ([]time.Time, error) {
+	rows, err := s.db.QueryContext(ctx, unsentHoursQuery, before, limit)
+	if err != nil {
+		return nil, fmt.Errorf("query unsent hours: %w", err)
 	}
 	defer func() { _ = rows.Close() }()
 	var out []time.Time

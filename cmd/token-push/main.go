@@ -15,38 +15,71 @@
 //     So an hour with no usage is sent as records: [] and a re-sent hour
 //     replaces the previous one. usage_id is a deterministic hash of the
 //     record's grain, so re-sending never duplicates.
+//
 //   - THE SETTLE HORIZON IS THE TRAILING WINDOW. Each run re-sends the last
 //     pushTrailingHours complete hours (default 24, matching the rater's
 //     rateTrailingHours), so late-drained events the rater folds into an old
 //     hour reach the manager on the next run.
+//
 //   - CONFLICTS HOLD BACK ONE IDENTITY, NEVER THE HOUR. A rollup that cannot
 //     become a valid record (no org, or a wire-rule violation), and any identity
 //     the rater has parked (cmd/rater), is left out of the request; every other
 //     record of the hour is sent on time. The usage_ids the manager already
 //     holds for that identity (recorded in pushed_usage) are listed in `held`,
 //     so delete-by-absence cannot remove usage the manager accepted.
+//
 //   - RESOLVED HOURS ARE RE-SENT. Besides the trailing window, each run sends
 //     every hour with parked usage resolved since that hour's last accepted push
 //     (pushed_hour), however old.
+//
 //   - RETRIES. 5xx, 429 and network errors are retried with capped exponential
 //     backoff; a 429's Retry-After is honoured up to the backoff cap. Every
 //     other status (400/401/409/422, other 4xx) is final.
+//
 //   - AUTH = the install's existing customer auth token (SATURN_TOKEN env), sent
 //     as "Authorization: token <t>", the same credential and header as the old
 //     push and /customer/usage. No new credential, no new scope.
 //
+//   - IT RUNS ON EVERY INSTALL (rulings.md 2026-11-17: usage is always recorded
+//     and sent; whether it is charged is the manager's decision, by plan or
+//     flag, never by switching collection off). Two states every install can be
+//     in are therefore normal, not failures:
+//
+//   - NOT CONNECTED: no manager URL is configured (an air-gapped install, or
+//     managerURI set to ""). Nothing is sent and the run exits 0. The usage
+//     stays recorded in phoebe's rated_usage, which the pruner never deletes.
+//     Once a manager URL is configured, runs send the trailing window; older
+//     hours are sent with an explicit -since/-until run (90 days at most per
+//     run).
+//
+//   - NO USAGE YET: rated_usage, parked_usage and pushed_hour are all empty (a
+//     fresh install that has served no Token Factory traffic). Nothing is
+//     sent and the run exits 0. Sending would be wrong: every hour would go
+//     as an empty snapshot and delete the manager's records for it.
+//
+//   - MISSED HOURS ARE RE-SENT. Besides the trailing window, each run sends up
+//     to maxUnsentHoursPerRun of the oldest hours that have usage, come after
+//     the first hour the manager ever accepted from this install, and were never
+//     accepted (a manager outage longer than the window, a 409 while the manager
+//     still refused this install). Hours before the first accepted push are not
+//     sent automatically: that is usage from before the install was connected,
+//     sent only by an explicit -since/-until run.
+//
 // It is a ONE-SHOT batch job (a k8s CronJob). Exit codes:
 //
-//	0  every hour in the window was accepted by the manager
-//	1  fatal: bad config, no token, DB unreachable, an hour that could not be
-//	   read, a 5xx/429/network failure that outlasted the retries, a 200 that
-//	   disagreed with the request, an entirely empty rated_usage table, or a
-//	   window range wider than the backfill cap
+//	0  every hour in the window was accepted by the manager; or the install is
+//	   not connected to a manager; or it has no usage yet (see above)
+//	1  fatal: bad config, a manager URL with no token, DB unreachable, an hour
+//	   that could not be read, a 5xx/429/network failure that outlasted the
+//	   retries, a 200 that disagreed with the request, rated_usage empty after
+//	   usage was already sent (a wiped table), or a window range wider than the
+//	   backfill cap
 //	2  token-push HELD BACK a rollup it could not turn into a valid record (no
 //	   org, or a wire rule); the rest of its hour was sent. Parked usage is
 //	   the rater's signal (its exit 4), not this one
 //	3  the manager REJECTED some hour with a final status (400 wire rule, 401
-//	   token, 409 install on the legacy billing path, 422 billing period
+//	   token, 409 a manager older than the 2026-11-17 rule that accepts token
+//	   usage from installs on the legacy billing path, 422 billing period
 //	   already settled, any other non-429 4xx). Not retried; needs a person
 //
 // Precedence when several apply: 1 > 3 > 2.
@@ -125,8 +158,10 @@ func runWith(argv []string) int {
 		opts.managerURL = *urlFlag
 	}
 	if opts.managerURL == "" {
-		log.Error.Printf("token-push: no manager URL configured (set managerURL in the settings file or pass -manager-url)")
-		return exitFatal
+		// NOT CONNECTED (package doc): a normal state, not a failure. The usage
+		// stays in rated_usage; nothing is lost and nothing is sent.
+		log.Info.Printf("token-push: no manager URL configured; this install is not connected to a manager, so nothing is sent. Token usage stays recorded in phoebe's rated_usage table. Once managerURL is set, each run sends the trailing %d hours; send older hours with -since/-until", opts.trailingHours)
+		return exitOK
 	}
 
 	token := os.Getenv(tokenEnv)
