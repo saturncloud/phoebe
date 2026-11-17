@@ -6,7 +6,7 @@ import (
 )
 
 // These cover the binary's fail-closed money-path guards: it must refuse to run
-// (exitFatal) when it lacks the auth token, the manager URL, or a database URL —
+// (exitFatal) when it has a manager URL but lacks the auth token or a database URL —
 // never push usage without an authenticated destination, never run without the DB it
 // reads rated_usage from.
 
@@ -25,15 +25,19 @@ func TestRun_NoTokenFatal(t *testing.T) {
 	}
 }
 
-// TestRun_NoManagerURLFatal (token-push-no-url): a missing managerURL is fatal — there
-// is no destination to push to.
-func TestRun_NoManagerURLFatal(t *testing.T) {
-	t.Setenv(tokenEnv, "tok")
-	t.Setenv("DATABASE_URL", "postgres://x")
+// TestRun_NoManagerURLIsNotConnectedAndSucceeds (token-push-no-url): with no
+// managerURL the install is not connected to a manager (air-gapped, or managerURI
+// ""). Token-push runs on every install (rulings.md 2026-11-17), so this is a
+// normal state: nothing is sent, the usage stays in rated_usage, and the run
+// exits 0 without touching the database or needing a token, so the CronJob never
+// fails on such an install.
+func TestRun_NoManagerURLIsNotConnectedAndSucceeds(t *testing.T) {
+	t.Setenv(tokenEnv, "")
+	t.Setenv("DATABASE_URL", "") // would be fatal if the run got that far
 	dir := t.TempDir()
 	code := runWith([]string{"-f", filepath.Join(dir, "does-not-exist.yaml")})
-	if code != exitFatal {
-		t.Fatalf("exit code = %d, want exitFatal(%d)", code, exitFatal)
+	if code != exitOK {
+		t.Fatalf("exit code = %d, want exitOK(%d)", code, exitOK)
 	}
 }
 

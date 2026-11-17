@@ -68,12 +68,14 @@ func fixtureRollups() []rollupRow {
 
 // fakeStore is an in-memory pushStore.
 type fakeStore struct {
-	empty    bool
-	rollups  map[time.Time][]rollupRow
-	parked   map[time.Time][]identity
-	pushed   map[time.Time][]pushedRow
-	resolved []time.Time
-	accepted map[time.Time]int
+	empty      bool
+	everPushed bool
+	unsent     []time.Time
+	rollups    map[time.Time][]rollupRow
+	parked     map[time.Time][]identity
+	pushed     map[time.Time][]pushedRow
+	resolved   []time.Time
+	accepted   map[time.Time]int
 }
 
 func newFake() *fakeStore {
@@ -95,6 +97,16 @@ func (f *fakeStore) ResolvedHours(_ context.Context, before time.Time) ([]time.T
 	var out []time.Time
 	for _, h := range f.resolved {
 		if h.Before(before) {
+			out = append(out, h)
+		}
+	}
+	return out, nil
+}
+func (f *fakeStore) EverPushed(context.Context) (bool, error) { return f.everPushed, nil }
+func (f *fakeStore) UnsentHours(_ context.Context, before time.Time, limit int) ([]time.Time, error) {
+	var out []time.Time
+	for _, h := range f.unsent {
+		if h.Before(before) && len(out) < limit {
 			out = append(out, h)
 		}
 	}
@@ -454,17 +466,67 @@ func TestPushWindows_RejectedOutranksHeldBack(t *testing.T) {
 	}
 }
 
-// An entirely empty database would send every hour as empty and delete the
-// manager's records; refuse instead.
-func TestPushWindows_EmptyDatabaseRefusesToSendAnything(t *testing.T) {
+// EMPTY-TABLE GUARD, fresh install: an entirely empty database would send every
+// hour as empty and delete the manager's records, so nothing is sent. Token-push
+// runs on every install (rulings.md 2026-11-17), so an install with no Token
+// Factory usage yet is normal and the run succeeds.
+func TestPushWindows_EmptyDatabaseOnAFreshInstallSendsNothingAndSucceeds(t *testing.T) {
 	f := newFake()
 	f.empty = true
+	m := &recordingManager{}
+	if code := newPusher(f, m.client(t)).pushWindows(context.Background(), []time.Time{win}, now); code != exitOK {
+		t.Fatalf("exit %d, want exitOK", code)
+	}
+	if len(m.bodies) != 0 {
+		t.Fatal("sent a request from an empty database")
+	}
+}
+
+// EMPTY-TABLE GUARD, wiped database: usage was sent before and rated_usage is
+// now empty. Nothing is sent and the run fails loudly.
+func TestPushWindows_EmptyDatabaseAfterUsageWasSentRefusesAndIsFatal(t *testing.T) {
+	f := newFake()
+	f.empty = true
+	f.everPushed = true
 	m := &recordingManager{}
 	if code := newPusher(f, m.client(t)).pushWindows(context.Background(), []time.Time{win}, now); code != exitFatal {
 		t.Fatalf("exit %d, want exitFatal", code)
 	}
 	if len(m.bodies) != 0 {
-		t.Fatal("sent a request from an empty database")
+		t.Fatal("sent a request from a wiped database")
+	}
+}
+
+// An hour the manager never accepted (an outage longer than the trailing
+// window, or a 409 while the manager still refused the install) is re-sent,
+// oldest first, before the window.
+func TestPushWindows_AnHourNeverAcceptedIsReSentOutsideTheWindow(t *testing.T) {
+	missed := win.Add(-48 * time.Hour)
+	f := fixtureStore()
+	f.rollups[missed] = fixtureRollups()
+	f.unsent = []time.Time{missed}
+	m := &recordingManager{}
+	if code := newPusher(f, m.client(t)).pushWindows(context.Background(), []time.Time{win}, now); code != exitOK {
+		t.Fatalf("exit %d", code)
+	}
+	if len(m.bodies) != 2 || sentRequest(t, m.bodies[0]).WindowStart != meteredusage.FormatWindowStart(missed) {
+		t.Fatalf("sent %d hours, want the missed hour first and then the window", len(m.bodies))
+	}
+	if f.accepted[missed] != 1 {
+		t.Fatal("the missed hour's push was not recorded as accepted")
+	}
+}
+
+// An unsent hour that is also in the window is sent once, not twice.
+func TestPushWindows_AnUnsentHourInsideTheWindowIsSentOnce(t *testing.T) {
+	f := fixtureStore()
+	f.unsent = []time.Time{win}
+	m := &recordingManager{}
+	if code := newPusher(f, m.client(t)).pushWindows(context.Background(), []time.Time{win}, now); code != exitOK {
+		t.Fatalf("exit %d", code)
+	}
+	if len(m.bodies) != 1 {
+		t.Fatalf("sent %d requests, want 1", len(m.bodies))
 	}
 }
 

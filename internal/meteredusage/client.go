@@ -29,7 +29,7 @@ const maxResponseBody = 64 << 10
 // RejectedError is a response the manager will give again for the same
 // request: every 4xx except 429, and any other non-200, non-5xx status. It is
 // never retried. wire-conventions.md names the ones that matter: 400 (the request broke a wire rule; nothing stored), 401 (bad or
-// missing token), 409 (the install is recorded on the legacy billing path),
+// missing token), 409 (a manager that refuses this install's billing path),
 // 422 (window_start is in a billing period already settled to Stripe; the
 // correction goes to the human credit path). Each needs a person, not a
 // retry.

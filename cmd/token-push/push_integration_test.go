@@ -215,3 +215,55 @@ func TestIntegration_ResolvingTheConflictSendsTheParkedHour(t *testing.T) {
 		t.Fatalf("the resolved hour was sent again (%d requests, want %d)", len(m.bodies), n+1)
 	}
 }
+
+// Missed hours are re-sent; usage from before the install was connected is not.
+// h0 has usage but comes before the first accepted push (the install was not
+// connected yet), h1 is the first accepted push, h2 failed (the manager refused
+// it) and has usage, h3 is the current window.
+func TestIntegration_AnHourNeverAcceptedAfterTheFirstPushIsReSentButNotEarlierUsage(t *testing.T) {
+	db := itDB(t, "phoebe_push_unsent_it")
+	now := time.Now().UTC().Truncate(time.Hour)
+	h0, h1, h2, h3 := now.Add(-100*time.Hour), now.Add(-80*time.Hour), now.Add(-60*time.Hour), now.Add(-time.Hour)
+	for _, h := range []time.Time{h0, h1, h2} {
+		event(t, db, h.Add(time.Minute), itRes1, itOrg1)
+		rate(t, db, h, h.Add(time.Hour))
+	}
+	store := pgStore{db: db}
+	if got, err := store.UnsentHours(context.Background(), now, 10); err != nil || len(got) != 0 {
+		t.Fatalf("before any accepted push: unsent %v err %v, want none", got, err)
+	}
+	if ever, err := store.EverPushed(context.Background()); err != nil || ever {
+		t.Fatalf("EverPushed = %v err %v before any push, want false", ever, err)
+	}
+
+	m := &recordingManager{}
+	if code := push(t, db, m, h1); code != exitOK { // first accepted push
+		t.Fatalf("exit %d", code)
+	}
+	refused := &recordingManager{statuses: []int{409}}
+	if code := push(t, db, refused, h2); code != exitRejected {
+		t.Fatalf("exit %d, want exitRejected", code)
+	}
+	got, err := store.UnsentHours(context.Background(), now, 10)
+	if err != nil || len(got) != 1 || !got[0].Equal(h2) {
+		t.Fatalf("unsent %v err %v, want [%s] (h0 predates the first push)", got, err, h2)
+	}
+
+	event(t, db, h3.Add(time.Minute), itRes1, itOrg1)
+	rate(t, db, h3, h3.Add(time.Hour))
+	m2 := &recordingManager{}
+	if code := push(t, db, m2, h3); code != exitOK {
+		t.Fatalf("exit %d", code)
+	}
+	var sent []string
+	for _, b := range m2.bodies {
+		sent = append(sent, sentRequest(t, b).WindowStart)
+	}
+	want := []string{meteredusage.FormatWindowStart(h2), meteredusage.FormatWindowStart(h3)}
+	if strings.Join(sent, ",") != strings.Join(want, ",") {
+		t.Fatalf("sent %v, want %v", sent, want)
+	}
+	if got, _ := store.UnsentHours(context.Background(), now, 10); len(got) != 0 {
+		t.Fatalf("unsent after re-send %v, want none", got)
+	}
+}
