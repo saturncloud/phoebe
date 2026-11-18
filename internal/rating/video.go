@@ -169,8 +169,13 @@ WITH ev AS (
         -- NUMERIC accepts 'NaN', and Postgres orders NaN above every number,
         -- so NaN >= 0 is true: refuse it by name, or one NaN job would turn
         -- its grain's sum into NaN, which no record can carry.
+        -- No '|' in an envelope field: the wire usage_id joins org, owner and
+        -- resource with '|' unescaped, so such a job could share its id with
+        -- another grain's record. It could never be sent (the wire requires
+        -- hex ids), so it is invalid evidence here, not a rollup.
         (output_seconds >= 0 AND output_frames >= 0 AND gpu_seconds >= 0
          AND output_seconds <> 'NaN'::numeric AND gpu_seconds <> 'NaN'::numeric
+         AND strpos(org_id || COALESCE(user_id, '') || COALESCE(group_id, '') || resource_id, '|') = 0
          AND request_count = CASE WHEN status = 'completed' THEN 1 ELSE 0 END) AS valid_usage,
         output_seconds, output_frames, request_count, gpu_seconds,
         date_trunc('hour', created_at AT TIME ZONE 'UTC') AT TIME ZONE 'UTC' AS window_start
@@ -424,8 +429,8 @@ func aggregateVideoWindow(ctx context.Context, tx *sql.Tx, start, end time.Time)
 
 // stampVideoUsageIDs stores each rollup's wire usage_id in [start, end), in
 // the aggregation's transaction. INVARIANT at commit: every rollup of the
-// window carries the id of its own fields (or NULL when two rollups compute
-// the same id; see below), and every id a deleted or regrained rollup carried
+// window carries the id of its own fields, and every id a deleted or
+// regrained rollup carried
 // before has a tombstone: the statement before this tombstones deleted rows,
 // this pass tombstones changed ids. Both run in one transaction, so no reader
 // sees one half. The id is computed by the same function
@@ -468,29 +473,17 @@ func stampVideoUsageIDs(ctx context.Context, tx *sql.Tx, start, end time.Time) (
 	}
 	_ = rows.Close()
 
-	// Two rollups can compute the same id only if an envelope field contains
-	// the '|' the wire hash joins them with (usageID does not escape it).
-	// Neither is stamped: both stay NULL, token-push holds them back (exit 2),
-	// and no tombstone is written for their old ids (their identity is held).
-	count := map[string]int{}
-	for _, s := range all {
-		count[s.want]++
-	}
+	// Ids are unique per grain: valid_usage refuses the '|' that could make
+	// two grains share one. Stamping clears every changing row first anyway,
+	// so the unique index never depends on the order of the updates.
 	var todo []stamp
 	var live []string
 	for _, s := range all {
-		if count[s.want] > 1 {
-			s.want = ""
-		} else {
-			live = append(live, s.want)
-		}
+		live = append(live, s.want)
 		if s.old != s.want {
 			todo = append(todo, s)
 		}
 	}
-
-	// Clear every changing row first, so the unique index on usage_id cannot
-	// trip on the order of the updates.
 	for _, s := range todo {
 		if _, err := tx.ExecContext(ctx, `UPDATE rated_video_usage SET usage_id = NULL WHERE id = $1`, s.id); err != nil {
 			return 0, fmt.Errorf("rating: clear video usage_id: %w", err)
@@ -498,9 +491,6 @@ func stampVideoUsageIDs(ctx context.Context, tx *sql.Tx, start, end time.Time) (
 	}
 	var written int64
 	for _, s := range todo {
-		if s.want == "" {
-			continue
-		}
 		if s.old != "" {
 			if _, err := tx.ExecContext(ctx, `INSERT INTO video_reconcile_deletion (window_start, usage_id, auth_id,
 				owner_type, owner_id, resource_id, model_id, serving_mode, reason)

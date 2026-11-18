@@ -263,6 +263,24 @@ func TestIntegration_AVanishedVideoRecordIsDeletedOnlyWhenTheRaterRemovedIt(t *t
 			t.Fatalf("held %v, want [%s]: a stale tombstone must not release it", req.Held, id)
 		}
 	})
+	t.Run("a live record with a stale tombstone is sent, alarms, and is not re-listed", func(t *testing.T) {
+		db, h, m, id := setup(t, "phoebe_push_video_stale_tomb_it")
+		if _, err := db.Exec(`INSERT INTO video_reconcile_deletion (window_start, usage_id, auth_id, owner_type,
+			owner_id, resource_id, model_id, serving_mode, reason)
+			SELECT window_start, usage_id, auth_id, owner_type, owner_id, resource_id, model_id, serving_mode, 'reconcile'
+			  FROM rated_video_usage`); err != nil {
+			t.Fatal(err)
+		}
+		if hours, err := (pgStore{db: db}).ResolvedHours(context.Background(), time.Now().UTC().Truncate(time.Hour)); err != nil || len(hours) != 0 {
+			t.Fatalf("hours to re-send %v (err %v), want none: %s is live", hours, err, id)
+		}
+		if code := push(t, db, m, h); code != exitFatal {
+			t.Fatalf("exit %d, want %d for a live record with a tombstone", code, exitFatal)
+		}
+		if req := lastRequest(t, m); len(req.VideoRecords) != 1 || req.VideoRecords[0].UsageID != id {
+			t.Fatalf("%d video records, want %s sent", len(req.VideoRecords), id)
+		}
+	})
 	t.Run("lost: the rollup row deleted outside the rater", func(t *testing.T) {
 		db, h, m, id := setup(t, "phoebe_push_video_lost_it")
 		if _, err := db.Exec(`DELETE FROM rated_video_usage`); err != nil {

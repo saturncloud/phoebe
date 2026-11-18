@@ -145,7 +145,7 @@ func (f *fakeStore) EverPushedToken(context.Context) (bool, error) {
 // VideoHour returns the hour's rows stamped as the rater stamps them
 // (usage_id from the row's own fields) unless a row carries its own UsageID,
 // and the hour's tombstones.
-func (f *fakeStore) VideoHour(_ context.Context, h time.Time) ([]videoRollupRow, map[string]bool, error) {
+func (f *fakeStore) VideoHour(_ context.Context, h time.Time) ([]videoRollupRow, map[string]bool, []identity, error) {
 	out := make([]videoRollupRow, len(f.videoRollups[h]))
 	for i, r := range f.videoRollups[h] {
 		switch r.UsageID {
@@ -160,7 +160,7 @@ func (f *fakeStore) VideoHour(_ context.Context, h time.Time) ([]videoRollupRow,
 	for _, id := range f.tombstones[h] {
 		tomb[id] = true
 	}
-	return out, tomb, nil
+	return out, tomb, f.videoParked[h], nil
 }
 
 // unstampedVideoID marks a fake rollup the rater never stamped.
@@ -171,9 +171,6 @@ func stampedVideoID(h time.Time, r videoRollupRow) string {
 	return meteredusage.VideoUsageID(meteredusage.FormatWindowStart(h), r.OrgID, r.OwnerType, r.OwnerID, r.ResourceID,
 		meteredusage.VideoAttributes{AuthID: r.AuthID, ModelID: r.ModelID, ServingMode: r.ServingMode,
 			BaseModel: r.BaseModel, Task: r.Task, Resolution: r.Resolution, Region: r.Region})
-}
-func (f *fakeStore) ParkedVideoIdentities(_ context.Context, h time.Time) ([]identity, error) {
-	return f.videoParked[h], nil
 }
 
 // eligible mirrors the SQL: never accepted and not parked.

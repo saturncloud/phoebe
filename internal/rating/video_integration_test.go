@@ -740,20 +740,19 @@ func TestIntegration_Migration0017OnADatabaseFromBeforeTheTombstones(t *testing.
 	}
 }
 
-// Two rollups that compute the same usage_id (only possible with a '|' in an
-// envelope field, which the wire hash does not escape) are both left
-// unstamped instead of failing the unique index and stopping every rating run.
-func TestIntegration_RollupsThatComputeTheSameUsageIDAreLeftUnstamped(t *testing.T) {
-	db := openRatingSchema(t, "phoebe_video_dup_id_it")
+// A job with '|' in an envelope field is invalid usage (withheld, counted,
+// exit 2), never a rollup: the wire usage_id joins those fields with '|'
+// unescaped, so two such grains could share one id.
+func TestIntegration_VideoJobsWithAPipeInAnEnvelopeFieldAreInvalidUsage(t *testing.T) {
+	db := openRatingSchema(t, "phoebe_video_pipe_it")
 	vseed(t, db,
 		vrow(func(r *vbRow) { r.user = "u|x"; r.resource = "res" }),
-		vrow(func(r *vbRow) { r.user = "u"; r.resource = "x|res" }))
-	vaggregate(t, db, itHour, itHour.Add(time.Hour))
-	var rows, unstamped int
-	if err := db.QueryRow(`SELECT COUNT(*), COUNT(*) FILTER (WHERE usage_id IS NULL) FROM rated_video_usage`).Scan(&rows, &unstamped); err != nil {
-		t.Fatal(err)
-	}
-	if rows != 2 || unstamped != 2 {
-		t.Fatalf("%d rollups, %d unstamped; want both rated and neither stamped", rows, unstamped)
+		vrow(func(r *vbRow) { r.user = "u"; r.resource = "x|res" }),
+		vrow(func(r *vbRow) { r.org = "org|1" }),
+		vrow(nil))
+	res := vaggregate(t, db, itHour, itHour.Add(time.Hour))
+	assertVideoPartition(t, res, 4)
+	if res.InvalidUsageEvents != 3 || res.EventsAggregated != 1 || !res.HasAnomaly() {
+		t.Fatalf("%+v, want the three jobs with a '|' withheld as invalid", res)
 	}
 }

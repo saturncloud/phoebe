@@ -69,9 +69,9 @@ CREATE INDEX IF NOT EXISTS rated_video_usage_window_ix ON rated_video_usage (win
 -- integration-2026.08.01 before #143) gets the column from this statement when
 -- the file is applied again by hand; it is idempotent.
 ALTER TABLE rated_video_usage ADD COLUMN IF NOT EXISTS usage_id CHAR(64);
--- Unique: one record per id. Two rollups can compute the same id only if an
--- envelope field contains '|', which the wire hash does not escape; the rater
--- then stamps neither (NULL), and token-push holds them back.
+-- Unique: one record per id. Two grains could compute the same id only if an
+-- envelope field contained '|' (the wire hash does not escape it); the rater
+-- refuses such jobs as invalid usage, so they never become rollups.
 DROP INDEX IF EXISTS rated_video_usage_usage_id_ix;
 CREATE UNIQUE INDEX IF NOT EXISTS rated_video_usage_usage_id_uq ON rated_video_usage (usage_id);
 

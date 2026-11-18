@@ -233,7 +233,7 @@ func (p *pusher) buildHour(ctx context.Context, hour time.Time, withVideo bool) 
 // hour: a video rollup (sent or held back) or a parked video identity.
 func (p *pusher) addVideo(ctx context.Context, hour time.Time, plan *hourPlan, hold map[heldKey]bool, live map[string]bool) (map[identity]bool, error) {
 	ws := plan.req.WindowStart
-	rollups, tombstones, err := p.store.VideoHour(ctx, hour)
+	rollups, tombstones, parked, err := p.store.VideoHour(ctx, hour)
 	if err != nil {
 		return nil, err
 	}
@@ -279,15 +279,11 @@ func (p *pusher) addVideo(ctx context.Context, hour time.Time, plan *hourPlan, h
 		plan.req.VideoRecords = append(plan.req.VideoRecords, rec)
 		if tombstones[rec.UsageID] {
 			plan.staleTombstones++
-			p.log.Error.Printf("token-push: %s: video record %s is live but has a tombstone; it was restored outside the rater without deleting its tombstone, which would release it if it were lost again. Delete that row from video_reconcile_deletion (docs/billing-reconciliation.md)",
+			p.log.Error.Printf("token-push: %s: video record %s is live but has a tombstone (likely a restore that skipped the runbook step of deleting it); it is sent, but the tombstone would release it if it were lost again. Delete that row from video_reconcile_deletion (docs/billing-reconciliation.md)",
 				ws, rec.UsageID)
 		}
 		plan.sent = append(plan.sent, pushedRow{UsageID: rec.UsageID, Kind: meteredusage.KindVideo, identity: r.identity})
 		live[rec.UsageID] = true
-	}
-	parked, err := p.store.ParkedVideoIdentities(ctx, hour)
-	if err != nil {
-		return nil, err
 	}
 	for _, id := range parked {
 		hold[heldKey{meteredusage.KindVideo, id}] = true
@@ -510,8 +506,9 @@ func (p *pusher) pushWindows(ctx context.Context, windows []time.Time, now time.
 	hours = uniqueHours(hours, recheck)
 
 	heldBack, rejected, failed, newlyParked := 0, 0, 0, 0
-	videoVanished := 0 // hours whose sent video rollups are gone (exit 1)
-	unreachable := 0   // consecutive hours the manager could not be reached for
+	videoVanished := 0   // hours whose sent video rollups are gone (exit 1)
+	staleTombstones := 0 // live video records that still have a tombstone (exit 1)
+	unreachable := 0     // consecutive hours the manager could not be reached for
 	var unchanged []time.Time
 send:
 	for i, h := range hours {
@@ -556,9 +553,10 @@ send:
 		heldBack += plan.heldBack
 		// Counted only for an hour that is sent: a parked hour rebuilt by the
 		// recheck rotation and skipped above does not repeat the alarm.
-		if plan.videoVanished || plan.staleTombstones > 0 {
+		if plan.videoVanished {
 			videoVanished++
 		}
+		staleTombstones += plan.staleTombstones
 		if err := meteredusage.Validate(plan.req); err != nil {
 			// Every record passed on its own, so this is a request-level rule
 			// (for instance a duplicate usage_id): a bug. Send nothing for the
@@ -654,7 +652,7 @@ send:
 	}
 
 	switch {
-	case failed > 0 || videoVanished > 0 || videoWiped:
+	case failed > 0 || videoVanished > 0 || staleTombstones > 0 || videoWiped:
 		return exitFatal
 	case rejected > 0:
 		return exitRejected
