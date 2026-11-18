@@ -1,8 +1,12 @@
 // Command token-push is phoebe's install-side hourly usage PUSH job. For each
 // hour in its window it reads the aggregator's rated_usage rollups and sends the
-// complete set of that hour's token records to the manager's
-// POST /customer/metered-usage with kinds ["token"] (billing-design.md section
-// 3; wire details in internal/meteredusage). The manager prices and settles;
+// complete set of that hour's token records, and its video generation records
+// (rated_video_usage), to the manager's POST /customer/metered-usage with kinds
+// ["token", "video"] (billing-design.md section 3; video-models-design.md
+// section 7.3; wire details in internal/meteredusage). Until the install has
+// recorded any video usage, kinds is ["token"] alone: listing "video" then could
+// delete nothing, and it keeps such installs working against a manager that
+// does not know the video kind. The manager prices and settles;
 // phoebe sends quantities and the facts a price depends on, never money.
 //
 // It replaces the old POST /customer/token-usage push outright (section 3: no
@@ -11,7 +15,7 @@
 // The contract points it honors:
 //
 //   - ONE REQUEST PER HOUR, A SNAPSHOT. The manager deletes, by absence, any
-//     token record it holds for this install and hour that the request omits.
+//     record of a listed kind it holds for this install and hour that the request omits.
 //     So a re-sent hour replaces the previous one, and an hour with no usage
 //     is sent as records: [] only if this install sent that hour before
 //     (pushed_hour or pushed_usage has it). An empty hour this install never

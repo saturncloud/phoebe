@@ -223,7 +223,7 @@ func runWith(argv []string, log *logging.Logger) int {
 		hasAnomaly = hasAnomaly || caught.HasAnomaly() || cu.ReconciledDeletions > 0
 		hasParked = hasParked || cu.ParkedWritten > 0
 	}
-	return exitCode(res.ReconciledDeletions, windowExplicit, hasAnomaly, hasParked)
+	return exitCode(res.AllReconciledDeletions(), windowExplicit, hasAnomaly, hasParked)
 }
 
 // catchUpHoursPerRun bounds the one-time catch-up per run. A variable so the
@@ -234,15 +234,15 @@ var catchUpHoursPerRun = rating.CatchUpHoursPerRun
 // header, for an operator.
 func printParked(w io.Writer, parked []rating.Parked) {
 	tw := tabwriter.NewWriter(w, 0, 0, 2, ' ', 0)
-	fmt.Fprintln(tw, "HOUR\tREASON\tAUTH_ID\tOWNER\tRESOURCE_ID\tMODEL_ID\tMODE\tEVENTS\tPROMPT\tCACHED\tCOMPLETION\tFIRST_PARKED\tRAW_EVENTS")
+	fmt.Fprintln(tw, "HOUR\tKIND\tREASON\tAUTH_ID\tOWNER\tRESOURCE_ID\tMODEL_ID\tMODE\tEVENTS\tUSAGE\tFIRST_PARKED\tRAW_EVENTS")
 	for _, p := range parked {
 		owner := p.OwnerType + "/" + p.OwnerID
 		if p.OwnerType == "" {
 			owner = "-"
 		}
-		fmt.Fprintf(tw, "%s\t%s\t%s\t%s\t%s\t%s\t%s\t%d\t%d\t%d\t%d\t%s\t%s\n",
-			p.WindowStart.Format(time.RFC3339), p.Reason, p.AuthID, owner, p.ResourceID, p.ModelID, p.ServingMode,
-			p.EventCount, p.PromptTokens, p.CachedTokens, p.CompletionTokens, p.FirstParkedAt.UTC().Format(time.RFC3339),
+		fmt.Fprintf(tw, "%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%d\t%s\t%s\t%s\n",
+			p.WindowStart.Format(time.RFC3339), p.Kind, p.Reason, p.AuthID, owner, p.ResourceID, p.ModelID, p.ServingMode,
+			p.EventCount, p.UsageLabel(), p.FirstParkedAt.UTC().Format(time.RFC3339),
 			p.RawEventsLabel())
 	}
 	_ = tw.Flush()

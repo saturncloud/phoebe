@@ -1,0 +1,325 @@
+package rating
+
+import (
+	"context"
+	"database/sql"
+	"fmt"
+	"time"
+)
+
+// Video generation usage (video models design, approved 2026-11-18, sections
+// 7.2 and 7.3). phoebe-videos writes one video_billing_event row per finished
+// job (migration 0016); the aggregator rolls them up by the hour into
+// rated_video_usage (migration 0017) in the same transaction as the token
+// rollup, and cmd/token-push sends them as kind "video" records.
+//
+// THE GRAIN is (auth_id, owner_type, owner_id, resource_id, model_id,
+// serving_mode, base_model, task, resolution, region, hour), carrying org_id.
+// Every grain column is a wire attribute and enters the record's usage_id.
+// base_model and region are grain here, not carried attributes as for tokens:
+// two base models or two regions in one hour are two records, never a conflict.
+//
+// THE SAME FAIL-CLOSED RULES AS TOKENS:
+//   - Evidence that cannot become any record (an empty auth, resource or model
+//     id; negative quantities; a request_count that disagrees with the job's
+//     status) is withheld per event, counted, logged at ERROR, and drives
+//     cmd/rater's exit 2. The raw rows stay in video_billing_event.
+//   - CONFLICTS are PARKED per gate identity (auth, owner, resource, model,
+//     serving mode) and hour in parked_video_usage, with their quantities: an
+//     owner conflict (a job carrying both a user and a group), an ambiguous org
+//     (two orgs for one identity in the hour) and a missing org (org_id '' on
+//     every job of the identity). Only that identity is held back.
+//
+// A job's hour is video_billing_event.created_at, the instant it finished.
+//
+// Failed and cancelled jobs are aggregated: they add to event_count and
+// gpu_seconds (margin evidence) and nothing else, so a rollup of failed jobs
+// only is sent with zero output and request_count 0 and prices at $0.
+
+// VideoAggregateResult is what one video aggregation statement reports. The
+// event counts partition the in-window video_billing_event rows:
+//
+//	EventsAggregated + InvalidUsage + Unattributable + OwnerConflict
+//	  + AmbiguousOrg + MissingOrg == in-window video_billing_event rows
+type VideoAggregateResult struct {
+	RollupsWritten   int64
+	EventsAggregated int64
+	// ReconciledDeletions and ParkedDeletions mean what they mean for tokens
+	// (AggregateResult), for rated_video_usage rows.
+	ReconciledDeletions int64
+	ParkedDeletions     int64
+
+	// InvalidUsageEvents: a negative quantity, or a request_count that is not 1
+	// for a completed job (0016's checks already force 0 for the others).
+	InvalidUsageEvents int64
+	// UnattributableEvents: auth_id, resource_id or model_id is ''.
+	UnattributableEvents int64
+	// OwnerConflictEvents: the job carried both a user and a group.
+	OwnerConflictEvents int64
+	// AmbiguousOrgEvents: jobs of an identity-hour that named more than one org.
+	AmbiguousOrgEvents int64
+	// MissingOrgEvents: jobs of an identity-hour none of which named an org.
+	MissingOrgEvents int64
+
+	ParkedWritten  int64
+	ParkedResolved int64
+
+	// EmptyBaseModelEvents counts AGGREGATED jobs with base_model ''. Sent as ""
+	// and priced by the manager (a shared one is reported unpriced). Not a
+	// partition bucket.
+	EmptyBaseModelEvents int64
+}
+
+// aggregateVideoWindowSQL filters, groups, upserts, reconciles and counts the
+// video rollups of [$1, $2) in ONE statement, for the same reason as
+// aggregateWindowSQL: a row phoebe-videos commits mid-run is visible to both
+// the rollups and the counts or to neither.
+//
+// The hour bucket is session-TZ-independent (date_trunc on a UTC wall clock).
+const aggregateVideoWindowSQL = `
+WITH ev AS (
+    SELECT
+        -- '' is unattributable: the wire requires each of these to be non-empty.
+        NULLIF(auth_id, '')     AS auth_id,
+        NULLIF(resource_id, '') AS resource_id,
+        NULLIF(model_id, '')    AS model_id,
+        -- '' means no org: the payer is unknown (missing_org).
+        NULLIF(org_id, '')      AS org_id,
+        -- 0016 constrains serving_mode, task and resolution to the wire's enums
+        -- with CHECKs, so they need no filter here.
+        serving_mode, task, resolution,
+        base_model,
+        COALESCE(region, '')    AS region,
+        CASE
+            WHEN COALESCE(user_id, '') <> '' AND COALESCE(group_id, '') <> '' THEN ''
+            WHEN COALESCE(user_id, '') <> '' THEN 'user'
+            WHEN COALESCE(group_id, '') <> '' THEN 'group'
+            ELSE ''
+        END AS owner_type,
+        CASE
+            WHEN COALESCE(user_id, '') <> '' AND COALESCE(group_id, '') <> '' THEN ''
+            WHEN COALESCE(user_id, '') <> '' THEN user_id
+            WHEN COALESCE(group_id, '') <> '' THEN group_id
+            ELSE ''
+        END AS owner_id,
+        (COALESCE(user_id, '') <> '' AND COALESCE(group_id, '') <> '') AS owner_conflict,
+        -- request_count counts completed jobs only (design 7.3): 1 for a completed
+        -- job, 0 otherwise. 0016 has no check that output_seconds, output_frames
+        -- or gpu_seconds are non-negative, so they are checked here.
+        (output_seconds >= 0 AND output_frames >= 0 AND gpu_seconds >= 0
+         AND request_count = CASE WHEN status = 'completed' THEN 1 ELSE 0 END) AS valid_usage,
+        output_seconds, output_frames, request_count, gpu_seconds,
+        date_trunc('hour', created_at AT TIME ZONE 'UTC') AT TIME ZONE 'UTC' AS window_start
+    FROM video_billing_event
+    WHERE created_at >= $1
+      AND created_at <  $2
+),
+attributable AS (
+    SELECT * FROM ev
+    WHERE valid_usage
+      AND auth_id     IS NOT NULL
+      AND resource_id IS NOT NULL
+      AND model_id    IS NOT NULL
+),
+billable AS (
+    SELECT * FROM attributable WHERE NOT owner_conflict
+),
+-- The payer gate over the identity (the grain without base model, task,
+-- resolution and region): who pays is a property of the endpoint, so two orgs
+-- across two resolutions are still a conflict.
+gate AS (
+    SELECT auth_id, owner_type, owner_id, resource_id, model_id, serving_mode, window_start,
+        MAX(org_id)                AS org_id,
+        COUNT(DISTINCT org_id) > 1 AS ambiguous_org
+    FROM billable
+    GROUP BY auth_id, owner_type, owner_id, resource_id, model_id, serving_mode, window_start
+),
+grouped_raw AS (
+    SELECT auth_id, owner_type, owner_id, resource_id, model_id, serving_mode,
+        base_model, task, resolution, region, window_start,
+        window_start + interval '1 hour' AS window_end,
+        SUM(output_seconds)              AS output_seconds,
+        SUM(output_frames)::bigint       AS output_frames,
+        SUM(request_count)::bigint       AS request_count,
+        SUM(gpu_seconds)                 AS gpu_seconds,
+        COUNT(*)::bigint                 AS event_count
+    FROM billable
+    GROUP BY auth_id, owner_type, owner_id, resource_id, model_id, serving_mode,
+             base_model, task, resolution, region, window_start
+),
+grouped AS (
+    SELECT r.*, g.org_id, g.ambiguous_org
+    FROM grouped_raw r
+    JOIN gate g
+      ON  g.auth_id      = r.auth_id
+      AND g.owner_type   = r.owner_type
+      AND g.owner_id     = r.owner_id
+      AND g.resource_id  = r.resource_id
+      AND g.model_id     = r.model_id
+      AND g.serving_mode = r.serving_mode
+      AND g.window_start = r.window_start
+),
+kept AS (
+    SELECT * FROM grouped WHERE NOT ambiguous_org AND org_id IS NOT NULL
+),
+conflicts AS (
+    SELECT window_start, auth_id, owner_type, owner_id, resource_id, model_id, serving_mode,
+        CASE WHEN bool_or(ambiguous_org) THEN 'ambiguous_org' ELSE 'missing_org' END AS reason,
+        SUM(event_count)::bigint   AS event_count,
+        SUM(output_seconds)        AS output_seconds,
+        SUM(output_frames)::bigint AS output_frames,
+        SUM(request_count)::bigint AS request_count,
+        SUM(gpu_seconds)           AS gpu_seconds
+    FROM grouped
+    WHERE ambiguous_org OR org_id IS NULL
+    GROUP BY window_start, auth_id, owner_type, owner_id, resource_id, model_id, serving_mode
+    UNION ALL
+    -- Owner-conflict jobs have no owner, so they park under owner ('', '').
+    SELECT window_start, auth_id, '', '', resource_id, model_id, serving_mode, 'owner_conflict',
+        COUNT(*)::bigint, SUM(output_seconds), SUM(output_frames)::bigint,
+        SUM(request_count)::bigint, SUM(gpu_seconds)
+    FROM attributable
+    WHERE owner_conflict
+    GROUP BY window_start, auth_id, resource_id, model_id, serving_mode
+),
+parked_upsert AS (
+    INSERT INTO parked_video_usage (window_start, auth_id, owner_type, owner_id, resource_id, model_id,
+        serving_mode, reason, event_count, output_seconds, output_frames, request_count, gpu_seconds)
+    SELECT window_start, auth_id, owner_type, owner_id, resource_id, model_id, serving_mode, reason,
+        event_count, output_seconds, output_frames, request_count, gpu_seconds
+    FROM conflicts
+    ON CONFLICT ON CONSTRAINT parked_video_usage_pk DO UPDATE SET
+        event_count    = EXCLUDED.event_count,
+        output_seconds = EXCLUDED.output_seconds,
+        output_frames  = EXCLUDED.output_frames,
+        request_count  = EXCLUDED.request_count,
+        gpu_seconds    = EXCLUDED.gpu_seconds,
+        last_seen_at   = now(),
+        -- A conflict that comes back after being resolved is parked again.
+        resolved_at    = NULL
+    RETURNING 1
+),
+parked_resolved AS (
+    UPDATE parked_video_usage p SET resolved_at = now()
+    WHERE p.window_start >= $1
+      AND p.window_start <  $2
+      AND p.resolved_at IS NULL
+      AND NOT EXISTS (
+          SELECT 1 FROM conflicts c
+          WHERE c.window_start = p.window_start AND c.auth_id = p.auth_id
+            AND c.owner_type = p.owner_type AND c.owner_id = p.owner_id
+            AND c.resource_id = p.resource_id AND c.model_id = p.model_id
+            AND c.serving_mode = p.serving_mode AND c.reason = p.reason
+      )
+    RETURNING 1
+),
+deleted AS (
+    DELETE FROM rated_video_usage ru
+    WHERE ru.window_start >= $1
+      AND ru.window_start <  $2
+      AND NOT EXISTS (
+          SELECT 1 FROM kept k
+          WHERE k.auth_id      = ru.auth_id
+            AND k.owner_type   = ru.owner_type
+            AND k.owner_id     = ru.owner_id
+            AND k.resource_id  = ru.resource_id
+            AND k.model_id     = ru.model_id
+            AND k.serving_mode = ru.serving_mode
+            AND k.base_model   = ru.base_model
+            AND k.task         = ru.task
+            AND k.resolution   = ru.resolution
+            AND k.region       = ru.region
+            AND k.window_start = ru.window_start
+      )
+    RETURNING ru.window_start, ru.auth_id, ru.owner_type, ru.owner_id, ru.resource_id,
+              ru.model_id, ru.serving_mode
+),
+upserted AS (
+    INSERT INTO rated_video_usage (
+        id, auth_id, owner_type, owner_id, resource_id, org_id, model_id, serving_mode,
+        base_model, task, resolution, region, window_start, window_end,
+        output_seconds, output_frames, request_count, gpu_seconds, event_count
+    )
+    SELECT
+        -- md5 of the LENGTH-PREFIXED grain (injective, so a '|' inside a field
+        -- cannot collide two keys). Local row id only.
+        md5(length(auth_id)::text || ':' || auth_id
+          || '|' || length(owner_type)::text || ':' || owner_type
+          || '|' || length(owner_id)::text || ':' || owner_id
+          || '|' || length(resource_id)::text || ':' || resource_id
+          || '|' || length(model_id)::text || ':' || model_id
+          || '|' || length(serving_mode)::text || ':' || serving_mode
+          || '|' || length(base_model)::text || ':' || base_model
+          || '|' || length(task)::text || ':' || task
+          || '|' || length(resolution)::text || ':' || resolution
+          || '|' || length(region)::text || ':' || region
+          || '|' || extract(epoch FROM window_start)::bigint::text),
+        auth_id, owner_type, owner_id, resource_id, org_id, model_id, serving_mode,
+        base_model, task, resolution, region, window_start, window_end,
+        output_seconds, output_frames, request_count, gpu_seconds, event_count
+    FROM kept
+    ORDER BY auth_id, owner_type, owner_id, resource_id, model_id, serving_mode,
+             base_model, task, resolution, region, window_start
+    ON CONFLICT ON CONSTRAINT rated_video_usage_grain_uq DO UPDATE SET
+        org_id         = EXCLUDED.org_id,
+        window_end     = EXCLUDED.window_end,
+        output_seconds = EXCLUDED.output_seconds,
+        output_frames  = EXCLUDED.output_frames,
+        request_count  = EXCLUDED.request_count,
+        gpu_seconds    = EXCLUDED.gpu_seconds,
+        event_count    = EXCLUDED.event_count,
+        rated_at       = now()
+    RETURNING event_count, base_model
+)
+SELECT
+    (SELECT COUNT(*)::bigint                      FROM upserted) AS rollups_written,
+    (SELECT COALESCE(SUM(event_count), 0)::bigint FROM upserted) AS events_aggregated,
+    (SELECT COUNT(*)::bigint FROM deleted d WHERE NOT EXISTS (
+        SELECT 1 FROM conflicts c
+        WHERE c.window_start = d.window_start AND c.auth_id = d.auth_id
+          AND c.owner_type = d.owner_type AND c.owner_id = d.owner_id
+          AND c.resource_id = d.resource_id AND c.model_id = d.model_id
+          AND c.serving_mode = d.serving_mode))                   AS reconciled_deletions,
+    (SELECT COUNT(*)::bigint FROM deleted d WHERE EXISTS (
+        SELECT 1 FROM conflicts c
+        WHERE c.window_start = d.window_start AND c.auth_id = d.auth_id
+          AND c.owner_type = d.owner_type AND c.owner_id = d.owner_id
+          AND c.resource_id = d.resource_id AND c.model_id = d.model_id
+          AND c.serving_mode = d.serving_mode))                   AS parked_deletions,
+    -- The withheld buckets, in precedence order so they PARTITION the window.
+    (SELECT COUNT(*)::bigint FROM ev WHERE NOT valid_usage)       AS invalid_usage_events,
+    (SELECT COUNT(*)::bigint FROM ev
+      WHERE valid_usage
+        AND (auth_id IS NULL OR resource_id IS NULL OR model_id IS NULL))
+                                                                  AS unattributable_events,
+    (SELECT COUNT(*)::bigint FROM attributable WHERE owner_conflict)
+                                                                  AS owner_conflict_events,
+    (SELECT COALESCE(SUM(event_count), 0)::bigint FROM grouped WHERE ambiguous_org)
+                                                                  AS ambiguous_org_events,
+    (SELECT COALESCE(SUM(event_count), 0)::bigint FROM grouped
+      WHERE org_id IS NULL AND NOT ambiguous_org)                 AS missing_org_events,
+    (SELECT COUNT(*)::bigint FROM parked_upsert)                  AS parked_written,
+    (SELECT COUNT(*)::bigint FROM parked_resolved)                AS parked_resolved,
+    (SELECT COALESCE(SUM(event_count), 0)::bigint FROM upserted
+      WHERE base_model = '')                                      AS empty_base_model_events`
+
+// aggregateVideoWindow runs aggregateVideoWindowSQL inside tx.
+func aggregateVideoWindow(ctx context.Context, tx *sql.Tx, start, end time.Time) (VideoAggregateResult, error) {
+	var r VideoAggregateResult
+	err := tx.QueryRowContext(ctx, aggregateVideoWindowSQL, start.UTC(), end.UTC()).
+		Scan(&r.RollupsWritten, &r.EventsAggregated, &r.ReconciledDeletions, &r.ParkedDeletions,
+			&r.InvalidUsageEvents, &r.UnattributableEvents, &r.OwnerConflictEvents,
+			&r.AmbiguousOrgEvents, &r.MissingOrgEvents,
+			&r.ParkedWritten, &r.ParkedResolved, &r.EmptyBaseModelEvents)
+	if err != nil {
+		return VideoAggregateResult{}, fmt.Errorf("rating: aggregate video window [%s,%s): %w",
+			start.UTC().Format(time.RFC3339), end.UTC().Format(time.RFC3339), err)
+	}
+	return r, nil
+}
+
+// HasAnomaly reports video evidence that cannot become any record and is not
+// parked. cmd/rater exits 2 on it.
+func (r VideoAggregateResult) HasAnomaly() bool {
+	return r.UnattributableEvents > 0 || r.InvalidUsageEvents > 0
+}

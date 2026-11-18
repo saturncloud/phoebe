@@ -24,7 +24,7 @@ func bodySHA(b []byte) string {
 // token-push builds for it now, as an earlier run's 400 would have.
 func parkAsBuilt(t *testing.T, f *fakeStore, h time.Time) {
 	t.Helper()
-	plan, err := newPusher(f, nil).buildHour(context.Background(), h)
+	plan, err := newPusher(f, nil).buildHour(context.Background(), h, false)
 	if err != nil {
 		t.Fatal(err)
 	}

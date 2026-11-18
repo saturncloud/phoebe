@@ -30,8 +30,17 @@ with the Atlas schema; they live in phoebe's own database.
   base model or adapter, missing org) parked per (hour, identity, reason) with its
   token counts. Written by the rater; never pruned. See "Parked usage" in
   docs/billing-reconciliation.md.
+- **`rated_video_usage`** — the hourly video generation rollup (0017), one row per
+  (auth_id, owner, resource_id, model_id, serving_mode, base_model, task,
+  resolution, region, hour), carrying `org_id`, with `output_seconds` (exact
+  NUMERIC), `output_frames`, `request_count` (completed jobs), `gpu_seconds` and
+  `event_count` (every finished job). Written by the rater from
+  `video_billing_event`; sent by token-push as kind `video`. Never pruned.
+- **`parked_video_usage`** — conflicted video usage, the video twin of
+  `parked_usage`. Never pruned.
 - **`pushed_usage`, `pushed_hour`** — token-push's record of which usage_ids the
-  manager holds per hour and when the hour was last accepted.
+  manager holds per hour (with each id's `kind` since 0017) and when the hour was
+  last accepted.
 - **`token_push_state`** — one row: `auto_floor`, the first hour accepted by a
   scheduled token-push run. Scheduled runs re-send never-accepted hours only
   after it; explicit `-since/-until` runs never change it.
@@ -70,6 +79,7 @@ golang-migrate up/down pairs, applied in version order:
 | 0014 | `0014_refused_hour.{up,down}.sql` | `refused_hour` (token-push parks an hour the manager refused for its content, 400/413/422, or that failed local request validation; it is not re-sent until its payload hash changes and does not count against the per-run missed-hour cap; an accepted push deletes the row) |
 | 0015 | `0015_rater_state.{up,down}.sql` | `rater_state` (one row: the rater's one-time catch-up cursor and completion time; the catch-up rates every billing_event hour before the trailing window with no rated_usage or parked_usage row, oldest first, a bounded number per run) |
 | 0016 | `0016_video_jobs.{up,down}.sql` | `video_job` and `video_billing_event` (video generation jobs written and read only by phoebe-videos, `cmd/videos`; new tables only). Numbered 0016, not 0013: 0013 was already `token_push_state` |
+| 0017 | `0017_rated_video_usage.{up,down}.sql` | `rated_video_usage` and `parked_video_usage` (the video rollup and its parked conflicts), and `pushed_usage.kind` (default `'token'`). Down refuses while video usage is parked or not yet accepted by the manager |
 
 `embed.go` embeds these into the `migrations` package; `cmd/migrate` applies them.
 
@@ -342,6 +352,18 @@ the contract migration drops the columns.
 Rolling back: `0011 down` refuses while any row has NULL money (it will not invent
 a `$0` cost). Deploy the previous rater and token-push, re-rate the affected hours
 with `--since/--until`, then run `migrate down`.
+
+### Rollout order for migration 0017
+
+Expand only: two new tables and a column with a default, so the previous
+release's rater and token-push keep working. Deploy the manager that accepts
+kind `video` (saturn-aws-manager, `LEGACY_PATH_ACCEPTED_KINDS` with `video`)
+before any install records video usage: token-push lists `video` in `kinds` only
+once `rated_video_usage` or `parked_video_usage` has a row, so installs without
+video keep sending `["token"]` to an older manager. If a previous-release
+token-push runs once after the migration, its trim of `pushed_usage` drops that
+hour's video rows; it sends `["token"]` only, so the manager's video records are
+untouched, and the next push re-records them.
 
 ## Local dev
 
