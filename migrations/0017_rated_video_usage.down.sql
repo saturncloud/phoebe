@@ -47,7 +47,9 @@ BEGIN
     IF to_regclass('video_reconcile_deletion') IS NOT NULL THEN
         SELECT COUNT(*) INTO removed FROM pushed_usage u
           JOIN video_reconcile_deletion t ON t.window_start = u.window_start AND t.usage_id = u.usage_id
-         WHERE u.kind = 'video';
+         WHERE u.kind = 'video'
+           AND NOT EXISTS (SELECT 1 FROM rated_video_usage v
+                            WHERE v.window_start = u.window_start AND v.usage_id = u.usage_id);
     END IF;
     IF removed > 0 THEN
         RAISE EXCEPTION '0017 down: % video record(s) the rater removed are still held by the manager. Run token-push over their hours so the manager deletes them before migrating down.', removed;

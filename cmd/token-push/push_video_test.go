@@ -466,3 +466,15 @@ func TestPushWindows_ALiveVideoRecordWithATombstoneIsSentAndAlarms(t *testing.T)
 		t.Fatalf("%d video records, want both sent", len(req.VideoRecords))
 	}
 }
+
+// A live rollup with a tombstone anywhere fails every run (exit 1), not only
+// runs that rebuild its hour, so the alarm does not stop once the hour leaves
+// the routine window.
+func TestPushWindows_AStaleTombstoneAnywhereFailsTheRun(t *testing.T) {
+	f := fixtureStore()
+	f.staleTombstone = true
+	m := &recordingManager{}
+	if code := push1(t, f, m, win); code != exitFatal {
+		t.Fatalf("exit %d, want %d", code, exitFatal)
+	}
+}

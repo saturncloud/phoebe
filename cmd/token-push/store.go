@@ -93,7 +93,10 @@ type pushStore interface {
 	// the rater writes them (and the runbook's by-hand release). token-push lists kind
 	// "video" when either of the first two holds; no recorded video with an
 	// untombstoned sent record means the video tables were wiped.
-	VideoUsageState(ctx context.Context) (has, everPushed, untombstoned bool, err error)
+	// stale reports a live rollup whose usage_id still has a tombstone (a
+	// restore outside the rater that skipped deleting it), anywhere, so the
+	// alarm does not stop once the hour leaves the routine window.
+	VideoUsageState(ctx context.Context) (has, everPushed, untombstoned, stale bool, err error)
 	// VideoHour reads one hour's video rollups, its tombstones (the usage_ids
 	// the rater removed on purpose, video_reconcile_deletion) and its
 	// unresolved video parks (ambiguous_org, missing_org) in ONE read-only
@@ -183,7 +186,7 @@ func (s pgStore) UsagePresent(ctx context.Context) (rated, parked bool, err erro
 	return rated, parked, err
 }
 
-func (s pgStore) VideoUsageState(ctx context.Context) (has, everPushed, untombstoned bool, err error) {
+func (s pgStore) VideoUsageState(ctx context.Context) (has, everPushed, untombstoned, stale bool, err error) {
 	err = s.db.QueryRowContext(ctx,
 		`SELECT EXISTS (SELECT 1 FROM rated_video_usage)
 		        OR EXISTS (SELECT 1 FROM parked_video_usage WHERE resolved_at IS NULL),
@@ -191,8 +194,11 @@ func (s pgStore) VideoUsageState(ctx context.Context) (has, everPushed, untombst
 		        EXISTS (SELECT 1 FROM pushed_usage u
 		                 WHERE u.kind = 'video'
 		                   AND NOT EXISTS (SELECT 1 FROM video_reconcile_deletion t
-		                                    WHERE t.window_start = u.window_start AND t.usage_id = u.usage_id))`).Scan(&has, &everPushed, &untombstoned)
-	return has, everPushed, untombstoned, err
+		                                    WHERE t.window_start = u.window_start AND t.usage_id = u.usage_id)),
+		        EXISTS (SELECT 1 FROM rated_video_usage v
+		                  JOIN video_reconcile_deletion t ON t.window_start = v.window_start AND t.usage_id = v.usage_id)`).
+		Scan(&has, &everPushed, &untombstoned, &stale)
+	return has, everPushed, untombstoned, stale, err
 }
 
 // videoHourQuery reads every video rollup of one hour. NUMERIC as text, so the
@@ -305,7 +311,8 @@ func (s pgStore) ParkedIdentities(ctx context.Context, hour time.Time) ([]identi
 }
 
 // parkedIdentities reads one parked table; table is one of two constants.
-// q is the database or the transaction of a snapshot.
+// parkedIdentitiesIn does the same through q, the database or a snapshot's
+// transaction.
 func (s pgStore) parkedIdentities(ctx context.Context, table string, hour time.Time) ([]identity, error) {
 	return parkedIdentitiesIn(ctx, s.db, table, hour)
 }

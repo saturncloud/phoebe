@@ -91,6 +91,8 @@ type fakeStore struct {
 	// is derived from pushed (a video row) unless forced.
 	hasVideo        bool
 	everPushedVideo bool
+	// staleTombstone: a live rollup's id has a tombstone somewhere.
+	staleTombstone bool
 	// tombstones are the video usage_ids the rater removed, per hour.
 	tombstones   map[time.Time][]string
 	videoRollups map[time.Time][]videoRollupRow
@@ -113,7 +115,7 @@ func newFake() *fakeStore {
 		videoRollups: map[time.Time][]videoRollupRow{}, videoParked: map[time.Time][]identity{}}
 }
 
-func (f *fakeStore) VideoUsageState(context.Context) (bool, bool, bool, error) {
+func (f *fakeStore) VideoUsageState(context.Context) (bool, bool, bool, bool, error) {
 	ever, untombstoned := f.everPushedVideo, f.everPushedVideo
 	for h, rows := range f.pushed {
 		for _, r := range rows {
@@ -128,7 +130,7 @@ func (f *fakeStore) VideoUsageState(context.Context) (bool, bool, bool, error) {
 			untombstoned = untombstoned || !gone
 		}
 	}
-	return f.hasVideo, ever, untombstoned, nil
+	return f.hasVideo, ever, untombstoned, f.staleTombstone, nil
 }
 
 func (f *fakeStore) EverPushedToken(context.Context) (bool, error) {

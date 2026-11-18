@@ -72,6 +72,8 @@ ALTER TABLE rated_video_usage ADD COLUMN IF NOT EXISTS usage_id CHAR(64);
 -- Unique: one record per id. Two grains could compute the same id only if an
 -- envelope field contained '|' (the wire hash does not escape it); the rater
 -- refuses such jobs as invalid usage, so they never become rollups.
+-- (Drops a non-unique index an earlier draft of this migration created on
+-- battery dev databases.)
 DROP INDEX IF EXISTS rated_video_usage_usage_id_ix;
 CREATE UNIQUE INDEX IF NOT EXISTS rated_video_usage_usage_id_uq ON rated_video_usage (usage_id);
 
@@ -84,8 +86,7 @@ CREATE UNIQUE INDEX IF NOT EXISTS rated_video_usage_usage_id_uq ON rated_video_u
 --   regrained  the rollup's usage_id changed (a new org_id for the same grain)
 -- token-push lets the manager delete a sent video record by absence ONLY when
 -- its id has a tombstone; any other sent id with no rollup was lost, and is
--- held. token-push clears a tombstone older than its read when it sends the id
--- again as a live rollup (a restore outside the rater). A parked identity's ids are held by the
+-- held. A parked identity's ids are held by the
 -- park whatever their tombstone says, so `reason` is an audit label, not read
 -- by token-push. deleted_at is the latest removal. The rater removes a
 -- tombstone when its id is live again. NEVER pruned: one small row per removed record, and

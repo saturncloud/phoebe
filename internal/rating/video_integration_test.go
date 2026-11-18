@@ -755,4 +755,10 @@ func TestIntegration_VideoJobsWithAPipeInAnEnvelopeFieldAreInvalidUsage(t *testi
 	if res.InvalidUsageEvents != 3 || res.EventsAggregated != 1 || !res.HasAnomaly() {
 		t.Fatalf("%+v, want the three jobs with a '|' withheld as invalid", res)
 	}
+	// Nor are they never-rated usage: they were never rateable.
+	exec(t, db, `DELETE FROM rated_video_usage`)
+	exec(t, db, `DELETE FROM video_billing_event WHERE strpos(org_id || COALESCE(user_id, '') || resource_id, '|') = 0`)
+	if n, err := itStore(db).UnratedVideoHours(context.Background(), itHour, itHour.Add(time.Hour)); err != nil || n != 0 {
+		t.Fatalf("never-rated hours %d (err %v), want 0 for jobs with a '|'", n, err)
+	}
 }

@@ -411,7 +411,7 @@ func (p *pusher) pushWindows(ctx context.Context, windows []time.Time, now time.
 	// Once video was sent, it stays listed even if the video tables are gone:
 	// every sent id without a rollup or a tombstone is then held (buildHour),
 	// so the manager keeps its records and the run exits 1.
-	hasVideo, everPushedVideo, untombstonedVideo, err := p.store.VideoUsageState(ctx)
+	hasVideo, everPushedVideo, untombstonedVideo, staleTombstone, err := p.store.VideoUsageState(ctx)
 	if err != nil {
 		p.log.Error.Printf("token-push: video liveness check: %v", err)
 		return exitFatal
@@ -420,6 +420,9 @@ func (p *pusher) pushWindows(ctx context.Context, windows []time.Time, now time.
 	// Wiped: nothing recorded, yet the manager holds a video record the rater
 	// never removed. (Every rollup legitimately removed leaves tombstones.)
 	videoWiped := !hasVideo && untombstonedVideo
+	if staleTombstone {
+		p.log.Error.Printf("token-push: a live video rollup's usage_id still has a tombstone (likely a restore that skipped the runbook step of deleting it); it would release the record if the rollup were lost again. Delete those rows from video_reconcile_deletion (docs/billing-reconciliation.md)")
+	}
 	if videoWiped {
 		p.log.Error.Printf("token-push: no video usage is recorded although the manager holds video records the rater never removed (pushed_usage video rows with no tombstone); the video tables look wiped. In the hours this run sends, those records are held; the run exits 1. Restore the database")
 	}
@@ -652,7 +655,7 @@ send:
 	}
 
 	switch {
-	case failed > 0 || videoVanished > 0 || staleTombstones > 0 || videoWiped:
+	case failed > 0 || videoVanished > 0 || staleTombstones > 0 || staleTombstone || videoWiped:
 		return exitFatal
 	case rejected > 0:
 		return exitRejected
