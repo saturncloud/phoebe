@@ -32,6 +32,10 @@ type rollupRow struct {
 // them.
 type videoRollupRow struct {
 	ID string
+	// UsageID is the usage_id the rater stored for the row ("" if never
+	// stamped). token-push sends a record only when it equals the id it
+	// computes from the row's own fields.
+	UsageID string
 	identity
 	OrgID, BaseModel, Task, Resolution, Region string
 	OutputSeconds, GPUSeconds                  string
@@ -82,15 +86,14 @@ type pushStore interface {
 	// video usage apart from one whose rated_usage was wiped.
 	EverPushedToken(ctx context.Context) (bool, error)
 	// VideoUsageState reports whether any video usage is recorded
-	// (rated_video_usage has a row, or parked_video_usage has an UNRESOLVED
-	// row: an install whose only video rollup the rater just parked), and
-	// whether the manager was ever sent a video record (pushed_usage has a
-	// video row). token-push lists kind "video" only when video usage is
-	// recorded. A resolved parked row does not count: parked rows are never
-	// pruned, so an old one would hide a wiped rated_video_usage forever and
-	// every re-sent hour would delete the manager's video records by absence.
-	// rated is whether rated_video_usage alone has a row.
-	VideoUsageState(ctx context.Context) (has, rated, everPushed bool, err error)
+	// (rated_video_usage has a row, or parked_video_usage an unresolved one)
+	// and whether the manager was ever sent a video record (pushed_usage has
+	// a video row). token-push lists kind "video" when either holds.
+	VideoUsageState(ctx context.Context) (has, everPushed bool, err error)
+	// VideoTombstones lists the hour's video usage_ids the rater removed on
+	// purpose (video_reconcile_deletion). Only those may be deleted by
+	// absence; any other sent video id with no rollup was lost and is held.
+	VideoTombstones(ctx context.Context, hour time.Time) (map[string]bool, error)
 	Rollups(ctx context.Context, hour time.Time) ([]rollupRow, error)
 	// VideoRollups reads every rated_video_usage row of one hour.
 	VideoRollups(ctx context.Context, hour time.Time) ([]videoRollupRow, error)
@@ -172,13 +175,29 @@ func (s pgStore) UsagePresent(ctx context.Context) (rated, parked bool, err erro
 	return rated, parked, err
 }
 
-func (s pgStore) VideoUsageState(ctx context.Context) (has, rated, everPushed bool, err error) {
-	var parked bool
+func (s pgStore) VideoUsageState(ctx context.Context) (has, everPushed bool, err error) {
 	err = s.db.QueryRowContext(ctx,
-		`SELECT EXISTS (SELECT 1 FROM rated_video_usage),
-		        EXISTS (SELECT 1 FROM parked_video_usage WHERE resolved_at IS NULL),
-		        EXISTS (SELECT 1 FROM pushed_usage WHERE kind = 'video')`).Scan(&rated, &parked, &everPushed)
-	return rated || parked, rated, everPushed, err
+		`SELECT EXISTS (SELECT 1 FROM rated_video_usage)
+		        OR EXISTS (SELECT 1 FROM parked_video_usage WHERE resolved_at IS NULL),
+		        EXISTS (SELECT 1 FROM pushed_usage WHERE kind = 'video')`).Scan(&has, &everPushed)
+	return has, everPushed, err
+}
+
+func (s pgStore) VideoTombstones(ctx context.Context, hour time.Time) (map[string]bool, error) {
+	rows, err := s.db.QueryContext(ctx, `SELECT usage_id FROM video_reconcile_deletion WHERE window_start = $1`, hour)
+	if err != nil {
+		return nil, fmt.Errorf("query video_reconcile_deletion: %w", err)
+	}
+	defer func() { _ = rows.Close() }()
+	out := map[string]bool{}
+	for rows.Next() {
+		var id string
+		if err := rows.Scan(&id); err != nil {
+			return nil, fmt.Errorf("scan video_reconcile_deletion: %w", err)
+		}
+		out[id] = true
+	}
+	return out, rows.Err()
 }
 
 // videoHourQuery reads every video rollup of one hour. NUMERIC as text, so the
@@ -186,7 +205,8 @@ func (s pgStore) VideoUsageState(ctx context.Context) (has, rated, everPushed bo
 const videoHourQuery = `
 SELECT v.id, v.auth_id, v.owner_type, v.owner_id, v.resource_id, v.model_id, v.serving_mode,
        v.org_id, v.base_model, v.task, v.resolution, v.region,
-       v.output_seconds::text, v.output_frames, v.request_count, v.gpu_seconds::text
+       v.output_seconds::text, v.output_frames, v.request_count, v.gpu_seconds::text,
+       COALESCE(v.usage_id, '')
   FROM rated_video_usage v
  WHERE v.window_start = $1
  ORDER BY v.id`
@@ -202,7 +222,7 @@ func (s pgStore) VideoRollups(ctx context.Context, hour time.Time) ([]videoRollu
 		var r videoRollupRow
 		if err := rows.Scan(&r.ID, &r.AuthID, &r.OwnerType, &r.OwnerID, &r.ResourceID, &r.ModelID, &r.ServingMode,
 			&r.OrgID, &r.BaseModel, &r.Task, &r.Resolution, &r.Region,
-			&r.OutputSeconds, &r.OutputFrames, &r.Requests, &r.GPUSeconds); err != nil {
+			&r.OutputSeconds, &r.OutputFrames, &r.Requests, &r.GPUSeconds, &r.UsageID); err != nil {
 			return nil, fmt.Errorf("scan rated_video_usage: %w", err)
 		}
 		out = append(out, r)

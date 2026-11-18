@@ -91,11 +91,10 @@ type fakeStore struct {
 	// is derived from pushed (a video row) unless forced.
 	hasVideo        bool
 	everPushedVideo bool
-	// videoParkedOnly: video is recorded only as unresolved parked rows
-	// (rated_video_usage is empty).
-	videoParkedOnly bool
-	videoRollups    map[time.Time][]videoRollupRow
-	videoParked     map[time.Time][]identity
+	// tombstones are the video usage_ids the rater removed, per hour.
+	tombstones   map[time.Time][]string
+	videoRollups map[time.Time][]videoRollupRow
+	videoParked  map[time.Time][]identity
 }
 
 // fakeRefused is one refused_hour row.
@@ -114,7 +113,7 @@ func newFake() *fakeStore {
 		videoRollups: map[time.Time][]videoRollupRow{}, videoParked: map[time.Time][]identity{}}
 }
 
-func (f *fakeStore) VideoUsageState(context.Context) (bool, bool, bool, error) {
+func (f *fakeStore) VideoUsageState(context.Context) (bool, bool, error) {
 	ever := f.everPushedVideo
 	for _, rows := range f.pushed {
 		for _, r := range rows {
@@ -123,8 +122,17 @@ func (f *fakeStore) VideoUsageState(context.Context) (bool, bool, bool, error) {
 			}
 		}
 	}
-	return f.hasVideo, f.hasVideo && !f.videoParkedOnly, ever, nil
+	return f.hasVideo, ever, nil
 }
+
+func (f *fakeStore) VideoTombstones(_ context.Context, h time.Time) (map[string]bool, error) {
+	out := map[string]bool{}
+	for _, id := range f.tombstones[h] {
+		out[id] = true
+	}
+	return out, nil
+}
+
 func (f *fakeStore) EverPushedToken(context.Context) (bool, error) {
 	for _, rows := range f.pushed {
 		for _, r := range rows {
@@ -135,8 +143,31 @@ func (f *fakeStore) EverPushedToken(context.Context) (bool, error) {
 	}
 	return false, nil
 }
+
+// VideoRollups returns the hour's rows stamped as the rater stamps them
+// (usage_id from the row's own fields) unless a row carries its own UsageID.
 func (f *fakeStore) VideoRollups(_ context.Context, h time.Time) ([]videoRollupRow, error) {
-	return f.videoRollups[h], nil
+	out := make([]videoRollupRow, len(f.videoRollups[h]))
+	for i, r := range f.videoRollups[h] {
+		switch r.UsageID {
+		case "":
+			r.UsageID = stampedVideoID(h, r)
+		case unstampedVideoID:
+			r.UsageID = "" // what the query reads for a NULL usage_id
+		}
+		out[i] = r
+	}
+	return out, nil
+}
+
+// unstampedVideoID marks a fake rollup the rater never stamped.
+const unstampedVideoID = "unstamped"
+
+// stampedVideoID is the usage_id the rater stores for a rollup.
+func stampedVideoID(h time.Time, r videoRollupRow) string {
+	return meteredusage.VideoUsageID(meteredusage.FormatWindowStart(h), r.OrgID, r.OwnerType, r.OwnerID, r.ResourceID,
+		meteredusage.VideoAttributes{AuthID: r.AuthID, ModelID: r.ModelID, ServingMode: r.ServingMode,
+			BaseModel: r.BaseModel, Task: r.Task, Resolution: r.Resolution, Region: r.Region})
 }
 func (f *fakeStore) ParkedVideoIdentities(_ context.Context, h time.Time) ([]identity, error) {
 	return f.videoParked[h], nil
