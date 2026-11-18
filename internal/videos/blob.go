@@ -1,6 +1,7 @@
 package videos
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
@@ -81,20 +82,37 @@ func (s *S3) Put(ctx context.Context, key string, r io.Reader, size int64, conte
 	return err
 }
 
+// Get stats the object, then opens it. The size comes from a separate
+// StatObject: calling Stat on the reader GetObject returns makes minio-go send
+// every later read with If-Match on the stat's ETag, which S3-compatible stores
+// that compute ETags differently refuse ("At least one of the pre-conditions
+// you specified did not hold"; SeaweedFS on uk2, 2026-11-18). The first byte is
+// read here, so a store that refuses the read fails before the API has written
+// a 200.
 func (s *S3) Get(ctx context.Context, key string) (io.ReadCloser, int64, error) {
-	obj, err := s.client.GetObject(ctx, s.bucket, key, minio.GetObjectOptions{})
+	info, err := s.client.StatObject(ctx, s.bucket, key, minio.StatObjectOptions{})
 	if err != nil {
-		return nil, 0, err
-	}
-	info, err := obj.Stat()
-	if err != nil {
-		_ = obj.Close()
 		if minio.ToErrorResponse(err).Code == "NoSuchKey" {
 			return nil, 0, ErrBlobNotFound
 		}
 		return nil, 0, err
 	}
-	return obj, info.Size, nil
+	obj, err := s.client.GetObject(ctx, s.bucket, key, minio.GetObjectOptions{})
+	if err != nil {
+		return nil, 0, err
+	}
+	first := make([]byte, 1)
+	n, err := obj.Read(first)
+	if err != nil && !(errors.Is(err, io.EOF) && info.Size == 0) {
+		_ = obj.Close()
+		return nil, 0, err
+	}
+	return readCloser{Reader: io.MultiReader(bytes.NewReader(first[:n]), obj), Closer: obj}, info.Size, nil
+}
+
+type readCloser struct {
+	io.Reader
+	io.Closer
 }
 
 func (s *S3) Delete(ctx context.Context, key string) error {
