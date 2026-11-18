@@ -61,7 +61,10 @@ type pushSettings struct {
 
 // loadConfig reads the YAML settings file, applies rating.DefaultConfig for the pool,
 // overlays DATABASE_URL from the env, and resolves the push knobs. A missing settings
-// file is tolerated (all defaults + env), so the binary can run env-only.
+// file is an error: the chart always renders and mounts it, so a missing file is a
+// broken mount or a wrong -f, and treating it as "no manager URL" would turn that
+// into a silent not-connected success. Only managerURL "" in a file that exists
+// means not connected.
 func loadConfig(path string) (rating.Config, pushOptions, error) {
 	cfg := rating.DefaultConfig()
 	opts := pushOptions{
@@ -70,11 +73,11 @@ func loadConfig(path string) (rating.Config, pushOptions, error) {
 	}
 
 	var s pushSettings
-	if data, err := os.ReadFile(path); err == nil {
-		if err := yaml.UnmarshalStrict(data, &s); err != nil {
-			return cfg, opts, err
-		}
-	} else if !os.IsNotExist(err) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return cfg, opts, fmt.Errorf("read settings file: %w", err)
+	}
+	if err := yaml.UnmarshalStrict(data, &s); err != nil {
 		return cfg, opts, err
 	}
 
