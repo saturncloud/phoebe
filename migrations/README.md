@@ -358,21 +358,30 @@ with `--since/--until`, then run `migrate down`.
 Expand only: two new tables and a column with a default, so the previous
 release's rater and token-push keep working. Deploy the manager that accepts
 kind `video` (saturn-aws-manager, `LEGACY_PATH_ACCEPTED_KINDS` with `video`)
-before any install records video usage: token-push lists `video` in `kinds` only
-once `rated_video_usage` or `parked_video_usage` has a row, so installs without
-video keep sending `["token"]` to an older manager.
+before any install records video usage. token-push lists `video` in `kinds` only
+once `rated_video_usage` (or an unresolved `parked_video_usage` row) has a row,
+and then only for hours that have video or had video sent before. So installs
+without video keep sending `["token"]` to an older manager. If an older manager
+refuses the `video` kind anyway (a 400 whose path is `kinds[...]`), token-push
+treats it like a 401: it parks nothing and stops the run, and the next run
+sends again.
 
 Once any install has pushed video, do NOT run the previous release's token-push
 against this schema. Its trim of `pushed_usage` has no kind filter, so each hour
 it sends loses that hour's video rows, and it stamps `pushed_hour`. The
-manager's video records are untouched (it lists `["token"]` only), but the new
+manager's video records are untouched (it lists `["token"]` only). But the new
 token-push re-records them only for hours still inside its 24-hour trailing
 window. For an older hour, a video identity parked later has no accepted ids to
 hold, so the manager deletes them by absence. The scheduled re-send also skips
-that hour, because it is stamped. Roll back with `0017 down` instead. It refuses
-until every video rollup has been accepted by the manager (a video `pushed_usage`
-row of its identity recorded after it was rated), then removes video from
-phoebe's side. The manager keeps the video records it holds.
+that hour, because it is stamped.
+
+To roll back, first suspend the token-push and rater CronJobs; do not roll them
+back to the previous release yet. Then run `0017 down`. It refuses until every
+video rollup has been accepted by the manager. That means the hour's last
+accepted push came after the rollup was rated, and recorded a video
+`pushed_usage` id for each rated row of the identity. Once it passes, it removes
+video from phoebe's side, and the manager keeps the video records it holds.
+Only then deploy the previous release.
 
 ## Local dev
 
