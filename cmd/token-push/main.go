@@ -64,14 +64,28 @@
 //     never parked: the run stops at the first one. Any other 4xx (including a
 //     400 without the manager's validation body) is not parked either.
 //
+//   - HTTPS ONLY. managerURL and -manager-url must be https:// URLs: the
+//     request carries the install's token and usage. Any other scheme, or a
+//     URL without one, is refused at startup (exit 1). The test-only settings
+//     key allowInsecureLocalhostManagerURL allows http to localhost, 127.0.0.1
+//     and ::1, and to no other host; the chart never sets it.
+//
 //   - AUTH = the install's existing customer auth token (SATURN_TOKEN env), sent
 //     as "Authorization: token <t>", the same credential and header as the old
 //     push and /customer/usage. No new credential, no new scope.
 //
 //   - IT RUNS ON EVERY INSTALL (rulings.md 2026-11-17: usage is always recorded
 //     and sent; whether it is charged is the manager's decision, by plan or
-//     flag, never by switching collection off). Two states every install can be
-//     in are therefore normal, not failures:
+//     flag, never by switching collection off). There is no opt-out. Once an
+//     install connects, all of its retained usage is sent (MISSED HOURS
+//     below). Suspending this CronJob or the rater's, or leaving managerURL
+//     empty, only delays sending; none of them stops it (the rater catches up
+//     the hours it never rated while their billing_event rows are retained;
+//     see cmd/rater). An empty manager URL
+//     is only for an install that has never connected (air-gapped); an install
+//     that has pushed and then loses its URL is misconfigured, and the run
+//     fails. The manager URL must be https (HTTPS ONLY below). Two states
+//     every install can be in are therefore normal, not failures:
 //
 //   - NOT CONNECTED: the settings file sets managerURL to "" and no
 //     -manager-url is given (an air-gapped install, or managerURI set to "").
