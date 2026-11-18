@@ -141,7 +141,10 @@ func TestBuildWakerConnectsBothModesToAtlas(t *testing.T) {
 	}
 	err = built.Wake(context.Background(), proxy.WakeTarget{
 		ResourceID: "dep-1", UpstreamHost: atlasURL.Host, ServedModel: "model-a",
-		ServingMode: identity.ServingModeDedicated,
+		// Distinct graphs, as in production: the waker runs one wake loop per
+		// graph and a call that arrives before a finished loop leaves the map
+		// takes its result, so two wakes of one graph may reach Atlas once.
+		GraphK8sName: "graph-dedicated", ServingMode: identity.ServingModeDedicated,
 	})
 	if err != nil {
 		t.Fatalf("dedicated Wake: %v", err)
@@ -151,7 +154,7 @@ func TestBuildWakerConnectsBothModesToAtlas(t *testing.T) {
 	}
 	err = built.Wake(context.Background(), proxy.WakeTarget{
 		ResourceID: "model-1", UpstreamHost: atlasURL.Host, ServedModel: "model-a",
-		ServingMode: identity.ServingModeShared,
+		GraphK8sName: "graph-shared", ServingMode: identity.ServingModeShared,
 	})
 	if err != nil {
 		t.Fatalf("shared Wake: %v", err)
