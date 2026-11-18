@@ -137,9 +137,11 @@ func TestIntegration_AVideoOnlyHourNeverAcceptedIsReSent(t *testing.T) {
 	if code := push(t, db, m2, h3); code != exitOK {
 		t.Fatalf("exit %d", code)
 	}
-	if len(m2.bodies) != 2 || sentRequest(t, m2.bodies[0]).WindowStart != meteredusage.FormatWindowStart(h2) ||
+	// h3 has no usage and was never sent, so it is skipped (an empty snapshot
+	// goes only to an hour this install sent before).
+	if len(m2.bodies) != 1 || sentRequest(t, m2.bodies[0]).WindowStart != meteredusage.FormatWindowStart(h2) ||
 		len(sentRequest(t, m2.bodies[0]).VideoRecords) != 1 {
-		t.Fatalf("sent %d hours, want h2 re-sent with its video record, then h3", len(m2.bodies))
+		t.Fatalf("sent %d hours, want only h2 re-sent with its video record", len(m2.bodies))
 	}
 }
 

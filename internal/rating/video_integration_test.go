@@ -375,14 +375,14 @@ func TestIntegration_VideoParkedRowsAreListedAndAPrunedHourIsNeverReAggregated(t
 	}
 }
 
-// 0014 down refuses while video usage is parked or not yet accepted by the
+// 0017 down refuses while video usage is parked or not yet accepted by the
 // manager, and otherwise round-trips (down, then up again).
 func TestIntegration_Migration0014DownRefusesWhileVideoUsageIsParkedOrUnsent(t *testing.T) {
 	db := openRatingSchema(t, "phoebe_video_m0014_it")
 	vseed(t, db, vrow(nil), vrow(func(r *vbRow) { r.resource = "res-2"; r.org = "org-2" }),
 		vrow(func(r *vbRow) { r.resource = "res-2" }))
 	vaggregate(t, db, itHour, itHour.Add(time.Hour))
-	down := readMigration(t, "0014_rated_video_usage.down.sql")
+	down := readMigration(t, "0017_rated_video_usage.down.sql")
 	if _, err := db.Exec(down); err == nil || !strings.Contains(err.Error(), "unresolved") {
 		t.Fatalf("down with parked video usage: err = %v, want the refusal", err)
 	}
@@ -399,7 +399,7 @@ func TestIntegration_Migration0014DownRefusesWhileVideoUsageIsParkedOrUnsent(t *
 	if err := db.QueryRow(`SELECT COUNT(*) FROM pushed_usage`).Scan(&left); err != nil || left != 1 {
 		t.Fatalf("pushed_usage rows after down = %d (err %v), want only the token row", left, err)
 	}
-	exec(t, db, readMigration(t, "0014_rated_video_usage.up.sql"))
+	exec(t, db, readMigration(t, "0017_rated_video_usage.up.sql"))
 	var kind string
 	if err := db.QueryRow(`SELECT kind FROM pushed_usage`).Scan(&kind); err != nil || kind != "token" {
 		t.Fatalf("kind after up = %q (err %v), want the 'token' default", kind, err)

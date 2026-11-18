@@ -38,6 +38,13 @@ type videoRollupRow struct {
 	OutputFrames, Requests                     int64
 }
 
+// refusedHour is a parked hour: refused for its content, with the hash of
+// the payload that was refused.
+type refusedHour struct {
+	Hour          time.Time
+	PayloadSHA256 string
+}
+
 // pushedRow is a usage_id the manager holds for an hour, with its kind and
 // identity. Kind "" is read as "token", the pushed_usage column default.
 type pushedRow struct {
@@ -57,10 +64,13 @@ func (p pushedRow) kind() string {
 // pushStore is token-push's data seam. pgStore is the production one; the unit
 // tests use an in-memory fake.
 type pushStore interface {
-	// HasAnyUsage is the liveness guard: false only when rated_usage,
-	// parked_usage, rated_video_usage and parked_video_usage are all empty (a
-	// fresh or wiped database).
-	HasAnyUsage(ctx context.Context) (bool, error)
+	// UsagePresent is the liveness guard's input: whether rated_usage and
+	// parked_usage each hold any row.
+	UsagePresent(ctx context.Context) (rated, parked bool, err error)
+	// EverPushedToken reports whether the manager was ever sent a token record
+	// (pushed_usage has a token row). It tells an install that only ever sent
+	// video usage apart from one whose rated_usage was wiped.
+	EverPushedToken(ctx context.Context) (bool, error)
 	// VideoUsageState reports whether any video usage is recorded
 	// (rated_video_usage or parked_video_usage has a row), and whether the
 	// manager was ever sent a video record (pushed_usage has a video row).
@@ -85,14 +95,39 @@ type pushStore interface {
 	// however old.
 	ResolvedHours(ctx context.Context, before time.Time) ([]time.Time, error)
 	// EverPushed reports whether the manager has ever accepted an hour from
-	// this install (pushed_hour has a row). With no usage at all, it tells a
+	// this install (pushed_hour has a row). With rated_usage empty, it tells a
 	// fresh install (false) from a wiped one (true).
 	EverPushed(ctx context.Context) (bool, error)
+	// HourEverSent reports whether this install ever sent the hour: a
+	// pushed_hour row (accepted) or a pushed_usage row (sent, maybe accepted).
+	// Only such an hour may be sent as an empty snapshot.
+	HourEverSent(ctx context.Context, hour time.Time) (bool, error)
 	// UnsentHours lists, oldest first and at most limit, the hours before
-	// `before` that have rated_usage or rated_video_usage, come after the first
-	// hour the manager ever
-	// accepted, and were never accepted (no pushed_hour row).
+	// `before` that have rated_usage or rated_video_usage, come after the automatic re-send floor
+	// (token_push_state.auto_floor: the first hour accepted by a scheduled run),
+	// were never accepted (no pushed_hour row) and are not parked (no
+	// refused_hour row). No floor yet: none.
 	UnsentHours(ctx context.Context, before time.Time, limit int) ([]time.Time, error)
+	// BackfillHours lists, oldest first and at most limit, the hours BEFORE the
+	// automatic re-send floor that have rated_usage or rated_video_usage, were
+	// never accepted and are
+	// not parked: usage from before the install's first connection, sent by
+	// scheduled runs once the floor is set. rated_usage is never pruned, so this
+	// reaches the install's first hour of usage. No floor yet: none.
+	BackfillHours(ctx context.Context, limit int) ([]time.Time, error)
+	// PreConnectionHours counts the hours BackfillHours would list with no
+	// limit, and returns the oldest. No floor yet: zero.
+	PreConnectionHours(ctx context.Context) (count int, oldest time.Time, err error)
+	// RefusedHours lists the parked hours (refused_hour), least recently
+	// checked first, with the SHA-256 of the payload that was refused.
+	RefusedHours(ctx context.Context) ([]refusedHour, error)
+	// RecordRefused parks the hour, or updates its row: status (0 = refused
+	// locally), message, payload hash, one more refusal, last_refused_at and
+	// checked_at now. first_refused_at is kept.
+	RecordRefused(ctx context.Context, hour time.Time, status int, message, payloadSHA256 string) error
+	// MarkRefusedChecked sets checked_at to now for parked hours a run rebuilt
+	// and found unchanged, so the next run re-checks other parked hours first.
+	MarkRefusedChecked(ctx context.Context, hours []time.Time) error
 	// RecordIntent adds rows to pushed_usage BEFORE the request is sent. If the
 	// manager commits and token-push dies before RecordAccepted, the ids are
 	// still known as sent; listing an id the manager does not have in `held` is
@@ -101,18 +136,25 @@ type pushStore interface {
 	// RecordAccepted makes pushed_usage for the hour and the request's kinds
 	// exactly rows (what the manager now holds) and stamps pushed_hour. Rows of
 	// a kind the request did not list are kept: the manager kept those
-	// records too.
-	RecordAccepted(ctx context.Context, hour time.Time, kinds []string, rows []pushedRow) error
+	// records too. With setAutoFloor (a scheduled run), it also sets
+	// token_push_state.auto_floor to the hour if no floor is set yet; an
+	// explicit -since/-until run passes false and never moves it. An accepted
+	// hour is no longer parked: its refused_hour row is deleted.
+	RecordAccepted(ctx context.Context, hour time.Time, kinds []string, rows []pushedRow, setAutoFloor bool) error
 }
 
 type pgStore struct{ db *sql.DB }
 
-func (s pgStore) HasAnyUsage(ctx context.Context) (bool, error) {
+func (s pgStore) EverPushedToken(ctx context.Context) (bool, error) {
 	var found bool
-	err := s.db.QueryRowContext(ctx,
-		`SELECT EXISTS (SELECT 1 FROM rated_usage) OR EXISTS (SELECT 1 FROM parked_usage)
-		     OR EXISTS (SELECT 1 FROM rated_video_usage) OR EXISTS (SELECT 1 FROM parked_video_usage)`).Scan(&found)
+	err := s.db.QueryRowContext(ctx, `SELECT EXISTS (SELECT 1 FROM pushed_usage WHERE kind = 'token')`).Scan(&found)
 	return found, err
+}
+
+func (s pgStore) UsagePresent(ctx context.Context) (rated, parked bool, err error) {
+	err = s.db.QueryRowContext(ctx,
+		`SELECT EXISTS (SELECT 1 FROM rated_usage), EXISTS (SELECT 1 FROM parked_usage)`).Scan(&rated, &parked)
+	return rated, parked, err
 }
 
 func (s pgStore) VideoUsageState(ctx context.Context) (has, everPushed bool, err error) {
@@ -266,25 +308,66 @@ func (s pgStore) EverPushed(ctx context.Context) (bool, error) {
 	return found, err
 }
 
-// unsentHoursQuery: an hour before the first accepted push is usage from
-// before the install was connected; min() over an empty pushed_hour is NULL,
-// so nothing qualifies until the first push is accepted.
+func (s pgStore) HourEverSent(ctx context.Context, hour time.Time) (bool, error) {
+	var found bool
+	err := s.db.QueryRowContext(ctx, `SELECT EXISTS (SELECT 1 FROM pushed_hour WHERE window_start = $1)
+		OR EXISTS (SELECT 1 FROM pushed_usage WHERE window_start = $1)`, hour).Scan(&found)
+	return found, err
+}
+
+// unsentHoursQuery walks the hours after the automatic re-send floor one by
+// one and keeps those with usage, no pushed_hour row and no refused_hour row
+// (a parked hour is re-checked separately, so it never uses up the cap). With
+// no token_push_state row the cross join is empty, so nothing qualifies until
+// a scheduled run has an hour accepted. Walking the series costs index probes
+// per hour since the floor, not a scan of all of rated_usage.
 const unsentHoursQuery = `
-SELECT DISTINCT ru.window_start
-  FROM (SELECT window_start FROM rated_usage
-        UNION
-        SELECT window_start FROM rated_video_usage) ru
- WHERE ru.window_start < $1
-   AND ru.window_start > (SELECT min(window_start) FROM pushed_hour)
-   AND NOT EXISTS (SELECT 1 FROM pushed_hour h WHERE h.window_start = ru.window_start)
- ORDER BY ru.window_start
+SELECT g.h
+  FROM token_push_state s,
+       generate_series(s.auto_floor + interval '1 hour', $1::timestamptz - interval '1 hour', interval '1 hour') AS g(h)
+ WHERE NOT EXISTS (SELECT 1 FROM pushed_hour p WHERE p.window_start = g.h)
+   AND NOT EXISTS (SELECT 1 FROM refused_hour r WHERE r.window_start = g.h)
+   AND (EXISTS (SELECT 1 FROM rated_usage ru WHERE ru.window_start = g.h)
+        OR EXISTS (SELECT 1 FROM rated_video_usage v WHERE v.window_start = g.h))
+ ORDER BY g.h
  LIMIT $2`
 
-func (s pgStore) UnsentHours(ctx context.Context, before time.Time, limit int) ([]time.Time, error) {
-	rows, err := s.db.QueryContext(ctx, unsentHoursQuery, before, limit)
-	if err != nil {
-		return nil, fmt.Errorf("query unsent hours: %w", err)
+// backfillHoursCTE walks the hours from the oldest rated_usage or
+// rated_video_usage hour (LEAST ignores a NULL) up to the
+// floor (exclusive) and keeps those with usage, never accepted and not
+// parked: the usage from before the install's first connection. Accepted
+// hours (by an earlier back-fill run or an operator's -since/-until run) have
+// a pushed_hour row and are not re-sent. No token_push_state row, or both
+// rollup tables empty (min is NULL): no rows.
+const backfillHoursCTE = `
+WITH backfill AS (
+SELECT g.h
+  FROM token_push_state s,
+       generate_series(LEAST((SELECT min(window_start) FROM rated_usage), (SELECT min(window_start) FROM rated_video_usage)),
+                       s.auto_floor - interval '1 hour', interval '1 hour') AS g(h)
+ WHERE NOT EXISTS (SELECT 1 FROM pushed_hour p WHERE p.window_start = g.h)
+   AND NOT EXISTS (SELECT 1 FROM refused_hour r WHERE r.window_start = g.h)
+   AND (EXISTS (SELECT 1 FROM rated_usage ru WHERE ru.window_start = g.h)
+        OR EXISTS (SELECT 1 FROM rated_video_usage v WHERE v.window_start = g.h))
+)`
+
+const backfillHoursQuery = backfillHoursCTE + `
+SELECT h FROM backfill ORDER BY h LIMIT $1`
+
+// preConnectionQuery counts what backfillHoursQuery would list with no limit.
+const preConnectionQuery = backfillHoursCTE + `
+SELECT count(*), min(h) FROM backfill`
+
+func (s pgStore) PreConnectionHours(ctx context.Context) (int, time.Time, error) {
+	var n int
+	var oldest sql.NullTime
+	if err := s.db.QueryRowContext(ctx, preConnectionQuery).Scan(&n, &oldest); err != nil {
+		return 0, time.Time{}, fmt.Errorf("count pre-connection hours: %w", err)
 	}
+	return n, oldest.Time.UTC(), nil
+}
+
+func scanHours(rows *sql.Rows) ([]time.Time, error) {
 	defer func() { _ = rows.Close() }()
 	var out []time.Time
 	for rows.Next() {
@@ -295,6 +378,69 @@ func (s pgStore) UnsentHours(ctx context.Context, before time.Time, limit int) (
 		out = append(out, h.UTC())
 	}
 	return out, rows.Err()
+}
+
+func (s pgStore) UnsentHours(ctx context.Context, before time.Time, limit int) ([]time.Time, error) {
+	rows, err := s.db.QueryContext(ctx, unsentHoursQuery, before, limit)
+	if err != nil {
+		return nil, fmt.Errorf("query unsent hours: %w", err)
+	}
+	return scanHours(rows)
+}
+
+func (s pgStore) BackfillHours(ctx context.Context, limit int) ([]time.Time, error) {
+	rows, err := s.db.QueryContext(ctx, backfillHoursQuery, limit)
+	if err != nil {
+		return nil, fmt.Errorf("query back-fill hours: %w", err)
+	}
+	return scanHours(rows)
+}
+
+func (s pgStore) RefusedHours(ctx context.Context) ([]refusedHour, error) {
+	rows, err := s.db.QueryContext(ctx, `SELECT window_start, payload_sha256 FROM refused_hour ORDER BY checked_at, window_start`)
+	if err != nil {
+		return nil, fmt.Errorf("query refused hours: %w", err)
+	}
+	defer func() { _ = rows.Close() }()
+	var out []refusedHour
+	for rows.Next() {
+		var r refusedHour
+		if err := rows.Scan(&r.Hour, &r.PayloadSHA256); err != nil {
+			return nil, err
+		}
+		r.Hour = r.Hour.UTC()
+		out = append(out, r)
+	}
+	return out, rows.Err()
+}
+
+// maxRefusedMessage bounds the stored response body; the start of it names
+// the field the manager refused.
+const maxRefusedMessage = 4096
+
+func (s pgStore) RecordRefused(ctx context.Context, hour time.Time, status int, message, payloadSHA256 string) error {
+	if len(message) > maxRefusedMessage {
+		message = message[:maxRefusedMessage]
+	}
+	if _, err := s.db.ExecContext(ctx, `INSERT INTO refused_hour (window_start, status, message, payload_sha256)
+		VALUES ($1, $2, $3, $4)
+		ON CONFLICT ON CONSTRAINT refused_hour_pk DO UPDATE SET
+			status = EXCLUDED.status, message = EXCLUDED.message, payload_sha256 = EXCLUDED.payload_sha256,
+			refusals = refused_hour.refusals + 1, last_refused_at = now(), checked_at = now()`,
+		hour, status, message, payloadSHA256); err != nil {
+		return fmt.Errorf("record refused hour: %w", err)
+	}
+	return nil
+}
+
+func (s pgStore) MarkRefusedChecked(ctx context.Context, hours []time.Time) error {
+	if len(hours) == 0 {
+		return nil
+	}
+	if _, err := s.db.ExecContext(ctx, `UPDATE refused_hour SET checked_at = now() WHERE window_start = ANY($1)`, hours); err != nil {
+		return fmt.Errorf("mark refused hours checked: %w", err)
+	}
+	return nil
 }
 
 func insertPushed(ctx context.Context, tx *sql.Tx, hour time.Time, rows []pushedRow) error {
@@ -325,7 +471,7 @@ func (s pgStore) RecordIntent(ctx context.Context, hour time.Time, rows []pushed
 	return s.inTx(ctx, func(tx *sql.Tx) error { return insertPushed(ctx, tx, hour, rows) })
 }
 
-func (s pgStore) RecordAccepted(ctx context.Context, hour time.Time, kinds []string, rows []pushedRow) error {
+func (s pgStore) RecordAccepted(ctx context.Context, hour time.Time, kinds []string, rows []pushedRow, setAutoFloor bool) error {
 	return s.inTx(ctx, func(tx *sql.Tx) error {
 		keep := make([]string, len(rows))
 		for i, r := range rows {
@@ -341,6 +487,15 @@ func (s pgStore) RecordAccepted(ctx context.Context, hour time.Time, kinds []str
 		if _, err := tx.ExecContext(ctx, `INSERT INTO pushed_hour (window_start, pushed_at) VALUES ($1, now())
 			ON CONFLICT ON CONSTRAINT pushed_hour_pk DO UPDATE SET pushed_at = now()`, hour); err != nil {
 			return fmt.Errorf("record pushed hour: %w", err)
+		}
+		if _, err := tx.ExecContext(ctx, `DELETE FROM refused_hour WHERE window_start = $1`, hour); err != nil {
+			return fmt.Errorf("unpark accepted hour: %w", err)
+		}
+		if setAutoFloor {
+			if _, err := tx.ExecContext(ctx, `INSERT INTO token_push_state (auto_floor) VALUES ($1)
+				ON CONFLICT (singleton) DO NOTHING`, hour); err != nil {
+				return fmt.Errorf("record the automatic re-send floor: %w", err)
+			}
 		}
 		return nil
 	})

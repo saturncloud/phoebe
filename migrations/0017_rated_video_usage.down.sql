@@ -1,4 +1,4 @@
--- Reverse 0014. rated_video_usage and parked_video_usage are the only durable
+-- Reverse 0017. rated_video_usage and parked_video_usage are the only durable
 -- record of video usage once video_billing_event is pruned (30 days), so this
 -- REFUSES while either holds usage the manager does not have:
 --   - an unresolved parked_video_usage row (unbilled, conflicted usage), or
@@ -12,13 +12,13 @@ DECLARE
 BEGIN
     SELECT COUNT(*) INTO parked FROM parked_video_usage WHERE resolved_at IS NULL;
     IF parked > 0 THEN
-        RAISE EXCEPTION '0014 down: % parked_video_usage rows are unresolved (unbilled video usage). Resolve them or export them before migrating down.', parked;
+        RAISE EXCEPTION '0017 down: % parked_video_usage rows are unresolved (unbilled video usage). Resolve them or export them before migrating down.', parked;
     END IF;
     SELECT COUNT(*) INTO unsent FROM rated_video_usage v
       LEFT JOIN pushed_hour h ON h.window_start = v.window_start
      WHERE h.pushed_at IS NULL OR v.rated_at > h.pushed_at;
     IF unsent > 0 THEN
-        RAISE EXCEPTION '0014 down: % rated_video_usage rows were never accepted by the manager since they were last rated. Run token-push over their hours (or export the table) before migrating down.', unsent;
+        RAISE EXCEPTION '0017 down: % rated_video_usage rows were never accepted by the manager since they were last rated. Run token-push over their hours (or export the table) before migrating down.', unsent;
     END IF;
 END $$;
 

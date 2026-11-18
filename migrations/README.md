@@ -30,7 +30,7 @@ with the Atlas schema; they live in phoebe's own database.
   base model or adapter, missing org) parked per (hour, identity, reason) with its
   token counts. Written by the rater; never pruned. See "Parked usage" in
   docs/billing-reconciliation.md.
-- **`rated_video_usage`** — the hourly video generation rollup (0014), one row per
+- **`rated_video_usage`** — the hourly video generation rollup (0017), one row per
   (auth_id, owner, resource_id, model_id, serving_mode, base_model, task,
   resolution, region, hour), carrying `org_id`, with `output_seconds` (exact
   NUMERIC), `output_frames`, `request_count` (completed jobs), `gpu_seconds` and
@@ -39,8 +39,15 @@ with the Atlas schema; they live in phoebe's own database.
 - **`parked_video_usage`** — conflicted video usage, the video twin of
   `parked_usage`. Never pruned.
 - **`pushed_usage`, `pushed_hour`** — token-push's record of which usage_ids the
-  manager holds per hour (with each id's `kind` since 0014) and when the hour was
+  manager holds per hour (with each id's `kind` since 0017) and when the hour was
   last accepted.
+- **`token_push_state`** — one row: `auto_floor`, the first hour accepted by a
+  scheduled token-push run. Scheduled runs re-send never-accepted hours only
+  after it; explicit `-since/-until` runs never change it.
+- **`rater_state`** — one row: the rater's one-time catch-up of billing_event
+  hours that were never rated (an install that ran with the rater suspended).
+  `catchup_cursor` is the last hour it rated; `catchup_completed_at` is set when
+  nothing is left, after which the rater rates only its trailing window.
 - **`io_log`** — optional, sampled, short-retention request/response body capture
   (M5 I/O logging). Written by the interceptor's iolog sink; OFF by default.
   `cmd/prune` enforces the short retention: rows older than 7 days on `created_at`
@@ -68,7 +75,11 @@ golang-migrate up/down pairs, applied in version order:
 | 0010 | `0010_rated_usage_identity.{up,down}.sql` | `rated_usage` attributes `base_model`, `adapter`, `price_key` (usage identity) |
 | 0011 | `0011_rated_usage_quantities_only.{up,down}.sql` | `rated_usage` money columns become nullable with no `$0` default (expand step: the aggregator writes NULL; dropped one release later) |
 | 0012 | `0012_parked_and_pushed_usage.{up,down}.sql` | `parked_usage` (conflicted usage parked per identity-hour by the rater, never pruned), `pushed_usage` and `pushed_hour` (what token-push last had accepted per hour, for `held` and re-sending resolved hours). Down refuses while unresolved parked rows exist |
-| 0014 | `0014_rated_video_usage.{up,down}.sql` | `rated_video_usage` and `parked_video_usage` (the video rollup and its parked conflicts), and `pushed_usage.kind` (default `'token'`). Down refuses while video usage is parked or not yet accepted by the manager |
+| 0013 | `0013_token_push_state.{up,down}.sql` | `token_push_state` (one row: `auto_floor`, the first hour a scheduled token-push run had accepted; scheduled runs re-send never-accepted hours only after it, and explicit `-since/-until` runs never move it). Backfilled from `min(pushed_hour.window_start)` |
+| 0014 | `0014_refused_hour.{up,down}.sql` | `refused_hour` (token-push parks an hour the manager refused for its content, 400/413/422, or that failed local request validation; it is not re-sent until its payload hash changes and does not count against the per-run missed-hour cap; an accepted push deletes the row) |
+| 0015 | `0015_rater_state.{up,down}.sql` | `rater_state` (one row: the rater's one-time catch-up cursor and completion time; the catch-up rates every billing_event hour before the trailing window with no rated_usage or parked_usage row, oldest first, a bounded number per run) |
+| 0016 | `0016_video_jobs.{up,down}.sql` | `video_job` and `video_billing_event` (video generation jobs written and read only by phoebe-videos, `cmd/videos`; new tables only). Numbered 0016, not 0013: 0013 was already `token_push_state` |
+| 0017 | `0017_rated_video_usage.{up,down}.sql` | `rated_video_usage` and `parked_video_usage` (the video rollup and its parked conflicts), and `pushed_usage.kind` (default `'token'`). Down refuses while video usage is parked or not yet accepted by the manager |
 
 `embed.go` embeds these into the `migrations` package; `cmd/migrate` applies them.
 
@@ -342,7 +353,7 @@ Rolling back: `0011 down` refuses while any row has NULL money (it will not inve
 a `$0` cost). Deploy the previous rater and token-push, re-rate the affected hours
 with `--since/--until`, then run `migrate down`.
 
-### Rollout order for migration 0014
+### Rollout order for migration 0017
 
 Expand only: two new tables and a column with a default, so the previous
 release's rater and token-push keep working. Deploy the manager that accepts

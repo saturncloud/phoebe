@@ -9,8 +9,8 @@ import (
 
 // Video generation usage (video models design, approved 2026-11-18, sections
 // 7.2 and 7.3). phoebe-videos writes one video_billing_event row per finished
-// job (migration 0013); the aggregator rolls them up by the hour into
-// rated_video_usage (migration 0014) in the same transaction as the token
+// job (migration 0016); the aggregator rolls them up by the hour into
+// rated_video_usage (migration 0017) in the same transaction as the token
 // rollup, and cmd/token-push sends them as kind "video" records.
 //
 // THE GRAIN is (auth_id, owner_type, owner_id, resource_id, model_id,
@@ -50,7 +50,7 @@ type VideoAggregateResult struct {
 	ParkedDeletions     int64
 
 	// InvalidUsageEvents: a negative quantity, or a request_count that is not 1
-	// for a completed job (0013's checks already force 0 for the others).
+	// for a completed job (0016's checks already force 0 for the others).
 	InvalidUsageEvents int64
 	// UnattributableEvents: auth_id, resource_id or model_id is ''.
 	UnattributableEvents int64
@@ -85,7 +85,7 @@ WITH ev AS (
         NULLIF(model_id, '')    AS model_id,
         -- '' means no org: the payer is unknown (missing_org).
         NULLIF(org_id, '')      AS org_id,
-        -- 0013 constrains serving_mode, task and resolution to the wire's enums
+        -- 0016 constrains serving_mode, task and resolution to the wire's enums
         -- with CHECKs, so they need no filter here.
         serving_mode, task, resolution,
         base_model,
@@ -104,7 +104,7 @@ WITH ev AS (
         END AS owner_id,
         (COALESCE(user_id, '') <> '' AND COALESCE(group_id, '') <> '') AS owner_conflict,
         -- request_count counts completed jobs only (design 7.3): 1 for a completed
-        -- job, 0 otherwise. 0013 has no check that output_seconds, output_frames
+        -- job, 0 otherwise. 0016 has no check that output_seconds, output_frames
         -- or gpu_seconds are non-negative, so they are checked here.
         (output_seconds >= 0 AND output_frames >= 0 AND gpu_seconds >= 0
          AND request_count = CASE WHEN status = 'completed' THEN 1 ELSE 0 END) AS valid_usage,

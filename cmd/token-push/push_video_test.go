@@ -37,7 +37,7 @@ func videoStore() *fakeStore {
 
 func push1(t *testing.T, f *fakeStore, m *recordingManager, hours ...time.Time) int {
 	t.Helper()
-	return newPusher(f, m.client(t)).pushWindows(context.Background(), hours, now)
+	return newPusher(f, m.client(t)).pushWindows(context.Background(), hours, now, false)
 }
 
 // Video recorded: the hour lists kinds ["token", "video"] and carries both
@@ -225,9 +225,12 @@ func TestPushWindows_WipedVideoTablesSendTokensOnlyAndFail(t *testing.T) {
 	}
 }
 
-// An install whose only usage is video: the liveness guard counts video.
+// An install whose only usage is video: the liveness guard counts video, both
+// before its first accepted hour and after (pushed_hour then has rows although
+// rated_usage is empty, which for a token install means a wiped table).
 func TestPushWindows_AVideoOnlyInstallIsNotTreatedAsEmpty(t *testing.T) {
 	f := newFake()
+	f.empty = true
 	f.hasVideo = true
 	f.videoRollups[win] = []videoRollupRow{videoRollup("vid-1", idVideo, "720p", "5.0625", "60.000", 81, 1)}
 	m := &recordingManager{}
@@ -236,6 +239,26 @@ func TestPushWindows_AVideoOnlyInstallIsNotTreatedAsEmpty(t *testing.T) {
 	}
 	if req := sentRequest(t, m.bodies[0]); len(req.Records) != 0 || len(req.VideoRecords) != 1 {
 		t.Fatalf("%d token and %d video records", len(req.Records), len(req.VideoRecords))
+	}
+	f.everPushed = true
+	if code := push1(t, f, m, win); code != exitOK || len(m.bodies) != 2 {
+		t.Fatalf("second run: exit %d with %d requests, want the video hour sent again", code, len(m.bodies))
+	}
+}
+
+// rated_usage wiped on an install that also has video: token records were
+// sent before (pushed_usage has token ids), so the run refuses to push at all,
+// as on a token-only install, instead of sending hours with an empty token set.
+func TestPushWindows_WipedTokenTablesRefuseEvenWithVideo(t *testing.T) {
+	f := videoStore()
+	m := &recordingManager{}
+	if code := push1(t, f, m, win); code != exitOK {
+		t.Fatalf("first push: exit %d", code)
+	}
+	f.empty, f.everPushed = true, true
+	f.rollups = map[time.Time][]rollupRow{}
+	if code := push1(t, f, m, win); code != exitFatal || len(m.bodies) != 1 {
+		t.Fatalf("exit %d with %d requests, want %d and no new request", code, len(m.bodies), exitFatal)
 	}
 }
 

@@ -5,12 +5,14 @@ import (
 	"context"
 	"database/sql"
 	"encoding/json"
+	"errors"
 	"flag"
 	"io"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 	"sync"
 	"testing"
@@ -68,14 +70,23 @@ func fixtureRollups() []rollupRow {
 
 // fakeStore is an in-memory pushStore.
 type fakeStore struct {
-	empty      bool
-	everPushed bool
-	unsent     []time.Time
-	rollups    map[time.Time][]rollupRow
-	parked     map[time.Time][]identity
-	pushed     map[time.Time][]pushedRow
-	resolved   []time.Time
-	accepted   map[time.Time]int
+	empty         bool // rated_usage and parked_usage both empty
+	noRated       bool // rated_usage empty, parked_usage not
+	everPushed    bool
+	everPushedErr error
+	unsent        []time.Time // candidates after the floor; the fake drops accepted and parked ones
+	unsentLimit   int         // the limit the last UnsentHours call was given
+	backfill      []time.Time // candidates before the floor; same filtering
+	backfillLimit int         // the limit the last BackfillHours call was given (0: not called)
+	refused       map[time.Time]*fakeRefused
+	checkSeq      int
+	rollups       map[time.Time][]rollupRow
+	parked        map[time.Time][]identity
+	pushed        map[time.Time][]pushedRow
+	resolved      []time.Time
+	accepted      map[time.Time]int
+	sentBefore    map[time.Time]bool // hours with a pushed_hour row from an earlier run
+	autoFloor     *time.Time
 	// Video usage: hasVideo is VideoUsageState's first answer; everPushedVideo
 	// is derived from pushed (a video row) unless forced.
 	hasVideo        bool
@@ -84,9 +95,19 @@ type fakeStore struct {
 	videoParked     map[time.Time][]identity
 }
 
+// fakeRefused is one refused_hour row.
+type fakeRefused struct {
+	status   int
+	message  string
+	sha      string
+	refusals int
+	checked  int // order of the last check; lower is checked longer ago
+}
+
 func newFake() *fakeStore {
 	return &fakeStore{rollups: map[time.Time][]rollupRow{}, parked: map[time.Time][]identity{},
-		pushed: map[time.Time][]pushedRow{}, accepted: map[time.Time]int{},
+		pushed: map[time.Time][]pushedRow{}, accepted: map[time.Time]int{}, sentBefore: map[time.Time]bool{},
+		refused:      map[time.Time]*fakeRefused{},
 		videoRollups: map[time.Time][]videoRollupRow{}, videoParked: map[time.Time][]identity{}}
 }
 
@@ -101,6 +122,16 @@ func (f *fakeStore) VideoUsageState(context.Context) (bool, bool, error) {
 	}
 	return f.hasVideo, ever, nil
 }
+func (f *fakeStore) EverPushedToken(context.Context) (bool, error) {
+	for _, rows := range f.pushed {
+		for _, r := range rows {
+			if r.kind() == meteredusage.KindToken {
+				return true, nil
+			}
+		}
+	}
+	return false, nil
+}
 func (f *fakeStore) VideoRollups(_ context.Context, h time.Time) ([]videoRollupRow, error) {
 	return f.videoRollups[h], nil
 }
@@ -108,7 +139,28 @@ func (f *fakeStore) ParkedVideoIdentities(_ context.Context, h time.Time) ([]ide
 	return f.videoParked[h], nil
 }
 
-func (f *fakeStore) HasAnyUsage(context.Context) (bool, error) { return !f.empty, nil }
+// eligible mirrors the SQL: never accepted and not parked.
+func (f *fakeStore) eligible(h time.Time) bool {
+	return !f.sentBefore[h] && f.accepted[h] == 0 && f.refused[h] == nil
+}
+
+func (f *fakeStore) backfillCandidates() []time.Time {
+	if f.autoFloor == nil {
+		return nil
+	}
+	var out []time.Time
+	for _, h := range f.backfill {
+		if h.Before(*f.autoFloor) && f.eligible(h) {
+			out = append(out, h)
+		}
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].Before(out[j]) })
+	return out
+}
+
+func (f *fakeStore) UsagePresent(context.Context) (bool, bool, error) {
+	return !f.empty && !f.noRated, !f.empty, nil
+}
 func (f *fakeStore) Rollups(_ context.Context, h time.Time) ([]rollupRow, error) {
 	return f.rollups[h], nil
 }
@@ -127,15 +179,70 @@ func (f *fakeStore) ResolvedHours(_ context.Context, before time.Time) ([]time.T
 	}
 	return out, nil
 }
-func (f *fakeStore) EverPushed(context.Context) (bool, error) { return f.everPushed, nil }
+func (f *fakeStore) EverPushed(context.Context) (bool, error) {
+	return f.everPushed, f.everPushedErr
+}
+func (f *fakeStore) HourEverSent(_ context.Context, h time.Time) (bool, error) {
+	return f.sentBefore[h] || f.accepted[h] > 0 || len(f.pushed[h]) > 0, nil
+}
+func (f *fakeStore) PreConnectionHours(context.Context) (int, time.Time, error) {
+	c := f.backfillCandidates()
+	if len(c) == 0 {
+		return 0, time.Time{}, nil
+	}
+	return len(c), c[0], nil
+}
+func (f *fakeStore) BackfillHours(_ context.Context, limit int) ([]time.Time, error) {
+	f.backfillLimit = limit
+	c := f.backfillCandidates()
+	if len(c) > limit {
+		c = c[:limit]
+	}
+	return c, nil
+}
 func (f *fakeStore) UnsentHours(_ context.Context, before time.Time, limit int) ([]time.Time, error) {
+	f.unsentLimit = limit
 	var out []time.Time
 	for _, h := range f.unsent {
-		if h.Before(before) && len(out) < limit {
+		if h.Before(before) && f.eligible(h) && len(out) < limit {
 			out = append(out, h)
 		}
 	}
 	return out, nil
+}
+func (f *fakeStore) RefusedHours(context.Context) ([]refusedHour, error) {
+	var out []refusedHour
+	for h, r := range f.refused {
+		out = append(out, refusedHour{Hour: h, PayloadSHA256: r.sha})
+	}
+	sort.Slice(out, func(i, j int) bool {
+		ci, cj := f.refused[out[i].Hour].checked, f.refused[out[j].Hour].checked
+		if ci != cj {
+			return ci < cj
+		}
+		return out[i].Hour.Before(out[j].Hour)
+	})
+	return out, nil
+}
+func (f *fakeStore) RecordRefused(_ context.Context, h time.Time, status int, message, sha string) error {
+	f.checkSeq++
+	r := f.refused[h]
+	if r == nil {
+		r = &fakeRefused{}
+		f.refused[h] = r
+	}
+	r.status, r.message, r.sha, r.checked = status, message, sha, f.checkSeq
+	r.refusals++
+	return nil
+}
+func (f *fakeStore) MarkRefusedChecked(_ context.Context, hours []time.Time) error {
+	for _, h := range hours {
+		f.checkSeq++
+		if r := f.refused[h]; r != nil {
+			r.checked = f.checkSeq
+		}
+	}
+	return nil
 }
 func (f *fakeStore) RecordIntent(_ context.Context, h time.Time, rows []pushedRow) error {
 	seen := map[string]bool{}
@@ -149,7 +256,7 @@ func (f *fakeStore) RecordIntent(_ context.Context, h time.Time, rows []pushedRo
 	}
 	return nil
 }
-func (f *fakeStore) RecordAccepted(_ context.Context, h time.Time, kinds []string, rows []pushedRow) error {
+func (f *fakeStore) RecordAccepted(_ context.Context, h time.Time, kinds []string, rows []pushedRow, setAutoFloor bool) error {
 	listed := map[string]bool{}
 	for _, k := range kinds {
 		listed[k] = true
@@ -162,6 +269,11 @@ func (f *fakeStore) RecordAccepted(_ context.Context, h time.Time, kinds []strin
 	}
 	f.pushed[h] = append(kept, rows...)
 	f.accepted[h]++
+	delete(f.refused, h)
+	if setAutoFloor && f.autoFloor == nil {
+		hh := h
+		f.autoFloor = &hh
+	}
 	return nil
 }
 
@@ -178,6 +290,7 @@ var now = win.Add(3 * time.Hour)
 type recordingManager struct {
 	mu       sync.Mutex
 	statuses []int
+	errBody  string // the body of a non-200 answer; default the manager's validation shape
 	bodies   [][]byte
 	auth     []string
 	paths    []string
@@ -201,7 +314,11 @@ func (m *recordingManager) server(t *testing.T) *httptest.Server {
 		m.mu.Unlock()
 		if status != http.StatusOK {
 			w.WriteHeader(status)
-			_, _ = w.Write([]byte(`{"error":"stub","path":"records[0]"}`))
+			body := m.errBody
+			if body == "" {
+				body = `{"error":"stub","path":"records[0]"}`
+			}
+			_, _ = w.Write([]byte(body))
 			return
 		}
 		var req meteredusage.Request
@@ -318,11 +435,14 @@ func TestBuildHour_EmptyHourIsAnEmptyRecordList(t *testing.T) {
 	}
 }
 
-// An empty hour is still SENT: that is how the manager learns usage it holds for
-// the hour is gone.
-func TestPushWindows_SendsAnEmptyHourSoTheManagerDeletesByAbsence(t *testing.T) {
+// An empty hour this install sent before is still SENT, as records: []: that
+// is how the manager learns usage it holds for the hour is gone.
+func TestPushWindows_EmptyHourPreviouslyPushedStillSentEmpty(t *testing.T) {
+	f := newFake()
+	f.everPushed = true
+	f.sentBefore[win] = true // an earlier run had this hour accepted
 	m := &recordingManager{}
-	if code := newPusher(newFake(), m.client(t)).pushWindows(context.Background(), []time.Time{win}, now); code != exitOK {
+	if code := newPusher(f, m.client(t)).pushWindows(context.Background(), []time.Time{win}, now, false); code != exitOK {
 		t.Fatalf("exit %d, want 0", code)
 	}
 	if len(m.bodies) != 1 || !strings.Contains(string(m.bodies[0]), `"records":[]`) {
@@ -339,7 +459,7 @@ func TestPushWindows_ResendingAnHourIsByteIdentical(t *testing.T) {
 	m := &recordingManager{}
 	p := newPusher(fixtureStore(), m.client(t))
 	for i := 0; i < 2; i++ {
-		if code := p.pushWindows(context.Background(), []time.Time{win}, now); code != exitOK {
+		if code := p.pushWindows(context.Background(), []time.Time{win}, now, false); code != exitOK {
 			t.Fatalf("run %d: exit %d", i, code)
 		}
 	}
@@ -366,7 +486,7 @@ func TestPushWindows_AConflictInOneIdentityStillSendsEveryCleanRecordOfTheHour(t
 	f.rollups[win] = []rollupRow{all[0], all[1], all[3]} // idShared parked by the rater
 	f.parked[win] = []identity{idShared}
 	m := &recordingManager{}
-	if code := newPusher(f, m.client(t)).pushWindows(context.Background(), []time.Time{win}, now); code != exitOK {
+	if code := newPusher(f, m.client(t)).pushWindows(context.Background(), []time.Time{win}, now, false); code != exitOK {
 		t.Fatalf("exit %d, want 0 (parked usage is the rater's signal)", code)
 	}
 	req := sentRequest(t, m.bodies[0])
@@ -381,7 +501,7 @@ func TestPushWindows_AnAlreadySentConflictedRecordIsHeld(t *testing.T) {
 	f := fixtureStore()
 	m := &recordingManager{}
 	p := newPusher(f, m.client(t))
-	if code := p.pushWindows(context.Background(), []time.Time{win}, now); code != exitOK {
+	if code := p.pushWindows(context.Background(), []time.Time{win}, now, false); code != exitOK {
 		t.Fatalf("first push: exit %d", code)
 	}
 	first := sentRequest(t, m.bodies[0])
@@ -391,7 +511,7 @@ func TestPushWindows_AnAlreadySentConflictedRecordIsHeld(t *testing.T) {
 	all := fixtureRollups()
 	f.rollups[win] = []rollupRow{all[0], all[1], all[3]}
 	f.parked[win] = []identity{idShared}
-	if code := p.pushWindows(context.Background(), []time.Time{win}, now); code != exitOK {
+	if code := p.pushWindows(context.Background(), []time.Time{win}, now, false); code != exitOK {
 		t.Fatalf("second push: exit %d", code)
 	}
 	second := sentRequest(t, m.bodies[1])
@@ -399,7 +519,7 @@ func TestPushWindows_AnAlreadySentConflictedRecordIsHeld(t *testing.T) {
 		t.Fatalf("second push: %d records, held %v; want 3 records and held [%s]", len(second.Records), second.Held, sharedID)
 	}
 	// And it stays held on every later push while parked.
-	if code := p.pushWindows(context.Background(), []time.Time{win}, now); code != exitOK {
+	if code := p.pushWindows(context.Background(), []time.Time{win}, now, false); code != exitOK {
 		t.Fatal("third push failed")
 	}
 	if third := sentRequest(t, m.bodies[2]); len(third.Held) != 1 || third.Held[0] != sharedID {
@@ -414,12 +534,12 @@ func TestPushWindows_AnUnsendableRollupHoldsBackOnlyItsIdentity(t *testing.T) {
 	f := fixtureStore()
 	m := &recordingManager{}
 	p := newPusher(f, m.client(t))
-	if code := p.pushWindows(context.Background(), []time.Time{win}, now); code != exitOK {
+	if code := p.pushWindows(context.Background(), []time.Time{win}, now, false); code != exitOK {
 		t.Fatal("first push failed")
 	}
 	firstFT := sentRequest(t, m.bodies[0]).Records[0].UsageID
 	f.rollups[win][0].OrgID = sql.NullString{}
-	if code := p.pushWindows(context.Background(), []time.Time{win}, now); code != exitWithheld {
+	if code := p.pushWindows(context.Background(), []time.Time{win}, now, false); code != exitWithheld {
 		t.Fatalf("exit %d, want exitWithheld (%d)", code, exitWithheld)
 	}
 	req := sentRequest(t, m.bodies[1])
@@ -428,18 +548,19 @@ func TestPushWindows_AnUnsendableRollupHoldsBackOnlyItsIdentity(t *testing.T) {
 	}
 }
 
-// A parked hour that resolves is re-sent however old, even outside the window.
+// A parked hour that resolves is re-sent however old, even outside the window,
+// after the window.
 func TestPushWindows_ResolvedParkedHourIsSentEvenOutsideTheWindow(t *testing.T) {
 	old := win.Add(-72 * time.Hour)
-	f := newFake()
+	f := fixtureStore()
 	f.rollups[old] = fixtureRollups()
 	f.resolved = []time.Time{old}
 	m := &recordingManager{}
-	if code := newPusher(f, m.client(t)).pushWindows(context.Background(), []time.Time{win}, now); code != exitOK {
+	if code := newPusher(f, m.client(t)).pushWindows(context.Background(), []time.Time{win}, now, false); code != exitOK {
 		t.Fatalf("exit %d", code)
 	}
-	if len(m.bodies) != 2 || sentRequest(t, m.bodies[0]).WindowStart != meteredusage.FormatWindowStart(old) {
-		t.Fatalf("sent %d hours, want the resolved old hour first and then the window", len(m.bodies))
+	if len(m.bodies) != 2 || sentRequest(t, m.bodies[1]).WindowStart != meteredusage.FormatWindowStart(old) {
+		t.Fatalf("sent %d hours, want the window first and then the resolved old hour", len(m.bodies))
 	}
 	if f.accepted[old] != 1 {
 		t.Fatal("the resolved hour's push was not recorded")
@@ -449,7 +570,7 @@ func TestPushWindows_ResolvedParkedHourIsSentEvenOutsideTheWindow(t *testing.T) 
 func TestPushWindows_NeverRetries400_409_422AndExits3(t *testing.T) {
 	for _, status := range []int{400, 409, 422} {
 		m := &recordingManager{statuses: []int{status, 200}}
-		if code := newPusher(fixtureStore(), m.client(t)).pushWindows(context.Background(), []time.Time{win}, now); code != exitRejected {
+		if code := newPusher(fixtureStore(), m.client(t)).pushWindows(context.Background(), []time.Time{win}, now, false); code != exitRejected {
 			t.Fatalf("status %d: exit %d, want exitRejected (%d)", status, code, exitRejected)
 		}
 		if len(m.bodies) != 1 {
@@ -460,7 +581,7 @@ func TestPushWindows_NeverRetries400_409_422AndExits3(t *testing.T) {
 
 func TestPushWindows_Retries5xxUntilTheManagerAccepts(t *testing.T) {
 	m := &recordingManager{statuses: []int{503, 502, 200}}
-	if code := newPusher(fixtureStore(), m.client(t)).pushWindows(context.Background(), []time.Time{win}, now); code != exitOK {
+	if code := newPusher(fixtureStore(), m.client(t)).pushWindows(context.Background(), []time.Time{win}, now, false); code != exitOK {
 		t.Fatalf("exit %d, want 0 after retries", code)
 	}
 	if len(m.bodies) != 3 || !bytes.Equal(m.bodies[0], m.bodies[2]) {
@@ -470,7 +591,7 @@ func TestPushWindows_Retries5xxUntilTheManagerAccepts(t *testing.T) {
 
 func TestPushWindows_Retries429UntilTheManagerAccepts(t *testing.T) {
 	m := &recordingManager{statuses: []int{429, 200}}
-	if code := newPusher(fixtureStore(), m.client(t)).pushWindows(context.Background(), []time.Time{win}, now); code != exitOK {
+	if code := newPusher(fixtureStore(), m.client(t)).pushWindows(context.Background(), []time.Time{win}, now, false); code != exitOK {
 		t.Fatalf("exit %d, want 0 after a 429 retry", code)
 	}
 	if len(m.bodies) != 2 {
@@ -484,7 +605,7 @@ func TestPushWindows_Persistent5xxIsFatalAndRecordsNoAcceptance(t *testing.T) {
 	f := fixtureStore()
 	f.rollups[win][0].OrgID = sql.NullString{} // also something held back
 	m := &recordingManager{statuses: []int{503}}
-	if code := newPusher(f, m.client(t)).pushWindows(context.Background(), []time.Time{win}, now); code != exitFatal {
+	if code := newPusher(f, m.client(t)).pushWindows(context.Background(), []time.Time{win}, now, false); code != exitFatal {
 		t.Fatalf("exit %d, want exitFatal", code)
 	}
 	if len(m.bodies) != meteredusage.DefaultMaxAttempts || f.accepted[win] != 0 {
@@ -496,7 +617,7 @@ func TestPushWindows_RejectedOutranksHeldBack(t *testing.T) {
 	f := fixtureStore()
 	f.rollups[win][0].OrgID = sql.NullString{}
 	m := &recordingManager{statuses: []int{422}}
-	if code := newPusher(f, m.client(t)).pushWindows(context.Background(), []time.Time{win}, now); code != exitRejected {
+	if code := newPusher(f, m.client(t)).pushWindows(context.Background(), []time.Time{win}, now, false); code != exitRejected {
 		t.Fatalf("exit %d, want exitRejected", code)
 	}
 }
@@ -509,7 +630,7 @@ func TestPushWindows_EmptyDatabaseOnAFreshInstallSendsNothingAndSucceeds(t *test
 	f := newFake()
 	f.empty = true
 	m := &recordingManager{}
-	if code := newPusher(f, m.client(t)).pushWindows(context.Background(), []time.Time{win}, now); code != exitOK {
+	if code := newPusher(f, m.client(t)).pushWindows(context.Background(), []time.Time{win}, now, false); code != exitOK {
 		t.Fatalf("exit %d, want exitOK", code)
 	}
 	if len(m.bodies) != 0 {
@@ -524,7 +645,7 @@ func TestPushWindows_EmptyDatabaseAfterUsageWasSentRefusesAndIsFatal(t *testing.
 	f.empty = true
 	f.everPushed = true
 	m := &recordingManager{}
-	if code := newPusher(f, m.client(t)).pushWindows(context.Background(), []time.Time{win}, now); code != exitFatal {
+	if code := newPusher(f, m.client(t)).pushWindows(context.Background(), []time.Time{win}, now, false); code != exitFatal {
 		t.Fatalf("exit %d, want exitFatal", code)
 	}
 	if len(m.bodies) != 0 {
@@ -532,20 +653,20 @@ func TestPushWindows_EmptyDatabaseAfterUsageWasSentRefusesAndIsFatal(t *testing.
 	}
 }
 
-// An hour the manager never accepted (an outage longer than the trailing
-// window, or a 409 while the manager still refused the install) is re-sent,
-// oldest first, before the window.
+// An hour the manager never accepted after the automatic re-send floor (for
+// instance an outage longer than the trailing window) is re-sent, after the
+// window.
 func TestPushWindows_AnHourNeverAcceptedIsReSentOutsideTheWindow(t *testing.T) {
 	missed := win.Add(-48 * time.Hour)
 	f := fixtureStore()
 	f.rollups[missed] = fixtureRollups()
 	f.unsent = []time.Time{missed}
 	m := &recordingManager{}
-	if code := newPusher(f, m.client(t)).pushWindows(context.Background(), []time.Time{win}, now); code != exitOK {
+	if code := newPusher(f, m.client(t)).pushWindows(context.Background(), []time.Time{win}, now, false); code != exitOK {
 		t.Fatalf("exit %d", code)
 	}
-	if len(m.bodies) != 2 || sentRequest(t, m.bodies[0]).WindowStart != meteredusage.FormatWindowStart(missed) {
-		t.Fatalf("sent %d hours, want the missed hour first and then the window", len(m.bodies))
+	if len(m.bodies) != 2 || sentRequest(t, m.bodies[1]).WindowStart != meteredusage.FormatWindowStart(missed) {
+		t.Fatalf("sent %d hours, want the window first and then the missed hour", len(m.bodies))
 	}
 	if f.accepted[missed] != 1 {
 		t.Fatal("the missed hour's push was not recorded as accepted")
@@ -557,7 +678,7 @@ func TestPushWindows_AnUnsentHourInsideTheWindowIsSentOnce(t *testing.T) {
 	f := fixtureStore()
 	f.unsent = []time.Time{win}
 	m := &recordingManager{}
-	if code := newPusher(f, m.client(t)).pushWindows(context.Background(), []time.Time{win}, now); code != exitOK {
+	if code := newPusher(f, m.client(t)).pushWindows(context.Background(), []time.Time{win}, now, false); code != exitOK {
 		t.Fatalf("exit %d", code)
 	}
 	if len(m.bodies) != 1 {
@@ -569,7 +690,7 @@ func TestPushWindows_AnUnsentHourInsideTheWindowIsSentOnce(t *testing.T) {
 // is sent with base_model "" in the same request as the rest of the hour.
 func TestPushWindows_EmptyBaseModelDedicatedRecordIsSentAndDoesNotBlockTheHour(t *testing.T) {
 	m := &recordingManager{}
-	if code := newPusher(fixtureStore(), m.client(t)).pushWindows(context.Background(), []time.Time{win}, now); code != exitOK {
+	if code := newPusher(fixtureStore(), m.client(t)).pushWindows(context.Background(), []time.Time{win}, now, false); code != exitOK {
 		t.Fatalf("exit %d, want 0", code)
 	}
 	sent := sentRequest(t, m.bodies[0])
@@ -579,5 +700,120 @@ func TestPushWindows_EmptyBaseModelDedicatedRecordIsSentAndDoesNotBlockTheHour(t
 	custom := sent.Records[3]
 	if custom.Attributes.ModelID != "acme-custom-llm" || custom.Attributes.BaseModel != "" || custom.Attributes.ServingMode != "dedicated" {
 		t.Fatalf("custom record %+v, want dedicated with base_model \"\"", custom.Attributes)
+	}
+}
+
+// After a full database wipe (pushed_hour and pushed_usage are empty too, so
+// the liveness guard cannot tell), new usage makes the run go ahead. The
+// earlier hours of the trailing window have no usage here, but the manager may
+// still hold records for them from before the wipe: sending them as
+// records: [] would delete those records. Only the hour with usage is sent.
+func TestPushWindows_WipedDatabaseNewUsageDoesNotSendEmptyHoursNeverPushed(t *testing.T) {
+	f := fixtureStore() // usage only at win; nothing was ever pushed
+	m := &recordingManager{}
+	windows := []time.Time{win.Add(-2 * time.Hour), win.Add(-time.Hour), win}
+	if code := newPusher(f, m.client(t)).pushWindows(context.Background(), windows, now, false); code != exitOK {
+		t.Fatalf("exit %d, want exitOK", code)
+	}
+	if len(m.bodies) != 1 || sentRequest(t, m.bodies[0]).WindowStart != meteredusage.FormatWindowStart(win) {
+		t.Fatalf("sent %d requests, want only the hour with usage (%s)", len(m.bodies), meteredusage.FormatWindowStart(win))
+	}
+	for _, h := range windows[:2] {
+		if f.accepted[h] != 0 || len(f.pushed[h]) != 0 {
+			t.Fatalf("hour %s was recorded as sent although it was skipped", h.Format(time.RFC3339))
+		}
+	}
+}
+
+// rated_usage is never pruned, so an empty rated_usage after usage was sent is
+// a wiped table, even when parked_usage still has rows. Nothing is sent.
+func TestPushWindows_RatedUsageWipedWithParkedRowsIsFatal(t *testing.T) {
+	f := newFake()
+	f.noRated = true // parked_usage has rows
+	f.everPushed = true
+	f.sentBefore[win] = true
+	m := &recordingManager{}
+	if code := newPusher(f, m.client(t)).pushWindows(context.Background(), []time.Time{win}, now, false); code != exitFatal {
+		t.Fatalf("exit %d, want exitFatal", code)
+	}
+	if len(m.bodies) != 0 {
+		t.Fatalf("sent %d requests from a wiped rated_usage, want none", len(m.bodies))
+	}
+}
+
+// If the guard cannot tell whether usage was sent before, it cannot tell a
+// fresh install from a wiped one: the run fails and sends nothing.
+func TestPushWindows_EverPushedErrorIsFatalAndSendsNothing(t *testing.T) {
+	f := fixtureStore()
+	f.everPushedErr = errors.New("connection reset")
+	m := &recordingManager{}
+	if code := newPusher(f, m.client(t)).pushWindows(context.Background(), []time.Time{win}, now, false); code != exitFatal {
+		t.Fatalf("exit %d, want exitFatal", code)
+	}
+	if len(m.bodies) != 0 {
+		t.Fatalf("sent %d requests, want none", len(m.bodies))
+	}
+}
+
+// The run asks the store for at most maxUnsentHoursPerRun never-accepted
+// hours, so a long backlog is spread over several runs.
+func TestPushWindows_PassesTheUnsentCapToTheStore(t *testing.T) {
+	f := fixtureStore()
+	m := &recordingManager{}
+	if code := newPusher(f, m.client(t)).pushWindows(context.Background(), []time.Time{win}, now, false); code != exitOK {
+		t.Fatalf("exit %d", code)
+	}
+	if f.unsentLimit != maxUnsentHoursPerRun || maxUnsentHoursPerRun != 168 {
+		t.Fatalf("UnsentHours limit %d (maxUnsentHoursPerRun %d), want 168", f.unsentLimit, maxUnsentHoursPerRun)
+	}
+}
+
+// The trailing window is sent first, then resolved hours, then unsent hours
+// oldest first, each hour once. A long backlog therefore cannot use up the
+// run's deadline before the current hours go out.
+func TestPushWindows_TrailingWindowSentBeforeBacklog(t *testing.T) {
+	f := fixtureStore()
+	w0 := win.Add(-time.Hour)
+	resolvedOld := win.Add(-30 * time.Hour)
+	unsentOlder, unsentOld := win.Add(-50*time.Hour), win.Add(-40*time.Hour)
+	for _, h := range []time.Time{w0, resolvedOld, unsentOlder, unsentOld} {
+		f.rollups[h] = fixtureRollups()
+	}
+	f.resolved = []time.Time{resolvedOld}
+	f.unsent = []time.Time{unsentOlder, unsentOld, win} // win is also in the window
+	m := &recordingManager{}
+	if code := newPusher(f, m.client(t)).pushWindows(context.Background(), []time.Time{w0, win}, now, false); code != exitOK {
+		t.Fatalf("exit %d", code)
+	}
+	var got []string
+	for _, b := range m.bodies {
+		got = append(got, sentRequest(t, b).WindowStart)
+	}
+	var want []string
+	for _, h := range []time.Time{w0, win, resolvedOld, unsentOlder, unsentOld} {
+		want = append(want, meteredusage.FormatWindowStart(h))
+	}
+	if strings.Join(got, ",") != strings.Join(want, ",") {
+		t.Fatalf("send order %v, want %v", got, want)
+	}
+}
+
+// A scheduled run sets the automatic re-send floor with its first accepted
+// hour; an explicit -since/-until run never does.
+func TestPushWindows_OnlyAScheduledRunSetsTheAutoResendFloor(t *testing.T) {
+	f := fixtureStore()
+	m := &recordingManager{}
+	p := newPusher(f, m.client(t))
+	if code := p.pushWindows(context.Background(), []time.Time{win}, now, true); code != exitOK {
+		t.Fatalf("explicit run: exit %d", code)
+	}
+	if f.autoFloor != nil {
+		t.Fatalf("an explicit run set the floor to %s", f.autoFloor)
+	}
+	if code := p.pushWindows(context.Background(), []time.Time{win}, now, false); code != exitOK {
+		t.Fatalf("scheduled run: exit %d", code)
+	}
+	if f.autoFloor == nil || !f.autoFloor.Equal(win) {
+		t.Fatalf("floor %v after a scheduled run, want %s", f.autoFloor, win)
 	}
 }

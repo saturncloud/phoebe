@@ -1,5 +1,5 @@
 -- Hourly video usage (video models design, approved 2026-11-18, sections 7.2
--- and 7.3). The rater (cmd/rater) rolls video_billing_event (0013) up by the
+-- and 7.3). The rater (cmd/rater) rolls video_billing_event (0016) up by the
 -- hour, and cmd/token-push sends each hour's rollups to the manager as
 -- kind "video" records. Quantities only: the manager prices (billing-design.md
 -- D1).
@@ -18,7 +18,7 @@
 --
 -- Failed and cancelled jobs are counted in event_count and gpu_seconds (margin
 -- evidence) and contribute nothing else: their output and request_count are 0
--- (0013's video_billing_event_unbilled_ck). request_count counts completed jobs.
+-- (0016's video_billing_event_unbilled_ck). request_count counts completed jobs.
 CREATE TABLE IF NOT EXISTS rated_video_usage (
     -- Deterministic local surrogate: md5 of the length-prefixed grain. phoebe's
     -- row id only; the wire's usage_id is computed by token-push.
@@ -64,7 +64,7 @@ CREATE INDEX IF NOT EXISTS rated_video_usage_window_ix ON rated_video_usage (win
 -- resource_id, model_id, serving_mode). Reasons:
 --   owner_conflict  jobs carrying both a user and a group (identity owner '')
 --   ambiguous_org   more than one org for the identity in the hour
---   missing_org     every job of the identity has org_id '' (0013 makes org_id
+--   missing_org     every job of the identity has org_id '' (0016 makes org_id
 --                   NOT NULL, so only an empty string can land here)
 -- There is no ambiguous_base: base_model is part of the video grain, so two base
 -- models are two records, not a conflict. NEVER pruned.
