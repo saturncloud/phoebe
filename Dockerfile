@@ -12,6 +12,10 @@
 #   /app/phoebe-prune       — evidence-retention batch job: prunes billing_event
 #                             (30d default, 7d floor) and io_log (7d default) on
 #                             created_at (a CronJob, ships suspended)
+#   /app/phoebe-videos      — video generation jobs: /v1/videos behind the
+#                             interceptor, the dispatcher and the reaper (a Deployment).
+#                             Uses ffprobe/ffmpeg (installed below) to read and
+#                             thumbnail the generated MP4.
 # Go >= 1.26.10 / 1.27.3 for CVE-2026-111943 (crypto/x509 distrusts the compromised eMudhra intermediates).
 FROM golang:1.26.10-alpine AS builder
 
@@ -34,13 +38,17 @@ RUN go build -o /phoebe ./cmd/interceptor && \
     go build -o /phoebe-token-push ./cmd/token-push && \
     go build -o /phoebe-migrate ./cmd/migrate && \
     go build -o /phoebe-recover ./cmd/recover && \
-    go build -o /phoebe-prune ./cmd/prune
+    go build -o /phoebe-prune ./cmd/prune && \
+    go build -o /phoebe-videos ./cmd/videos
 
 FROM alpine:latest
 
 # ca-certificates for outbound TLS (Valkey/Postgres/upstreams over TLS). --upgrade keeps the
 # trust store current (>= 20261020 drops the emSign ECC Root CA - G3, CVE-2026-111943).
 RUN apk add --no-cache --upgrade ca-certificates
+# ffmpeg (with ffprobe and libwebp) for phoebe-videos: frame count and rate of a
+# generated video, and its WebP thumbnail.
+RUN apk add --no-cache ffmpeg
 
 COPY --from=builder /phoebe /app/phoebe
 COPY --from=builder /phoebe-drainer /app/phoebe-drainer
@@ -49,6 +57,7 @@ COPY --from=builder /phoebe-token-push /app/phoebe-token-push
 COPY --from=builder /phoebe-migrate /app/phoebe-migrate
 COPY --from=builder /phoebe-recover /app/phoebe-recover
 COPY --from=builder /phoebe-prune /app/phoebe-prune
+COPY --from=builder /phoebe-videos /app/phoebe-videos
 
 # Default to the interceptor; the drainer/rater workloads override the command.
 ENTRYPOINT ["/app/phoebe"]

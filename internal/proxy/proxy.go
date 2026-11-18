@@ -151,6 +151,10 @@ type Server struct {
 	// gateway-marked requests fail closed with 503. Set via WithGateway.
 	gateway *gatewayRoute
 
+	// videos hands video endpoints' /v1/videos requests to phoebe-videos.
+	// nil = video generation off: video routes answer 404. Set via WithVideos.
+	videos *videosRoute
+
 	// admitter is the distributed shared-inference physical-capacity gate. nil means
 	// the feature is disabled. It runs only after trusted org/model resolution
 	// and model binding, and before any engine request.
@@ -541,6 +545,15 @@ func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request) {
 		// don't invent a target. Log loudly with the resource for diagnosis.
 		s.log.Error.Printf("refusing %q: %v (resource_id=%q)", identity.HeaderUpstream, err, id.ResourceID)
 		http.Error(w, "no upstream for this request", http.StatusBadGateway)
+		return
+	}
+
+	// VIDEO ENDPOINT: a route Atlas stamped with X-Saturn-Video-Limits serves
+	// /v1/videos only, and phoebe-videos owns those jobs. Nothing below
+	// applies to it (no model binding on the chat surface, no wake hold, no
+	// token metering: a job is metered when it finishes).
+	if !id.Gateway && id.VideoLimits != "" {
+		s.serveVideo(w, r, id, requestID, routePath, pathCanonical)
 		return
 	}
 
