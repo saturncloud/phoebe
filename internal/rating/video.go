@@ -87,8 +87,9 @@ type VideoAggregateResult struct {
 	EmptyBaseModelEvents int64
 
 	// OutOfReachHours counts the window's hours before VideoFloor that hold
-	// video rollups: their video was not re-rated (its jobs may be pruned)
-	// and the rollups are kept as they are.
+	// video rollups or video jobs: their video was not re-rated (its jobs may
+	// be pruned), the rollups are kept as they are, and jobs never rated
+	// there are never billed.
 	OutOfReachHours int64
 }
 

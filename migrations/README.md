@@ -376,7 +376,10 @@ hold, so the manager deletes them by absence. The scheduled re-send also skips
 that hour, because it is stamped.
 
 To roll back, first suspend the token-push and rater CronJobs; do not roll them
-back to the previous release yet. Then run `0017 down`. It refuses until every
+back to the previous release yet. Wait for any running job to finish, then run
+the current token-push once by hand, so the manager has every hour's latest
+rating. A token-push that overlapped a rater run may have sent an hour's older
+content, and the down guard cannot tell. Then run `0017 down`. It refuses until every
 video rollup has been accepted by the manager. That means the hour's last
 accepted push came after the rollup was rated, and recorded a video
 `pushed_usage` id for each rated row of the identity. Once it passes, it removes

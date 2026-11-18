@@ -583,10 +583,15 @@ func (s *PostgresStore) AggregateWindow(ctx context.Context, start, end time.Tim
 		if floor.Before(reachEnd) {
 			reachEnd = floor
 		}
-		// Only hours that hold video rollups are worth reporting: those are
-		// the ones a re-rate would have deleted.
-		if err := tx.QueryRowContext(ctx, `SELECT COUNT(DISTINCT window_start) FROM rated_video_usage
-			WHERE window_start >= $1 AND window_start < $2`, start.UTC(), reachEnd).Scan(&outOfReach); err != nil {
+		// Only hours with video are worth reporting: hours holding rollups (a
+		// re-rate would have deleted them) and hours holding jobs never rated
+		// (they will now never be billed).
+		if err := tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM (
+			SELECT window_start FROM rated_video_usage WHERE window_start >= $1 AND window_start < $2
+			UNION
+			SELECT date_trunc('hour', created_at AT TIME ZONE 'UTC') AT TIME ZONE 'UTC'
+			  FROM video_billing_event WHERE created_at >= $1 AND created_at < $2) h`,
+			start.UTC(), reachEnd).Scan(&outOfReach); err != nil {
 			return AggregateResult{}, fmt.Errorf("rating: count video hours out of reach: %w", err)
 		}
 		res.Video.OutOfReachHours = outOfReach

@@ -466,6 +466,13 @@ func TestIntegration_VideoOlderThanTheReachIsNeverReRatedOrDeleted(t *testing.T)
 	if after := readVideoRollups(t, db); len(after) != 1 || after[0] != before[0] {
 		t.Fatalf("video rollups %+v, want %+v kept", after, before)
 	}
+	// Only hours with video count: itHour (its rollup), itHour-2h (a job
+	// never rated), not itHour-1h (nothing).
+	vseed(t, db, vrow(func(r *vbRow) { r.at = itHour.Add(-2*time.Hour + 5*time.Minute) }))
+	res, err = store.AggregateWindow(context.Background(), itHour.Add(-2*time.Hour), itHour.Add(time.Hour))
+	if err != nil || res.Video.OutOfReachHours != 2 {
+		t.Fatalf("out-of-reach hours %d (err %v), want 2", res.Video.OutOfReachHours, err)
+	}
 
 	// The reach is one day inside the 30-day row retention.
 	if got := itHour.Add(40 * 24 * time.Hour).Sub(VideoFloor(itHour.Add(40 * 24 * time.Hour))); got != 29*24*time.Hour {
