@@ -9,7 +9,7 @@ import (
 	"time"
 )
 
-// Store is the video_job and video_billing_event tables (migration 0013).
+// Store is the video_job and video_billing_event tables (migration 0016).
 type Store struct {
 	db *sql.DB
 }

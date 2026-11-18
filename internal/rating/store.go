@@ -24,6 +24,16 @@ type Store interface {
 	ParkedHours(ctx context.Context, notBefore time.Time) ([]time.Time, error)
 	// ListParked lists every unresolved parked row, oldest hour first.
 	ListParked(ctx context.Context) ([]Parked, error)
+	// CatchUpState reads the one-time catch-up's progress (rater_state).
+	CatchUpState(ctx context.Context) (CatchUpState, error)
+	// NeverRatedHours lists, oldest first and at most limit, the hours in
+	// [notBefore, before) that have billing_event rows but no rated_usage and
+	// no parked_usage row.
+	NeverRatedHours(ctx context.Context, notBefore, before time.Time, limit int) ([]time.Time, error)
+	// RecordCatchUpProgress records the last hour the catch-up rated.
+	RecordCatchUpProgress(ctx context.Context, hour time.Time) error
+	// CompleteCatchUp marks the catch-up done.
+	CompleteCatchUp(ctx context.Context) error
 	Ping(ctx context.Context) error
 	Close() error
 }

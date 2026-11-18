@@ -35,6 +35,10 @@ with the Atlas schema; they live in phoebe's own database.
 - **`token_push_state`** — one row: `auto_floor`, the first hour accepted by a
   scheduled token-push run. Scheduled runs re-send never-accepted hours only
   after it; explicit `-since/-until` runs never change it.
+- **`rater_state`** — one row: the rater's one-time catch-up of billing_event
+  hours that were never rated (an install that ran with the rater suspended).
+  `catchup_cursor` is the last hour it rated; `catchup_completed_at` is set when
+  nothing is left, after which the rater rates only its trailing window.
 - **`io_log`** — optional, sampled, short-retention request/response body capture
   (M5 I/O logging). Written by the interceptor's iolog sink; OFF by default.
   `cmd/prune` enforces the short retention: rows older than 7 days on `created_at`
@@ -64,6 +68,8 @@ golang-migrate up/down pairs, applied in version order:
 | 0012 | `0012_parked_and_pushed_usage.{up,down}.sql` | `parked_usage` (conflicted usage parked per identity-hour by the rater, never pruned), `pushed_usage` and `pushed_hour` (what token-push last had accepted per hour, for `held` and re-sending resolved hours). Down refuses while unresolved parked rows exist |
 | 0013 | `0013_token_push_state.{up,down}.sql` | `token_push_state` (one row: `auto_floor`, the first hour a scheduled token-push run had accepted; scheduled runs re-send never-accepted hours only after it, and explicit `-since/-until` runs never move it). Backfilled from `min(pushed_hour.window_start)` |
 | 0014 | `0014_refused_hour.{up,down}.sql` | `refused_hour` (token-push parks an hour the manager refused for its content, 400/413/422, or that failed local request validation; it is not re-sent until its payload hash changes and does not count against the per-run missed-hour cap; an accepted push deletes the row) |
+| 0015 | `0015_rater_state.{up,down}.sql` | `rater_state` (one row: the rater's one-time catch-up cursor and completion time; the catch-up rates every billing_event hour before the trailing window with no rated_usage or parked_usage row, oldest first, a bounded number per run) |
+| 0016 | `0016_video_jobs.{up,down}.sql` | `video_job` and `video_billing_event` (video generation jobs written and read only by phoebe-videos, `cmd/videos`; new tables only). Numbered 0016, not 0013: 0013 was already `token_push_state` |
 
 `embed.go` embeds these into the `migrations` package; `cmd/migrate` applies them.
 

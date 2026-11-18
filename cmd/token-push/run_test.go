@@ -33,7 +33,7 @@ func TestRun_NoTokenFatal(t *testing.T) {
 	t.Setenv(tokenEnv, "")
 	t.Setenv("DATABASE_URL", "postgres://x") // present so the failure is the token
 	code := runWith([]string{
-		"-manager-url", "http://manager.example",
+		"-manager-url", "https://manager.example",
 		"-f", settingsFile(t, "debug: false\n"),
 	})
 	if code != exitFatal {
@@ -76,7 +76,7 @@ func TestRun_NoDatabaseURLFatal(t *testing.T) {
 	t.Setenv(tokenEnv, "tok")
 	t.Setenv("DATABASE_URL", "")
 	code := runWith([]string{
-		"-manager-url", "http://manager.example",
+		"-manager-url", "https://manager.example",
 		"-f", settingsFile(t, "debug: false\n"),
 	})
 	if code != exitFatal {
@@ -92,7 +92,7 @@ func TestRun_UnalignedUntilFatal(t *testing.T) {
 	t.Setenv(tokenEnv, "tok")
 	t.Setenv("DATABASE_URL", "postgres://x")
 	code := runWith([]string{
-		"-manager-url", "http://manager.example",
+		"-manager-url", "https://manager.example",
 		"-until", "2026-06-16T14:30:00Z", // not hour-aligned
 		"-f", settingsFile(t, "debug: false\n"),
 	})

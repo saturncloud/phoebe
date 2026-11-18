@@ -40,6 +40,16 @@
 //     backoff; a 429's Retry-After is honoured up to the backoff cap. Every
 //     other status is final for the run.
 //
+//   - AN UNREACHABLE MANAGER STOPS THE RUN. Connecting is bounded by 10 s dial
+//     and 10 s TLS-handshake timeouts (the request timeout still bounds a slow
+//     answer). When maxConsecutiveUnreachable (3) hours in a row fail because
+//     the manager cannot be reached at all (DNS failure, connection refused or
+//     timed out, TLS handshake failure or a certificate that does not verify),
+//     the run logs "cannot reach manager at <url>: <cause>" at ERROR and stops
+//     with exit 1, within minutes rather than at the job deadline. Blocked
+//     egress is a misconfiguration, never a way to stop sending. Any answer
+//     from the manager, including a 5xx, resets the count.
+//
 //   - REFUSED HOURS ARE PARKED. A 400 with the manager's validation body
 //     ({"error", "path"}) will be given again for the same payload, so the hour
 //     is recorded in refused_hour (status, body, SHA-256 of the request, count,
@@ -54,14 +64,28 @@
 //     never parked: the run stops at the first one. Any other 4xx (including a
 //     400 without the manager's validation body) is not parked either.
 //
+//   - HTTPS ONLY. managerURL and -manager-url must be https:// URLs: the
+//     request carries the install's token and usage. Any other scheme, or a
+//     URL without one, is refused at startup (exit 1). The test-only settings
+//     key allowInsecureLocalhostManagerURL allows http to localhost, 127.0.0.1
+//     and ::1, and to no other host; the chart never sets it.
+//
 //   - AUTH = the install's existing customer auth token (SATURN_TOKEN env), sent
 //     as "Authorization: token <t>", the same credential and header as the old
 //     push and /customer/usage. No new credential, no new scope.
 //
 //   - IT RUNS ON EVERY INSTALL (rulings.md 2026-11-17: usage is always recorded
 //     and sent; whether it is charged is the manager's decision, by plan or
-//     flag, never by switching collection off). Two states every install can be
-//     in are therefore normal, not failures:
+//     flag, never by switching collection off). There is no opt-out. Once an
+//     install connects, all of its retained usage is sent (MISSED HOURS
+//     below). Suspending this CronJob or the rater's, or leaving managerURL
+//     empty, only delays sending; none of them stops it (the rater catches up
+//     the hours it never rated while their billing_event rows are retained;
+//     see cmd/rater). An empty manager URL
+//     is only for an install that has never connected (air-gapped); an install
+//     that has pushed and then loses its URL is misconfigured, and the run
+//     fails. The manager URL must be https (HTTPS ONLY below). Two states
+//     every install can be in are therefore normal, not failures:
 //
 //   - NOT CONNECTED: the settings file sets managerURL to "" and no
 //     -manager-url is given (an air-gapped install, or managerURI set to "").
@@ -99,8 +123,10 @@
 //	   never connected to a manager; or it has no usage yet (see above)
 //	1  fatal: a missing or bad settings file (-f), no manager URL on an
 //	   install that has pushed before (a lost URL), a manager URL with no
-//	   token, DATABASE_URL set but unreachable, an hour that could not be read
-//	   or recorded, a 5xx/429/network failure that outlasted the retries, a
+//	   token, a manager URL that is not https, DATABASE_URL set but
+//	   unreachable, an hour that could not be read or recorded, a
+//	   5xx/429/network failure that outlasted the retries, a manager that could
+//	   not be reached for 3 hours in a row (the run stops there), a
 //	   200 that disagreed with the request, rated_usage empty after usage was
 //	   already sent (a wiped table), or a window range wider than the backfill
 //	   cap
@@ -121,7 +147,6 @@ package main
 import (
 	"context"
 	"flag"
-	"net/http"
 	"os"
 	"os/signal"
 	"syscall"
@@ -189,6 +214,10 @@ func runWith(argv []string) int {
 		log.SetLevel(logging.DEBUG)
 	}
 	if *urlFlag != "" {
+		if err := checkManagerURL(*urlFlag, opts.allowInsecureLocalhost); err != nil {
+			log.Error.Printf("token-push: -manager-url: %v", err)
+			return exitFatal
+		}
 		opts.managerURL = *urlFlag
 	}
 	ctx, stop := signalContext()
@@ -221,13 +250,16 @@ func runWith(argv []string) int {
 	defer func() { _ = closeStore() }()
 
 	p := &pusher{
-		store: store,
-		log:   log,
+		store:      store,
+		log:        log,
+		managerURL: opts.managerURL,
 		client: &meteredusage.Client{
 			BaseURL: opts.managerURL,
 			Token:   token,
 			// One client for every hour of the run, so connections are reused.
-			HTTP: &http.Client{Timeout: opts.requestTimeout},
+			// Connecting is bounded by short dial and TLS-handshake timeouts,
+			// so an unreachable manager fails in seconds.
+			HTTP: meteredusage.NewHTTPClient(opts.requestTimeout),
 		},
 	}
 
