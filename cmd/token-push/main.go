@@ -189,6 +189,10 @@ func runWith(argv []string) int {
 		log.SetLevel(logging.DEBUG)
 	}
 	if *urlFlag != "" {
+		if err := checkManagerURL(*urlFlag, opts.allowInsecureLocalhost); err != nil {
+			log.Error.Printf("token-push: -manager-url: %v", err)
+			return exitFatal
+		}
 		opts.managerURL = *urlFlag
 	}
 	ctx, stop := signalContext()
