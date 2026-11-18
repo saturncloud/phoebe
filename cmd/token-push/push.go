@@ -29,7 +29,21 @@ type pusher struct {
 	store  pushStore
 	log    *logging.Logger
 	client poster
+	// managerURL is the manager's base URL, for error messages only.
+	managerURL string
 }
+
+// maxConsecutiveUnreachable is how many hours in a row may fail because the
+// manager cannot be reached at all (DNS, connection refused or timed out, TLS
+// handshake; see meteredusage.Unreachable) before the run stops. Each such hour
+// costs at most DefaultMaxAttempts connection attempts, each bounded by the
+// dial and TLS-handshake timeouts (10 s each), plus about 15 s of backoff:
+// under two minutes. So the run stops within about six minutes, far inside its
+// deadline,
+// instead of spending the deadline on hours that cannot be sent. Any hour that
+// gets an answer from the manager (accepted, refused, or a 5xx) resets the
+// count.
+const maxConsecutiveUnreachable = 3
 
 // openDB opens phoebe's Postgres the same way the rater does (pgx stdlib,
 // UTC-pinned DSN, small batch-job pool).
@@ -294,6 +308,7 @@ func (p *pusher) pushWindows(ctx context.Context, windows []time.Time, now time.
 	hours = uniqueHours(hours, recheck)
 
 	heldBack, rejected, failed, newlyParked := 0, 0, 0, 0
+	unreachable := 0 // consecutive hours the manager could not be reached for
 	var unchanged []time.Time
 send:
 	for i, h := range hours {
@@ -358,6 +373,18 @@ send:
 		}
 
 		resp, err := p.client.Post(ctx, plan.req)
+		if err != nil && meteredusage.Unreachable(err) {
+			unreachable++
+			failed++
+			if unreachable >= maxConsecutiveUnreachable {
+				p.log.Error.Printf("token-push: cannot reach manager at %s: %v. %d hour(s) in a row could not connect (DNS, connection refused or timed out, or TLS handshake), so the run stops; %d hour(s) not sent this run. Check this install's egress to the manager (firewall, proxy, DNS). Nothing is lost: the usage stays in rated_usage and is sent once the manager is reachable",
+					p.managerURL, err, unreachable, len(hours)-i-1)
+				break send
+			}
+			p.log.Error.Printf("token-push: send %s: cannot reach manager at %s: %v (the next run re-sends this hour)", plan.req.WindowStart, p.managerURL, err)
+			continue
+		}
+		unreachable = 0
 		var rej *meteredusage.RejectedError
 		switch {
 		case err == nil:

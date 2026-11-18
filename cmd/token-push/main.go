@@ -40,6 +40,16 @@
 //     backoff; a 429's Retry-After is honoured up to the backoff cap. Every
 //     other status is final for the run.
 //
+//   - AN UNREACHABLE MANAGER STOPS THE RUN. Connecting is bounded by 10 s dial
+//     and 10 s TLS-handshake timeouts (the request timeout still bounds a slow
+//     answer). When maxConsecutiveUnreachable (3) hours in a row fail because
+//     the manager cannot be reached at all (DNS failure, connection refused or
+//     timed out, TLS handshake failure or a certificate that does not verify),
+//     the run logs "cannot reach manager at <url>: <cause>" at ERROR and stops
+//     with exit 1, within minutes rather than at the job deadline. Blocked
+//     egress is a misconfiguration, never a way to stop sending. Any answer
+//     from the manager, including a 5xx, resets the count.
+//
 //   - REFUSED HOURS ARE PARKED. A 400 with the manager's validation body
 //     ({"error", "path"}) will be given again for the same payload, so the hour
 //     is recorded in refused_hour (status, body, SHA-256 of the request, count,
@@ -99,8 +109,10 @@
 //	   never connected to a manager; or it has no usage yet (see above)
 //	1  fatal: a missing or bad settings file (-f), no manager URL on an
 //	   install that has pushed before (a lost URL), a manager URL with no
-//	   token, DATABASE_URL set but unreachable, an hour that could not be read
-//	   or recorded, a 5xx/429/network failure that outlasted the retries, a
+//	   token, a manager URL that is not https, DATABASE_URL set but
+//	   unreachable, an hour that could not be read or recorded, a
+//	   5xx/429/network failure that outlasted the retries, a manager that could
+//	   not be reached for 3 hours in a row (the run stops there), a
 //	   200 that disagreed with the request, rated_usage empty after usage was
 //	   already sent (a wiped table), or a window range wider than the backfill
 //	   cap
@@ -121,7 +133,6 @@ package main
 import (
 	"context"
 	"flag"
-	"net/http"
 	"os"
 	"os/signal"
 	"syscall"
@@ -225,13 +236,16 @@ func runWith(argv []string) int {
 	defer func() { _ = closeStore() }()
 
 	p := &pusher{
-		store: store,
-		log:   log,
+		store:      store,
+		log:        log,
+		managerURL: opts.managerURL,
 		client: &meteredusage.Client{
 			BaseURL: opts.managerURL,
 			Token:   token,
 			// One client for every hour of the run, so connections are reused.
-			HTTP: &http.Client{Timeout: opts.requestTimeout},
+			// Connecting is bounded by short dial and TLS-handshake timeouts,
+			// so an unreachable manager fails in seconds.
+			HTTP: meteredusage.NewHTTPClient(opts.requestTimeout),
 		},
 	}
 
