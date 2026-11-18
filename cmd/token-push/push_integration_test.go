@@ -101,10 +101,45 @@ func rate(t *testing.T, db *sql.DB, start, end time.Time) rating.Result {
 	return res
 }
 
+// push runs token-push as the CronJob does (a scheduled run, no -since/-until)
+// over the given hours.
 func push(t *testing.T, db *sql.DB, m *recordingManager, hours ...time.Time) int {
 	t.Helper()
+	return pushRun(t, db, m, false, hours...)
+}
+
+// pushExplicit runs token-push as an operator's -since/-until run.
+func pushExplicit(t *testing.T, db *sql.DB, m *recordingManager, hours ...time.Time) int {
+	t.Helper()
+	return pushRun(t, db, m, true, hours...)
+}
+
+func pushRun(t *testing.T, db *sql.DB, m *recordingManager, explicit bool, hours ...time.Time) int {
+	t.Helper()
 	return (&pusher{store: pgStore{db: db}, log: logging.New(logging.ERROR), client: m.client(t)}).
-		pushWindows(context.Background(), hours, time.Now())
+		pushWindows(context.Background(), hours, time.Now(), explicit)
+}
+
+func autoFloor(t *testing.T, db *sql.DB) *time.Time {
+	t.Helper()
+	var f time.Time
+	switch err := db.QueryRow(`SELECT auto_floor FROM token_push_state`).Scan(&f); {
+	case err == sql.ErrNoRows:
+		return nil
+	case err != nil:
+		t.Fatal(err)
+	}
+	f = f.UTC()
+	return &f
+}
+
+func windowStarts(t *testing.T, m *recordingManager) []string {
+	t.Helper()
+	var out []string
+	for _, b := range m.bodies {
+		out = append(out, sentRequest(t, b).WindowStart)
+	}
+	return out
 }
 
 func lastRequest(t *testing.T, m *recordingManager) meteredusage.Request {
@@ -180,6 +215,7 @@ func TestIntegration_ResolvingTheConflictSendsTheParkedHour(t *testing.T) {
 	rate(t, db, old, old.Add(time.Hour)) // the run three days ago parked it
 
 	window := now.Add(-24 * time.Hour)
+	event(t, db, window.Add(time.Minute), itRes1, itOrg1) // the window hour has usage, so it is sent
 	if res := rate(t, db, window, now); len(res.Parked) != 1 || res.RescannedParkedHours != 1 {
 		t.Fatalf("%+v parked=%d, want the old hour re-checked and still parked", res.AggregateResult, len(res.Parked))
 	}
@@ -217,9 +253,10 @@ func TestIntegration_ResolvingTheConflictSendsTheParkedHour(t *testing.T) {
 }
 
 // Missed hours are re-sent; usage from before the install was connected is not.
-// h0 has usage but comes before the first accepted push (the install was not
-// connected yet), h1 is the first accepted push, h2 failed (the manager refused
-// it) and has usage, h3 is the current window.
+// h0 has usage but comes before the first hour a scheduled run had accepted
+// (the install was not connected yet), h1 is that first accepted hour, h2 has
+// usage and its push failed (the manager answered 503 until the retries ran
+// out), h3 is the current window.
 func TestIntegration_AnHourNeverAcceptedAfterTheFirstPushIsReSentButNotEarlierUsage(t *testing.T) {
 	db := itDB(t, "phoebe_push_unsent_it")
 	now := time.Now().UTC().Truncate(time.Hour)
@@ -237,16 +274,22 @@ func TestIntegration_AnHourNeverAcceptedAfterTheFirstPushIsReSentButNotEarlierUs
 	}
 
 	m := &recordingManager{}
-	if code := push(t, db, m, h1); code != exitOK { // first accepted push
+	if code := push(t, db, m, h1); code != exitOK { // first hour a scheduled run had accepted
 		t.Fatalf("exit %d", code)
 	}
-	refused := &recordingManager{statuses: []int{409}}
-	if code := push(t, db, refused, h2); code != exitRejected {
-		t.Fatalf("exit %d, want exitRejected", code)
+	if f := autoFloor(t, db); f == nil || !f.Equal(h1) {
+		t.Fatalf("auto_floor %v, want %s", f, h1)
+	}
+	down := &recordingManager{statuses: []int{503}}
+	if code := push(t, db, down, h2); code != exitFatal {
+		t.Fatalf("exit %d, want exitFatal (503 outlasted the retries)", code)
 	}
 	got, err := store.UnsentHours(context.Background(), now, 10)
 	if err != nil || len(got) != 1 || !got[0].Equal(h2) {
 		t.Fatalf("unsent %v err %v, want [%s] (h0 predates the first push)", got, err, h2)
+	}
+	if n, oldest, err := store.PreConnectionHours(context.Background()); err != nil || n != 1 || !oldest.Equal(h0) {
+		t.Fatalf("PreConnectionHours = %d, %s, %v; want 1 hour, oldest %s (h0)", n, oldest, err, h0)
 	}
 
 	event(t, db, h3.Add(time.Minute), itRes1, itOrg1)
@@ -255,15 +298,125 @@ func TestIntegration_AnHourNeverAcceptedAfterTheFirstPushIsReSentButNotEarlierUs
 	if code := push(t, db, m2, h3); code != exitOK {
 		t.Fatalf("exit %d", code)
 	}
-	var sent []string
-	for _, b := range m2.bodies {
-		sent = append(sent, sentRequest(t, b).WindowStart)
-	}
-	want := []string{meteredusage.FormatWindowStart(h2), meteredusage.FormatWindowStart(h3)}
+	sent := windowStarts(t, m2)
+	// The window first, then the missed hour.
+	want := []string{meteredusage.FormatWindowStart(h3), meteredusage.FormatWindowStart(h2)}
 	if strings.Join(sent, ",") != strings.Join(want, ",") {
 		t.Fatalf("sent %v, want %v", sent, want)
 	}
 	if got, _ := store.UnsentHours(context.Background(), now, 10); len(got) != 0 {
 		t.Fatalf("unsent after re-send %v, want none", got)
+	}
+}
+
+// An operator's -since/-until backfill sends old hours, but must not lower the
+// automatic re-send floor: if it did, every later scheduled run would send, on
+// its own, the pre-connection usage between the backfilled hour and the floor.
+func TestExplicitBackfillDoesNotLowerAutoResendFloor(t *testing.T) {
+	db := itDB(t, "phoebe_push_floor_it")
+	now := time.Now().UTC().Truncate(time.Hour)
+	hBackfill, hBetween, hFirst := now.Add(-60*time.Hour), now.Add(-50*time.Hour), now.Add(-10*time.Hour)
+	for _, h := range []time.Time{hBackfill, hBetween, hFirst} {
+		event(t, db, h.Add(time.Minute), itRes1, itOrg1)
+		rate(t, db, h, h.Add(time.Hour))
+	}
+	store := pgStore{db: db}
+
+	// An explicit run before any scheduled one sets no floor.
+	m := &recordingManager{}
+	if code := pushExplicit(t, db, m, hBackfill); code != exitOK {
+		t.Fatalf("explicit run: exit %d", code)
+	}
+	if f := autoFloor(t, db); f != nil {
+		t.Fatalf("an explicit run set auto_floor to %s", f)
+	}
+	if got, err := store.UnsentHours(context.Background(), now, 10); err != nil || len(got) != 0 {
+		t.Fatalf("unsent %v err %v after only an explicit run, want none", got, err)
+	}
+
+	// The first scheduled run sets the floor to its first accepted hour.
+	if code := push(t, db, m, hFirst); code != exitOK {
+		t.Fatalf("scheduled run: exit %d", code)
+	}
+	if f := autoFloor(t, db); f == nil || !f.Equal(hFirst) {
+		t.Fatalf("auto_floor %v, want %s", f, hFirst)
+	}
+
+	// Another explicit backfill of an older hour leaves the floor where it is.
+	if code := pushExplicit(t, db, m, hBackfill); code != exitOK {
+		t.Fatalf("second explicit run: exit %d", code)
+	}
+	if f := autoFloor(t, db); f == nil || !f.Equal(hFirst) {
+		t.Fatalf("auto_floor %v after a backfill, want %s still", f, hFirst)
+	}
+
+	// hBetween is pre-connection usage: a scheduled run never sends it.
+	if got, err := store.UnsentHours(context.Background(), now, 10); err != nil || len(got) != 0 {
+		t.Fatalf("unsent %v err %v, want none (hBetween is before the floor)", got, err)
+	}
+	m2 := &recordingManager{}
+	if code := push(t, db, m2, hFirst); code != exitOK {
+		t.Fatalf("later scheduled run: exit %d", code)
+	}
+	if sent := windowStarts(t, m2); len(sent) != 1 || sent[0] != meteredusage.FormatWindowStart(hFirst) {
+		t.Fatalf("later scheduled run sent %v, want only %s", sent, meteredusage.FormatWindowStart(hFirst))
+	}
+	// It is reported instead; the backfilled hour is not, it was accepted.
+	if n, oldest, err := store.PreConnectionHours(context.Background()); err != nil || n != 1 || !oldest.Equal(hBetween) {
+		t.Fatalf("PreConnectionHours = %d, %s, %v; want 1, %s", n, oldest, err, hBetween)
+	}
+}
+
+// 0013 backfills the floor from pushed_hour on an install that already pushed,
+// so the floor does not move on upgrade.
+func TestIntegration_Migration0013BackfillsTheFloorFromPushedHour(t *testing.T) {
+	db := itDB(t, "phoebe_push_m0013_it")
+	h := time.Now().UTC().Truncate(time.Hour).Add(-30 * time.Hour)
+	down, _ := migrations.FS.ReadFile("0013_token_push_state.down.sql")
+	up, _ := migrations.FS.ReadFile("0013_token_push_state.up.sql")
+	if _, err := db.Exec(string(down)); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(`INSERT INTO pushed_hour (window_start, pushed_at) VALUES ($1, now()), ($2, now())`, h, h.Add(5*time.Hour)); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(string(up)); err != nil {
+		t.Fatal(err)
+	}
+	if f := autoFloor(t, db); f == nil || !f.Equal(h) {
+		t.Fatalf("auto_floor %v after 0013, want %s (min pushed_hour)", f, h)
+	}
+	if _, err := db.Exec(`INSERT INTO token_push_state (singleton, auto_floor) VALUES (false, now())`); err == nil {
+		t.Fatal("token_push_state accepted a second row; it must hold one")
+	}
+}
+
+// The unsent-hours list is capped and oldest first: with 200 never-accepted
+// hours after the floor, one call returns exactly the 168 oldest, in order.
+func TestIntegration_UnsentHoursIsCappedAndOldestFirst(t *testing.T) {
+	db := itDB(t, "phoebe_push_unsent_cap_it")
+	now := time.Now().UTC().Truncate(time.Hour)
+	floor := now.Add(-210 * time.Hour)
+	if _, err := db.Exec(`INSERT INTO token_push_state (auto_floor) VALUES ($1)`, floor); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(`INSERT INTO pushed_hour (window_start, pushed_at) VALUES ($1, now())`, floor); err != nil {
+		t.Fatal(err)
+	}
+	for i := 1; i <= 200; i++ {
+		event(t, db, floor.Add(time.Duration(i)*time.Hour+time.Minute), itRes1, itOrg1)
+	}
+	rate(t, db, floor, now)
+	got, err := pgStore{db: db}.UnsentHours(context.Background(), now, maxUnsentHoursPerRun)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 168 {
+		t.Fatalf("%d unsent hours, want 168 (the cap)", len(got))
+	}
+	for i, h := range got {
+		if want := floor.Add(time.Duration(i+1) * time.Hour); !h.Equal(want) {
+			t.Fatalf("unsent[%d] = %s, want %s (oldest first)", i, h, want)
+		}
 	}
 }

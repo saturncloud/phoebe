@@ -5,7 +5,6 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
-	"sort"
 	"time"
 
 	_ "github.com/jackc/pgx/v5/stdlib"
@@ -137,36 +136,55 @@ func (p *pusher) buildHour(ctx context.Context, hour time.Time) (hourPlan, error
 const maxUnsentHoursPerRun = 24 * 7
 
 // pushWindows sends one request per hour and returns the exit code. The hours
-// are the trailing window, every hour with parked usage resolved since its
-// last accepted push (however old), and up to maxUnsentHoursPerRun hours with
-// usage that were never accepted since the first accepted push. Hours are independent: a failed or rejected
-// hour does not stop the others.
+// are, in this order: the trailing window (or the -since/-until range), every
+// hour with parked usage resolved since its last accepted push (however old),
+// and up to maxUnsentHoursPerRun hours with usage after the automatic re-send
+// floor that were never accepted, oldest first. The window goes first so a
+// long backlog can never use up the run's deadline before the current hours
+// are sent. Hours are independent: a failed or rejected hour does not stop
+// the others.
+//
+// explicit is true for an operator's -since/-until run. Such a run never sets
+// the automatic re-send floor, so backfilling old usage does not make later
+// scheduled runs re-send the hours around it.
 //
 // Exit code precedence: fatal (1) > rejected (3) > held back (2) > ok (0).
-func (p *pusher) pushWindows(ctx context.Context, windows []time.Time, now time.Time) int {
+func (p *pusher) pushWindows(ctx context.Context, windows []time.Time, now time.Time, explicit bool) int {
 	// LIVENESS GUARD. An empty hour is sent as records: [], which deletes the
-	// manager's records for that hour. If the database holds no usage at all
-	// (fresh install, wiped database), every hour would be a delete-all.
-	hasAny, err := p.store.HasAnyUsage(ctx)
+	// manager's records for that hour. A database whose usage is gone must
+	// never send.
+	everPushed, err := p.store.EverPushed(ctx)
 	if err != nil {
 		p.log.Error.Printf("token-push: liveness check: %v", err)
 		return exitFatal
 	}
-	if !hasAny {
-		everPushed, err := p.store.EverPushed(ctx)
-		if err != nil {
-			p.log.Error.Printf("token-push: liveness check: %v", err)
-			return exitFatal
-		}
-		if everPushed {
-			// Usage was sent before and is gone now: rated_usage is never pruned, so
-			// this is a wiped table. Sending would delete the manager's records.
-			p.log.Error.Printf("token-push: rated_usage and parked_usage are EMPTY although usage was sent before (pushed_hour has rows); refusing to push (every hour would be sent as empty and delete the manager's records). Restore the database")
-			return exitFatal
-		}
+	hasRated, hasParked, err := p.store.UsagePresent(ctx)
+	if err != nil {
+		p.log.Error.Printf("token-push: liveness check: %v", err)
+		return exitFatal
+	}
+	if !hasRated && everPushed {
+		// Usage was sent before and rated_usage is empty now: rated_usage is never
+		// pruned, so this is a wiped table, whatever parked_usage holds. Sending
+		// would delete the manager's records.
+		p.log.Error.Printf("token-push: rated_usage is EMPTY although usage was sent before (pushed_hour has rows); refusing to push (every hour would be sent as empty and delete the manager's records). Restore the database")
+		return exitFatal
+	}
+	if !hasRated && !hasParked {
 		// NO USAGE YET (main.go package doc): a fresh install. Nothing to send.
 		p.log.Info.Printf("token-push: no Token Factory usage recorded yet; nothing to send")
 		return exitOK
+	}
+	if everPushed {
+		n, oldest, err := p.store.PreConnectionHours(ctx)
+		if err != nil {
+			p.log.Error.Printf("token-push: %v", err)
+			return exitFatal
+		}
+		if n > 0 {
+			p.log.Info.Printf("token-push: %d hour(s) of usage from before this install's first accepted push (oldest %s) are not sent automatically; send them with -since/-until (%d days per run at most)",
+				n, oldest.Format(time.RFC3339), maxPushWindows/24)
+		}
 	}
 
 	floor := now.UTC().Truncate(time.Hour)
@@ -183,7 +201,7 @@ func (p *pusher) pushWindows(ctx context.Context, windows []time.Time, now time.
 	if len(unsent) > 0 {
 		p.log.Info.Printf("token-push: re-sending %d hour(s) with usage the manager never accepted, oldest %s", len(unsent), unsent[0].Format(time.RFC3339))
 	}
-	hours := mergeHours(windows, mergeHours(resolved, unsent))
+	hours := uniqueHours(windows, resolved, unsent)
 
 	heldBack, rejected, failed := 0, 0, 0
 	for _, h := range hours {
@@ -194,6 +212,23 @@ func (p *pusher) pushWindows(ctx context.Context, windows []time.Time, now time.
 			continue
 		}
 		heldBack += plan.heldBack
+		if len(plan.req.Records) == 0 && len(plan.req.Held) == 0 {
+			// An empty snapshot deletes, by absence, whatever the manager holds
+			// for the hour. Send one only for an hour this install sent before:
+			// otherwise the manager's records for it did not come from this
+			// database (for instance a database wiped and restarted), and an
+			// empty request would delete them.
+			sentBefore, err := p.store.HourEverSent(ctx, h)
+			if err != nil {
+				p.log.Error.Printf("token-push: check whether %s was sent before: %v", plan.req.WindowStart, err)
+				failed++
+				continue
+			}
+			if !sentBefore {
+				p.log.Info.Printf("token-push: skipping %s: no usage, and this install never sent the hour, so there is nothing to replace", plan.req.WindowStart)
+				continue
+			}
+		}
 		if err := meteredusage.Validate(plan.req); err != nil {
 			// Every record passed on its own, so this is a request-level rule
 			// (for instance a duplicate usage_id): a bug. Send nothing for the
@@ -212,7 +247,7 @@ func (p *pusher) pushWindows(ctx context.Context, windows []time.Time, now time.
 		var rej *meteredusage.RejectedError
 		switch {
 		case err == nil:
-			if err := p.store.RecordAccepted(ctx, h, plan.sent); err != nil {
+			if err := p.store.RecordAccepted(ctx, h, plan.sent, !explicit); err != nil {
 				// The manager has the hour; our bookkeeping keeps a superset
 				// (RecordIntent), which is the safe direction. The next run
 				// re-sends and records it.
@@ -225,9 +260,8 @@ func (p *pusher) pushWindows(ctx context.Context, windows []time.Time, now time.
 		case errors.As(err, &rej):
 			// Final: 400 = a wire rule we did not catch; 401 = the customer
 			// token; 409 = a manager that still refuses token usage from an install
-			// on the legacy billing path (older than 2026-11-17); 422 = the
-			// hour is in a billing period already settled to Stripe (correction
-			// goes to the human credit path). Each needs a person.
+			// on the legacy billing path (older than 2026-11-17). Each needs a
+			// person.
 			p.log.Error.Printf("token-push: manager REJECTED %s with %d (not retried; needs a person): %s",
 				plan.req.WindowStart, rej.Status, rej.Body)
 			rejected++
@@ -249,11 +283,12 @@ func (p *pusher) pushWindows(ctx context.Context, windows []time.Time, now time.
 	}
 }
 
-// mergeHours returns the sorted union of two hour lists.
-func mergeHours(a, b []time.Time) []time.Time {
+// uniqueHours concatenates the hour lists in order, keeping the first
+// occurrence of each hour. It does not sort: the order is the send order.
+func uniqueHours(lists ...[]time.Time) []time.Time {
 	seen := map[time.Time]bool{}
 	var out []time.Time
-	for _, l := range [][]time.Time{a, b} {
+	for _, l := range lists {
 		for _, h := range l {
 			h = h.UTC()
 			if !seen[h] {
@@ -262,6 +297,5 @@ func mergeHours(a, b []time.Time) []time.Time {
 			}
 		}
 	}
-	sort.Slice(out, func(i, j int) bool { return out[i].Before(out[j]) })
 	return out
 }

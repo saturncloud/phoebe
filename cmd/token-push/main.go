@@ -12,9 +12,13 @@
 //
 //   - ONE REQUEST PER HOUR, A SNAPSHOT. The manager deletes, by absence, any
 //     token record it holds for this install and hour that the request omits.
-//     So an hour with no usage is sent as records: [] and a re-sent hour
-//     replaces the previous one. usage_id is a deterministic hash of the
-//     record's grain, so re-sending never duplicates.
+//     So a re-sent hour replaces the previous one, and an hour with no usage
+//     is sent as records: [] only if this install sent that hour before
+//     (pushed_hour or pushed_usage has it). An empty hour this install never
+//     sent is skipped: the manager's records for it did not come from this
+//     database (a wiped and restarted one, for instance), so an empty request
+//     must not delete them. usage_id is a deterministic hash of the record's
+//     grain, so re-sending never duplicates.
 //
 //   - THE SETTLE HORIZON IS THE TRAILING WINDOW. Each run re-sends the last
 //     pushTrailingHours complete hours (default 24, matching the rater's
@@ -45,8 +49,9 @@
 //     flag, never by switching collection off). Two states every install can be
 //     in are therefore normal, not failures:
 //
-//   - NOT CONNECTED: no manager URL is configured (an air-gapped install, or
-//     managerURI set to ""). Nothing is sent and the run exits 0. The usage
+//   - NOT CONNECTED: the settings file sets managerURL to "" and no
+//     -manager-url is given (an air-gapped install, or managerURI set to "").
+//     A missing settings file is not this state: it is fatal. Nothing is sent and the run exits 0. The usage
 //     stays recorded in phoebe's rated_usage, which the pruner never deletes.
 //     Once a manager URL is configured, runs send the trailing window; older
 //     hours are sent with an explicit -since/-until run (90 days at most per
@@ -57,19 +62,23 @@
 //     sent and the run exits 0. Sending would be wrong: every hour would go
 //     as an empty snapshot and delete the manager's records for it.
 //
-//   - MISSED HOURS ARE RE-SENT. Besides the trailing window, each run sends up
-//     to maxUnsentHoursPerRun of the oldest hours that have usage, come after
-//     the first hour the manager ever accepted from this install, and were never
-//     accepted (a manager outage longer than the window, a 409 while the manager
-//     still refused this install). Hours before the first accepted push are not
-//     sent automatically: that is usage from before the install was connected,
-//     sent only by an explicit -since/-until run.
+//   - MISSED HOURS ARE RE-SENT. After the trailing window and the resolved
+//     hours, each run sends up to maxUnsentHoursPerRun of the oldest hours
+//     that have usage, come after the first hour accepted by a scheduled run
+//     (token_push_state.auto_floor), and were never accepted (for instance a
+//     manager outage longer than the window). Hours before the first hour
+//     accepted by a scheduled run are not re-sent automatically: usage from
+//     before the install was connected, and hours refused (409) or failed
+//     before that first acceptance. Send them with -since/-until; each run
+//     logs how many there are. An explicit -since/-until run never moves the
+//     floor, so a backfill does not pull older hours into the automatic
+//     re-send.
 //
 // It is a ONE-SHOT batch job (a k8s CronJob). Exit codes:
 //
 //	0  every hour in the window was accepted by the manager; or the install is
 //	   not connected to a manager; or it has no usage yet (see above)
-//	1  fatal: bad config, a manager URL with no token, DB unreachable, an hour
+//	1  fatal: a missing or bad settings file (-f), a manager URL with no token, DB unreachable, an hour
 //	   that could not be read, a 5xx/429/network failure that outlasted the
 //	   retries, a 200 that disagreed with the request, rated_usage empty after
 //	   usage was already sent (a wiped table), or a window range wider than the
@@ -79,8 +88,8 @@
 //	   the rater's signal (its exit 4), not this one
 //	3  the manager REJECTED some hour with a final status (400 wire rule, 401
 //	   token, 409 a manager older than the 2026-11-17 rule that accepts token
-//	   usage from installs on the legacy billing path, 422 billing period
-//	   already settled, any other non-429 4xx). Not retried; needs a person
+//	   usage from installs on the legacy billing path, any other non-429
+//	   4xx). Not retried; needs a person
 //
 // Precedence when several apply: 1 > 3 > 2.
 package main
@@ -202,7 +211,7 @@ func runWith(argv []string) int {
 		},
 	}
 
-	return p.pushWindows(ctx, windows, time.Now())
+	return p.pushWindows(ctx, windows, time.Now(), *since != "" || *until != "")
 }
 
 // signalContext returns a context cancelled on SIGTERM/SIGINT so a CronJob pod
