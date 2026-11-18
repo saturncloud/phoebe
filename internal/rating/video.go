@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"time"
 
+	"github.com/saturncloud/phoebe/internal/meteredusage"
 	"github.com/saturncloud/phoebe/internal/prune"
 )
 
@@ -95,6 +96,11 @@ type VideoAggregateResult struct {
 	// the rater never rated and now never will (phoebe-videos prunes the jobs
 	// at 30 days). Settled by hand through the manager's credit path.
 	UnratedOutOfReachHours int64
+	// TombstonesWritten counts the video usage_ids this run recorded as
+	// removed by the rater (video_reconcile_deletion): deleted rollups and
+	// rollups whose usage_id changed.
+	TombstonesWritten int64
+
 	// UnratedInReachHours counts, on a routine run, the hours between
 	// VideoFloor and the start of its window that hold completed, rateable
 	// video jobs of an identity with no rollup and no unresolved park: the
@@ -120,6 +126,7 @@ func (r VideoAggregateResult) add(b VideoAggregateResult) VideoAggregateResult {
 	r.OutOfReachHours += b.OutOfReachHours
 	r.UnratedOutOfReachHours += b.UnratedOutOfReachHours
 	r.UnratedInReachHours += b.UnratedInReachHours
+	r.TombstonesWritten += b.TombstonesWritten
 	return r
 }
 
@@ -289,7 +296,31 @@ deleted AS (
             AND k.window_start = ru.window_start
       )
     RETURNING ru.window_start, ru.auth_id, ru.owner_type, ru.owner_id, ru.resource_id,
-              ru.model_id, ru.serving_mode
+              ru.model_id, ru.serving_mode, ru.usage_id
+),
+-- TOMBSTONES (0017 video_reconcile_deletion): every deleted rollup's usage_id,
+-- in this statement, so token-push can tell a record the rater removed from
+-- one that was lost. A deletion explained by a park is 'parked' (token-push
+-- holds the id while the park is unresolved); any other is 'reconcile'. A row
+-- never stamped (usage_id NULL) leaves no tombstone, so its record, if sent,
+-- is held.
+tombstoned AS (
+    INSERT INTO video_reconcile_deletion (window_start, usage_id, auth_id, owner_type, owner_id,
+        resource_id, model_id, serving_mode, reason)
+    SELECT d.window_start, d.usage_id, d.auth_id, d.owner_type, d.owner_id, d.resource_id, d.model_id,
+        d.serving_mode,
+        CASE WHEN EXISTS (
+            SELECT 1 FROM conflicts c
+            WHERE c.window_start = d.window_start AND c.auth_id = d.auth_id
+              AND c.owner_type = d.owner_type AND c.owner_id = d.owner_id
+              AND c.resource_id = d.resource_id AND c.model_id = d.model_id
+              AND c.serving_mode = d.serving_mode
+              AND c.reason <> 'owner_conflict') THEN 'parked' ELSE 'reconcile' END
+    FROM deleted d
+    WHERE d.usage_id IS NOT NULL
+    ON CONFLICT ON CONSTRAINT video_reconcile_deletion_pk DO UPDATE SET
+        reason = EXCLUDED.reason, deleted_at = now()
+    RETURNING 1
 ),
 upserted AS (
     INSERT INTO rated_video_usage (
@@ -364,7 +395,8 @@ SELECT
     (SELECT COUNT(*)::bigint FROM parked_upsert)                  AS parked_written,
     (SELECT COUNT(*)::bigint FROM parked_resolved)                AS parked_resolved,
     (SELECT COALESCE(SUM(event_count), 0)::bigint FROM upserted
-      WHERE base_model = '')                                      AS empty_base_model_events`
+      WHERE base_model = '')                                      AS empty_base_model_events,
+    (SELECT COUNT(*)::bigint FROM tombstoned)                     AS tombstones_written`
 
 // aggregateVideoWindow runs aggregateVideoWindowSQL inside tx.
 func aggregateVideoWindow(ctx context.Context, tx *sql.Tx, start, end time.Time) (VideoAggregateResult, error) {
@@ -373,12 +405,89 @@ func aggregateVideoWindow(ctx context.Context, tx *sql.Tx, start, end time.Time)
 		Scan(&r.RollupsWritten, &r.EventsAggregated, &r.ReconciledDeletions, &r.ParkedDeletions,
 			&r.InvalidUsageEvents, &r.UnattributableEvents, &r.OwnerConflictEvents,
 			&r.AmbiguousOrgEvents, &r.MissingOrgEvents,
-			&r.ParkedWritten, &r.ParkedResolved, &r.EmptyBaseModelEvents)
+			&r.ParkedWritten, &r.ParkedResolved, &r.EmptyBaseModelEvents, &r.TombstonesWritten)
 	if err != nil {
 		return VideoAggregateResult{}, fmt.Errorf("rating: aggregate video window [%s,%s): %w",
 			start.UTC().Format(time.RFC3339), end.UTC().Format(time.RFC3339), err)
 	}
+	regrained, err := stampVideoUsageIDs(ctx, tx, start, end)
+	if err != nil {
+		return VideoAggregateResult{}, err
+	}
+	r.TombstonesWritten += regrained
 	return r, nil
+}
+
+// stampVideoUsageIDs stores each rollup's wire usage_id in [start, end), in
+// the aggregation's transaction. The id is computed by the same function
+// token-push sends with (meteredusage.VideoUsageID), here, once, so the
+// tombstones and 0017 down's guard can match records by id. A rollup whose id
+// changes (the grain kept its row but got a new org_id) leaves a 'regrained'
+// tombstone for its old id. An id that is live again loses its tombstone, so
+// a tombstone never releases a record the rater still produces. It returns the
+// number of tombstones written.
+func stampVideoUsageIDs(ctx context.Context, tx *sql.Tx, start, end time.Time) (int64, error) {
+	rows, err := tx.QueryContext(ctx, `SELECT id, window_start, org_id, owner_type, owner_id, resource_id,
+		auth_id, model_id, serving_mode, base_model, task, resolution, region, COALESCE(usage_id, '')
+		FROM rated_video_usage WHERE window_start >= $1 AND window_start < $2`, start.UTC(), end.UTC())
+	if err != nil {
+		return 0, fmt.Errorf("rating: read video rollups to stamp: %w", err)
+	}
+	type stamp struct {
+		id, old, want string
+		ws            time.Time
+		identity      [6]string
+	}
+	var todo []stamp
+	var live []string
+	for rows.Next() {
+		var (
+			s                                    stamp
+			org                                  string
+			a                                    meteredusage.VideoAttributes
+			ownerType, ownerID, resourceID, mode string
+		)
+		if err := rows.Scan(&s.id, &s.ws, &org, &ownerType, &ownerID, &resourceID,
+			&a.AuthID, &a.ModelID, &mode, &a.BaseModel, &a.Task, &a.Resolution, &a.Region, &s.old); err != nil {
+			_ = rows.Close()
+			return 0, fmt.Errorf("rating: scan video rollup to stamp: %w", err)
+		}
+		a.ServingMode = mode
+		s.want = meteredusage.VideoUsageID(meteredusage.FormatWindowStart(s.ws), org, ownerType, ownerID, resourceID, a)
+		s.identity = [6]string{a.AuthID, ownerType, ownerID, resourceID, a.ModelID, mode}
+		live = append(live, s.want)
+		if s.old != s.want {
+			todo = append(todo, s)
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return 0, fmt.Errorf("rating: read video rollups to stamp: %w", err)
+	}
+	_ = rows.Close()
+
+	var written int64
+	for _, s := range todo {
+		if s.old != "" {
+			if _, err := tx.ExecContext(ctx, `INSERT INTO video_reconcile_deletion (window_start, usage_id, auth_id,
+				owner_type, owner_id, resource_id, model_id, serving_mode, reason)
+				VALUES ($1, $2, $3, $4, $5, $6, $7, $8, 'regrained')
+				ON CONFLICT ON CONSTRAINT video_reconcile_deletion_pk DO UPDATE SET reason = 'regrained', deleted_at = now()`,
+				s.ws, s.old, s.identity[0], s.identity[1], s.identity[2], s.identity[3], s.identity[4], s.identity[5]); err != nil {
+				return 0, fmt.Errorf("rating: tombstone regrained video usage_id: %w", err)
+			}
+			written++
+		}
+		if _, err := tx.ExecContext(ctx, `UPDATE rated_video_usage SET usage_id = $2 WHERE id = $1`, s.id, s.want); err != nil {
+			return 0, fmt.Errorf("rating: stamp video usage_id: %w", err)
+		}
+	}
+	if len(live) > 0 {
+		if _, err := tx.ExecContext(ctx, `DELETE FROM video_reconcile_deletion
+			WHERE window_start >= $1 AND window_start < $2 AND usage_id = ANY($3)`, start.UTC(), end.UTC(), live); err != nil {
+			return 0, fmt.Errorf("rating: clear tombstones of live video usage_ids: %w", err)
+		}
+	}
+	return written, nil
 }
 
 // HasAnomaly reports video evidence that cannot become any record and is not

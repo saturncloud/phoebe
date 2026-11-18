@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/saturncloud/phoebe/internal/logging"
+	"github.com/saturncloud/phoebe/internal/meteredusage"
 )
 
 // vbRow is one video_billing_event row. The defaults (see vrow) describe one
@@ -408,7 +409,7 @@ func TestIntegration_Migration0017DownRefusesWhileVideoUsageIsParkedOrUnsent(t *
 	insertVideoIDs := func(at, limit string) {
 		exec(t, db, `INSERT INTO pushed_usage (window_start, usage_id, kind, auth_id, owner_type, owner_id, resource_id,
 			model_id, serving_mode, pushed_at)
-			SELECT window_start, md5(id) || md5(id), 'video', auth_id, owner_type, owner_id, resource_id, model_id,
+			SELECT window_start, usage_id, 'video', auth_id, owner_type, owner_id, resource_id, model_id,
 			       serving_mode, `+at+`
 			  FROM rated_video_usage ORDER BY id LIMIT `+limit+`
 			ON CONFLICT ON CONSTRAINT pushed_usage_pk DO UPDATE SET pushed_at = EXCLUDED.pushed_at`)
@@ -597,5 +598,90 @@ func TestIntegration_UnratedOutOfReachVideoIsCountedPerIdentity(t *testing.T) {
 	exec(t, db, `UPDATE parked_video_usage SET resolved_at = now()`)
 	if n := count(); n != 1 {
 		t.Fatalf("unrated hours %d, want 1 once B's park is resolved and B is still not rated", n)
+	}
+}
+
+// TOMBSTONES, both directions at the rater: every rollup carries its wire
+// usage_id, and every usage_id the rater removes gets a tombstone in the same
+// run (reconcile, parked, regrained), cleared when the id is live again. A
+// rollup lost outside the rater leaves none.
+func TestIntegration_TheRaterTombstonesEveryVideoUsageIDItRemoves(t *testing.T) {
+	db := openRatingSchema(t, "phoebe_video_tombstone_it")
+	tombstones := func() map[string]string {
+		t.Helper()
+		rows, err := db.Query(`SELECT usage_id, reason FROM video_reconcile_deletion`)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer rows.Close()
+		out := map[string]string{}
+		for rows.Next() {
+			var id, reason string
+			if err := rows.Scan(&id, &reason); err != nil {
+				t.Fatal(err)
+			}
+			out[id] = reason
+		}
+		return out
+	}
+	stamped := func() string {
+		t.Helper()
+		var id, org string
+		if err := db.QueryRow(`SELECT COALESCE(usage_id, ''), org_id FROM rated_video_usage`).Scan(&id, &org); err != nil {
+			t.Fatal(err)
+		}
+		return id
+	}
+	vseed(t, db, vrow(func(r *vbRow) { r.id = "video_t1" }))
+	vaggregate(t, db, itHour, itHour.Add(time.Hour))
+	first := stamped()
+	want := meteredusage.VideoUsageID(meteredusage.FormatWindowStart(itHour), "org-1", "user", "user-1", "res-v",
+		meteredusage.VideoAttributes{AuthID: "auth-a", ModelID: "wan-ep", ServingMode: "dedicated",
+			BaseModel: "Wan-AI/Wan2.2-T2V-A14B-Diffusers", Task: "t2v", Resolution: "720p"})
+	if first != want {
+		t.Fatalf("stamped usage_id %s, want token-push's id %s", first, want)
+	}
+
+	// Regrained: the org changes, the row keeps its grain and gets a new id.
+	exec(t, db, `UPDATE video_billing_event SET org_id = 'org-2'`)
+	if res := vaggregate(t, db, itHour, itHour.Add(time.Hour)); res.TombstonesWritten != 1 {
+		t.Fatalf("%+v, want one tombstone", res)
+	}
+	second := stamped()
+	if ts := tombstones(); second == first || ts[first] != "regrained" || len(ts) != 1 {
+		t.Fatalf("tombstones %v, new id %s; want the old id %s tombstoned as regrained", ts, second, first)
+	}
+
+	// Live again: the org changes back, the old id's tombstone is cleared and
+	// the second id is tombstoned.
+	exec(t, db, `UPDATE video_billing_event SET org_id = 'org-1'`)
+	vaggregate(t, db, itHour, itHour.Add(time.Hour))
+	if ts := tombstones(); stamped() != first || ts[first] != "" || ts[second] != "regrained" {
+		t.Fatalf("tombstones %v; want %s cleared (live again) and %s tombstoned", ts, first, second)
+	}
+
+	// Parked: a second org for the identity parks it and deletes its rollup.
+	vseed(t, db, vrow(func(r *vbRow) { r.id = "video_t2"; r.org = "org-3" }))
+	vaggregate(t, db, itHour, itHour.Add(time.Hour))
+	if ts := tombstones(); ts[first] != "parked" {
+		t.Fatalf("tombstones %v; want %s tombstoned as parked", ts, first)
+	}
+
+	// Reconcile: the jobs vanish.
+	exec(t, db, `DELETE FROM video_billing_event WHERE job_id = 'video_t2'`)
+	vaggregate(t, db, itHour, itHour.Add(time.Hour)) // resolves the park; the rollup is back
+	exec(t, db, `DELETE FROM video_billing_event`)
+	vaggregate(t, db, itHour, itHour.Add(time.Hour))
+	if ts := tombstones(); ts[first] != "reconcile" {
+		t.Fatalf("tombstones %v; want %s tombstoned as reconcile", ts, first)
+	}
+
+	// Lost: a rollup deleted outside the rater leaves no tombstone.
+	exec(t, db, `DELETE FROM video_reconcile_deletion`)
+	vseed(t, db, vrow(func(r *vbRow) { r.id = "video_t3" }))
+	vaggregate(t, db, itHour, itHour.Add(time.Hour))
+	exec(t, db, `DELETE FROM rated_video_usage`)
+	if ts := tombstones(); len(ts) != 0 {
+		t.Fatalf("tombstones %v after a rollup was deleted outside the rater, want none", ts)
 	}
 }
