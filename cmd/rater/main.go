@@ -220,8 +220,8 @@ func runWith(argv []string, log *logging.Logger) int {
 			return exitFatal
 		}
 		caught := rating.Result{AggregateResult: cu.AggregateResult}
-		hasAnomaly = hasAnomaly || caught.HasAnomaly() || cu.ReconciledDeletions > 0
-		hasParked = hasParked || cu.ParkedWritten > 0
+		hasAnomaly = hasAnomaly || caught.HasAnomaly() || caught.AllReconciledDeletions() > 0
+		hasParked = hasParked || cu.ParkedWritten > 0 || cu.Video.ParkedWritten > 0
 	}
 	return exitCode(res.AllReconciledDeletions(), windowExplicit, hasAnomaly, hasParked)
 }

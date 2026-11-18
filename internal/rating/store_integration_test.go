@@ -911,9 +911,20 @@ func seed(t *testing.T, db *sql.DB, rows ...beRow) {
 	}
 }
 
+// itNow is the integration tests' clock: a day after itHour, so the fixed
+// test hours stay inside the video reach (VideoFloor) whatever today is.
+func itNow() time.Time { return itHour.Add(24 * time.Hour) }
+
+// itStore is a PostgresStore on the integration tests' clock.
+func itStore(db *sql.DB) *PostgresStore {
+	s := NewPostgresStore(db)
+	s.now = itNow
+	return s
+}
+
 func aggregate(t *testing.T, db *sql.DB, start, end time.Time) AggregateResult {
 	t.Helper()
-	res, err := NewPostgresStore(db).AggregateWindow(context.Background(), start, end)
+	res, err := itStore(db).AggregateWindow(context.Background(), start, end)
 	if err != nil {
 		t.Fatalf("AggregateWindow: %v", err)
 	}

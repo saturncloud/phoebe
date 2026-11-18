@@ -5,7 +5,23 @@ import (
 	"database/sql"
 	"fmt"
 	"time"
+
+	"github.com/saturncloud/phoebe/internal/prune"
 )
+
+// VideoRateReach is how far back the rater re-rates video: one day inside
+// phoebe-videos' row retention (prune.VideoRowRetentionDays), a margin for the
+// reaper's cadence and for clock skew between the videos pod and the
+// database. An hour older than that may have lost some or all of its
+// video_billing_event rows, so re-running it would replace its rollups with a
+// partial sum or reconcile-delete them, and token-push would then delete the
+// manager's records. Token rating is not limited by it.
+const VideoRateReach = time.Duration(prune.VideoRowRetentionDays-1) * 24 * time.Hour
+
+// VideoFloor is the oldest hour the rater may re-rate video in at now.
+func VideoFloor(now time.Time) time.Time {
+	return now.UTC().Truncate(time.Hour).Add(-VideoRateReach)
+}
 
 // Video generation usage (video models design, approved 2026-11-18, sections
 // 7.2 and 7.3). phoebe-videos writes one video_billing_event row per finished
@@ -32,9 +48,10 @@ import (
 //
 // A job's hour is video_billing_event.created_at, the instant it finished.
 //
-// Failed and cancelled jobs are aggregated: they add to event_count and
-// gpu_seconds (margin evidence) and nothing else, so a rollup of failed jobs
-// only is sent with zero output and request_count 0 and prices at $0.
+// Failed and cancelled jobs are aggregated: they add to event_count only.
+// phoebe-videos writes them with every quantity 0, gpu_seconds included
+// (design 7.2: "a row with zero quantities and their status"), so a rollup of
+// failed jobs only is sent with all-zero quantities and prices at $0.
 
 // VideoAggregateResult is what one video aggregation statement reports. The
 // event counts partition the in-window video_billing_event rows:
@@ -68,6 +85,28 @@ type VideoAggregateResult struct {
 	// and priced by the manager (a shared one is reported unpriced). Not a
 	// partition bucket.
 	EmptyBaseModelEvents int64
+
+	// OutOfReachHours counts the window's hours before VideoFloor, whose video
+	// was not re-rated (their jobs may be pruned); their rollups are kept.
+	OutOfReachHours int64
+}
+
+// add sums two video results field by field.
+func (r VideoAggregateResult) add(b VideoAggregateResult) VideoAggregateResult {
+	r.RollupsWritten += b.RollupsWritten
+	r.EventsAggregated += b.EventsAggregated
+	r.ReconciledDeletions += b.ReconciledDeletions
+	r.ParkedDeletions += b.ParkedDeletions
+	r.InvalidUsageEvents += b.InvalidUsageEvents
+	r.UnattributableEvents += b.UnattributableEvents
+	r.OwnerConflictEvents += b.OwnerConflictEvents
+	r.AmbiguousOrgEvents += b.AmbiguousOrgEvents
+	r.MissingOrgEvents += b.MissingOrgEvents
+	r.ParkedWritten += b.ParkedWritten
+	r.ParkedResolved += b.ParkedResolved
+	r.EmptyBaseModelEvents += b.EmptyBaseModelEvents
+	r.OutOfReachHours += b.OutOfReachHours
+	return r
 }
 
 // aggregateVideoWindowSQL filters, groups, upserts, reconciles and counts the
@@ -106,7 +145,11 @@ WITH ev AS (
         -- request_count counts completed jobs only (design 7.3): 1 for a completed
         -- job, 0 otherwise. 0016 has no check that output_seconds, output_frames
         -- or gpu_seconds are non-negative, so they are checked here.
+        -- NUMERIC accepts 'NaN', and Postgres orders NaN above every number,
+        -- so NaN >= 0 is true: refuse it by name, or one NaN job would turn
+        -- its grain's sum into NaN, which no record can carry.
         (output_seconds >= 0 AND output_frames >= 0 AND gpu_seconds >= 0
+         AND output_seconds <> 'NaN'::numeric AND gpu_seconds <> 'NaN'::numeric
          AND request_count = CASE WHEN status = 'completed' THEN 1 ELSE 0 END) AS valid_usage,
         output_seconds, output_frames, request_count, gpu_seconds,
         date_trunc('hour', created_at AT TIME ZONE 'UTC') AT TIME ZONE 'UTC' AS window_start
@@ -274,18 +317,24 @@ upserted AS (
 SELECT
     (SELECT COUNT(*)::bigint                      FROM upserted) AS rollups_written,
     (SELECT COALESCE(SUM(event_count), 0)::bigint FROM upserted) AS events_aggregated,
+    -- A deletion is explained by a park only if the park can hold a record:
+    -- owner-conflict jobs park under owner ('', '') but never formed one, so
+    -- a vanished no-owner rollup of the same endpoint is still a reconcile
+    -- deletion and pages.
     (SELECT COUNT(*)::bigint FROM deleted d WHERE NOT EXISTS (
         SELECT 1 FROM conflicts c
         WHERE c.window_start = d.window_start AND c.auth_id = d.auth_id
           AND c.owner_type = d.owner_type AND c.owner_id = d.owner_id
           AND c.resource_id = d.resource_id AND c.model_id = d.model_id
-          AND c.serving_mode = d.serving_mode))                   AS reconciled_deletions,
+          AND c.serving_mode = d.serving_mode
+          AND c.reason <> 'owner_conflict'))                      AS reconciled_deletions,
     (SELECT COUNT(*)::bigint FROM deleted d WHERE EXISTS (
         SELECT 1 FROM conflicts c
         WHERE c.window_start = d.window_start AND c.auth_id = d.auth_id
           AND c.owner_type = d.owner_type AND c.owner_id = d.owner_id
           AND c.resource_id = d.resource_id AND c.model_id = d.model_id
-          AND c.serving_mode = d.serving_mode))                   AS parked_deletions,
+          AND c.serving_mode = d.serving_mode
+          AND c.reason <> 'owner_conflict'))                      AS parked_deletions,
     -- The withheld buckets, in precedence order so they PARTITION the window.
     (SELECT COUNT(*)::bigint FROM ev WHERE NOT valid_usage)       AS invalid_usage_events,
     (SELECT COUNT(*)::bigint FROM ev

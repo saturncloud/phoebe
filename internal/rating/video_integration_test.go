@@ -336,7 +336,7 @@ func TestIntegration_VideoParkedRowsAreListedAndAPrunedHourIsNeverReAggregated(t
 	vseed(t, db, vrow(nil), vrow(func(r *vbRow) { r.org = "org-2" }))
 	seed(t, db, row(nil), row(func(r *beRow) { r.org = "org-2" }))
 	vaggregate(t, db, itHour, itHour.Add(time.Hour))
-	store := NewPostgresStore(db)
+	store := itStore(db)
 	parked, err := store.ListParked(context.Background())
 	if err != nil {
 		t.Fatal(err)
@@ -369,16 +369,20 @@ func TestIntegration_VideoParkedRowsAreListedAndAPrunedHourIsNeverReAggregated(t
 			t.Fatalf("%+v, want the video row marked pruned", p)
 		}
 	}
-	if _, err := New(store, quiet()).Run(context.Background(), itHour, itHour.Add(time.Hour), true); err == nil ||
+	agg := New(store, quiet())
+	agg.now = itNow
+	if _, err := agg.Run(context.Background(), itHour, itHour.Add(time.Hour), true); err == nil ||
 		!strings.Contains(err.Error(), "pruned") {
 		t.Fatalf("Run over a pruned parked video hour: err = %v, want the refusal", err)
 	}
 }
 
 // 0017 down refuses while video usage is parked or not yet accepted by the
-// manager, and otherwise round-trips (down, then up again).
-func TestIntegration_Migration0014DownRefusesWhileVideoUsageIsParkedOrUnsent(t *testing.T) {
-	db := openRatingSchema(t, "phoebe_video_m0014_it")
+// manager, and otherwise round-trips (down, then up again). A token-only push
+// of the hour (pushed_hour stamped, no video pushed_usage row) does not count
+// as the video being accepted.
+func TestIntegration_Migration0017DownRefusesWhileVideoUsageIsParkedOrUnsent(t *testing.T) {
+	db := openRatingSchema(t, "phoebe_video_m0017_it")
 	vseed(t, db, vrow(nil), vrow(func(r *vbRow) { r.resource = "res-2"; r.org = "org-2" }),
 		vrow(func(r *vbRow) { r.resource = "res-2" }))
 	vaggregate(t, db, itHour, itHour.Add(time.Hour))
@@ -390,10 +394,21 @@ func TestIntegration_Migration0014DownRefusesWhileVideoUsageIsParkedOrUnsent(t *
 	if _, err := db.Exec(down); err == nil || !strings.Contains(err.Error(), "never accepted") {
 		t.Fatalf("down with unsent video usage: err = %v, want the refusal", err)
 	}
+	// A token-only accepted push: the previous release's token-push stamps
+	// pushed_hour and records only token ids.
 	exec(t, db, `INSERT INTO pushed_hour (window_start, pushed_at) VALUES ('`+itHour.Format(time.RFC3339)+`', now() + interval '1 minute')`)
 	exec(t, db, `INSERT INTO pushed_usage (window_start, usage_id, kind, auth_id, owner_type, owner_id, resource_id, model_id, serving_mode)
-		VALUES ('`+itHour.Format(time.RFC3339)+`', repeat('a', 64), 'video', 'a', '', '', 'r', 'm', 'dedicated'),
-		       ('`+itHour.Format(time.RFC3339)+`', repeat('b', 64), 'token', 'a', '', '', 'r', 'm', 'dedicated')`)
+		VALUES ('`+itHour.Format(time.RFC3339)+`', repeat('b', 64), 'token', 'a', '', '', 'r', 'm', 'dedicated')`)
+	if _, err := db.Exec(down); err == nil || !strings.Contains(err.Error(), "never accepted") {
+		t.Fatalf("down after a token-only push: err = %v, want the refusal", err)
+	}
+	// The video records accepted after they were rated: one video id per
+	// rated identity.
+	exec(t, db, `INSERT INTO pushed_usage (window_start, usage_id, kind, auth_id, owner_type, owner_id, resource_id,
+		model_id, serving_mode, pushed_at)
+		SELECT window_start, md5(id) || md5(id), 'video', auth_id, owner_type, owner_id, resource_id, model_id,
+		       serving_mode, rated_at + interval '1 minute'
+		  FROM rated_video_usage`)
 	exec(t, db, down)
 	var left int
 	if err := db.QueryRow(`SELECT COUNT(*) FROM pushed_usage`).Scan(&left); err != nil || left != 1 {
@@ -403,5 +418,100 @@ func TestIntegration_Migration0014DownRefusesWhileVideoUsageIsParkedOrUnsent(t *
 	var kind string
 	if err := db.QueryRow(`SELECT kind FROM pushed_usage`).Scan(&kind); err != nil || kind != "token" {
 		t.Fatalf("kind after up = %q (err %v), want the 'token' default", kind, err)
+	}
+}
+
+// An hour older than the video reach is never re-rated for video: its jobs
+// may be pruned, so re-running it would reconcile-delete the rollup the
+// manager bills from (and token-push would then delete the manager's record).
+// An explicit re-rate of that hour, for instance to fix its tokens, keeps the
+// video rollup as it is and reports the hour as out of reach.
+func TestIntegration_VideoOlderThanTheReachIsNeverReRatedOrDeleted(t *testing.T) {
+	db := openRatingSchema(t, "phoebe_video_reach_it")
+	vseed(t, db, vrow(nil))
+	seed(t, db, row(nil))
+	if res := vaggregate(t, db, itHour, itHour.Add(time.Hour)); res.RollupsWritten != 1 {
+		t.Fatalf("%+v, want the hour rated while its jobs are retained", res)
+	}
+	before := readVideoRollups(t, db)
+
+	// Forty days on, phoebe-videos has pruned the hour's jobs.
+	exec(t, db, `DELETE FROM video_billing_event`)
+	store := itStore(db)
+	store.now = func() time.Time { return itHour.Add(40 * 24 * time.Hour) }
+	res, err := store.AggregateWindow(context.Background(), itHour, itHour.Add(time.Hour))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res.Video.OutOfReachHours != 1 || res.Video.ReconciledDeletions != 0 || res.RollupsWritten != 1 {
+		t.Fatalf("%+v, want tokens re-rated, video left alone and the hour reported out of reach", res)
+	}
+	if after := readVideoRollups(t, db); len(after) != 1 || after[0] != before[0] {
+		t.Fatalf("video rollups %+v, want %+v kept", after, before)
+	}
+
+	// The reach is one day inside the 30-day row retention.
+	if got := itHour.Add(40 * 24 * time.Hour).Sub(VideoFloor(itHour.Add(40 * 24 * time.Hour))); got != 29*24*time.Hour {
+		t.Fatalf("reach %s, want 29 days", got)
+	}
+}
+
+// The one-time catch-up rates a video-only hour (video jobs, no token
+// events) that the trailing window never reached, so its usage is pushed.
+// An hour with video jobs older than the video reach is not listed.
+func TestIntegration_CatchUpRatesVideoOnlyHours(t *testing.T) {
+	db := openRatingSchema(t, "phoebe_video_catchup_it")
+	exec(t, db, readMigration(t, "0015_rater_state.up.sql"))
+	old := itHour.Add(-30 * 24 * time.Hour)
+	vseed(t, db, vrow(nil), vrow(func(r *vbRow) { r.at = old.Add(5 * time.Minute) }))
+	agg := New(itStore(db), quiet())
+	agg.now = itNow
+	cu, err := agg.CatchUp(context.Background(), itHour.Add(5*time.Hour), 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(cu.Hours) != 1 || !cu.Hours[0].Equal(itHour) || !cu.Completed {
+		t.Fatalf("caught up %v (completed %v), want only %s", cu.Hours, cu.Completed, itHour)
+	}
+	if cu.Video.RollupsWritten != 1 || cu.Video.EventsAggregated != 1 {
+		t.Fatalf("catch-up video result %+v, want the hour's one job rolled up", cu.Video)
+	}
+	if got := readVideoRollups(t, db); len(got) != 1 {
+		t.Fatalf("video rollups %+v, want one", got)
+	}
+}
+
+// A NaN quantity is invalid evidence (withheld, counted, exit 2), never summed:
+// Postgres orders NaN above every number, so NaN >= 0 alone would pass it.
+func TestIntegration_VideoNaNQuantitiesAreInvalidUsage(t *testing.T) {
+	db := openRatingSchema(t, "phoebe_video_nan_it")
+	vseed(t, db, vrow(nil),
+		vrow(func(r *vbRow) { r.outputSeconds = "NaN" }),
+		vrow(func(r *vbRow) { r.gpuSeconds = "NaN" }))
+	res := vaggregate(t, db, itHour, itHour.Add(time.Hour))
+	assertVideoPartition(t, res, 3)
+	if res.InvalidUsageEvents != 2 || res.EventsAggregated != 1 || !res.HasAnomaly() {
+		t.Fatalf("%+v, want both NaN jobs withheld as invalid", res)
+	}
+	if got := readVideoRollups(t, db); len(got) != 1 || got[0].outputSeconds != "5.062500000" {
+		t.Fatalf("rollups %+v, want the clean job only", got)
+	}
+}
+
+// A no-owner rollup whose jobs vanish is a reconcile deletion (it pages on a
+// routine run) even when an owner-conflict job of the same endpoint is parked
+// under the same (”, ”) owner in that hour: owner-conflict jobs never formed
+// a record, so their park explains no deletion.
+func TestIntegration_VideoOwnerConflictParkDoesNotExplainAVanishedNoOwnerRollup(t *testing.T) {
+	db := openRatingSchema(t, "phoebe_video_ownerless_it")
+	vseed(t, db, vrow(func(r *vbRow) { r.id = "video_noowner"; r.user = "" }))
+	if res := vaggregate(t, db, itHour, itHour.Add(time.Hour)); res.RollupsWritten != 1 {
+		t.Fatalf("%+v, want the no-owner rollup", res)
+	}
+	exec(t, db, `DELETE FROM video_billing_event WHERE job_id = 'video_noowner'`)
+	vseed(t, db, vrow(func(r *vbRow) { r.group = "group-1" }))
+	res := vaggregate(t, db, itHour, itHour.Add(time.Hour))
+	if res.ReconciledDeletions != 1 || res.ParkedDeletions != 0 || res.OwnerConflictEvents != 1 {
+		t.Fatalf("%+v, want one reconcile deletion and none explained by the owner-conflict park", res)
 	}
 }

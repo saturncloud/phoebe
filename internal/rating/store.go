@@ -133,6 +133,8 @@ type AggregateResult struct {
 // Postgres. It does not run migrations.
 type PostgresStore struct {
 	db *sql.DB
+	// now is the clock behind the video reach (VideoFloor); tests move it.
+	now func() time.Time
 }
 
 // OpenPostgres opens a *sql.DB against the DSN using the pgx stdlib driver, applies
@@ -151,7 +153,7 @@ func OpenPostgres(ctx context.Context, cfg Config) (*PostgresStore, error) {
 	db.SetMaxIdleConns(cfg.MaxIdleConns)
 	db.SetConnMaxLifetime(cfg.ConnMaxLifetime)
 
-	s := &PostgresStore{db: db}
+	s := &PostgresStore{db: db, now: time.Now}
 	if err := s.Ping(ctx); err != nil {
 		_ = db.Close()
 		return nil, fmt.Errorf("rating: postgres ping: %w", err)
@@ -178,7 +180,7 @@ func ensureUTCTimeZone(dsn string) string {
 // NewPostgresStore wraps an existing *sql.DB. Used by tests and callers owning
 // the pool lifecycle.
 func NewPostgresStore(db *sql.DB) *PostgresStore {
-	return &PostgresStore{db: db}
+	return &PostgresStore{db: db, now: time.Now}
 }
 
 func (s *PostgresStore) Ping(ctx context.Context) error { return s.db.PingContext(ctx) }
@@ -567,8 +569,28 @@ func (s *PostgresStore) AggregateWindow(ctx context.Context, start, end time.Tim
 	}
 	// Same transaction: an hour's token and video rollups move together, so
 	// token-push never reads one kind re-aggregated and the other not.
-	if res.Video, err = aggregateVideoWindow(ctx, tx, start, end); err != nil {
-		return AggregateResult{}, err
+	//
+	// Only the hours whose video jobs are still retained (VideoFloor): an
+	// older hour's video_billing_event rows are pruned, so re-running it would
+	// reconcile-delete its rated_video_usage rows (or replace them with a
+	// partial sum) and token-push would delete the manager's records. Those
+	// rollups are the record now and are left as they are.
+	vstart := start.UTC()
+	if floor := VideoFloor(s.now()); vstart.Before(floor) {
+		vstart = floor
+		if !vstart.Before(end.UTC()) {
+			res.Video.OutOfReachHours = int64(end.UTC().Sub(start.UTC()) / time.Hour)
+		} else {
+			res.Video.OutOfReachHours = int64(floor.Sub(start.UTC()) / time.Hour)
+		}
+	}
+	if vstart.Before(end.UTC()) {
+		v, err := aggregateVideoWindow(ctx, tx, vstart, end)
+		if err != nil {
+			return AggregateResult{}, err
+		}
+		v.OutOfReachHours = res.Video.OutOfReachHours
+		res.Video = v
 	}
 	if err := tx.Commit(); err != nil {
 		return AggregateResult{}, fmt.Errorf("rating: commit: %w", err)

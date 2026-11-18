@@ -144,9 +144,14 @@ of the video grain, so two values are two records, not a conflict.
   `parked_usage`. Holding is per kind: a parked video identity holds only its
   video usage_ids (`pushed_usage.kind`), never a token record.
 - Video jobs that cannot become any record (an empty auth, resource or model id,
-  a negative quantity, or a completed job whose `request_count` is not 1) are
-  withheld per job, logged at ERROR, and make the rater exit `2`, like invalid
-  token events.
+  a negative or NaN quantity, or a completed job whose `request_count` is not 1)
+  are withheld per job, logged at ERROR, and make the rater exit `2`, like
+  invalid token events.
+- phoebe-videos deletes `video_billing_event` rows after 30 days, always. So the
+  rater never re-rates video in an hour older than 29 days, even in an explicit
+  `--since/--until` run. That hour's `rated_video_usage` rows are the record and
+  are kept as they are, and the run logs a WARN naming how many hours it left
+  alone. Tokens in such a window are re-rated as usual.
 
 ## Routine checks and alert conditions
 

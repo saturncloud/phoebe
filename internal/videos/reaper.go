@@ -5,13 +5,16 @@ import (
 	"time"
 
 	"github.com/saturncloud/phoebe/internal/logging"
+	"github.com/saturncloud/phoebe/internal/prune"
 )
 
 // ReaperConfig bounds the reaper.
 type ReaperConfig struct {
 	// QueueTimeout fails a job that waited longer (design 5.3: 60 min).
 	QueueTimeout time.Duration
-	// RowRetention deletes job and billing rows older than this (30 days).
+	// RowRetention deletes job and billing rows older than this
+	// (prune.VideoRowRetentionDays). The rater's video reach is derived from
+	// the same constant; a longer setting is safe, a shorter one is not.
 	RowRetention time.Duration
 	// Every is how often the reaper runs.
 	Every time.Duration
@@ -25,7 +28,7 @@ func (c *ReaperConfig) defaults() {
 		c.QueueTimeout = 60 * time.Minute
 	}
 	if c.RowRetention <= 0 {
-		c.RowRetention = 30 * 24 * time.Hour
+		c.RowRetention = prune.VideoRowRetentionDays * 24 * time.Hour
 	}
 	if c.Every <= 0 {
 		c.Every = 30 * time.Second
