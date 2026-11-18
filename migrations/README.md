@@ -63,6 +63,7 @@ golang-migrate up/down pairs, applied in version order:
 | 0011 | `0011_rated_usage_quantities_only.{up,down}.sql` | `rated_usage` money columns become nullable with no `$0` default (expand step: the aggregator writes NULL; dropped one release later) |
 | 0012 | `0012_parked_and_pushed_usage.{up,down}.sql` | `parked_usage` (conflicted usage parked per identity-hour by the rater, never pruned), `pushed_usage` and `pushed_hour` (what token-push last had accepted per hour, for `held` and re-sending resolved hours). Down refuses while unresolved parked rows exist |
 | 0013 | `0013_token_push_state.{up,down}.sql` | `token_push_state` (one row: `auto_floor`, the first hour a scheduled token-push run had accepted; scheduled runs re-send never-accepted hours only after it, and explicit `-since/-until` runs never move it). Backfilled from `min(pushed_hour.window_start)` |
+| 0014 | `0014_refused_hour.{up,down}.sql` | `refused_hour` (token-push parks an hour the manager refused for its content, 400/413/422, or that failed local request validation; it is not re-sent until its payload hash changes and does not count against the per-run missed-hour cap; an accepted push deletes the row) |
 
 `embed.go` embeds these into the `migrations` package; `cmd/migrate` applies them.
 
