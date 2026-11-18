@@ -54,8 +54,9 @@ func pinnedSet() map[string]struct{} {
 // quota headers (X-Saturn-Service-Tier, X-Saturn-Rate-Limit-*), taking the
 // R3 set from 18 to 13; the membership-aware group scope envelope
 // (X-Saturn-Group-Scopes, ruled 2026-10-07) takes it from 13 to 14; the
-// serving-profile header takes the current set from 14 to 15.
-func TestPinnedFallbackIsExactlyThe15(t *testing.T) {
+// serving-profile header takes it from 14 to 15; the video endpoint limits
+// (X-Saturn-Video-Limits, video models design 2026-11-18) take it to 16.
+func TestPinnedFallbackIsExactlyThe16(t *testing.T) {
 	want := []string{
 		"X-Saturn-Gateway",
 		"X-Saturn-Org-Id",
@@ -72,14 +73,15 @@ func TestPinnedFallbackIsExactlyThe15(t *testing.T) {
 		"X-Saturn-Owner-Rate-Limit-Uncached-Prompt-Tokens",
 		"X-Saturn-Owner-Rate-Limit-Generated-Tokens",
 		"X-Saturn-Group-Scopes",
+		"X-Saturn-Video-Limits",
 	}
 	if !reflect.DeepEqual(pinnedTrustedHeaders, want) {
-		t.Fatalf("pinnedTrustedHeaders = %v, want the pinned 15 in order %v", pinnedTrustedHeaders, want)
+		t.Fatalf("pinnedTrustedHeaders = %v, want the pinned 16 in order %v", pinnedTrustedHeaders, want)
 	}
 }
 
 // TestLoadTrustedHeadersFallback: unset, empty, whitespace-only, or
-// all-empty-after-split config engages the pinned 15 — never an empty set.
+// all-empty-after-split config engages the pinned 16 — never an empty set.
 func TestLoadTrustedHeadersFallback(t *testing.T) {
 	cases := []struct {
 		name  string
@@ -96,7 +98,7 @@ func TestLoadTrustedHeadersFallback(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			withTrustedHeadersEnv(t, tc.value, tc.set)
 			if got := ActiveTrustedHeaders(); !reflect.DeepEqual(got, pinnedSet()) {
-				t.Fatalf("active set = %v, want the pinned 15 %v", got, pinnedSet())
+				t.Fatalf("active set = %v, want the pinned 16 %v", got, pinnedSet())
 			}
 		})
 	}
@@ -452,6 +454,7 @@ var candidateSaturnHeaders = []string{
 	HeaderOwnerRateLimitUncachedPromptTokens,
 	HeaderOwnerRateLimitGeneratedTokens,
 	HeaderGroupScopes,
+	HeaderVideoLimits,
 }
 
 // packageSaturnHeaderConstants parses the package's non-test Go files and

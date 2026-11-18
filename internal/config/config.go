@@ -69,6 +69,11 @@ type Settings struct {
 	// only fairness/capacity limits for otherwise authorized, valid requests.
 	Admission AdmissionSettings `yaml:"admission"`
 
+	// Videos configures the hand-off of video endpoints' /v1/videos requests
+	// to the phoebe-videos service. OFF by default (empty serviceUrl): video
+	// routes answer 404. The shared token comes from PHOEBE_VIDEOS_TOKEN.
+	Videos VideosSettings `yaml:"videos"`
+
 	// --- Parsed settings (populated by parse) ---
 
 	ListenAddr  string        `yaml:"-"`
@@ -391,6 +396,12 @@ type IOLogSettings struct {
 
 	// MaxBodyBytes caps the buffered response-body copy (default 256 KiB if 0).
 	MaxBodyBytes int `yaml:"maxBodyBytes"`
+}
+
+// VideosSettings is the YAML shape for the video hand-off.
+type VideosSettings struct {
+	// ServiceURL is the phoebe-videos Service, http://host:port.
+	ServiceURL string `yaml:"serviceUrl"`
 }
 
 // GatewaySettings is the YAML shape for the TF gateway resolution path.
