@@ -305,28 +305,34 @@ func TestPushWindows_NineDecimalSecondsAreSentShortestAndExact(t *testing.T) {
 	}
 }
 
-// A video identity this install sent for an hour, with no rollup and no park
-// now, is let go (the empty video set deletes the manager's records) only when
-// the rater could have removed it: rated_video_usage has rows and the hour is
-// inside the video reach. Otherwise its rollups were lost: its ids are held so
-// the manager keeps them, and the run exits 1. This is decided per identity,
-// so another identity's park in the same hour does not let it be deleted.
+// A video record this install sent for an hour, with no rollup now, is let
+// go (the hour's video set no longer names it, so the manager deletes it) only
+// when the rater could have removed it: rated_video_usage has rows and the
+// hour is inside the video reach plus a day of slack. Otherwise its rollup was
+// lost: its id is held so the manager keeps the record, and the run exits 1.
+// This is decided per id: another identity's park, or another grain of the
+// same identity, in the same hour does not let it be deleted.
 func TestPushWindows_VanishedVideoIsNotDeletedWhenTheRaterCannotHaveRemovedIt(t *testing.T) {
 	sentID := strings.Repeat("e", 64)
 	sentVideo := []pushedRow{{UsageID: sentID, Kind: meteredusage.KindVideo, identity: idVideo}}
-	old := rating.VideoFloor(now).Add(-time.Hour)
+	floor := rating.VideoFloor(now)
+	old := floor.Add(-videoReconcileSlack - time.Hour)
+	inSlack := floor.Add(-time.Hour)
 	for _, tc := range []struct {
 		name        string
 		hour        time.Time
 		parkedOnly  bool
 		parkedOther bool
+		otherGrain  bool
 		wantHeld    []string
 		wantExit    int
 	}{
-		{"inside the reach, rollups rated elsewhere: a reconcile deletion", win, false, false, []string{}, exitOK},
-		{"rated_video_usage empty, only an unresolved park left", win, true, false, []string{sentID}, exitFatal},
-		{"rated_video_usage empty, another identity parked in the same hour", win, true, true, []string{sentID}, exitFatal},
-		{"older than the video reach", old, false, false, []string{sentID}, exitFatal},
+		{"inside the reach, rollups rated elsewhere: a reconcile deletion", win, false, false, false, nil, exitOK},
+		{"a day older than the floor, within the slack: a reconcile deletion", inSlack, false, false, false, nil, exitOK},
+		{"rated_video_usage empty, only an unresolved park left", win, true, false, false, []string{sentID}, exitFatal},
+		{"rated_video_usage empty, another identity parked in the same hour", win, true, true, false, []string{sentID}, exitFatal},
+		{"older than the video reach and its slack", old, false, false, false, []string{sentID}, exitFatal},
+		{"older than the reach, the same identity keeps another grain", old, false, false, true, []string{sentID}, exitFatal},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			f := videoStore()
@@ -337,14 +343,26 @@ func TestPushWindows_VanishedVideoIsNotDeletedWhenTheRaterCannotHaveRemovedIt(t 
 			if tc.parkedOther {
 				f.videoParked[tc.hour] = []identity{idVideoOnFT}
 			}
+			if tc.otherGrain {
+				f.videoRollups[tc.hour] = videoStore().videoRollups[win][:1] // idVideo at 720p
+			}
 			f.videoRollups[win.Add(time.Hour)] = videoStore().videoRollups[win] // rated elsewhere
 			m := &recordingManager{}
 			if code := push1(t, f, m, tc.hour); code != tc.wantExit {
 				t.Fatalf("exit %d, want %d", code, tc.wantExit)
 			}
 			req := sentRequest(t, m.bodies[0])
-			if !reflect.DeepEqual(req.Kinds, []string{"token", "video"}) || !reflect.DeepEqual(req.Held, tc.wantHeld) {
+			if !reflect.DeepEqual(req.Kinds, []string{"token", "video"}) || len(req.Held) != len(tc.wantHeld) ||
+				(len(tc.wantHeld) > 0 && !reflect.DeepEqual(req.Held, tc.wantHeld)) {
 				t.Fatalf("kinds %v held %v, want [token video] and %v", req.Kinds, req.Held, tc.wantHeld)
+			}
+			// A held id is kept through RecordAccepted's trim; a let-go id is not.
+			kept := false
+			for _, r := range f.pushed[tc.hour] {
+				kept = kept || r.UsageID == sentID
+			}
+			if kept != (len(tc.wantHeld) > 0) {
+				t.Fatalf("sent id kept in pushed_usage = %v, want %v", kept, len(tc.wantHeld) > 0)
 			}
 		})
 	}

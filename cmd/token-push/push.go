@@ -111,8 +111,10 @@ type heldKey struct {
 // the manager deletes by absence per listed kind, so listing video with an
 // empty set for an hour this install never sent video for would delete video
 // records that did not come from this database, the per-kind form of the
-// empty-hour rule below. An hour whose video rollups all vanished still lists
-// it, so their records are deleted. Token is always listed, as before video.
+// empty-hour rule below. An hour whose sent video rollups vanished still
+// lists it: the records are deleted when the rater can have removed them, and
+// held (with exit 1) when it cannot (see VANISHED VIDEO). Token is always
+// listed, as before video.
 func (p *pusher) buildHour(ctx context.Context, hour time.Time, withVideo bool) (hourPlan, error) {
 	ws := meteredusage.FormatWindowStart(hour)
 	plan := hourPlan{req: meteredusage.Request{
@@ -176,32 +178,32 @@ func (p *pusher) buildHour(ctx context.Context, hour time.Time, withVideo bool) 
 		if err != nil {
 			return plan, err
 		}
+		heldID := map[string]bool{}
 		if withVideo {
-			// VANISHED VIDEO. A video identity this install sent for the hour
-			// that now has no rollup and no park: the rater removed it by a
-			// reconcile, which it can do only inside the video reach and
-			// never by emptying rated_video_usage. Otherwise its rollups were
-			// lost, and leaving it out of the request would delete the
-			// manager's records of it by absence, so its ids are held and the
-			// run exits 1. Decided per identity: the hour may still have
-			// other video of its own.
-			reconcilable := p.videoRated && !hour.Before(p.videoFloor)
+			// VANISHED VIDEO. A video record this install sent for the hour
+			// that has no rollup now. When the rater can have removed it (a
+			// reconcile inside the video reach, while rated_video_usage has
+			// rows: the rater never empties it), the empty slot deletes the
+			// manager's record by absence, which is the convergence the
+			// rater asked for. Otherwise the rollup was lost: the id is held
+			// so the manager keeps the record, and the run exits 1. Decided
+			// per id, not per identity: an identity can keep one grain
+			// (resolution, task, base model, region) and lose another.
+			reconcilable := p.videoRated && !hour.Before(p.videoFloor.Add(-videoReconcileSlack))
 			vanished := 0
 			for _, pr := range pushed {
 				if pr.kind() != meteredusage.KindVideo {
 					continue
 				}
 				listVideo = true // sent before: the request must say what is left
-				if !reconcilable && !ownVideo[pr.identity] && !live[pr.UsageID] {
-					if k := (heldKey{meteredusage.KindVideo, pr.identity}); !holdIdentity[k] {
-						holdIdentity[k] = true
-						vanished++
-					}
+				if !reconcilable && !live[pr.UsageID] && !holdIdentity[heldKey{meteredusage.KindVideo, pr.identity}] {
+					heldID[pr.UsageID] = true
+					vanished++
 				}
 			}
 			if vanished > 0 {
 				plan.videoVanished = true
-				p.log.Error.Printf("token-push: %s: %d video identity(ies) this install sent have no rollup now, and the rater cannot have removed them (%s); their ids are held so the manager keeps them. Restore rated_video_usage",
+				p.log.Error.Printf("token-push: %s: %d video record(s) this install sent have no rollup now, and the rater cannot have removed them (%s); their ids are held so the manager keeps them. Restore rated_video_usage",
 					ws, vanished, vanishedReason(p.videoRated))
 			}
 		}
@@ -211,7 +213,7 @@ func (p *pusher) buildHour(ctx context.Context, hour time.Time, withVideo bool) 
 			if pr.kind() == meteredusage.KindVideo && !listVideo {
 				continue
 			}
-			if holdIdentity[heldKey{pr.kind(), pr.identity}] && !live[pr.UsageID] {
+			if (holdIdentity[heldKey{pr.kind(), pr.identity}] || heldID[pr.UsageID]) && !live[pr.UsageID] {
 				pr.held = true
 				plan.req.Held = append(plan.req.Held, pr.UsageID)
 				plan.sent = append(plan.sent, pr)
@@ -224,11 +226,20 @@ func (p *pusher) buildHour(ctx context.Context, hour time.Time, withVideo bool) 
 	return plan, nil
 }
 
+// videoReconcileSlack widens, for token-push, the hours in which a vanished
+// video record counts as the rater's own reconcile: one day older than the
+// rater's floor. The rater and token-push compute the floor at different
+// times, and an operator's explicit re-rate of an hour near the floor may be
+// pushed after the hour crosses it; without the slack such a legitimate
+// deletion would be held and the stale record kept. A lost rollup in that
+// extra day is the price, and only when rated_video_usage still has rows.
+const videoReconcileSlack = 24 * time.Hour
+
 func vanishedReason(videoRated bool) string {
 	if !videoRated {
 		return "rated_video_usage is empty"
 	}
-	return "the hour is older than the video reach, where the rater never re-rates video"
+	return "the hour is older than the video reach (plus a day), where the rater never re-rates video"
 }
 
 // addVideo adds the hour's video records to plan, with the same per-identity

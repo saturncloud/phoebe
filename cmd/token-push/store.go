@@ -52,9 +52,12 @@ type pushedRow struct {
 	Kind    string
 	identity
 	// held: an id the request lists in `held`, not a record it sends. Its
-	// pushed_usage row keeps the pushed_at of the push that sent it, so
-	// pushed_at says when the manager last received that record (0017
-	// down relies on it).
+	// pushed_usage row already exists and is not re-stamped (ON CONFLICT DO
+	// NOTHING), for token and video ids alike, so pushed_at stays the time
+	// token-push last tried to send that record. That time can be an intent
+	// stamp (RecordIntent runs before the POST), which only makes 0017 down's
+	// guard stricter, never looser. If the row was trimmed meanwhile, it is
+	// inserted again with now(), so the id stays known as sent.
 	held bool
 }
 
