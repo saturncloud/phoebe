@@ -36,6 +36,7 @@ CREATE TABLE IF NOT EXISTS video_job (
     size              VARCHAR(16)  NOT NULL,
     fps               INTEGER      NOT NULL,
     gpus              INTEGER      NOT NULL,
+    max_concurrency   INTEGER      NOT NULL DEFAULT 1,     -- jobs the endpoint runs at once, from the route's limits
     params            JSONB        NOT NULL DEFAULT '{}',  -- negative_prompt, seed, num_inference_steps, guidance_scale
     status            VARCHAR(16)  NOT NULL,
     progress          SMALLINT     NOT NULL DEFAULT 0,
