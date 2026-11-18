@@ -20,6 +20,9 @@ type fakeStore struct {
 	parkedHours  []time.Time
 	parked       []Parked
 	windows      [][2]time.Time
+	// catch-up state and the never-rated hours NeverRatedHours filters.
+	catchUp    CatchUpState
+	neverRated []time.Time
 }
 
 func (f *fakeStore) AggregateWindow(_ context.Context, start, end time.Time) (AggregateResult, error) {
@@ -32,8 +35,28 @@ func (f *fakeStore) ParkedHours(context.Context, time.Time) ([]time.Time, error)
 	return f.parkedHours, nil
 }
 func (f *fakeStore) ListParked(context.Context) ([]Parked, error) { return f.parked, nil }
-func (f *fakeStore) Ping(context.Context) error                   { return nil }
-func (f *fakeStore) Close() error                                 { return nil }
+func (f *fakeStore) CatchUpState(context.Context) (CatchUpState, error) {
+	return f.catchUp, nil
+}
+func (f *fakeStore) NeverRatedHours(_ context.Context, notBefore, before time.Time, limit int) ([]time.Time, error) {
+	var out []time.Time
+	for _, h := range f.neverRated {
+		if !h.Before(notBefore) && h.Before(before) && len(out) < limit {
+			out = append(out, h)
+		}
+	}
+	return out, nil
+}
+func (f *fakeStore) RecordCatchUpProgress(_ context.Context, h time.Time) error {
+	f.catchUp.Cursor = h
+	return nil
+}
+func (f *fakeStore) CompleteCatchUp(context.Context) error {
+	f.catchUp.Done = true
+	return nil
+}
+func (f *fakeStore) Ping(context.Context) error { return nil }
+func (f *fakeStore) Close() error               { return nil }
 
 func captureLogger() (*logging.Logger, *bytes.Buffer, *bytes.Buffer) {
 	var info, errBuf bytes.Buffer
@@ -257,5 +280,55 @@ func TestAggregator_PrunedParkedRowIsLoggedWithTheMarkerAndNotRescanned(t *testi
 	}
 	if !strings.Contains(errBuf.String(), PrunedMarker) {
 		t.Fatalf("ERROR log lacks the marker:\n%s", errBuf.String())
+	}
+}
+
+// The catch-up rates at most limit hours per run, oldest first, one hour per
+// aggregation, continues after its cursor on the next run, and marks itself
+// done on the run that finds nothing more; after that it does nothing.
+func TestCatchUp_RespectsThePerRunLimitAndContinuesAfterItsCursor(t *testing.T) {
+	l, _, _ := captureLogger()
+	before := h0.Add(-24 * time.Hour)
+	f := &fakeStore{}
+	for i := 7; i >= 1; i-- {
+		f.neverRated = append(f.neverRated, before.Add(-time.Duration(i)*time.Hour))
+	}
+	agg := New(f, l)
+	for run, want := range []int{3, 3, 1} {
+		res, err := agg.CatchUp(context.Background(), before, 3)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(res.Hours) != want || res.Completed != (run == 2) {
+			t.Fatalf("run %d: rated %d hours (completed %v), want %d (completed %v)", run+1, len(res.Hours), res.Completed, want, run == 2)
+		}
+		for i, h := range res.Hours {
+			if wantH := f.neverRated[run*3+i]; !h.Equal(wantH) {
+				t.Fatalf("run %d hour %d = %s, want %s (oldest first, after the cursor)", run+1, i, h, wantH)
+			}
+		}
+	}
+	if len(f.windows) != 7 {
+		t.Fatalf("%d aggregations, want one per never-rated hour (7)", len(f.windows))
+	}
+	for _, w := range f.windows {
+		if !w[1].Equal(w[0].Add(time.Hour)) {
+			t.Fatalf("aggregated %v; the catch-up aggregates one hour at a time", w)
+		}
+	}
+	res, err := agg.CatchUp(context.Background(), before, 3)
+	if err != nil || !res.AlreadyDone || len(f.windows) != 7 {
+		t.Fatalf("after completion: %+v, %d aggregations, err %v; want nothing done", res, len(f.windows), err)
+	}
+}
+
+// An install with nothing to catch up (a fresh one, or one whose rater always
+// ran) completes on its first run without aggregating anything.
+func TestCatchUp_NothingToRateCompletesAtOnce(t *testing.T) {
+	l, _, _ := captureLogger()
+	f := &fakeStore{}
+	res, err := New(f, l).CatchUp(context.Background(), h0, CatchUpHoursPerRun)
+	if err != nil || !res.Completed || !f.catchUp.Done || f.calls != 0 {
+		t.Fatalf("res %+v done %v calls %d err %v; want completed with no aggregation", res, f.catchUp.Done, f.calls, err)
 	}
 }
