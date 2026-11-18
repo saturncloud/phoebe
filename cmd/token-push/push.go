@@ -92,19 +92,20 @@ type heldKey struct {
 // identity, the usage_ids the manager already holds for it (pushed_usage) go
 // into `held`, so delete-by-absence cannot remove usage the manager accepted.
 //
-// withVideo lists kind "video" and sends the hour's video records too. The
-// manager deletes by absence per listed kind, so an hour with token usage and
-// no video usage sends its token records and an empty video set, and the
-// reverse.
+// withVideo (the install records video and its video tables are not wiped)
+// lets the hour list kind "video" and send its video records. The hour lists
+// "video" only if it has video of its own (a rated or parked video row) or
+// this install sent the manager video records for it before (pushed_usage):
+// the manager deletes by absence per listed kind, so listing video with an
+// empty set for an hour this install never sent video for would delete video
+// records that did not come from this database, the per-kind form of the
+// empty-hour rule below. An hour whose video rollups all vanished still lists
+// it, so their records are deleted. Token is always listed, as before video.
 func (p *pusher) buildHour(ctx context.Context, hour time.Time, withVideo bool) (hourPlan, error) {
 	ws := meteredusage.FormatWindowStart(hour)
-	kinds := []string{meteredusage.KindToken}
-	if withVideo {
-		kinds = append(kinds, meteredusage.KindVideo)
-	}
 	plan := hourPlan{req: meteredusage.Request{
 		WindowStart: ws,
-		Kinds:       kinds,
+		Kinds:       []string{meteredusage.KindToken},
 		// Non-nil: an hour with no usage is [] (delete-by-absence), never null.
 		Records: make([]meteredusage.Record, 0),
 		Held:    make([]string, 0),
@@ -151,20 +152,27 @@ func (p *pusher) buildHour(ctx context.Context, hour time.Time, withVideo bool) 
 		holdIdentity[heldKey{meteredusage.KindToken, id}] = true
 	}
 
+	hourHasVideo := false
 	if withVideo {
-		if err := p.addVideo(ctx, hour, &plan, holdIdentity, live); err != nil {
+		if hourHasVideo, err = p.addVideo(ctx, hour, &plan, holdIdentity, live); err != nil {
 			return plan, err
 		}
 	}
-	if len(holdIdentity) > 0 {
+	listVideo := hourHasVideo
+	if len(holdIdentity) > 0 || (withVideo && !hourHasVideo) {
 		pushed, err := p.store.Pushed(ctx, hour)
 		if err != nil {
 			return plan, err
 		}
 		for _, pr := range pushed {
+			if withVideo && pr.kind() == meteredusage.KindVideo {
+				listVideo = true
+			}
+		}
+		for _, pr := range pushed {
 			// A video id is held only while video is listed: in a token-only
 			// request the manager keeps video records anyway.
-			if pr.kind() == meteredusage.KindVideo && !withVideo {
+			if pr.kind() == meteredusage.KindVideo && !listVideo {
 				continue
 			}
 			if holdIdentity[heldKey{pr.kind(), pr.identity}] && !live[pr.UsageID] {
@@ -173,16 +181,20 @@ func (p *pusher) buildHour(ctx context.Context, hour time.Time, withVideo bool) 
 			}
 		}
 	}
+	if listVideo {
+		plan.req.Kinds = append(plan.req.Kinds, meteredusage.KindVideo)
+	}
 	return plan, nil
 }
 
 // addVideo adds the hour's video records to plan, with the same per-identity
-// holding as tokens.
-func (p *pusher) addVideo(ctx context.Context, hour time.Time, plan *hourPlan, hold map[heldKey]bool, live map[string]bool) error {
+// holding as tokens. It reports whether the hour has video of its own: a
+// video rollup (sent or held back) or a parked video identity.
+func (p *pusher) addVideo(ctx context.Context, hour time.Time, plan *hourPlan, hold map[heldKey]bool, live map[string]bool) (bool, error) {
 	ws := plan.req.WindowStart
 	rollups, err := p.store.VideoRollups(ctx, hour)
 	if err != nil {
-		return err
+		return false, err
 	}
 	plan.req.VideoRecords = make([]meteredusage.VideoRecord, 0, len(rollups))
 	for _, r := range rollups {
@@ -212,12 +224,12 @@ func (p *pusher) addVideo(ctx context.Context, hour time.Time, plan *hourPlan, h
 	}
 	parked, err := p.store.ParkedVideoIdentities(ctx, hour)
 	if err != nil {
-		return err
+		return false, err
 	}
 	for _, id := range parked {
 		hold[heldKey{meteredusage.KindVideo, id}] = true
 	}
-	return nil
+	return len(rollups) > 0 || len(parked) > 0, nil
 }
 
 // maxUnsentHoursPerRun bounds how many never-accepted hours one run sends:
@@ -310,13 +322,16 @@ func (p *pusher) pushWindows(ctx context.Context, windows []time.Time, now time.
 		p.log.Error.Printf("token-push: liveness check: %v", err)
 		return exitFatal
 	}
-	// VIDEO IS LISTED ONLY ONCE VIDEO USAGE IS RECORDED. Until then a request
-	// lists kinds ["token"], exactly as before video existed: listing "video"
-	// with no video records could delete nothing the manager legitimately
-	// holds, and a manager without the video kind keeps accepting the hour.
-	// If video was sent before and the video tables are now empty, they were
-	// wiped: video is left out of every request (so the manager's video records
-	// are not deleted by absence), tokens are still sent, and the run exits 1.
+	// VIDEO IS LISTED ONLY ONCE VIDEO USAGE IS RATED, and then only for hours
+	// with video (buildHour). Until then a request lists kinds ["token"],
+	// exactly as before video existed: listing "video" with no video records
+	// could delete nothing the manager legitimately holds, and a manager
+	// without the video kind keeps accepting the hour. If video was sent
+	// before and rated_video_usage is now empty with no unresolved parked
+	// video (resolved parked rows do not count), it was wiped: video is left
+	// out of every request (so the
+	// manager's video records are not deleted by absence), tokens are still
+	// sent, and the run exits 1.
 	withVideo, everPushedVideo, err := p.store.VideoUsageState(ctx)
 	if err != nil {
 		p.log.Error.Printf("token-push: video liveness check: %v", err)
@@ -349,7 +364,7 @@ func (p *pusher) pushWindows(ctx context.Context, windows []time.Time, now time.
 	}
 	videoWiped := !withVideo && everPushedVideo
 	if videoWiped {
-		p.log.Error.Printf("token-push: rated_video_usage and parked_video_usage are EMPTY although video usage was sent before (pushed_usage has video rows); sending token usage only, so the manager's video records are not deleted. Restore the database")
+		p.log.Error.Printf("token-push: rated_video_usage is EMPTY (and no video usage is parked) although video usage was sent before (pushed_usage has video rows); sending token usage only, so the manager's video records are not deleted. Restore the database")
 	}
 
 	floor := now.UTC().Truncate(time.Hour)

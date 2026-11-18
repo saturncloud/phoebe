@@ -74,28 +74,41 @@ func TestPushWindows_SendsTokenAndVideoRecordsInOneRequest(t *testing.T) {
 	}
 }
 
-// Once video is recorded, an hour with token usage and no video usage still
-// lists "video" (so the manager deletes, by absence, video records the rater
-// reconciled away), and an hour with only video usage sends an empty token
-// set.
-func TestPushWindows_AnHourWithOnlyOneKindStillListsBoth(t *testing.T) {
+// Once video is rated, an hour lists "video" only if it has video of its own
+// or this install sent the manager video records for it before:
+//   - a token-only hour that never had video lists ["token"], so the manager's
+//     video records for that hour that did not come from this database are
+//     not deleted by absence (the per-kind form of the empty-hour rule);
+//   - a token-only hour whose video rollups the rater reconciled away still
+//     lists "video" with an empty set, so the manager deletes those records;
+//   - a video-only hour sends an empty token set beside its video records.
+func TestPushWindows_ListsVideoOnlyForHoursWithVideoOrSentVideo(t *testing.T) {
 	f := videoStore()
 	videoOnly := win.Add(time.Hour)
+	videoGone := win.Add(2 * time.Hour)
 	f.videoRollups[videoOnly] = f.videoRollups[win]
 	delete(f.videoRollups, win)
+	f.rollups[videoGone] = f.rollups[win]
+	f.pushed[videoGone] = []pushedRow{{UsageID: strings.Repeat("e", 64), Kind: meteredusage.KindVideo, identity: idVideo}}
 	m := &recordingManager{}
-	if code := push1(t, f, m, win, videoOnly); code != exitOK {
+	if code := push1(t, f, m, win, videoOnly, videoGone); code != exitOK {
 		t.Fatalf("exit %d", code)
 	}
-	tokensOnly, onlyVideo := sentRequest(t, m.bodies[0]), sentRequest(t, m.bodies[1])
-	for _, r := range []meteredusage.Request{tokensOnly, onlyVideo} {
-		if !reflect.DeepEqual(r.Kinds, []string{"token", "video"}) {
-			t.Fatalf("kinds %v, want both", r.Kinds)
+	tokensOnly, onlyVideo, gone := sentRequest(t, m.bodies[0]), sentRequest(t, m.bodies[1]), sentRequest(t, m.bodies[2])
+	for _, tc := range []struct {
+		name          string
+		req           meteredusage.Request
+		kinds         []string
+		token, videos int
+	}{
+		{"token-only hour, never sent video", tokensOnly, []string{"token"}, 4, 0},
+		{"video-only hour", onlyVideo, []string{"token", "video"}, 0, 2},
+		{"token-only hour whose sent video vanished", gone, []string{"token", "video"}, 4, 0},
+	} {
+		if !reflect.DeepEqual(tc.req.Kinds, tc.kinds) || len(tc.req.Records) != tc.token || len(tc.req.VideoRecords) != tc.videos {
+			t.Errorf("%s: kinds %v, %d token and %d video records; want %v, %d and %d",
+				tc.name, tc.req.Kinds, len(tc.req.Records), len(tc.req.VideoRecords), tc.kinds, tc.token, tc.videos)
 		}
-	}
-	if len(tokensOnly.Records) != 4 || len(tokensOnly.VideoRecords) != 0 || len(onlyVideo.Records) != 0 || len(onlyVideo.VideoRecords) != 2 {
-		t.Fatalf("token hour %d/%d, video hour %d/%d", len(tokensOnly.Records), len(tokensOnly.VideoRecords),
-			len(onlyVideo.Records), len(onlyVideo.VideoRecords))
 	}
 	if !strings.Contains(string(m.bodies[0]), `"records":[{`) {
 		t.Fatalf("token-only hour body %s", m.bodies[0])

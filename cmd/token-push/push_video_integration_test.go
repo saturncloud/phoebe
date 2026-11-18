@@ -145,6 +145,37 @@ func TestIntegration_AVideoOnlyHourNeverAcceptedIsReSent(t *testing.T) {
 	}
 }
 
+// A wiped rated_video_usage is caught even though parked_video_usage still
+// holds a RESOLVED row (parked rows are never pruned): video is left out of
+// the request and the run exits 1, instead of every re-sent hour listing
+// video with no records and deleting the manager's video records.
+func TestIntegration_AWipedVideoRollupIsCaughtDespiteAResolvedParkedRow(t *testing.T) {
+	db := itDB(t, "phoebe_push_video_wipe_parked_it")
+	h := time.Now().UTC().Truncate(time.Hour).Add(-time.Hour)
+	event(t, db, h.Add(time.Minute), itRes1, itOrg1)
+	videoJob(t, db, h.Add(2*time.Minute), itOrg1, "completed")
+	rate(t, db, h, h.Add(time.Hour))
+	m := &recordingManager{}
+	if code := push(t, db, m, h); code != exitOK {
+		t.Fatalf("exit %d", code)
+	}
+	if _, err := db.Exec(`INSERT INTO parked_video_usage (window_start, auth_id, owner_type, owner_id, resource_id,
+		model_id, serving_mode, reason, event_count, output_seconds, output_frames, request_count, gpu_seconds, resolved_at)
+		VALUES ($1, 'old-auth', '', '', 'old-res', 'old-model', 'dedicated', 'ambiguous_org', 1, 0, 0, 0, 0, now())`,
+		h.Add(-48*time.Hour)); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(`DELETE FROM rated_video_usage`); err != nil {
+		t.Fatal(err)
+	}
+	if code := push(t, db, m, h); code != exitFatal {
+		t.Fatalf("exit %d, want %d for a wiped rated_video_usage", code, exitFatal)
+	}
+	if req := lastRequest(t, m); !reflect.DeepEqual(req.Kinds, []string{"token"}) {
+		t.Fatalf("kinds %v, want token only so the manager's video records are kept", req.Kinds)
+	}
+}
+
 // The empty-database guards behave as before: nothing at all is a fresh
 // install (exit 0, nothing sent); video bookkeeping with the video tables
 // emptied sends tokens only and exits 1.

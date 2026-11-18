@@ -72,9 +72,13 @@ type pushStore interface {
 	// video usage apart from one whose rated_usage was wiped.
 	EverPushedToken(ctx context.Context) (bool, error)
 	// VideoUsageState reports whether any video usage is recorded
-	// (rated_video_usage or parked_video_usage has a row), and whether the
-	// manager was ever sent a video record (pushed_usage has a video row).
-	// token-push lists kind "video" only when video usage is recorded.
+	// (rated_video_usage has a row, or parked_video_usage has an UNRESOLVED
+	// row: an install whose only video rollup the rater just parked), and
+	// whether the manager was ever sent a video record (pushed_usage has a
+	// video row). token-push lists kind "video" only when video usage is
+	// recorded. A resolved parked row does not count: parked rows are never
+	// pruned, so an old one would hide a wiped rated_video_usage forever and
+	// every re-sent hour would delete the manager's video records by absence.
 	VideoUsageState(ctx context.Context) (has, everPushed bool, err error)
 	Rollups(ctx context.Context, hour time.Time) ([]rollupRow, error)
 	// VideoRollups reads every rated_video_usage row of one hour.
@@ -159,7 +163,8 @@ func (s pgStore) UsagePresent(ctx context.Context) (rated, parked bool, err erro
 
 func (s pgStore) VideoUsageState(ctx context.Context) (has, everPushed bool, err error) {
 	err = s.db.QueryRowContext(ctx,
-		`SELECT EXISTS (SELECT 1 FROM rated_video_usage) OR EXISTS (SELECT 1 FROM parked_video_usage),
+		`SELECT EXISTS (SELECT 1 FROM rated_video_usage)
+		        OR EXISTS (SELECT 1 FROM parked_video_usage WHERE resolved_at IS NULL),
 		        EXISTS (SELECT 1 FROM pushed_usage WHERE kind = 'video')`).Scan(&has, &everPushed)
 	return has, everPushed, err
 }
