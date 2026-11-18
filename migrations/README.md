@@ -360,10 +360,19 @@ release's rater and token-push keep working. Deploy the manager that accepts
 kind `video` (saturn-aws-manager, `LEGACY_PATH_ACCEPTED_KINDS` with `video`)
 before any install records video usage: token-push lists `video` in `kinds` only
 once `rated_video_usage` or `parked_video_usage` has a row, so installs without
-video keep sending `["token"]` to an older manager. If a previous-release
-token-push runs once after the migration, its trim of `pushed_usage` drops that
-hour's video rows; it sends `["token"]` only, so the manager's video records are
-untouched, and the next push re-records them.
+video keep sending `["token"]` to an older manager.
+
+Once any install has pushed video, do NOT run the previous release's token-push
+against this schema. Its trim of `pushed_usage` has no kind filter, so each hour
+it sends loses that hour's video rows, and it stamps `pushed_hour`. The
+manager's video records are untouched (it lists `["token"]` only), but the new
+token-push re-records them only for hours still inside its 24-hour trailing
+window. For an older hour, a video identity parked later has no accepted ids to
+hold, so the manager deletes them by absence. The scheduled re-send also skips
+that hour, because it is stamped. Roll back with `0017 down` instead. It refuses
+until every video rollup has been accepted by the manager (a video `pushed_usage`
+row of its identity recorded after it was rated), then removes video from
+phoebe's side. The manager keeps the video records it holds.
 
 ## Local dev
 
