@@ -7,7 +7,7 @@
 //
 // Config: a YAML file (-f) for settings, the environment for secrets:
 //
-//	DATABASE_URL            phoebe's own Postgres (migration 0013)
+//	DATABASE_URL            phoebe's own Postgres (migration 0016)
 //	PHOEBE_VIDEOS_TOKEN     shared with the interceptor; required
 //	VIDEO_STORE_ACCESS_KEY  object store credentials for the video prefix
 //	VIDEO_STORE_SECRET_KEY
