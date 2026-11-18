@@ -12,14 +12,16 @@ import (
 )
 
 type fakeStore struct {
-	res          AggregateResult
-	calls        int
-	gotStart     time.Time
-	gotEnd       time.Time
-	returnsError error
-	parkedHours  []time.Time
-	parked       []Parked
-	windows      [][2]time.Time
+	// unratedVideoHours is UnratedVideoHours' answer.
+	unratedVideoHours int64
+	res               AggregateResult
+	calls             int
+	gotStart          time.Time
+	gotEnd            time.Time
+	returnsError      error
+	parkedHours       []time.Time
+	parked            []Parked
+	windows           [][2]time.Time
 	// catch-up state and the never-rated hours NeverRatedHours filters.
 	catchUp    CatchUpState
 	neverRated []time.Time
@@ -38,6 +40,10 @@ func (f *fakeStore) ListParked(context.Context) ([]Parked, error) { return f.par
 func (f *fakeStore) CatchUpState(context.Context) (CatchUpState, error) {
 	return f.catchUp, nil
 }
+func (f *fakeStore) UnratedVideoHours(context.Context, time.Time, time.Time) (int64, error) {
+	return f.unratedVideoHours, nil
+}
+
 func (f *fakeStore) NeverRatedHours(_ context.Context, notBefore, before time.Time, limit int) ([]time.Time, error) {
 	var out []time.Time
 	for _, h := range f.neverRated {
@@ -330,5 +336,37 @@ func TestCatchUp_NothingToRateCompletesAtOnce(t *testing.T) {
 	res, err := New(f, l).CatchUp(context.Background(), h0, CatchUpHoursPerRun)
 	if err != nil || !res.Completed || !f.catchUp.Done || f.calls != 0 {
 		t.Fatalf("res %+v done %v calls %d err %v; want completed with no aggregation", res, f.catchUp.Done, f.calls, err)
+	}
+}
+
+// A routine run pages (exit 2 through HasAnomaly) while hours between the
+// video floor and its window hold video jobs that were never rated: the
+// trailing window and the one-time catch-up never reach them again. It does
+// not page while the catch-up is still running (the catch-up rates them), nor
+// on an explicit run (it names its own window).
+func TestRun_RoutineRunPagesOnNeverRatedVideoInReach(t *testing.T) {
+	now := time.Now().UTC().Truncate(time.Hour)
+	start, end := now.Add(-24*time.Hour), now
+	for _, tc := range []struct {
+		name     string
+		done     bool
+		explicit bool
+		want     int64
+	}{
+		{"routine, catch-up done", true, false, 3},
+		{"routine, catch-up still running", false, false, 0},
+		{"explicit", true, true, 0},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			l, _, _ := captureLogger()
+			f := &fakeStore{unratedVideoHours: 3, catchUp: CatchUpState{Done: tc.done}}
+			res, err := New(f, l).Run(context.Background(), start, end, tc.explicit)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if res.Video.UnratedInReachHours != tc.want || res.HasAnomaly() != (tc.want > 0) {
+				t.Fatalf("unrated in reach %d (anomaly %v), want %d", res.Video.UnratedInReachHours, res.HasAnomaly(), tc.want)
+			}
+		})
 	}
 }

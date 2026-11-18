@@ -95,6 +95,12 @@ type VideoAggregateResult struct {
 	// the rater never rated and now never will (phoebe-videos prunes the jobs
 	// at 30 days). Settled by hand through the manager's credit path.
 	UnratedOutOfReachHours int64
+	// UnratedInReachHours counts, on a routine run, the hours between
+	// VideoFloor and the start of its window that hold completed, rateable
+	// video jobs of an identity with no rollup and no unresolved park: the
+	// rater was down (or suspended) for longer than its trailing window. They
+	// can still be rated: re-rate them with --since/--until.
+	UnratedInReachHours int64
 }
 
 // add sums two video results field by field.
@@ -113,6 +119,7 @@ func (r VideoAggregateResult) add(b VideoAggregateResult) VideoAggregateResult {
 	r.EmptyBaseModelEvents += b.EmptyBaseModelEvents
 	r.OutOfReachHours += b.OutOfReachHours
 	r.UnratedOutOfReachHours += b.UnratedOutOfReachHours
+	r.UnratedInReachHours += b.UnratedInReachHours
 	return r
 }
 
@@ -375,8 +382,9 @@ func aggregateVideoWindow(ctx context.Context, tx *sql.Tx, start, end time.Time)
 }
 
 // HasAnomaly reports video evidence that cannot become any record and is not
-// parked, including completed jobs the rater never rated and no longer
-// will (UnratedOutOfReachHours). cmd/rater exits 2 on it.
+// parked, including completed jobs the rater never rated (UnratedInReachHours,
+// UnratedOutOfReachHours). cmd/rater exits 2 on it.
 func (r VideoAggregateResult) HasAnomaly() bool {
-	return r.UnattributableEvents > 0 || r.InvalidUsageEvents > 0 || r.UnratedOutOfReachHours > 0
+	return r.UnattributableEvents > 0 || r.InvalidUsageEvents > 0 || r.UnratedOutOfReachHours > 0 ||
+		r.UnratedInReachHours > 0
 }

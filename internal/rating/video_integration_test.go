@@ -550,3 +550,52 @@ func TestIntegration_VideoOwnerConflictParkDoesNotExplainAVanishedNoOwnerRollup(
 		t.Fatalf("%+v, want one reconcile deletion and none explained by the owner-conflict park", res)
 	}
 }
+
+// Never-rated video older than the reach is found per identity: a rated
+// identity in the same hour does not hide another identity's unrated
+// completed jobs, an unresolved park does cover its own identity, a resolved
+// park does not, and jobs that were never rateable (unattributable) are not
+// reported as unbilled usage.
+func TestIntegration_UnratedOutOfReachVideoIsCountedPerIdentity(t *testing.T) {
+	db := openRatingSchema(t, "phoebe_video_unrated_it")
+	h := itHour.Add(-5 * time.Hour)
+	at := func(r *vbRow) { r.at = h.Add(10 * time.Minute) }
+	// Identity A (res-v) is rated while inside the reach.
+	vseed(t, db, vrow(at))
+	store := itStore(db)
+	if _, err := store.AggregateWindow(context.Background(), h, h.Add(time.Hour)); err != nil {
+		t.Fatal(err)
+	}
+	old := func() time.Time { return itHour.Add(40 * 24 * time.Hour) }
+	store.now = old
+	count := func() int64 {
+		t.Helper()
+		res, err := store.AggregateWindow(context.Background(), h, h.Add(time.Hour))
+		if err != nil {
+			t.Fatal(err)
+		}
+		return res.Video.UnratedOutOfReachHours
+	}
+	// An unattributable completed job (never rateable) is not unbilled usage.
+	vseed(t, db, vrow(func(r *vbRow) { at(r); r.auth = "" }))
+	if n := count(); n != 0 {
+		t.Fatalf("unrated hours %d, want 0 with A rated and only an unattributable job", n)
+	}
+	// Identity B (res-b) has a completed job and no rollup: unbilled.
+	vseed(t, db, vrow(func(r *vbRow) { at(r); r.resource = "res-b" }))
+	if n := count(); n != 1 {
+		t.Fatalf("unrated hours %d, want 1: A's rollup must not hide B", n)
+	}
+	// An unresolved park of B covers it; a resolved one does not.
+	exec(t, db, `INSERT INTO parked_video_usage (window_start, auth_id, owner_type, owner_id, resource_id, model_id,
+		serving_mode, reason, event_count, output_seconds, output_frames, request_count, gpu_seconds)
+		VALUES ('`+h.Format(time.RFC3339)+`', 'auth-a', 'user', 'user-1', 'res-b', 'wan-ep', 'dedicated',
+		        'ambiguous_org', 1, 0, 0, 0, 0)`)
+	if n := count(); n != 0 {
+		t.Fatalf("unrated hours %d, want 0 with B parked", n)
+	}
+	exec(t, db, `UPDATE parked_video_usage SET resolved_at = now()`)
+	if n := count(); n != 1 {
+		t.Fatalf("unrated hours %d, want 1 once B's park is resolved and B is still not rated", n)
+	}
+}
