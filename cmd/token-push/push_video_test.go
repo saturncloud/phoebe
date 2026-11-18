@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"reflect"
+	"sort"
 	"strings"
 	"testing"
 	"time"
@@ -411,36 +412,57 @@ func TestPushWindows_AVideoOnlyInstallWithEveryRollupRemovedStillPushes(t *testi
 	f.pushed[win] = []pushedRow{{UsageID: sentID, Kind: meteredusage.KindVideo, identity: idVideo}}
 	f.tombstones = map[time.Time][]string{win: {sentID}}
 	m := &recordingManager{}
-	push1(t, f, m, win)
-	if len(m.bodies) != 1 {
-		t.Fatalf("%d requests, want the hour sent", len(m.bodies))
+	if code := push1(t, f, m, win); code != exitOK || len(m.bodies) != 1 {
+		t.Fatalf("exit %d with %d requests, want 0 and the hour sent (an all-removed install is not wiped)", code, len(m.bodies))
 	}
 	if req := sentRequest(t, m.bodies[0]); !reflect.DeepEqual(req.Kinds, []string{"token", "video"}) || len(req.Held) != 0 {
 		t.Fatalf("kinds %v held %v, want video listed empty so the tombstoned record is deleted", req.Kinds, req.Held)
 	}
 }
 
-// A video rollup token-push holds back holds only its own record (its stored
-// usage_id), not its whole identity: a sibling grain's tombstoned old id is
-// still released.
-func TestPushWindows_AHeldBackVideoRollupHoldsOnlyItsOwnRecord(t *testing.T) {
+// A video rollup token-push holds back holds its whole identity, tombstones
+// or not: while one of its rollups cannot be sent, the manager keeps every
+// record of the identity. Releasing a regrained predecessor here would leave
+// the grain with no record at all until a person fixes the rollup.
+func TestPushWindows_AHeldBackVideoRollupHoldsItsIdentityEvenWithTombstones(t *testing.T) {
 	f := videoStore()
 	rows := f.videoRollups[win]
 	bad := rows[0]
-	bad.OrgID = "not-hex" // fails the wire rule; its stored id is still its own
+	bad.OrgID = "not-hex" // fails the wire rule
 	f.videoRollups[win] = []videoRollupRow{bad}
 	badID := stampedVideoID(win, bad)
-	gone := strings.Repeat("e", 64) // a sibling grain of the same identity, removed by the rater
+	predecessor := strings.Repeat("e", 64) // the grain's old id, regrained by the rater
 	f.pushed[win] = []pushedRow{
 		{UsageID: badID, Kind: meteredusage.KindVideo, identity: idVideo},
-		{UsageID: gone, Kind: meteredusage.KindVideo, identity: idVideo},
+		{UsageID: predecessor, Kind: meteredusage.KindVideo, identity: idVideo},
 	}
-	f.tombstones = map[time.Time][]string{win: {gone}}
+	f.tombstones = map[time.Time][]string{win: {predecessor}}
 	m := &recordingManager{}
 	if code := push1(t, f, m, win); code != exitWithheld {
 		t.Fatalf("exit %d, want exitWithheld", code)
 	}
-	if req := sentRequest(t, m.bodies[0]); !reflect.DeepEqual(req.Held, []string{badID}) {
-		t.Fatalf("held %v, want only the held-back rollup's own id %s", req.Held, badID)
+	held := sentRequest(t, m.bodies[0]).Held
+	sort.Strings(held)
+	want := []string{badID, predecessor}
+	sort.Strings(want)
+	if !reflect.DeepEqual(held, want) {
+		t.Fatalf("held %v, want both of the identity's records %v", held, want)
+	}
+}
+
+// A live video rollup whose id has a tombstone was restored outside the rater
+// without deleting its tombstone (the rater clears a live id's tombstone in
+// the transaction that makes it live). The record is sent, and the run exits
+// 1 so a person deletes the tombstone before a later loss would release it.
+func TestPushWindows_ALiveVideoRecordWithATombstoneIsSentAndAlarms(t *testing.T) {
+	f := videoStore()
+	live := stampedVideoID(win, f.videoRollups[win][0])
+	f.tombstones = map[time.Time][]string{win: {live}}
+	m := &recordingManager{}
+	if code := push1(t, f, m, win); code != exitFatal {
+		t.Fatalf("exit %d, want %d", code, exitFatal)
+	}
+	if req := sentRequest(t, m.bodies[0]); len(req.VideoRecords) != 2 {
+		t.Fatalf("%d video records, want both sent", len(req.VideoRecords))
 	}
 }

@@ -169,9 +169,11 @@ of the video grain, so two values are two records, not a conflict.
   for the same grain (`regrained`). token-push lets the manager delete a sent
   video record by absence only when its id has a tombstone. A parked identity's
   ids stay held while the park is unresolved.
-  - When token-push sends an id again as a live rollup (restored outside the
-    rater), it clears that id's older tombstone before sending. If the record
-    is lost again later, it is held.
+  - A restore of `rated_video_usage` rows must also delete their ids from
+    `video_reconcile_deletion` in the same transaction. Otherwise a stale
+    tombstone would release the record if it were lost again. token-push
+    reports a live rollup that still has a tombstone at ERROR and exits `1`.
+    Inside the 29-day reach, the rater's next run of the hour also clears it.
   - Any other sent video id with no rollup was lost. token-push holds it, so the
     manager keeps the record, logs `video record(s) this install sent have no
     rollup and no tombstone` at ERROR, and exits `1` each time the hour is sent.
@@ -184,10 +186,11 @@ of the video grain, so two values are two records, not a conflict.
       hour stops listing video and the manager keeps the record silently.
 
       ```sql
+      -- <reason> is 'reconcile' here, 'regrained' for an id replaced by a new one.
       INSERT INTO video_reconcile_deletion (window_start, usage_id, auth_id, owner_type,
           owner_id, resource_id, model_id, serving_mode, reason)
       SELECT window_start, usage_id, auth_id, owner_type, owner_id, resource_id,
-             model_id, serving_mode, 'reconcile'
+             model_id, serving_mode, '<reason>'
         FROM pushed_usage WHERE window_start = '<hour>' AND usage_id = '<id>';
       ```
   - An hour the rater tombstones after its last accepted push (an explicit
@@ -200,8 +203,9 @@ of the video grain, so two values are two records, not a conflict.
     not sent under a new id (exit `2`). Inside the 29-day reach, re-rating the
     hour re-stamps it and tombstones the old id. Older hours are never re-rated:
     fix the row by hand. Set `usage_id` to the id of its fields (the
-    `HOLDING BACK` log line names it), and write a `regrained` tombstone for
-    the old id as above.
+    `HOLDING BACK` log line names it). If the old stored id is in
+    `pushed_usage` (the manager holds it), write a `regrained` tombstone for it
+    as above.
 
 ## Routine checks and alert conditions
 

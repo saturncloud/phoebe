@@ -43,9 +43,12 @@ BEGIN
     -- A video record the rater removed (tombstone) that the manager still
     -- holds (its id is still in pushed_usage): the previous release never
     -- lists video, so the record would stay at the manager for good.
-    SELECT COUNT(*) INTO removed FROM pushed_usage u
-      JOIN video_reconcile_deletion t ON t.window_start = u.window_start AND t.usage_id = u.usage_id
-     WHERE u.kind = 'video';
+    -- (A database from before the tombstones has no tombstone table.)
+    IF to_regclass('video_reconcile_deletion') IS NOT NULL THEN
+        SELECT COUNT(*) INTO removed FROM pushed_usage u
+          JOIN video_reconcile_deletion t ON t.window_start = u.window_start AND t.usage_id = u.usage_id
+         WHERE u.kind = 'video';
+    END IF;
     IF removed > 0 THEN
         RAISE EXCEPTION '0017 down: % video record(s) the rater removed are still held by the manager. Run token-push over their hours so the manager deletes them before migrating down.', removed;
     END IF;

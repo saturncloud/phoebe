@@ -424,10 +424,11 @@ func aggregateVideoWindow(ctx context.Context, tx *sql.Tx, start, end time.Time)
 
 // stampVideoUsageIDs stores each rollup's wire usage_id in [start, end), in
 // the aggregation's transaction. INVARIANT at commit: every rollup of the
-// window carries the id of its own fields, and every id the window's rollups
-// carried before and no longer carry has a tombstone: the statement before
-// this tombstones deleted rows, this pass tombstones changed ids. Both run in
-// one transaction, so no reader sees one half. The id is computed by the same function
+// window carries the id of its own fields (or NULL when two rollups compute
+// the same id; see below), and every id a deleted or regrained rollup carried
+// before has a tombstone: the statement before this tombstones deleted rows,
+// this pass tombstones changed ids. Both run in one transaction, so no reader
+// sees one half. The id is computed by the same function
 // token-push sends with (meteredusage.VideoUsageID), here, once, so the
 // tombstones and 0017 down's guard can match records by id. A rollup whose id
 // changes (the grain kept its row but got a new org_id) leaves a 'regrained'
@@ -446,8 +447,7 @@ func stampVideoUsageIDs(ctx context.Context, tx *sql.Tx, start, end time.Time) (
 		ws                                                time.Time
 		auth, ownerType, ownerID, resourceID, model, mode string
 	}
-	var todo []stamp
-	var live []string
+	var all []stamp
 	for rows.Next() {
 		var (
 			s   stamp
@@ -461,18 +461,46 @@ func stampVideoUsageIDs(ctx context.Context, tx *sql.Tx, start, end time.Time) (
 		}
 		s.auth, s.model, s.mode = a.AuthID, a.ModelID, a.ServingMode
 		s.want = meteredusage.VideoUsageID(meteredusage.FormatWindowStart(s.ws), org, s.ownerType, s.ownerID, s.resourceID, a)
-		live = append(live, s.want)
-		if s.old != s.want {
-			todo = append(todo, s)
-		}
+		all = append(all, s)
 	}
 	if err := rows.Err(); err != nil {
 		return 0, fmt.Errorf("rating: read video rollups to stamp: %w", err)
 	}
 	_ = rows.Close()
 
+	// Two rollups can compute the same id only if an envelope field contains
+	// the '|' the wire hash joins them with (usageID does not escape it).
+	// Neither is stamped: both stay NULL, token-push holds them back (exit 2),
+	// and no tombstone is written for their old ids (their identity is held).
+	count := map[string]int{}
+	for _, s := range all {
+		count[s.want]++
+	}
+	var todo []stamp
+	var live []string
+	for _, s := range all {
+		if count[s.want] > 1 {
+			s.want = ""
+		} else {
+			live = append(live, s.want)
+		}
+		if s.old != s.want {
+			todo = append(todo, s)
+		}
+	}
+
+	// Clear every changing row first, so the unique index on usage_id cannot
+	// trip on the order of the updates.
+	for _, s := range todo {
+		if _, err := tx.ExecContext(ctx, `UPDATE rated_video_usage SET usage_id = NULL WHERE id = $1`, s.id); err != nil {
+			return 0, fmt.Errorf("rating: clear video usage_id: %w", err)
+		}
+	}
 	var written int64
 	for _, s := range todo {
+		if s.want == "" {
+			continue
+		}
 		if s.old != "" {
 			if _, err := tx.ExecContext(ctx, `INSERT INTO video_reconcile_deletion (window_start, usage_id, auth_id,
 				owner_type, owner_id, resource_id, model_id, serving_mode, reason)

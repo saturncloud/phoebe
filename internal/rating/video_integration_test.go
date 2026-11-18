@@ -711,7 +711,7 @@ func TestIntegration_TheRaterTombstonesEveryVideoUsageIDItRemoves(t *testing.T) 
 func TestIntegration_Migration0017OnADatabaseFromBeforeTheTombstones(t *testing.T) {
 	db := openRatingSchema(t, "phoebe_video_m0017_old_it")
 	exec(t, db, `DROP TABLE video_reconcile_deletion`)
-	exec(t, db, `DROP INDEX rated_video_usage_usage_id_ix`)
+	exec(t, db, `DROP INDEX rated_video_usage_usage_id_uq`)
 	exec(t, db, `ALTER TABLE rated_video_usage DROP COLUMN usage_id`)
 	exec(t, db, `INSERT INTO rated_video_usage (id, auth_id, owner_type, owner_id, resource_id, org_id, model_id,
 		serving_mode, base_model, task, resolution, region, window_start, window_end, output_seconds, output_frames,
@@ -721,11 +721,39 @@ func TestIntegration_Migration0017OnADatabaseFromBeforeTheTombstones(t *testing.
 		t.Fatalf("down on the old schema: err = %v, want the guard's refusal (not a missing column)", err)
 	}
 	exec(t, db, readMigration(t, "0017_rated_video_usage.up.sql"))
+	// With no rows, down runs every guard on the old schema (no tombstone
+	// table) and succeeds.
+	exec(t, db, `DELETE FROM rated_video_usage`)
+	exec(t, db, `DROP TABLE video_reconcile_deletion`)
+	exec(t, db, readMigration(t, "0017_rated_video_usage.down.sql"))
+	exec(t, db, readMigration(t, "0017_rated_video_usage.up.sql"))
+	exec(t, db, `INSERT INTO rated_video_usage (id, auth_id, owner_type, owner_id, resource_id, org_id, model_id,
+		serving_mode, base_model, task, resolution, region, window_start, window_end, output_seconds, output_frames,
+		request_count, gpu_seconds, event_count)
+		VALUES (repeat('a', 32), 'a', '', '', 'r', 'o', 'm', 'dedicated', '', 't2v', '720p', '', now(), now(), 1, 1, 1, 1, 1)`)
 	var n int
 	if err := db.QueryRow(`SELECT COUNT(*) FROM video_reconcile_deletion`).Scan(&n); err != nil {
 		t.Fatalf("tombstone table after re-applying up: %v", err)
 	}
 	if err := db.QueryRow(`SELECT COUNT(*) FROM rated_video_usage WHERE usage_id IS NULL`).Scan(&n); err != nil || n != 1 {
 		t.Fatalf("unstamped rows %d (err %v), want the old row with usage_id NULL", n, err)
+	}
+}
+
+// Two rollups that compute the same usage_id (only possible with a '|' in an
+// envelope field, which the wire hash does not escape) are both left
+// unstamped instead of failing the unique index and stopping every rating run.
+func TestIntegration_RollupsThatComputeTheSameUsageIDAreLeftUnstamped(t *testing.T) {
+	db := openRatingSchema(t, "phoebe_video_dup_id_it")
+	vseed(t, db,
+		vrow(func(r *vbRow) { r.user = "u|x"; r.resource = "res" }),
+		vrow(func(r *vbRow) { r.user = "u"; r.resource = "x|res" }))
+	vaggregate(t, db, itHour, itHour.Add(time.Hour))
+	var rows, unstamped int
+	if err := db.QueryRow(`SELECT COUNT(*), COUNT(*) FILTER (WHERE usage_id IS NULL) FROM rated_video_usage`).Scan(&rows, &unstamped); err != nil {
+		t.Fatal(err)
+	}
+	if rows != 2 || unstamped != 2 {
+		t.Fatalf("%d rollups, %d unstamped; want both rated and neither stamped", rows, unstamped)
 	}
 }

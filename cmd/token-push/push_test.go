@@ -131,33 +131,6 @@ func (f *fakeStore) VideoUsageState(context.Context) (bool, bool, bool, error) {
 	return f.hasVideo, ever, untombstoned, nil
 }
 
-func (f *fakeStore) Now(context.Context) (time.Time, error) { return now, nil }
-
-func (f *fakeStore) ClearSupersededTombstones(_ context.Context, h time.Time, ids []string, _ time.Time) error {
-	keep := f.tombstones[h][:0:0]
-	for _, t := range f.tombstones[h] {
-		live := false
-		for _, id := range ids {
-			live = live || id == t
-		}
-		if !live {
-			keep = append(keep, t)
-		}
-	}
-	if f.tombstones != nil {
-		f.tombstones[h] = keep
-	}
-	return nil
-}
-
-func (f *fakeStore) VideoTombstones(_ context.Context, h time.Time) (map[string]bool, error) {
-	out := map[string]bool{}
-	for _, id := range f.tombstones[h] {
-		out[id] = true
-	}
-	return out, nil
-}
-
 func (f *fakeStore) EverPushedToken(context.Context) (bool, error) {
 	for _, rows := range f.pushed {
 		for _, r := range rows {
@@ -169,9 +142,10 @@ func (f *fakeStore) EverPushedToken(context.Context) (bool, error) {
 	return false, nil
 }
 
-// VideoRollups returns the hour's rows stamped as the rater stamps them
-// (usage_id from the row's own fields) unless a row carries its own UsageID.
-func (f *fakeStore) VideoRollups(_ context.Context, h time.Time) ([]videoRollupRow, error) {
+// VideoHour returns the hour's rows stamped as the rater stamps them
+// (usage_id from the row's own fields) unless a row carries its own UsageID,
+// and the hour's tombstones.
+func (f *fakeStore) VideoHour(_ context.Context, h time.Time) ([]videoRollupRow, map[string]bool, error) {
 	out := make([]videoRollupRow, len(f.videoRollups[h]))
 	for i, r := range f.videoRollups[h] {
 		switch r.UsageID {
@@ -182,7 +156,11 @@ func (f *fakeStore) VideoRollups(_ context.Context, h time.Time) ([]videoRollupR
 		}
 		out[i] = r
 	}
-	return out, nil
+	tomb := map[string]bool{}
+	for _, id := range f.tombstones[h] {
+		tomb[id] = true
+	}
+	return out, tomb, nil
 }
 
 // unstampedVideoID marks a fake rollup the rater never stamped.

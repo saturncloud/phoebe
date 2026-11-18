@@ -72,12 +72,15 @@ type hourPlan struct {
 	// sent is what the manager will hold for the hour once it accepts req: the
 	// records plus the held ids.
 	sent []pushedRow
-	// videoReadAt is the database clock just before the hour's video rollups
-	// were read; liveVideo the video ids sent as records. Before the send,
-	// tombstones of those ids older than the read are cleared (a restore
-	// outside the rater), so a later loss of the record is held.
-	videoReadAt time.Time
-	liveVideo   []string
+	// staleTombstones counts live video rollups whose id has a tombstone.
+	// The rater clears a live id's tombstone in the transaction that makes it
+	// live, so in one snapshot this means a write outside the rater (a
+	// restore that did not delete the tombstone). The record is sent; the
+	// tombstone would release it if it were lost again, so the run exits 1.
+	staleTombstones int
+	// videoTombstones is the hour's tombstones, from the same snapshot as
+	// its video rollups (VideoHour).
+	videoTombstones map[string]bool
 	// heldBack counts rollups token-push itself could not turn into a record
 	// (no org, or a wire rule). Parked identities are the rater's to report.
 	heldBack int
@@ -168,7 +171,7 @@ func (p *pusher) buildHour(ctx context.Context, hour time.Time, withVideo bool) 
 	var ownVideo map[identity]bool
 	heldID := map[string]bool{}
 	if withVideo {
-		if ownVideo, err = p.addVideo(ctx, hour, &plan, holdIdentity, heldID, live); err != nil {
+		if ownVideo, err = p.addVideo(ctx, hour, &plan, holdIdentity, live); err != nil {
 			return plan, err
 		}
 	}
@@ -187,10 +190,7 @@ func (p *pusher) buildHour(ctx context.Context, hour time.Time, withVideo bool) 
 			// such id was lost, so it is held (the manager keeps the record)
 			// and the run exits 1. A parked identity's ids are held by the
 			// park whatever their tombstone says.
-			tombstones, err := p.store.VideoTombstones(ctx, hour)
-			if err != nil {
-				return plan, err
-			}
+			tombstones := plan.videoTombstones
 			vanished := 0
 			for _, pr := range pushed {
 				if pr.kind() != meteredusage.KindVideo {
@@ -231,17 +231,13 @@ func (p *pusher) buildHour(ctx context.Context, hour time.Time, withVideo bool) 
 // addVideo adds the hour's video records to plan, with the same per-identity
 // holding as tokens. It returns the identities with video of their own in the
 // hour: a video rollup (sent or held back) or a parked video identity.
-func (p *pusher) addVideo(ctx context.Context, hour time.Time, plan *hourPlan, hold map[heldKey]bool, heldID, live map[string]bool) (map[identity]bool, error) {
+func (p *pusher) addVideo(ctx context.Context, hour time.Time, plan *hourPlan, hold map[heldKey]bool, live map[string]bool) (map[identity]bool, error) {
 	ws := plan.req.WindowStart
-	readAt, err := p.store.Now(ctx)
+	rollups, tombstones, err := p.store.VideoHour(ctx, hour)
 	if err != nil {
 		return nil, err
 	}
-	plan.videoReadAt = readAt
-	rollups, err := p.store.VideoRollups(ctx, hour)
-	if err != nil {
-		return nil, err
-	}
+	plan.videoTombstones = tombstones
 	own := make(map[identity]bool, len(rollups))
 	plan.req.VideoRecords = make([]meteredusage.VideoRecord, 0, len(rollups))
 	for _, r := range rollups {
@@ -270,20 +266,22 @@ func (p *pusher) addVideo(ctx context.Context, hour time.Time, plan *hourPlan, h
 			err = fmt.Errorf("stored usage_id %q is not the id of its fields (%s); re-rate the hour so the rater stamps it", r.UsageID, rec.UsageID)
 		}
 		if err != nil {
-			p.log.Error.Printf("token-push: HOLDING BACK rated_video_usage %s (hour %s, auth_id=%s, resource_id=%s, model_id=%s): %v. Only this rollup's video record is held back; the rest of the hour is sent",
+			p.log.Error.Printf("token-push: HOLDING BACK rated_video_usage %s (hour %s, auth_id=%s, resource_id=%s, model_id=%s): %v. Only this identity's video records are held back; the rest of the hour is sent",
 				r.ID, ws, r.AuthID, r.ResourceID, r.ModelID, err)
-			// Hold this rollup's own record by its stored id. Only an
-			// unstamped row (no stored id) holds its whole identity.
-			if r.UsageID != "" {
-				heldID[r.UsageID] = true
-			} else {
-				hold[heldKey{meteredusage.KindVideo, r.identity}] = true
-			}
+			// Hold the whole identity, tombstones or not: while one of its
+			// rollups cannot be sent, the manager keeps every record of it.
+			// Releasing a regrained predecessor here would leave the grain
+			// with no record at all until a person fixes the rollup.
+			hold[heldKey{meteredusage.KindVideo, r.identity}] = true
 			plan.heldBack++
 			continue
 		}
 		plan.req.VideoRecords = append(plan.req.VideoRecords, rec)
-		plan.liveVideo = append(plan.liveVideo, rec.UsageID)
+		if tombstones[rec.UsageID] {
+			plan.staleTombstones++
+			p.log.Error.Printf("token-push: %s: video record %s is live but has a tombstone; it was restored outside the rater without deleting its tombstone, which would release it if it were lost again. Delete that row from video_reconcile_deletion (docs/billing-reconciliation.md)",
+				ws, rec.UsageID)
+		}
 		plan.sent = append(plan.sent, pushedRow{UsageID: rec.UsageID, Kind: meteredusage.KindVideo, identity: r.identity})
 		live[rec.UsageID] = true
 	}
@@ -427,7 +425,7 @@ func (p *pusher) pushWindows(ctx context.Context, windows []time.Time, now time.
 	// never removed. (Every rollup legitimately removed leaves tombstones.)
 	videoWiped := !hasVideo && untombstonedVideo
 	if videoWiped {
-		p.log.Error.Printf("token-push: no video usage is recorded although video usage was sent before (pushed_usage has video rows); the video tables look wiped. Every sent video record without a tombstone is held in the hours this run sends, and the run exits 1. Restore the database")
+		p.log.Error.Printf("token-push: no video usage is recorded although the manager holds video records the rater never removed (pushed_usage video rows with no tombstone); the video tables look wiped. In the hours this run sends, those records are held; the run exits 1. Restore the database")
 	}
 	if !hasRated && everPushed {
 		// Usage was sent before and rated_usage is empty now: rated_usage is never
@@ -558,7 +556,7 @@ send:
 		heldBack += plan.heldBack
 		// Counted only for an hour that is sent: a parked hour rebuilt by the
 		// recheck rotation and skipped above does not repeat the alarm.
-		if plan.videoVanished {
+		if plan.videoVanished || plan.staleTombstones > 0 {
 			videoVanished++
 		}
 		if err := meteredusage.Validate(plan.req); err != nil {
@@ -578,11 +576,6 @@ send:
 		}
 		if err := p.store.RecordIntent(ctx, h, plan.sent); err != nil {
 			p.log.Error.Printf("token-push: record intent for %s: %v (not sent)", plan.req.WindowStart, err)
-			failed++
-			continue
-		}
-		if err := p.store.ClearSupersededTombstones(ctx, h, plan.liveVideo, plan.videoReadAt); err != nil {
-			p.log.Error.Printf("token-push: %s: %v (not sent)", plan.req.WindowStart, err)
 			failed++
 			continue
 		}

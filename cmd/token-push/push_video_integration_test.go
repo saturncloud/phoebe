@@ -213,11 +213,22 @@ func TestIntegration_AVanishedVideoRecordIsDeletedOnlyWhenTheRaterRemovedIt(t *t
 		rate(t, db, h, h.Add(time.Hour))
 		hours, err := (pgStore{db: db}).ResolvedHours(context.Background(), time.Now().UTC().Truncate(time.Hour))
 		if err != nil || len(hours) != 1 || !hours[0].Equal(h) {
-			t.Fatalf("hours to re-send %v (err %v), want [%s]: its record %s was tombstoned after its last push", hours, err, h, id)
+			t.Fatalf("hours to re-send %v (err %v), want [%s]: the manager holds %s, which the rater removed", hours, err, h, id)
 		}
-		_ = m
+		// A scheduled run that does not list the hour in its window still
+		// sends it, the manager deletes the record, and the hour drops out.
+		p := newPusher(pgStore{db: db}, m.client(t))
+		if code := p.pushWindows(context.Background(), nil, time.Now().UTC(), false); code != exitOK {
+			t.Fatalf("exit %d", code)
+		}
+		if req := lastRequest(t, m); req.WindowStart != meteredusage.FormatWindowStart(h) || len(req.VideoRecords) != 0 || len(req.Held) != 0 {
+			t.Fatalf("last request %s with %d video records, held %v; want %s re-sent with video empty", req.WindowStart, len(req.VideoRecords), req.Held, h)
+		}
+		if hours, err := (pgStore{db: db}).ResolvedHours(context.Background(), time.Now().UTC().Truncate(time.Hour)); err != nil || len(hours) != 0 {
+			t.Fatalf("hours to re-send after the release %v (err %v), want none", hours, err)
+		}
 	})
-	t.Run("restored outside the rater, sent again, then lost again: held", func(t *testing.T) {
+	t.Run("restored by the runbook, sent again, then lost again: held", func(t *testing.T) {
 		db, h, m, id := setup(t, "phoebe_push_video_restored_it")
 		// The rater removes it (tombstone), the manager deletes it.
 		if _, err := db.Exec(`CREATE TABLE saved AS SELECT * FROM rated_video_usage`); err != nil {
@@ -230,8 +241,12 @@ func TestIntegration_AVanishedVideoRecordIsDeletedOnlyWhenTheRaterRemovedIt(t *t
 		if code := push(t, db, m, h); code != exitOK {
 			t.Fatalf("release push: exit %d", code)
 		}
-		// Restored by hand (the tombstone stays), and sent again.
+		// Restored by hand, deleting its tombstone as the runbook says, and
+		// sent again.
 		if _, err := db.Exec(`INSERT INTO rated_video_usage SELECT * FROM saved`); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := db.Exec(`DELETE FROM video_reconcile_deletion WHERE usage_id IN (SELECT usage_id FROM saved)`); err != nil {
 			t.Fatal(err)
 		}
 		if code := push(t, db, m, h); code != exitOK || len(lastRequest(t, m).VideoRecords) != 1 {
