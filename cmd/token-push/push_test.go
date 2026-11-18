@@ -12,6 +12,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 	"sync"
 	"testing"
@@ -73,10 +74,12 @@ type fakeStore struct {
 	noRated       bool // rated_usage empty, parked_usage not
 	everPushed    bool
 	everPushedErr error
-	unsent        []time.Time
-	unsentLimit   int // the limit the last UnsentHours call was given
-	preConnN      int
-	preConnOldest time.Time
+	unsent        []time.Time // candidates after the floor; the fake drops accepted and parked ones
+	unsentLimit   int         // the limit the last UnsentHours call was given
+	backfill      []time.Time // candidates before the floor; same filtering
+	backfillLimit int         // the limit the last BackfillHours call was given (0: not called)
+	refused       map[time.Time]*fakeRefused
+	checkSeq      int
 	rollups       map[time.Time][]rollupRow
 	parked        map[time.Time][]identity
 	pushed        map[time.Time][]pushedRow
@@ -86,9 +89,38 @@ type fakeStore struct {
 	autoFloor     *time.Time
 }
 
+// fakeRefused is one refused_hour row.
+type fakeRefused struct {
+	status   int
+	message  string
+	sha      string
+	refusals int
+	checked  int // order of the last check; lower is checked longer ago
+}
+
 func newFake() *fakeStore {
 	return &fakeStore{rollups: map[time.Time][]rollupRow{}, parked: map[time.Time][]identity{},
-		pushed: map[time.Time][]pushedRow{}, accepted: map[time.Time]int{}, sentBefore: map[time.Time]bool{}}
+		pushed: map[time.Time][]pushedRow{}, accepted: map[time.Time]int{}, sentBefore: map[time.Time]bool{},
+		refused: map[time.Time]*fakeRefused{}}
+}
+
+// eligible mirrors the SQL: never accepted and not parked.
+func (f *fakeStore) eligible(h time.Time) bool {
+	return !f.sentBefore[h] && f.accepted[h] == 0 && f.refused[h] == nil
+}
+
+func (f *fakeStore) backfillCandidates() []time.Time {
+	if f.autoFloor == nil {
+		return nil
+	}
+	var out []time.Time
+	for _, h := range f.backfill {
+		if h.Before(*f.autoFloor) && f.eligible(h) {
+			out = append(out, h)
+		}
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].Before(out[j]) })
+	return out
 }
 
 func (f *fakeStore) UsagePresent(context.Context) (bool, bool, error) {
@@ -119,17 +151,63 @@ func (f *fakeStore) HourEverSent(_ context.Context, h time.Time) (bool, error) {
 	return f.sentBefore[h] || f.accepted[h] > 0 || len(f.pushed[h]) > 0, nil
 }
 func (f *fakeStore) PreConnectionHours(context.Context) (int, time.Time, error) {
-	return f.preConnN, f.preConnOldest, nil
+	c := f.backfillCandidates()
+	if len(c) == 0 {
+		return 0, time.Time{}, nil
+	}
+	return len(c), c[0], nil
+}
+func (f *fakeStore) BackfillHours(_ context.Context, limit int) ([]time.Time, error) {
+	f.backfillLimit = limit
+	c := f.backfillCandidates()
+	if len(c) > limit {
+		c = c[:limit]
+	}
+	return c, nil
 }
 func (f *fakeStore) UnsentHours(_ context.Context, before time.Time, limit int) ([]time.Time, error) {
 	f.unsentLimit = limit
 	var out []time.Time
 	for _, h := range f.unsent {
-		if h.Before(before) && len(out) < limit {
+		if h.Before(before) && f.eligible(h) && len(out) < limit {
 			out = append(out, h)
 		}
 	}
 	return out, nil
+}
+func (f *fakeStore) RefusedHours(context.Context) ([]refusedHour, error) {
+	var out []refusedHour
+	for h, r := range f.refused {
+		out = append(out, refusedHour{Hour: h, PayloadSHA256: r.sha})
+	}
+	sort.Slice(out, func(i, j int) bool {
+		ci, cj := f.refused[out[i].Hour].checked, f.refused[out[j].Hour].checked
+		if ci != cj {
+			return ci < cj
+		}
+		return out[i].Hour.Before(out[j].Hour)
+	})
+	return out, nil
+}
+func (f *fakeStore) RecordRefused(_ context.Context, h time.Time, status int, message, sha string) error {
+	f.checkSeq++
+	r := f.refused[h]
+	if r == nil {
+		r = &fakeRefused{}
+		f.refused[h] = r
+	}
+	r.status, r.message, r.sha, r.checked = status, message, sha, f.checkSeq
+	r.refusals++
+	return nil
+}
+func (f *fakeStore) MarkRefusedChecked(_ context.Context, hours []time.Time) error {
+	for _, h := range hours {
+		f.checkSeq++
+		if r := f.refused[h]; r != nil {
+			r.checked = f.checkSeq
+		}
+	}
+	return nil
 }
 func (f *fakeStore) RecordIntent(_ context.Context, h time.Time, rows []pushedRow) error {
 	seen := map[string]bool{}
@@ -146,6 +224,7 @@ func (f *fakeStore) RecordIntent(_ context.Context, h time.Time, rows []pushedRo
 func (f *fakeStore) RecordAccepted(_ context.Context, h time.Time, rows []pushedRow, setAutoFloor bool) error {
 	f.pushed[h] = append([]pushedRow(nil), rows...)
 	f.accepted[h]++
+	delete(f.refused, h)
 	if setAutoFloor && f.autoFloor == nil {
 		hh := h
 		f.autoFloor = &hh
@@ -166,6 +245,7 @@ var now = win.Add(3 * time.Hour)
 type recordingManager struct {
 	mu       sync.Mutex
 	statuses []int
+	errBody  string // the body of a non-200 answer; default the manager's validation shape
 	bodies   [][]byte
 	auth     []string
 	paths    []string
@@ -189,7 +269,11 @@ func (m *recordingManager) server(t *testing.T) *httptest.Server {
 		m.mu.Unlock()
 		if status != http.StatusOK {
 			w.WriteHeader(status)
-			_, _ = w.Write([]byte(`{"error":"stub","path":"records[0]"}`))
+			body := m.errBody
+			if body == "" {
+				body = `{"error":"stub","path":"records[0]"}`
+			}
+			_, _ = w.Write([]byte(body))
 			return
 		}
 		var req meteredusage.Request
@@ -686,26 +770,5 @@ func TestPushWindows_OnlyAScheduledRunSetsTheAutoResendFloor(t *testing.T) {
 	}
 	if f.autoFloor == nil || !f.autoFloor.Equal(win) {
 		t.Fatalf("floor %v after a scheduled run, want %s", f.autoFloor, win)
-	}
-}
-
-// Usage before the automatic re-send floor is never sent by a scheduled run;
-// each run says how much there is and how to send it.
-func TestPushWindows_LogsUsageFromBeforeTheFirstAcceptedPush(t *testing.T) {
-	f := fixtureStore()
-	f.everPushed = true
-	f.preConnN = 3
-	f.preConnOldest = win.Add(-100 * time.Hour)
-	var buf bytes.Buffer
-	p := newPusher(f, (&recordingManager{}).client(t))
-	p.log = logging.New(logging.INFO)
-	p.log.Info.SetOutput(&buf)
-	if code := p.pushWindows(context.Background(), []time.Time{win}, now, false); code != exitOK {
-		t.Fatalf("exit %d", code)
-	}
-	want := "3 hour(s) of usage from before this install's first accepted push (oldest " + f.preConnOldest.Format(time.RFC3339) +
-		") are not sent automatically; send them with -since/-until (90 days per run at most)"
-	if n := strings.Count(buf.String(), want); n != 1 {
-		t.Fatalf("logged the pre-connection line %d times, want once:\n%s", n, buf.String())
 	}
 }

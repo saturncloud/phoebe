@@ -252,12 +252,12 @@ func TestIntegration_ResolvingTheConflictSendsTheParkedHour(t *testing.T) {
 	}
 }
 
-// Missed hours are re-sent; usage from before the install was connected is not.
-// h0 has usage but comes before the first hour a scheduled run had accepted
-// (the install was not connected yet), h1 is that first accepted hour, h2 has
-// usage and its push failed (the manager answered 503 until the retries ran
-// out), h3 is the current window.
-func TestIntegration_AnHourNeverAcceptedAfterTheFirstPushIsReSentButNotEarlierUsage(t *testing.T) {
+// Missed hours are re-sent, and usage from before the install was connected
+// is back-filled after them. h0 has usage but comes before the first hour a
+// scheduled run had accepted (the install was not connected yet), h1 is that
+// first accepted hour, h2 has usage and its push failed (the manager answered
+// 503 until the retries ran out), h3 is the current window.
+func TestIntegration_AnHourNeverAcceptedAfterTheFirstPushIsReSentThenEarlierUsage(t *testing.T) {
 	db := itDB(t, "phoebe_push_unsent_it")
 	now := time.Now().UTC().Truncate(time.Hour)
 	h0, h1, h2, h3 := now.Add(-100*time.Hour), now.Add(-80*time.Hour), now.Add(-60*time.Hour), now.Add(-time.Hour)
@@ -299,19 +299,24 @@ func TestIntegration_AnHourNeverAcceptedAfterTheFirstPushIsReSentButNotEarlierUs
 		t.Fatalf("exit %d", code)
 	}
 	sent := windowStarts(t, m2)
-	// The window first, then the missed hour.
-	want := []string{meteredusage.FormatWindowStart(h3), meteredusage.FormatWindowStart(h2)}
+	// The window first, then the missed hour, then the back-fill.
+	want := []string{meteredusage.FormatWindowStart(h3), meteredusage.FormatWindowStart(h2), meteredusage.FormatWindowStart(h0)}
 	if strings.Join(sent, ",") != strings.Join(want, ",") {
 		t.Fatalf("sent %v, want %v", sent, want)
 	}
 	if got, _ := store.UnsentHours(context.Background(), now, 10); len(got) != 0 {
 		t.Fatalf("unsent after re-send %v, want none", got)
 	}
+	if n, _, err := store.PreConnectionHours(context.Background()); err != nil || n != 0 {
+		t.Fatalf("PreConnectionHours = %d, %v after the back-fill, want 0", n, err)
+	}
 }
 
 // An operator's -since/-until backfill sends old hours, but must not lower the
-// automatic re-send floor: if it did, every later scheduled run would send, on
-// its own, the pre-connection usage between the backfilled hour and the floor.
+// automatic re-send floor. The floor is the first hour a scheduled run had
+// accepted: missed hours after it go first, the back-fill of the usage before
+// it shares what is left of the per-run cap. An explicit run moving it would
+// turn pre-connection usage into missed hours ahead of real outages.
 func TestExplicitBackfillDoesNotLowerAutoResendFloor(t *testing.T) {
 	db := itDB(t, "phoebe_push_floor_it")
 	now := time.Now().UTC().Truncate(time.Hour)
@@ -342,6 +347,15 @@ func TestExplicitBackfillDoesNotLowerAutoResendFloor(t *testing.T) {
 		t.Fatalf("auto_floor %v, want %s", f, hFirst)
 	}
 
+	// hBetween is pre-connection usage: not a missed hour after the floor but
+	// the back-fill's; the explicitly sent hBackfill was accepted and is not.
+	if got, err := store.UnsentHours(context.Background(), now, 10); err != nil || len(got) != 0 {
+		t.Fatalf("unsent %v err %v, want none (hBetween is before the floor)", got, err)
+	}
+	if got, err := store.BackfillHours(context.Background(), 10); err != nil || len(got) != 1 || !got[0].Equal(hBetween) {
+		t.Fatalf("back-fill %v err %v, want [%s]", got, err, hBetween)
+	}
+
 	// Another explicit backfill of an older hour leaves the floor where it is.
 	if code := pushExplicit(t, db, m, hBackfill); code != exitOK {
 		t.Fatalf("second explicit run: exit %d", code)
@@ -349,10 +363,10 @@ func TestExplicitBackfillDoesNotLowerAutoResendFloor(t *testing.T) {
 	if f := autoFloor(t, db); f == nil || !f.Equal(hFirst) {
 		t.Fatalf("auto_floor %v after a backfill, want %s still", f, hFirst)
 	}
-
-	// hBetween is pre-connection usage: a scheduled run never sends it.
-	if got, err := store.UnsentHours(context.Background(), now, 10); err != nil || len(got) != 0 {
-		t.Fatalf("unsent %v err %v, want none (hBetween is before the floor)", got, err)
+	// That run also sent the pending back-fill hour (every run does); nothing
+	// before the floor is left, and the later scheduled run sends the window.
+	if n, _, err := store.PreConnectionHours(context.Background()); err != nil || n != 0 {
+		t.Fatalf("PreConnectionHours = %d, %v; want 0", n, err)
 	}
 	m2 := &recordingManager{}
 	if code := push(t, db, m2, hFirst); code != exitOK {
@@ -360,10 +374,6 @@ func TestExplicitBackfillDoesNotLowerAutoResendFloor(t *testing.T) {
 	}
 	if sent := windowStarts(t, m2); len(sent) != 1 || sent[0] != meteredusage.FormatWindowStart(hFirst) {
 		t.Fatalf("later scheduled run sent %v, want only %s", sent, meteredusage.FormatWindowStart(hFirst))
-	}
-	// It is reported instead; the backfilled hour is not, it was accepted.
-	if n, oldest, err := store.PreConnectionHours(context.Background()); err != nil || n != 1 || !oldest.Equal(hBetween) {
-		t.Fatalf("PreConnectionHours = %d, %s, %v; want 1, %s", n, oldest, err, hBetween)
 	}
 }
 
@@ -418,5 +428,187 @@ func TestIntegration_UnsentHoursIsCappedAndOldestFirst(t *testing.T) {
 		if want := floor.Add(time.Duration(i+1) * time.Hour); !h.Equal(want) {
 			t.Fatalf("unsent[%d] = %s, want %s (oldest first)", i, h, want)
 		}
+	}
+}
+
+func refusedCount(t *testing.T, db *sql.DB) int {
+	t.Helper()
+	var n int
+	if err := db.QueryRow(`SELECT count(*) FROM refused_hour`).Scan(&n); err != nil {
+		t.Fatal(err)
+	}
+	return n
+}
+
+// 170 hours the manager refused for their content (400) and one newer hour
+// whose push was never accepted: the newer hour is sent in the next run. The
+// refused hours are parked, so they are not in the unsent list and cannot use
+// up the 168-hour cap, and none is sent again while its usage is unchanged.
+func TestIntegration_RefusedHoursDoNotStarveNewerMissedHours(t *testing.T) {
+	db := itDB(t, "phoebe_push_refused_starve_it")
+	now := time.Now().UTC().Truncate(time.Hour)
+	floor := now.Add(-200 * time.Hour)
+	if _, err := db.Exec(`INSERT INTO token_push_state (auto_floor) VALUES ($1)`, floor); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(`INSERT INTO pushed_hour (window_start, pushed_at) VALUES ($1, now())`, floor); err != nil {
+		t.Fatal(err)
+	}
+	for i := 1; i <= 170; i++ {
+		event(t, db, floor.Add(time.Duration(i)*time.Hour+time.Minute), itRes1, itOrg1)
+	}
+	rate(t, db, floor, now)
+
+	refusing := &recordingManager{statuses: []int{400}}
+	for run := 0; run < 2; run++ { // 168 hours, then the last 2
+		if code := push(t, db, refusing); code != exitRejected {
+			t.Fatalf("refusing run %d: exit %d, want exitRejected", run, code)
+		}
+	}
+	if len(refusing.bodies) != 170 || refusedCount(t, db) != 170 {
+		t.Fatalf("%d requests, %d parked; want each of the 170 hours sent once and parked", len(refusing.bodies), refusedCount(t, db))
+	}
+
+	newer := floor.Add(180 * time.Hour)
+	event(t, db, newer.Add(time.Minute), itRes1, itOrg1)
+	rate(t, db, newer, newer.Add(time.Hour))
+	got, err := pgStore{db: db}.UnsentHours(context.Background(), now, maxUnsentHoursPerRun)
+	if err != nil || len(got) != 1 || !got[0].Equal(newer) {
+		t.Fatalf("unsent %v err %v, want only [%s]", got, err, newer)
+	}
+	var runStart time.Time
+	if err := db.QueryRow(`SELECT clock_timestamp()`).Scan(&runStart); err != nil {
+		t.Fatal(err)
+	}
+	m := &recordingManager{}
+	if code := push(t, db, m); code != exitOK {
+		t.Fatalf("exit %d", code)
+	}
+	if sent := windowStarts(t, m); len(sent) != 1 || sent[0] != meteredusage.FormatWindowStart(newer) {
+		t.Fatalf("sent %v, want only the newer missed hour %s", sent, meteredusage.FormatWindowStart(newer))
+	}
+	var checked int
+	if err := db.QueryRow(`SELECT count(*) FROM refused_hour WHERE checked_at >= $1`, runStart).Scan(&checked); err != nil {
+		t.Fatal(err)
+	}
+	if checked != maxParkedRechecksPerRun {
+		t.Fatalf("%d parked hours re-checked, want %d (bounded per run)", checked, maxParkedRechecksPerRun)
+	}
+}
+
+// The refused_hour row records the refusal (status, body, hash of the sent
+// body, count, first and last refusal); a changed payload refused again
+// updates it; an accepted push of the hour deletes it.
+func TestIntegration_RefusedHourRecordsTheRefusalAndAcceptanceUnparksIt(t *testing.T) {
+	db := itDB(t, "phoebe_push_refused_row_it")
+	h := time.Now().UTC().Truncate(time.Hour).Add(-time.Hour)
+	event(t, db, h.Add(time.Minute), itRes1, itOrg1)
+	rate(t, db, h, h.Add(time.Hour))
+
+	refusing := &recordingManager{statuses: []int{400}}
+	if code := push(t, db, refusing, h); code != exitRejected {
+		t.Fatalf("exit %d", code)
+	}
+	var status, refusals int
+	var message, sha string
+	var first, last time.Time
+	row := `SELECT status, message, payload_sha256, refusals, first_refused_at, last_refused_at FROM refused_hour WHERE window_start = $1`
+	if err := db.QueryRow(row, h).Scan(&status, &message, &sha, &refusals, &first, &last); err != nil {
+		t.Fatal(err)
+	}
+	if status != 400 || !strings.Contains(message, `"path":"records[0]"`) || refusals != 1 || sha != bodySHA(refusing.bodies[0]) {
+		t.Fatalf("row status=%d message=%q refusals=%d sha=%s, want 400, the body, 1, %s", status, message, refusals, sha, bodySHA(refusing.bodies[0]))
+	}
+	if code := push(t, db, refusing, h); code != exitOK || len(refusing.bodies) != 1 {
+		t.Fatalf("unchanged: exit %d, %d requests; want 0 and 1", code, len(refusing.bodies))
+	}
+
+	event(t, db, h.Add(2*time.Minute), itRes1, itOrg1) // a late event changes the hour
+	rate(t, db, h, h.Add(time.Hour))
+	if code := push(t, db, refusing, h); code != exitRejected || len(refusing.bodies) != 2 {
+		t.Fatalf("changed: exit %d, %d requests; want 3 and 2", code, len(refusing.bodies))
+	}
+	var first2 time.Time
+	if err := db.QueryRow(row, h).Scan(&status, &message, &sha, &refusals, &first2, &last); err != nil {
+		t.Fatal(err)
+	}
+	if refusals != 2 || !first2.Equal(first) || sha != bodySHA(refusing.bodies[1]) {
+		t.Fatalf("refusals=%d first %s (was %s) sha=%s; want 2, first kept, the second body's hash", refusals, first2, first, sha)
+	}
+
+	event(t, db, h.Add(3*time.Minute), itRes1, itOrg1)
+	rate(t, db, h, h.Add(time.Hour))
+	if code := push(t, db, &recordingManager{}, h); code != exitOK {
+		t.Fatalf("accepted: exit %d", code)
+	}
+	if n := refusedCount(t, db); n != 0 {
+		t.Fatalf("%d refused_hour rows after the hour was accepted, want 0", n)
+	}
+}
+
+// The back-fill query: nothing before the first scheduled acceptance sets the
+// floor; then every hour before it with usage that was never accepted (an
+// hour an operator's -since/-until run sent is skipped) and is not parked,
+// oldest first; the scheduled runs send them after the window, once.
+func TestIntegration_BackfillSendsPreConnectionUsageOnceSkippingAcceptedAndParkedHours(t *testing.T) {
+	db := itDB(t, "phoebe_push_backfill_it")
+	now := time.Now().UTC().Truncate(time.Hour)
+	p1, p2, p3, p4, hc := now.Add(-500*time.Hour), now.Add(-400*time.Hour), now.Add(-300*time.Hour), now.Add(-200*time.Hour), now.Add(-2*time.Hour)
+	for _, h := range []time.Time{p1, p2, p3, p4, hc} {
+		event(t, db, h.Add(time.Minute), itRes1, itOrg1)
+	}
+	rate(t, db, p1, now)
+	store := pgStore{db: db}
+	ctx := context.Background()
+
+	if got, err := store.BackfillHours(ctx, 10); err != nil || len(got) != 0 {
+		t.Fatalf("before any scheduled acceptance: back-fill %v err %v, want none", got, err)
+	}
+	m := &recordingManager{}
+	if code := pushExplicit(t, db, m, p2); code != exitOK { // an operator sent p2
+		t.Fatalf("explicit run: exit %d", code)
+	}
+	if code := push(t, db, m, hc); code != exitOK { // the first scheduled acceptance
+		t.Fatalf("first scheduled run: exit %d", code)
+	}
+	if f := autoFloor(t, db); f == nil || !f.Equal(hc) {
+		t.Fatalf("auto_floor %v, want %s", f, hc)
+	}
+	if err := store.RecordRefused(ctx, p4, 400, `{"error":"x","path":"records[0]"}`, strings.Repeat("0", 64)); err != nil {
+		t.Fatal(err)
+	}
+	got, err := store.BackfillHours(ctx, 10)
+	if err != nil || len(got) != 2 || !got[0].Equal(p1) || !got[1].Equal(p3) {
+		t.Fatalf("back-fill %v err %v, want [%s %s] (p2 accepted, p4 parked)", got, err, p1, p3)
+	}
+	if got, _ := store.BackfillHours(ctx, 1); len(got) != 1 || !got[0].Equal(p1) {
+		t.Fatalf("back-fill with limit 1 %v, want [%s]", got, p1)
+	}
+	if n, oldest, err := store.PreConnectionHours(ctx); err != nil || n != 2 || !oldest.Equal(p1) {
+		t.Fatalf("PreConnectionHours = %d, %s, %v; want 2, %s", n, oldest, err, p1)
+	}
+
+	m2 := &recordingManager{}
+	if code := push(t, db, m2, hc); code != exitOK {
+		t.Fatalf("back-fill run: exit %d", code)
+	}
+	// p4 is parked with a hash that no longer matches its payload, so the
+	// bounded re-check sends it last.
+	want := []string{meteredusage.FormatWindowStart(hc), meteredusage.FormatWindowStart(p1), meteredusage.FormatWindowStart(p3), meteredusage.FormatWindowStart(p4)}
+	if sent := windowStarts(t, m2); strings.Join(sent, ",") != strings.Join(want, ",") {
+		t.Fatalf("sent %v, want %v", sent, want)
+	}
+	if n, _, err := store.PreConnectionHours(ctx); err != nil || n != 0 {
+		t.Fatalf("PreConnectionHours = %d, %v after the back-fill, want 0", n, err)
+	}
+	m3 := &recordingManager{}
+	if code := push(t, db, m3, hc); code != exitOK {
+		t.Fatalf("next run: exit %d", code)
+	}
+	if sent := windowStarts(t, m3); len(sent) != 1 || sent[0] != meteredusage.FormatWindowStart(hc) {
+		t.Fatalf("next run sent %v, want only %s", sent, meteredusage.FormatWindowStart(hc))
+	}
+	if f := autoFloor(t, db); !f.Equal(hc) {
+		t.Fatalf("auto_floor moved to %s", f)
 	}
 }
