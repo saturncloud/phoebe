@@ -312,5 +312,5 @@ func (a *Aggregator) logVideo(w string, v VideoAggregateResult, windowExplicit b
 	if v.ParkedResolved > 0 {
 		a.log.Info.Printf("rating: window %s resolved %d parked video identity-hour(s); token-push re-sends their hours", w, v.ParkedResolved)
 	}
-	a.log.Info.Printf("rating: window %s aggregated %d video jobs into %d video rollups; %d video identity-hour(s) parked", w, v.EventsAggregated, v.RollupsWritten, v.ParkedWritten)
+	a.log.Info.Printf("rating: window %s aggregated %d video jobs into %d video rollups; %d video identity-hour(s) parked; %d video usage_id(s) tombstoned as removed", w, v.EventsAggregated, v.RollupsWritten, v.ParkedWritten, v.TombstonesWritten)
 }

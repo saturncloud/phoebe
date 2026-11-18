@@ -425,8 +425,28 @@ func TestIntegration_Migration0017DownRefusesWhileVideoUsageIsParkedOrUnsent(t *
 	if _, err := db.Exec(down); err == nil || !strings.Contains(err.Error(), "never accepted") {
 		t.Fatalf("down with one of two grains accepted: err = %v, want the refusal", err)
 	}
-	// Every grain accepted with the hour's push.
+	// Accepted with the hour's push: one grain's own id plus some OTHER id of
+	// the same identity (a held older record). The other grain's id is
+	// missing, and a per-identity count would have let it pass.
+	exec(t, db, `INSERT INTO pushed_usage (window_start, usage_id, kind, auth_id, owner_type, owner_id, resource_id,
+		model_id, serving_mode, pushed_at)
+		SELECT window_start, repeat('f', 64), 'video', auth_id, owner_type, owner_id, resource_id, model_id,
+		       serving_mode, (SELECT pushed_at FROM pushed_hour)
+		  FROM rated_video_usage ORDER BY id LIMIT 1`)
+	if _, err := db.Exec(down); err == nil || !strings.Contains(err.Error(), "never accepted") {
+		t.Fatalf("down with a sibling id standing in for a grain: err = %v, want the refusal", err)
+	}
+	// Every grain accepted with the hour's push, but the stand-in id is a
+	// record the rater removed (tombstone) that the manager still holds.
 	insertVideoIDs("(SELECT pushed_at FROM pushed_hour)", "ALL")
+	exec(t, db, `INSERT INTO video_reconcile_deletion (window_start, usage_id, auth_id, owner_type, owner_id,
+		resource_id, model_id, serving_mode, reason)
+		SELECT window_start, usage_id, auth_id, owner_type, owner_id, resource_id, model_id, serving_mode, 'reconcile'
+		  FROM pushed_usage WHERE usage_id = repeat('f', 64)`)
+	if _, err := db.Exec(down); err == nil || !strings.Contains(err.Error(), "still held by the manager") {
+		t.Fatalf("down with a removed record still at the manager: err = %v, want the refusal", err)
+	}
+	exec(t, db, `DELETE FROM pushed_usage WHERE usage_id = repeat('f', 64)`)
 	exec(t, db, down)
 	var left int
 	if err := db.QueryRow(`SELECT COUNT(*) FROM pushed_usage`).Scan(&left); err != nil || left != 1 {
@@ -601,10 +621,11 @@ func TestIntegration_UnratedOutOfReachVideoIsCountedPerIdentity(t *testing.T) {
 	}
 }
 
-// TOMBSTONES, both directions at the rater: every rollup carries its wire
-// usage_id, and every usage_id the rater removes gets a tombstone in the same
-// run (reconcile, parked, regrained), cleared when the id is live again. A
-// rollup lost outside the rater leaves none.
+// TOMBSTONES at the rater: every rollup carries its wire usage_id, and every
+// usage_id the rater removes gets a tombstone in the same run (reconcile,
+// parked, regrained), cleared when the id is live again. The other direction
+// (a rollup lost outside the rater leaves none, and token-push holds it) is
+// TestIntegration_AVanishedVideoRecordIsDeletedOnlyWhenTheRaterRemovedIt.
 func TestIntegration_TheRaterTombstonesEveryVideoUsageIDItRemoves(t *testing.T) {
 	db := openRatingSchema(t, "phoebe_video_tombstone_it")
 	tombstones := func() map[string]string {
@@ -667,21 +688,44 @@ func TestIntegration_TheRaterTombstonesEveryVideoUsageIDItRemoves(t *testing.T) 
 		t.Fatalf("tombstones %v; want %s tombstoned as parked", ts, first)
 	}
 
-	// Reconcile: the jobs vanish.
+	// The park resolves: the rollup is back with its old id, whose tombstone
+	// is cleared (a tombstone never releases an id the rater produces).
 	exec(t, db, `DELETE FROM video_billing_event WHERE job_id = 'video_t2'`)
-	vaggregate(t, db, itHour, itHour.Add(time.Hour)) // resolves the park; the rollup is back
+	vaggregate(t, db, itHour, itHour.Add(time.Hour))
+	if ts := tombstones(); stamped() != first || ts[first] != "" {
+		t.Fatalf("tombstones %v; want %s cleared once its rollup is back", ts, first)
+	}
+
+	// Reconcile: the jobs vanish.
 	exec(t, db, `DELETE FROM video_billing_event`)
 	vaggregate(t, db, itHour, itHour.Add(time.Hour))
 	if ts := tombstones(); ts[first] != "reconcile" {
 		t.Fatalf("tombstones %v; want %s tombstoned as reconcile", ts, first)
 	}
+}
 
-	// Lost: a rollup deleted outside the rater leaves no tombstone.
-	exec(t, db, `DELETE FROM video_reconcile_deletion`)
-	vseed(t, db, vrow(func(r *vbRow) { r.id = "video_t3" }))
-	vaggregate(t, db, itHour, itHour.Add(time.Hour))
-	exec(t, db, `DELETE FROM rated_video_usage`)
-	if ts := tombstones(); len(ts) != 0 {
-		t.Fatalf("tombstones %v after a rollup was deleted outside the rater, want none", ts)
+// A database that applied 0017 before usage_id and the tombstones existed
+// (dev installs before #143): 0017 down still runs its guard (it adds the
+// column first; the unstamped rows refuse), and 0017 up applied again by hand
+// brings the schema up to date.
+func TestIntegration_Migration0017OnADatabaseFromBeforeTheTombstones(t *testing.T) {
+	db := openRatingSchema(t, "phoebe_video_m0017_old_it")
+	exec(t, db, `DROP TABLE video_reconcile_deletion`)
+	exec(t, db, `DROP INDEX rated_video_usage_usage_id_ix`)
+	exec(t, db, `ALTER TABLE rated_video_usage DROP COLUMN usage_id`)
+	exec(t, db, `INSERT INTO rated_video_usage (id, auth_id, owner_type, owner_id, resource_id, org_id, model_id,
+		serving_mode, base_model, task, resolution, region, window_start, window_end, output_seconds, output_frames,
+		request_count, gpu_seconds, event_count)
+		VALUES (repeat('a', 32), 'a', '', '', 'r', 'o', 'm', 'dedicated', '', 't2v', '720p', '', now(), now(), 1, 1, 1, 1, 1)`)
+	if _, err := db.Exec(readMigration(t, "0017_rated_video_usage.down.sql")); err == nil || !strings.Contains(err.Error(), "never accepted") {
+		t.Fatalf("down on the old schema: err = %v, want the guard's refusal (not a missing column)", err)
+	}
+	exec(t, db, readMigration(t, "0017_rated_video_usage.up.sql"))
+	var n int
+	if err := db.QueryRow(`SELECT COUNT(*) FROM video_reconcile_deletion`).Scan(&n); err != nil {
+		t.Fatalf("tombstone table after re-applying up: %v", err)
+	}
+	if err := db.QueryRow(`SELECT COUNT(*) FROM rated_video_usage WHERE usage_id IS NULL`).Scan(&n); err != nil || n != 1 {
+		t.Fatalf("unstamped rows %d (err %v), want the old row with usage_id NULL", n, err)
 	}
 }

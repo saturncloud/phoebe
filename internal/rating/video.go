@@ -300,10 +300,14 @@ deleted AS (
 ),
 -- TOMBSTONES (0017 video_reconcile_deletion): every deleted rollup's usage_id,
 -- in this statement, so token-push can tell a record the rater removed from
--- one that was lost. A deletion explained by a park is 'parked' (token-push
--- holds the id while the park is unresolved); any other is 'reconcile'. A row
--- never stamped (usage_id NULL) leaves no tombstone, so its record, if sent,
--- is held.
+-- one that was lost. A deletion explained by a park is 'parked' (an audit
+-- label: token-push holds a parked identity's ids by the park, not by the
+-- reason); any other is 'reconcile', including a rollup whose jobs became
+-- owner-conflicted (those park under owner ('', ''), a different identity, so
+-- the record is released and the usage waits in the owner_conflict park).
+-- usage_id IS NULL is defensive: every committed row is stamped (the stamp
+-- runs in this transaction); only rows from a database that applied 0017
+-- before usage_id existed can be NULL, and their records are held.
 tombstoned AS (
     INSERT INTO video_reconcile_deletion (window_start, usage_id, auth_id, owner_type, owner_id,
         resource_id, model_id, serving_mode, reason)
@@ -419,7 +423,11 @@ func aggregateVideoWindow(ctx context.Context, tx *sql.Tx, start, end time.Time)
 }
 
 // stampVideoUsageIDs stores each rollup's wire usage_id in [start, end), in
-// the aggregation's transaction. The id is computed by the same function
+// the aggregation's transaction. INVARIANT at commit: every rollup of the
+// window carries the id of its own fields, and every id the window's rollups
+// carried before and no longer carry has a tombstone: the statement before
+// this tombstones deleted rows, this pass tombstones changed ids. Both run in
+// one transaction, so no reader sees one half. The id is computed by the same function
 // token-push sends with (meteredusage.VideoUsageID), here, once, so the
 // tombstones and 0017 down's guard can match records by id. A rollup whose id
 // changes (the grain kept its row but got a new org_id) leaves a 'regrained'
@@ -434,27 +442,25 @@ func stampVideoUsageIDs(ctx context.Context, tx *sql.Tx, start, end time.Time) (
 		return 0, fmt.Errorf("rating: read video rollups to stamp: %w", err)
 	}
 	type stamp struct {
-		id, old, want string
-		ws            time.Time
-		identity      [6]string
+		id, old, want                                     string
+		ws                                                time.Time
+		auth, ownerType, ownerID, resourceID, model, mode string
 	}
 	var todo []stamp
 	var live []string
 	for rows.Next() {
 		var (
-			s                                    stamp
-			org                                  string
-			a                                    meteredusage.VideoAttributes
-			ownerType, ownerID, resourceID, mode string
+			s   stamp
+			org string
+			a   meteredusage.VideoAttributes
 		)
-		if err := rows.Scan(&s.id, &s.ws, &org, &ownerType, &ownerID, &resourceID,
-			&a.AuthID, &a.ModelID, &mode, &a.BaseModel, &a.Task, &a.Resolution, &a.Region, &s.old); err != nil {
+		if err := rows.Scan(&s.id, &s.ws, &org, &s.ownerType, &s.ownerID, &s.resourceID,
+			&a.AuthID, &a.ModelID, &a.ServingMode, &a.BaseModel, &a.Task, &a.Resolution, &a.Region, &s.old); err != nil {
 			_ = rows.Close()
 			return 0, fmt.Errorf("rating: scan video rollup to stamp: %w", err)
 		}
-		a.ServingMode = mode
-		s.want = meteredusage.VideoUsageID(meteredusage.FormatWindowStart(s.ws), org, ownerType, ownerID, resourceID, a)
-		s.identity = [6]string{a.AuthID, ownerType, ownerID, resourceID, a.ModelID, mode}
+		s.auth, s.model, s.mode = a.AuthID, a.ModelID, a.ServingMode
+		s.want = meteredusage.VideoUsageID(meteredusage.FormatWindowStart(s.ws), org, s.ownerType, s.ownerID, s.resourceID, a)
 		live = append(live, s.want)
 		if s.old != s.want {
 			todo = append(todo, s)
@@ -472,7 +478,7 @@ func stampVideoUsageIDs(ctx context.Context, tx *sql.Tx, start, end time.Time) (
 				owner_type, owner_id, resource_id, model_id, serving_mode, reason)
 				VALUES ($1, $2, $3, $4, $5, $6, $7, $8, 'regrained')
 				ON CONFLICT ON CONSTRAINT video_reconcile_deletion_pk DO UPDATE SET reason = 'regrained', deleted_at = now()`,
-				s.ws, s.old, s.identity[0], s.identity[1], s.identity[2], s.identity[3], s.identity[4], s.identity[5]); err != nil {
+				s.ws, s.old, s.auth, s.ownerType, s.ownerID, s.resourceID, s.model, s.mode); err != nil {
 				return 0, fmt.Errorf("rating: tombstone regrained video usage_id: %w", err)
 			}
 			written++

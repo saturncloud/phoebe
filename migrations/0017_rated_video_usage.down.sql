@@ -9,14 +9,22 @@
 --     so they are equal, while an id recorded only as intent before a send
 --     that failed carries a later pushed_at). Matched per usage_id, so a
 --     sibling grain's id cannot stand in for it. A row with no usage_id was
---     never stamped and refuses.
+--     never stamped and refuses, or
+--   - a video record the rater removed (a tombstone) whose id the manager
+--     still holds (pushed_usage has it).
 -- Stop token-push and the rater first (suspend their CronJobs) so neither
 -- writes these tables; do not run the previous release's token-push before
 -- this has run (migrations/README.md, "Rollout order for migration 0017").
+-- A database that applied 0017 before usage_id existed has no such column:
+-- add it so the guard below runs (every such row is then unstamped and
+-- refuses, as it should: nothing proves the manager accepted it).
+ALTER TABLE rated_video_usage ADD COLUMN IF NOT EXISTS usage_id CHAR(64);
+
 DO $$
 DECLARE
     parked bigint;
     unsent bigint;
+    removed bigint;
 BEGIN
     SELECT COUNT(*) INTO parked FROM parked_video_usage WHERE resolved_at IS NULL;
     IF parked > 0 THEN
@@ -31,6 +39,15 @@ BEGIN
                           AND u.pushed_at >= v.rated_at AND u.pushed_at <= h.pushed_at);
     IF unsent > 0 THEN
         RAISE EXCEPTION '0017 down: % rated_video_usage row(s) were never accepted by the manager since they were last rated. Run token-push over their hours (or export the table) before migrating down.', unsent;
+    END IF;
+    -- A video record the rater removed (tombstone) that the manager still
+    -- holds (its id is still in pushed_usage): the previous release never
+    -- lists video, so the record would stay at the manager for good.
+    SELECT COUNT(*) INTO removed FROM pushed_usage u
+      JOIN video_reconcile_deletion t ON t.window_start = u.window_start AND t.usage_id = u.usage_id
+     WHERE u.kind = 'video';
+    IF removed > 0 THEN
+        RAISE EXCEPTION '0017 down: % video record(s) the rater removed are still held by the manager. Run token-push over their hours so the manager deletes them before migrating down.', removed;
     END IF;
 END $$;
 

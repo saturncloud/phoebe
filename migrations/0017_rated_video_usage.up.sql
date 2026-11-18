@@ -65,7 +65,14 @@ CREATE TABLE IF NOT EXISTS rated_video_usage (
 
 -- token-push reads one hour at a time, and the reconcile deletes by hour.
 CREATE INDEX IF NOT EXISTS rated_video_usage_window_ix ON rated_video_usage (window_start);
-CREATE UNIQUE INDEX IF NOT EXISTS rated_video_usage_usage_id_uq ON rated_video_usage (usage_id);
+-- A database that applied 0017 before usage_id existed (dev installs from
+-- integration-2026.08.01 before #143) gets the column from this statement when
+-- the file is applied again by hand; it is idempotent.
+ALTER TABLE rated_video_usage ADD COLUMN IF NOT EXISTS usage_id CHAR(64);
+-- Not unique: the id is a hash the rater computes from fields it does not
+-- validate, and a duplicate must not stop every rating run (token-push holds
+-- back any record whose id is malformed or does not match its fields).
+CREATE INDEX IF NOT EXISTS rated_video_usage_usage_id_ix ON rated_video_usage (usage_id);
 
 -- video_reconcile_deletion: a TOMBSTONE for every video usage_id the rater
 -- removed on purpose, written in the same transaction as the removal:
@@ -76,7 +83,12 @@ CREATE UNIQUE INDEX IF NOT EXISTS rated_video_usage_usage_id_uq ON rated_video_u
 --   regrained  the rollup's usage_id changed (a new org_id for the same grain)
 -- token-push lets the manager delete a sent video record by absence ONLY when
 -- its id has a tombstone; any other sent id with no rollup was lost, and is
--- held. A tombstone is removed when its id is live again. NEVER pruned.
+-- held. token-push clears a tombstone older than its read when it sends the id
+-- again as a live rollup (a restore outside the rater). A parked identity's ids are held by the
+-- park whatever their tombstone says, so `reason` is an audit label, not read
+-- by token-push. deleted_at is the latest removal. The rater removes a
+-- tombstone when its id is live again. NEVER pruned: one small row per removed record, and
+-- 0017 down reads them to refuse while the manager still holds one.
 CREATE TABLE IF NOT EXISTS video_reconcile_deletion (
     window_start  TIMESTAMPTZ   NOT NULL,
     usage_id      CHAR(64)      NOT NULL,
