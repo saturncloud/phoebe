@@ -305,24 +305,28 @@ func TestPushWindows_NineDecimalSecondsAreSentShortestAndExact(t *testing.T) {
 	}
 }
 
-// An hour this install sent video for, with no video of its own now, lists
-// video (an empty set that deletes the manager's records) only when the rater
-// could have removed them: rated_video_usage has rows and the hour is inside
-// the video reach. Otherwise the rollups were lost, video is left out of the
-// hour so the manager keeps its records, and the run exits 1.
+// A video identity this install sent for an hour, with no rollup and no park
+// now, is let go (the empty video set deletes the manager's records) only when
+// the rater could have removed it: rated_video_usage has rows and the hour is
+// inside the video reach. Otherwise its rollups were lost: its ids are held so
+// the manager keeps them, and the run exits 1. This is decided per identity,
+// so another identity's park in the same hour does not let it be deleted.
 func TestPushWindows_VanishedVideoIsNotDeletedWhenTheRaterCannotHaveRemovedIt(t *testing.T) {
-	sentVideo := []pushedRow{{UsageID: strings.Repeat("e", 64), Kind: meteredusage.KindVideo, identity: idVideo}}
+	sentID := strings.Repeat("e", 64)
+	sentVideo := []pushedRow{{UsageID: sentID, Kind: meteredusage.KindVideo, identity: idVideo}}
 	old := rating.VideoFloor(now).Add(-time.Hour)
 	for _, tc := range []struct {
-		name       string
-		hour       time.Time
-		parkedOnly bool
-		wantKinds  []string
-		wantExit   int
+		name        string
+		hour        time.Time
+		parkedOnly  bool
+		parkedOther bool
+		wantHeld    []string
+		wantExit    int
 	}{
-		{"inside the reach, rollups rated elsewhere: a reconcile deletion", win, false, []string{"token", "video"}, exitOK},
-		{"rated_video_usage empty, only an unresolved park left", win, true, []string{"token"}, exitFatal},
-		{"older than the video reach", old, false, []string{"token"}, exitFatal},
+		{"inside the reach, rollups rated elsewhere: a reconcile deletion", win, false, false, []string{}, exitOK},
+		{"rated_video_usage empty, only an unresolved park left", win, true, false, []string{sentID}, exitFatal},
+		{"rated_video_usage empty, another identity parked in the same hour", win, true, true, []string{sentID}, exitFatal},
+		{"older than the video reach", old, false, false, []string{sentID}, exitFatal},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			f := videoStore()
@@ -330,13 +334,17 @@ func TestPushWindows_VanishedVideoIsNotDeletedWhenTheRaterCannotHaveRemovedIt(t 
 			delete(f.videoRollups, win)
 			f.rollups[tc.hour] = fixtureStore().rollups[win]
 			f.pushed[tc.hour] = sentVideo
+			if tc.parkedOther {
+				f.videoParked[tc.hour] = []identity{idVideoOnFT}
+			}
 			f.videoRollups[win.Add(time.Hour)] = videoStore().videoRollups[win] // rated elsewhere
 			m := &recordingManager{}
 			if code := push1(t, f, m, tc.hour); code != tc.wantExit {
 				t.Fatalf("exit %d, want %d", code, tc.wantExit)
 			}
-			if req := sentRequest(t, m.bodies[0]); !reflect.DeepEqual(req.Kinds, tc.wantKinds) {
-				t.Fatalf("kinds %v, want %v", req.Kinds, tc.wantKinds)
+			req := sentRequest(t, m.bodies[0])
+			if !reflect.DeepEqual(req.Kinds, []string{"token", "video"}) || !reflect.DeepEqual(req.Held, tc.wantHeld) {
+				t.Fatalf("kinds %v held %v, want [token video] and %v", req.Kinds, req.Held, tc.wantHeld)
 			}
 		})
 	}

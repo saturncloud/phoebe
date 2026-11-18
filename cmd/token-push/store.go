@@ -51,6 +51,11 @@ type pushedRow struct {
 	UsageID string
 	Kind    string
 	identity
+	// held: an id the request lists in `held`, not a record it sends. Its
+	// pushed_usage row keeps the pushed_at of the push that sent it, so
+	// pushed_at says when the manager last received that record (0017
+	// down relies on it).
+	held bool
 }
 
 // kind returns the row's kind, "token" when unset.
@@ -452,9 +457,13 @@ func (s pgStore) MarkRefusedChecked(ctx context.Context, hours []time.Time) erro
 
 func insertPushed(ctx context.Context, tx *sql.Tx, hour time.Time, rows []pushedRow) error {
 	for _, r := range rows {
+		onConflict := `DO UPDATE SET pushed_at = now(), kind = EXCLUDED.kind`
+		if r.held {
+			onConflict = `DO NOTHING`
+		}
 		if _, err := tx.ExecContext(ctx, `INSERT INTO pushed_usage (window_start, usage_id, kind, auth_id, owner_type, owner_id,
 			resource_id, model_id, serving_mode) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)
-			ON CONFLICT ON CONSTRAINT pushed_usage_pk DO UPDATE SET pushed_at = now(), kind = EXCLUDED.kind`,
+			ON CONFLICT ON CONSTRAINT pushed_usage_pk `+onConflict,
 			hour, r.UsageID, r.kind(), r.AuthID, r.OwnerType, r.OwnerID, r.ResourceID, r.ModelID, r.ServingMode); err != nil {
 			return fmt.Errorf("record pushed usage: %w", err)
 		}

@@ -81,11 +81,10 @@ type hourPlan struct {
 	// heldBack counts rollups token-push itself could not turn into a record
 	// (no org, or a wire rule). Parked identities are the rater's to report.
 	heldBack int
-	// videoVanished: the manager holds video records this install sent for
-	// the hour, the hour has no video of its own, and the rater cannot have
-	// removed it (rated_video_usage is empty, or the hour is older than the
-	// video reach). Video is left out of the request so those records are not
-	// deleted by absence, and the run exits 1.
+	// videoVanished: a video identity this install sent for the hour has no
+	// rollup or park now, and the rater cannot have removed it
+	// (rated_video_usage is empty, or the hour is older than the video
+	// reach). Its ids are held so the manager keeps them, and the run exits 1.
 	videoVanished bool
 }
 
@@ -165,35 +164,45 @@ func (p *pusher) buildHour(ctx context.Context, hour time.Time, withVideo bool) 
 		holdIdentity[heldKey{meteredusage.KindToken, id}] = true
 	}
 
-	hourHasVideo := false
+	var ownVideo map[identity]bool
 	if withVideo {
-		if hourHasVideo, err = p.addVideo(ctx, hour, &plan, holdIdentity, live); err != nil {
+		if ownVideo, err = p.addVideo(ctx, hour, &plan, holdIdentity, live); err != nil {
 			return plan, err
 		}
 	}
-	listVideo := hourHasVideo
-	if len(holdIdentity) > 0 || (withVideo && !hourHasVideo) {
+	listVideo := len(ownVideo) > 0
+	if len(holdIdentity) > 0 || withVideo {
 		pushed, err := p.store.Pushed(ctx, hour)
 		if err != nil {
 			return plan, err
 		}
-		sentVideo := false
-		for _, pr := range pushed {
-			if pr.kind() == meteredusage.KindVideo {
-				sentVideo = true
+		if withVideo {
+			// VANISHED VIDEO. A video identity this install sent for the hour
+			// that now has no rollup and no park: the rater removed it by a
+			// reconcile, which it can do only inside the video reach and
+			// never by emptying rated_video_usage. Otherwise its rollups were
+			// lost, and leaving it out of the request would delete the
+			// manager's records of it by absence, so its ids are held and the
+			// run exits 1. Decided per identity: the hour may still have
+			// other video of its own.
+			reconcilable := p.videoRated && !hour.Before(p.videoFloor)
+			vanished := 0
+			for _, pr := range pushed {
+				if pr.kind() != meteredusage.KindVideo {
+					continue
+				}
+				listVideo = true // sent before: the request must say what is left
+				if !reconcilable && !ownVideo[pr.identity] && !live[pr.UsageID] {
+					if k := (heldKey{meteredusage.KindVideo, pr.identity}); !holdIdentity[k] {
+						holdIdentity[k] = true
+						vanished++
+					}
+				}
 			}
-		}
-		if withVideo && !hourHasVideo && sentVideo {
-			// The hour's sent video rollups are gone. The rater removes them
-			// only by a reconcile inside the video reach, and never empties
-			// rated_video_usage; anything else is lost data, and an empty
-			// video set would delete the manager's records of it.
-			if p.videoRated && !hour.Before(p.videoFloor) {
-				listVideo = true
-			} else {
+			if vanished > 0 {
 				plan.videoVanished = true
-				p.log.Error.Printf("token-push: %s: the manager holds video records this install sent, but the hour has no video rollup and the rater cannot have removed them (%s); video is left out of this hour so they are not deleted. Restore rated_video_usage",
-					ws, vanishedReason(p.videoRated))
+				p.log.Error.Printf("token-push: %s: %d video identity(ies) this install sent have no rollup now, and the rater cannot have removed them (%s); their ids are held so the manager keeps them. Restore rated_video_usage",
+					ws, vanished, vanishedReason(p.videoRated))
 			}
 		}
 		for _, pr := range pushed {
@@ -203,6 +212,7 @@ func (p *pusher) buildHour(ctx context.Context, hour time.Time, withVideo bool) 
 				continue
 			}
 			if holdIdentity[heldKey{pr.kind(), pr.identity}] && !live[pr.UsageID] {
+				pr.held = true
 				plan.req.Held = append(plan.req.Held, pr.UsageID)
 				plan.sent = append(plan.sent, pr)
 			}
@@ -222,16 +232,18 @@ func vanishedReason(videoRated bool) string {
 }
 
 // addVideo adds the hour's video records to plan, with the same per-identity
-// holding as tokens. It reports whether the hour has video of its own: a
-// video rollup (sent or held back) or a parked video identity.
-func (p *pusher) addVideo(ctx context.Context, hour time.Time, plan *hourPlan, hold map[heldKey]bool, live map[string]bool) (bool, error) {
+// holding as tokens. It returns the identities with video of their own in the
+// hour: a video rollup (sent or held back) or a parked video identity.
+func (p *pusher) addVideo(ctx context.Context, hour time.Time, plan *hourPlan, hold map[heldKey]bool, live map[string]bool) (map[identity]bool, error) {
 	ws := plan.req.WindowStart
 	rollups, err := p.store.VideoRollups(ctx, hour)
 	if err != nil {
-		return false, err
+		return nil, err
 	}
+	own := make(map[identity]bool, len(rollups))
 	plan.req.VideoRecords = make([]meteredusage.VideoRecord, 0, len(rollups))
 	for _, r := range rollups {
+		own[r.identity] = true
 		rec := meteredusage.VideoRecord{
 			Kind: meteredusage.KindVideo, OrgID: r.OrgID, OwnerType: r.OwnerType, OwnerID: r.OwnerID,
 			ResourceID: r.ResourceID,
@@ -258,12 +270,13 @@ func (p *pusher) addVideo(ctx context.Context, hour time.Time, plan *hourPlan, h
 	}
 	parked, err := p.store.ParkedVideoIdentities(ctx, hour)
 	if err != nil {
-		return false, err
+		return nil, err
 	}
 	for _, id := range parked {
 		hold[heldKey{meteredusage.KindVideo, id}] = true
+		own[id] = true
 	}
-	return len(rollups) > 0 || len(parked) > 0, nil
+	return own, nil
 }
 
 // maxUnsentHoursPerRun bounds how many never-accepted hours one run sends:

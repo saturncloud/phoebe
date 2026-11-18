@@ -83,6 +83,10 @@ func TestIntegration_AnAlreadySentVideoRecordIsHeldWhileParkedThenResent(t *test
 		t.Fatalf("first push: exit %d", code)
 	}
 	videoID := lastRequest(t, m).VideoRecords[0].UsageID
+	var sentAt time.Time
+	if err := db.QueryRow(`SELECT pushed_at FROM pushed_usage WHERE usage_id = $1`, videoID).Scan(&sentAt); err != nil {
+		t.Fatal(err)
+	}
 
 	videoJob(t, db, h.Add(30*time.Minute), itOrg2, "completed") // late, another org
 	if res := rate(t, db, h, h.Add(time.Hour)); res.Video.ParkedDeletions != 1 || res.Video.AmbiguousOrgEvents != 2 {
@@ -96,6 +100,12 @@ func TestIntegration_AnAlreadySentVideoRecordIsHeldWhileParkedThenResent(t *test
 		if len(req.Records) != 1 || len(req.VideoRecords) != 0 || !reflect.DeepEqual(req.Held, []string{videoID}) {
 			t.Fatalf("push %d: %d token, %d video, held %v; want the token record sent and [%s] held", i,
 				len(req.Records), len(req.VideoRecords), req.Held, videoID)
+		}
+		// A held id keeps the pushed_at of the push that sent the record:
+		// pushed_at says when the manager last received it (0017 down).
+		var heldAt time.Time
+		if err := db.QueryRow(`SELECT pushed_at FROM pushed_usage WHERE usage_id = $1`, videoID).Scan(&heldAt); err != nil || !heldAt.Equal(sentAt) {
+			t.Fatalf("push %d: held id pushed_at %s (err %v), want %s kept", i, heldAt, err, sentAt)
 		}
 	}
 
