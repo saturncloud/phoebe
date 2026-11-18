@@ -246,3 +246,24 @@ func TestVideoHourQuery_ReadsQuantitiesAsExactText(t *testing.T) {
 		}
 	}
 }
+
+// Nine-decimal sums from rated_video_usage reach the wire in their shortest
+// exact spelling: trailing zeros go, significant digits never do.
+func TestPushWindows_NineDecimalSecondsAreSentShortestAndExact(t *testing.T) {
+	f := newFake()
+	f.hasVideo = true
+	f.videoRollups[win] = []videoRollupRow{
+		videoRollup("vid-24fps", idVideo, "720p", "15.125000001", "181.500", 363, 3),
+		videoRollup("vid-16fps", idVideo, "480p", "10.125000000", "0.000", 162, 2),
+	}
+	m := &recordingManager{}
+	if code := push1(t, f, m, win); code != exitOK {
+		t.Fatalf("exit %d", code)
+	}
+	body := string(m.bodies[0])
+	for _, want := range []string{`"output_seconds":"15.125000001"`, `"output_seconds":"10.125"`, `"gpu_seconds":"181.5"`, `"gpu_seconds":"0"`} {
+		if !strings.Contains(body, want) {
+			t.Fatalf("body lacks %s: %s", want, body)
+		}
+	}
+}

@@ -236,7 +236,7 @@ func TestValidate_TheRecordCapCountsBothKinds(t *testing.T) {
 
 func TestCanonicalDecimal_DropsOnlyTrailingFractionalZeros(t *testing.T) {
 	for in, want := range map[string]string{
-		"10.1250": "10.125", "0.0000": "0", "0.000": "0", "5.0625": "5.0625", "100": "100", "120.500": "120.5", "10.0": "10",
+		"10.1250": "10.125", "10.125000000": "10.125", "15.125000001": "15.125000001", "0.000000000": "0", "5.041666667": "5.041666667", "0.0000": "0", "0.000": "0", "5.0625": "5.0625", "100": "100", "120.500": "120.5", "10.0": "10",
 	} {
 		if got := CanonicalDecimal(in); got != want {
 			t.Errorf("CanonicalDecimal(%q) = %q, want %q", in, got, want)

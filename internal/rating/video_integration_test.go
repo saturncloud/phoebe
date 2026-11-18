@@ -117,7 +117,7 @@ func readVideoRollups(t *testing.T, db *sql.DB) []videoRollup {
 }
 
 // Two completed 81-frame clips and one failed job in one grain: output seconds
-// sum exactly (5.0625 + 5.0625 = 10.1250, never a float), request_count counts
+// sum exactly (5.0625 + 5.0625 = 10.125000000, never a float), request_count counts
 // the two completed jobs only, and the failed job adds its GPU time and its
 // event. The rollup carries the org.
 func TestIntegration_VideoJobsRollUpExactlyAndCountCompletedRequestsOnly(t *testing.T) {
@@ -133,11 +133,25 @@ func TestIntegration_VideoJobsRollUpExactlyAndCountCompletedRequestsOnly(t *test
 		t.Fatalf("%d rollups, want 1", len(got))
 	}
 	r := got[0]
-	if r.outputSeconds != "10.1250" || r.frames != 162 || r.requests != 2 || r.gpuSeconds != "361.500" || r.events != 3 {
-		t.Fatalf("rollup %+v, want 10.1250 s, 162 frames, 2 requests, 361.500 GPU s over 3 jobs", r)
+	if r.outputSeconds != "10.125000000" || r.frames != 162 || r.requests != 2 || r.gpuSeconds != "361.500" || r.events != 3 {
+		t.Fatalf("rollup %+v, want 10.125000000 s, 162 frames, 2 requests, 361.500 GPU s over 3 jobs", r)
 	}
 	if r.org != "org-1" || r.ownerType != "user" || r.ownerID != "user-1" || r.region != "" || r.task != "t2v" || r.resolution != "720p" {
 		t.Fatalf("rollup identity %+v", r)
+	}
+}
+
+// A frame count the frame rate does not divide (121 frames at 24 fps,
+// 5.041666667 s at nine decimals) sums with all nine digits kept: the rollup
+// column has the same scale as video_billing_event, so nothing is rounded.
+func TestIntegration_VideoSecondsKeepNineDecimalsThroughTheRollup(t *testing.T) {
+	db := openRatingSchema(t, "phoebe_video_nine_it")
+	at24 := func(r *vbRow) { r.outputSeconds, r.outputFrames = "5.041666667", 121 }
+	vseed(t, db, vrow(at24), vrow(at24), vrow(at24))
+	vaggregate(t, db, itHour, itHour.Add(time.Hour))
+	got := readVideoRollups(t, db)
+	if len(got) != 1 || got[0].outputSeconds != "15.125000001" || got[0].frames != 363 {
+		t.Fatalf("rollups %+v, want 15.125000001 s over 363 frames", got)
 	}
 }
 
@@ -193,7 +207,7 @@ func TestIntegration_VideoReRunIsIdempotentAndReconciles(t *testing.T) {
 		t.Fatalf("%+v, want the 720p rollup rewritten and the vanished 1080p rollup reconciled away", third)
 	}
 	got := readVideoRollups(t, db)
-	if len(got) != 1 || got[0].requests != 2 || got[0].outputSeconds != "10.1250" {
+	if len(got) != 1 || got[0].requests != 2 || got[0].outputSeconds != "10.125000000" {
 		t.Fatalf("rollups %+v, want one 720p rollup with the late job folded in", got)
 	}
 }
@@ -234,7 +248,7 @@ func TestIntegration_VideoAmbiguousOrgParksTheIdentityThenResolves(t *testing.T)
 		WHERE resource_id = 'res-v' AND resolved_at IS NULL`).Scan(&reason, &events, &requests, &secs); err != nil {
 		t.Fatal(err)
 	}
-	if reason != "ambiguous_org" || events != 2 || requests != 2 || secs != "10.1250" {
+	if reason != "ambiguous_org" || events != 2 || requests != 2 || secs != "10.125000000" {
 		t.Fatalf("parked %s events=%d requests=%d seconds=%s, want ambiguous_org with both jobs' usage", reason, events, requests, secs)
 	}
 
@@ -336,11 +350,11 @@ func TestIntegration_VideoParkedRowsAreListedAndAPrunedHourIsNeverReAggregated(t
 			v = p
 		}
 	}
-	if v.Reason != "ambiguous_org" || v.EventCount != 2 || v.RequestCount != 2 || v.OutputSeconds != "10.1250" ||
+	if v.Reason != "ambiguous_org" || v.EventCount != 2 || v.RequestCount != 2 || v.OutputSeconds != "10.125000000" ||
 		v.OutputFrames != 162 || v.GPUSeconds != "241.000" || v.RawEvents != 2 || v.RawEventsPruned {
 		t.Fatalf("video parked row %+v", v)
 	}
-	if !strings.Contains(v.UsageLabel(), "output_seconds=10.1250") {
+	if !strings.Contains(v.UsageLabel(), "output_seconds=10.125000000") {
 		t.Fatalf("usage label %q", v.UsageLabel())
 	}
 	hours, err := store.ParkedHours(context.Background(), itHour.Add(-time.Hour))

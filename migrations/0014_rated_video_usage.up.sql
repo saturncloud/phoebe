@@ -36,8 +36,9 @@ CREATE TABLE IF NOT EXISTS rated_video_usage (
     region          VARCHAR(64)   NOT NULL,
     window_start    TIMESTAMPTZ   NOT NULL,
     window_end      TIMESTAMPTZ   NOT NULL,
-    -- Exact sums of video_billing_event's NUMERIC(12,4) and NUMERIC(14,3).
-    output_seconds  NUMERIC(24,4) NOT NULL,
+    -- Exact sums of video_billing_event's NUMERIC(18,9) and NUMERIC(14,3):
+    -- nine fractional digits, the manager's decimal limit.
+    output_seconds  NUMERIC(30,9) NOT NULL,
     output_frames   BIGINT        NOT NULL,
     request_count   BIGINT        NOT NULL,
     gpu_seconds     NUMERIC(24,3) NOT NULL,
@@ -77,7 +78,7 @@ CREATE TABLE IF NOT EXISTS parked_video_usage (
     serving_mode     VARCHAR(32)   NOT NULL,
     reason           VARCHAR(32)   NOT NULL,
     event_count      BIGINT        NOT NULL,
-    output_seconds   NUMERIC(24,4) NOT NULL,
+    output_seconds   NUMERIC(30,9) NOT NULL,
     output_frames    BIGINT        NOT NULL,
     request_count    BIGINT        NOT NULL,
     gpu_seconds      NUMERIC(24,3) NOT NULL,
