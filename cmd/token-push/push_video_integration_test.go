@@ -205,6 +205,49 @@ func TestIntegration_AVanishedVideoRecordIsDeletedOnlyWhenTheRaterRemovedIt(t *t
 			t.Fatalf("%d video records, held %v; want the new org's record sent and the old id %s let go", len(req.VideoRecords), req.Held, id)
 		}
 	})
+	t.Run("an explicit re-rate of an older hour is re-sent automatically", func(t *testing.T) {
+		db, h, m, id := setup(t, "phoebe_push_video_rerate_resent_it")
+		if _, err := db.Exec(`DELETE FROM video_billing_event`); err != nil {
+			t.Fatal(err)
+		}
+		rate(t, db, h, h.Add(time.Hour))
+		hours, err := (pgStore{db: db}).ResolvedHours(context.Background(), time.Now().UTC().Truncate(time.Hour))
+		if err != nil || len(hours) != 1 || !hours[0].Equal(h) {
+			t.Fatalf("hours to re-send %v (err %v), want [%s]: its record %s was tombstoned after its last push", hours, err, h, id)
+		}
+		_ = m
+	})
+	t.Run("restored outside the rater, sent again, then lost again: held", func(t *testing.T) {
+		db, h, m, id := setup(t, "phoebe_push_video_restored_it")
+		// The rater removes it (tombstone), the manager deletes it.
+		if _, err := db.Exec(`CREATE TABLE saved AS SELECT * FROM rated_video_usage`); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := db.Exec(`DELETE FROM video_billing_event`); err != nil {
+			t.Fatal(err)
+		}
+		rate(t, db, h, h.Add(time.Hour))
+		if code := push(t, db, m, h); code != exitOK {
+			t.Fatalf("release push: exit %d", code)
+		}
+		// Restored by hand (the tombstone stays), and sent again.
+		if _, err := db.Exec(`INSERT INTO rated_video_usage SELECT * FROM saved`); err != nil {
+			t.Fatal(err)
+		}
+		if code := push(t, db, m, h); code != exitOK || len(lastRequest(t, m).VideoRecords) != 1 {
+			t.Fatalf("re-send after restore: exit %d", code)
+		}
+		// Lost again: the old tombstone predates the re-send, so it is held.
+		if _, err := db.Exec(`DELETE FROM rated_video_usage`); err != nil {
+			t.Fatal(err)
+		}
+		if code := push(t, db, m, h); code != exitFatal {
+			t.Fatalf("exit %d, want %d", code, exitFatal)
+		}
+		if req := lastRequest(t, m); !reflect.DeepEqual(req.Held, []string{id}) {
+			t.Fatalf("held %v, want [%s]: a stale tombstone must not release it", req.Held, id)
+		}
+	})
 	t.Run("lost: the rollup row deleted outside the rater", func(t *testing.T) {
 		db, h, m, id := setup(t, "phoebe_push_video_lost_it")
 		if _, err := db.Exec(`DELETE FROM rated_video_usage`); err != nil {

@@ -385,3 +385,62 @@ func TestPushWindows_ARollupWhoseStoredUsageIDDiffersIsHeldBack(t *testing.T) {
 		}
 	}
 }
+
+// Wiped video tables fail every run (exit 1) even when no hour the run sends
+// had video: the scheduled run otherwise exits 0 and the loss of the only
+// durable video record goes unpaged.
+func TestPushWindows_WipedVideoTablesFailEvenWithoutAVideoHourInTheRun(t *testing.T) {
+	f := fixtureStore()
+	f.everPushedVideo = true // video was sent for some older hour
+	m := &recordingManager{}
+	if code := push1(t, f, m, win); code != exitFatal {
+		t.Fatalf("exit %d, want %d", code, exitFatal)
+	}
+	if req := sentRequest(t, m.bodies[0]); len(req.Records) != 4 || len(req.Held) != 0 {
+		t.Fatalf("%d token records, held %v; want the token hour sent unchanged", len(req.Records), req.Held)
+	}
+}
+
+// A video-only install (never sent a token record) whose video rollups were
+// all removed is not refused as a wiped token table: it pushes, so the
+// tombstoned records are released.
+func TestPushWindows_AVideoOnlyInstallWithEveryRollupRemovedStillPushes(t *testing.T) {
+	sentID := strings.Repeat("e", 64)
+	f := newFake()
+	f.empty, f.everPushed = true, true
+	f.pushed[win] = []pushedRow{{UsageID: sentID, Kind: meteredusage.KindVideo, identity: idVideo}}
+	f.tombstones = map[time.Time][]string{win: {sentID}}
+	m := &recordingManager{}
+	push1(t, f, m, win)
+	if len(m.bodies) != 1 {
+		t.Fatalf("%d requests, want the hour sent", len(m.bodies))
+	}
+	if req := sentRequest(t, m.bodies[0]); !reflect.DeepEqual(req.Kinds, []string{"token", "video"}) || len(req.Held) != 0 {
+		t.Fatalf("kinds %v held %v, want video listed empty so the tombstoned record is deleted", req.Kinds, req.Held)
+	}
+}
+
+// A video rollup token-push holds back holds only its own record (its stored
+// usage_id), not its whole identity: a sibling grain's tombstoned old id is
+// still released.
+func TestPushWindows_AHeldBackVideoRollupHoldsOnlyItsOwnRecord(t *testing.T) {
+	f := videoStore()
+	rows := f.videoRollups[win]
+	bad := rows[0]
+	bad.OrgID = "not-hex" // fails the wire rule; its stored id is still its own
+	f.videoRollups[win] = []videoRollupRow{bad}
+	badID := stampedVideoID(win, bad)
+	gone := strings.Repeat("e", 64) // a sibling grain of the same identity, removed by the rater
+	f.pushed[win] = []pushedRow{
+		{UsageID: badID, Kind: meteredusage.KindVideo, identity: idVideo},
+		{UsageID: gone, Kind: meteredusage.KindVideo, identity: idVideo},
+	}
+	f.tombstones = map[time.Time][]string{win: {gone}}
+	m := &recordingManager{}
+	if code := push1(t, f, m, win); code != exitWithheld {
+		t.Fatalf("exit %d, want exitWithheld", code)
+	}
+	if req := sentRequest(t, m.bodies[0]); !reflect.DeepEqual(req.Held, []string{badID}) {
+		t.Fatalf("held %v, want only the held-back rollup's own id %s", req.Held, badID)
+	}
+}

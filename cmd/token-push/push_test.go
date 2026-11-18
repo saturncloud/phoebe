@@ -113,16 +113,41 @@ func newFake() *fakeStore {
 		videoRollups: map[time.Time][]videoRollupRow{}, videoParked: map[time.Time][]identity{}}
 }
 
-func (f *fakeStore) VideoUsageState(context.Context) (bool, bool, error) {
-	ever := f.everPushedVideo
-	for _, rows := range f.pushed {
+func (f *fakeStore) VideoUsageState(context.Context) (bool, bool, bool, error) {
+	ever, untombstoned := f.everPushedVideo, f.everPushedVideo
+	for h, rows := range f.pushed {
 		for _, r := range rows {
-			if r.kind() == meteredusage.KindVideo {
-				ever = true
+			if r.kind() != meteredusage.KindVideo {
+				continue
 			}
+			ever = true
+			gone := false
+			for _, id := range f.tombstones[h] {
+				gone = gone || id == r.UsageID
+			}
+			untombstoned = untombstoned || !gone
 		}
 	}
-	return f.hasVideo, ever, nil
+	return f.hasVideo, ever, untombstoned, nil
+}
+
+func (f *fakeStore) Now(context.Context) (time.Time, error) { return now, nil }
+
+func (f *fakeStore) ClearSupersededTombstones(_ context.Context, h time.Time, ids []string, _ time.Time) error {
+	keep := f.tombstones[h][:0:0]
+	for _, t := range f.tombstones[h] {
+		live := false
+		for _, id := range ids {
+			live = live || id == t
+		}
+		if !live {
+			keep = append(keep, t)
+		}
+	}
+	if f.tombstones != nil {
+		f.tombstones[h] = keep
+	}
+	return nil
 }
 
 func (f *fakeStore) VideoTombstones(_ context.Context, h time.Time) (map[string]bool, error) {

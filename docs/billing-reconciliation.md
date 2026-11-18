@@ -169,15 +169,39 @@ of the video grain, so two values are two records, not a conflict.
   for the same grain (`regrained`). token-push lets the manager delete a sent
   video record by absence only when its id has a tombstone. A parked identity's
   ids stay held while the park is unresolved.
+  - When token-push sends an id again as a live rollup (restored outside the
+    rater), it clears that id's older tombstone before sending. If the record
+    is lost again later, it is held.
   - Any other sent video id with no rollup was lost. token-push holds it, so the
     manager keeps the record, logs `video record(s) this install sent have no
     rollup and no tombstone` at ERROR, and exits `1` each time the hour is sent.
-    Restore `rated_video_usage`. If the record really should go, re-rate the
-    hour so the rater removes it and writes the tombstone, or delete the id
-    from `pushed_usage` by hand and re-send the hour with `-since/-until`.
+    - To keep billing it, restore the rollup in `rated_video_usage` with its
+      `usage_id`.
+    - To let it go, write the tombstone by hand, then re-send the hour with
+      `-since/-until`. Re-rating cannot do this: the rater tombstones only rows
+      it deletes, and a lost row is not there to delete. Do not delete the id
+      from `pushed_usage` instead: if it was the hour's only video record, the
+      hour stops listing video and the manager keeps the record silently.
+
+      ```sql
+      INSERT INTO video_reconcile_deletion (window_start, usage_id, auth_id, owner_type,
+          owner_id, resource_id, model_id, serving_mode, reason)
+      SELECT window_start, usage_id, auth_id, owner_type, owner_id, resource_id,
+             model_id, serving_mode, 'reconcile'
+        FROM pushed_usage WHERE window_start = '<hour>' AND usage_id = '<id>';
+      ```
+  - An hour the rater tombstones after its last accepted push (an explicit
+    re-rate of an older hour) is re-sent automatically, however old, like an
+    hour with a resolved park.
+  - If no video usage is recorded at all although video was sent before, the
+    video tables look wiped. Every run then logs it at ERROR and exits `1`.
   - A rollup whose stored `usage_id` is not the id of its own fields was edited
     outside the rater, or rated under another `usage_id` rule. It is held back,
-    not sent under a new id (exit `2`), until the rater re-rates the hour.
+    not sent under a new id (exit `2`). Inside the 29-day reach, re-rating the
+    hour re-stamps it and tombstones the old id. Older hours are never re-rated:
+    fix the row by hand. Set `usage_id` to the id of its fields (the
+    `HOLDING BACK` log line names it), and write a `regrained` tombstone for
+    the old id as above.
 
 ## Routine checks and alert conditions
 

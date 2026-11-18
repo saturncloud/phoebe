@@ -86,14 +86,27 @@ type pushStore interface {
 	// video usage apart from one whose rated_usage was wiped.
 	EverPushedToken(ctx context.Context) (bool, error)
 	// VideoUsageState reports whether any video usage is recorded
-	// (rated_video_usage has a row, or parked_video_usage an unresolved one)
-	// and whether the manager was ever sent a video record (pushed_usage has
-	// a video row). token-push lists kind "video" when either holds.
-	VideoUsageState(ctx context.Context) (has, everPushed bool, err error)
+	// (rated_video_usage has a row, or parked_video_usage an unresolved one),
+	// whether the manager was ever sent a video record (pushed_usage has a
+	// video row), and whether some sent video record has no tombstone written
+	// after it was sent (the rater did not remove it). token-push lists kind
+	// "video" when either of the first two holds; no recorded video with an
+	// untombstoned sent record means the video tables were wiped.
+	VideoUsageState(ctx context.Context) (has, everPushed, untombstoned bool, err error)
 	// VideoTombstones lists the hour's video usage_ids the rater removed on
 	// purpose (video_reconcile_deletion). Only those may be deleted by
 	// absence; any other sent video id with no rollup was lost and is held.
 	VideoTombstones(ctx context.Context, hour time.Time) (map[string]bool, error)
+	// Now is the database's clock (clock_timestamp()), the clock tombstones
+	// are written with.
+	Now(ctx context.Context) (time.Time, error)
+	// ClearSupersededTombstones deletes the hour's tombstones for ids that
+	// token-push read as live rollups, when the tombstone was written before
+	// that read (readAt). Such an id was brought back outside the rater (a
+	// restore) and is being sent again; its old tombstone must not release it
+	// if it is lost later. A tombstone written after the read is newer than
+	// what is sent and stays.
+	ClearSupersededTombstones(ctx context.Context, hour time.Time, ids []string, readAt time.Time) error
 	Rollups(ctx context.Context, hour time.Time) ([]rollupRow, error)
 	// VideoRollups reads every rated_video_usage row of one hour.
 	VideoRollups(ctx context.Context, hour time.Time) ([]videoRollupRow, error)
@@ -175,12 +188,33 @@ func (s pgStore) UsagePresent(ctx context.Context) (rated, parked bool, err erro
 	return rated, parked, err
 }
 
-func (s pgStore) VideoUsageState(ctx context.Context) (has, everPushed bool, err error) {
+func (s pgStore) VideoUsageState(ctx context.Context) (has, everPushed, untombstoned bool, err error) {
 	err = s.db.QueryRowContext(ctx,
 		`SELECT EXISTS (SELECT 1 FROM rated_video_usage)
 		        OR EXISTS (SELECT 1 FROM parked_video_usage WHERE resolved_at IS NULL),
-		        EXISTS (SELECT 1 FROM pushed_usage WHERE kind = 'video')`).Scan(&has, &everPushed)
-	return has, everPushed, err
+		        EXISTS (SELECT 1 FROM pushed_usage WHERE kind = 'video'),
+		        EXISTS (SELECT 1 FROM pushed_usage u
+		                 WHERE u.kind = 'video'
+		                   AND NOT EXISTS (SELECT 1 FROM video_reconcile_deletion t
+		                                    WHERE t.window_start = u.window_start AND t.usage_id = u.usage_id))`).Scan(&has, &everPushed, &untombstoned)
+	return has, everPushed, untombstoned, err
+}
+
+func (s pgStore) Now(ctx context.Context) (time.Time, error) {
+	var t time.Time
+	err := s.db.QueryRowContext(ctx, `SELECT clock_timestamp()`).Scan(&t)
+	return t, err
+}
+
+func (s pgStore) ClearSupersededTombstones(ctx context.Context, hour time.Time, ids []string, readAt time.Time) error {
+	if len(ids) == 0 {
+		return nil
+	}
+	if _, err := s.db.ExecContext(ctx, `DELETE FROM video_reconcile_deletion
+		WHERE window_start = $1 AND usage_id = ANY($2) AND deleted_at < $3`, hour, ids, readAt); err != nil {
+		return fmt.Errorf("clear superseded video tombstones: %w", err)
+	}
+	return nil
 }
 
 func (s pgStore) VideoTombstones(ctx context.Context, hour time.Time) (map[string]bool, error) {
@@ -315,10 +349,18 @@ func (s pgStore) Pushed(ctx context.Context, hour time.Time) ([]pushedRow, error
 }
 
 func (s pgStore) ResolvedHours(ctx context.Context, before time.Time) ([]time.Time, error) {
+	// A tombstone the rater wrote after the hour's last accepted push, for an
+	// id the manager still holds, is a change the manager has not seen (an
+	// explicit re-rate of an older hour removed or regrained a record): the
+	// hour is re-sent like a resolved park, however old.
 	rows, err := s.db.QueryContext(ctx, `SELECT p.window_start
 		FROM (SELECT window_start, resolved_at FROM parked_usage
 		      UNION ALL
-		      SELECT window_start, resolved_at FROM parked_video_usage) p
+		      SELECT window_start, resolved_at FROM parked_video_usage
+		      UNION ALL
+		      SELECT t.window_start, t.deleted_at FROM video_reconcile_deletion t
+		       WHERE EXISTS (SELECT 1 FROM pushed_usage u WHERE u.window_start = t.window_start
+		                        AND u.usage_id = t.usage_id AND u.kind = 'video')) p
 		LEFT JOIN pushed_hour h ON h.window_start = p.window_start
 		WHERE p.resolved_at IS NOT NULL AND p.window_start < $1
 		  AND (h.pushed_at IS NULL OR p.resolved_at > h.pushed_at)
