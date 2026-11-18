@@ -79,7 +79,8 @@ type pushStore interface {
 	// recorded. A resolved parked row does not count: parked rows are never
 	// pruned, so an old one would hide a wiped rated_video_usage forever and
 	// every re-sent hour would delete the manager's video records by absence.
-	VideoUsageState(ctx context.Context) (has, everPushed bool, err error)
+	// rated is whether rated_video_usage alone has a row.
+	VideoUsageState(ctx context.Context) (has, rated, everPushed bool, err error)
 	Rollups(ctx context.Context, hour time.Time) ([]rollupRow, error)
 	// VideoRollups reads every rated_video_usage row of one hour.
 	VideoRollups(ctx context.Context, hour time.Time) ([]videoRollupRow, error)
@@ -161,12 +162,13 @@ func (s pgStore) UsagePresent(ctx context.Context) (rated, parked bool, err erro
 	return rated, parked, err
 }
 
-func (s pgStore) VideoUsageState(ctx context.Context) (has, everPushed bool, err error) {
+func (s pgStore) VideoUsageState(ctx context.Context) (has, rated, everPushed bool, err error) {
+	var parked bool
 	err = s.db.QueryRowContext(ctx,
-		`SELECT EXISTS (SELECT 1 FROM rated_video_usage)
-		        OR EXISTS (SELECT 1 FROM parked_video_usage WHERE resolved_at IS NULL),
-		        EXISTS (SELECT 1 FROM pushed_usage WHERE kind = 'video')`).Scan(&has, &everPushed)
-	return has, everPushed, err
+		`SELECT EXISTS (SELECT 1 FROM rated_video_usage),
+		        EXISTS (SELECT 1 FROM parked_video_usage WHERE resolved_at IS NULL),
+		        EXISTS (SELECT 1 FROM pushed_usage WHERE kind = 'video')`).Scan(&rated, &parked, &everPushed)
+	return rated || parked, rated, everPushed, err
 }
 
 // videoHourQuery reads every video rollup of one hour. NUMERIC as text, so the

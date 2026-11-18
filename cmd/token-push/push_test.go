@@ -91,6 +91,9 @@ type fakeStore struct {
 	// is derived from pushed (a video row) unless forced.
 	hasVideo        bool
 	everPushedVideo bool
+	// videoParkedOnly: video is recorded only as unresolved parked rows
+	// (rated_video_usage is empty).
+	videoParkedOnly bool
 	videoRollups    map[time.Time][]videoRollupRow
 	videoParked     map[time.Time][]identity
 }
@@ -111,7 +114,7 @@ func newFake() *fakeStore {
 		videoRollups: map[time.Time][]videoRollupRow{}, videoParked: map[time.Time][]identity{}}
 }
 
-func (f *fakeStore) VideoUsageState(context.Context) (bool, bool, error) {
+func (f *fakeStore) VideoUsageState(context.Context) (bool, bool, bool, error) {
 	ever := f.everPushedVideo
 	for _, rows := range f.pushed {
 		for _, r := range rows {
@@ -120,7 +123,7 @@ func (f *fakeStore) VideoUsageState(context.Context) (bool, bool, error) {
 			}
 		}
 	}
-	return f.hasVideo, ever, nil
+	return f.hasVideo, f.hasVideo && !f.videoParkedOnly, ever, nil
 }
 func (f *fakeStore) EverPushedToken(context.Context) (bool, error) {
 	for _, rows := range f.pushed {

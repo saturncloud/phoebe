@@ -314,3 +314,35 @@ func TestPushWindows_LocalWireRuleFailureParksTheHourOnce(t *testing.T) {
 		t.Fatalf("%d requests, want none", len(m.bodies))
 	}
 }
+
+// A 400 whose validation path is `kinds` is a manager that does not know a
+// kind phoebe lists (a manager older than the video kind). It is about the
+// install, not the hour: nothing is parked (parking would also hold the hour's
+// token records and never re-send them after the manager is upgraded, since
+// the payload does not change), the run exits 3 and stops, and the next run
+// sends the hours again.
+func TestPushWindows_ARefusedKindParksNothingAndStopsTheRun(t *testing.T) {
+	for _, path := range []string{"kinds[1]", "kinds"} {
+		f := videoStore()
+		other := win.Add(-time.Hour)
+		f.rollups[other] = fixtureRollups()
+		f.videoRollups[other] = f.videoRollups[win]
+		m := &recordingManager{statuses: []int{400}, errBody: `{"error":"unknown kind video","path":"` + path + `"}`}
+		p := newPusher(f, m.client(t))
+		for i := 0; i < 2; i++ {
+			if code := p.pushWindows(context.Background(), []time.Time{other, win}, now, false); code != exitRejected {
+				t.Fatalf("%s run %d: exit %d, want exitRejected", path, i, code)
+			}
+		}
+		if len(f.refused) != 0 {
+			t.Fatalf("%s: parked %d hours, want none", path, len(f.refused))
+		}
+		if len(m.bodies) != 2 {
+			t.Fatalf("%s: %d requests over 2 runs, want 2 (each run stops after the first refusal)", path, len(m.bodies))
+		}
+	}
+	// A validation answer about a record still parks the hour.
+	if !refusalParksTheHour(&meteredusage.RejectedError{Status: 400, Body: `{"error":"x","path":"records[3].kind"}`}) {
+		t.Fatal("a refusal of records[3].kind must park the hour")
+	}
+}
