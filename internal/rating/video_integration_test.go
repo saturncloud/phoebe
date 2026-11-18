@@ -383,7 +383,8 @@ func TestIntegration_VideoParkedRowsAreListedAndAPrunedHourIsNeverReAggregated(t
 // as the video being accepted.
 func TestIntegration_Migration0017DownRefusesWhileVideoUsageIsParkedOrUnsent(t *testing.T) {
 	db := openRatingSchema(t, "phoebe_video_m0017_it")
-	vseed(t, db, vrow(nil), vrow(func(r *vbRow) { r.resource = "res-2"; r.org = "org-2" }),
+	vseed(t, db, vrow(nil), vrow(func(r *vbRow) { r.resolution = "480p" }),
+		vrow(func(r *vbRow) { r.resource = "res-2"; r.org = "org-2" }),
 		vrow(func(r *vbRow) { r.resource = "res-2" }))
 	vaggregate(t, db, itHour, itHour.Add(time.Hour))
 	down := readMigration(t, "0017_rated_video_usage.down.sql")
@@ -402,13 +403,29 @@ func TestIntegration_Migration0017DownRefusesWhileVideoUsageIsParkedOrUnsent(t *
 	if _, err := db.Exec(down); err == nil || !strings.Contains(err.Error(), "never accepted") {
 		t.Fatalf("down after a token-only push: err = %v, want the refusal", err)
 	}
-	// The video records accepted after they were rated: one video id per
-	// rated identity.
-	exec(t, db, `INSERT INTO pushed_usage (window_start, usage_id, kind, auth_id, owner_type, owner_id, resource_id,
-		model_id, serving_mode, pushed_at)
-		SELECT window_start, md5(id) || md5(id), 'video', auth_id, owner_type, owner_id, resource_id, model_id,
-		       serving_mode, rated_at + interval '1 minute'
-		  FROM rated_video_usage`)
+	// Ids recorded only as intent (RecordIntent before a send that failed):
+	// pushed_at after the hour's last acceptance. Not accepted.
+	insertVideoIDs := func(at, limit string) {
+		exec(t, db, `INSERT INTO pushed_usage (window_start, usage_id, kind, auth_id, owner_type, owner_id, resource_id,
+			model_id, serving_mode, pushed_at)
+			SELECT window_start, md5(id) || md5(id), 'video', auth_id, owner_type, owner_id, resource_id, model_id,
+			       serving_mode, `+at+`
+			  FROM rated_video_usage ORDER BY id LIMIT `+limit+`
+			ON CONFLICT ON CONSTRAINT pushed_usage_pk DO UPDATE SET pushed_at = EXCLUDED.pushed_at`)
+	}
+	insertVideoIDs("now() + interval '1 hour'", "ALL")
+	if _, err := db.Exec(down); err == nil || !strings.Contains(err.Error(), "never accepted") {
+		t.Fatalf("down with intent-only video ids: err = %v, want the refusal", err)
+	}
+	// Accepted with the hour's push, but only one of the identity's two
+	// grains (720p and 480p): the other was never sent.
+	exec(t, db, `DELETE FROM pushed_usage WHERE kind = 'video'`)
+	insertVideoIDs("(SELECT pushed_at FROM pushed_hour)", "1")
+	if _, err := db.Exec(down); err == nil || !strings.Contains(err.Error(), "never accepted") {
+		t.Fatalf("down with one of two grains accepted: err = %v, want the refusal", err)
+	}
+	// Every grain accepted with the hour's push.
+	insertVideoIDs("(SELECT pushed_at FROM pushed_hour)", "ALL")
 	exec(t, db, down)
 	var left int
 	if err := db.QueryRow(`SELECT COUNT(*) FROM pushed_usage`).Scan(&left); err != nil || left != 1 {
@@ -463,21 +480,29 @@ func TestIntegration_CatchUpRatesVideoOnlyHours(t *testing.T) {
 	db := openRatingSchema(t, "phoebe_video_catchup_it")
 	exec(t, db, readMigration(t, "0015_rater_state.up.sql"))
 	old := itHour.Add(-30 * 24 * time.Hour)
-	vseed(t, db, vrow(nil), vrow(func(r *vbRow) { r.at = old.Add(5 * time.Minute) }))
+	// Video in three hours with a gap (itHour, +1h, +3h), token events
+	// interleaved at +2h, and one video hour older than the reach.
+	vseed(t, db, vrow(nil),
+		vrow(func(r *vbRow) { r.at = itHour.Add(70 * time.Minute) }),
+		vrow(func(r *vbRow) { r.at = itHour.Add(3*time.Hour + 5*time.Minute) }),
+		vrow(func(r *vbRow) { r.at = old.Add(5 * time.Minute) }))
+	seed(t, db, row(func(r *beRow) { r.at = itHour.Add(2*time.Hour + 5*time.Minute) }))
 	agg := New(itStore(db), quiet())
 	agg.now = itNow
 	cu, err := agg.CatchUp(context.Background(), itHour.Add(5*time.Hour), 10)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(cu.Hours) != 1 || !cu.Hours[0].Equal(itHour) || !cu.Completed {
-		t.Fatalf("caught up %v (completed %v), want only %s", cu.Hours, cu.Completed, itHour)
+	want := []time.Time{itHour, itHour.Add(time.Hour), itHour.Add(2 * time.Hour), itHour.Add(3 * time.Hour)}
+	if fmt.Sprint(cu.Hours) != fmt.Sprint(want) || !cu.Completed {
+		t.Fatalf("caught up %v (completed %v), want %v", cu.Hours, cu.Completed, want)
 	}
-	if cu.Video.RollupsWritten != 1 || cu.Video.EventsAggregated != 1 {
-		t.Fatalf("catch-up video result %+v, want the hour's one job rolled up", cu.Video)
+	if cu.Video.RollupsWritten != 3 || cu.Video.EventsAggregated != 3 || cu.EventsAggregated != 1 {
+		t.Fatalf("catch-up result %+v, want three video hours and one token hour rolled up", cu.AggregateResult)
 	}
-	if got := readVideoRollups(t, db); len(got) != 1 {
-		t.Fatalf("video rollups %+v, want one", got)
+	var n int
+	if err := db.QueryRow(`SELECT COUNT(*) FROM rated_video_usage`).Scan(&n); err != nil || n != 3 {
+		t.Fatalf("rated_video_usage rows %d (err %v), want one per video hour", n, err)
 	}
 }
 

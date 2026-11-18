@@ -12,9 +12,11 @@ import (
 type ReaperConfig struct {
 	// QueueTimeout fails a job that waited longer (design 5.3: 60 min).
 	QueueTimeout time.Duration
-	// RowRetention deletes job and billing rows older than this
-	// (prune.VideoRowRetentionDays). The rater's video reach is derived from
-	// the same constant; a longer setting is safe, a shorter one is not.
+	// RowRetention deletes job and billing rows older than this. Its default,
+	// prune.VideoRowRetentionDays, is what the rater's video reach
+	// (rating.VideoRateReach) is derived from: the rater never re-rates video
+	// in an hour whose jobs this may have deleted. Tests set it; production
+	// uses the default.
 	RowRetention time.Duration
 	// Every is how often the reaper runs.
 	Every time.Duration

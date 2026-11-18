@@ -1,6 +1,9 @@
 package rating
 
-import "testing"
+import (
+	"reflect"
+	"testing"
+)
 
 // The catch-up's summed result carries every video counter, so withheld video
 // jobs, video reconcile deletions and parked video in caught-up hours reach
@@ -17,5 +20,25 @@ func TestAddResults_SumsTheVideoCounters(t *testing.T) {
 	r := Result{AggregateResult: sum}
 	if !r.HasAnomaly() || r.AllReconciledDeletions() != 3 {
 		t.Fatalf("HasAnomaly %v, AllReconciledDeletions %d; want true and 3", r.HasAnomaly(), r.AllReconciledDeletions())
+	}
+}
+
+// VideoAggregateResult.add sums every counter: a field added later and
+// forgotten in add would silently drop out of the catch-up and re-check
+// totals (the bug this sum replaced).
+func TestVideoAggregateResultAddSumsEveryField(t *testing.T) {
+	var one VideoAggregateResult
+	v := reflect.ValueOf(&one).Elem()
+	for i := 0; i < v.NumField(); i++ {
+		if v.Field(i).Kind() != reflect.Int64 {
+			t.Fatalf("field %s is %s; extend this test", v.Type().Field(i).Name, v.Field(i).Kind())
+		}
+		v.Field(i).SetInt(1)
+	}
+	sum := reflect.ValueOf(one.add(one))
+	for i := 0; i < sum.NumField(); i++ {
+		if sum.Field(i).Int() != 2 {
+			t.Errorf("add does not sum %s", sum.Type().Field(i).Name)
+		}
 	}
 }

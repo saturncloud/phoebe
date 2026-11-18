@@ -86,8 +86,9 @@ type VideoAggregateResult struct {
 	// partition bucket.
 	EmptyBaseModelEvents int64
 
-	// OutOfReachHours counts the window's hours before VideoFloor, whose video
-	// was not re-rated (their jobs may be pruned); their rollups are kept.
+	// OutOfReachHours counts the window's hours before VideoFloor that hold
+	// video rollups: their video was not re-rated (its jobs may be pruned)
+	// and the rollups are kept as they are.
 	OutOfReachHours int64
 }
 

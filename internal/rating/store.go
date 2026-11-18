@@ -576,13 +576,20 @@ func (s *PostgresStore) AggregateWindow(ctx context.Context, start, end time.Tim
 	// partial sum) and token-push would delete the manager's records. Those
 	// rollups are the record now and are left as they are.
 	vstart := start.UTC()
+	var outOfReach int64
 	if floor := VideoFloor(s.now()); vstart.Before(floor) {
 		vstart = floor
-		if !vstart.Before(end.UTC()) {
-			res.Video.OutOfReachHours = int64(end.UTC().Sub(start.UTC()) / time.Hour)
-		} else {
-			res.Video.OutOfReachHours = int64(floor.Sub(start.UTC()) / time.Hour)
+		reachEnd := end.UTC()
+		if floor.Before(reachEnd) {
+			reachEnd = floor
 		}
+		// Only hours that hold video rollups are worth reporting: those are
+		// the ones a re-rate would have deleted.
+		if err := tx.QueryRowContext(ctx, `SELECT COUNT(DISTINCT window_start) FROM rated_video_usage
+			WHERE window_start >= $1 AND window_start < $2`, start.UTC(), reachEnd).Scan(&outOfReach); err != nil {
+			return AggregateResult{}, fmt.Errorf("rating: count video hours out of reach: %w", err)
+		}
+		res.Video.OutOfReachHours = outOfReach
 	}
 	if vstart.Before(end.UTC()) {
 		v, err := aggregateVideoWindow(ctx, tx, vstart, end)
