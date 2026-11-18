@@ -74,6 +74,10 @@ func ratingSchemaDDL(t *testing.T) string {
 		"../../migrations/0011_rated_usage_quantities_only.up.sql",
 		// 0012: parked_usage (the rater parks conflicts), pushed_usage, pushed_hour.
 		"../../migrations/0012_parked_and_pushed_usage.up.sql",
+		// 0013: video_billing_event (the video rollup reads it); 0014:
+		// rated_video_usage and parked_video_usage (the video rollup writes them).
+		"../../migrations/0013_video_jobs.up.sql",
+		"../../migrations/0014_rated_video_usage.up.sql",
 	} {
 		ddl, err := os.ReadFile(f)
 		if err != nil {

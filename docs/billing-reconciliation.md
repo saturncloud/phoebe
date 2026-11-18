@@ -83,6 +83,8 @@ identity is (auth_id, owner, resource_id, model_id, serving_mode) in one hour.
          serving_mode, reason, event_count, prompt_tokens, cached_tokens,
          completion_tokens, first_parked_at, last_seen_at
     FROM parked_usage WHERE resolved_at IS NULL ORDER BY window_start;
+  -- video: the same from parked_video_usage, with output_seconds,
+  -- output_frames, request_count and gpu_seconds
   ```
 - **Resolution.** Fix the cause (header propagation, or correct the evidence in
   `billing_event`). Every rater run re-checks unresolved parked hours from the last
@@ -120,6 +122,28 @@ identity is (auth_id, owner, resource_id, model_id, serving_mode) in one hour.
   is expected and needs no further action.
 - **Held ids.** While an identity is parked, every push of its hour lists the
   usage_ids the manager accepted for it earlier in `held`.
+
+### Parked video usage
+
+Video generation jobs (kind `video`, migration 0014) are parked the same way, in
+`parked_video_usage`, with video quantities (`output_seconds`, `output_frames`,
+`request_count`, `gpu_seconds`) instead of token counts. The identity is the same
+(auth_id, owner, resource_id, model_id, serving_mode) in one hour, and the
+reasons are `owner_conflict`, `ambiguous_org` and `missing_org` (org_id `''`).
+There is no `ambiguous_base`: base model, task, resolution and region are part
+of the video grain, so two values are two records, not a conflict.
+
+- `phoebe-rater -list-parked` lists both kinds; its `KIND` column says which, and
+  its `USAGE` column carries the counts in the kind's own units. The raw-event
+  check counts `video_billing_event` rows for a video row.
+- Resolution, the pruned-raw-events rule and holding are the same as above, with
+  `video_billing_event` and `parked_video_usage` in place of `billing_event` and
+  `parked_usage`. Holding is per kind: a parked video identity holds only its
+  video usage_ids (`pushed_usage.kind`), never a token record.
+- Video jobs that cannot become any record (an empty auth, resource or model id,
+  a negative quantity, or a completed job whose `request_count` is not 1) are
+  withheld per job, logged at ERROR, and make the rater exit `2`, like invalid
+  token events.
 
 ## Routine checks and alert conditions
 

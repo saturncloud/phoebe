@@ -30,8 +30,17 @@ with the Atlas schema; they live in phoebe's own database.
   base model or adapter, missing org) parked per (hour, identity, reason) with its
   token counts. Written by the rater; never pruned. See "Parked usage" in
   docs/billing-reconciliation.md.
+- **`rated_video_usage`** — the hourly video generation rollup (0014), one row per
+  (auth_id, owner, resource_id, model_id, serving_mode, base_model, task,
+  resolution, region, hour), carrying `org_id`, with `output_seconds` (exact
+  NUMERIC), `output_frames`, `request_count` (completed jobs), `gpu_seconds` and
+  `event_count` (every finished job). Written by the rater from
+  `video_billing_event`; sent by token-push as kind `video`. Never pruned.
+- **`parked_video_usage`** — conflicted video usage, the video twin of
+  `parked_usage`. Never pruned.
 - **`pushed_usage`, `pushed_hour`** — token-push's record of which usage_ids the
-  manager holds per hour and when the hour was last accepted.
+  manager holds per hour (with each id's `kind` since 0014) and when the hour was
+  last accepted.
 - **`io_log`** — optional, sampled, short-retention request/response body capture
   (M5 I/O logging). Written by the interceptor's iolog sink; OFF by default.
   `cmd/prune` enforces the short retention: rows older than 7 days on `created_at`
@@ -59,6 +68,7 @@ golang-migrate up/down pairs, applied in version order:
 | 0010 | `0010_rated_usage_identity.{up,down}.sql` | `rated_usage` attributes `base_model`, `adapter`, `price_key` (usage identity) |
 | 0011 | `0011_rated_usage_quantities_only.{up,down}.sql` | `rated_usage` money columns become nullable with no `$0` default (expand step: the aggregator writes NULL; dropped one release later) |
 | 0012 | `0012_parked_and_pushed_usage.{up,down}.sql` | `parked_usage` (conflicted usage parked per identity-hour by the rater, never pruned), `pushed_usage` and `pushed_hour` (what token-push last had accepted per hour, for `held` and re-sending resolved hours). Down refuses while unresolved parked rows exist |
+| 0014 | `0014_rated_video_usage.{up,down}.sql` | `rated_video_usage` and `parked_video_usage` (the video rollup and its parked conflicts), and `pushed_usage.kind` (default `'token'`). Down refuses while video usage is parked or not yet accepted by the manager |
 
 `embed.go` embeds these into the `migrations` package; `cmd/migrate` applies them.
 
@@ -331,6 +341,18 @@ the contract migration drops the columns.
 Rolling back: `0011 down` refuses while any row has NULL money (it will not invent
 a `$0` cost). Deploy the previous rater and token-push, re-rate the affected hours
 with `--since/--until`, then run `migrate down`.
+
+### Rollout order for migration 0014
+
+Expand only: two new tables and a column with a default, so the previous
+release's rater and token-push keep working. Deploy the manager that accepts
+kind `video` (saturn-aws-manager, `LEGACY_PATH_ACCEPTED_KINDS` with `video`)
+before any install records video usage: token-push lists `video` in `kinds` only
+once `rated_video_usage` or `parked_video_usage` has a row, so installs without
+video keep sending `["token"]` to an older manager. If a previous-release
+token-push runs once after the migration, its trim of `pushed_usage` drops that
+hour's video rows; it sends `["token"]` only, so the manager's video records are
+untouched, and the next push re-records them.
 
 ## Local dev
 

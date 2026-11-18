@@ -193,22 +193,22 @@ func runWith(argv []string, log *logging.Logger) int {
 		log.Error.Printf("rater: run: %v", err)
 		return exitFatal
 	}
-	return exitCode(res.ReconciledDeletions, windowExplicit, res.HasAnomaly(), res.HasParked())
+	return exitCode(res.AllReconciledDeletions(), windowExplicit, res.HasAnomaly(), res.HasParked())
 }
 
 // printParked writes one tab-separated line per parked identity-hour, with a
 // header, for an operator.
 func printParked(w io.Writer, parked []rating.Parked) {
 	tw := tabwriter.NewWriter(w, 0, 0, 2, ' ', 0)
-	fmt.Fprintln(tw, "HOUR\tREASON\tAUTH_ID\tOWNER\tRESOURCE_ID\tMODEL_ID\tMODE\tEVENTS\tPROMPT\tCACHED\tCOMPLETION\tFIRST_PARKED\tRAW_EVENTS")
+	fmt.Fprintln(tw, "HOUR\tKIND\tREASON\tAUTH_ID\tOWNER\tRESOURCE_ID\tMODEL_ID\tMODE\tEVENTS\tUSAGE\tFIRST_PARKED\tRAW_EVENTS")
 	for _, p := range parked {
 		owner := p.OwnerType + "/" + p.OwnerID
 		if p.OwnerType == "" {
 			owner = "-"
 		}
-		fmt.Fprintf(tw, "%s\t%s\t%s\t%s\t%s\t%s\t%s\t%d\t%d\t%d\t%d\t%s\t%s\n",
-			p.WindowStart.Format(time.RFC3339), p.Reason, p.AuthID, owner, p.ResourceID, p.ModelID, p.ServingMode,
-			p.EventCount, p.PromptTokens, p.CachedTokens, p.CompletionTokens, p.FirstParkedAt.UTC().Format(time.RFC3339),
+		fmt.Fprintf(tw, "%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%d\t%s\t%s\t%s\n",
+			p.WindowStart.Format(time.RFC3339), p.Kind, p.Reason, p.AuthID, owner, p.ResourceID, p.ModelID, p.ServingMode,
+			p.EventCount, p.UsageLabel(), p.FirstParkedAt.UTC().Format(time.RFC3339),
 			p.RawEventsLabel())
 	}
 	_ = tw.Flush()
