@@ -254,7 +254,10 @@ func (a *Aggregator) aggregateAndLog(ctx context.Context, windowStart, windowEnd
 // the same levels as the token buckets.
 func (a *Aggregator) logVideo(w string, v VideoAggregateResult, windowExplicit bool) {
 	if v.OutOfReachHours > 0 {
-		a.log.Warn.Printf("rating: window %s: video of %d hour(s) older than %s was NOT re-rated; phoebe-videos prunes video jobs after %d days, so existing video rollups there are kept as the record, and video jobs there that were never rated are not billed", w, v.OutOfReachHours, VideoRateReach, prune.VideoRowRetentionDays)
+		a.log.Warn.Printf("rating: window %s: video rollups of %d hour(s) older than %s were NOT re-rated; phoebe-videos prunes video jobs after %d days, so the existing rollups are kept as the record", w, v.OutOfReachHours, VideoRateReach, prune.VideoRowRetentionDays)
+	}
+	if v.UnratedOutOfReachHours > 0 {
+		a.log.Error.Printf("rating: window %s: %d hour(s) older than %s hold completed video jobs that were NEVER rated (no rollup, no park); the rater no longer rates them, so they are not billed. Export them from video_billing_event before phoebe-videos prunes them at %d days and settle by hand through the manager's credit path", w, v.UnratedOutOfReachHours, VideoRateReach, prune.VideoRowRetentionDays)
 	}
 	if v.UnattributableEvents > 0 {
 		a.log.Error.Printf("rating: window %s has %d UNATTRIBUTABLE video jobs (auth_id, resource_id or model_id is ''); they cannot name who used what and are not sent. phoebe-videos must stamp the request's trusted identity on every job", w, v.UnattributableEvents)

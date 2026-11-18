@@ -583,15 +583,21 @@ func (s *PostgresStore) AggregateWindow(ctx context.Context, start, end time.Tim
 		if floor.Before(reachEnd) {
 			reachEnd = floor
 		}
-		// Only hours with video are worth reporting: hours holding rollups (a
-		// re-rate would have deleted them) and hours holding jobs never rated
-		// (they will now never be billed).
-		if err := tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM (
-			SELECT window_start FROM rated_video_usage WHERE window_start >= $1 AND window_start < $2
-			UNION
-			SELECT date_trunc('hour', created_at AT TIME ZONE 'UTC') AT TIME ZONE 'UTC'
-			  FROM video_billing_event WHERE created_at >= $1 AND created_at < $2) h`,
-			start.UTC(), reachEnd).Scan(&outOfReach); err != nil {
+		// Two kinds of out-of-reach hour are worth reporting: hours holding
+		// video rollups (kept as the record; a re-rate would have deleted
+		// them), and hours holding completed video jobs with no rollup and no
+		// park (rated never, billed never: the rater was down longer than the
+		// reach).
+		if err := tx.QueryRowContext(ctx, `SELECT
+			(SELECT COUNT(DISTINCT window_start) FROM rated_video_usage
+			  WHERE window_start >= $1 AND window_start < $2),
+			(SELECT COUNT(*) FROM (
+			   SELECT DISTINCT date_trunc('hour', e.created_at AT TIME ZONE 'UTC') AT TIME ZONE 'UTC' AS h
+			     FROM video_billing_event e
+			    WHERE e.created_at >= $1 AND e.created_at < $2 AND e.status = 'completed') j
+			  WHERE NOT EXISTS (SELECT 1 FROM rated_video_usage r WHERE r.window_start = j.h)
+			    AND NOT EXISTS (SELECT 1 FROM parked_video_usage p WHERE p.window_start = j.h))`,
+			start.UTC(), reachEnd).Scan(&outOfReach, &res.Video.UnratedOutOfReachHours); err != nil {
 			return AggregateResult{}, fmt.Errorf("rating: count video hours out of reach: %w", err)
 		}
 		res.Video.OutOfReachHours = outOfReach
@@ -602,6 +608,7 @@ func (s *PostgresStore) AggregateWindow(ctx context.Context, start, end time.Tim
 			return AggregateResult{}, err
 		}
 		v.OutOfReachHours = res.Video.OutOfReachHours
+		v.UnratedOutOfReachHours = res.Video.UnratedOutOfReachHours
 		res.Video = v
 	}
 	if err := tx.Commit(); err != nil {

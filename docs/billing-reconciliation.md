@@ -151,7 +151,17 @@ of the video grain, so two values are two records, not a conflict.
   rater never re-rates video in an hour older than 29 days, even in an explicit
   `--since/--until` run. That hour's `rated_video_usage` rows are the record and
   are kept as they are, and the run logs a WARN naming how many hours it left
-  alone. Tokens in such a window are re-rated as usual.
+  alone. Tokens in such a window are re-rated as usual. An hour there that holds
+  completed video jobs but no video rollup (the rater was down for longer than
+  the reach) is logged at ERROR. Those jobs are never billed automatically:
+  export them before the 30-day prune and settle them by hand through the
+  manager's credit path.
+- token-push holds a video record it sent before whose rollup is gone, unless
+  the rater can have removed it: `rated_video_usage` still has rows and the hour
+  is at most 30 days old. It logs `video record(s) this install sent have no
+  rollup now` at ERROR and exits `1`. The alert repeats only while the hour is
+  re-sent (the trailing 24 hours, or an explicit `-since/-until`), so treat the
+  first one as the page.
 
 ## Routine checks and alert conditions
 

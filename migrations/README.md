@@ -377,9 +377,21 @@ that hour, because it is stamped.
 
 To roll back, first suspend the token-push and rater CronJobs; do not roll them
 back to the previous release yet. Wait for any running job to finish, then run
-the current token-push once by hand, so the manager has every hour's latest
-rating. A token-push that overlapped a rater run may have sent an hour's older
-content, and the down guard cannot tell. Then run `0017 down`. It refuses until every
+the current token-push once by hand. A token-push that overlapped a rater run
+may have sent an hour's older content, and the down guard cannot tell. Then run
+`0017 down`. If it refuses, it names how many identity-hours the manager has
+not accepted since they were last rated: find them with
+
+```sql
+SELECT DISTINCT v.window_start FROM rated_video_usage v
+  LEFT JOIN pushed_hour h ON h.window_start = v.window_start
+ WHERE h.pushed_at IS NULL OR h.pushed_at < v.rated_at;
+```
+
+re-send those hours with `token-push -since ... -until ...`, and run `0017 down`
+again. An identity whose grain token-push holds back (it logs `HOLDING BACK
+rated_video_usage`) keeps refusing until the cause is fixed or the row is
+exported. It refuses until every
 video rollup has been accepted by the manager. That means the hour's last
 accepted push came after the rollup was rated, and recorded a video
 `pushed_usage` id for each rated row of the identity. Once it passes, it removes

@@ -466,12 +466,15 @@ func TestIntegration_VideoOlderThanTheReachIsNeverReRatedOrDeleted(t *testing.T)
 	if after := readVideoRollups(t, db); len(after) != 1 || after[0] != before[0] {
 		t.Fatalf("video rollups %+v, want %+v kept", after, before)
 	}
-	// Only hours with video count: itHour (its rollup), itHour-2h (a job
-	// never rated), not itHour-1h (nothing).
-	vseed(t, db, vrow(func(r *vbRow) { r.at = itHour.Add(-2*time.Hour + 5*time.Minute) }))
-	res, err = store.AggregateWindow(context.Background(), itHour.Add(-2*time.Hour), itHour.Add(time.Hour))
-	if err != nil || res.Video.OutOfReachHours != 2 {
-		t.Fatalf("out-of-reach hours %d (err %v), want 2", res.Video.OutOfReachHours, err)
+	// Out-of-reach hours are reported by kind: itHour holds a rollup (kept);
+	// itHour-2h a completed job never rated (unbilled); itHour-3h only a
+	// failed job (nothing to bill, not reported); itHour-1h nothing.
+	vseed(t, db, vrow(func(r *vbRow) { r.at = itHour.Add(-2*time.Hour + 5*time.Minute) }),
+		vrow(func(r *vbRow) { r.at = itHour.Add(-3*time.Hour + 5*time.Minute); failed(r) }))
+	res, err = store.AggregateWindow(context.Background(), itHour.Add(-3*time.Hour), itHour.Add(time.Hour))
+	if err != nil || res.Video.OutOfReachHours != 1 || res.Video.UnratedOutOfReachHours != 1 || !res.Video.HasAnomaly() {
+		t.Fatalf("out-of-reach hours %d with rollups and %d unrated (err %v), want 1 and 1 and an anomaly (exit 2)",
+			res.Video.OutOfReachHours, res.Video.UnratedOutOfReachHours, err)
 	}
 
 	// The reach is one day inside the 30-day row retention.
