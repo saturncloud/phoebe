@@ -5,6 +5,8 @@ import (
 	"database/sql"
 	"fmt"
 	"time"
+
+	"github.com/saturncloud/phoebe/internal/meteredusage"
 )
 
 // identity is the rater's gate identity: who used what, at which serving mode,
@@ -24,36 +26,71 @@ type rollupRow struct {
 	Prompt, Cached, Completion, Requests int64
 }
 
-// pushedRow is a usage_id the manager holds for an hour, with its identity.
+// videoRollupRow is one rated_video_usage row as token-push reads it. Every
+// grain column is NOT NULL (” for an unknown base model or region), and
+// OutputSeconds and GPUSeconds are the exact NUMERIC sums as Postgres prints
+// them.
+type videoRollupRow struct {
+	ID string
+	identity
+	OrgID, BaseModel, Task, Resolution, Region string
+	OutputSeconds, GPUSeconds                  string
+	OutputFrames, Requests                     int64
+}
+
+// pushedRow is a usage_id the manager holds for an hour, with its kind and
+// identity. Kind "" is read as "token", the pushed_usage column default.
 type pushedRow struct {
 	UsageID string
+	Kind    string
 	identity
+}
+
+// kind returns the row's kind, "token" when unset.
+func (p pushedRow) kind() string {
+	if p.Kind == "" {
+		return meteredusage.KindToken
+	}
+	return p.Kind
 }
 
 // pushStore is token-push's data seam. pgStore is the production one; the unit
 // tests use an in-memory fake.
 type pushStore interface {
-	// HasAnyUsage is the liveness guard: false only when rated_usage AND
-	// parked_usage are both empty (a fresh or wiped database).
+	// HasAnyUsage is the liveness guard: false only when rated_usage,
+	// parked_usage, rated_video_usage and parked_video_usage are all empty (a
+	// fresh or wiped database).
 	HasAnyUsage(ctx context.Context) (bool, error)
+	// VideoUsageState reports whether any video usage is recorded
+	// (rated_video_usage or parked_video_usage has a row), and whether the
+	// manager was ever sent a video record (pushed_usage has a video row).
+	// token-push lists kind "video" only when video usage is recorded.
+	VideoUsageState(ctx context.Context) (has, everPushed bool, err error)
 	Rollups(ctx context.Context, hour time.Time) ([]rollupRow, error)
+	// VideoRollups reads every rated_video_usage row of one hour.
+	VideoRollups(ctx context.Context, hour time.Time) ([]videoRollupRow, error)
 	// ParkedIdentities lists the identities of the hour whose usage is parked
 	// and unresolved, for reasons that can hide an already-sent record
 	// (ambiguous_org, ambiguous_base, missing_org). Owner-conflict events never
 	// formed a record, so there is nothing of theirs to hold.
 	ParkedIdentities(ctx context.Context, hour time.Time) ([]identity, error)
+	// ParkedVideoIdentities is ParkedIdentities for parked_video_usage
+	// (ambiguous_org and missing_org; never owner_conflict).
+	ParkedVideoIdentities(ctx context.Context, hour time.Time) ([]identity, error)
 	// Pushed lists the usage_ids the manager holds for the hour after
 	// token-push's last request for it.
 	Pushed(ctx context.Context, hour time.Time) ([]pushedRow, error)
-	// ResolvedHours lists hours before `before` with a parked row resolved after
-	// the hour's last accepted push: they must be re-sent however old.
+	// ResolvedHours lists hours before `before` with a parked row (token or
+	// video) resolved after the hour's last accepted push: they must be re-sent
+	// however old.
 	ResolvedHours(ctx context.Context, before time.Time) ([]time.Time, error)
 	// EverPushed reports whether the manager has ever accepted an hour from
 	// this install (pushed_hour has a row). With no usage at all, it tells a
 	// fresh install (false) from a wiped one (true).
 	EverPushed(ctx context.Context) (bool, error)
 	// UnsentHours lists, oldest first and at most limit, the hours before
-	// `before` that have rated_usage, come after the first hour the manager ever
+	// `before` that have rated_usage or rated_video_usage, come after the first
+	// hour the manager ever
 	// accepted, and were never accepted (no pushed_hour row).
 	UnsentHours(ctx context.Context, before time.Time, limit int) ([]time.Time, error)
 	// RecordIntent adds rows to pushed_usage BEFORE the request is sent. If the
@@ -61,9 +98,11 @@ type pushStore interface {
 	// still known as sent; listing an id the manager does not have in `held` is
 	// harmless, forgetting one it does have is not.
 	RecordIntent(ctx context.Context, hour time.Time, rows []pushedRow) error
-	// RecordAccepted makes pushed_usage for the hour exactly rows (what the
-	// manager now holds) and stamps pushed_hour.
-	RecordAccepted(ctx context.Context, hour time.Time, rows []pushedRow) error
+	// RecordAccepted makes pushed_usage for the hour and the request's kinds
+	// exactly rows (what the manager now holds) and stamps pushed_hour. Rows of
+	// a kind the request did not list are kept: the manager kept those
+	// records too.
+	RecordAccepted(ctx context.Context, hour time.Time, kinds []string, rows []pushedRow) error
 }
 
 type pgStore struct{ db *sql.DB }
@@ -71,8 +110,45 @@ type pgStore struct{ db *sql.DB }
 func (s pgStore) HasAnyUsage(ctx context.Context) (bool, error) {
 	var found bool
 	err := s.db.QueryRowContext(ctx,
-		`SELECT EXISTS (SELECT 1 FROM rated_usage) OR EXISTS (SELECT 1 FROM parked_usage)`).Scan(&found)
+		`SELECT EXISTS (SELECT 1 FROM rated_usage) OR EXISTS (SELECT 1 FROM parked_usage)
+		     OR EXISTS (SELECT 1 FROM rated_video_usage) OR EXISTS (SELECT 1 FROM parked_video_usage)`).Scan(&found)
 	return found, err
+}
+
+func (s pgStore) VideoUsageState(ctx context.Context) (has, everPushed bool, err error) {
+	err = s.db.QueryRowContext(ctx,
+		`SELECT EXISTS (SELECT 1 FROM rated_video_usage) OR EXISTS (SELECT 1 FROM parked_video_usage),
+		        EXISTS (SELECT 1 FROM pushed_usage WHERE kind = 'video')`).Scan(&has, &everPushed)
+	return has, everPushed, err
+}
+
+// videoHourQuery reads every video rollup of one hour. NUMERIC as text, so the
+// sums reach the wire exactly.
+const videoHourQuery = `
+SELECT v.id, v.auth_id, v.owner_type, v.owner_id, v.resource_id, v.model_id, v.serving_mode,
+       v.org_id, v.base_model, v.task, v.resolution, v.region,
+       v.output_seconds::text, v.output_frames, v.request_count, v.gpu_seconds::text
+  FROM rated_video_usage v
+ WHERE v.window_start = $1
+ ORDER BY v.id`
+
+func (s pgStore) VideoRollups(ctx context.Context, hour time.Time) ([]videoRollupRow, error) {
+	rows, err := s.db.QueryContext(ctx, videoHourQuery, hour)
+	if err != nil {
+		return nil, fmt.Errorf("query rated_video_usage: %w", err)
+	}
+	defer func() { _ = rows.Close() }()
+	var out []videoRollupRow
+	for rows.Next() {
+		var r videoRollupRow
+		if err := rows.Scan(&r.ID, &r.AuthID, &r.OwnerType, &r.OwnerID, &r.ResourceID, &r.ModelID, &r.ServingMode,
+			&r.OrgID, &r.BaseModel, &r.Task, &r.Resolution, &r.Region,
+			&r.OutputSeconds, &r.OutputFrames, &r.Requests, &r.GPUSeconds); err != nil {
+			return nil, fmt.Errorf("scan rated_video_usage: %w", err)
+		}
+		out = append(out, r)
+	}
+	return out, rows.Err()
 }
 
 // hourQuery reads every rollup of one hour. No money: the manager prices.
@@ -110,7 +186,7 @@ func scanIdentities(rows *sql.Rows, withUsageID bool) ([]pushedRow, error) {
 		var p pushedRow
 		dest := []any{&p.AuthID, &p.OwnerType, &p.OwnerID, &p.ResourceID, &p.ModelID, &p.ServingMode}
 		if withUsageID {
-			dest = append([]any{&p.UsageID}, dest...)
+			dest = append([]any{&p.UsageID, &p.Kind}, dest...)
 		}
 		if err := rows.Scan(dest...); err != nil {
 			return nil, err
@@ -121,14 +197,23 @@ func scanIdentities(rows *sql.Rows, withUsageID bool) ([]pushedRow, error) {
 }
 
 func (s pgStore) ParkedIdentities(ctx context.Context, hour time.Time) ([]identity, error) {
+	return s.parkedIdentities(ctx, "parked_usage", hour)
+}
+
+func (s pgStore) ParkedVideoIdentities(ctx context.Context, hour time.Time) ([]identity, error) {
+	return s.parkedIdentities(ctx, "parked_video_usage", hour)
+}
+
+// parkedIdentities reads one parked table; table is one of two constants.
+func (s pgStore) parkedIdentities(ctx context.Context, table string, hour time.Time) ([]identity, error) {
 	rows, err := s.db.QueryContext(ctx, `SELECT DISTINCT auth_id, owner_type, owner_id, resource_id, model_id, serving_mode
-		FROM parked_usage WHERE window_start = $1 AND resolved_at IS NULL AND reason <> 'owner_conflict'`, hour)
+		FROM `+table+` WHERE window_start = $1 AND resolved_at IS NULL AND reason <> 'owner_conflict'`, hour)
 	if err != nil {
-		return nil, fmt.Errorf("query parked_usage: %w", err)
+		return nil, fmt.Errorf("query %s: %w", table, err)
 	}
 	ps, err := scanIdentities(rows, false)
 	if err != nil {
-		return nil, fmt.Errorf("scan parked_usage: %w", err)
+		return nil, fmt.Errorf("scan %s: %w", table, err)
 	}
 	out := make([]identity, len(ps))
 	for i, p := range ps {
@@ -138,7 +223,7 @@ func (s pgStore) ParkedIdentities(ctx context.Context, hour time.Time) ([]identi
 }
 
 func (s pgStore) Pushed(ctx context.Context, hour time.Time) ([]pushedRow, error) {
-	rows, err := s.db.QueryContext(ctx, `SELECT usage_id, auth_id, owner_type, owner_id, resource_id, model_id, serving_mode
+	rows, err := s.db.QueryContext(ctx, `SELECT usage_id, kind, auth_id, owner_type, owner_id, resource_id, model_id, serving_mode
 		FROM pushed_usage WHERE window_start = $1 ORDER BY usage_id`, hour)
 	if err != nil {
 		return nil, fmt.Errorf("query pushed_usage: %w", err)
@@ -151,10 +236,14 @@ func (s pgStore) Pushed(ctx context.Context, hour time.Time) ([]pushedRow, error
 }
 
 func (s pgStore) ResolvedHours(ctx context.Context, before time.Time) ([]time.Time, error) {
-	rows, err := s.db.QueryContext(ctx, `SELECT DISTINCT p.window_start
-		FROM parked_usage p LEFT JOIN pushed_hour h ON h.window_start = p.window_start
+	rows, err := s.db.QueryContext(ctx, `SELECT p.window_start
+		FROM (SELECT window_start, resolved_at FROM parked_usage
+		      UNION ALL
+		      SELECT window_start, resolved_at FROM parked_video_usage) p
+		LEFT JOIN pushed_hour h ON h.window_start = p.window_start
 		WHERE p.resolved_at IS NOT NULL AND p.window_start < $1
 		  AND (h.pushed_at IS NULL OR p.resolved_at > h.pushed_at)
+		GROUP BY p.window_start
 		ORDER BY p.window_start`, before)
 	if err != nil {
 		return nil, fmt.Errorf("query resolved parked hours: %w", err)
@@ -182,7 +271,9 @@ func (s pgStore) EverPushed(ctx context.Context) (bool, error) {
 // so nothing qualifies until the first push is accepted.
 const unsentHoursQuery = `
 SELECT DISTINCT ru.window_start
-  FROM rated_usage ru
+  FROM (SELECT window_start FROM rated_usage
+        UNION
+        SELECT window_start FROM rated_video_usage) ru
  WHERE ru.window_start < $1
    AND ru.window_start > (SELECT min(window_start) FROM pushed_hour)
    AND NOT EXISTS (SELECT 1 FROM pushed_hour h WHERE h.window_start = ru.window_start)
@@ -208,10 +299,10 @@ func (s pgStore) UnsentHours(ctx context.Context, before time.Time, limit int) (
 
 func insertPushed(ctx context.Context, tx *sql.Tx, hour time.Time, rows []pushedRow) error {
 	for _, r := range rows {
-		if _, err := tx.ExecContext(ctx, `INSERT INTO pushed_usage (window_start, usage_id, auth_id, owner_type, owner_id,
-			resource_id, model_id, serving_mode) VALUES ($1,$2,$3,$4,$5,$6,$7,$8)
-			ON CONFLICT ON CONSTRAINT pushed_usage_pk DO UPDATE SET pushed_at = now()`,
-			hour, r.UsageID, r.AuthID, r.OwnerType, r.OwnerID, r.ResourceID, r.ModelID, r.ServingMode); err != nil {
+		if _, err := tx.ExecContext(ctx, `INSERT INTO pushed_usage (window_start, usage_id, kind, auth_id, owner_type, owner_id,
+			resource_id, model_id, serving_mode) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)
+			ON CONFLICT ON CONSTRAINT pushed_usage_pk DO UPDATE SET pushed_at = now(), kind = EXCLUDED.kind`,
+			hour, r.UsageID, r.kind(), r.AuthID, r.OwnerType, r.OwnerID, r.ResourceID, r.ModelID, r.ServingMode); err != nil {
 			return fmt.Errorf("record pushed usage: %w", err)
 		}
 	}
@@ -234,14 +325,14 @@ func (s pgStore) RecordIntent(ctx context.Context, hour time.Time, rows []pushed
 	return s.inTx(ctx, func(tx *sql.Tx) error { return insertPushed(ctx, tx, hour, rows) })
 }
 
-func (s pgStore) RecordAccepted(ctx context.Context, hour time.Time, rows []pushedRow) error {
+func (s pgStore) RecordAccepted(ctx context.Context, hour time.Time, kinds []string, rows []pushedRow) error {
 	return s.inTx(ctx, func(tx *sql.Tx) error {
 		keep := make([]string, len(rows))
 		for i, r := range rows {
 			keep[i] = r.UsageID
 		}
-		if _, err := tx.ExecContext(ctx, `DELETE FROM pushed_usage WHERE window_start = $1 AND NOT (usage_id = ANY($2))`,
-			hour, keep); err != nil {
+		if _, err := tx.ExecContext(ctx, `DELETE FROM pushed_usage WHERE window_start = $1 AND kind = ANY($3)
+			AND NOT (usage_id = ANY($2))`, hour, keep, kinds); err != nil {
 			return fmt.Errorf("trim pushed usage: %w", err)
 		}
 		if err := insertPushed(ctx, tx, hour, rows); err != nil {

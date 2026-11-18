@@ -76,11 +76,36 @@ type fakeStore struct {
 	pushed     map[time.Time][]pushedRow
 	resolved   []time.Time
 	accepted   map[time.Time]int
+	// Video usage: hasVideo is VideoUsageState's first answer; everPushedVideo
+	// is derived from pushed (a video row) unless forced.
+	hasVideo        bool
+	everPushedVideo bool
+	videoRollups    map[time.Time][]videoRollupRow
+	videoParked     map[time.Time][]identity
 }
 
 func newFake() *fakeStore {
 	return &fakeStore{rollups: map[time.Time][]rollupRow{}, parked: map[time.Time][]identity{},
-		pushed: map[time.Time][]pushedRow{}, accepted: map[time.Time]int{}}
+		pushed: map[time.Time][]pushedRow{}, accepted: map[time.Time]int{},
+		videoRollups: map[time.Time][]videoRollupRow{}, videoParked: map[time.Time][]identity{}}
+}
+
+func (f *fakeStore) VideoUsageState(context.Context) (bool, bool, error) {
+	ever := f.everPushedVideo
+	for _, rows := range f.pushed {
+		for _, r := range rows {
+			if r.kind() == meteredusage.KindVideo {
+				ever = true
+			}
+		}
+	}
+	return f.hasVideo, ever, nil
+}
+func (f *fakeStore) VideoRollups(_ context.Context, h time.Time) ([]videoRollupRow, error) {
+	return f.videoRollups[h], nil
+}
+func (f *fakeStore) ParkedVideoIdentities(_ context.Context, h time.Time) ([]identity, error) {
+	return f.videoParked[h], nil
 }
 
 func (f *fakeStore) HasAnyUsage(context.Context) (bool, error) { return !f.empty, nil }
@@ -124,8 +149,18 @@ func (f *fakeStore) RecordIntent(_ context.Context, h time.Time, rows []pushedRo
 	}
 	return nil
 }
-func (f *fakeStore) RecordAccepted(_ context.Context, h time.Time, rows []pushedRow) error {
-	f.pushed[h] = append([]pushedRow(nil), rows...)
+func (f *fakeStore) RecordAccepted(_ context.Context, h time.Time, kinds []string, rows []pushedRow) error {
+	listed := map[string]bool{}
+	for _, k := range kinds {
+		listed[k] = true
+	}
+	var kept []pushedRow
+	for _, r := range f.pushed[h] {
+		if !listed[r.kind()] {
+			kept = append(kept, r)
+		}
+	}
+	f.pushed[h] = append(kept, rows...)
 	f.accepted[h]++
 	return nil
 }
@@ -171,7 +206,7 @@ func (m *recordingManager) server(t *testing.T) *httptest.Server {
 		}
 		var req meteredusage.Request
 		_ = json.Unmarshal(body, &req)
-		_ = json.NewEncoder(w).Encode(meteredusage.Response{Accepted: int64(len(req.Records)), WindowStart: req.WindowStart, Kinds: req.Kinds})
+		_ = json.NewEncoder(w).Encode(meteredusage.Response{Accepted: int64(req.RecordCount()), WindowStart: req.WindowStart, Kinds: req.Kinds})
 	}))
 	t.Cleanup(srv.Close)
 	return srv
@@ -199,7 +234,7 @@ func fixtureStore() *fakeStore {
 }
 
 func TestBuildHour_MapsEachRollupToATokenRecord(t *testing.T) {
-	plan, err := newPusher(fixtureStore(), nil).buildHour(context.Background(), win)
+	plan, err := newPusher(fixtureStore(), nil).buildHour(context.Background(), win, false)
 	if err != nil || plan.heldBack != 0 {
 		t.Fatalf("buildHour: heldBack=%d err=%v", plan.heldBack, err)
 	}
@@ -239,7 +274,7 @@ func TestBuildHour_MapsEachRollupToATokenRecord(t *testing.T) {
 // manager's ingest can be tested against exactly what phoebe sends.
 // Regenerate with: go test ./cmd/token-push -run TestGoldenRequest -update
 func TestGoldenRequest_FullHourBody(t *testing.T) {
-	plan, err := newPusher(fixtureStore(), nil).buildHour(context.Background(), win)
+	plan, err := newPusher(fixtureStore(), nil).buildHour(context.Background(), win, false)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -273,7 +308,7 @@ func TestGoldenRequest_FullHourBody(t *testing.T) {
 }
 
 func TestBuildHour_EmptyHourIsAnEmptyRecordList(t *testing.T) {
-	plan, err := newPusher(newFake(), nil).buildHour(context.Background(), win)
+	plan, err := newPusher(newFake(), nil).buildHour(context.Background(), win, false)
 	if err != nil {
 		t.Fatal(err)
 	}

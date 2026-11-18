@@ -197,8 +197,8 @@ func (c *Client) once(ctx context.Context, url string, body []byte) (Response, e
 // sent, for the hour and kinds we sent. A mismatch means the two sides disagree
 // about the wire, which no retry fixes.
 func checkResponse(req Request, resp Response) error {
-	if resp.Accepted != int64(len(req.Records)) {
-		return &malformedResponseError{msg: fmt.Sprintf("manager accepted %d records for %s, sent %d", resp.Accepted, req.WindowStart, len(req.Records))}
+	if resp.Accepted != int64(req.RecordCount()) {
+		return &malformedResponseError{msg: fmt.Sprintf("manager accepted %d records for %s, sent %d", resp.Accepted, req.WindowStart, req.RecordCount())}
 	}
 	if resp.WindowStart != "" {
 		got, err := time.Parse(time.RFC3339, resp.WindowStart)

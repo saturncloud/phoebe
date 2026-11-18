@@ -59,6 +59,14 @@ type hourPlan struct {
 	heldBack int
 }
 
+// heldKey is a held-back or parked identity of one kind. Holding is per kind:
+// a parked video identity holds only video records, never a token record of
+// the same (auth, owner, resource, model, serving mode), and the reverse.
+type heldKey struct {
+	kind string
+	identity
+}
+
 // buildHour turns one hour's rollups into the hour's request.
 //
 // A rollup that cannot become a valid record holds back ONLY its own identity
@@ -66,11 +74,20 @@ type hourPlan struct {
 // goes for identities the rater has parked. For each held-back or parked
 // identity, the usage_ids the manager already holds for it (pushed_usage) go
 // into `held`, so delete-by-absence cannot remove usage the manager accepted.
-func (p *pusher) buildHour(ctx context.Context, hour time.Time) (hourPlan, error) {
+//
+// withVideo lists kind "video" and sends the hour's video records too. The
+// manager deletes by absence per listed kind, so an hour with token usage and
+// no video usage sends its token records and an empty video set, and the
+// reverse.
+func (p *pusher) buildHour(ctx context.Context, hour time.Time, withVideo bool) (hourPlan, error) {
 	ws := meteredusage.FormatWindowStart(hour)
+	kinds := []string{meteredusage.KindToken}
+	if withVideo {
+		kinds = append(kinds, meteredusage.KindVideo)
+	}
 	plan := hourPlan{req: meteredusage.Request{
 		WindowStart: ws,
-		Kinds:       []string{meteredusage.KindToken},
+		Kinds:       kinds,
 		// Non-nil: an hour with no usage is [] (delete-by-absence), never null.
 		Records: make([]meteredusage.Record, 0),
 		Held:    make([]string, 0),
@@ -80,7 +97,7 @@ func (p *pusher) buildHour(ctx context.Context, hour time.Time) (hourPlan, error
 	if err != nil {
 		return plan, err
 	}
-	holdIdentity := map[identity]bool{}
+	holdIdentity := map[heldKey]bool{}
 	live := map[string]bool{}
 	for _, r := range rollups {
 		rec := meteredusage.Record{
@@ -100,12 +117,12 @@ func (p *pusher) buildHour(ctx context.Context, hour time.Time) (hourPlan, error
 			// before the rater parked missing orgs.
 			p.log.Error.Printf("token-push: HOLDING BACK rated_usage %s (hour %s, auth_id=%s, resource_id=%s, model_id=%s): %v. Only this identity is held back; the rest of the hour is sent",
 				r.ID, ws, r.AuthID, r.ResourceID, r.ModelID, err)
-			holdIdentity[r.identity] = true
+			holdIdentity[heldKey{meteredusage.KindToken, r.identity}] = true
 			plan.heldBack++
 			continue
 		}
 		plan.req.Records = append(plan.req.Records, rec)
-		plan.sent = append(plan.sent, pushedRow{UsageID: rec.UsageID, identity: r.identity})
+		plan.sent = append(plan.sent, pushedRow{UsageID: rec.UsageID, Kind: meteredusage.KindToken, identity: r.identity})
 		live[rec.UsageID] = true
 	}
 
@@ -114,7 +131,13 @@ func (p *pusher) buildHour(ctx context.Context, hour time.Time) (hourPlan, error
 		return plan, err
 	}
 	for _, id := range parked {
-		holdIdentity[id] = true
+		holdIdentity[heldKey{meteredusage.KindToken, id}] = true
+	}
+
+	if withVideo {
+		if err := p.addVideo(ctx, hour, &plan, holdIdentity, live); err != nil {
+			return plan, err
+		}
 	}
 	if len(holdIdentity) > 0 {
 		pushed, err := p.store.Pushed(ctx, hour)
@@ -122,13 +145,62 @@ func (p *pusher) buildHour(ctx context.Context, hour time.Time) (hourPlan, error
 			return plan, err
 		}
 		for _, pr := range pushed {
-			if holdIdentity[pr.identity] && !live[pr.UsageID] {
+			// A video id is held only while video is listed: in a token-only
+			// request the manager keeps video records anyway.
+			if pr.kind() == meteredusage.KindVideo && !withVideo {
+				continue
+			}
+			if holdIdentity[heldKey{pr.kind(), pr.identity}] && !live[pr.UsageID] {
 				plan.req.Held = append(plan.req.Held, pr.UsageID)
 				plan.sent = append(plan.sent, pr)
 			}
 		}
 	}
 	return plan, nil
+}
+
+// addVideo adds the hour's video records to plan, with the same per-identity
+// holding as tokens.
+func (p *pusher) addVideo(ctx context.Context, hour time.Time, plan *hourPlan, hold map[heldKey]bool, live map[string]bool) error {
+	ws := plan.req.WindowStart
+	rollups, err := p.store.VideoRollups(ctx, hour)
+	if err != nil {
+		return err
+	}
+	plan.req.VideoRecords = make([]meteredusage.VideoRecord, 0, len(rollups))
+	for _, r := range rollups {
+		rec := meteredusage.VideoRecord{
+			Kind: meteredusage.KindVideo, OrgID: r.OrgID, OwnerType: r.OwnerType, OwnerID: r.OwnerID,
+			ResourceID: r.ResourceID,
+			Attributes: meteredusage.VideoAttributes{
+				AuthID: r.AuthID, ModelID: r.ModelID, ServingMode: r.ServingMode, BaseModel: r.BaseModel,
+				Task: r.Task, Resolution: r.Resolution, Region: r.Region,
+			},
+			Quantities: meteredusage.VideoQuantities{
+				OutputSeconds: meteredusage.CanonicalDecimal(r.OutputSeconds), OutputFrames: r.OutputFrames,
+				RequestCount: r.Requests, GPUSeconds: meteredusage.CanonicalDecimal(r.GPUSeconds),
+			},
+		}
+		rec.UsageID = meteredusage.VideoUsageID(ws, rec.OrgID, rec.OwnerType, rec.OwnerID, rec.ResourceID, rec.Attributes)
+		if err := meteredusage.ValidateVideoRecord(ws, rec); err != nil {
+			p.log.Error.Printf("token-push: HOLDING BACK rated_video_usage %s (hour %s, auth_id=%s, resource_id=%s, model_id=%s): %v. Only this identity's video records are held back; the rest of the hour is sent",
+				r.ID, ws, r.AuthID, r.ResourceID, r.ModelID, err)
+			hold[heldKey{meteredusage.KindVideo, r.identity}] = true
+			plan.heldBack++
+			continue
+		}
+		plan.req.VideoRecords = append(plan.req.VideoRecords, rec)
+		plan.sent = append(plan.sent, pushedRow{UsageID: rec.UsageID, Kind: meteredusage.KindVideo, identity: r.identity})
+		live[rec.UsageID] = true
+	}
+	parked, err := p.store.ParkedVideoIdentities(ctx, hour)
+	if err != nil {
+		return err
+	}
+	for _, id := range parked {
+		hold[heldKey{meteredusage.KindVideo, id}] = true
+	}
+	return nil
 }
 
 // maxUnsentHoursPerRun bounds how many never-accepted hours one run re-sends
@@ -169,6 +241,23 @@ func (p *pusher) pushWindows(ctx context.Context, windows []time.Time, now time.
 		return exitOK
 	}
 
+	// VIDEO IS LISTED ONLY ONCE VIDEO USAGE IS RECORDED. Until then a request
+	// lists kinds ["token"], exactly as before video existed: listing "video"
+	// with no video records could delete nothing the manager legitimately
+	// holds, and a manager without the video kind keeps accepting the hour.
+	// If video was sent before and the video tables are now empty, they were
+	// wiped: video is left out of every request (so the manager's video records
+	// are not deleted by absence), tokens are still sent, and the run exits 1.
+	withVideo, everPushedVideo, err := p.store.VideoUsageState(ctx)
+	if err != nil {
+		p.log.Error.Printf("token-push: video liveness check: %v", err)
+		return exitFatal
+	}
+	videoWiped := !withVideo && everPushedVideo
+	if videoWiped {
+		p.log.Error.Printf("token-push: rated_video_usage and parked_video_usage are EMPTY although video usage was sent before (pushed_usage has video rows); sending token usage only, so the manager's video records are not deleted. Restore the database")
+	}
+
 	floor := now.UTC().Truncate(time.Hour)
 	resolved, err := p.store.ResolvedHours(ctx, floor)
 	if err != nil {
@@ -187,7 +276,7 @@ func (p *pusher) pushWindows(ctx context.Context, windows []time.Time, now time.
 
 	heldBack, rejected, failed := 0, 0, 0
 	for _, h := range hours {
-		plan, err := p.buildHour(ctx, h)
+		plan, err := p.buildHour(ctx, h, withVideo)
 		if err != nil {
 			p.log.Error.Printf("token-push: build request for %s: %v", h.Format(time.RFC3339), err)
 			failed++
@@ -212,7 +301,7 @@ func (p *pusher) pushWindows(ctx context.Context, windows []time.Time, now time.
 		var rej *meteredusage.RejectedError
 		switch {
 		case err == nil:
-			if err := p.store.RecordAccepted(ctx, h, plan.sent); err != nil {
+			if err := p.store.RecordAccepted(ctx, h, plan.req.Kinds, plan.sent); err != nil {
 				// The manager has the hour; our bookkeeping keeps a superset
 				// (RecordIntent), which is the safe direction. The next run
 				// re-sends and records it.
@@ -220,8 +309,8 @@ func (p *pusher) pushWindows(ctx context.Context, windows []time.Time, now time.
 				failed++
 				continue
 			}
-			p.log.Info.Printf("token-push: sent %s: %d token records, %d held (manager accepted %d, deleted %d)",
-				plan.req.WindowStart, len(plan.req.Records), len(plan.req.Held), resp.Accepted, resp.Deleted)
+			p.log.Info.Printf("token-push: sent %s (kinds %v): %d token records, %d video records, %d held (manager accepted %d, deleted %d)",
+				plan.req.WindowStart, plan.req.Kinds, len(plan.req.Records), len(plan.req.VideoRecords), len(plan.req.Held), resp.Accepted, resp.Deleted)
 		case errors.As(err, &rej):
 			// Final: 400 = a wire rule we did not catch; 401 = the customer
 			// token; 409 = a manager that still refuses token usage from an install
@@ -238,7 +327,7 @@ func (p *pusher) pushWindows(ctx context.Context, windows []time.Time, now time.
 	}
 
 	switch {
-	case failed > 0:
+	case failed > 0 || videoWiped:
 		return exitFatal
 	case rejected > 0:
 		return exitRejected
