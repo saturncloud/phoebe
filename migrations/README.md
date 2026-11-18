@@ -32,6 +32,9 @@ with the Atlas schema; they live in phoebe's own database.
   docs/billing-reconciliation.md.
 - **`pushed_usage`, `pushed_hour`** — token-push's record of which usage_ids the
   manager holds per hour and when the hour was last accepted.
+- **`token_push_state`** — one row: `auto_floor`, the first hour accepted by a
+  scheduled token-push run. Scheduled runs re-send never-accepted hours only
+  after it; explicit `-since/-until` runs never change it.
 - **`io_log`** — optional, sampled, short-retention request/response body capture
   (M5 I/O logging). Written by the interceptor's iolog sink; OFF by default.
   `cmd/prune` enforces the short retention: rows older than 7 days on `created_at`
@@ -59,6 +62,7 @@ golang-migrate up/down pairs, applied in version order:
 | 0010 | `0010_rated_usage_identity.{up,down}.sql` | `rated_usage` attributes `base_model`, `adapter`, `price_key` (usage identity) |
 | 0011 | `0011_rated_usage_quantities_only.{up,down}.sql` | `rated_usage` money columns become nullable with no `$0` default (expand step: the aggregator writes NULL; dropped one release later) |
 | 0012 | `0012_parked_and_pushed_usage.{up,down}.sql` | `parked_usage` (conflicted usage parked per identity-hour by the rater, never pruned), `pushed_usage` and `pushed_hour` (what token-push last had accepted per hour, for `held` and re-sending resolved hours). Down refuses while unresolved parked rows exist |
+| 0013 | `0013_token_push_state.{up,down}.sql` | `token_push_state` (one row: `auto_floor`, the first hour a scheduled token-push run had accepted; scheduled runs re-send never-accepted hours only after it, and explicit `-since/-until` runs never move it). Backfilled from `min(pushed_hour.window_start)` |
 
 `embed.go` embeds these into the `migrations` package; `cmd/migrate` applies them.
 
