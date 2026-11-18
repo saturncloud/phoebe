@@ -190,6 +190,8 @@ func (p *pusher) buildHour(ctx context.Context, hour time.Time, withVideo bool) 
 			// per id, not per identity: an identity can keep one grain
 			// (resolution, task, base model, region) and lose another.
 			reconcilable := p.videoRated && !hour.Before(p.videoFloor.Add(-videoReconcileSlack))
+			// p.videoFloor - videoReconcileSlack is the start of phoebe-videos'
+			// row retention (TestVideoReconcileSlackEndsAtTheRowRetention).
 			vanished := 0
 			for _, pr := range pushed {
 				if pr.kind() != meteredusage.KindVideo {
@@ -203,8 +205,14 @@ func (p *pusher) buildHour(ctx context.Context, hour time.Time, withVideo bool) 
 			}
 			if vanished > 0 {
 				plan.videoVanished = true
-				p.log.Error.Printf("token-push: %s: %d video record(s) this install sent have no rollup now, and the rater cannot have removed them (%s); their ids are held so the manager keeps them. Restore rated_video_usage",
+				p.log.Error.Printf("token-push: %s: %d video record(s) this install sent have no rollup now, and the rater cannot have removed them (%s); their ids are held so the manager keeps them. If the rollups were lost, restore rated_video_usage; if an explicit re-rate removed them and was pushed late, see docs/billing-reconciliation.md (\"Vanished video\")",
 					ws, vanished, vanishedReason(p.videoRated))
+				// The ids stay held, run after run, until a person decides.
+				// If the rollups were lost, restore rated_video_usage. If the
+				// rater legitimately removed them (an explicit re-rate pushed
+				// more than a day late), delete those ids from pushed_usage
+				// and re-send the hour with -since/-until
+				// (docs/billing-reconciliation.md).
 			}
 		}
 		for _, pr := range pushed {
@@ -515,9 +523,6 @@ send:
 			failed++
 			continue
 		}
-		if plan.videoVanished {
-			videoVanished++
-		}
 		if len(plan.req.Records) == 0 && len(plan.req.VideoRecords) == 0 && len(plan.req.Held) == 0 {
 			// An empty snapshot deletes, by absence, whatever the manager holds
 			// for the hour. Send one only for an hour this install sent before:
@@ -551,6 +556,11 @@ send:
 			continue
 		}
 		heldBack += plan.heldBack
+		// Counted only for an hour that is sent: a parked hour rebuilt by the
+		// recheck rotation and skipped above does not repeat the alarm.
+		if plan.videoVanished {
+			videoVanished++
+		}
 		if err := meteredusage.Validate(plan.req); err != nil {
 			// Every record passed on its own, so this is a request-level rule
 			// (for instance a duplicate usage_id): a bug. Send nothing for the

@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/saturncloud/phoebe/internal/meteredusage"
+	"github.com/saturncloud/phoebe/internal/prune"
 	"github.com/saturncloud/phoebe/internal/rating"
 )
 
@@ -329,6 +330,7 @@ func TestPushWindows_VanishedVideoIsNotDeletedWhenTheRaterCannotHaveRemovedIt(t 
 	}{
 		{"inside the reach, rollups rated elsewhere: a reconcile deletion", win, false, false, false, nil, exitOK},
 		{"a day older than the floor, within the slack: a reconcile deletion", inSlack, false, false, false, nil, exitOK},
+		{"exactly at the end of the slack: a reconcile deletion", floor.Add(-videoReconcileSlack), false, false, false, nil, exitOK},
 		{"rated_video_usage empty, only an unresolved park left", win, true, false, false, []string{sentID}, exitFatal},
 		{"rated_video_usage empty, another identity parked in the same hour", win, true, true, false, []string{sentID}, exitFatal},
 		{"older than the video reach and its slack", old, false, false, false, []string{sentID}, exitFatal},
@@ -365,5 +367,13 @@ func TestPushWindows_VanishedVideoIsNotDeletedWhenTheRaterCannotHaveRemovedIt(t 
 				t.Fatalf("sent id kept in pushed_usage = %v, want %v", kept, len(tc.wantHeld) > 0)
 			}
 		})
+	}
+}
+
+// token-push's reconcile range ends exactly where phoebe-videos' row
+// retention starts: the rater's reach plus the slack is the retention.
+func TestVideoReconcileSlackEndsAtTheRowRetention(t *testing.T) {
+	if got, want := rating.VideoRateReach+videoReconcileSlack, time.Duration(prune.VideoRowRetentionDays)*24*time.Hour; got != want {
+		t.Fatalf("reach %s + slack %s = %s, want the row retention %s", rating.VideoRateReach, videoReconcileSlack, got, want)
 	}
 }

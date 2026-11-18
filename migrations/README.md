@@ -383,9 +383,20 @@ may have sent an hour's older content, and the down guard cannot tell. Then run
 not accepted since they were last rated: find them with
 
 ```sql
-SELECT DISTINCT v.window_start FROM rated_video_usage v
-  LEFT JOIN pushed_hour h ON h.window_start = v.window_start
- WHERE h.pushed_at IS NULL OR h.pushed_at < v.rated_at;
+-- The down guard's own condition: identity-hours not accepted since rated.
+SELECT r.window_start, r.auth_id, r.owner_type, r.owner_id, r.resource_id, r.model_id, r.serving_mode
+  FROM (SELECT window_start, auth_id, owner_type, owner_id, resource_id, model_id, serving_mode,
+               COUNT(*) AS n_rated, MAX(rated_at) AS rated_at
+          FROM rated_video_usage
+         GROUP BY window_start, auth_id, owner_type, owner_id, resource_id, model_id, serving_mode) r
+  LEFT JOIN pushed_hour h ON h.window_start = r.window_start
+ WHERE h.pushed_at IS NULL OR h.pushed_at < r.rated_at
+    OR (SELECT COUNT(*) FROM pushed_usage u
+         WHERE u.kind = 'video' AND u.window_start = r.window_start
+           AND u.auth_id = r.auth_id AND u.owner_type = r.owner_type AND u.owner_id = r.owner_id
+           AND u.resource_id = r.resource_id AND u.model_id = r.model_id
+           AND u.serving_mode = r.serving_mode
+           AND u.pushed_at >= r.rated_at AND u.pushed_at <= h.pushed_at) < r.n_rated;
 ```
 
 re-send those hours with `token-push -since ... -until ...`, and run `0017 down`

@@ -14,8 +14,10 @@
 --     accepted push stamps it, including a token-only one (the previous
 --     release's token-push), which says nothing about the hour's video. The
 --     count is per identity because rated_video_usage does not store the
---     usage_id; a grain held back by token-push leaves the identity short of
---     ids and refuses.
+--     usage_id. A grain held back by token-push usually leaves the identity
+--     short of ids and refuses, but not always: an older id of the same
+--     identity that token-push holds (its record vanished) still counts. A
+--     per-id check needs the usage_id stored at rating time.
 -- Stop token-push and the rater first (suspend their CronJobs) so neither
 -- writes these tables; do not run the previous release's token-push before
 -- this has run (migrations/README.md, "Rollout order for migration 0017").

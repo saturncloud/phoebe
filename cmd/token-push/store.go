@@ -55,9 +55,11 @@ type pushedRow struct {
 	// pushed_usage row already exists and is not re-stamped (ON CONFLICT DO
 	// NOTHING), for token and video ids alike, so pushed_at stays the time
 	// token-push last tried to send that record. That time can be an intent
-	// stamp (RecordIntent runs before the POST), which only makes 0017 down's
-	// guard stricter, never looser. If the row was trimmed meanwhile, it is
-	// inserted again with now(), so the id stays known as sent.
+	// stamp (RecordIntent runs before the POST). 0017 down's guard counts ids
+	// per identity, not per id, so a held id still counts toward its
+	// identity; the guard is only as exact as that count (see the down file).
+	// If the row was trimmed meanwhile, it is inserted again with now(), so
+	// the id stays known as sent.
 	held bool
 }
 
