@@ -22,15 +22,16 @@ type Probe struct {
 	FPS *big.Rat
 }
 
-// OutputSeconds is frames / fps as a decimal string rounded half up to four
-// places (the column is NUMERIC(12,4)): 81 frames at 16 fps is "5.0625", 121
-// at 24 is "5.0417".
+// OutputSeconds is frames / fps as a decimal string rounded half up to nine
+// places, the most the manager's decimal quantities carry (the column is
+// NUMERIC(18,9)): 81 frames at 16 fps is "5.0625", 121 at 24 is
+// "5.041666667".
 func (p Probe) OutputSeconds() string {
 	if p.FPS == nil || p.FPS.Sign() <= 0 {
 		return "0"
 	}
 	secs := new(big.Rat).Quo(new(big.Rat).SetInt64(int64(p.Frames)), p.FPS)
-	return roundRat(secs, 4)
+	return roundRat(secs, 9)
 }
 
 // roundRat renders r rounded half up to places decimals, without trailing

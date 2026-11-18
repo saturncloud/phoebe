@@ -274,7 +274,7 @@ func TestVideoJobRunsEndToEndAndBillsOnce(t *testing.T) {
 	h.run()
 	got := h.object(h.do(http.MethodGet, "/v1/videos/"+o.ID, "", id))
 	if got.Status != StatusCompleted || got.Progress != 100 || got.Usage == nil ||
-		got.Usage.OutputSeconds != "5.0417" || got.Usage.OutputFrames != 121 || got.ExpiresAt == nil ||
+		got.Usage.OutputSeconds != "5.041666667" || got.Usage.OutputFrames != 121 || got.ExpiresAt == nil ||
 		*got.ExpiresAt != h.now.Add(24*time.Hour).Unix() || got.CompletedAt == nil {
 		t.Fatalf("completed object: %+v usage %+v", got, got.Usage)
 	}
@@ -291,7 +291,7 @@ func TestVideoJobRunsEndToEndAndBillsOnce(t *testing.T) {
 		t.Fatalf("spritesheet variant: %d", w.Code)
 	}
 	b, n := h.billing(o.ID)
-	if n != 1 || b.status != "completed" || b.resolution != "720p" || b.task != "t2v" || b.seconds != "5.0417" ||
+	if n != 1 || b.status != "completed" || b.resolution != "720p" || b.task != "t2v" || b.seconds != "5.041666667" ||
 		b.frames != 121 || b.count != 1 {
 		t.Fatalf("billing row (%d): %+v", n, b)
 	}
@@ -368,7 +368,7 @@ func TestDeleteCancelsQueuedRefusesRunningAndExpiresFinished(t *testing.T) {
 	if w.Code != http.StatusOK || o.Status != StatusCancelled || o.Error == nil || o.Error.Code != CodeCancelled {
 		t.Fatalf("cancel queued: %d %+v", w.Code, o)
 	}
-	if b, n := h.billing(queued.ID); n != 1 || b.status != "cancelled" || b.count != 0 || b.seconds != "0.0000" {
+	if b, n := h.billing(queued.ID); n != 1 || b.status != "cancelled" || b.count != 0 || b.seconds != "0.000000000" {
 		t.Fatalf("cancelled billing row (%d): %+v", n, b)
 	}
 	h.run() // the cancelled job is skipped

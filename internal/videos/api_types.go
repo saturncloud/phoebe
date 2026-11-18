@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"strconv"
+	"strings"
 	"time"
 )
 
@@ -179,7 +180,17 @@ func (j *Job) Object() Object {
 		o.Error = &ObjectError{Code: j.ErrorCode, Message: j.ErrorMessage}
 	}
 	if j.Status == StatusCompleted {
-		o.Usage = &ObjectUsage{OutputSeconds: j.OutputSeconds, OutputFrames: j.OutputFrames}
+		o.Usage = &ObjectUsage{OutputSeconds: trimDecimal(j.OutputSeconds), OutputFrames: j.OutputFrames}
 	}
 	return o
+}
+
+// trimDecimal drops trailing fractional zeros ("5.062500000" -> "5.0625",
+// "5.000000000" -> "5"), the shortest exact form.
+func trimDecimal(s string) string {
+	if !strings.Contains(s, ".") {
+		return s
+	}
+	s = strings.TrimRight(s, "0")
+	return strings.TrimSuffix(s, ".")
 }

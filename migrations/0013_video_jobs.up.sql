@@ -55,7 +55,7 @@ CREATE TABLE IF NOT EXISTS video_job (
     thumbnail_key     TEXT,
     video_bytes       BIGINT,
     output_frames     INTEGER,
-    output_seconds    NUMERIC(12,4),
+    output_seconds    NUMERIC(18,9),
     gpu_seconds       NUMERIC(14,3),
     CONSTRAINT video_job_status_ck CHECK
         (status IN ('queued', 'in_progress', 'completed', 'failed', 'cancelled')),
@@ -101,7 +101,7 @@ CREATE TABLE IF NOT EXISTS video_billing_event (
     resolution      VARCHAR(8)    NOT NULL,
     region          VARCHAR(64),
     status          VARCHAR(16)   NOT NULL,
-    output_seconds  NUMERIC(12,4) NOT NULL DEFAULT 0,
+    output_seconds  NUMERIC(18,9) NOT NULL DEFAULT 0,
     output_frames   INTEGER       NOT NULL DEFAULT 0,
     request_count   INTEGER       NOT NULL DEFAULT 0,
     gpu_seconds     NUMERIC(14,3) NOT NULL DEFAULT 0,
