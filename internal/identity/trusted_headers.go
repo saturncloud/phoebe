@@ -9,10 +9,10 @@ package identity
 // PHOEBE_TRUSTED_HEADERS, comma-separated, rendered from the saturn-k8s
 // phoebe chart's ConfigMap); when the config is empty, unset, or malformed
 // (nothing left after trimming and dropping empties), a hard-coded fallback
-// equal to the pinned 16 engages so phoebe fails closed, and a loud warning
+// equal to the pinned 17 engages so phoebe fails closed, and a loud warning
 // flags the misrendered chart for the operator.
 //
-// The set covers exactly the R3 envelope headers listed in the pinned 16.
+// The set covers exactly the R3 envelope headers listed in the pinned 17.
 // The remaining identity headers (AuthID / UserID / GroupID / ResourceID /
 // ResourceType / BaseModel / Adapter / Upstream) are read under the ratified
 // edge contract (ForwardAuth authResponseHeaders allowlist + Atlas
@@ -65,6 +65,7 @@ var pinnedTrustedHeaders = []string{
 	HeaderOwnerRateLimitGeneratedTokens,
 	HeaderGroupScopes,
 	HeaderVideoLimits,
+	HeaderVideoRetrieval,
 }
 
 // requiredTrustedHeaders are the envelope headers request handling cannot work
@@ -95,7 +96,7 @@ type trustedHeaderSet map[string]struct{}
 var activeTrustedHeaders atomic.Pointer[trustedHeaderSet]
 
 func init() {
-	// Before config load the pinned 16 are active: phoebe never reads an
+	// Before config load the pinned 17 are active: phoebe never reads an
 	// envelope header outside the list, before OR after the runtime config
 	// is loaded, and the pre-load default must preserve request handling.
 	fallback := newTrustedHeaderSet(pinnedTrustedHeaders)
@@ -133,7 +134,7 @@ func trustedHeaderValue(r *http.Request, name string) string {
 //     active (entries are canonicalized; case is ignored per HTTP
 //     convention);
 //   - unset, empty/whitespace-only, or nothing left after splitting and
-//     trimming -> the pinned 16 engage AND a loud warning flags the
+//     trimming -> the pinned 17 engage AND a loud warning flags the
 //     misrendered chart. Fallback, never a startup failure: phoebe must keep
 //     serving with the pinned set rather than crash-loop behind a broken
 //     ConfigMap render.

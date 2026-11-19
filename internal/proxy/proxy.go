@@ -458,6 +458,16 @@ func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request) {
 	// attempt without usage as unbilled work (UNEXPLAINED MISSING-USAGE).
 	metered := r.Method == http.MethodPost && inferenceRequestPathAllowed(routePath)
 
+	// VIDEO RETRIEVAL: the always-on route that reads or deletes one video
+	// whatever its endpoint's state (issue #13). Atlas's retrieval
+	// ForwardAuth authorized the key for this video and stamped its org and
+	// endpoint; there is no upstream, serving mode or engine work, so none of
+	// the gateway, billing or routing steps below apply.
+	if id.VideoRetrieval {
+		s.serveVideoRetrieval(w, r, id, routePath, pathCanonical)
+		return
+	}
+
 	if id.Gateway {
 		if !pathCanonical || !gatewayRequestAllowed(r.Method, routePath) {
 			s.log.Warn.Printf("gateway: refusing route outside public inference surface method=%s raw_path=%q canonical=%v org_id=%q",
