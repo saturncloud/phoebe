@@ -71,15 +71,71 @@ func newDB(t *testing.T) *sql.DB {
 	return db
 }
 
+// memBlob stands in for Atlas and the store. Like Atlas it refuses an upload
+// for a job that was never registered or is already closed, so these tests
+// also check the order the service registers, writes and closes in.
 type memBlob struct {
-	mu   sync.Mutex
-	objs map[string][]byte
-	fail bool
+	mu     sync.Mutex
+	objs   map[string][]byte
+	fail   bool
+	grants map[string]*grant
+	// refuse makes Register fail, as Atlas does for an org that does not own
+	// the endpoint or when the store is not configured.
+	refuse bool
+}
+
+type grant struct {
+	org, resource, inputExt string
+	closed                  bool
+}
+
+func (b *memBlob) Register(_ context.Context, orgID, jobID, resourceID, inputExt string) error {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if b.refuse {
+		return fmt.Errorf("Atlas answered 404")
+	}
+	if b.grants == nil {
+		b.grants = map[string]*grant{}
+	}
+	b.grants[jobID] = &grant{org: orgID, resource: resourceID, inputExt: inputExt}
+	return nil
+}
+
+func (b *memBlob) Close(_ context.Context, orgID, jobID string) error {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	g, ok := b.grants[jobID]
+	if !ok || g.org != orgID {
+		return fmt.Errorf("no job %s for %s", jobID, orgID)
+	}
+	g.closed = true
+	return nil
+}
+
+func (b *memBlob) grant(jobID string) grant {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if g, ok := b.grants[jobID]; ok {
+		return *g
+	}
+	return grant{}
 }
 
 func (b *memBlob) Put(_ context.Context, key string, r io.Reader, _ int64, _ string) error {
 	if b.fail {
 		return fmt.Errorf("store down")
+	}
+	org, jobID, err := (Keys{Prefix: "tf-videos"}).Parse(key)
+	if err != nil {
+		return err
+	}
+	b.mu.Lock()
+	g, ok := b.grants[jobID]
+	open := ok && g.org == org && !g.closed
+	b.mu.Unlock()
+	if !open {
+		return fmt.Errorf("put %s: the job is not in progress", key)
 	}
 	data, err := io.ReadAll(r)
 	if err != nil {
@@ -295,6 +351,9 @@ func TestVideoJobRunsEndToEndAndBillsOnce(t *testing.T) {
 		b.frames != 121 || b.count != 1 {
 		t.Fatalf("billing row (%d): %+v", n, b)
 	}
+	if g := h.blob.grant(o.ID); g.org != "org-a" || g.resource != "res-1" || g.inputExt != "" || !g.closed {
+		t.Fatalf("store grant after completion: %+v (registered for the org and endpoint, then closed)", g)
+	}
 	keys := h.blob.keys()
 	want := []string{"tf-videos/org-a/" + o.ID + "/thumbnail.webp", "tf-videos/org-a/" + o.ID + "/video.mp4"}
 	if fmt.Sprint(keys) != fmt.Sprint(want) {
@@ -375,6 +434,9 @@ func TestDeleteCancelsQueuedRefusesRunningAndExpiresFinished(t *testing.T) {
 	if h.engine.calls != 0 {
 		t.Fatal("a cancelled job reached the engine")
 	}
+	if !h.blob.grant(queued.ID).closed {
+		t.Fatal("a cancelled job's store grant is still open")
+	}
 
 	running := h.create(id)
 	if _, _, err := h.store.Claim(context.Background(), running.ID, time.Minute, h.now); err != nil {
@@ -416,6 +478,9 @@ func TestEngineFailuresFailRetryOrWait(t *testing.T) {
 	}
 	if b, n := h.billing(o.ID); n != 1 || b.status != "failed" || b.count != 0 || b.frames != 0 {
 		t.Fatalf("failed billing row (%d): %+v", n, b)
+	}
+	if !h.blob.grant(o.ID).closed {
+		t.Fatal("a failed job's store grant is still open")
 	}
 
 	// Not ready: requeued, the attempt not counted, then it runs.
@@ -466,6 +531,9 @@ func TestImageToVideoPassesTheStoredImageAndDeletesIt(t *testing.T) {
 	o := h.object(w)
 	if w.Code != http.StatusOK {
 		t.Fatalf("i2v create: %d %s", w.Code, w.Body)
+	}
+	if g := h.blob.grant(o.ID); g.inputExt != "png" {
+		t.Fatalf("i2v grant: %+v (the input extension is registered before the image is stored)", g)
 	}
 	h.run()
 	if !bytes.Equal(h.engine.input, pngBytes) {
@@ -602,3 +670,53 @@ func TestBillingRowsCannotCarryUsageUnlessCompleted(t *testing.T) {
 }
 
 func encodeB64(b []byte) string { return base64.StdEncoding.EncodeToString(b) }
+
+// A job Atlas will not register is never accepted: nothing is stored, queued
+// or billed, and the customer gets the opaque internal error.
+func TestCreateIsRefusedWhenAtlasRefusesTheJob(t *testing.T) {
+	h := newHarness(t)
+	h.blob.refuse = true
+	id := identity("org-a", "res-1")
+	w := h.do(http.MethodPost, "/v1/videos", `{"model":"my-wan","prompt":"a cat"}`, id)
+	if w.Code != http.StatusInternalServerError {
+		t.Fatalf("create: %d %s", w.Code, w.Body)
+	}
+	var n int
+	_ = h.db.QueryRow(`SELECT count(*) FROM video_job`).Scan(&n)
+	if n != 0 || len(h.blob.keys()) != 0 {
+		t.Fatalf("rows %d, objects %v", n, h.blob.keys())
+	}
+}
+
+// A job whose create is refused after registration (here the org's
+// jobs-in-flight limit) is closed with Atlas and its input image deleted.
+func TestARefusedCreateClosesItsGrant(t *testing.T) {
+	h := newHarness(t)
+	id := identity("org-a", "res-1")
+	h.create(id)
+	h.create(id) // jobs_in_flight is 2
+	dataURL := "data:image/png;base64," + encodeB64(pngBytes)
+	w := h.do(http.MethodPost, "/v1/videos", `{"model":"my-wan","prompt":"move","input_reference":{"image_url":"`+dataURL+`"}}`, id)
+	if w.Code != http.StatusTooManyRequests {
+		t.Fatalf("third create: %d %s", w.Code, w.Body)
+	}
+	h.blob.mu.Lock()
+	var refused []string
+	for jobID, g := range h.blob.grants {
+		if g.inputExt == "png" {
+			refused = append(refused, jobID)
+			if !g.closed {
+				t.Errorf("refused job %s still open", jobID)
+			}
+		}
+	}
+	h.blob.mu.Unlock()
+	if len(refused) != 1 {
+		t.Fatalf("refused grants %v", refused)
+	}
+	for _, k := range h.blob.keys() {
+		if strings.Contains(k, refused[0]) {
+			t.Fatalf("the refused job's input image remains: %s", k)
+		}
+	}
+}

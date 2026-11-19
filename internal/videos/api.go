@@ -174,6 +174,17 @@ func (a *API) create(w http.ResponseWriter, r *http.Request, id Handoff, limits 
 		return
 	}
 	keys := Keys{Prefix: a.cfg.Prefix}
+	inputExt := ""
+	if req.Input != nil {
+		inputExt = imageTypes[req.Params.InputContentType]
+	}
+	// Atlas signs a URL for this job's files only once it knows the job, and
+	// only for the input extension registered here (design 6.1).
+	if err := a.blob.Register(ctx, id.OrgID, jobID, id.ResourceID, inputExt); err != nil {
+		a.log.Error.Printf("videos: register %s with Atlas: %v", jobID, err)
+		writeError(w, errInternal)
+		return
+	}
 	job := &Job{
 		ID: jobID, OrgID: id.OrgID, AuthID: id.AuthID, UserID: id.UserID, GroupID: id.GroupID,
 		ResourceID: id.ResourceID, ServedModel: req.Model, BaseModel: id.BaseModel,
@@ -182,9 +193,10 @@ func (a *API) create(w http.ResponseWriter, r *http.Request, id Handoff, limits 
 		Params: req.Params, Status: StatusQueued, CreatedAt: now,
 	}
 	if req.Input != nil {
-		job.InputKey = keys.Input(id.OrgID, jobID, imageTypes[req.Params.InputContentType])
+		job.InputKey = keys.Input(id.OrgID, jobID, inputExt)
 		if err := a.blob.Put(ctx, job.InputKey, bytes.NewReader(req.Input), int64(len(req.Input)), req.Params.InputContentType); err != nil {
 			a.log.Error.Printf("videos: store input image for %s: %v", jobID, err)
+			a.dropInput(job)
 			writeError(w, errInternal)
 			return
 		}
@@ -212,14 +224,26 @@ func (a *API) create(w http.ResponseWriter, r *http.Request, id Handoff, limits 
 	writeJSON(w, http.StatusOK, job.Object())
 }
 
+// dropInput undoes a create that was refused after registration: the input
+// image (if any) is deleted and the job closed with Atlas, so nothing more can
+// be written under its prefix.
 func (a *API) dropInput(job *Job) {
-	if job.InputKey == "" {
-		return
-	}
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
-	if err := a.blob.Delete(ctx, job.InputKey); err != nil {
-		a.log.Warn.Printf("videos: delete input image of refused job %s: %v", job.ID, err)
+	if job.InputKey != "" {
+		if err := a.blob.Delete(ctx, job.InputKey); err != nil {
+			a.log.Warn.Printf("videos: delete input image of refused job %s: %v", job.ID, err)
+		}
+	}
+	CloseGrant(ctx, a.blob, a.log, job)
+}
+
+// CloseGrant tells Atlas the job finished, so no upload is signed for it
+// again. Best effort: a job that is never closed stops being writable when
+// its upload window ends (Atlas TF_VIDEO_UPLOAD_WINDOW_MINUTES).
+func CloseGrant(ctx context.Context, blob Blob, log *logging.Logger, job *Job) {
+	if err := blob.Close(ctx, job.OrgID, job.ID); err != nil {
+		log.Warn.Printf("videos: close %s with Atlas (its upload window still ends it): %v", job.ID, err)
 	}
 }
 
@@ -327,6 +351,7 @@ func (a *API) delete(w http.ResponseWriter, r *http.Request, id Handoff, jobID s
 			writeError(w, errInProgress)
 			return
 		}
+		CloseGrant(ctx, a.blob, a.log, j)
 		a.deleteFiles(ctx, j)
 		writeJSON(w, http.StatusOK, j.Object())
 	case StatusInProgress:
