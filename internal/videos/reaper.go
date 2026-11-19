@@ -27,6 +27,9 @@ type ReaperConfig struct {
 	// Requeue re-adds a queued job to its stream when its stream is empty and
 	// the job has waited this long since it was last added (lost entries).
 	Requeue time.Duration
+	// DeleteTimeout bounds deleting one job's files (default 2 min), so a
+	// store that stops answering cannot stall the reaper. Tests shorten it.
+	DeleteTimeout time.Duration
 }
 
 func (c *ReaperConfig) defaults() {
@@ -41,6 +44,9 @@ func (c *ReaperConfig) defaults() {
 	}
 	if c.Requeue <= 0 {
 		c.Requeue = 2 * time.Minute
+	}
+	if c.DeleteTimeout <= 0 {
+		c.DeleteTimeout = 2 * time.Minute
 	}
 }
 
@@ -189,6 +195,8 @@ func (r *Reaper) expireFiles(ctx context.Context, now time.Time) {
 // refused for good (see deleteRefusedForGood) is skipped and returned with
 // its error; any other failure stops and is returned, so the job is retried.
 func (r *Reaper) deleteFiles(ctx context.Context, j *Job) (givenUp []string, err error) {
+	ctx, cancel := context.WithTimeout(ctx, r.cfg.DeleteTimeout)
+	defer cancel()
 	for _, key := range []string{j.InputKey, j.VideoKey, j.ThumbnailKey} {
 		if key == "" {
 			continue

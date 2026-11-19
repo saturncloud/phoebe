@@ -38,6 +38,19 @@ import (
 
 const videoStoreTokenEnv = "TF_INTERNAL_VIDEO_STORE_TOKEN"
 
+// Limits Atlas enforces when it signs an upload (saturn pdc/settings.py
+// TF_VIDEO_UPLOAD_WINDOW_MINUTES and pdc/managers/tf_video_store.py
+// _MAX_BYTES). The chart checks the same values.
+const (
+	// maxUploadWindow is the largest upload window Atlas allows.
+	maxUploadWindow = 1440 * time.Minute
+	// uploadMargin is the time load() keeps for storing the video after the
+	// last run ends.
+	uploadMargin = 30 * time.Minute
+	// maxStoreObjectBytes is the largest video.mp4 Atlas signs (5 GiB).
+	maxStoreObjectBytes = 5 << 30
+)
+
 // Settings is the YAML file.
 type Settings struct {
 	Debug      bool   `yaml:"debug"`
@@ -108,6 +121,19 @@ func load(path string, getenv func(string) string) (config, error) {
 			}
 			*d.dst = v
 		}
+	}
+	// Atlas lets an upload be signed for a job until at most 1440 minutes
+	// after it registered (TF_VIDEO_UPLOAD_WINDOW_MINUTES' ceiling). A job can
+	// wait queueTimeout, run twice for runTimeout, and needs time to store its
+	// video, so timeouts longer than that would let a job finish generating
+	// after its upload can no longer be signed.
+	if need := c.queueTimeout + 2*c.runTimeout + uploadMargin; need > maxUploadWindow {
+		return c, fmt.Errorf("queueTimeout + 2*runTimeout + %s is %s, more than the %s upload window Atlas allows at most",
+			uploadMargin, need, maxUploadWindow)
+	}
+	if s.MaxOutputBytes > maxStoreObjectBytes {
+		return c, fmt.Errorf("maxOutputBytes must be at most %d (the largest video Atlas signs an upload for), got %d",
+			maxStoreObjectBytes, s.MaxOutputBytes)
 	}
 	if s.ValkeyAddr == "" {
 		return c, errors.New("valkeyAddr is required")

@@ -59,3 +59,33 @@ func TestLoadRefusesBadConfig(t *testing.T) {
 		}
 	}
 }
+
+// Atlas signs uploads for a job until at most 1440 minutes after it
+// registered. Timeouts that let a job wait and run twice past that (with 30
+// minutes kept to store the video) are refused at start.
+func TestLoadRefusesTimeoutsNoUploadWindowCovers(t *testing.T) {
+	// 60m + 2*675m + 30m = 1440m: the largest that fits.
+	if _, err := load(writeConfig(t, atlas+"valkeyAddr: v\nqueueTimeout: 60m\nrunTimeout: 675m\n"), fullEnv); err != nil {
+		t.Fatalf("timeouts that fit the window refused: %v", err)
+	}
+	for _, yaml := range []string{
+		"queueTimeout: 61m\nrunTimeout: 675m\n",
+		"queueTimeout: 60m\nrunTimeout: 676m\n",
+		"queueTimeout: 1400m\n",
+	} {
+		if _, err := load(writeConfig(t, atlas+"valkeyAddr: v\n"+yaml), fullEnv); err == nil {
+			t.Errorf("accepted %q", yaml)
+		}
+	}
+}
+
+// Atlas signs a video upload of at most 5 GiB; a larger maxOutputBytes would
+// let a job generate a video no upload can store.
+func TestLoadRefusesMaxOutputBytesAboveStoreLimit(t *testing.T) {
+	if _, err := load(writeConfig(t, atlas+"valkeyAddr: v\nmaxOutputBytes: 5368709120\n"), fullEnv); err != nil {
+		t.Fatalf("5 GiB refused: %v", err)
+	}
+	if _, err := load(writeConfig(t, atlas+"valkeyAddr: v\nmaxOutputBytes: 5368709121\n"), fullEnv); err == nil {
+		t.Fatal("accepted maxOutputBytes above 5 GiB")
+	}
+}
