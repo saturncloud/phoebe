@@ -398,7 +398,7 @@ func TestAtlasBlobSendsItsTokenOnEveryAtlasCall(t *testing.T) {
 func TestAtlasBlobNeverFollowsAStoreRedirect(t *testing.T) {
 	var followed int
 	var mu sync.Mutex
-	elsewhere := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	elsewhere := httptest.NewServer(http.HandlerFunc(func(_ http.ResponseWriter, _ *http.Request) {
 		mu.Lock()
 		followed++
 		mu.Unlock()
@@ -432,7 +432,7 @@ func TestAtlasBlobNeverFollowsAStoreRedirect(t *testing.T) {
 func TestAtlasBlobNeverSendsTheTokenAcrossARedirect(t *testing.T) {
 	var reached []string
 	var mu sync.Mutex
-	elsewhere := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	elsewhere := httptest.NewServer(http.HandlerFunc(func(_ http.ResponseWriter, r *http.Request) {
 		mu.Lock()
 		reached = append(reached, r.Header.Get(atlasVideoStoreHeader))
 		mu.Unlock()
@@ -474,7 +474,7 @@ func TestAtlasBlobNeverSendsTheTokenAcrossARedirect(t *testing.T) {
 func TestAtlasBlobIgnoresAmbientProxy(t *testing.T) {
 	var proxied int
 	var mu sync.Mutex
-	proxy := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	proxy := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		mu.Lock()
 		proxied++
 		mu.Unlock()
@@ -509,7 +509,7 @@ func TestAtlasBlobIgnoresAmbientProxy(t *testing.T) {
 // stops it), and the error says so instead of hanging.
 func TestAtlasBlobStoreThatNeverAnswersTimesOut(t *testing.T) {
 	release := make(chan struct{})
-	hung := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	hung := httptest.NewServer(http.HandlerFunc(func(_ http.ResponseWriter, r *http.Request) {
 		_, _ = io.Copy(io.Discard, r.Body)
 		<-release
 	}))
