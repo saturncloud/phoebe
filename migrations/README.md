@@ -84,6 +84,7 @@ golang-migrate up/down pairs, applied in version order:
 | 0015 | `0015_rater_state.{up,down}.sql` | `rater_state` (one row: the rater's one-time catch-up cursor and completion time; the catch-up rates every billing_event hour before the trailing window with no rated_usage or parked_usage row, oldest first, a bounded number per run) |
 | 0016 | `0016_video_jobs.{up,down}.sql` | `video_job` and `video_billing_event` (video generation jobs written and read only by phoebe-videos, `cmd/videos`; new tables only). Numbered 0016, not 0013: 0013 was already `token_push_state` |
 | 0017 | `0017_rated_video_usage.{up,down}.sql` | `rated_video_usage` (with each rollup's wire `usage_id`), `parked_video_usage` and `video_reconcile_deletion` (the video rollup, its parked conflicts, and the rater's tombstones), and `pushed_usage.kind` (default `'token'`). Down refuses while video usage is parked or any rollup's usage_id is not yet accepted by the manager. A dev database that applied 0017 before the tombstones (#143) has no `usage_id` column or tombstone table: apply `0017_rated_video_usage.up.sql` again by hand (it is idempotent). Its old rollups stay unstamped until the rater re-rates them, and token-push holds them back meanwhile |
+| 0018 | `0018_video_job_files_delete_failed.{up,down}.sql` | `video_job.files_delete_failed_at` (nullable; when the phoebe-videos reaper last failed to delete the job's files, so the reaper retries those after every job not yet tried). Expand step |
 
 `embed.go` embeds these into the `migrations` package; `cmd/migrate` applies them.
 

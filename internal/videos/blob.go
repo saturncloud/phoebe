@@ -46,13 +46,16 @@ func (k Keys) join(orgID, jobID, name string) string {
 	return strings.Trim(k.Prefix, "/") + "/" + orgID + "/" + jobID + "/" + name
 }
 
+// errNotVideoKey is Parse refusing a key: no retry can make it valid.
+var errNotVideoKey = errors.New("not a video job object")
+
 // Parse splits a key this layout made into the job's org and id. Anything
 // else is refused before Atlas is asked (Atlas refuses it too).
 func (k Keys) Parse(key string) (orgID, jobID string, err error) {
 	rest, ok := strings.CutPrefix(key, strings.Trim(k.Prefix, "/")+"/")
 	parts := strings.Split(rest, "/")
 	if !ok || len(parts) != 3 || parts[0] == "" || !ValidID(parts[1]) || parts[2] == "" {
-		return "", "", fmt.Errorf("video store: key %q is not a video job object", key)
+		return "", "", fmt.Errorf("video store: key %q is %w", key, errNotVideoKey)
 	}
 	return parts[0], parts[1], nil
 }

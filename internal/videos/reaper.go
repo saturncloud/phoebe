@@ -2,6 +2,10 @@ package videos
 
 import (
 	"context"
+	"errors"
+	"fmt"
+	"net/http"
+	"strings"
 	"time"
 
 	"github.com/saturncloud/phoebe/internal/logging"
@@ -76,16 +80,22 @@ func (r *Reaper) Run(ctx context.Context) {
 // Once runs every reaper step one time.
 func (r *Reaper) Once(ctx context.Context) {
 	now := r.now().UTC()
-	if n, err := r.store.ExpireQueued(ctx, now.Add(-r.cfg.QueueTimeout), now); err != nil {
+	timedOut, err := r.store.ExpireQueued(ctx, now.Add(-r.cfg.QueueTimeout), now)
+	if err != nil {
 		r.log.Error.Printf("videos reaper: queue timeouts: %v", err)
-	} else if n > 0 {
-		r.log.Warn.Printf("videos reaper: %d job(s) failed with queue_timeout", n)
 	}
-	if requeued, failed, err := r.store.ExpireLeases(ctx, now); err != nil {
+	if len(timedOut) > 0 {
+		r.log.Warn.Printf("videos reaper: %d job(s) failed with queue_timeout", len(timedOut))
+	}
+	r.closeGrants(ctx, timedOut)
+	requeued, failed, err := r.store.ExpireLeases(ctx, now)
+	if err != nil {
 		r.log.Error.Printf("videos reaper: expired leases: %v", err)
-	} else if requeued+failed > 0 {
-		r.log.Warn.Printf("videos reaper: expired leases: %d requeued, %d failed", requeued, failed)
 	}
+	if requeued+len(failed) > 0 {
+		r.log.Warn.Printf("videos reaper: expired leases: %d requeued, %d failed", requeued, len(failed))
+	}
+	r.closeGrants(ctx, failed)
 	r.reenqueue(ctx, now)
 	r.expireFiles(ctx, now)
 	if now.Sub(r.lastPrune) >= time.Hour {
@@ -98,6 +108,14 @@ func (r *Reaper) Once(ctx context.Context) {
 				r.log.Info.Printf("videos reaper: pruned %d job and %d billing row(s)", jobs, events)
 			}
 		}
+	}
+}
+
+// closeGrants tells Atlas that jobs the reaper failed have ended, so no
+// upload is signed for them again (best effort, like every close).
+func (r *Reaper) closeGrants(ctx context.Context, jobs []*Job) {
+	for _, j := range jobs {
+		CloseGrant(ctx, r.blob, r.log, j)
 	}
 }
 
@@ -148,12 +166,57 @@ func (r *Reaper) expireFiles(ctx context.Context, now time.Time) {
 		return
 	}
 	for _, j := range jobs {
-		if err := DeleteJobFiles(ctx, r.blob, j); err != nil {
-			r.log.Error.Printf("videos reaper: delete files of %s: %v", j.ID, err)
+		givenUp, err := r.deleteFiles(ctx, j)
+		if err != nil {
+			r.log.Error.Printf("videos reaper: delete files of %s (retried after newer jobs): %v", j.ID, err)
+			if err := r.store.MarkFilesDeleteFailed(ctx, j.ID, now); err != nil {
+				r.log.Error.Printf("videos reaper: mark delete of %s failed: %v", j.ID, err)
+			}
 			continue
+		}
+		if len(givenUp) > 0 {
+			r.log.Error.Printf("videos reaper: files of %s can never be deleted through Atlas; "+
+				"they are marked deleted and must be removed from the store by hand: %s",
+				j.ID, strings.Join(givenUp, "; "))
 		}
 		if err := r.store.MarkFilesDeleted(ctx, j.ID, now); err != nil {
 			r.log.Error.Printf("videos reaper: mark files of %s deleted: %v", j.ID, err)
 		}
 	}
+}
+
+// deleteFiles deletes every object job j stored. A key whose delete is
+// refused for good (see deleteRefusedForGood) is skipped and returned with
+// its error; any other failure stops and is returned, so the job is retried.
+func (r *Reaper) deleteFiles(ctx context.Context, j *Job) (givenUp []string, err error) {
+	for _, key := range []string{j.InputKey, j.VideoKey, j.ThumbnailKey} {
+		if key == "" {
+			continue
+		}
+		err := r.blob.Delete(ctx, key)
+		switch {
+		case err == nil:
+		case deleteRefusedForGood(err):
+			givenUp = append(givenUp, fmt.Sprintf("%s (%v)", key, err))
+		default:
+			return nil, err
+		}
+	}
+	return givenUp, nil
+}
+
+// deleteRefusedForGood is a delete no retry can make succeed: the key is not
+// one this service's layout makes, or Atlas no longer has the job (404).
+//
+// A 403 from Atlas is NOT final: Atlas also answers 403 to a wrong or rotated
+// internal token, on every route. Treating it as final would let one
+// misconfiguration mark every expired job's files deleted while the objects
+// stay in the bucket, with nothing left to retry them. Such a job is retried
+// behind newer ones instead (ExpiredFiles orders it last).
+func deleteRefusedForGood(err error) bool {
+	if errors.Is(err, errNotVideoKey) {
+		return true
+	}
+	var ae *atlasError
+	return errors.As(err, &ae) && ae.status == http.StatusNotFound
 }
