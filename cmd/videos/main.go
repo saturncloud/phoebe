@@ -7,11 +7,13 @@
 //
 // Config: a YAML file (-f) for settings, the environment for secrets:
 //
-//	DATABASE_URL            phoebe's own Postgres (migration 0016)
-//	PHOEBE_VIDEOS_TOKEN     shared with the interceptor; required
-//	VIDEO_STORE_ACCESS_KEY  object store credentials for the video prefix
-//	VIDEO_STORE_SECRET_KEY
-//	POD_NAME                the queue consumer name (defaults to the host name)
+//	DATABASE_URL                   phoebe's own Postgres (migration 0016)
+//	PHOEBE_VIDEOS_TOKEN            shared with the interceptor; required
+//	TF_INTERNAL_VIDEO_STORE_TOKEN  shared with Atlas (atlas-secrets); required
+//	POD_NAME                       the queue consumer name (defaults to the host name)
+//
+// phoebe-videos holds no object-store credential. Atlas (atlasURL) signs a
+// presigned URL for each object of a registered job (design 6.1).
 package main
 
 import (
@@ -34,16 +36,18 @@ import (
 	"github.com/saturncloud/phoebe/internal/videos"
 )
 
+const videoStoreTokenEnv = "TF_INTERNAL_VIDEO_STORE_TOKEN"
+
 // Settings is the YAML file.
 type Settings struct {
 	Debug      bool   `yaml:"debug"`
 	ListenPort int    `yaml:"listenPort"`
 	ValkeyAddr string `yaml:"valkeyAddr"`
-	Store      struct {
-		Endpoint string `yaml:"endpoint"`
-		Bucket   string `yaml:"bucket"`
-		Region   string `yaml:"region"`
-		// Prefix is TF_VIDEO_STORE_PREFIX (default tf-videos).
+	// AtlasURL is the in-cluster Atlas that signs the object store URLs.
+	AtlasURL string `yaml:"atlasURL"`
+	Store    struct {
+		// Prefix is TF_VIDEO_STORE_PREFIX (default tf-videos). Atlas signs
+		// only keys under its own TF_VIDEO_STORE_PREFIX, so the two must match.
 		Prefix string `yaml:"prefix"`
 	} `yaml:"store"`
 	// RetentionHours is TF_VIDEO_RETENTION_HOURS: 1 to 168, default 24.
@@ -114,6 +118,12 @@ func load(path string, getenv func(string) string) (config, error) {
 	if getenv("PHOEBE_VIDEOS_TOKEN") == "" {
 		return c, errors.New("PHOEBE_VIDEOS_TOKEN is required")
 	}
+	if s.AtlasURL == "" {
+		return c, errors.New("atlasURL is required: Atlas signs every object store request")
+	}
+	if getenv(videoStoreTokenEnv) == "" {
+		return c, errors.New(videoStoreTokenEnv + " is required")
+	}
 	return c, nil
 }
 
@@ -137,10 +147,7 @@ func main() {
 	db.SetConnMaxLifetime(30 * time.Minute)
 	defer db.Close()
 
-	blob, err := videos.NewS3(videos.S3Config{
-		Endpoint: c.s.Store.Endpoint, Bucket: c.s.Store.Bucket, Region: c.s.Store.Region,
-		AccessKey: os.Getenv("VIDEO_STORE_ACCESS_KEY"), SecretKey: os.Getenv("VIDEO_STORE_SECRET_KEY"),
-	})
+	blob, err := videos.NewAtlasBlob(c.s.AtlasURL, os.Getenv(videoStoreTokenEnv), c.s.Store.Prefix)
 	if err != nil {
 		log.Error.Fatalf("videos: %v", err)
 	}
@@ -192,8 +199,8 @@ func main() {
 		defer cancel()
 		_ = srv.Shutdown(sctx)
 	}()
-	log.Info.Printf("videos: listening on %s (store %s/%s, retention %s, queue timeout %s, run timeout %s)",
-		srv.Addr, c.s.Store.Bucket, c.s.Store.Prefix, c.retention, c.queueTimeout, c.runTimeout)
+	log.Info.Printf("videos: listening on %s (store prefix %s signed by %s, retention %s, queue timeout %s, run timeout %s)",
+		srv.Addr, c.s.Store.Prefix, c.s.AtlasURL, c.retention, c.queueTimeout, c.runTimeout)
 	if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
 		log.Error.Printf("videos: server: %v", err)
 	}

@@ -277,6 +277,7 @@ func (d *Dispatcher) complete(ctx context.Context, job *Job, attempt int, videoP
 		}
 		return
 	}
+	CloseGrant(ctx, d.blob, d.log, job)
 	d.log.Info.Printf("videos dispatcher: completed %s frames=%d seconds=%s bytes=%d (engine wrote %d) wall=%s",
 		job.ID, probe.Frames, probe.OutputSeconds(), info.Size(), written, wall.Round(time.Millisecond))
 }
@@ -292,9 +293,13 @@ func (d *Dispatcher) putFile(ctx context.Context, key, path string, size int64, 
 
 func (d *Dispatcher) fail(ctx context.Context, job *Job, attempt int, code, message string, cause error) {
 	d.log.Warn.Printf("videos dispatcher: %s failed (%s): %v", job.ID, code, cause)
-	if _, err := d.store.Finish(ctx, job.ID, attempt, finish{status: StatusFailed, code: code,
-		message: message, at: d.now().UTC()}); err != nil {
+	ok, err := d.store.Finish(ctx, job.ID, attempt, finish{status: StatusFailed, code: code,
+		message: message, at: d.now().UTC()})
+	if err != nil {
 		d.log.Error.Printf("videos dispatcher: record failure of %s: %v", job.ID, err)
+	}
+	if ok {
+		CloseGrant(ctx, d.blob, d.log, job)
 	}
 }
 
