@@ -720,3 +720,116 @@ func TestARefusedCreateClosesItsGrant(t *testing.T) {
 		}
 	}
 }
+
+// retrieval is the handoff the always-on retrieval route sends (issue #13):
+// the video's org and endpoint as Atlas stamped them, the caller's key, and
+// nothing a stopped or deleted endpoint could no longer provide (no upstream,
+// served model, serving mode or limits).
+func retrieval(org, resource string) Handoff {
+	return Handoff{Retrieval: true, OrgID: org, AuthID: "other-key-" + org, ResourceID: resource}
+}
+
+// completed creates a job on the endpoint's own route and runs it.
+func (h *harness) completed(id Handoff) Object {
+	h.t.Helper()
+	o := h.create(id)
+	h.run()
+	return o
+}
+
+func TestRetrievalReadsAndDownloadsWhenTheEndpointIsStoppedOrDeleted(t *testing.T) {
+	h := newHarness(t)
+	o := h.completed(identity("org-a", "res-1"))
+	// The endpoint is gone (stopped or deleted): nothing in the handoff
+	// comes from its route, and the job is still served for its org.
+	r := retrieval("org-a", "res-1")
+	got := h.object(h.do(http.MethodGet, "/v1/videos/"+o.ID, "", r))
+	if got.ID != o.ID || got.Status != StatusCompleted || got.ExpiresAt == nil || got.Usage == nil {
+		t.Fatalf("object via retrieval: %+v", got)
+	}
+	w := h.do(http.MethodGet, "/v1/videos/"+o.ID+"/content", "", r)
+	if w.Code != http.StatusOK || w.Header().Get("Content-Type") != "video/mp4" ||
+		!bytes.HasPrefix(w.Body.Bytes(), []byte("\x00\x00\x00\x08ftypMP4!"+o.ID)) {
+		t.Fatalf("content via retrieval: %d %q", w.Code, w.Body.String())
+	}
+	if w := h.do(http.MethodGet, "/v1/videos/"+o.ID+"/content?variant=thumbnail", "", r); w.Code != http.StatusOK || w.Header().Get("Content-Type") != "image/webp" {
+		t.Fatalf("thumbnail via retrieval: %d", w.Code)
+	}
+	// Still 24 hours of it: one second before expires_at the file is served.
+	h.now = time.Unix(*got.ExpiresAt, 0).Add(-time.Second)
+	if w := h.do(http.MethodGet, "/v1/videos/"+o.ID+"/content", "", r); w.Code != http.StatusOK {
+		t.Fatalf("content just before expiry: %d %s", w.Code, w.Body)
+	}
+}
+
+func TestRetrievalOfAnotherOrgsOrEndpointsVideoIsNotFound(t *testing.T) {
+	h := newHarness(t)
+	o := h.completed(identity("org-a", "res-1"))
+	for _, other := range []Handoff{retrieval("org-b", "res-1"), retrieval("org-a", "res-2")} {
+		for _, req := range []struct{ method, path string }{
+			{http.MethodGet, "/v1/videos/" + o.ID},
+			{http.MethodGet, "/v1/videos/" + o.ID + "/content"},
+			{http.MethodDelete, "/v1/videos/" + o.ID},
+		} {
+			if w := h.do(req.method, req.path, "", other); w.Code != http.StatusNotFound {
+				t.Errorf("%s %s as %s/%s: %d, want 404 (never 403)", req.method, req.path, other.OrgID, other.ResourceID, w.Code)
+			}
+		}
+	}
+	if len(h.blob.keys()) != 2 {
+		t.Fatalf("a refused delete removed files: %v", h.blob.keys())
+	}
+}
+
+func TestRetrievalAfterExpiryAnswers410(t *testing.T) {
+	h := newHarness(t)
+	o := h.completed(identity("org-a", "res-1"))
+	r := retrieval("org-a", "res-1")
+	// More than 24 hours after completion: the object still reads (the row is
+	// kept 30 days), the content is gone.
+	h.now = h.now.Add(24*time.Hour + time.Second)
+	if w := h.do(http.MethodGet, "/v1/videos/"+o.ID, "", r); w.Code != http.StatusOK {
+		t.Fatalf("object after expiry: %d", w.Code)
+	}
+	if w := h.do(http.MethodGet, "/v1/videos/"+o.ID+"/content", "", r); w.Code != http.StatusGone || errorCode(w) != "video_expired" {
+		t.Fatalf("content after expiry: %d %s", w.Code, w.Body)
+	}
+}
+
+func TestRetrievalDeletesAVideoAndThenAnswers410(t *testing.T) {
+	h := newHarness(t)
+	o := h.completed(identity("org-a", "res-1"))
+	r := retrieval("org-a", "res-1")
+	w := h.do(http.MethodDelete, "/v1/videos/"+o.ID, "", r)
+	if got := h.object(w); w.Code != http.StatusOK || got.Status != StatusCompleted {
+		t.Fatalf("delete via retrieval: %d %+v", w.Code, got)
+	}
+	if len(h.blob.keys()) != 0 {
+		t.Fatalf("files remain after delete: %v", h.blob.keys())
+	}
+	if w := h.do(http.MethodGet, "/v1/videos/"+o.ID+"/content", "", r); w.Code != http.StatusGone || errorCode(w) != "video_expired" {
+		t.Fatalf("content after delete: %d %s", w.Code, w.Body)
+	}
+	// A queued job on a stopped endpoint can be cancelled from here too.
+	q := h.create(identity("org-a", "res-1"))
+	w = h.do(http.MethodDelete, "/v1/videos/"+q.ID, "", r)
+	if got := h.object(w); w.Code != http.StatusOK || got.Status != StatusCancelled {
+		t.Fatalf("cancel via retrieval: %d %+v", w.Code, got)
+	}
+}
+
+func TestRetrievalNeverCreatesOrLists(t *testing.T) {
+	h := newHarness(t)
+	r := retrieval("org-a", "res-1")
+	if w := h.do(http.MethodPost, "/v1/videos", `{"model":"my-wan","prompt":"x"}`, r); w.Code != http.StatusNotFound {
+		t.Fatalf("create via retrieval: %d", w.Code)
+	}
+	if w := h.do(http.MethodGet, "/v1/videos", "", r); w.Code != http.StatusNotFound {
+		t.Fatalf("list via retrieval: %d", w.Code)
+	}
+	var n int
+	_ = h.db.QueryRow(`SELECT count(*) FROM video_job`).Scan(&n)
+	if n != 0 {
+		t.Fatalf("%d jobs exist", n)
+	}
+}

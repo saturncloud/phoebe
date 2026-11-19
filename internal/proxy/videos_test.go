@@ -1,6 +1,8 @@
 package proxy
 
 import (
+	"encoding/base64"
+	"encoding/json"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -8,6 +10,7 @@ import (
 	"testing"
 
 	"github.com/saturncloud/phoebe/internal/identity"
+	"github.com/saturncloud/phoebe/internal/logging"
 	"github.com/saturncloud/phoebe/internal/videos"
 )
 
@@ -183,5 +186,140 @@ func TestWithVideosRefusesABadServiceURL(t *testing.T) {
 	srv, err := newTestServer(t, nil).WithVideos("http://x:1", "")
 	if err != nil || srv.videos != nil {
 		t.Error("an empty token must leave videos off")
+	}
+}
+
+const testVideoID = "video_01ARZ3NDEKTSV4RRFFQ69G5FAV"
+
+// retrievalRequest is what the always-on retrieval route delivers (issue
+// #13): Atlas's retrieval ForwardAuth stamped the mark, the video's org and
+// endpoint, and the caller's key. No upstream, serving mode or served model.
+func retrievalRequest(method, path string) *http.Request {
+	req := httptest.NewRequest(method, path, nil)
+	req.Header.Set(identity.HeaderVideoRetrieval, "true")
+	req.Header.Set(identity.HeaderOrgID, "org-1")
+	req.Header.Set(identity.HeaderResourceID, "res-1")
+	req.Header.Set(identity.HeaderAuthID, "auth-1")
+	return req
+}
+
+func TestVideoRetrievalRouteHandsAnOrgAndEndpointOnlyIdentity(t *testing.T) {
+	srv, backend := newVideoServer(t)
+	req := retrievalRequest(http.MethodGet, "/v1/videos/"+testVideoID+"/content")
+	req.Header.Set(videos.HeaderHandoff, "forged")
+	rr := httptest.NewRecorder()
+	srv.Handler().ServeHTTP(rr, req)
+	if rr.Code != http.StatusOK || len(backend.reqs) != 1 {
+		t.Fatalf("status %d, backend calls %d", rr.Code, len(backend.reqs))
+	}
+	got := backend.reqs[0]
+	if got.Header.Get(videos.HeaderToken) != "shared-token" {
+		t.Error("the shared token was not set")
+	}
+	raw, err := base64.RawURLEncoding.DecodeString(got.Header.Get(videos.HeaderHandoff))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var h videos.Handoff
+	if err := json.Unmarshal(raw, &h); err != nil {
+		t.Fatal(err)
+	}
+	want := videos.Handoff{Retrieval: true, OrgID: "org-1", AuthID: "auth-1", ResourceID: "res-1"}
+	if h != want {
+		t.Fatalf("handoff %+v, want %+v", h, want)
+	}
+	for name := range got.Header {
+		if strings.HasPrefix(name, "X-Saturn-") {
+			t.Errorf("%s reached phoebe-videos", name)
+		}
+	}
+}
+
+func TestVideoRetrievalRouteServesOnlyReadDownloadAndDelete(t *testing.T) {
+	srv, backend := newVideoServer(t)
+	for _, tc := range []struct {
+		method, path string
+		want         int
+	}{
+		{http.MethodGet, "/v1/videos/" + testVideoID, 200},
+		{http.MethodDelete, "/v1/videos/" + testVideoID, 200},
+		{http.MethodGet, "/v1/videos/" + testVideoID + "/content", 200},
+		{http.MethodGet, "/v1/videos/" + testVideoID + "/content?variant=thumbnail", 200},
+		{http.MethodPost, "/v1/videos", 404},
+		{http.MethodGet, "/v1/videos", 404},
+		{http.MethodPost, "/v1/chat/completions", 404},
+		{http.MethodGet, "/v1/models", 404},
+		{http.MethodGet, "/v1/videos/not-a-video-id", 404},
+		{http.MethodDelete, "/v1/videos/" + testVideoID + "/content", 404},
+		{http.MethodGet, "/v1/videos/" + testVideoID + "/", 404},
+		{http.MethodPost, "/v1/videos/" + testVideoID + "/remix", 404},
+	} {
+		before := len(backend.reqs)
+		rr := httptest.NewRecorder()
+		srv.Handler().ServeHTTP(rr, retrievalRequest(tc.method, tc.path))
+		if rr.Code != tc.want {
+			t.Errorf("%s %s: %d, want %d", tc.method, tc.path, rr.Code, tc.want)
+		}
+		if tc.want == 404 && len(backend.reqs) != before {
+			t.Errorf("%s %s reached phoebe-videos", tc.method, tc.path)
+		}
+	}
+}
+
+func TestVideoRetrievalRouteFailsClosed(t *testing.T) {
+	srv, backend := newVideoServer(t)
+	path := "/v1/videos/" + testVideoID
+	for _, tc := range []struct {
+		reason string
+		mut    func(*http.Request)
+	}{
+		{"no org", func(r *http.Request) { r.Header.Del(identity.HeaderOrgID) }},
+		{"no endpoint", func(r *http.Request) { r.Header.Del(identity.HeaderResourceID) }},
+		{"no key", func(r *http.Request) { r.Header.Del(identity.HeaderAuthID) }},
+		{"with the gateway mark", func(r *http.Request) { r.Header.Set(identity.HeaderGateway, "true") }},
+		{"with endpoint limits", func(r *http.Request) { r.Header.Set(identity.HeaderVideoLimits, testVideoLimits) }},
+	} {
+		req := retrievalRequest(http.MethodGet, path)
+		tc.mut(req)
+		rr := httptest.NewRecorder()
+		srv.Handler().ServeHTTP(rr, req)
+		if rr.Code != 404 {
+			t.Errorf("%s: %d, want 404", tc.reason, rr.Code)
+		}
+	}
+	// Only the exact value "true" marks a retrieval request; anything else is
+	// an ordinary header-routed request, refused for its missing upstream.
+	req := retrievalRequest(http.MethodGet, path)
+	req.Header.Set(identity.HeaderVideoRetrieval, "yes")
+	rr := httptest.NewRecorder()
+	srv.Handler().ServeHTTP(rr, req)
+	if rr.Code == http.StatusOK {
+		t.Errorf("mark %q was accepted", "yes")
+	}
+	if len(backend.reqs) != 0 {
+		t.Errorf("%d refused requests reached phoebe-videos", len(backend.reqs))
+	}
+	// Video generation off on this phoebe: 404.
+	off := newTestServer(t, nil)
+	rr = httptest.NewRecorder()
+	off.Handler().ServeHTTP(rr, retrievalRequest(http.MethodGet, path))
+	if rr.Code != 404 {
+		t.Errorf("videos off: %d", rr.Code)
+	}
+}
+
+// With the mark left out of PHOEBE_TRUSTED_HEADERS (an old chart), a client
+// copy is never read: the request is not a retrieval request.
+func TestVideoRetrievalMarkIsReadOnlyWhenTrusted(t *testing.T) {
+	// Reload after t.Setenv restores the variable (cleanups run last in,
+	// first out), as TestSaturnHeadersStrippedWithConfiguredTrustedSet does.
+	t.Cleanup(func() { identity.LoadTrustedHeaders(logging.New(logging.ERROR)) })
+	t.Setenv(identity.TrustedHeadersEnv, "X-Saturn-Gateway,X-Saturn-Org-Id,X-Saturn-Serving-Mode")
+	identity.LoadTrustedHeaders(logging.New(logging.ERROR))
+	srv, backend := newVideoServer(t)
+	rr := httptest.NewRecorder()
+	srv.Handler().ServeHTTP(rr, retrievalRequest(http.MethodGet, "/v1/videos/"+testVideoID))
+	if rr.Code == http.StatusOK || len(backend.reqs) != 0 {
+		t.Fatalf("an untrusted mark reached phoebe-videos: %d", rr.Code)
 	}
 }

@@ -54,6 +54,63 @@ func videoRequestAllowed(method, path string) bool {
 	return sub == "content" && method == http.MethodGet
 }
 
+// videoRetrievalAllowed is the always-on retrieval route's whole surface
+// (issue #13): read one video, download its content, or delete it. Creating
+// and listing stay on the endpoint's own route, which needs it running.
+func videoRetrievalAllowed(method, path string) bool {
+	rest, ok := strings.CutPrefix(path, "/v1/videos/")
+	if !ok {
+		return false
+	}
+	id, sub, hasSub := strings.Cut(rest, "/")
+	if !videos.ValidID(id) {
+		return false
+	}
+	if !hasSub {
+		return method == http.MethodGet || method == http.MethodDelete
+	}
+	return sub == "content" && method == http.MethodGet
+}
+
+// serveVideoRetrieval answers a request Atlas's retrieval ForwardAuth marked
+// with X-Saturn-Video-Retrieval. Atlas has checked the key may read the video
+// and stamped the video's org and endpoint; phoebe-videos then looks the job
+// up by id, org and endpoint, so a mark without both answers nothing. Every
+// refusal is the generic 404.
+func (s *Server) serveVideoRetrieval(w http.ResponseWriter, r *http.Request, id identity.Identity, routePath string, pathCanonical bool) {
+	requestID, err := generateRequestID()
+	if err != nil {
+		s.log.Error.Printf("videos: generate request id: %v", err)
+		http.Error(w, "internal error", http.StatusInternalServerError)
+		return
+	}
+	refuse := func(reason string) {
+		s.log.Warn.Printf("videos: refused retrieval request_id=%s org_id=%q resource_id=%q method=%s raw_path=%q: %s",
+			requestID, id.OrgID, id.ResourceID, r.Method, r.URL.RawPath, reason)
+		http.Error(w, "not found", http.StatusNotFound)
+	}
+	switch {
+	case s.videos == nil:
+		refuse("video generation is not enabled on this phoebe (videos.serviceUrl / PHOEBE_VIDEOS_TOKEN)")
+		return
+	case id.Gateway || id.VideoLimits != "":
+		// The retrieval mark comes from one route only; together with another
+		// route's mark the edge contract is broken.
+		refuse("retrieval mark together with the gateway mark or video endpoint limits")
+		return
+	case id.OrgID == "" || id.ResourceID == "" || id.AuthID == "":
+		refuse("retrieval request without org, endpoint or auth id")
+		return
+	case !pathCanonical || !videoRetrievalAllowed(r.Method, routePath):
+		refuse("outside the video retrieval surface")
+		return
+	}
+	s.handOffVideo(w, r, requestID, videos.Handoff{
+		Retrieval: true, OrgID: id.OrgID, AuthID: id.AuthID, UserID: id.UserID, GroupID: id.GroupID,
+		ResourceID: id.ResourceID,
+	})
+}
+
 // serveVideo answers a request on a route that carries X-Saturn-Video-Limits.
 // Every refusal is the same generic 404 the other route gates use.
 func (s *Server) serveVideo(w http.ResponseWriter, r *http.Request, id identity.Identity, requestID, routePath string, pathCanonical bool) {
@@ -78,11 +135,17 @@ func (s *Server) serveVideo(w http.ResponseWriter, r *http.Request, id identity.
 		refuse("outside the video surface")
 		return
 	}
-	handoff, err := videos.EncodeHandoff(videos.Handoff{
+	s.handOffVideo(w, r, requestID, videos.Handoff{
 		OrgID: id.OrgID, AuthID: id.AuthID, UserID: id.UserID, GroupID: id.GroupID,
 		ResourceID: id.ResourceID, ServedModel: id.ServedModel, BaseModel: id.BaseModel,
 		ServingMode: id.ServingMode, Upstream: id.Upstream, Limits: id.VideoLimits,
 	})
+}
+
+// handOffVideo passes a checked request to phoebe-videos with the trusted
+// identity and the shared token, replacing any client copy of either.
+func (s *Server) handOffVideo(w http.ResponseWriter, r *http.Request, requestID string, h videos.Handoff) {
+	handoff, err := videos.EncodeHandoff(h)
 	if err != nil {
 		s.log.Error.Printf("videos: encode identity: %v", err)
 		http.Error(w, "internal error", http.StatusInternalServerError)

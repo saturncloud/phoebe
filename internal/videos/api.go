@@ -31,6 +31,11 @@ const (
 // Handoff is the trusted request identity the interceptor passes on: what
 // ForwardAuth and Atlas's route stamped, after the interceptor's own checks.
 type Handoff struct {
+	// Retrieval marks a request from the always-on retrieval route (issue
+	// #13): it may only read, download or delete one video, and carries only
+	// the org, the caller and the video's endpoint, never the endpoint's
+	// served model, upstream or limits (the endpoint may be stopped or gone).
+	Retrieval   bool   `json:"retrieval,omitempty"`
 	OrgID       string `json:"org_id"`
 	AuthID      string `json:"auth_id"`
 	UserID      string `json:"user_id,omitempty"`
@@ -64,6 +69,15 @@ func decodeHandoff(v string) (Handoff, error) {
 	dec.DisallowUnknownFields()
 	if err := dec.Decode(&h); err != nil {
 		return h, err
+	}
+	if h.Retrieval {
+		if h.OrgID == "" || h.AuthID == "" || h.ResourceID == "" {
+			return h, fmt.Errorf("incomplete retrieval identity")
+		}
+		if h.ServedModel != "" || h.BaseModel != "" || h.Upstream != "" || h.ServingMode != "" || h.Limits != "" {
+			return h, fmt.Errorf("retrieval identity carries endpoint fields")
+		}
+		return h, nil
 	}
 	if h.OrgID == "" || h.AuthID == "" || h.ResourceID == "" || h.ServedModel == "" ||
 		h.BaseModel == "" || h.Upstream == "" || h.ServingMode != "dedicated" {
@@ -112,35 +126,50 @@ func (a *API) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		writeError(w, errNotFound)
 		return
 	}
+	path := r.URL.Path
+	if id.Retrieval {
+		// The always-on route reads, downloads or deletes one video (issue
+		// #13); it never creates or lists, which need the endpoint itself.
+		if !strings.HasPrefix(path, "/v1/videos/") {
+			writeError(w, errNotFound)
+			return
+		}
+		a.serveOne(w, r, id, strings.TrimPrefix(path, "/v1/videos/"))
+		return
+	}
 	limits, err := ParseLimits(id.Limits)
 	if err != nil {
 		a.log.Error.Printf("videos: resource %s: %v", id.ResourceID, err)
 		writeError(w, errNotFound)
 		return
 	}
-	path := r.URL.Path
 	switch {
 	case path == "/v1/videos" && r.Method == http.MethodPost:
 		a.create(w, r, id, limits)
 	case path == "/v1/videos" && r.Method == http.MethodGet:
 		a.list(w, r, id)
 	case strings.HasPrefix(path, "/v1/videos/"):
-		rest := strings.TrimPrefix(path, "/v1/videos/")
-		jobID, sub, _ := strings.Cut(rest, "/")
-		if !ValidID(jobID) {
-			writeError(w, errNotFound)
-			return
-		}
-		switch {
-		case sub == "" && r.Method == http.MethodGet:
-			a.get(w, r, id, jobID)
-		case sub == "" && r.Method == http.MethodDelete:
-			a.delete(w, r, id, jobID)
-		case sub == "content" && r.Method == http.MethodGet:
-			a.content(w, r, id, jobID)
-		default:
-			writeError(w, errNotFound)
-		}
+		a.serveOne(w, r, id, strings.TrimPrefix(path, "/v1/videos/"))
+	default:
+		writeError(w, errNotFound)
+	}
+}
+
+// serveOne answers the three requests on one video: rest is the path after
+// /v1/videos/. The job is looked up by id, org and endpoint on either route.
+func (a *API) serveOne(w http.ResponseWriter, r *http.Request, id Handoff, rest string) {
+	jobID, sub, hasSub := strings.Cut(rest, "/")
+	if !ValidID(jobID) {
+		writeError(w, errNotFound)
+		return
+	}
+	switch {
+	case !hasSub && r.Method == http.MethodGet:
+		a.get(w, r, id, jobID)
+	case !hasSub && r.Method == http.MethodDelete:
+		a.delete(w, r, id, jobID)
+	case sub == "content" && r.Method == http.MethodGet:
+		a.content(w, r, id, jobID)
 	default:
 		writeError(w, errNotFound)
 	}

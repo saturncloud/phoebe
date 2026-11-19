@@ -359,3 +359,49 @@ func TestAPIRefusesRequestsWithoutTheInterceptorToken(t *testing.T) {
 }
 
 func testLogger() *logging.Logger { return logging.New(logging.ERROR) }
+
+// A retrieval handoff (issue #13) needs the org, the key and the video's
+// endpoint, and must carry none of the endpoint's own route fields: the
+// endpoint may be stopped or deleted, and a mix would mean the edge contract
+// is broken.
+func TestRetrievalHandoffNeedsOrgKeyAndEndpointOnly(t *testing.T) {
+	h := Handoff{Retrieval: true, OrgID: "o", AuthID: "a", ResourceID: "r"}
+	enc, _ := EncodeHandoff(h)
+	if got, err := decodeHandoff(enc); err != nil || got != h {
+		t.Fatalf("round trip: %+v %v", got, err)
+	}
+	for _, mut := range []func(*Handoff){
+		func(h *Handoff) { h.OrgID = "" }, func(h *Handoff) { h.AuthID = "" },
+		func(h *Handoff) { h.ResourceID = "" }, func(h *Handoff) { h.ServedModel = "m" },
+		func(h *Handoff) { h.Upstream = "u:8000" }, func(h *Handoff) { h.Limits = "{}" },
+		func(h *Handoff) { h.ServingMode = "dedicated" }, func(h *Handoff) { h.BaseModel = "b" },
+	} {
+		bad := h
+		mut(&bad)
+		enc, _ := EncodeHandoff(bad)
+		if _, err := decodeHandoff(enc); err == nil {
+			t.Errorf("accepted retrieval identity %+v", bad)
+		}
+	}
+}
+
+// The retrieval route never creates or lists: those answer 404 before the
+// store is touched (this API has none).
+func TestRetrievalHandoffCannotCreateOrList(t *testing.T) {
+	api := NewAPI(APIConfig{Token: "tok"}, nil, nil, nil, testLogger())
+	enc, _ := EncodeHandoff(Handoff{Retrieval: true, OrgID: "o", AuthID: "a", ResourceID: "r"})
+	for _, tc := range []struct{ method, path string }{
+		{http.MethodPost, "/v1/videos"}, {http.MethodGet, "/v1/videos"},
+		{http.MethodGet, "/v1/videos/not-an-id"}, {http.MethodPut, "/v1/videos/video_01ARZ3NDEKTSV4RRFFQ69G5FAV"},
+		{http.MethodGet, "/v1/videos/video_01ARZ3NDEKTSV4RRFFQ69G5FAV/remix"},
+	} {
+		r := httptest.NewRequest(tc.method, tc.path, nil)
+		r.Header.Set(HeaderToken, "tok")
+		r.Header.Set(HeaderHandoff, enc)
+		w := httptest.NewRecorder()
+		api.ServeHTTP(w, r)
+		if w.Code != http.StatusNotFound {
+			t.Errorf("%s %s: %d, want 404", tc.method, tc.path, w.Code)
+		}
+	}
+}

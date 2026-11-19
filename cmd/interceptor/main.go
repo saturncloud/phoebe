@@ -45,7 +45,7 @@ func main() {
 
 	// R3 trusted-header registry: parse PHOEBE_TRUSTED_HEADERS (rendered
 	// from the phoebe chart's ConfigMap) into the active set the parser's
-	// envelope reads resolve through. The pinned 16 already govern from
+	// envelope reads resolve through. The pinned 17 already govern from
 	// package init; this engages the runtime config once, at startup, and
 	// warns loudly if the chart render was empty/malformed.
 	identity.LoadTrustedHeaders(log)
