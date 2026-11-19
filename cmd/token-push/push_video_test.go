@@ -3,13 +3,12 @@ package main
 import (
 	"context"
 	"reflect"
+	"sort"
 	"strings"
 	"testing"
 	"time"
 
 	"github.com/saturncloud/phoebe/internal/meteredusage"
-	"github.com/saturncloud/phoebe/internal/prune"
-	"github.com/saturncloud/phoebe/internal/rating"
 )
 
 // idVideo is a dedicated video endpoint's identity. idVideoOnFT shares every
@@ -92,6 +91,7 @@ func TestPushWindows_ListsVideoOnlyForHoursWithVideoOrSentVideo(t *testing.T) {
 	delete(f.videoRollups, win)
 	f.rollups[videoGone] = f.rollups[win]
 	f.pushed[videoGone] = []pushedRow{{UsageID: strings.Repeat("e", 64), Kind: meteredusage.KindVideo, identity: idVideo}}
+	f.tombstones = map[time.Time][]string{videoGone: {strings.Repeat("e", 64)}} // the rater removed it
 	m := &recordingManager{}
 	if code := push1(t, f, m, win, videoOnly, videoGone); code != exitOK {
 		t.Fatalf("exit %d", code)
@@ -210,11 +210,11 @@ func TestPushWindows_RecordsTheKindOfEverySentID(t *testing.T) {
 	}
 }
 
-// Video was sent before and the video tables are now empty (a wipe): video is
-// left out of the request so the manager's video records are not deleted by
-// absence, tokens are still sent, the video bookkeeping is kept, and the run
-// exits 1.
-func TestPushWindows_WipedVideoTablesSendTokensOnlyAndFail(t *testing.T) {
+// Video was sent before and the video tables are now empty (a wipe): there is
+// no tombstone for the sent ids, so they are held and the manager keeps its
+// video records. Tokens are still sent, the video bookkeeping is kept, and the
+// run exits 1.
+func TestPushWindows_WipedVideoTablesHoldEverySentVideoRecord(t *testing.T) {
 	f := videoStore()
 	m := &recordingManager{}
 	if code := push1(t, f, m, win); code != exitOK {
@@ -226,8 +226,10 @@ func TestPushWindows_WipedVideoTablesSendTokensOnlyAndFail(t *testing.T) {
 		t.Fatalf("exit %d, want %d", code, exitFatal)
 	}
 	req := sentRequest(t, m.bodies[1])
-	if !reflect.DeepEqual(req.Kinds, []string{"token"}) || len(req.Records) != 4 || len(req.Held) != 0 {
-		t.Fatalf("kinds %v, %d records, held %v; want the token hour only", req.Kinds, len(req.Records), req.Held)
+	if !reflect.DeepEqual(req.Kinds, []string{"token", "video"}) || len(req.Records) != 4 ||
+		len(req.VideoRecords) != 0 || len(req.Held) != 2 {
+		t.Fatalf("kinds %v, %d token and %d video records, held %v; want the tokens sent and both video ids held",
+			req.Kinds, len(req.Records), len(req.VideoRecords), req.Held)
 	}
 	videoLeft := 0
 	for _, r := range f.pushed[win] {
@@ -307,50 +309,44 @@ func TestPushWindows_NineDecimalSecondsAreSentShortestAndExact(t *testing.T) {
 }
 
 // A video record this install sent for an hour, with no rollup now, is let
-// go (the hour's video set no longer names it, so the manager deletes it) only
-// when the rater could have removed it: rated_video_usage has rows and the
-// hour is inside the video reach plus a day of slack. Otherwise its rollup was
-// lost: its id is held so the manager keeps the record, and the run exits 1.
-// This is decided per id: another identity's park, or another grain of the
-// same identity, in the same hour does not let it be deleted.
-func TestPushWindows_VanishedVideoIsNotDeletedWhenTheRaterCannotHaveRemovedIt(t *testing.T) {
+// go (the hour's video set no longer names it, so the manager deletes it) ONLY
+// when the rater recorded removing it: a tombstone for its usage_id. Without
+// one it was lost, whatever the hour's age or the state of the other tables:
+// its id is held so the manager keeps the record, and the run exits 1. A
+// parked identity's id is held even with a tombstone (the park holds it until
+// it resolves). Decided per id: another grain of the same identity, live in
+// the same hour, does not release it.
+func TestPushWindows_AVanishedVideoRecordIsDeletedOnlyWithATombstone(t *testing.T) {
 	sentID := strings.Repeat("e", 64)
 	sentVideo := []pushedRow{{UsageID: sentID, Kind: meteredusage.KindVideo, identity: idVideo}}
-	floor := rating.VideoFloor(now)
-	old := floor.Add(-videoReconcileSlack - time.Hour)
-	inSlack := floor.Add(-time.Hour)
 	for _, tc := range []struct {
-		name        string
-		hour        time.Time
-		parkedOnly  bool
-		parkedOther bool
-		otherGrain  bool
-		wantHeld    []string
-		wantExit    int
+		name       string
+		tombstone  bool
+		parked     bool
+		otherGrain bool
+		wantHeld   []string
+		wantExit   int
 	}{
-		{"inside the reach, rollups rated elsewhere: a reconcile deletion", win, false, false, false, nil, exitOK},
-		{"a day older than the floor, within the slack: a reconcile deletion", inSlack, false, false, false, nil, exitOK},
-		{"exactly at the end of the slack: a reconcile deletion", floor.Add(-videoReconcileSlack), false, false, false, nil, exitOK},
-		{"rated_video_usage empty, only an unresolved park left", win, true, false, false, []string{sentID}, exitFatal},
-		{"rated_video_usage empty, another identity parked in the same hour", win, true, true, false, []string{sentID}, exitFatal},
-		{"older than the video reach and its slack", old, false, false, false, []string{sentID}, exitFatal},
-		{"older than the reach, the same identity keeps another grain", old, false, false, true, []string{sentID}, exitFatal},
+		{"the rater removed it: tombstone, deleted by absence", true, false, false, nil, exitOK},
+		{"lost: no tombstone, held", false, false, false, []string{sentID}, exitFatal},
+		{"lost while the same identity keeps another grain: held", false, false, true, []string{sentID}, exitFatal},
+		{"tombstone but the identity is parked: held by the park", true, true, false, []string{sentID}, exitOK},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			f := videoStore()
-			f.videoParkedOnly = tc.parkedOnly
 			delete(f.videoRollups, win)
-			f.rollups[tc.hour] = fixtureStore().rollups[win]
-			f.pushed[tc.hour] = sentVideo
-			if tc.parkedOther {
-				f.videoParked[tc.hour] = []identity{idVideoOnFT}
+			f.pushed[win] = sentVideo
+			if tc.tombstone {
+				f.tombstones = map[time.Time][]string{win: {sentID}}
+			}
+			if tc.parked {
+				f.videoParked[win] = []identity{idVideo}
 			}
 			if tc.otherGrain {
-				f.videoRollups[tc.hour] = videoStore().videoRollups[win][:1] // idVideo at 720p
+				f.videoRollups[win] = videoStore().videoRollups[win][:1] // idVideo at 720p
 			}
-			f.videoRollups[win.Add(time.Hour)] = videoStore().videoRollups[win] // rated elsewhere
 			m := &recordingManager{}
-			if code := push1(t, f, m, tc.hour); code != tc.wantExit {
+			if code := push1(t, f, m, win); code != tc.wantExit {
 				t.Fatalf("exit %d, want %d", code, tc.wantExit)
 			}
 			req := sentRequest(t, m.bodies[0])
@@ -358,9 +354,9 @@ func TestPushWindows_VanishedVideoIsNotDeletedWhenTheRaterCannotHaveRemovedIt(t 
 				(len(tc.wantHeld) > 0 && !reflect.DeepEqual(req.Held, tc.wantHeld)) {
 				t.Fatalf("kinds %v held %v, want [token video] and %v", req.Kinds, req.Held, tc.wantHeld)
 			}
-			// A held id is kept through RecordAccepted's trim; a let-go id is not.
+			// A held id is kept through RecordAccepted's trim; a released id is not.
 			kept := false
-			for _, r := range f.pushed[tc.hour] {
+			for _, r := range f.pushed[win] {
 				kept = kept || r.UsageID == sentID
 			}
 			if kept != (len(tc.wantHeld) > 0) {
@@ -370,10 +366,115 @@ func TestPushWindows_VanishedVideoIsNotDeletedWhenTheRaterCannotHaveRemovedIt(t 
 	}
 }
 
-// token-push's reconcile range ends exactly where phoebe-videos' row
-// retention starts: the rater's reach plus the slack is the retention.
-func TestVideoReconcileSlackEndsAtTheRowRetention(t *testing.T) {
-	if got, want := rating.VideoRateReach+videoReconcileSlack, time.Duration(prune.VideoRowRetentionDays)*24*time.Hour; got != want {
-		t.Fatalf("reach %s + slack %s = %s, want the row retention %s", rating.VideoRateReach, videoReconcileSlack, got, want)
+// A rollup whose stored usage_id is not the id of its own fields (edited
+// outside the rater, or rated under another usage_id rule, or never stamped)
+// is held back, not sent under its new id: sending it would leave the old
+// record at the manager with no tombstone, a double charge.
+func TestPushWindows_ARollupWhoseStoredUsageIDDiffersIsHeldBack(t *testing.T) {
+	for _, stored := range []string{strings.Repeat("d", 64), unstampedVideoID} {
+		f := videoStore()
+		f.videoRollups[win][0].UsageID = stored
+		m := &recordingManager{}
+		if code := push1(t, f, m, win); code != exitWithheld {
+			t.Fatalf("stored %q: exit %d, want exitWithheld", stored, code)
+		}
+		req := sentRequest(t, m.bodies[0])
+		for _, r := range req.VideoRecords {
+			if r.Attributes.Resolution == "720p" {
+				t.Fatalf("stored %q: the mismatched rollup was sent", stored)
+			}
+		}
+	}
+}
+
+// Wiped video tables fail every run (exit 1) even when no hour the run sends
+// had video: the scheduled run otherwise exits 0 and the loss of the only
+// durable video record goes unpaged.
+func TestPushWindows_WipedVideoTablesFailEvenWithoutAVideoHourInTheRun(t *testing.T) {
+	f := fixtureStore()
+	f.everPushedVideo = true // video was sent for some older hour
+	m := &recordingManager{}
+	if code := push1(t, f, m, win); code != exitFatal {
+		t.Fatalf("exit %d, want %d", code, exitFatal)
+	}
+	if req := sentRequest(t, m.bodies[0]); len(req.Records) != 4 || len(req.Held) != 0 {
+		t.Fatalf("%d token records, held %v; want the token hour sent unchanged", len(req.Records), req.Held)
+	}
+}
+
+// A video-only install (never sent a token record) whose video rollups were
+// all removed is not refused as a wiped token table: it pushes, so the
+// tombstoned records are released.
+func TestPushWindows_AVideoOnlyInstallWithEveryRollupRemovedStillPushes(t *testing.T) {
+	sentID := strings.Repeat("e", 64)
+	f := newFake()
+	f.empty, f.everPushed = true, true
+	f.pushed[win] = []pushedRow{{UsageID: sentID, Kind: meteredusage.KindVideo, identity: idVideo}}
+	f.tombstones = map[time.Time][]string{win: {sentID}}
+	m := &recordingManager{}
+	if code := push1(t, f, m, win); code != exitOK || len(m.bodies) != 1 {
+		t.Fatalf("exit %d with %d requests, want 0 and the hour sent (an all-removed install is not wiped)", code, len(m.bodies))
+	}
+	if req := sentRequest(t, m.bodies[0]); !reflect.DeepEqual(req.Kinds, []string{"token", "video"}) || len(req.Held) != 0 {
+		t.Fatalf("kinds %v held %v, want video listed empty so the tombstoned record is deleted", req.Kinds, req.Held)
+	}
+}
+
+// A video rollup token-push holds back holds its whole identity, tombstones
+// or not: while one of its rollups cannot be sent, the manager keeps every
+// record of the identity. Releasing a regrained predecessor here would leave
+// the grain with no record at all until a person fixes the rollup.
+func TestPushWindows_AHeldBackVideoRollupHoldsItsIdentityEvenWithTombstones(t *testing.T) {
+	f := videoStore()
+	rows := f.videoRollups[win]
+	bad := rows[0]
+	bad.OrgID = "not-hex" // fails the wire rule
+	f.videoRollups[win] = []videoRollupRow{bad}
+	badID := stampedVideoID(win, bad)
+	predecessor := strings.Repeat("e", 64) // the grain's old id, regrained by the rater
+	f.pushed[win] = []pushedRow{
+		{UsageID: badID, Kind: meteredusage.KindVideo, identity: idVideo},
+		{UsageID: predecessor, Kind: meteredusage.KindVideo, identity: idVideo},
+	}
+	f.tombstones = map[time.Time][]string{win: {predecessor}}
+	m := &recordingManager{}
+	if code := push1(t, f, m, win); code != exitWithheld {
+		t.Fatalf("exit %d, want exitWithheld", code)
+	}
+	held := sentRequest(t, m.bodies[0]).Held
+	sort.Strings(held)
+	want := []string{badID, predecessor}
+	sort.Strings(want)
+	if !reflect.DeepEqual(held, want) {
+		t.Fatalf("held %v, want both of the identity's records %v", held, want)
+	}
+}
+
+// A live video rollup whose id has a tombstone was restored outside the rater
+// without deleting its tombstone (the rater clears a live id's tombstone in
+// the transaction that makes it live). The record is sent, and the run exits
+// 1 so a person deletes the tombstone before a later loss would release it.
+func TestPushWindows_ALiveVideoRecordWithATombstoneIsSentAndAlarms(t *testing.T) {
+	f := videoStore()
+	live := stampedVideoID(win, f.videoRollups[win][0])
+	f.tombstones = map[time.Time][]string{win: {live}}
+	m := &recordingManager{}
+	if code := push1(t, f, m, win); code != exitFatal {
+		t.Fatalf("exit %d, want %d", code, exitFatal)
+	}
+	if req := sentRequest(t, m.bodies[0]); len(req.VideoRecords) != 2 {
+		t.Fatalf("%d video records, want both sent", len(req.VideoRecords))
+	}
+}
+
+// A live rollup with a tombstone anywhere fails every run (exit 1), not only
+// runs that rebuild its hour, so the alarm does not stop once the hour leaves
+// the routine window.
+func TestPushWindows_AStaleTombstoneAnywhereFailsTheRun(t *testing.T) {
+	f := fixtureStore()
+	f.staleTombstone = true
+	m := &recordingManager{}
+	if code := push1(t, f, m, win); code != exitFatal {
+		t.Fatalf("exit %d, want %d", code, exitFatal)
 	}
 }

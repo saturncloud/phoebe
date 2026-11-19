@@ -132,17 +132,21 @@
 //	   5xx/429/network failure that outlasted the retries, a manager that could
 //	   not be reached for 3 hours in a row (the run stops there), a
 //	   200 that disagreed with the request, rated_usage empty after usage was
-//	   already sent (a wiped table), or a window range wider than the backfill
-//	   cap
+//	   already sent (a wiped table), no video usage recorded after video was
+//	   already sent (wiped video tables), a sent video record with no rollup,
+//	   no tombstone and no park (lost; its id is held), or a window range wider
+//	   than the backfill cap
 //	2  token-push HELD BACK a rollup it could not turn into a valid record (no
-//	   org, or a wire rule; the rest of its hour was sent), or parked an hour
+//	   org, or a wire rule, or a video rollup whose stored usage_id is not the
+//	   id of its fields; the rest of its hour was sent), or parked an hour
 //	   whose request breaks a request-level wire rule. Parked usage is the
 //	   rater's signal (its exit 4), not this one
 //	3  the manager REJECTED some hour with a final status: a 400 validation
 //	   answer (the hour is parked; later runs do not fail for it while its
 //	   usage is unchanged), 401 token, 403 inactive or uninstalled install, 409
 //	   a manager older than the 2026-11-17 rule that accepts token usage from
-//	   installs on the legacy billing path, or any other non-429 4xx. Not
+//	   installs on the legacy billing path, a 400 on kinds (a manager older
+//	   than the video kind), or any other non-429 4xx. Not
 //	   retried; needs a person
 //
 // Precedence when several apply: 1 > 3 > 2.

@@ -4,7 +4,7 @@
 -- kind "video" records. Quantities only: the manager prices (billing-design.md
 -- D1).
 --
--- EXPAND ONLY. Two new tables, and one column with a default on pushed_usage,
+-- EXPAND ONLY. Three new tables, and one column with a default on pushed_usage,
 -- so the previous release's rater and token-push keep working unchanged.
 
 -- rated_video_usage: one row per grain
@@ -22,8 +22,16 @@
 -- request_count). request_count counts completed jobs. (Comment only.)
 CREATE TABLE IF NOT EXISTS rated_video_usage (
     -- Deterministic local surrogate: md5 of the length-prefixed grain. phoebe's
-    -- row id only; the wire's usage_id is computed by token-push.
+    -- row id only.
     id              CHAR(32)      NOT NULL PRIMARY KEY,
+    -- The wire usage_id of the row's record (meteredusage.VideoUsageID over
+    -- the grain, org_id and hour), stored by the rater in the transaction that
+    -- writes the row. When the rater removes a record (a reconcile deletion,
+    -- or a change of org_id that gives the grain a new usage_id) it writes the
+    -- old id to video_reconcile_deletion, so token-push can tell a record the
+    -- rater removed from one that was lost. NULL only between the statement
+    -- that upserts the row and the one that stamps it, inside one transaction.
+    usage_id        CHAR(64),
     auth_id         VARCHAR(64)   NOT NULL,
     owner_type      VARCHAR(16)   NOT NULL,
     owner_id        VARCHAR(64)   NOT NULL,
@@ -57,6 +65,46 @@ CREATE TABLE IF NOT EXISTS rated_video_usage (
 
 -- token-push reads one hour at a time, and the reconcile deletes by hour.
 CREATE INDEX IF NOT EXISTS rated_video_usage_window_ix ON rated_video_usage (window_start);
+-- A database that applied 0017 before usage_id existed (dev installs from
+-- integration-2026.08.01 before #143) gets the column from this statement when
+-- the file is applied again by hand; it is idempotent.
+ALTER TABLE rated_video_usage ADD COLUMN IF NOT EXISTS usage_id CHAR(64);
+-- Unique: one record per id. Two grains could compute the same id only if an
+-- envelope field contained '|' (the wire hash does not escape it); the rater
+-- refuses such jobs as invalid usage, so they never become rollups.
+-- (Drops a non-unique index an earlier draft of this migration created on
+-- battery dev databases.)
+DROP INDEX IF EXISTS rated_video_usage_usage_id_ix;
+CREATE UNIQUE INDEX IF NOT EXISTS rated_video_usage_usage_id_uq ON rated_video_usage (usage_id);
+
+-- video_reconcile_deletion: a TOMBSTONE for every video usage_id the rater
+-- removed on purpose, written in the same transaction as the removal:
+--   reconcile  the rollup was deleted by a re-rate (its jobs vanished or now
+--              fail a check)
+--   parked     the rollup was deleted because its identity was parked; the
+--              park holds the id until it resolves
+--   regrained  the rollup's usage_id changed (a new org_id for the same grain)
+-- token-push lets the manager delete a sent video record by absence ONLY when
+-- its id has a tombstone; any other sent id with no rollup was lost, and is
+-- held. A parked identity's ids are held by the
+-- park whatever their tombstone says, so `reason` is an audit label, not read
+-- by token-push. deleted_at is the latest removal. The rater removes a
+-- tombstone when its id is live again. NEVER pruned: one small row per removed record, and
+-- 0017 down reads them to refuse while the manager still holds one.
+CREATE TABLE IF NOT EXISTS video_reconcile_deletion (
+    window_start  TIMESTAMPTZ   NOT NULL,
+    usage_id      CHAR(64)      NOT NULL,
+    auth_id       VARCHAR(64)   NOT NULL,
+    owner_type    VARCHAR(16)   NOT NULL,
+    owner_id      VARCHAR(64)   NOT NULL,
+    resource_id   VARCHAR(64)   NOT NULL,
+    model_id      VARCHAR(255)  NOT NULL,
+    serving_mode  VARCHAR(32)   NOT NULL,
+    reason        VARCHAR(16)   NOT NULL,
+    deleted_at    TIMESTAMPTZ   NOT NULL DEFAULT now(),
+    CONSTRAINT video_reconcile_deletion_pk PRIMARY KEY (window_start, usage_id),
+    CONSTRAINT video_reconcile_deletion_reason_ck CHECK (reason IN ('reconcile', 'parked', 'regrained'))
+);
 
 -- parked_video_usage: conflicted video usage parked per (hour, identity,
 -- reason), never dropped and never holding back the rest of the hour: the

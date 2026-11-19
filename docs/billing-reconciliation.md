@@ -144,7 +144,8 @@ of the video grain, so two values are two records, not a conflict.
   `parked_usage`. Holding is per kind: a parked video identity holds only its
   video usage_ids (`pushed_usage.kind`), never a token record.
 - Video jobs that cannot become any record (an empty auth, resource or model id,
-  a negative or NaN quantity, or a completed job whose `request_count` is not 1)
+  a `|` in the org, owner or resource id, a negative or NaN quantity, or a
+  completed job whose `request_count` is not 1)
   are withheld per job, logged at ERROR, and make the rater exit `2`, like
   invalid token events.
 - phoebe-videos deletes `video_billing_event` rows after 30 days, always. So the
@@ -162,18 +163,56 @@ of the video grain, so two values are two records, not a conflict.
   rater was down longer than its trailing window), the run logs them at ERROR
   and exits `2`. It keeps doing so on each run until they are re-rated with
   `--since/--until`, which must happen before they pass 29 days.
-- **Vanished video.** token-push holds a video record it sent before whose
-  rollup is gone, unless the rater can have removed it: `rated_video_usage`
-  still has rows and the hour is at most 30 days old. It logs `video record(s)
-  this install sent have no rollup now` at ERROR and exits `1`. The ids stay
-  held, and the alarm repeats each time the hour is sent again (the trailing 24
-  hours, an explicit `-since/-until`, or a never-accepted or resolved hour).
-  - If the rollups were lost, restore `rated_video_usage`.
-  - If the rater removed them on purpose (an explicit re-rate of an old hour,
-    pushed more than a day later), delete the held ids from `pushed_usage`
-    (`DELETE FROM pushed_usage WHERE window_start = '<hour>' AND kind = 'video'
-    AND usage_id IN (...)`), then re-send the hour with `-since/-until`. To avoid
-    this, push an explicitly re-rated hour in the same session as the re-rate.
+- **Tombstones and vanished video.** The rater stores each video rollup's wire
+  `usage_id` (`rated_video_usage.usage_id`). Whenever it removes one, it writes a
+  tombstone to `video_reconcile_deletion` in the same transaction. That happens
+  for a reconcile deletion (`reconcile`), a park (`parked`), or a new `org_id`
+  for the same grain (`regrained`). token-push lets the manager delete a sent
+  video record by absence only when its id has a tombstone. A parked identity's
+  ids stay held while the park is unresolved.
+  - A restore of `rated_video_usage` rows must also delete their ids from
+    `video_reconcile_deletion` in the same transaction. Otherwise a stale
+    tombstone would release the record if it were lost again. token-push
+    reports a live rollup that still has a tombstone at ERROR and exits `1`.
+    A rater run over the hour also clears the tombstone of every id live in
+    it, but routine runs reach back only 24 hours (7 days for parked hours).
+    For an older hour, delete the tombstone or re-rate the hour with
+    `--since/--until`.
+  - Any other sent video id with no rollup was lost. token-push holds it, so the
+    manager keeps the record, logs `video record(s) this install sent have no
+    rollup and no tombstone` at ERROR, and exits `1` each time the hour is sent.
+    - To keep billing it, restore the rollup in `rated_video_usage` with its
+      `usage_id`.
+    - To let it go, write the tombstone by hand, then re-send the hour with
+      `-since/-until`. Re-rating cannot do this: the rater tombstones only rows
+      it deletes, and a lost row is not there to delete. Do not delete the id
+      from `pushed_usage` instead: if it was the hour's only video record, the
+      hour stops listing video and the manager keeps the record silently.
+
+      ```sql
+      -- <reason> is 'reconcile' here, 'regrained' for an id replaced by a new one.
+      INSERT INTO video_reconcile_deletion (window_start, usage_id, auth_id, owner_type,
+          owner_id, resource_id, model_id, serving_mode, reason)
+      SELECT window_start, usage_id, auth_id, owner_type, owner_id, resource_id,
+             model_id, serving_mode, '<reason>'
+        FROM pushed_usage WHERE window_start = '<hour>' AND usage_id = '<id>';
+      ```
+  - An hour where the manager still holds a record the rater removed (an
+    explicit re-rate of an older hour) is re-sent automatically, however old,
+    like an hour with a resolved park. It drops out once the manager accepts
+    the release. If the record stays held (its identity is held back by
+    token-push), the hour is re-sent on every run, with the run's exit 2,
+    until the held-back rollup is fixed.
+  - If no video usage is recorded at all although video was sent before, the
+    video tables look wiped. Every run then logs it at ERROR and exits `1`.
+  - A rollup whose stored `usage_id` is not the id of its own fields was edited
+    outside the rater, or rated under another `usage_id` rule. It is held back,
+    not sent under a new id (exit `2`). Inside the 29-day reach, re-rating the
+    hour re-stamps it and tombstones the old id. Older hours are never re-rated:
+    fix the row by hand. Set `usage_id` to the id of its fields (the
+    `HOLDING BACK` log line names it). If the old stored id is in
+    `pushed_usage` (the manager holds it), write a `regrained` tombstone for it
+    as above.
 
 ## Routine checks and alert conditions
 

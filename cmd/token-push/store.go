@@ -32,6 +32,10 @@ type rollupRow struct {
 // them.
 type videoRollupRow struct {
 	ID string
+	// UsageID is the usage_id the rater stored for the row ("" if never
+	// stamped). token-push sends a record only when it equals the id it
+	// computes from the row's own fields.
+	UsageID string
 	identity
 	OrgID, BaseModel, Task, Resolution, Region string
 	OutputSeconds, GPUSeconds                  string
@@ -82,32 +86,42 @@ type pushStore interface {
 	// video usage apart from one whose rated_usage was wiped.
 	EverPushedToken(ctx context.Context) (bool, error)
 	// VideoUsageState reports whether any video usage is recorded
-	// (rated_video_usage has a row, or parked_video_usage has an UNRESOLVED
-	// row: an install whose only video rollup the rater just parked), and
+	// (rated_video_usage has a row, or parked_video_usage an unresolved one),
 	// whether the manager was ever sent a video record (pushed_usage has a
-	// video row). token-push lists kind "video" only when video usage is
-	// recorded. A resolved parked row does not count: parked rows are never
-	// pruned, so an old one would hide a wiped rated_video_usage forever and
-	// every re-sent hour would delete the manager's video records by absence.
-	// rated is whether rated_video_usage alone has a row.
-	VideoUsageState(ctx context.Context) (has, rated, everPushed bool, err error)
+	// video row), and whether some sent video record has no tombstone (the
+	// rater did not remove it). A tombstone is trusted as the rater's: only
+	// the rater writes them (and the runbook's by-hand release). token-push lists kind
+	// "video" when either of the first two holds; no recorded video with an
+	// untombstoned sent record means the video tables were wiped.
+	// stale reports a live rollup whose usage_id still has a tombstone (a
+	// restore outside the rater that skipped deleting it), anywhere, so the
+	// alarm does not stop once the hour leaves the routine window.
+	VideoUsageState(ctx context.Context) (has, everPushed, untombstoned, stale bool, err error)
+	// VideoHour reads one hour's video rollups, its tombstones (the usage_ids
+	// the rater removed on purpose, video_reconcile_deletion) and its
+	// unresolved video parks (ambiguous_org, missing_org) in ONE read-only
+	// snapshot. A park resolves in the same rater transaction that restores
+	// its rollup, so reading the park outside the snapshot could see the park
+	// gone and the rollup not yet back, and release the record. The rater writes a removal and its tombstone, and
+	// clears the tombstone of an id that is live again, in one transaction;
+	// one snapshot therefore never shows an id both missing and untombstoned
+	// because of a rater run in between, nor live and tombstoned. Only a
+	// tombstoned id may be deleted by absence; any other sent video id with no
+	// rollup was lost and is held.
+	VideoHour(ctx context.Context, hour time.Time) ([]videoRollupRow, map[string]bool, []identity, error)
 	Rollups(ctx context.Context, hour time.Time) ([]rollupRow, error)
-	// VideoRollups reads every rated_video_usage row of one hour.
-	VideoRollups(ctx context.Context, hour time.Time) ([]videoRollupRow, error)
 	// ParkedIdentities lists the identities of the hour whose usage is parked
 	// and unresolved, for reasons that can hide an already-sent record
 	// (ambiguous_org, ambiguous_base, missing_org). Owner-conflict events never
 	// formed a record, so there is nothing of theirs to hold.
 	ParkedIdentities(ctx context.Context, hour time.Time) ([]identity, error)
-	// ParkedVideoIdentities is ParkedIdentities for parked_video_usage
-	// (ambiguous_org and missing_org; never owner_conflict).
-	ParkedVideoIdentities(ctx context.Context, hour time.Time) ([]identity, error)
 	// Pushed lists the usage_ids the manager holds for the hour after
 	// token-push's last request for it.
 	Pushed(ctx context.Context, hour time.Time) ([]pushedRow, error)
-	// ResolvedHours lists hours before `before` with a parked row (token or
-	// video) resolved after the hour's last accepted push: they must be re-sent
-	// however old.
+	// ResolvedHours lists hours before `before` that must be re-sent however
+	// old: a parked row (token or video) resolved after the hour's last
+	// accepted push, or a video record the rater removed (tombstoned) that the
+	// manager still holds and no park holds.
 	ResolvedHours(ctx context.Context, before time.Time) ([]time.Time, error)
 	// EverPushed reports whether the manager has ever accepted an hour from
 	// this install (pushed_hour has a row). With rated_usage empty, it tells a
@@ -172,13 +186,19 @@ func (s pgStore) UsagePresent(ctx context.Context) (rated, parked bool, err erro
 	return rated, parked, err
 }
 
-func (s pgStore) VideoUsageState(ctx context.Context) (has, rated, everPushed bool, err error) {
-	var parked bool
+func (s pgStore) VideoUsageState(ctx context.Context) (has, everPushed, untombstoned, stale bool, err error) {
 	err = s.db.QueryRowContext(ctx,
-		`SELECT EXISTS (SELECT 1 FROM rated_video_usage),
-		        EXISTS (SELECT 1 FROM parked_video_usage WHERE resolved_at IS NULL),
-		        EXISTS (SELECT 1 FROM pushed_usage WHERE kind = 'video')`).Scan(&rated, &parked, &everPushed)
-	return rated || parked, rated, everPushed, err
+		`SELECT EXISTS (SELECT 1 FROM rated_video_usage)
+		        OR EXISTS (SELECT 1 FROM parked_video_usage WHERE resolved_at IS NULL),
+		        EXISTS (SELECT 1 FROM pushed_usage WHERE kind = 'video'),
+		        EXISTS (SELECT 1 FROM pushed_usage u
+		                 WHERE u.kind = 'video'
+		                   AND NOT EXISTS (SELECT 1 FROM video_reconcile_deletion t
+		                                    WHERE t.window_start = u.window_start AND t.usage_id = u.usage_id)),
+		        EXISTS (SELECT 1 FROM rated_video_usage v
+		                  JOIN video_reconcile_deletion t ON t.window_start = v.window_start AND t.usage_id = v.usage_id)`).
+		Scan(&has, &everPushed, &untombstoned, &stale)
+	return has, everPushed, untombstoned, stale, err
 }
 
 // videoHourQuery reads every video rollup of one hour. NUMERIC as text, so the
@@ -186,28 +206,59 @@ func (s pgStore) VideoUsageState(ctx context.Context) (has, rated, everPushed bo
 const videoHourQuery = `
 SELECT v.id, v.auth_id, v.owner_type, v.owner_id, v.resource_id, v.model_id, v.serving_mode,
        v.org_id, v.base_model, v.task, v.resolution, v.region,
-       v.output_seconds::text, v.output_frames, v.request_count, v.gpu_seconds::text
+       v.output_seconds::text, v.output_frames, v.request_count, v.gpu_seconds::text,
+       COALESCE(v.usage_id, '')
   FROM rated_video_usage v
  WHERE v.window_start = $1
  ORDER BY v.id`
 
-func (s pgStore) VideoRollups(ctx context.Context, hour time.Time) ([]videoRollupRow, error) {
-	rows, err := s.db.QueryContext(ctx, videoHourQuery, hour)
+func (s pgStore) VideoHour(ctx context.Context, hour time.Time) ([]videoRollupRow, map[string]bool, []identity, error) {
+	tx, err := s.db.BeginTx(ctx, &sql.TxOptions{Isolation: sql.LevelRepeatableRead, ReadOnly: true})
 	if err != nil {
-		return nil, fmt.Errorf("query rated_video_usage: %w", err)
+		return nil, nil, nil, fmt.Errorf("begin video hour snapshot: %w", err)
 	}
-	defer func() { _ = rows.Close() }()
+	defer func() { _ = tx.Rollback() }()
+	rows, err := tx.QueryContext(ctx, videoHourQuery, hour)
+	if err != nil {
+		return nil, nil, nil, fmt.Errorf("query rated_video_usage: %w", err)
+	}
 	var out []videoRollupRow
 	for rows.Next() {
 		var r videoRollupRow
 		if err := rows.Scan(&r.ID, &r.AuthID, &r.OwnerType, &r.OwnerID, &r.ResourceID, &r.ModelID, &r.ServingMode,
 			&r.OrgID, &r.BaseModel, &r.Task, &r.Resolution, &r.Region,
-			&r.OutputSeconds, &r.OutputFrames, &r.Requests, &r.GPUSeconds); err != nil {
-			return nil, fmt.Errorf("scan rated_video_usage: %w", err)
+			&r.OutputSeconds, &r.OutputFrames, &r.Requests, &r.GPUSeconds, &r.UsageID); err != nil {
+			_ = rows.Close()
+			return nil, nil, nil, fmt.Errorf("scan rated_video_usage: %w", err)
 		}
 		out = append(out, r)
 	}
-	return out, rows.Err()
+	if err := rows.Err(); err != nil {
+		return nil, nil, nil, fmt.Errorf("read rated_video_usage: %w", err)
+	}
+	_ = rows.Close()
+	trows, err := tx.QueryContext(ctx, `SELECT usage_id FROM video_reconcile_deletion WHERE window_start = $1`, hour)
+	if err != nil {
+		return nil, nil, nil, fmt.Errorf("query video_reconcile_deletion: %w", err)
+	}
+	tomb := map[string]bool{}
+	for trows.Next() {
+		var id string
+		if err := trows.Scan(&id); err != nil {
+			_ = trows.Close()
+			return nil, nil, nil, fmt.Errorf("scan video_reconcile_deletion: %w", err)
+		}
+		tomb[id] = true
+	}
+	if err := trows.Err(); err != nil {
+		return nil, nil, nil, fmt.Errorf("read video_reconcile_deletion: %w", err)
+	}
+	_ = trows.Close()
+	parked, err := parkedIdentitiesIn(ctx, tx, "parked_video_usage", hour)
+	if err != nil {
+		return nil, nil, nil, err
+	}
+	return out, tomb, parked, nil
 }
 
 // hourQuery reads every rollup of one hour. No money: the manager prices.
@@ -259,13 +310,19 @@ func (s pgStore) ParkedIdentities(ctx context.Context, hour time.Time) ([]identi
 	return s.parkedIdentities(ctx, "parked_usage", hour)
 }
 
-func (s pgStore) ParkedVideoIdentities(ctx context.Context, hour time.Time) ([]identity, error) {
-	return s.parkedIdentities(ctx, "parked_video_usage", hour)
+// parkedIdentities reads one parked table; table is one of two constants.
+// parkedIdentitiesIn does the same through q, the database or a snapshot's
+// transaction.
+func (s pgStore) parkedIdentities(ctx context.Context, table string, hour time.Time) ([]identity, error) {
+	return parkedIdentitiesIn(ctx, s.db, table, hour)
 }
 
-// parkedIdentities reads one parked table; table is one of two constants.
-func (s pgStore) parkedIdentities(ctx context.Context, table string, hour time.Time) ([]identity, error) {
-	rows, err := s.db.QueryContext(ctx, `SELECT DISTINCT auth_id, owner_type, owner_id, resource_id, model_id, serving_mode
+type queryer interface {
+	QueryContext(ctx context.Context, query string, args ...any) (*sql.Rows, error)
+}
+
+func parkedIdentitiesIn(ctx context.Context, q queryer, table string, hour time.Time) ([]identity, error) {
+	rows, err := q.QueryContext(ctx, `SELECT DISTINCT auth_id, owner_type, owner_id, resource_id, model_id, serving_mode
 		FROM `+table+` WHERE window_start = $1 AND resolved_at IS NULL AND reason <> 'owner_conflict'`, hour)
 	if err != nil {
 		return nil, fmt.Errorf("query %s: %w", table, err)
@@ -295,15 +352,37 @@ func (s pgStore) Pushed(ctx context.Context, hour time.Time) ([]pushedRow, error
 }
 
 func (s pgStore) ResolvedHours(ctx context.Context, before time.Time) ([]time.Time, error) {
-	rows, err := s.db.QueryContext(ctx, `SELECT p.window_start
-		FROM (SELECT window_start, resolved_at FROM parked_usage
-		      UNION ALL
-		      SELECT window_start, resolved_at FROM parked_video_usage) p
-		LEFT JOIN pushed_hour h ON h.window_start = p.window_start
-		WHERE p.resolved_at IS NOT NULL AND p.window_start < $1
-		  AND (h.pushed_at IS NULL OR p.resolved_at > h.pushed_at)
-		GROUP BY p.window_start
-		ORDER BY p.window_start`, before)
+	// Also every hour where the manager still holds a video record the rater
+	// removed (a tombstoned id still in pushed_usage, its identity not parked):
+	// a change the manager has not seen, e.g. an explicit re-rate of an older
+	// hour. Decided from state, not from timestamps, so a rater run that
+	// overlaps a push cannot hide it; once the re-send is accepted the id
+	// leaves pushed_usage and the hour drops out.
+	rows, err := s.db.QueryContext(ctx, `SELECT window_start FROM (
+		SELECT p.window_start
+		  FROM (SELECT window_start, resolved_at FROM parked_usage
+		        UNION ALL
+		        SELECT window_start, resolved_at FROM parked_video_usage) p
+		  LEFT JOIN pushed_hour h ON h.window_start = p.window_start
+		 WHERE p.resolved_at IS NOT NULL AND p.window_start < $1
+		   AND (h.pushed_at IS NULL OR p.resolved_at > h.pushed_at)
+		UNION
+		SELECT u.window_start
+		  FROM pushed_usage u
+		  JOIN video_reconcile_deletion t ON t.window_start = u.window_start AND t.usage_id = u.usage_id
+		 WHERE u.kind = 'video' AND u.window_start < $1
+		   -- A live id is sent anyway; its stale tombstone is an alarm
+		   -- (VideoHour), not a reason to re-send the hour every run.
+		   AND NOT EXISTS (SELECT 1 FROM rated_video_usage v
+		                    WHERE v.window_start = u.window_start AND v.usage_id = u.usage_id)
+		   AND NOT EXISTS (SELECT 1 FROM parked_video_usage pv
+		                    WHERE pv.window_start = u.window_start AND pv.resolved_at IS NULL
+		                      AND pv.reason <> 'owner_conflict'
+		                      AND pv.auth_id = u.auth_id AND pv.owner_type = u.owner_type
+		                      AND pv.owner_id = u.owner_id AND pv.resource_id = u.resource_id
+		                      AND pv.model_id = u.model_id AND pv.serving_mode = u.serving_mode)
+		) r
+		ORDER BY window_start`, before)
 	if err != nil {
 		return nil, fmt.Errorf("query resolved parked hours: %w", err)
 	}

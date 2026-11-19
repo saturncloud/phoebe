@@ -155,40 +155,150 @@ func TestIntegration_AVideoOnlyHourNeverAcceptedIsReSent(t *testing.T) {
 	}
 }
 
-// A wiped rated_video_usage is caught even though parked_video_usage still
-// holds a RESOLVED row (parked rows are never pruned): video is left out of
-// the request and the run exits 1, instead of every re-sent hour listing
-// video with no records and deleting the manager's video records.
-func TestIntegration_AWipedVideoRollupIsCaughtDespiteAResolvedParkedRow(t *testing.T) {
-	db := itDB(t, "phoebe_push_video_wipe_parked_it")
-	h := time.Now().UTC().Truncate(time.Hour).Add(-time.Hour)
-	event(t, db, h.Add(time.Minute), itRes1, itOrg1)
-	videoJob(t, db, h.Add(2*time.Minute), itOrg1, "completed")
-	rate(t, db, h, h.Add(time.Hour))
-	m := &recordingManager{}
-	if code := push(t, db, m, h); code != exitOK {
-		t.Fatalf("exit %d", code)
+// BOTH DIRECTIONS of a vanished video record, end to end through the real
+// rater and token-push:
+//   - the rater removed it (its job vanished, or its org changed): the rater
+//     wrote a tombstone in the same transaction, so token-push lets the
+//     manager delete the old record by absence, and the run exits 0;
+//   - it was lost (the rollup row deleted outside the rater): no tombstone,
+//     so token-push holds its id, the manager keeps the record, and the run
+//     exits 1.
+func TestIntegration_AVanishedVideoRecordIsDeletedOnlyWhenTheRaterRemovedIt(t *testing.T) {
+	setup := func(t *testing.T, name string) (*sql.DB, time.Time, *recordingManager, string) {
+		db := itDB(t, name)
+		h := time.Now().UTC().Truncate(time.Hour).Add(-time.Hour)
+		event(t, db, h.Add(time.Minute), itRes1, itOrg1)
+		videoJob(t, db, h.Add(2*time.Minute), itOrg1, "completed")
+		rate(t, db, h, h.Add(time.Hour))
+		m := &recordingManager{}
+		if code := push(t, db, m, h); code != exitOK {
+			t.Fatalf("first push: exit %d", code)
+		}
+		return db, h, m, lastRequest(t, m).VideoRecords[0].UsageID
 	}
-	if _, err := db.Exec(`INSERT INTO parked_video_usage (window_start, auth_id, owner_type, owner_id, resource_id,
-		model_id, serving_mode, reason, event_count, output_seconds, output_frames, request_count, gpu_seconds, resolved_at)
-		VALUES ($1, 'old-auth', '', '', 'old-res', 'old-model', 'dedicated', 'ambiguous_org', 1, 0, 0, 0, 0, now())`,
-		h.Add(-48*time.Hour)); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := db.Exec(`DELETE FROM rated_video_usage`); err != nil {
-		t.Fatal(err)
-	}
-	if code := push(t, db, m, h); code != exitFatal {
-		t.Fatalf("exit %d, want %d for a wiped rated_video_usage", code, exitFatal)
-	}
-	if req := lastRequest(t, m); !reflect.DeepEqual(req.Kinds, []string{"token"}) {
-		t.Fatalf("kinds %v, want token only so the manager's video records are kept", req.Kinds)
-	}
+	t.Run("the rater removed it: its job vanished", func(t *testing.T) {
+		db, h, m, id := setup(t, "phoebe_push_video_removed_it")
+		if _, err := db.Exec(`DELETE FROM video_billing_event`); err != nil {
+			t.Fatal(err)
+		}
+		rate(t, db, h, h.Add(time.Hour))
+		if code := push(t, db, m, h); code != exitOK {
+			t.Fatalf("exit %d, want 0", code)
+		}
+		req := lastRequest(t, m)
+		if !reflect.DeepEqual(req.Kinds, []string{"token", "video"}) || len(req.VideoRecords) != 0 || len(req.Held) != 0 {
+			t.Fatalf("kinds %v, %d video records, held %v; want video listed empty so the manager deletes %s",
+				req.Kinds, len(req.VideoRecords), req.Held, id)
+		}
+	})
+	t.Run("the rater removed it: its org changed", func(t *testing.T) {
+		db, h, m, id := setup(t, "phoebe_push_video_regrained_it")
+		if _, err := db.Exec(`UPDATE video_billing_event SET org_id = $1`, itOrg2); err != nil {
+			t.Fatal(err)
+		}
+		rate(t, db, h, h.Add(time.Hour))
+		if code := push(t, db, m, h); code != exitOK {
+			t.Fatalf("exit %d, want 0", code)
+		}
+		req := lastRequest(t, m)
+		if len(req.VideoRecords) != 1 || req.VideoRecords[0].UsageID == id || req.VideoRecords[0].OrgID != itOrg2 || len(req.Held) != 0 {
+			t.Fatalf("%d video records, held %v; want the new org's record sent and the old id %s let go", len(req.VideoRecords), req.Held, id)
+		}
+	})
+	t.Run("an explicit re-rate of an older hour is re-sent automatically", func(t *testing.T) {
+		db, h, m, id := setup(t, "phoebe_push_video_rerate_resent_it")
+		if _, err := db.Exec(`DELETE FROM video_billing_event`); err != nil {
+			t.Fatal(err)
+		}
+		rate(t, db, h, h.Add(time.Hour))
+		hours, err := (pgStore{db: db}).ResolvedHours(context.Background(), time.Now().UTC().Truncate(time.Hour))
+		if err != nil || len(hours) != 1 || !hours[0].Equal(h) {
+			t.Fatalf("hours to re-send %v (err %v), want [%s]: the manager holds %s, which the rater removed", hours, err, h, id)
+		}
+		// A scheduled run that does not list the hour in its window still
+		// sends it, the manager deletes the record, and the hour drops out.
+		p := newPusher(pgStore{db: db}, m.client(t))
+		if code := p.pushWindows(context.Background(), nil, time.Now().UTC(), false); code != exitOK {
+			t.Fatalf("exit %d", code)
+		}
+		if req := lastRequest(t, m); req.WindowStart != meteredusage.FormatWindowStart(h) || len(req.VideoRecords) != 0 || len(req.Held) != 0 {
+			t.Fatalf("last request %s with %d video records, held %v; want %s re-sent with video empty", req.WindowStart, len(req.VideoRecords), req.Held, h)
+		}
+		if hours, err := (pgStore{db: db}).ResolvedHours(context.Background(), time.Now().UTC().Truncate(time.Hour)); err != nil || len(hours) != 0 {
+			t.Fatalf("hours to re-send after the release %v (err %v), want none", hours, err)
+		}
+	})
+	t.Run("restored by the runbook, sent again, then lost again: held", func(t *testing.T) {
+		db, h, m, id := setup(t, "phoebe_push_video_restored_it")
+		// The rater removes it (tombstone), the manager deletes it.
+		if _, err := db.Exec(`CREATE TABLE saved AS SELECT * FROM rated_video_usage`); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := db.Exec(`DELETE FROM video_billing_event`); err != nil {
+			t.Fatal(err)
+		}
+		rate(t, db, h, h.Add(time.Hour))
+		if code := push(t, db, m, h); code != exitOK {
+			t.Fatalf("release push: exit %d", code)
+		}
+		// Restored by hand, deleting its tombstone as the runbook says, and
+		// sent again.
+		if _, err := db.Exec(`INSERT INTO rated_video_usage SELECT * FROM saved`); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := db.Exec(`DELETE FROM video_reconcile_deletion WHERE usage_id IN (SELECT usage_id FROM saved)`); err != nil {
+			t.Fatal(err)
+		}
+		if code := push(t, db, m, h); code != exitOK || len(lastRequest(t, m).VideoRecords) != 1 {
+			t.Fatalf("re-send after restore: exit %d", code)
+		}
+		// Lost again: the old tombstone predates the re-send, so it is held.
+		if _, err := db.Exec(`DELETE FROM rated_video_usage`); err != nil {
+			t.Fatal(err)
+		}
+		if code := push(t, db, m, h); code != exitFatal {
+			t.Fatalf("exit %d, want %d", code, exitFatal)
+		}
+		if req := lastRequest(t, m); !reflect.DeepEqual(req.Held, []string{id}) {
+			t.Fatalf("held %v, want [%s]: a stale tombstone must not release it", req.Held, id)
+		}
+	})
+	t.Run("a live record with a stale tombstone is sent, alarms, and is not re-listed", func(t *testing.T) {
+		db, h, m, id := setup(t, "phoebe_push_video_stale_tomb_it")
+		if _, err := db.Exec(`INSERT INTO video_reconcile_deletion (window_start, usage_id, auth_id, owner_type,
+			owner_id, resource_id, model_id, serving_mode, reason)
+			SELECT window_start, usage_id, auth_id, owner_type, owner_id, resource_id, model_id, serving_mode, 'reconcile'
+			  FROM rated_video_usage`); err != nil {
+			t.Fatal(err)
+		}
+		if hours, err := (pgStore{db: db}).ResolvedHours(context.Background(), time.Now().UTC().Truncate(time.Hour)); err != nil || len(hours) != 0 {
+			t.Fatalf("hours to re-send %v (err %v), want none: %s is live", hours, err, id)
+		}
+		if code := push(t, db, m, h); code != exitFatal {
+			t.Fatalf("exit %d, want %d for a live record with a tombstone", code, exitFatal)
+		}
+		if req := lastRequest(t, m); len(req.VideoRecords) != 1 || req.VideoRecords[0].UsageID != id {
+			t.Fatalf("%d video records, want %s sent", len(req.VideoRecords), id)
+		}
+	})
+	t.Run("lost: the rollup row deleted outside the rater", func(t *testing.T) {
+		db, h, m, id := setup(t, "phoebe_push_video_lost_it")
+		if _, err := db.Exec(`DELETE FROM rated_video_usage`); err != nil {
+			t.Fatal(err)
+		}
+		if code := push(t, db, m, h); code != exitFatal {
+			t.Fatalf("exit %d, want %d", code, exitFatal)
+		}
+		if req := lastRequest(t, m); !reflect.DeepEqual(req.Held, []string{id}) {
+			t.Fatalf("held %v, want [%s] so the manager keeps the record", req.Held, id)
+		}
+	})
 }
 
-// The empty-database guards behave as before: nothing at all is a fresh
-// install (exit 0, nothing sent); video bookkeeping with the video tables
-// emptied sends tokens only and exits 1.
+// The empty-database guards: nothing at all is a fresh install (exit 0,
+// nothing sent); with the video tables emptied after video was sent, the
+// tokens are sent, every sent video id is held (no tombstone), and the run
+// exits 1.
 func TestIntegration_TheEmptyDatabaseGuardsCoverVideo(t *testing.T) {
 	db := itDB(t, "phoebe_push_video_guard_it")
 	h := time.Now().UTC().Truncate(time.Hour).Add(-time.Hour)
@@ -209,8 +319,9 @@ func TestIntegration_TheEmptyDatabaseGuardsCoverVideo(t *testing.T) {
 		t.Fatalf("exit %d, want %d for wiped video tables", code, exitFatal)
 	}
 	req := lastRequest(t, m)
-	if !reflect.DeepEqual(req.Kinds, []string{"token"}) || len(req.Records) != 1 {
-		t.Fatalf("kinds %v with %d records, want the token hour only", req.Kinds, len(req.Records))
+	if !reflect.DeepEqual(req.Kinds, []string{"token", "video"}) || len(req.Records) != 1 || len(req.Held) != 1 {
+		t.Fatalf("kinds %v with %d records, held %v; want the token record sent and the video id held",
+			req.Kinds, len(req.Records), req.Held)
 	}
 	var videoRows int
 	if err := db.QueryRow(`SELECT COUNT(*) FROM pushed_usage WHERE kind = 'video'`).Scan(&videoRows); err != nil || videoRows != 1 {

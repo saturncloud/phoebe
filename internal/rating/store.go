@@ -640,6 +640,7 @@ const unratedVideoHoursSQL = `(SELECT COUNT(DISTINCT j.h) FROM (
 			      AND e.status = 'completed' AND e.request_count = 1
 			      AND e.output_seconds >= 0 AND e.output_frames >= 0 AND e.gpu_seconds >= 0
 			      AND e.output_seconds <> 'NaN'::numeric AND e.gpu_seconds <> 'NaN'::numeric
+			      AND strpos(e.org_id || COALESCE(e.user_id, '') || COALESCE(e.group_id, '') || e.resource_id, '|') = 0
 			      AND e.auth_id <> '' AND e.resource_id <> '' AND e.model_id <> ''
 			      AND NOT (COALESCE(e.user_id, '') <> '' AND COALESCE(e.group_id, '') <> '')) j
 			  WHERE NOT EXISTS (SELECT 1 FROM rated_video_usage r
