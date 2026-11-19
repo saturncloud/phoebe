@@ -144,9 +144,36 @@ of the video grain, so two values are two records, not a conflict.
   `parked_usage`. Holding is per kind: a parked video identity holds only its
   video usage_ids (`pushed_usage.kind`), never a token record.
 - Video jobs that cannot become any record (an empty auth, resource or model id,
-  a negative quantity, or a completed job whose `request_count` is not 1) are
-  withheld per job, logged at ERROR, and make the rater exit `2`, like invalid
-  token events.
+  a negative or NaN quantity, or a completed job whose `request_count` is not 1)
+  are withheld per job, logged at ERROR, and make the rater exit `2`, like
+  invalid token events.
+- phoebe-videos deletes `video_billing_event` rows after 30 days, always. So the
+  rater never re-rates video in an hour older than 29 days, even in an explicit
+  `--since/--until` run. That hour's `rated_video_usage` rows are the record and
+  are kept as they are, and the run logs a WARN naming how many hours it left
+  alone. Tokens in such a window are re-rated as usual. If such a window also
+  finds completed, rateable video jobs of an identity with no video rollup and no
+  unresolved park, it logs them at ERROR and exits `2`. Those jobs are never
+  billed automatically: export them before the 30-day prune, and settle them by
+  hand through the manager's credit path.
+- Every routine run, once the one-time catch-up is done, also checks the hours
+  between 29 days ago and its own trailing window. If an identity has completed,
+  rateable video jobs there with no video rollup and no unresolved park (the
+  rater was down longer than its trailing window), the run logs them at ERROR
+  and exits `2`. It keeps doing so on each run until they are re-rated with
+  `--since/--until`, which must happen before they pass 29 days.
+- **Vanished video.** token-push holds a video record it sent before whose
+  rollup is gone, unless the rater can have removed it: `rated_video_usage`
+  still has rows and the hour is at most 30 days old. It logs `video record(s)
+  this install sent have no rollup now` at ERROR and exits `1`. The ids stay
+  held, and the alarm repeats each time the hour is sent again (the trailing 24
+  hours, an explicit `-since/-until`, or a never-accepted or resolved hour).
+  - If the rollups were lost, restore `rated_video_usage`.
+  - If the rater removed them on purpose (an explicit re-rate of an old hour,
+    pushed more than a day later), delete the held ids from `pushed_usage`
+    (`DELETE FROM pushed_usage WHERE window_start = '<hour>' AND kind = 'video'
+    AND usage_id IN (...)`), then re-send the hour with `-since/-until`. To avoid
+    this, push an explicitly re-rated hour in the same session as the re-rate.
 
 ## Routine checks and alert conditions
 

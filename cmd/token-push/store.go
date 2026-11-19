@@ -51,6 +51,16 @@ type pushedRow struct {
 	UsageID string
 	Kind    string
 	identity
+	// held: an id the request lists in `held`, not a record it sends. Its
+	// pushed_usage row already exists and is not re-stamped (ON CONFLICT DO
+	// NOTHING), for token and video ids alike, so pushed_at stays the time
+	// token-push last tried to send that record. That time can be an intent
+	// stamp (RecordIntent runs before the POST). 0017 down's guard counts ids
+	// per identity, not per id, so a held id still counts toward its
+	// identity; the guard is only as exact as that count (see the down file).
+	// If the row was trimmed meanwhile, it is inserted again with now(), so
+	// the id stays known as sent.
+	held bool
 }
 
 // kind returns the row's kind, "token" when unset.
@@ -72,10 +82,15 @@ type pushStore interface {
 	// video usage apart from one whose rated_usage was wiped.
 	EverPushedToken(ctx context.Context) (bool, error)
 	// VideoUsageState reports whether any video usage is recorded
-	// (rated_video_usage or parked_video_usage has a row), and whether the
-	// manager was ever sent a video record (pushed_usage has a video row).
-	// token-push lists kind "video" only when video usage is recorded.
-	VideoUsageState(ctx context.Context) (has, everPushed bool, err error)
+	// (rated_video_usage has a row, or parked_video_usage has an UNRESOLVED
+	// row: an install whose only video rollup the rater just parked), and
+	// whether the manager was ever sent a video record (pushed_usage has a
+	// video row). token-push lists kind "video" only when video usage is
+	// recorded. A resolved parked row does not count: parked rows are never
+	// pruned, so an old one would hide a wiped rated_video_usage forever and
+	// every re-sent hour would delete the manager's video records by absence.
+	// rated is whether rated_video_usage alone has a row.
+	VideoUsageState(ctx context.Context) (has, rated, everPushed bool, err error)
 	Rollups(ctx context.Context, hour time.Time) ([]rollupRow, error)
 	// VideoRollups reads every rated_video_usage row of one hour.
 	VideoRollups(ctx context.Context, hour time.Time) ([]videoRollupRow, error)
@@ -157,11 +172,13 @@ func (s pgStore) UsagePresent(ctx context.Context) (rated, parked bool, err erro
 	return rated, parked, err
 }
 
-func (s pgStore) VideoUsageState(ctx context.Context) (has, everPushed bool, err error) {
+func (s pgStore) VideoUsageState(ctx context.Context) (has, rated, everPushed bool, err error) {
+	var parked bool
 	err = s.db.QueryRowContext(ctx,
-		`SELECT EXISTS (SELECT 1 FROM rated_video_usage) OR EXISTS (SELECT 1 FROM parked_video_usage),
-		        EXISTS (SELECT 1 FROM pushed_usage WHERE kind = 'video')`).Scan(&has, &everPushed)
-	return has, everPushed, err
+		`SELECT EXISTS (SELECT 1 FROM rated_video_usage),
+		        EXISTS (SELECT 1 FROM parked_video_usage WHERE resolved_at IS NULL),
+		        EXISTS (SELECT 1 FROM pushed_usage WHERE kind = 'video')`).Scan(&rated, &parked, &everPushed)
+	return rated || parked, rated, everPushed, err
 }
 
 // videoHourQuery reads every video rollup of one hour. NUMERIC as text, so the
@@ -445,9 +462,13 @@ func (s pgStore) MarkRefusedChecked(ctx context.Context, hours []time.Time) erro
 
 func insertPushed(ctx context.Context, tx *sql.Tx, hour time.Time, rows []pushedRow) error {
 	for _, r := range rows {
+		onConflict := `DO UPDATE SET pushed_at = now(), kind = EXCLUDED.kind`
+		if r.held {
+			onConflict = `DO NOTHING`
+		}
 		if _, err := tx.ExecContext(ctx, `INSERT INTO pushed_usage (window_start, usage_id, kind, auth_id, owner_type, owner_id,
 			resource_id, model_id, serving_mode) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)
-			ON CONFLICT ON CONSTRAINT pushed_usage_pk DO UPDATE SET pushed_at = now(), kind = EXCLUDED.kind`,
+			ON CONFLICT ON CONSTRAINT pushed_usage_pk `+onConflict,
 			hour, r.UsageID, r.kind(), r.AuthID, r.OwnerType, r.OwnerID, r.ResourceID, r.ModelID, r.ServingMode); err != nil {
 			return fmt.Errorf("record pushed usage: %w", err)
 		}

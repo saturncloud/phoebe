@@ -36,9 +36,9 @@ type CatchUpResult struct {
 	AggregateResult
 }
 
-// CatchUp rates, once per install, the billing_event hours before `before`
-// (the routine window's start) that were never rated: hours with raw events
-// but no rated_usage and no parked_usage row. They exist on an install that
+// CatchUp rates, once per install, the billing_event and video_billing_event
+// hours before `before` (the routine window's start) that were never rated:
+// hours with raw events but no rollup or parked row of either kind. They exist on an install that
 // ran phoebe with the rater suspended: the drainer kept writing billing_event,
 // and the trailing window never reached back to those hours.
 //
@@ -130,6 +130,7 @@ func addResults(a, b AggregateResult) AggregateResult {
 	a.ParkedResolved += b.ParkedResolved
 	a.EmptyBaseModelEvents += b.EmptyBaseModelEvents
 	a.UnknownRevisionRollups += b.UnknownRevisionRollups
+	a.Video = a.Video.add(b.Video)
 	return a
 }
 
@@ -152,9 +153,16 @@ func (s *PostgresStore) CatchUpState(ctx context.Context) (CatchUpState, error) 
 
 // neverRatedHoursSQL walks the hours that have billing_event rows in
 // [$1, $2) with one index probe per hour (billing_event_rating_instant_ix, on
-// the rating instant), instead of grouping the whole table, then keeps the
-// hours with no rated_usage and no parked_usage row. Hour buckets match
-// aggregateWindowSQL's.
+// the rating instant), instead of grouping the whole table, and the hours that
+// have video_billing_event rows in [max($1, $4), $2) the same way
+// (video_billing_event_created_ix), then keeps the hours with no row in any
+// rollup or parked table of either kind. Hour buckets match
+// aggregateWindowSQL's and aggregateVideoWindowSQL's.
+//
+// A video-only hour (video jobs, no token events) is caught up too: the
+// routine window reaches 24 hours back, so without this a rater suspended for
+// longer would never rate it. $4 is VideoFloor: older video jobs may be pruned
+// and the aggregation does not re-rate them.
 const neverRatedHoursSQL = `
 WITH RECURSIVE h(hour) AS (
     SELECT date_trunc('hour', min(COALESCE(event_ts, created_at)) AT TIME ZONE 'UTC') AT TIME ZONE 'UTC'
@@ -168,17 +176,36 @@ WITH RECURSIVE h(hour) AS (
                AND COALESCE(b.event_ts, b.created_at) <  $2::timestamptz)
       FROM h
      WHERE h.hour IS NOT NULL
+),
+v(hour) AS (
+    SELECT date_trunc('hour', min(created_at) AT TIME ZONE 'UTC') AT TIME ZONE 'UTC'
+      FROM video_billing_event
+     WHERE created_at >= GREATEST($1::timestamptz, $4::timestamptz)
+       AND created_at <  $2::timestamptz
+  UNION ALL
+    SELECT (SELECT date_trunc('hour', min(e.created_at) AT TIME ZONE 'UTC') AT TIME ZONE 'UTC'
+              FROM video_billing_event e
+             WHERE e.created_at >= v.hour + interval '1 hour'
+               AND e.created_at <  $2::timestamptz)
+      FROM v
+     WHERE v.hour IS NOT NULL
+),
+hours AS (
+    SELECT hour FROM h WHERE hour IS NOT NULL
+    UNION
+    SELECT hour FROM v WHERE hour IS NOT NULL
 )
-SELECT h.hour FROM h
- WHERE h.hour IS NOT NULL
-   AND NOT EXISTS (SELECT 1 FROM rated_usage r WHERE r.window_start = h.hour)
-   AND NOT EXISTS (SELECT 1 FROM parked_usage p WHERE p.window_start = h.hour)
- ORDER BY h.hour
+SELECT hours.hour FROM hours
+ WHERE NOT EXISTS (SELECT 1 FROM rated_usage r WHERE r.window_start = hours.hour)
+   AND NOT EXISTS (SELECT 1 FROM parked_usage p WHERE p.window_start = hours.hour)
+   AND NOT EXISTS (SELECT 1 FROM rated_video_usage rv WHERE rv.window_start = hours.hour)
+   AND NOT EXISTS (SELECT 1 FROM parked_video_usage pv WHERE pv.window_start = hours.hour)
+ ORDER BY hours.hour
  LIMIT $3`
 
 // NeverRatedHours implements Store.
 func (s *PostgresStore) NeverRatedHours(ctx context.Context, notBefore, before time.Time, limit int) ([]time.Time, error) {
-	rows, err := s.db.QueryContext(ctx, neverRatedHoursSQL, notBefore.UTC(), before.UTC(), limit)
+	rows, err := s.db.QueryContext(ctx, neverRatedHoursSQL, notBefore.UTC(), before.UTC(), limit, VideoFloor(s.now()))
 	if err != nil {
 		return nil, fmt.Errorf("rating: list never-rated hours: %w", err)
 	}

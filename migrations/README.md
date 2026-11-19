@@ -358,12 +358,56 @@ with `--since/--until`, then run `migrate down`.
 Expand only: two new tables and a column with a default, so the previous
 release's rater and token-push keep working. Deploy the manager that accepts
 kind `video` (saturn-aws-manager, `LEGACY_PATH_ACCEPTED_KINDS` with `video`)
-before any install records video usage: token-push lists `video` in `kinds` only
-once `rated_video_usage` or `parked_video_usage` has a row, so installs without
-video keep sending `["token"]` to an older manager. If a previous-release
-token-push runs once after the migration, its trim of `pushed_usage` drops that
-hour's video rows; it sends `["token"]` only, so the manager's video records are
-untouched, and the next push re-records them.
+before any install records video usage. token-push lists `video` in `kinds` only
+once `rated_video_usage` (or an unresolved `parked_video_usage` row) has a row,
+and then only for hours that have video or had video sent before. So installs
+without video keep sending `["token"]` to an older manager. If an older manager
+refuses the `video` kind anyway (a 400 whose path is `kinds[...]`), token-push
+treats it like a 401: it parks nothing and stops the run, and the next run
+sends again.
+
+Once any install has pushed video, do NOT run the previous release's token-push
+against this schema. Its trim of `pushed_usage` has no kind filter, so each hour
+it sends loses that hour's video rows, and it stamps `pushed_hour`. The
+manager's video records are untouched (it lists `["token"]` only). But the new
+token-push re-records them only for hours still inside its 24-hour trailing
+window. For an older hour, a video identity parked later has no accepted ids to
+hold, so the manager deletes them by absence. The scheduled re-send also skips
+that hour, because it is stamped.
+
+To roll back, first suspend the token-push and rater CronJobs; do not roll them
+back to the previous release yet. Wait for any running job to finish, then run
+the current token-push once by hand. A token-push that overlapped a rater run
+may have sent an hour's older content, and the down guard cannot tell. Then run
+`0017 down`. If it refuses, it names how many identity-hours the manager has
+not accepted since they were last rated: find them with
+
+```sql
+-- The down guard's own condition: identity-hours not accepted since rated.
+SELECT r.window_start, r.auth_id, r.owner_type, r.owner_id, r.resource_id, r.model_id, r.serving_mode
+  FROM (SELECT window_start, auth_id, owner_type, owner_id, resource_id, model_id, serving_mode,
+               COUNT(*) AS n_rated, MAX(rated_at) AS rated_at
+          FROM rated_video_usage
+         GROUP BY window_start, auth_id, owner_type, owner_id, resource_id, model_id, serving_mode) r
+  LEFT JOIN pushed_hour h ON h.window_start = r.window_start
+ WHERE h.pushed_at IS NULL OR h.pushed_at < r.rated_at
+    OR (SELECT COUNT(*) FROM pushed_usage u
+         WHERE u.kind = 'video' AND u.window_start = r.window_start
+           AND u.auth_id = r.auth_id AND u.owner_type = r.owner_type AND u.owner_id = r.owner_id
+           AND u.resource_id = r.resource_id AND u.model_id = r.model_id
+           AND u.serving_mode = r.serving_mode
+           AND u.pushed_at >= r.rated_at AND u.pushed_at <= h.pushed_at) < r.n_rated;
+```
+
+re-send those hours with `token-push -since ... -until ...`, and run `0017 down`
+again. An identity whose grain token-push holds back (it logs `HOLDING BACK
+rated_video_usage`) keeps refusing until the cause is fixed or the row is
+exported. It refuses until every
+video rollup has been accepted by the manager. That means the hour's last
+accepted push came after the rollup was rated, and recorded a video
+`pushed_usage` id for each rated row of the identity. Once it passes, it removes
+video from phoebe's side, and the manager keeps the video records it holds.
+Only then deploy the previous release.
 
 ## Local dev
 

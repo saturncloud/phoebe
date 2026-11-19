@@ -83,6 +83,10 @@ func TestIntegration_AnAlreadySentVideoRecordIsHeldWhileParkedThenResent(t *test
 		t.Fatalf("first push: exit %d", code)
 	}
 	videoID := lastRequest(t, m).VideoRecords[0].UsageID
+	var sentAt time.Time
+	if err := db.QueryRow(`SELECT pushed_at FROM pushed_usage WHERE usage_id = $1`, videoID).Scan(&sentAt); err != nil {
+		t.Fatal(err)
+	}
 
 	videoJob(t, db, h.Add(30*time.Minute), itOrg2, "completed") // late, another org
 	if res := rate(t, db, h, h.Add(time.Hour)); res.Video.ParkedDeletions != 1 || res.Video.AmbiguousOrgEvents != 2 {
@@ -96,6 +100,12 @@ func TestIntegration_AnAlreadySentVideoRecordIsHeldWhileParkedThenResent(t *test
 		if len(req.Records) != 1 || len(req.VideoRecords) != 0 || !reflect.DeepEqual(req.Held, []string{videoID}) {
 			t.Fatalf("push %d: %d token, %d video, held %v; want the token record sent and [%s] held", i,
 				len(req.Records), len(req.VideoRecords), req.Held, videoID)
+		}
+		// A held id keeps the pushed_at of the push that sent the record:
+		// pushed_at says when the manager last received it (0017 down).
+		var heldAt time.Time
+		if err := db.QueryRow(`SELECT pushed_at FROM pushed_usage WHERE usage_id = $1`, videoID).Scan(&heldAt); err != nil || !heldAt.Equal(sentAt) {
+			t.Fatalf("push %d: held id pushed_at %s (err %v), want %s kept", i, heldAt, err, sentAt)
 		}
 	}
 
@@ -142,6 +152,37 @@ func TestIntegration_AVideoOnlyHourNeverAcceptedIsReSent(t *testing.T) {
 	if len(m2.bodies) != 1 || sentRequest(t, m2.bodies[0]).WindowStart != meteredusage.FormatWindowStart(h2) ||
 		len(sentRequest(t, m2.bodies[0]).VideoRecords) != 1 {
 		t.Fatalf("sent %d hours, want only h2 re-sent with its video record", len(m2.bodies))
+	}
+}
+
+// A wiped rated_video_usage is caught even though parked_video_usage still
+// holds a RESOLVED row (parked rows are never pruned): video is left out of
+// the request and the run exits 1, instead of every re-sent hour listing
+// video with no records and deleting the manager's video records.
+func TestIntegration_AWipedVideoRollupIsCaughtDespiteAResolvedParkedRow(t *testing.T) {
+	db := itDB(t, "phoebe_push_video_wipe_parked_it")
+	h := time.Now().UTC().Truncate(time.Hour).Add(-time.Hour)
+	event(t, db, h.Add(time.Minute), itRes1, itOrg1)
+	videoJob(t, db, h.Add(2*time.Minute), itOrg1, "completed")
+	rate(t, db, h, h.Add(time.Hour))
+	m := &recordingManager{}
+	if code := push(t, db, m, h); code != exitOK {
+		t.Fatalf("exit %d", code)
+	}
+	if _, err := db.Exec(`INSERT INTO parked_video_usage (window_start, auth_id, owner_type, owner_id, resource_id,
+		model_id, serving_mode, reason, event_count, output_seconds, output_frames, request_count, gpu_seconds, resolved_at)
+		VALUES ($1, 'old-auth', '', '', 'old-res', 'old-model', 'dedicated', 'ambiguous_org', 1, 0, 0, 0, 0, now())`,
+		h.Add(-48*time.Hour)); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(`DELETE FROM rated_video_usage`); err != nil {
+		t.Fatal(err)
+	}
+	if code := push(t, db, m, h); code != exitFatal {
+		t.Fatalf("exit %d, want %d for a wiped rated_video_usage", code, exitFatal)
+	}
+	if req := lastRequest(t, m); !reflect.DeepEqual(req.Kinds, []string{"token"}) {
+		t.Fatalf("kinds %v, want token only so the manager's video records are kept", req.Kinds)
 	}
 }
 

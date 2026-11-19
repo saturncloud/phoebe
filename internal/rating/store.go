@@ -37,6 +37,10 @@ type Store interface {
 	RecordCatchUpProgress(ctx context.Context, hour time.Time) error
 	// CompleteCatchUp marks the catch-up done.
 	CompleteCatchUp(ctx context.Context) error
+	// UnratedVideoHours counts the hours in [start, end) holding completed,
+	// rateable video jobs of an identity with no video rollup and no
+	// unresolved park (never rated).
+	UnratedVideoHours(ctx context.Context, start, end time.Time) (int64, error)
 	Ping(ctx context.Context) error
 	Close() error
 }
@@ -133,6 +137,8 @@ type AggregateResult struct {
 // Postgres. It does not run migrations.
 type PostgresStore struct {
 	db *sql.DB
+	// now is the clock behind the video reach (VideoFloor); tests move it.
+	now func() time.Time
 }
 
 // OpenPostgres opens a *sql.DB against the DSN using the pgx stdlib driver, applies
@@ -151,7 +157,7 @@ func OpenPostgres(ctx context.Context, cfg Config) (*PostgresStore, error) {
 	db.SetMaxIdleConns(cfg.MaxIdleConns)
 	db.SetConnMaxLifetime(cfg.ConnMaxLifetime)
 
-	s := &PostgresStore{db: db}
+	s := &PostgresStore{db: db, now: time.Now}
 	if err := s.Ping(ctx); err != nil {
 		_ = db.Close()
 		return nil, fmt.Errorf("rating: postgres ping: %w", err)
@@ -178,7 +184,7 @@ func ensureUTCTimeZone(dsn string) string {
 // NewPostgresStore wraps an existing *sql.DB. Used by tests and callers owning
 // the pool lifecycle.
 func NewPostgresStore(db *sql.DB) *PostgresStore {
-	return &PostgresStore{db: db}
+	return &PostgresStore{db: db, now: time.Now}
 }
 
 func (s *PostgresStore) Ping(ctx context.Context) error { return s.db.PingContext(ctx) }
@@ -567,14 +573,93 @@ func (s *PostgresStore) AggregateWindow(ctx context.Context, start, end time.Tim
 	}
 	// Same transaction: an hour's token and video rollups move together, so
 	// token-push never reads one kind re-aggregated and the other not.
-	if res.Video, err = aggregateVideoWindow(ctx, tx, start, end); err != nil {
-		return AggregateResult{}, err
+	//
+	// Only the hours whose video jobs are still retained (VideoFloor): an
+	// older hour's video_billing_event rows are pruned, so re-running it would
+	// reconcile-delete its rated_video_usage rows (or replace them with a
+	// partial sum) and token-push would delete the manager's records. Those
+	// rollups are the record now and are left as they are.
+	vstart := start.UTC()
+	var outOfReach int64
+	if floor := VideoFloor(s.now()); vstart.Before(floor) {
+		vstart = floor
+		reachEnd := end.UTC()
+		if floor.Before(reachEnd) {
+			reachEnd = floor
+		}
+		// Two kinds of out-of-reach hour are worth reporting: hours holding
+		// video rollups (kept as the record; a re-rate would have deleted
+		// them), and hours where some identity has completed, rateable jobs
+		// (attributable, valid: what aggregateVideoWindowSQL would roll up)
+		// but neither a rollup nor an unresolved park: rated never, billed
+		// never. Checked per gate identity, so one rated identity does not
+		// hide another's unrated jobs. Invalid and unattributable jobs are
+		// not counted here: they were never rateable, and were reported as
+		// such while inside the reach. Only windows reaching past the floor
+		// (explicit runs) see these hours; a routine run checks the hours
+		// between the floor and its own window instead (Run,
+		// UnratedInReachHours).
+		if err := tx.QueryRowContext(ctx, `SELECT
+			(SELECT COUNT(DISTINCT window_start) FROM rated_video_usage
+			  WHERE window_start >= $1 AND window_start < $2),
+			`+unratedVideoHoursSQL,
+			start.UTC(), reachEnd).Scan(&outOfReach, &res.Video.UnratedOutOfReachHours); err != nil {
+			return AggregateResult{}, fmt.Errorf("rating: count video hours out of reach: %w", err)
+		}
+		res.Video.OutOfReachHours = outOfReach
+	}
+	if vstart.Before(end.UTC()) {
+		v, err := aggregateVideoWindow(ctx, tx, vstart, end)
+		if err != nil {
+			return AggregateResult{}, err
+		}
+		v.OutOfReachHours = res.Video.OutOfReachHours
+		v.UnratedOutOfReachHours = res.Video.UnratedOutOfReachHours
+		res.Video = v
 	}
 	if err := tx.Commit(); err != nil {
 		return AggregateResult{}, fmt.Errorf("rating: commit: %w", err)
 	}
 	committed = true
 	return res, nil
+}
+
+// unratedVideoHoursSQL counts the hours in [$1, $2) where some gate identity
+// has completed, rateable video jobs (attributable, valid: what
+// aggregateVideoWindowSQL would roll up, owner conflicts excluded since they
+// park) but neither a video rollup nor an unresolved park: usage the rater
+// never rated. Per identity, so one rated identity does not hide another.
+const unratedVideoHoursSQL = `(SELECT COUNT(DISTINCT j.h) FROM (
+			   SELECT date_trunc('hour', e.created_at AT TIME ZONE 'UTC') AT TIME ZONE 'UTC' AS h,
+			          e.auth_id, e.resource_id, e.model_id, e.serving_mode,
+			          CASE WHEN COALESCE(e.user_id, '') <> '' THEN 'user'
+			               WHEN COALESCE(e.group_id, '') <> '' THEN 'group' ELSE '' END AS owner_type,
+			          COALESCE(NULLIF(e.user_id, ''), NULLIF(e.group_id, ''), '') AS owner_id
+			     FROM video_billing_event e
+			    WHERE e.created_at >= $1 AND e.created_at < $2
+			      AND e.status = 'completed' AND e.request_count = 1
+			      AND e.output_seconds >= 0 AND e.output_frames >= 0 AND e.gpu_seconds >= 0
+			      AND e.output_seconds <> 'NaN'::numeric AND e.gpu_seconds <> 'NaN'::numeric
+			      AND e.auth_id <> '' AND e.resource_id <> '' AND e.model_id <> ''
+			      AND NOT (COALESCE(e.user_id, '') <> '' AND COALESCE(e.group_id, '') <> '')) j
+			  WHERE NOT EXISTS (SELECT 1 FROM rated_video_usage r
+			                     WHERE r.window_start = j.h AND r.auth_id = j.auth_id
+			                       AND r.owner_type = j.owner_type AND r.owner_id = j.owner_id
+			                       AND r.resource_id = j.resource_id AND r.model_id = j.model_id
+			                       AND r.serving_mode = j.serving_mode)
+			    AND NOT EXISTS (SELECT 1 FROM parked_video_usage p
+			                     WHERE p.window_start = j.h AND p.resolved_at IS NULL
+			                       AND p.auth_id = j.auth_id AND p.owner_type = j.owner_type
+			                       AND p.owner_id = j.owner_id AND p.resource_id = j.resource_id
+			                       AND p.model_id = j.model_id AND p.serving_mode = j.serving_mode))`
+
+// UnratedVideoHours implements Store.
+func (s *PostgresStore) UnratedVideoHours(ctx context.Context, start, end time.Time) (int64, error) {
+	var n int64
+	if err := s.db.QueryRowContext(ctx, `SELECT `+unratedVideoHoursSQL, start.UTC(), end.UTC()).Scan(&n); err != nil {
+		return 0, fmt.Errorf("rating: count never-rated video hours: %w", err)
+	}
+	return n, nil
 }
 
 // Parked is one unresolved parked_usage row: usage of one identity in one hour

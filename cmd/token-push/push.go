@@ -9,6 +9,7 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"strings"
 	"time"
 
 	_ "github.com/jackc/pgx/v5/stdlib"
@@ -31,6 +32,12 @@ type pusher struct {
 	client poster
 	// managerURL is the manager's base URL, for error messages only.
 	managerURL string
+	// videoRated (rated_video_usage has a row) and videoFloor (the oldest hour
+	// the rater still re-rates video in, rating.VideoFloor) are set per run by
+	// pushWindows. buildHour lists video with an empty video set only when
+	// both say the hour's rollups could have been reconciled away.
+	videoRated bool
+	videoFloor time.Time
 }
 
 // maxConsecutiveUnreachable is how many hours in a row may fail because the
@@ -74,6 +81,11 @@ type hourPlan struct {
 	// heldBack counts rollups token-push itself could not turn into a record
 	// (no org, or a wire rule). Parked identities are the rater's to report.
 	heldBack int
+	// videoVanished: a video identity this install sent for the hour has no
+	// rollup or park now, and the rater cannot have removed it
+	// (rated_video_usage is empty, or the hour is older than the video
+	// reach). Its ids are held so the manager keeps them, and the run exits 1.
+	videoVanished bool
 }
 
 // heldKey is a held-back or parked identity of one kind. Holding is per kind:
@@ -92,19 +104,22 @@ type heldKey struct {
 // identity, the usage_ids the manager already holds for it (pushed_usage) go
 // into `held`, so delete-by-absence cannot remove usage the manager accepted.
 //
-// withVideo lists kind "video" and sends the hour's video records too. The
-// manager deletes by absence per listed kind, so an hour with token usage and
-// no video usage sends its token records and an empty video set, and the
-// reverse.
+// withVideo (the install records video and its video tables are not wiped)
+// lets the hour list kind "video" and send its video records. The hour lists
+// "video" only if it has video of its own (a rated or parked video row) or
+// this install sent the manager video records for it before (pushed_usage):
+// the manager deletes by absence per listed kind, so listing video with an
+// empty set for an hour this install never sent video for would delete video
+// records that did not come from this database, the per-kind form of the
+// empty-hour rule below. An hour whose sent video rollups vanished still
+// lists it: the records are deleted when the rater can have removed them, and
+// held (with exit 1) when it cannot (see VANISHED VIDEO). Token is always
+// listed, as before video.
 func (p *pusher) buildHour(ctx context.Context, hour time.Time, withVideo bool) (hourPlan, error) {
 	ws := meteredusage.FormatWindowStart(hour)
-	kinds := []string{meteredusage.KindToken}
-	if withVideo {
-		kinds = append(kinds, meteredusage.KindVideo)
-	}
 	plan := hourPlan{req: meteredusage.Request{
 		WindowStart: ws,
-		Kinds:       kinds,
+		Kinds:       []string{meteredusage.KindToken},
 		// Non-nil: an hour with no usage is [] (delete-by-absence), never null.
 		Records: make([]meteredusage.Record, 0),
 		Held:    make([]string, 0),
@@ -151,41 +166,103 @@ func (p *pusher) buildHour(ctx context.Context, hour time.Time, withVideo bool) 
 		holdIdentity[heldKey{meteredusage.KindToken, id}] = true
 	}
 
+	var ownVideo map[identity]bool
 	if withVideo {
-		if err := p.addVideo(ctx, hour, &plan, holdIdentity, live); err != nil {
+		if ownVideo, err = p.addVideo(ctx, hour, &plan, holdIdentity, live); err != nil {
 			return plan, err
 		}
 	}
-	if len(holdIdentity) > 0 {
+	listVideo := len(ownVideo) > 0
+	if len(holdIdentity) > 0 || withVideo {
 		pushed, err := p.store.Pushed(ctx, hour)
 		if err != nil {
 			return plan, err
 		}
+		heldID := map[string]bool{}
+		if withVideo {
+			// VANISHED VIDEO. A video record this install sent for the hour
+			// that has no rollup now. When the rater can have removed it (a
+			// reconcile inside the video reach, while rated_video_usage has
+			// rows: the rater never empties it), the empty slot deletes the
+			// manager's record by absence, which is the convergence the
+			// rater asked for. Otherwise the rollup was lost: the id is held
+			// so the manager keeps the record, and the run exits 1. Decided
+			// per id, not per identity: an identity can keep one grain
+			// (resolution, task, base model, region) and lose another.
+			reconcilable := p.videoRated && !hour.Before(p.videoFloor.Add(-videoReconcileSlack))
+			// p.videoFloor - videoReconcileSlack is the start of phoebe-videos'
+			// row retention (TestVideoReconcileSlackEndsAtTheRowRetention).
+			vanished := 0
+			for _, pr := range pushed {
+				if pr.kind() != meteredusage.KindVideo {
+					continue
+				}
+				listVideo = true // sent before: the request must say what is left
+				if !reconcilable && !live[pr.UsageID] && !holdIdentity[heldKey{meteredusage.KindVideo, pr.identity}] {
+					heldID[pr.UsageID] = true
+					vanished++
+				}
+			}
+			if vanished > 0 {
+				plan.videoVanished = true
+				p.log.Error.Printf("token-push: %s: %d video record(s) this install sent have no rollup now, and the rater cannot have removed them (%s); their ids are held so the manager keeps them. If the rollups were lost, restore rated_video_usage; if an explicit re-rate removed them and was pushed late, see docs/billing-reconciliation.md (\"Vanished video\")",
+					ws, vanished, vanishedReason(p.videoRated))
+				// The ids stay held, run after run, until a person decides.
+				// If the rollups were lost, restore rated_video_usage. If the
+				// rater legitimately removed them (an explicit re-rate pushed
+				// more than a day late), delete those ids from pushed_usage
+				// and re-send the hour with -since/-until
+				// (docs/billing-reconciliation.md).
+			}
+		}
 		for _, pr := range pushed {
 			// A video id is held only while video is listed: in a token-only
 			// request the manager keeps video records anyway.
-			if pr.kind() == meteredusage.KindVideo && !withVideo {
+			if pr.kind() == meteredusage.KindVideo && !listVideo {
 				continue
 			}
-			if holdIdentity[heldKey{pr.kind(), pr.identity}] && !live[pr.UsageID] {
+			if (holdIdentity[heldKey{pr.kind(), pr.identity}] || heldID[pr.UsageID]) && !live[pr.UsageID] {
+				pr.held = true
 				plan.req.Held = append(plan.req.Held, pr.UsageID)
 				plan.sent = append(plan.sent, pr)
 			}
 		}
 	}
+	if listVideo {
+		plan.req.Kinds = append(plan.req.Kinds, meteredusage.KindVideo)
+	}
 	return plan, nil
 }
 
+// videoReconcileSlack widens, for token-push, the hours in which a vanished
+// video record counts as the rater's own reconcile: one day older than the
+// rater's floor. The rater and token-push compute the floor at different
+// times, and an operator's explicit re-rate of an hour near the floor may be
+// pushed after the hour crosses it; without the slack such a legitimate
+// deletion would be held and the stale record kept. A lost rollup in that
+// extra day is the price, and only when rated_video_usage still has rows.
+const videoReconcileSlack = 24 * time.Hour
+
+func vanishedReason(videoRated bool) string {
+	if !videoRated {
+		return "rated_video_usage is empty"
+	}
+	return "the hour is older than the video reach (plus a day), where the rater never re-rates video"
+}
+
 // addVideo adds the hour's video records to plan, with the same per-identity
-// holding as tokens.
-func (p *pusher) addVideo(ctx context.Context, hour time.Time, plan *hourPlan, hold map[heldKey]bool, live map[string]bool) error {
+// holding as tokens. It returns the identities with video of their own in the
+// hour: a video rollup (sent or held back) or a parked video identity.
+func (p *pusher) addVideo(ctx context.Context, hour time.Time, plan *hourPlan, hold map[heldKey]bool, live map[string]bool) (map[identity]bool, error) {
 	ws := plan.req.WindowStart
 	rollups, err := p.store.VideoRollups(ctx, hour)
 	if err != nil {
-		return err
+		return nil, err
 	}
+	own := make(map[identity]bool, len(rollups))
 	plan.req.VideoRecords = make([]meteredusage.VideoRecord, 0, len(rollups))
 	for _, r := range rollups {
+		own[r.identity] = true
 		rec := meteredusage.VideoRecord{
 			Kind: meteredusage.KindVideo, OrgID: r.OrgID, OwnerType: r.OwnerType, OwnerID: r.OwnerID,
 			ResourceID: r.ResourceID,
@@ -212,12 +289,13 @@ func (p *pusher) addVideo(ctx context.Context, hour time.Time, plan *hourPlan, h
 	}
 	parked, err := p.store.ParkedVideoIdentities(ctx, hour)
 	if err != nil {
-		return err
+		return nil, err
 	}
 	for _, id := range parked {
 		hold[heldKey{meteredusage.KindVideo, id}] = true
+		own[id] = true
 	}
-	return nil
+	return own, nil
 }
 
 // maxUnsentHoursPerRun bounds how many never-accepted hours one run sends:
@@ -239,29 +317,51 @@ const maxParkedRechecksPerRun = 24 * 7
 // other 400 (a proxy in front of the manager, for instance) is not parked:
 // parking stops the hour from being re-sent, so a refusal that may be about
 // the install rather than the hour must keep failing loudly instead.
+//
+// A validation answer about `kinds` is not about the hour: it is a manager
+// that does not know a kind phoebe lists (a manager older than the video
+// kind). Parking would hold the hour's token records too and never re-send
+// them once the manager is upgraded, since the payload does not change; it is
+// treated as a refusal for the whole install instead.
 func refusalParksTheHour(rej *meteredusage.RejectedError) bool {
+	path, ok := validationPath(rej)
+	return ok && !refusesAKind(path)
+}
+
+// validationPath returns the "path" of a 400 whose body is the manager's
+// validation answer ({"error": ..., "path": ...}).
+func validationPath(rej *meteredusage.RejectedError) (string, bool) {
 	if rej.Status != http.StatusBadRequest {
-		return false
+		return "", false
 	}
 	var body map[string]json.RawMessage
 	if err := json.Unmarshal([]byte(rej.Body), &body); err != nil {
-		return false
+		return "", false
 	}
 	_, hasError := body["error"]
-	_, hasPath := body["path"]
-	return hasError && hasPath
+	rawPath, hasPath := body["path"]
+	if !hasError || !hasPath {
+		return "", false
+	}
+	var path string
+	_ = json.Unmarshal(rawPath, &path)
+	return path, true
 }
+
+func refusesAKind(path string) bool { return path == "kinds" || strings.HasPrefix(path, "kinds[") }
 
 // refusalIsForTheInstall reports whether a manager refusal applies to every
 // hour of this install (401 token, 403 inactive or uninstalled install, 409 a
-// manager older than the 2026-11-17 rule refusing a legacy install). The rest
-// of the run would get the same answer, so the run stops sending.
+// manager older than the 2026-11-17 rule refusing a legacy install, or a 400
+// refusing a listed kind: a manager older than the video kind). The rest of
+// the run would get the same answer, so the run stops sending.
 func refusalIsForTheInstall(rej *meteredusage.RejectedError) bool {
 	switch rej.Status {
 	case http.StatusUnauthorized, http.StatusForbidden, http.StatusConflict:
 		return true
 	}
-	return false
+	path, ok := validationPath(rej)
+	return ok && refusesAKind(path)
 }
 
 func payloadSHA256(req meteredusage.Request) (string, error) {
@@ -310,18 +410,21 @@ func (p *pusher) pushWindows(ctx context.Context, windows []time.Time, now time.
 		p.log.Error.Printf("token-push: liveness check: %v", err)
 		return exitFatal
 	}
-	// VIDEO IS LISTED ONLY ONCE VIDEO USAGE IS RECORDED. Until then a request
-	// lists kinds ["token"], exactly as before video existed: listing "video"
-	// with no video records could delete nothing the manager legitimately
-	// holds, and a manager without the video kind keeps accepting the hour.
-	// If video was sent before and the video tables are now empty, they were
-	// wiped: video is left out of every request (so the manager's video records
-	// are not deleted by absence), tokens are still sent, and the run exits 1.
-	withVideo, everPushedVideo, err := p.store.VideoUsageState(ctx)
+	// VIDEO IS LISTED ONLY ONCE VIDEO USAGE IS RECORDED, and then only for
+	// hours with video or with video sent before (buildHour). Until then a
+	// request lists kinds ["token"], exactly as before video existed, so a
+	// manager without the video kind keeps accepting the install's hours. If
+	// video was sent before and rated_video_usage is now empty with no
+	// unresolved parked video (resolved parked rows do not count), it was
+	// wiped: video is left out of every request (so the
+	// manager's video records are not deleted by absence), tokens are still
+	// sent, and the run exits 1.
+	withVideo, videoRated, everPushedVideo, err := p.store.VideoUsageState(ctx)
 	if err != nil {
 		p.log.Error.Printf("token-push: video liveness check: %v", err)
 		return exitFatal
 	}
+	p.videoRated, p.videoFloor = videoRated, rating.VideoFloor(now)
 	if !hasRated && everPushed {
 		// Usage was sent before and rated_usage is empty now: rated_usage is never
 		// pruned, so this is a wiped table, whatever parked_usage holds. Sending
@@ -349,7 +452,7 @@ func (p *pusher) pushWindows(ctx context.Context, windows []time.Time, now time.
 	}
 	videoWiped := !withVideo && everPushedVideo
 	if videoWiped {
-		p.log.Error.Printf("token-push: rated_video_usage and parked_video_usage are EMPTY although video usage was sent before (pushed_usage has video rows); sending token usage only, so the manager's video records are not deleted. Restore the database")
+		p.log.Error.Printf("token-push: rated_video_usage is EMPTY (and no video usage is parked) although video usage was sent before (pushed_usage has video rows); sending token usage only, so the manager's video records are not deleted. Restore the database")
 	}
 
 	floor := now.UTC().Truncate(time.Hour)
@@ -409,7 +512,8 @@ func (p *pusher) pushWindows(ctx context.Context, windows []time.Time, now time.
 	hours = uniqueHours(hours, recheck)
 
 	heldBack, rejected, failed, newlyParked := 0, 0, 0, 0
-	unreachable := 0 // consecutive hours the manager could not be reached for
+	videoVanished := 0 // hours whose sent video rollups are gone (exit 1)
+	unreachable := 0   // consecutive hours the manager could not be reached for
 	var unchanged []time.Time
 send:
 	for i, h := range hours {
@@ -452,6 +556,11 @@ send:
 			continue
 		}
 		heldBack += plan.heldBack
+		// Counted only for an hour that is sent: a parked hour rebuilt by the
+		// recheck rotation and skipped above does not repeat the alarm.
+		if plan.videoVanished {
+			videoVanished++
+		}
 		if err := meteredusage.Validate(plan.req); err != nil {
 			// Every record passed on its own, so this is a request-level rule
 			// (for instance a duplicate usage_id): a bug. Send nothing for the
@@ -519,7 +628,7 @@ send:
 				plan.req.WindowStart, rej.Status, rej.Body)
 		case errors.As(err, &rej) && refusalIsForTheInstall(rej):
 			rejected++
-			p.log.Error.Printf("token-push: manager REJECTED %s with %d: %s. This refusal is for the whole install (401 token, 403 inactive or uninstalled install, 409 a manager older than the 2026-11-17 rule), so the run stops; %d hour(s) not sent this run. Needs a person",
+			p.log.Error.Printf("token-push: manager REJECTED %s with %d: %s. This refusal is for the whole install (401 token, 403 inactive or uninstalled install, 409 a manager older than the 2026-11-17 rule, 400 on kinds: a manager older than the video kind), so the run stops; %d hour(s) not sent this run. Needs a person",
 				plan.req.WindowStart, rej.Status, rej.Body, len(hours)-i-1)
 			break send
 		case errors.As(err, &rej):
@@ -547,7 +656,7 @@ send:
 	}
 
 	switch {
-	case failed > 0 || videoWiped:
+	case failed > 0 || videoWiped || videoVanished > 0:
 		return exitFatal
 	case rejected > 0:
 		return exitRejected

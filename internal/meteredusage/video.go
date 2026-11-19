@@ -76,8 +76,9 @@ type VideoQuantities struct {
 	OutputFrames  int64  `json:"output_frames"`
 	// RequestCount counts completed jobs only.
 	RequestCount int64 `json:"request_count"`
-	// GPUSeconds is GPU count x wall time on the engine, failed jobs included,
-	// as a decimal string.
+	// GPUSeconds is GPU count x wall time on the engine of the completed jobs,
+	// as a decimal string (phoebe-videos records 0 for a failed or cancelled
+	// job, design 7.2).
 	GPUSeconds string `json:"gpu_seconds"`
 }
 

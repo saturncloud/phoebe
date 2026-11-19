@@ -16,9 +16,10 @@
 -- latest run (re-running an hour replaces its rows and deletes the ones it no
 -- longer produces). NEVER pruned, like rated_usage.
 --
--- Failed and cancelled jobs are counted in event_count and gpu_seconds (margin
--- evidence) and contribute nothing else: their output and request_count are 0
--- (0016's video_billing_event_unbilled_ck). request_count counts completed jobs.
+-- Failed and cancelled jobs are counted in event_count and contribute nothing
+-- else: phoebe-videos writes every quantity 0 for them, gpu_seconds included
+-- (design 7.2; 0016's video_billing_event_unbilled_ck forces the output and
+-- request_count). request_count counts completed jobs. (Comment only.)
 CREATE TABLE IF NOT EXISTS rated_video_usage (
     -- Deterministic local surrogate: md5 of the length-prefixed grain. phoebe's
     -- row id only; the wire's usage_id is computed by token-push.

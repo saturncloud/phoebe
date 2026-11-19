@@ -113,7 +113,13 @@ func (a *Aggregator) Run(ctx context.Context, windowStart, windowEnd time.Time, 
 	if err != nil {
 		return res, err
 	}
+	videoFloor := VideoFloor(a.now())
 	for _, p := range before {
+		if p.Kind == KindVideo && p.WindowStart.Before(videoFloor) {
+			// Video older than the reach is never re-rated (VideoFloor), so
+			// this run cannot touch it.
+			continue
+		}
 		if p.RawEventsPruned && !p.WindowStart.Before(windowStart) && p.WindowStart.Before(windowEnd) {
 			return res, fmt.Errorf("rating: window %s contains parked hour %s (auth_id=%s resource_id=%s model_id=%s reason=%s) whose raw events are pruned (%d of %d remain); it must never be re-aggregated. Narrow the window to exclude it; %s",
 				w, p.WindowStart.Format(time.RFC3339), p.AuthID, p.ResourceID, p.ModelID, p.Reason, p.RawEvents, p.EventCount, PrunedMarker)
@@ -125,6 +131,31 @@ func (a *Aggregator) Run(ctx context.Context, windowStart, windowEnd time.Time, 
 		return res, err
 	}
 	res.AggregateResult = ar
+
+	// NEVER-RATED VIDEO. A routine run rates only its trailing window, and
+	// the one-time catch-up does not run again, so video jobs of a rater
+	// outage longer than the window would never be rated and would be pruned
+	// unbilled at 30 days. Check the hours between the video floor and the
+	// window on every routine run, and page (exit 2) while any are left.
+	// While the catch-up is still running it rates those hours itself.
+	if floor := VideoFloor(a.now()); !windowExplicit && floor.Before(windowStart) {
+		st, err := a.store.CatchUpState(ctx)
+		if err != nil {
+			return res, err
+		}
+		n := int64(0)
+		if st.Done {
+			n, err = a.store.UnratedVideoHours(ctx, floor, windowStart)
+		}
+		if err != nil {
+			return res, err
+		}
+		res.Video.UnratedInReachHours = n
+		if n > 0 {
+			a.log.Error.Printf("rating: %d hour(s) between %s and %s hold completed video jobs that were NEVER rated (no rollup, no unresolved park): the rater was down longer than its trailing window. Re-rate them with --since/--until before they pass %s; phoebe-videos prunes video jobs after %d days",
+				n, floor.Format(time.RFC3339), windowStart.Format(time.RFC3339), VideoRateReach, prune.VideoRowRetentionDays)
+		}
+	}
 
 	// Parked hours outside the window: re-check the ones whose raw events are
 	// guaranteed present, so a conflict that resolved (or that an operator fixed
@@ -155,10 +186,9 @@ func (a *Aggregator) Run(ctx context.Context, windowStart, windowEnd time.Time, 
 		res.ParkedWritten += hr.ParkedWritten
 		res.ReconciledDeletions += hr.ReconciledDeletions
 		res.ParkedDeletions += hr.ParkedDeletions
-		res.Video.ParkedResolved += hr.Video.ParkedResolved
-		res.Video.ParkedWritten += hr.Video.ParkedWritten
-		res.Video.ReconciledDeletions += hr.Video.ReconciledDeletions
-		res.Video.ParkedDeletions += hr.Video.ParkedDeletions
+		// Every video counter, so a re-checked hour's withheld video jobs
+		// reach HasAnomaly and the exit code.
+		res.Video = res.Video.add(hr.Video)
 	}
 
 	res.Parked, err = a.store.ListParked(ctx)
@@ -248,6 +278,12 @@ func (a *Aggregator) aggregateAndLog(ctx context.Context, windowStart, windowEnd
 // logVideo logs what one video aggregation withheld, parked or deleted, at
 // the same levels as the token buckets.
 func (a *Aggregator) logVideo(w string, v VideoAggregateResult, windowExplicit bool) {
+	if v.OutOfReachHours > 0 {
+		a.log.Warn.Printf("rating: window %s: video rollups of %d hour(s) older than %s were NOT re-rated; phoebe-videos prunes video jobs after %d days, so the existing rollups are kept as the record", w, v.OutOfReachHours, VideoRateReach, prune.VideoRowRetentionDays)
+	}
+	if v.UnratedOutOfReachHours > 0 {
+		a.log.Error.Printf("rating: window %s: %d hour(s) older than %s hold completed, rateable video jobs of an identity that has no rollup and no unresolved park: NEVER rated; the rater no longer rates them, so they are not billed. Export them from video_billing_event before phoebe-videos prunes them at %d days and settle by hand through the manager's credit path", w, v.UnratedOutOfReachHours, VideoRateReach, prune.VideoRowRetentionDays)
+	}
 	if v.UnattributableEvents > 0 {
 		a.log.Error.Printf("rating: window %s has %d UNATTRIBUTABLE video jobs (auth_id, resource_id or model_id is ''); they cannot name who used what and are not sent. phoebe-videos must stamp the request's trusted identity on every job", w, v.UnattributableEvents)
 	}
