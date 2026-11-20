@@ -22,28 +22,70 @@ import (
 //
 // Every job is registered before any of its files is written, and closed when
 // it finishes, so the store can refuse uploads for a job that is not in
-// progress.
+// progress. Closing a completed job names the attempt whose files are its
+// output; Discard (a superseded attempt removing its own files) is refused for
+// that attempt.
 type Blob interface {
 	Register(ctx context.Context, orgID, jobID, resourceID, inputExt string) error
-	Close(ctx context.Context, orgID, jobID string) error
+	// Close ends the job's grant. outputAttempt is the attempt whose files are
+	// a completed job's output, or 0 when the job did not complete.
+	Close(ctx context.Context, orgID, jobID string, outputAttempt int) error
 	Put(ctx context.Context, key string, r io.Reader, size int64, contentType string) error
 	Get(ctx context.Context, key string) (io.ReadCloser, int64, error)
 	Delete(ctx context.Context, key string) error
+	// Discard deletes a file of a superseded attempt. Unlike Delete it is
+	// refused for the attempt recorded as the job's output.
+	Discard(ctx context.Context, key string) error
 }
 
 // ErrBlobNotFound is Get on a missing object, or on one whose job's files can
 // no longer exist.
 var ErrBlobNotFound = errors.New("object not found")
 
-// Keys lays out one job's objects: <prefix>/<org_id>/<video_id>/<name>. The
-// org id in the key makes per-org deletion and auditing a prefix operation.
+// Keys lays out one job's objects. The input image, written once when the job
+// is created, is <prefix>/<org_id>/<video_id>/input.<ext>. Each attempt writes
+// its output under its own keys, <prefix>/<org_id>/<video_id>/attempt-<n>/
+// video.mp4 and thumbnail.webp, so an attempt whose lease was taken over can
+// neither overwrite nor delete the output of the attempt that completed the
+// job, even with an upload URL signed before the job closed. The org id in the
+// key makes per-org deletion and auditing a prefix operation.
+//
+// The layout is internal to phoebe-videos and Atlas (saturn
+// pdc/models/tf_video_job.py), which signs only keys of this shape. The job
+// row records the completed attempt's keys (video_key, thumbnail_key), which
+// are the only ones the API reads.
 type Keys struct{ Prefix string }
 
+// MaxAttempt is the largest attempt number a key may carry (Atlas refuses a
+// larger one). The dispatcher runs a job at most twice.
+const MaxAttempt = 999
+
 func (k Keys) Input(orgID, jobID, ext string) string { return k.join(orgID, jobID, "input."+ext) }
-func (k Keys) Video(orgID, jobID string) string      { return k.join(orgID, jobID, "video.mp4") }
-func (k Keys) Thumbnail(orgID, jobID string) string  { return k.join(orgID, jobID, "thumbnail.webp") }
+func (k Keys) Video(orgID, jobID string, attempt int) string {
+	return k.join(orgID, jobID, attemptSegment(attempt)+"/video.mp4")
+}
+func (k Keys) Thumbnail(orgID, jobID string, attempt int) string {
+	return k.join(orgID, jobID, attemptSegment(attempt)+"/thumbnail.webp")
+}
 func (k Keys) join(orgID, jobID, name string) string {
 	return strings.Trim(k.Prefix, "/") + "/" + orgID + "/" + jobID + "/" + name
+}
+
+func attemptSegment(attempt int) string { return "attempt-" + strconv.Itoa(attempt) }
+
+// validAttemptSegment is "attempt-<n>" with n from 1 to MaxAttempt and no
+// leading zero, matching Atlas.
+func validAttemptSegment(s string) bool {
+	n, ok := strings.CutPrefix(s, "attempt-")
+	if !ok || n == "" || n[0] == '0' || len(n) > 3 {
+		return false
+	}
+	for _, c := range n {
+		if c < '0' || c > '9' {
+			return false
+		}
+	}
+	return true
 }
 
 // errNotVideoKey is Parse refusing a key: no retry can make it valid.
@@ -54,7 +96,8 @@ var errNotVideoKey = errors.New("not a video job object")
 func (k Keys) Parse(key string) (orgID, jobID string, err error) {
 	rest, ok := strings.CutPrefix(key, strings.Trim(k.Prefix, "/")+"/")
 	parts := strings.Split(rest, "/")
-	if !ok || len(parts) != 3 || parts[0] == "" || !ValidID(parts[1]) || parts[2] == "" {
+	valid := ok && (len(parts) == 3 || (len(parts) == 4 && validAttemptSegment(parts[2])))
+	if !valid || parts[0] == "" || !ValidID(parts[1]) || parts[len(parts)-1] == "" {
 		return "", "", fmt.Errorf("video store: key %q is %w", key, errNotVideoKey)
 	}
 	return parts[0], parts[1], nil
@@ -209,8 +252,12 @@ func (b *AtlasBlob) Register(ctx context.Context, orgID, jobID, resourceID, inpu
 	return b.call(ctx, atlasVideoJobsPath, body, http.StatusCreated, nil)
 }
 
-func (b *AtlasBlob) Close(ctx context.Context, orgID, jobID string) error {
-	return b.call(ctx, atlasVideoJobsPath+"/"+jobID+"/close", map[string]any{"org_id": orgID}, http.StatusOK, nil)
+func (b *AtlasBlob) Close(ctx context.Context, orgID, jobID string, outputAttempt int) error {
+	body := map[string]any{"org_id": orgID}
+	if outputAttempt > 0 {
+		body["output_attempt"] = outputAttempt
+	}
+	return b.call(ctx, atlasVideoJobsPath+"/"+jobID+"/close", body, http.StatusOK, nil)
 }
 
 // presigned is Atlas's answer: one request to send as is.
@@ -225,7 +272,7 @@ type presigned struct {
 // far behind Atlas's, or a stalled call). It is never sent.
 var errURLExpired = errors.New("video store: the presigned URL expired before it was used")
 
-func (b *AtlasBlob) presign(ctx context.Context, key, method string, size int64) (*http.Request, error) {
+func (b *AtlasBlob) presign(ctx context.Context, key, method string, size int64, discard bool) (*http.Request, error) {
 	orgID, jobID, err := b.keys.Parse(key)
 	if err != nil {
 		return nil, err
@@ -233,6 +280,9 @@ func (b *AtlasBlob) presign(ctx context.Context, key, method string, size int64)
 	body := map[string]any{"org_id": orgID, "key": key, "method": method}
 	if method == http.MethodPut {
 		body["content_length"] = size
+	}
+	if discard {
+		body["discard"] = true
 	}
 	var p presigned
 	if err := b.call(ctx, atlasVideoJobsPath+"/"+jobID+"/object-urls", body, http.StatusOK, &p); err != nil {
@@ -280,7 +330,7 @@ func storeError(op, key string, resp *http.Response) error {
 }
 
 func (b *AtlasBlob) Put(ctx context.Context, key string, r io.Reader, size int64, contentType string) error {
-	req, err := b.presign(ctx, key, http.MethodPut, size)
+	req, err := b.presign(ctx, key, http.MethodPut, size, false)
 	if err != nil {
 		return err
 	}
@@ -306,7 +356,7 @@ func (b *AtlasBlob) Put(ctx context.Context, key string, r io.Reader, size int64
 // row was pruned) or an object that is gone reads as ErrBlobNotFound. A 403
 // stays an error: Atlas also answers 403 to a wrong internal token.
 func (b *AtlasBlob) Get(ctx context.Context, key string) (io.ReadCloser, int64, error) {
-	req, err := b.presign(ctx, key, http.MethodGet, 0)
+	req, err := b.presign(ctx, key, http.MethodGet, 0, false)
 	var ae *atlasError
 	if errors.As(err, &ae) && (ae.status == http.StatusConflict || ae.status == http.StatusNotFound) {
 		return nil, 0, ErrBlobNotFound
@@ -333,7 +383,17 @@ func (b *AtlasBlob) Get(ctx context.Context, key string) (io.ReadCloser, int64, 
 }
 
 func (b *AtlasBlob) Delete(ctx context.Context, key string) error {
-	req, err := b.presign(ctx, key, http.MethodDelete, 0)
+	return b.delete(ctx, key, false)
+}
+
+// Discard deletes a superseded attempt's file. Atlas refuses it (409) for the
+// attempt recorded as the job's output.
+func (b *AtlasBlob) Discard(ctx context.Context, key string) error {
+	return b.delete(ctx, key, true)
+}
+
+func (b *AtlasBlob) delete(ctx context.Context, key string, discard bool) error {
+	req, err := b.presign(ctx, key, http.MethodDelete, 0, discard)
 	if err != nil {
 		return err
 	}

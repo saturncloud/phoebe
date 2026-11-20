@@ -152,7 +152,7 @@ func newTestBlob(t *testing.T) (*AtlasBlob, *fakeAtlas, *fakeStore) {
 	return b, at, st
 }
 
-func videoKey() string { return Keys{Prefix: "tf-videos"}.Video(testOrg, testJob) }
+func videoKey() string { return Keys{Prefix: "tf-videos"}.Video(testOrg, testJob, 1) }
 
 func TestAtlasBlobPutSendsTheSignedRequestExactly(t *testing.T) {
 	b, at, st := newTestBlob(t)
@@ -214,6 +214,12 @@ func TestAtlasBlobRefusesAKeyOutsideThePrefix(t *testing.T) {
 		"tf-videos/org1/" + testJob + "/nested/video.mp4",
 		"tf-videos//" + testJob + "/video.mp4",
 		"tf-videos-x/org1/" + testJob + "/video.mp4",
+		"tf-videos/org1/" + testJob + "/attempt-0/video.mp4",
+		"tf-videos/org1/" + testJob + "/attempt-01/video.mp4",
+		"tf-videos/org1/" + testJob + "/attempt-1000/video.mp4",
+		"tf-videos/org1/" + testJob + "/attempt-x/video.mp4",
+		"tf-videos/org1/" + testJob + "/attempt-1/",
+		"tf-videos/org1/" + testJob + "/attempt-1/nested/video.mp4",
 	} {
 		if err := b.Put(context.Background(), key, strings.NewReader("x"), 1, "video/mp4"); err == nil {
 			t.Errorf("put %q accepted", key)
@@ -289,7 +295,8 @@ func TestAtlasBlobMapsAtlasRefusalStatuses(t *testing.T) {
 				}
 			}
 			isRefusal("register", b.Register(context.Background(), testOrg, testJob, "dep1", ""))
-			isRefusal("close", b.Close(context.Background(), testOrg, testJob))
+			isRefusal("close", b.Close(context.Background(), testOrg, testJob, 0))
+			isRefusal("discard", b.Discard(context.Background(), videoKey()))
 			isRefusal("put", b.Put(context.Background(), videoKey(), strings.NewReader("x"), 1, "video/mp4"))
 			isRefusal("delete", b.Delete(context.Background(), videoKey()))
 			_, _, err := b.Get(context.Background(), videoKey())
@@ -333,6 +340,50 @@ func TestAtlasBlobRefusesASigningMismatch(t *testing.T) {
 	}
 }
 
+// Each attempt's output keys are its own; the input image belongs to no
+// attempt. Parse reads all of them back to the job.
+func TestKeysScopeOutputsToTheAttempt(t *testing.T) {
+	k := Keys{Prefix: "/tf-videos/"}
+	for _, tc := range []struct{ got, want string }{
+		{k.Video(testOrg, testJob, 1), "tf-videos/org1/" + testJob + "/attempt-1/video.mp4"},
+		{k.Thumbnail(testOrg, testJob, 2), "tf-videos/org1/" + testJob + "/attempt-2/thumbnail.webp"},
+		{k.Input(testOrg, testJob, "png"), "tf-videos/org1/" + testJob + "/input.png"},
+	} {
+		if tc.got != tc.want {
+			t.Errorf("key %q, want %q", tc.got, tc.want)
+		}
+		org, job, err := k.Parse(tc.got)
+		if err != nil || org != testOrg || job != testJob {
+			t.Errorf("parse %q: %s %s %v", tc.got, org, job, err)
+		}
+	}
+	if k.Video(testOrg, testJob, 1) == k.Video(testOrg, testJob, 2) {
+		t.Fatal("two attempts share a video key")
+	}
+}
+
+// Discard is a DELETE that tells Atlas it removes a superseded attempt's own
+// file (Atlas refuses it for the recorded output); Delete never says so.
+func TestAtlasBlobDiscardMarksTheDelete(t *testing.T) {
+	b, at, st := newTestBlob(t)
+	ctx := context.Background()
+	if err := b.Delete(ctx, videoKey()); err != nil {
+		t.Fatal(err)
+	}
+	if err := b.Discard(ctx, videoKey()); err != nil {
+		t.Fatal(err)
+	}
+	if _, marked := at.calls[0]["discard"]; marked || at.calls[0]["method"] != "DELETE" {
+		t.Fatalf("delete body %v", at.calls[0])
+	}
+	if at.calls[1]["discard"] != true || at.calls[1]["method"] != "DELETE" {
+		t.Fatalf("discard body %v", at.calls[1])
+	}
+	if len(st.reqs) != 2 || st.reqs[1].method != http.MethodDelete {
+		t.Fatalf("store %v", st.reqs)
+	}
+}
+
 func TestAtlasBlobRegisterAndClose(t *testing.T) {
 	b, at, _ := newTestBlob(t)
 	if err := b.Register(context.Background(), testOrg, testJob, "dep1", "png"); err != nil {
@@ -341,8 +392,17 @@ func TestAtlasBlobRegisterAndClose(t *testing.T) {
 	if err := b.Register(context.Background(), testOrg, testJob, "dep1", ""); err != nil {
 		t.Fatal(err)
 	}
-	if err := b.Close(context.Background(), testOrg, testJob); err != nil {
+	if err := b.Close(context.Background(), testOrg, testJob, 0); err != nil {
 		t.Fatal(err)
+	}
+	if err := b.Close(context.Background(), testOrg, testJob, 2); err != nil {
+		t.Fatal(err)
+	}
+	if _, named := at.calls[2]["output_attempt"]; named {
+		t.Fatalf("a close without an output named one: %v", at.calls[2])
+	}
+	if at.calls[3]["output_attempt"] != float64(2) {
+		t.Fatalf("close of a completed job %v", at.calls[3])
 	}
 	if at.calls[0]["input_ext"] != "png" || at.calls[1]["input_ext"] != nil ||
 		at.calls[0]["resource_id"] != "dep1" || at.calls[0]["video_id"] != testJob {
@@ -372,7 +432,7 @@ func TestAtlasBlobSendsItsTokenOnEveryAtlasCall(t *testing.T) {
 	if err := b.Delete(ctx, videoKey()); err != nil {
 		t.Fatal(err)
 	}
-	if err := b.Close(ctx, testOrg, testJob); err != nil {
+	if err := b.Close(ctx, testOrg, testJob, 1); err != nil {
 		t.Fatal(err)
 	}
 	if len(at.tokens) != 5 {
@@ -455,7 +515,7 @@ func TestAtlasBlobNeverSendsTheTokenAcrossARedirect(t *testing.T) {
 		}
 	}
 	isRedirect("register", b.Register(ctx, testOrg, testJob, "dep1", ""))
-	isRedirect("close", b.Close(ctx, testOrg, testJob))
+	isRedirect("close", b.Close(ctx, testOrg, testJob, 0))
 	isRedirect("put", b.Put(ctx, videoKey(), strings.NewReader("x"), 1, "video/mp4"))
 	_, _, err = b.Get(ctx, videoKey())
 	isRedirect("get", err)

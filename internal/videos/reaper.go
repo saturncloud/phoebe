@@ -30,6 +30,10 @@ type ReaperConfig struct {
 	// DeleteTimeout bounds deleting one job's files (default 2 min), so a
 	// store that stops answering cannot stall the reaper. Tests shorten it.
 	DeleteTimeout time.Duration
+	// Prefix is the object key prefix (the dispatcher's), from which the
+	// reaper derives every attempt's keys. Default "tf-videos", the design
+	// default.
+	Prefix string
 }
 
 func (c *ReaperConfig) defaults() {
@@ -47,6 +51,9 @@ func (c *ReaperConfig) defaults() {
 	}
 	if c.DeleteTimeout <= 0 {
 		c.DeleteTimeout = 2 * time.Minute
+	}
+	if strings.Trim(c.Prefix, "/") == "" {
+		c.Prefix = "tf-videos"
 	}
 }
 
@@ -121,7 +128,7 @@ func (r *Reaper) Once(ctx context.Context) {
 // upload is signed for them again (best effort, like every close).
 func (r *Reaper) closeGrants(ctx context.Context, jobs []*Job) {
 	for _, j := range jobs {
-		CloseGrant(ctx, r.blob, r.log, j)
+		CloseGrant(ctx, r.blob, r.log, j, 0)
 	}
 }
 
@@ -197,10 +204,7 @@ func (r *Reaper) expireFiles(ctx context.Context, now time.Time) {
 func (r *Reaper) deleteFiles(ctx context.Context, j *Job) (givenUp []string, err error) {
 	ctx, cancel := context.WithTimeout(ctx, r.cfg.DeleteTimeout)
 	defer cancel()
-	for _, key := range []string{j.InputKey, j.VideoKey, j.ThumbnailKey} {
-		if key == "" {
-			continue
-		}
+	for _, key := range jobFileKeys(r.cfg.Prefix, j) {
 		err := r.blob.Delete(ctx, key)
 		switch {
 		case err == nil:
@@ -221,6 +225,31 @@ func (r *Reaper) deleteFiles(ctx context.Context, j *Job) (givenUp []string, err
 // misconfiguration mark every expired job's files deleted while the objects
 // stay in the bucket, with nothing left to retry them. Such a job is retried
 // behind newer ones instead (ExpiredFiles orders it last).
+// jobFileKeys is every key job j may have written: its input image, the
+// recorded output, and the video and thumbnail of every attempt it ran (an
+// attempt that lost its lease, or whose completion could not be recorded,
+// may have left files under its own keys; deleting a key that was never
+// written is harmless). Each key once.
+func jobFileKeys(prefix string, j *Job) []string {
+	keys := Keys{Prefix: prefix}
+	var out []string
+	seen := map[string]bool{}
+	add := func(k string) {
+		if k != "" && !seen[k] {
+			seen[k] = true
+			out = append(out, k)
+		}
+	}
+	add(j.InputKey)
+	add(j.VideoKey)
+	add(j.ThumbnailKey)
+	for n := 1; n <= j.Attempts && n <= MaxAttempt; n++ {
+		add(keys.Video(j.OrgID, j.ID, n))
+		add(keys.Thumbnail(j.OrgID, j.ID, n))
+	}
+	return out
+}
+
 func deleteRefusedForGood(err error) bool {
 	if errors.Is(err, errNotVideoKey) {
 		return true
