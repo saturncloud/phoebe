@@ -172,5 +172,11 @@ func (s *Server) handOffVideo(w http.ResponseWriter, r *http.Request, requestID 
 	// path does before it reaches here.
 	r.Header.Set(requestIDHeader, requestID)
 	w.Header().Set(requestIDHeader, requestID)
+	// Both callers have checked the path against their surface, so a GET
+	// ending in /content is a download of a stored file: the one request
+	// exempt from protection.maxStreamDuration (stall guards still apply).
+	if r.Method == http.MethodGet && strings.HasSuffix(r.URL.Path, "/content") {
+		exemptFromMaxStreamDuration(r.Context())
+	}
 	s.videos.proxy.ServeHTTP(w, r)
 }

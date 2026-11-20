@@ -102,7 +102,10 @@ type ProtectionSettings struct {
 	StreamStallTimeoutStr string        `yaml:"streamStallTimeout"`
 	StreamStallTimeout    time.Duration `yaml:"-"`
 	// MaxStreamDurationStr bounds a whole request, from arrival to the last
-	// response byte, including any wake hold.
+	// response byte, including any wake hold. One request is exempt: a video
+	// content download (GET /v1/videos/{id}/content), a stored file that
+	// cannot be resumed; the stall bounds still apply to it
+	// (proxy.exemptFromMaxStreamDuration).
 	MaxStreamDurationStr string        `yaml:"maxStreamDuration"`
 	MaxStreamDuration    time.Duration `yaml:"-"`
 	// MaxResponseBufferBytesPerStream caps the response bytes phoebe holds in

@@ -384,6 +384,9 @@ func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request) {
 		handlerDone = true
 		maxDurationMu.Unlock()
 	}()
+	// A video content download stops the timer once it is checked (the one
+	// exemption, exemptFromMaxStreamDuration).
+	ctx = withMaxStreamDurationExempt(ctx, func() { maxDuration.Stop() })
 	r = r.WithContext(ctx)
 	stallGuard := newStallGuardWriter(w, prot.StreamStallTimeout, cancel)
 	w = stallGuard
