@@ -25,10 +25,6 @@ import (
 	"github.com/saturncloud/phoebe/internal/waker"
 )
 
-// internalWakeTokenEnv is the legacy shared wake secret, kept for one
-// transition build (internal/waker internalWakeHeader).
-const internalWakeTokenEnv = "TF_INTERNAL_WAKE_TOKEN"
-
 // videosTokenEnv is the token the interceptor and phoebe-videos share.
 const videosTokenEnv = "PHOEBE_VIDEOS_TOKEN"
 
@@ -333,24 +329,19 @@ func buildWaker(s *config.Settings, log *logging.Logger) proxy.Waker {
 		return nil
 	}
 	// phoebe's Atlas service token (tf-internal:wake), re-read from its
-	// mounted Secret before every call. The legacy shared secret is sent too
-	// for the one transition build (internal/waker internalWakeHeader).
-	var tokens atlastoken.Source
-	if path := os.Getenv(atlastoken.EnvFile); path != "" {
-		file, err := atlastoken.NewFile(path, log)
-		if err != nil {
-			log.Error.Printf("wake: %v; wake-from-zero is disabled", err)
-			return nil
-		}
-		tokens = file
-	}
-	atlasWaker, err := waker.NewAtlas(s.Wake.AtlasURL, tokens, os.Getenv(internalWakeTokenEnv), log)
+	// mounted Secret before every call.
+	tokens, err := atlastoken.NewFile(os.Getenv(atlastoken.EnvFile), log)
 	if err != nil {
 		log.Error.Printf("wake: Atlas actuator unavailable (%v); wake-from-zero is disabled", err)
 		return nil
 	}
-	log.Info.Printf("wake: enabled through Atlas %s (service token file %q, legacy secret set: %t)",
-		s.Wake.AtlasURL, os.Getenv(atlastoken.EnvFile), os.Getenv(internalWakeTokenEnv) != "")
+	atlasWaker, err := waker.NewAtlas(s.Wake.AtlasURL, tokens, log)
+	if err != nil {
+		log.Error.Printf("wake: Atlas actuator unavailable (%v); wake-from-zero is disabled", err)
+		return nil
+	}
+	log.Info.Printf("wake: enabled through Atlas %s (service token file %q)",
+		s.Wake.AtlasURL, os.Getenv(atlastoken.EnvFile))
 	return atlasWaker
 }
 

@@ -94,10 +94,9 @@ emit:
 # call while Atlas answers that the workers are still starting, until timeout.
 # phoebe authenticates with its Atlas service token (tf-internal:wake), read
 # before every call from the file PHOEBE_ATLAS_TOKEN_FILE names; Atlas writes
-# and renews it. TF_INTERNAL_WAKE_TOKEN (the legacy shared secret) is also sent
-# while it is set, for one transition build. wake.enabled requires atlasURL;
-# with neither credential wake is disabled (cold responses pass through)
-# rather than crashing the proxy.
+# and renews it. wake.enabled requires atlasURL; without the token file path
+# wake is disabled (cold responses pass through) rather than crashing the
+# proxy.
 # timeout bounds one wake's request hold (default 300s). It MUST exceed the
 # real cold start — vLLM's cold reload measured ~2.5min on staging. If worker
 # restoration was confirmed but readiness exceeds this budget, the client gets
