@@ -394,6 +394,7 @@ func (a *API) delete(w http.ResponseWriter, r *http.Request, id Handoff, jobID s
 		}
 		CloseGrant(ctx, a.blob, a.log, j)
 		a.deleteFiles(ctx, j)
+		a.logDeleted(r, id, "cancelled", jobID)
 		writeJSON(w, http.StatusOK, j.Object())
 	case StatusInProgress:
 		writeError(w, errInProgress)
@@ -405,6 +406,7 @@ func (a *API) delete(w http.ResponseWriter, r *http.Request, id Handoff, jobID s
 			return
 		}
 		a.deleteFiles(ctx, job)
+		a.logDeleted(r, id, "deleted", jobID)
 		j, err := a.store.Get(ctx, jobID, id.OrgID, id.ResourceID)
 		if err != nil {
 			writeError(w, errInternal)
@@ -412,6 +414,14 @@ func (a *API) delete(w http.ResponseWriter, r *http.Request, id Handoff, jobID s
 		}
 		writeJSON(w, http.StatusOK, j.Object())
 	}
+}
+
+// logDeleted records which key cancelled a job or deleted its files: a
+// DELETE destroys a customer's files, and nothing else records who sent it.
+// The request id is the one the interceptor minted.
+func (a *API) logDeleted(r *http.Request, id Handoff, what, jobID string) {
+	a.log.Info.Printf("videos: %s %s org_id=%q resource_id=%q auth_id=%q retrieval=%v request_id=%q",
+		what, jobID, id.OrgID, id.ResourceID, id.AuthID, id.Retrieval, r.Header.Get("X-Request-Id"))
 }
 
 // deleteFiles removes a job's objects and records it. A failure is logged and

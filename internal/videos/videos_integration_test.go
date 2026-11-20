@@ -10,6 +10,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"log"
 	"math/big"
 	"net/http"
 	"net/http/httptest"
@@ -1225,5 +1226,35 @@ func TestReaperContinuesPastAHungDelete(t *testing.T) {
 	}
 	if s := filesOf(t, h.db, nextID); !s.deleted || s.prompt {
 		t.Errorf("the job behind the hung one: %+v; want its files deleted", s)
+	}
+}
+
+// P7: a DELETE that cancels a job or deletes its files logs the key that sent
+// it, with the org, endpoint, route and request id.
+func TestRetrievalDeleteLogsTheCallersKey(t *testing.T) {
+	h := newHarness(t)
+	var buf bytes.Buffer
+	h.api.log.Info = log.New(&buf, "", 0)
+	del := func(jobID string) int {
+		r := httptest.NewRequest(http.MethodDelete, "/v1/videos/"+jobID, nil)
+		enc, _ := EncodeHandoff(retrieval("org-a", "res-1"))
+		r.Header.Set(HeaderHandoff, enc)
+		r.Header.Set(HeaderToken, "tok")
+		r.Header.Set("X-Request-Id", "req-"+jobID)
+		w := httptest.NewRecorder()
+		h.api.ServeHTTP(w, r)
+		return w.Code
+	}
+	done := h.completed(identity("org-a", "res-1"))
+	queued := h.create(identity("org-a", "res-1"))
+	for _, tc := range []struct{ jobID, what string }{{done.ID, "deleted"}, {queued.ID, "cancelled"}} {
+		if code := del(tc.jobID); code != http.StatusOK {
+			t.Fatalf("delete %s: %d", tc.jobID, code)
+		}
+		want := fmt.Sprintf(`videos: %s %s org_id="org-a" resource_id="res-1" auth_id="other-key-org-a" retrieval=true request_id="req-%s"`,
+			tc.what, tc.jobID, tc.jobID)
+		if !strings.Contains(buf.String(), want) {
+			t.Errorf("log %q has no line %q", buf.String(), want)
+		}
 	}
 }
