@@ -276,14 +276,16 @@ func (a *API) dropInput(job *Job) {
 			a.log.Warn.Printf("videos: delete input image of refused job %s: %v", job.ID, err)
 		}
 	}
-	CloseGrant(ctx, a.blob, a.log, job)
+	CloseGrant(ctx, a.blob, a.log, job, 0)
 }
 
 // CloseGrant tells Atlas the job finished, so no upload is signed for it
-// again. Best effort: a job that is never closed stops being writable when
-// its upload window ends (Atlas TF_VIDEO_UPLOAD_WINDOW_MINUTES).
-func CloseGrant(ctx context.Context, blob Blob, log *logging.Logger, job *Job) {
-	if err := blob.Close(ctx, job.OrgID, job.ID); err != nil {
+// again. outputAttempt is the attempt whose files are a completed job's
+// output (0 for a job that did not complete). Best effort: a job that is
+// never closed stops being writable when its upload window ends (Atlas
+// TF_VIDEO_UPLOAD_WINDOW_MINUTES).
+func CloseGrant(ctx context.Context, blob Blob, log *logging.Logger, job *Job, outputAttempt int) {
+	if err := blob.Close(ctx, job.OrgID, job.ID, outputAttempt); err != nil {
 		log.Warn.Printf("videos: close %s with Atlas (its upload window still ends it): %v", job.ID, err)
 	}
 }
@@ -392,7 +394,7 @@ func (a *API) delete(w http.ResponseWriter, r *http.Request, id Handoff, jobID s
 			writeError(w, errInProgress)
 			return
 		}
-		CloseGrant(ctx, a.blob, a.log, j)
+		CloseGrant(ctx, a.blob, a.log, j, 0)
 		a.deleteFiles(ctx, j)
 		a.logDeleted(r, id, "cancelled", jobID)
 		writeJSON(w, http.StatusOK, j.Object())
@@ -427,7 +429,7 @@ func (a *API) logDeleted(r *http.Request, id Handoff, what, jobID string) {
 // deleteFiles removes a job's objects and records it. A failure is logged and
 // left for the reaper, which retries every expired job whose files remain.
 func (a *API) deleteFiles(ctx context.Context, j *Job) {
-	if err := DeleteJobFiles(ctx, a.blob, j); err != nil {
+	if err := DeleteJobFiles(ctx, a.blob, a.cfg.Prefix, j); err != nil {
 		a.log.Warn.Printf("videos: delete files of %s (the reaper will retry): %v", j.ID, err)
 		return
 	}
@@ -436,12 +438,10 @@ func (a *API) deleteFiles(ctx context.Context, j *Job) {
 	}
 }
 
-// DeleteJobFiles deletes every object a job stored.
-func DeleteJobFiles(ctx context.Context, blob Blob, j *Job) error {
-	for _, key := range []string{j.InputKey, j.VideoKey, j.ThumbnailKey} {
-		if key == "" {
-			continue
-		}
+// DeleteJobFiles deletes every object a job may have stored, every
+// attempt's files included (jobFileKeys).
+func DeleteJobFiles(ctx context.Context, blob Blob, prefix string, j *Job) error {
+	for _, key := range jobFileKeys(prefix, j) {
 		if err := blob.Delete(ctx, key); err != nil {
 			return err
 		}
