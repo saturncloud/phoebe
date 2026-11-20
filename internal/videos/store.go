@@ -57,11 +57,39 @@ func nullable(s string) any {
 	return s
 }
 
-// Insert writes a new queued job, unless the org already has jobsInFlight jobs
-// queued or running on the endpoint (errStoreOrgLimit) or the endpoint has
-// queueCap queued jobs (errStoreQueueFull). The counts and the insert run
-// under one transaction-scoped advisory lock per endpoint, so two concurrent
-// creates cannot both pass a limit with one slot left.
+// admit counts the jobs on the endpoint and refuses a new one when the org
+// already has jobsInFlight jobs queued or running there (errStoreOrgLimit) or
+// the endpoint has queueCap queued jobs (errStoreQueueFull).
+func admit(ctx context.Context, q interface {
+	QueryRowContext(context.Context, string, ...any) *sql.Row
+}, resourceID, orgID string, jobsInFlight, queueCap int) error {
+	var orgOpen, queued int
+	if err := q.QueryRowContext(ctx, `SELECT
+			count(*) FILTER (WHERE org_id = $2),
+			count(*) FILTER (WHERE status = 'queued')
+		FROM video_job WHERE resource_id = $1 AND status IN ('queued', 'in_progress')`,
+		resourceID, orgID).Scan(&orgOpen, &queued); err != nil {
+		return err
+	}
+	if orgOpen >= jobsInFlight {
+		return errStoreOrgLimit
+	}
+	if queued >= queueCap {
+		return errStoreQueueFull
+	}
+	return nil
+}
+
+// Admit runs Insert's limit checks without a lock, so a create that would be
+// refused is refused before Atlas is asked to register the job. It is only a
+// pre-check: two creates can both pass it, and Insert decides.
+func (s *Store) Admit(ctx context.Context, resourceID, orgID string, jobsInFlight, queueCap int) error {
+	return admit(ctx, s.db, resourceID, orgID, jobsInFlight, queueCap)
+}
+
+// Insert writes a new queued job, unless admit refuses it. The counts and the
+// insert run under one transaction-scoped advisory lock per endpoint, so two
+// concurrent creates cannot both pass a limit with one slot left.
 func (s *Store) Insert(ctx context.Context, j *Job, jobsInFlight, queueCap int) error {
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
@@ -71,19 +99,8 @@ func (s *Store) Insert(ctx context.Context, j *Job, jobsInFlight, queueCap int) 
 	if _, err := tx.ExecContext(ctx, `SELECT pg_advisory_xact_lock(hashtextextended('video_job:' || $1, 0))`, j.ResourceID); err != nil {
 		return err
 	}
-	var orgOpen, queued int
-	if err := tx.QueryRowContext(ctx, `SELECT
-			count(*) FILTER (WHERE org_id = $2),
-			count(*) FILTER (WHERE status = 'queued')
-		FROM video_job WHERE resource_id = $1 AND status IN ('queued', 'in_progress')`,
-		j.ResourceID, j.OrgID).Scan(&orgOpen, &queued); err != nil {
+	if err := admit(ctx, tx, j.ResourceID, j.OrgID, jobsInFlight, queueCap); err != nil {
 		return err
-	}
-	if orgOpen >= jobsInFlight {
-		return errStoreOrgLimit
-	}
-	if queued >= queueCap {
-		return errStoreQueueFull
 	}
 	params, err := json.Marshal(j.Params)
 	if err != nil {
@@ -383,8 +400,9 @@ func (s *Store) ActiveResources(ctx context.Context) ([]string, error) {
 	return out, rows.Err()
 }
 
-// ExpireQueued fails jobs that waited longer than the queue timeout.
-func (s *Store) ExpireQueued(ctx context.Context, createdBefore, now time.Time) (int, error) {
+// ExpireQueued fails jobs that waited longer than the queue timeout and
+// returns them, so the caller can close their grants with Atlas.
+func (s *Store) ExpireQueued(ctx context.Context, createdBefore, now time.Time) ([]*Job, error) {
 	return s.failWhere(ctx, `status = 'queued' AND created_at < $1`, createdBefore, finish{
 		status: StatusFailed, code: CodeQueueTimeout, at: now,
 		message: "the job waited in the queue longer than the queue timeout",
@@ -394,12 +412,13 @@ func (s *Store) ExpireQueued(ctx context.Context, createdBefore, now time.Time) 
 // ExpireLeases handles running jobs whose dispatcher stopped renewing the
 // lease (it crashed or lost its connection): the first attempt is requeued,
 // a second one fails, so a job that kills its dispatcher cannot loop forever.
-func (s *Store) ExpireLeases(ctx context.Context, now time.Time) (requeued, failed int, err error) {
+// It returns the failed jobs, so the caller can close their grants with Atlas.
+func (s *Store) ExpireLeases(ctx context.Context, now time.Time) (requeued int, failed []*Job, err error) {
 	res, err := s.db.ExecContext(ctx, `UPDATE video_job SET status = 'queued', progress = 0, lease_until = NULL,
 			started_at = NULL, enqueued_at = 'epoch'
 		WHERE status = 'in_progress' AND lease_until < $1 AND attempts < 2`, now)
 	if err != nil {
-		return 0, 0, err
+		return 0, nil, err
 	}
 	n, _ := res.RowsAffected()
 	f, err := s.failWhere(ctx, `status = 'in_progress' AND lease_until < $1`, now, finish{
@@ -409,22 +428,25 @@ func (s *Store) ExpireLeases(ctx context.Context, now time.Time) (requeued, fail
 	return int(n), f, err
 }
 
-func (s *Store) failWhere(ctx context.Context, where string, arg any, f finish) (int, error) {
+// failWhere ends the jobs that match where with f and returns them as they
+// were before the change (their id and org are what the caller needs). On an
+// error it returns the jobs it already ended.
+func (s *Store) failWhere(ctx context.Context, where string, arg any, f finish) ([]*Job, error) {
 	rows, err := s.db.QueryContext(ctx, `SELECT id FROM video_job WHERE `+where+` LIMIT 500`, arg)
 	if err != nil {
-		return 0, err
+		return nil, err
 	}
 	var ids []string
 	for rows.Next() {
 		var id string
 		if err := rows.Scan(&id); err != nil {
 			rows.Close()
-			return 0, err
+			return nil, err
 		}
 		ids = append(ids, id)
 	}
 	rows.Close()
-	done := 0
+	var done []*Job
 	for _, id := range ids {
 		tx, err := s.db.BeginTx(ctx, nil)
 		if err != nil {
@@ -447,7 +469,7 @@ func (s *Store) failWhere(ctx context.Context, where string, arg any, f finish) 
 		if err := tx.Commit(); err != nil {
 			return done, err
 		}
-		done++
+		done = append(done, j)
 	}
 	return done, nil
 }
@@ -467,13 +489,16 @@ func whereWithID(where string) string {
 }
 
 // ExpiredFiles lists completed jobs whose files are past expires_at, or jobs
-// that ended without completing but still have an input image stored.
+// that ended without completing but still have an input image stored. Jobs
+// whose delete never failed come first, then the ones that failed longest
+// ago, so a batch of files that cannot be deleted does not hold back the
+// files behind it.
 func (s *Store) ExpiredFiles(ctx context.Context, now time.Time, limit int) ([]*Job, error) {
 	rows, err := s.db.QueryContext(ctx, `SELECT `+jobColumns+` FROM video_job
 		WHERE files_deleted_at IS NULL AND (
 			(expires_at IS NOT NULL AND expires_at < $1)
 			OR (status IN ('failed', 'cancelled') AND completed_at < $1)
-		) ORDER BY created_at LIMIT $2`, now, limit)
+		) ORDER BY files_delete_failed_at NULLS FIRST, created_at LIMIT $2`, now, limit)
 	if err != nil {
 		return nil, err
 	}
@@ -494,6 +519,14 @@ func (s *Store) ExpiredFiles(ctx context.Context, now time.Time, limit int) ([]*
 func (s *Store) MarkFilesDeleted(ctx context.Context, id string, now time.Time) error {
 	_, err := s.db.ExecContext(ctx, `UPDATE video_job SET files_deleted_at = $2, prompt = NULL,
 			params = params - 'negative_prompt'
+		WHERE id = $1 AND files_deleted_at IS NULL`, id, now)
+	return err
+}
+
+// MarkFilesDeleteFailed records that deleting a job's files failed, which puts
+// the job behind every job not yet tried in ExpiredFiles.
+func (s *Store) MarkFilesDeleteFailed(ctx context.Context, id string, now time.Time) error {
+	_, err := s.db.ExecContext(ctx, `UPDATE video_job SET files_delete_failed_at = $2
 		WHERE id = $1 AND files_deleted_at IS NULL`, id, now)
 	return err
 }

@@ -82,6 +82,18 @@ type memBlob struct {
 	// refuse makes Register fail, as Atlas does for an org that does not own
 	// the endpoint or when the store is not configured.
 	refuse bool
+	// registers and closes count the calls that reached "Atlas".
+	registers, closes int
+	// onRegister runs after a successful Register (outside the lock).
+	onRegister func()
+	// deleteErr, when set, decides Delete's answer for a key.
+	deleteErr func(key string) error
+	// deleteHangs, when set and true for a key, makes Delete wait until its
+	// context ends, like a store that never answers.
+	deleteHangs func(key string) bool
+	// putErr, when set, decides Put's answer for a key (as Atlas refusing to
+	// sign it would).
+	putErr func(key string) error
 }
 
 type grant struct {
@@ -91,20 +103,27 @@ type grant struct {
 
 func (b *memBlob) Register(_ context.Context, orgID, jobID, resourceID, inputExt string) error {
 	b.mu.Lock()
-	defer b.mu.Unlock()
+	b.registers++
 	if b.refuse {
+		b.mu.Unlock()
 		return fmt.Errorf("Atlas answered 404")
 	}
 	if b.grants == nil {
 		b.grants = map[string]*grant{}
 	}
 	b.grants[jobID] = &grant{org: orgID, resource: resourceID, inputExt: inputExt}
+	hook := b.onRegister
+	b.mu.Unlock()
+	if hook != nil {
+		hook()
+	}
 	return nil
 }
 
 func (b *memBlob) Close(_ context.Context, orgID, jobID string) error {
 	b.mu.Lock()
 	defer b.mu.Unlock()
+	b.closes++
 	g, ok := b.grants[jobID]
 	if !ok || g.org != orgID {
 		return fmt.Errorf("no job %s for %s", jobID, orgID)
@@ -123,6 +142,11 @@ func (b *memBlob) grant(jobID string) grant {
 }
 
 func (b *memBlob) Put(_ context.Context, key string, r io.Reader, _ int64, _ string) error {
+	if b.putErr != nil {
+		if err := b.putErr(key); err != nil {
+			return err
+		}
+	}
 	if b.fail {
 		return fmt.Errorf("store down")
 	}
@@ -157,9 +181,18 @@ func (b *memBlob) Get(_ context.Context, key string) (io.ReadCloser, int64, erro
 	return io.NopCloser(bytes.NewReader(d)), int64(len(d)), nil
 }
 
-func (b *memBlob) Delete(_ context.Context, key string) error {
+func (b *memBlob) Delete(ctx context.Context, key string) error {
+	if b.deleteHangs != nil && b.deleteHangs(key) {
+		<-ctx.Done()
+		return ctx.Err()
+	}
 	b.mu.Lock()
 	defer b.mu.Unlock()
+	if b.deleteErr != nil {
+		if err := b.deleteErr(key); err != nil {
+			return err
+		}
+	}
 	delete(b.objs, key)
 	return nil
 }
@@ -689,12 +722,16 @@ func TestCreateIsRefusedWhenAtlasRefusesTheJob(t *testing.T) {
 }
 
 // A job whose create is refused after registration (here the org's
-// jobs-in-flight limit) is closed with Atlas and its input image deleted.
+// jobs-in-flight limit, reached by a concurrent create between the pre-check
+// and the insert) is closed with Atlas and its input image deleted.
 func TestARefusedCreateClosesItsGrant(t *testing.T) {
 	h := newHarness(t)
 	id := identity("org-a", "res-1")
-	h.create(id)
-	h.create(id) // jobs_in_flight is 2
+	h.create(id) // jobs_in_flight is 2: one slot left, so the pre-check passes
+	h.blob.onRegister = func() {
+		h.blob.onRegister = nil
+		h.insertRow(id) // a concurrent create takes the last slot
+	}
 	dataURL := "data:image/png;base64," + encodeB64(pngBytes)
 	w := h.do(http.MethodPost, "/v1/videos", `{"model":"my-wan","prompt":"move","input_reference":{"image_url":"`+dataURL+`"}}`, id)
 	if w.Code != http.StatusTooManyRequests {
@@ -831,5 +868,354 @@ func TestRetrievalNeverCreatesOrLists(t *testing.T) {
 	_ = h.db.QueryRow(`SELECT count(*) FROM video_job`).Scan(&n)
 	if n != 0 {
 		t.Fatalf("%d jobs exist", n)
+	}
+}
+
+// insertRow writes a queued job straight into the store, as a concurrent
+// create would, without registering it with Atlas.
+func (h *harness) insertRow(id Handoff) *Job {
+	h.t.Helper()
+	jobID, err := NewID(h.now)
+	if err != nil {
+		h.t.Fatal(err)
+	}
+	prompt := "a dog"
+	j := &Job{ID: jobID, OrgID: id.OrgID, AuthID: id.AuthID, ResourceID: id.ResourceID,
+		ServedModel: id.ServedModel, BaseModel: id.BaseModel, ServingMode: id.ServingMode,
+		Upstream: id.Upstream, Task: "t2v", Prompt: &prompt, Seconds: 5, Size: "1280x704",
+		FPS: 24, GPUs: 1, MaxConcurrency: 1, Status: StatusQueued, CreatedAt: h.now}
+	if err := h.store.Insert(context.Background(), j, 100, 100); err != nil {
+		h.t.Fatal(err)
+	}
+	return j
+}
+
+func (h *harness) atlasCalls() (registers, closes int) {
+	h.blob.mu.Lock()
+	defer h.blob.mu.Unlock()
+	return h.blob.registers, h.blob.closes
+}
+
+// A create the org's jobs-in-flight limit refuses is refused before Atlas is
+// asked to register it: no grant is opened, so none needs closing.
+func TestCreateRefusedByOrgLimitDoesNotRegisterWithAtlas(t *testing.T) {
+	h := newHarness(t)
+	id := identity("org-a", "res-1")
+	h.create(id)
+	h.create(id) // jobs_in_flight is 2
+	regs, closes := h.atlasCalls()
+	w := h.do(http.MethodPost, "/v1/videos", `{"model":"my-wan","prompt":"x"}`, id)
+	if w.Code != http.StatusTooManyRequests {
+		t.Fatalf("third create: %d %s", w.Code, w.Body)
+	}
+	if r, c := h.atlasCalls(); r != regs || c != closes {
+		t.Fatalf("Atlas calls for the refused create: %d register(s), %d close(s); want none", r-regs, c-closes)
+	}
+}
+
+// A create the endpoint's full queue refuses is refused before Atlas is
+// asked to register it.
+func TestCreateRefusedByFullQueueDoesNotRegisterWithAtlas(t *testing.T) {
+	h := newHarness(t)
+	a := identity("org-a", "res-1")
+	h.create(a)
+	h.create(a)
+	b := identity("org-b", "res-1")
+	h.create(b) // the queue cap is 3
+	regs, closes := h.atlasCalls()
+	w := h.do(http.MethodPost, "/v1/videos", `{"model":"my-wan","prompt":"x"}`, b)
+	if w.Code != http.StatusServiceUnavailable {
+		t.Fatalf("fourth queued job: %d %s", w.Code, w.Body)
+	}
+	if r, c := h.atlasCalls(); r != regs || c != closes {
+		t.Fatalf("Atlas calls for the refused create: %d register(s), %d close(s); want none", r-regs, c-closes)
+	}
+}
+
+// A job the reaper fails for waiting too long is closed with Atlas, so no
+// upload can be signed for it again.
+func TestReaperClosesGrantOfQueueTimedOutJob(t *testing.T) {
+	h := newHarness(t)
+	id := identity("org-a", "res-1")
+	o := h.create(id)
+	if g := h.blob.grant(o.ID); g.org != "org-a" || g.closed {
+		t.Fatalf("grant after create: %+v", g)
+	}
+	h.now = h.now.Add(61 * time.Minute)
+	h.reaper.Once(context.Background())
+	if got := h.object(h.do(http.MethodGet, "/v1/videos/"+o.ID, "", id)); got.Error == nil || got.Error.Code != CodeQueueTimeout {
+		t.Fatalf("queue timeout: %+v", got)
+	}
+	if g := h.blob.grant(o.ID); !g.closed {
+		t.Fatalf("the timed-out job's grant is still open")
+	}
+}
+
+// A job the reaper fails because its worker stopped twice is closed with
+// Atlas; after the first stop it is requeued and its grant stays open.
+func TestReaperClosesGrantOfJobFailedOnLeaseLoss(t *testing.T) {
+	h := newHarness(t)
+	id := identity("org-a", "res-1")
+	o := h.create(id)
+	for i := 0; i < 2; i++ {
+		e, _ := h.queue.Next(context.Background(), id.ResourceID, time.Minute)
+		if e != nil {
+			_ = h.queue.Done(context.Background(), id.ResourceID, e.StreamID)
+		}
+		if j, _, err := h.store.Claim(context.Background(), o.ID, time.Minute, h.now); err != nil || j == nil {
+			t.Fatalf("claim %d: %v %v", i, j, err)
+		}
+		h.now = h.now.Add(2 * time.Minute)
+		h.reaper.Once(context.Background())
+		if i == 0 && h.blob.grant(o.ID).closed {
+			t.Fatalf("the requeued job's grant was closed; it will run again")
+		}
+	}
+	if got := h.object(h.do(http.MethodGet, "/v1/videos/"+o.ID, "", id)); got.Status != StatusFailed {
+		t.Fatalf("lease expired twice: %+v", got)
+	}
+	if g := h.blob.grant(o.ID); !g.closed {
+		t.Fatalf("the failed job's grant is still open")
+	}
+}
+
+// insertExpired writes a failed job whose input image is due for deletion.
+func insertExpired(t *testing.T, db *sql.DB, id, inputKey string, created, now time.Time) {
+	t.Helper()
+	if _, err := db.Exec(`INSERT INTO video_job (id, org_id, auth_id, resource_id, served_model,
+			base_model, serving_mode, upstream, task, prompt, seconds, size, fps, gpus, status,
+			error_code, created_at, completed_at, input_key)
+		VALUES ($1, 'org-a', 'key-a', 'res-1', 'my-wan', 'base', 'dedicated', 'up:8000', 'i2v',
+			'a secret prompt', 5, '1280x704', 24, 1, 'failed', 'engine_error', $2, $3, $4)`,
+		id, created, now.Add(-time.Hour), inputKey); err != nil {
+		t.Fatal(err)
+	}
+}
+
+type fileState struct {
+	deleted, failed, prompt bool
+}
+
+func filesOf(t *testing.T, db *sql.DB, id string) fileState {
+	t.Helper()
+	var s fileState
+	if err := db.QueryRow(`SELECT files_deleted_at IS NOT NULL, files_delete_failed_at IS NOT NULL,
+			prompt IS NOT NULL FROM video_job WHERE id = $1`, id).Scan(&s.deleted, &s.failed, &s.prompt); err != nil {
+		t.Fatal(err)
+	}
+	return s
+}
+
+// Jobs whose files keep failing to delete go behind every job not yet tried,
+// so more of them than one reaper batch (500) cannot hold back a newer job's
+// files forever.
+func TestReaperDoesNotStarveBehindUndeletableFiles(t *testing.T) {
+	h := newHarness(t)
+	ctx := context.Background()
+	base := h.now.Add(-3 * time.Hour)
+	if _, err := h.db.Exec(`INSERT INTO video_job (id, org_id, auth_id, resource_id, served_model,
+			base_model, serving_mode, upstream, task, prompt, seconds, size, fps, gpus, status,
+			error_code, created_at, completed_at, input_key)
+		SELECT 'stuck-' || i, 'org-a', 'key-a', 'res-1', 'my-wan', 'base', 'dedicated', 'up:8000', 'i2v',
+			'p', 5, '1280x704', 24, 1, 'failed', 'engine_error', $1::timestamptz + i * interval '1 second',
+			$2, 'tf-videos/org-a/stuck-' || i || '/input.png'
+		FROM generate_series(1, 600) AS i`, base, h.now.Add(-time.Hour)); err != nil {
+		t.Fatal(err)
+	}
+	h.blob.deleteErr = func(key string) error {
+		if strings.Contains(key, "/stuck-") {
+			return fmt.Errorf("store answered 500")
+		}
+		return nil
+	}
+	// Every stuck job is tried once (two batches of at most 500).
+	h.reaper.Once(ctx)
+	h.reaper.Once(ctx)
+	var failed, deleted int
+	_ = h.db.QueryRow(`SELECT count(*) FILTER (WHERE files_delete_failed_at IS NOT NULL),
+		count(*) FILTER (WHERE files_deleted_at IS NOT NULL) FROM video_job`).Scan(&failed, &deleted)
+	if failed != 600 || deleted != 0 {
+		t.Fatalf("after two runs: %d marked failed, %d marked deleted; want 600 and 0", failed, deleted)
+	}
+
+	// A newer job's files expire: one run deletes them, though 600 older
+	// undeletable jobs are still due.
+	fresh := "tf-videos/org-a/fresh/input.png"
+	h.blob.mu.Lock()
+	h.blob.objs[fresh] = []byte("png")
+	h.blob.mu.Unlock()
+	insertExpired(t, h.db, "fresh", fresh, base.Add(time.Hour), h.now)
+	h.reaper.Once(ctx)
+	if s := filesOf(t, h.db, "fresh"); !s.deleted || s.prompt {
+		t.Fatalf("the newer job's files after one run: %+v", s)
+	}
+	for _, k := range h.blob.keys() {
+		if k == fresh {
+			t.Fatalf("the newer job's input image is still stored")
+		}
+	}
+}
+
+// When Atlas no longer has a job (404), or a stored key is not one this
+// service's layout makes, no retry can delete the file: the reaper logs it and
+// marks the files deleted, so the prompt is erased and the row can be pruned.
+// A 403 (also Atlas's answer to a wrong internal token) and a 503 are retried.
+func TestReaperTreatsMissingAtlasGrantAsFinal(t *testing.T) {
+	h := newHarness(t)
+	ctx := context.Background()
+	keys := Keys{Prefix: "tf-videos"}
+	newID := func() string {
+		id, err := NewID(h.now)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return id
+	}
+	gone, denied, down, badKey := newID(), newID(), newID(), newID()
+	status := map[string]int{gone: http.StatusNotFound, denied: http.StatusForbidden, down: http.StatusServiceUnavailable}
+	var mu sync.Mutex
+	asked := map[string]int{}
+	atlas := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		jobID := strings.TrimSuffix(strings.TrimPrefix(r.URL.Path, atlasVideoJobsPath+"/"), "/object-urls")
+		mu.Lock()
+		asked[jobID]++
+		mu.Unlock()
+		code, ok := status[jobID]
+		if !ok {
+			code = http.StatusInternalServerError
+		}
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(code)
+		_, _ = w.Write([]byte(`{"message":"refused"}`))
+	}))
+	t.Cleanup(atlas.Close)
+	blob, err := NewAtlasBlob(atlas.URL, "tok", "tf-videos")
+	if err != nil {
+		t.Fatal(err)
+	}
+	h.reaper = NewReaper(ReaperConfig{}, h.store, h.queue, blob, testLogger())
+	h.reaper.now = func() time.Time { return h.now }
+
+	created := h.now.Add(-2 * time.Hour)
+	for _, id := range []string{gone, denied, down} {
+		insertExpired(t, h.db, id, keys.Input("org-a", id, "png"), created, h.now)
+	}
+	insertExpired(t, h.db, badKey, "tf-videos/org-a/not-a-job/input.png", created, h.now)
+	h.reaper.Once(ctx)
+
+	for name, id := range map[string]string{"atlas 404": gone, "unparseable key": badKey} {
+		if s := filesOf(t, h.db, id); !s.deleted || s.prompt {
+			t.Errorf("%s: %+v; want the files marked deleted and the prompt erased", name, s)
+		}
+	}
+	for name, id := range map[string]string{"atlas 403": denied, "atlas 503": down} {
+		if s := filesOf(t, h.db, id); s.deleted || !s.failed || !s.prompt {
+			t.Errorf("%s: %+v; want a retry (marked failed, not deleted, prompt kept)", name, s)
+		}
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if asked["not-a-job"] != 0 || len(asked) != 3 {
+		t.Errorf("Atlas was asked %v; want only the three well-formed jobs", asked)
+	}
+}
+
+// Atlas refusing to sign the video upload (here 409: the job is no longer in
+// progress) answers the same on every attempt, so the job fails at once
+// instead of generating the whole video again. A 503 is still retried.
+func TestDispatcherDoesNotRetryAnAtlasRefusedUpload(t *testing.T) {
+	h := newHarness(t)
+	id := identity("org-a", "res-1")
+	status := http.StatusConflict
+	h.blob.putErr = func(key string) error {
+		if strings.HasSuffix(key, "/video.mp4") {
+			return &atlasError{status: status, msg: "refused"}
+		}
+		return nil
+	}
+	o := h.create(id)
+	h.run()
+	h.run()
+	got := h.object(h.do(http.MethodGet, "/v1/videos/"+o.ID, "", id))
+	if got.Status != StatusFailed || got.Error == nil || got.Error.Code != CodeEngine ||
+		got.Error.Message != "the video could not be stored" {
+		t.Fatalf("refused upload: %+v %+v", got, got.Error)
+	}
+	if h.engine.calls != 1 {
+		t.Fatalf("the engine ran %d times for a refused upload; want 1", h.engine.calls)
+	}
+	if !h.blob.grant(o.ID).closed {
+		t.Fatal("the failed job's grant is still open")
+	}
+
+	status = http.StatusServiceUnavailable
+	o = h.create(id)
+	h.run()
+	var st string
+	var attempts int
+	_ = h.db.QueryRow(`SELECT status, attempts FROM video_job WHERE id = $1`, o.ID).Scan(&st, &attempts)
+	if st != StatusQueued || attempts != 1 {
+		t.Fatalf("Atlas 503 on upload: status %s attempts %d; want it requeued for a retry", st, attempts)
+	}
+}
+
+// A video larger than Atlas signs an upload for (413) fails the job with
+// output_too_large, not a generic error, and is not generated again.
+func TestDispatcherOutputOverStoreCapIsOutputTooLarge(t *testing.T) {
+	h := newHarness(t)
+	id := identity("org-a", "res-1")
+	h.blob.putErr = func(key string) error {
+		if strings.HasSuffix(key, "/video.mp4") {
+			return &atlasError{status: http.StatusRequestEntityTooLarge, msg: "too large"}
+		}
+		return nil
+	}
+	o := h.create(id)
+	h.run()
+	h.run()
+	got := h.object(h.do(http.MethodGet, "/v1/videos/"+o.ID, "", id))
+	if got.Status != StatusFailed || got.Error == nil || got.Error.Code != CodeOutputTooLarge {
+		t.Fatalf("upload over the store cap: %+v %+v", got, got.Error)
+	}
+	if h.engine.calls != 1 {
+		t.Fatalf("the engine ran %d times; want 1", h.engine.calls)
+	}
+}
+
+// A delete that never returns is cut off by the reaper's per-job timeout: the
+// job is marked for a later retry and the jobs behind it are still deleted in
+// the same run.
+func TestReaperContinuesPastAHungDelete(t *testing.T) {
+	h := newHarness(t)
+	ctx := context.Background()
+	h.reaper = NewReaper(ReaperConfig{DeleteTimeout: 200 * time.Millisecond}, h.store, h.queue, h.blob, testLogger())
+	h.reaper.now = func() time.Time { return h.now }
+	keys := Keys{Prefix: "tf-videos"}
+	hungID, err := NewID(h.now.Add(-3 * time.Hour))
+	if err != nil {
+		t.Fatal(err)
+	}
+	nextID, err := NewID(h.now.Add(-2 * time.Hour))
+	if err != nil {
+		t.Fatal(err)
+	}
+	hungKey, nextKey := keys.Input("org-a", hungID, "png"), keys.Input("org-a", nextID, "png")
+	h.blob.objs[nextKey] = []byte("png")
+	insertExpired(t, h.db, hungID, hungKey, h.now.Add(-3*time.Hour), h.now)
+	insertExpired(t, h.db, nextID, nextKey, h.now.Add(-2*time.Hour), h.now)
+	h.blob.deleteHangs = func(key string) bool { return key == hungKey }
+
+	done := make(chan struct{})
+	go func() { h.reaper.Once(ctx); close(done) }()
+	select {
+	case <-done:
+	case <-time.After(30 * time.Second):
+		t.Fatal("the reaper is stuck on a delete that never returns")
+	}
+	if s := filesOf(t, h.db, hungID); s.deleted || !s.failed {
+		t.Errorf("the hung job: %+v; want it marked for a retry", s)
+	}
+	if s := filesOf(t, h.db, nextID); !s.deleted || s.prompt {
+		t.Errorf("the job behind the hung one: %+v; want its files deleted", s)
 	}
 }

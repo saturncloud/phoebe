@@ -46,13 +46,16 @@ func (k Keys) join(orgID, jobID, name string) string {
 	return strings.Trim(k.Prefix, "/") + "/" + orgID + "/" + jobID + "/" + name
 }
 
+// errNotVideoKey is Parse refusing a key: no retry can make it valid.
+var errNotVideoKey = errors.New("not a video job object")
+
 // Parse splits a key this layout made into the job's org and id. Anything
 // else is refused before Atlas is asked (Atlas refuses it too).
 func (k Keys) Parse(key string) (orgID, jobID string, err error) {
 	rest, ok := strings.CutPrefix(key, strings.Trim(k.Prefix, "/")+"/")
 	parts := strings.Split(rest, "/")
 	if !ok || len(parts) != 3 || parts[0] == "" || !ValidID(parts[1]) || parts[2] == "" {
-		return "", "", fmt.Errorf("video store: key %q is not a video job object", key)
+		return "", "", fmt.Errorf("video store: key %q is %w", key, errNotVideoKey)
 	}
 	return parts[0], parts[1], nil
 }
@@ -75,7 +78,9 @@ type AtlasBlob struct {
 	keys    Keys
 	// atlas calls Atlas; store sends the signed requests. Neither uses an
 	// ambient HTTP proxy from the pod environment (the token and the URLs are
-	// credentials), and the store client never follows a redirect.
+	// credentials), and neither follows a redirect: a redirect from Atlas
+	// would carry the token to another host, and one from the store would
+	// send a signed request somewhere it was not signed for.
 	atlas *http.Client
 	store *http.Client
 	now   func() time.Time
@@ -95,18 +100,63 @@ func NewAtlasBlob(baseURL, token, prefix string) (*AtlasBlob, error) {
 	if strings.Trim(prefix, "/") == "" {
 		return nil, errors.New("video store: the key prefix is empty")
 	}
-	transport := http.DefaultTransport.(*http.Transport).Clone()
-	transport.Proxy = nil
+	noRedirect := func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }
+	atlasTransport := http.DefaultTransport.(*http.Transport).Clone()
+	atlasTransport.Proxy = nil
+	// The store client has no whole-request timeout (a 5 GiB upload takes as
+	// long as it takes; the caller's context bounds it), so a store that
+	// accepts the request and never answers is cut off by
+	// ResponseHeaderTimeout instead. DisableCompression keeps the transport
+	// from asking for gzip, so a Get's Content-Length is the object's length.
+	storeTransport := http.DefaultTransport.(*http.Transport).Clone()
+	storeTransport.Proxy = nil
+	storeTransport.ResponseHeaderTimeout = storeResponseHeaderTimeout
+	storeTransport.DisableCompression = true
 	return &AtlasBlob{
 		baseURL: strings.TrimRight(baseURL, "/"),
 		token:   token,
 		keys:    Keys{Prefix: prefix},
-		atlas:   &http.Client{Transport: transport, Timeout: 30 * time.Second},
-		store: &http.Client{Transport: transport, CheckRedirect: func(*http.Request, []*http.Request) error {
-			return http.ErrUseLastResponse
-		}},
-		now: time.Now,
+		atlas:   &http.Client{Transport: atlasTransport, Timeout: 30 * time.Second, CheckRedirect: noRedirect},
+		store:   &http.Client{Transport: storeTransport, CheckRedirect: noRedirect},
+		now:     time.Now,
 	}, nil
+}
+
+// storeResponseHeaderTimeout is how long the store may take to start
+// answering a request it has received (for an upload, after the last byte).
+const storeResponseHeaderTimeout = 60 * time.Second
+
+// scrubURLError removes the query and fragment from the URL a transport error
+// names. A presigned URL's query holds its signature (X-Amz-Signature), which
+// must not reach a log; the scheme, host and path are enough to debug.
+func scrubURLError(err error) error {
+	var ue *url.Error
+	if errors.As(err, &ue) {
+		if u, perr := url.Parse(ue.URL); perr == nil {
+			ue.URL = (&url.URL{Scheme: u.Scheme, Host: u.Host, Path: u.Path}).String()
+		} else {
+			ue.URL = "(unparseable URL)"
+		}
+	}
+	return err
+}
+
+// storageRefusedPermanently reports whether err is Atlas refusing to sign a
+// request in a way that sending the same request again cannot change (a bad
+// request, a key or job Atlas will not sign for, a job no longer in progress,
+// a length over the store's limit), and with what status. Transport errors,
+// Atlas 5xx and the store's own answers are not permanent.
+func storageRefusedPermanently(err error) (status int, ok bool) {
+	var ae *atlasError
+	if !errors.As(err, &ae) {
+		return 0, false
+	}
+	switch ae.status {
+	case http.StatusBadRequest, http.StatusForbidden, http.StatusNotFound,
+		http.StatusConflict, http.StatusRequestEntityTooLarge:
+		return ae.status, true
+	}
+	return 0, false
 }
 
 // atlasError is a refusal from Atlas, with its status.
@@ -132,7 +182,7 @@ func (b *AtlasBlob) call(ctx context.Context, path string, body any, want int, o
 	req.Header.Set(atlasVideoStoreHeader, b.token)
 	resp, err := b.atlas.Do(req)
 	if err != nil {
-		return fmt.Errorf("video store: Atlas: %w", err)
+		return fmt.Errorf("video store: Atlas: %w", scrubURLError(err))
 	}
 	defer resp.Body.Close()
 	data, _ := io.ReadAll(io.LimitReader(resp.Body, 64<<10))
@@ -241,7 +291,7 @@ func (b *AtlasBlob) Put(ctx context.Context, key string, r io.Reader, size int64
 	req.ContentLength = size
 	resp, err := b.store.Do(req)
 	if err != nil {
-		return fmt.Errorf("video store: put %s: %w", key, err)
+		return fmt.Errorf("video store: put %s: %w", key, scrubURLError(err))
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusNoContent {
@@ -252,12 +302,13 @@ func (b *AtlasBlob) Put(ctx context.Context, key string, r io.Reader, size int64
 
 // Get opens the object. Its status is known before any byte of the body, so
 // a refused read fails before the API has written a 200. A job whose files
-// can no longer exist (Atlas 409) or whose object is gone reads as
-// ErrBlobNotFound.
+// can no longer exist (Atlas 409), a job Atlas no longer has (Atlas 404: its
+// row was pruned) or an object that is gone reads as ErrBlobNotFound. A 403
+// stays an error: Atlas also answers 403 to a wrong internal token.
 func (b *AtlasBlob) Get(ctx context.Context, key string) (io.ReadCloser, int64, error) {
 	req, err := b.presign(ctx, key, http.MethodGet, 0)
 	var ae *atlasError
-	if errors.As(err, &ae) && ae.status == http.StatusConflict {
+	if errors.As(err, &ae) && (ae.status == http.StatusConflict || ae.status == http.StatusNotFound) {
 		return nil, 0, ErrBlobNotFound
 	}
 	if err != nil {
@@ -265,7 +316,7 @@ func (b *AtlasBlob) Get(ctx context.Context, key string) (io.ReadCloser, int64, 
 	}
 	resp, err := b.store.Do(req)
 	if err != nil {
-		return nil, 0, fmt.Errorf("video store: get %s: %w", key, err)
+		return nil, 0, fmt.Errorf("video store: get %s: %w", key, scrubURLError(err))
 	}
 	switch {
 	case resp.StatusCode == http.StatusNotFound:
@@ -288,7 +339,7 @@ func (b *AtlasBlob) Delete(ctx context.Context, key string) error {
 	}
 	resp, err := b.store.Do(req)
 	if err != nil {
-		return fmt.Errorf("video store: delete %s: %w", key, err)
+		return fmt.Errorf("video store: delete %s: %w", key, scrubURLError(err))
 	}
 	defer resp.Body.Close()
 	switch resp.StatusCode {

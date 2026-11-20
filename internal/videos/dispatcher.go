@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"net/http"
 	"os"
 	"path/filepath"
 	"sync"
@@ -207,7 +208,17 @@ func (d *Dispatcher) run(ctx context.Context, job *Job) {
 	d.complete(ctx, job, attempt, videoPath, written, wall)
 }
 
+// The longest one store call of the dispatcher may take. The run context has
+// no deadline of its own, so without these a store that stops answering would
+// hold the job (and its renewed lease) forever.
+const (
+	readInputTimeout = 2 * time.Minute
+	putFileTimeout   = 15 * time.Minute
+)
+
 func (d *Dispatcher) readInput(ctx context.Context, key string) ([]byte, error) {
+	ctx, cancel := context.WithTimeout(ctx, readInputTimeout)
+	defer cancel()
 	r, size, err := d.blob.Get(ctx, key)
 	if err != nil {
 		return nil, err
@@ -239,7 +250,18 @@ func (d *Dispatcher) complete(ctx context.Context, job *Job, attempt int, videoP
 		return
 	}
 	if err := d.putFile(ctx, videoKey, videoPath, info.Size(), "video/mp4"); err != nil {
-		d.retryOrFail(ctx, job, attempt, fmt.Errorf("store video: %w", err))
+		err = fmt.Errorf("store video: %w", err)
+		// Atlas refusing to sign the upload answers the same way on a second
+		// attempt, after the whole generation has run again: fail now. Only a
+		// transport error or an Atlas or store failure is retried.
+		switch status, permanent := storageRefusedPermanently(err); {
+		case permanent && status == http.StatusRequestEntityTooLarge:
+			d.fail(ctx, job, attempt, CodeOutputTooLarge, "the generated video is larger than the store accepts", err)
+		case permanent:
+			d.fail(ctx, job, attempt, CodeEngine, "the video could not be stored", err)
+		default:
+			d.retryOrFail(ctx, job, attempt, err)
+		}
 		return
 	}
 	thumbKey := ""
@@ -283,6 +305,8 @@ func (d *Dispatcher) complete(ctx context.Context, job *Job, attempt int, videoP
 }
 
 func (d *Dispatcher) putFile(ctx context.Context, key, path string, size int64, ctype string) error {
+	ctx, cancel := context.WithTimeout(ctx, putFileTimeout)
+	defer cancel()
 	f, err := os.Open(path)
 	if err != nil {
 		return err

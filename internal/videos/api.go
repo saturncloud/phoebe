@@ -196,6 +196,13 @@ func (a *API) create(w http.ResponseWriter, r *http.Request, id Handoff, limits 
 		writeError(w, errQueueDown)
 		return
 	}
+	// A create the limits refuse now is refused before Atlas registers it, so
+	// a client retrying into a full queue never adds work to Atlas. Insert
+	// checks the limits again under its lock and decides.
+	if err := a.store.Admit(ctx, id.ResourceID, id.OrgID, limits.JobsInFlight, a.cfg.QueueCap); err != nil {
+		a.writeLimitError(w, "count jobs on "+id.ResourceID, err)
+		return
+	}
 	now := a.now().UTC()
 	jobID, err := NewID(now)
 	if err != nil {
@@ -232,15 +239,7 @@ func (a *API) create(w http.ResponseWriter, r *http.Request, id Handoff, limits 
 	}
 	if err := a.store.Insert(ctx, job, limits.JobsInFlight, a.cfg.QueueCap); err != nil {
 		a.dropInput(job)
-		switch {
-		case errors.Is(err, errStoreOrgLimit):
-			writeError(w, errOrgLimit)
-		case errors.Is(err, errStoreQueueFull):
-			writeError(w, errQueueFull)
-		default:
-			a.log.Error.Printf("videos: insert %s: %v", jobID, err)
-			writeError(w, errInternal)
-		}
+		a.writeLimitError(w, "insert "+jobID, err)
 		return
 	}
 	if err := a.queue.Add(ctx, id.ResourceID, jobID); err != nil {
@@ -251,6 +250,19 @@ func (a *API) create(w http.ResponseWriter, r *http.Request, id Handoff, limits 
 	a.log.Info.Printf("videos: queued %s resource=%s org=%s task=%s size=%s seconds=%d",
 		jobID, id.ResourceID, id.OrgID, job.Task, job.Size, job.Seconds)
 	writeJSON(w, http.StatusOK, job.Object())
+}
+
+// writeLimitError answers a create that Admit or Insert refused.
+func (a *API) writeLimitError(w http.ResponseWriter, step string, err error) {
+	switch {
+	case errors.Is(err, errStoreOrgLimit):
+		writeError(w, errOrgLimit)
+	case errors.Is(err, errStoreQueueFull):
+		writeError(w, errQueueFull)
+	default:
+		a.log.Error.Printf("videos: %s: %v", step, err)
+		writeError(w, errInternal)
+	}
 }
 
 // dropInput undoes a create that was refused after registration: the input
