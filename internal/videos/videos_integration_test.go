@@ -774,11 +774,14 @@ func (h *harness) completed(id Handoff) Object {
 	return o
 }
 
-func TestRetrievalReadsAndDownloadsWhenTheEndpointIsStoppedOrDeleted(t *testing.T) {
+func TestRetrievalServesAVideoWithoutTheEndpointRouteIdentity(t *testing.T) {
 	h := newHarness(t)
 	o := h.completed(identity("org-a", "res-1"))
-	// The endpoint is gone (stopped or deleted): nothing in the handoff
-	// comes from its route, and the job is still served for its org.
+	// phoebe-videos never sees endpoint state; the retrieval handoff carries
+	// no served model, base model or limits, and the job is still served for
+	// its org and endpoint. Stopped and deleted endpoints are covered in
+	// Atlas test_retrieval_check_works_when_the_endpoint_is_stopped /
+	// _is_deleted.
 	r := retrieval("org-a", "res-1")
 	got := h.object(h.do(http.MethodGet, "/v1/videos/"+o.ID, "", r))
 	if got.ID != o.ID || got.Status != StatusCompleted || got.ExpiresAt == nil || got.Usage == nil {
@@ -855,6 +858,11 @@ func TestRetrievalDeletesAVideoAndThenAnswers410(t *testing.T) {
 	}
 }
 
+// Checks the outcome: create and list on a retrieval handoff answer 404 and
+// write no job. The outcome holds even with the Retrieval branch in
+// API.ServeHTTP removed, because a retrieval handoff carries no limits and
+// ParseLimits("") fails. The retrieval read, download and delete tests are
+// what catch a missing branch.
 func TestRetrievalNeverCreatesOrLists(t *testing.T) {
 	h := newHarness(t)
 	r := retrieval("org-a", "res-1")
