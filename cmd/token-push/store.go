@@ -134,13 +134,14 @@ type pushStore interface {
 	// UnsentHours lists, oldest first and at most limit, the hours before
 	// `before` that have rated_usage or rated_video_usage, come after the automatic re-send floor
 	// (token_push_state.auto_floor: the first hour accepted by a scheduled run),
-	// were never accepted (no pushed_hour row) and are not parked (no
-	// refused_hour row). No floor yet: none.
+	// were never accepted (no pushed_hour row) and are neither parked (no
+	// refused_hour row) nor deferred (no deferred_hour row; DeferredHours
+	// lists those, under their own cap). No floor yet: none.
 	UnsentHours(ctx context.Context, before time.Time, limit int) ([]time.Time, error)
 	// BackfillHours lists, oldest first and at most limit, the hours BEFORE the
 	// automatic re-send floor that have rated_usage or rated_video_usage, were
 	// never accepted and are
-	// not parked: usage from before the install's first connection, sent by
+	// neither parked nor deferred: usage from before the install's first connection, sent by
 	// scheduled runs once the floor is set. rated_usage is never pruned, so this
 	// reaches the install's first hour of usage. No floor yet: none.
 	BackfillHours(ctx context.Context, limit int) ([]time.Time, error)
@@ -152,11 +153,25 @@ type pushStore interface {
 	RefusedHours(ctx context.Context) ([]refusedHour, error)
 	// RecordRefused parks the hour, or updates its row: status (0 = refused
 	// locally), message, payload hash, one more refusal, last_refused_at and
-	// checked_at now. first_refused_at is kept.
+	// checked_at now. first_refused_at is kept. In the same transaction it
+	// deletes the hour's deferred_hour row: the hour's content is now refused,
+	// so it waits for its payload to change, like any parked hour.
 	RecordRefused(ctx context.Context, hour time.Time, status int, message, payloadSHA256 string) error
 	// MarkRefusedChecked sets checked_at to now for parked hours a run rebuilt
 	// and found unchanged, so the next run re-checks other parked hours first.
 	MarkRefusedChecked(ctx context.Context, hours []time.Time) error
+	// DeferredHours lists at most limit deferred hours (deferred_hour: the
+	// manager does not accept a kind they list from this install), least
+	// recently refused first, so a run that cannot retry them all retries the
+	// others next.
+	DeferredHours(ctx context.Context, limit int) ([]time.Time, error)
+	// DeferredSummary counts the deferred hours and returns the oldest.
+	DeferredSummary(ctx context.Context) (count int, oldest time.Time, err error)
+	// RecordDeferred defers the hour, or updates its row: status, message, one
+	// more refusal, last_deferred_at now. first_deferred_at is kept. In the
+	// same transaction it deletes the hour's refused_hour row: a deferred hour
+	// is retried every run, so it must not also be held back as parked.
+	RecordDeferred(ctx context.Context, hour time.Time, status int, message string) error
 	// RecordIntent adds rows to pushed_usage BEFORE the request is sent. If the
 	// manager commits and token-push dies before RecordAccepted, the ids are
 	// still known as sent; listing an id the manager does not have in `held` is
@@ -168,7 +183,8 @@ type pushStore interface {
 	// records too. With setAutoFloor (a scheduled run), it also sets
 	// token_push_state.auto_floor to the hour if no floor is set yet; an
 	// explicit -since/-until run passes false and never moves it. An accepted
-	// hour is no longer parked: its refused_hour row is deleted.
+	// hour is no longer parked or deferred: its refused_hour and deferred_hour
+	// rows are deleted.
 	RecordAccepted(ctx context.Context, hour time.Time, kinds []string, rows []pushedRow, setAutoFloor bool) error
 }
 
@@ -412,8 +428,9 @@ func (s pgStore) HourEverSent(ctx context.Context, hour time.Time) (bool, error)
 }
 
 // unsentHoursQuery walks the hours after the automatic re-send floor one by
-// one and keeps those with usage, no pushed_hour row and no refused_hour row
-// (a parked hour is re-checked separately, so it never uses up the cap). With
+// one and keeps those with usage, no pushed_hour row, no refused_hour row and
+// no deferred_hour row (a parked hour is re-checked separately and a deferred
+// hour is retried separately, so neither uses up the cap). With
 // no token_push_state row the cross join is empty, so nothing qualifies until
 // a scheduled run has an hour accepted. Walking the series costs index probes
 // per hour since the floor, not a scan of all of rated_usage.
@@ -423,6 +440,7 @@ SELECT g.h
        generate_series(s.auto_floor + interval '1 hour', $1::timestamptz - interval '1 hour', interval '1 hour') AS g(h)
  WHERE NOT EXISTS (SELECT 1 FROM pushed_hour p WHERE p.window_start = g.h)
    AND NOT EXISTS (SELECT 1 FROM refused_hour r WHERE r.window_start = g.h)
+   AND NOT EXISTS (SELECT 1 FROM deferred_hour d WHERE d.window_start = g.h)
    AND (EXISTS (SELECT 1 FROM rated_usage ru WHERE ru.window_start = g.h)
         OR EXISTS (SELECT 1 FROM rated_video_usage v WHERE v.window_start = g.h))
  ORDER BY g.h
@@ -430,8 +448,8 @@ SELECT g.h
 
 // backfillHoursCTE walks the hours from the oldest rated_usage or
 // rated_video_usage hour (LEAST ignores a NULL) up to the
-// floor (exclusive) and keeps those with usage, never accepted and not
-// parked: the usage from before the install's first connection. Accepted
+// floor (exclusive) and keeps those with usage, never accepted, not parked
+// and not deferred: the usage from before the install's first connection. Accepted
 // hours (by an earlier back-fill run or an operator's -since/-until run) have
 // a pushed_hour row and are not re-sent. No token_push_state row, or both
 // rollup tables empty (min is NULL): no rows.
@@ -443,6 +461,7 @@ SELECT g.h
                        s.auto_floor - interval '1 hour', interval '1 hour') AS g(h)
  WHERE NOT EXISTS (SELECT 1 FROM pushed_hour p WHERE p.window_start = g.h)
    AND NOT EXISTS (SELECT 1 FROM refused_hour r WHERE r.window_start = g.h)
+   AND NOT EXISTS (SELECT 1 FROM deferred_hour d WHERE d.window_start = g.h)
    AND (EXISTS (SELECT 1 FROM rated_usage ru WHERE ru.window_start = g.h)
         OR EXISTS (SELECT 1 FROM rated_video_usage v WHERE v.window_start = g.h))
 )`
@@ -518,15 +537,58 @@ func (s pgStore) RecordRefused(ctx context.Context, hour time.Time, status int, 
 	if len(message) > maxRefusedMessage {
 		message = message[:maxRefusedMessage]
 	}
-	if _, err := s.db.ExecContext(ctx, `INSERT INTO refused_hour (window_start, status, message, payload_sha256)
+	return s.inTx(ctx, func(tx *sql.Tx) error {
+		if _, err := tx.ExecContext(ctx, `INSERT INTO refused_hour (window_start, status, message, payload_sha256)
 		VALUES ($1, $2, $3, $4)
 		ON CONFLICT ON CONSTRAINT refused_hour_pk DO UPDATE SET
 			status = EXCLUDED.status, message = EXCLUDED.message, payload_sha256 = EXCLUDED.payload_sha256,
 			refusals = refused_hour.refusals + 1, last_refused_at = now(), checked_at = now()`,
-		hour, status, message, payloadSHA256); err != nil {
-		return fmt.Errorf("record refused hour: %w", err)
+			hour, status, message, payloadSHA256); err != nil {
+			return fmt.Errorf("record refused hour: %w", err)
+		}
+		if _, err := tx.ExecContext(ctx, `DELETE FROM deferred_hour WHERE window_start = $1`, hour); err != nil {
+			return fmt.Errorf("undefer parked hour: %w", err)
+		}
+		return nil
+	})
+}
+
+func (s pgStore) DeferredHours(ctx context.Context, limit int) ([]time.Time, error) {
+	rows, err := s.db.QueryContext(ctx, `SELECT window_start FROM deferred_hour
+		ORDER BY last_deferred_at, window_start LIMIT $1`, limit)
+	if err != nil {
+		return nil, fmt.Errorf("query deferred hours: %w", err)
 	}
-	return nil
+	return scanHours(rows)
+}
+
+func (s pgStore) DeferredSummary(ctx context.Context) (int, time.Time, error) {
+	var n int
+	var oldest sql.NullTime
+	if err := s.db.QueryRowContext(ctx, `SELECT count(*), min(window_start) FROM deferred_hour`).Scan(&n, &oldest); err != nil {
+		return 0, time.Time{}, fmt.Errorf("count deferred hours: %w", err)
+	}
+	return n, oldest.Time.UTC(), nil
+}
+
+func (s pgStore) RecordDeferred(ctx context.Context, hour time.Time, status int, message string) error {
+	if len(message) > maxRefusedMessage {
+		message = message[:maxRefusedMessage]
+	}
+	return s.inTx(ctx, func(tx *sql.Tx) error {
+		if _, err := tx.ExecContext(ctx, `INSERT INTO deferred_hour (window_start, status, message)
+		VALUES ($1, $2, $3)
+		ON CONFLICT ON CONSTRAINT deferred_hour_pk DO UPDATE SET
+			status = EXCLUDED.status, message = EXCLUDED.message,
+			refusals = deferred_hour.refusals + 1, last_deferred_at = now()`,
+			hour, status, message); err != nil {
+			return fmt.Errorf("record deferred hour: %w", err)
+		}
+		if _, err := tx.ExecContext(ctx, `DELETE FROM refused_hour WHERE window_start = $1`, hour); err != nil {
+			return fmt.Errorf("unpark deferred hour: %w", err)
+		}
+		return nil
+	})
 }
 
 func (s pgStore) MarkRefusedChecked(ctx context.Context, hours []time.Time) error {
@@ -590,6 +652,9 @@ func (s pgStore) RecordAccepted(ctx context.Context, hour time.Time, kinds []str
 		}
 		if _, err := tx.ExecContext(ctx, `DELETE FROM refused_hour WHERE window_start = $1`, hour); err != nil {
 			return fmt.Errorf("unpark accepted hour: %w", err)
+		}
+		if _, err := tx.ExecContext(ctx, `DELETE FROM deferred_hour WHERE window_start = $1`, hour); err != nil {
+			return fmt.Errorf("undefer accepted hour: %w", err)
 		}
 		if setAutoFloor {
 			if _, err := tx.ExecContext(ctx, `INSERT INTO token_push_state (auto_floor) VALUES ($1)
