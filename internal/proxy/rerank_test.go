@@ -88,7 +88,7 @@ func TestDedicatedRerankIsForwardedAndMeteredByPromptTokens(t *testing.T) {
 // inference request: the binding applies to /v1/rerank too.
 func TestDedicatedRerankEnforcesModelBinding(t *testing.T) {
 	var calls int32
-	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+	backend := httptest.NewServer(http.HandlerFunc(func(_ http.ResponseWriter, _ *http.Request) {
 		atomic.AddInt32(&calls, 1)
 	}))
 	defer backend.Close()
@@ -116,7 +116,7 @@ func TestDedicatedRerankEnforcesModelBinding(t *testing.T) {
 // shared work. Same generic 404 as every other unauthorized route.
 func TestSharedRouteRefusesRerank(t *testing.T) {
 	var calls int32
-	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+	backend := httptest.NewServer(http.HandlerFunc(func(_ http.ResponseWriter, _ *http.Request) {
 		atomic.AddInt32(&calls, 1)
 	}))
 	defer backend.Close()
