@@ -385,8 +385,11 @@ func TestRetrievalHandoffNeedsOrgKeyAndEndpointOnly(t *testing.T) {
 	}
 }
 
-// The retrieval route never creates or lists: those answer 404 before the
-// store is touched (this API has none).
+// Checks the outcome: create and list on a retrieval handoff answer 404 and
+// write no job (this API has no store to touch). The outcome holds even with
+// the Retrieval branch in API.ServeHTTP removed, because a retrieval handoff
+// carries no limits and ParseLimits("") fails. The retrieval read, download
+// and delete tests are what catch a missing branch.
 func TestRetrievalHandoffCannotCreateOrList(t *testing.T) {
 	api := NewAPI(APIConfig{Token: "tok"}, nil, nil, nil, testLogger())
 	enc, _ := EncodeHandoff(Handoff{Retrieval: true, OrgID: "o", AuthID: "a", ResourceID: "r"})

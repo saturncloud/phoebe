@@ -28,7 +28,9 @@ idleTimeout: "10m"
 #   streamStallTimeout: "2m"
 #   # Longest a request may run, from arrival to its last response byte,
 #   # including any wake hold. With no response headers by then the client
-#   # gets 504; mid-stream the stream is ended.
+#   # gets 504; mid-stream the stream is ended. A video content download
+#   # (GET /v1/videos/{id}/content) is exempt: it is a stored file that cannot
+#   # be resumed, so only streamStallTimeout bounds it.
 #   maxStreamDuration: "60m"
 #   # Response bytes held in memory for inspection (an incomplete SSE line or a
 #   # whole non-streamed body), per request and summed over this replica. Over

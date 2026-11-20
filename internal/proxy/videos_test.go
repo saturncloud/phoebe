@@ -3,6 +3,8 @@ package proxy
 import (
 	"encoding/base64"
 	"encoding/json"
+	"fmt"
+	"log"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -243,6 +245,7 @@ func TestVideoRetrievalRouteServesOnlyReadDownloadAndDelete(t *testing.T) {
 	}{
 		{http.MethodGet, "/v1/videos/" + testVideoID, 200},
 		{http.MethodDelete, "/v1/videos/" + testVideoID, 200},
+		{http.MethodDelete, "/v1/videos/" + testVideoID + "?x=1", 200},
 		{http.MethodGet, "/v1/videos/" + testVideoID + "/content", 200},
 		{http.MethodGet, "/v1/videos/" + testVideoID + "/content?variant=thumbnail", 200},
 		{http.MethodPost, "/v1/videos", 404},
@@ -289,19 +292,21 @@ func TestVideoRetrievalRouteFailsClosed(t *testing.T) {
 	}
 	// Only the exact value "true" marks a retrieval request; anything else is
 	// an ordinary header-routed request, refused for its missing upstream.
-	req := retrievalRequest(http.MethodGet, path)
-	req.Header.Set(identity.HeaderVideoRetrieval, "yes")
-	rr := httptest.NewRecorder()
-	srv.Handler().ServeHTTP(rr, req)
-	if rr.Code == http.StatusOK {
-		t.Errorf("mark %q was accepted", "yes")
+	for _, mark := range []string{"yes", "True", "TRUE", " true"} {
+		req := retrievalRequest(http.MethodGet, path)
+		req.Header.Set(identity.HeaderVideoRetrieval, mark)
+		rr := httptest.NewRecorder()
+		srv.Handler().ServeHTTP(rr, req)
+		if rr.Code == http.StatusOK {
+			t.Errorf("mark %q was accepted", mark)
+		}
 	}
 	if len(backend.reqs) != 0 {
 		t.Errorf("%d refused requests reached phoebe-videos", len(backend.reqs))
 	}
 	// Video generation off on this phoebe: 404.
 	off := newTestServer(t, nil)
-	rr = httptest.NewRecorder()
+	rr := httptest.NewRecorder()
 	off.Handler().ServeHTTP(rr, retrievalRequest(http.MethodGet, path))
 	if rr.Code != 404 {
 		t.Errorf("videos off: %d", rr.Code)
@@ -321,5 +326,133 @@ func TestVideoRetrievalMarkIsReadOnlyWhenTrusted(t *testing.T) {
 	srv.Handler().ServeHTTP(rr, retrievalRequest(http.MethodGet, "/v1/videos/"+testVideoID))
 	if rr.Code == http.StatusOK || len(backend.reqs) != 0 {
 		t.Fatalf("an untrusted mark reached phoebe-videos: %d", rr.Code)
+	}
+}
+
+// captureWarn sends the server's warnings to a buffer the test can read.
+func captureWarn(srv *Server) *lockedBuffer {
+	buf := &lockedBuffer{}
+	srv.log.Warn = log.New(buf, "", 0)
+	return buf
+}
+
+// C13: a refusal names the path the client sent. Go leaves URL.RawPath empty
+// for an ordinary path, so logging it showed "" for almost every refusal.
+func TestVideoRetrievalRefusalLogsThePath(t *testing.T) {
+	srv, backend := newVideoServer(t)
+	warn := captureWarn(srv)
+	path := "/v1/videos/" + testVideoID
+	rr := httptest.NewRecorder()
+	srv.Handler().ServeHTTP(rr, retrievalRequest(http.MethodPost, path))
+	if rr.Code != 404 || len(backend.reqs) != 0 {
+		t.Fatalf("status %d, backend calls %d", rr.Code, len(backend.reqs))
+	}
+	if got := warn.String(); !strings.Contains(got, fmt.Sprintf("path=%q", path)) {
+		t.Fatalf("refusal log %q does not name the path %q", got, path)
+	}
+	// The endpoint route's refusal names it too.
+	warn = captureWarn(srv)
+	rr = httptest.NewRecorder()
+	srv.Handler().ServeHTTP(rr, videoRequest(http.MethodPost, "/v1/videos/sync"))
+	if got := warn.String(); rr.Code != 404 || !strings.Contains(got, `path="/v1/videos/sync"`) {
+		t.Fatalf("status %d, refusal log %q does not name the path", rr.Code, got)
+	}
+}
+
+// C14: the caller's Saturn key and cookies stop at the interceptor on both
+// video routes; phoebe-videos is reached with the shared token only.
+func TestVideoHandoffDropsCallerCredentials(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		req  *http.Request
+	}{
+		{"retrieval", retrievalRequest(http.MethodGet, "/v1/videos/"+testVideoID+"/content")},
+		{"endpoint", videoRequest(http.MethodPost, "/v1/videos")},
+	} {
+		srv, backend := newVideoServer(t)
+		tc.req.Header.Set("Authorization", "Bearer k")
+		tc.req.Header.Set("Cookie", "a=b")
+		rr := httptest.NewRecorder()
+		srv.Handler().ServeHTTP(rr, tc.req)
+		if rr.Code != http.StatusOK || len(backend.reqs) != 1 {
+			t.Fatalf("%s: status %d, backend calls %d", tc.name, rr.Code, len(backend.reqs))
+		}
+		got := backend.reqs[0]
+		if v := got.Header.Get("Authorization"); v != "" {
+			t.Errorf("%s: Authorization %q reached phoebe-videos", tc.name, v)
+		}
+		if v := got.Header.Get("Cookie"); v != "" {
+			t.Errorf("%s: Cookie %q reached phoebe-videos", tc.name, v)
+		}
+		if got.Header.Get(videos.HeaderToken) != "shared-token" {
+			t.Errorf("%s: the shared token was not set", tc.name)
+		}
+	}
+}
+
+// C15: the retrieval route replaces the client's X-Request-Id with the
+// minted one on the request to phoebe-videos, as the endpoint route does.
+func TestVideoRetrievalReplacesTheClientRequestID(t *testing.T) {
+	srv, backend := newVideoServer(t)
+	req := retrievalRequest(http.MethodGet, "/v1/videos/"+testVideoID)
+	req.Header.Set(requestIDHeader, "client-chosen")
+	rr := httptest.NewRecorder()
+	srv.Handler().ServeHTTP(rr, req)
+	if rr.Code != http.StatusOK || len(backend.reqs) != 1 {
+		t.Fatalf("status %d, backend calls %d", rr.Code, len(backend.reqs))
+	}
+	sent := backend.reqs[0].Header.Get(requestIDHeader)
+	if sent == "client-chosen" || sent == "" {
+		t.Fatalf("phoebe-videos got request id %q, want the minted one", sent)
+	}
+	if echoed := rr.Header().Get(requestIDHeader); sent != echoed {
+		t.Fatalf("phoebe-videos got %q, the response carries %q", sent, echoed)
+	}
+}
+
+// C16: a retrieval mark on an endpoint route (one that stamped an upstream,
+// serving mode or served model) is refused, whatever the trusted set says.
+func TestVideoRetrievalMarkIsRefusedOnAnEndpointRoute(t *testing.T) {
+	srv, backend := newVideoServer(t)
+	for _, tc := range []struct {
+		header, value string
+	}{
+		{identity.HeaderUpstream, "pd-chat.ns.svc.cluster.local:8000"},
+		{identity.HeaderServingMode, identity.ServingModeDedicated},
+		{identity.HeaderServedModel, "my-chat"},
+	} {
+		req := retrievalRequest(http.MethodGet, "/v1/videos/"+testVideoID)
+		req.Header.Set(tc.header, tc.value)
+		rr := httptest.NewRecorder()
+		srv.Handler().ServeHTTP(rr, req)
+		if rr.Code != http.StatusNotFound {
+			t.Errorf("mark with %s: %d, want 404", tc.header, rr.Code)
+		}
+	}
+	if len(backend.reqs) != 0 {
+		t.Errorf("%d refused requests reached phoebe-videos", len(backend.reqs))
+	}
+}
+
+// C7: a percent-encoded retrieval path is refused before phoebe-videos.
+// This pins the outcome, not one guard: it still passes with the
+// !pathCanonical check in serveVideoRetrieval removed, because
+// canonicalRequestPath returns an empty path for these targets and
+// videoRetrievalAllowed("") is false.
+func TestVideoRetrievalRouteRefusesANonCanonicalPath(t *testing.T) {
+	srv, backend := newVideoServer(t)
+	for _, path := range []string{
+		"/v1/videos/" + testVideoID + "%2Fcontent",
+		"/v1/videos/" + testVideoID + "/%63ontent",
+		"/v1%2Fvideos/" + testVideoID,
+	} {
+		rr := httptest.NewRecorder()
+		srv.Handler().ServeHTTP(rr, retrievalRequest(http.MethodGet, path))
+		if rr.Code != http.StatusNotFound {
+			t.Errorf("%s: %d, want 404", path, rr.Code)
+		}
+	}
+	if len(backend.reqs) != 0 {
+		t.Errorf("%d encoded paths reached phoebe-videos", len(backend.reqs))
 	}
 }

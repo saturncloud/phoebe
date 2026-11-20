@@ -384,6 +384,9 @@ func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request) {
 		handlerDone = true
 		maxDurationMu.Unlock()
 	}()
+	// A video content download stops the timer once it is checked (the one
+	// exemption, exemptFromMaxStreamDuration).
+	ctx = withMaxStreamDurationExempt(ctx, func() { maxDuration.Stop() })
 	r = r.WithContext(ctx)
 	stallGuard := newStallGuardWriter(w, prot.StreamStallTimeout, cancel)
 	w = stallGuard
@@ -470,8 +473,8 @@ func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request) {
 
 	if id.Gateway {
 		if !pathCanonical || !gatewayRequestAllowed(r.Method, routePath) {
-			s.log.Warn.Printf("gateway: refusing route outside public inference surface method=%s raw_path=%q canonical=%v org_id=%q",
-				r.Method, r.URL.RawPath, pathCanonical, id.OrgID)
+			s.log.Warn.Printf("gateway: refusing route outside public inference surface method=%s path=%q canonical=%v org_id=%q",
+				r.Method, r.URL.EscapedPath(), pathCanonical, id.OrgID)
 			http.Error(w, "not found", http.StatusNotFound)
 			return
 		}

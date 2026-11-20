@@ -85,18 +85,20 @@ func (s *Server) serveVideoRetrieval(w http.ResponseWriter, r *http.Request, id 
 		return
 	}
 	refuse := func(reason string) {
-		s.log.Warn.Printf("videos: refused retrieval request_id=%s org_id=%q resource_id=%q method=%s raw_path=%q: %s",
-			requestID, id.OrgID, id.ResourceID, r.Method, r.URL.RawPath, reason)
+		s.log.Warn.Printf("videos: refused retrieval request_id=%s org_id=%q resource_id=%q method=%s path=%q: %s",
+			requestID, id.OrgID, id.ResourceID, r.Method, r.URL.EscapedPath(), reason)
 		http.Error(w, "not found", http.StatusNotFound)
 	}
 	switch {
 	case s.videos == nil:
 		refuse("video generation is not enabled on this phoebe (videos.serviceUrl / PHOEBE_VIDEOS_TOKEN)")
 		return
-	case id.Gateway || id.VideoLimits != "":
-		// The retrieval mark comes from one route only; together with another
-		// route's mark the edge contract is broken.
-		refuse("retrieval mark together with the gateway mark or video endpoint limits")
+	case id.Gateway || id.VideoLimits != "" || id.Upstream != "" || id.ServingMode != "" || id.ServedModel != "":
+		// The retrieval mark comes from one route only, and that route removes
+		// the upstream, serving mode and served model. Together with another
+		// route's stamps (every endpoint route stamps an upstream and serving
+		// mode) the edge contract is broken.
+		refuse("retrieval mark together with another route's stamps")
 		return
 	case id.OrgID == "" || id.ResourceID == "" || id.AuthID == "":
 		refuse("retrieval request without org, endpoint or auth id")
@@ -105,6 +107,9 @@ func (s *Server) serveVideoRetrieval(w http.ResponseWriter, r *http.Request, id 
 		refuse("outside the video retrieval surface")
 		return
 	}
+	// The stamped org and endpoint are now checked, so the endpoint id is a
+	// safe metric label, as on the endpoint path after its billing gate.
+	recordFrom(r.Context()).bind(id)
 	s.handOffVideo(w, r, requestID, videos.Handoff{
 		Retrieval: true, OrgID: id.OrgID, AuthID: id.AuthID, UserID: id.UserID, GroupID: id.GroupID,
 		ResourceID: id.ResourceID,
@@ -115,8 +120,8 @@ func (s *Server) serveVideoRetrieval(w http.ResponseWriter, r *http.Request, id 
 // Every refusal is the same generic 404 the other route gates use.
 func (s *Server) serveVideo(w http.ResponseWriter, r *http.Request, id identity.Identity, requestID, routePath string, pathCanonical bool) {
 	refuse := func(reason string) {
-		s.log.Warn.Printf("videos: refused request_id=%s resource_id=%s method=%s raw_path=%q: %s",
-			requestID, id.ResourceID, r.Method, r.URL.RawPath, reason)
+		s.log.Warn.Printf("videos: refused request_id=%s resource_id=%s method=%s path=%q: %s",
+			requestID, id.ResourceID, r.Method, r.URL.EscapedPath(), reason)
 		http.Error(w, "not found", http.StatusNotFound)
 	}
 	switch {
@@ -157,8 +162,21 @@ func (s *Server) handOffVideo(w http.ResponseWriter, r *http.Request, requestID 
 			r.Header.Del(name)
 		}
 	}
+	// phoebe-videos authenticates by the shared token; the caller's
+	// credentials never go past the interceptor.
+	r.Header.Del("Authorization")
+	r.Header.Del("Cookie")
 	r.Header.Set(videos.HeaderHandoff, handoff)
 	r.Header.Set(videos.HeaderToken, s.videos.token)
+	// Replace, never preserve, the client correlation id, as the endpoint
+	// path does before it reaches here.
+	r.Header.Set(requestIDHeader, requestID)
 	w.Header().Set(requestIDHeader, requestID)
+	// Both callers have checked the path against their surface, so a GET
+	// ending in /content is a download of a stored file: the one request
+	// exempt from protection.maxStreamDuration (stall guards still apply).
+	if r.Method == http.MethodGet && strings.HasSuffix(r.URL.Path, "/content") {
+		exemptFromMaxStreamDuration(r.Context())
+	}
 	s.videos.proxy.ServeHTTP(w, r)
 }
