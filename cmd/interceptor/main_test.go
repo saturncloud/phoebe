@@ -187,7 +187,7 @@ func TestBuildWakerLogsMissingDedicatedToken(t *testing.T) {
 	}
 	s := &config.Settings{}
 	s.Wake.Enabled = true
-	s.Wake.AtlasURL = "http://atlas.internal"
+	s.Wake.AtlasURL = "http://atlas.saturn.svc"
 	if built := buildWaker(s, logger); built != nil {
 		t.Fatalf("buildWaker returned %T without %s, want nil", built, internalWakeTokenEnv)
 	}

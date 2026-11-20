@@ -2,9 +2,10 @@
 // standard Atlas token of its own service identity, scoped to the one family
 // of /api/internal routes it calls (saturn pdc/service_tokens.py).
 //
-// Atlas is the issuer and the renewer. Its service-tokens job keeps the
-// token in a Secret that the pod mounts as a file, and replaces it when half
-// its 24-hour life has gone; the replaced token stays valid until its own
+// Atlas is the issuer and the renewer. Its leader process (a periodic task
+// inside the Atlas server, every 10 minutes) keeps the token in a Secret that
+// the pod mounts as a file, and replaces it when half its 24-hour life has
+// gone; the replaced token stays valid until its own
 // expiry. So the client's refresh is re-reading the file: File reads it
 // before every call, which picks up a new token with no restart, and costs one
 // small read per call to Atlas.
@@ -36,8 +37,8 @@ const EnvFile = "PHOEBE_ATLAS_TOKEN_FILE"
 const expirySkew = 60 * time.Second
 
 // warnBelow is how little life left is worth a warning. Atlas replaces the
-// token with 12 hours left, so less than 6 means its job has failed for at
-// least 6 hours.
+// token with 12 hours left, so less than 6 means its leader's renewal has
+// failed for at least 6 hours.
 const warnBelow = 6 * time.Hour
 
 // logEvery limits the repeated warning and error lines to one per interval.
@@ -64,8 +65,8 @@ type File struct {
 }
 
 // NewFile returns a Source for path. The file need not exist yet: on a new
-// install the pod can start before Atlas's job writes the Secret, and the
-// kubelet fills the mounted file in when it does.
+// install the pod can start before the Atlas leader first writes the Secret,
+// and the kubelet fills the mounted file in when it does.
 func NewFile(path string, log *logging.Logger) (*File, error) {
 	if strings.TrimSpace(path) == "" {
 		return nil, fmt.Errorf("atlas token: %s is empty", EnvFile)
@@ -86,14 +87,14 @@ func (f *File) Token() (string, error) {
 	}
 	left := exp.Sub(f.now())
 	if left <= expirySkew {
-		return "", f.refuse(fmt.Errorf("%w: the token in %s expired at %s; Atlas's service-tokens job has not replaced it",
+		return "", f.refuse(fmt.Errorf("%w: the token in %s expired at %s; Atlas has not replaced it (its leader renews service tokens every 10 minutes; check the Atlas pod logs for 'service tokens:')",
 			ErrUnavailable, f.path, exp.UTC().Format(time.RFC3339)))
 	}
 	if left < warnBelow {
 		f.mu.Lock()
 		if f.now().Sub(f.lastWarn) >= logEvery {
 			f.lastWarn = f.now()
-			f.log.Warn.Printf("atlas token: the token in %s expires in %s; Atlas's service-tokens job should have replaced it",
+			f.log.Warn.Printf("atlas token: the token in %s expires in %s; Atlas should have replaced it (its leader renews service tokens every 10 minutes; check the Atlas pod logs for 'service tokens:')",
 				f.path, left.Round(time.Minute))
 		}
 		f.mu.Unlock()

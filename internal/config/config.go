@@ -457,8 +457,10 @@ type WakeSettings struct {
 	// directly without a readiness wait.
 	Enabled bool `yaml:"enabled"`
 
-	// AtlasURL is the in-cluster Atlas base URL. Atlas validates the endpoint
-	// and performs the ordered worker-readiness-Planner transition.
+	// AtlasURL is the Atlas base URL. Atlas validates the endpoint and
+	// performs the ordered worker-readiness-Planner transition. It must be
+	// https unless the host is cluster-local (atlastoken.CheckAtlasURL);
+	// otherwise wake is disabled.
 	AtlasURL string `yaml:"atlasURL"`
 
 	// TimeoutStr bounds how long a single wake may hold the woken request

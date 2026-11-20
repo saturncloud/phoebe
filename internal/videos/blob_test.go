@@ -630,10 +630,10 @@ func TestAtlasBlobStoreTransportErrorNeverCarriesTheSignature(t *testing.T) {
 
 func TestNewAtlasBlobRefusesBadConfig(t *testing.T) {
 	for _, tc := range []struct{ url, token, prefix string }{
-		{"http://atlas:8888", "", "tf-videos"},
-		{"atlas:8888", "t", "tf-videos"},
-		{"http://user:pw@atlas:8888", "t", "tf-videos"},
-		{"http://atlas:8888", "t", "/"},
+		{"http://atlas.saturn.svc:8888", "", "tf-videos"},
+		{"atlas.saturn.svc:8888", "t", "tf-videos"},
+		{"http://user:pw@atlas.saturn.svc:8888", "t", "tf-videos"},
+		{"http://atlas.saturn.svc:8888", "t", "/"},
 	} {
 		var src atlastoken.Source
 		if tc.token != "" {
@@ -641,6 +641,23 @@ func TestNewAtlasBlobRefusesBadConfig(t *testing.T) {
 		}
 		if _, err := NewAtlasBlob(tc.url, src, tc.prefix); err == nil {
 			t.Errorf("accepted %+v", tc)
+		}
+	}
+}
+
+// TestNewAtlasBlobRefusesHTTPToAnExternalHost: every call to Atlas carries
+// phoebe-videos' Atlas service token, so NewAtlasBlob returns an error that
+// says https is required for an http URL to an external host. It checks only
+// the constructor's error.
+func TestNewAtlasBlobRefusesHTTPToAnExternalHost(t *testing.T) {
+	for _, rawURL := range []string{"http://atlas.example.com", "http://evilsvc.com:8000", "http://a.svc.evil.com"} {
+		if _, err := NewAtlasBlob(rawURL, staticToken("t"), "tf-videos"); err == nil || !strings.Contains(err.Error(), "https") {
+			t.Errorf("NewAtlasBlob(%q) err = %v, want a refusal that says https is required", rawURL, err)
+		}
+	}
+	for _, rawURL := range []string{"https://atlas.example.com", "http://atlas.saturn.svc:8000"} {
+		if _, err := NewAtlasBlob(rawURL, staticToken("t"), "tf-videos"); err != nil {
+			t.Errorf("NewAtlasBlob(%q): %v", rawURL, err)
 		}
 	}
 }

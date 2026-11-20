@@ -57,7 +57,9 @@ type Settings struct {
 	Debug      bool   `yaml:"debug"`
 	ListenPort int    `yaml:"listenPort"`
 	ValkeyAddr string `yaml:"valkeyAddr"`
-	// AtlasURL is the in-cluster Atlas that signs the object store URLs.
+	// AtlasURL is the Atlas that signs the object store URLs. It must be
+	// https unless the host is cluster-local (atlastoken.CheckAtlasURL);
+	// otherwise phoebe-videos refuses to start.
 	AtlasURL string `yaml:"atlasURL"`
 	Store    struct {
 		// Prefix is TF_VIDEO_STORE_PREFIX (default tf-videos). Atlas signs
