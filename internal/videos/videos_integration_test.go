@@ -1119,7 +1119,7 @@ func TestReaperTreatsMissingAtlasGrantAsFinal(t *testing.T) {
 		_, _ = w.Write([]byte(`{"message":"refused"}`))
 	}))
 	t.Cleanup(atlas.Close)
-	blob, err := NewAtlasBlob(atlas.URL, "tok", "tf-videos")
+	blob, err := NewAtlasBlob(atlas.URL, staticToken("tok"), "tf-videos")
 	if err != nil {
 		t.Fatal(err)
 	}
