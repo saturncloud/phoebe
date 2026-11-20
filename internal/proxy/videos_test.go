@@ -245,6 +245,7 @@ func TestVideoRetrievalRouteServesOnlyReadDownloadAndDelete(t *testing.T) {
 	}{
 		{http.MethodGet, "/v1/videos/" + testVideoID, 200},
 		{http.MethodDelete, "/v1/videos/" + testVideoID, 200},
+		{http.MethodDelete, "/v1/videos/" + testVideoID + "?x=1", 200},
 		{http.MethodGet, "/v1/videos/" + testVideoID + "/content", 200},
 		{http.MethodGet, "/v1/videos/" + testVideoID + "/content?variant=thumbnail", 200},
 		{http.MethodPost, "/v1/videos", 404},
@@ -291,19 +292,21 @@ func TestVideoRetrievalRouteFailsClosed(t *testing.T) {
 	}
 	// Only the exact value "true" marks a retrieval request; anything else is
 	// an ordinary header-routed request, refused for its missing upstream.
-	req := retrievalRequest(http.MethodGet, path)
-	req.Header.Set(identity.HeaderVideoRetrieval, "yes")
-	rr := httptest.NewRecorder()
-	srv.Handler().ServeHTTP(rr, req)
-	if rr.Code == http.StatusOK {
-		t.Errorf("mark %q was accepted", "yes")
+	for _, mark := range []string{"yes", "True", "TRUE", " true"} {
+		req := retrievalRequest(http.MethodGet, path)
+		req.Header.Set(identity.HeaderVideoRetrieval, mark)
+		rr := httptest.NewRecorder()
+		srv.Handler().ServeHTTP(rr, req)
+		if rr.Code == http.StatusOK {
+			t.Errorf("mark %q was accepted", mark)
+		}
 	}
 	if len(backend.reqs) != 0 {
 		t.Errorf("%d refused requests reached phoebe-videos", len(backend.reqs))
 	}
 	// Video generation off on this phoebe: 404.
 	off := newTestServer(t, nil)
-	rr = httptest.NewRecorder()
+	rr := httptest.NewRecorder()
 	off.Handler().ServeHTTP(rr, retrievalRequest(http.MethodGet, path))
 	if rr.Code != 404 {
 		t.Errorf("videos off: %d", rr.Code)
@@ -428,5 +431,28 @@ func TestVideoRetrievalMarkIsRefusedOnAnEndpointRoute(t *testing.T) {
 	}
 	if len(backend.reqs) != 0 {
 		t.Errorf("%d refused requests reached phoebe-videos", len(backend.reqs))
+	}
+}
+
+// C7: a percent-encoded retrieval path is refused before phoebe-videos.
+// This pins the outcome, not one guard: it still passes with the
+// !pathCanonical check in serveVideoRetrieval removed, because
+// canonicalRequestPath returns an empty path for these targets and
+// videoRetrievalAllowed("") is false.
+func TestVideoRetrievalRouteRefusesANonCanonicalPath(t *testing.T) {
+	srv, backend := newVideoServer(t)
+	for _, path := range []string{
+		"/v1/videos/" + testVideoID + "%2Fcontent",
+		"/v1/videos/" + testVideoID + "/%63ontent",
+		"/v1%2Fvideos/" + testVideoID,
+	} {
+		rr := httptest.NewRecorder()
+		srv.Handler().ServeHTTP(rr, retrievalRequest(http.MethodGet, path))
+		if rr.Code != http.StatusNotFound {
+			t.Errorf("%s: %d, want 404", path, rr.Code)
+		}
+	}
+	if len(backend.reqs) != 0 {
+		t.Errorf("%d encoded paths reached phoebe-videos", len(backend.reqs))
 	}
 }
