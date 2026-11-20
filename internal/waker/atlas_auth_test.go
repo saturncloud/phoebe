@@ -123,7 +123,7 @@ func TestWakeNeverSendsAnUnusableToken(t *testing.T) {
 	}
 }
 
-// A token that becomes usable again (Atlas's job wrote a new one) is picked
+// A token that becomes usable again (the Atlas leader wrote a new one) is picked
 // up by the next call, with no restart.
 func TestWakeUsesTheTokenAgainOnceItIsBack(t *testing.T) {
 	src := &switchableToken{}

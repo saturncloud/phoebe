@@ -47,9 +47,9 @@ func TestNewAtlasValidatesURLScheme(t *testing.T) {
 }
 
 // TestNewAtlasRefusesHTTPToAnExternalHost: every wake call carries the Atlas
-// service token and, in the transition build, the legacy wake secret, so an
-// http URL to an external host is refused and wake stays disabled. http to a
-// cluster-local service name is still allowed.
+// service token and, in the transition build, the legacy wake secret, so
+// NewAtlas returns an error that says https is required for an http URL to
+// an external host. It checks only the constructor's error.
 func TestNewAtlasRefusesHTTPToAnExternalHost(t *testing.T) {
 	for _, rawURL := range []string{"http://atlas.example.com", "http://evilsvc.com:8000", "http://a.svc.evil.com"} {
 		if _, err := NewAtlas(rawURL, staticToken("svc-token"), "legacy", logging.New(logging.ERROR)); err == nil || !strings.Contains(err.Error(), "https") {

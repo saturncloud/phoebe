@@ -646,9 +646,9 @@ func TestNewAtlasBlobRefusesBadConfig(t *testing.T) {
 }
 
 // TestNewAtlasBlobRefusesHTTPToAnExternalHost: every call to Atlas carries
-// phoebe-videos' Atlas service token, so an http URL to an external host is
-// refused and phoebe-videos does not start. http to a cluster-local service
-// name is still allowed.
+// phoebe-videos' Atlas service token, so NewAtlasBlob returns an error that
+// says https is required for an http URL to an external host. It checks only
+// the constructor's error.
 func TestNewAtlasBlobRefusesHTTPToAnExternalHost(t *testing.T) {
 	for _, rawURL := range []string{"http://atlas.example.com", "http://evilsvc.com:8000", "http://a.svc.evil.com"} {
 		if _, err := NewAtlasBlob(rawURL, staticToken("t"), "tf-videos"); err == nil || !strings.Contains(err.Error(), "https") {

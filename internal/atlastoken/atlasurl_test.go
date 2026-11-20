@@ -5,7 +5,8 @@ import "testing"
 // TestAtlasURLMustBeHTTPSUnlessClusterLocal: the Atlas service token goes in
 // a header on every call, so http is allowed only to a cluster-local host.
 // The suffix match is dot-anchored: "evilsvc.com" and "a.svc.evil.com" are
-// external hosts.
+// external hosts. A trailing root dot skips the pod's DNS search path, so
+// http to any host ending in "." is refused; https to one is accepted.
 func TestAtlasURLMustBeHTTPSUnlessClusterLocal(t *testing.T) {
 	for _, tc := range []struct {
 		url string
@@ -21,7 +22,13 @@ func TestAtlasURLMustBeHTTPSUnlessClusterLocal(t *testing.T) {
 		{"http://atlas.saturn.svc:8000", true},
 		{"http://atlas.saturn.svc.cluster.local:8000", true},
 		{"http://ATLAS.SATURN.SVC.CLUSTER.LOCAL", true},
-		{"http://atlas.saturn.svc.cluster.local.:8000", true},
+		{"http://atlas.saturn.svc.cluster.local.:8000", false},
+		{"http://atlas.saturn.svc.", false},
+		{"http://atlas.saturn.svc.:8888", false},
+		{"http://localhost.:8000", false},
+		{"http://127.0.0.1.:8000", false},
+		{"https://atlas.example.com.", true},
+		{"https://atlas.saturn.svc.:8443", true},
 		{"http://localhost:8000", true},
 		{"http://127.0.0.1:41234", true},
 		{"http://[::1]:9000", true},
