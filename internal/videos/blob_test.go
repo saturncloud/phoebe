@@ -13,6 +13,8 @@ import (
 	"sync"
 	"testing"
 	"time"
+
+	"github.com/saturncloud/phoebe/internal/atlastoken"
 )
 
 const (
@@ -50,7 +52,7 @@ func (a *fakeAtlas) handler(t *testing.T) http.HandlerFunc {
 		a.mu.Lock()
 		a.calls = append(a.calls, body)
 		a.paths = append(a.paths, r.URL.Path)
-		a.tokens = append(a.tokens, r.Header.Get(atlasVideoStoreHeader))
+		a.tokens = append(a.tokens, strings.TrimPrefix(r.Header.Get("Authorization"), "token "))
 		a.mu.Unlock()
 		if a.status != 0 && a.status != http.StatusOK {
 			w.WriteHeader(a.status)
@@ -97,7 +99,7 @@ type storeReq struct {
 	method, path, ctype string
 	length              int64
 	body                []byte
-	// token is whether the request carried the Atlas internal token header.
+	// token is whether the request carried an Atlas service token.
 	token bool
 }
 
@@ -114,7 +116,7 @@ func (s *fakeStore) handler(w http.ResponseWriter, r *http.Request) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.reqs = append(s.reqs, storeReq{r.Method, r.URL.Path, r.Header.Get("Content-Type"), r.ContentLength, body,
-		r.Header.Get(atlasVideoStoreHeader) != ""})
+		strings.TrimPrefix(r.Header.Get("Authorization"), "token ") != ""})
 	if s.status != 0 {
 		w.WriteHeader(s.status)
 		_, _ = io.WriteString(w, s.reply)
@@ -145,7 +147,7 @@ func newTestBlob(t *testing.T) (*AtlasBlob, *fakeAtlas, *fakeStore) {
 	at := &fakeAtlas{store: storeSrv}
 	atlasSrv := httptest.NewServer(at.handler(t))
 	t.Cleanup(atlasSrv.Close)
-	b, err := NewAtlasBlob(atlasSrv.URL, testToken, "tf-videos")
+	b, err := NewAtlasBlob(atlasSrv.URL, staticToken(testToken), "tf-videos")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -413,7 +415,7 @@ func TestAtlasBlobRegisterAndClose(t *testing.T) {
 	}
 }
 
-// Every call to Atlas carries the internal token, and no request to the store
+// Every call to Atlas carries the service token, and no request to the store
 // does (the store is another host; the token is a credential).
 func TestAtlasBlobSendsItsTokenOnEveryAtlasCall(t *testing.T) {
 	b, at, st := newTestBlob(t)
@@ -494,7 +496,7 @@ func TestAtlasBlobNeverSendsTheTokenAcrossARedirect(t *testing.T) {
 	var mu sync.Mutex
 	elsewhere := httptest.NewServer(http.HandlerFunc(func(_ http.ResponseWriter, r *http.Request) {
 		mu.Lock()
-		reached = append(reached, r.Header.Get(atlasVideoStoreHeader))
+		reached = append(reached, strings.TrimPrefix(r.Header.Get("Authorization"), "token "))
 		mu.Unlock()
 	}))
 	t.Cleanup(elsewhere.Close)
@@ -502,7 +504,7 @@ func TestAtlasBlobNeverSendsTheTokenAcrossARedirect(t *testing.T) {
 		http.Redirect(w, r, elsewhere.URL+r.URL.Path, http.StatusTemporaryRedirect)
 	}))
 	t.Cleanup(atlas.Close)
-	b, err := NewAtlasBlob(atlas.URL, testToken, "tf-videos")
+	b, err := NewAtlasBlob(atlas.URL, staticToken(testToken), "tf-videos")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -633,7 +635,11 @@ func TestNewAtlasBlobRefusesBadConfig(t *testing.T) {
 		{"http://user:pw@atlas:8888", "t", "tf-videos"},
 		{"http://atlas:8888", "t", "/"},
 	} {
-		if _, err := NewAtlasBlob(tc.url, tc.token, tc.prefix); err == nil {
+		var src atlastoken.Source
+		if tc.token != "" {
+			src = staticToken(tc.token)
+		}
+		if _, err := NewAtlasBlob(tc.url, src, tc.prefix); err == nil {
 			t.Errorf("accepted %+v", tc)
 		}
 	}

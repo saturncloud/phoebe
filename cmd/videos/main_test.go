@@ -19,7 +19,7 @@ func writeConfig(t *testing.T, body string) string {
 func env(m map[string]string) func(string) string { return func(k string) string { return m[k] } }
 
 var fullEnv = env(map[string]string{"DATABASE_URL": "postgres://x", "PHOEBE_VIDEOS_TOKEN": "t",
-	"TF_INTERNAL_VIDEO_STORE_TOKEN": "s"})
+	"PHOEBE_ATLAS_TOKEN_FILE": "/var/run/saturn/atlas-token/token"})
 
 const atlas = "atlasURL: http://atlas:8888\n"
 
@@ -45,10 +45,10 @@ func TestLoadRefusesBadConfig(t *testing.T) {
 		{atlas + "valkeyAddr: v\nqueueTimeout: soon\n", fullEnv, "bad duration"},
 		{atlas + "valkeyAddr: v\nunknownKey: 1\n", fullEnv, "unknown key"},
 		{atlas + "retentionHours: 24\n", fullEnv, "no valkey"},
-		{atlas + "valkeyAddr: v\n", env(map[string]string{"DATABASE_URL": "x", "TF_INTERNAL_VIDEO_STORE_TOKEN": "s"}), "no token"},
-		{atlas + "valkeyAddr: v\n", env(map[string]string{"PHOEBE_VIDEOS_TOKEN": "t", "TF_INTERNAL_VIDEO_STORE_TOKEN": "s"}), "no database"},
+		{atlas + "valkeyAddr: v\n", env(map[string]string{"DATABASE_URL": "x", "PHOEBE_ATLAS_TOKEN_FILE": "/var/run/saturn/atlas-token/token"}), "no token"},
+		{atlas + "valkeyAddr: v\n", env(map[string]string{"PHOEBE_VIDEOS_TOKEN": "t", "PHOEBE_ATLAS_TOKEN_FILE": "/var/run/saturn/atlas-token/token"}), "no database"},
 		{"valkeyAddr: v\n", fullEnv, "no Atlas URL"},
-		{atlas + "valkeyAddr: v\n", env(map[string]string{"DATABASE_URL": "x", "PHOEBE_VIDEOS_TOKEN": "t"}), "no video store token"},
+		{atlas + "valkeyAddr: v\n", env(map[string]string{"DATABASE_URL": "x", "PHOEBE_VIDEOS_TOKEN": "t"}), "no Atlas service token file"},
 		// The store credential and location settings are gone: an old
 		// config that still carries them fails rather than being ignored.
 		{atlas + "valkeyAddr: v\nstore:\n  bucket: b\n", fullEnv, "a store bucket"},

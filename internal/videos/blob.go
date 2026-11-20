@@ -13,6 +13,8 @@ import (
 	"strconv"
 	"strings"
 	"time"
+
+	"github.com/saturncloud/phoebe/internal/atlastoken"
 )
 
 // Blob is the object store the outputs live in: the install's Token Factory
@@ -105,10 +107,7 @@ func (k Keys) Parse(key string) (orgID, jobID string, err error) {
 
 // The internal routes Atlas serves phoebe-videos (saturn
 // pdc/routes/token_factory_internal.py). CONTRACT with Atlas.
-const (
-	atlasVideoJobsPath    = "/api/internal/token-factory/video-jobs"
-	atlasVideoStoreHeader = "X-Saturn-Internal-Video-Store-Token"
-)
+const atlasVideoJobsPath = "/api/internal/token-factory/video-jobs"
 
 // AtlasBlob is Blob without a store credential: Atlas signs a presigned URL
 // for one exact key of one registered job, immediately before each request
@@ -117,8 +116,10 @@ const (
 // and content type it signs.
 type AtlasBlob struct {
 	baseURL string
-	token   string
-	keys    Keys
+	// tokens gives phoebe-videos' Atlas service token
+	// (tf-internal:video-store) for each call.
+	tokens atlastoken.Source
+	keys   Keys
 	// atlas calls Atlas; store sends the signed requests. Neither uses an
 	// ambient HTTP proxy from the pod environment (the token and the URLs are
 	// credentials), and neither follows a redirect: a redirect from Atlas
@@ -129,11 +130,11 @@ type AtlasBlob struct {
 	now   func() time.Time
 }
 
-// NewAtlasBlob checks the Atlas URL and the token. Both are required: with
-// either missing the service must not start.
-func NewAtlasBlob(baseURL, token, prefix string) (*AtlasBlob, error) {
-	if strings.TrimSpace(token) == "" {
-		return nil, errors.New("video store: the internal video store token is empty")
+// NewAtlasBlob checks the Atlas URL and the token source. Both are
+// required: with either missing the service must not start.
+func NewAtlasBlob(baseURL string, tokens atlastoken.Source, prefix string) (*AtlasBlob, error) {
+	if tokens == nil {
+		return nil, errors.New("video store: no Atlas service token source")
 	}
 	u, err := url.Parse(baseURL)
 	if err != nil || (u.Scheme != "http" && u.Scheme != "https") || u.Host == "" ||
@@ -157,7 +158,7 @@ func NewAtlasBlob(baseURL, token, prefix string) (*AtlasBlob, error) {
 	storeTransport.DisableCompression = true
 	return &AtlasBlob{
 		baseURL: strings.TrimRight(baseURL, "/"),
-		token:   token,
+		tokens:  tokens,
 		keys:    Keys{Prefix: prefix},
 		atlas:   &http.Client{Transport: atlasTransport, Timeout: 30 * time.Second, CheckRedirect: noRedirect},
 		store:   &http.Client{Transport: storeTransport, CheckRedirect: noRedirect},
@@ -222,7 +223,14 @@ func (b *AtlasBlob) call(ctx context.Context, path string, body any, want int, o
 		return err
 	}
 	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set(atlasVideoStoreHeader, b.token)
+	// Never sent without a usable token. The error is not an *atlasError, so
+	// callers treat it as temporary (the job is retried, not failed): Atlas's
+	// job may write a new token any minute.
+	token, err := b.tokens.Token()
+	if err != nil {
+		return fmt.Errorf("video store: %w", err)
+	}
+	req.Header.Set("Authorization", "token "+token)
 	resp, err := b.atlas.Do(req)
 	if err != nil {
 		return fmt.Errorf("video store: Atlas: %w", scrubURLError(err))
@@ -354,7 +362,7 @@ func (b *AtlasBlob) Put(ctx context.Context, key string, r io.Reader, size int64
 // a refused read fails before the API has written a 200. A job whose files
 // can no longer exist (Atlas 409), a job Atlas no longer has (Atlas 404: its
 // row was pruned) or an object that is gone reads as ErrBlobNotFound. A 403
-// stays an error: Atlas also answers 403 to a wrong internal token.
+// stays an error: Atlas also answers 403 to a wrong or revoked service token.
 func (b *AtlasBlob) Get(ctx context.Context, key string) (io.ReadCloser, int64, error) {
 	req, err := b.presign(ctx, key, http.MethodGet, 0, false)
 	var ae *atlasError
