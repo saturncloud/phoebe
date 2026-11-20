@@ -93,10 +93,12 @@ func (s *Server) serveVideoRetrieval(w http.ResponseWriter, r *http.Request, id 
 	case s.videos == nil:
 		refuse("video generation is not enabled on this phoebe (videos.serviceUrl / PHOEBE_VIDEOS_TOKEN)")
 		return
-	case id.Gateway || id.VideoLimits != "":
-		// The retrieval mark comes from one route only; together with another
-		// route's mark the edge contract is broken.
-		refuse("retrieval mark together with the gateway mark or video endpoint limits")
+	case id.Gateway || id.VideoLimits != "" || id.Upstream != "" || id.ServingMode != "" || id.ServedModel != "":
+		// The retrieval mark comes from one route only, and that route removes
+		// the upstream, serving mode and served model. Together with another
+		// route's stamps (every endpoint route stamps an upstream and serving
+		// mode) the edge contract is broken.
+		refuse("retrieval mark together with another route's stamps")
 		return
 	case id.OrgID == "" || id.ResourceID == "" || id.AuthID == "":
 		refuse("retrieval request without org, endpoint or auth id")

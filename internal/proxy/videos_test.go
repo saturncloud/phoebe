@@ -406,3 +406,27 @@ func TestVideoRetrievalReplacesTheClientRequestID(t *testing.T) {
 		t.Fatalf("phoebe-videos got %q, the response carries %q", sent, echoed)
 	}
 }
+
+// C16: a retrieval mark on an endpoint route (one that stamped an upstream,
+// serving mode or served model) is refused, whatever the trusted set says.
+func TestVideoRetrievalMarkIsRefusedOnAnEndpointRoute(t *testing.T) {
+	srv, backend := newVideoServer(t)
+	for _, tc := range []struct {
+		header, value string
+	}{
+		{identity.HeaderUpstream, "pd-chat.ns.svc.cluster.local:8000"},
+		{identity.HeaderServingMode, identity.ServingModeDedicated},
+		{identity.HeaderServedModel, "my-chat"},
+	} {
+		req := retrievalRequest(http.MethodGet, "/v1/videos/"+testVideoID)
+		req.Header.Set(tc.header, tc.value)
+		rr := httptest.NewRecorder()
+		srv.Handler().ServeHTTP(rr, req)
+		if rr.Code != http.StatusNotFound {
+			t.Errorf("mark with %s: %d, want 404", tc.header, rr.Code)
+		}
+	}
+	if len(backend.reqs) != 0 {
+		t.Errorf("%d refused requests reached phoebe-videos", len(backend.reqs))
+	}
+}
