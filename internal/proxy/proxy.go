@@ -699,6 +699,12 @@ func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request) {
 			// injecting the header restores the full bound surface.
 			allowed = allowed && unboundRequestAllowed(r.Method, routePath)
 		}
+		// A shared route never serves the dedicated-only rerank API
+		// (sharedTierPathAllowed): refuse it here, before admission could
+		// count it as shared work.
+		if id.ServingMode == identity.ServingModeShared && routePath == rerankPath {
+			allowed = false
+		}
 		if !allowed {
 			s.log.Warn.Printf("model-binding: refused request_id=%s resource_id=%s raw_path=%q canonical=%v serving_mode=%q (route not authorized for resource)",
 				requestID, id.ResourceID, r.URL.RawPath, pathCanonical, id.ServingMode)
