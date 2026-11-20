@@ -9,7 +9,9 @@
 //
 //	DATABASE_URL                   phoebe's own Postgres (migration 0016)
 //	PHOEBE_VIDEOS_TOKEN            shared with the interceptor; required
-//	TF_INTERNAL_VIDEO_STORE_TOKEN  shared with Atlas (atlas-secrets); required
+//	PHOEBE_ATLAS_TOKEN_FILE        the mounted file that holds phoebe-videos'
+//	                               Atlas service token (tf-internal:video-store),
+//	                               which Atlas renews; required
 //	POD_NAME                       the queue consumer name (defaults to the host name)
 //
 // phoebe-videos holds no object-store credential. Atlas (atlasURL) signs a
@@ -32,11 +34,10 @@ import (
 	"github.com/redis/go-redis/v9"
 	"gopkg.in/yaml.v2"
 
+	"github.com/saturncloud/phoebe/internal/atlastoken"
 	"github.com/saturncloud/phoebe/internal/logging"
 	"github.com/saturncloud/phoebe/internal/videos"
 )
-
-const videoStoreTokenEnv = "TF_INTERNAL_VIDEO_STORE_TOKEN"
 
 // Limits Atlas enforces when it signs an upload (saturn pdc/settings.py
 // TF_VIDEO_UPLOAD_WINDOW_MINUTES and pdc/managers/tf_video_store.py
@@ -147,8 +148,10 @@ func load(path string, getenv func(string) string) (config, error) {
 	if s.AtlasURL == "" {
 		return c, errors.New("atlasURL is required: Atlas signs every object store request")
 	}
-	if getenv(videoStoreTokenEnv) == "" {
-		return c, errors.New(videoStoreTokenEnv + " is required")
+	// Only the path is checked here: on a new install the pod may start
+	// before Atlas has written the token, which is read before every call.
+	if getenv(atlastoken.EnvFile) == "" {
+		return c, errors.New(atlastoken.EnvFile + " is required")
 	}
 	return c, nil
 }
@@ -173,7 +176,11 @@ func main() {
 	db.SetConnMaxLifetime(30 * time.Minute)
 	defer db.Close()
 
-	blob, err := videos.NewAtlasBlob(c.s.AtlasURL, os.Getenv(videoStoreTokenEnv), c.s.Store.Prefix)
+	tokens, err := atlastoken.NewFile(os.Getenv(atlastoken.EnvFile), log)
+	if err != nil {
+		log.Error.Fatalf("videos: %v", err)
+	}
+	blob, err := videos.NewAtlasBlob(c.s.AtlasURL, tokens, c.s.Store.Prefix)
 	if err != nil {
 		log.Error.Fatalf("videos: %v", err)
 	}
@@ -194,7 +201,7 @@ func main() {
 		RunTimeout: c.runTimeout, Retention: c.retention, MaxOutputBytes: c.s.MaxOutputBytes,
 		WorkDir: c.s.WorkDir, Prefix: c.s.Store.Prefix,
 	}, store, queue, blob, videos.NewOmniEngine(), media, log)
-	reaper := videos.NewReaper(videos.ReaperConfig{QueueTimeout: c.queueTimeout}, store, queue, blob, log)
+	reaper := videos.NewReaper(videos.ReaperConfig{QueueTimeout: c.queueTimeout, Prefix: c.s.Store.Prefix}, store, queue, blob, log)
 
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGTERM, syscall.SIGINT)
 	defer stop()

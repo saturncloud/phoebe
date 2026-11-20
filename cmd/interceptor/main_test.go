@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"context"
+	"encoding/base64"
 	"errors"
 	"io"
 	"log"
@@ -25,6 +26,7 @@ import (
 	k8stesting "k8s.io/client-go/testing"
 
 	"github.com/saturncloud/phoebe/internal/admission"
+	"github.com/saturncloud/phoebe/internal/atlastoken"
 	"github.com/saturncloud/phoebe/internal/config"
 	"github.com/saturncloud/phoebe/internal/emit"
 	"github.com/saturncloud/phoebe/internal/gateway"
@@ -109,14 +111,18 @@ func TestBuildAdmissionLogsMeteringStoreFallback(t *testing.T) {
 	}
 }
 
+// serviceToken is a JWT-shaped token that expires in 2100 (atlastoken reads
+// only its exp).
+var serviceToken = "e30." + base64.RawURLEncoding.EncodeToString([]byte(`{"exp":4102444800}`)) + ".sig"
+
 func TestBuildWakerConnectsBothModesToAtlas(t *testing.T) {
 	var wakeCalls int
 	atlas := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.URL.Path {
 		case "/api/internal/token-factory/inference-endpoints/wake":
 			wakeCalls++
-			if got := r.Header.Get("X-Saturn-Internal-Wake-Token"); got != "secret" {
-				t.Fatalf("wake token = %q, want secret", got)
+			if got := r.Header.Get("Authorization"); got != "token "+serviceToken {
+				t.Fatalf("Authorization = %q, want the service token", got)
 			}
 			w.WriteHeader(http.StatusNoContent)
 		case "/v1/models":
@@ -130,7 +136,12 @@ func TestBuildWakerConnectsBothModesToAtlas(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	t.Setenv(internalWakeTokenEnv, "secret")
+	t.Setenv(internalWakeTokenEnv, "")
+	tokenFile := filepath.Join(t.TempDir(), "token")
+	if err := os.WriteFile(tokenFile, []byte(serviceToken), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv(atlastoken.EnvFile, tokenFile)
 
 	s := &config.Settings{}
 	s.Wake.Enabled = true
@@ -166,6 +177,7 @@ func TestBuildWakerConnectsBothModesToAtlas(t *testing.T) {
 
 func TestBuildWakerLogsMissingDedicatedToken(t *testing.T) {
 	t.Setenv(internalWakeTokenEnv, "")
+	t.Setenv(atlastoken.EnvFile, "")
 	var buf bytes.Buffer
 	logger := &logging.Logger{
 		Debug: log.New(io.Discard, "", 0),
@@ -179,7 +191,7 @@ func TestBuildWakerLogsMissingDedicatedToken(t *testing.T) {
 	if built := buildWaker(s, logger); built != nil {
 		t.Fatalf("buildWaker returned %T without %s, want nil", built, internalWakeTokenEnv)
 	}
-	if got := buf.String(); !strings.Contains(got, "Atlas actuator unavailable") || !strings.Contains(got, "internal wake token is empty") {
+	if got := buf.String(); !strings.Contains(got, "Atlas actuator unavailable") || !strings.Contains(got, "no Atlas service token file") {
 		t.Fatalf("missing-token startup log = %q", got)
 	}
 }

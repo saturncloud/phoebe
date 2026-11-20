@@ -15,6 +15,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"path/filepath"
 	"sort"
 	"strings"
 	"sync"
@@ -85,6 +86,8 @@ type memBlob struct {
 	refuse bool
 	// registers and closes count the calls that reached "Atlas".
 	registers, closes int
+	// discards lists the keys Discard was asked for.
+	discards []string
 	// onRegister runs after a successful Register (outside the lock).
 	onRegister func()
 	// deleteErr, when set, decides Delete's answer for a key.
@@ -95,11 +98,16 @@ type memBlob struct {
 	// putErr, when set, decides Put's answer for a key (as Atlas refusing to
 	// sign it would).
 	putErr func(key string) error
+	// signedBeforeClose, when set and true for a key, accepts its upload even
+	// after the job closed, as a URL Atlas signed while the job was still in
+	// progress would be.
+	signedBeforeClose func(key string) bool
 }
 
 type grant struct {
 	org, resource, inputExt string
 	closed                  bool
+	outputAttempt           int
 }
 
 func (b *memBlob) Register(_ context.Context, orgID, jobID, resourceID, inputExt string) error {
@@ -121,7 +129,7 @@ func (b *memBlob) Register(_ context.Context, orgID, jobID, resourceID, inputExt
 	return nil
 }
 
-func (b *memBlob) Close(_ context.Context, orgID, jobID string) error {
+func (b *memBlob) Close(_ context.Context, orgID, jobID string, outputAttempt int) error {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	b.closes++
@@ -129,8 +137,30 @@ func (b *memBlob) Close(_ context.Context, orgID, jobID string) error {
 	if !ok || g.org != orgID {
 		return fmt.Errorf("no job %s for %s", jobID, orgID)
 	}
-	g.closed = true
+	if g.closed && g.outputAttempt != outputAttempt {
+		return fmt.Errorf("Atlas answered 409: closed with output attempt %d", g.outputAttempt)
+	}
+	if !g.closed {
+		g.closed, g.outputAttempt = true, outputAttempt
+	}
 	return nil
+}
+
+// Discard is Delete, refused like Atlas for the attempt recorded as the
+// job's output.
+func (b *memBlob) Discard(ctx context.Context, key string) error {
+	_, jobID, err := (Keys{Prefix: "tf-videos"}).Parse(key)
+	if err != nil {
+		return err
+	}
+	b.mu.Lock()
+	b.discards = append(b.discards, key)
+	g := b.grants[jobID]
+	b.mu.Unlock()
+	if g != nil && g.outputAttempt > 0 && strings.Contains(key, fmt.Sprintf("/attempt-%d/", g.outputAttempt)) {
+		return fmt.Errorf("Atlas answered 409: %s is the recorded output", key)
+	}
+	return b.Delete(ctx, key)
 }
 
 func (b *memBlob) grant(jobID string) grant {
@@ -157,7 +187,7 @@ func (b *memBlob) Put(_ context.Context, key string, r io.Reader, _ int64, _ str
 	}
 	b.mu.Lock()
 	g, ok := b.grants[jobID]
-	open := ok && g.org == org && !g.closed
+	open := ok && g.org == org && (!g.closed || (b.signedBeforeClose != nil && b.signedBeforeClose(key)))
 	b.mu.Unlock()
 	if !open {
 		return fmt.Errorf("put %s: the job is not in progress", key)
@@ -266,7 +296,7 @@ func newHarness(t *testing.T) *harness {
 	h.disp = NewDispatcher(DispatchConfig{Prefix: "tf-videos", WorkDir: t.TempDir(), Lease: time.Minute},
 		h.store, h.queue, h.blob, h.engine, fakeMedia{}, testLogger())
 	h.disp.now = func() time.Time { return h.now }
-	h.reaper = NewReaper(ReaperConfig{}, h.store, h.queue, h.blob, testLogger())
+	h.reaper = NewReaper(ReaperConfig{Prefix: "tf-videos"}, h.store, h.queue, h.blob, testLogger())
 	h.reaper.now = func() time.Time { return h.now }
 	return h
 }
@@ -389,7 +419,7 @@ func TestVideoJobRunsEndToEndAndBillsOnce(t *testing.T) {
 		t.Fatalf("store grant after completion: %+v (registered for the org and endpoint, then closed)", g)
 	}
 	keys := h.blob.keys()
-	want := []string{"tf-videos/org-a/" + o.ID + "/thumbnail.webp", "tf-videos/org-a/" + o.ID + "/video.mp4"}
+	want := []string{"tf-videos/org-a/" + o.ID + "/attempt-1/thumbnail.webp", "tf-videos/org-a/" + o.ID + "/attempt-1/video.mp4"}
 	if fmt.Sprint(keys) != fmt.Sprint(want) {
 		t.Fatalf("stored keys %v, want %v", keys, want)
 	}
@@ -1098,11 +1128,11 @@ func TestReaperTreatsMissingAtlasGrantAsFinal(t *testing.T) {
 		_, _ = w.Write([]byte(`{"message":"refused"}`))
 	}))
 	t.Cleanup(atlas.Close)
-	blob, err := NewAtlasBlob(atlas.URL, "tok", "tf-videos")
+	blob, err := NewAtlasBlob(atlas.URL, staticToken("tok"), "tf-videos")
 	if err != nil {
 		t.Fatal(err)
 	}
-	h.reaper = NewReaper(ReaperConfig{}, h.store, h.queue, blob, testLogger())
+	h.reaper = NewReaper(ReaperConfig{Prefix: "tf-videos"}, h.store, h.queue, blob, testLogger())
 	h.reaper.now = func() time.Time { return h.now }
 
 	created := h.now.Add(-2 * time.Hour)
@@ -1197,7 +1227,7 @@ func TestDispatcherOutputOverStoreCapIsOutputTooLarge(t *testing.T) {
 func TestReaperContinuesPastAHungDelete(t *testing.T) {
 	h := newHarness(t)
 	ctx := context.Background()
-	h.reaper = NewReaper(ReaperConfig{DeleteTimeout: 200 * time.Millisecond}, h.store, h.queue, h.blob, testLogger())
+	h.reaper = NewReaper(ReaperConfig{DeleteTimeout: 200 * time.Millisecond, Prefix: "tf-videos"}, h.store, h.queue, h.blob, testLogger())
 	h.reaper.now = func() time.Time { return h.now }
 	keys := Keys{Prefix: "tf-videos"}
 	hungID, err := NewID(h.now.Add(-3 * time.Hour))
@@ -1256,5 +1286,184 @@ func TestRetrievalDeleteLogsTheCallersKey(t *testing.T) {
 		if !strings.Contains(buf.String(), want) {
 			t.Errorf("log %q has no line %q", buf.String(), want)
 		}
+	}
+}
+
+// --- Attempt-scoped outputs (battery P on phoebe#144) ------------------------
+
+// claimDirect takes job id's queue entry and claims it as the next attempt,
+// as a dispatcher replica would, without running it.
+func (h *harness) claimDirect(id Handoff, jobID string) *Job {
+	h.t.Helper()
+	if e, _ := h.queue.Next(context.Background(), id.ResourceID, time.Minute); e != nil {
+		_ = h.queue.Done(context.Background(), id.ResourceID, e.StreamID)
+	}
+	j, _, err := h.store.Claim(context.Background(), jobID, time.Minute, h.now)
+	if err != nil || j == nil {
+		h.t.Fatalf("claim %s: %v %v", jobID, j, err)
+	}
+	return j
+}
+
+// supersede claims job o as attempt 1, lets its lease expire (the reaper
+// requeues it), then lets the dispatcher run and complete it as attempt 2.
+// It returns attempt 1's claim, still held by its stalled dispatcher.
+func (h *harness) supersede(id Handoff, o Object) *Job {
+	h.t.Helper()
+	first := h.claimDirect(id, o.ID)
+	if first.Attempts != 1 {
+		h.t.Fatalf("first claim is attempt %d", first.Attempts)
+	}
+	h.now = h.now.Add(2 * time.Minute)
+	h.reaper.Once(context.Background())
+	h.run()
+	j, err := h.store.GetByID(context.Background(), o.ID)
+	if err != nil || j.Status != StatusCompleted || j.Attempts != 2 {
+		h.t.Fatalf("attempt 2 did not complete the job: %+v %v", j, err)
+	}
+	return first
+}
+
+// lateComplete runs attempt's completion with its own video, as a dispatcher
+// that lost its lease and finished its engine call late would.
+func (h *harness) lateComplete(job *Job, attempt int, content string) {
+	h.t.Helper()
+	path := filepath.Join(h.t.TempDir(), "video.mp4")
+	if err := os.WriteFile(path, []byte(content), 0o600); err != nil {
+		h.t.Fatal(err)
+	}
+	h.disp.complete(context.Background(), job, attempt, path, int64(len(content)), time.Second)
+}
+
+func (h *harness) objectBytes(key string) []byte {
+	h.blob.mu.Lock()
+	defer h.blob.mu.Unlock()
+	return append([]byte(nil), h.blob.objs[key]...)
+}
+
+func TestSupersededAttemptsLatePutCannotChangeTheRecordedOutput(t *testing.T) {
+	h := newHarness(t)
+	id := identity("org-a", "res-1")
+	o := h.create(id)
+	first := h.supersede(id, o)
+	keys := Keys{Prefix: "tf-videos"}
+	output := keys.Video("org-a", o.ID, 2)
+	done, _ := h.store.GetByID(context.Background(), o.ID)
+	if done.VideoKey != output || done.ThumbnailKey != keys.Thumbnail("org-a", o.ID, 2) {
+		t.Fatalf("recorded output %q %q, want attempt 2's keys", done.VideoKey, done.ThumbnailKey)
+	}
+	if g := h.blob.grant(o.ID); !g.closed || g.outputAttempt != 2 {
+		t.Fatalf("grant %+v, want closed with output attempt 2", g)
+	}
+	before := h.objectBytes(output)
+
+	// Attempt 1 still holds upload URLs signed before the job closed, and
+	// its upload lands after attempt 2 completed.
+	h.blob.signedBeforeClose = func(key string) bool { return strings.Contains(key, "/attempt-1/") }
+	h.lateComplete(first, 1, "\x00\x00\x00\x08ftypLATE attempt 1")
+
+	after, _ := h.store.GetByID(context.Background(), o.ID)
+	if after.VideoKey != output || after.Status != StatusCompleted {
+		t.Fatalf("the late attempt changed the job: %+v", after)
+	}
+	if !bytes.Equal(h.objectBytes(output), before) || len(before) == 0 {
+		t.Fatal("the late attempt changed the recorded output's bytes")
+	}
+	w := h.do(http.MethodGet, "/v1/videos/"+o.ID+"/content", "", id)
+	if w.Code != http.StatusOK || bytes.Contains(w.Body.Bytes(), []byte("LATE")) {
+		t.Fatalf("content after the late attempt: %d %q", w.Code, w.Body.String())
+	}
+	// The late attempt removed only its own files, and the store keeps
+	// exactly attempt 2's output.
+	for _, k := range h.blob.discards {
+		if !strings.Contains(k, "/attempt-1/") {
+			t.Fatalf("the late attempt discarded %s", k)
+		}
+	}
+	want := []string{keys.Thumbnail("org-a", o.ID, 2), output}
+	if got := h.blob.keys(); fmt.Sprint(got) != fmt.Sprint(want) {
+		t.Fatalf("stored keys %v, want %v", got, want)
+	}
+	if b, n := h.billing(o.ID); n != 1 || b.count != 1 {
+		t.Fatalf("billing (%d): %+v", n, b)
+	}
+}
+
+func TestCleanupNeverDeletesTheRecordedOutput(t *testing.T) {
+	h := newHarness(t)
+	id := identity("org-a", "res-1")
+	o := h.create(id)
+	h.supersede(id, o)
+	done, _ := h.store.GetByID(context.Background(), o.ID)
+
+	// Even a cleanup that names the recorded output (two attempts with one
+	// number) leaves it: the dispatcher checks the job row, and Atlas
+	// refuses a discard of the output attempt.
+	h.disp.discard(context.Background(), o.ID, 2, done.VideoKey, done.ThumbnailKey)
+	if len(h.blob.discards) != 0 {
+		t.Fatalf("discard asked Atlas for the recorded output: %v", h.blob.discards)
+	}
+	if err := h.blob.Discard(context.Background(), done.VideoKey); err == nil {
+		t.Fatal("the fake Atlas signed a discard of the recorded output")
+	}
+	for _, k := range []string{done.VideoKey, done.ThumbnailKey} {
+		if len(h.objectBytes(k)) == 0 {
+			t.Fatalf("%s was deleted", k)
+		}
+	}
+	if w := h.do(http.MethodGet, "/v1/videos/"+o.ID+"/content", "", id); w.Code != http.StatusOK {
+		t.Fatalf("content after cleanup: %d", w.Code)
+	}
+}
+
+func TestRetriedAttemptSucceedsUnderItsOwnKeys(t *testing.T) {
+	h := newHarness(t)
+	id := identity("org-a", "res-1")
+	// Attempt 1's engine pod goes away; the job is retried once.
+	h.engine.errs = []error{fmt.Errorf("%w: reset", ErrEngineGone)}
+	o := h.create(id)
+	h.run()
+	h.run()
+	got := h.object(h.do(http.MethodGet, "/v1/videos/"+o.ID, "", id))
+	if got.Status != StatusCompleted {
+		t.Fatalf("the retried job: %+v", got)
+	}
+	keys := Keys{Prefix: "tf-videos"}
+	j, _ := h.store.GetByID(context.Background(), o.ID)
+	if j.Attempts != 2 || j.VideoKey != keys.Video("org-a", o.ID, 2) {
+		t.Fatalf("attempts %d, video key %q", j.Attempts, j.VideoKey)
+	}
+	if g := h.blob.grant(o.ID); g.outputAttempt != 2 {
+		t.Fatalf("grant %+v, want output attempt 2", g)
+	}
+	if w := h.do(http.MethodGet, "/v1/videos/"+o.ID+"/content", "", id); w.Code != http.StatusOK ||
+		!bytes.HasPrefix(w.Body.Bytes(), []byte("\x00\x00\x00\x08ftypMP4!"+o.ID)) {
+		t.Fatalf("content: %d", w.Code)
+	}
+}
+
+// Files an attempt left under its own keys (its completion could not be
+// recorded, or its discard failed) go when the job's files expire.
+func TestReaperDeletesEveryAttemptsFiles(t *testing.T) {
+	h := newHarness(t)
+	id := identity("org-a", "res-1")
+	o := h.create(id)
+	h.supersede(id, o)
+	keys := Keys{Prefix: "tf-videos"}
+	leftover := keys.Video("org-a", o.ID, 1)
+	h.blob.mu.Lock()
+	h.blob.objs[leftover] = []byte("attempt 1")
+	h.blob.mu.Unlock()
+
+	if w := h.do(http.MethodDelete, "/v1/videos/"+o.ID, "", id); w.Code != http.StatusOK {
+		t.Fatalf("delete: %d", w.Code)
+	}
+	h.now = h.now.Add(time.Minute)
+	h.reaper.Once(context.Background())
+	if got := h.blob.keys(); len(got) != 0 {
+		t.Fatalf("left in the store: %v", got)
+	}
+	if s := filesOf(t, h.db, o.ID); !s.deleted {
+		t.Fatalf("files state %+v", s)
 	}
 }
