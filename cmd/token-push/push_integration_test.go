@@ -612,3 +612,113 @@ func TestIntegration_BackfillSendsPreConnectionUsageOnceSkippingAcceptedAndParke
 		t.Fatalf("auto_floor moved to %s", f)
 	}
 }
+
+func deferredCount(t *testing.T, db *sql.DB) int {
+	t.Helper()
+	var n int
+	if err := db.QueryRow(`SELECT count(*) FROM deferred_hour`).Scan(&n); err != nil {
+		t.Fatal(err)
+	}
+	return n
+}
+
+// A 409 from the manager defers the hour (deferred_hour: status, body, count,
+// first and last refusal) instead of stopping the run. The deferred hour is not
+// in the unsent list (it does not use up that cap) and is re-sent by every
+// scheduled run, outside the window too, until accepted; acceptance deletes the
+// row. Parking the hour also deletes it, and deferring a parked hour unparks it.
+func TestIntegration_DeferredHourIsResentEveryRunAndAcceptanceUndefersIt(t *testing.T) {
+	db := itDB(t, "phoebe_push_deferred_it")
+	ctx := context.Background()
+	store := pgStore{db: db}
+	now := time.Now().UTC().Truncate(time.Hour)
+	floor := now.Add(-10 * time.Hour)
+	if _, err := db.Exec(`INSERT INTO token_push_state (auto_floor) VALUES ($1)`, floor); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(`INSERT INTO pushed_hour (window_start, pushed_at) VALUES ($1, now())`, floor); err != nil {
+		t.Fatal(err)
+	}
+	h, other := floor.Add(2*time.Hour), floor.Add(3*time.Hour)
+	event(t, db, h.Add(time.Minute), itRes1, itOrg1)
+	event(t, db, other.Add(time.Minute), itRes1, itOrg1)
+	rate(t, db, floor, now)
+
+	legacy := &recordingManager{statuses: []int{409, 200}, errBody: `{"error": "install billing path is legacy"}`}
+	if code := push(t, db, legacy, h, other); code != exitRejected {
+		t.Fatalf("exit %d, want exitRejected", code)
+	}
+	if sent := windowStarts(t, legacy); len(sent) != 2 {
+		t.Fatalf("sent %v, want both hours (the 409 does not stop the run)", sent)
+	}
+	var status, refusals int
+	var message string
+	var first, last time.Time
+	row := `SELECT status, message, refusals, first_deferred_at, last_deferred_at FROM deferred_hour WHERE window_start = $1`
+	if err := db.QueryRow(row, h).Scan(&status, &message, &refusals, &first, &last); err != nil {
+		t.Fatal(err)
+	}
+	if status != 409 || message != `{"error": "install billing path is legacy"}` || refusals != 1 {
+		t.Fatalf("row status=%d message=%q refusals=%d, want 409, the body, 1", status, message, refusals)
+	}
+	if refusedCount(t, db) != 0 || deferredCount(t, db) != 1 {
+		t.Fatalf("%d parked, %d deferred; want 0 and 1", refusedCount(t, db), deferredCount(t, db))
+	}
+	if unsent, err := store.UnsentHours(ctx, now, maxUnsentHoursPerRun); err != nil || len(unsent) != 0 {
+		t.Fatalf("unsent %v err %v, want none (the deferred hour is listed on its own)", unsent, err)
+	}
+
+	still := &recordingManager{statuses: []int{409}, errBody: `{"error": "install billing path is legacy"}`}
+	if code := push(t, db, still); code != exitRejected {
+		t.Fatalf("second run: exit %d", code)
+	}
+	if sent := windowStarts(t, still); len(sent) != 1 || sent[0] != meteredusage.FormatWindowStart(h) {
+		t.Fatalf("second run sent %v, want only the deferred hour", sent)
+	}
+	var first2 time.Time
+	if err := db.QueryRow(row, h).Scan(&status, &message, &refusals, &first2, &last); err != nil {
+		t.Fatal(err)
+	}
+	if refusals != 2 || !first2.Equal(first) {
+		t.Fatalf("refusals=%d first %s (was %s); want 2 and first kept", refusals, first2, first)
+	}
+
+	upgraded := &recordingManager{}
+	if code := push(t, db, upgraded); code != exitOK {
+		t.Fatalf("upgraded run: exit %d", code)
+	}
+	if sent := windowStarts(t, upgraded); len(sent) != 1 || sent[0] != meteredusage.FormatWindowStart(h) {
+		t.Fatalf("upgraded run sent %v, want the deferred hour", sent)
+	}
+	if !bytesEqual(upgraded.bodies[0], still.bodies[0]) {
+		t.Fatal("the accepted request differs from the refused one")
+	}
+	if deferredCount(t, db) != 0 {
+		t.Fatal("the accepted hour is still deferred")
+	}
+	if code := push(t, db, upgraded); code != exitOK || len(upgraded.bodies) != 1 {
+		t.Fatalf("after acceptance: exit %d, %d requests; want 0 and no new request", code, len(upgraded.bodies))
+	}
+
+	// Deferred and parked never hold the same hour.
+	if err := store.RecordDeferred(ctx, other, 409, "x"); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.RecordRefused(ctx, other, 400, `{"error":"x","path":"records[0]"}`, strings.Repeat("a", 64)); err != nil {
+		t.Fatal(err)
+	}
+	if refusedCount(t, db) != 1 || deferredCount(t, db) != 0 {
+		t.Fatalf("after parking: %d parked, %d deferred; want 1 and 0", refusedCount(t, db), deferredCount(t, db))
+	}
+	if err := store.RecordDeferred(ctx, other, 409, "x"); err != nil {
+		t.Fatal(err)
+	}
+	if refusedCount(t, db) != 0 || deferredCount(t, db) != 1 {
+		t.Fatalf("after deferring: %d parked, %d deferred; want 0 and 1", refusedCount(t, db), deferredCount(t, db))
+	}
+	if n, oldest, err := store.DeferredSummary(ctx); err != nil || n != 1 || !oldest.Equal(other) {
+		t.Fatalf("summary %d %s %v, want 1 deferred hour, oldest %s", n, oldest, err, other)
+	}
+}
+
+func bytesEqual(a, b []byte) bool { return string(a) == string(b) }

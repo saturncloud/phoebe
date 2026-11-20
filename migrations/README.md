@@ -45,6 +45,12 @@ with the Atlas schema; they live in phoebe's own database.
 - **`pushed_usage`, `pushed_hour`** — token-push's record of which usage_ids the
   manager holds per hour (with each id's `kind` since 0017) and when the hour was
   last accepted.
+- **`refused_hour`, `deferred_hour`** — token-push's per-hour refusals. A
+  parked hour (`refused_hour`, 0014) was refused for its content and is re-sent
+  only when its payload changes. A deferred hour (`deferred_hour`, 0019) was
+  refused because the manager does not accept a usage kind it lists (a 409 or
+  a 400 on `kinds` from an older manager) and is re-sent by every run until
+  accepted. See docs/billing-reconciliation.md.
 - **`token_push_state`** — one row: `auto_floor`, the first hour accepted by a
   scheduled token-push run. Scheduled runs re-send never-accepted hours only
   after it; explicit `-since/-until` runs never change it.
@@ -85,6 +91,7 @@ golang-migrate up/down pairs, applied in version order:
 | 0016 | `0016_video_jobs.{up,down}.sql` | `video_job` and `video_billing_event` (video generation jobs written and read only by phoebe-videos, `cmd/videos`; new tables only). Numbered 0016, not 0013: 0013 was already `token_push_state` |
 | 0017 | `0017_rated_video_usage.{up,down}.sql` | `rated_video_usage` (with each rollup's wire `usage_id`), `parked_video_usage` and `video_reconcile_deletion` (the video rollup, its parked conflicts, and the rater's tombstones), and `pushed_usage.kind` (default `'token'`). Down refuses while video usage is parked or any rollup's usage_id is not yet accepted by the manager. A dev database that applied 0017 before the tombstones (#143) has no `usage_id` column or tombstone table: apply `0017_rated_video_usage.up.sql` again by hand (it is idempotent). Its old rollups stay unstamped until the rater re-rates them, and token-push holds them back meanwhile |
 | 0018 | `0018_video_job_files_delete_failed.{up,down}.sql` | `video_job.files_delete_failed_at` (nullable; when the phoebe-videos reaper last failed to delete the job's files, so the reaper retries those after every job not yet tried). Expand step |
+| 0019 | `0019_deferred_hour.{up,down}.sql` | `deferred_hour` (token-push defers an hour the manager refused because it does not accept a usage kind the hour lists, a 409 or a 400 on `kinds` from an older manager; every run re-sends it until accepted, outside the per-run missed-hour cap; an accepted push or parking the hour deletes the row). New table, expand step |
 
 `embed.go` embeds these into the `migrations` package; `cmd/migrate` applies them.
 

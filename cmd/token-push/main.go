@@ -64,9 +64,24 @@
 //     to maxParkedRechecksPerRun of them, so one whose usage changes is sent
 //     again. An explicit -since/-until run sends parked hours too (the way to
 //     retry after fixing the cause). Every run with parked hours logs at WARN
-//     how many there are. 401, 403 and 409 are refusals for the whole install,
+//     how many there are. 401 and 403 are refusals for the whole install,
 //     never parked: the run stops at the first one. Any other 4xx (including a
 //     400 without the manager's validation body) is not parked either.
+//
+//   - HOURS WITH A KIND THE MANAGER REFUSES ARE DEFERRED, NEVER THE INSTALL. A
+//     409 ("install billing path is legacy") or a 400 whose validation path is
+//     `kinds` comes from a manager older than phoebe that does not accept, from
+//     this install, a kind the hour lists (video, from an install on the legacy
+//     billing path, before saturn-aws-manager#334). The same manager keeps
+//     accepting the install's token-only hours, so the run goes on with the
+//     other hours. The refused hour is recorded in deferred_hour (status, body,
+//     count, first and last refusal), logged at ERROR, and re-sent by every
+//     run, outside the window too, until the manager accepts it; each run
+//     retries up to maxDeferredRetriesPerRun, least recently refused first,
+//     without using up maxUnsentHoursPerRun, and logs at WARN how many hours
+//     are deferred. A refused request stores nothing at the manager, so the
+//     manager keeps what it held for the hour, and the accepted request later
+//     replaces it whole: nothing is counted twice and nothing is dropped.
 //
 //   - HTTPS ONLY. managerURL and -manager-url must be https:// URLs: the
 //     request carries the install's token and usage. Any other scheme, or a
@@ -143,11 +158,11 @@
 //	   rater's signal (its exit 4), not this one
 //	3  the manager REJECTED some hour with a final status: a 400 validation
 //	   answer (the hour is parked; later runs do not fail for it while its
-//	   usage is unchanged), 401 token, 403 inactive or uninstalled install, 409
-//	   a manager older than the 2026-11-17 rule that accepts token usage from
-//	   installs on the legacy billing path, a 400 on kinds (a manager older
-//	   than the video kind), or any other non-429 4xx. Not
-//	   retried; needs a person
+//	   usage is unchanged), 401 token, 403 inactive or uninstalled install, a
+//	   409 or a 400 on kinds (a manager older than phoebe that does not accept
+//	   a kind the hour lists; the hour is deferred and every run re-sends it,
+//	   and exits 3, until the manager accepts it), or any other non-429 4xx.
+//	   Needs a person
 //
 // Precedence when several apply: 1 > 3 > 2.
 package main

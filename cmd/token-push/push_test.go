@@ -79,6 +79,7 @@ type fakeStore struct {
 	backfill      []time.Time // candidates before the floor; same filtering
 	backfillLimit int         // the limit the last BackfillHours call was given (0: not called)
 	refused       map[time.Time]*fakeRefused
+	deferred      map[time.Time]*fakeDeferred
 	checkSeq      int
 	rollups       map[time.Time][]rollupRow
 	parked        map[time.Time][]identity
@@ -108,10 +109,18 @@ type fakeRefused struct {
 	checked  int // order of the last check; lower is checked longer ago
 }
 
+// fakeDeferred is one deferred_hour row.
+type fakeDeferred struct {
+	status   int
+	message  string
+	refusals int
+	last     int // order of the last refusal; lower is refused longer ago
+}
+
 func newFake() *fakeStore {
 	return &fakeStore{rollups: map[time.Time][]rollupRow{}, parked: map[time.Time][]identity{},
 		pushed: map[time.Time][]pushedRow{}, accepted: map[time.Time]int{}, sentBefore: map[time.Time]bool{},
-		refused:      map[time.Time]*fakeRefused{},
+		refused: map[time.Time]*fakeRefused{}, deferred: map[time.Time]*fakeDeferred{},
 		videoRollups: map[time.Time][]videoRollupRow{}, videoParked: map[time.Time][]identity{}}
 }
 
@@ -175,9 +184,9 @@ func stampedVideoID(h time.Time, r videoRollupRow) string {
 			BaseModel: r.BaseModel, Task: r.Task, Resolution: r.Resolution, Region: r.Region})
 }
 
-// eligible mirrors the SQL: never accepted and not parked.
+// eligible mirrors the SQL: never accepted, not parked and not deferred.
 func (f *fakeStore) eligible(h time.Time) bool {
-	return !f.sentBefore[h] && f.accepted[h] == 0 && f.refused[h] == nil
+	return !f.sentBefore[h] && f.accepted[h] == 0 && f.refused[h] == nil && f.deferred[h] == nil
 }
 
 func (f *fakeStore) backfillCandidates() []time.Time {
@@ -269,6 +278,45 @@ func (f *fakeStore) RecordRefused(_ context.Context, h time.Time, status int, me
 	}
 	r.status, r.message, r.sha, r.checked = status, message, sha, f.checkSeq
 	r.refusals++
+	delete(f.deferred, h)
+	return nil
+}
+func (f *fakeStore) DeferredHours(_ context.Context, limit int) ([]time.Time, error) {
+	var out []time.Time
+	for h := range f.deferred {
+		out = append(out, h)
+	}
+	sort.Slice(out, func(i, j int) bool {
+		li, lj := f.deferred[out[i]].last, f.deferred[out[j]].last
+		if li != lj {
+			return li < lj
+		}
+		return out[i].Before(out[j])
+	})
+	if len(out) > limit {
+		out = out[:limit]
+	}
+	return out, nil
+}
+func (f *fakeStore) DeferredSummary(context.Context) (int, time.Time, error) {
+	var oldest time.Time
+	for h := range f.deferred {
+		if oldest.IsZero() || h.Before(oldest) {
+			oldest = h
+		}
+	}
+	return len(f.deferred), oldest, nil
+}
+func (f *fakeStore) RecordDeferred(_ context.Context, h time.Time, status int, message string) error {
+	f.checkSeq++
+	d := f.deferred[h]
+	if d == nil {
+		d = &fakeDeferred{}
+		f.deferred[h] = d
+	}
+	d.status, d.message, d.last = status, message, f.checkSeq
+	d.refusals++
+	delete(f.refused, h)
 	return nil
 }
 func (f *fakeStore) MarkRefusedChecked(_ context.Context, hours []time.Time) error {
@@ -306,6 +354,7 @@ func (f *fakeStore) RecordAccepted(_ context.Context, h time.Time, kinds []strin
 	f.pushed[h] = append(kept, rows...)
 	f.accepted[h]++
 	delete(f.refused, h)
+	delete(f.deferred, h)
 	if setAutoFloor && f.autoFloor == nil {
 		hh := h
 		f.autoFloor = &hh

@@ -279,13 +279,31 @@ hours too. The same applies to an hour whose request breaks a request-level wire
 rule token-push checks itself (for instance a duplicate usage_id; status `0` in
 `refused_hour`, exit `2` in the run that parks it).
 
-Every other 4xx is never retried and exits `3`, and nothing is parked: `401`
-means the customer token, `403` an inactive or uninstalled install, and `409`
-a manager older than the 2026-11-17 rule that refuses token usage from an
-install on the legacy billing path. These three are about the install, not the
-hour, so the run stops at the first one and the next run sends again. A `400`
-without the manager's validation body (a proxy in front of it, for instance) and
-any other 4xx exit `3` every run until fixed.
+**Hours with a kind the manager refuses are deferred.** A `409`
+(`{"error": "install billing path is legacy"}`) or a `400` whose validation path
+is `kinds` comes from a manager older than phoebe that does not accept, from
+this install, a usage kind the hour lists: for instance video from an install on
+the legacy billing path, before saturn-aws-manager#334. The same manager keeps
+accepting the install's hours that list only token, so the refusal is about
+the hour, not the install, and the run goes on with the other hours.
+token-push records the hour in `deferred_hour` (status, response body, number
+of refusals, first and last refusal), logs `DEFERRED <hour>` at ERROR, and
+re-sends it in every run, also after it leaves the trailing window, until the
+manager accepts it; each run retries up to 168 of them, least recently refused
+first, outside the 168-hour budget for missed hours. While any hour is
+deferred, every run logs at WARN `N hour(s) are deferred (K refused this run),
+oldest ...`, and a run in which one is refused exits `3`. The fix is to upgrade
+the manager. A refused request stores nothing, so the manager keeps what it
+held for the hour (for instance the token records of an earlier push), and the
+accepted request replaces the hour whole: nothing is counted twice. An accepted
+push removes the row; an hour is deferred or parked, never both.
+
+Every other 4xx is never retried and exits `3`, and nothing is parked or
+deferred: `401` means the customer token and `403` an inactive or uninstalled
+install. These two are about the install, not the hour, so the run stops at the
+first one and the next run sends again. A `400` without the manager's
+validation body (a proxy in front of it, for instance) and any other 4xx exit
+`3` every run until fixed.
 
 ### Sending is not optional
 

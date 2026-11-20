@@ -266,11 +266,11 @@ func TestPushWindows_A400WithoutTheManagersValidationBodyIsNotParked(t *testing.
 	}
 }
 
-// 401, 403 and 409 are about the install, not the hour: nothing is parked,
-// the run exits 3 and stops sending (every other hour would get the same
-// answer), and the next run sends the hours again.
+// 401 and 403 are about the install, not the hour: nothing is parked or
+// deferred, the run exits 3 and stops sending (every other hour would get the
+// same answer), and the next run sends the hours again.
 func TestPushWindows_WholeInstallRefusalParksNothingAndStopsTheRun(t *testing.T) {
-	for _, status := range []int{401, 403, 409} {
+	for _, status := range []int{401, 403} {
 		f := fixtureStore()
 		other := win.Add(-time.Hour)
 		f.rollups[other] = fixtureRollups()
@@ -281,8 +281,8 @@ func TestPushWindows_WholeInstallRefusalParksNothingAndStopsTheRun(t *testing.T)
 				t.Fatalf("%d run %d: exit %d, want exitRejected", status, i, code)
 			}
 		}
-		if len(f.refused) != 0 {
-			t.Fatalf("%d: parked %d hours, want none", status, len(f.refused))
+		if len(f.refused) != 0 || len(f.deferred) != 0 {
+			t.Fatalf("%d: parked %d and deferred %d hours, want none", status, len(f.refused), len(f.deferred))
 		}
 		if len(m.bodies) != 2 {
 			t.Fatalf("%d: %d requests over 2 runs, want 2 (each run stops after the first refusal)", status, len(m.bodies))
@@ -317,11 +317,12 @@ func TestPushWindows_LocalWireRuleFailureParksTheHourOnce(t *testing.T) {
 
 // A 400 whose validation path is `kinds` is a manager that does not know a
 // kind phoebe lists (a manager older than the video kind). It is about the
-// install, not the hour: nothing is parked (parking would also hold the hour's
-// token records and never re-send them after the manager is upgraded, since
-// the payload does not change), the run exits 3 and stops, and the next run
-// sends the hours again.
-func TestPushWindows_ARefusedKindParksNothingAndStopsTheRun(t *testing.T) {
+// hour's kinds, not its records and not the whole install: the hour is
+// deferred, not parked (parking would also hold the hour's token records and
+// never re-send them after the manager is upgraded, since the payload does
+// not change), the other hours are still sent, the run exits 3, and the next
+// run sends the deferred hour again.
+func TestPushWindows_ARefusedKindDefersTheHourAndSendsTheOthers(t *testing.T) {
 	for _, path := range []string{"kinds[1]", "kinds"} {
 		f := videoStore()
 		other := win.Add(-time.Hour)
@@ -337,8 +338,13 @@ func TestPushWindows_ARefusedKindParksNothingAndStopsTheRun(t *testing.T) {
 		if len(f.refused) != 0 {
 			t.Fatalf("%s: parked %d hours, want none", path, len(f.refused))
 		}
-		if len(m.bodies) != 2 {
-			t.Fatalf("%s: %d requests over 2 runs, want 2 (each run stops after the first refusal)", path, len(m.bodies))
+		for _, h := range []time.Time{other, win} {
+			if d := f.deferred[h]; d == nil || d.status != 400 || d.refusals != 2 {
+				t.Fatalf("%s: hour %s deferred row %+v, want status 400 and 2 refusals", path, h, d)
+			}
+		}
+		if len(m.bodies) != 4 {
+			t.Fatalf("%s: %d requests over 2 runs, want 4 (a deferred hour does not stop the run)", path, len(m.bodies))
 		}
 	}
 	// A validation answer about a record still parks the hour.
