@@ -136,7 +136,6 @@ func TestBuildWakerConnectsBothModesToAtlas(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	t.Setenv(internalWakeTokenEnv, "")
 	tokenFile := filepath.Join(t.TempDir(), "token")
 	if err := os.WriteFile(tokenFile, []byte(serviceToken), 0o600); err != nil {
 		t.Fatal(err)
@@ -176,7 +175,6 @@ func TestBuildWakerConnectsBothModesToAtlas(t *testing.T) {
 }
 
 func TestBuildWakerLogsMissingDedicatedToken(t *testing.T) {
-	t.Setenv(internalWakeTokenEnv, "")
 	t.Setenv(atlastoken.EnvFile, "")
 	var buf bytes.Buffer
 	logger := &logging.Logger{
@@ -189,9 +187,9 @@ func TestBuildWakerLogsMissingDedicatedToken(t *testing.T) {
 	s.Wake.Enabled = true
 	s.Wake.AtlasURL = "http://atlas.internal"
 	if built := buildWaker(s, logger); built != nil {
-		t.Fatalf("buildWaker returned %T without %s, want nil", built, internalWakeTokenEnv)
+		t.Fatalf("buildWaker returned %T without %s, want nil", built, atlastoken.EnvFile)
 	}
-	if got := buf.String(); !strings.Contains(got, "Atlas actuator unavailable") || !strings.Contains(got, "no Atlas service token file") {
+	if got := buf.String(); !strings.Contains(got, "Atlas actuator unavailable") || !strings.Contains(got, atlastoken.EnvFile+" is empty") {
 		t.Fatalf("missing-token startup log = %q", got)
 	}
 }
