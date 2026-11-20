@@ -46,8 +46,11 @@ central billing service.
    with `kinds: ["token"]`: the complete set of that hour's token records, each
    keyed by a deterministic `usage_id` (sha256 of the record's grain). The manager
    deletes, by absence, records it holds for the hour that the request omits, so a
-   re-sent hour replaces the previous one and an empty hour is sent as an empty
-   list. A parked identity, or a rollup token-push cannot turn into a valid record,
+   re-sent hour replaces the previous one. An hour with no usage is sent as
+   `records: []` only if this install sent that hour before (`pushed_hour` or
+   `pushed_usage` has it); an empty hour it never sent is skipped, because the
+   manager's records for it did not come from this database (a wiped and
+   restarted one, for instance) and an empty request would delete them. A parked identity, or a rollup token-push cannot turn into a valid record,
    is left out of the request while the rest of the hour is sent; usage_ids the
    manager already holds for that identity (recorded in `pushed_usage`) are listed
    in `held`, so delete-by-absence cannot remove usage the manager accepted. The
@@ -83,6 +86,8 @@ identity is (auth_id, owner, resource_id, model_id, serving_mode) in one hour.
          serving_mode, reason, event_count, prompt_tokens, cached_tokens,
          completion_tokens, first_parked_at, last_seen_at
     FROM parked_usage WHERE resolved_at IS NULL ORDER BY window_start;
+  -- video: the same from parked_video_usage, with output_seconds,
+  -- output_frames, request_count and gpu_seconds
   ```
 - **Resolution.** Fix the cause (header propagation, or correct the evidence in
   `billing_event`). Every rater run re-checks unresolved parked hours from the last
@@ -115,11 +120,99 @@ identity is (auth_id, owner, resource_id, model_id, serving_mode) in one hour.
   only). The settled identity is no longer held, so any record the manager still
   held for it from before the conflict is deleted by absence: the manual
   settlement must therefore cover the row's FULL parked counts, which include
-  those earlier events, and nothing is charged twice. If the hour is in a billing period the
-  manager has already settled, that re-send gets `422` (token-push exit `3`); that
-  is expected and needs no further action.
+  those earlier events, and nothing is charged twice. The manager accepts a change
+  to an hour whose billing period has closed like any other (settlement decides
+  what it bills), so the re-send needs no further action.
 - **Held ids.** While an identity is parked, every push of its hour lists the
   usage_ids the manager accepted for it earlier in `held`.
+
+### Parked video usage
+
+Video generation jobs (kind `video`, migration 0017) are parked the same way, in
+`parked_video_usage`, with video quantities (`output_seconds`, `output_frames`,
+`request_count`, `gpu_seconds`) instead of token counts. The identity is the same
+(auth_id, owner, resource_id, model_id, serving_mode) in one hour, and the
+reasons are `owner_conflict`, `ambiguous_org` and `missing_org` (org_id `''`).
+There is no `ambiguous_base`: base model, task, resolution and region are part
+of the video grain, so two values are two records, not a conflict.
+
+- `phoebe-rater -list-parked` lists both kinds; its `KIND` column says which, and
+  its `USAGE` column carries the counts in the kind's own units. The raw-event
+  check counts `video_billing_event` rows for a video row.
+- Resolution, the pruned-raw-events rule and holding are the same as above, with
+  `video_billing_event` and `parked_video_usage` in place of `billing_event` and
+  `parked_usage`. Holding is per kind: a parked video identity holds only its
+  video usage_ids (`pushed_usage.kind`), never a token record.
+- Video jobs that cannot become any record (an empty auth, resource or model id,
+  a `|` in the org, owner or resource id, a negative or NaN quantity, or a
+  completed job whose `request_count` is not 1)
+  are withheld per job, logged at ERROR, and make the rater exit `2`, like
+  invalid token events.
+- phoebe-videos deletes `video_billing_event` rows after 30 days, always. So the
+  rater never re-rates video in an hour older than 29 days, even in an explicit
+  `--since/--until` run. That hour's `rated_video_usage` rows are the record and
+  are kept as they are, and the run logs a WARN naming how many hours it left
+  alone. Tokens in such a window are re-rated as usual. If such a window also
+  finds completed, rateable video jobs of an identity with no video rollup and no
+  unresolved park, it logs them at ERROR and exits `2`. Those jobs are never
+  billed automatically: export them before the 30-day prune, and settle them by
+  hand through the manager's credit path.
+- Every routine run, once the one-time catch-up is done, also checks the hours
+  between 29 days ago and its own trailing window. If an identity has completed,
+  rateable video jobs there with no video rollup and no unresolved park (the
+  rater was down longer than its trailing window), the run logs them at ERROR
+  and exits `2`. It keeps doing so on each run until they are re-rated with
+  `--since/--until`, which must happen before they pass 29 days.
+- **Tombstones and vanished video.** The rater stores each video rollup's wire
+  `usage_id` (`rated_video_usage.usage_id`). Whenever it removes one, it writes a
+  tombstone to `video_reconcile_deletion` in the same transaction. That happens
+  for a reconcile deletion (`reconcile`), a park (`parked`), or a new `org_id`
+  for the same grain (`regrained`). token-push lets the manager delete a sent
+  video record by absence only when its id has a tombstone. A parked identity's
+  ids stay held while the park is unresolved.
+  - A restore of `rated_video_usage` rows must also delete their ids from
+    `video_reconcile_deletion` in the same transaction. Otherwise a stale
+    tombstone would release the record if it were lost again. token-push
+    reports a live rollup that still has a tombstone at ERROR and exits `1`.
+    A rater run over the hour also clears the tombstone of every id live in
+    it, but routine runs reach back only 24 hours (7 days for parked hours).
+    For an older hour, delete the tombstone or re-rate the hour with
+    `--since/--until`.
+  - Any other sent video id with no rollup was lost. token-push holds it, so the
+    manager keeps the record, logs `video record(s) this install sent have no
+    rollup and no tombstone` at ERROR, and exits `1` each time the hour is sent.
+    - To keep billing it, restore the rollup in `rated_video_usage` with its
+      `usage_id`.
+    - To let it go, write the tombstone by hand, then re-send the hour with
+      `-since/-until`. Re-rating cannot do this: the rater tombstones only rows
+      it deletes, and a lost row is not there to delete. Do not delete the id
+      from `pushed_usage` instead: if it was the hour's only video record, the
+      hour stops listing video and the manager keeps the record silently.
+
+      ```sql
+      -- <reason> is 'reconcile' here, 'regrained' for an id replaced by a new one.
+      INSERT INTO video_reconcile_deletion (window_start, usage_id, auth_id, owner_type,
+          owner_id, resource_id, model_id, serving_mode, reason)
+      SELECT window_start, usage_id, auth_id, owner_type, owner_id, resource_id,
+             model_id, serving_mode, '<reason>'
+        FROM pushed_usage WHERE window_start = '<hour>' AND usage_id = '<id>';
+      ```
+  - An hour where the manager still holds a record the rater removed (an
+    explicit re-rate of an older hour) is re-sent automatically, however old,
+    like an hour with a resolved park. It drops out once the manager accepts
+    the release. If the record stays held (its identity is held back by
+    token-push), the hour is re-sent on every run, with the run's exit 2,
+    until the held-back rollup is fixed.
+  - If no video usage is recorded at all although video was sent before, the
+    video tables look wiped. Every run then logs it at ERROR and exits `1`.
+  - A rollup whose stored `usage_id` is not the id of its own fields was edited
+    outside the rater, or rated under another `usage_id` rule. It is held back,
+    not sent under a new id (exit `2`). Inside the 29-day reach, re-rating the
+    hour re-stamps it and tombstones the old id. Older hours are never re-rated:
+    fix the row by hand. Set `usage_id` to the id of its fields (the
+    `HOLDING BACK` log line names it). If the old stored id is in
+    `pushed_usage` (the manager holds it), write a `regrained` tombstone for it
+    as above.
 
 ## Routine checks and alert conditions
 
@@ -158,15 +251,113 @@ The rater never calls the manager, so a manager outage cannot stop aggregation.
 (5 attempts; a 429's `Retry-After` is honoured up to the 30 s cap); if they persist it exits `1` and the hour is re-sent by the next run,
 because each run re-sends the trailing `pushTrailingHours` hours (default 24) and a
 re-send is idempotent. An outage shorter than that window heals with no operator
-action. A longer one moves hours out of every routine run: re-send them explicitly
-with `token-push -since ... -until ...`.
+action. A longer one is healed too: each run also sends, after the window, up to
+168 hours that have usage and were never accepted, oldest first, starting after
+the first hour a scheduled run had accepted (`token_push_state.auto_floor`). The
+same per-run budget then back-fills the usage recorded before that first
+accepted push (an install that ran before it was connected to a manager):
+`rated_usage` is never pruned, so all of it is sent, over as many runs as it
+takes, and each run logs `back-filling usage from before this install's first
+accepted push: N hour(s) not sent yet (oldest ...); this run sends M`. Hours
+already accepted (by an earlier run or by an operator) are not sent again.
+`token-push -since ... -until ...` still re-sends any range on demand (90 days
+per run at most); it never moves `auto_floor`.
 
-Any other 4xx is never retried and exits `3`: `400` means the request broke a wire rule
-token-push did not catch (a bug: compare the logged path with the rollup); `401`
-means the customer token; `409` means the manager has this install on the legacy
-billing path (an operator step, billing-design.md section 3a); `422` means the hour
-is in a billing period already settled to Stripe, so its correction goes to the
-manager's human credit path. Exit `2` means token-push held back a rollup it could
+**Refused hours are parked.** A `400` whose body is the manager's validation
+answer (`{"error", "path"}`) means that hour's payload will never be accepted.
+token-push records the hour in `refused_hour` (status, response body, SHA-256 of
+the refused request, number of refusals, first and last refusal), logs `PARKED
+<hour>` at ERROR, and exits `3` in that run. A parked hour is not re-sent while
+its usage is unchanged and does not use up the 168-hour budget, so it cannot hold
+back newer hours. Each run rebuilds up to 168 parked hours (least recently
+checked first) and sends any whose payload changed (a re-rate, a resolved
+conflict); an accepted push removes the row. While any hour is parked, every run
+logs at WARN `N hour(s) are parked (K newly this run), oldest ...` and, if
+nothing else is wrong, exits `0`. To retry a parked hour after fixing its cause
+without changing its usage, send it with `-since/-until`, which sends parked
+hours too. The same applies to an hour whose request breaks a request-level wire
+rule token-push checks itself (for instance a duplicate usage_id; status `0` in
+`refused_hour`, exit `2` in the run that parks it).
+
+**Hours with a kind the manager refuses are deferred.** A `409`
+(`{"error": "install billing path is legacy"}`) or a `400` whose validation path
+is `kinds` comes from a manager older than phoebe that does not accept, from
+this install, a usage kind the hour lists: for instance video from an install on
+the legacy billing path, before saturn-aws-manager#334. The same manager keeps
+accepting the install's hours that list only token, so the refusal is about
+the hour, not the install, and the run goes on with the other hours.
+token-push records the hour in `deferred_hour` (status, response body, number
+of refusals, first and last refusal), logs `DEFERRED <hour>` at ERROR, and
+re-sends it in every run, also after it leaves the trailing window, until the
+manager accepts it; each run retries up to 168 of them, least recently refused
+first, outside the 168-hour budget for missed hours. While any hour is
+deferred, every run logs at WARN `N hour(s) are deferred (K refused this run),
+oldest ...`, and a run in which one is refused exits `3`. The fix is to upgrade
+the manager. A refused request stores nothing, so the manager keeps what it
+held for the hour (for instance the token records of an earlier push), and the
+accepted request replaces the hour whole: nothing is counted twice. An accepted
+push removes the row; an hour is deferred or parked, never both.
+
+Every other 4xx is never retried and exits `3`, and nothing is parked or
+deferred: `401` means the customer token and `403` an inactive or uninstalled
+install. These two are about the install, not the hour, so the run stops at the
+first one and the next run sends again. A `400` without the manager's
+validation body (a proxy in front of it, for instance) and any other 4xx exit
+`3` every run until fixed.
+
+### Sending is not optional
+
+Token Factory usage is always recorded and always sent (Hugo, 2026-11-17).
+There is no opt-out. Whether usage is charged is the manager's decision, by plan
+or flag, never the install's. Once an install connects to a manager, all of its
+retained usage is sent: the trailing window, then missed hours, then the
+back-fill of everything recorded before the first accepted push. Two settings
+can delay sending, and neither stops it:
+
+- **A suspended rater or token-push CronJob only delays sending.** While the
+  rater is suspended the drainer keeps writing `billing_event`. When the rater
+  runs again, its first routine runs rate every `billing_event` hour that was
+  never rated (hours with no `rated_usage` and no `parked_usage` row), oldest
+  first, up to 168 hours per run after the trailing window, recording progress
+  in `rater_state.catchup_cursor`. When nothing is left the rater sets
+  `rater_state.catchup_completed_at`, and later runs rate only the trailing
+  window. Each run logs `catch-up rated N never-rated hour(s), <first> to
+  <last>` and whether more remain. An hour that already has rollups or parked
+  rows is never re-aggregated by the catch-up, so a partially pruned hour keeps
+  its rollup. The catch-up reaches only hours still in `billing_event`: with the
+  pruner enabled, hours older than its horizon are gone and cannot be rated. A
+  suspended token-push only delays sending too: `rated_usage` is never pruned,
+  and the next runs send every hour never accepted.
+- **An empty manager URL is only for an install that has never connected** (an
+  air-gapped install, or one not connected yet). Its usage stays in
+  `rated_usage` and is all sent once a URL is configured.
+
+**A lost manager URL fails.** An install that has pushed and then loses its URL
+is misconfigured, and token-push fails loudly. With no manager URL, token-push
+reads `pushed_hour`: an install that has pushed before has lost its URL and the
+run exits `1`; one that never pushed is not connected yet and exits `0`. With
+no `DATABASE_URL` at all it exits `0`; with one it cannot read, `1`.
+
+**The manager URL must be https.** token-push sends the install's token and its
+usage, so `managerURL` (and `-manager-url`) is refused, with exit `1`, unless
+its scheme is `https`: `http`, any other scheme, or a URL without one fails at
+startup with a message that says https is required. The settings key
+`allowInsecureLocalhostManagerURL: true` exists for tests with a stub manager.
+It allows `http` to `localhost`, `127.0.0.1` and `::1` only, never to any other
+host, and the chart never sets it.
+
+**Blocked egress fails fast.** Connecting to the manager is bounded by 10 s dial
+and 10 s TLS-handshake timeouts (`requestTimeout`, default 60 s, still bounds a
+slow answer). When 3 hours in a row fail because the manager cannot be reached
+at all (DNS failure, connection refused or timed out, TLS handshake failure, or a
+certificate that does not verify, as from an intercepting proxy), token-push
+logs `cannot reach manager at <url>: <cause>` at ERROR and stops the run with
+exit `1`, within minutes instead of at the job deadline. Fix the install's
+egress to the manager (firewall, proxy, DNS); nothing is lost meanwhile. A 5xx or
+429 is an answer from the manager: it is retried as above and does not count
+toward the 3.
+
+Exit `2` means token-push held back a rollup it could
 not turn into a valid record (a wire rule, or a row without an org written before
 the rater parked missing orgs); the rest of that hour was sent and the rollup's
 earlier usage_ids were held. Parked usage is reported by the rater (exit `4`), not
@@ -197,8 +388,10 @@ the only copy left once the trim passes it, so it needs repair by hand), the dra
 log line `valkey is full and consumer group "<group>" does not exist; stored and trimmed`
 (see "A full Valkey" below),
 `METERING_FLOOR`, WAL corruption,
-token-push withheld hour (exit 2), manager rejection (exit 3), or push failure
-(exit 1). Alert separately when the oldest Valkey
+token-push withheld hour (exit 2), manager rejection or a newly parked hour
+(exit 3), push failure, an unreachable manager, or a lost manager URL (exit
+1), and on the WARN line
+`hour(s) are parked` while it persists. Alert separately when the oldest Valkey
 pending entry, oldest WAL entry, or oldest unpushed rated hour exceeds two job
 periods. The deployment/chart owns those queue-age metrics.
 
@@ -474,8 +667,8 @@ undercharged.
 
 4. Check the exit codes. token-push exit `3` is explained under "A manager outage
    delays sending": a `404` means the manager is too old for `/customer/metered-usage`,
-   so deploy it and run step 3's token-push again. A `422` on an hour goes to the
-   manager's human credit path. Then compare the hours with the reconciliation view.
+   so deploy it and run step 3's token-push again. A `400` parks that hour (see
+   "Refused hours are parked"). Then compare the hours with the reconciliation view.
 
 An hour already pushed is replaced by its new snapshot, so re-running is safe. A window
 that contains a parked hour with pruned raw events makes the rater exit `1`; see

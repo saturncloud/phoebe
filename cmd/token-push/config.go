@@ -2,6 +2,7 @@ package main
 
 import (
 	"fmt"
+	"net/url"
 	"os"
 	"strings"
 	"time"
@@ -29,10 +30,12 @@ func ensureUTCTimeZone(dsn string) string {
 
 // pushOptions are the resolved knobs from the settings file (+ flag/env overrides).
 type pushOptions struct {
-	debug          bool
-	managerURL     string
-	trailingHours  int
-	requestTimeout time.Duration
+	debug      bool
+	managerURL string
+	// allowInsecureLocalhost is the settings key allowInsecureLocalhostManagerURL.
+	allowInsecureLocalhost bool
+	trailingHours          int
+	requestTimeout         time.Duration
 }
 
 // pushSettings is the YAML shape for the settings file. Mirrors the rater's
@@ -43,7 +46,14 @@ type pushSettings struct {
 
 	// ManagerURL is the base URL of the manager. The endpoint path
 	// (/customer/metered-usage) is appended by this binary.
+	// It must be https (checkManagerURL); "" means not connected.
 	ManagerURL string `yaml:"managerURL"`
+
+	// AllowInsecureLocalhostManagerURL is for tests only. It lets managerURL
+	// (or -manager-url) be http when the host is localhost, 127.0.0.1 or ::1,
+	// such as a stub manager in a test. It never allows http to any other
+	// host. The chart never sets it.
+	AllowInsecureLocalhostManagerURL bool `yaml:"allowInsecureLocalhostManagerURL"`
 
 	// PushTrailingHours is N in the default window: how many complete trailing hours
 	// each run snapshots. Default 24; must be >= 1. A pointer so an explicit 0 fails
@@ -61,7 +71,10 @@ type pushSettings struct {
 
 // loadConfig reads the YAML settings file, applies rating.DefaultConfig for the pool,
 // overlays DATABASE_URL from the env, and resolves the push knobs. A missing settings
-// file is tolerated (all defaults + env), so the binary can run env-only.
+// file is an error: the chart always renders and mounts it, so a missing file is a
+// broken mount or a wrong -f, and treating it as "no manager URL" would turn that
+// into a silent not-connected success. Only managerURL "" in a file that exists
+// means not connected.
 func loadConfig(path string) (rating.Config, pushOptions, error) {
 	cfg := rating.DefaultConfig()
 	opts := pushOptions{
@@ -70,11 +83,11 @@ func loadConfig(path string) (rating.Config, pushOptions, error) {
 	}
 
 	var s pushSettings
-	if data, err := os.ReadFile(path); err == nil {
-		if err := yaml.UnmarshalStrict(data, &s); err != nil {
-			return cfg, opts, err
-		}
-	} else if !os.IsNotExist(err) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return cfg, opts, fmt.Errorf("read settings file: %w", err)
+	}
+	if err := yaml.UnmarshalStrict(data, &s); err != nil {
 		return cfg, opts, err
 	}
 
@@ -111,8 +124,54 @@ func loadConfig(path string) (rating.Config, pushOptions, error) {
 	// DATABASE_URL (Atlas convention) is the authoritative Postgres source.
 	cfg.DatabaseURL = os.Getenv("DATABASE_URL")
 	opts.debug = s.Debug
+	opts.allowInsecureLocalhost = s.AllowInsecureLocalhostManagerURL
+	if err := checkManagerURL(s.ManagerURL, opts.allowInsecureLocalhost); err != nil {
+		return cfg, opts, err
+	}
 	opts.managerURL = s.ManagerURL
 	return cfg, opts, nil
+}
+
+// checkManagerURL refuses a manager URL that is not https. The request carries
+// the install's SATURN_TOKEN and its usage, so it must never travel in clear
+// text. "" is allowed: it means the install is not connected. With
+// allowInsecureLocalhost (the test-only settings key
+// allowInsecureLocalhostManagerURL), http is allowed for localhost, 127.0.0.1
+// and ::1 only, never for any other host.
+func checkManagerURL(raw string, allowInsecureLocalhost bool) error {
+	if raw == "" {
+		return nil
+	}
+	u, err := url.Parse(raw)
+	if err != nil {
+		return fmt.Errorf("manager URL %q is not a valid URL: %w", raw, err)
+	}
+	if u.Host == "" {
+		return fmt.Errorf("manager URL %q has no scheme or host; it must be an https:// URL such as https://manager.saturnenterprise.io", raw)
+	}
+	switch u.Scheme {
+	case "https":
+		return nil
+	case "http":
+		if allowInsecureLocalhost && isLoopbackName(u.Hostname()) {
+			return nil
+		}
+		if allowInsecureLocalhost {
+			return fmt.Errorf("manager URL %q uses http; allowInsecureLocalhostManagerURL allows http only for localhost, 127.0.0.1 and ::1, not %q", raw, u.Hostname())
+		}
+		return fmt.Errorf("manager URL %q uses http; it must be https, because the request carries the install's token and usage", raw)
+	default:
+		return fmt.Errorf("manager URL %q has scheme %q; it must be https", raw, u.Scheme)
+	}
+}
+
+// isLoopbackName reports whether host is exactly localhost, 127.0.0.1 or ::1.
+func isLoopbackName(host string) bool {
+	switch strings.ToLower(host) {
+	case "localhost", "127.0.0.1", "::1":
+		return true
+	}
+	return false
 }
 
 // resolveWindows returns the list of hour-aligned window_start values to snapshot,

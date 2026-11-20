@@ -151,6 +151,10 @@ type Server struct {
 	// gateway-marked requests fail closed with 503. Set via WithGateway.
 	gateway *gatewayRoute
 
+	// videos hands video endpoints' /v1/videos requests to phoebe-videos.
+	// nil = video generation off: video routes answer 404. Set via WithVideos.
+	videos *videosRoute
+
 	// admitter is the distributed shared-inference physical-capacity gate. nil means
 	// the feature is disabled. It runs only after trusted org/model resolution
 	// and model binding, and before any engine request.
@@ -380,6 +384,9 @@ func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request) {
 		handlerDone = true
 		maxDurationMu.Unlock()
 	}()
+	// A video content download stops the timer once it is checked (the one
+	// exemption, exemptFromMaxStreamDuration).
+	ctx = withMaxStreamDurationExempt(ctx, func() { maxDuration.Stop() })
 	r = r.WithContext(ctx)
 	stallGuard := newStallGuardWriter(w, prot.StreamStallTimeout, cancel)
 	w = stallGuard
@@ -454,10 +461,20 @@ func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request) {
 	// attempt without usage as unbilled work (UNEXPLAINED MISSING-USAGE).
 	metered := r.Method == http.MethodPost && inferenceRequestPathAllowed(routePath)
 
+	// VIDEO RETRIEVAL: the always-on route that reads or deletes one video
+	// whatever its endpoint's state (issue #13). Atlas's retrieval
+	// ForwardAuth authorized the key for this video and stamped its org and
+	// endpoint; there is no upstream, serving mode or engine work, so none of
+	// the gateway, billing or routing steps below apply.
+	if id.VideoRetrieval {
+		s.serveVideoRetrieval(w, r, id, routePath, pathCanonical)
+		return
+	}
+
 	if id.Gateway {
 		if !pathCanonical || !gatewayRequestAllowed(r.Method, routePath) {
-			s.log.Warn.Printf("gateway: refusing route outside public inference surface method=%s raw_path=%q canonical=%v org_id=%q",
-				r.Method, r.URL.RawPath, pathCanonical, id.OrgID)
+			s.log.Warn.Printf("gateway: refusing route outside public inference surface method=%s path=%q canonical=%v org_id=%q",
+				r.Method, r.URL.EscapedPath(), pathCanonical, id.OrgID)
 			http.Error(w, "not found", http.StatusNotFound)
 			return
 		}
@@ -541,6 +558,15 @@ func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request) {
 		// don't invent a target. Log loudly with the resource for diagnosis.
 		s.log.Error.Printf("refusing %q: %v (resource_id=%q)", identity.HeaderUpstream, err, id.ResourceID)
 		http.Error(w, "no upstream for this request", http.StatusBadGateway)
+		return
+	}
+
+	// VIDEO ENDPOINT: a route Atlas stamped with X-Saturn-Video-Limits serves
+	// /v1/videos only, and phoebe-videos owns those jobs. Nothing below
+	// applies to it (no model binding on the chat surface, no wake hold, no
+	// token metering: a job is metered when it finishes).
+	if !id.Gateway && id.VideoLimits != "" {
+		s.serveVideo(w, r, id, requestID, routePath, pathCanonical)
 		return
 	}
 
@@ -672,6 +698,12 @@ func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request) {
 			// preflight that precedes it) stays reachable; Atlas's middleware
 			// injecting the header restores the full bound surface.
 			allowed = allowed && unboundRequestAllowed(r.Method, routePath)
+		}
+		// A shared route never serves the dedicated-only rerank API
+		// (sharedTierPathAllowed): refuse it here, before admission could
+		// count it as shared work.
+		if id.ServingMode == identity.ServingModeShared && routePath == rerankPath {
+			allowed = false
 		}
 		if !allowed {
 			s.log.Warn.Printf("model-binding: refused request_id=%s resource_id=%s raw_path=%q canonical=%v serving_mode=%q (route not authorized for resource)",

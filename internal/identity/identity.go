@@ -188,6 +188,27 @@ const (
 	// this design exists to make impossible. phoebe FAILS CLOSED: an absent/invalid
 	// upstream → the request is refused, never forwarded to a default or a guess.
 	HeaderUpstream = "X-Saturn-Upstream"
+
+	// HeaderVideoLimits marks a route as a VIDEO GENERATION endpoint and
+	// carries what it accepts (sizes, seconds, frame rate, step cap,
+	// concurrency, the org's jobs-in-flight limit, GPUs) as compact JSON
+	// (videos.Limits). Atlas renders it per deployment from the model catalog
+	// on the same anti-spoof middleware as HeaderServedModel; an empty value
+	// removes a client forgery. Read through the trusted-header registry.
+	// Present: the route serves /v1/videos only (handed to phoebe-videos).
+	// Absent: the route serves no /v1/videos path.
+	HeaderVideoLimits = "X-Saturn-Video-Limits"
+
+	// HeaderVideoRetrieval marks a request on the always-on video retrieval
+	// route (issue #13): GET /v1/videos/{id}, GET /v1/videos/{id}/content and
+	// DELETE /v1/videos/{id} on the Token Factory API host, which exists
+	// whether or not the video's endpoint is running. Atlas's retrieval
+	// ForwardAuth (/api/auth/videos/check) stamps it, together with the
+	// video's org (HeaderOrgID), endpoint (HeaderResourceID) and the caller's
+	// key (HeaderAuthID), only after it has checked the key may read that
+	// video. Read strictly through the trusted-header registry: only the
+	// exact value "true" marks a retrieval request.
+	HeaderVideoRetrieval = "X-Saturn-Video-Retrieval"
 )
 
 // Identity is the trusted, pre-resolved caller identity for a request. Phoebe
@@ -266,6 +287,15 @@ type Identity struct {
 	// (parseTrustedGroupScopes); Identity carries the envelope verbatim,
 	// exactly like the eight scoped rate-limit fields above.
 	GroupScopes string
+	// VideoLimits is the raw, trusted X-Saturn-Video-Limits value; non-empty
+	// only on a video generation endpoint's route. Parsed by phoebe-videos.
+	VideoLimits string
+	// VideoRetrieval reports the request arrived on the always-on video
+	// retrieval route (HeaderVideoRetrieval == "true", stamped by Atlas's
+	// retrieval ForwardAuth). Such a request carries no upstream, serving mode
+	// or served model: it names one video, and phoebe-videos looks it up by
+	// id, org and endpoint.
+	VideoRetrieval bool
 }
 
 // The two serving modes, spelled exactly as they are stored in billing_event and
@@ -287,7 +317,7 @@ func ValidServingMode(s string) bool {
 //
 // The R3 envelope reads (gateway mark, org, owner, serving mode, served
 // model, every rate-limit policy header, and the group scope envelope —
-// the pinned 15) resolve through the trusted-header registry: a header
+// the pinned 17) resolve through the trusted-header registry: a header
 // outside the active set is treated
 // as ABSENT, never read for a trust decision. The remaining identity headers
 // are read directly (ratified edge contract, outside the R3 gate). The proxy
@@ -325,6 +355,8 @@ func FromRequest(r *http.Request) Identity {
 		OwnerRateLimitUncachedPromptTokens: trustedHeaderValue(r, HeaderOwnerRateLimitUncachedPromptTokens),
 		OwnerRateLimitGeneratedTokens:      trustedHeaderValue(r, HeaderOwnerRateLimitGeneratedTokens),
 		GroupScopes:                        trustedHeaderValue(r, HeaderGroupScopes),
+		VideoLimits:                        trustedHeaderValue(r, HeaderVideoLimits),
+		VideoRetrieval:                     trustedHeaderValue(r, HeaderVideoRetrieval) == "true",
 	}
 }
 

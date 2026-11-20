@@ -42,6 +42,32 @@ func protectionCause(ctx context.Context) error {
 	return nil
 }
 
+// maxStreamDurationExemptKey carries the function that stops a request's
+// protection.maxStreamDuration timer (see exemptFromMaxStreamDuration).
+type maxStreamDurationExemptKey struct{}
+
+func withMaxStreamDurationExempt(ctx context.Context, stop func()) context.Context {
+	return context.WithValue(ctx, maxStreamDurationExemptKey{}, stop)
+}
+
+// exemptFromMaxStreamDuration stops the request's whole-request bound. It is
+// for one request only: a video content download (GET /v1/videos/{id}/content,
+// on the endpoint's route and on the retrieval route), which is a stored file
+// of up to videos.maxOutputBytes that phoebe-videos cannot resume (it ignores
+// Range). Under the bound a client slower than about 1.2 Mbit/s could never
+// finish the largest output, and every retry would restart from byte 0
+// (battery X4 on phoebe#148). The download does no engine work and holds no
+// admission lease, so the bound protects nothing there that the stall guards
+// do not: the interceptor's streamStallTimeout still ends a download whose
+// client stops reading, and phoebe-videos ends one whose store stops sending
+// after 60 s. Every other request keeps the bound. A bound that has already
+// fired stays fired.
+func exemptFromMaxStreamDuration(ctx context.Context) {
+	if stop, ok := ctx.Value(maxStreamDurationExemptKey{}).(func()); ok {
+		stop()
+	}
+}
+
 func (s *Server) protection() config.ProtectionSettings {
 	return s.settings.Protection.Effective()
 }
