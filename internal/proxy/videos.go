@@ -105,6 +105,9 @@ func (s *Server) serveVideoRetrieval(w http.ResponseWriter, r *http.Request, id 
 		refuse("outside the video retrieval surface")
 		return
 	}
+	// The stamped org and endpoint are now checked, so the endpoint id is a
+	// safe metric label, as on the endpoint path after its billing gate.
+	recordFrom(r.Context()).bind(id)
 	s.handOffVideo(w, r, requestID, videos.Handoff{
 		Retrieval: true, OrgID: id.OrgID, AuthID: id.AuthID, UserID: id.UserID, GroupID: id.GroupID,
 		ResourceID: id.ResourceID,
@@ -157,8 +160,15 @@ func (s *Server) handOffVideo(w http.ResponseWriter, r *http.Request, requestID 
 			r.Header.Del(name)
 		}
 	}
+	// phoebe-videos authenticates by the shared token; the caller's
+	// credentials never go past the interceptor.
+	r.Header.Del("Authorization")
+	r.Header.Del("Cookie")
 	r.Header.Set(videos.HeaderHandoff, handoff)
 	r.Header.Set(videos.HeaderToken, s.videos.token)
+	// Replace, never preserve, the client correlation id, as the endpoint
+	// path does before it reaches here.
+	r.Header.Set(requestIDHeader, requestID)
 	w.Header().Set(requestIDHeader, requestID)
 	s.videos.proxy.ServeHTTP(w, r)
 }

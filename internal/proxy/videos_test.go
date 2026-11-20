@@ -355,3 +355,54 @@ func TestVideoRetrievalRefusalLogsThePath(t *testing.T) {
 		t.Fatalf("status %d, refusal log %q does not name the path", rr.Code, got)
 	}
 }
+
+// C14: the caller's Saturn key and cookies stop at the interceptor on both
+// video routes; phoebe-videos is reached with the shared token only.
+func TestVideoHandoffDropsCallerCredentials(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		req  *http.Request
+	}{
+		{"retrieval", retrievalRequest(http.MethodGet, "/v1/videos/"+testVideoID+"/content")},
+		{"endpoint", videoRequest(http.MethodPost, "/v1/videos")},
+	} {
+		srv, backend := newVideoServer(t)
+		tc.req.Header.Set("Authorization", "Bearer k")
+		tc.req.Header.Set("Cookie", "a=b")
+		rr := httptest.NewRecorder()
+		srv.Handler().ServeHTTP(rr, tc.req)
+		if rr.Code != http.StatusOK || len(backend.reqs) != 1 {
+			t.Fatalf("%s: status %d, backend calls %d", tc.name, rr.Code, len(backend.reqs))
+		}
+		got := backend.reqs[0]
+		if v := got.Header.Get("Authorization"); v != "" {
+			t.Errorf("%s: Authorization %q reached phoebe-videos", tc.name, v)
+		}
+		if v := got.Header.Get("Cookie"); v != "" {
+			t.Errorf("%s: Cookie %q reached phoebe-videos", tc.name, v)
+		}
+		if got.Header.Get(videos.HeaderToken) != "shared-token" {
+			t.Errorf("%s: the shared token was not set", tc.name)
+		}
+	}
+}
+
+// C15: the retrieval route replaces the client's X-Request-Id with the
+// minted one on the request to phoebe-videos, as the endpoint route does.
+func TestVideoRetrievalReplacesTheClientRequestID(t *testing.T) {
+	srv, backend := newVideoServer(t)
+	req := retrievalRequest(http.MethodGet, "/v1/videos/"+testVideoID)
+	req.Header.Set(requestIDHeader, "client-chosen")
+	rr := httptest.NewRecorder()
+	srv.Handler().ServeHTTP(rr, req)
+	if rr.Code != http.StatusOK || len(backend.reqs) != 1 {
+		t.Fatalf("status %d, backend calls %d", rr.Code, len(backend.reqs))
+	}
+	sent := backend.reqs[0].Header.Get(requestIDHeader)
+	if sent == "client-chosen" || sent == "" {
+		t.Fatalf("phoebe-videos got request id %q, want the minted one", sent)
+	}
+	if echoed := rr.Header().Get(requestIDHeader); sent != echoed {
+		t.Fatalf("phoebe-videos got %q, the response carries %q", sent, echoed)
+	}
+}
