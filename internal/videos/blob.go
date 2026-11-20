@@ -12,6 +12,7 @@ import (
 	"net/url"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"time"
 )
 
@@ -84,6 +85,9 @@ type AtlasBlob struct {
 	atlas *http.Client
 	store *http.Client
 	now   func() time.Time
+	// readTimeout is how long one Read of a Get body may wait for the store
+	// to send something (storeResponseHeaderTimeout; tests shorten it).
+	readTimeout time.Duration
 }
 
 // NewAtlasBlob checks the Atlas URL and the token. Both are required: with
@@ -113,17 +117,19 @@ func NewAtlasBlob(baseURL, token, prefix string) (*AtlasBlob, error) {
 	storeTransport.ResponseHeaderTimeout = storeResponseHeaderTimeout
 	storeTransport.DisableCompression = true
 	return &AtlasBlob{
-		baseURL: strings.TrimRight(baseURL, "/"),
-		token:   token,
-		keys:    Keys{Prefix: prefix},
-		atlas:   &http.Client{Transport: atlasTransport, Timeout: 30 * time.Second, CheckRedirect: noRedirect},
-		store:   &http.Client{Transport: storeTransport, CheckRedirect: noRedirect},
-		now:     time.Now,
+		baseURL:     strings.TrimRight(baseURL, "/"),
+		token:       token,
+		keys:        Keys{Prefix: prefix},
+		atlas:       &http.Client{Transport: atlasTransport, Timeout: 30 * time.Second, CheckRedirect: noRedirect},
+		store:       &http.Client{Transport: storeTransport, CheckRedirect: noRedirect},
+		now:         time.Now,
+		readTimeout: storeResponseHeaderTimeout,
 	}, nil
 }
 
 // storeResponseHeaderTimeout is how long the store may take to start
-// answering a request it has received (for an upload, after the last byte).
+// answering a request it has received (for an upload, after the last byte),
+// and how long a download may wait for the next bytes of the body.
 const storeResponseHeaderTimeout = 60 * time.Second
 
 // scrubURLError removes the query and fragment from the URL a transport error
@@ -305,6 +311,10 @@ func (b *AtlasBlob) Put(ctx context.Context, key string, r io.Reader, size int64
 // can no longer exist (Atlas 409), a job Atlas no longer has (Atlas 404: its
 // row was pruned) or an object that is gone reads as ErrBlobNotFound. A 403
 // stays an error: Atlas also answers 403 to a wrong internal token.
+//
+// The body is cut off when one Read waits longer than readTimeout: a store
+// that sends its headers and then stops would otherwise hold the download
+// open with nothing written, which the interceptor's stall guard never sees.
 func (b *AtlasBlob) Get(ctx context.Context, key string) (io.ReadCloser, int64, error) {
 	req, err := b.presign(ctx, key, http.MethodGet, 0)
 	var ae *atlasError
@@ -314,22 +324,73 @@ func (b *AtlasBlob) Get(ctx context.Context, key string) (io.ReadCloser, int64, 
 	if err != nil {
 		return nil, 0, err
 	}
-	resp, err := b.store.Do(req)
+	rctx, cancel := context.WithCancel(ctx)
+	resp, err := b.store.Do(req.WithContext(rctx))
 	if err != nil {
+		cancel()
 		return nil, 0, fmt.Errorf("video store: get %s: %w", key, scrubURLError(err))
 	}
 	switch {
 	case resp.StatusCode == http.StatusNotFound:
 		resp.Body.Close()
+		cancel()
 		return nil, 0, ErrBlobNotFound
 	case resp.StatusCode != http.StatusOK:
+		defer cancel()
 		defer resp.Body.Close()
 		return nil, 0, storeError("get", key, resp)
 	case resp.ContentLength < 0:
 		resp.Body.Close()
+		cancel()
 		return nil, 0, fmt.Errorf("video store: get %s: the store sent no length", key)
 	}
-	return resp.Body, resp.ContentLength, nil
+	return newStallCutBody(resp.Body, key, b.readTimeout, cancel), resp.ContentLength, nil
+}
+
+// stallCutBody is a Get body whose every Read must make progress within
+// timeout. On expiry it cancels the store request, which unblocks the Read,
+// and returns an error that says the store stalled.
+type stallCutBody struct {
+	body    io.ReadCloser
+	key     string
+	timeout time.Duration
+	cancel  context.CancelFunc
+	timer   *time.Timer
+	stalled atomic.Bool
+}
+
+func newStallCutBody(body io.ReadCloser, key string, timeout time.Duration, cancel context.CancelFunc) *stallCutBody {
+	s := &stallCutBody{body: body, key: key, timeout: timeout, cancel: cancel}
+	s.timer = time.AfterFunc(timeout, func() {
+		s.stalled.Store(true)
+		cancel()
+	})
+	s.timer.Stop()
+	return s
+}
+
+func (s *stallCutBody) Read(p []byte) (int, error) {
+	if s.stalled.Load() {
+		return 0, s.stallError()
+	}
+	s.timer.Reset(s.timeout)
+	n, err := s.body.Read(p)
+	s.timer.Stop()
+	if s.stalled.Load() {
+		return n, s.stallError()
+	}
+	return n, err
+}
+
+func (s *stallCutBody) stallError() error {
+	return fmt.Errorf("video store: get %s: the store sent nothing for %s", s.key, s.timeout)
+}
+
+func (s *stallCutBody) Close() error {
+	s.timer.Stop()
+	err := s.body.Close()
+	s.cancel()
+	return err
 }
 
 func (b *AtlasBlob) Delete(ctx context.Context, key string) error {

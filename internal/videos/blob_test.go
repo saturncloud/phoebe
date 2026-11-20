@@ -578,3 +578,51 @@ func TestNewAtlasBlobRefusesBadConfig(t *testing.T) {
 		}
 	}
 }
+
+// P4: a store that sends its headers and part of the body and then stops is
+// cut off once one Read waits longer than the store response timeout, with
+// an error, instead of holding the download open until the interceptor's
+// whole-stream limit ends it.
+func TestAtlasBlobGetCutsAStoreThatStallsMidBody(t *testing.T) {
+	release := make(chan struct{})
+	stalled := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Length", "100")
+		_, _ = w.Write(make([]byte, 50))
+		w.(http.Flusher).Flush()
+		select {
+		case <-release:
+		case <-r.Context().Done():
+		}
+	}))
+	t.Cleanup(stalled.Close)
+	t.Cleanup(func() { close(release) })
+	b, at, _ := newTestBlob(t)
+	at.store = stalled
+	if b.readTimeout != storeResponseHeaderTimeout {
+		t.Fatalf("read timeout %s, want %s", b.readTimeout, storeResponseHeaderTimeout)
+	}
+	b.readTimeout = 100 * time.Millisecond
+	body, size, err := b.Get(context.Background(), videoKey())
+	if err != nil || size != 100 {
+		t.Fatalf("get: size %d, %v", size, err)
+	}
+	defer body.Close()
+	done := make(chan error, 1)
+	var n int64
+	go func() {
+		var err error
+		n, err = io.Copy(io.Discard, body)
+		done <- err
+	}()
+	select {
+	case err := <-done:
+		if err == nil || !strings.Contains(err.Error(), "the store sent nothing for") {
+			t.Fatalf("read of a stalled body: %v", err)
+		}
+		if n != 50 {
+			t.Fatalf("read %d bytes before the cut, want 50", n)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("read of a stalled body did not time out")
+	}
+}
