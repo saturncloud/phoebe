@@ -130,6 +130,9 @@ func NewAtlas(baseURL string, tokens atlastoken.Source, legacyToken string, log 
 		u.RawQuery != "" || u.Fragment != "" || u.User != nil {
 		return nil, fmt.Errorf("atlas waker: invalid Atlas URL %q", baseURL)
 	}
+	if err := atlastoken.CheckAtlasURL(baseURL); err != nil {
+		return nil, fmt.Errorf("atlas waker: %w", err)
+	}
 	transport := http.DefaultTransport.(*http.Transport).Clone()
 	// The wake token is an internal credential. Never send it through an
 	// ambient HTTP proxy inherited from the pod environment.

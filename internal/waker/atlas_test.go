@@ -27,21 +27,38 @@ func (f roundTripFunc) RoundTrip(req *http.Request) (*http.Response, error) {
 }
 
 func TestNewAtlasValidatesURLScheme(t *testing.T) {
-	for _, rawURL := range []string{"http://atlas.internal", "https://atlas.internal"} {
+	for _, rawURL := range []string{"http://atlas.saturn.svc", "https://atlas.saturn.svc"} {
 		if _, err := NewAtlas(rawURL, staticToken("svc-token"), "", logging.New(logging.ERROR)); err != nil {
 			t.Errorf("NewAtlas(%q): %v", rawURL, err)
 		}
 	}
 	for _, rawURL := range []string{
-		"ftp://atlas.internal",
-		"file://atlas.internal",
-		"atlas.internal",
-		"http://atlas.internal?debug=1",
-		"http://atlas.internal#fragment",
-		"http://user:pass@atlas.internal",
+		"ftp://atlas.saturn.svc",
+		"file://atlas.saturn.svc",
+		"atlas.saturn.svc",
+		"http://atlas.saturn.svc?debug=1",
+		"http://atlas.saturn.svc#fragment",
+		"http://user:pass@atlas.saturn.svc",
 	} {
 		if _, err := NewAtlas(rawURL, staticToken("svc-token"), "", logging.New(logging.ERROR)); err == nil {
 			t.Errorf("NewAtlas(%q) succeeded, want unsupported URL error", rawURL)
+		}
+	}
+}
+
+// TestNewAtlasRefusesHTTPToAnExternalHost: every wake call carries the Atlas
+// service token and, in the transition build, the legacy wake secret, so an
+// http URL to an external host is refused and wake stays disabled. http to a
+// cluster-local service name is still allowed.
+func TestNewAtlasRefusesHTTPToAnExternalHost(t *testing.T) {
+	for _, rawURL := range []string{"http://atlas.example.com", "http://evilsvc.com:8000", "http://a.svc.evil.com"} {
+		if _, err := NewAtlas(rawURL, staticToken("svc-token"), "legacy", logging.New(logging.ERROR)); err == nil || !strings.Contains(err.Error(), "https") {
+			t.Errorf("NewAtlas(%q) err = %v, want a refusal that says https is required", rawURL, err)
+		}
+	}
+	for _, rawURL := range []string{"https://atlas.example.com", "http://atlas.saturn.svc.cluster.local:8000"} {
+		if _, err := NewAtlas(rawURL, staticToken("svc-token"), "legacy", logging.New(logging.ERROR)); err != nil {
+			t.Errorf("NewAtlas(%q): %v", rawURL, err)
 		}
 	}
 }
@@ -133,7 +150,7 @@ func TestAtlasWakerAuthenticatesAndSendsOnlyResourceID(t *testing.T) {
 }
 
 func TestAtlasWakerTreatsLostWakeResponseAsInProgress(t *testing.T) {
-	waker, err := NewAtlas("http://atlas.example", staticToken("svc-token"), "", logging.New(logging.ERROR))
+	waker, err := NewAtlas("https://atlas.example", staticToken("svc-token"), "", logging.New(logging.ERROR))
 	if err != nil {
 		t.Fatalf("NewAtlas: %v", err)
 	}
@@ -221,7 +238,7 @@ func TestAtlasWakerBypassesAmbientHTTPProxy(t *testing.T) {
 		t.Fatalf("parse Atlas test URL: %v", err)
 	}
 
-	waker, err := NewAtlas("http://atlas.internal", staticToken("svc-token"), "", logging.New(logging.ERROR))
+	waker, err := NewAtlas("http://atlas.saturn.svc", staticToken("svc-token"), "", logging.New(logging.ERROR))
 	if err != nil {
 		t.Fatalf("NewAtlas: %v", err)
 	}
@@ -253,7 +270,7 @@ func TestAtlasWakerBypassesAmbientHTTPProxy(t *testing.T) {
 // asks again; a hold that ends while Atlas is still unreachable is
 // ErrWakeUnavailable, which is retryable, not a definite "nothing started".
 func TestAtlasWakerRetriesWhileAtlasIsUnreachable(t *testing.T) {
-	waker, err := NewAtlas("http://atlas.example", staticToken("svc-token"), "", logging.New(logging.ERROR))
+	waker, err := NewAtlas("https://atlas.example", staticToken("svc-token"), "", logging.New(logging.ERROR))
 	if err != nil {
 		t.Fatalf("NewAtlas: %v", err)
 	}
@@ -286,7 +303,7 @@ func TestAtlasWakerRetriesWhileAtlasIsUnreachable(t *testing.T) {
 // or the loop window, and makes no further calls, so held requests release
 // their cold-hold slots and no graph is woken after every caller has left.
 func TestAtlasWakerGivesUpAfterTheUnreachableBudget(t *testing.T) {
-	waker, err := NewAtlas("http://atlas.example", staticToken("svc-token"), "", logging.New(logging.ERROR))
+	waker, err := NewAtlas("https://atlas.example", staticToken("svc-token"), "", logging.New(logging.ERROR))
 	if err != nil {
 		t.Fatalf("NewAtlas: %v", err)
 	}
@@ -319,7 +336,7 @@ func TestAtlasWakerGivesUpAfterTheUnreachableBudget(t *testing.T) {
 // host that does not resolve is not a restart. The flight ends at once as
 // ErrWakeUnavailable carrying the cause, instead of retrying for the hold.
 func TestAtlasWakerFailsFastOnAMisconfiguredAtlasURL(t *testing.T) {
-	waker, err := NewAtlas("http://atlas.invalid", staticToken("svc-token"), "", logging.New(logging.ERROR))
+	waker, err := NewAtlas("https://atlas.invalid", staticToken("svc-token"), "", logging.New(logging.ERROR))
 	if err != nil {
 		t.Fatalf("NewAtlas: %v", err)
 	}
@@ -376,7 +393,7 @@ func TestAtlasWakerStaysStatusUnknownOnceAtlasWasReached(t *testing.T) {
 // TestAtlasWakerHoldEndingDuringTheFirstDialIsStatusUnknown (#104 battery):
 // nothing has failed yet, so the hold must not claim Atlas was unreachable.
 func TestAtlasWakerHoldEndingDuringTheFirstDialIsStatusUnknown(t *testing.T) {
-	waker, err := NewAtlas("http://atlas.example", staticToken("svc-token"), "", logging.New(logging.ERROR))
+	waker, err := NewAtlas("https://atlas.example", staticToken("svc-token"), "", logging.New(logging.ERROR))
 	if err != nil {
 		t.Fatalf("NewAtlas: %v", err)
 	}

@@ -145,6 +145,9 @@ func NewAtlasBlob(baseURL string, tokens atlastoken.Source, prefix string) (*Atl
 		u.RawQuery != "" || u.Fragment != "" || u.User != nil {
 		return nil, fmt.Errorf("video store: invalid Atlas URL %q", baseURL)
 	}
+	if err := atlastoken.CheckAtlasURL(baseURL); err != nil {
+		return nil, fmt.Errorf("video store: %w", err)
+	}
 	if strings.Trim(prefix, "/") == "" {
 		return nil, errors.New("video store: the key prefix is empty")
 	}

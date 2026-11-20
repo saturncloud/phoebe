@@ -37,13 +37,13 @@ func (s *switchableToken) Token() (string, error) {
 }
 
 func TestNewAtlasRequiresACredential(t *testing.T) {
-	if _, err := NewAtlas("http://atlas.internal", nil, "  ", logging.New(logging.ERROR)); err == nil {
+	if _, err := NewAtlas("http://atlas.saturn.svc", nil, "  ", logging.New(logging.ERROR)); err == nil {
 		t.Fatal("NewAtlas succeeded with no token source and no legacy secret")
 	}
-	if _, err := NewAtlas("http://atlas.internal", nil, "legacy", logging.New(logging.ERROR)); err != nil {
+	if _, err := NewAtlas("http://atlas.saturn.svc", nil, "legacy", logging.New(logging.ERROR)); err != nil {
 		t.Fatalf("legacy only: %v", err)
 	}
-	if _, err := NewAtlas("http://atlas.internal", staticToken("t"), "", logging.New(logging.ERROR)); err != nil {
+	if _, err := NewAtlas("http://atlas.saturn.svc", staticToken("t"), "", logging.New(logging.ERROR)); err != nil {
 		t.Fatalf("token only: %v", err)
 	}
 }
@@ -62,7 +62,7 @@ func captureHeaders(t *testing.T, w *AtlasWaker) http.Header {
 }
 
 func TestWakeSendsTheServiceTokenInAuthorization(t *testing.T) {
-	w, _ := NewAtlas("http://atlas.internal", staticToken("svc-token"), "", logging.New(logging.ERROR))
+	w, _ := NewAtlas("http://atlas.saturn.svc", staticToken("svc-token"), "", logging.New(logging.ERROR))
 	h := captureHeaders(t, w)
 	if h.Get("Authorization") != "token svc-token" {
 		t.Fatalf("Authorization = %q", h.Get("Authorization"))
@@ -75,7 +75,7 @@ func TestWakeSendsTheServiceTokenInAuthorization(t *testing.T) {
 // Transition build: an Atlas pod of the previous build reads only the legacy
 // header, so both are sent while the legacy secret is set.
 func TestWakeSendsBothCredentialsDuringTheTransition(t *testing.T) {
-	w, _ := NewAtlas("http://atlas.internal", staticToken("svc-token"), "legacy", logging.New(logging.ERROR))
+	w, _ := NewAtlas("http://atlas.saturn.svc", staticToken("svc-token"), "legacy", logging.New(logging.ERROR))
 	h := captureHeaders(t, w)
 	if h.Get("Authorization") != "token svc-token" || h.Get(internalWakeHeader) != "legacy" {
 		t.Fatalf("headers = %v", h)
@@ -113,7 +113,7 @@ func TestWakeWithNoUsableTokenIsNotSent(t *testing.T) {
 // An expired token is never sent, even when the legacy secret is set: only
 // the legacy header goes, and a new Atlas decides on it alone.
 func TestWakeNeverSendsAnUnusableToken(t *testing.T) {
-	w, _ := NewAtlas("http://atlas.internal", noToken{}, "legacy", logging.New(logging.ERROR))
+	w, _ := NewAtlas("http://atlas.saturn.svc", noToken{}, "legacy", logging.New(logging.ERROR))
 	h := captureHeaders(t, w)
 	if h.Get("Authorization") != "" {
 		t.Fatalf("Authorization sent without a usable token: %q", h.Get("Authorization"))
@@ -127,7 +127,7 @@ func TestWakeNeverSendsAnUnusableToken(t *testing.T) {
 // up by the next call, with no restart.
 func TestWakeUsesTheTokenAgainOnceItIsBack(t *testing.T) {
 	src := &switchableToken{}
-	w, _ := NewAtlas("http://atlas.internal", src, "", logging.New(logging.ERROR))
+	w, _ := NewAtlas("http://atlas.saturn.svc", src, "", logging.New(logging.ERROR))
 	if err := w.requestWake(context.Background(), "dep-1", func() {}); !errors.Is(err, errNoCredential) {
 		t.Fatalf("requestWake = %v", err)
 	}

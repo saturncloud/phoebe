@@ -99,7 +99,11 @@ emit:
 # and renews it. TF_INTERNAL_WAKE_TOKEN (the legacy shared secret) is also sent
 # while it is set, for one transition build. wake.enabled requires atlasURL;
 # with neither credential wake is disabled (cold responses pass through)
-# rather than crashing the proxy.
+# rather than crashing the proxy. Because every call carries the token,
+# atlasURL must be https unless its host is cluster-local (a name ending in
+# .svc or .svc.cluster.local, or localhost, 127.0.0.1, ::1); an http URL to
+# any other host (for example a spoke pointing at Atlas's external address)
+# disables wake.
 # timeout bounds one wake's request hold (default 300s). It MUST exceed the
 # real cold start — vLLM's cold reload measured ~2.5min on staging. If worker
 # restoration was confirmed but readiness exceeds this budget, the client gets
