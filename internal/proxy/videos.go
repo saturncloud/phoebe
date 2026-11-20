@@ -85,8 +85,8 @@ func (s *Server) serveVideoRetrieval(w http.ResponseWriter, r *http.Request, id 
 		return
 	}
 	refuse := func(reason string) {
-		s.log.Warn.Printf("videos: refused retrieval request_id=%s org_id=%q resource_id=%q method=%s raw_path=%q: %s",
-			requestID, id.OrgID, id.ResourceID, r.Method, r.URL.RawPath, reason)
+		s.log.Warn.Printf("videos: refused retrieval request_id=%s org_id=%q resource_id=%q method=%s path=%q: %s",
+			requestID, id.OrgID, id.ResourceID, r.Method, r.URL.EscapedPath(), reason)
 		http.Error(w, "not found", http.StatusNotFound)
 	}
 	switch {
@@ -115,8 +115,8 @@ func (s *Server) serveVideoRetrieval(w http.ResponseWriter, r *http.Request, id 
 // Every refusal is the same generic 404 the other route gates use.
 func (s *Server) serveVideo(w http.ResponseWriter, r *http.Request, id identity.Identity, requestID, routePath string, pathCanonical bool) {
 	refuse := func(reason string) {
-		s.log.Warn.Printf("videos: refused request_id=%s resource_id=%s method=%s raw_path=%q: %s",
-			requestID, id.ResourceID, r.Method, r.URL.RawPath, reason)
+		s.log.Warn.Printf("videos: refused request_id=%s resource_id=%s method=%s path=%q: %s",
+			requestID, id.ResourceID, r.Method, r.URL.EscapedPath(), reason)
 		http.Error(w, "not found", http.StatusNotFound)
 	}
 	switch {

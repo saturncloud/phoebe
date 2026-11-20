@@ -3,6 +3,8 @@ package proxy
 import (
 	"encoding/base64"
 	"encoding/json"
+	"fmt"
+	"log"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -321,5 +323,35 @@ func TestVideoRetrievalMarkIsReadOnlyWhenTrusted(t *testing.T) {
 	srv.Handler().ServeHTTP(rr, retrievalRequest(http.MethodGet, "/v1/videos/"+testVideoID))
 	if rr.Code == http.StatusOK || len(backend.reqs) != 0 {
 		t.Fatalf("an untrusted mark reached phoebe-videos: %d", rr.Code)
+	}
+}
+
+// captureWarn sends the server's warnings to a buffer the test can read.
+func captureWarn(srv *Server) *lockedBuffer {
+	buf := &lockedBuffer{}
+	srv.log.Warn = log.New(buf, "", 0)
+	return buf
+}
+
+// C13: a refusal names the path the client sent. Go leaves URL.RawPath empty
+// for an ordinary path, so logging it showed "" for almost every refusal.
+func TestVideoRetrievalRefusalLogsThePath(t *testing.T) {
+	srv, backend := newVideoServer(t)
+	warn := captureWarn(srv)
+	path := "/v1/videos/" + testVideoID
+	rr := httptest.NewRecorder()
+	srv.Handler().ServeHTTP(rr, retrievalRequest(http.MethodPost, path))
+	if rr.Code != 404 || len(backend.reqs) != 0 {
+		t.Fatalf("status %d, backend calls %d", rr.Code, len(backend.reqs))
+	}
+	if got := warn.String(); !strings.Contains(got, fmt.Sprintf("path=%q", path)) {
+		t.Fatalf("refusal log %q does not name the path %q", got, path)
+	}
+	// The endpoint route's refusal names it too.
+	warn = captureWarn(srv)
+	rr = httptest.NewRecorder()
+	srv.Handler().ServeHTTP(rr, videoRequest(http.MethodPost, "/v1/videos/sync"))
+	if got := warn.String(); rr.Code != 404 || !strings.Contains(got, `path="/v1/videos/sync"`) {
+		t.Fatalf("status %d, refusal log %q does not name the path", rr.Code, got)
 	}
 }

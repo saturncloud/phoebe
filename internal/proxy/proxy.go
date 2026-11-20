@@ -470,8 +470,8 @@ func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request) {
 
 	if id.Gateway {
 		if !pathCanonical || !gatewayRequestAllowed(r.Method, routePath) {
-			s.log.Warn.Printf("gateway: refusing route outside public inference surface method=%s raw_path=%q canonical=%v org_id=%q",
-				r.Method, r.URL.RawPath, pathCanonical, id.OrgID)
+			s.log.Warn.Printf("gateway: refusing route outside public inference surface method=%s path=%q canonical=%v org_id=%q",
+				r.Method, r.URL.EscapedPath(), pathCanonical, id.OrgID)
 			http.Error(w, "not found", http.StatusNotFound)
 			return
 		}
