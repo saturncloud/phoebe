@@ -243,7 +243,7 @@ func (d *Dispatcher) complete(ctx context.Context, job *Job, attempt int, videoP
 		return
 	}
 	keys := Keys{Prefix: d.cfg.Prefix}
-	videoKey := keys.Video(job.OrgID, job.ID)
+	videoKey := keys.Video(job.OrgID, job.ID, attempt)
 	info, err := os.Stat(videoPath)
 	if err != nil {
 		d.fail(ctx, job, attempt, CodeEngine, "internal error", err)
@@ -270,7 +270,7 @@ func (d *Dispatcher) complete(ctx context.Context, job *Job, attempt int, videoP
 		// A thumbnail is a convenience; the video is what was asked for.
 		d.log.Warn.Printf("videos dispatcher: thumbnail of %s: %v", job.ID, err)
 	} else if st, err := os.Stat(thumbPath); err == nil {
-		k := keys.Thumbnail(job.OrgID, job.ID)
+		k := keys.Thumbnail(job.OrgID, job.ID, attempt)
 		if err := d.putFile(ctx, k, thumbPath, st.Size(), "image/webp"); err != nil {
 			d.log.Warn.Printf("videos dispatcher: store thumbnail of %s: %v", job.ID, err)
 		} else {
@@ -289,19 +289,54 @@ func (d *Dispatcher) complete(ctx context.Context, job *Job, attempt int, videoP
 		gpuSeconds: gpuSeconds(job.GPUs, wall.Milliseconds()), expiresAt: now.Add(d.cfg.Retention),
 		resolution: resolution,
 	})
-	if err != nil || !ok {
-		// Not ours any more (the lease was taken over) or the write failed:
-		// remove what this attempt stored so nothing outlives its record.
-		d.log.Error.Printf("videos dispatcher: finish %s (attempt %d) ok=%v: %v", job.ID, attempt, ok, err)
-		_ = d.blob.Delete(ctx, videoKey)
-		if thumbKey != "" {
-			_ = d.blob.Delete(ctx, thumbKey)
-		}
+	switch {
+	case err != nil:
+		// The outcome is unknown: the commit may have landed, and then this
+		// attempt's keys are the job's recorded output. Keep the files; the
+		// reaper deletes every attempt's files when the job's files expire.
+		d.log.Error.Printf("videos dispatcher: finish %s (attempt %d): %v", job.ID, attempt, err)
+		return
+	case !ok:
+		// Not ours any more: another attempt took the lease over. This
+		// attempt's files are under its own keys, never the other attempt's
+		// output, so remove them (battery P on phoebe#144).
+		d.log.Warn.Printf("videos dispatcher: %s attempt %d was superseded; discarding its files", job.ID, attempt)
+		d.discard(ctx, job.ID, attempt, videoKey, thumbKey)
 		return
 	}
-	CloseGrant(ctx, d.blob, d.log, job)
+	CloseGrant(ctx, d.blob, d.log, job, attempt)
 	d.log.Info.Printf("videos dispatcher: completed %s frames=%d seconds=%s bytes=%d (engine wrote %d) wall=%s",
 		job.ID, probe.Frames, probe.OutputSeconds(), info.Size(), written, wall.Round(time.Millisecond))
+}
+
+// discardTimeout bounds a superseded attempt's cleanup.
+const discardTimeout = 2 * time.Minute
+
+// discard removes the files a superseded attempt stored. It never removes the
+// job's recorded output: it checks the job row first, and Atlas refuses a
+// discard for the attempt it recorded as the output. Whatever is left (a
+// failed discard) the reaper deletes with the job's files.
+func (d *Dispatcher) discard(ctx context.Context, jobID string, attempt int, keys ...string) {
+	ctx, cancel := context.WithTimeout(ctx, discardTimeout)
+	defer cancel()
+	current, err := d.store.GetByID(ctx, jobID)
+	if err != nil {
+		d.log.Warn.Printf("videos dispatcher: discard files of %s attempt %d (the reaper will): read job: %v",
+			jobID, attempt, err)
+		return
+	}
+	for _, key := range keys {
+		if key == "" {
+			continue
+		}
+		if current != nil && (key == current.VideoKey || key == current.ThumbnailKey) {
+			d.log.Error.Printf("videos dispatcher: not discarding %s: it is %s's recorded output", key, jobID)
+			continue
+		}
+		if err := d.blob.Discard(ctx, key); err != nil {
+			d.log.Warn.Printf("videos dispatcher: discard %s (the reaper will): %v", key, err)
+		}
+	}
 }
 
 func (d *Dispatcher) putFile(ctx context.Context, key, path string, size int64, ctype string) error {
@@ -323,7 +358,7 @@ func (d *Dispatcher) fail(ctx context.Context, job *Job, attempt int, code, mess
 		d.log.Error.Printf("videos dispatcher: record failure of %s: %v", job.ID, err)
 	}
 	if ok {
-		CloseGrant(ctx, d.blob, d.log, job)
+		CloseGrant(ctx, d.blob, d.log, job, 0)
 	}
 }
 

@@ -194,7 +194,7 @@ func main() {
 		RunTimeout: c.runTimeout, Retention: c.retention, MaxOutputBytes: c.s.MaxOutputBytes,
 		WorkDir: c.s.WorkDir, Prefix: c.s.Store.Prefix,
 	}, store, queue, blob, videos.NewOmniEngine(), media, log)
-	reaper := videos.NewReaper(videos.ReaperConfig{QueueTimeout: c.queueTimeout}, store, queue, blob, log)
+	reaper := videos.NewReaper(videos.ReaperConfig{QueueTimeout: c.queueTimeout, Prefix: c.s.Store.Prefix}, store, queue, blob, log)
 
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGTERM, syscall.SIGINT)
 	defer stop()
