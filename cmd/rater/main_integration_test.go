@@ -281,3 +281,125 @@ func TestRater_ParkedRowOlderThanThePruneHorizonIsListedAsPrunedAndNeverReaggreg
 		t.Fatalf("unresolved parked rows %d (err %v), want 1 with its counts", unresolved, err)
 	}
 }
+
+// Issue #87, the uk2 case: build 43's catch-up parked a 40-day-old hour of
+// dedicated usage with no org (missing_org), its raw events still present, so
+// every routine run exited 4 and nothing could clear it. -settle-parked
+// records the hand settlement (Hugo, 2026-10-27): the row is kept with who and
+// why, routine runs exit 0 with no PARKED line, -list-parked shows it under the
+// settled rows and exits 0, and no window may re-aggregate its hour. A video
+// row settles the same way.
+func TestRater_SettleParkedStopsExit4KeepsTheRowAndRefusesItsHour(t *testing.T) {
+	base := os.Getenv("PHOEBE_TEST_DATABASE_URL")
+	if base == "" {
+		t.Skip("PHOEBE_TEST_DATABASE_URL not set")
+	}
+	const sch = "phoebe_rater_settle_it"
+	applyMigrations(t, base, sch)
+	sep := "?"
+	if strings.Contains(base, "?") {
+		sep = "&"
+	}
+	dsn := base + sep + "search_path=" + sch
+	t.Setenv("DATABASE_URL", dsn)
+	db, err := sql.Open("pgx", dsn)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+
+	old := time.Now().UTC().Truncate(time.Hour).Add(-40 * 24 * time.Hour)
+	for i := 0; i < 2; i++ {
+		at := old.Add(time.Duration(i+1) * time.Minute)
+		if _, err := db.Exec(`INSERT INTO billing_event (request_id, auth_id, resource_id, model, base_model,
+			user_id, serving_mode, prompt_tokens, completion_tokens, usage_found, status_code, event_ts, created_at)
+			VALUES ($1,'a','res','qwen25-7b-profile','B','u','dedicated',100,20,true,200,$2,$2)`,
+			"noorg-"+string(rune('0'+i)), at); err != nil {
+			t.Fatal(err)
+		}
+	}
+	path := filepath.Join(t.TempDir(), "rater.yaml")
+	_ = os.WriteFile(path, []byte("rateTrailingHours: 24\n"), 0o600)
+	explicit := []string{"-f", path, "-since", old.Format(time.RFC3339), "-until", old.Add(time.Hour).Format(time.RFC3339)}
+	if code := runWith(explicit, logging.New(logging.ERROR)); code != exitParked {
+		t.Fatalf("parking run: exit %d, want exitParked", code)
+	}
+	// A parked video row of the same age (video is parked by the same rater).
+	if _, err := db.Exec(`INSERT INTO parked_video_usage (window_start, auth_id, owner_type, owner_id, resource_id,
+		model_id, serving_mode, reason, event_count, output_seconds, output_frames, request_count, gpu_seconds)
+		VALUES ($1,'va','','','vres','wan','dedicated','owner_conflict',1,5,120,1,30)`, old); err != nil {
+		t.Fatal(err)
+	}
+	if code := runWith([]string{"-f", path}, logging.New(logging.ERROR)); code != exitParked {
+		t.Fatalf("routine run before settling: exit %d, want exitParked", code)
+	}
+
+	settle := func(args ...string) int {
+		return runWith(append([]string{"-f", path, "-settle-parked", "-hour", old.Format(time.RFC3339),
+			"-settled-by", "ops@example", "-settle-reason", "no org, no payer: written off"}, args...),
+			logging.New(logging.ERROR))
+	}
+	// One field wrong: nothing settled.
+	if code := settle("-auth-id", "a", "-owner", "user/u", "-resource-id", "res", "-model-id", "qwen25-7b-profile",
+		"-serving-mode", "shared", "-parked-reason", "missing_org"); code != exitFatal {
+		t.Fatalf("settle with a wrong serving mode: exit %d, want exitFatal", code)
+	}
+	if code := settle("-auth-id", "a", "-owner", "user/u", "-resource-id", "res", "-model-id", "qwen25-7b-profile",
+		"-serving-mode", "dedicated", "-parked-reason", "missing_org"); code != exitOK {
+		t.Fatalf("settle token row: exit %d, want 0", code)
+	}
+	if code := settle("-auth-id", "a", "-owner", "user/u", "-resource-id", "res", "-model-id", "qwen25-7b-profile",
+		"-serving-mode", "dedicated", "-parked-reason", "missing_org"); code != exitFatal {
+		t.Fatalf("settling the same row twice: exit %d, want exitFatal", code)
+	}
+	if code := settle("-kind", "video", "-auth-id", "va", "-owner", "-", "-resource-id", "vres", "-model-id", "wan",
+		"-serving-mode", "dedicated", "-parked-reason", "owner_conflict"); code != exitOK {
+		t.Fatalf("settle video row: exit %d, want 0", code)
+	}
+
+	// The rows are kept, resolved, with who and why.
+	for _, table := range []string{"parked_usage", "parked_video_usage"} {
+		var n int
+		if err := db.QueryRow(`SELECT COUNT(*) FROM ` + table + ` WHERE resolved_at IS NOT NULL
+			AND settled_at IS NOT NULL AND settled_by = 'ops@example'
+			AND settle_reason = 'no org, no payer: written off'`).Scan(&n); err != nil || n != 1 {
+			t.Fatalf("%s: %d settled rows (err %v), want 1 kept", table, n, err)
+		}
+	}
+
+	// Routine run: exit 0, no PARKED line.
+	var errLog bytes.Buffer
+	l := logging.New(logging.INFO)
+	l.Error = log.New(&errLog, "", 0)
+	if code := runWith([]string{"-f", path}, l); code != exitOK {
+		t.Fatalf("routine run after settling: exit %d, want 0:\n%s", code, errLog.String())
+	}
+	if strings.Contains(errLog.String(), "PARKED") {
+		t.Fatalf("settled rows still logged at ERROR:\n%s", errLog.String())
+	}
+
+	// -list-parked: no unresolved rows, both settled rows listed, exit 0.
+	r, w, _ := os.Pipe()
+	stdout := os.Stdout
+	os.Stdout = w
+	code := runWith([]string{"-f", path, "-list-parked"}, logging.New(logging.ERROR))
+	_ = w.Close()
+	os.Stdout = stdout
+	var out bytes.Buffer
+	_, _ = out.ReadFrom(r)
+	if code != exitOK || !strings.Contains(out.String(), "0 parked identity-hour(s)") ||
+		!strings.Contains(out.String(), "2 parked identity-hour(s) settled by hand") ||
+		!strings.Contains(out.String(), "ops@example") {
+		t.Fatalf("-list-parked exit %d output:\n%s", code, out.String())
+	}
+
+	// No window may re-aggregate the hour: the conflict is still in the raw
+	// events and a re-run would park the row again.
+	if code := runWith(explicit, logging.New(logging.ERROR)); code != exitFatal {
+		t.Fatalf("explicit re-run over the settled hour: exit %d, want exitFatal (refused)", code)
+	}
+	var unresolved int
+	if err := db.QueryRow(`SELECT COUNT(*) FROM parked_usage WHERE resolved_at IS NULL`).Scan(&unresolved); err != nil || unresolved != 0 {
+		t.Fatalf("%d unresolved parked rows after the refused re-run (err %v), want 0", unresolved, err)
+	}
+}

@@ -173,6 +173,8 @@ func newHarness(t *testing.T, schema string) *harness {
 	// 0015: rater_state, which a routine rater run reads to know whether the
 	// one-time catch-up is done before checking for never-rated video.
 	mustExec(t, db, readMigration(t, "0015_rater_state.up.sql"))
+	// 0020: the settled_* columns on both parked tables, which the rater reads.
+	mustExec(t, db, readMigration(t, "0020_parked_usage_settled.up.sql"))
 
 	mr, err := miniredis.Run()
 	if err != nil {

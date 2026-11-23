@@ -75,7 +75,9 @@ identity is (auth_id, owner, resource_id, model_id, serving_mode) in one hour.
   reason, token counts) and exits `4` (exit `1` and `2` outrank it), so a Job
   alert keeps firing until it is resolved.
 - **Listed.** `phoebe-rater -list-parked` prints the unresolved rows and exits `4`
-  when there are any, `0` when there are none. Its `RAW_EVENTS` column is
+  when there are any, `0` when there are none. Below them it prints the rows
+  settled by hand (see below), with who settled each and why; those never change
+  the exit code. Its `RAW_EVENTS` column is
   `present`, or `raw_events: pruned — settle manually via manager credit` when the
   pruner has removed the hour's raw events (fewer `billing_event` rows remain than
   were parked); the run's ERROR line carries the same marker. The same data in SQL
@@ -98,23 +100,39 @@ identity is (auth_id, owner, resource_id, model_id, serving_mode) in one hour.
   `pushed_hour`). For an older parked hour, confirm `billing_event` still holds its
   events, then run `phoebe-rater -since <hour> -until <hour+1h>`; the same
   resolution and re-send follow.
-- **Pruned raw events: settle by hand (Hugo, 2026-10-27).** The `billing_event`
-  horizon (30 days by default) has NO exception for parked usage. Once the pruner
-  has removed a parked hour's raw events, the hour can never be re-aggregated:
-  the rater never re-checks it, and refuses (exit `1`) any `--since/--until`
-  window that contains it, so a partial re-run cannot wipe the hour's clean
-  rollups or mark the conflict resolved without evidence. The `parked_usage` row
-  keeps the hour, identity, reason and token counts. Settle it by hand: decide the
-  correct payer and pricing facts from the row and your records, apply the charge
-  or credit through the manager's credit path, and keep the `-list-parked` output
-  as the evidence. Then mark the row settled so it stops paging:
+- **Settle by hand after 30 days (Hugo, 2026-10-27).** The `billing_event`
+  horizon (30 days by default) has NO exception for parked usage, and usage that
+  can never be billed (for example `missing_org`: nobody to bill) is settled by a
+  person. Once the pruner has removed a parked hour's raw events, the hour can
+  never be re-aggregated: the rater never re-checks it, and refuses (exit `1`)
+  any `--since/--until` window that contains it, so a partial re-run cannot wipe
+  the hour's clean rollups or mark the conflict resolved without evidence. The
+  `parked_usage` row keeps the hour, identity, reason and token counts.
 
-  ```sql
-  UPDATE parked_usage SET resolved_at = now()
-   WHERE window_start = :hour AND auth_id = :auth_id AND resource_id = :resource_id
-     AND model_id = :model_id AND serving_mode = :serving_mode AND reason = :reason
-     AND resolved_at IS NULL;
+  To settle a row: decide the correct payer and pricing facts from the row and
+  your records, apply the charge or credit through the manager's credit path (or
+  decide to write it off), keep the `-list-parked` output as the evidence, then
+  record the settlement with the row's fields copied from `-list-parked` (OWNER
+  `-` is the empty owner of an `owner_conflict` row):
+
+  ```sh
+  phoebe-rater -settle-parked -hour 2026-09-14T04:00:00Z -kind token \
+    -auth-id <AUTH_ID> -owner <OWNER> -resource-id <RESOURCE_ID> \
+    -model-id <MODEL_ID> -serving-mode <MODE> -parked-reason <REASON> \
+    -settled-by <you> -settle-reason "<why, and what was done in the manager>"
   ```
+
+  It settles exactly that one unresolved row and exits `0`; anything else exits
+  `1` and changes nothing (no row matches every field, the row is already
+  settled, or the hour is younger than 30 days while all its raw events are
+  still present, so its usage can still be billed: fix the cause and re-run the
+  hour instead). The row is kept: the command sets `resolved_at` with
+  `settled_at`, `settled_by` and `settle_reason` (migration 0020). From then on
+  rater runs do not log it at ERROR or exit `4` for it, and refuse (exit `1`)
+  any window that contains its hour, because its conflict is still in the raw
+  events and a re-run would park it again. Do not settle with a bare `UPDATE
+  ... SET resolved_at`: that leaves no record of who settled it, and the rater
+  would re-aggregate the hour.
 
   token-push then re-sends that hour from `rated_usage` (the clean identities
   only). The settled identity is no longer held, so any record the manager still
@@ -325,7 +343,12 @@ can delay sending, and neither stops it:
   <last>` and whether more remain. An hour that already has rollups or parked
   rows is never re-aggregated by the catch-up, so a partially pruned hour keeps
   its rollup. The catch-up reaches only hours still in `billing_event`: with the
-  pruner enabled, hours older than its horizon are gone and cannot be rated. A
+  pruner enabled, hours older than its horizon are gone and cannot be rated.
+  The catch-up can park old usage that can never be billed (for example
+  `missing_org` usage from before orgs were recorded); the rater then exits `4`
+  every hour. After the upgrade, run `phoebe-rater -list-parked` in a phoebe pod
+  and settle each such row by hand (see "Parked usage", "Settle by hand after 30
+  days"). A
   suspended token-push only delays sending too: `rated_usage` is never pruned,
   and the next runs send every hour never accepted.
 - **An empty manager URL is only for an install that has never connected** (an
