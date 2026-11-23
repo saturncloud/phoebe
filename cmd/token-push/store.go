@@ -4,7 +4,9 @@ import (
 	"context"
 	"database/sql"
 	"fmt"
+	"strings"
 	"time"
+	"unicode/utf8"
 
 	"github.com/saturncloud/phoebe/internal/meteredusage"
 )
@@ -170,13 +172,27 @@ type pushStore interface {
 	// RecordDeferred defers the hour, or updates its row: status, message, one
 	// more refusal, last_deferred_at now. first_deferred_at is kept. In the
 	// same transaction it deletes the hour's refused_hour row: a deferred hour
-	// is retried every run, so it must not also be held back as parked.
-	RecordDeferred(ctx context.Context, hour time.Time, status int, message string) error
+	// is retried every run, so it must not also be held back as parked. first
+	// is true when the hour was not deferred before this call (a new row): only
+	// that run exits 3 for it.
+	RecordDeferred(ctx context.Context, hour time.Time, status int, message string) (first bool, err error)
+	// TouchDeferred sets last_deferred_at to now for those of hours that are
+	// deferred: a run tried them and they failed some other way (a 5xx, an
+	// unreachable manager, a read error), so the next run retries the other
+	// deferred hours first instead of the same ones again.
+	TouchDeferred(ctx context.Context, hours []time.Time) error
 	// RecordIntent adds rows to pushed_usage BEFORE the request is sent. If the
 	// manager commits and token-push dies before RecordAccepted, the ids are
 	// still known as sent; listing an id the manager does not have in `held` is
-	// harmless, forgetting one it does have is not.
-	RecordIntent(ctx context.Context, hour time.Time, rows []pushedRow) error
+	// harmless, forgetting one it does have is not. It returns the usage_ids of
+	// the records (not held ids) it added: those pushed_usage had no row for.
+	RecordIntent(ctx context.Context, hour time.Time, rows []pushedRow) (added []string, err error)
+	// ForgetIntent deletes the hour's pushed_usage rows for ids, the ones
+	// RecordIntent added for a request the manager then definitely refused
+	// (a refused request stores nothing at the manager). Left in place, they
+	// would make the hour look sent before, and a video id would keep kind
+	// "video" listed for the hour after its video is gone.
+	ForgetIntent(ctx context.Context, hour time.Time, ids []string) error
 	// RecordAccepted makes pushed_usage for the hour and the request's kinds
 	// exactly rows (what the manager now holds) and stamps pushed_hour. Rows of
 	// a kind the request did not list are kept: the manager kept those
@@ -529,14 +545,30 @@ func (s pgStore) RefusedHours(ctx context.Context) ([]refusedHour, error) {
 	return out, rows.Err()
 }
 
-// maxRefusedMessage bounds the stored response body; the start of it names
-// the field the manager refused.
+// maxRefusedMessage bounds the stored response body in bytes; the start of
+// it names the field the manager refused.
 const maxRefusedMessage = 4096
 
-func (s pgStore) RecordRefused(ctx context.Context, hour time.Time, status int, message, payloadSHA256 string) error {
-	if len(message) > maxRefusedMessage {
-		message = message[:maxRefusedMessage]
+// storedMessage makes a response body safe to store in a TEXT column: invalid
+// UTF-8 is replaced, NUL bytes (which Postgres TEXT cannot hold) are removed,
+// and the result is cut to at most maxRefusedMessage bytes at a character
+// boundary. A cut inside a multi-byte character, or a NUL, would make Postgres
+// refuse the row (SQLSTATE 22021) and the hour could not be parked or
+// deferred.
+func storedMessage(message string) string {
+	message = strings.ReplaceAll(strings.ToValidUTF8(message, "\uFFFD"), "\x00", "")
+	if len(message) <= maxRefusedMessage {
+		return message
 	}
+	cut := maxRefusedMessage
+	for cut > 0 && !utf8.RuneStart(message[cut]) {
+		cut--
+	}
+	return message[:cut]
+}
+
+func (s pgStore) RecordRefused(ctx context.Context, hour time.Time, status int, message, payloadSHA256 string) error {
+	message = storedMessage(message)
 	return s.inTx(ctx, func(tx *sql.Tx) error {
 		if _, err := tx.ExecContext(ctx, `INSERT INTO refused_hour (window_start, status, message, payload_sha256)
 		VALUES ($1, $2, $3, $4)
@@ -571,17 +603,19 @@ func (s pgStore) DeferredSummary(ctx context.Context) (int, time.Time, error) {
 	return n, oldest.Time.UTC(), nil
 }
 
-func (s pgStore) RecordDeferred(ctx context.Context, hour time.Time, status int, message string) error {
-	if len(message) > maxRefusedMessage {
-		message = message[:maxRefusedMessage]
-	}
-	return s.inTx(ctx, func(tx *sql.Tx) error {
-		if _, err := tx.ExecContext(ctx, `INSERT INTO deferred_hour (window_start, status, message)
+func (s pgStore) RecordDeferred(ctx context.Context, hour time.Time, status int, message string) (bool, error) {
+	message = storedMessage(message)
+	var refusals int64
+	err := s.inTx(ctx, func(tx *sql.Tx) error {
+		// refusals is 1 only on the insert: a row that existed was refused
+		// before, by this run or an earlier one.
+		if err := tx.QueryRowContext(ctx, `INSERT INTO deferred_hour (window_start, status, message)
 		VALUES ($1, $2, $3)
 		ON CONFLICT ON CONSTRAINT deferred_hour_pk DO UPDATE SET
 			status = EXCLUDED.status, message = EXCLUDED.message,
-			refusals = deferred_hour.refusals + 1, last_deferred_at = now()`,
-			hour, status, message); err != nil {
+			refusals = deferred_hour.refusals + 1, last_deferred_at = now()
+		RETURNING refusals`,
+			hour, status, message).Scan(&refusals); err != nil {
 			return fmt.Errorf("record deferred hour: %w", err)
 		}
 		if _, err := tx.ExecContext(ctx, `DELETE FROM refused_hour WHERE window_start = $1`, hour); err != nil {
@@ -589,6 +623,17 @@ func (s pgStore) RecordDeferred(ctx context.Context, hour time.Time, status int,
 		}
 		return nil
 	})
+	return err == nil && refusals == 1, err
+}
+
+func (s pgStore) TouchDeferred(ctx context.Context, hours []time.Time) error {
+	if len(hours) == 0 {
+		return nil
+	}
+	if _, err := s.db.ExecContext(ctx, `UPDATE deferred_hour SET last_deferred_at = now() WHERE window_start = ANY($1)`, hours); err != nil {
+		return fmt.Errorf("touch deferred hours: %w", err)
+	}
+	return nil
 }
 
 func (s pgStore) MarkRefusedChecked(ctx context.Context, hours []time.Time) error {
@@ -629,8 +674,94 @@ func (s pgStore) inTx(ctx context.Context, f func(*sql.Tx) error) error {
 	return tx.Commit()
 }
 
-func (s pgStore) RecordIntent(ctx context.Context, hour time.Time, rows []pushedRow) error {
-	return s.inTx(ctx, func(tx *sql.Tx) error { return insertPushed(ctx, tx, hour, rows) })
+func (s pgStore) RecordIntent(ctx context.Context, hour time.Time, rows []pushedRow) ([]string, error) {
+	var added []string
+	err := s.inTx(ctx, func(tx *sql.Tx) error {
+		ids := make([]string, 0, len(rows))
+		for _, r := range rows {
+			if !r.held {
+				ids = append(ids, r.UsageID)
+			}
+		}
+		known := map[string]bool{}
+		if len(ids) > 0 {
+			rs, err := tx.QueryContext(ctx, `SELECT usage_id FROM pushed_usage WHERE window_start = $1 AND usage_id = ANY($2)`, hour, ids)
+			if err != nil {
+				return fmt.Errorf("read pushed usage: %w", err)
+			}
+			for rs.Next() {
+				var id string
+				if err := rs.Scan(&id); err != nil {
+					_ = rs.Close()
+					return fmt.Errorf("scan pushed usage: %w", err)
+				}
+				known[id] = true
+			}
+			if err := rs.Err(); err != nil {
+				return fmt.Errorf("read pushed usage: %w", err)
+			}
+			_ = rs.Close()
+		}
+		for _, id := range ids {
+			if !known[id] {
+				added = append(added, id)
+			}
+		}
+		return insertPushed(ctx, tx, hour, rows)
+	})
+	if err != nil {
+		return nil, err
+	}
+	return added, nil
+}
+
+func (s pgStore) ForgetIntent(ctx context.Context, hour time.Time, ids []string) error {
+	if len(ids) == 0 {
+		return nil
+	}
+	if _, err := s.db.ExecContext(ctx, `DELETE FROM pushed_usage WHERE window_start = $1 AND usage_id = ANY($2)`, hour, ids); err != nil {
+		return fmt.Errorf("forget refused intent: %w", err)
+	}
+	return nil
+}
+
+// runLockKey is token-push's session advisory lock, one per schema (the
+// integration tests give each test its own schema in one database).
+const runLockKey = `hashtextextended('phoebe.token-push:' || current_schema(), 0)`
+
+// lockRun makes token-push single-flight: it holds a session advisory lock on
+// one dedicated connection for the whole run. The CronJob's concurrencyPolicy
+// Forbid stops two scheduled runs overlapping, but not a manual Job (an
+// operator's -since/-until run) overlapping a scheduled one; two runs
+// interleaving could leave an hour both parked and deferred, or have one
+// run's ForgetIntent remove an id the other run's accepted request made the
+// manager hold. A run that finds the lock held waits for it (bounded by the
+// run's context and the Job's deadline): it is not a failure, and the run that
+// waited then sends its hours as usual. The connection is taken from the pool
+// on top of its configured size (openStore raises the limit by one), so a
+// pool of one cannot deadlock. release unlocks and returns the connection;
+// the lock also ends with the process.
+func (s pgStore) lockRun(ctx context.Context, waiting func()) (release func(), err error) {
+	conn, err := s.db.Conn(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("run lock: %w", err)
+	}
+	var got bool
+	if err := conn.QueryRowContext(ctx, `SELECT pg_try_advisory_lock(`+runLockKey+`)`).Scan(&got); err != nil {
+		_ = conn.Close()
+		return nil, fmt.Errorf("run lock: %w", err)
+	}
+	if !got {
+		waiting()
+		if _, err := conn.ExecContext(ctx, `SELECT pg_advisory_lock(`+runLockKey+`)`); err != nil {
+			_ = conn.Close()
+			return nil, fmt.Errorf("run lock: wait for the other token-push run: %w", err)
+		}
+	}
+	return func() {
+		_, _ = conn.ExecContext(context.Background(), `SELECT pg_advisory_unlock(`+runLockKey+`)`)
+		_ = conn.Close()
+	}, nil
 }
 
 func (s pgStore) RecordAccepted(ctx context.Context, hour time.Time, kinds []string, rows []pushedRow, setAutoFloor bool) error {

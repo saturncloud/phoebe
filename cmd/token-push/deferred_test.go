@@ -94,20 +94,22 @@ func TestPushWindows_A409OnTheVideoHourDefersOnlyThatHourAndSendsTheOthers(t *te
 	if !strings.Contains(out, "DEFERRED "+meteredusage.FormatWindowStart(videoHour)) || !strings.Contains(out, "saturn-aws-manager#334") {
 		t.Fatalf("no ERROR line naming the deferred hour and the manager change:\n%s", out)
 	}
-	if !strings.Contains(out, "1 hour(s) are deferred (1 refused this run)") {
+	if !strings.Contains(out, "1 hour(s) are deferred (1 refused this run, 1 newly)") || !strings.Contains(out, "report it to Saturn support") {
 		t.Fatalf("no WARN summary of deferred hours:\n%s", out)
 	}
 }
 
 // A deferred hour is re-sent by every run, also once it has left the trailing
-// window, until the manager accepts it. The accepted request is byte for byte
-// the refused one (one snapshot of the hour, replacing what the manager held),
-// so nothing is counted twice; acceptance removes the deferral and the run
-// exits 0.
+// window, until the manager accepts it. Only the run that deferred it exits 3
+// (issue #95, option B): later runs that are refused again exit 0, log no
+// ERROR for it and log the WARN summary. The accepted request is byte for
+// byte the refused one (one snapshot of the hour, replacing what the manager
+// held), so nothing is counted twice; acceptance removes the deferral and the
+// run exits 0.
 func TestPushWindows_ADeferredHourIsResentEveryRunUntilTheUpgradedManagerAcceptsIt(t *testing.T) {
 	f, before, videoHour, after := uk2Store()
 	m := &legacyManager{}
-	p := newPusher(f, m.client(t))
+	p, logs := capturingPusher(f, m.client(t))
 	if code := p.pushWindows(context.Background(), []time.Time{before, videoHour, after}, now, false); code != exitRejected {
 		t.Fatalf("first run: exit %d", code)
 	}
@@ -115,8 +117,13 @@ func TestPushWindows_ADeferredHourIsResentEveryRunUntilTheUpgradedManagerAccepts
 	// Later runs: the window has moved past every one of these hours.
 	later := after.Add(time.Hour)
 	for i := 0; i < 2; i++ {
-		if code := p.pushWindows(context.Background(), []time.Time{later}, now, false); code != exitRejected {
-			t.Fatalf("run %d with the old manager: exit %d, want exitRejected (the deferred hour is still refused)", i, code)
+		logs.Reset()
+		if code := p.pushWindows(context.Background(), []time.Time{later}, now, false); code != exitOK {
+			t.Fatalf("run %d with the old manager: exit %d, want exitOK (only the run that defers an hour exits 3)", i, code)
+		}
+		out := logs.String()
+		if strings.Contains(out, "ERROR") || !strings.Contains(out, "1 hour(s) are deferred (1 refused this run, 0 newly)") {
+			t.Fatalf("run %d: want no ERROR line and the WARN summary:\n%s", i, out)
 		}
 	}
 	if d := f.deferred[videoHour]; d == nil || d.refusals != 3 {
@@ -194,7 +201,7 @@ func TestPushWindows_DeferredHoursAreRetriedUnderTheirOwnCap(t *testing.T) {
 		h := win.Add(-time.Duration(i+1) * time.Hour)
 		f.rollups[h] = fixtureRollups()
 		f.videoRollups[h] = f.videoRollups[win]
-		if err := f.RecordDeferred(context.Background(), h, 409, "x"); err != nil {
+		if _, err := f.RecordDeferred(context.Background(), h, 409, "x"); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -223,7 +230,7 @@ func TestPushWindows_DeferredHoursAreRetriedUnderTheirOwnCap(t *testing.T) {
 // refused for its kinds is deferred and no longer parked.
 func TestPushWindows_AnHourIsDeferredOrParkedNeverBoth(t *testing.T) {
 	f := videoStore()
-	if err := f.RecordDeferred(context.Background(), win, 409, "x"); err != nil {
+	if _, err := f.RecordDeferred(context.Background(), win, 409, "x"); err != nil {
 		t.Fatal(err)
 	}
 	m := &recordingManager{statuses: []int{400}}
@@ -253,4 +260,136 @@ func countKinds(rows []pushedRow) map[string]int {
 		out[r.kind()]++
 	}
 	return out
+}
+
+// An operator's -since/-until run asked for the hour, so a deferred hour of
+// its own range that is refused again still exits 3. A deferred hour outside
+// the range, retried by the same run, does not.
+func TestPushWindows_AnExplicitRunExits3ForADeferredHourOfItsRangeRefusedAgain(t *testing.T) {
+	f, before, videoHour, after := uk2Store()
+	m := &legacyManager{}
+	p := newPusher(f, m.client(t))
+	if code := p.pushWindows(context.Background(), []time.Time{before, videoHour, after}, now, false); code != exitRejected {
+		t.Fatalf("scheduled run: exit %d", code)
+	}
+	if code := p.pushWindows(context.Background(), []time.Time{videoHour}, now, true); code != exitRejected {
+		t.Fatalf("explicit run over the deferred hour: exit %d, want exitRejected", code)
+	}
+	if code := p.pushWindows(context.Background(), []time.Time{before}, now, true); code != exitOK {
+		t.Fatalf("explicit run over another hour: exit %d, want exitOK (the deferred hour is outside its range)", code)
+	}
+	if d := f.deferred[videoHour]; d == nil || d.refusals != 3 {
+		t.Fatalf("deferred row %+v, want 3 refusals (every run re-sent it)", d)
+	}
+}
+
+// A 409, or a 400 on kinds, to a request that lists only token is a manager
+// that refuses this install's token usage: every hour would get the same
+// answer. The run stops at the first one, as before deferral existed, and
+// defers and parks nothing; the next run sends again. The log names the
+// whole-install refusal, not saturn-aws-manager#334.
+func TestPushWindows_AKindRefusalOfATokenOnlyRequestStopsTheRunAndDefersNothing(t *testing.T) {
+	for _, tc := range []struct {
+		status int
+		body   string
+	}{
+		{409, `{"error": "install billing path is legacy"}`},
+		{400, `{"error": "unknown kind token", "path": "kinds[0]"}`},
+	} {
+		f := fixtureStore()
+		other := win.Add(-time.Hour)
+		f.rollups[other] = fixtureRollups()
+		m := &recordingManager{statuses: []int{tc.status}, errBody: tc.body}
+		p, logs := capturingPusher(f, m.client(t))
+		if code := p.pushWindows(context.Background(), []time.Time{other, win}, now, false); code != exitRejected {
+			t.Fatalf("%d: exit %d, want exitRejected", tc.status, code)
+		}
+		if len(m.bodies) != 1 {
+			t.Fatalf("%d: %d requests, want 1 (the run stops at the first refusal)", tc.status, len(m.bodies))
+		}
+		if len(f.deferred) != 0 || len(f.refused) != 0 {
+			t.Fatalf("%d: %d deferred, %d parked; want none", tc.status, len(f.deferred), len(f.refused))
+		}
+		if len(f.pushed[other]) != 0 {
+			t.Fatalf("%d: pushed_usage kept %d intent rows for the refused hour, want none", tc.status, len(f.pushed[other]))
+		}
+		if out := logs.String(); !strings.Contains(out, "for the whole install") || strings.Contains(out, "DEFERRED") {
+			t.Fatalf("%d: want the whole-install refusal logged and no DEFERRED line:\n%s", tc.status, out)
+		}
+	}
+}
+
+// The manager stores nothing for a request it refuses, so the pushed_usage
+// rows RecordIntent added for it are removed. Left in place, the hour's video
+// intent rows would keep kind "video" listed after its video is gone (a later
+// re-rate), and an old manager would refuse the hour forever. Without them,
+// the hour goes back to token only and is accepted.
+func TestPushWindows_ARefusedRequestForgetsTheIntentRowsItAdded(t *testing.T) {
+	f := videoStore()
+	m := &legacyManager{}
+	p := newPusher(f, m.client(t))
+	if code := p.pushWindows(context.Background(), []time.Time{win}, now, false); code != exitRejected {
+		t.Fatalf("first run: exit %d", code)
+	}
+	if f.deferred[win] == nil || len(f.pushed[win]) != 0 {
+		t.Fatalf("deferred %+v, %d pushed_usage rows; want the hour deferred and no intent rows left", f.deferred[win], len(f.pushed[win]))
+	}
+	// The hour's video is re-rated away.
+	delete(f.videoRollups, win)
+	f.hasVideo = false
+	if code := p.pushWindows(context.Background(), nil, now, false); code != exitOK {
+		t.Fatalf("second run: exit %d, want exitOK", code)
+	}
+	if f.accepted[win] != 1 || f.deferred[win] != nil {
+		t.Fatalf("accepted %d, deferred %+v; want the token-only hour accepted and undeferred", f.accepted[win], f.deferred[win])
+	}
+	if got := countKinds(f.pushed[win]); got[meteredusage.KindVideo] != 0 || got[meteredusage.KindToken] != 4 {
+		t.Fatalf("pushed_usage %v, want the 4 token records only", got)
+	}
+}
+
+// Intent rows that were already in pushed_usage (the manager may hold them)
+// are never forgotten on a refusal: only the ones this attempt added.
+func TestPushWindows_ARefusalKeepsIntentRowsFromEarlierPushes(t *testing.T) {
+	f := fixtureStore()
+	m := &legacyManager{}
+	p := newPusher(f, m.client(t))
+	if code := p.pushWindows(context.Background(), []time.Time{win}, now, false); code != exitOK {
+		t.Fatalf("token-only run: exit %d", code)
+	}
+	v := videoStore()
+	f.hasVideo = true
+	f.videoRollups[win] = v.videoRollups[win]
+	if code := p.pushWindows(context.Background(), []time.Time{win}, now, false); code != exitRejected {
+		t.Fatalf("run with video: exit %d", code)
+	}
+	if got := countKinds(f.pushed[win]); got[meteredusage.KindToken] != 4 || got[meteredusage.KindVideo] != 0 {
+		t.Fatalf("pushed_usage %v, want the 4 accepted token records kept and no video intent rows", got)
+	}
+}
+
+// A deferred hour that fails some other way (here a 5xx past the retries) is
+// moved to the back of the retry order, so it cannot stay first while other
+// deferred hours wait.
+func TestPushWindows_ADeferredHourThatFailsAnotherWayMovesToTheBackOfTheRetryOrder(t *testing.T) {
+	f := videoStore()
+	a, b := win.Add(-2*time.Hour), win.Add(-time.Hour)
+	for _, h := range []time.Time{a, b} {
+		f.rollups[h] = fixtureRollups()
+		f.videoRollups[h] = f.videoRollups[win]
+		if _, err := f.RecordDeferred(context.Background(), h, 409, "x"); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// a is retried first and gets 503 on every attempt; b gets the 409 again.
+	m := &recordingManager{statuses: []int{503, 503, 503, 503, 503, 409}, errBody: `{"error": "install billing path is legacy"}`}
+	if code := newPusher(f, m.client(t)).pushWindows(context.Background(), nil, now, false); code != exitFatal {
+		t.Fatalf("exit %d, want exitFatal (a 5xx outlasted the retries)", code)
+	}
+	if f.deferred[a].last <= f.deferred[b].last {
+		t.Fatalf("a last=%d, b last=%d; want a behind b in the retry order", f.deferred[a].last, f.deferred[b].last)
+	}
+	if next, _ := f.DeferredHours(context.Background(), 1); len(next) != 1 || !next[0].Equal(b) {
+		t.Fatalf("next run retries %v first, want %s", next, b)
+	}
 }

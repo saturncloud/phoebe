@@ -622,11 +622,13 @@ func deferredCount(t *testing.T, db *sql.DB) int {
 	return n
 }
 
-// A 409 from the manager defers the hour (deferred_hour: status, body, count,
-// first and last refusal) instead of stopping the run. The deferred hour is not
-// in the unsent list (it does not use up that cap) and is re-sent by every
-// scheduled run, outside the window too, until accepted; acceptance deletes the
-// row. Parking the hour also deletes it, and deferring a parked hour unparks it.
+// A 409 from the manager to an hour that lists video defers the hour
+// (deferred_hour: status, body, count, first and last refusal) instead of
+// stopping the run. The deferred hour is not in the unsent list (it does not
+// use up that cap) and is re-sent by every scheduled run, outside the window
+// too, until accepted; only the run that deferred it exits 3 (issue #95,
+// option B). Acceptance deletes the row. Parking the hour also deletes it, and
+// deferring a parked hour unparks it.
 func TestIntegration_DeferredHourIsResentEveryRunAndAcceptanceUndefersIt(t *testing.T) {
 	db := itDB(t, "phoebe_push_deferred_it")
 	ctx := context.Background()
@@ -641,6 +643,7 @@ func TestIntegration_DeferredHourIsResentEveryRunAndAcceptanceUndefersIt(t *test
 	}
 	h, other := floor.Add(2*time.Hour), floor.Add(3*time.Hour)
 	event(t, db, h.Add(time.Minute), itRes1, itOrg1)
+	videoJob(t, db, h.Add(2*time.Minute), itOrg1, "completed")
 	event(t, db, other.Add(time.Minute), itRes1, itOrg1)
 	rate(t, db, floor, now)
 
@@ -669,8 +672,8 @@ func TestIntegration_DeferredHourIsResentEveryRunAndAcceptanceUndefersIt(t *test
 	}
 
 	still := &recordingManager{statuses: []int{409}, errBody: `{"error": "install billing path is legacy"}`}
-	if code := push(t, db, still); code != exitRejected {
-		t.Fatalf("second run: exit %d", code)
+	if code := push(t, db, still); code != exitOK {
+		t.Fatalf("second run: exit %d, want exitOK (only the run that defers an hour exits 3)", code)
 	}
 	if sent := windowStarts(t, still); len(sent) != 1 || sent[0] != meteredusage.FormatWindowStart(h) {
 		t.Fatalf("second run sent %v, want only the deferred hour", sent)
@@ -701,8 +704,11 @@ func TestIntegration_DeferredHourIsResentEveryRunAndAcceptanceUndefersIt(t *test
 	}
 
 	// Deferred and parked never hold the same hour.
-	if err := store.RecordDeferred(ctx, other, 409, "x"); err != nil {
-		t.Fatal(err)
+	if first, err := store.RecordDeferred(ctx, other, 409, "x"); err != nil || !first {
+		t.Fatalf("first %v err %v, want the first deferral", first, err)
+	}
+	if first, err := store.RecordDeferred(ctx, other, 409, "x"); err != nil || first {
+		t.Fatalf("first %v err %v, want a repeat refusal (not first)", first, err)
 	}
 	if err := store.RecordRefused(ctx, other, 400, `{"error":"x","path":"records[0]"}`, strings.Repeat("a", 64)); err != nil {
 		t.Fatal(err)
@@ -710,8 +716,9 @@ func TestIntegration_DeferredHourIsResentEveryRunAndAcceptanceUndefersIt(t *test
 	if refusedCount(t, db) != 1 || deferredCount(t, db) != 0 {
 		t.Fatalf("after parking: %d parked, %d deferred; want 1 and 0", refusedCount(t, db), deferredCount(t, db))
 	}
-	if err := store.RecordDeferred(ctx, other, 409, "x"); err != nil {
-		t.Fatal(err)
+	// Parking removed the deferral, so deferring it again is a first deferral.
+	if first, err := store.RecordDeferred(ctx, other, 409, "x"); err != nil || !first {
+		t.Fatalf("first %v err %v, want a first deferral after the park", first, err)
 	}
 	if refusedCount(t, db) != 0 || deferredCount(t, db) != 1 {
 		t.Fatalf("after deferring: %d parked, %d deferred; want 0 and 1", refusedCount(t, db), deferredCount(t, db))
@@ -722,3 +729,220 @@ func TestIntegration_DeferredHourIsResentEveryRunAndAcceptanceUndefersIt(t *test
 }
 
 func bytesEqual(a, b []byte) bool { return string(a) == string(b) }
+
+// Deferred hours are retried under their own cap, so the queries for
+// never-accepted hours leave them out: BackfillHours (before the floor),
+// PreConnectionHours and UnsentHours (after it) list none of them.
+func TestIntegration_DeferredHoursAreLeftOutOfBackfillAndUnsentHours(t *testing.T) {
+	db := itDB(t, "phoebe_push_deferred_backfill_it")
+	ctx := context.Background()
+	store := pgStore{db: db}
+	now := time.Now().UTC().Truncate(time.Hour)
+	floor := now.Add(-5 * time.Hour)
+	before1, before2 := floor.Add(-3*time.Hour), floor.Add(-2*time.Hour)
+	after := floor.Add(time.Hour)
+	for _, h := range []time.Time{before1, before2, after} {
+		event(t, db, h.Add(time.Minute), itRes1, itOrg1)
+	}
+	rate(t, db, before1, now)
+	if _, err := db.Exec(`INSERT INTO token_push_state (auto_floor) VALUES ($1)`, floor); err != nil {
+		t.Fatal(err)
+	}
+	for _, h := range []time.Time{before1, after} {
+		if _, err := store.RecordDeferred(ctx, h, 409, "x"); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if got, err := store.BackfillHours(ctx, maxUnsentHoursPerRun); err != nil || len(got) != 1 || !got[0].Equal(before2) {
+		t.Fatalf("BackfillHours %v (err %v), want only %s (the deferred hour is left out)", got, err, before2)
+	}
+	if n, oldest, err := store.PreConnectionHours(ctx); err != nil || n != 1 || !oldest.Equal(before2) {
+		t.Fatalf("PreConnectionHours %d %s (err %v), want 1, %s", n, oldest, err, before2)
+	}
+	if got, err := store.UnsentHours(ctx, now, maxUnsentHoursPerRun); err != nil || len(got) != 0 {
+		t.Fatalf("UnsentHours %v (err %v), want none (the hour after the floor is deferred)", got, err)
+	}
+}
+
+// The case deferral exists for, end to end on a real database: an hour the
+// manager accepted with token records only, refused (409) once a video job is
+// rated into it, is deferred and re-sent by scheduled runs after it has left
+// the trailing window, until the upgraded manager accepts it. The manager's
+// token records for it stay recorded throughout, and the refused attempt's
+// video intent rows are removed.
+func TestIntegration_AnAcceptedHourDeferredOnceVideoArrivesIsResentAfterLeavingTheWindow(t *testing.T) {
+	db := itDB(t, "phoebe_push_deferred_window_it")
+	now := time.Now().UTC().Truncate(time.Hour)
+	h := now.Add(-3 * time.Hour)
+	event(t, db, h.Add(time.Minute), itRes1, itOrg1)
+	rate(t, db, h, now)
+	if code := push(t, db, &recordingManager{}, h); code != exitOK {
+		t.Fatalf("token-only push: exit %d", code)
+	}
+	videoJob(t, db, h.Add(2*time.Minute), itOrg1, "completed")
+	rate(t, db, h, now)
+	legacy := &recordingManager{statuses: []int{409}, errBody: `{"error": "install billing path is legacy"}`}
+	if code := push(t, db, legacy, h); code != exitRejected {
+		t.Fatalf("push with video: exit %d, want exitRejected", code)
+	}
+	if deferredCount(t, db) != 1 {
+		t.Fatal("the refused hour was not deferred")
+	}
+	kinds := func() string {
+		var k sql.NullString
+		if err := db.QueryRow(`SELECT string_agg(kind, ',' ORDER BY kind) FROM pushed_usage WHERE window_start = $1`, h).Scan(&k); err != nil {
+			t.Fatal(err)
+		}
+		return k.String
+	}
+	if got := kinds(); got != "token" {
+		t.Fatalf("pushed_usage kinds %q after the refusal, want token only (the accepted token record kept, the video intent row removed)", got)
+	}
+	// The trailing window has moved past h: the scheduled run's window is a
+	// later, empty hour.
+	later := now.Add(-time.Hour)
+	if code := push(t, db, legacy, later); code != exitOK {
+		t.Fatalf("retry with the old manager: exit %d, want exitOK", code)
+	}
+	if sent := windowStarts(t, legacy); len(sent) != 2 || sent[1] != meteredusage.FormatWindowStart(h) {
+		t.Fatalf("sent %v, want the deferred hour re-sent outside the window", sent)
+	}
+	upgraded := &recordingManager{}
+	if code := push(t, db, upgraded, later); code != exitOK {
+		t.Fatalf("upgraded: exit %d", code)
+	}
+	if req := lastRequest(t, upgraded); req.WindowStart != meteredusage.FormatWindowStart(h) || len(req.VideoRecords) != 1 || len(req.Records) != 1 {
+		t.Fatalf("accepted request %s with %d token and %d video records, want %s with 1 and 1", req.WindowStart, len(req.Records), len(req.VideoRecords), meteredusage.FormatWindowStart(h))
+	}
+	if deferredCount(t, db) != 0 || kinds() != "token,video" {
+		t.Fatalf("%d deferred, pushed_usage kinds %q; want 0 and token,video", deferredCount(t, db), kinds())
+	}
+}
+
+// TouchDeferred moves an hour to the back of the retry order, and ignores
+// hours that are not deferred.
+func TestIntegration_TouchDeferredMovesAnHourToTheBackOfTheRetryOrder(t *testing.T) {
+	db := itDB(t, "phoebe_push_deferred_touch_it")
+	ctx := context.Background()
+	store := pgStore{db: db}
+	base := time.Now().UTC().Truncate(time.Hour).Add(-10 * time.Hour)
+	a, b, c := base, base.Add(time.Hour), base.Add(2*time.Hour)
+	for _, h := range []time.Time{a, b} {
+		if _, err := store.RecordDeferred(ctx, h, 409, "x"); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := store.TouchDeferred(ctx, []time.Time{a, c}); err != nil {
+		t.Fatal(err)
+	}
+	got, err := store.DeferredHours(ctx, 10)
+	if err != nil || len(got) != 2 || !got[0].Equal(b) || !got[1].Equal(a) {
+		t.Fatalf("DeferredHours %v (err %v), want [%s %s]", got, err, b, a)
+	}
+}
+
+// A response body longer than the stored limit, with a multi-byte character
+// across the cut, a NUL and an invalid byte, is stored when the hour is
+// parked or deferred (Postgres would refuse the raw cut with SQLSTATE 22021).
+func TestIntegration_ALongMultiByteRefusalBodyIsStored(t *testing.T) {
+	db := itDB(t, "phoebe_push_message_it")
+	ctx := context.Background()
+	store := pgStore{db: db}
+	h := time.Now().UTC().Truncate(time.Hour).Add(-2 * time.Hour)
+	body := "\x00\xff" + strings.Repeat("a", maxRefusedMessage-4) + "é" + "tail"
+	if err := store.RecordRefused(ctx, h, 400, body, strings.Repeat("a", 64)); err != nil {
+		t.Fatalf("park: %v", err)
+	}
+	if _, err := store.RecordDeferred(ctx, h, 409, body); err != nil {
+		t.Fatalf("defer: %v", err)
+	}
+	var msg string
+	if err := db.QueryRow(`SELECT message FROM deferred_hour WHERE window_start = $1`, h).Scan(&msg); err != nil {
+		t.Fatal(err)
+	}
+	if len(msg) > maxRefusedMessage || !strings.HasPrefix(msg, "�aaa") {
+		t.Fatalf("stored %d bytes starting %q", len(msg), msg[:8])
+	}
+}
+
+// RecordIntent reports the record ids it added; ForgetIntent removes exactly
+// those, never a row that was there before.
+func TestIntegration_ForgetIntentRemovesOnlyTheRowsTheAttemptAdded(t *testing.T) {
+	db := itDB(t, "phoebe_push_forget_it")
+	ctx := context.Background()
+	store := pgStore{db: db}
+	h := time.Now().UTC().Truncate(time.Hour).Add(-2 * time.Hour)
+	row := func(id string, held bool) pushedRow {
+		return pushedRow{UsageID: strings.Repeat(id, 64), Kind: meteredusage.KindToken, held: held,
+			identity: identity{AuthID: itAuth, OwnerType: "user", OwnerID: itUser, ResourceID: itRes1, ModelID: "m", ServingMode: "dedicated"}}
+	}
+	if _, err := store.RecordIntent(ctx, h, []pushedRow{row("a", false)}); err != nil {
+		t.Fatal(err)
+	}
+	added, err := store.RecordIntent(ctx, h, []pushedRow{row("a", false), row("b", false), row("c", true)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(added) != 1 || added[0] != strings.Repeat("b", 64) {
+		t.Fatalf("added %v, want only the new record id (not the earlier one, not the held one)", added)
+	}
+	if err := store.ForgetIntent(ctx, h, added); err != nil {
+		t.Fatal(err)
+	}
+	var ids string
+	if err := db.QueryRow(`SELECT string_agg(left(usage_id, 1), ',' ORDER BY usage_id) FROM pushed_usage WHERE window_start = $1`, h).Scan(&ids); err != nil {
+		t.Fatal(err)
+	}
+	if ids != "a,c" {
+		t.Fatalf("pushed_usage %q, want a,c", ids)
+	}
+}
+
+// A second run waits for the first one's run lock and goes ahead once it is
+// released; the lock is per schema.
+func TestIntegration_RunLockMakesASecondRunWaitForTheFirst(t *testing.T) {
+	db := itDB(t, "phoebe_push_lock_it")
+	ctx := context.Background()
+	store := pgStore{db: db}
+	release, err := store.lockRun(ctx, func() { t.Error("the first run waited") })
+	if err != nil {
+		t.Fatal(err)
+	}
+	waited := make(chan struct{}, 1)
+	got := make(chan func(), 1)
+	go func() {
+		r, err := store.lockRun(ctx, func() { waited <- struct{}{} })
+		if err != nil {
+			t.Error(err)
+		}
+		got <- r
+	}()
+	select {
+	case <-waited:
+	case <-time.After(10 * time.Second):
+		t.Fatal("the second run did not report waiting")
+	}
+	select {
+	case <-got:
+		t.Fatal("the second run took the lock while the first held it")
+	case <-time.After(300 * time.Millisecond):
+	}
+	release()
+	select {
+	case r := <-got:
+		r()
+	case <-time.After(10 * time.Second):
+		t.Fatal("the second run did not get the lock after the first released it")
+	}
+	other := pgStore{db: itDB(t, "phoebe_push_lock_other_it")}
+	r1, err := store.lockRun(ctx, func() {})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer r1()
+	r2, err := other.lockRun(ctx, func() { t.Error("a run in another schema waited") })
+	if err != nil {
+		t.Fatal(err)
+	}
+	r2()
+}
