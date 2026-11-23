@@ -753,15 +753,13 @@ func wakeStartingResponse(req *http.Request, requestID string) *http.Response {
 }
 
 // adapterNotLoadedResponse is the answer to a held request for a not-ready
-// adapter that was not served (Q69): 503 with the plain "adapter_not_loaded"
-// body the gateway always answered, plus Retry-After and the request id.
+// adapter that was not served (Q69): 503 with the OpenAI-shaped
+// adapter_not_loaded error (code "adapter_not_loaded"; plain text before
+// issue #71), plus Retry-After and the request id.
 func adapterNotLoadedResponse(req *http.Request, requestID string) *http.Response {
 	buf := newBufferingResponseWriter()
 	buf.Header().Set("Retry-After", strconv.Itoa(wakeRetryAfterSeconds))
-	if requestID != "" {
-		buf.Header().Set(requestIDHeader, requestID)
-	}
-	http.Error(buf, "adapter_not_loaded", http.StatusServiceUnavailable)
+	writeClientError(buf, requestID, http.StatusServiceUnavailable, gatewayAdapterNotLoaded)
 	return bufferedHTTPResponse(req, buf, true)
 }
 

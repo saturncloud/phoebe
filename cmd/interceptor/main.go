@@ -48,7 +48,7 @@ func main() {
 
 	// R3 trusted-header registry: parse PHOEBE_TRUSTED_HEADERS (rendered
 	// from the phoebe chart's ConfigMap) into the active set the parser's
-	// envelope reads resolve through. The pinned 17 already govern from
+	// envelope reads resolve through. The pinned 19 already govern from
 	// package init; this engages the runtime config once, at startup, and
 	// warns loudly if the chart render was empty/malformed.
 	identity.LoadTrustedHeaders(log)
@@ -82,6 +82,13 @@ func main() {
 		// Timeout 0 = the proxy default (300s — sized above vLLM's measured
 		// ~2.5min cold reload). A recognized cold response permits one retry.
 		srv = srv.WithWaker(w, settings.Wake.Timeout)
+	}
+	if gwResolver != nil {
+		// Org hosts (issue #71) need the registry resolver's dedicated rows;
+		// with the deprecated Postgres resolver they stay off and org-host
+		// requests are refused. After WithWaker: the cross-cluster forward
+		// timeout is sized above the wake hold.
+		srv = srv.WithOrgHosts(gwResolver, settings.Gateway.SharedBaseURL)
 	}
 	srv, err = srv.WithVideos(settings.Videos.ServiceURL, os.Getenv(videosTokenEnv))
 	if err != nil {

@@ -398,11 +398,13 @@ func skipValue(dec *json.Decoder) error {
 }
 
 // clientError is an OpenAI-style error object, the shape OpenAI clients
-// parse: {"error": {"message", "type", "code"}}.
+// parse: {"error": {"message", "type", "code", "param"}}. Param is null
+// unless a refusal names the request field at fault.
 type clientError struct {
-	Message string `json:"message"`
-	Type    string `json:"type"`
-	Code    string `json:"code"`
+	Message string  `json:"message"`
+	Type    string  `json:"type"`
+	Code    string  `json:"code"`
+	Param   *string `json:"param"`
 }
 
 // The model-binding refusals (gateway-admission Q64, approved by Hugo

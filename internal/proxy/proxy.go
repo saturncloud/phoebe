@@ -151,6 +151,10 @@ type Server struct {
 	// gateway-marked requests fail closed with 503. Set via WithGateway.
 	gateway *gatewayRoute
 
+	// orgHosts wires the org-host path (orghost.go, issue #71). nil = org
+	// hosts off: org-host-marked requests fail closed with 503.
+	orgHosts *orgHostRoute
+
 	// videos hands video endpoints' /v1/videos requests to phoebe-videos.
 	// nil = video generation off: video routes answer 404. Set via WithVideos.
 	videos *videosRoute
@@ -461,6 +465,24 @@ func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request) {
 	// attempt without usage as unbilled work (UNEXPLAINED MISSING-USAGE).
 	metered := r.Method == http.MethodPost && inferenceRequestPathAllowed(routePath)
 
+	// ORG HOST (issue #71): <label>-inference.<domain>, one org's dedicated
+	// endpoints. Checked FIRST, so an org-host mark together with any other
+	// route's mark is refused rather than handled as the other route.
+	// serveOrgHost resolves the endpoint from the registry and fills id from
+	// the row; on true the request continues down the dedicated path below
+	// exactly like a per-endpoint route.
+	if id.OrgHost {
+		if !s.serveOrgHost(w, r, &id, routePath, pathCanonical) {
+			return
+		}
+	} else if id.EndpointScopePresent {
+		// The endpoint scope is stamped only by the org-host ForwardAuth and
+		// blanked on every other route; anywhere else the edge is broken.
+		s.log.Error.Printf("refusing %s on a request that is not an org-host request (edge contract broken)", identity.HeaderEndpointScope)
+		writeClientError(w, "", http.StatusForbidden, orgHostConflictingRoute)
+		return
+	}
+
 	// VIDEO RETRIEVAL: the always-on route that reads or deletes one video
 	// whatever its endpoint's state (issue #13). Atlas's retrieval
 	// ForwardAuth authorized the key for this video and stamped its org and
@@ -475,7 +497,7 @@ func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request) {
 		if !pathCanonical || !gatewayRequestAllowed(r.Method, routePath) {
 			s.log.Warn.Printf("gateway: refusing route outside public inference surface method=%s path=%q canonical=%v org_id=%q",
 				r.Method, r.URL.EscapedPath(), pathCanonical, id.OrgID)
-			http.Error(w, "not found", http.StatusNotFound)
+			writeClientError(w, "", http.StatusNotFound, gatewayUnknownPath)
 			return
 		}
 		// Preflight is answered LOCALLY: phoebe writes 204 and no OPTIONS is
@@ -491,7 +513,7 @@ func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request) {
 		// pins the non-support so it stays a decision rather than an accident.
 		if r.Method == http.MethodOptions {
 			if id.OrgID == "" {
-				http.Error(w, "forbidden", http.StatusForbidden)
+				writeClientError(w, "", http.StatusForbidden, gatewayForbidden)
 				return
 			}
 			w.WriteHeader(http.StatusNoContent)
