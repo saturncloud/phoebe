@@ -664,9 +664,19 @@ send:
 			failed++
 			continue
 		}
-		// forget removes the intent rows this attempt added, after a refusal
-		// the manager answered itself (it stored nothing for the request).
-		forget := func() {
+		// forget removes the intent rows this attempt added after a refusal.
+		// A refused request stores nothing at the manager, but Post retries a
+		// 5xx or a network error first, and an earlier attempt may have been
+		// committed before it failed. So forget only when the manager answered
+		// the only attempt (rej.AfterRetry is false). When in doubt, keep the
+		// rows: an extra held id is harmless, a missing one is not (the manager
+		// keeps usage it is not told to hold, or deletes by absence usage it
+		// accepted). A later accepted push trims the extra rows.
+		forget := func(rej *meteredusage.RejectedError) {
+			if rej.AfterRetry {
+				p.log.Info.Printf("token-push: %s: keeping the pushed_usage intent rows of the refused request: an earlier attempt of the request (a 5xx or a network error) may have been stored by the manager", plan.req.WindowStart)
+				return
+			}
 			if err := p.store.ForgetIntent(ctx, h, added); err != nil {
 				p.log.Error.Printf("token-push: %s: %v", plan.req.WindowStart, err)
 				failed++
@@ -709,7 +719,7 @@ send:
 			// be accepted. Park the hour so it is not re-sent every run and
 			// does not hold up other hours.
 			rejected++
-			forget()
+			forget(rej)
 			if err := p.store.RecordRefused(ctx, h, rej.Status, rej.Body, sum); err != nil {
 				p.log.Error.Printf("token-push: manager REJECTED %s with %d (%s) and it could not be parked: %v", plan.req.WindowStart, rej.Status, rej.Body, err)
 				failed++
@@ -725,7 +735,7 @@ send:
 			// older than phoebe). It stored nothing, so it still holds what it
 			// held for the hour. Defer the hour: every run re-sends it until
 			// it is accepted, and the other hours are still sent.
-			forget()
+			forget(rej)
 			first, err := p.store.RecordDeferred(ctx, h, rej.Status, rej.Body)
 			if err != nil {
 				rejected++
@@ -754,11 +764,15 @@ send:
 				plan.req.WindowStart, rej.Status, rej.Body, plan.req.Kinds)
 		case errors.As(err, &rej) && refusalIsForTheInstall(rej, plan.req.Kinds):
 			rejected++
-			forget()
+			forget(rej)
 			p.log.Error.Printf("token-push: manager REJECTED %s with %d: %s. This refusal is for the whole install (401 token, 403 inactive or uninstalled install, or a 409 or a 400 on kinds for a request that lists only token: the manager refuses this install's token usage), so the run stops; %d hour(s) not sent this run. Needs a person",
 				plan.req.WindowStart, rej.Status, rej.Body, len(hours)-i-1)
 			break send
 		case errors.As(err, &rej):
+			// Not a status the manager's handler returns (it answers only 200,
+			// 400 with {error, path}, 401, 403 and 409), and it may follow a
+			// retried attempt the manager committed. So the intent rows are
+			// kept, not forgotten; a later accepted push trims them.
 			p.log.Error.Printf("token-push: manager REJECTED %s with %d (not retried; needs a person): %s",
 				plan.req.WindowStart, rej.Status, rej.Body)
 			rejected++

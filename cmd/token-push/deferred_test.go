@@ -393,3 +393,117 @@ func TestPushWindows_ADeferredHourThatFailsAnotherWayMovesToTheBackOfTheRetryOrd
 		t.Fatalf("next run retries %v first, want %s", next, b)
 	}
 }
+
+// intentRecorder is a fakeStore that remembers the ids each RecordIntent call
+// added, so a test can check what became of them.
+type intentRecorder struct {
+	*fakeStore
+	added map[time.Time][]string
+}
+
+func (s *intentRecorder) RecordIntent(ctx context.Context, h time.Time, rows []pushedRow) ([]string, error) {
+	added, err := s.fakeStore.RecordIntent(ctx, h, rows)
+	s.added[h] = append(s.added[h], added...)
+	return added, err
+}
+
+// Post retries a 5xx or a network error before it returns, and the manager may
+// have committed one of those attempts. So the pushed_usage intent rows an
+// attempt added are removed only when the manager refused the only attempt;
+// after any outcome where it may hold the request they stay, because a
+// missing id is lost or double-billed usage and an extra one is harmless. The
+// first-attempt rows are the positive control: those refusals still forget.
+// Each row also checks that the hour's handling (deferred, parked, stopped
+// run) is the same as without the retry.
+func TestPushWindows_IntentRowsSurviveEveryOutcomeTheManagerMayHaveCommitted(t *testing.T) {
+	legacy := `{"error": "install billing path is legacy"}`
+	other := win.Add(time.Hour) // a later hour, sent after win when the run goes on
+	for _, tc := range []struct {
+		name     string
+		statuses []int // nil: nothing listens, every attempt is a network error
+		body     string
+		wantExit int
+		wantKept bool
+		check    func(t *testing.T, f *fakeStore, requests int)
+	}{
+		{name: "unreachable on every attempt", wantExit: exitFatal, wantKept: true},
+		{name: "5xx past the retries", statuses: []int{503}, wantExit: exitFatal, wantKept: true},
+		{name: "5xx then 409", statuses: []int{502, 409}, body: legacy, wantExit: exitRejected, wantKept: true,
+			check: func(t *testing.T, f *fakeStore, _ int) {
+				if f.deferred[win] == nil || f.refused[win] != nil {
+					t.Fatalf("deferred %+v, parked %+v; want the hour still deferred", f.deferred[win], f.refused[win])
+				}
+			}},
+		{name: "5xx then a 400 content refusal", statuses: []int{500, 400}, wantExit: exitRejected, wantKept: true,
+			check: func(t *testing.T, f *fakeStore, _ int) {
+				if f.refused[win] == nil || f.deferred[win] != nil {
+					t.Fatalf("parked %+v, deferred %+v; want the hour still parked", f.refused[win], f.deferred[win])
+				}
+			}},
+		{name: "5xx then 401", statuses: []int{503, 401}, wantExit: exitRejected, wantKept: true,
+			check: func(t *testing.T, f *fakeStore, requests int) {
+				if requests != 2 || f.accepted[other] != 0 {
+					t.Fatalf("%d requests, later hour accepted %d times; want the run stopped after the 401 (2 requests)", requests, f.accepted[other])
+				}
+			}},
+		{name: "control: 409 on the only attempt", statuses: []int{409}, body: legacy, wantExit: exitRejected,
+			check: func(t *testing.T, f *fakeStore, _ int) {
+				if f.deferred[win] == nil {
+					t.Fatal("the hour was not deferred")
+				}
+			}},
+		{name: "control: 400 content refusal on the only attempt", statuses: []int{400}, wantExit: exitRejected,
+			check: func(t *testing.T, f *fakeStore, _ int) {
+				if f.refused[win] == nil {
+					t.Fatal("the hour was not parked")
+				}
+			}},
+		{name: "control: 401 on the only attempt", statuses: []int{401}, wantExit: exitRejected,
+			check: func(t *testing.T, _ *fakeStore, requests int) {
+				if requests != 1 {
+					t.Fatalf("%d requests, want 1 (the run stops)", requests)
+				}
+			}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			f := videoStore()
+			f.rollups[other] = fixtureRollups()
+			s := &intentRecorder{fakeStore: f, added: map[time.Time][]string{}}
+			m := &recordingManager{statuses: tc.statuses, errBody: tc.body}
+			c := m.client(t)
+			if tc.statuses == nil {
+				c.BaseURL = closedURL(t)
+			}
+			if code := newPusher(s, c).pushWindows(context.Background(), []time.Time{win, other}, now, false); code != tc.wantExit {
+				t.Fatalf("exit %d, want %d", code, tc.wantExit)
+			}
+			if len(s.added[win]) == 0 {
+				t.Fatal("the attempt added no intent rows; the test checks nothing")
+			}
+			have := map[string]bool{}
+			for _, r := range f.pushed[win] {
+				have[r.UsageID] = true
+			}
+			for _, id := range s.added[win] {
+				if have[id] != tc.wantKept {
+					t.Fatalf("intent row %s kept=%v, want kept=%v (pushed_usage %v)", id, have[id], tc.wantKept, countKinds(f.pushed[win]))
+				}
+			}
+			if tc.check != nil {
+				m.mu.Lock()
+				requests := len(m.bodies)
+				m.mu.Unlock()
+				tc.check(t, f, requests)
+			}
+		})
+	}
+}
+
+// closedURL is the URL of a server that is no longer listening.
+func closedURL(t *testing.T) string {
+	t.Helper()
+	srv := httptest.NewServer(http.NotFoundHandler())
+	u := srv.URL + "/"
+	srv.Close()
+	return u
+}

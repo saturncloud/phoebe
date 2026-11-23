@@ -328,7 +328,9 @@ more than a day, report it to Saturn support with the output of the query
 below. A refused request stores nothing, so the manager keeps what it held for
 the hour (for instance the token records of an earlier push), and the accepted
 request replaces the hour whole: nothing is counted twice. The `pushed_usage`
-rows the refused attempt added are removed again. An accepted push removes the
+rows the refused attempt added are removed again, unless an earlier attempt of
+the same request failed with a `5xx` or a network error: the manager may have
+stored that attempt, so the rows are kept (a later accepted push trims them). An accepted push removes the
 `deferred_hour` row; an hour is deferred or parked, never both.
 
 ```sql
