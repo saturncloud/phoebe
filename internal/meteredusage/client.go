@@ -38,6 +38,19 @@ const maxResponseBody = 64 << 10
 type RejectedError struct {
 	Status int
 	Body   string
+	// AfterRetry is true when an earlier attempt of the same Post failed in a
+	// way where the manager may have stored the request: a 5xx (the manager
+	// may have committed before answering) or a network or transport error
+	// (the request may have been written before the connection failed). A 429
+	// does not count: the manager answers it before storing anything. When
+	// AfterRetry is true, the refusal describes only the last attempt, and the
+	// manager may hold what an earlier attempt sent.
+	//
+	// Post does not try to tell a failed dial (nothing written) from a failure
+	// after the request was written: the caller's safe reaction to a true
+	// AfterRetry is to keep what it recorded as sent, which is harmless when
+	// nothing was stored.
+	AfterRetry bool
 }
 
 func (e *RejectedError) Error() string {
@@ -79,7 +92,8 @@ type Client struct {
 }
 
 // Post sends one hour. It returns the manager's 200 body, a *RejectedError
-// (4xx other than 429, not retried), a *TransientError (5xx, 429 or network,
+// (4xx other than 429, not retried; AfterRetry says whether an earlier attempt
+// may have been stored), a *TransientError (5xx, 429 or network,
 // retried with exponential backoff until MaxAttempts), or another error (the
 // request could not be built or the 200 body did not match the contract).
 //
@@ -105,6 +119,7 @@ func (c *Client) Post(ctx context.Context, req Request) (Response, error) {
 	}
 	var last error
 	var retryAfter time.Duration
+	mayBeStored := false // an earlier attempt may have been committed (RejectedError.AfterRetry)
 	for attempt := 1; attempt <= attempts; attempt++ {
 		if attempt > 1 {
 			if err := c.sleep(ctx, c.wait(attempt-1, retryAfter)); err != nil {
@@ -120,6 +135,7 @@ func (c *Client) Post(ctx context.Context, req Request) (Response, error) {
 		}
 		var rejected *RejectedError
 		if errors.As(err, &rejected) {
+			rejected.AfterRetry = mayBeStored
 			return Response{}, err
 		}
 		var malformed *malformedResponseError
@@ -131,6 +147,9 @@ func (c *Client) Post(ctx context.Context, req Request) (Response, error) {
 		var slow *tooManyRequestsError
 		if errors.As(err, &slow) {
 			retryAfter = slow.retryAfter
+		} else {
+			// A 5xx or a network error: the manager may have stored it.
+			mayBeStored = true
 		}
 		if ctx.Err() != nil {
 			return Response{}, &TransientError{Attempts: attempt, Last: last}
