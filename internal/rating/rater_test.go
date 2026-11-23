@@ -21,6 +21,7 @@ type fakeStore struct {
 	returnsError      error
 	parkedHours       []time.Time
 	parked            []Parked
+	settled           []Parked
 	windows           [][2]time.Time
 	// catch-up state and the never-rated hours NeverRatedHours filters.
 	catchUp    CatchUpState
@@ -36,7 +37,8 @@ func (f *fakeStore) AggregateWindow(_ context.Context, start, end time.Time) (Ag
 func (f *fakeStore) ParkedHours(context.Context, time.Time) ([]time.Time, error) {
 	return f.parkedHours, nil
 }
-func (f *fakeStore) ListParked(context.Context) ([]Parked, error) { return f.parked, nil }
+func (f *fakeStore) ListParked(context.Context) ([]Parked, error)  { return f.parked, nil }
+func (f *fakeStore) ListSettled(context.Context) ([]Parked, error) { return f.settled, nil }
 func (f *fakeStore) CatchUpState(context.Context) (CatchUpState, error) {
 	return f.catchUp, nil
 }
@@ -286,6 +288,43 @@ func TestAggregator_PrunedParkedRowIsLoggedWithTheMarkerAndNotRescanned(t *testi
 	}
 	if !strings.Contains(errBuf.String(), PrunedMarker) {
 		t.Fatalf("ERROR log lacks the marker:\n%s", errBuf.String())
+	}
+}
+
+// A row settled by hand (phoebe-rater -settle-parked) is resolved, but its
+// conflict is still in the raw events: re-aggregating its hour would park it
+// again and page for usage an operator already settled. A window containing
+// it is refused before any statement runs.
+func TestAggregator_RefusesAWindowContainingAnHourSettledByHand(t *testing.T) {
+	l, _, _ := captureLogger()
+	settled := Parked{Kind: KindToken, WindowStart: h0, AuthID: "a", ResourceID: "r", ModelID: "m",
+		Reason: "missing_org", SettledAt: h1, SettledBy: "ops"}
+	f := &fakeStore{settled: []Parked{settled}}
+	_, err := New(f, l).Run(context.Background(), h0, h1, true)
+	if err == nil || !strings.Contains(err.Error(), "settled by hand") {
+		t.Fatalf("err = %v, want a refusal naming the settled row", err)
+	}
+	if f.calls != 0 {
+		t.Fatalf("aggregated %d times, want 0", f.calls)
+	}
+}
+
+// The automatic re-check of parked hours never re-aggregates an hour that
+// holds a row settled by hand, even when another row of that hour is still
+// unresolved.
+func TestAggregator_DoesNotRescanAnHourSettledByHand(t *testing.T) {
+	l, _, _ := captureLogger()
+	old := h0.Add(-48 * time.Hour)
+	settled := Parked{Kind: KindToken, WindowStart: old, AuthID: "a", Reason: "missing_org", SettledAt: h0}
+	f := &fakeStore{settled: []Parked{settled}, parkedHours: []time.Time{old}}
+	a := New(f, l)
+	a.now = func() time.Time { return h1 }
+	res, err := a.Run(context.Background(), h0, h1, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res.RescannedParkedHours != 0 || f.calls != 1 {
+		t.Fatalf("rescanned %d, statements %d; want the settled hour never re-aggregated", res.RescannedParkedHours, f.calls)
 	}
 }
 

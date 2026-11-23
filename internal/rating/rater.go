@@ -126,6 +126,27 @@ func (a *Aggregator) Run(ctx context.Context, windowStart, windowEnd time.Time, 
 		}
 	}
 
+	// NEVER RE-AGGREGATE AN HOUR WITH A ROW SETTLED BY HAND. Its conflict is
+	// still in the raw events (if any remain), so a re-run would park the row
+	// again (clearing resolved_at), page for usage an operator already settled,
+	// and make token-push hold the identity again. Refuse the whole window.
+	settled, err := a.store.ListSettled(ctx)
+	if err != nil {
+		return res, err
+	}
+	settledHour := map[time.Time]bool{}
+	for _, p := range settled {
+		if p.Kind == KindVideo && p.WindowStart.Before(videoFloor) {
+			continue // never re-rated (VideoFloor)
+		}
+		settledHour[p.WindowStart] = true
+		if !p.WindowStart.Before(windowStart) && p.WindowStart.Before(windowEnd) {
+			return res, fmt.Errorf("rating: window %s contains hour %s whose parked row (kind=%s auth_id=%s resource_id=%s model_id=%s reason=%s) was settled by hand at %s by %q; it must never be re-aggregated. Narrow the window to exclude it",
+				w, p.WindowStart.Format(time.RFC3339), p.Kind, p.AuthID, p.ResourceID, p.ModelID, p.Reason,
+				p.SettledAt.Format(time.RFC3339), p.SettledBy)
+		}
+	}
+
 	ar, err := a.aggregateAndLog(ctx, windowStart, windowEnd, windowExplicit)
 	if err != nil {
 		return res, err
@@ -174,7 +195,7 @@ func (a *Aggregator) Run(ctx context.Context, windowStart, windowEnd time.Time, 
 		if !h.Before(windowStart) && h.Before(windowEnd) {
 			continue // already re-aggregated above
 		}
-		if prunedHour[h] {
+		if prunedHour[h] || settledHour[h] {
 			continue // never re-aggregated (see above)
 		}
 		hr, err := a.aggregateAndLog(ctx, h, h.Add(time.Hour), windowExplicit)
