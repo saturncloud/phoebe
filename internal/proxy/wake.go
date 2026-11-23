@@ -128,41 +128,50 @@ const wakeNeverServedHeader = "X-Phoebe-Wake-Never-Served"
 // response (a Dynamo 404 "Model not found", or the not-ready 503) is NOT
 // passed through: a 404 tells API clients the model does not exist and they
 // do not retry it, which is wrong while the model is starting.
-func writeWakeStarting(w http.ResponseWriter, requestID string) {
-	writeRetryLater(w, requestID, "The model is starting from zero; retry in about "+
+func writeWakeStarting(ctx context.Context, w http.ResponseWriter, requestID string) {
+	writeRetryLater(ctx, w, requestID, "The model is starting from zero; retry in about "+
 		strconv.Itoa(wakeRetryAfterSeconds)+" seconds.")
 }
 
-func writeWakeUnavailable(w http.ResponseWriter, requestID string) {
-	writeRetryLater(w, requestID, "The wake service is unavailable; retry in about "+
+func writeWakeUnavailable(ctx context.Context, w http.ResponseWriter, requestID string) {
+	writeRetryLater(ctx, w, requestID, "The wake service is unavailable; retry in about "+
 		strconv.Itoa(wakeRetryAfterSeconds)+" seconds.")
 }
 
-func writeWakeStatusUnknown(w http.ResponseWriter, requestID string) {
-	writeRetryLater(w, requestID, "The wake service could not confirm whether startup began; retry in about "+
+func writeWakeStatusUnknown(ctx context.Context, w http.ResponseWriter, requestID string) {
+	writeRetryLater(ctx, w, requestID, "The wake service could not confirm whether startup began; retry in about "+
 		strconv.Itoa(wakeRetryAfterSeconds)+" seconds.")
 }
 
 // writeRetryLater is phoebe's one retryable 503 answer: Retry-After
-// (wakeRetryAfterSeconds), the request id, and a JSON {"error": msg} body.
-// The wake writers, the dedicated cold-hold overflow (D4) and, through
+// (wakeRetryAfterSeconds), the request id, and a JSON error body. The wake
+// writers, the dedicated cold-hold overflow (D4) and, through
 // writeRetryLaterAfter, the request-buffer-full refusal (D43) all answer
-// through it so the shape cannot drift between them.
-func writeRetryLater(w http.ResponseWriter, requestID, msg string) {
-	writeRetryLaterAfter(w, requestID, msg, wakeRetryAfterSeconds)
+// through it so the shape cannot drift between them. On an org-host request
+// (ctx marked by withOrgHostErrors) the body is the OpenAI error object with
+// type server_error and code endpoint_starting (tenant-domains design 3.2);
+// everywhere else it keeps the {"error": msg} shape.
+func writeRetryLater(ctx context.Context, w http.ResponseWriter, requestID, msg string) {
+	writeRetryLaterAfter(ctx, w, requestID, msg, orgHostCodeEndpointStarting, wakeRetryAfterSeconds)
 }
 
-// writeRetryLaterAfter is writeRetryLater with its own Retry-After seconds.
-func writeRetryLaterAfter(w http.ResponseWriter, requestID, msg string, retryAfterSeconds int) {
-	body, _ := json.Marshal(map[string]string{"error": msg})
+// writeRetryLaterAfter is writeRetryLater with its own org-host error code
+// and Retry-After seconds.
+func writeRetryLaterAfter(ctx context.Context, w http.ResponseWriter, requestID, msg, orgHostCode string, retryAfterSeconds int) {
 	h := w.Header()
+	h.Set("Retry-After", strconv.Itoa(retryAfterSeconds))
+	if orgHostErrors(ctx) {
+		writeClientError(w, requestID, http.StatusServiceUnavailable,
+			clientError{Message: msg, Type: "server_error", Code: orgHostCode})
+		return
+	}
+	body, _ := json.Marshal(map[string]string{"error": msg})
 	if requestID != "" {
 		// A refusal before the attempt id is minted (the request-buffer
 		// budget at body admission) has none to echo.
 		h.Set(requestIDHeader, requestID)
 	}
 	h.Set("Content-Type", "application/json")
-	h.Set("Retry-After", strconv.Itoa(retryAfterSeconds))
 	h.Set("Content-Length", strconv.Itoa(len(body)))
 	w.WriteHeader(http.StatusServiceUnavailable)
 	_, _ = w.Write(body)
@@ -355,7 +364,7 @@ func (t *wakeRoundTripper) RoundTrip(req *http.Request) (*http.Response, error) 
 			t.server.log.Warn.Printf("wake: dedicated cold-hold limit reached request_id=%s resource_id=%s",
 				t.requestID, t.target.ResourceID)
 			buf := newBufferingResponseWriter()
-			writeDedicatedColdHoldsFull(buf, t.requestID)
+			writeDedicatedColdHoldsFull(req.Context(), buf, t.requestID)
 			return bufferedHTTPResponse(req, buf, true), nil
 		}
 		releaseHold = release // idempotent (acquire), so the explicit call and the defer are both safe
@@ -445,7 +454,7 @@ func (t *wakeRoundTripper) noBackendResponse(req *http.Request, resp *http.Respo
 	_ = resp.Body.Close()
 	t.neverServed = true
 	buf := newBufferingResponseWriter()
-	writeRetryLater(buf, t.requestID, coldUnavailableMessage)
+	writeRetryLater(req.Context(), buf, t.requestID, coldUnavailableMessage)
 	return bufferedHTTPResponse(req, buf, true)
 }
 
@@ -748,7 +757,7 @@ func bufferedHTTPResponse(req *http.Request, buf *bufferingResponseWriter, never
 
 func wakeStartingResponse(req *http.Request, requestID string) *http.Response {
 	buf := newBufferingResponseWriter()
-	writeWakeStarting(buf, requestID)
+	writeWakeStarting(req.Context(), buf, requestID)
 	return bufferedHTTPResponse(req, buf, true)
 }
 
@@ -765,13 +774,13 @@ func adapterNotLoadedResponse(req *http.Request, requestID string) *http.Respons
 
 func wakeUnavailableResponse(req *http.Request, requestID string) *http.Response {
 	buf := newBufferingResponseWriter()
-	writeWakeUnavailable(buf, requestID)
+	writeWakeUnavailable(req.Context(), buf, requestID)
 	return bufferedHTTPResponse(req, buf, true)
 }
 
 func wakeStatusUnknownResponse(req *http.Request, requestID string) *http.Response {
 	buf := newBufferingResponseWriter()
-	writeWakeStatusUnknown(buf, requestID)
+	writeWakeStatusUnknown(req.Context(), buf, requestID)
 	return bufferedHTTPResponse(req, buf, true)
 }
 

@@ -921,14 +921,14 @@ func TestLoadGatewaySharedBaseURL(t *testing.T) {
 gateway:
   enabled: true
   namespace: "tf-shared"
-  sharedBaseUrl: "https://inference.example.com/v1"
+  sharedBaseURL: "https://inference.example.com/v1"
 `))
 	if err != nil || s.Gateway.SharedBaseURL != "https://inference.example.com/v1" {
-		t.Fatalf("sharedBaseUrl = %q (%v)", s.Gateway.SharedBaseURL, err)
+		t.Fatalf("sharedBaseURL = %q (%v)", s.Gateway.SharedBaseURL, err)
 	}
 	for _, bad := range []string{"http://inference.example.com/v1", "inference.example.com", "https://u:p@h/v1"} {
-		if _, err := Load(writeTemp(t, "gateway:\n  enabled: true\n  namespace: tf-shared\n  sharedBaseUrl: \""+bad+"\"\n")); err == nil {
-			t.Fatalf("sharedBaseUrl %q accepted", bad)
+		if _, err := Load(writeTemp(t, "gateway:\n  enabled: true\n  namespace: tf-shared\n  sharedBaseURL: \""+bad+"\"\n")); err == nil {
+			t.Fatalf("sharedBaseURL %q accepted", bad)
 		}
 	}
 }

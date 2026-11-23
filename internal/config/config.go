@@ -455,7 +455,7 @@ type GatewaySettings struct {
 	// wrong_endpoint_host refusal when a shared model is sent there (issue
 	// #71). Optional: empty leaves the URL out of the message. Must be an
 	// https URL when set.
-	SharedBaseURL string `yaml:"sharedBaseUrl"`
+	SharedBaseURL string `yaml:"sharedBaseURL"`
 }
 
 // WakeSettings is the YAML shape for wake-from-zero actuation. Both shared
@@ -875,7 +875,7 @@ func (g *GatewaySettings) parse() error {
 	if g.SharedBaseURL != "" {
 		u, err := url.Parse(g.SharedBaseURL)
 		if err != nil || u.Scheme != "https" || u.Host == "" || u.User != nil || u.RawQuery != "" || u.Fragment != "" {
-			return fmt.Errorf("gateway.sharedBaseUrl %q must be an https URL (for example https://inference.<domain>/v1)", g.SharedBaseURL)
+			return fmt.Errorf("gateway.sharedBaseURL %q must be an https URL (for example https://inference.<domain>/v1)", g.SharedBaseURL)
 		}
 	}
 	return nil

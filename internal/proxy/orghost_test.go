@@ -889,8 +889,11 @@ func TestOrgHostColdHoldLimitPerEndpoint(t *testing.T) {
 	<-waker.started
 	over := httptest.NewRecorder()
 	s.Handler().ServeHTTP(over, orgHostRequest(http.MethodPost, "/v1/chat/completions", "org-1", chat("a")))
-	if over.Code != http.StatusServiceUnavailable || over.Header().Get("Retry-After") == "" {
+	if over.Code != http.StatusServiceUnavailable || over.Header().Get("Retry-After") != "30" {
 		t.Fatalf("over-limit: %d retry-after %q", over.Code, over.Header().Get("Retry-After"))
+	}
+	if e := errorBody(t, over.Body.Bytes()); e.Type != "server_error" || e.Code != "endpoint_starting" {
+		t.Fatalf("over-limit body %s, want server_error/endpoint_starting", over.Body.String())
 	}
 	other := httptest.NewRecorder()
 	wg.Add(1)
@@ -907,5 +910,79 @@ func TestOrgHostColdHoldLimitPerEndpoint(t *testing.T) {
 	wg.Wait()
 	if held.Code != http.StatusOK || other.Code != http.StatusOK {
 		t.Fatalf("held=%d other=%d", held.Code, other.Code)
+	}
+}
+
+// The design 3.2 row for scale-to-zero: after the hold budget the org host
+// answers 503 + Retry-After: 30 with the OpenAI error object, type
+// server_error, code endpoint_starting.
+func TestOrgHostWakeHoldExpiryIsEndpointStarting(t *testing.T) {
+	backend := &coldToWarmBackend{} // never warms
+	be := httptest.NewServer(backend)
+	defer be.Close()
+	up, _ := url.Parse(be.URL)
+	row := dedicatedRow("org-1", "m", "dep-cold", up.Host)
+	row.ServingProfile = "disaggregated"
+	res := &fakeTierResolver{dedicated: []gateway.DedicatedEndpoint{row}}
+	s := New(&config.Settings{}, logging.New(logging.ERROR), &recordingEmitter{}).
+		WithGateway(res, "tf-shared", 8000).
+		WithWaker(&fakeWaker{}, 200*time.Millisecond)
+	s = s.WithOrgHosts(res, "")
+	rr := httptest.NewRecorder()
+	s.Handler().ServeHTTP(rr, orgHostRequest(http.MethodPost, "/v1/chat/completions", "org-1", chat("m")))
+	if rr.Code != http.StatusServiceUnavailable || rr.Header().Get("Retry-After") != "30" {
+		t.Fatalf("status %d retry-after %q body %s", rr.Code, rr.Header().Get("Retry-After"), rr.Body.String())
+	}
+	e := errorBody(t, rr.Body.Bytes())
+	if e.Type != "server_error" || e.Code != "endpoint_starting" || e.Message == "" {
+		t.Fatalf("body %s, want server_error/endpoint_starting", rr.Body.String())
+	}
+}
+
+// The same expiry on a per-endpoint route (not an org-host request) keeps
+// phoebe's existing {"error": "<message>"} shape.
+func TestPerEndpointWakeHoldExpiryKeepsItsShape(t *testing.T) {
+	backend := &coldToWarmBackend{}
+	be := httptest.NewServer(backend)
+	defer be.Close()
+	up, _ := url.Parse(be.URL)
+	s := New(&config.Settings{}, logging.New(logging.ERROR), &recordingEmitter{}).
+		WithWaker(&fakeWaker{}, 200*time.Millisecond)
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(chat("m")))
+	setUpstream(req, up)
+	req.Header.Set(identity.HeaderAuthID, "auth-1")
+	req.Header.Set(identity.HeaderResourceID, "r1")
+	req.Header.Set(identity.HeaderServedModel, "m")
+	req.Header.Set(identity.HeaderServingProfile, "disaggregated")
+	rr := httptest.NewRecorder()
+	s.Handler().ServeHTTP(rr, req)
+	var legacy map[string]string
+	if rr.Code != http.StatusServiceUnavailable || json.Unmarshal(rr.Body.Bytes(), &legacy) != nil || legacy["error"] == "" {
+		t.Fatalf("status %d body %s, want the {\"error\": msg} shape", rr.Code, rr.Body.String())
+	}
+}
+
+func TestOrgHostRequestBufferFullIsTheErrorObject(t *testing.T) {
+	be := &orgEngine{}
+	srv := httptest.NewServer(be)
+	defer srv.Close()
+	up, _ := url.Parse(srv.URL)
+	res := &fakeTierResolver{dedicated: []gateway.DedicatedEndpoint{dedicatedRow("org-1", "m", "dep-1", up.Host)}}
+	s := New(&config.Settings{Protection: config.ProtectionSettings{
+		MaxRequestBodyBytes: 1024, MaxRequestBufferBytesTotal: 1024,
+	}}, logging.New(logging.ERROR), &recordingEmitter{}).WithGateway(res, "tf-shared", 8000)
+	s = s.WithOrgHosts(res, "")
+	s.requestBuffers.held.Store(1000)
+	body := `{"model":"m","padding":"` + strings.Repeat("x", 200) + `"}`
+	rr := httptest.NewRecorder()
+	s.Handler().ServeHTTP(rr, orgHostRequest(http.MethodPost, "/v1/chat/completions", "org-1", body))
+	if rr.Code != http.StatusServiceUnavailable || rr.Header().Get("Retry-After") == "" {
+		t.Fatalf("status %d retry-after %q", rr.Code, rr.Header().Get("Retry-After"))
+	}
+	if e := errorBody(t, rr.Body.Bytes()); e.Type != "server_error" || e.Code != "server_busy" {
+		t.Fatalf("body %s, want server_error/server_busy", rr.Body.String())
+	}
+	if be.hits.Load() != 0 {
+		t.Fatal("refused request reached the engine")
 	}
 }

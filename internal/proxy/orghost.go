@@ -39,7 +39,7 @@ type orgHostRoute struct {
 	// model of your org" (wrong_endpoint_host) from "no such model".
 	shared gateway.Resolver
 	// sharedBaseURL is named in the org host's wrong_endpoint_host message
-	// (config gateway.sharedBaseUrl). Empty: the message names no URL.
+	// (config gateway.sharedBaseURL). Empty: the message names no URL.
 	sharedBaseURL string
 	forward       *orgHostForwarder
 }

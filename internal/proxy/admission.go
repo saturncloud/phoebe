@@ -238,8 +238,8 @@ func writeRequestBodyError(w http.ResponseWriter, r *http.Request, requestID str
 		return
 	}
 	if errors.Is(err, errRequestBufferFull) {
-		writeRetryLaterAfter(w, requestID, "The gateway request buffer is full; retry in about "+
-			strconv.Itoa(requestBufferRetryAfterSeconds)+" second.", requestBufferRetryAfterSeconds)
+		writeRetryLaterAfter(r.Context(), w, requestID, "The gateway request buffer is full; retry in about "+
+			strconv.Itoa(requestBufferRetryAfterSeconds)+" second.", orgHostCodeServerBusy, requestBufferRetryAfterSeconds)
 		return
 	}
 	var tooLarge *http.MaxBytesError

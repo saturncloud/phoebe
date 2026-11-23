@@ -307,6 +307,12 @@ func (s *Server) handleHealth(w http.ResponseWriter, _ *http.Request) {
 func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request) {
 	r = r.WithContext(withRequestStart(r.Context(), time.Now()))
 	id := identity.FromRequest(r)
+	if id.OrgHost {
+		// Org-host requests answer every retryable 503 (wake, cold holds,
+		// request-buffer budget) with the full OpenAI error object. Set
+		// before any context is derived, so every later one inherits it.
+		r = r.WithContext(withOrgHostErrors(r.Context()))
+	}
 	// The legacy quota headers feed only a log diagnostic on the admission path
 	// (R8 cutover); record their presence now, because the strip below removes
 	// them. Without an admitter the diagnostic can never fire, so skip the

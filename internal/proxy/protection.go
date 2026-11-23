@@ -315,8 +315,8 @@ func (d *dedicatedColdHolds) acquire(endpoint string, limit int64) (func(), bool
 // that already has the maximum number of requests waiting on its start: 503
 // (out of capacity, the code the shared tier's cold-hold limit uses) with
 // Retry-After, in phoebe's {"error": "..."} shape.
-func writeDedicatedColdHoldsFull(w http.ResponseWriter, requestID string) {
-	writeRetryLater(w, requestID, "The endpoint is starting from zero and too many requests are already waiting; retry in about "+
+func writeDedicatedColdHoldsFull(ctx context.Context, w http.ResponseWriter, requestID string) {
+	writeRetryLater(ctx, w, requestID, "The endpoint is starting from zero and too many requests are already waiting; retry in about "+
 		strconv.Itoa(wakeRetryAfterSeconds)+" seconds.")
 }
 

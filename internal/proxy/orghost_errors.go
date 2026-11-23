@@ -1,5 +1,7 @@
 package proxy
 
+import "context"
+
 // The OpenAI-shaped refusals of the org host and the shared gateway (issue
 // #71, tenant-domains design 3.2). No body names the requested model, so no
 // refusal is an oracle for which models exist. model_not_found is one fixed
@@ -115,4 +117,27 @@ func gatewayWrongEndpointHost(orgHostURL string) clientError {
 		msg += " Send dedicated endpoints to your organization's dedicated host."
 	}
 	return clientError{Message: msg, Type: "invalid_request_error", Code: "wrong_endpoint_host"}
+}
+
+// Codes of the org host's retryable 503s (writeRetryLaterAfter). Every
+// wake-path refusal (hold expired, too many held, cold with no wake path,
+// wake service unavailable or unconfirmed) is endpoint_starting, the design
+// 3.2 row for scale-to-zero; the replica request-buffer refusal is
+// server_busy, because the endpoint is not starting then.
+const (
+	orgHostCodeEndpointStarting = "endpoint_starting"
+	orgHostCodeServerBusy       = "server_busy"
+)
+
+type orgHostErrorsKey struct{}
+
+// withOrgHostErrors marks ctx as an org-host request's, so phoebe's
+// retryable 503s answer with the full OpenAI error object.
+func withOrgHostErrors(ctx context.Context) context.Context {
+	return context.WithValue(ctx, orgHostErrorsKey{}, true)
+}
+
+func orgHostErrors(ctx context.Context) bool {
+	v, _ := ctx.Value(orgHostErrorsKey{}).(bool)
+	return v
 }
