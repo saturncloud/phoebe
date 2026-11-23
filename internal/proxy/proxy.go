@@ -461,15 +461,12 @@ func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request) {
 	// attempt without usage as unbilled work (UNEXPLAINED MISSING-USAGE).
 	metered := r.Method == http.MethodPost && inferenceRequestPathAllowed(routePath)
 
-	// VIDEO RETRIEVAL: the always-on route that reads or deletes one video
-	// whatever its endpoint's state (issue #13). Atlas's retrieval
-	// ForwardAuth authorized the key for this video and stamped its org and
-	// endpoint; there is no upstream, serving mode or engine work, so none of
-	// the gateway, billing or routing steps below apply.
-	if id.VideoRetrieval {
-		s.serveVideoRetrieval(w, r, id, routePath, pathCanonical)
-		return
-	}
+	// The issue #13 video retrieval route on the shared host is gone (issue
+	// #71): an org's videos are read, downloaded, deleted and listed on its
+	// org host (serveOrgHostVideo). A request that still carries the old
+	// retrieval mark gets no special treatment: it is judged like any other
+	// request on its route (the mark was removed above with every other
+	// X-Saturn-* header).
 
 	if id.Gateway {
 		if !pathCanonical || !gatewayRequestAllowed(r.Method, routePath) {

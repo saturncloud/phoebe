@@ -54,68 +54,6 @@ func videoRequestAllowed(method, path string) bool {
 	return sub == "content" && method == http.MethodGet
 }
 
-// videoRetrievalAllowed is the always-on retrieval route's whole surface
-// (issue #13): read one video, download its content, or delete it. Creating
-// and listing stay on the endpoint's own route, which needs it running.
-func videoRetrievalAllowed(method, path string) bool {
-	rest, ok := strings.CutPrefix(path, "/v1/videos/")
-	if !ok {
-		return false
-	}
-	id, sub, hasSub := strings.Cut(rest, "/")
-	if !videos.ValidID(id) {
-		return false
-	}
-	if !hasSub {
-		return method == http.MethodGet || method == http.MethodDelete
-	}
-	return sub == "content" && method == http.MethodGet
-}
-
-// serveVideoRetrieval answers a request Atlas's retrieval ForwardAuth marked
-// with X-Saturn-Video-Retrieval. Atlas has checked the key may read the video
-// and stamped the video's org and endpoint; phoebe-videos then looks the job
-// up by id, org and endpoint, so a mark without both answers nothing. Every
-// refusal is the generic 404.
-func (s *Server) serveVideoRetrieval(w http.ResponseWriter, r *http.Request, id identity.Identity, routePath string, pathCanonical bool) {
-	requestID, err := generateRequestID()
-	if err != nil {
-		s.log.Error.Printf("videos: generate request id: %v", err)
-		http.Error(w, "internal error", http.StatusInternalServerError)
-		return
-	}
-	refuse := func(reason string) {
-		s.log.Warn.Printf("videos: refused retrieval request_id=%s org_id=%q resource_id=%q method=%s path=%q: %s",
-			requestID, id.OrgID, id.ResourceID, r.Method, r.URL.EscapedPath(), reason)
-		http.Error(w, "not found", http.StatusNotFound)
-	}
-	switch {
-	case s.videos == nil:
-		refuse("video generation is not enabled on this phoebe (videos.serviceUrl / PHOEBE_VIDEOS_TOKEN)")
-		return
-	case id.Gateway || id.VideoLimits != "" || id.Upstream != "" || id.ServingMode != "" || id.ServedModel != "":
-		// The retrieval mark comes from one route only, and that route removes
-		// the upstream, serving mode and served model. Together with another
-		// route's stamps (every endpoint route stamps an upstream and serving
-		// mode) the edge contract is broken.
-		refuse("retrieval mark together with another route's stamps")
-		return
-	case id.OrgID == "" || id.ResourceID == "" || id.AuthID == "":
-		refuse("retrieval request without org, endpoint or auth id")
-		return
-	case !pathCanonical || !videoRetrievalAllowed(r.Method, routePath):
-		refuse("outside the video retrieval surface")
-		return
-	}
-	// The stamped org and endpoint are now checked, so the endpoint id is a
-	// safe metric label, as on the endpoint path after its billing gate.
-	recordFrom(r.Context()).bind(id)
-	s.handOffVideo(w, r, requestID, videos.Handoff{
-		Retrieval: true, OrgID: id.OrgID, AuthID: id.AuthID, UserID: id.UserID, GroupID: id.GroupID,
-		ResourceID: id.ResourceID,
-	})
-}
-
 // serveVideo answers a request on a route that carries X-Saturn-Video-Limits.
 // Every refusal is the same generic 404 the other route gates use.
 func (s *Server) serveVideo(w http.ResponseWriter, r *http.Request, id identity.Identity, requestID, routePath string, pathCanonical bool) {
@@ -172,7 +110,7 @@ func (s *Server) handOffVideo(w http.ResponseWriter, r *http.Request, requestID 
 	// path does before it reaches here.
 	r.Header.Set(requestIDHeader, requestID)
 	w.Header().Set(requestIDHeader, requestID)
-	// Both callers have checked the path against their surface, so a GET
+	// Every caller has checked the path against its surface, so a GET
 	// ending in /content is a download of a stored file: the one request
 	// exempt from protection.maxStreamDuration (stall guards still apply).
 	if r.Method == http.MethodGet && strings.HasSuffix(r.URL.Path, "/content") {
