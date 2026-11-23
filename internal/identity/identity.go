@@ -199,16 +199,25 @@ const (
 	// Absent: the route serves no /v1/videos path.
 	HeaderVideoLimits = "X-Saturn-Video-Limits"
 
-	// HeaderVideoRetrieval marks a request on the always-on video retrieval
-	// route (issue #13): GET /v1/videos/{id}, GET /v1/videos/{id}/content and
-	// DELETE /v1/videos/{id} on the Token Factory API host, which exists
-	// whether or not the video's endpoint is running. Atlas's retrieval
-	// ForwardAuth (/api/auth/videos/check) stamps it, together with the
-	// video's org (HeaderOrgID), endpoint (HeaderResourceID) and the caller's
-	// key (HeaderAuthID), only after it has checked the key may read that
-	// video. Read strictly through the trusted-header registry: only the
-	// exact value "true" marks a retrieval request.
-	HeaderVideoRetrieval = "X-Saturn-Video-Retrieval"
+	// HeaderOrgHost marks a request that arrived on an org host,
+	// <label>-inference.<domain> (issue #71, tenant-domains design 4.1): the
+	// route that serves one org's dedicated endpoints and their videos. Only
+	// the saturn-k8s tf-org-hosts route's header Middleware sets it, after
+	// Atlas's /api/auth/org-host/check ForwardAuth has pinned the host's org
+	// (HeaderOrgID). Every other Token Factory route blanks it. Read strictly
+	// through the trusted-header registry: only the exact value "true" marks
+	// an org-host request. On such a request the body model= picks the
+	// endpoint, and phoebe resolves it against the org's dedicated rows in
+	// the served-model registry; no per-route header is honoured.
+	HeaderOrgHost = "X-Saturn-Org-Host"
+
+	// HeaderEndpointScope carries the one dedicated endpoint (deployment id)
+	// a key narrowed to one endpoint may reach on an org host. Stamped only
+	// by the org-host ForwardAuth (authResponseHeaders), blanked on every
+	// other route. Present: the resolved endpoint must be exactly this one,
+	// or the request is refused (403 model_not_authorized). A present but
+	// empty or malformed value refuses.
+	HeaderEndpointScope = "X-Saturn-Endpoint-Scope"
 )
 
 // Identity is the trusted, pre-resolved caller identity for a request. Phoebe
@@ -290,12 +299,14 @@ type Identity struct {
 	// VideoLimits is the raw, trusted X-Saturn-Video-Limits value; non-empty
 	// only on a video generation endpoint's route. Parsed by phoebe-videos.
 	VideoLimits string
-	// VideoRetrieval reports the request arrived on the always-on video
-	// retrieval route (HeaderVideoRetrieval == "true", stamped by Atlas's
-	// retrieval ForwardAuth). Such a request carries no upstream, serving mode
-	// or served model: it names one video, and phoebe-videos looks it up by
-	// id, org and endpoint.
-	VideoRetrieval bool
+	// OrgHost reports the request arrived on an org host (HeaderOrgHost ==
+	// "true"). The org comes from the edge (OrgID); phoebe resolves the
+	// endpoint from the registry and fills the routing and billing fields.
+	OrgHost bool
+	// EndpointScopePresent and EndpointScope carry HeaderEndpointScope.
+	// Present with any value other than one endpoint id refuses.
+	EndpointScopePresent bool
+	EndpointScope        string
 }
 
 // The two serving modes, spelled exactly as they are stored in billing_event and
@@ -356,7 +367,9 @@ func FromRequest(r *http.Request) Identity {
 		OwnerRateLimitGeneratedTokens:      trustedHeaderValue(r, HeaderOwnerRateLimitGeneratedTokens),
 		GroupScopes:                        trustedHeaderValue(r, HeaderGroupScopes),
 		VideoLimits:                        trustedHeaderValue(r, HeaderVideoLimits),
-		VideoRetrieval:                     trustedHeaderValue(r, HeaderVideoRetrieval) == "true",
+		OrgHost:                            trustedHeaderValue(r, HeaderOrgHost) == "true",
+		EndpointScopePresent:               trustedHeaderPresent(r, HeaderEndpointScope),
+		EndpointScope:                      trustedHeaderValue(r, HeaderEndpointScope),
 	}
 }
 

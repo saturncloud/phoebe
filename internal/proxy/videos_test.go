@@ -14,6 +14,7 @@ import (
 	"sync"
 	"testing"
 
+	"github.com/saturncloud/phoebe/internal/gateway"
 	"github.com/saturncloud/phoebe/internal/identity"
 	"github.com/saturncloud/phoebe/internal/videos"
 )
@@ -195,68 +196,66 @@ func TestWithVideosRefusesABadServiceURL(t *testing.T) {
 
 const testVideoID = "video_01ARZ3NDEKTSV4RRFFQ69G5FAV"
 
-// orgHostVideoRequest is what the org-host route delivers (issue #71):
-// Atlas's org-host ForwardAuth stamped the host's org and the caller's key,
-// and the route's header middleware the org-host mark. No upstream, serving
-// mode, served model or video limits.
+// orgHostVideoRequest is what the tf-org-hosts route delivers for a video
+// request (issue #71): the org-host mark, the host's org and the caller's key.
+// No upstream, serving mode, served model or video limits.
 func orgHostVideoRequest(method, target, body string) *http.Request {
-	var req *http.Request
+	req := orgHostRequest(method, target, "org-1", body)
 	if body == "" {
-		req = httptest.NewRequest(method, target, nil)
-	} else {
-		req = httptest.NewRequest(method, target, strings.NewReader(body))
-		req.Header.Set("Content-Type", "application/json")
+		req.Header.Del("Content-Type")
 	}
-	req.Header.Set(identity.HeaderOrgID, "org-1")
-	req.Header.Set(identity.HeaderAuthID, "auth-1")
 	return req
 }
 
-// fakeOrgHostEndpoints is the org-host path's registry view for one org:
-// endpoint name -> row.
-type fakeOrgHostEndpoints map[string]orgHostVideoEndpoint
+func videoRow(name, resource, upstream string) gateway.DedicatedEndpoint {
+	ep := dedicatedRow("org-1", name, resource, upstream)
+	ep.BaseModel = "Wan-AI/Wan2.2-TI2V-5B-Diffusers"
+	ep.VideoLimits = testVideoLimits
+	return ep
+}
 
-func (f fakeOrgHostEndpoints) resolvers(scope string) orgHostVideoResolvers {
-	return orgHostVideoResolvers{
-		Create: func(w http.ResponseWriter, model string) (orgHostVideoEndpoint, bool) {
-			ep, ok := f[model]
-			if !ok {
-				writeClientError(w, "", http.StatusNotFound, clientError{Message: "This organization has no dedicated endpoint with that name.", Type: "invalid_request_error", Code: "model_not_found"})
-				return orgHostVideoEndpoint{}, false
-			}
-			if scope != "" && ep.ResourceID != scope {
-				writeClientError(w, "", http.StatusForbidden, orgHostVideoModelNotAuthorized)
-				return orgHostVideoEndpoint{}, false
-			}
-			return ep, true
-		},
-		EndpointID: func(name string) (string, bool) {
-			ep, ok := f[name]
-			return ep.ResourceID, ok
-		},
+func testOrgHostVideoRows() []gateway.DedicatedEndpoint {
+	stopped := videoRow("stopped-wan", "res-5", "pd-wan5.ns.svc.cluster.local:8000")
+	stopped.State = gateway.EndpointStateStopped
+	legacy := videoRow("legacy-wan", "res-6", "pd-wan6.ns.svc.cluster.local:8000")
+	legacy.Aliases = []string{"legacy-wan-base"}
+	return []gateway.DedicatedEndpoint{
+		videoRow("my-wan", "res-1", "pd-wan.ns.svc.cluster.local:8000"),
+		videoRow("other-wan", "res-2", "pd-wan2.ns.svc.cluster.local:8000"),
+		dedicatedRow("org-1", "my-chat", "res-3", "pd-chat.ns.svc.cluster.local:8000"),
+		stopped, legacy,
+		videoRow("their-wan", "res-9", "pd-x.ns.svc.cluster.local:8000"),
 	}
 }
 
-var testOrgHostEndpoints = fakeOrgHostEndpoints{
-	"my-wan": {ResourceID: "res-1", ServedModels: []string{"my-wan"}, BaseModel: "Wan-AI/Wan2.2-TI2V-5B-Diffusers",
-		Upstream: "pd-wan.ns.svc.cluster.local:8000", VideoLimits: testVideoLimits},
-	"other-wan": {ResourceID: "res-2", ServedModels: []string{"other-wan"}, BaseModel: "Wan-AI/Wan2.2-TI2V-5B-Diffusers",
-		Upstream: "pd-wan2.ns.svc.cluster.local:8000", VideoLimits: testVideoLimits},
-	"my-chat": {ResourceID: "res-3", ServedModels: []string{"my-chat"}, BaseModel: "Qwen/Qwen3-8B",
-		Upstream: "pd-chat.ns.svc.cluster.local:8000"},
-	"remote-wan": {ResourceID: "res-4", ServedModels: []string{"remote-wan"}, BaseModel: "Wan-AI/Wan2.2-TI2V-5B-Diffusers",
-		VideoLimits: testVideoLimits},
+// newOrgHostVideoServer is an interceptor with org hosts and videos on, over
+// the given dedicated rows (another org's row is moved to org-2).
+func newOrgHostVideoServer(t *testing.T, rows []gateway.DedicatedEndpoint) (*Server, *videoBackend) {
+	t.Helper()
+	for i := range rows {
+		if rows[i].Name == "their-wan" {
+			rows[i].OrgID = "org-2"
+		}
+	}
+	backend := &videoBackend{}
+	ts := httptest.NewServer(backend)
+	t.Cleanup(ts.Close)
+	srv, err := newOrgHostTestServer(t, nil, &fakeTierResolver{dedicated: rows}, nil).WithVideos(ts.URL, "shared-token")
+	if err != nil {
+		t.Fatal(err)
+	}
+	return srv, backend
 }
 
-// serveOrgHost runs a request through the org-host video hook the way the
-// org-host path does: identity parsed, X-Saturn-* stripped, canonical path.
-func serveOrgHost(srv *Server, req *http.Request, scope string) *httptest.ResponseRecorder {
-	id := identity.FromRequest(req)
-	identity.StripSaturnHeaders(req.Header)
-	routePath, canonical := canonicalRequestPath(req.URL)
+func serveOrgHost(srv *Server, req *http.Request) *httptest.ResponseRecorder {
 	rr := httptest.NewRecorder()
-	srv.serveOrgHostVideo(rr, req, id, scope, routePath, canonical, testOrgHostEndpoints.resolvers(scope))
+	srv.Handler().ServeHTTP(rr, req)
 	return rr
+}
+
+func scoped(req *http.Request, endpoint string) *http.Request {
+	req.Header.Set(identity.HeaderEndpointScope, endpoint)
+	return req
 }
 
 func handoffOf(t *testing.T, r *http.Request) videos.Handoff {
@@ -272,24 +271,32 @@ func handoffOf(t *testing.T, r *http.Request) videos.Handoff {
 	return h
 }
 
+func clientErrorCode(rr *httptest.ResponseRecorder) string {
+	var e struct{ Error clientError }
+	_ = json.Unmarshal(rr.Body.Bytes(), &e)
+	return e.Error.Code
+}
+
 func TestOrgHostVideoCreatePicksEndpointByModel(t *testing.T) {
-	srv, backend := newVideoServer(t)
-	for _, tc := range []struct{ model, resource, upstream string }{
-		{"my-wan", "res-1", "pd-wan.ns.svc.cluster.local:8000"},
-		{"other-wan", "res-2", "pd-wan2.ns.svc.cluster.local:8000"},
+	srv, backend := newOrgHostVideoServer(t, testOrgHostVideoRows())
+	for _, tc := range []struct{ model, resource, upstream, served string }{
+		{"my-wan", "res-1", "pd-wan.ns.svc.cluster.local:8000", "my-wan"},
+		{"other-wan", "res-2", "pd-wan2.ns.svc.cluster.local:8000", "other-wan"},
+		// A legacy alias picks its endpoint; phoebe-videos gets every served name.
+		{"legacy-wan-base", "res-6", "pd-wan6.ns.svc.cluster.local:8000", "legacy-wan,legacy-wan-base"},
 	} {
 		before := len(backend.reqs)
 		body := `{"model":"` + tc.model + `","prompt":"a cat"}`
 		req := orgHostVideoRequest(http.MethodPost, "/v1/videos", body)
-		// Client forgeries of the handoff or the routing headers are ignored.
+		// Client forgeries of the handoff are replaced.
 		req.Header.Set(videos.HeaderHandoff, "forged")
-		rr := serveOrgHost(srv, req, "")
+		rr := serveOrgHost(srv, req)
 		if rr.Code != http.StatusOK || len(backend.reqs) != before+1 {
 			t.Fatalf("%s: status %d %s", tc.model, rr.Code, rr.Body)
 		}
 		got := backend.reqs[len(backend.reqs)-1]
 		h := handoffOf(t, got)
-		want := videos.Handoff{OrgID: "org-1", AuthID: "auth-1", ResourceID: tc.resource, ServedModel: tc.model,
+		want := videos.Handoff{OrgID: "org-1", AuthID: "auth-1", ResourceID: tc.resource, ServedModel: tc.served,
 			BaseModel: "Wan-AI/Wan2.2-TI2V-5B-Diffusers", ServingMode: "dedicated", Upstream: tc.upstream, Limits: testVideoLimits}
 		if h != want {
 			t.Fatalf("%s: handoff %+v, want %+v", tc.model, h, want)
@@ -298,8 +305,16 @@ func TestOrgHostVideoCreatePicksEndpointByModel(t *testing.T) {
 		if got.ContentLength != int64(len(body)) {
 			t.Fatalf("%s: forwarded %d body bytes, want %d", tc.model, got.ContentLength, len(body))
 		}
+		for name := range got.Header {
+			if strings.HasPrefix(name, "X-Saturn-") {
+				t.Errorf("%s reached phoebe-videos", name)
+			}
+		}
+		if got.Header.Get("Authorization") != "" {
+			t.Error("the caller's key reached phoebe-videos")
+		}
 	}
-	// Multipart (the OpenAI SDK with an uploaded input_reference).
+	// Multipart (the OpenAI SDK with an uploaded input_reference), model last.
 	var buf bytes.Buffer
 	mw := multipart.NewWriter(&buf)
 	_ = mw.WriteField("prompt", "a cat")
@@ -309,8 +324,9 @@ func TestOrgHostVideoCreatePicksEndpointByModel(t *testing.T) {
 	_ = mw.Close()
 	req := orgHostVideoRequest(http.MethodPost, "/v1/videos", "")
 	req.Body = io.NopCloser(bytes.NewReader(buf.Bytes()))
+	req.ContentLength = int64(buf.Len())
 	req.Header.Set("Content-Type", mw.FormDataContentType())
-	rr := serveOrgHost(srv, req, "")
+	rr := serveOrgHost(srv, req)
 	if rr.Code != http.StatusOK {
 		t.Fatalf("multipart: %d %s", rr.Code, rr.Body)
 	}
@@ -320,52 +336,85 @@ func TestOrgHostVideoCreatePicksEndpointByModel(t *testing.T) {
 }
 
 func TestOrgHostVideoCreateRefusals(t *testing.T) {
-	srv, backend := newVideoServer(t)
+	srv, backend := newOrgHostVideoServer(t, testOrgHostVideoRows())
 	for _, tc := range []struct {
 		name, body, scope string
 		want              int
 		code              string
 	}{
 		{"unknown model", `{"model":"nope","prompt":"x"}`, "", 404, "model_not_found"},
-		{"chat endpoint", `{"model":"my-chat","prompt":"x"}`, "", 404, "not_found"},
-		{"forwarding copy", `{"model":"remote-wan","prompt":"x"}`, "", 404, "not_found"},
+		{"another org's endpoint", `{"model":"their-wan","prompt":"x"}`, "", 404, "model_not_found"},
+		{"chat endpoint", `{"model":"my-chat","prompt":"x"}`, "", 404, "not_a_video_endpoint"},
+		{"stopped endpoint", `{"model":"stopped-wan","prompt":"x"}`, "", 409, "endpoint_not_running"},
 		{"no model", `{"prompt":"x"}`, "", 400, "invalid_request"},
 		{"model not a string", `{"model":3,"prompt":"x"}`, "", 400, "invalid_request"},
 		{"not JSON", `nope`, "", 400, "invalid_request"},
-		{"scoped key, other endpoint", `{"model":"other-wan","prompt":"x"}`, "res-1", 403, "model_not_authorized"},
+		{"scoped key, other endpoint", `{"model":"other-wan","prompt":"x"}`, "0123456789abcdef0123456789abcdef", 403, "model_not_authorized"},
 	} {
-		rr := serveOrgHost(srv, orgHostVideoRequest(http.MethodPost, "/v1/videos", tc.body), tc.scope)
-		var e struct{ Error clientError }
-		_ = json.Unmarshal(rr.Body.Bytes(), &e)
-		if rr.Code != tc.want || e.Error.Code != tc.code {
+		req := orgHostVideoRequest(http.MethodPost, "/v1/videos", tc.body)
+		if tc.scope != "" {
+			scoped(req, tc.scope)
+		}
+		rr := serveOrgHost(srv, req)
+		if rr.Code != tc.want || clientErrorCode(rr) != tc.code {
 			t.Errorf("%s: %d %s, want %d %s", tc.name, rr.Code, rr.Body, tc.want, tc.code)
 		}
 	}
 	if len(backend.reqs) != 0 {
 		t.Fatalf("%d refused creates reached phoebe-videos", len(backend.reqs))
 	}
-	// The scoped key's own endpoint is allowed.
-	if rr := serveOrgHost(srv, orgHostVideoRequest(http.MethodPost, "/v1/videos", `{"model":"my-wan","prompt":"x"}`), "res-1"); rr.Code != 200 {
-		t.Fatalf("scoped key, own endpoint: %d", rr.Code)
+	// Another org's endpoint answers exactly like an unknown name.
+	a := serveOrgHost(srv, orgHostVideoRequest(http.MethodPost, "/v1/videos", `{"model":"their-wan","prompt":"x"}`))
+	b := serveOrgHost(srv, orgHostVideoRequest(http.MethodPost, "/v1/videos", `{"model":"nope","prompt":"x"}`))
+	if a.Code != b.Code || a.Body.String() != b.Body.String() {
+		t.Fatalf("another org's model %d %s differs from an unknown one %d %s", a.Code, a.Body, b.Code, b.Body)
+	}
+}
+
+// Endpoint ids in these tests are 32-hex, as the scope header requires.
+const (
+	scopeRes1 = "11111111111111111111111111111111"
+	scopeRes2 = "22222222222222222222222222222222"
+)
+
+func scopedRows() []gateway.DedicatedEndpoint {
+	return []gateway.DedicatedEndpoint{
+		videoRow("my-wan", scopeRes1, "pd-wan.ns.svc.cluster.local:8000"),
+		videoRow("other-wan", scopeRes2, "pd-wan2.ns.svc.cluster.local:8000"),
+	}
+}
+
+func TestOrgHostVideoScopedKeyCreatesOnlyOnItsEndpoint(t *testing.T) {
+	srv, backend := newOrgHostVideoServer(t, scopedRows())
+	if rr := serveOrgHost(srv, scoped(orgHostVideoRequest(http.MethodPost, "/v1/videos", `{"model":"my-wan","prompt":"x"}`), scopeRes1)); rr.Code != 200 {
+		t.Fatalf("own endpoint: %d %s", rr.Code, rr.Body)
+	}
+	rr := serveOrgHost(srv, scoped(orgHostVideoRequest(http.MethodPost, "/v1/videos", `{"model":"other-wan","prompt":"x"}`), scopeRes1))
+	if rr.Code != 403 || clientErrorCode(rr) != "model_not_authorized" || len(backend.reqs) != 1 {
+		t.Fatalf("other endpoint: %d %s", rr.Code, rr.Body)
 	}
 }
 
 func TestOrgHostVideoReadsListAndDeletesCarryOnlyTheOrgAndScope(t *testing.T) {
-	srv, backend := newVideoServer(t)
+	srv, backend := newOrgHostVideoServer(t, scopedRows())
 	for _, tc := range []struct {
 		method, target, scope string
 		want                  videos.Handoff
 	}{
 		{http.MethodGet, "/v1/videos/" + testVideoID, "", videos.Handoff{OrgHost: true, OrgID: "org-1", AuthID: "auth-1"}},
-		{http.MethodGet, "/v1/videos/" + testVideoID + "/content", "res-1", videos.Handoff{OrgHost: true, OrgID: "org-1", AuthID: "auth-1", ResourceID: "res-1"}},
+		{http.MethodGet, "/v1/videos/" + testVideoID + "/content", scopeRes1, videos.Handoff{OrgHost: true, OrgID: "org-1", AuthID: "auth-1", ResourceID: scopeRes1}},
 		{http.MethodDelete, "/v1/videos/" + testVideoID, "", videos.Handoff{OrgHost: true, OrgID: "org-1", AuthID: "auth-1"}},
 		{http.MethodGet, "/v1/videos", "", videos.Handoff{OrgHost: true, OrgID: "org-1", AuthID: "auth-1"}},
-		{http.MethodGet, "/v1/videos?limit=5", "res-2", videos.Handoff{OrgHost: true, OrgID: "org-1", AuthID: "auth-1", ResourceID: "res-2"}},
+		{http.MethodGet, "/v1/videos?limit=5", scopeRes2, videos.Handoff{OrgHost: true, OrgID: "org-1", AuthID: "auth-1", ResourceID: scopeRes2}},
 	} {
 		before := len(backend.reqs)
-		rr := serveOrgHost(srv, orgHostVideoRequest(tc.method, tc.target, ""), tc.scope)
+		req := orgHostVideoRequest(tc.method, tc.target, "")
+		if tc.scope != "" {
+			scoped(req, tc.scope)
+		}
+		rr := serveOrgHost(srv, req)
 		if rr.Code != 200 || len(backend.reqs) != before+1 {
-			t.Fatalf("%s %s: %d", tc.method, tc.target, rr.Code)
+			t.Fatalf("%s %s: %d %s", tc.method, tc.target, rr.Code, rr.Body)
 		}
 		got := backend.reqs[len(backend.reqs)-1]
 		if h := handoffOf(t, got); h != tc.want {
@@ -380,26 +429,33 @@ func TestOrgHostVideoReadsListAndDeletesCarryOnlyTheOrgAndScope(t *testing.T) {
 }
 
 func TestOrgHostVideoListModelFilter(t *testing.T) {
-	srv, backend := newVideoServer(t)
+	rows := scopedRows()
+	rows = append(rows, videoRow("their-wan", "33333333333333333333333333333333", "pd-x.ns.svc.cluster.local:8000"))
+	srv, backend := newOrgHostVideoServer(t, rows)
 	for _, tc := range []struct {
 		query, scope string
 		resource     string
 		noMatch      bool
 	}{
-		{"model=my-wan", "", "res-1", false},
-		{"model=other-wan&limit=3", "", "res-2", false},
-		{"model=my-wan", "res-1", "res-1", false},
+		{"model=my-wan", "", scopeRes1, false},
+		{"model=other-wan&limit=3", "", scopeRes2, false},
+		{"model=my-wan", scopeRes1, scopeRes1, false},
 		// TestOrgHostVideoListUnknownModelIsEmptyNot404 at the interceptor: an
-		// unknown name, and another endpoint's name for a scoped key, both
-		// become an empty list in phoebe-videos (never a 404 here).
+		// unknown name, another org's name, and another endpoint's name for a
+		// scoped key all become an empty list in phoebe-videos, never a 404.
 		{"model=nope", "", "", true},
-		{"model=other-wan", "res-1", "", true},
+		{"model=their-wan", "", "", true},
+		{"model=other-wan", scopeRes1, "", true},
 		{"model=", "", "", true},
 	} {
 		before := len(backend.reqs)
-		rr := serveOrgHost(srv, orgHostVideoRequest(http.MethodGet, "/v1/videos?"+tc.query, ""), tc.scope)
+		req := orgHostVideoRequest(http.MethodGet, "/v1/videos?"+tc.query, "")
+		if tc.scope != "" {
+			scoped(req, tc.scope)
+		}
+		rr := serveOrgHost(srv, req)
 		if rr.Code != 200 || len(backend.reqs) != before+1 {
-			t.Fatalf("%s: %d", tc.query, rr.Code)
+			t.Fatalf("%s: %d %s", tc.query, rr.Code, rr.Body)
 		}
 		h := handoffOf(t, backend.reqs[len(backend.reqs)-1])
 		if h.ResourceID != tc.resource || h.NoMatch != tc.noMatch || !h.OrgHost {
@@ -407,14 +463,14 @@ func TestOrgHostVideoListModelFilter(t *testing.T) {
 		}
 	}
 	before := len(backend.reqs)
-	rr := serveOrgHost(srv, orgHostVideoRequest(http.MethodGet, "/v1/videos?model=my-wan&model=other-wan", ""), "")
+	rr := serveOrgHost(srv, orgHostVideoRequest(http.MethodGet, "/v1/videos?model=my-wan&model=other-wan", ""))
 	if rr.Code != 400 || len(backend.reqs) != before {
 		t.Fatalf("model twice: %d", rr.Code)
 	}
 }
 
 func TestOrgHostVideoFailsClosed(t *testing.T) {
-	srv, backend := newVideoServer(t)
+	srv, backend := newOrgHostVideoServer(t, testOrgHostVideoRows())
 	for _, tc := range []struct {
 		reason string
 		mut    func(*http.Request)
@@ -426,11 +482,14 @@ func TestOrgHostVideoFailsClosed(t *testing.T) {
 		{"serving mode stamp", func(r *http.Request) { r.Header.Set(identity.HeaderServingMode, "dedicated") }},
 		{"served model stamp", func(r *http.Request) { r.Header.Set(identity.HeaderServedModel, "my-wan") }},
 		{"video limits stamp", func(r *http.Request) { r.Header.Set(identity.HeaderVideoLimits, testVideoLimits) }},
+		{"resource id stamp", func(r *http.Request) { r.Header.Set(identity.HeaderResourceID, "res-1") }},
+		{"empty scope", func(r *http.Request) { r.Header.Set(identity.HeaderEndpointScope, "") }},
+		{"malformed scope", func(r *http.Request) { r.Header.Set(identity.HeaderEndpointScope, "res-1,res-2") }},
 	} {
 		req := orgHostVideoRequest(http.MethodGet, "/v1/videos/"+testVideoID, "")
 		tc.mut(req)
-		if rr := serveOrgHost(srv, req, ""); rr.Code != 404 {
-			t.Errorf("%s: %d, want 404", tc.reason, rr.Code)
+		if rr := serveOrgHost(srv, req); rr.Code < 400 || rr.Code == http.StatusOK {
+			t.Errorf("%s: %d, want a refusal", tc.reason, rr.Code)
 		}
 	}
 	for _, tc := range []struct{ method, path string }{
@@ -440,30 +499,68 @@ func TestOrgHostVideoFailsClosed(t *testing.T) {
 		{http.MethodGet, "/v1%2Fvideos/" + testVideoID},
 		{http.MethodGet, "/v1/videos/x/content/extra"},
 	} {
-		rr := serveOrgHost(srv, orgHostVideoRequest(tc.method, tc.path, ""), "")
-		var e struct{ Error clientError }
-		if rr.Code != 404 || json.Unmarshal(rr.Body.Bytes(), &e) != nil || e.Error.Code != "not_found" {
+		rr := serveOrgHost(srv, orgHostVideoRequest(tc.method, tc.path, ""))
+		if rr.Code != 404 || clientErrorCode(rr) != "not_found" {
 			t.Errorf("%s %s: %d %s, want the JSON 404", tc.method, tc.path, rr.Code, rr.Body)
 		}
 	}
 	if len(backend.reqs) != 0 {
 		t.Errorf("%d refused requests reached phoebe-videos", len(backend.reqs))
 	}
-	off := newTestServer(t, nil)
-	if rr := serveOrgHost(off, orgHostVideoRequest(http.MethodGet, "/v1/videos", ""), ""); rr.Code != 404 {
-		t.Errorf("videos off: %d", rr.Code)
+	// Video generation off on this phoebe: reads and creates are 404.
+	off := newOrgHostTestServer(t, nil, &fakeTierResolver{dedicated: testOrgHostVideoRows()}, nil)
+	for _, req := range []*http.Request{
+		orgHostVideoRequest(http.MethodGet, "/v1/videos", ""),
+		orgHostVideoRequest(http.MethodPost, "/v1/videos", `{"model":"my-wan","prompt":"x"}`),
+	} {
+		if rr := serveOrgHost(off, req); rr.Code != 404 {
+			t.Errorf("videos off: %d %s", rr.Code, rr.Body)
+		}
 	}
 }
 
-// The org-host handoff, like the endpoint one, stops the caller's key and
-// cookies at the interceptor and replaces the client's request id.
+// A create for an endpoint on another cluster is forwarded to that
+// cluster's org host with the caller's key; nothing reaches the local
+// phoebe-videos, and a request that was already forwarded is not forwarded
+// again.
+func TestOrgHostVideoCreateForwardsToTheServingCluster(t *testing.T) {
+	be := &orgEngine{}
+	serving, base := tlsServing(t, be)
+	remote := forwardRow("org-1", "remote-wan", "res-4", base, "spoke")
+	remote.VideoLimits = testVideoLimits
+	srv, backend := newOrgHostVideoServer(t, []gateway.DedicatedEndpoint{remote})
+	srv.orgHosts.forward.transport = serving.Client().Transport
+	body := `{"model":"remote-wan","prompt":"x"}`
+	rr := serveOrgHost(srv, orgHostVideoRequest(http.MethodPost, "/v1/videos", body))
+	if rr.Code != http.StatusOK || be.hits.Load() != 1 || len(backend.reqs) != 0 {
+		t.Fatalf("status %d, serving hits %d, local phoebe-videos %d: %s", rr.Code, be.hits.Load(), len(backend.reqs), rr.Body)
+	}
+	be.mu.Lock()
+	path, hdr, sent := be.paths[0], be.headers[0], string(be.bodies[0])
+	be.mu.Unlock()
+	if path != "/v1/videos" || sent != body || hdr.Get("Authorization") != "Bearer sk-test" || hdr.Get(orgHostForwardedHeader) == "" {
+		t.Fatalf("forwarded %s %q headers %v", path, sent, hdr)
+	}
+	for name := range hdr {
+		if strings.HasPrefix(name, "X-Saturn-") {
+			t.Errorf("%s was forwarded", name)
+		}
+	}
+	again := orgHostVideoRequest(http.MethodPost, "/v1/videos", body)
+	again.Header.Set(orgHostForwardedHeader, "1")
+	if rr := serveOrgHost(srv, again); rr.Code != http.StatusLoopDetected || be.hits.Load() != 1 {
+		t.Fatalf("second forward: %d hits %d", rr.Code, be.hits.Load())
+	}
+}
+
+// The org-host handoff stops the caller's key and cookies at the interceptor
+// and replaces the client's request id.
 func TestOrgHostVideoHandoffDropsCredentialsAndReplacesRequestID(t *testing.T) {
-	srv, backend := newVideoServer(t)
+	srv, backend := newOrgHostVideoServer(t, testOrgHostVideoRows())
 	req := orgHostVideoRequest(http.MethodGet, "/v1/videos/"+testVideoID, "")
-	req.Header.Set("Authorization", "Bearer k")
 	req.Header.Set("Cookie", "a=b")
 	req.Header.Set(requestIDHeader, "client-chosen")
-	rr := serveOrgHost(srv, req, "")
+	rr := serveOrgHost(srv, req)
 	if rr.Code != 200 || len(backend.reqs) != 1 {
 		t.Fatalf("status %d", rr.Code)
 	}
@@ -486,7 +583,8 @@ func TestRetiredVideoRetrievalMarkReachesNothing(t *testing.T) {
 	srv, backend := newVideoServer(t)
 	for _, path := range []string{"/v1/videos/" + testVideoID, "/v1/videos/" + testVideoID + "/content"} {
 		req := httptest.NewRequest(http.MethodGet, path, nil)
-		req.Header.Set(identity.HeaderVideoRetrieval, "true")
+		// Retired in issue #71; no constant names it any more.
+		req.Header.Set("X-Saturn-Video-Retrieval", "true")
 		req.Header.Set(identity.HeaderOrgID, "org-1")
 		req.Header.Set(identity.HeaderResourceID, "res-1")
 		req.Header.Set(identity.HeaderAuthID, "auth-1")
@@ -511,10 +609,10 @@ func captureWarn(srv *Server) *lockedBuffer {
 // C13: a refusal names the path the client sent. Go leaves URL.RawPath empty
 // for an ordinary path, so logging it showed "" for almost every refusal.
 func TestVideoRefusalLogsThePath(t *testing.T) {
-	srv, _ := newVideoServer(t)
+	srv, _ := newOrgHostVideoServer(t, testOrgHostVideoRows())
 	warn := captureWarn(srv)
 	path := "/v1/videos/" + testVideoID
-	if rr := serveOrgHost(srv, orgHostVideoRequest(http.MethodPost, path, ""), ""); rr.Code != 404 {
+	if rr := serveOrgHost(srv, orgHostVideoRequest(http.MethodPost, path, "")); rr.Code != 404 {
 		t.Fatalf("status %d", rr.Code)
 	}
 	if got := warn.String(); !strings.Contains(got, fmt.Sprintf("path=%q", path)) {

@@ -2,6 +2,7 @@ package proxy
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"io"
 	"net/http"
@@ -160,8 +161,14 @@ func TestGatewayRejectsNonSharedRegistryResolution(t *testing.T) {
 			s := newGatewayTestServer(t, &recordingEmitter{}, resolver, up)
 			rr := httptest.NewRecorder()
 			s.Handler().ServeHTTP(rr, gatewayRequest("org-1", `{"model":"model-a","max_tokens":20}`))
-			if rr.Code != http.StatusServiceUnavailable {
-				t.Fatalf("status=%d, want 503", rr.Code)
+			// A malformed mode is broken data (503); a dedicated row is
+			// simply not served on the shared host (404, issue #71).
+			want := http.StatusServiceUnavailable
+			if mode == "dedicated" {
+				want = http.StatusNotFound
+			}
+			if rr.Code != want {
+				t.Fatalf("status=%d, want %d", rr.Code, want)
 			}
 			if upstreamHits != 0 {
 				t.Fatalf("non-shared gateway resolution reached upstream %d times", upstreamHits)
@@ -385,7 +392,7 @@ func TestGateway_AdapterNotLoaded503WithoutAWaker(t *testing.T) {
 	if rr.Code != http.StatusServiceUnavailable {
 		t.Fatalf("status = %d, want 503", rr.Code)
 	}
-	if strings.TrimSpace(rr.Body.String()) != "adapter_not_loaded" {
+	if !isAdapterNotLoaded(rr.Body.Bytes()) {
 		t.Fatalf("body = %q, want adapter_not_loaded", rr.Body.String())
 	}
 	if atomic.LoadInt32(&upstreamHits) != 0 || em.count() != 0 {
@@ -510,7 +517,7 @@ func TestGateway_NotReadyAdapterStillUnlistedAfterTheWakeIsAdapterNotLoaded(t *t
 
 func assertAdapterNotLoaded(t *testing.T, rr *httptest.ResponseRecorder) {
 	t.Helper()
-	if rr.Code != http.StatusServiceUnavailable || strings.TrimSpace(rr.Body.String()) != "adapter_not_loaded" {
+	if rr.Code != http.StatusServiceUnavailable || !isAdapterNotLoaded(rr.Body.Bytes()) {
 		t.Fatalf("status = %d body = %q, want 503 adapter_not_loaded", rr.Code, rr.Body.String())
 	}
 	if rr.Header().Get("Retry-After") == "" {
@@ -595,7 +602,7 @@ func TestGateway_NotReadyAdapterWithAWakerThatCannotWakeItIs503(t *testing.T) {
 	srv, _ := notReadyAdapterServer(t, beURL, &unsupportedWaker{}, "shared")
 	rr := httptest.NewRecorder()
 	srv.Handler().ServeHTTP(rr, gatewayRequest("org-1", `{"model":"support-bot","max_tokens":10}`))
-	if rr.Code != http.StatusServiceUnavailable || strings.TrimSpace(rr.Body.String()) != "adapter_not_loaded" {
+	if rr.Code != http.StatusServiceUnavailable || !isAdapterNotLoaded(rr.Body.Bytes()) {
 		t.Fatalf("status = %d body = %q, want 503 adapter_not_loaded", rr.Code, rr.Body.String())
 	}
 	if atomic.LoadInt32(&hits) != 0 {
@@ -610,12 +617,14 @@ func TestGateway_NotReadyAdapterWithAWakerThatCannotWakeItIs503(t *testing.T) {
 // second case pins that it is not woken either.)
 func TestGateway_NotReadyAdapterNotWakeableStill503(t *testing.T) {
 	for name, tc := range map[string]struct {
-		waker Waker
-		mode  string
-		body  string
+		waker  Waker
+		mode   string
+		status int
+		code   string
 	}{
-		"wake disabled": {nil, "shared", "adapter_not_loaded"},
-		"dedicated row": {&fakeWaker{}, "dedicated", "service unavailable"},
+		"wake disabled": {nil, "shared", http.StatusServiceUnavailable, "adapter_not_loaded"},
+		// Issue #71: a dedicated row is not served on the shared host (404).
+		"dedicated row": {&fakeWaker{}, "dedicated", http.StatusNotFound, "model_not_found"},
 	} {
 		t.Run(name, func(t *testing.T) {
 			var hits int32
@@ -627,8 +636,8 @@ func TestGateway_NotReadyAdapterNotWakeableStill503(t *testing.T) {
 			srv, _ := notReadyAdapterServer(t, beURL, tc.waker, tc.mode)
 			rr := httptest.NewRecorder()
 			srv.Handler().ServeHTTP(rr, gatewayRequest("org-1", `{"model":"support-bot","max_tokens":10}`))
-			if rr.Code != http.StatusServiceUnavailable || strings.TrimSpace(rr.Body.String()) != tc.body {
-				t.Fatalf("status = %d body = %q, want 503 %q", rr.Code, rr.Body.String(), tc.body)
+			if rr.Code != tc.status || errorCode(t, rr.Body.Bytes()) != tc.code {
+				t.Fatalf("status = %d body = %q, want %d %q", rr.Code, rr.Body.String(), tc.status, tc.code)
 			}
 			if atomic.LoadInt32(&hits) != 0 {
 				t.Fatalf("not-wakeable not-ready adapter reached the upstream")
@@ -657,11 +666,8 @@ func TestGateway_UnknownModel404NoEcho(t *testing.T) {
 	if strings.Contains(rr.Body.String(), "super-secret-probe") {
 		t.Fatalf("404 body echoes the attempted model: %q", rr.Body.String())
 	}
-	if got := strings.TrimSpace(rr.Body.String()); got != gatewayModelNotFoundMessage {
-		t.Fatalf("404 body = %q, want the generic how-to message", got)
-	}
-	if !strings.HasPrefix(rr.Body.String(), "model not found") {
-		t.Fatalf("404 body lost its \"model not found\" prefix: %q", rr.Body.String())
+	if got := errorCode(t, rr.Body.Bytes()); got != "model_not_found" {
+		t.Fatalf("404 code = %q, want model_not_found (body %q)", got, rr.Body.String())
 	}
 	if em.count() != 0 {
 		t.Fatalf("unresolved request must not bill, emitted %d", em.count())
@@ -690,8 +696,8 @@ func TestGateway_CrossTenantModel404(t *testing.T) {
 		t.Fatalf("cross-tenant 404 echoes the model: %q", rr.Body.String())
 	}
 	// Byte-identical to the unknown-model answer: no oracle.
-	if got := strings.TrimSpace(rr.Body.String()); got != gatewayModelNotFoundMessage {
-		t.Fatalf("cross-tenant 404 body = %q, want the same message as an unknown model", got)
+	if got := errorBody(t, rr.Body.Bytes()); got.Code != "model_not_found" || got.Message != gatewayModelNotFound.Message {
+		t.Fatalf("cross-tenant 404 body = %q, want the same message as an unknown model", rr.Body.String())
 	}
 }
 
@@ -1136,4 +1142,11 @@ func TestWithGatewayWiresEveryRegistryCapacitySource(t *testing.T) {
 		t.Fatalf("WithGateway(RegistryResolver) wiring: graphCapacity=%v graphCapacityPair=%v, want both set",
 			s.graphCapacity != nil, s.graphCapacityPair != nil)
 	}
+}
+
+func isAdapterNotLoaded(body []byte) bool {
+	var env struct {
+		Error *clientError `json:"error"`
+	}
+	return json.Unmarshal(body, &env) == nil && env.Error != nil && env.Error.Code == "adapter_not_loaded"
 }

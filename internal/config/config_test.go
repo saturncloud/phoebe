@@ -913,3 +913,22 @@ func TestLoadMetricsPortOutOfRangeIsRefused(t *testing.T) {
 		}
 	}
 }
+
+// TestLoadGatewaySharedBaseURL: the org host's wrong_endpoint_host message
+// names this URL (issue #71); only an https URL is accepted.
+func TestLoadGatewaySharedBaseURL(t *testing.T) {
+	s, err := Load(writeTemp(t, `
+gateway:
+  enabled: true
+  namespace: "tf-shared"
+  sharedBaseURL: "https://inference.example.com/v1"
+`))
+	if err != nil || s.Gateway.SharedBaseURL != "https://inference.example.com/v1" {
+		t.Fatalf("sharedBaseURL = %q (%v)", s.Gateway.SharedBaseURL, err)
+	}
+	for _, bad := range []string{"http://inference.example.com/v1", "inference.example.com", "https://u:p@h/v1"} {
+		if _, err := Load(writeTemp(t, "gateway:\n  enabled: true\n  namespace: tf-shared\n  sharedBaseURL: \""+bad+"\"\n")); err == nil {
+			t.Fatalf("sharedBaseURL %q accepted", bad)
+		}
+	}
+}

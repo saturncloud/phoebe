@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"strings"
 
+	"github.com/saturncloud/phoebe/internal/gateway"
 	"github.com/saturncloud/phoebe/internal/identity"
 	"github.com/saturncloud/phoebe/internal/videos"
 )
@@ -30,33 +31,13 @@ import (
 // registry row its model resolved to. Nothing here reads a per-route header.
 // Reads, downloads, deletes and lists need no endpoint state, so they work
 // for an endpoint that is stopped or deleted.
-
-// orgHostVideoEndpoint is the dedicated endpoint a create's model resolved
-// to: the registry row's values, never the request's.
-type orgHostVideoEndpoint struct {
-	ResourceID string
-	// ServedModels is every name the endpoint answers to (its name, then any
-	// legacy alias); the create's model must be one of them.
-	ServedModels []string
-	BaseModel    string
-	// Upstream is the engine (host:port). Empty on a row that forwards to
-	// another cluster: the caller forwards those before calling the hook.
-	Upstream    string
-	VideoLimits string
-}
-
-// orgHostVideoResolvers is what the org-host path gives the video hook.
-type orgHostVideoResolvers struct {
-	// Create resolves a create's body model to a dedicated endpoint of the
-	// host's org. When ok is false it has already written the refusal
-	// (model_not_found, wrong_endpoint_host, endpoint_not_running,
-	// model_not_authorized), exactly as for an inference request.
-	Create func(w http.ResponseWriter, model string) (ep orgHostVideoEndpoint, ok bool)
-	// EndpointID maps a list's ?model= name to the endpoint id of the
-	// host's org that has it, false when no dedicated endpoint of the org
-	// has that name. Stopped and scaled-to-zero endpoints count.
-	EndpointID func(name string) (resourceID string, ok bool)
-}
+//
+// Other clusters: a create whose endpoint runs on another cluster is
+// forwarded to that cluster's org host (forwardOrgHost), which checks the key
+// again and runs the job there. Reads, downloads, deletes and lists answer
+// from this cluster's phoebe-videos only: design section 6 leaves merging
+// per-cluster video stores out of v1 (video generation runs on one cluster
+// today), so a video made on another cluster is a 404 here.
 
 var (
 	orgHostVideoNotFound   = clientError{Message: "Not found.", Type: "invalid_request_error", Code: "not_found"}
@@ -72,25 +53,29 @@ var (
 		Message: "model is required: set it to the name of one of your organization's video endpoints.",
 		Type:    "invalid_request_error", Code: "invalid_request",
 	}
-	orgHostVideoModelNotAuthorized = clientError{
-		Message: "The requested model is not served by this endpoint. Set model to this endpoint's model name.",
-		Type:    "permission_error", Code: "model_not_authorized",
+	orgHostNotVideoEndpoint = clientError{
+		Message: "This endpoint does not generate videos. Set model to one of your organization's video endpoints.",
+		Type:    "invalid_request_error", Code: "not_a_video_endpoint",
 	}
 )
 
-// serveOrgHostVideo is the org-host /v1/videos hook. The org-host path calls
-// it for every request whose path starts with /v1/videos, after its own
-// checks: the org-host mark is trusted and alone (no gateway, retrieval or
-// per-route stamps), id.OrgID is the host's org, and scope is the validated
-// X-Saturn-Endpoint-Scope value ("" for an org key; a present but empty or
-// malformed header was refused before this point). A create whose row
-// forwards to another cluster is forwarded by the caller, not handed here.
-func (s *Server) serveOrgHostVideo(w http.ResponseWriter, r *http.Request, id identity.Identity, scope, routePath string, pathCanonical bool, res orgHostVideoResolvers) {
+// serveOrgHostVideos is the org host's /v1/videos surface. serveOrgHost
+// calls it for every path under /v1/videos after its own checks: the org-host
+// mark is trusted and alone (no other route's marker or stamps), the
+// interceptor is configured for org hosts, id.OrgID is the host's org, a
+// present X-Saturn-Endpoint-Scope is one well-formed endpoint id, and the
+// path is canonical. alreadyForwarded reports that another cluster
+// forwarded this request here; such a request is never forwarded again.
+func (s *Server) serveOrgHostVideos(w http.ResponseWriter, r *http.Request, id identity.Identity, routePath string, alreadyForwarded bool) {
 	requestID, err := generateRequestID()
 	if err != nil {
 		s.log.Error.Printf("videos: generate request id: %v", err)
-		http.Error(w, "internal error", http.StatusInternalServerError)
+		writeClientError(w, "", http.StatusInternalServerError, clientError{Message: "Internal error.", Type: "server_error", Code: "internal_error"})
 		return
+	}
+	scope := ""
+	if id.EndpointScopePresent {
+		scope = id.EndpointScope
 	}
 	refuse := func(reason string) {
 		s.log.Warn.Printf("videos: refused org-host request request_id=%s org_id=%q scope=%q method=%s path=%q: %s",
@@ -98,62 +83,76 @@ func (s *Server) serveOrgHostVideo(w http.ResponseWriter, r *http.Request, id id
 		writeClientError(w, requestID, http.StatusNotFound, orgHostVideoNotFound)
 	}
 	switch {
-	case s.videos == nil:
-		refuse("video generation is not enabled on this phoebe (videos.serviceUrl / PHOEBE_VIDEOS_TOKEN)")
+	case !id.OrgHost || orgHostConflictingMarkers(id):
+		// serveOrgHost refuses these already; this is the backstop for the
+		// video path, which must never take a per-route stamp.
+		refuse("org-host video request without the mark or with another route's stamps")
 		return
-	case id.Gateway || id.VideoLimits != "" || id.Upstream != "" || id.ServingMode != "" || id.ServedModel != "":
-		// The org-host route blanks every per-route header; a stamp next to
-		// the mark means the edge contract is broken.
-		refuse("org-host video request with another route's stamps")
+	case s.orgHosts == nil:
+		refuse("org hosts are not configured on this interceptor")
 		return
 	case id.OrgID == "" || id.AuthID == "":
 		refuse("org-host video request without org or auth id")
 		return
-	case !pathCanonical || !videoRequestAllowed(r.Method, routePath):
+	case id.EndpointScopePresent && scope == "":
+		refuse("empty endpoint scope")
+		return
+	case !videoRequestAllowed(r.Method, routePath):
 		refuse("outside the video surface")
+		return
+	}
+	if routePath == "/v1/videos" && r.Method == http.MethodPost {
+		s.orgHostVideoCreate(w, r, id, requestID, alreadyForwarded)
+		return
+	}
+	// Video generation off here: checked after the create branch, because a
+	// create for an endpoint on another cluster is forwarded whatever this
+	// cluster runs.
+	if s.videos == nil {
+		refuse("video generation is not enabled on this phoebe (videos.serviceUrl / PHOEBE_VIDEOS_TOKEN)")
 		return
 	}
 	h := videos.Handoff{
 		OrgHost: true, OrgID: id.OrgID, AuthID: id.AuthID, UserID: id.UserID, GroupID: id.GroupID,
 		ResourceID: scope,
 	}
-	switch {
-	case routePath == "/v1/videos" && r.Method == http.MethodPost:
-		s.orgHostVideoCreate(w, r, id, scope, requestID, res)
-		return
-	case routePath == "/v1/videos" && r.Method == http.MethodGet:
+	if routePath == "/v1/videos" {
 		models := r.URL.Query()["model"]
 		if len(models) > 1 {
 			writeClientError(w, requestID, http.StatusBadRequest, orgHostVideoModelTwice)
 			return
 		}
 		if len(models) == 1 {
-			// The filter reveals nothing: a name no endpoint of the org has,
-			// and another endpoint's name for an endpoint-scoped key, both
-			// list nothing, exactly like a real endpoint with no videos.
-			resourceID, ok := "", false
-			if res.EndpointID != nil {
-				resourceID, ok = res.EndpointID(models[0])
-			}
+			// The filter reveals nothing: a name no dedicated endpoint of the
+			// org has, and another endpoint's name for an endpoint-scoped
+			// key, both list nothing, exactly like an endpoint with no
+			// videos.
+			ep, err := s.orgHosts.resolver.ResolveDedicated(r.Context(), id.OrgID, models[0])
 			switch {
-			case !ok || resourceID == "":
+			case errors.Is(err, gateway.ErrNotFound) || (err == nil && (ep.OrgID != id.OrgID || ep.ResourceID == "")):
 				h.ResourceID, h.NoMatch = "", true
-			case scope != "" && resourceID != scope:
+			case err != nil:
+				s.log.Error.Printf("videos: org-host list filter request_id=%s org_id=%s: %v", requestID, id.OrgID, err)
+				writeClientError(w, requestID, http.StatusServiceUnavailable, orgHostUnavailable)
+				return
+			case scope != "" && ep.ResourceID != scope:
 				h.ResourceID, h.NoMatch = "", true
 			default:
-				h.ResourceID = resourceID
+				h.ResourceID = ep.ResourceID
 			}
 		}
 	}
-	// Reads, downloads, deletes and lists: the org's videos, restricted to
-	// the scoped endpoint for an endpoint-scoped key. No endpoint is bound,
-	// so the request's metrics carry the org only.
+	// Reads, downloads, deletes and lists: the org's videos on this cluster,
+	// restricted to the scoped endpoint for an endpoint-scoped key. No
+	// endpoint is bound, so the request's metrics carry no endpoint label.
 	s.handOffVideo(w, r, requestID, h)
 }
 
-// orgHostVideoCreate hands a create to phoebe-videos as the endpoint its
-// body model resolved to, with that endpoint's row values.
-func (s *Server) orgHostVideoCreate(w http.ResponseWriter, r *http.Request, id identity.Identity, scope, requestID string, res orgHostVideoResolvers) {
+// orgHostVideoCreate resolves a create's body model to one of the org's
+// dedicated endpoints (the same 404, 403 and 409 rules as inference) and
+// either forwards it to the cluster that serves the endpoint or hands it to
+// phoebe-videos with that endpoint's row values.
+func (s *Server) orgHostVideoCreate(w http.ResponseWriter, r *http.Request, id identity.Identity, requestID string, alreadyForwarded bool) {
 	model, err := videoCreateModel(r)
 	if err != nil {
 		s.log.Warn.Printf("videos: org-host create request_id=%s org_id=%q: %v", requestID, id.OrgID, err)
@@ -164,39 +163,37 @@ func (s *Server) orgHostVideoCreate(w http.ResponseWriter, r *http.Request, id i
 		writeClientError(w, requestID, http.StatusBadRequest, orgHostVideoNoModel)
 		return
 	}
-	if res.Create == nil {
-		s.log.Error.Printf("videos: org-host create request_id=%s: no endpoint resolver wired", requestID)
-		writeClientError(w, requestID, http.StatusServiceUnavailable, clientError{
-			Message: "Video generation is unavailable on this host right now.", Type: "server_error", Code: "service_unavailable",
-		})
-		return
-	}
-	ep, ok := res.Create(w, model)
+	ep, ok := s.resolveOrgHostModel(w, r, id, model)
 	if !ok {
 		return
 	}
-	switch {
-	case scope != "" && ep.ResourceID != scope:
-		// The resolver applies the scope too; this is the backstop.
-		writeClientError(w, requestID, http.StatusForbidden, orgHostVideoModelNotAuthorized)
+	if ep.VideoLimits == "" {
+		// A chat endpoint: the inference path's mirror image of
+		// orgHostVideoEndpointOnly.
+		writeClientError(w, requestID, http.StatusNotFound, orgHostNotVideoEndpoint)
 		return
-	case ep.ResourceID == "" || ep.BaseModel == "" || ep.Upstream == "" || ep.VideoLimits == "" || len(ep.ServedModels) == 0:
-		// A chat endpoint (no video limits), a forwarding copy (no
-		// upstream) or an incomplete row: nothing here can run the job.
-		s.log.Warn.Printf("videos: org-host create request_id=%s org_id=%q resource_id=%q: endpoint row cannot serve videos here",
-			requestID, id.OrgID, ep.ResourceID)
+	}
+	if ep.Forwards() {
+		s.forwardOrgHost(w, r, id, ep, alreadyForwarded)
+		return
+	}
+	if s.videos == nil {
+		s.log.Warn.Printf("videos: org-host create request_id=%s resource_id=%s: video generation is not enabled on this phoebe", requestID, ep.ResourceID)
 		writeClientError(w, requestID, http.StatusNotFound, orgHostVideoNotFound)
 		return
 	}
 	bound := id
-	bound.ResourceID, bound.BaseModel, bound.ServingMode = ep.ResourceID, ep.BaseModel, identity.ServingModeDedicated
-	bound.Upstream, bound.VideoLimits = ep.Upstream, ep.VideoLimits
-	bound.ServedModel = strings.Join(ep.ServedModels, ",")
+	if !s.applyDedicatedEndpoint(w, &bound, ep, model) {
+		return
+	}
+	// phoebe-videos checks the create's model against the endpoint's
+	// served names, as on the endpoint's own route.
+	served := strings.Join(append([]string{ep.Name}, ep.Aliases...), ",")
 	recordFrom(r.Context()).bind(bound)
 	s.handOffVideo(w, r, requestID, videos.Handoff{
 		OrgID: id.OrgID, AuthID: id.AuthID, UserID: id.UserID, GroupID: id.GroupID,
-		ResourceID: ep.ResourceID, ServedModel: bound.ServedModel, BaseModel: ep.BaseModel,
-		ServingMode: identity.ServingModeDedicated, Upstream: ep.Upstream, Limits: ep.VideoLimits,
+		ResourceID: bound.ResourceID, ServedModel: served, BaseModel: bound.BaseModel,
+		ServingMode: identity.ServingModeDedicated, Upstream: bound.Upstream, Limits: bound.VideoLimits,
 	})
 }
 

@@ -55,18 +55,19 @@ func newCappedVideoServer(t *testing.T, p config.ProtectionSettings, backendURL 
 }
 
 // X4 (battery on phoebe#148): a video content download is the one request
-// exempt from protection.maxStreamDuration. The exemption lives in
-// handOffVideo, which the endpoint route and the org host's video hook share;
-// the org host's own end-to-end case joins this table once the org-host path
-// routes to serveOrgHostVideo (issue #71). The download here takes about six
-// times the limit and arrives whole.
+// exempt from protection.maxStreamDuration, on the endpoint's route and on
+// the org host (issue #71) alike. The download here takes about six times
+// the limit and arrives whole.
 func TestVideoContentDownloadOutlivesMaxStreamDuration(t *testing.T) {
 	const limit = 100 * time.Millisecond
 	backend, want := slowVideosBackend(t, 5, limit)
 	srv := newCappedVideoServer(t, config.ProtectionSettings{MaxStreamDuration: limit}, backend.URL)
+	srv = srv.WithGateway(&fakeTierResolver{}, "tf-shared", 8000).WithOrgHosts(&fakeTierResolver{}, testSharedBaseURL)
 	for name, req := range map[string]*http.Request{
-		"endpoint route": videoRequest(http.MethodGet, "/v1/videos/"+testVideoID+"/content"),
-		"thumbnail":      videoRequest(http.MethodGet, "/v1/videos/"+testVideoID+"/content?variant=thumbnail"),
+		"endpoint route":      videoRequest(http.MethodGet, "/v1/videos/"+testVideoID+"/content"),
+		"thumbnail":           videoRequest(http.MethodGet, "/v1/videos/"+testVideoID+"/content?variant=thumbnail"),
+		"org host":            orgHostVideoRequest(http.MethodGet, "/v1/videos/"+testVideoID+"/content", ""),
+		"org host, thumbnail": orgHostVideoRequest(http.MethodGet, "/v1/videos/"+testVideoID+"/content?variant=thumbnail", ""),
 	} {
 		t.Run(name, func(t *testing.T) {
 			start := time.Now()

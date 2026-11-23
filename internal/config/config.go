@@ -5,6 +5,7 @@ package config
 
 import (
 	"fmt"
+	"net/url"
 	"os"
 	"path"
 	"path/filepath"
@@ -448,6 +449,13 @@ type GatewaySettings struct {
 	// resolved in main); legacy-enabled with NEITHER set is a startup error.
 	// Ignored in registry mode.
 	DatabaseURL string `yaml:"databaseUrl"`
+
+	// SharedBaseURL is the shared tier's public base URL
+	// (https://inference.<domain>/v1), named in the org host's
+	// wrong_endpoint_host refusal when a shared model is sent there (issue
+	// #71). Optional: empty leaves the URL out of the message. Must be an
+	// https URL when set.
+	SharedBaseURL string `yaml:"sharedBaseURL"`
 }
 
 // WakeSettings is the YAML shape for wake-from-zero actuation. Both shared
@@ -863,6 +871,12 @@ func (g *GatewaySettings) parse() error {
 	}
 	if g.Port < 1 || g.Port > 65535 {
 		return fmt.Errorf("gateway.port %d out of range [1,65535]", g.Port)
+	}
+	if g.SharedBaseURL != "" {
+		u, err := url.Parse(g.SharedBaseURL)
+		if err != nil || u.Scheme != "https" || u.Host == "" || u.User != nil || u.RawQuery != "" || u.Fragment != "" {
+			return fmt.Errorf("gateway.sharedBaseURL %q must be an https URL (for example https://inference.<domain>/v1)", g.SharedBaseURL)
+		}
 	}
 	return nil
 }
