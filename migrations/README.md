@@ -30,8 +30,34 @@ with the Atlas schema; they live in phoebe's own database.
   base model or adapter, missing org) parked per (hour, identity, reason) with its
   token counts. Written by the rater; never pruned. See "Parked usage" in
   docs/billing-reconciliation.md.
+- **`rated_video_usage`** — the hourly video generation rollup (0017), one row per
+  (auth_id, owner, resource_id, model_id, serving_mode, base_model, task,
+  resolution, region, hour), carrying `org_id`, with `output_seconds` (exact
+  NUMERIC), `output_frames`, `request_count` (completed jobs), `gpu_seconds` and
+  `event_count` (every finished job). Written by the rater from
+  `video_billing_event`; sent by token-push as kind `video`. Never pruned.
+- **`parked_video_usage`** — conflicted video usage, the video twin of
+  `parked_usage`. Never pruned.
+- **`video_reconcile_deletion`** — a tombstone per video usage_id the rater
+  removed (reconcile, parked, regrained), written in the same transaction as the
+  removal. token-push deletes a sent video record by absence only when it has
+  one. Never pruned.
 - **`pushed_usage`, `pushed_hour`** — token-push's record of which usage_ids the
-  manager holds per hour and when the hour was last accepted.
+  manager holds per hour (with each id's `kind` since 0017) and when the hour was
+  last accepted.
+- **`refused_hour`, `deferred_hour`** — token-push's per-hour refusals. A
+  parked hour (`refused_hour`, 0014) was refused for its content and is re-sent
+  only when its payload changes. A deferred hour (`deferred_hour`, 0019) was
+  refused because the manager does not accept a usage kind it lists (a 409 or
+  a 400 on `kinds` from an older manager) and is re-sent by every run until
+  accepted. See docs/billing-reconciliation.md.
+- **`token_push_state`** — one row: `auto_floor`, the first hour accepted by a
+  scheduled token-push run. Scheduled runs re-send never-accepted hours only
+  after it; explicit `-since/-until` runs never change it.
+- **`rater_state`** — one row: the rater's one-time catch-up of billing_event
+  hours that were never rated (an install that ran with the rater suspended).
+  `catchup_cursor` is the last hour it rated; `catchup_completed_at` is set when
+  nothing is left, after which the rater rates only its trailing window.
 - **`io_log`** — optional, sampled, short-retention request/response body capture
   (M5 I/O logging). Written by the interceptor's iolog sink; OFF by default.
   `cmd/prune` enforces the short retention: rows older than 7 days on `created_at`
@@ -59,6 +85,13 @@ golang-migrate up/down pairs, applied in version order:
 | 0010 | `0010_rated_usage_identity.{up,down}.sql` | `rated_usage` attributes `base_model`, `adapter`, `price_key` (usage identity) |
 | 0011 | `0011_rated_usage_quantities_only.{up,down}.sql` | `rated_usage` money columns become nullable with no `$0` default (expand step: the aggregator writes NULL; dropped one release later) |
 | 0012 | `0012_parked_and_pushed_usage.{up,down}.sql` | `parked_usage` (conflicted usage parked per identity-hour by the rater, never pruned), `pushed_usage` and `pushed_hour` (what token-push last had accepted per hour, for `held` and re-sending resolved hours). Down refuses while unresolved parked rows exist |
+| 0013 | `0013_token_push_state.{up,down}.sql` | `token_push_state` (one row: `auto_floor`, the first hour a scheduled token-push run had accepted; scheduled runs re-send never-accepted hours only after it, and explicit `-since/-until` runs never move it). Backfilled from `min(pushed_hour.window_start)` |
+| 0014 | `0014_refused_hour.{up,down}.sql` | `refused_hour` (token-push parks an hour the manager refused for its content, 400/413/422, or that failed local request validation; it is not re-sent until its payload hash changes and does not count against the per-run missed-hour cap; an accepted push deletes the row) |
+| 0015 | `0015_rater_state.{up,down}.sql` | `rater_state` (one row: the rater's one-time catch-up cursor and completion time; the catch-up rates every billing_event hour before the trailing window with no rated_usage or parked_usage row, oldest first, a bounded number per run) |
+| 0016 | `0016_video_jobs.{up,down}.sql` | `video_job` and `video_billing_event` (video generation jobs written and read only by phoebe-videos, `cmd/videos`; new tables only). Numbered 0016, not 0013: 0013 was already `token_push_state` |
+| 0017 | `0017_rated_video_usage.{up,down}.sql` | `rated_video_usage` (with each rollup's wire `usage_id`), `parked_video_usage` and `video_reconcile_deletion` (the video rollup, its parked conflicts, and the rater's tombstones), and `pushed_usage.kind` (default `'token'`). Down refuses while video usage is parked or any rollup's usage_id is not yet accepted by the manager. A dev database that applied 0017 before the tombstones (#143) has no `usage_id` column or tombstone table: apply `0017_rated_video_usage.up.sql` again by hand (it is idempotent). Its old rollups stay unstamped until the rater re-rates them, and token-push holds them back meanwhile |
+| 0018 | `0018_video_job_files_delete_failed.{up,down}.sql` | `video_job.files_delete_failed_at` (nullable; when the phoebe-videos reaper last failed to delete the job's files, so the reaper retries those after every job not yet tried). Expand step |
+| 0019 | `0019_deferred_hour.{up,down}.sql` | `deferred_hour` (token-push defers an hour the manager refused because it does not accept a usage kind the hour lists, a 409 or a 400 on `kinds` from an older manager; every run re-sends it until accepted, outside the per-run missed-hour cap; an accepted push or parking the hour deletes the row). New table, expand step |
 
 `embed.go` embeds these into the `migrations` package; `cmd/migrate` applies them.
 
@@ -331,6 +364,57 @@ the contract migration drops the columns.
 Rolling back: `0011 down` refuses while any row has NULL money (it will not invent
 a `$0` cost). Deploy the previous rater and token-push, re-rate the affected hours
 with `--since/--until`, then run `migrate down`.
+
+### Rollout order for migration 0017
+
+Expand only: two new tables and a column with a default, so the previous
+release's rater and token-push keep working. Deploy the manager that accepts
+kind `video` (saturn-aws-manager, `LEGACY_PATH_ACCEPTED_KINDS` with `video`)
+before any install records video usage. token-push lists `video` in `kinds` only
+once `rated_video_usage` (or an unresolved `parked_video_usage` row) has a row,
+and then only for hours that have video or had video sent before. So installs
+without video keep sending `["token"]` to an older manager. If an older manager
+refuses the `video` kind anyway (a 400 whose path is `kinds[...]`), token-push
+treats it like a 401: it parks nothing and stops the run, and the next run
+sends again.
+
+Once any install has pushed video, do NOT run the previous release's token-push
+against this schema. Its trim of `pushed_usage` has no kind filter, so each hour
+it sends loses that hour's video rows, and it stamps `pushed_hour`. The
+manager's video records are untouched (it lists `["token"]` only). But the new
+token-push re-records them only for hours still inside its 24-hour trailing
+window. For an older hour, a video identity parked later has no accepted ids to
+hold, so the manager deletes them by absence. The scheduled re-send also skips
+that hour, because it is stamped.
+
+To roll back, first suspend the token-push and rater CronJobs; do not roll them
+back to the previous release yet. Wait for any running job to finish, then run
+the current token-push once by hand. A token-push that overlapped a rater run
+may have sent an hour's older content, and the down guard cannot tell. Then run
+`0017 down`. If it refuses, it names how many rollups the manager has
+not accepted since they were last rated: find them with
+
+```sql
+-- The down guard's own condition: rollups not accepted since rated.
+SELECT v.window_start, v.usage_id, v.auth_id, v.resource_id, v.model_id
+  FROM rated_video_usage v
+  LEFT JOIN pushed_hour h ON h.window_start = v.window_start
+ WHERE v.usage_id IS NULL
+    OR NOT EXISTS (SELECT 1 FROM pushed_usage u
+                    WHERE u.kind = 'video' AND u.window_start = v.window_start
+                      AND u.usage_id = v.usage_id
+                      AND u.pushed_at >= v.rated_at AND u.pushed_at <= h.pushed_at);
+```
+
+re-send those hours with `token-push -since ... -until ...`, and run `0017 down`
+again. An identity whose grain token-push holds back (it logs `HOLDING BACK
+rated_video_usage`) keeps refusing until the cause is fixed or the row is
+exported. It refuses until every
+video rollup has been accepted by the manager. That means the hour's last
+accepted push came after the rollup was rated, and recorded that rollup's own
+`usage_id` in `pushed_usage`. Once it passes, it removes
+video from phoebe's side, and the manager keeps the video records it holds.
+Only then deploy the previous release.
 
 ## Local dev
 

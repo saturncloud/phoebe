@@ -74,6 +74,10 @@ func ratingSchemaDDL(t *testing.T) string {
 		"../../migrations/0011_rated_usage_quantities_only.up.sql",
 		// 0012: parked_usage (the rater parks conflicts), pushed_usage, pushed_hour.
 		"../../migrations/0012_parked_and_pushed_usage.up.sql",
+		// 0016: video_billing_event (the video rollup reads it); 0017:
+		// rated_video_usage and parked_video_usage (the video rollup writes them).
+		"../../migrations/0016_video_jobs.up.sql",
+		"../../migrations/0017_rated_video_usage.up.sql",
 	} {
 		ddl, err := os.ReadFile(f)
 		if err != nil {
@@ -907,9 +911,20 @@ func seed(t *testing.T, db *sql.DB, rows ...beRow) {
 	}
 }
 
+// itNow is the integration tests' clock: a day after itHour, so the fixed
+// test hours stay inside the video reach (VideoFloor) whatever today is.
+func itNow() time.Time { return itHour.Add(24 * time.Hour) }
+
+// itStore is a PostgresStore on the integration tests' clock.
+func itStore(db *sql.DB) *PostgresStore {
+	s := NewPostgresStore(db)
+	s.now = itNow
+	return s
+}
+
 func aggregate(t *testing.T, db *sql.DB, start, end time.Time) AggregateResult {
 	t.Helper()
-	res, err := NewPostgresStore(db).AggregateWindow(context.Background(), start, end)
+	res, err := itStore(db).AggregateWindow(context.Background(), start, end)
 	if err != nil {
 		t.Fatalf("AggregateWindow: %v", err)
 	}

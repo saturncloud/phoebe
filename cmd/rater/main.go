@@ -50,6 +50,22 @@
 // (the upsert REPLACES each bucket). An event more than N hours late still needs
 // an explicit --since/--until run.
 //
+// ONE-TIME CATCH-UP OF HOURS NEVER RATED. An install that ran phoebe with the
+// rater suspended kept writing billing_event (the drainer runs regardless and
+// the pruner is suspended by default), but no run ever rated those hours, and
+// the trailing window does not reach back to them, so their usage was never
+// sent. Each routine run, after its trailing window, rates up to
+// rating.CatchUpHoursPerRun (168) billing_event hours before the window that
+// have no rated_usage and no parked_usage row, oldest first, and records its
+// progress in rater_state after every hour. When nothing is left it sets
+// rater_state.catchup_completed_at, and from then on runs rate only the
+// trailing window. An hour that already has rollups or parked rows is never
+// touched, so the catch-up cannot overwrite an earlier rollup with a partial
+// sum after the pruner removed some of its events. Re-rating is idempotent.
+// token-push sends the newly rated hours as never-accepted hours. A catch-up
+// hour with withheld or parked usage counts toward exit 2 or 4 like a window
+// hour. Explicit --since/--until runs do not run the catch-up.
+//
 // SINGLE-FLIGHT (deployment contract): two aggregators must never run over
 // overlapping windows at once; the reconcile DELETE and the ordered upsert are
 // deadlock-safe only then. The chart's CronJob sets concurrencyPolicy: Forbid.
@@ -188,27 +204,45 @@ func runWith(argv []string, log *logging.Logger) int {
 		return exitOK
 	}
 
-	res, err := rating.New(store, log).Run(ctx, windowStart, windowEnd, windowExplicit)
+	agg := rating.New(store, log)
+	res, err := agg.Run(ctx, windowStart, windowEnd, windowExplicit)
 	if err != nil {
 		log.Error.Printf("rater: run: %v", err)
 		return exitFatal
 	}
-	return exitCode(res.ReconciledDeletions, windowExplicit, res.HasAnomaly(), res.HasParked())
+	hasAnomaly, hasParked := res.HasAnomaly(), res.HasParked()
+	if !windowExplicit {
+		// CATCH-UP (package doc): after the trailing window, so current hours
+		// are rated first. An explicit run rates only the window it names.
+		cu, err := agg.CatchUp(ctx, windowStart, catchUpHoursPerRun)
+		if err != nil {
+			log.Error.Printf("rater: catch-up: %v", err)
+			return exitFatal
+		}
+		caught := rating.Result{AggregateResult: cu.AggregateResult}
+		hasAnomaly = hasAnomaly || caught.HasAnomaly() || caught.AllReconciledDeletions() > 0
+		hasParked = hasParked || cu.ParkedWritten > 0 || cu.Video.ParkedWritten > 0
+	}
+	return exitCode(res.AllReconciledDeletions(), windowExplicit, hasAnomaly, hasParked)
 }
+
+// catchUpHoursPerRun bounds the one-time catch-up per run. A variable so the
+// integration tests can exercise several runs with a few hours of data.
+var catchUpHoursPerRun = rating.CatchUpHoursPerRun
 
 // printParked writes one tab-separated line per parked identity-hour, with a
 // header, for an operator.
 func printParked(w io.Writer, parked []rating.Parked) {
 	tw := tabwriter.NewWriter(w, 0, 0, 2, ' ', 0)
-	fmt.Fprintln(tw, "HOUR\tREASON\tAUTH_ID\tOWNER\tRESOURCE_ID\tMODEL_ID\tMODE\tEVENTS\tPROMPT\tCACHED\tCOMPLETION\tFIRST_PARKED\tRAW_EVENTS")
+	fmt.Fprintln(tw, "HOUR\tKIND\tREASON\tAUTH_ID\tOWNER\tRESOURCE_ID\tMODEL_ID\tMODE\tEVENTS\tUSAGE\tFIRST_PARKED\tRAW_EVENTS")
 	for _, p := range parked {
 		owner := p.OwnerType + "/" + p.OwnerID
 		if p.OwnerType == "" {
 			owner = "-"
 		}
-		fmt.Fprintf(tw, "%s\t%s\t%s\t%s\t%s\t%s\t%s\t%d\t%d\t%d\t%d\t%s\t%s\n",
-			p.WindowStart.Format(time.RFC3339), p.Reason, p.AuthID, owner, p.ResourceID, p.ModelID, p.ServingMode,
-			p.EventCount, p.PromptTokens, p.CachedTokens, p.CompletionTokens, p.FirstParkedAt.UTC().Format(time.RFC3339),
+		fmt.Fprintf(tw, "%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%d\t%s\t%s\t%s\n",
+			p.WindowStart.Format(time.RFC3339), p.Kind, p.Reason, p.AuthID, owner, p.ResourceID, p.ModelID, p.ServingMode,
+			p.EventCount, p.UsageLabel(), p.FirstParkedAt.UTC().Format(time.RFC3339),
 			p.RawEventsLabel())
 	}
 	_ = tw.Flush()

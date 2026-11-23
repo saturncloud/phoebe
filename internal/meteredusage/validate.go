@@ -4,7 +4,6 @@ import (
 	"fmt"
 	"regexp"
 	"time"
-	"unicode/utf8"
 )
 
 // ValidationError names the first field that breaks a wire rule, in the same
@@ -27,7 +26,7 @@ var (
 )
 
 // knownKinds is the manager's closed set of kinds.
-var knownKinds = map[string]bool{"token": true, "compute": true, "storage": true, "seats": true}
+var knownKinds = map[string]bool{"token": true, "compute": true, "storage": true, "seats": true, "video": true}
 
 // Validate applies the manager's request rules (wire-conventions.md) on the
 // install, before sending. The manager rejects a bad request whole with a 400
@@ -35,7 +34,7 @@ var knownKinds = map[string]bool{"token": true, "compute": true, "storage": true
 // would fail there too; refusing it locally keeps the failure on the install,
 // where the evidence is, and names the bad field.
 //
-// It also recomputes every token record's usage_id from the record's own
+// It also recomputes every record's usage_id (token and video) from the record's own
 // fields. The manager treats usage_id as opaque, so it cannot catch a record
 // whose id does not match its grain; this check is the only place that can.
 func Validate(req Request) error {
@@ -69,8 +68,8 @@ func Validate(req Request) error {
 	if req.Records == nil {
 		return invalid("records", "must be a list (an empty hour is [], never null)")
 	}
-	if len(req.Records) > MaxRecordsPerRequest {
-		return invalid("records", "%d records exceed the %d-record cap", len(req.Records), MaxRecordsPerRequest)
+	if n := req.RecordCount(); n > MaxRecordsPerRequest {
+		return invalid("records", "%d records exceed the %d-record cap", n, MaxRecordsPerRequest)
 	}
 	if req.Held == nil {
 		return invalid("held", "must be a list ([] when nothing is held)")
@@ -98,6 +97,22 @@ func Validate(req Request) error {
 		}
 		seen[rec.UsageID] = i
 	}
+	// Video records follow the token records on the wire (MarshalJSON), so
+	// their paths continue the index.
+	for k, rec := range req.VideoRecords {
+		i := len(req.Records) + k
+		path := fmt.Sprintf("records[%d]", i)
+		if !kinds[rec.Kind] {
+			return invalid(path+".kind", "%q is not listed in kinds", rec.Kind)
+		}
+		if err := validateVideoRecord(path, req.WindowStart, rec); err != nil {
+			return err
+		}
+		if j, dup := seen[rec.UsageID]; dup {
+			return invalid(path+".usage_id", "duplicates records[%d].usage_id", j)
+		}
+		seen[rec.UsageID] = i
+	}
 	return nil
 }
 
@@ -112,37 +127,12 @@ func ValidateTokenRecord(windowStart string, rec Record) error {
 }
 
 func validateTokenRecord(path, windowStart string, rec Record) error {
-	if !hex64.MatchString(rec.UsageID) {
-		return invalid(path+".usage_id", "not 64 lowercase hex")
+	if err := validateEnvelope(path, rec.UsageID, rec.OrgID, rec.OwnerType, rec.OwnerID, rec.ResourceID); err != nil {
+		return err
 	}
-	if !hex32.MatchString(rec.OrgID) {
-		return invalid(path+".org_id", "not 32 lowercase hex")
-	}
-	switch rec.OwnerType {
-	case OwnerTypeUser, OwnerTypeGroup:
-		if !hex32.MatchString(rec.OwnerID) {
-			return invalid(path+".owner_id", "not 32 lowercase hex (owner_type %q)", rec.OwnerType)
-		}
-	case OwnerTypeNone:
-		if rec.OwnerID != "" {
-			return invalid(path+".owner_id", "must be empty when owner_type is empty")
-		}
-	default:
-		return invalid(path+".owner_type", "%q is not user, group or empty", rec.OwnerType)
-	}
-	// A token record always names the endpoint that served it.
-	if !hex32.MatchString(rec.ResourceID) {
-		return invalid(path+".resource_id", "not 32 lowercase hex")
-	}
-
 	a := rec.Attributes
-	for _, kv := range a.attributePairs() {
-		if !utf8.ValidString(kv[1]) {
-			return invalid(path+".attributes."+kv[0], "not valid UTF-8")
-		}
-		if n := utf8.RuneCountInString(kv[1]); n > MaxAttributeChars {
-			return invalid(path+".attributes."+kv[0], "%d characters exceed the %d cap", n, MaxAttributeChars)
-		}
+	if err := validateStringAttributes(path, a.attributePairs()); err != nil {
+		return err
 	}
 	// base_model may be "" (corrected conventions, 2026-10-27): a dedicated
 	// endpoint may serve a model with no catalog base, and the manager prices it.

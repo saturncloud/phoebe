@@ -66,7 +66,15 @@ func (r Result) HasAnomaly() bool {
 	return r.UnattributableEvents > 0 ||
 		r.HasUnexplainedMissingUsage() ||
 		r.InvalidUsageEvents > 0 ||
-		r.InvalidServingModeEvents > 0
+		r.InvalidServingModeEvents > 0 ||
+		r.Video.HasAnomaly()
+}
+
+// AllReconciledDeletions is the unexplained reconcile-deletions of both kinds
+// (token rated_usage and video rated_video_usage). cmd/rater pages on it for a
+// routine run.
+func (r Result) AllReconciledDeletions() int64 {
+	return r.ReconciledDeletions + r.Video.ReconciledDeletions
 }
 
 // Run aggregates [windowStart, windowEnd).
@@ -105,7 +113,13 @@ func (a *Aggregator) Run(ctx context.Context, windowStart, windowEnd time.Time, 
 	if err != nil {
 		return res, err
 	}
+	videoFloor := VideoFloor(a.now())
 	for _, p := range before {
+		if p.Kind == KindVideo && p.WindowStart.Before(videoFloor) {
+			// Video older than the reach is never re-rated (VideoFloor), so
+			// this run cannot touch it.
+			continue
+		}
 		if p.RawEventsPruned && !p.WindowStart.Before(windowStart) && p.WindowStart.Before(windowEnd) {
 			return res, fmt.Errorf("rating: window %s contains parked hour %s (auth_id=%s resource_id=%s model_id=%s reason=%s) whose raw events are pruned (%d of %d remain); it must never be re-aggregated. Narrow the window to exclude it; %s",
 				w, p.WindowStart.Format(time.RFC3339), p.AuthID, p.ResourceID, p.ModelID, p.Reason, p.RawEvents, p.EventCount, PrunedMarker)
@@ -117,6 +131,31 @@ func (a *Aggregator) Run(ctx context.Context, windowStart, windowEnd time.Time, 
 		return res, err
 	}
 	res.AggregateResult = ar
+
+	// NEVER-RATED VIDEO. A routine run rates only its trailing window, and
+	// the one-time catch-up does not run again, so video jobs of a rater
+	// outage longer than the window would never be rated and would be pruned
+	// unbilled at 30 days. Check the hours between the video floor and the
+	// window on every routine run, and page (exit 2) while any are left.
+	// While the catch-up is still running it rates those hours itself.
+	if floor := VideoFloor(a.now()); !windowExplicit && floor.Before(windowStart) {
+		st, err := a.store.CatchUpState(ctx)
+		if err != nil {
+			return res, err
+		}
+		n := int64(0)
+		if st.Done {
+			n, err = a.store.UnratedVideoHours(ctx, floor, windowStart)
+		}
+		if err != nil {
+			return res, err
+		}
+		res.Video.UnratedInReachHours = n
+		if n > 0 {
+			a.log.Error.Printf("rating: %d hour(s) between %s and %s hold completed video jobs that were NEVER rated (no rollup, no unresolved park): the rater was down longer than its trailing window. Re-rate them with --since/--until before they pass %s; phoebe-videos prunes video jobs after %d days",
+				n, floor.Format(time.RFC3339), windowStart.Format(time.RFC3339), VideoRateReach, prune.VideoRowRetentionDays)
+		}
+	}
 
 	// Parked hours outside the window: re-check the ones whose raw events are
 	// guaranteed present, so a conflict that resolved (or that an operator fixed
@@ -147,6 +186,9 @@ func (a *Aggregator) Run(ctx context.Context, windowStart, windowEnd time.Time, 
 		res.ParkedWritten += hr.ParkedWritten
 		res.ReconciledDeletions += hr.ReconciledDeletions
 		res.ParkedDeletions += hr.ParkedDeletions
+		// Every video counter, so a re-checked hour's withheld video jobs
+		// reach HasAnomaly and the exit code.
+		res.Video = res.Video.add(hr.Video)
 	}
 
 	res.Parked, err = a.store.ListParked(ctx)
@@ -162,9 +204,9 @@ func (a *Aggregator) Run(ctx context.Context, windowStart, windowEnd time.Time, 
 		case p.WindowStart.Before(reach):
 			note = "; older than the automatic re-check reach but raw events still present: fix the data and re-run this hour with --since/--until before the prune horizon"
 		}
-		a.log.Error.Printf("rating: PARKED (unbilled) usage hour=%s auth_id=%s owner=%s/%s resource_id=%s model_id=%s serving_mode=%s reason=%s events=%d prompt=%d cached=%d completion=%d first_parked=%s%s",
-			p.WindowStart.Format(time.RFC3339), p.AuthID, p.OwnerType, p.OwnerID, p.ResourceID, p.ModelID, p.ServingMode,
-			p.Reason, p.EventCount, p.PromptTokens, p.CachedTokens, p.CompletionTokens, p.FirstParkedAt.UTC().Format(time.RFC3339), note)
+		a.log.Error.Printf("rating: PARKED (unbilled) usage hour=%s kind=%s auth_id=%s owner=%s/%s resource_id=%s model_id=%s serving_mode=%s reason=%s events=%d %s first_parked=%s%s",
+			p.WindowStart.Format(time.RFC3339), p.Kind, p.AuthID, p.OwnerType, p.OwnerID, p.ResourceID, p.ModelID, p.ServingMode,
+			p.Reason, p.EventCount, p.UsageLabel(), p.FirstParkedAt.UTC().Format(time.RFC3339), note)
 	}
 	if len(res.Parked) > 0 {
 		a.log.Error.Printf("rating: %d parked identity-hour(s) hold unbilled usage; list them with `phoebe-rater -list-parked`", len(res.Parked))
@@ -229,5 +271,46 @@ func (a *Aggregator) aggregateAndLog(ctx context.Context, windowStart, windowEnd
 		a.log.Info.Printf("rating: window %s resolved %d parked identity-hour(s); token-push re-sends their hours", w, ar.ParkedResolved)
 	}
 	a.log.Info.Printf("rating: window %s aggregated %d events into %d rollups; %d identity-hour(s) parked", w, ar.EventsAggregated, ar.RollupsWritten, ar.ParkedWritten)
+	a.logVideo(w, ar.Video, windowExplicit)
 	return ar, nil
+}
+
+// logVideo logs what one video aggregation withheld, parked or deleted, at
+// the same levels as the token buckets.
+func (a *Aggregator) logVideo(w string, v VideoAggregateResult, windowExplicit bool) {
+	if v.OutOfReachHours > 0 {
+		a.log.Warn.Printf("rating: window %s: video rollups of %d hour(s) older than %s were NOT re-rated; phoebe-videos prunes video jobs after %d days, so the existing rollups are kept as the record", w, v.OutOfReachHours, VideoRateReach, prune.VideoRowRetentionDays)
+	}
+	if v.UnratedOutOfReachHours > 0 {
+		a.log.Error.Printf("rating: window %s: %d hour(s) older than %s hold completed, rateable video jobs of an identity that has no rollup and no unresolved park: NEVER rated; the rater no longer rates them, so they are not billed. Export them from video_billing_event before phoebe-videos prunes them at %d days and settle by hand through the manager's credit path", w, v.UnratedOutOfReachHours, VideoRateReach, prune.VideoRowRetentionDays)
+	}
+	if v.UnattributableEvents > 0 {
+		a.log.Error.Printf("rating: window %s has %d UNATTRIBUTABLE video jobs (auth_id, resource_id or model_id is ''); they cannot name who used what and are not sent. phoebe-videos must stamp the request's trusted identity on every job", w, v.UnattributableEvents)
+	}
+	if v.InvalidUsageEvents > 0 {
+		a.log.Error.Printf("rating: window %s has %d INVALID-USAGE video jobs (a negative quantity, or request_count not 1 on a completed job); retained in video_billing_event as evidence, not aggregated. Repair the evidence and re-run the hour", w, v.InvalidUsageEvents)
+	}
+	if v.OwnerConflictEvents > 0 {
+		a.log.Error.Printf("rating: window %s has %d OWNER-CONFLICT video jobs (both a user and a group); they are parked, not sent. Fix the header producer; the next run sends them once resolved", w, v.OwnerConflictEvents)
+	}
+	if v.AmbiguousOrgEvents > 0 {
+		a.log.Error.Printf("rating: window %s has %d video jobs under AMBIGUOUS-ORG identities (more than one org_id); the org pays, so a guess would bill the wrong customer; they are parked, not sent", w, v.AmbiguousOrgEvents)
+	}
+	if v.MissingOrgEvents > 0 {
+		a.log.Error.Printf("rating: window %s has %d video jobs under MISSING-ORG identities (org_id ''); the payer is unknown, so they are parked, not sent", w, v.MissingOrgEvents)
+	}
+	if v.EmptyBaseModelEvents > 0 {
+		a.log.Warn.Printf("rating: window %s aggregated %d video jobs with no base_model (sent as \"\"); the manager reports shared ones as unpriced", w, v.EmptyBaseModelEvents)
+	}
+	if v.ReconciledDeletions > 0 {
+		if windowExplicit {
+			a.log.Info.Printf("rating: EXPLICIT window %s reconcile DELETED %d video rollup(s) earlier runs wrote and this run no longer produces; intended convergence", w, v.ReconciledDeletions)
+		} else {
+			a.log.Error.Printf("rating: ROUTINE window %s reconcile DELETED %d video rollup(s) earlier runs wrote; with no operator behind it this means jobs VANISHED from video_billing_event or now fail a check. token-push will tell the manager to delete them. Investigate before the next push", w, v.ReconciledDeletions)
+		}
+	}
+	if v.ParkedResolved > 0 {
+		a.log.Info.Printf("rating: window %s resolved %d parked video identity-hour(s); token-push re-sends their hours", w, v.ParkedResolved)
+	}
+	a.log.Info.Printf("rating: window %s aggregated %d video jobs into %d video rollups; %d video identity-hour(s) parked; %d video usage_id(s) tombstoned as removed", w, v.EventsAggregated, v.RollupsWritten, v.ParkedWritten, v.TombstonesWritten)
 }
