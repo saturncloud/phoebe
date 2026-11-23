@@ -75,13 +75,24 @@
 //     billing path, before saturn-aws-manager#334). The same manager keeps
 //     accepting the install's token-only hours, so the run goes on with the
 //     other hours. The refused hour is recorded in deferred_hour (status, body,
-//     count, first and last refusal), logged at ERROR, and re-sent by every
-//     run, outside the window too, until the manager accepts it; each run
-//     retries up to maxDeferredRetriesPerRun, least recently refused first,
-//     without using up maxUnsentHoursPerRun, and logs at WARN how many hours
-//     are deferred. A refused request stores nothing at the manager, so the
-//     manager keeps what it held for the hour, and the accepted request later
-//     replaces it whole: nothing is counted twice and nothing is dropped.
+//     count, first and last refusal), logged at ERROR in the run that defers
+//     it (that run exits 3), and re-sent by every run, outside the window too,
+//     until the manager accepts it; each run retries up to
+//     maxDeferredRetriesPerRun, least recently refused first, without using up
+//     maxUnsentHoursPerRun, and logs at WARN how many hours are deferred. A
+//     deferred hour refused again does not fail the run (Hugo, 2026-11-23,
+//     issue #95 option B): only Saturn can fix it, by upgrading the manager,
+//     and Saturn alerts on it from the manager's side. A refused request
+//     stores nothing at the manager, so the manager keeps what it held for the
+//     hour, and the accepted request later replaces it whole: nothing is
+//     counted twice and nothing is dropped. The pushed_usage rows the refused
+//     attempt added are removed again. A 409 or a 400 on kinds for a request
+//     that lists only token is a refusal for the whole install instead (the
+//     run stops, like a 401).
+//
+//   - ONE RUN AT A TIME. A run holds a Postgres advisory lock for its whole
+//     length; a run that finds it held (a manual -since/-until Job next to the
+//     scheduled one) waits for the other to finish, then runs as usual.
 //
 //   - HTTPS ONLY. managerURL and -manager-url must be https:// URLs: the
 //     request carries the install's token and usage. Any other scheme, or a
@@ -160,9 +171,12 @@
 //	   answer (the hour is parked; later runs do not fail for it while its
 //	   usage is unchanged), 401 token, 403 inactive or uninstalled install, a
 //	   409 or a 400 on kinds (a manager older than phoebe that does not accept
-//	   a kind the hour lists; the hour is deferred and every run re-sends it,
-//	   and exits 3, until the manager accepts it), or any other non-429 4xx.
-//	   Needs a person
+//	   a kind the hour lists; the hour is deferred and every run re-sends it
+//	   until the manager accepts it, but only the run that defers it exits 3;
+//	   an explicit -since/-until run also exits 3 for a deferred hour of its
+//	   own range that is refused again), a 409 or a 400 on kinds for a
+//	   request that lists only token (the run stops), or any other non-429
+//	   4xx. Needs a person
 //
 // Precedence when several apply: 1 > 3 > 2.
 package main
@@ -271,6 +285,16 @@ func runWith(argv []string) int {
 		return exitFatal
 	}
 	defer func() { _ = closeStore() }()
+	if l, ok := store.(runLocker); ok {
+		release, err := l.lockRun(ctx, func() {
+			log.Info.Printf("token-push: another token-push run holds the run lock (a manual -since/-until Job next to the scheduled run, for instance); waiting for it to finish")
+		})
+		if err != nil {
+			log.Error.Printf("token-push: %v", err)
+			return exitFatal
+		}
+		defer release()
+	}
 
 	p := &pusher{
 		store:      store,
@@ -298,7 +322,17 @@ var openStore = func(ctx context.Context, cfg rating.Config) (pushStore, func() 
 	if err != nil {
 		return nil, nil, err
 	}
+	if cfg.MaxOpenConns > 0 {
+		// One more than configured: the run lock holds one connection for
+		// the whole run (pgStore.lockRun).
+		db.SetMaxOpenConns(cfg.MaxOpenConns + 1)
+	}
 	return pgStore{db: db}, db.Close, nil
+}
+
+// runLocker is implemented by pgStore: token-push's single-flight lock.
+type runLocker interface {
+	lockRun(ctx context.Context, waiting func()) (release func(), err error)
 }
 
 // notConnected handles a run with no manager URL (package doc, NOT CONNECTED).

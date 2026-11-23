@@ -307,16 +307,40 @@ func (f *fakeStore) DeferredSummary(context.Context) (int, time.Time, error) {
 	}
 	return len(f.deferred), oldest, nil
 }
-func (f *fakeStore) RecordDeferred(_ context.Context, h time.Time, status int, message string) error {
+func (f *fakeStore) RecordDeferred(_ context.Context, h time.Time, status int, message string) (bool, error) {
 	f.checkSeq++
 	d := f.deferred[h]
-	if d == nil {
+	first := d == nil
+	if first {
 		d = &fakeDeferred{}
 		f.deferred[h] = d
 	}
 	d.status, d.message, d.last = status, message, f.checkSeq
 	d.refusals++
 	delete(f.refused, h)
+	return first, nil
+}
+func (f *fakeStore) TouchDeferred(_ context.Context, hours []time.Time) error {
+	for _, h := range hours {
+		f.checkSeq++
+		if d := f.deferred[h]; d != nil {
+			d.last = f.checkSeq
+		}
+	}
+	return nil
+}
+func (f *fakeStore) ForgetIntent(_ context.Context, h time.Time, ids []string) error {
+	drop := map[string]bool{}
+	for _, id := range ids {
+		drop[id] = true
+	}
+	var kept []pushedRow
+	for _, r := range f.pushed[h] {
+		if !drop[r.UsageID] {
+			kept = append(kept, r)
+		}
+	}
+	f.pushed[h] = kept
 	return nil
 }
 func (f *fakeStore) MarkRefusedChecked(_ context.Context, hours []time.Time) error {
@@ -328,17 +352,21 @@ func (f *fakeStore) MarkRefusedChecked(_ context.Context, hours []time.Time) err
 	}
 	return nil
 }
-func (f *fakeStore) RecordIntent(_ context.Context, h time.Time, rows []pushedRow) error {
+func (f *fakeStore) RecordIntent(_ context.Context, h time.Time, rows []pushedRow) ([]string, error) {
 	seen := map[string]bool{}
 	for _, r := range f.pushed[h] {
 		seen[r.UsageID] = true
 	}
+	var added []string
 	for _, r := range rows {
 		if !seen[r.UsageID] {
 			f.pushed[h] = append(f.pushed[h], r)
+			if !r.held {
+				added = append(added, r.UsageID)
+			}
 		}
 	}
-	return nil
+	return added, nil
 }
 func (f *fakeStore) RecordAccepted(_ context.Context, h time.Time, kinds []string, rows []pushedRow, setAutoFloor bool) error {
 	listed := map[string]bool{}

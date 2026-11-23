@@ -10,6 +10,7 @@ import (
 	"strings"
 	"testing"
 	"time"
+	"unicode/utf8"
 
 	"github.com/saturncloud/phoebe/internal/logging"
 	"github.com/saturncloud/phoebe/internal/meteredusage"
@@ -321,7 +322,8 @@ func TestPushWindows_LocalWireRuleFailureParksTheHourOnce(t *testing.T) {
 // deferred, not parked (parking would also hold the hour's token records and
 // never re-send them after the manager is upgraded, since the payload does
 // not change), the other hours are still sent, the run exits 3, and the next
-// run sends the deferred hour again.
+// run sends the deferred hour again and exits 0 (only the run that defers an
+// hour exits 3).
 func TestPushWindows_ARefusedKindDefersTheHourAndSendsTheOthers(t *testing.T) {
 	for _, path := range []string{"kinds[1]", "kinds"} {
 		f := videoStore()
@@ -330,9 +332,9 @@ func TestPushWindows_ARefusedKindDefersTheHourAndSendsTheOthers(t *testing.T) {
 		f.videoRollups[other] = f.videoRollups[win]
 		m := &recordingManager{statuses: []int{400}, errBody: `{"error":"unknown kind video","path":"` + path + `"}`}
 		p := newPusher(f, m.client(t))
-		for i := 0; i < 2; i++ {
-			if code := p.pushWindows(context.Background(), []time.Time{other, win}, now, false); code != exitRejected {
-				t.Fatalf("%s run %d: exit %d, want exitRejected", path, i, code)
+		for i, want := range []int{exitRejected, exitOK} {
+			if code := p.pushWindows(context.Background(), []time.Time{other, win}, now, false); code != want {
+				t.Fatalf("%s run %d: exit %d, want %d", path, i, code, want)
 			}
 		}
 		if len(f.refused) != 0 {
@@ -350,5 +352,23 @@ func TestPushWindows_ARefusedKindDefersTheHourAndSendsTheOthers(t *testing.T) {
 	// A validation answer about a record still parks the hour.
 	if !refusalParksTheHour(&meteredusage.RejectedError{Status: 400, Body: `{"error":"x","path":"records[3].kind"}`}) {
 		t.Fatal("a refusal of records[3].kind must park the hour")
+	}
+}
+
+// A response body is stored in a TEXT column: it is cut at a character
+// boundary, invalid UTF-8 is replaced and NUL bytes are dropped, so Postgres
+// never refuses the row (SQLSTATE 22021) and the hour can still be parked or
+// deferred.
+func TestStoredMessage_CutsAtACharacterBoundaryAndKeepsValidUTF8(t *testing.T) {
+	long := strings.Repeat("a", maxRefusedMessage-1) + "é" + "tail" // é straddles the limit
+	got := storedMessage(long)
+	if len(got) != maxRefusedMessage-1 || !utf8.ValidString(got) {
+		t.Fatalf("len %d valid %v, want %d bytes of valid UTF-8", len(got), utf8.ValidString(got), maxRefusedMessage-1)
+	}
+	if got := storedMessage("bad \xff byte\x00 nul"); got != "bad � byte nul" {
+		t.Fatalf("%q", got)
+	}
+	if got := storedMessage(`{"error":"x"}`); got != `{"error":"x"}` {
+		t.Fatalf("a short valid body changed: %q", got)
 	}
 }

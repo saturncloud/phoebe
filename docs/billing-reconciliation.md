@@ -299,29 +299,64 @@ rule token-push checks itself (for instance a duplicate usage_id; status `0` in
 
 **Hours with a kind the manager refuses are deferred.** A `409`
 (`{"error": "install billing path is legacy"}`) or a `400` whose validation path
-is `kinds` comes from a manager older than phoebe that does not accept, from
-this install, a usage kind the hour lists: for instance video from an install on
-the legacy billing path, before saturn-aws-manager#334. The same manager keeps
-accepting the install's hours that list only token, so the refusal is about
-the hour, not the install, and the run goes on with the other hours.
-token-push records the hour in `deferred_hour` (status, response body, number
-of refusals, first and last refusal), logs `DEFERRED <hour>` at ERROR, and
-re-sends it in every run, also after it leaves the trailing window, until the
-manager accepts it; each run retries up to 168 of them, least recently refused
-first, outside the 168-hour budget for missed hours. While any hour is
-deferred, every run logs at WARN `N hour(s) are deferred (K refused this run),
-oldest ...`, and a run in which one is refused exits `3`. The fix is to upgrade
-the manager. A refused request stores nothing, so the manager keeps what it
-held for the hour (for instance the token records of an earlier push), and the
-accepted request replaces the hour whole: nothing is counted twice. An accepted
-push removes the row; an hour is deferred or parked, never both.
+is `kinds`, to a request that lists a kind other than token, comes from a
+manager older than phoebe that does not accept, from this install, a usage kind
+the hour lists: for instance video from an install on the legacy billing path,
+before saturn-aws-manager#334. The same manager keeps accepting the install's
+hours that list only token, so the refusal is about the hour, not the install,
+and the run goes on with the other hours. token-push records the hour in
+`deferred_hour` (status, response body, number of refusals, first and last
+refusal) and re-sends it in every run, also after it leaves the trailing
+window, until the manager accepts it; each run retries up to 168 of them, least
+recently refused first, outside the 168-hour budget for missed hours. A
+deferred hour that fails some other way (a `5xx`, an unreachable manager) goes
+to the back of that order.
+
+Exit `3` comes only from the run that first defers an hour, the same way
+parking works (Hugo, 2026-11-23, issue #95): that run logs `DEFERRED <hour>` at
+ERROR. A later run in which the hour is refused again logs it at INFO, exits
+`0` if nothing else is wrong, and, like every run while any hour is deferred,
+logs at WARN `N hour(s) are deferred (K refused this run, J newly), oldest
+...`. An explicit `-since/-until` run is the exception: it exits `3` when a
+deferred hour inside its own range is refused again, because the operator asked
+for that hour.
+
+**Nothing is needed on the install, and nothing is lost.** The fix is a
+manager upgrade, which only Saturn can do, and Saturn alerts on the age of the
+oldest deferred hour from the manager's side. If the WARN line persists for
+more than a day, report it to Saturn support with the output of the query
+below. A refused request stores nothing, so the manager keeps what it held for
+the hour (for instance the token records of an earlier push), and the accepted
+request replaces the hour whole: nothing is counted twice. The `pushed_usage`
+rows the refused attempt added are removed again. An accepted push removes the
+`deferred_hour` row; an hour is deferred or parked, never both.
+
+```sql
+SELECT window_start, status, message, refusals, first_deferred_at, last_deferred_at
+FROM deferred_hour
+ORDER BY window_start;
+```
+
+Do not delete `deferred_hour` rows to clear the WARN line. Deleting a row does
+not make the manager accept the hour. It only stops token-push from retrying
+it: an hour the manager never accepted is sent again as a missed hour and is
+deferred again (and that run exits `3`), and an hour the manager accepted
+earlier with fewer kinds (its token records, before video was rated into it) is
+no longer re-sent once it leaves the trailing window, so the refused kind never
+reaches the manager.
 
 Every other 4xx is never retried and exits `3`, and nothing is parked or
 deferred: `401` means the customer token and `403` an inactive or uninstalled
-install. These two are about the install, not the hour, so the run stops at the
-first one and the next run sends again. A `400` without the manager's
-validation body (a proxy in front of it, for instance) and any other 4xx exit
-`3` every run until fixed.
+install. A `409`, or a `400` on `kinds`, to a request that lists only token
+means the manager refuses this install's token usage at all. These are about
+the install, not the hour, so the run stops at the first one and the next run
+sends again. A `400` without the manager's validation body (a proxy in front of
+it, for instance) and any other 4xx exit `3` every run until fixed.
+
+**One run at a time.** A run holds a Postgres advisory lock while it runs. A
+manual `-since/-until` Job started while the scheduled run is running (or the
+other way round) logs `another token-push run holds the run lock ...; waiting
+for it to finish` and starts once the other run ends. Waiting is not a failure.
 
 ### Sending is not optional
 
@@ -411,10 +446,13 @@ the only copy left once the trim passes it, so it needs repair by hand), the dra
 log line `valkey is full and consumer group "<group>" does not exist; stored and trimmed`
 (see "A full Valkey" below),
 `METERING_FLOOR`, WAL corruption,
-token-push withheld hour (exit 2), manager rejection or a newly parked hour
-(exit 3), push failure, an unreachable manager, or a lost manager URL (exit
-1), and on the WARN line
-`hour(s) are parked` while it persists. Alert separately when the oldest Valkey
+token-push withheld hour (exit 2), manager rejection, a newly parked hour or a
+newly deferred hour (exit 3), push failure, an unreachable manager, or a lost
+manager URL (exit 1), and on the WARN line
+`hour(s) are parked` while it persists. Do not page on the WARN line `hour(s)
+are deferred`: only Saturn can fix a deferred hour, and Saturn alerts on it
+from the manager's side (see "Hours with a kind the manager refuses are
+deferred"). Alert separately when the oldest Valkey
 pending entry, oldest WAL entry, or oldest unpushed rated hour exceeds two job
 periods. The deployment/chart owns those queue-age metrics.
 
@@ -690,8 +728,12 @@ undercharged.
 
 4. Check the exit codes. token-push exit `3` is explained under "A manager outage
    delays sending": a `404` means the manager is too old for `/customer/metered-usage`,
-   so deploy it and run step 3's token-push again. A `400` parks that hour (see
-   "Refused hours are parked"). Then compare the hours with the reconciliation view.
+   so deploy it and run step 3's token-push again. A `400` with the manager's
+   validation body parks that hour (see "Refused hours are parked"). A `409`, or a
+   `400` on `kinds`, defers the hour when it lists a kind other than token. Every
+   scheduled run re-sends a deferred hour until the manager accepts that kind, so
+   this replay needs nothing more for it (see "Hours with a kind the manager
+   refuses are deferred"). Then compare the hours with the reconciliation view.
 
 An hour already pushed is replaced by its new snapshot, so re-running is safe. A window
 that contains a parked hour with pruned raw events makes the rater exit `1`; see

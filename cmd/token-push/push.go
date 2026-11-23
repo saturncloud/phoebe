@@ -351,31 +351,54 @@ func validationPath(rej *meteredusage.RejectedError) (string, bool) {
 func refusesAKind(path string) bool { return path == "kinds" || strings.HasPrefix(path, "kinds[") }
 
 // refusalIsForTheInstall reports whether a manager refusal applies to every
-// hour of this install: 401 (the install's token) or 403 (an inactive or
-// uninstalled install). The rest of the run would get the same answer, so the
-// run stops sending, and the next run sends the hours again.
-func refusalIsForTheInstall(rej *meteredusage.RejectedError) bool {
-	return rej.Status == http.StatusUnauthorized || rej.Status == http.StatusForbidden
+// hour of this install: 401 (the install's token), 403 (an inactive or
+// uninstalled install), or a refusal of the listed kinds (see
+// refusalIsAboutKinds) for a request that lists only token. Every request
+// lists token, so the rest of the run would get the same answer: the run stops
+// sending, and the next run sends the hours again.
+func refusalIsForTheInstall(rej *meteredusage.RejectedError, kinds []string) bool {
+	return rej.Status == http.StatusUnauthorized || rej.Status == http.StatusForbidden ||
+		(refusalIsAboutKinds(rej) && !listsMoreThanToken(kinds))
 }
 
-// refusalDefersTheHour reports whether a manager refusal is about the usage
-// kinds the hour lists, from a manager older than phoebe: a 409 ("install
+// refusalIsAboutKinds reports whether a manager refusal is about the usage
+// kinds the request lists, from a manager older than phoebe: a 409 ("install
 // billing path is legacy": the manager does not accept one of the listed kinds
-// from an install on the legacy billing path; before saturn-aws-manager#334
-// that is video) or a 400 whose validation path is `kinds` (a manager that
-// does not know a listed kind). The same manager keeps accepting this
-// install's hours that list only token, so the refusal is per hour, not for
-// the install: the hour is deferred and re-sent by every run until the
-// manager accepts it, and the run goes on with the other hours. It is not
-// parked: its payload does not change when the manager is upgraded, so a
-// parked hour would never be sent again. The manager stores nothing for a
-// refused request, so nothing is counted twice when the hour is accepted.
-func refusalDefersTheHour(rej *meteredusage.RejectedError) bool {
+// from an install on the legacy billing path; for video, a manager without
+// saturn-aws-manager#334) or a 400 whose validation path is `kinds` (a
+// manager that does not know a listed kind).
+func refusalIsAboutKinds(rej *meteredusage.RejectedError) bool {
 	if rej.Status == http.StatusConflict {
 		return true
 	}
 	path, ok := validationPath(rej)
 	return ok && refusesAKind(path)
+}
+
+func listsMoreThanToken(kinds []string) bool {
+	for _, k := range kinds {
+		if k != meteredusage.KindToken {
+			return true
+		}
+	}
+	return false
+}
+
+// refusalDefersTheHour reports whether a manager refusal is about a usage kind
+// other than token that the hour lists (refusalIsAboutKinds, for a request
+// that lists more than token). The same manager keeps accepting this
+// install's hours that list only token, so the refusal is per hour, not for
+// the install: the hour is deferred and re-sent by every run until the
+// manager accepts it, and the run goes on with the other hours. It is not
+// parked: its payload does not change when the manager is upgraded, so a
+// parked hour would never be sent again. The manager stores nothing for a
+// refused request, so nothing is counted twice when the hour is accepted. A
+// request that lists only token and gets such a refusal is refused for the
+// whole install instead (refusalIsForTheInstall): a manager that refuses
+// token refuses every hour, and deferring them all would turn one refusal per
+// run into one per hour.
+func refusalDefersTheHour(rej *meteredusage.RejectedError, kinds []string) bool {
+	return refusalIsAboutKinds(rej) && listsMoreThanToken(kinds)
 }
 
 func payloadSHA256(req meteredusage.Request) (string, error) {
@@ -402,7 +425,12 @@ func payloadSHA256(req meteredusage.Request) (string, error) {
 //
 // A DEFERRED hour (deferred_hour: the manager refused a kind it lists, a 409
 // or a 400 on `kinds`, see refusalDefersTheHour) is re-sent by every run until
-// the manager accepts it, and exits 3 while it is refused.
+// the manager accepts it. It exits 3 once, in the run that defers it, the way
+// parking does (Hugo, 2026-11-23, issue #95 option B): only Saturn can fix it,
+// by upgrading the manager, so later runs log a WARN line and Saturn alerts on
+// the age of the oldest deferred hour from the manager's side. An explicit
+// -since/-until run still exits 3 for a deferred hour of its own range that is
+// refused again: the operator asked for that hour.
 //
 // A PARKED hour (refused_hour: the manager refused its content, or it breaks
 // a request-level wire rule) is rebuilt but sent again only if its payload
@@ -415,7 +443,8 @@ func payloadSHA256(req meteredusage.Request) (string, error) {
 // Exit code precedence: fatal (1) > rejected (3) > held back (2) > ok (0).
 // Parking an hour counts once, in the run that parks it (3 for a manager
 // refusal, 2 for a local wire-rule failure); a parked hour left unchanged
-// adds nothing.
+// adds nothing. Deferring an hour counts once too (3), in the run that defers
+// it; a deferred hour refused again adds nothing.
 func (p *pusher) pushWindows(ctx context.Context, windows []time.Time, now time.Time, explicit bool) int {
 	// LIVENESS GUARD. An empty hour is sent as records: [], which deletes the
 	// manager's records for that hour. A database whose usage is gone must
@@ -542,13 +571,32 @@ func (p *pusher) pushWindows(ctx context.Context, windows []time.Time, now time.
 	}
 	hours = uniqueHours(hours, recheck)
 
-	heldBack, rejected, failed, newlyParked, deferredNow := 0, 0, 0, 0, 0
+	// A deferred hour this run tries that is neither accepted, deferred again
+	// nor parked is touched after the loop (TouchDeferred), so a deferred hour
+	// failing some other way does not stay first in the retry order.
+	wasDeferred := make(map[time.Time]bool, len(deferred))
+	for _, h := range deferred {
+		wasDeferred[h] = true
+	}
+	// An explicit run's own range: a deferred hour in it that is refused
+	// again still exits 3 (the operator asked for that hour).
+	requested := map[time.Time]bool{}
+	if explicit {
+		for _, h := range windows {
+			requested[h.UTC()] = true
+		}
+	}
+	var attempted []time.Time
+	settled := map[time.Time]bool{}
+
+	heldBack, rejected, failed, newlyParked, deferredNow, newlyDeferred := 0, 0, 0, 0, 0, 0
 	videoVanished := 0   // hours whose sent video rollups are gone (exit 1)
 	staleTombstones := 0 // live video records that still have a tombstone (exit 1)
 	unreachable := 0     // consecutive hours the manager could not be reached for
 	var unchanged []time.Time
 send:
 	for i, h := range hours {
+		attempted = append(attempted, h)
 		plan, err := p.buildHour(ctx, h, withVideo)
 		if err != nil {
 			p.log.Error.Printf("token-push: build request for %s: %v", h.Format(time.RFC3339), err)
@@ -605,14 +653,24 @@ send:
 				continue
 			}
 			parked[h] = sum
+			settled[h] = true
 			newlyParked++
 			p.log.Error.Printf("token-push: PARKED %s: the request breaks a wire rule (%v); not sent, and not re-sent until its usage changes (refused_hour)", plan.req.WindowStart, err)
 			continue
 		}
-		if err := p.store.RecordIntent(ctx, h, plan.sent); err != nil {
+		added, err := p.store.RecordIntent(ctx, h, plan.sent)
+		if err != nil {
 			p.log.Error.Printf("token-push: record intent for %s: %v (not sent)", plan.req.WindowStart, err)
 			failed++
 			continue
+		}
+		// forget removes the intent rows this attempt added, after a refusal
+		// the manager answered itself (it stored nothing for the request).
+		forget := func() {
+			if err := p.store.ForgetIntent(ctx, h, added); err != nil {
+				p.log.Error.Printf("token-push: %s: %v", plan.req.WindowStart, err)
+				failed++
+			}
 		}
 
 		resp, err := p.client.Post(ctx, plan.req)
@@ -639,6 +697,7 @@ send:
 				failed++
 				continue
 			}
+			settled[h] = true
 			if wasParked {
 				delete(parked, h)
 				p.log.Info.Printf("token-push: %s was parked; its payload changed and the manager accepted it", plan.req.WindowStart)
@@ -650,34 +709,53 @@ send:
 			// be accepted. Park the hour so it is not re-sent every run and
 			// does not hold up other hours.
 			rejected++
+			forget()
 			if err := p.store.RecordRefused(ctx, h, rej.Status, rej.Body, sum); err != nil {
 				p.log.Error.Printf("token-push: manager REJECTED %s with %d (%s) and it could not be parked: %v", plan.req.WindowStart, rej.Status, rej.Body, err)
 				failed++
 				continue
 			}
 			parked[h] = sum
+			settled[h] = true
 			newlyParked++
 			p.log.Error.Printf("token-push: PARKED %s: manager REJECTED it with %d: %s. Not re-sent until its usage changes (refused_hour); needs a person",
 				plan.req.WindowStart, rej.Status, rej.Body)
-		case errors.As(err, &rej) && refusalDefersTheHour(rej):
+		case errors.As(err, &rej) && refusalDefersTheHour(rej, plan.req.Kinds):
 			// The manager does not accept a kind this hour lists (a manager
 			// older than phoebe). It stored nothing, so it still holds what it
 			// held for the hour. Defer the hour: every run re-sends it until
 			// it is accepted, and the other hours are still sent.
-			rejected++
-			if err := p.store.RecordDeferred(ctx, h, rej.Status, rej.Body); err != nil {
+			forget()
+			first, err := p.store.RecordDeferred(ctx, h, rej.Status, rej.Body)
+			if err != nil {
+				rejected++
 				p.log.Error.Printf("token-push: manager REFUSED %s (kinds %v) with %d (%s) and it could not be deferred: %v. It is re-sent only while it is in the trailing window or never accepted",
 					plan.req.WindowStart, plan.req.Kinds, rej.Status, rej.Body, err)
 				failed++
 				continue
 			}
 			deferredNow++
+			settled[h] = true
 			delete(parked, h) // RecordDeferred unparked it
-			p.log.Error.Printf("token-push: DEFERRED %s: manager REFUSED it with %d: %s. The manager does not accept a usage kind this hour lists (kinds %v) from this install: it is older than phoebe (a 409 here means a manager without saturn-aws-manager#334, which accepts video from installs on the legacy billing path; a 400 on kinds means a manager without the video kind). The manager stored nothing for the hour; it is re-sent by every run until accepted (deferred_hour), and the other hours are still sent. Upgrade the manager",
-				plan.req.WindowStart, rej.Status, rej.Body, plan.req.Kinds)
-		case errors.As(err, &rej) && refusalIsForTheInstall(rej):
+			if !first {
+				// Refused again. Option B (issue #95): no exit 3 and no ERROR
+				// for it; the WARN summary below counts it, and Saturn alerts
+				// on the oldest deferred hour from the manager's side.
+				if requested[h] {
+					rejected++
+				}
+				p.log.Info.Printf("token-push: %s is still deferred: manager refused it again with %d: %s (kinds %v)",
+					plan.req.WindowStart, rej.Status, rej.Body, plan.req.Kinds)
+				continue
+			}
 			rejected++
-			p.log.Error.Printf("token-push: manager REJECTED %s with %d: %s. This refusal is for the whole install (401 token, 403 inactive or uninstalled install), so the run stops; %d hour(s) not sent this run. Needs a person",
+			newlyDeferred++
+			p.log.Error.Printf("token-push: DEFERRED %s: manager REFUSED it with %d: %s. The manager does not accept, from this install, a usage kind this hour lists (kinds %v): it is older than phoebe (a 409 is a kind it does not accept from an install on the legacy billing path, for video a manager without saturn-aws-manager#334; a 400 on kinds is a kind it does not know). Nothing is lost and nothing is needed on this install: the manager stored nothing for this request and keeps what it held for the hour, every run re-sends the hour until the manager accepts it (deferred_hour), and the other hours are still sent. Only this first refusal exits 3. The fix is a manager upgrade, which only Saturn can do: report this line to Saturn support",
+				plan.req.WindowStart, rej.Status, rej.Body, plan.req.Kinds)
+		case errors.As(err, &rej) && refusalIsForTheInstall(rej, plan.req.Kinds):
+			rejected++
+			forget()
+			p.log.Error.Printf("token-push: manager REJECTED %s with %d: %s. This refusal is for the whole install (401 token, 403 inactive or uninstalled install, or a 409 or a 400 on kinds for a request that lists only token: the manager refuses this install's token usage), so the run stops; %d hour(s) not sent this run. Needs a person",
 				plan.req.WindowStart, rej.Status, rej.Body, len(hours)-i-1)
 			break send
 		case errors.As(err, &rej):
@@ -690,6 +768,16 @@ send:
 		}
 	}
 	if err := p.store.MarkRefusedChecked(ctx, unchanged); err != nil {
+		p.log.Error.Printf("token-push: %v", err)
+		failed++
+	}
+	var touch []time.Time
+	for _, h := range attempted {
+		if wasDeferred[h] && !settled[h] {
+			touch = append(touch, h)
+		}
+	}
+	if err := p.store.TouchDeferred(ctx, touch); err != nil {
 		p.log.Error.Printf("token-push: %v", err)
 		failed++
 	}
@@ -708,8 +796,8 @@ send:
 		p.log.Error.Printf("token-push: %v", err)
 		failed++
 	} else if count > 0 {
-		p.log.Warn.Printf("token-push: %d hour(s) are deferred (%d refused this run), oldest %s: the manager refuses a usage kind they list from this install, so they are re-sent every run until it accepts them. They are listed in deferred_hour; upgrade the manager",
-			count, deferredNow, oldest.Format(time.RFC3339))
+		p.log.Warn.Printf("token-push: %d hour(s) are deferred (%d refused this run, %d newly), oldest %s: the manager refuses a usage kind they list from this install, so they are re-sent every run until it accepts them (deferred_hour). Nothing is lost and nothing is needed on this install; only the run that defers an hour exits 3. Saturn is alerted to the oldest deferred hour and fixes it by upgrading the manager. If this line persists for more than a day, report it to Saturn support",
+			count, deferredNow, newlyDeferred, oldest.Format(time.RFC3339))
 	}
 
 	switch {
