@@ -360,45 +360,63 @@ func TestAPIRefusesRequestsWithoutTheInterceptorToken(t *testing.T) {
 
 func testLogger() *logging.Logger { return logging.New(logging.ERROR) }
 
-// A retrieval handoff (issue #13) needs the org, the key and the video's
-// endpoint, and must carry none of the endpoint's own route fields: the
-// endpoint may be stopped or deleted, and a mix would mean the edge contract
-// is broken.
-func TestRetrievalHandoffNeedsOrgKeyAndEndpointOnly(t *testing.T) {
-	h := Handoff{Retrieval: true, OrgID: "o", AuthID: "a", ResourceID: "r"}
-	enc, _ := EncodeHandoff(h)
-	if got, err := decodeHandoff(enc); err != nil || got != h {
-		t.Fatalf("round trip: %+v %v", got, err)
+// An org-host handoff (issue #71) needs the org and the key; its endpoint is
+// an optional restriction. It must carry none of an endpoint route's own
+// fields: the videos may belong to a stopped or deleted endpoint, and a mix
+// would mean the edge contract is broken.
+func TestOrgHostHandoffNeedsOrgAndKeyOnly(t *testing.T) {
+	for _, h := range []Handoff{
+		{OrgHost: true, OrgID: "o", AuthID: "a"},
+		{OrgHost: true, OrgID: "o", AuthID: "a", ResourceID: "r"},
+		{OrgHost: true, NoMatch: true, OrgID: "o", AuthID: "a"},
+	} {
+		enc, _ := EncodeHandoff(h)
+		if got, err := decodeHandoff(enc); err != nil || got != h {
+			t.Fatalf("round trip: %+v %v", got, err)
+		}
 	}
+	base := Handoff{OrgHost: true, OrgID: "o", AuthID: "a", ResourceID: "r"}
 	for _, mut := range []func(*Handoff){
 		func(h *Handoff) { h.OrgID = "" }, func(h *Handoff) { h.AuthID = "" },
-		func(h *Handoff) { h.ResourceID = "" }, func(h *Handoff) { h.ServedModel = "m" },
+		func(h *Handoff) { h.ServedModel = "m" },
 		func(h *Handoff) { h.Upstream = "u:8000" }, func(h *Handoff) { h.Limits = "{}" },
 		func(h *Handoff) { h.ServingMode = "dedicated" }, func(h *Handoff) { h.BaseModel = "b" },
 	} {
-		bad := h
+		bad := base
 		mut(&bad)
 		enc, _ := EncodeHandoff(bad)
 		if _, err := decodeHandoff(enc); err == nil {
-			t.Errorf("accepted retrieval identity %+v", bad)
+			t.Errorf("accepted org-host identity %+v", bad)
 		}
+	}
+	// no_match belongs to the org host's list only.
+	endpoint := Handoff{NoMatch: true, OrgID: "o", AuthID: "a", ResourceID: "r", ServedModel: "m",
+		BaseModel: "b", ServingMode: "dedicated", Upstream: "u:8000"}
+	enc, _ := EncodeHandoff(endpoint)
+	if _, err := decodeHandoff(enc); err == nil {
+		t.Error("accepted no_match on an endpoint identity")
+	}
+	// The retired retrieval handoff (issue #13) is refused outright.
+	if _, err := decodeHandoff(base64RawJSON(`{"retrieval":true,"org_id":"o","auth_id":"a","resource_id":"r"}`)); err == nil {
+		t.Error("accepted the retired retrieval handoff")
 	}
 }
 
-// Checks the outcome: create and list on a retrieval handoff answer 404 and
-// write no job (this API has no store to touch). The outcome holds even with
-// the Retrieval branch in API.ServeHTTP removed, because a retrieval handoff
-// carries no limits and ParseLimits("") fails. The retrieval read, download
-// and delete tests are what catch a missing branch.
-func TestRetrievalHandoffCannotCreateOrList(t *testing.T) {
+func base64RawJSON(s string) string { return base64.RawURLEncoding.EncodeToString([]byte(s)) }
+
+// An org-host handoff never creates a video (the interceptor builds an
+// endpoint handoff for that) and serves nothing outside the video surface.
+// This API has no store, so only refusals that happen before the store are
+// checked here; the integration tests cover the rest.
+func TestOrgHostHandoffNeverCreates(t *testing.T) {
 	api := NewAPI(APIConfig{Token: "tok"}, nil, nil, nil, testLogger())
-	enc, _ := EncodeHandoff(Handoff{Retrieval: true, OrgID: "o", AuthID: "a", ResourceID: "r"})
+	enc, _ := EncodeHandoff(Handoff{OrgHost: true, OrgID: "o", AuthID: "a"})
 	for _, tc := range []struct{ method, path string }{
-		{http.MethodPost, "/v1/videos"}, {http.MethodGet, "/v1/videos"},
+		{http.MethodPost, "/v1/videos"}, {http.MethodDelete, "/v1/videos"},
 		{http.MethodGet, "/v1/videos/not-an-id"}, {http.MethodPut, "/v1/videos/video_01ARZ3NDEKTSV4RRFFQ69G5FAV"},
 		{http.MethodGet, "/v1/videos/video_01ARZ3NDEKTSV4RRFFQ69G5FAV/remix"},
 	} {
-		r := httptest.NewRequest(tc.method, tc.path, nil)
+		r := httptest.NewRequest(tc.method, tc.path, strings.NewReader(`{"model":"m","prompt":"x"}`))
 		r.Header.Set(HeaderToken, "tok")
 		r.Header.Set(HeaderHandoff, enc)
 		w := httptest.NewRecorder()

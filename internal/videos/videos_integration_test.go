@@ -789,12 +789,12 @@ func TestARefusedCreateClosesItsGrant(t *testing.T) {
 	}
 }
 
-// retrieval is the handoff the always-on retrieval route sends (issue #13):
-// the video's org and endpoint as Atlas stamped them, the caller's key, and
-// nothing a stopped or deleted endpoint could no longer provide (no upstream,
-// served model, serving mode or limits).
-func retrieval(org, resource string) Handoff {
-	return Handoff{Retrieval: true, OrgID: org, AuthID: "other-key-" + org, ResourceID: resource}
+// orgHost is the handoff an org host sends (issue #71) for list, read,
+// download and delete: the host's org and the caller's key, and an endpoint
+// only as a restriction (an endpoint-scoped key, or the list's model filter).
+// Nothing a stopped or deleted endpoint could no longer provide.
+func orgHost(org, scope string) Handoff {
+	return Handoff{OrgHost: true, OrgID: org, AuthID: "other-key-" + org, ResourceID: scope}
 }
 
 // completed creates a job on the endpoint's own route and runs it.
@@ -805,45 +805,53 @@ func (h *harness) completed(id Handoff) Object {
 	return o
 }
 
-func TestRetrievalServesAVideoWithoutTheEndpointRouteIdentity(t *testing.T) {
+// TestOrgHostVideoRetrievalAfterEndpointDeleted: phoebe-videos never sees
+// endpoint state, and the org-host handoff carries no served model, base
+// model or limits, so a video is served for its org whatever became of the
+// endpoint (Atlas has no say on the org host's read path).
+func TestOrgHostVideoRetrievalAfterEndpointDeleted(t *testing.T) {
 	h := newHarness(t)
 	o := h.completed(identity("org-a", "res-1"))
-	// phoebe-videos never sees endpoint state; the retrieval handoff carries
-	// no served model, base model or limits, and the job is still served for
-	// its org and endpoint. Stopped and deleted endpoints are covered in
-	// Atlas test_retrieval_check_works_when_the_endpoint_is_stopped /
-	// _is_deleted.
-	r := retrieval("org-a", "res-1")
-	got := h.object(h.do(http.MethodGet, "/v1/videos/"+o.ID, "", r))
-	if got.ID != o.ID || got.Status != StatusCompleted || got.ExpiresAt == nil || got.Usage == nil {
-		t.Fatalf("object via retrieval: %+v", got)
-	}
-	w := h.do(http.MethodGet, "/v1/videos/"+o.ID+"/content", "", r)
-	if w.Code != http.StatusOK || w.Header().Get("Content-Type") != "video/mp4" ||
-		!bytes.HasPrefix(w.Body.Bytes(), []byte("\x00\x00\x00\x08ftypMP4!"+o.ID)) {
-		t.Fatalf("content via retrieval: %d %q", w.Code, w.Body.String())
-	}
-	if w := h.do(http.MethodGet, "/v1/videos/"+o.ID+"/content?variant=thumbnail", "", r); w.Code != http.StatusOK || w.Header().Get("Content-Type") != "image/webp" {
-		t.Fatalf("thumbnail via retrieval: %d", w.Code)
+	for _, r := range []Handoff{orgHost("org-a", ""), orgHost("org-a", "res-1")} {
+		got := h.object(h.do(http.MethodGet, "/v1/videos/"+o.ID, "", r))
+		if got.ID != o.ID || got.Status != StatusCompleted || got.ExpiresAt == nil || got.Usage == nil {
+			t.Fatalf("object via the org host: %+v", got)
+		}
+		w := h.do(http.MethodGet, "/v1/videos/"+o.ID+"/content", "", r)
+		if w.Code != http.StatusOK || w.Header().Get("Content-Type") != "video/mp4" ||
+			!bytes.HasPrefix(w.Body.Bytes(), []byte("\x00\x00\x00\x08ftypMP4!"+o.ID)) {
+			t.Fatalf("content via the org host: %d %q", w.Code, w.Body.String())
+		}
+		if w := h.do(http.MethodGet, "/v1/videos/"+o.ID+"/content?variant=thumbnail", "", r); w.Code != http.StatusOK || w.Header().Get("Content-Type") != "image/webp" {
+			t.Fatalf("thumbnail via the org host: %d", w.Code)
+		}
 	}
 	// Still 24 hours of it: one second before expires_at the file is served.
+	got := h.object(h.do(http.MethodGet, "/v1/videos/"+o.ID, "", orgHost("org-a", "")))
 	h.now = time.Unix(*got.ExpiresAt, 0).Add(-time.Second)
-	if w := h.do(http.MethodGet, "/v1/videos/"+o.ID+"/content", "", r); w.Code != http.StatusOK {
+	if w := h.do(http.MethodGet, "/v1/videos/"+o.ID+"/content", "", orgHost("org-a", "")); w.Code != http.StatusOK {
 		t.Fatalf("content just before expiry: %d %s", w.Code, w.Body)
 	}
 }
 
-func TestRetrievalOfAnotherOrgsOrEndpointsVideoIsNotFound(t *testing.T) {
+// TestOrgHostOtherOrgsVideoIs404 and TestEndpointScopedKeyReachesOnlyItsVideos:
+// another org's video, and another endpoint's video for an endpoint-scoped
+// key, answer exactly like an unknown id (404, never 403), and a refused
+// delete removes nothing.
+func TestOrgHostOtherOrgsVideoIs404(t *testing.T) {
 	h := newHarness(t)
 	o := h.completed(identity("org-a", "res-1"))
-	for _, other := range []Handoff{retrieval("org-b", "res-1"), retrieval("org-a", "res-2")} {
+	unknown := "video_01ARZ3NDEKTSV4RRFFQ69G5FAV"
+	for _, other := range []Handoff{orgHost("org-b", ""), orgHost("org-b", "res-1")} {
 		for _, req := range []struct{ method, path string }{
 			{http.MethodGet, "/v1/videos/" + o.ID},
 			{http.MethodGet, "/v1/videos/" + o.ID + "/content"},
 			{http.MethodDelete, "/v1/videos/" + o.ID},
 		} {
-			if w := h.do(req.method, req.path, "", other); w.Code != http.StatusNotFound {
-				t.Errorf("%s %s as %s/%s: %d, want 404 (never 403)", req.method, req.path, other.OrgID, other.ResourceID, w.Code)
+			w := h.do(req.method, req.path, "", other)
+			u := h.do(req.method, strings.Replace(req.path, o.ID, unknown, 1), "", other)
+			if w.Code != http.StatusNotFound || w.Body.String() != u.Body.String() {
+				t.Errorf("%s %s as %s: %d %s, want the unknown id's 404 %s", req.method, req.path, other.OrgID, w.Code, w.Body, u.Body)
 			}
 		}
 	}
@@ -852,28 +860,39 @@ func TestRetrievalOfAnotherOrgsOrEndpointsVideoIsNotFound(t *testing.T) {
 	}
 }
 
-func TestRetrievalAfterExpiryAnswers410(t *testing.T) {
+func TestEndpointScopedKeyReachesOnlyItsVideos(t *testing.T) {
 	h := newHarness(t)
-	o := h.completed(identity("org-a", "res-1"))
-	r := retrieval("org-a", "res-1")
-	// More than 24 hours after completion: the object still reads (the row is
-	// kept 30 days), the content is gone.
-	h.now = h.now.Add(24*time.Hour + time.Second)
-	if w := h.do(http.MethodGet, "/v1/videos/"+o.ID, "", r); w.Code != http.StatusOK {
-		t.Fatalf("object after expiry: %d", w.Code)
+	mine := h.completed(identity("org-a", "res-1"))
+	theirs := h.completed(identity("org-a", "res-2"))
+	scoped := orgHost("org-a", "res-1")
+	if w := h.do(http.MethodGet, "/v1/videos/"+mine.ID, "", scoped); w.Code != http.StatusOK {
+		t.Fatalf("own endpoint's video: %d", w.Code)
 	}
-	if w := h.do(http.MethodGet, "/v1/videos/"+o.ID+"/content", "", r); w.Code != http.StatusGone || errorCode(w) != "video_expired" {
-		t.Fatalf("content after expiry: %d %s", w.Code, w.Body)
+	for _, req := range []struct{ method, path string }{
+		{http.MethodGet, "/v1/videos/" + theirs.ID},
+		{http.MethodGet, "/v1/videos/" + theirs.ID + "/content"},
+		{http.MethodDelete, "/v1/videos/" + theirs.ID},
+	} {
+		if w := h.do(req.method, req.path, "", scoped); w.Code != http.StatusNotFound {
+			t.Errorf("%s %s with a key scoped to res-1: %d, want 404", req.method, req.path, w.Code)
+		}
+	}
+	page := h.listPage("/v1/videos", scoped)
+	if len(page.Data) != 1 || page.Data[0].ID != mine.ID {
+		t.Fatalf("scoped list: %+v", page.Data)
+	}
+	if w := h.do(http.MethodGet, "/v1/videos?after="+theirs.ID, "", scoped); w.Code != http.StatusBadRequest {
+		t.Fatalf("another endpoint's id as the scoped key's cursor: %d", w.Code)
 	}
 }
 
-func TestRetrievalDeletesAVideoAndThenAnswers410(t *testing.T) {
+func TestOrgHostDeletesAVideoAndThenAnswers410(t *testing.T) {
 	h := newHarness(t)
 	o := h.completed(identity("org-a", "res-1"))
-	r := retrieval("org-a", "res-1")
+	r := orgHost("org-a", "")
 	w := h.do(http.MethodDelete, "/v1/videos/"+o.ID, "", r)
 	if got := h.object(w); w.Code != http.StatusOK || got.Status != StatusCompleted {
-		t.Fatalf("delete via retrieval: %d %+v", w.Code, got)
+		t.Fatalf("delete via the org host: %d %+v", w.Code, got)
 	}
 	if len(h.blob.keys()) != 0 {
 		t.Fatalf("files remain after delete: %v", h.blob.keys())
@@ -881,32 +900,286 @@ func TestRetrievalDeletesAVideoAndThenAnswers410(t *testing.T) {
 	if w := h.do(http.MethodGet, "/v1/videos/"+o.ID+"/content", "", r); w.Code != http.StatusGone || errorCode(w) != "video_expired" {
 		t.Fatalf("content after delete: %d %s", w.Code, w.Body)
 	}
-	// A queued job on a stopped endpoint can be cancelled from here too.
+	// A queued job on a stopped endpoint can be cancelled from the org host
+	// with no endpoint named in the handoff.
 	q := h.create(identity("org-a", "res-1"))
 	w = h.do(http.MethodDelete, "/v1/videos/"+q.ID, "", r)
 	if got := h.object(w); w.Code != http.StatusOK || got.Status != StatusCancelled {
-		t.Fatalf("cancel via retrieval: %d %+v", w.Code, got)
+		t.Fatalf("cancel via the org host: %d %+v", w.Code, got)
+	}
+	if w := h.do(http.MethodGet, "/v1/videos/"+o.ID, "", r); w.Code != http.StatusOK {
+		t.Fatalf("object after expiry: %d", w.Code)
 	}
 }
 
-// Checks the outcome: create and list on a retrieval handoff answer 404 and
-// write no job. The outcome holds even with the Retrieval branch in
-// API.ServeHTTP removed, because a retrieval handoff carries no limits and
-// ParseLimits("") fails. The retrieval read, download and delete tests are
-// what catch a missing branch.
-func TestRetrievalNeverCreatesOrLists(t *testing.T) {
+func TestOrgHostNeverCreates(t *testing.T) {
 	h := newHarness(t)
-	r := retrieval("org-a", "res-1")
-	if w := h.do(http.MethodPost, "/v1/videos", `{"model":"my-wan","prompt":"x"}`, r); w.Code != http.StatusNotFound {
-		t.Fatalf("create via retrieval: %d", w.Code)
-	}
-	if w := h.do(http.MethodGet, "/v1/videos", "", r); w.Code != http.StatusNotFound {
-		t.Fatalf("list via retrieval: %d", w.Code)
+	if w := h.do(http.MethodPost, "/v1/videos", `{"model":"my-wan","prompt":"x"}`, orgHost("org-a", "res-1")); w.Code != http.StatusNotFound {
+		t.Fatalf("create via an org-host handoff: %d", w.Code)
 	}
 	var n int
 	_ = h.db.QueryRow(`SELECT count(*) FROM video_job`).Scan(&n)
 	if n != 0 {
 		t.Fatalf("%d jobs exist", n)
+	}
+}
+
+type listPage struct {
+	Object  string   `json:"object"`
+	Data    []Object `json:"data"`
+	FirstID *string  `json:"first_id"`
+	LastID  *string  `json:"last_id"`
+	HasMore bool     `json:"has_more"`
+}
+
+func (h *harness) listPage(path string, id Handoff) listPage {
+	h.t.Helper()
+	w := h.do(http.MethodGet, path, "", id)
+	if w.Code != http.StatusOK {
+		h.t.Fatalf("GET %s: %d %s", path, w.Code, w.Body)
+	}
+	var p listPage
+	if err := json.Unmarshal(w.Body.Bytes(), &p); err != nil {
+		h.t.Fatal(err)
+	}
+	return p
+}
+
+// seedJobs writes jobs straight into the store at the given creation times,
+// for (org, resource) pairs, and returns their ids in creation order.
+func (h *harness) seedJobs(specs []struct {
+	org, resource string
+	at            time.Time
+}) []string {
+	h.t.Helper()
+	var ids []string
+	for _, sp := range specs {
+		id := identity(sp.org, sp.resource)
+		j := &Job{OrgID: id.OrgID, AuthID: id.AuthID, ResourceID: id.ResourceID, ServedModel: "my-wan",
+			BaseModel: id.BaseModel, ServingMode: "dedicated", Upstream: id.Upstream, Task: TaskT2V,
+			Seconds: 5, Size: "1280x704", FPS: 24, GPUs: 1, MaxConcurrency: 1, CreatedAt: sp.at}
+		j.ID, _ = NewID(sp.at)
+		if err := h.store.Insert(context.Background(), j, 1000, 1000); err != nil {
+			h.t.Fatal(err)
+		}
+		ids = append(ids, j.ID)
+	}
+	return ids
+}
+
+// walk pages through a list with limit per page and returns every id.
+func (h *harness) walk(id Handoff, base string, limit int, order string) (ids []string, pages int) {
+	h.t.Helper()
+	after := ""
+	for {
+		q := fmt.Sprintf("%s%slimit=%d&order=%s", base, sep(base), limit, order)
+		if after != "" {
+			q += "&after=" + after
+		}
+		p := h.listPage(q, id)
+		pages++
+		for _, o := range p.Data {
+			ids = append(ids, o.ID)
+		}
+		if !p.HasMore {
+			return ids, pages
+		}
+		if p.LastID == nil || pages > 1000 {
+			h.t.Fatalf("has_more with last_id %v after %d pages", p.LastID, pages)
+		}
+		after = *p.LastID
+	}
+}
+
+func sep(base string) string {
+	if strings.Contains(base, "?") {
+		return "&"
+	}
+	return "?"
+}
+
+func reversed(in []string) []string {
+	out := make([]string, len(in))
+	for i, v := range in {
+		out[len(in)-1-i] = v
+	}
+	return out
+}
+
+// TestOrgHostVideoListIsOrgWide: the org host's list covers every endpoint
+// of the host's org (a stopped or deleted one's too) and nothing of another
+// org.
+func TestOrgHostVideoListIsOrgWide(t *testing.T) {
+	h := newHarness(t)
+	ids := h.seedJobs([]struct {
+		org, resource string
+		at            time.Time
+	}{
+		{"org-a", "res-1", h.now}, {"org-b", "res-9", h.now.Add(time.Second)},
+		{"org-a", "res-2", h.now.Add(2 * time.Second)}, {"org-a", "res-3", h.now.Add(3 * time.Second)},
+	})
+	p := h.listPage("/v1/videos", orgHost("org-a", ""))
+	var got []string
+	for _, o := range p.Data {
+		got = append(got, o.ID)
+	}
+	if want := []string{ids[3], ids[2], ids[0]}; fmt.Sprint(got) != fmt.Sprint(want) || p.Object != "list" || p.HasMore {
+		t.Fatalf("org-wide list %v want %v (newest first): %+v", got, want, p)
+	}
+	if *p.FirstID != ids[3] || *p.LastID != ids[0] {
+		t.Fatalf("first_id/last_id: %v %v", *p.FirstID, *p.LastID)
+	}
+	// The video object carries its endpoint's model, so callers can tell
+	// jobs of different endpoints apart.
+	if p.Data[0].Model != "my-wan" {
+		t.Fatalf("model on the object: %+v", p.Data[0])
+	}
+}
+
+// TestOrgHostVideoListModelFilter: the interceptor resolves ?model= to one
+// endpoint and passes it as the restriction; phoebe-videos accepts the model
+// parameter only on the org host.
+func TestOrgHostVideoListModelFilter(t *testing.T) {
+	h := newHarness(t)
+	ids := h.seedJobs([]struct {
+		org, resource string
+		at            time.Time
+	}{
+		{"org-a", "res-1", h.now}, {"org-a", "res-2", h.now.Add(time.Second)}, {"org-a", "res-1", h.now.Add(2 * time.Second)},
+	})
+	p := h.listPage("/v1/videos?model=wan-one", orgHost("org-a", "res-1"))
+	if len(p.Data) != 2 || p.Data[0].ID != ids[2] || p.Data[1].ID != ids[0] {
+		t.Fatalf("filtered list: %+v", p.Data)
+	}
+	// On an endpoint route model is not a list parameter (unchanged).
+	if w := h.do(http.MethodGet, "/v1/videos?model=wan-one", "", identity("org-a", "res-1")); w.Code != http.StatusBadRequest {
+		t.Fatalf("model on an endpoint route's list: %d", w.Code)
+	}
+}
+
+// TestOrgHostVideoListUnknownModelIsEmptyNot404: a filter that names no
+// endpoint the caller may see is an empty page, never a 404, so the filter
+// reveals nothing; it stays empty whatever the other parameters are.
+func TestOrgHostVideoListUnknownModelIsEmptyNot404(t *testing.T) {
+	h := newHarness(t)
+	h.seedJobs([]struct {
+		org, resource string
+		at            time.Time
+	}{{"org-a", "res-1", h.now}})
+	none := Handoff{OrgHost: true, NoMatch: true, OrgID: "org-a", AuthID: "k"}
+	for _, q := range []string{"/v1/videos?model=nope", "/v1/videos?model=nope&limit=5&order=asc"} {
+		p := h.listPage(q, none)
+		if p.Object != "list" || len(p.Data) != 0 || p.HasMore || p.FirstID != nil || p.LastID != nil {
+			t.Fatalf("%s: %+v", q, p)
+		}
+	}
+	// Parameter validation still applies.
+	if w := h.do(http.MethodGet, "/v1/videos?model=nope&limit=0", "", none); w.Code != http.StatusBadRequest {
+		t.Fatalf("limit=0: %d", w.Code)
+	}
+}
+
+// TestOrgHostVideoListPaginatesWithAfterLimitOrder walks more than one page
+// in both orders, checks the defaults (20, newest first) and the 1..100
+// bound, and that any other parameter is a 400.
+func TestOrgHostVideoListPaginatesWithAfterLimitOrder(t *testing.T) {
+	h := newHarness(t)
+	var specs []struct {
+		org, resource string
+		at            time.Time
+	}
+	for i := 0; i < 25; i++ {
+		specs = append(specs, struct {
+			org, resource string
+			at            time.Time
+		}{"org-a", fmt.Sprintf("res-%d", i%3), h.now.Add(time.Duration(i) * time.Second)})
+	}
+	ids := h.seedJobs(specs)
+	r := orgHost("org-a", "")
+	got, pages := h.walk(r, "/v1/videos", 7, "asc")
+	if fmt.Sprint(got) != fmt.Sprint(ids) || pages != 4 {
+		t.Fatalf("asc: %d pages %v want %v", pages, got, ids)
+	}
+	got, pages = h.walk(r, "/v1/videos", 10, "desc")
+	if fmt.Sprint(got) != fmt.Sprint(reversed(ids)) || pages != 3 {
+		t.Fatalf("desc: %d pages %v", pages, got)
+	}
+	// Defaults: 20 per page, newest first.
+	p := h.listPage("/v1/videos", r)
+	if len(p.Data) != 20 || !p.HasMore || *p.FirstID != ids[24] || *p.LastID != ids[5] {
+		t.Fatalf("defaults: %d items has_more=%v first=%v last=%v", len(p.Data), p.HasMore, *p.FirstID, *p.LastID)
+	}
+	next := h.listPage("/v1/videos?after="+*p.LastID, r)
+	if len(next.Data) != 5 || next.HasMore || next.Data[0].ID != ids[4] {
+		t.Fatalf("second default page: %+v", next)
+	}
+	p = h.listPage("/v1/videos?limit=100", r)
+	if len(p.Data) != 25 || p.HasMore {
+		t.Fatalf("limit=100: %d %v", len(p.Data), p.HasMore)
+	}
+	for _, bad := range []string{"limit=0", "limit=101", "limit=x", "order=sideways", "after=nope", "foo=1", "variant=video"} {
+		if w := h.do(http.MethodGet, "/v1/videos?"+bad, "", r); w.Code != http.StatusBadRequest {
+			t.Errorf("%s: %d", bad, w.Code)
+		}
+	}
+}
+
+// TestOrgHostVideoListCursorStableOnEqualTimestamps: jobs created in the same
+// instant are ordered by id, so a cursor never skips or repeats one.
+func TestOrgHostVideoListCursorStableOnEqualTimestamps(t *testing.T) {
+	h := newHarness(t)
+	var specs []struct {
+		org, resource string
+		at            time.Time
+	}
+	for i := 0; i < 9; i++ {
+		specs = append(specs, struct {
+			org, resource string
+			at            time.Time
+		}{"org-a", fmt.Sprintf("res-%d", i%2), h.now})
+	}
+	ids := h.seedJobs(specs)
+	sorted := append([]string(nil), ids...)
+	sort.Strings(sorted)
+	r := orgHost("org-a", "")
+	for _, limit := range []int{1, 2, 4} {
+		if got, _ := h.walk(r, "/v1/videos", limit, "asc"); fmt.Sprint(got) != fmt.Sprint(sorted) {
+			t.Fatalf("asc limit %d: %v want %v", limit, got, sorted)
+		}
+		if got, _ := h.walk(r, "/v1/videos", limit, "desc"); fmt.Sprint(got) != fmt.Sprint(reversed(sorted)) {
+			t.Fatalf("desc limit %d: %v", limit, got)
+		}
+	}
+}
+
+// TestOrgHostVideoListAfterFromAnotherOrgIs400: a cursor must be a video of
+// the same list; another org's id is refused as a bad parameter, the same
+// answer as an unknown id.
+func TestOrgHostVideoListAfterFromAnotherOrgIs400(t *testing.T) {
+	h := newHarness(t)
+	ids := h.seedJobs([]struct {
+		org, resource string
+		at            time.Time
+	}{{"org-b", "res-1", h.now}, {"org-a", "res-1", h.now}})
+	w := h.do(http.MethodGet, "/v1/videos?after="+ids[0], "", orgHost("org-a", ""))
+	u := h.do(http.MethodGet, "/v1/videos?after=video_01ARZ3NDEKTSV4RRFFQ69G5FAV", "", orgHost("org-a", ""))
+	if w.Code != http.StatusBadRequest || w.Body.String() != u.Body.String() {
+		t.Fatalf("another org's cursor: %d %s vs unknown %s", w.Code, w.Body, u.Body)
+	}
+	if !strings.Contains(w.Body.String(), `"param":"after"`) {
+		t.Fatalf("param not named: %s", w.Body)
+	}
+}
+
+// The org-wide list reads video_job_org_list_ix (migration 0021).
+func TestOrgWideListIndexExists(t *testing.T) {
+	h := newHarness(t)
+	var def string
+	if err := h.db.QueryRow(`SELECT indexdef FROM pg_indexes WHERE indexname = 'video_job_org_list_ix'`).Scan(&def); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(def, "(org_id, created_at, id)") {
+		t.Fatalf("index definition %q", def)
 	}
 }
 
@@ -1261,13 +1534,13 @@ func TestReaperContinuesPastAHungDelete(t *testing.T) {
 
 // P7: a DELETE that cancels a job or deletes its files logs the key that sent
 // it, with the org, endpoint, route and request id.
-func TestRetrievalDeleteLogsTheCallersKey(t *testing.T) {
+func TestOrgHostDeleteLogsTheCallersKey(t *testing.T) {
 	h := newHarness(t)
 	var buf bytes.Buffer
 	h.api.log.Info = log.New(&buf, "", 0)
 	del := func(jobID string) int {
 		r := httptest.NewRequest(http.MethodDelete, "/v1/videos/"+jobID, nil)
-		enc, _ := EncodeHandoff(retrieval("org-a", "res-1"))
+		enc, _ := EncodeHandoff(orgHost("org-a", "res-1"))
 		r.Header.Set(HeaderHandoff, enc)
 		r.Header.Set(HeaderToken, "tok")
 		r.Header.Set("X-Request-Id", "req-"+jobID)
@@ -1281,7 +1554,7 @@ func TestRetrievalDeleteLogsTheCallersKey(t *testing.T) {
 		if code := del(tc.jobID); code != http.StatusOK {
 			t.Fatalf("delete %s: %d", tc.jobID, code)
 		}
-		want := fmt.Sprintf(`videos: %s %s org_id="org-a" resource_id="res-1" auth_id="other-key-org-a" retrieval=true request_id="req-%s"`,
+		want := fmt.Sprintf(`videos: %s %s org_id="org-a" resource_id="res-1" auth_id="other-key-org-a" org_host=true request_id="req-%s"`,
 			tc.what, tc.jobID, tc.jobID)
 		if !strings.Contains(buf.String(), want) {
 			t.Errorf("log %q has no line %q", buf.String(), want)

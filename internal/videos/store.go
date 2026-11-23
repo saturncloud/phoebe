@@ -119,10 +119,18 @@ func (s *Store) Insert(ctx context.Context, j *Job, jobsInFlight, queueCap int) 
 	return tx.Commit()
 }
 
-// Get reads a job that belongs to the org on the endpoint. Any other job,
-// including one that exists for another org or endpoint, is sql.ErrNoRows:
-// the caller cannot learn that an id exists.
+// Get reads a job that belongs to the org, on the endpoint when resourceID is
+// set (an empty resourceID is the org host's org-wide lookup, issue #71). Any
+// other job, including one that exists for another org or endpoint, is
+// sql.ErrNoRows: the caller cannot learn that an id exists.
 func (s *Store) Get(ctx context.Context, id, orgID, resourceID string) (*Job, error) {
+	if orgID == "" {
+		return nil, sql.ErrNoRows
+	}
+	if resourceID == "" {
+		return scanJob(s.db.QueryRowContext(ctx, `SELECT `+jobColumns+` FROM video_job
+			WHERE id = $1 AND org_id = $2`, id, orgID))
+	}
 	row := s.db.QueryRowContext(ctx, `SELECT `+jobColumns+` FROM video_job
 		WHERE id = $1 AND org_id = $2 AND resource_id = $3`, id, orgID, resourceID)
 	return scanJob(row)
@@ -133,28 +141,47 @@ func (s *Store) GetByID(ctx context.Context, id string) (*Job, error) {
 	return scanJob(s.db.QueryRowContext(ctx, `SELECT `+jobColumns+` FROM video_job WHERE id = $1`, id))
 }
 
-// List returns up to limit+1 of the org's jobs on the endpoint, ordered by
-// (created_at, id) in order, starting after the job named by after (which
-// must itself belong to the org and endpoint; otherwise sql.ErrNoRows).
+// List returns up to limit+1 of the org's jobs, on the endpoint when
+// resourceID is set or across every endpoint of the org when it is empty (the
+// org host's list, issue #71), ordered by (created_at, id) in order, starting
+// after the job named by after (which must itself be in the same list;
+// otherwise sql.ErrNoRows). The endpoint list reads video_job_list_ix, the
+// org-wide list video_job_org_list_ix (migration 0021).
 func (s *Store) List(ctx context.Context, orgID, resourceID, after string, limit int, asc bool) ([]*Job, error) {
+	if orgID == "" {
+		return nil, nil
+	}
 	cmp, dir := "<", "DESC"
 	if asc {
 		cmp, dir = ">", "ASC"
 	}
-	args := []any{orgID, resourceID, limit + 1}
+	scope := ` WHERE org_id = $1`
+	args := []any{orgID}
+	if resourceID != "" {
+		args = append(args, resourceID)
+		scope += ` AND resource_id = $2`
+	}
 	cursor := ""
 	if after != "" {
+		// The cursor must be a job of the same list.
 		var created time.Time
-		if err := s.db.QueryRowContext(ctx, `SELECT created_at FROM video_job
-			WHERE id = $1 AND org_id = $2 AND resource_id = $3`, after, orgID, resourceID).Scan(&created); err != nil {
+		var err error
+		if resourceID == "" {
+			err = s.db.QueryRowContext(ctx, `SELECT created_at FROM video_job
+				WHERE id = $1 AND org_id = $2`, after, orgID).Scan(&created)
+		} else {
+			err = s.db.QueryRowContext(ctx, `SELECT created_at FROM video_job
+				WHERE id = $1 AND org_id = $2 AND resource_id = $3`, after, orgID, resourceID).Scan(&created)
+		}
+		if err != nil {
 			return nil, err
 		}
 		args = append(args, created, after)
-		cursor = fmt.Sprintf(` AND (created_at, id) %s ($4, $5)`, cmp)
+		cursor = fmt.Sprintf(` AND (created_at, id) %s ($%d, $%d)`, cmp, len(args)-1, len(args))
 	}
-	rows, err := s.db.QueryContext(ctx, `SELECT `+jobColumns+` FROM video_job
-		WHERE org_id = $1 AND resource_id = $2`+cursor+`
-		ORDER BY created_at `+dir+`, id `+dir+` LIMIT $3`, args...)
+	args = append(args, limit+1)
+	rows, err := s.db.QueryContext(ctx, `SELECT `+jobColumns+` FROM video_job`+scope+cursor+`
+		ORDER BY created_at `+dir+`, id `+dir+fmt.Sprintf(` LIMIT $%d`, len(args)), args...)
 	if err != nil {
 		return nil, err
 	}
