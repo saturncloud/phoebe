@@ -34,10 +34,11 @@ import (
 //
 // Other clusters: a create whose endpoint runs on another cluster is
 // forwarded to that cluster's org host (forwardOrgHost), which checks the key
-// again and runs the job there. Reads, downloads, deletes and lists answer
-// from this cluster's phoebe-videos only: design section 6 leaves merging
-// per-cluster video stores out of v1 (video generation runs on one cluster
-// today), so a video made on another cluster is a 404 here.
+// again and runs the job there. Reads, downloads and deletes of one video are
+// forwarded the same way when this cluster does not hold it, as design
+// section 6 says (orghost_video_forward.go). Only the org-wide list answers
+// from this cluster's phoebe-videos alone: design section 6 defers merging
+// per-cluster lists (video generation runs on one cluster today).
 
 var (
 	orgHostVideoNotFound   = clientError{Message: "Not found.", Type: "invalid_request_error", Code: "not_found"}
@@ -105,6 +106,22 @@ func (s *Server) serveOrgHostVideos(w http.ResponseWriter, r *http.Request, id i
 		s.orgHostVideoCreate(w, r, id, requestID, alreadyForwarded)
 		return
 	}
+	h := videos.Handoff{
+		OrgHost: true, OrgID: id.OrgID, AuthID: id.AuthID, UserID: id.UserID, GroupID: id.GroupID,
+		ResourceID: scope,
+	}
+	if routePath != "/v1/videos" {
+		// Read, download or delete one video: this cluster's store first,
+		// then the other clusters that serve the org's video endpoints
+		// (orghost_video_forward.go). With video generation off here only
+		// the other clusters are asked.
+		var local func(http.ResponseWriter, *http.Request)
+		if s.videos != nil {
+			local = func(w http.ResponseWriter, r *http.Request) { s.handOffVideo(w, r, requestID, h) }
+		}
+		s.serveOrgHostVideoByID(w, r, id, requestID, scope, local, alreadyForwarded)
+		return
+	}
 	// Video generation off here: checked after the create branch, because a
 	// create for an endpoint on another cluster is forwarded whatever this
 	// cluster runs.
@@ -112,11 +129,7 @@ func (s *Server) serveOrgHostVideos(w http.ResponseWriter, r *http.Request, id i
 		refuse("video generation is not enabled on this phoebe (videos.serviceUrl / PHOEBE_VIDEOS_TOKEN)")
 		return
 	}
-	h := videos.Handoff{
-		OrgHost: true, OrgID: id.OrgID, AuthID: id.AuthID, UserID: id.UserID, GroupID: id.GroupID,
-		ResourceID: scope,
-	}
-	if routePath == "/v1/videos" {
+	{
 		models := r.URL.Query()["model"]
 		if len(models) > 1 {
 			writeClientError(w, requestID, http.StatusBadRequest, orgHostVideoModelTwice)
@@ -142,9 +155,9 @@ func (s *Server) serveOrgHostVideos(w http.ResponseWriter, r *http.Request, id i
 			}
 		}
 	}
-	// Reads, downloads, deletes and lists: the org's videos on this cluster,
-	// restricted to the scoped endpoint for an endpoint-scoped key. No
-	// endpoint is bound, so the request's metrics carry no endpoint label.
+	// The list: the org's videos on this cluster, restricted to the scoped
+	// endpoint for an endpoint-scoped key. No endpoint is bound, so the
+	// request's metrics carry no endpoint label.
 	s.handOffVideo(w, r, requestID, h)
 }
 
