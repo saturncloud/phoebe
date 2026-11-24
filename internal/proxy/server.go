@@ -22,7 +22,7 @@ func (s *Server) Run() error {
 	return s.serve(stop)
 }
 
-// serve runs the proxy and metrics listeners until one fails or stop fires.
+// serve runs the proxy, metrics and org-host check listeners until one fails or stop fires.
 func (s *Server) serve(stop <-chan os.Signal) error {
 	srv := &http.Server{
 		Addr:              s.settings.ListenAddr,
@@ -31,7 +31,7 @@ func (s *Server) serve(stop <-chan os.Signal) error {
 		IdleTimeout:       s.settings.IdleTimeout,
 	}
 
-	errCh := make(chan error, 2)
+	errCh := make(chan error, 3)
 	go func() {
 		s.log.Info.Printf("interceptor listening on %s", s.settings.ListenAddr)
 		if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
@@ -54,6 +54,30 @@ func (s *Server) serve(stop <-chan os.Signal) error {
 		}()
 	}
 
+	// The spoke org-host check relay (orghost_check.go) gets its own
+	// listener, like /metrics, so it is never reachable through the proxy
+	// port. A failure to build or bind it stops phoebe: a spoke whose relay is
+	// missing would refuse every org-host request.
+	var checkSrv *http.Server
+	if s.settings.OrgHostCheck.Enabled() {
+		relay, err := NewOrgHostCheckRelay(s.settings.OrgHostCheck.AtlasCheckURL, nil, s.log)
+		if err != nil {
+			return err
+		}
+		checkSrv = &http.Server{
+			Addr:              s.settings.OrgHostCheck.Listen,
+			Handler:           relay.Handler(),
+			ReadHeaderTimeout: 10 * time.Second,
+			WriteTimeout:      30 * time.Second,
+		}
+		go func() {
+			s.log.Info.Printf("org-host check relay listening on %s", s.settings.OrgHostCheck.Listen)
+			if err := checkSrv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+				errCh <- err
+			}
+		}()
+	}
+
 	select {
 	case err := <-errCh:
 		return err
@@ -65,6 +89,9 @@ func (s *Server) serve(stop <-chan os.Signal) error {
 	defer cancel()
 	if metricsSrv != nil {
 		defer func() { _ = metricsSrv.Shutdown(ctx) }()
+	}
+	if checkSrv != nil {
+		defer func() { _ = checkSrv.Shutdown(ctx) }()
 	}
 	return srv.Shutdown(ctx)
 }

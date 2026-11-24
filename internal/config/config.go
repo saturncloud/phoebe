@@ -5,10 +5,12 @@ package config
 
 import (
 	"fmt"
+	"net"
 	"net/url"
 	"os"
 	"path"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"time"
 
@@ -75,6 +77,12 @@ type Settings struct {
 	// routes answer 404. The shared token comes from PHOEBE_VIDEOS_TOKEN.
 	Videos VideosSettings `yaml:"videos"`
 
+	// OrgHostCheck configures the spoke org-host check relay (issue #71,
+	// proxy/orghost_check.go). OFF by default (both keys empty). On a cluster
+	// whose Atlas is remote, the tf-org-host-auth ForwardAuth points at this
+	// listener instead of Atlas, so Atlas learns the host the customer called.
+	OrgHostCheck OrgHostCheckSettings `yaml:"orgHostCheck"`
+
 	// --- Parsed settings (populated by parse) ---
 
 	ListenAddr  string        `yaml:"-"`
@@ -84,6 +92,46 @@ type Settings struct {
 	// configDir is the directory the settings file was loaded from; relative
 	// paths in the YAML are resolved against it.
 	configDir string
+}
+
+// OrgHostCheckSettings is the YAML shape of the spoke org-host check relay.
+// Both keys are set together or both left empty.
+type OrgHostCheckSettings struct {
+	// Listen is the relay's own listen address, for example ":8083". It must
+	// differ from listenPort and metricsPort: the relay must never be reachable
+	// through the proxy port.
+	Listen string `yaml:"listen"`
+	// AtlasCheckURL is the hub Atlas's org-host check, for example
+	// https://app.<hub domain>/api/auth/org-host/check (https, no query).
+	AtlasCheckURL string `yaml:"atlasCheckURL"`
+}
+
+// Enabled reports whether the relay runs.
+func (o OrgHostCheckSettings) Enabled() bool { return o.Listen != "" }
+
+func (o *OrgHostCheckSettings) parse(listenPort, metricsPort int) error {
+	o.Listen = strings.TrimSpace(o.Listen)
+	o.AtlasCheckURL = strings.TrimSpace(o.AtlasCheckURL)
+	if o.Listen == "" && o.AtlasCheckURL == "" {
+		return nil
+	}
+	if o.Listen == "" || o.AtlasCheckURL == "" {
+		return fmt.Errorf("orgHostCheck.listen and orgHostCheck.atlasCheckURL must be set together")
+	}
+	_, portStr, err := net.SplitHostPort(o.Listen)
+	port, perr := strconv.Atoi(portStr)
+	if err != nil || perr != nil || port < 1 || port > 65535 {
+		return fmt.Errorf("orgHostCheck.listen %q must be a listen address such as :8083", o.Listen)
+	}
+	if port == listenPort || port == metricsPort {
+		return fmt.Errorf("orgHostCheck.listen port %d must differ from listenPort and metricsPort", port)
+	}
+	u, err := url.Parse(o.AtlasCheckURL)
+	if err != nil || u.Scheme != "https" || u.Host == "" || u.User != nil || u.RawQuery != "" || u.Fragment != "" ||
+		!strings.HasSuffix(u.Path, "/api/auth/org-host/check") {
+		return fmt.Errorf("orgHostCheck.atlasCheckURL %q must be an https URL ending in /api/auth/org-host/check", o.AtlasCheckURL)
+	}
+	return nil
 }
 
 // ProtectionSettings is the YAML shape for gateway-wide resource bounds. Every
@@ -555,6 +603,9 @@ func (s *Settings) parse() error {
 		return err
 	}
 	if err := s.Gateway.parse(); err != nil {
+		return err
+	}
+	if err := s.OrgHostCheck.parse(s.ListenPort, s.MetricsPort); err != nil {
 		return err
 	}
 	s.Wake.AtlasURL = strings.TrimSpace(s.Wake.AtlasURL)

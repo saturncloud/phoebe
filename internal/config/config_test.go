@@ -932,3 +932,31 @@ gateway:
 		}
 	}
 }
+
+func TestLoadOrgHostCheckRelay(t *testing.T) {
+	s, err := Load(writeTemp(t, `
+orgHostCheck:
+  listen: ":8083"
+  atlasCheckURL: "https://app.hub.example.com/api/auth/org-host/check"
+`))
+	if err != nil || !s.OrgHostCheck.Enabled() || s.OrgHostCheck.Listen != ":8083" {
+		t.Fatalf("orgHostCheck = %+v (%v)", s.OrgHostCheck, err)
+	}
+	off, err := Load(writeTemp(t, "debug: false\n"))
+	if err != nil || off.OrgHostCheck.Enabled() {
+		t.Fatalf("relay must be off by default: %+v (%v)", off.OrgHostCheck, err)
+	}
+	for name, yml := range map[string]string{
+		"listen without URL":   "orgHostCheck:\n  listen: \":8083\"\n",
+		"URL without listen":   "orgHostCheck:\n  atlasCheckURL: \"https://app.h/api/auth/org-host/check\"\n",
+		"http URL":             "orgHostCheck:\n  listen: \":8083\"\n  atlasCheckURL: \"http://app.h/api/auth/org-host/check\"\n",
+		"URL with query":       "orgHostCheck:\n  listen: \":8083\"\n  atlasCheckURL: \"https://app.h/api/auth/org-host/check?host=x\"\n",
+		"wrong path":           "orgHostCheck:\n  listen: \":8083\"\n  atlasCheckURL: \"https://app.h/api/auth/gateway/check\"\n",
+		"proxy port":           "listenPort: 8080\norgHostCheck:\n  listen: \":8080\"\n  atlasCheckURL: \"https://app.h/api/auth/org-host/check\"\n",
+		"not a listen address": "orgHostCheck:\n  listen: \"8083\"\n  atlasCheckURL: \"https://app.h/api/auth/org-host/check\"\n",
+	} {
+		if _, err := Load(writeTemp(t, yml)); err == nil {
+			t.Fatalf("%s: accepted", name)
+		}
+	}
+}
