@@ -56,8 +56,10 @@ func pinnedSet() map[string]struct{} {
 // (X-Saturn-Group-Scopes, ruled 2026-10-07) takes it from 13 to 14; the
 // serving-profile header takes it from 14 to 15; the video endpoint limits
 // (X-Saturn-Video-Limits, video models design 2026-11-18) take it to 16; the
-// always-on video retrieval mark (X-Saturn-Video-Retrieval, issue #13) to 17.
-func TestPinnedFallbackIsExactlyThe17(t *testing.T) {
+// always-on video retrieval mark (X-Saturn-Video-Retrieval, issue #13) to 17;
+// the org-host mark and endpoint scope (issue #71) to 19; and the retirement of
+// the retrieval mark, whose route the org host replaced (issue #71), to 18.
+func TestPinnedFallbackIsExactlyThe18(t *testing.T) {
 	want := []string{
 		"X-Saturn-Gateway",
 		"X-Saturn-Org-Id",
@@ -75,15 +77,16 @@ func TestPinnedFallbackIsExactlyThe17(t *testing.T) {
 		"X-Saturn-Owner-Rate-Limit-Generated-Tokens",
 		"X-Saturn-Group-Scopes",
 		"X-Saturn-Video-Limits",
-		"X-Saturn-Video-Retrieval",
+		"X-Saturn-Org-Host",
+		"X-Saturn-Endpoint-Scope",
 	}
 	if !reflect.DeepEqual(pinnedTrustedHeaders, want) {
-		t.Fatalf("pinnedTrustedHeaders = %v, want the pinned 17 in order %v", pinnedTrustedHeaders, want)
+		t.Fatalf("pinnedTrustedHeaders = %v, want the pinned 18 in order %v", pinnedTrustedHeaders, want)
 	}
 }
 
 // TestLoadTrustedHeadersFallback: unset, empty, whitespace-only, or
-// all-empty-after-split config engages the pinned 17 — never an empty set.
+// all-empty-after-split config engages the pinned 18 — never an empty set.
 func TestLoadTrustedHeadersFallback(t *testing.T) {
 	cases := []struct {
 		name  string
@@ -100,7 +103,7 @@ func TestLoadTrustedHeadersFallback(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			withTrustedHeadersEnv(t, tc.value, tc.set)
 			if got := ActiveTrustedHeaders(); !reflect.DeepEqual(got, pinnedSet()) {
-				t.Fatalf("active set = %v, want the pinned 17 %v", got, pinnedSet())
+				t.Fatalf("active set = %v, want the pinned 18 %v", got, pinnedSet())
 			}
 		})
 	}
@@ -298,7 +301,7 @@ func TestLoadTrustedHeadersErrorsWhenServingProfileMissing(t *testing.T) {
 // TestLoadTrustedHeadersNoErrorWhenRequiredHeadersPresent: a configured list
 // containing every required header (in any case) logs nothing at ERROR.
 func TestLoadTrustedHeadersNoErrorWhenRequiredHeadersPresent(t *testing.T) {
-	out := loadTrustedHeadersCapturingErrors(t, "x-saturn-gateway, X-SATURN-SERVING-MODE, X-Saturn-Serving-Profile, X-Saturn-Org-Id, x-saturn-owner-id")
+	out := loadTrustedHeadersCapturingErrors(t, "x-saturn-gateway, X-SATURN-SERVING-MODE, X-Saturn-Serving-Profile, X-Saturn-Org-Id, x-saturn-owner-id, x-saturn-org-host, X-Saturn-Endpoint-Scope")
 	if out != "" {
 		t.Fatalf("unexpected error log for a list with every required header: %q", out)
 	}
@@ -457,7 +460,8 @@ var candidateSaturnHeaders = []string{
 	HeaderOwnerRateLimitGeneratedTokens,
 	HeaderGroupScopes,
 	HeaderVideoLimits,
-	HeaderVideoRetrieval,
+	HeaderOrgHost,
+	HeaderEndpointScope,
 }
 
 // packageSaturnHeaderConstants parses the package's non-test Go files and

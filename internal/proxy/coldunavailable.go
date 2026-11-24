@@ -93,7 +93,7 @@ func (t *coldUnavailableRoundTripper) RoundTrip(req *http.Request) (*http.Respon
 	_ = resp.Body.Close()
 	t.neverServed = true
 	buf := newBufferingResponseWriter()
-	writeRetryLater(buf, t.requestID, coldUnavailableMessage)
+	writeRetryLater(req.Context(), buf, t.requestID, coldUnavailableMessage)
 	return bufferedHTTPResponse(req, buf, true), nil
 }
 

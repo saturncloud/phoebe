@@ -151,6 +151,10 @@ type Server struct {
 	// gateway-marked requests fail closed with 503. Set via WithGateway.
 	gateway *gatewayRoute
 
+	// orgHosts wires the org-host path (orghost.go, issue #71). nil = org
+	// hosts off: org-host-marked requests fail closed with 503.
+	orgHosts *orgHostRoute
+
 	// videos hands video endpoints' /v1/videos requests to phoebe-videos.
 	// nil = video generation off: video routes answer 404. Set via WithVideos.
 	videos *videosRoute
@@ -303,6 +307,12 @@ func (s *Server) handleHealth(w http.ResponseWriter, _ *http.Request) {
 func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request) {
 	r = r.WithContext(withRequestStart(r.Context(), time.Now()))
 	id := identity.FromRequest(r)
+	if id.OrgHost {
+		// Org-host requests answer every retryable 503 (wake, cold holds,
+		// request-buffer budget) with the full OpenAI error object. Set
+		// before any context is derived, so every later one inherits it.
+		r = r.WithContext(withOrgHostErrors(r.Context()))
+	}
 	// The legacy quota headers feed only a log diagnostic on the admission path
 	// (R8 cutover); record their presence now, because the strip below removes
 	// them. Without an admitter the diagnostic can never fire, so skip the
@@ -461,21 +471,36 @@ func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request) {
 	// attempt without usage as unbilled work (UNEXPLAINED MISSING-USAGE).
 	metered := r.Method == http.MethodPost && inferenceRequestPathAllowed(routePath)
 
-	// VIDEO RETRIEVAL: the always-on route that reads or deletes one video
-	// whatever its endpoint's state (issue #13). Atlas's retrieval
-	// ForwardAuth authorized the key for this video and stamped its org and
-	// endpoint; there is no upstream, serving mode or engine work, so none of
-	// the gateway, billing or routing steps below apply.
-	if id.VideoRetrieval {
-		s.serveVideoRetrieval(w, r, id, routePath, pathCanonical)
+	// ORG HOST (issue #71): <label>-inference.<domain>, one org's dedicated
+	// endpoints. Checked FIRST, so an org-host mark together with any other
+	// route's mark is refused rather than handled as the other route.
+	// serveOrgHost resolves the endpoint from the registry and fills id from
+	// the row; on true the request continues down the dedicated path below
+	// exactly like a per-endpoint route.
+	if id.OrgHost {
+		if !s.serveOrgHost(w, r, &id, routePath, pathCanonical) {
+			return
+		}
+	} else if id.EndpointScopePresent {
+		// The endpoint scope is stamped only by the org-host ForwardAuth and
+		// blanked on every other route; anywhere else the edge is broken.
+		s.log.Error.Printf("refusing %s on a request that is not an org-host request (edge contract broken)", identity.HeaderEndpointScope)
+		writeClientError(w, "", http.StatusForbidden, orgHostConflictingRoute)
 		return
 	}
+
+	// The issue #13 video retrieval route on the shared host is gone (issue
+	// #71): an org's videos are read, downloaded, deleted and listed on its
+	// org host (serveOrgHostVideos). A request that still carries the old
+	// retrieval mark gets no special treatment: it is judged like any other
+	// request on its route (the mark was removed above with every other
+	// X-Saturn-* header).
 
 	if id.Gateway {
 		if !pathCanonical || !gatewayRequestAllowed(r.Method, routePath) {
 			s.log.Warn.Printf("gateway: refusing route outside public inference surface method=%s path=%q canonical=%v org_id=%q",
 				r.Method, r.URL.EscapedPath(), pathCanonical, id.OrgID)
-			http.Error(w, "not found", http.StatusNotFound)
+			writeClientError(w, "", http.StatusNotFound, gatewayUnknownPath)
 			return
 		}
 		// Preflight is answered LOCALLY: phoebe writes 204 and no OPTIONS is
@@ -491,7 +516,7 @@ func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request) {
 		// pins the non-support so it stays a decision rather than an accident.
 		if r.Method == http.MethodOptions {
 			if id.OrgID == "" {
-				http.Error(w, "forbidden", http.StatusForbidden)
+				writeClientError(w, "", http.StatusForbidden, gatewayForbidden)
 				return
 			}
 			w.WriteHeader(http.StatusNoContent)

@@ -178,6 +178,10 @@ type RegistryResolver struct {
 	// the headroom the entry's room to grow allows, growthInfo.headroom: one
 	// worker by default, none at max workers or capacity no) (Q4(b), Q63).
 	workers readyWorkerSource
+	// dedicated holds the dedicated endpoint rows (dedicated.go), indexed
+	// apart from the shared rows above so neither tier's lookup can return
+	// the other's row.
+	dedicated dedicatedIndex
 }
 
 // WithReadyWorkers makes GraphCapacity scale the published per-worker limits
@@ -204,12 +208,13 @@ func NewRegistryResolver(client kubernetes.Interface, namespace string, log *log
 		}),
 	)
 	r := &RegistryResolver{
-		log:      log,
-		informer: factory.Core().V1().ConfigMaps().Informer(),
-		byKey:    map[cacheKey]map[string]Resolution{},
-		cmKey:    map[string]cacheKey{},
-		byGraph:  map[string]map[string]GraphCapacity{},
-		cmGraph:  map[string]string{},
+		log:       log,
+		informer:  factory.Core().V1().ConfigMaps().Informer(),
+		byKey:     map[cacheKey]map[string]Resolution{},
+		cmKey:     map[string]cacheKey{},
+		byGraph:   map[string]map[string]GraphCapacity{},
+		cmGraph:   map[string]string{},
+		dedicated: newDedicatedIndex(),
 	}
 
 	// Loud, periodic connectivity logging: client-go invokes this on every
@@ -294,13 +299,19 @@ func (r *RegistryResolver) upsert(obj any) {
 	if !ok {
 		return
 	}
-	res, key, err := parseRegistryConfigMap(cm)
-
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	if old, had := r.cmKey[cm.Name]; had {
 		r.dropClaimLocked(cm.Name, old)
 	}
+	if isDedicatedEndpointConfigMap(cm) {
+		// A dedicated endpoint row (issue #71) is indexed only in the
+		// dedicated index: the shared-tier Resolve never sees it.
+		r.upsertDedicatedLocked(cm)
+		return
+	}
+	r.dedicated.drop(cm.Name)
+	res, key, err := parseRegistryConfigMap(cm)
 	if err != nil {
 		r.log.Error.Printf("gateway: ignoring registry ConfigMap %s/%s: %v", cm.Namespace, cm.Name, err)
 		return
@@ -350,6 +361,7 @@ func (r *RegistryResolver) remove(obj any) {
 	if key, had := r.cmKey[cm.Name]; had {
 		r.dropClaimLocked(cm.Name, key)
 	}
+	r.dedicated.drop(cm.Name)
 }
 
 // dropClaimLocked removes one ConfigMap's claim and its published capacity.

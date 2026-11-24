@@ -31,11 +31,22 @@ const (
 // Handoff is the trusted request identity the interceptor passes on: what
 // ForwardAuth and Atlas's route stamped, after the interceptor's own checks.
 type Handoff struct {
-	// Retrieval marks a request from the always-on retrieval route (issue
-	// #13): it may only read, download or delete one video, and carries only
-	// the org, the caller and the video's endpoint, never the endpoint's
-	// served model, upstream or limits (the endpoint may be stopped or gone).
-	Retrieval   bool   `json:"retrieval,omitempty"`
+	// OrgHost marks a request from an org host, <org>-inference.<domain>
+	// (issue #71): it reads, downloads, deletes or lists the org's videos.
+	// It carries the host's org and the caller, never an endpoint's served
+	// model, upstream or limits: the videos may belong to an endpoint that is
+	// stopped or deleted. Creating a video on the org host arrives as an
+	// ordinary endpoint handoff, built by the interceptor from the endpoint
+	// the body's model resolved to.
+	//
+	// On an org-host handoff ResourceID is a restriction: empty means every
+	// endpoint of the org; set, only that endpoint's videos (an endpoint-scoped
+	// key, or the list's model filter).
+	OrgHost bool `json:"org_host,omitempty"`
+	// NoMatch is set on an org-host list whose model filter names no
+	// endpoint the caller may see: the answer is an empty page, never a 404,
+	// so the filter reveals nothing about which names exist.
+	NoMatch     bool   `json:"no_match,omitempty"`
 	OrgID       string `json:"org_id"`
 	AuthID      string `json:"auth_id"`
 	UserID      string `json:"user_id,omitempty"`
@@ -46,7 +57,8 @@ type Handoff struct {
 	ServingMode string `json:"serving_mode"`
 	Upstream    string `json:"upstream"`
 	Region      string `json:"region,omitempty"`
-	// Limits is the raw X-Saturn-Video-Limits value.
+	// Limits is the raw X-Saturn-Video-Limits value (or the registry row's
+	// video_limits on the org host).
 	Limits string `json:"limits"`
 }
 
@@ -70,14 +82,17 @@ func decodeHandoff(v string) (Handoff, error) {
 	if err := dec.Decode(&h); err != nil {
 		return h, err
 	}
-	if h.Retrieval {
-		if h.OrgID == "" || h.AuthID == "" || h.ResourceID == "" {
-			return h, fmt.Errorf("incomplete retrieval identity")
+	if h.OrgHost {
+		if h.OrgID == "" || h.AuthID == "" {
+			return h, fmt.Errorf("incomplete org-host identity")
 		}
 		if h.ServedModel != "" || h.BaseModel != "" || h.Upstream != "" || h.ServingMode != "" || h.Limits != "" {
-			return h, fmt.Errorf("retrieval identity carries endpoint fields")
+			return h, fmt.Errorf("org-host identity carries endpoint fields")
 		}
 		return h, nil
+	}
+	if h.NoMatch {
+		return h, fmt.Errorf("no_match outside an org-host identity")
 	}
 	if h.OrgID == "" || h.AuthID == "" || h.ResourceID == "" || h.ServedModel == "" ||
 		h.BaseModel == "" || h.Upstream == "" || h.ServingMode != "dedicated" {
@@ -127,14 +142,17 @@ func (a *API) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	path := r.URL.Path
-	if id.Retrieval {
-		// The always-on route reads, downloads or deletes one video (issue
-		// #13); it never creates or lists, which need the endpoint itself.
-		if !strings.HasPrefix(path, "/v1/videos/") {
+	if id.OrgHost {
+		// The org host lists the org's videos and reads, downloads or deletes
+		// one (issue #71). A create never arrives as an org-host handoff.
+		switch {
+		case path == "/v1/videos" && r.Method == http.MethodGet:
+			a.list(w, r, id)
+		case strings.HasPrefix(path, "/v1/videos/"):
+			a.serveOne(w, r, id, strings.TrimPrefix(path, "/v1/videos/"))
+		default:
 			writeError(w, errNotFound)
-			return
 		}
-		a.serveOne(w, r, id, strings.TrimPrefix(path, "/v1/videos/"))
 		return
 	}
 	limits, err := ParseLimits(id.Limits)
@@ -156,7 +174,9 @@ func (a *API) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 }
 
 // serveOne answers the three requests on one video: rest is the path after
-// /v1/videos/. The job is looked up by id, org and endpoint on either route.
+// /v1/videos/. The job is looked up by id and org, and by endpoint when the
+// handoff names one (always on an endpoint route; on the org host only for an
+// endpoint-scoped key).
 func (a *API) serveOne(w http.ResponseWriter, r *http.Request, id Handoff, rest string) {
 	jobID, sub, hasSub := strings.Cut(rest, "/")
 	if !ValidID(jobID) {
@@ -322,7 +342,9 @@ func (a *API) get(w http.ResponseWriter, r *http.Request, id Handoff, jobID stri
 func (a *API) list(w http.ResponseWriter, r *http.Request, id Handoff) {
 	q := r.URL.Query()
 	for k := range q {
-		if k != "after" && k != "limit" && k != "order" {
+		// model is the org host's filter (our extension); the interceptor has
+		// already resolved it into the handoff.
+		if k != "after" && k != "limit" && k != "order" && !(id.OrgHost && k == "model") {
 			writeError(w, badRequest(k, fmt.Sprintf("unknown query parameter %q", k)))
 			return
 		}
@@ -349,13 +371,21 @@ func (a *API) list(w http.ResponseWriter, r *http.Request, id Handoff) {
 		writeError(w, badRequest("after", "after must be a video id"))
 		return
 	}
-	jobs, err := a.store.List(r.Context(), id.OrgID, id.ResourceID, after, limit, order == "asc")
+	var jobs []*Job
+	var err error
+	if !id.NoMatch {
+		jobs, err = a.store.List(r.Context(), id.OrgID, id.ResourceID, after, limit, order == "asc")
+	}
 	if errors.Is(err, sql.ErrNoRows) {
-		writeError(w, badRequest("after", "after names no video of yours on this endpoint"))
+		msg := "after names no video of yours on this endpoint"
+		if id.OrgHost {
+			msg = "after names no video of yours in this list"
+		}
+		writeError(w, badRequest("after", msg))
 		return
 	}
 	if err != nil {
-		a.log.Error.Printf("videos: list %s: %v", id.ResourceID, err)
+		a.log.Error.Printf("videos: list org=%s resource=%q: %v", id.OrgID, id.ResourceID, err)
 		writeError(w, errInternal)
 		return
 	}
@@ -383,7 +413,10 @@ func (a *API) delete(w http.ResponseWriter, r *http.Request, id Handoff, jobID s
 	}
 	switch job.Status {
 	case StatusQueued:
-		j, err := a.store.CancelQueued(ctx, jobID, id.OrgID, id.ResourceID, a.now().UTC())
+		// lookup has checked the job against the handoff; from here on the
+		// job's own endpoint names it (on the org host the handoff may name
+		// none).
+		j, err := a.store.CancelQueued(ctx, jobID, id.OrgID, job.ResourceID, a.now().UTC())
 		if err != nil {
 			a.log.Error.Printf("videos: cancel %s: %v", jobID, err)
 			writeError(w, errInternal)
@@ -409,7 +442,7 @@ func (a *API) delete(w http.ResponseWriter, r *http.Request, id Handoff, jobID s
 		}
 		a.deleteFiles(ctx, job)
 		a.logDeleted(r, id, "deleted", jobID)
-		j, err := a.store.Get(ctx, jobID, id.OrgID, id.ResourceID)
+		j, err := a.store.Get(ctx, jobID, id.OrgID, job.ResourceID)
 		if err != nil {
 			writeError(w, errInternal)
 			return
@@ -422,8 +455,8 @@ func (a *API) delete(w http.ResponseWriter, r *http.Request, id Handoff, jobID s
 // DELETE destroys a customer's files, and nothing else records who sent it.
 // The request id is the one the interceptor minted.
 func (a *API) logDeleted(r *http.Request, id Handoff, what, jobID string) {
-	a.log.Info.Printf("videos: %s %s org_id=%q resource_id=%q auth_id=%q retrieval=%v request_id=%q",
-		what, jobID, id.OrgID, id.ResourceID, id.AuthID, id.Retrieval, r.Header.Get("X-Request-Id"))
+	a.log.Info.Printf("videos: %s %s org_id=%q resource_id=%q auth_id=%q org_host=%v request_id=%q",
+		what, jobID, id.OrgID, id.ResourceID, id.AuthID, id.OrgHost, r.Header.Get("X-Request-Id"))
 }
 
 // deleteFiles removes a job's objects and records it. A failure is logged and

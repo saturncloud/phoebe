@@ -56,16 +56,18 @@ func newCappedVideoServer(t *testing.T, p config.ProtectionSettings, backendURL 
 
 // X4 (battery on phoebe#148): a video content download is the one request
 // exempt from protection.maxStreamDuration, on the endpoint's route and on
-// the always-on retrieval route alike. The download here takes about six
-// times the limit and arrives whole.
+// the org host (issue #71) alike. The download here takes about six times
+// the limit and arrives whole.
 func TestVideoContentDownloadOutlivesMaxStreamDuration(t *testing.T) {
 	const limit = 100 * time.Millisecond
 	backend, want := slowVideosBackend(t, 5, limit)
 	srv := newCappedVideoServer(t, config.ProtectionSettings{MaxStreamDuration: limit}, backend.URL)
+	srv = srv.WithGateway(&fakeTierResolver{}, "tf-shared", 8000).WithOrgHosts(&fakeTierResolver{}, testSharedBaseURL)
 	for name, req := range map[string]*http.Request{
-		"endpoint route":  videoRequest(http.MethodGet, "/v1/videos/"+testVideoID+"/content"),
-		"retrieval route": retrievalRequest(http.MethodGet, "/v1/videos/"+testVideoID+"/content"),
-		"thumbnail":       retrievalRequest(http.MethodGet, "/v1/videos/"+testVideoID+"/content?variant=thumbnail"),
+		"endpoint route":      videoRequest(http.MethodGet, "/v1/videos/"+testVideoID+"/content"),
+		"thumbnail":           videoRequest(http.MethodGet, "/v1/videos/"+testVideoID+"/content?variant=thumbnail"),
+		"org host":            orgHostVideoRequest(http.MethodGet, "/v1/videos/"+testVideoID+"/content", ""),
+		"org host, thumbnail": orgHostVideoRequest(http.MethodGet, "/v1/videos/"+testVideoID+"/content?variant=thumbnail", ""),
 	} {
 		t.Run(name, func(t *testing.T) {
 			start := time.Now()
@@ -93,12 +95,10 @@ func TestVideoRequestsOtherThanContentKeepMaxStreamDuration(t *testing.T) {
 	backend, _ := slowVideosBackend(t, 1, 5*limit)
 	srv := newCappedVideoServer(t, config.ProtectionSettings{MaxStreamDuration: limit}, backend.URL)
 	for name, req := range map[string]*http.Request{
-		"read on the endpoint route":    videoRequest(http.MethodGet, "/v1/videos/"+testVideoID),
-		"delete on the endpoint route":  videoRequest(http.MethodDelete, "/v1/videos/"+testVideoID),
-		"create":                        videoRequest(http.MethodPost, "/v1/videos"),
-		"list":                          videoRequest(http.MethodGet, "/v1/videos"),
-		"read on the retrieval route":   retrievalRequest(http.MethodGet, "/v1/videos/"+testVideoID),
-		"delete on the retrieval route": retrievalRequest(http.MethodDelete, "/v1/videos/"+testVideoID),
+		"read on the endpoint route":   videoRequest(http.MethodGet, "/v1/videos/"+testVideoID),
+		"delete on the endpoint route": videoRequest(http.MethodDelete, "/v1/videos/"+testVideoID),
+		"create":                       videoRequest(http.MethodPost, "/v1/videos"),
+		"list":                         videoRequest(http.MethodGet, "/v1/videos"),
 	} {
 		t.Run(name, func(t *testing.T) {
 			start := time.Now()
@@ -133,7 +133,7 @@ func TestVideoContentDownloadKeepsTheStallGuard(t *testing.T) {
 	}, backend.URL)
 	proxySrv := liveProxy(t, srv)
 
-	req := retrievalRequest(http.MethodGet, proxySrv.URL+"/v1/videos/"+testVideoID+"/content")
+	req := videoRequest(http.MethodGet, proxySrv.URL+"/v1/videos/"+testVideoID+"/content")
 	req.RequestURI = ""
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
