@@ -60,14 +60,14 @@ type orgHostForwarder struct {
 func newOrgHostForwarder() *orgHostForwarder {
 	return &orgHostForwarder{
 		transport: &http.Transport{
-			Proxy:                 nil,
-			DialContext:           (&net.Dialer{Timeout: 10 * time.Second, KeepAlive: 30 * time.Second}).DialContext,
-			TLSClientConfig:       &tls.Config{MinVersion: tls.VersionTLS12},
-			TLSHandshakeTimeout:   10 * time.Second,
-			DisableCompression:    true,
-			ForceAttemptHTTP2:     true,
-			MaxIdleConnsPerHost:   32,
-			IdleConnTimeout:       90 * time.Second,
+			Proxy:               nil,
+			DialContext:         (&net.Dialer{Timeout: 10 * time.Second, KeepAlive: 30 * time.Second}).DialContext,
+			TLSClientConfig:     &tls.Config{MinVersion: tls.VersionTLS12},
+			TLSHandshakeTimeout: 10 * time.Second,
+			DisableCompression:  true,
+			ForceAttemptHTTP2:   true,
+			MaxIdleConnsPerHost: 32,
+			IdleConnTimeout:     90 * time.Second,
 		},
 	}
 }

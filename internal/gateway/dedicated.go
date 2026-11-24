@@ -240,21 +240,32 @@ func (x *dedicatedIndex) drop(cm string) bool {
 	return true
 }
 
-// pickLowest is the deterministic winner among duplicate claimants: the
-// lowest resource_id (then ConfigMap name), so every replica agrees.
-func pickLowest(claims map[string]DedicatedEndpoint) (DedicatedEndpoint, int) {
+// ErrAmbiguousDedicated reports that two different endpoints of one org claim
+// the same served name. Atlas guarantees names are unique per org, so this
+// only happens when a deleted endpoint's row outlived its delete and the
+// name was reused before the registry sweep removed the stale row. Serving
+// either could send a request to the wrong (possibly stale) endpoint, so the
+// proxy refuses with 503 (it treats every resolver error that way) until the
+// sweep heals the registry.
+var ErrAmbiguousDedicated = errors.New("gateway: several dedicated endpoints claim this name")
+
+// pickClaim returns the one endpoint behind claims. Several ConfigMaps of
+// the SAME endpoint (resource id) are one claimant and resolve to the row
+// with the lowest ConfigMap name, so every replica agrees; claims by two
+// different endpoints are ambiguous.
+func pickClaim(claims map[string]DedicatedEndpoint) (DedicatedEndpoint, int, bool) {
 	names := make([]string, 0, len(claims))
 	for n := range claims {
 		names = append(names, n)
 	}
-	sort.Slice(names, func(i, j int) bool {
-		a, b := claims[names[i]], claims[names[j]]
-		if a.ResourceID != b.ResourceID {
-			return a.ResourceID < b.ResourceID
+	sort.Strings(names)
+	first := claims[names[0]]
+	for _, n := range names[1:] {
+		if claims[n].ResourceID != first.ResourceID {
+			return DedicatedEndpoint{}, len(names), false
 		}
-		return names[i] < names[j]
-	})
-	return claims[names[0]], len(names)
+	}
+	return first, len(names), true
 }
 
 // ResolveDedicated implements DedicatedResolver from memory. An exact
@@ -269,10 +280,11 @@ func (r *RegistryResolver) ResolveDedicated(_ context.Context, orgID, model stri
 	k := cacheKey{org: orgID, model: model}
 	for _, m := range []map[cacheKey]map[string]DedicatedEndpoint{r.dedicated.byName, r.dedicated.byAlias} {
 		if claims := m[k]; len(claims) > 0 {
-			ep, n := pickLowest(claims)
-			if n > 1 {
-				r.log.Error.Printf("gateway: %d dedicated registry rows claim (org=%s, model=%q) — Atlas uniqueness violated; serving resource_id=%s (lowest)",
-					n, orgID, model, ep.ResourceID)
+			ep, n, ok := pickClaim(claims)
+			if !ok {
+				r.log.Error.Printf("gateway: %d dedicated registry rows of different endpoints claim (org=%s, model=%q) — Atlas uniqueness violated (a stale row?); refusing until the registry sweep removes it",
+					n, orgID, model)
+				return DedicatedEndpoint{}, ErrAmbiguousDedicated
 			}
 			return ep, nil
 		}

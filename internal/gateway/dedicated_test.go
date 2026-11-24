@@ -207,3 +207,27 @@ func TestDedicatedNotSyncedFailsClosed(t *testing.T) {
 		t.Fatalf("err=%v, want ErrNotSynced", err)
 	}
 }
+
+// Two different endpoints of one org claiming one name (a stale row after a
+// failed delete, then the name reused) is refused, never served from either.
+func TestDedicatedDuplicateNameOfTwoEndpointsIsAmbiguous(t *testing.T) {
+	r, _, _ := startedRegistry(t,
+		dedicatedCM("tf-endpoint-old", map[string]string{"resource_id": "dep-a"}),
+		dedicatedCM("tf-endpoint-new", map[string]string{"resource_id": "dep-b"}),
+	)
+	if _, err := r.ResolveDedicated(context.Background(), "org-1", "my-endpoint"); !errors.Is(err, ErrAmbiguousDedicated) {
+		t.Fatalf("err=%v, want ErrAmbiguousDedicated", err)
+	}
+}
+
+// Two rows of the same endpoint (one resource id) are one claimant.
+func TestDedicatedTwoRowsOfOneEndpointResolve(t *testing.T) {
+	r, _, _ := startedRegistry(t,
+		dedicatedCM("tf-endpoint-a", map[string]string{"resource_id": "dep-a"}),
+		dedicatedCM("tf-endpoint-b", map[string]string{"resource_id": "dep-a"}),
+	)
+	ep, err := r.ResolveDedicated(context.Background(), "org-1", "my-endpoint")
+	if err != nil || ep.ResourceID != "dep-a" {
+		t.Fatalf("ep=%+v err=%v", ep, err)
+	}
+}
