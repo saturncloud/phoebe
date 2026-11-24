@@ -106,7 +106,7 @@ func TestAtlasWakerOtherAtlas503StaysStatusUnknown(t *testing.T) {
 		`{"message":"x","error_code":"something_else","phase":"pulling_image"}`,
 		`not json`,
 	} {
-		atlas := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		atlas := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 			w.WriteHeader(http.StatusServiceUnavailable)
 			_, _ = w.Write([]byte(body))
 		}))
