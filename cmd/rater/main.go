@@ -19,8 +19,7 @@
 //	4  window aggregated, nothing in exit 2's list, BUT unbilled usage is PARKED
 //	   (owner conflict, ambiguous org, ambiguous base model or adapter, missing
 //	   org; any hour, any age). Returned by EVERY run until the parked usage is
-//	   resolved or settled by hand, so a Job alert keeps firing. List it with
-//	   -list-parked; settle a row by hand with -settle-parked (settle.go).
+//	   resolved, so a Job alert keeps firing. List it with -list-parked.
 //
 // Precedence: 1 > 2 > 4 > 0. Exit 3 (an hour skipped because its prices were
 // unavailable) no longer exists: there are no prices to wait for.
@@ -41,12 +40,7 @@
 // whose billing_event rows the pruner has removed (30-day horizon, no exception
 // for parked usage; Hugo, 2026-10-27): "raw_events: pruned — settle manually via
 // manager credit". Such an hour is never re-aggregated; a window containing it is
-// refused. Below the unresolved rows it lists the rows settled by hand, which
-// never change its exit code.
-//
-// `phoebe-rater -settle-parked` records that an operator settled one parked
-// row by hand (settle.go): the row is kept and resolved, and no run pages for
-// it or re-aggregates its hour again.
+// refused.
 //
 // THE DEFAULT WINDOW IS THE TRAILING N COMPLETE HOURS, [floor(now)-N*1h,
 // floor(now)), N = rateTrailingHours (default 24). Events can be drained late (a
@@ -55,22 +49,6 @@
 // same trailing hours, so the manager converges. Re-aggregating is idempotent
 // (the upsert REPLACES each bucket). An event more than N hours late still needs
 // an explicit --since/--until run.
-//
-// ONE-TIME CATCH-UP OF HOURS NEVER RATED. An install that ran phoebe with the
-// rater suspended kept writing billing_event (the drainer runs regardless and
-// the pruner is suspended by default), but no run ever rated those hours, and
-// the trailing window does not reach back to them, so their usage was never
-// sent. Each routine run, after its trailing window, rates up to
-// rating.CatchUpHoursPerRun (168) billing_event hours before the window that
-// have no rated_usage and no parked_usage row, oldest first, and records its
-// progress in rater_state after every hour. When nothing is left it sets
-// rater_state.catchup_completed_at, and from then on runs rate only the
-// trailing window. An hour that already has rollups or parked rows is never
-// touched, so the catch-up cannot overwrite an earlier rollup with a partial
-// sum after the pruner removed some of its events. Re-rating is idempotent.
-// token-push sends the newly rated hours as never-accepted hours. A catch-up
-// hour with withheld or parked usage counts toward exit 2 or 4 like a window
-// hour. Explicit --since/--until runs do not run the catch-up.
 //
 // SINGLE-FLIGHT (deployment contract): two aggregators must never run over
 // overlapping windows at once; the reconcile DELETE and the ordered upsert are
@@ -162,28 +140,9 @@ func runWith(argv []string, log *logging.Logger) int {
 	settingsFile := fs.String("f", "/etc/saturn/config/rater.yaml", "Settings YAML file path")
 	since := fs.String("since", "", "Window start, RFC3339 (default: floor(now) minus rateTrailingHours)")
 	until := fs.String("until", "", "Window end, RFC3339 (default: start of the current hour)")
-	listParked := fs.Bool("list-parked", false, "Print the unresolved parked (unbilled) usage, then the rows settled by hand, and exit; no aggregation")
-	settle := settleFlags(fs)
+	listParked := fs.Bool("list-parked", false, "Print the unresolved parked (unbilled) usage and exit; no aggregation")
 	if err := fs.Parse(argv); err != nil {
 		return exitFatal
-	}
-
-	if *settle.on && *listParked {
-		log.Error.Printf("rater: -settle-parked and -list-parked are separate commands; give one")
-		return exitFatal
-	}
-	var settleKey rating.ParkedKey
-	if *settle.on {
-		if *since != "" || *until != "" {
-			log.Error.Printf("rater: -settle-parked takes -hour, not -since/-until")
-			return exitFatal
-		}
-		k, err := settle.key()
-		if err != nil {
-			log.Error.Printf("rater: -settle-parked: %v", err)
-			return exitFatal
-		}
-		settleKey = k
 	}
 
 	cfg, opts, err := loadConfig(*settingsFile)
@@ -216,65 +175,40 @@ func runWith(argv []string, log *logging.Logger) int {
 	}
 	defer func() { _ = store.Close() }()
 
-	if *settle.on {
-		return settleParked(ctx, store, os.Stdout, log, settleKey, *settle.by, *settle.reason, time.Now())
-	}
-
 	if *listParked {
 		parked, err := store.ListParked(ctx)
 		if err != nil {
 			log.Error.Printf("rater: %v", err)
 			return exitFatal
 		}
-		settled, err := store.ListSettled(ctx)
-		if err != nil {
-			log.Error.Printf("rater: %v", err)
-			return exitFatal
-		}
 		printParked(os.Stdout, parked)
-		printSettled(os.Stdout, settled)
 		if len(parked) > 0 {
 			return exitParked
 		}
 		return exitOK
 	}
 
-	agg := rating.New(store, log)
-	res, err := agg.Run(ctx, windowStart, windowEnd, windowExplicit)
+	res, err := rating.New(store, log).Run(ctx, windowStart, windowEnd, windowExplicit)
 	if err != nil {
 		log.Error.Printf("rater: run: %v", err)
 		return exitFatal
 	}
-	hasAnomaly, hasParked := res.HasAnomaly(), res.HasParked()
-	if !windowExplicit {
-		// CATCH-UP (package doc): after the trailing window, so current hours
-		// are rated first. An explicit run rates only the window it names.
-		cu, err := agg.CatchUp(ctx, windowStart, catchUpHoursPerRun)
-		if err != nil {
-			log.Error.Printf("rater: catch-up: %v", err)
-			return exitFatal
-		}
-		caught := rating.Result{AggregateResult: cu.AggregateResult}
-		hasAnomaly = hasAnomaly || caught.HasAnomaly() || caught.AllReconciledDeletions() > 0
-		hasParked = hasParked || cu.ParkedWritten > 0 || cu.Video.ParkedWritten > 0
-	}
-	return exitCode(res.AllReconciledDeletions(), windowExplicit, hasAnomaly, hasParked)
+	return exitCode(res.ReconciledDeletions, windowExplicit, res.HasAnomaly(), res.HasParked())
 }
-
-// catchUpHoursPerRun bounds the one-time catch-up per run. A variable so the
-// integration tests can exercise several runs with a few hours of data.
-var catchUpHoursPerRun = rating.CatchUpHoursPerRun
 
 // printParked writes one tab-separated line per parked identity-hour, with a
 // header, for an operator.
 func printParked(w io.Writer, parked []rating.Parked) {
 	tw := tabwriter.NewWriter(w, 0, 0, 2, ' ', 0)
-	fmt.Fprintln(tw, "HOUR\tKIND\tREASON\tAUTH_ID\tOWNER\tRESOURCE_ID\tMODEL_ID\tMODE\tEVENTS\tUSAGE\tFIRST_PARKED\tRAW_EVENTS")
+	fmt.Fprintln(tw, "HOUR\tREASON\tAUTH_ID\tOWNER\tRESOURCE_ID\tMODEL_ID\tMODE\tEVENTS\tPROMPT\tCACHED\tCOMPLETION\tFIRST_PARKED\tRAW_EVENTS")
 	for _, p := range parked {
-		owner := ownerLabel(p.OwnerType, p.OwnerID)
-		fmt.Fprintf(tw, "%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%d\t%s\t%s\t%s\n",
-			p.WindowStart.Format(time.RFC3339), p.Kind, p.Reason, p.AuthID, owner, p.ResourceID, p.ModelID, p.ServingMode,
-			p.EventCount, p.UsageLabel(), p.FirstParkedAt.UTC().Format(time.RFC3339),
+		owner := p.OwnerType + "/" + p.OwnerID
+		if p.OwnerType == "" {
+			owner = "-"
+		}
+		fmt.Fprintf(tw, "%s\t%s\t%s\t%s\t%s\t%s\t%s\t%d\t%d\t%d\t%d\t%s\t%s\n",
+			p.WindowStart.Format(time.RFC3339), p.Reason, p.AuthID, owner, p.ResourceID, p.ModelID, p.ServingMode,
+			p.EventCount, p.PromptTokens, p.CachedTokens, p.CompletionTokens, p.FirstParkedAt.UTC().Format(time.RFC3339),
 			p.RawEventsLabel())
 	}
 	_ = tw.Flush()

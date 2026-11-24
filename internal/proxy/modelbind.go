@@ -111,33 +111,13 @@ func canonicalRequestPath(u *url.URL) (string, bool) {
 // inferenceRequestPathAllowed lists the model-bearing APIs whose response
 // usage schema Phoebe can meter. Responses API uses different token field names
 // and remains closed until its billing parser is implemented.
-//
-// /v1/rerank is a reranker endpoint's API (vLLM's Jina and Cohere v1 shape:
-// query and documents in, relevance scores out). Its response carries
-// usage.prompt_tokens and usage.total_tokens (vLLM 0.31 RerankUsage), so it
-// meters exactly like embeddings: prompt tokens only. It is the only rerank
-// spelling opened; vLLM's /rerank, /v2/rerank, /score and /v1/score stay
-// closed (one customer route per API, embeddings design section 8).
 func inferenceRequestPathAllowed(path string) bool {
 	switch path {
-	case "/v1/chat/completions", "/v1/completions", "/v1/embeddings", rerankPath:
+	case "/v1/chat/completions", "/v1/completions", "/v1/embeddings":
 		return true
 	default:
 		return false
 	}
-}
-
-// rerankPath is served by dedicated reranker endpoints only. A shared graph
-// is a Dynamo graph, and Dynamo 1.6's vLLM backend registers no rerank model
-// (only its SGLang backend does), so no shared model can answer it. Refusing
-// it on every shared surface keeps a rerank request from being admitted as
-// shared work and forwarded to a graph that would 404 it.
-const rerankPath = "/v1/rerank"
-
-// sharedTierPathAllowed is the inference surface a shared graph serves: every
-// metered path except the dedicated-only rerank route.
-func sharedTierPathAllowed(path string) bool {
-	return path != rerankPath && inferenceRequestPathAllowed(path)
 }
 
 // gatewayRequestAllowed is narrower than the bound-resource surface because a
@@ -150,7 +130,7 @@ func sharedTierPathAllowed(path string) bool {
 // gates saying the same thing, so a future refactor that drops the
 // short-circuit cannot silently open every path to OPTIONS.
 func gatewayRequestAllowed(method, path string) bool {
-	return (method == "OPTIONS" || method == "POST") && sharedTierPathAllowed(path)
+	return (method == "OPTIONS" || method == "POST") && inferenceRequestPathAllowed(path)
 }
 
 var errNotObject = errors.New("request body is not a JSON object")

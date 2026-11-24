@@ -23,16 +23,11 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/saturncloud/phoebe/internal/atlastoken"
 	"github.com/saturncloud/phoebe/internal/logging"
 	"github.com/saturncloud/phoebe/internal/proxy"
 )
 
 const internalWakePath = "/api/internal/token-factory/inference-endpoints/wake"
-
-// internalWakeHeader carries the legacy shared secret, for the one transition
-// build in which Atlas pods of the previous build may still answer a wake
-// (they know only this header). Removed with TF_INTERNAL_WAKE_TOKEN.
 const internalWakeHeader = "X-Saturn-Internal-Wake-Token"
 
 // wakeLoopWindow bounds one wake loop. It is independent of the client's
@@ -53,12 +48,8 @@ const wakeLoopWindow = 10 * time.Minute
 // cold requests from becoming a burst of Atlas calls, each of which holds a
 // database connection while Atlas waits on the graph's lock.
 type AtlasWaker struct {
-	baseURL string
-	// tokens gives phoebe's Atlas service token (tf-internal:wake) for each
-	// call; nil when the install has not mounted it.
-	tokens atlastoken.Source
-	// legacyToken is the transition build's shared secret, or "".
-	legacyToken  string
+	baseURL      string
+	token        string
 	client       *http.Client
 	pollInterval time.Duration
 	loopWindow   time.Duration
@@ -109,38 +100,25 @@ var errAtlasRefused = errors.New("atlas waker: Atlas refused the wake")
 // made, so Atlas never received it. It is safe to retry.
 var errBeforeConnection = errors.New("atlas waker: request failed before connection")
 
-// errNoCredential marks a wake call phoebe refused to send because it holds
-// no usable credential (atlastoken logs why). Like an Atlas refusal, it ends
-// the flight at once: the held requests get the cold response.
-var errNoCredential = errors.New("atlas waker: no usable Atlas credential; the wake was not sent")
-
-// NewAtlas builds the waker. tokens is phoebe's Atlas service token source;
-// legacyToken is the transition build's shared secret. At least one is
-// required.
-func NewAtlas(baseURL string, tokens atlastoken.Source, legacyToken string, log *logging.Logger) (*AtlasWaker, error) {
+func NewAtlas(baseURL, token string, log *logging.Logger) (*AtlasWaker, error) {
 	if strings.TrimSpace(baseURL) == "" {
 		return nil, errors.New("atlas waker: atlas URL is empty")
 	}
-	legacyToken = strings.TrimSpace(legacyToken)
-	if tokens == nil && legacyToken == "" {
-		return nil, errors.New("atlas waker: no Atlas service token file and no legacy wake token")
+	if strings.TrimSpace(token) == "" {
+		return nil, errors.New("atlas waker: internal wake token is empty")
 	}
 	u, err := url.Parse(baseURL)
 	if err != nil || (u.Scheme != "http" && u.Scheme != "https") || u.Host == "" ||
 		u.RawQuery != "" || u.Fragment != "" || u.User != nil {
 		return nil, fmt.Errorf("atlas waker: invalid Atlas URL %q", baseURL)
 	}
-	if err := atlastoken.CheckAtlasURL(baseURL); err != nil {
-		return nil, fmt.Errorf("atlas waker: %w", err)
-	}
 	transport := http.DefaultTransport.(*http.Transport).Clone()
 	// The wake token is an internal credential. Never send it through an
 	// ambient HTTP proxy inherited from the pod environment.
 	transport.Proxy = nil
 	return &AtlasWaker{
-		baseURL:     strings.TrimRight(baseURL, "/"),
-		tokens:      tokens,
-		legacyToken: legacyToken,
+		baseURL: strings.TrimRight(baseURL, "/"),
+		token:   token,
 		client: &http.Client{
 			Timeout:   30 * time.Second,
 			Transport: transport,
@@ -320,9 +298,7 @@ func (w *AtlasWaker) requestWake(ctx context.Context, resourceID string, reached
 		return fmt.Errorf("atlas waker: build request: %w", err)
 	}
 	req.Header.Set("Content-Type", "application/json")
-	if err := w.setCredentials(req); err != nil {
-		return err
-	}
+	req.Header.Set(internalWakeHeader, w.token)
 	req.Header.Set("Idempotency-Key", resourceID)
 	var gotConn atomic.Bool
 	req = req.WithContext(httptrace.WithClientTrace(req.Context(), &httptrace.ClientTrace{
@@ -357,32 +333,6 @@ func (w *AtlasWaker) requestWake(ctx context.Context, resourceID string, reached
 	}
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		return fmt.Errorf("%w: status %d: %s", errAtlasRefused, resp.StatusCode, string(responseBody))
-	}
-	return nil
-}
-
-// setCredentials puts phoebe's service token in Authorization when it has a
-// usable one, and the legacy header when the transition secret is set (an
-// Atlas of the previous build reads only that). A new Atlas decides on
-// Authorization when it is present. With neither, nothing is sent.
-func (w *AtlasWaker) setCredentials(req *http.Request) error {
-	sent := false
-	var tokenErr error
-	if w.tokens != nil {
-		token, err := w.tokens.Token()
-		if err == nil {
-			req.Header.Set("Authorization", "token "+token)
-			sent = true
-		}
-		tokenErr = err
-	}
-	if w.legacyToken != "" {
-		req.Header.Set(internalWakeHeader, w.legacyToken)
-		sent = true
-	}
-	if !sent {
-		// Nothing was dispatched, so the wake is unavailable, not unknown.
-		return fmt.Errorf("%w: %w: %v", proxy.ErrWakeUnavailable, errNoCredential, tokenErr)
 	}
 	return nil
 }
