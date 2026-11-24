@@ -194,12 +194,21 @@ func (e *OmniEngine) Generate(ctx context.Context, job *Job, input []byte, path 
 	return n, nil
 }
 
+// isRefused reports a call that never connected to the engine: refused, a
+// dial timeout or no route (a Service with no ready engine pod; on uk2 such a
+// dial times out instead of being refused, issue #111), or a name that does
+// not resolve yet. Nothing was sent, so the engine is not ready rather than
+// gone, and the attempt does not count.
 func isRefused(err error) bool {
 	if errors.Is(err, syscall.ECONNREFUSED) {
 		return true
 	}
 	var dnsErr *net.DNSError
-	return errors.As(err, &dnsErr)
+	if errors.As(err, &dnsErr) {
+		return true
+	}
+	var opErr *net.OpError
+	return errors.As(err, &opErr) && opErr.Op == "dial"
 }
 
 func readFull(r io.Reader, buf []byte) (int, error) { return io.ReadFull(r, buf) }
