@@ -226,7 +226,13 @@ func videoCreateModel(r *http.Request) (string, error) {
 			if err != nil {
 				return "", err
 			}
-			if part.FormName() != "model" {
+			if name := part.FormName(); name != "model" {
+				// A case variant of model ("Model") is refused rather
+				// than skipped, so phoebe and phoebe-videos can never
+				// read two different values (battery round 2, #71).
+				if strings.EqualFold(name, "model") {
+					return "", errors.New("model given in another letter case")
+				}
 				continue
 			}
 			if found {
@@ -239,6 +245,11 @@ func videoCreateModel(r *http.Request) (string, error) {
 			model, found = string(b), true
 		}
 	case "application/json", "":
+		// A duplicate model key, or one in another letter case, is
+		// refused, as on every other body phoebe reads model from.
+		if _, err := checkTopLevelKeyAmbiguity(body, []string{"model"}); err != nil {
+			return "", err
+		}
 		var fields map[string]json.RawMessage
 		if err := json.Unmarshal(body, &fields); err != nil {
 			return "", err

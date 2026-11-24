@@ -240,43 +240,36 @@ func parseServedModelAllowList(h string) map[string]struct{} {
 
 // extractRequestModel pulls the top-level "model" string from an OpenAI-shaped
 // request body. Returns ("", false) if the body is not a JSON object, has no
-// model field, model is not a non-empty string, OR the object has DUPLICATE
-// top-level "model" keys.
+// model field, model is not a non-empty string, OR the top-level "model" key is
+// ambiguous: given twice, or given in another letter case ("Model", "MODEL").
 //
-// The duplicate-key check is a security guard: a plain struct Unmarshal silently
-// takes the LAST duplicate, but the Dynamo router downstream may resolve
-// duplicates differently (e.g. first-wins). If phoebe validated the last and the
-// router routed the first, `{"model":"victim","model":"mine"}` would bypass the
-// binding. We can't see the router's resolution, so we refuse the ambiguity: a
-// body with two top-level "model" keys fails the check (-> bindingUnparseable ->
-// 403). A well-formed request has exactly one.
+// The ambiguity check is a security guard. encoding/json matches struct keys
+// case-insensitively and keeps the LAST match, while the Dynamo/vLLM frontends
+// match keys exactly and may resolve duplicates differently. If phoebe read one
+// value and the engine served another, `{"model":"victim","Model":"mine"}`
+// would resolve, authorize and bill "mine" while the engine serves "victim"
+// (battery round 2, issue #71). So every key equal to "model" ignoring case is
+// refused unless it is the one exact key, and the value is read from that
+// exact key only (a map lookup, never a case-insensitive struct match). A
+// nested "model" (inside another object or array) is not a top-level key and
+// is allowed. A well-formed request has exactly one top-level "model".
 func extractRequestModel(body []byte) (string, bool) {
 	if len(body) == 0 {
 		return "", false
 	}
-	// Fast path for the value; then verify uniqueness of the top-level key.
-	var m struct {
-		Model string `json:"model"`
-	}
-	if err := json.Unmarshal(body, &m); err != nil {
+	counts, err := checkTopLevelKeyAmbiguity(body, []string{"model"})
+	if err != nil || counts["model"] != 1 {
 		return "", false
 	}
-	if m.Model == "" {
+	var fields map[string]json.RawMessage
+	if err := json.Unmarshal(body, &fields); err != nil {
 		return "", false
 	}
-	if count, err := countTopLevelModelKeys(body); err != nil || count != 1 {
+	var model string
+	if err := json.Unmarshal(fields["model"], &model); err != nil || model == "" {
 		return "", false
 	}
-	return m.Model, true
-}
-
-// countTopLevelModelKeys counts how many times "model" appears as a key of the
-// top-level JSON object, using a streaming token decoder (so nested "model"
-// keys, e.g. inside an array element, are not counted). Returns an error if the
-// body is not a JSON object.
-func countTopLevelModelKeys(body []byte) (int, error) {
-	counts, err := countTopLevelKeys(body, map[string]struct{}{"model": {}})
-	return counts["model"], err
+	return model, true
 }
 
 // scanTopLevelKeys walks the keys of the top-level JSON object in body, in
