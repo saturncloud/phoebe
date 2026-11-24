@@ -28,7 +28,9 @@ with the Atlas schema; they live in phoebe's own database.
   release.
 - **`parked_usage`** — conflicted usage (owner conflict, ambiguous org, ambiguous
   base model or adapter, missing org) parked per (hour, identity, reason) with its
-  token counts. Written by the rater; never pruned. See "Parked usage" in
+  token counts. Written by the rater; never pruned. A row an operator settled
+  by hand (`phoebe-rater -settle-parked`) is resolved and carries `settled_at`,
+  `settled_by` and `settle_reason` (0020). See "Parked usage" in
   docs/billing-reconciliation.md.
 - **`rated_video_usage`** — the hourly video generation rollup (0017), one row per
   (auth_id, owner, resource_id, model_id, serving_mode, base_model, task,
@@ -92,6 +94,7 @@ golang-migrate up/down pairs, applied in version order:
 | 0017 | `0017_rated_video_usage.{up,down}.sql` | `rated_video_usage` (with each rollup's wire `usage_id`), `parked_video_usage` and `video_reconcile_deletion` (the video rollup, its parked conflicts, and the rater's tombstones), and `pushed_usage.kind` (default `'token'`). Down refuses while video usage is parked or any rollup's usage_id is not yet accepted by the manager. A dev database that applied 0017 before the tombstones (#143) has no `usage_id` column or tombstone table: apply `0017_rated_video_usage.up.sql` again by hand (it is idempotent). Its old rollups stay unstamped until the rater re-rates them, and token-push holds them back meanwhile |
 | 0018 | `0018_video_job_files_delete_failed.{up,down}.sql` | `video_job.files_delete_failed_at` (nullable; when the phoebe-videos reaper last failed to delete the job's files, so the reaper retries those after every job not yet tried). Expand step |
 | 0019 | `0019_deferred_hour.{up,down}.sql` | `deferred_hour` (token-push defers an hour the manager refused because it does not accept a usage kind the hour lists, a 409 or a 400 on `kinds` from an older manager; every run re-sends it until accepted, outside the per-run missed-hour cap; an accepted push or parking the hour deletes the row). New table, expand step |
+| 0020 | `0020_parked_usage_settled.{up,down}.sql` | `settled_at`, `settled_by`, `settle_reason` (nullable) on `parked_usage` and `parked_video_usage`: `phoebe-rater -settle-parked` records that an operator settled a parked row by hand (Hugo, 2026-10-27), setting them with `resolved_at` and keeping the row. Expand step. Down drops the columns; settled rows stay resolved, only who and why is lost |
 
 `embed.go` embeds these into the `migrations` package; `cmd/migrate` applies them.
 

@@ -78,6 +78,8 @@ func ratingSchemaDDL(t *testing.T) string {
 		// rated_video_usage and parked_video_usage (the video rollup writes them).
 		"../../migrations/0016_video_jobs.up.sql",
 		"../../migrations/0017_rated_video_usage.up.sql",
+		// 0020: the settled_* columns on both parked tables (ListParked reads them).
+		"../../migrations/0020_parked_usage_settled.up.sql",
 	} {
 		ddl, err := os.ReadFile(f)
 		if err != nil {

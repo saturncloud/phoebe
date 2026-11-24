@@ -3,6 +3,7 @@ package rating
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"fmt"
 	"strings"
 	"time"
@@ -27,6 +28,9 @@ type Store interface {
 	// ListParked lists every unresolved parked row of either kind, oldest hour
 	// first.
 	ListParked(ctx context.Context) ([]Parked, error)
+	// ListSettled lists every parked row of either kind that an operator
+	// settled by hand (`phoebe-rater -settle-parked`), oldest hour first.
+	ListSettled(ctx context.Context) ([]Parked, error)
 	// CatchUpState reads the one-time catch-up's progress (rater_state).
 	CatchUpState(ctx context.Context) (CatchUpState, error)
 	// NeverRatedHours lists, oldest first and at most limit, the hours in
@@ -697,7 +701,15 @@ type Parked struct {
 	// 2026-10-27). The hour is never re-aggregated; settle it by hand through
 	// the manager's credit path using this row's counts.
 	RawEventsPruned bool
+	// SettledAt, SettledBy and SettleReason are set on a row an operator
+	// settled by hand (ListSettled only; zero on an unresolved row).
+	SettledAt    time.Time
+	SettledBy    string
+	SettleReason string
 }
+
+// Settled reports whether an operator settled the row by hand.
+func (p Parked) Settled() bool { return !p.SettledAt.IsZero() }
 
 // PrunedMarker is the operator-facing note on a parked row whose raw events
 // are gone, in the -list-parked output and the per-run ERROR line.
@@ -762,10 +774,11 @@ func (s *PostgresStore) ParkedHours(ctx context.Context, notBefore time.Time) ([
 // by default, with no exception for parked usage: Hugo, 2026-10-27), so the
 // hour can never be re-aggregated and the row is settled by hand through the
 // manager's credit path. The row's counts are the remaining record.
-const ListParkedSQL = `SELECT 'token' AS kind, p.window_start, p.auth_id, p.owner_type, p.owner_id, p.resource_id, p.model_id,
+const parkedRowsSQL = `SELECT 'token' AS kind, p.window_start, p.auth_id, p.owner_type, p.owner_id, p.resource_id, p.model_id,
        p.serving_mode, p.reason, p.event_count, p.prompt_tokens, p.cached_tokens, p.completion_tokens,
        '' AS output_seconds, 0::bigint AS output_frames, 0::bigint AS request_count, '' AS gpu_seconds,
-       p.first_parked_at, p.last_seen_at, raw.n AS raw_events
+       p.first_parked_at, p.last_seen_at, raw.n AS raw_events,
+       p.settled_at, COALESCE(p.settled_by, ''), COALESCE(p.settle_reason, '')
   FROM parked_usage p
   CROSS JOIN LATERAL (
       SELECT COUNT(*)::bigint AS n
@@ -785,12 +798,13 @@ const ListParkedSQL = `SELECT 'token' AS kind, p.window_start, p.auth_id, p.owne
               ELSE COALESCE(e.user_id, '') = '' AND COALESCE(e.group_id, '') = ''
               END)
   ) raw
- WHERE p.resolved_at IS NULL
+ WHERE %[1]s
 UNION ALL
 SELECT 'video', v.window_start, v.auth_id, v.owner_type, v.owner_id, v.resource_id, v.model_id,
        v.serving_mode, v.reason, v.event_count, 0, 0, 0,
        v.output_seconds::text, v.output_frames, v.request_count, v.gpu_seconds::text,
-       v.first_parked_at, v.last_seen_at, raw.n
+       v.first_parked_at, v.last_seen_at, raw.n,
+       v.settled_at, COALESCE(v.settled_by, ''), COALESCE(v.settle_reason, '')
   FROM parked_video_usage v
   CROSS JOIN LATERAL (
       SELECT COUNT(*)::bigint AS n
@@ -809,12 +823,30 @@ SELECT 'video', v.window_start, v.auth_id, v.owner_type, v.owner_id, v.resource_
               ELSE COALESCE(e.user_id, '') = '' AND COALESCE(e.group_id, '') = ''
               END)
   ) raw
- WHERE v.resolved_at IS NULL
+ WHERE %[2]s
  ORDER BY 2, 3, 4, 5, 6, 7, 8, 9, 1`
+
+// ListParkedSQL is parkedRowsSQL over the unresolved rows.
+var ListParkedSQL = fmt.Sprintf(parkedRowsSQL, "p.resolved_at IS NULL", "v.resolved_at IS NULL")
+
+// listSettledSQL is parkedRowsSQL over the rows an operator settled by hand
+// (resolved, with settled_at set). Their raw_events count is shown as is.
+var listSettledSQL = fmt.Sprintf(parkedRowsSQL,
+	"p.resolved_at IS NOT NULL AND p.settled_at IS NOT NULL",
+	"v.resolved_at IS NOT NULL AND v.settled_at IS NOT NULL")
 
 // ListParked implements Store.
 func (s *PostgresStore) ListParked(ctx context.Context) ([]Parked, error) {
-	rows, err := s.db.QueryContext(ctx, ListParkedSQL)
+	return s.listParkedRows(ctx, ListParkedSQL)
+}
+
+// ListSettled implements Store.
+func (s *PostgresStore) ListSettled(ctx context.Context) ([]Parked, error) {
+	return s.listParkedRows(ctx, listSettledSQL)
+}
+
+func (s *PostgresStore) listParkedRows(ctx context.Context, query string) ([]Parked, error) {
+	rows, err := s.db.QueryContext(ctx, query)
 	if err != nil {
 		return nil, fmt.Errorf("rating: list parked usage: %w", err)
 	}
@@ -822,15 +854,77 @@ func (s *PostgresStore) ListParked(ctx context.Context) ([]Parked, error) {
 	var out []Parked
 	for rows.Next() {
 		var p Parked
+		var settledAt sql.NullTime
 		if err := rows.Scan(&p.Kind, &p.WindowStart, &p.AuthID, &p.OwnerType, &p.OwnerID, &p.ResourceID, &p.ModelID,
 			&p.ServingMode, &p.Reason, &p.EventCount, &p.PromptTokens, &p.CachedTokens, &p.CompletionTokens,
 			&p.OutputSeconds, &p.OutputFrames, &p.RequestCount, &p.GPUSeconds,
-			&p.FirstParkedAt, &p.LastSeenAt, &p.RawEvents); err != nil {
+			&p.FirstParkedAt, &p.LastSeenAt, &p.RawEvents,
+			&settledAt, &p.SettledBy, &p.SettleReason); err != nil {
 			return nil, fmt.Errorf("rating: scan parked usage: %w", err)
 		}
 		p.WindowStart = p.WindowStart.UTC()
 		p.RawEventsPruned = p.RawEvents < p.EventCount
+		if settledAt.Valid {
+			p.SettledAt = settledAt.Time.UTC()
+		}
 		out = append(out, p)
 	}
 	return out, rows.Err()
+}
+
+// ParkedKey names one parked row: its kind (KindToken or KindVideo) and its
+// primary key.
+type ParkedKey struct {
+	Kind        string
+	WindowStart time.Time
+	AuthID      string
+	OwnerType   string
+	OwnerID     string
+	ResourceID  string
+	ModelID     string
+	ServingMode string
+	Reason      string
+}
+
+// Key returns the row's ParkedKey.
+func (p Parked) Key() ParkedKey {
+	return ParkedKey{Kind: p.Kind, WindowStart: p.WindowStart.UTC(), AuthID: p.AuthID, OwnerType: p.OwnerType,
+		OwnerID: p.OwnerID, ResourceID: p.ResourceID, ModelID: p.ModelID, ServingMode: p.ServingMode, Reason: p.Reason}
+}
+
+// ErrParkedRowNotUnresolved: SettleParked found no unresolved row with the key
+// (it was resolved or settled in the meantime, or never existed).
+var ErrParkedRowNotUnresolved = errors.New("rating: no unresolved parked row with that key")
+
+// SettleParked records that an operator settled one unresolved parked row by
+// hand (Hugo, 2026-10-27). It keeps the row and, in one UPDATE, sets
+// resolved_at (the row stops paging, and token-push re-sends the hour without
+// the identity, as for any resolved row) with settled_at, settled_by and
+// settle_reason. The caller decides whether the row may be settled; this only
+// refuses a row that is not unresolved (ErrParkedRowNotUnresolved).
+func (s *PostgresStore) SettleParked(ctx context.Context, k ParkedKey, by, reason string) (time.Time, error) {
+	table := "parked_usage"
+	switch k.Kind {
+	case KindToken:
+	case KindVideo:
+		table = "parked_video_usage"
+	default:
+		return time.Time{}, fmt.Errorf("rating: unknown parked kind %q", k.Kind)
+	}
+	var at time.Time
+	err := s.db.QueryRowContext(ctx, `UPDATE `+table+`
+		   SET resolved_at = now(), settled_at = now(), settled_by = $9, settle_reason = $10
+		 WHERE window_start = $1 AND auth_id = $2 AND owner_type = $3 AND owner_id = $4
+		   AND resource_id = $5 AND model_id = $6 AND serving_mode = $7 AND reason = $8
+		   AND resolved_at IS NULL
+		RETURNING settled_at`,
+		k.WindowStart.UTC(), k.AuthID, k.OwnerType, k.OwnerID, k.ResourceID, k.ModelID, k.ServingMode, k.Reason,
+		by, reason).Scan(&at)
+	if errors.Is(err, sql.ErrNoRows) {
+		return time.Time{}, ErrParkedRowNotUnresolved
+	}
+	if err != nil {
+		return time.Time{}, fmt.Errorf("rating: settle parked row: %w", err)
+	}
+	return at.UTC(), nil
 }
