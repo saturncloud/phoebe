@@ -85,6 +85,26 @@ type wakeFlight struct {
 	triedUnreached atomic.Bool
 	// lastUnreached is the most recent such failure, for the caller's log.
 	lastUnreached atomic.Pointer[error]
+	// phase is set once Atlas answered wake_starting: proof the workers are
+	// starting. It holds the startup phase Atlas last reported (issue #111).
+	phase atomic.Pointer[string]
+}
+
+// starting reports whether Atlas said the workers are starting, and the
+// phase it last reported.
+func (f *wakeFlight) starting() (string, bool) {
+	if p := f.phase.Load(); p != nil {
+		return *p, true
+	}
+	return "", false
+}
+
+// startingError is the wake error for a flight whose workers are starting:
+// ErrWakeNotReady with the phase, which the proxy turns into its 503 "the
+// model is starting" naming the phase.
+func (f *wakeFlight) startingError(why error) error {
+	phase, _ := f.starting()
+	return fmt.Errorf("%w: %w: atlas waker: %v", proxy.ErrWakeNotReady, &proxy.StartupPhaseError{Phase: phase}, why)
 }
 
 // unavailable reports that Atlas was tried and never reached by this flight:
@@ -191,6 +211,9 @@ func (w *AtlasWaker) waitFlight(ctx context.Context, f *wakeFlight) error {
 		}
 	case <-ctx.Done():
 		// The loop keeps running, so the Planner is still restored.
+		if _, ok := f.starting(); ok {
+			return f.startingError(fmt.Errorf("hold ended while the workers were starting: %w", ctx.Err()))
+		}
 		if f.unavailable() {
 			return fmt.Errorf("%w: atlas waker: Atlas unreachable for the whole hold: %v (last error: %v)",
 				proxy.ErrWakeUnavailable, ctx.Err(), f.lastUnreachedError())
@@ -250,9 +273,15 @@ func (w *AtlasWaker) callUntilWoken(ctx context.Context, resourceID string, f *w
 	reached := func() { f.reachedAtlas.Store(true) }
 	for {
 		err := w.requestWake(ctx, resourceID, reached)
+		var starting *atlasStarting
 		switch {
 		case err == nil:
 			return nil
+		case errors.As(err, &starting):
+			// Atlas restored the workers and they are not Ready yet: ask again.
+			phase := starting.phase
+			f.phase.Store(&phase)
+			unknown = err
 		case errors.Is(err, proxy.ErrWakeStatusUnknown):
 			unknown = err
 		case errors.Is(err, errBeforeConnection):
@@ -279,6 +308,11 @@ func (w *AtlasWaker) callUntilWoken(ctx context.Context, resourceID string, f *w
 		select {
 		case <-ctx.Done():
 			timer.Stop()
+			if _, ok := f.starting(); ok {
+				// Atlas said the workers are starting; a later lost answer
+				// does not undo that.
+				return f.startingError(fmt.Errorf("wake loop ended while the workers were starting: %w", ctx.Err()))
+			}
 			if unknown == nil && f.unavailable() {
 				return fmt.Errorf("%w: %v", proxy.ErrWakeUnavailable, f.lastUnreachedError())
 			}
@@ -349,6 +383,11 @@ func (w *AtlasWaker) requestWake(ctx context.Context, resourceID string, reached
 	}
 	defer func() { _ = resp.Body.Close() }()
 	responseBody, _ := io.ReadAll(io.LimitReader(resp.Body, 64<<10))
+	if resp.StatusCode == http.StatusServiceUnavailable {
+		if phase, ok := atlasStartingPhase(responseBody); ok {
+			return &atlasStarting{phase: phase, body: string(responseBody)}
+		}
+	}
 	if resp.StatusCode >= http.StatusInternalServerError {
 		// Atlas may have restored the workers before a later server-side
 		// failure. Treat that outcome as indeterminate, as with a response lost
@@ -359,6 +398,37 @@ func (w *AtlasWaker) requestWake(ctx context.Context, resourceID string, reached
 		return fmt.Errorf("%w: status %d: %s", errAtlasRefused, resp.StatusCode, string(responseBody))
 	}
 	return nil
+}
+
+// atlasWakeStartingCode is the error_code of Atlas's 503 for a wake whose
+// workers it restored but which are not Ready yet (saturn
+// pdc/tf_wake_phase.py, issue #111). Its body also names the phase.
+const atlasWakeStartingCode = "wake_starting"
+
+// atlasStarting is a wake call Atlas answered wake_starting: the workers are
+// starting. It wraps ErrWakeNotReady.
+type atlasStarting struct {
+	phase string
+	body  string
+}
+
+func (e *atlasStarting) Error() string {
+	return "atlas waker: workers are starting (phase " + e.phase + "): " + e.body
+}
+
+func (e *atlasStarting) Unwrap() error { return proxy.ErrWakeNotReady }
+
+// atlasStartingPhase reads a wake_starting answer's phase. ok is false for
+// any other body, which keeps the "status unknown" reading of an Atlas 503.
+func atlasStartingPhase(body []byte) (phase string, ok bool) {
+	var answer struct {
+		ErrorCode string `json:"error_code"`
+		Phase     string `json:"phase"`
+	}
+	if err := json.Unmarshal(body, &answer); err != nil || answer.ErrorCode != atlasWakeStartingCode {
+		return "", false
+	}
+	return answer.Phase, true
 }
 
 // setCredentials puts phoebe's service token in Authorization when it has a
