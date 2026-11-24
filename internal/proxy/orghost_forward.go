@@ -19,8 +19,13 @@ package proxy
 //
 // No metering, admission or wake happens on the entry: the forward runs
 // before handleProxy's billing gate, so the serving cluster records the usage
-// once. The first-byte timeout is the wake hold plus a margin, so a cold
-// endpoint is held where it runs, not cut off at the entry. A request is
+// once. The forward has no response-header limit of its own: a non-streaming
+// completion sends its headers only when generation ends, and a cold endpoint
+// first holds the request for up to its wake budget, so any first-byte limit
+// shorter than the whole request would cut work the serving cluster is still
+// doing. The forward is bounded exactly like the local upstream path: dial and
+// TLS-handshake limits here, and protection.maxStreamDuration on the request
+// context (handleProxy) for the whole request. A request is
 // never forwarded twice: the forward carries orgHostForwardedHeader, and a
 // request that carries it is served only from a local row (508 otherwise).
 // Atlas writes forwarding copies only to clusters other than the serving one,
@@ -38,39 +43,27 @@ import (
 	"github.com/saturncloud/phoebe/internal/identity"
 )
 
-// orgHostForwardMargin is added to the wake hold to size the forward's
-// first-byte timeout (design: "300 s plus a margin").
-const orgHostForwardMargin = 60 * time.Second
-
 // orgHostForwardHeaders is the complete list of request headers that cross
 // the hop. Everything else is dropped.
 var orgHostForwardHeaders = []string{"Authorization", "Content-Type", "Accept"}
 
 // orgHostForwarder holds the transport for forwards to other clusters.
 type orgHostForwarder struct {
-	transport        http.RoundTripper
-	firstByteTimeout time.Duration
+	transport http.RoundTripper
 }
 
 // newOrgHostForwarder builds the forward transport: TLS 1.2+ with the system
 // roots (verification on; there is no option to turn it off), compression
-// off so streamed responses pass through chunk by chunk, and a first-byte
-// timeout above the serving cluster's wake hold.
-func newOrgHostForwarder(hold time.Duration) *orgHostForwarder {
-	if hold < defaultWakeTimeout {
-		// The serving cluster's hold is its own setting; never cut it off
-		// below the default even when this entry runs a shorter one.
-		hold = defaultWakeTimeout
-	}
-	timeout := hold + orgHostForwardMargin
+// off so streamed responses pass through chunk by chunk, dial and handshake
+// limits, and no response-header limit (the request context carries the
+// whole-request bound; see the file comment).
+func newOrgHostForwarder() *orgHostForwarder {
 	return &orgHostForwarder{
-		firstByteTimeout: timeout,
 		transport: &http.Transport{
 			Proxy:                 nil,
 			DialContext:           (&net.Dialer{Timeout: 10 * time.Second, KeepAlive: 30 * time.Second}).DialContext,
 			TLSClientConfig:       &tls.Config{MinVersion: tls.VersionTLS12},
 			TLSHandshakeTimeout:   10 * time.Second,
-			ResponseHeaderTimeout: timeout,
 			DisableCompression:    true,
 			ForceAttemptHTTP2:     true,
 			MaxIdleConnsPerHost:   32,

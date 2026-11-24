@@ -727,23 +727,82 @@ func TestForwardedRequestIsNotMeteredOnTheEntry(t *testing.T) {
 	}
 }
 
-func TestForwardOutlastsTheServingHoldBudget(t *testing.T) {
+func TestForwardHasNoFirstByteLimitShorterThanTheRequest(t *testing.T) {
 	s := New(&config.Settings{}, logging.New(logging.ERROR), &recordingEmitter{}).
 		WithWaker(&fakeWaker{}, 10*time.Second).
 		WithOrgHosts(&fakeTierResolver{}, "")
-	f := s.orgHosts.forward
-	if f.firstByteTimeout <= config.DefaultWakeTimeout {
-		t.Fatalf("first-byte timeout %s must exceed the serving hold budget %s", f.firstByteTimeout, config.DefaultWakeTimeout)
+	tr := s.orgHosts.forward.transport.(*http.Transport)
+	if tr.ResponseHeaderTimeout != 0 {
+		t.Fatalf("forward response-header timeout %s: a non-streaming completion sends headers only when generation ends", tr.ResponseHeaderTimeout)
 	}
-	tr := f.transport.(*http.Transport)
-	if tr.ResponseHeaderTimeout != f.firstByteTimeout {
-		t.Fatalf("transport header timeout %s != %s", tr.ResponseHeaderTimeout, f.firstByteTimeout)
+	if tr.TLSHandshakeTimeout == 0 {
+		t.Fatal("forward must keep a TLS handshake limit")
 	}
-	long := New(&config.Settings{}, logging.New(logging.ERROR), &recordingEmitter{}).
-		WithWaker(&fakeWaker{}, 600*time.Second).
-		WithOrgHosts(&fakeTierResolver{}, "")
-	if long.orgHosts.forward.firstByteTimeout <= 600*time.Second {
-		t.Fatalf("a longer local hold must lengthen the forward timeout: %s", long.orgHosts.forward.firstByteTimeout)
+}
+
+// A slow non-streaming answer (headers only after generation) passes through
+// the forward; the whole request is bounded by protection.maxStreamDuration,
+// as on the local upstream path.
+func TestForwardServesSlowNonStreamingAndIsBoundedByMaxStreamDuration(t *testing.T) {
+	slow := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		select {
+		case <-time.After(700 * time.Millisecond):
+		case <-r.Context().Done():
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"model":"m","choices":[],"usage":{"prompt_tokens":1,"completion_tokens":1}}`))
+	})
+	serving, base := tlsServing(t, slow)
+	build := func(maxDur time.Duration) *Server {
+		res := &fakeTierResolver{dedicated: []gateway.DedicatedEndpoint{forwardRow("org-1", "remote", "dep-1", base, "spoke")}}
+		s := New(&config.Settings{Protection: config.ProtectionSettings{MaxStreamDuration: maxDur}}, logging.New(logging.ERROR), &recordingEmitter{}).
+			WithGateway(res, "tf-shared", 8000).
+			WithOrgHosts(res, testSharedBaseURL)
+		s.orgHosts.forward.transport = serving.Client().Transport
+		return s
+	}
+	rr := httptest.NewRecorder()
+	build(10*time.Second).Handler().ServeHTTP(rr, orgHostRequest(http.MethodPost, "/v1/chat/completions", "org-1", chat("remote")))
+	if rr.Code != http.StatusOK {
+		t.Fatalf("slow non-streaming forward: status %d body %s", rr.Code, rr.Body.String())
+	}
+	start := time.Now()
+	rr = httptest.NewRecorder()
+	build(200*time.Millisecond).Handler().ServeHTTP(rr, orgHostRequest(http.MethodPost, "/v1/chat/completions", "org-1", chat("remote")))
+	if rr.Code == http.StatusOK || time.Since(start) > 650*time.Millisecond {
+		t.Fatalf("maxStreamDuration must bound the forward: status %d after %s", rr.Code, time.Since(start))
+	}
+}
+
+// The caller's Saturn credential never reaches the local engine (issue #26),
+// while a forward still carries Authorization to the serving cluster.
+func TestOrgHostEngineNeverSeesTheCallersCredential(t *testing.T) {
+	be := &orgEngine{}
+	srv := httptest.NewServer(be)
+	defer srv.Close()
+	up, _ := url.Parse(srv.URL)
+	s := newOrgHostTestServer(t, nil, &fakeTierResolver{dedicated: []gateway.DedicatedEndpoint{dedicatedRow("org-1", "mine", "dep-1", up.Host)}}, nil)
+	req := orgHostRequest(http.MethodPost, "/v1/chat/completions", "org-1", chat("mine"))
+	req.Header.Set("Cookie", "session=secret")
+	req.Header.Set("X-Saturn-Authorization", "token secret")
+	rr := httptest.NewRecorder()
+	s.Handler().ServeHTTP(rr, req)
+	if rr.Code != http.StatusOK || be.hits.Load() != 1 {
+		t.Fatalf("status %d hits %d body %s", rr.Code, be.hits.Load(), rr.Body.String())
+	}
+	for _, name := range []string{"Authorization", "Cookie", "X-Saturn-Authorization"} {
+		if v := be.headers[0].Get(name); v != "" {
+			t.Fatalf("engine received %s", name)
+		}
+	}
+	fbe := &orgEngine{}
+	serving, base := tlsServing(t, fbe)
+	fs := forwardingServer(t, nil, serving, forwardRow("org-1", "remote", "dep-2", base, "spoke"))
+	rr = httptest.NewRecorder()
+	fs.Handler().ServeHTTP(rr, orgHostRequest(http.MethodPost, "/v1/chat/completions", "org-1", chat("remote")))
+	if rr.Code != http.StatusOK || fbe.headers[0].Get("Authorization") != "Bearer sk-test" {
+		t.Fatalf("forward must still carry the key: status %d", rr.Code)
 	}
 }
 

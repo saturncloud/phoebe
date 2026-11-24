@@ -46,22 +46,17 @@ type orgHostRoute struct {
 
 // WithOrgHosts enables the org-host path. resolver must implement
 // gateway.DedicatedResolver (the registry resolver does); otherwise org hosts
-// stay off and org-host requests are refused (fail closed). Call it after
-// WithWaker: the forward first-byte timeout is sized above the wake hold.
+// stay off and org-host requests are refused (fail closed).
 func (s *Server) WithOrgHosts(resolver gateway.Resolver, sharedBaseURL string) *Server {
 	dedicated, ok := resolver.(gateway.DedicatedResolver)
 	if !ok || resolver == nil {
 		return s
 	}
-	hold := s.wakeTimeout
-	if hold <= 0 {
-		hold = defaultWakeTimeout
-	}
 	s.orgHosts = &orgHostRoute{
 		resolver:      dedicated,
 		shared:        resolver,
 		sharedBaseURL: strings.TrimRight(sharedBaseURL, "/"),
-		forward:       newOrgHostForwarder(hold),
+		forward:       newOrgHostForwarder(),
 	}
 	return s
 }
@@ -178,10 +173,30 @@ func (s *Server) serveOrgHost(w http.ResponseWriter, r *http.Request, id *identi
 		return false
 	}
 	if ep.Forwards() {
+		// The forward needs the key: the serving cluster's edge checks it again.
 		s.forwardOrgHost(w, r, *id, ep, forwarded)
 		return false
 	}
-	return s.applyDedicatedEndpoint(w, id, ep, model)
+	if !s.applyDedicatedEndpoint(w, id, ep, model) {
+		return false
+	}
+	stripCallerCredentials(r)
+	return true
+}
+
+// stripCallerCredentials removes the caller's Saturn credential before an
+// org-host request is proxied to the local engine. On the per-endpoint routes
+// atlas-auth removed it (issue #26: a Saturn token never reaches the app);
+// on the org host the ForwardAuth is Atlas's check, which cannot remove
+// request headers, so phoebe does it here. The key may be an org API key or
+// the playground relay token, which carries the session's audiences. It runs
+// only after the forward decision, because a forward needs the key. The
+// X-Saturn-* strip at handler entry already removed X-Saturn-Authorization;
+// it is deleted again here so this function alone states the rule.
+func stripCallerCredentials(r *http.Request) {
+	r.Header.Del("Authorization")
+	r.Header.Del("Cookie")
+	r.Header.Del("X-Saturn-Authorization")
 }
 
 // resolveOrgHostModel resolves the body model= of an org-host request to one
