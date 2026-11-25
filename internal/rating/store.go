@@ -3,7 +3,6 @@ package rating
 import (
 	"context"
 	"database/sql"
-	"errors"
 	"fmt"
 	"strings"
 	"time"
@@ -18,33 +17,13 @@ import (
 // unit-tested against a fake and the Postgres SQL tested in isolation.
 type Store interface {
 	// AggregateWindow rolls billing_event in [start, end) into rated_usage and
-	// video_billing_event into rated_video_usage, in one transaction, and
-	// reports the rollups and the anomaly counts (one statement per kind).
+	// reports the rollups and the anomaly counts, all from one statement.
 	AggregateWindow(ctx context.Context, start, end time.Time) (AggregateResult, error)
-	// ParkedHours lists the hours with unresolved parked usage of either kind
-	// at or after notBefore, so the aggregator can re-check them outside its
-	// window.
+	// ParkedHours lists the hours with unresolved parked usage at or after
+	// notBefore, so the aggregator can re-check them outside its window.
 	ParkedHours(ctx context.Context, notBefore time.Time) ([]time.Time, error)
-	// ListParked lists every unresolved parked row of either kind, oldest hour
-	// first.
+	// ListParked lists every unresolved parked row, oldest hour first.
 	ListParked(ctx context.Context) ([]Parked, error)
-	// ListSettled lists every parked row of either kind that an operator
-	// settled by hand (`phoebe-rater -settle-parked`), oldest hour first.
-	ListSettled(ctx context.Context) ([]Parked, error)
-	// CatchUpState reads the one-time catch-up's progress (rater_state).
-	CatchUpState(ctx context.Context) (CatchUpState, error)
-	// NeverRatedHours lists, oldest first and at most limit, the hours in
-	// [notBefore, before) that have billing_event rows but no rated_usage and
-	// no parked_usage row.
-	NeverRatedHours(ctx context.Context, notBefore, before time.Time, limit int) ([]time.Time, error)
-	// RecordCatchUpProgress records the last hour the catch-up rated.
-	RecordCatchUpProgress(ctx context.Context, hour time.Time) error
-	// CompleteCatchUp marks the catch-up done.
-	CompleteCatchUp(ctx context.Context) error
-	// UnratedVideoHours counts the hours in [start, end) holding completed,
-	// rateable video jobs of an identity with no video rollup and no
-	// unresolved park (never rated).
-	UnratedVideoHours(ctx context.Context, start, end time.Time) (int64, error)
 	Ping(ctx context.Context) error
 	Close() error
 }
@@ -130,19 +109,12 @@ type AggregateResult struct {
 	// topology revision 0. Not an anomaly: the quantities and payer are right;
 	// only margin attribution of that slice of the hour is lost.
 	UnknownRevisionRollups int64
-
-	// Video is the same window's video rollup (video.go), run in the same
-	// transaction. Its counts partition video_billing_event, not billing_event;
-	// none of the token fields above include video.
-	Video VideoAggregateResult
 }
 
 // PostgresStore reads billing_event and writes rated_usage in phoebe's own
 // Postgres. It does not run migrations.
 type PostgresStore struct {
 	db *sql.DB
-	// now is the clock behind the video reach (VideoFloor); tests move it.
-	now func() time.Time
 }
 
 // OpenPostgres opens a *sql.DB against the DSN using the pgx stdlib driver, applies
@@ -161,7 +133,7 @@ func OpenPostgres(ctx context.Context, cfg Config) (*PostgresStore, error) {
 	db.SetMaxIdleConns(cfg.MaxIdleConns)
 	db.SetConnMaxLifetime(cfg.ConnMaxLifetime)
 
-	s := &PostgresStore{db: db, now: time.Now}
+	s := &PostgresStore{db: db}
 	if err := s.Ping(ctx); err != nil {
 		_ = db.Close()
 		return nil, fmt.Errorf("rating: postgres ping: %w", err)
@@ -188,7 +160,7 @@ func ensureUTCTimeZone(dsn string) string {
 // NewPostgresStore wraps an existing *sql.DB. Used by tests and callers owning
 // the pool lifecycle.
 func NewPostgresStore(db *sql.DB) *PostgresStore {
-	return &PostgresStore{db: db, now: time.Now}
+	return &PostgresStore{db: db}
 }
 
 func (s *PostgresStore) Ping(ctx context.Context) error { return s.db.PingContext(ctx) }
@@ -575,52 +547,6 @@ func (s *PostgresStore) AggregateWindow(ctx context.Context, start, end time.Tim
 		return AggregateResult{}, fmt.Errorf("rating: aggregate window [%s,%s): %w",
 			start.UTC().Format(time.RFC3339), end.UTC().Format(time.RFC3339), err)
 	}
-	// Same transaction: an hour's token and video rollups move together, so
-	// token-push never reads one kind re-aggregated and the other not.
-	//
-	// Only the hours whose video jobs are still retained (VideoFloor): an
-	// older hour's video_billing_event rows are pruned, so re-running it would
-	// reconcile-delete its rated_video_usage rows (or replace them with a
-	// partial sum) and token-push would delete the manager's records. Those
-	// rollups are the record now and are left as they are.
-	vstart := start.UTC()
-	var outOfReach int64
-	if floor := VideoFloor(s.now()); vstart.Before(floor) {
-		vstart = floor
-		reachEnd := end.UTC()
-		if floor.Before(reachEnd) {
-			reachEnd = floor
-		}
-		// Two kinds of out-of-reach hour are worth reporting: hours holding
-		// video rollups (kept as the record; a re-rate would have deleted
-		// them), and hours where some identity has completed, rateable jobs
-		// (attributable, valid: what aggregateVideoWindowSQL would roll up)
-		// but neither a rollup nor an unresolved park: rated never, billed
-		// never. Checked per gate identity, so one rated identity does not
-		// hide another's unrated jobs. Invalid and unattributable jobs are
-		// not counted here: they were never rateable, and were reported as
-		// such while inside the reach. Only windows reaching past the floor
-		// (explicit runs) see these hours; a routine run checks the hours
-		// between the floor and its own window instead (Run,
-		// UnratedInReachHours).
-		if err := tx.QueryRowContext(ctx, `SELECT
-			(SELECT COUNT(DISTINCT window_start) FROM rated_video_usage
-			  WHERE window_start >= $1 AND window_start < $2),
-			`+unratedVideoHoursSQL,
-			start.UTC(), reachEnd).Scan(&outOfReach, &res.Video.UnratedOutOfReachHours); err != nil {
-			return AggregateResult{}, fmt.Errorf("rating: count video hours out of reach: %w", err)
-		}
-		res.Video.OutOfReachHours = outOfReach
-	}
-	if vstart.Before(end.UTC()) {
-		v, err := aggregateVideoWindow(ctx, tx, vstart, end)
-		if err != nil {
-			return AggregateResult{}, err
-		}
-		v.OutOfReachHours = res.Video.OutOfReachHours
-		v.UnratedOutOfReachHours = res.Video.UnratedOutOfReachHours
-		res.Video = v
-	}
 	if err := tx.Commit(); err != nil {
 		return AggregateResult{}, fmt.Errorf("rating: commit: %w", err)
 	}
@@ -628,52 +554,9 @@ func (s *PostgresStore) AggregateWindow(ctx context.Context, start, end time.Tim
 	return res, nil
 }
 
-// unratedVideoHoursSQL counts the hours in [$1, $2) where some gate identity
-// has completed, rateable video jobs (attributable, valid: what
-// aggregateVideoWindowSQL would roll up, owner conflicts excluded since they
-// park) but neither a video rollup nor an unresolved park: usage the rater
-// never rated. Per identity, so one rated identity does not hide another.
-const unratedVideoHoursSQL = `(SELECT COUNT(DISTINCT j.h) FROM (
-			   SELECT date_trunc('hour', e.created_at AT TIME ZONE 'UTC') AT TIME ZONE 'UTC' AS h,
-			          e.auth_id, e.resource_id, e.model_id, e.serving_mode,
-			          CASE WHEN COALESCE(e.user_id, '') <> '' THEN 'user'
-			               WHEN COALESCE(e.group_id, '') <> '' THEN 'group' ELSE '' END AS owner_type,
-			          COALESCE(NULLIF(e.user_id, ''), NULLIF(e.group_id, ''), '') AS owner_id
-			     FROM video_billing_event e
-			    WHERE e.created_at >= $1 AND e.created_at < $2
-			      AND e.status = 'completed' AND e.request_count = 1
-			      AND e.output_seconds >= 0 AND e.output_frames >= 0 AND e.gpu_seconds >= 0
-			      AND e.output_seconds <> 'NaN'::numeric AND e.gpu_seconds <> 'NaN'::numeric
-			      AND strpos(e.org_id || COALESCE(e.user_id, '') || COALESCE(e.group_id, '') || e.resource_id, '|') = 0
-			      AND e.auth_id <> '' AND e.resource_id <> '' AND e.model_id <> ''
-			      AND NOT (COALESCE(e.user_id, '') <> '' AND COALESCE(e.group_id, '') <> '')) j
-			  WHERE NOT EXISTS (SELECT 1 FROM rated_video_usage r
-			                     WHERE r.window_start = j.h AND r.auth_id = j.auth_id
-			                       AND r.owner_type = j.owner_type AND r.owner_id = j.owner_id
-			                       AND r.resource_id = j.resource_id AND r.model_id = j.model_id
-			                       AND r.serving_mode = j.serving_mode)
-			    AND NOT EXISTS (SELECT 1 FROM parked_video_usage p
-			                     WHERE p.window_start = j.h AND p.resolved_at IS NULL
-			                       AND p.auth_id = j.auth_id AND p.owner_type = j.owner_type
-			                       AND p.owner_id = j.owner_id AND p.resource_id = j.resource_id
-			                       AND p.model_id = j.model_id AND p.serving_mode = j.serving_mode))`
-
-// UnratedVideoHours implements Store.
-func (s *PostgresStore) UnratedVideoHours(ctx context.Context, start, end time.Time) (int64, error) {
-	var n int64
-	if err := s.db.QueryRowContext(ctx, `SELECT `+unratedVideoHoursSQL, start.UTC(), end.UTC()).Scan(&n); err != nil {
-		return 0, fmt.Errorf("rating: count never-rated video hours: %w", err)
-	}
-	return n, nil
-}
-
 // Parked is one unresolved parked_usage row: usage of one identity in one hour
 // that is not billed because of a conflict, with the counts it holds back.
 type Parked struct {
-	// Kind is "token" (parked_usage) or "video" (parked_video_usage). A token
-	// row carries the token counts and zero video fields; a video row the
-	// reverse.
-	Kind             string
 	WindowStart      time.Time
 	AuthID           string
 	OwnerType        string
@@ -686,14 +569,8 @@ type Parked struct {
 	PromptTokens     int64
 	CachedTokens     int64
 	CompletionTokens int64
-	// Video quantities. OutputSeconds and GPUSeconds are exact decimals, as
-	// Postgres prints them; "" on a token row.
-	OutputSeconds string
-	OutputFrames  int64
-	RequestCount  int64
-	GPUSeconds    string
-	FirstParkedAt time.Time
-	LastSeenAt    time.Time
+	FirstParkedAt    time.Time
+	LastSeenAt       time.Time
 	// RawEvents is how many of the identity-hour's billing_event rows remain.
 	RawEvents int64
 	// RawEventsPruned: fewer raw events remain than were parked, so the pruner
@@ -701,34 +578,11 @@ type Parked struct {
 	// 2026-10-27). The hour is never re-aggregated; settle it by hand through
 	// the manager's credit path using this row's counts.
 	RawEventsPruned bool
-	// SettledAt, SettledBy and SettleReason are set on a row an operator
-	// settled by hand (ListSettled only; zero on an unresolved row).
-	SettledAt    time.Time
-	SettledBy    string
-	SettleReason string
 }
-
-// Settled reports whether an operator settled the row by hand.
-func (p Parked) Settled() bool { return !p.SettledAt.IsZero() }
 
 // PrunedMarker is the operator-facing note on a parked row whose raw events
 // are gone, in the -list-parked output and the per-run ERROR line.
 const PrunedMarker = "raw_events: pruned — settle manually via manager credit"
-
-// UsageLabel is the parked usage of the row, in its own kind's units.
-func (p Parked) UsageLabel() string {
-	if p.Kind == KindVideo {
-		return fmt.Sprintf("output_seconds=%s output_frames=%d request_count=%d gpu_seconds=%s",
-			p.OutputSeconds, p.OutputFrames, p.RequestCount, p.GPUSeconds)
-	}
-	return fmt.Sprintf("prompt=%d cached=%d completion=%d", p.PromptTokens, p.CachedTokens, p.CompletionTokens)
-}
-
-// Parked row kinds.
-const (
-	KindToken = "token"
-	KindVideo = "video"
-)
 
 // RawEventsLabel is the RAW_EVENTS column value for a parked row.
 func (p Parked) RawEventsLabel() string {
@@ -740,12 +594,8 @@ func (p Parked) RawEventsLabel() string {
 
 // ParkedHours implements Store.
 func (s *PostgresStore) ParkedHours(ctx context.Context, notBefore time.Time) ([]time.Time, error) {
-	rows, err := s.db.QueryContext(ctx, `SELECT window_start FROM parked_usage
-		WHERE resolved_at IS NULL AND window_start >= $1
-		UNION
-		SELECT window_start FROM parked_video_usage
-		WHERE resolved_at IS NULL AND window_start >= $1
-		ORDER BY window_start`, notBefore.UTC())
+	rows, err := s.db.QueryContext(ctx, `SELECT DISTINCT window_start FROM parked_usage
+		WHERE resolved_at IS NULL AND window_start >= $1 ORDER BY window_start`, notBefore.UTC())
 	if err != nil {
 		return nil, fmt.Errorf("rating: list parked hours: %w", err)
 	}
@@ -764,21 +614,15 @@ func (s *PostgresStore) ParkedHours(ctx context.Context, notBefore time.Time) ([
 // ListParkedSQL is the operator query behind `phoebe-rater -list-parked`
 // (docs/billing-reconciliation.md, "Parked usage").
 //
-// It lists both kinds: token rows from parked_usage and video rows from
-// parked_video_usage (kind column first).
-//
-// raw_events is the number of billing_event rows (video_billing_event rows for
-// a video row) of the parked identity-hour still present (counted like the
-// aggregator counts them). When it is below
+// raw_events is the number of billing_event rows of the parked identity-hour
+// still present (counted like the aggregator counts them). When it is below
 // event_count, the pruner has removed raw evidence (billing_event keeps 30 days
 // by default, with no exception for parked usage: Hugo, 2026-10-27), so the
 // hour can never be re-aggregated and the row is settled by hand through the
 // manager's credit path. The row's counts are the remaining record.
-const parkedRowsSQL = `SELECT 'token' AS kind, p.window_start, p.auth_id, p.owner_type, p.owner_id, p.resource_id, p.model_id,
+const ListParkedSQL = `SELECT p.window_start, p.auth_id, p.owner_type, p.owner_id, p.resource_id, p.model_id,
        p.serving_mode, p.reason, p.event_count, p.prompt_tokens, p.cached_tokens, p.completion_tokens,
-       '' AS output_seconds, 0::bigint AS output_frames, 0::bigint AS request_count, '' AS gpu_seconds,
-       p.first_parked_at, p.last_seen_at, raw.n AS raw_events,
-       p.settled_at, COALESCE(p.settled_by, ''), COALESCE(p.settle_reason, '')
+       p.first_parked_at, p.last_seen_at, raw.n AS raw_events
   FROM parked_usage p
   CROSS JOIN LATERAL (
       SELECT COUNT(*)::bigint AS n
@@ -798,55 +642,12 @@ const parkedRowsSQL = `SELECT 'token' AS kind, p.window_start, p.auth_id, p.owne
               ELSE COALESCE(e.user_id, '') = '' AND COALESCE(e.group_id, '') = ''
               END)
   ) raw
- WHERE %[1]s
-UNION ALL
-SELECT 'video', v.window_start, v.auth_id, v.owner_type, v.owner_id, v.resource_id, v.model_id,
-       v.serving_mode, v.reason, v.event_count, 0, 0, 0,
-       v.output_seconds::text, v.output_frames, v.request_count, v.gpu_seconds::text,
-       v.first_parked_at, v.last_seen_at, raw.n,
-       v.settled_at, COALESCE(v.settled_by, ''), COALESCE(v.settle_reason, '')
-  FROM parked_video_usage v
-  CROSS JOIN LATERAL (
-      SELECT COUNT(*)::bigint AS n
-        FROM video_billing_event e
-       WHERE e.created_at >= v.window_start
-         AND e.created_at <  v.window_start + interval '1 hour'
-         AND e.auth_id = v.auth_id AND e.resource_id = v.resource_id AND e.model_id = v.model_id
-         AND e.serving_mode = v.serving_mode
-         AND (CASE
-              WHEN v.reason = 'owner_conflict'
-                  THEN COALESCE(e.user_id, '') <> '' AND COALESCE(e.group_id, '') <> ''
-              WHEN v.owner_type = 'user'
-                  THEN e.user_id = v.owner_id AND COALESCE(e.group_id, '') = ''
-              WHEN v.owner_type = 'group'
-                  THEN e.group_id = v.owner_id AND COALESCE(e.user_id, '') = ''
-              ELSE COALESCE(e.user_id, '') = '' AND COALESCE(e.group_id, '') = ''
-              END)
-  ) raw
- WHERE %[2]s
- ORDER BY 2, 3, 4, 5, 6, 7, 8, 9, 1`
-
-// ListParkedSQL is parkedRowsSQL over the unresolved rows.
-var ListParkedSQL = fmt.Sprintf(parkedRowsSQL, "p.resolved_at IS NULL", "v.resolved_at IS NULL")
-
-// listSettledSQL is parkedRowsSQL over the rows an operator settled by hand
-// (resolved, with settled_at set). Their raw_events count is shown as is.
-var listSettledSQL = fmt.Sprintf(parkedRowsSQL,
-	"p.resolved_at IS NOT NULL AND p.settled_at IS NOT NULL",
-	"v.resolved_at IS NOT NULL AND v.settled_at IS NOT NULL")
+ WHERE p.resolved_at IS NULL
+ ORDER BY p.window_start, p.auth_id, p.owner_type, p.owner_id, p.resource_id, p.model_id, p.serving_mode, p.reason`
 
 // ListParked implements Store.
 func (s *PostgresStore) ListParked(ctx context.Context) ([]Parked, error) {
-	return s.listParkedRows(ctx, ListParkedSQL)
-}
-
-// ListSettled implements Store.
-func (s *PostgresStore) ListSettled(ctx context.Context) ([]Parked, error) {
-	return s.listParkedRows(ctx, listSettledSQL)
-}
-
-func (s *PostgresStore) listParkedRows(ctx context.Context, query string) ([]Parked, error) {
-	rows, err := s.db.QueryContext(ctx, query)
+	rows, err := s.db.QueryContext(ctx, ListParkedSQL)
 	if err != nil {
 		return nil, fmt.Errorf("rating: list parked usage: %w", err)
 	}
@@ -854,77 +655,14 @@ func (s *PostgresStore) listParkedRows(ctx context.Context, query string) ([]Par
 	var out []Parked
 	for rows.Next() {
 		var p Parked
-		var settledAt sql.NullTime
-		if err := rows.Scan(&p.Kind, &p.WindowStart, &p.AuthID, &p.OwnerType, &p.OwnerID, &p.ResourceID, &p.ModelID,
+		if err := rows.Scan(&p.WindowStart, &p.AuthID, &p.OwnerType, &p.OwnerID, &p.ResourceID, &p.ModelID,
 			&p.ServingMode, &p.Reason, &p.EventCount, &p.PromptTokens, &p.CachedTokens, &p.CompletionTokens,
-			&p.OutputSeconds, &p.OutputFrames, &p.RequestCount, &p.GPUSeconds,
-			&p.FirstParkedAt, &p.LastSeenAt, &p.RawEvents,
-			&settledAt, &p.SettledBy, &p.SettleReason); err != nil {
+			&p.FirstParkedAt, &p.LastSeenAt, &p.RawEvents); err != nil {
 			return nil, fmt.Errorf("rating: scan parked usage: %w", err)
 		}
 		p.WindowStart = p.WindowStart.UTC()
 		p.RawEventsPruned = p.RawEvents < p.EventCount
-		if settledAt.Valid {
-			p.SettledAt = settledAt.Time.UTC()
-		}
 		out = append(out, p)
 	}
 	return out, rows.Err()
-}
-
-// ParkedKey names one parked row: its kind (KindToken or KindVideo) and its
-// primary key.
-type ParkedKey struct {
-	Kind        string
-	WindowStart time.Time
-	AuthID      string
-	OwnerType   string
-	OwnerID     string
-	ResourceID  string
-	ModelID     string
-	ServingMode string
-	Reason      string
-}
-
-// Key returns the row's ParkedKey.
-func (p Parked) Key() ParkedKey {
-	return ParkedKey{Kind: p.Kind, WindowStart: p.WindowStart.UTC(), AuthID: p.AuthID, OwnerType: p.OwnerType,
-		OwnerID: p.OwnerID, ResourceID: p.ResourceID, ModelID: p.ModelID, ServingMode: p.ServingMode, Reason: p.Reason}
-}
-
-// ErrParkedRowNotUnresolved: SettleParked found no unresolved row with the key
-// (it was resolved or settled in the meantime, or never existed).
-var ErrParkedRowNotUnresolved = errors.New("rating: no unresolved parked row with that key")
-
-// SettleParked records that an operator settled one unresolved parked row by
-// hand (Hugo, 2026-10-27). It keeps the row and, in one UPDATE, sets
-// resolved_at (the row stops paging, and token-push re-sends the hour without
-// the identity, as for any resolved row) with settled_at, settled_by and
-// settle_reason. The caller decides whether the row may be settled; this only
-// refuses a row that is not unresolved (ErrParkedRowNotUnresolved).
-func (s *PostgresStore) SettleParked(ctx context.Context, k ParkedKey, by, reason string) (time.Time, error) {
-	table := "parked_usage"
-	switch k.Kind {
-	case KindToken:
-	case KindVideo:
-		table = "parked_video_usage"
-	default:
-		return time.Time{}, fmt.Errorf("rating: unknown parked kind %q", k.Kind)
-	}
-	var at time.Time
-	err := s.db.QueryRowContext(ctx, `UPDATE `+table+`
-		   SET resolved_at = now(), settled_at = now(), settled_by = $9, settle_reason = $10
-		 WHERE window_start = $1 AND auth_id = $2 AND owner_type = $3 AND owner_id = $4
-		   AND resource_id = $5 AND model_id = $6 AND serving_mode = $7 AND reason = $8
-		   AND resolved_at IS NULL
-		RETURNING settled_at`,
-		k.WindowStart.UTC(), k.AuthID, k.OwnerType, k.OwnerID, k.ResourceID, k.ModelID, k.ServingMode, k.Reason,
-		by, reason).Scan(&at)
-	if errors.Is(err, sql.ErrNoRows) {
-		return time.Time{}, ErrParkedRowNotUnresolved
-	}
-	if err != nil {
-		return time.Time{}, fmt.Errorf("rating: settle parked row: %w", err)
-	}
-	return at.UTC(), nil
 }

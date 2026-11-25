@@ -111,33 +111,13 @@ func canonicalRequestPath(u *url.URL) (string, bool) {
 // inferenceRequestPathAllowed lists the model-bearing APIs whose response
 // usage schema Phoebe can meter. Responses API uses different token field names
 // and remains closed until its billing parser is implemented.
-//
-// /v1/rerank is a reranker endpoint's API (vLLM's Jina and Cohere v1 shape:
-// query and documents in, relevance scores out). Its response carries
-// usage.prompt_tokens and usage.total_tokens (vLLM 0.31 RerankUsage), so it
-// meters exactly like embeddings: prompt tokens only. It is the only rerank
-// spelling opened; vLLM's /rerank, /v2/rerank, /score and /v1/score stay
-// closed (one customer route per API, embeddings design section 8).
 func inferenceRequestPathAllowed(path string) bool {
 	switch path {
-	case "/v1/chat/completions", "/v1/completions", "/v1/embeddings", rerankPath:
+	case "/v1/chat/completions", "/v1/completions", "/v1/embeddings":
 		return true
 	default:
 		return false
 	}
-}
-
-// rerankPath is served by dedicated reranker endpoints only. A shared graph
-// is a Dynamo graph, and Dynamo 1.6's vLLM backend registers no rerank model
-// (only its SGLang backend does), so no shared model can answer it. Refusing
-// it on every shared surface keeps a rerank request from being admitted as
-// shared work and forwarded to a graph that would 404 it.
-const rerankPath = "/v1/rerank"
-
-// sharedTierPathAllowed is the inference surface a shared graph serves: every
-// metered path except the dedicated-only rerank route.
-func sharedTierPathAllowed(path string) bool {
-	return path != rerankPath && inferenceRequestPathAllowed(path)
 }
 
 // gatewayRequestAllowed is narrower than the bound-resource surface because a
@@ -150,7 +130,7 @@ func sharedTierPathAllowed(path string) bool {
 // gates saying the same thing, so a future refactor that drops the
 // short-circuit cannot silently open every path to OPTIONS.
 func gatewayRequestAllowed(method, path string) bool {
-	return (method == "OPTIONS" || method == "POST") && sharedTierPathAllowed(path)
+	return (method == "OPTIONS" || method == "POST") && inferenceRequestPathAllowed(path)
 }
 
 var errNotObject = errors.New("request body is not a JSON object")
@@ -240,36 +220,43 @@ func parseServedModelAllowList(h string) map[string]struct{} {
 
 // extractRequestModel pulls the top-level "model" string from an OpenAI-shaped
 // request body. Returns ("", false) if the body is not a JSON object, has no
-// model field, model is not a non-empty string, OR the top-level "model" key is
-// ambiguous: given twice, or given in another letter case ("Model", "MODEL").
+// model field, model is not a non-empty string, OR the object has DUPLICATE
+// top-level "model" keys.
 //
-// The ambiguity check is a security guard. encoding/json matches struct keys
-// case-insensitively and keeps the LAST match, while the Dynamo/vLLM frontends
-// match keys exactly and may resolve duplicates differently. If phoebe read one
-// value and the engine served another, `{"model":"victim","Model":"mine"}`
-// would resolve, authorize and bill "mine" while the engine serves "victim"
-// (battery round 2, issue #71). So every key equal to "model" ignoring case is
-// refused unless it is the one exact key, and the value is read from that
-// exact key only (a map lookup, never a case-insensitive struct match). A
-// nested "model" (inside another object or array) is not a top-level key and
-// is allowed. A well-formed request has exactly one top-level "model".
+// The duplicate-key check is a security guard: a plain struct Unmarshal silently
+// takes the LAST duplicate, but the Dynamo router downstream may resolve
+// duplicates differently (e.g. first-wins). If phoebe validated the last and the
+// router routed the first, `{"model":"victim","model":"mine"}` would bypass the
+// binding. We can't see the router's resolution, so we refuse the ambiguity: a
+// body with two top-level "model" keys fails the check (-> bindingUnparseable ->
+// 403). A well-formed request has exactly one.
 func extractRequestModel(body []byte) (string, bool) {
 	if len(body) == 0 {
 		return "", false
 	}
-	counts, err := checkTopLevelKeyAmbiguity(body, []string{"model"})
-	if err != nil || counts["model"] != 1 {
+	// Fast path for the value; then verify uniqueness of the top-level key.
+	var m struct {
+		Model string `json:"model"`
+	}
+	if err := json.Unmarshal(body, &m); err != nil {
 		return "", false
 	}
-	var fields map[string]json.RawMessage
-	if err := json.Unmarshal(body, &fields); err != nil {
+	if m.Model == "" {
 		return "", false
 	}
-	var model string
-	if err := json.Unmarshal(fields["model"], &model); err != nil || model == "" {
+	if count, err := countTopLevelModelKeys(body); err != nil || count != 1 {
 		return "", false
 	}
-	return model, true
+	return m.Model, true
+}
+
+// countTopLevelModelKeys counts how many times "model" appears as a key of the
+// top-level JSON object, using a streaming token decoder (so nested "model"
+// keys, e.g. inside an array element, are not counted). Returns an error if the
+// body is not a JSON object.
+func countTopLevelModelKeys(body []byte) (int, error) {
+	counts, err := countTopLevelKeys(body, map[string]struct{}{"model": {}})
+	return counts["model"], err
 }
 
 // scanTopLevelKeys walks the keys of the top-level JSON object in body, in
@@ -391,13 +378,11 @@ func skipValue(dec *json.Decoder) error {
 }
 
 // clientError is an OpenAI-style error object, the shape OpenAI clients
-// parse: {"error": {"message", "type", "code", "param"}}. Param is null
-// unless a refusal names the request field at fault.
+// parse: {"error": {"message", "type", "code"}}.
 type clientError struct {
-	Message string  `json:"message"`
-	Type    string  `json:"type"`
-	Code    string  `json:"code"`
-	Param   *string `json:"param"`
+	Message string `json:"message"`
+	Type    string `json:"type"`
+	Code    string `json:"code"`
 }
 
 // The model-binding refusals (gateway-admission Q64, approved by Hugo

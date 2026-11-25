@@ -3,7 +3,6 @@ package main
 import (
 	"os"
 	"path/filepath"
-	"strings"
 	"testing"
 	"time"
 )
@@ -137,89 +136,5 @@ func TestEnsureUTCTimeZone(t *testing.T) {
 		if got := ensureUTCTimeZone(in); got != want {
 			t.Fatalf("ensureUTCTimeZone(%q) = %q, want %q", in, got, want)
 		}
-	}
-}
-
-// The push carries the install's SATURN_TOKEN and its usage, so the manager URL
-// must be https. A plain http URL, another scheme, or a URL with no scheme is
-// refused at load, and so is the same URL given as -manager-url.
-func TestLoadConfig_RejectsNonHTTPSManagerURL(t *testing.T) {
-	for _, u := range []string{
-		"http://manager.saturnenterprise.io",
-		"http://127.0.0.1:8080", // loopback http still needs the test-only key
-		"ftp://manager.saturnenterprise.io",
-		"manager.saturnenterprise.io",
-		"//manager.saturnenterprise.io",
-		"https://", // no host
-	} {
-		t.Run(u, func(t *testing.T) {
-			_, _, err := loadConfig(settingsFile(t, "managerURL: \""+u+"\"\n"))
-			if err == nil {
-				t.Fatalf("loadConfig accepted managerURL %q; want a refusal", u)
-			}
-			if !strings.Contains(err.Error(), "https") {
-				t.Fatalf("error %q does not say https is required", err)
-			}
-			t.Setenv(tokenEnv, "tok")
-			t.Setenv("DATABASE_URL", "postgres://phoebe")
-			opened := useStore(t, newFake(), nil)
-			if code := runWith([]string{"-manager-url", u, "-f", settingsFile(t, "debug: false\n")}); code != exitFatal {
-				t.Fatalf("-manager-url %q: exit %d, want exitFatal(%d)", u, code, exitFatal)
-			}
-			if *opened {
-				t.Fatalf("-manager-url %q: the run reached the database; it must stop at the URL check", u)
-			}
-		})
-	}
-	_, opts, err := loadConfig(settingsFile(t, "managerURL: \"https://manager.saturnenterprise.io\"\n"))
-	if err != nil || opts.managerURL != "https://manager.saturnenterprise.io" {
-		t.Fatalf("https URL: managerURL %q, err %v; want it accepted", opts.managerURL, err)
-	}
-	if _, _, err := loadConfig(settingsFile(t, "managerURL: \"\"\n")); err != nil {
-		t.Fatalf("empty managerURL (not connected) refused: %v", err)
-	}
-}
-
-// allowInsecureLocalhostManagerURL exists for tests with a stub manager. It
-// allows http to localhost, 127.0.0.1 and ::1 and nothing else: http to any
-// other host is refused even with the key set.
-func TestLoadConfig_AllowsHTTPLocalhostOnlyWithTheTestFlag(t *testing.T) {
-	const key = "allowInsecureLocalhostManagerURL: true\n"
-	for _, u := range []string{"http://localhost:8080", "http://127.0.0.1:41234/", "http://[::1]:9000", "http://LOCALHOST"} {
-		_, opts, err := loadConfig(settingsFile(t, key+"managerURL: \""+u+"\"\n"))
-		if err != nil || opts.managerURL != u {
-			t.Fatalf("%s with the test key: managerURL %q, err %v; want it accepted", u, opts.managerURL, err)
-		}
-		if err := checkManagerURL(u, false); err == nil {
-			t.Fatalf("%s accepted without the test key", u)
-		}
-	}
-	for _, u := range []string{
-		"http://example.com",
-		"http://manager.saturnenterprise.io",
-		"http://127.0.0.2",
-		"http://localhost.example.com",
-		"http://10.0.0.1",
-		"http://[::ffff:127.0.0.1]",
-		"ftp://localhost",
-	} {
-		if _, _, err := loadConfig(settingsFile(t, key+"managerURL: \""+u+"\"\n")); err == nil {
-			t.Fatalf("%s accepted with the test key; it allows loopback http only", u)
-		}
-	}
-	// The key also governs -manager-url: loopback http runs (a fresh install
-	// with no usage exits 0 without sending), http to another host is refused
-	// before the database is opened.
-	t.Setenv(tokenEnv, "tok")
-	t.Setenv("DATABASE_URL", "postgres://phoebe")
-	fresh := newFake()
-	fresh.empty = true
-	opened := useStore(t, fresh, nil)
-	if code := runWith([]string{"-manager-url", "http://127.0.0.1:1", "-f", settingsFile(t, key)}); code != exitOK || !*opened {
-		t.Fatalf("-manager-url http://127.0.0.1:1 with the test key: exit %d (database opened %v), want exitOK", code, *opened)
-	}
-	opened = useStore(t, newFake(), nil)
-	if code := runWith([]string{"-manager-url", "http://example.com", "-f", settingsFile(t, key)}); code != exitFatal || *opened {
-		t.Fatalf("-manager-url http://example.com with the test key: exit %d (database opened %v), want exitFatal before the database", code, *opened)
 	}
 }

@@ -151,14 +151,6 @@ type Server struct {
 	// gateway-marked requests fail closed with 503. Set via WithGateway.
 	gateway *gatewayRoute
 
-	// orgHosts wires the org-host path (orghost.go, issue #71). nil = org
-	// hosts off: org-host-marked requests fail closed with 503.
-	orgHosts *orgHostRoute
-
-	// videos hands video endpoints' /v1/videos requests to phoebe-videos.
-	// nil = video generation off: video routes answer 404. Set via WithVideos.
-	videos *videosRoute
-
 	// admitter is the distributed shared-inference physical-capacity gate. nil means
 	// the feature is disabled. It runs only after trusted org/model resolution
 	// and model binding, and before any engine request.
@@ -307,12 +299,6 @@ func (s *Server) handleHealth(w http.ResponseWriter, _ *http.Request) {
 func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request) {
 	r = r.WithContext(withRequestStart(r.Context(), time.Now()))
 	id := identity.FromRequest(r)
-	if id.OrgHost {
-		// Org-host requests answer every retryable 503 (wake, cold holds,
-		// request-buffer budget) with the full OpenAI error object. Set
-		// before any context is derived, so every later one inherits it.
-		r = r.WithContext(withOrgHostErrors(r.Context()))
-	}
 	// The legacy quota headers feed only a log diagnostic on the admission path
 	// (R8 cutover); record their presence now, because the strip below removes
 	// them. Without an admitter the diagnostic can never fire, so skip the
@@ -394,9 +380,6 @@ func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request) {
 		handlerDone = true
 		maxDurationMu.Unlock()
 	}()
-	// A video content download stops the timer once it is checked (the one
-	// exemption, exemptFromMaxStreamDuration).
-	ctx = withMaxStreamDurationExempt(ctx, func() { maxDuration.Stop() })
 	r = r.WithContext(ctx)
 	stallGuard := newStallGuardWriter(w, prot.StreamStallTimeout, cancel)
 	w = stallGuard
@@ -471,36 +454,11 @@ func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request) {
 	// attempt without usage as unbilled work (UNEXPLAINED MISSING-USAGE).
 	metered := r.Method == http.MethodPost && inferenceRequestPathAllowed(routePath)
 
-	// ORG HOST (issue #71): <label>-inference.<domain>, one org's dedicated
-	// endpoints. Checked FIRST, so an org-host mark together with any other
-	// route's mark is refused rather than handled as the other route.
-	// serveOrgHost resolves the endpoint from the registry and fills id from
-	// the row; on true the request continues down the dedicated path below
-	// exactly like a per-endpoint route.
-	if id.OrgHost {
-		if !s.serveOrgHost(w, r, &id, routePath, pathCanonical) {
-			return
-		}
-	} else if id.EndpointScopePresent {
-		// The endpoint scope is stamped only by the org-host ForwardAuth and
-		// blanked on every other route; anywhere else the edge is broken.
-		s.log.Error.Printf("refusing %s on a request that is not an org-host request (edge contract broken)", identity.HeaderEndpointScope)
-		writeClientError(w, "", http.StatusForbidden, orgHostConflictingRoute)
-		return
-	}
-
-	// The issue #13 video retrieval route on the shared host is gone (issue
-	// #71): an org's videos are read, downloaded, deleted and listed on its
-	// org host (serveOrgHostVideos). A request that still carries the old
-	// retrieval mark gets no special treatment: it is judged like any other
-	// request on its route (the mark was removed above with every other
-	// X-Saturn-* header).
-
 	if id.Gateway {
 		if !pathCanonical || !gatewayRequestAllowed(r.Method, routePath) {
-			s.log.Warn.Printf("gateway: refusing route outside public inference surface method=%s path=%q canonical=%v org_id=%q",
-				r.Method, r.URL.EscapedPath(), pathCanonical, id.OrgID)
-			writeClientError(w, "", http.StatusNotFound, gatewayUnknownPath)
+			s.log.Warn.Printf("gateway: refusing route outside public inference surface method=%s raw_path=%q canonical=%v org_id=%q",
+				r.Method, r.URL.RawPath, pathCanonical, id.OrgID)
+			http.Error(w, "not found", http.StatusNotFound)
 			return
 		}
 		// Preflight is answered LOCALLY: phoebe writes 204 and no OPTIONS is
@@ -516,7 +474,7 @@ func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request) {
 		// pins the non-support so it stays a decision rather than an accident.
 		if r.Method == http.MethodOptions {
 			if id.OrgID == "" {
-				writeClientError(w, "", http.StatusForbidden, gatewayForbidden)
+				http.Error(w, "forbidden", http.StatusForbidden)
 				return
 			}
 			w.WriteHeader(http.StatusNoContent)
@@ -583,15 +541,6 @@ func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request) {
 		// don't invent a target. Log loudly with the resource for diagnosis.
 		s.log.Error.Printf("refusing %q: %v (resource_id=%q)", identity.HeaderUpstream, err, id.ResourceID)
 		http.Error(w, "no upstream for this request", http.StatusBadGateway)
-		return
-	}
-
-	// VIDEO ENDPOINT: a route Atlas stamped with X-Saturn-Video-Limits serves
-	// /v1/videos only, and phoebe-videos owns those jobs. Nothing below
-	// applies to it (no model binding on the chat surface, no wake hold, no
-	// token metering: a job is metered when it finishes).
-	if !id.Gateway && id.VideoLimits != "" {
-		s.serveVideo(w, r, id, requestID, routePath, pathCanonical)
 		return
 	}
 
@@ -723,12 +672,6 @@ func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request) {
 			// preflight that precedes it) stays reachable; Atlas's middleware
 			// injecting the header restores the full bound surface.
 			allowed = allowed && unboundRequestAllowed(r.Method, routePath)
-		}
-		// A shared route never serves the dedicated-only rerank API
-		// (sharedTierPathAllowed): refuse it here, before admission could
-		// count it as shared work.
-		if id.ServingMode == identity.ServingModeShared && routePath == rerankPath {
-			allowed = false
 		}
 		if !allowed {
 			s.log.Warn.Printf("model-binding: refused request_id=%s resource_id=%s raw_path=%q canonical=%v serving_mode=%q (route not authorized for resource)",

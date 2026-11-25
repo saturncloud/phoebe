@@ -23,16 +23,11 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/saturncloud/phoebe/internal/atlastoken"
 	"github.com/saturncloud/phoebe/internal/logging"
 	"github.com/saturncloud/phoebe/internal/proxy"
 )
 
 const internalWakePath = "/api/internal/token-factory/inference-endpoints/wake"
-
-// internalWakeHeader carries the legacy shared secret, for the one transition
-// build in which Atlas pods of the previous build may still answer a wake
-// (they know only this header). Removed with TF_INTERNAL_WAKE_TOKEN.
 const internalWakeHeader = "X-Saturn-Internal-Wake-Token"
 
 // wakeLoopWindow bounds one wake loop. It is independent of the client's
@@ -53,12 +48,8 @@ const wakeLoopWindow = 10 * time.Minute
 // cold requests from becoming a burst of Atlas calls, each of which holds a
 // database connection while Atlas waits on the graph's lock.
 type AtlasWaker struct {
-	baseURL string
-	// tokens gives phoebe's Atlas service token (tf-internal:wake) for each
-	// call; nil when the install has not mounted it.
-	tokens atlastoken.Source
-	// legacyToken is the transition build's shared secret, or "".
-	legacyToken  string
+	baseURL      string
+	token        string
 	client       *http.Client
 	pollInterval time.Duration
 	loopWindow   time.Duration
@@ -85,26 +76,6 @@ type wakeFlight struct {
 	triedUnreached atomic.Bool
 	// lastUnreached is the most recent such failure, for the caller's log.
 	lastUnreached atomic.Pointer[error]
-	// phase is set once Atlas answered wake_starting: proof the workers are
-	// starting. It holds the startup phase Atlas last reported (issue #111).
-	phase atomic.Pointer[string]
-}
-
-// starting reports whether Atlas said the workers are starting, and the
-// phase it last reported.
-func (f *wakeFlight) starting() (string, bool) {
-	if p := f.phase.Load(); p != nil {
-		return *p, true
-	}
-	return "", false
-}
-
-// startingError is the wake error for a flight whose workers are starting:
-// ErrWakeNotReady with the phase, which the proxy turns into its 503 "the
-// model is starting" naming the phase.
-func (f *wakeFlight) startingError(why error) error {
-	phase, _ := f.starting()
-	return fmt.Errorf("%w: %w: atlas waker: %v", proxy.ErrWakeNotReady, &proxy.StartupPhaseError{Phase: phase}, why)
 }
 
 // unavailable reports that Atlas was tried and never reached by this flight:
@@ -129,38 +100,25 @@ var errAtlasRefused = errors.New("atlas waker: Atlas refused the wake")
 // made, so Atlas never received it. It is safe to retry.
 var errBeforeConnection = errors.New("atlas waker: request failed before connection")
 
-// errNoCredential marks a wake call phoebe refused to send because it holds
-// no usable credential (atlastoken logs why). Like an Atlas refusal, it ends
-// the flight at once: the held requests get the cold response.
-var errNoCredential = errors.New("atlas waker: no usable Atlas credential; the wake was not sent")
-
-// NewAtlas builds the waker. tokens is phoebe's Atlas service token source;
-// legacyToken is the transition build's shared secret. At least one is
-// required.
-func NewAtlas(baseURL string, tokens atlastoken.Source, legacyToken string, log *logging.Logger) (*AtlasWaker, error) {
+func NewAtlas(baseURL, token string, log *logging.Logger) (*AtlasWaker, error) {
 	if strings.TrimSpace(baseURL) == "" {
 		return nil, errors.New("atlas waker: atlas URL is empty")
 	}
-	legacyToken = strings.TrimSpace(legacyToken)
-	if tokens == nil && legacyToken == "" {
-		return nil, errors.New("atlas waker: no Atlas service token file and no legacy wake token")
+	if strings.TrimSpace(token) == "" {
+		return nil, errors.New("atlas waker: internal wake token is empty")
 	}
 	u, err := url.Parse(baseURL)
 	if err != nil || (u.Scheme != "http" && u.Scheme != "https") || u.Host == "" ||
 		u.RawQuery != "" || u.Fragment != "" || u.User != nil {
 		return nil, fmt.Errorf("atlas waker: invalid Atlas URL %q", baseURL)
 	}
-	if err := atlastoken.CheckAtlasURL(baseURL); err != nil {
-		return nil, fmt.Errorf("atlas waker: %w", err)
-	}
 	transport := http.DefaultTransport.(*http.Transport).Clone()
 	// The wake token is an internal credential. Never send it through an
 	// ambient HTTP proxy inherited from the pod environment.
 	transport.Proxy = nil
 	return &AtlasWaker{
-		baseURL:     strings.TrimRight(baseURL, "/"),
-		tokens:      tokens,
-		legacyToken: legacyToken,
+		baseURL: strings.TrimRight(baseURL, "/"),
+		token:   token,
 		client: &http.Client{
 			Timeout:   30 * time.Second,
 			Transport: transport,
@@ -211,9 +169,6 @@ func (w *AtlasWaker) waitFlight(ctx context.Context, f *wakeFlight) error {
 		}
 	case <-ctx.Done():
 		// The loop keeps running, so the Planner is still restored.
-		if _, ok := f.starting(); ok {
-			return f.startingError(fmt.Errorf("hold ended while the workers were starting: %w", ctx.Err()))
-		}
 		if f.unavailable() {
 			return fmt.Errorf("%w: atlas waker: Atlas unreachable for the whole hold: %v (last error: %v)",
 				proxy.ErrWakeUnavailable, ctx.Err(), f.lastUnreachedError())
@@ -273,15 +228,9 @@ func (w *AtlasWaker) callUntilWoken(ctx context.Context, resourceID string, f *w
 	reached := func() { f.reachedAtlas.Store(true) }
 	for {
 		err := w.requestWake(ctx, resourceID, reached)
-		var starting *atlasStarting
 		switch {
 		case err == nil:
 			return nil
-		case errors.As(err, &starting):
-			// Atlas restored the workers and they are not Ready yet: ask again.
-			phase := starting.phase
-			f.phase.Store(&phase)
-			unknown = err
 		case errors.Is(err, proxy.ErrWakeStatusUnknown):
 			unknown = err
 		case errors.Is(err, errBeforeConnection):
@@ -308,11 +257,6 @@ func (w *AtlasWaker) callUntilWoken(ctx context.Context, resourceID string, f *w
 		select {
 		case <-ctx.Done():
 			timer.Stop()
-			if _, ok := f.starting(); ok {
-				// Atlas said the workers are starting; a later lost answer
-				// does not undo that.
-				return f.startingError(fmt.Errorf("wake loop ended while the workers were starting: %w", ctx.Err()))
-			}
 			if unknown == nil && f.unavailable() {
 				return fmt.Errorf("%w: %v", proxy.ErrWakeUnavailable, f.lastUnreachedError())
 			}
@@ -354,9 +298,7 @@ func (w *AtlasWaker) requestWake(ctx context.Context, resourceID string, reached
 		return fmt.Errorf("atlas waker: build request: %w", err)
 	}
 	req.Header.Set("Content-Type", "application/json")
-	if err := w.setCredentials(req); err != nil {
-		return err
-	}
+	req.Header.Set(internalWakeHeader, w.token)
 	req.Header.Set("Idempotency-Key", resourceID)
 	var gotConn atomic.Bool
 	req = req.WithContext(httptrace.WithClientTrace(req.Context(), &httptrace.ClientTrace{
@@ -383,11 +325,6 @@ func (w *AtlasWaker) requestWake(ctx context.Context, resourceID string, reached
 	}
 	defer func() { _ = resp.Body.Close() }()
 	responseBody, _ := io.ReadAll(io.LimitReader(resp.Body, 64<<10))
-	if resp.StatusCode == http.StatusServiceUnavailable {
-		if phase, ok := atlasStartingPhase(responseBody); ok {
-			return &atlasStarting{phase: phase, body: string(responseBody)}
-		}
-	}
 	if resp.StatusCode >= http.StatusInternalServerError {
 		// Atlas may have restored the workers before a later server-side
 		// failure. Treat that outcome as indeterminate, as with a response lost
@@ -396,63 +333,6 @@ func (w *AtlasWaker) requestWake(ctx context.Context, resourceID string, reached
 	}
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		return fmt.Errorf("%w: status %d: %s", errAtlasRefused, resp.StatusCode, string(responseBody))
-	}
-	return nil
-}
-
-// atlasWakeStartingCode is the error_code of Atlas's 503 for a wake whose
-// workers it restored but which are not Ready yet (saturn
-// pdc/tf_wake_phase.py, issue #111). Its body also names the phase.
-const atlasWakeStartingCode = "wake_starting"
-
-// atlasStarting is a wake call Atlas answered wake_starting: the workers are
-// starting. It wraps ErrWakeNotReady.
-type atlasStarting struct {
-	phase string
-	body  string
-}
-
-func (e *atlasStarting) Error() string {
-	return "atlas waker: workers are starting (phase " + e.phase + "): " + e.body
-}
-
-func (e *atlasStarting) Unwrap() error { return proxy.ErrWakeNotReady }
-
-// atlasStartingPhase reads a wake_starting answer's phase. ok is false for
-// any other body, which keeps the "status unknown" reading of an Atlas 503.
-func atlasStartingPhase(body []byte) (phase string, ok bool) {
-	var answer struct {
-		ErrorCode string `json:"error_code"`
-		Phase     string `json:"phase"`
-	}
-	if err := json.Unmarshal(body, &answer); err != nil || answer.ErrorCode != atlasWakeStartingCode {
-		return "", false
-	}
-	return answer.Phase, true
-}
-
-// setCredentials puts phoebe's service token in Authorization when it has a
-// usable one, and the legacy header when the transition secret is set (an
-// Atlas of the previous build reads only that). A new Atlas decides on
-// Authorization when it is present. With neither, nothing is sent.
-func (w *AtlasWaker) setCredentials(req *http.Request) error {
-	sent := false
-	var tokenErr error
-	if w.tokens != nil {
-		token, err := w.tokens.Token()
-		if err == nil {
-			req.Header.Set("Authorization", "token "+token)
-			sent = true
-		}
-		tokenErr = err
-	}
-	if w.legacyToken != "" {
-		req.Header.Set(internalWakeHeader, w.legacyToken)
-		sent = true
-	}
-	if !sent {
-		// Nothing was dispatched, so the wake is unavailable, not unknown.
-		return fmt.Errorf("%w: %w: %v", proxy.ErrWakeUnavailable, errNoCredential, tokenErr)
 	}
 	return nil
 }

@@ -128,92 +128,41 @@ const wakeNeverServedHeader = "X-Phoebe-Wake-Never-Served"
 // response (a Dynamo 404 "Model not found", or the not-ready 503) is NOT
 // passed through: a 404 tells API clients the model does not exist and they
 // do not retry it, which is wrong while the model is starting.
-func writeWakeStarting(ctx context.Context, w http.ResponseWriter, requestID, phase string) {
-	writeRetryLater(ctx, w, requestID, wakeStartingMessage(phase))
-}
-
-// The startup phases Atlas reports on its wake_starting answer (saturn
-// pdc/tf_wake_phase.py WakePhase), issue #111.
-const (
-	StartupPhaseWaitingForGPUNode = "waiting_for_gpu_node"
-	StartupPhasePullingImage      = "pulling_image"
-	StartupPhaseLoadingModel      = "loading_model"
-)
-
-// wakeStartingMessage is the client's message for a wake whose workers are
-// starting. A known phase says what they wait on; any other phase (none, or
-// Atlas's generic "starting") keeps the message clients already saw.
-func wakeStartingMessage(phase string) string {
-	retry := "; retry in about " + strconv.Itoa(wakeRetryAfterSeconds) + " seconds."
-	switch phase {
-	case StartupPhaseWaitingForGPUNode:
-		return "The model is starting: waiting for a GPU node" + retry
-	case StartupPhasePullingImage:
-		return "The model is starting: pulling its container image" + retry
-	case StartupPhaseLoadingModel:
-		return "The model is starting: loading the model" + retry
-	default:
-		return "The model is starting from zero" + retry
-	}
-}
-
-// StartupPhaseError carries the startup phase Atlas last reported for a wake
-// whose workers are starting. A Waker joins it to ErrWakeNotReady;
-// wakeStartingPhase reads it back for the client's message.
-type StartupPhaseError struct {
-	Phase string
-}
-
-func (e *StartupPhaseError) Error() string { return "startup phase " + e.Phase }
-
-// wakeStartingPhase is the phase a wake error carries, or "".
-func wakeStartingPhase(err error) string {
-	var phaseErr *StartupPhaseError
-	if errors.As(err, &phaseErr) {
-		return phaseErr.Phase
-	}
-	return ""
-}
-
-func writeWakeUnavailable(ctx context.Context, w http.ResponseWriter, requestID string) {
-	writeRetryLater(ctx, w, requestID, "The wake service is unavailable; retry in about "+
+func writeWakeStarting(w http.ResponseWriter, requestID string) {
+	writeRetryLater(w, requestID, "The model is starting from zero; retry in about "+
 		strconv.Itoa(wakeRetryAfterSeconds)+" seconds.")
 }
 
-func writeWakeStatusUnknown(ctx context.Context, w http.ResponseWriter, requestID string) {
-	writeRetryLater(ctx, w, requestID, "The wake service could not confirm whether startup began; retry in about "+
+func writeWakeUnavailable(w http.ResponseWriter, requestID string) {
+	writeRetryLater(w, requestID, "The wake service is unavailable; retry in about "+
+		strconv.Itoa(wakeRetryAfterSeconds)+" seconds.")
+}
+
+func writeWakeStatusUnknown(w http.ResponseWriter, requestID string) {
+	writeRetryLater(w, requestID, "The wake service could not confirm whether startup began; retry in about "+
 		strconv.Itoa(wakeRetryAfterSeconds)+" seconds.")
 }
 
 // writeRetryLater is phoebe's one retryable 503 answer: Retry-After
-// (wakeRetryAfterSeconds), the request id, and a JSON error body. The wake
-// writers, the dedicated cold-hold overflow (D4) and, through
+// (wakeRetryAfterSeconds), the request id, and a JSON {"error": msg} body.
+// The wake writers, the dedicated cold-hold overflow (D4) and, through
 // writeRetryLaterAfter, the request-buffer-full refusal (D43) all answer
-// through it so the shape cannot drift between them. On an org-host request
-// (ctx marked by withOrgHostErrors) the body is the OpenAI error object with
-// type server_error and code endpoint_starting (tenant-domains design 3.2);
-// everywhere else it keeps the {"error": msg} shape.
-func writeRetryLater(ctx context.Context, w http.ResponseWriter, requestID, msg string) {
-	writeRetryLaterAfter(ctx, w, requestID, msg, orgHostCodeEndpointStarting, wakeRetryAfterSeconds)
+// through it so the shape cannot drift between them.
+func writeRetryLater(w http.ResponseWriter, requestID, msg string) {
+	writeRetryLaterAfter(w, requestID, msg, wakeRetryAfterSeconds)
 }
 
-// writeRetryLaterAfter is writeRetryLater with its own org-host error code
-// and Retry-After seconds.
-func writeRetryLaterAfter(ctx context.Context, w http.ResponseWriter, requestID, msg, orgHostCode string, retryAfterSeconds int) {
-	h := w.Header()
-	h.Set("Retry-After", strconv.Itoa(retryAfterSeconds))
-	if orgHostErrors(ctx) {
-		writeClientError(w, requestID, http.StatusServiceUnavailable,
-			clientError{Message: msg, Type: "server_error", Code: orgHostCode})
-		return
-	}
+// writeRetryLaterAfter is writeRetryLater with its own Retry-After seconds.
+func writeRetryLaterAfter(w http.ResponseWriter, requestID, msg string, retryAfterSeconds int) {
 	body, _ := json.Marshal(map[string]string{"error": msg})
+	h := w.Header()
 	if requestID != "" {
 		// A refusal before the attempt id is minted (the request-buffer
 		// budget at body admission) has none to echo.
 		h.Set(requestIDHeader, requestID)
 	}
 	h.Set("Content-Type", "application/json")
+	h.Set("Retry-After", strconv.Itoa(retryAfterSeconds))
 	h.Set("Content-Length", strconv.Itoa(len(body)))
 	w.WriteHeader(http.StatusServiceUnavailable)
 	_, _ = w.Write(body)
@@ -355,14 +304,14 @@ func (t *wakeRoundTripper) RoundTrip(req *http.Request) (*http.Response, error) 
 	// wake definitely fails, the refusal itself is returned, as before.
 	var refusedErr error
 	if err != nil {
-		if !isDialFailure(req.Context(), err) {
+		if !errors.Is(err, syscall.ECONNREFUSED) {
 			return nil, err
 		}
 		refusedErr = err
 		resp = &http.Response{StatusCode: http.StatusBadGateway, Header: http.Header{}, Body: http.NoBody, Request: req}
 		t.server.log.Info.Printf(
-			"wake: could not connect to the upstream on the first forward; holding for a wake request_id=%s resource_id=%s: %v",
-			t.requestID, t.target.ResourceID, err,
+			"wake: upstream refused the first forward; holding for a wake request_id=%s resource_id=%s",
+			t.requestID, t.target.ResourceID,
 		)
 	} else {
 		cold, noBackend, err := classifyWakeCandidate(req.Context(), resp, t.candidateReadTimeout())
@@ -406,7 +355,7 @@ func (t *wakeRoundTripper) RoundTrip(req *http.Request) (*http.Response, error) 
 			t.server.log.Warn.Printf("wake: dedicated cold-hold limit reached request_id=%s resource_id=%s",
 				t.requestID, t.target.ResourceID)
 			buf := newBufferingResponseWriter()
-			writeDedicatedColdHoldsFull(req.Context(), buf, t.requestID)
+			writeDedicatedColdHoldsFull(buf, t.requestID)
 			return bufferedHTTPResponse(req, buf, true), nil
 		}
 		releaseHold = release // idempotent (acquire), so the explicit call and the defer are both safe
@@ -456,7 +405,7 @@ func (t *wakeRoundTripper) RoundTrip(req *http.Request) (*http.Response, error) 
 		if errors.Is(wakeErr, ErrWakeNotReady) {
 			_ = resp.Body.Close()
 			t.neverServed = true
-			return wakeStartingResponse(req, t.requestID, wakeStartingPhase(wakeErr)), nil
+			return wakeStartingResponse(req, t.requestID), nil
 		}
 		t.neverServed = true
 		if refusedErr != nil {
@@ -480,7 +429,7 @@ func (t *wakeRoundTripper) RoundTrip(req *http.Request) (*http.Response, error) 
 		if t.target.AdapterNotReady {
 			return adapterNotLoadedResponse(req, t.requestID), nil
 		}
-		return wakeStartingResponse(req, t.requestID, ""), nil
+		return wakeStartingResponse(req, t.requestID), nil
 	}
 	if noBackend {
 		return t.noBackendResponse(req, resp), nil
@@ -496,7 +445,7 @@ func (t *wakeRoundTripper) noBackendResponse(req *http.Request, resp *http.Respo
 	_ = resp.Body.Close()
 	t.neverServed = true
 	buf := newBufferingResponseWriter()
-	writeRetryLater(req.Context(), buf, t.requestID, coldUnavailableMessage)
+	writeRetryLater(buf, t.requestID, coldUnavailableMessage)
 	return bufferedHTTPResponse(req, buf, true)
 }
 
@@ -518,40 +467,6 @@ func classifyWakeCandidate(ctx context.Context, resp *http.Response, timeout tim
 	}
 	return false, bodyLooksNoBackend(body), nil
 }
-
-// isDialFailure reports whether a forward failed before any connection to the
-// upstream was made: refused, a dial timeout, no route. No request bytes left
-// phoebe, so the request can be sent again, and on a wakeable route it means
-// the graph's frontend is not reachable yet (restarting, still pulling its
-// image, or its Service has no ready endpoint). Which of these phoebe sees
-// depends on the network: kube-proxy refuses a Service with no ready
-// endpoint, while on uk2 (Nebius, 2026-11-23) the dial timed out after 30 s,
-// and that first request got a 502 and started no wake (issue #111). A failure
-// after the client went away is not one.
-func isDialFailure(ctx context.Context, err error) bool {
-	if ctx.Err() != nil {
-		return false
-	}
-	if errors.Is(err, syscall.ECONNREFUSED) {
-		return true
-	}
-	var opErr *net.OpError
-	return errors.As(err, &opErr) && opErr.Op == "dial"
-}
-
-// wakeDialTimeout bounds connecting to a wakeable graph's frontend. In the
-// cluster a connection is made in milliseconds; a frontend that has not
-// answered in this time is not up, and every second spent dialling delays the
-// wake (net/http's default is 30 s).
-const wakeDialTimeout = 5 * time.Second
-
-// wakeUpstreamTransport is the upstream transport of wakeable routes: the
-// default transport with wakeDialTimeout.
-var wakeUpstreamTransport http.RoundTripper = func() *http.Transport {
-	t := http.DefaultTransport.(*http.Transport).Clone()
-	t.DialContext = (&net.Dialer{Timeout: wakeDialTimeout, KeepAlive: 30 * time.Second}).DialContext
-	return t
-}()
 
 // wakeRefusedRetryInterval is the pause between resends of a held request
 // whose upstream refused the connection right after a wake.
@@ -578,15 +493,15 @@ func (t *wakeRoundTripper) forwardAfterWake(req *http.Request, deadline time.Tim
 			retry.Body = body
 		}
 		resp, err := t.base.RoundTrip(retry)
-		if err == nil || !isDialFailure(req.Context(), err) {
+		if err == nil || !errors.Is(err, syscall.ECONNREFUSED) {
 			return resp, err
 		}
 		if deadline.IsZero() || time.Until(deadline) < wakeRefusedRetryInterval {
 			return nil, err
 		}
 		t.server.log.Info.Printf(
-			"wake: could not connect to the upstream after the wake; retrying request_id=%s resource_id=%s: %v",
-			t.requestID, t.target.ResourceID, err,
+			"wake: upstream refused the connection after the wake; retrying request_id=%s resource_id=%s",
+			t.requestID, t.target.ResourceID,
 		)
 		select {
 		case <-req.Context().Done():
@@ -831,32 +746,34 @@ func bufferedHTTPResponse(req *http.Request, buf *bufferingResponseWriter, never
 	}
 }
 
-func wakeStartingResponse(req *http.Request, requestID, phase string) *http.Response {
+func wakeStartingResponse(req *http.Request, requestID string) *http.Response {
 	buf := newBufferingResponseWriter()
-	writeWakeStarting(req.Context(), buf, requestID, phase)
+	writeWakeStarting(buf, requestID)
 	return bufferedHTTPResponse(req, buf, true)
 }
 
 // adapterNotLoadedResponse is the answer to a held request for a not-ready
-// adapter that was not served (Q69): 503 with the OpenAI-shaped
-// adapter_not_loaded error (code "adapter_not_loaded"; plain text before
-// issue #71), plus Retry-After and the request id.
+// adapter that was not served (Q69): 503 with the plain "adapter_not_loaded"
+// body the gateway always answered, plus Retry-After and the request id.
 func adapterNotLoadedResponse(req *http.Request, requestID string) *http.Response {
 	buf := newBufferingResponseWriter()
 	buf.Header().Set("Retry-After", strconv.Itoa(wakeRetryAfterSeconds))
-	writeClientError(buf, requestID, http.StatusServiceUnavailable, gatewayAdapterNotLoaded)
+	if requestID != "" {
+		buf.Header().Set(requestIDHeader, requestID)
+	}
+	http.Error(buf, "adapter_not_loaded", http.StatusServiceUnavailable)
 	return bufferedHTTPResponse(req, buf, true)
 }
 
 func wakeUnavailableResponse(req *http.Request, requestID string) *http.Response {
 	buf := newBufferingResponseWriter()
-	writeWakeUnavailable(req.Context(), buf, requestID)
+	writeWakeUnavailable(buf, requestID)
 	return bufferedHTTPResponse(req, buf, true)
 }
 
 func wakeStatusUnknownResponse(req *http.Request, requestID string) *http.Response {
 	buf := newBufferingResponseWriter()
-	writeWakeStatusUnknown(req.Context(), buf, requestID)
+	writeWakeStatusUnknown(buf, requestID)
 	return bufferedHTTPResponse(req, buf, true)
 }
 
@@ -869,7 +786,7 @@ func (s *Server) newWakeTransport(
 	lease *admission.Lease,
 ) *wakeRoundTripper {
 	if base == nil {
-		base = wakeUpstreamTransport
+		base = http.DefaultTransport
 	}
 	target := WakeTarget{
 		UpstreamHost: upstream.Host,

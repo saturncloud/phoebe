@@ -9,10 +9,10 @@ package identity
 // PHOEBE_TRUSTED_HEADERS, comma-separated, rendered from the saturn-k8s
 // phoebe chart's ConfigMap); when the config is empty, unset, or malformed
 // (nothing left after trimming and dropping empties), a hard-coded fallback
-// equal to the pinned 18 engages so phoebe fails closed, and a loud warning
+// equal to the pinned 15 engages so phoebe fails closed, and a loud warning
 // flags the misrendered chart for the operator.
 //
-// The set covers exactly the R3 envelope headers listed in the pinned 18.
+// The set covers exactly the R3 envelope headers listed in the pinned 15.
 // The remaining identity headers (AuthID / UserID / GroupID / ResourceID /
 // ResourceType / BaseModel / Adapter / Upstream) are read under the ratified
 // edge contract (ForwardAuth authResponseHeaders allowlist + Atlas
@@ -64,9 +64,6 @@ var pinnedTrustedHeaders = []string{
 	HeaderOwnerRateLimitUncachedPromptTokens,
 	HeaderOwnerRateLimitGeneratedTokens,
 	HeaderGroupScopes,
-	HeaderVideoLimits,
-	HeaderOrgHost,
-	HeaderEndpointScope,
 }
 
 // requiredTrustedHeaders are the envelope headers request handling cannot work
@@ -86,8 +83,6 @@ var requiredTrustedHeaders = []struct {
 	{HeaderServingMode, "every header-routed (non-gateway) inference request will be refused with 404 because the serving mode reads as absent (ruling #19)"},
 	{HeaderServingProfile, "dedicated disaggregated requests will bypass cold wake because the serving profile reads as absent"},
 	{HeaderOwnerID, "every shared inference request that carries a contract rate limit (and, with admission enabled, every shared gateway inference request) will be refused with 503 because the quota policy has no owner-id anchor (R7/R8: the legacy service-tier envelope is no longer read)"},
-	{HeaderOrgHost, "org-host requests (<org>-inference.<domain>) will not be recognized and are refused because they carry no route"},
-	{HeaderEndpointScope, "every org-host request will be refused (503), because phoebe cannot tell a key narrowed to one endpoint from an org key without it"},
 	{HeaderOrgID, "every shared inference request that carries the trusted quota envelope (owner id or any contract rate-limit header), and with admission enabled every shared inference request, will be refused with 503 because the trusted organization identity reads as absent"},
 }
 
@@ -99,7 +94,7 @@ type trustedHeaderSet map[string]struct{}
 var activeTrustedHeaders atomic.Pointer[trustedHeaderSet]
 
 func init() {
-	// Before config load the pinned 18 are active: phoebe never reads an
+	// Before config load the pinned 15 are active: phoebe never reads an
 	// envelope header outside the list, before OR after the runtime config
 	// is loaded, and the pre-load default must preserve request handling.
 	fallback := newTrustedHeaderSet(pinnedTrustedHeaders)
@@ -130,16 +125,6 @@ func trustedHeaderValue(r *http.Request, name string) string {
 	return r.Header.Get(name)
 }
 
-// trustedHeaderPresent reports whether name is trusted and present at all,
-// even with an empty value, so a present-but-empty scope can refuse.
-func trustedHeaderPresent(r *http.Request, name string) bool {
-	if !isTrustedHeader(name) {
-		return false
-	}
-	_, ok := r.Header[http.CanonicalHeaderKey(name)]
-	return ok
-}
-
 // LoadTrustedHeaders parses PHOEBE_TRUSTED_HEADERS and installs the active
 // trusted-header set for the process. It is called ONCE at startup,
 // immediately after config load (cmd/interceptor/main.go). Semantics:
@@ -147,7 +132,7 @@ func trustedHeaderPresent(r *http.Request, name string) bool {
 //     active (entries are canonicalized; case is ignored per HTTP
 //     convention);
 //   - unset, empty/whitespace-only, or nothing left after splitting and
-//     trimming -> the pinned 18 engage AND a loud warning flags the
+//     trimming -> the pinned 15 engage AND a loud warning flags the
 //     misrendered chart. Fallback, never a startup failure: phoebe must keep
 //     serving with the pinned set rather than crash-loop behind a broken
 //     ConfigMap render.
@@ -297,9 +282,3 @@ func StripSaturnHeaders(h http.Header) int {
 	}
 	return removed
 }
-
-// EndpointScopeTrusted reports whether HeaderEndpointScope is in the active
-// trusted set. The org-host path refuses every request when it is not: an
-// untrusted scope header reads as absent, which would let a key narrowed to
-// one endpoint reach every endpoint of its org (fail open).
-func EndpointScopeTrusted() bool { return isTrustedHeader(HeaderEndpointScope) }

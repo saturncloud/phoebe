@@ -45,6 +45,14 @@ type graphCapacityPairSource interface {
 	GraphCapacities(graph string) (gateway.GraphCapacity, gateway.GraphCapacity)
 }
 
+// gatewayModelNotFoundMessage answers every unresolvable (org, model): a
+// model nobody serves, a base model the org has no endpoint for, and another
+// org's endpoint name all get these same words, so the answer reveals nothing
+// about which models exist elsewhere. It starts with the old "model not
+// found" text and says what to do (journey-qa, 2026-10-20).
+const gatewayModelNotFoundMessage = "model not found: this organization has no model endpoint with that name. " +
+	"Create an endpoint in Token Factory (Model endpoints), then send its endpoint name as the model."
+
 // WithGateway enables gateway resolution: requests carrying the trusted
 // X-Saturn-Gateway marker resolve their (org, body model=) against Atlas's
 // tf_model via resolver, and forward to the resolved graph's frontend Service
@@ -114,7 +122,7 @@ func (s *Server) resolveGateway(w http.ResponseWriter, r *http.Request, id *iden
 	if s.gateway == nil {
 		s.log.Error.Printf("gateway: refusing gateway-marked request: gateway resolution is not configured on this interceptor (set gateway.enabled/namespace/databaseUrl) org_id=%q request_id=%q",
 			id.OrgID, requestID)
-		writeClientError(w, "", http.StatusServiceUnavailable, gatewayNotConfigured)
+		http.Error(w, "gateway not configured", http.StatusServiceUnavailable)
 		return false
 	}
 
@@ -125,7 +133,7 @@ func (s *Server) resolveGateway(w http.ResponseWriter, r *http.Request, id *iden
 	if id.OrgID == "" {
 		s.log.Warn.Printf("gateway: refusing gateway-marked request with no %s (edge contract broken) request_id=%q",
 			identity.HeaderOrgID, requestID)
-		writeClientError(w, "", http.StatusForbidden, gatewayForbidden)
+		http.Error(w, "forbidden", http.StatusForbidden)
 		return false
 	}
 
@@ -143,11 +151,7 @@ func (s *Server) resolveGateway(w http.ResponseWriter, r *http.Request, id *iden
 		// not validate one key while the downstream router honors another).
 		s.log.Warn.Printf("gateway: refusing request with no unambiguous body model= org_id=%s request_id=%q",
 			id.OrgID, requestID)
-		if len(body) > 0 && !validJSON(body) {
-			writeClientError(w, "", http.StatusBadRequest, bindingInvalidJSON)
-			return false
-		}
-		writeClientError(w, "", http.StatusBadRequest, modelFieldRequired)
+		http.Error(w, "request body must carry a single model field", http.StatusBadRequest)
 		return false
 	}
 
@@ -159,36 +163,24 @@ func (s *Server) resolveGateway(w http.ResponseWriter, r *http.Request, id *iden
 		// (no oracle for probing which models exist). Server-side the model is
 		// logged for ops (a customer's "my model 404s" is undebuggable without
 		// it); logs are not client-visible.
-		//
-		// Tier rule (issue #71, design 3.2): when the name is one of the
-		// CALLER'S OWN org's dedicated endpoints, say so and name the org
-		// host from that endpoint's own row (wrong_endpoint_host). The
-		// lookup is keyed by the caller's org, so another org's endpoint is
-		// never found and answers the same model_not_found as a typo.
-		if url, own := s.ownDedicatedEndpoint(r, id.OrgID, model); own {
-			s.log.Info.Printf("gateway: dedicated endpoint sent to the shared host org_id=%s model=%q request_id=%q", id.OrgID, model, requestID)
-			writeClientError(w, "", http.StatusNotFound, gatewayWrongEndpointHost(url))
-			return false
-		}
 		s.log.Warn.Printf("gateway: no model for org_id=%s model=%q request_id=%q", id.OrgID, model, requestID)
-		writeClientError(w, "", http.StatusNotFound, gatewayModelNotFound)
+		http.Error(w, gatewayModelNotFoundMessage, http.StatusNotFound)
 		return false
 	case err != nil:
 		// Resolver (DB) failure: fail closed — phoebe must never forward
 		// traffic it cannot attribute, and must never guess a route.
 		s.log.Error.Printf("gateway: resolve failed org_id=%s request_id=%q: %v", id.OrgID, requestID, err)
-		writeClientError(w, "", http.StatusServiceUnavailable, gatewayUnavailable)
+		http.Error(w, "service unavailable", http.StatusServiceUnavailable)
 		return false
 	}
-	if identity.ValidServingMode(res.ServingMode) && res.ServingMode != identity.ServingModeShared {
-		// The gateway is exclusively the shared-inference entry point: only
-		// shared rows can be served here (issue #71, design 4.4). A
-		// non-shared tf-model row is a producer bug; it is logged loudly and
-		// answered like a miss, so it never skips tenant isolation, scheduler
-		// sanitization or quota admission.
+	if res.ServingMode != identity.ServingModeShared {
+		// The gateway is exclusively the shared-inference entry point. Treat a
+		// non-shared registry row as a broken trusted contract; otherwise the
+		// request would skip tenant isolation, scheduler sanitization, and quota
+		// admission after resolving onto a shared graph.
 		s.log.Error.Printf("gateway: resolved non-shared model org_id=%s model=%q serving_mode=%q request_id=%q",
 			id.OrgID, model, res.ServingMode, requestID)
-		writeClientError(w, "", http.StatusNotFound, gatewayModelNotFound)
+		http.Error(w, "service unavailable", http.StatusServiceUnavailable)
 		return false
 	}
 
@@ -208,7 +200,7 @@ func (s *Server) resolveGateway(w http.ResponseWriter, r *http.Request, id *iden
 	if !identity.ValidServingMode(res.ServingMode) {
 		s.log.Error.Printf("gateway: resolver returned invalid serving_mode %q org_id=%s request_id=%q",
 			res.ServingMode, id.OrgID, requestID)
-		writeClientError(w, "", http.StatusServiceUnavailable, gatewayUnavailable)
+		http.Error(w, "service unavailable", http.StatusServiceUnavailable)
 		return false
 	}
 	// The resolved model is definitionally the single model this request is
@@ -258,25 +250,10 @@ func (s *Server) resolveGateway(w http.ResponseWriter, r *http.Request, id *iden
 		// condition is defense in depth.
 		s.log.Warn.Printf("gateway: adapter not loaded org_id=%s model=%q request_id=%q",
 			id.OrgID, model, requestID)
-		writeClientError(w, "", http.StatusServiceUnavailable, gatewayAdapterNotLoaded)
+		http.Error(w, "adapter_not_loaded", http.StatusServiceUnavailable)
 		return false
 	}
 	return true
-}
-
-// ownDedicatedEndpoint reports whether model names one of org's own dedicated
-// endpoints, and that endpoint's org host URL. Only a resolver that indexes
-// dedicated rows (the registry) can answer; any other reads as "no".
-func (s *Server) ownDedicatedEndpoint(r *http.Request, orgID, model string) (string, bool) {
-	dedicated, ok := s.gateway.resolver.(gateway.DedicatedResolver)
-	if !ok {
-		return "", false
-	}
-	ep, err := dedicated.ResolveDedicated(r.Context(), orgID, model)
-	if err != nil || ep.OrgID != orgID {
-		return "", false
-	}
-	return ep.OrgHostURL, true
 }
 
 // wakerSupports reports whether the configured waker can wake the graph id
