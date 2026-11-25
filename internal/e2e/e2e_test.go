@@ -166,15 +166,6 @@ func newHarness(t *testing.T, schema string) *harness {
 	mustExec(t, db, readMigration(t, "0011_rated_usage_quantities_only.up.sql"))
 	// 0012: parked_usage, pushed_usage, pushed_hour.
 	mustExec(t, db, readMigration(t, "0012_parked_and_pushed_usage.up.sql"))
-	// 0016: video_billing_event, which the rater's video rollup reads; 0017:
-	// rated_video_usage and parked_video_usage, which it writes.
-	mustExec(t, db, readMigration(t, "0016_video_jobs.up.sql"))
-	mustExec(t, db, readMigration(t, "0017_rated_video_usage.up.sql"))
-	// 0015: rater_state, which a routine rater run reads to know whether the
-	// one-time catch-up is done before checking for never-rated video.
-	mustExec(t, db, readMigration(t, "0015_rater_state.up.sql"))
-	// 0020: the settled_* columns on both parked tables, which the rater reads.
-	mustExec(t, db, readMigration(t, "0020_parked_usage_settled.up.sql"))
 
 	mr, err := miniredis.Run()
 	if err != nil {

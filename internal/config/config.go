@@ -69,11 +69,6 @@ type Settings struct {
 	// only fairness/capacity limits for otherwise authorized, valid requests.
 	Admission AdmissionSettings `yaml:"admission"`
 
-	// Videos configures the hand-off of video endpoints' /v1/videos requests
-	// to the phoebe-videos service. OFF by default (empty serviceUrl): video
-	// routes answer 404. The shared token comes from PHOEBE_VIDEOS_TOKEN.
-	Videos VideosSettings `yaml:"videos"`
-
 	// --- Parsed settings (populated by parse) ---
 
 	ListenAddr  string        `yaml:"-"`
@@ -102,10 +97,7 @@ type ProtectionSettings struct {
 	StreamStallTimeoutStr string        `yaml:"streamStallTimeout"`
 	StreamStallTimeout    time.Duration `yaml:"-"`
 	// MaxStreamDurationStr bounds a whole request, from arrival to the last
-	// response byte, including any wake hold. One request is exempt: a video
-	// content download (GET /v1/videos/{id}/content), a stored file that
-	// cannot be resumed; the stall bounds still apply to it
-	// (proxy.exemptFromMaxStreamDuration).
+	// response byte, including any wake hold.
 	MaxStreamDurationStr string        `yaml:"maxStreamDuration"`
 	MaxStreamDuration    time.Duration `yaml:"-"`
 	// MaxResponseBufferBytesPerStream caps the response bytes phoebe holds in
@@ -401,12 +393,6 @@ type IOLogSettings struct {
 	MaxBodyBytes int `yaml:"maxBodyBytes"`
 }
 
-// VideosSettings is the YAML shape for the video hand-off.
-type VideosSettings struct {
-	// ServiceURL is the phoebe-videos Service, http://host:port.
-	ServiceURL string `yaml:"serviceUrl"`
-}
-
 // GatewaySettings is the YAML shape for the TF gateway resolution path.
 //
 // FAIL CLOSED: Enabled defaults to false, and enabling without a Namespace is
@@ -457,10 +443,8 @@ type WakeSettings struct {
 	// directly without a readiness wait.
 	Enabled bool `yaml:"enabled"`
 
-	// AtlasURL is the Atlas base URL. Atlas validates the endpoint and
-	// performs the ordered worker-readiness-Planner transition. It must be
-	// https unless the host is cluster-local (atlastoken.CheckAtlasURL);
-	// otherwise wake is disabled.
+	// AtlasURL is the in-cluster Atlas base URL. Atlas validates the endpoint
+	// and performs the ordered worker-readiness-Planner transition.
 	AtlasURL string `yaml:"atlasURL"`
 
 	// TimeoutStr bounds how long a single wake may hold the woken request

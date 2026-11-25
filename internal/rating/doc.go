@@ -38,10 +38,6 @@
 // with no catalog base (D3). It is sent as "" with a warning, and the manager
 // prices it.
 //
-// VIDEO. The same run also rolls video_billing_event (one row per finished
-// video generation job) into rated_video_usage, in the same transaction, with
-// the same fail-closed rules and its own parked table (video.go).
-//
 // IDEMPOTENT. Re-running any window converges rated_usage to that run's output,
 // and a re-sent hour replaces the manager's copy (usage_id is deterministic), so
 // cron overlap or a manual backfill never double-counts.

@@ -13,7 +13,6 @@ import (
 	"github.com/redis/go-redis/v9"
 
 	"github.com/saturncloud/phoebe/internal/admission"
-	"github.com/saturncloud/phoebe/internal/atlastoken"
 	"github.com/saturncloud/phoebe/internal/config"
 	"github.com/saturncloud/phoebe/internal/emit"
 	"github.com/saturncloud/phoebe/internal/gateway"
@@ -25,12 +24,7 @@ import (
 	"github.com/saturncloud/phoebe/internal/waker"
 )
 
-// internalWakeTokenEnv is the legacy shared wake secret, kept for one
-// transition build (internal/waker internalWakeHeader).
 const internalWakeTokenEnv = "TF_INTERNAL_WAKE_TOKEN"
-
-// videosTokenEnv is the token the interceptor and phoebe-videos share.
-const videosTokenEnv = "PHOEBE_VIDEOS_TOKEN"
 
 func main() {
 	settingsFile := flag.String("f", "/etc/saturn/config/settings.yaml", "Settings YAML file path")
@@ -48,7 +42,7 @@ func main() {
 
 	// R3 trusted-header registry: parse PHOEBE_TRUSTED_HEADERS (rendered
 	// from the phoebe chart's ConfigMap) into the active set the parser's
-	// envelope reads resolve through. The pinned 17 already govern from
+	// envelope reads resolve through. The pinned 15 already govern from
 	// package init; this engages the runtime config once, at startup, and
 	// warns loudly if the chart render was empty/malformed.
 	identity.LoadTrustedHeaders(log)
@@ -82,13 +76,6 @@ func main() {
 		// Timeout 0 = the proxy default (300s — sized above vLLM's measured
 		// ~2.5min cold reload). A recognized cold response permits one retry.
 		srv = srv.WithWaker(w, settings.Wake.Timeout)
-	}
-	srv, err = srv.WithVideos(settings.Videos.ServiceURL, os.Getenv(videosTokenEnv))
-	if err != nil {
-		log.Error.Fatalf("videos: %v", err)
-	}
-	if settings.Videos.ServiceURL != "" && os.Getenv(videosTokenEnv) == "" {
-		log.Error.Printf("videos: videos.serviceUrl is set but %s is empty; video routes answer 404", videosTokenEnv)
 	}
 	srvErr := srv.Run()
 
@@ -332,25 +319,12 @@ func buildWaker(s *config.Settings, log *logging.Logger) proxy.Waker {
 	if !s.Wake.Enabled {
 		return nil
 	}
-	// phoebe's Atlas service token (tf-internal:wake), re-read from its
-	// mounted Secret before every call. The legacy shared secret is sent too
-	// for the one transition build (internal/waker internalWakeHeader).
-	var tokens atlastoken.Source
-	if path := os.Getenv(atlastoken.EnvFile); path != "" {
-		file, err := atlastoken.NewFile(path, log)
-		if err != nil {
-			log.Error.Printf("wake: %v; wake-from-zero is disabled", err)
-			return nil
-		}
-		tokens = file
-	}
-	atlasWaker, err := waker.NewAtlas(s.Wake.AtlasURL, tokens, os.Getenv(internalWakeTokenEnv), log)
+	atlasWaker, err := waker.NewAtlas(s.Wake.AtlasURL, os.Getenv(internalWakeTokenEnv), log)
 	if err != nil {
 		log.Error.Printf("wake: Atlas actuator unavailable (%v); wake-from-zero is disabled", err)
 		return nil
 	}
-	log.Info.Printf("wake: enabled through Atlas %s (service token file %q, legacy secret set: %t)",
-		s.Wake.AtlasURL, os.Getenv(atlastoken.EnvFile), os.Getenv(internalWakeTokenEnv) != "")
+	log.Info.Printf("wake: enabled through Atlas %s", s.Wake.AtlasURL)
 	return atlasWaker
 }
 

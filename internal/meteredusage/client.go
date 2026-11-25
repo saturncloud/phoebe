@@ -13,12 +13,9 @@ import (
 	"time"
 )
 
-// Retry policy defaults. A run pushes its hours one after another: up to 24
-// trailing hours plus 168 never-accepted hours, plus any resolved hours. The
-// worst case per hour is about 1+2+4+8 = 15 s of waiting plus request time, so
-// a run where many hours exhaust their attempts can outlast its deadline. The
-// CronJob's deadline bounds the run, and the next run continues from the hours
-// still not accepted (token-push sends the trailing window first).
+// Retry policy defaults. A run pushes up to 24 hours one after another, so the
+// worst case per hour (about 1+2+4+8 = 15 s of waiting plus request time) stays
+// well inside an hourly CronJob even if every hour exhausts its attempts.
 const (
 	DefaultMaxAttempts = 5
 	DefaultBaseBackoff = time.Second
@@ -31,10 +28,11 @@ const maxResponseBody = 64 << 10
 
 // RejectedError is a response the manager will give again for the same
 // request: every 4xx except 429, and any other non-200, non-5xx status. It is
-// never retried. The ones that matter: 400 (the request broke a wire rule;
-// nothing stored), 401 (bad or missing token), 409 (a manager older than the
-// 2026-11-17 rule, which refuses token usage from an install on the legacy
-// billing path). Each needs a person, not a retry.
+// never retried. wire-conventions.md names the ones that matter: 400 (the request broke a wire rule; nothing stored), 401 (bad or
+// missing token), 409 (the install is recorded on the legacy billing path),
+// 422 (window_start is in a billing period already settled to Stripe; the
+// correction goes to the human credit path). Each needs a person, not a
+// retry.
 type RejectedError struct {
 	Status int
 	Body   string
@@ -199,8 +197,8 @@ func (c *Client) once(ctx context.Context, url string, body []byte) (Response, e
 // sent, for the hour and kinds we sent. A mismatch means the two sides disagree
 // about the wire, which no retry fixes.
 func checkResponse(req Request, resp Response) error {
-	if resp.Accepted != int64(req.RecordCount()) {
-		return &malformedResponseError{msg: fmt.Sprintf("manager accepted %d records for %s, sent %d", resp.Accepted, req.WindowStart, req.RecordCount())}
+	if resp.Accepted != int64(len(req.Records)) {
+		return &malformedResponseError{msg: fmt.Sprintf("manager accepted %d records for %s, sent %d", resp.Accepted, req.WindowStart, len(req.Records))}
 	}
 	if resp.WindowStart != "" {
 		got, err := time.Parse(time.RFC3339, resp.WindowStart)

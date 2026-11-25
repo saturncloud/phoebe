@@ -87,13 +87,6 @@ const (
 	DefaultIoLogRetentionDays = 7
 	// MinIoLogRetentionDays keeps io_log pruning from being a table wipe.
 	MinIoLogRetentionDays = 1
-	// VideoRowRetentionDays is how long phoebe-videos keeps video_job and
-	// video_billing_event rows (internal/videos reaper, always on, not
-	// configurable). The rater never re-rates video older than this
-	// (rating.VideoRateReach): a re-run of an hour whose jobs are gone would
-	// reconcile-delete its rollups, and token-push would then delete the
-	// manager's records of them.
-	VideoRowRetentionDays = 30
 	// DefaultBatchSize is how many rows one DELETE statement removes. Batches
 	// bound statement time, lock hold, and WAL per statement; the loop repeats
 	// until a batch deletes nothing.
