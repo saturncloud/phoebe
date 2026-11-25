@@ -2,14 +2,10 @@ package main
 
 import (
 	"context"
-	"crypto/sha256"
 	"database/sql"
-	"encoding/hex"
-	"encoding/json"
 	"errors"
 	"fmt"
-	"net/http"
-	"strings"
+	"sort"
 	"time"
 
 	_ "github.com/jackc/pgx/v5/stdlib"
@@ -30,21 +26,7 @@ type pusher struct {
 	store  pushStore
 	log    *logging.Logger
 	client poster
-	// managerURL is the manager's base URL, for error messages only.
-	managerURL string
 }
-
-// maxConsecutiveUnreachable is how many hours in a row may fail because the
-// manager cannot be reached at all (DNS, connection refused or timed out, TLS
-// handshake; see meteredusage.Unreachable) before the run stops. Each such hour
-// costs at most DefaultMaxAttempts connection attempts, each bounded by the
-// dial and TLS-handshake timeouts (10 s each), plus about 15 s of backoff:
-// under two minutes. So the run stops within about six minutes, far inside its
-// deadline,
-// instead of spending the deadline on hours that cannot be sent. Any hour that
-// gets an answer from the manager (accepted, refused, or a 5xx) resets the
-// count.
-const maxConsecutiveUnreachable = 3
 
 // openDB opens phoebe's Postgres the same way the rater does (pgx stdlib,
 // UTC-pinned DSN, small batch-job pool).
@@ -72,30 +54,9 @@ type hourPlan struct {
 	// sent is what the manager will hold for the hour once it accepts req: the
 	// records plus the held ids.
 	sent []pushedRow
-	// staleTombstones counts live video rollups whose id has a tombstone.
-	// The rater clears a live id's tombstone in the transaction that makes it
-	// live, so in one snapshot this means a write outside the rater (a
-	// restore that did not delete the tombstone). The record is sent; the
-	// tombstone would release it if it were lost again, so the run exits 1.
-	staleTombstones int
-	// videoTombstones is the hour's tombstones, from the same snapshot as
-	// its video rollups (VideoHour).
-	videoTombstones map[string]bool
 	// heldBack counts rollups token-push itself could not turn into a record
 	// (no org, or a wire rule). Parked identities are the rater's to report.
 	heldBack int
-	// videoVanished: a video record this install sent for the hour has no
-	// rollup, no tombstone (video_reconcile_deletion) and no park. Its id is
-	// held so the manager keeps it, and the run exits 1.
-	videoVanished bool
-}
-
-// heldKey is a held-back or parked identity of one kind. Holding is per kind:
-// a parked video identity holds only video records, never a token record of
-// the same (auth, owner, resource, model, serving mode), and the reverse.
-type heldKey struct {
-	kind string
-	identity
 }
 
 // buildHour turns one hour's rollups into the hour's request.
@@ -105,19 +66,7 @@ type heldKey struct {
 // goes for identities the rater has parked. For each held-back or parked
 // identity, the usage_ids the manager already holds for it (pushed_usage) go
 // into `held`, so delete-by-absence cannot remove usage the manager accepted.
-//
-// withVideo (the install records video, or sent video before) lets the hour
-// list kind "video" and send its video records. The hour lists
-// "video" only if it has video of its own (a rated or parked video row) or
-// this install sent the manager video records for it before (pushed_usage):
-// the manager deletes by absence per listed kind, so listing video with an
-// empty set for an hour this install never sent video for would delete video
-// records that did not come from this database, the per-kind form of the
-// empty-hour rule below. An hour whose sent video rollups vanished still
-// lists it: a record the rater recorded removing (a tombstone) is deleted, any
-// other is held with exit 1 (see VANISHED VIDEO). Token is always listed, as
-// before video.
-func (p *pusher) buildHour(ctx context.Context, hour time.Time, withVideo bool) (hourPlan, error) {
+func (p *pusher) buildHour(ctx context.Context, hour time.Time) (hourPlan, error) {
 	ws := meteredusage.FormatWindowStart(hour)
 	plan := hourPlan{req: meteredusage.Request{
 		WindowStart: ws,
@@ -131,7 +80,7 @@ func (p *pusher) buildHour(ctx context.Context, hour time.Time, withVideo bool) 
 	if err != nil {
 		return plan, err
 	}
-	holdIdentity := map[heldKey]bool{}
+	holdIdentity := map[identity]bool{}
 	live := map[string]bool{}
 	for _, r := range rollups {
 		rec := meteredusage.Record{
@@ -151,12 +100,12 @@ func (p *pusher) buildHour(ctx context.Context, hour time.Time, withVideo bool) 
 			// before the rater parked missing orgs.
 			p.log.Error.Printf("token-push: HOLDING BACK rated_usage %s (hour %s, auth_id=%s, resource_id=%s, model_id=%s): %v. Only this identity is held back; the rest of the hour is sent",
 				r.ID, ws, r.AuthID, r.ResourceID, r.ModelID, err)
-			holdIdentity[heldKey{meteredusage.KindToken, r.identity}] = true
+			holdIdentity[r.identity] = true
 			plan.heldBack++
 			continue
 		}
 		plan.req.Records = append(plan.req.Records, rec)
-		plan.sent = append(plan.sent, pushedRow{UsageID: rec.UsageID, Kind: meteredusage.KindToken, identity: r.identity})
+		plan.sent = append(plan.sent, pushedRow{UsageID: rec.UsageID, identity: r.identity})
 		live[rec.UsageID] = true
 	}
 
@@ -165,541 +114,78 @@ func (p *pusher) buildHour(ctx context.Context, hour time.Time, withVideo bool) 
 		return plan, err
 	}
 	for _, id := range parked {
-		holdIdentity[heldKey{meteredusage.KindToken, id}] = true
+		holdIdentity[id] = true
 	}
-
-	var ownVideo map[identity]bool
-	heldID := map[string]bool{}
-	if withVideo {
-		if ownVideo, err = p.addVideo(ctx, hour, &plan, holdIdentity, live); err != nil {
-			return plan, err
-		}
-	}
-	listVideo := len(ownVideo) > 0
-	if len(holdIdentity) > 0 || withVideo {
+	if len(holdIdentity) > 0 {
 		pushed, err := p.store.Pushed(ctx, hour)
 		if err != nil {
 			return plan, err
 		}
-		if withVideo {
-			// VANISHED VIDEO. A video record this install sent for the hour
-			// that has no rollup now may be deleted by absence ONLY if the
-			// rater recorded removing it (a tombstone in
-			// video_reconcile_deletion, written in the transaction that
-			// removed it). Absence alone never counts as removal: any other
-			// such id was lost, so it is held (the manager keeps the record)
-			// and the run exits 1. A parked identity's ids are held by the
-			// park whatever their tombstone says.
-			tombstones := plan.videoTombstones
-			vanished := 0
-			for _, pr := range pushed {
-				if pr.kind() != meteredusage.KindVideo {
-					continue
-				}
-				listVideo = true // sent before: the request must say what is left
-				if !live[pr.UsageID] && !tombstones[pr.UsageID] && !heldID[pr.UsageID] &&
-					!holdIdentity[heldKey{meteredusage.KindVideo, pr.identity}] {
-					heldID[pr.UsageID] = true
-					vanished++
-				}
-			}
-			if vanished > 0 {
-				plan.videoVanished = true
-				p.log.Error.Printf("token-push: %s: %d video record(s) this install sent have no rollup and no tombstone (the rater did not remove them); their ids are held so the manager keeps them. Restore rated_video_usage, or see docs/billing-reconciliation.md (\"Tombstones and vanished video\")",
-					ws, vanished)
-			}
-		}
 		for _, pr := range pushed {
-			// A video id is held only while video is listed: in a token-only
-			// request the manager keeps video records anyway.
-			if pr.kind() == meteredusage.KindVideo && !listVideo {
-				continue
-			}
-			if (holdIdentity[heldKey{pr.kind(), pr.identity}] || heldID[pr.UsageID]) && !live[pr.UsageID] {
-				pr.held = true
+			if holdIdentity[pr.identity] && !live[pr.UsageID] {
 				plan.req.Held = append(plan.req.Held, pr.UsageID)
 				plan.sent = append(plan.sent, pr)
 			}
 		}
 	}
-	if listVideo {
-		plan.req.Kinds = append(plan.req.Kinds, meteredusage.KindVideo)
-	}
 	return plan, nil
 }
 
-// addVideo adds the hour's video records to plan, with the same per-identity
-// holding as tokens. It returns the identities with video of their own in the
-// hour: a video rollup (sent or held back) or a parked video identity.
-func (p *pusher) addVideo(ctx context.Context, hour time.Time, plan *hourPlan, hold map[heldKey]bool, live map[string]bool) (map[identity]bool, error) {
-	ws := plan.req.WindowStart
-	rollups, tombstones, parked, err := p.store.VideoHour(ctx, hour)
-	if err != nil {
-		return nil, err
-	}
-	plan.videoTombstones = tombstones
-	own := make(map[identity]bool, len(rollups))
-	plan.req.VideoRecords = make([]meteredusage.VideoRecord, 0, len(rollups))
-	for _, r := range rollups {
-		own[r.identity] = true
-		rec := meteredusage.VideoRecord{
-			Kind: meteredusage.KindVideo, OrgID: r.OrgID, OwnerType: r.OwnerType, OwnerID: r.OwnerID,
-			ResourceID: r.ResourceID,
-			Attributes: meteredusage.VideoAttributes{
-				AuthID: r.AuthID, ModelID: r.ModelID, ServingMode: r.ServingMode, BaseModel: r.BaseModel,
-				Task: r.Task, Resolution: r.Resolution, Region: r.Region,
-			},
-			Quantities: meteredusage.VideoQuantities{
-				OutputSeconds: meteredusage.CanonicalDecimal(r.OutputSeconds), OutputFrames: r.OutputFrames,
-				RequestCount: r.Requests, GPUSeconds: meteredusage.CanonicalDecimal(r.GPUSeconds),
-			},
-		}
-		rec.UsageID = meteredusage.VideoUsageID(ws, rec.OrgID, rec.OwnerType, rec.OwnerID, rec.ResourceID, rec.Attributes)
-		err := meteredusage.ValidateVideoRecord(ws, rec)
-		if err == nil && r.UsageID != rec.UsageID {
-			// The rater stamps each rollup's usage_id when it writes the row,
-			// and tombstones the old id when the id changes. A row whose
-			// fields no longer give its stamped id was edited outside the
-			// rater (or rated under another usage_id rule): sending the new id
-			// would leave the old record at the manager with no tombstone, a
-			// double charge. Hold it back until the rater re-rates the hour.
-			err = fmt.Errorf("stored usage_id %q is not the id of its fields (%s); re-rate the hour so the rater stamps it", r.UsageID, rec.UsageID)
-		}
-		if err != nil {
-			p.log.Error.Printf("token-push: HOLDING BACK rated_video_usage %s (hour %s, auth_id=%s, resource_id=%s, model_id=%s): %v. Only this identity's video records are held back; the rest of the hour is sent",
-				r.ID, ws, r.AuthID, r.ResourceID, r.ModelID, err)
-			// Hold the whole identity, tombstones or not: while one of its
-			// rollups cannot be sent, the manager keeps every record of it.
-			// Releasing a regrained predecessor here would leave the grain
-			// with no record at all until a person fixes the rollup.
-			hold[heldKey{meteredusage.KindVideo, r.identity}] = true
-			plan.heldBack++
-			continue
-		}
-		plan.req.VideoRecords = append(plan.req.VideoRecords, rec)
-		if tombstones[rec.UsageID] {
-			plan.staleTombstones++
-			p.log.Error.Printf("token-push: %s: video record %s is live but has a tombstone (likely a restore that skipped the runbook step of deleting it); it is sent, but the tombstone would release it if it were lost again. Delete that row from video_reconcile_deletion (docs/billing-reconciliation.md)",
-				ws, rec.UsageID)
-		}
-		plan.sent = append(plan.sent, pushedRow{UsageID: rec.UsageID, Kind: meteredusage.KindVideo, identity: r.identity})
-		live[rec.UsageID] = true
-	}
-	for _, id := range parked {
-		hold[heldKey{meteredusage.KindVideo, id}] = true
-		own[id] = true
-	}
-	return own, nil
-}
-
-// maxUnsentHoursPerRun bounds how many never-accepted hours one run sends:
-// missed hours after the automatic re-send floor first, then back-filled hours
-// from before it, each oldest first. The next run continues. A week of hours
-// is far below the run's deadline at one request per hour. Parked hours do not
-// count against it.
-const maxUnsentHoursPerRun = 24 * 7
-
-// maxDeferredRetriesPerRun bounds how many deferred hours (deferred_hour) one
-// run re-sends, least recently refused first; the next run continues with the
-// rest. A deferred hour is not counted against maxUnsentHoursPerRun, so hours
-// an old manager keeps refusing never crowd out hours it would accept.
-const maxDeferredRetriesPerRun = 24 * 7
-
-// maxParkedRechecksPerRun bounds how many parked hours outside the other lists
-// one run rebuilds to see whether their payload changed (least recently
-// checked first). Rebuilding costs database reads only; an unchanged hour is
-// not sent.
-const maxParkedRechecksPerRun = 24 * 7
-
-// refusalParksTheHour reports whether a manager refusal is about the hour's
-// content, so re-sending the same payload would be refused again: a 400 whose
-// body is the manager's validation answer ({"error": ..., "path": ...}). Any
-// other 400 (a proxy in front of the manager, for instance) is not parked:
-// parking stops the hour from being re-sent, so a refusal that may be about
-// the install rather than the hour must keep failing loudly instead.
-//
-// A validation answer about `kinds` is not about the hour: it is a manager
-// that does not know a kind phoebe lists (a manager older than the video
-// kind). Parking would hold the hour's token records too and never re-send
-// them once the manager is upgraded, since the payload does not change; it is
-// treated as a refusal for the whole install instead.
-func refusalParksTheHour(rej *meteredusage.RejectedError) bool {
-	path, ok := validationPath(rej)
-	return ok && !refusesAKind(path)
-}
-
-// validationPath returns the "path" of a 400 whose body is the manager's
-// validation answer ({"error": ..., "path": ...}).
-func validationPath(rej *meteredusage.RejectedError) (string, bool) {
-	if rej.Status != http.StatusBadRequest {
-		return "", false
-	}
-	var body map[string]json.RawMessage
-	if err := json.Unmarshal([]byte(rej.Body), &body); err != nil {
-		return "", false
-	}
-	_, hasError := body["error"]
-	rawPath, hasPath := body["path"]
-	if !hasError || !hasPath {
-		return "", false
-	}
-	var path string
-	_ = json.Unmarshal(rawPath, &path)
-	return path, true
-}
-
-func refusesAKind(path string) bool { return path == "kinds" || strings.HasPrefix(path, "kinds[") }
-
-// refusalIsForTheInstall reports whether a manager refusal applies to every
-// hour of this install: 401 (the install's token), 403 (an inactive or
-// uninstalled install), or a refusal of the listed kinds (see
-// refusalIsAboutKinds) for a request that lists only token. Every request
-// lists token, so the rest of the run would get the same answer: the run stops
-// sending, and the next run sends the hours again.
-func refusalIsForTheInstall(rej *meteredusage.RejectedError, kinds []string) bool {
-	return rej.Status == http.StatusUnauthorized || rej.Status == http.StatusForbidden ||
-		(refusalIsAboutKinds(rej) && !listsMoreThanToken(kinds))
-}
-
-// refusalIsAboutKinds reports whether a manager refusal is about the usage
-// kinds the request lists, from a manager older than phoebe: a 409 ("install
-// billing path is legacy": the manager does not accept one of the listed kinds
-// from an install on the legacy billing path; for video, a manager without
-// saturn-aws-manager#334) or a 400 whose validation path is `kinds` (a
-// manager that does not know a listed kind).
-func refusalIsAboutKinds(rej *meteredusage.RejectedError) bool {
-	if rej.Status == http.StatusConflict {
-		return true
-	}
-	path, ok := validationPath(rej)
-	return ok && refusesAKind(path)
-}
-
-func listsMoreThanToken(kinds []string) bool {
-	for _, k := range kinds {
-		if k != meteredusage.KindToken {
-			return true
-		}
-	}
-	return false
-}
-
-// refusalDefersTheHour reports whether a manager refusal is about a usage kind
-// other than token that the hour lists (refusalIsAboutKinds, for a request
-// that lists more than token). The same manager keeps accepting this
-// install's hours that list only token, so the refusal is per hour, not for
-// the install: the hour is deferred and re-sent by every run until the
-// manager accepts it, and the run goes on with the other hours. It is not
-// parked: its payload does not change when the manager is upgraded, so a
-// parked hour would never be sent again. The manager stores nothing for a
-// refused request, so nothing is counted twice when the hour is accepted. A
-// request that lists only token and gets such a refusal is refused for the
-// whole install instead (refusalIsForTheInstall): a manager that refuses
-// token refuses every hour, and deferring them all would turn one refusal per
-// run into one per hour.
-func refusalDefersTheHour(rej *meteredusage.RejectedError, kinds []string) bool {
-	return refusalIsAboutKinds(rej) && listsMoreThanToken(kinds)
-}
-
-func payloadSHA256(req meteredusage.Request) (string, error) {
-	b, err := json.Marshal(req) // the bytes meteredusage.Client sends
-	if err != nil {
-		return "", err
-	}
-	sum := sha256.Sum256(b)
-	return hex.EncodeToString(sum[:]), nil
-}
-
 // pushWindows sends one request per hour and returns the exit code. The hours
-// are, in this order: the trailing window (or the -since/-until range), every
-// hour with parked usage resolved since its last accepted push (however old),
-// up to maxUnsentHoursPerRun never-accepted hours after the automatic re-send
-// floor (oldest first), up to maxDeferredRetriesPerRun deferred hours (least
-// recently refused first), the rest of maxUnsentHoursPerRun for the back-fill
-// of usage from before the floor (oldest first), and up to
-// maxParkedRechecksPerRun parked hours. The window goes first so a
-// long backlog can never use up the run's deadline before the current hours
-// are sent. Hours are independent: a failed, refused or deferred hour does not
-// stop the others, except a refusal for the whole install (401/403), which
-// stops the run.
-//
-// A DEFERRED hour (deferred_hour: the manager refused a kind it lists, a 409
-// or a 400 on `kinds`, see refusalDefersTheHour) is re-sent by every run until
-// the manager accepts it. It exits 3 once, in the run that defers it, the way
-// parking does (Hugo, 2026-11-23, issue #95 option B): only Saturn can fix it,
-// by upgrading the manager, so later runs log a WARN line and Saturn alerts on
-// the age of the oldest deferred hour from the manager's side. An explicit
-// -since/-until run still exits 3 for a deferred hour of its own range that is
-// refused again: the operator asked for that hour.
-//
-// A PARKED hour (refused_hour: the manager refused its content, or it breaks
-// a request-level wire rule) is rebuilt but sent again only if its payload
-// changed. An explicit run sends every hour of its range, parked or not.
-//
-// explicit is true for an operator's -since/-until run. Such a run never sets
-// the automatic re-send floor, so backfilling old usage does not make later
-// scheduled runs re-send the hours around it.
+// are the trailing window plus every hour with parked usage resolved since its
+// last accepted push (however old). Hours are independent: a failed or rejected
+// hour does not stop the others.
 //
 // Exit code precedence: fatal (1) > rejected (3) > held back (2) > ok (0).
-// Parking an hour counts once, in the run that parks it (3 for a manager
-// refusal, 2 for a local wire-rule failure); a parked hour left unchanged
-// adds nothing. Deferring an hour counts once too (3), in the run that defers
-// it; a deferred hour refused again adds nothing.
-func (p *pusher) pushWindows(ctx context.Context, windows []time.Time, now time.Time, explicit bool) int {
+func (p *pusher) pushWindows(ctx context.Context, windows []time.Time, now time.Time) int {
 	// LIVENESS GUARD. An empty hour is sent as records: [], which deletes the
-	// manager's records for that hour. A database whose usage is gone must
-	// never send.
-	everPushed, err := p.store.EverPushed(ctx)
+	// manager's records for that hour. If the database holds no usage at all
+	// (fresh install, wiped database), every hour would be a delete-all.
+	hasAny, err := p.store.HasAnyUsage(ctx)
 	if err != nil {
 		p.log.Error.Printf("token-push: liveness check: %v", err)
 		return exitFatal
 	}
-	hasRated, hasParked, err := p.store.UsagePresent(ctx)
-	if err != nil {
-		p.log.Error.Printf("token-push: liveness check: %v", err)
+	if !hasAny {
+		p.log.Error.Printf("token-push: rated_usage and parked_usage are EMPTY; refusing to push (every hour would be sent as empty and delete the manager's records). If this install genuinely has no usage there is nothing to push; if the database was wiped, restore it first")
 		return exitFatal
-	}
-	// VIDEO IS LISTED ONLY ONCE VIDEO USAGE IS RECORDED OR SENT, and then
-	// only for hours with video or with video sent before (buildHour). Until
-	// then a request lists kinds ["token"], exactly as before video existed,
-	// so a manager without the video kind keeps accepting the install's hours.
-	// Once video was sent, it stays listed even if the video tables are gone:
-	// every sent id without a rollup or a tombstone is then held (buildHour),
-	// so the manager keeps its records and the run exits 1.
-	hasVideo, everPushedVideo, untombstonedVideo, staleTombstone, err := p.store.VideoUsageState(ctx)
-	if err != nil {
-		p.log.Error.Printf("token-push: video liveness check: %v", err)
-		return exitFatal
-	}
-	withVideo := hasVideo || everPushedVideo
-	// Wiped: nothing recorded, yet the manager holds a video record the rater
-	// never removed. (Every rollup legitimately removed leaves tombstones.)
-	videoWiped := !hasVideo && untombstonedVideo
-	if staleTombstone {
-		p.log.Error.Printf("token-push: a live video rollup's usage_id still has a tombstone (likely a restore that skipped the runbook step of deleting it); it would release the record if the rollup were lost again. Delete those rows from video_reconcile_deletion (docs/billing-reconciliation.md)")
-	}
-	if videoWiped {
-		p.log.Error.Printf("token-push: no video usage is recorded although the manager holds video records the rater never removed (pushed_usage video rows with no tombstone); the video tables look wiped. In the hours this run sends, those records are held; the run exits 1. Restore the database")
-	}
-	if !hasRated && everPushed {
-		// Usage was sent before and rated_usage is empty now: rated_usage is never
-		// pruned, so this is a wiped table, whatever parked_usage holds. Sending
-		// would delete the manager's records. The one exception is an install
-		// that has video usage and never sent a token record: its pushed_hour
-		// rows come from video hours, and there are no token records to lose.
-		videoOnly := false
-		if hasVideo || everPushedVideo {
-			everPushedToken, err := p.store.EverPushedToken(ctx)
-			if err != nil {
-				p.log.Error.Printf("token-push: liveness check: %v", err)
-				return exitFatal
-			}
-			videoOnly = !everPushedToken
-		}
-		if !videoOnly {
-			p.log.Error.Printf("token-push: rated_usage is EMPTY although usage was sent before (pushed_hour has rows); refusing to push (every hour would be sent as empty and delete the manager's records). Restore the database")
-			return exitFatal
-		}
-	}
-	if !hasRated && !hasParked && !withVideo {
-		// NO USAGE YET (main.go package doc): a fresh install. Nothing to send.
-		p.log.Info.Printf("token-push: no Token Factory usage recorded yet; nothing to send")
-		return exitOK
 	}
 
-	floor := now.UTC().Truncate(time.Hour)
-	resolved, err := p.store.ResolvedHours(ctx, floor)
+	resolved, err := p.store.ResolvedHours(ctx, now.UTC().Truncate(time.Hour))
 	if err != nil {
 		p.log.Error.Printf("token-push: list resolved parked hours: %v", err)
 		return exitFatal
 	}
-	unsent, err := p.store.UnsentHours(ctx, floor, maxUnsentHoursPerRun)
-	if err != nil {
-		p.log.Error.Printf("token-push: list unsent hours: %v", err)
-		return exitFatal
-	}
-	if len(unsent) > 0 {
-		p.log.Info.Printf("token-push: re-sending %d hour(s) with usage the manager never accepted, oldest %s", len(unsent), unsent[0].Format(time.RFC3339))
-	}
-	deferred, err := p.store.DeferredHours(ctx, maxDeferredRetriesPerRun)
-	if err != nil {
-		p.log.Error.Printf("token-push: list deferred hours: %v", err)
-		return exitFatal
-	}
-	if len(deferred) > 0 {
-		p.log.Info.Printf("token-push: re-sending %d deferred hour(s) the manager refused for a usage kind they list (deferred_hour), oldest %s", len(deferred), deferred[0].Format(time.RFC3339))
-	}
-	var backfill []time.Time
-	if room := maxUnsentHoursPerRun - len(unsent); room > 0 {
-		if backfill, err = p.store.BackfillHours(ctx, room); err != nil {
-			p.log.Error.Printf("token-push: list back-fill hours: %v", err)
-			return exitFatal
-		}
-	}
-	remaining, oldest, err := p.store.PreConnectionHours(ctx)
-	if err != nil {
-		p.log.Error.Printf("token-push: %v", err)
-		return exitFatal
-	}
-	if remaining > 0 {
-		p.log.Info.Printf("token-push: back-filling usage from before this install's first accepted push: %d hour(s) not sent yet (oldest %s); this run sends %d (at most %d never-accepted hours per run, missed hours after the first push go first)",
-			remaining, oldest.Format(time.RFC3339), len(backfill), maxUnsentHoursPerRun)
-	}
+	hours := mergeHours(windows, resolved)
 
-	refused, err := p.store.RefusedHours(ctx)
-	if err != nil {
-		p.log.Error.Printf("token-push: list parked hours: %v", err)
-		return exitFatal
-	}
-	parked := make(map[time.Time]string, len(refused))
-	for _, r := range refused {
-		parked[r.Hour.UTC()] = r.PayloadSHA256
-	}
-	hours := uniqueHours(windows, resolved, unsent, deferred, backfill)
-	listed := make(map[time.Time]bool, len(hours))
+	heldBack, rejected, failed := 0, 0, 0
 	for _, h := range hours {
-		listed[h] = true
-	}
-	var recheck []time.Time
-	for _, r := range refused {
-		if len(recheck) == maxParkedRechecksPerRun {
-			break
-		}
-		if !listed[r.Hour.UTC()] {
-			recheck = append(recheck, r.Hour.UTC())
-		}
-	}
-	hours = uniqueHours(hours, recheck)
-
-	// A deferred hour this run tries that is neither accepted, deferred again
-	// nor parked is touched after the loop (TouchDeferred), so a deferred hour
-	// failing some other way does not stay first in the retry order.
-	wasDeferred := make(map[time.Time]bool, len(deferred))
-	for _, h := range deferred {
-		wasDeferred[h] = true
-	}
-	// An explicit run's own range: a deferred hour in it that is refused
-	// again still exits 3 (the operator asked for that hour).
-	requested := map[time.Time]bool{}
-	if explicit {
-		for _, h := range windows {
-			requested[h.UTC()] = true
-		}
-	}
-	var attempted []time.Time
-	settled := map[time.Time]bool{}
-
-	heldBack, rejected, failed, newlyParked, deferredNow, newlyDeferred := 0, 0, 0, 0, 0, 0
-	videoVanished := 0   // hours whose sent video rollups are gone (exit 1)
-	staleTombstones := 0 // live video records that still have a tombstone (exit 1)
-	unreachable := 0     // consecutive hours the manager could not be reached for
-	var unchanged []time.Time
-send:
-	for i, h := range hours {
-		attempted = append(attempted, h)
-		plan, err := p.buildHour(ctx, h, withVideo)
+		plan, err := p.buildHour(ctx, h)
 		if err != nil {
 			p.log.Error.Printf("token-push: build request for %s: %v", h.Format(time.RFC3339), err)
 			failed++
 			continue
 		}
-		if len(plan.req.Records) == 0 && len(plan.req.VideoRecords) == 0 && len(plan.req.Held) == 0 {
-			// An empty snapshot deletes, by absence, whatever the manager holds
-			// for the hour. Send one only for an hour this install sent before:
-			// otherwise the manager's records for it did not come from this
-			// database (for instance a database wiped and restarted), and an
-			// empty request would delete them.
-			sentBefore, err := p.store.HourEverSent(ctx, h)
-			if err != nil {
-				p.log.Error.Printf("token-push: check whether %s was sent before: %v", plan.req.WindowStart, err)
-				failed++
-				continue
-			}
-			if !sentBefore {
-				heldBack += plan.heldBack
-				p.log.Info.Printf("token-push: skipping %s: no usage, and this install never sent the hour, so there is nothing to replace", plan.req.WindowStart)
-				continue
-			}
-		}
-		sum, err := payloadSHA256(plan.req)
-		if err != nil {
-			p.log.Error.Printf("token-push: encode request for %s: %v", plan.req.WindowStart, err)
-			failed++
-			continue
-		}
-		prev, wasParked := parked[h]
-		if wasParked && prev == sum && !explicit {
-			// Refused for this exact content before: the same request would be
-			// refused again. Counted in the parked-hours line below.
-			unchanged = append(unchanged, h)
-			p.log.Debug.Printf("token-push: %s is parked and its payload has not changed; not sent", plan.req.WindowStart)
-			continue
-		}
 		heldBack += plan.heldBack
-		// Counted only for an hour that is sent: a parked hour rebuilt by the
-		// recheck rotation and skipped above does not repeat the alarm.
-		if plan.videoVanished {
-			videoVanished++
-		}
-		staleTombstones += plan.staleTombstones
 		if err := meteredusage.Validate(plan.req); err != nil {
 			// Every record passed on its own, so this is a request-level rule
 			// (for instance a duplicate usage_id): a bug. Send nothing for the
-			// hour rather than earn a 400, and park it.
+			// hour rather than earn a 400.
+			p.log.Error.Printf("token-push: NOT SENDING %s: the request breaks a wire rule (%v)", plan.req.WindowStart, err)
 			heldBack++
-			if err := p.store.RecordRefused(ctx, h, 0, err.Error(), sum); err != nil {
-				p.log.Error.Printf("token-push: NOT SENDING %s and could not park it: %v", plan.req.WindowStart, err)
-				failed++
-				continue
-			}
-			parked[h] = sum
-			settled[h] = true
-			newlyParked++
-			p.log.Error.Printf("token-push: PARKED %s: the request breaks a wire rule (%v); not sent, and not re-sent until its usage changes (refused_hour)", plan.req.WindowStart, err)
 			continue
 		}
-		added, err := p.store.RecordIntent(ctx, h, plan.sent)
-		if err != nil {
+		if err := p.store.RecordIntent(ctx, h, plan.sent); err != nil {
 			p.log.Error.Printf("token-push: record intent for %s: %v (not sent)", plan.req.WindowStart, err)
 			failed++
 			continue
 		}
-		// forget removes the intent rows this attempt added after a refusal.
-		// A refused request stores nothing at the manager, but Post retries a
-		// 5xx or a network error first, and an earlier attempt may have been
-		// committed before it failed. So forget only when the manager answered
-		// the only attempt (rej.AfterRetry is false). When in doubt, keep the
-		// rows: an extra held id is harmless, a missing one is not (the manager
-		// keeps usage it is not told to hold, or deletes by absence usage it
-		// accepted). A later accepted push trims the extra rows.
-		forget := func(rej *meteredusage.RejectedError) {
-			if rej.AfterRetry {
-				p.log.Info.Printf("token-push: %s: keeping the pushed_usage intent rows of the refused request: an earlier attempt of the request (a 5xx or a network error) may have been stored by the manager", plan.req.WindowStart)
-				return
-			}
-			if err := p.store.ForgetIntent(ctx, h, added); err != nil {
-				p.log.Error.Printf("token-push: %s: %v", plan.req.WindowStart, err)
-				failed++
-			}
-		}
 
 		resp, err := p.client.Post(ctx, plan.req)
-		if err != nil && meteredusage.Unreachable(err) {
-			unreachable++
-			failed++
-			if unreachable >= maxConsecutiveUnreachable {
-				p.log.Error.Printf("token-push: cannot reach manager at %s: %v. %d hour(s) in a row could not connect (DNS, connection refused or timed out, or TLS handshake), so the run stops; %d hour(s) not sent this run. Check this install's egress to the manager (firewall, proxy, DNS). Nothing is lost: the usage stays in rated_usage and is sent once the manager is reachable",
-					p.managerURL, err, unreachable, len(hours)-i-1)
-				break send
-			}
-			p.log.Error.Printf("token-push: send %s: cannot reach manager at %s: %v (the next run re-sends this hour)", plan.req.WindowStart, p.managerURL, err)
-			continue
-		}
-		unreachable = 0
 		var rej *meteredusage.RejectedError
 		switch {
 		case err == nil:
-			if err := p.store.RecordAccepted(ctx, h, plan.req.Kinds, plan.sent, !explicit); err != nil {
+			if err := p.store.RecordAccepted(ctx, h, plan.sent); err != nil {
 				// The manager has the hour; our bookkeeping keeps a superset
 				// (RecordIntent), which is the safe direction. The next run
 				// re-sends and records it.
@@ -707,72 +193,13 @@ send:
 				failed++
 				continue
 			}
-			settled[h] = true
-			if wasParked {
-				delete(parked, h)
-				p.log.Info.Printf("token-push: %s was parked; its payload changed and the manager accepted it", plan.req.WindowStart)
-			}
-			p.log.Info.Printf("token-push: sent %s (kinds %v): %d token records, %d video records, %d held (manager accepted %d, deleted %d)",
-				plan.req.WindowStart, plan.req.Kinds, len(plan.req.Records), len(plan.req.VideoRecords), len(plan.req.Held), resp.Accepted, resp.Deleted)
-		case errors.As(err, &rej) && refusalParksTheHour(rej):
-			// 400 with the manager's validation body: this payload will never
-			// be accepted. Park the hour so it is not re-sent every run and
-			// does not hold up other hours.
-			rejected++
-			forget(rej)
-			if err := p.store.RecordRefused(ctx, h, rej.Status, rej.Body, sum); err != nil {
-				p.log.Error.Printf("token-push: manager REJECTED %s with %d (%s) and it could not be parked: %v", plan.req.WindowStart, rej.Status, rej.Body, err)
-				failed++
-				continue
-			}
-			parked[h] = sum
-			settled[h] = true
-			newlyParked++
-			p.log.Error.Printf("token-push: PARKED %s: manager REJECTED it with %d: %s. Not re-sent until its usage changes (refused_hour); needs a person",
-				plan.req.WindowStart, rej.Status, rej.Body)
-		case errors.As(err, &rej) && refusalDefersTheHour(rej, plan.req.Kinds):
-			// The manager does not accept a kind this hour lists (a manager
-			// older than phoebe). It stored nothing, so it still holds what it
-			// held for the hour. Defer the hour: every run re-sends it until
-			// it is accepted, and the other hours are still sent.
-			forget(rej)
-			first, err := p.store.RecordDeferred(ctx, h, rej.Status, rej.Body)
-			if err != nil {
-				rejected++
-				p.log.Error.Printf("token-push: manager REFUSED %s (kinds %v) with %d (%s) and it could not be deferred: %v. It is re-sent only while it is in the trailing window or never accepted",
-					plan.req.WindowStart, plan.req.Kinds, rej.Status, rej.Body, err)
-				failed++
-				continue
-			}
-			deferredNow++
-			settled[h] = true
-			delete(parked, h) // RecordDeferred unparked it
-			if !first {
-				// Refused again. Option B (issue #95): no exit 3 and no ERROR
-				// for it; the WARN summary below counts it, and Saturn alerts
-				// on the oldest deferred hour from the manager's side.
-				if requested[h] {
-					rejected++
-				}
-				p.log.Info.Printf("token-push: %s is still deferred: manager refused it again with %d: %s (kinds %v)",
-					plan.req.WindowStart, rej.Status, rej.Body, plan.req.Kinds)
-				continue
-			}
-			rejected++
-			newlyDeferred++
-			p.log.Error.Printf("token-push: DEFERRED %s: manager REFUSED it with %d: %s. The manager does not accept, from this install, a usage kind this hour lists (kinds %v): it is older than phoebe (a 409 is a kind it does not accept from an install on the legacy billing path, for video a manager without saturn-aws-manager#334; a 400 on kinds is a kind it does not know). Nothing is lost and nothing is needed on this install: the manager stored nothing for this request and keeps what it held for the hour, every run re-sends the hour until the manager accepts it (deferred_hour), and the other hours are still sent. Only this first refusal exits 3. The fix is a manager upgrade, which only Saturn can do: report this line to Saturn support",
-				plan.req.WindowStart, rej.Status, rej.Body, plan.req.Kinds)
-		case errors.As(err, &rej) && refusalIsForTheInstall(rej, plan.req.Kinds):
-			rejected++
-			forget(rej)
-			p.log.Error.Printf("token-push: manager REJECTED %s with %d: %s. This refusal is for the whole install (401 token, 403 inactive or uninstalled install, or a 409 or a 400 on kinds for a request that lists only token: the manager refuses this install's token usage), so the run stops; %d hour(s) not sent this run. Needs a person",
-				plan.req.WindowStart, rej.Status, rej.Body, len(hours)-i-1)
-			break send
+			p.log.Info.Printf("token-push: sent %s: %d token records, %d held (manager accepted %d, deleted %d)",
+				plan.req.WindowStart, len(plan.req.Records), len(plan.req.Held), resp.Accepted, resp.Deleted)
 		case errors.As(err, &rej):
-			// Not a status the manager's handler returns (it answers only 200,
-			// 400 with {error, path}, 401, 403 and 409), and it may follow a
-			// retried attempt the manager committed. So the intent rows are
-			// kept, not forgotten; a later accepted push trims them.
+			// Final: 400 = a wire rule we did not catch; 401 = the customer
+			// token; 409 = this install is on the legacy billing path; 422 = the
+			// hour is in a billing period already settled to Stripe (correction
+			// goes to the human credit path). Each needs a person.
 			p.log.Error.Printf("token-push: manager REJECTED %s with %d (not retried; needs a person): %s",
 				plan.req.WindowStart, rej.Status, rej.Body)
 			rejected++
@@ -781,41 +208,9 @@ send:
 			failed++
 		}
 	}
-	if err := p.store.MarkRefusedChecked(ctx, unchanged); err != nil {
-		p.log.Error.Printf("token-push: %v", err)
-		failed++
-	}
-	var touch []time.Time
-	for _, h := range attempted {
-		if wasDeferred[h] && !settled[h] {
-			touch = append(touch, h)
-		}
-	}
-	if err := p.store.TouchDeferred(ctx, touch); err != nil {
-		p.log.Error.Printf("token-push: %v", err)
-		failed++
-	}
-	if len(parked) > 0 {
-		var oldestParked time.Time
-		for h := range parked {
-			if oldestParked.IsZero() || h.Before(oldestParked) {
-				oldestParked = h
-			}
-		}
-		p.log.Warn.Printf("token-push: %d hour(s) are parked (%d newly this run), oldest %s: the manager refused their content or they break a wire rule, so they are not re-sent until their usage changes. They are listed in refused_hour; after fixing the cause, send one with -since/-until",
-			len(parked), newlyParked, oldestParked.Format(time.RFC3339))
-	}
-
-	if count, oldest, err := p.store.DeferredSummary(ctx); err != nil {
-		p.log.Error.Printf("token-push: %v", err)
-		failed++
-	} else if count > 0 {
-		p.log.Warn.Printf("token-push: %d hour(s) are deferred (%d refused this run, %d newly), oldest %s: the manager refuses a usage kind they list from this install, so they are re-sent every run until it accepts them (deferred_hour). Nothing is lost and nothing is needed on this install; only the run that defers an hour exits 3. Saturn is alerted to the oldest deferred hour and fixes it by upgrading the manager. If this line persists for more than a day, report it to Saturn support",
-			count, deferredNow, newlyDeferred, oldest.Format(time.RFC3339))
-	}
 
 	switch {
-	case failed > 0 || videoVanished > 0 || staleTombstones > 0 || staleTombstone || videoWiped:
+	case failed > 0:
 		return exitFatal
 	case rejected > 0:
 		return exitRejected
@@ -826,12 +221,11 @@ send:
 	}
 }
 
-// uniqueHours concatenates the hour lists in order, keeping the first
-// occurrence of each hour. It does not sort: the order is the send order.
-func uniqueHours(lists ...[]time.Time) []time.Time {
+// mergeHours returns the sorted union of two hour lists.
+func mergeHours(a, b []time.Time) []time.Time {
 	seen := map[time.Time]bool{}
 	var out []time.Time
-	for _, l := range lists {
+	for _, l := range [][]time.Time{a, b} {
 		for _, h := range l {
 			h = h.UTC()
 			if !seen[h] {
@@ -840,5 +234,6 @@ func uniqueHours(lists ...[]time.Time) []time.Time {
 			}
 		}
 	}
+	sort.Slice(out, func(i, j int) bool { return out[i].Before(out[j]) })
 	return out
 }

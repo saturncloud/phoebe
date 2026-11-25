@@ -28,9 +28,7 @@ idleTimeout: "10m"
 #   streamStallTimeout: "2m"
 #   # Longest a request may run, from arrival to its last response byte,
 #   # including any wake hold. With no response headers by then the client
-#   # gets 504; mid-stream the stream is ended. A video content download
-#   # (GET /v1/videos/{id}/content) is exempt: it is a stored file that cannot
-#   # be resumed, so only streamStallTimeout bounds it.
+#   # gets 504; mid-stream the stream is ended.
 #   maxStreamDuration: "60m"
 #   # Response bytes held in memory for inspection (an incomplete SSE line or a
 #   # whole non-streamed body), per request and summed over this replica. Over
@@ -94,16 +92,9 @@ emit:
 # ask Atlas (atlasURL) to wake the endpoint: Atlas scales the workers to one,
 # waits until they are ready, then restores the Planner. phoebe repeats the
 # call while Atlas answers that the workers are still starting, until timeout.
-# phoebe authenticates with its Atlas service token (tf-internal:wake), read
-# before every call from the file PHOEBE_ATLAS_TOKEN_FILE names; Atlas writes
-# and renews it. TF_INTERNAL_WAKE_TOKEN (the legacy shared secret) is also sent
-# while it is set, for one transition build. wake.enabled requires atlasURL;
-# with neither credential wake is disabled (cold responses pass through)
-# rather than crashing the proxy. Because every call carries the token,
-# atlasURL must be https unless its host is cluster-local (a name ending in
-# .svc or .svc.cluster.local, or localhost, 127.0.0.1, ::1); an http URL to
-# any other host (for example a spoke pointing at Atlas's external address)
-# disables wake.
+# Set TF_INTERNAL_WAKE_TOKEN to the internal wake token configured in Atlas.
+# wake.enabled requires atlasURL; a missing token disables wake (cold
+# responses pass through) rather than crashing the proxy.
 # timeout bounds one wake's request hold (default 300s). It MUST exceed the
 # real cold start — vLLM's cold reload measured ~2.5min on staging. If worker
 # restoration was confirmed but readiness exceeds this budget, the client gets

@@ -188,36 +188,6 @@ const (
 	// this design exists to make impossible. phoebe FAILS CLOSED: an absent/invalid
 	// upstream → the request is refused, never forwarded to a default or a guess.
 	HeaderUpstream = "X-Saturn-Upstream"
-
-	// HeaderVideoLimits marks a route as a VIDEO GENERATION endpoint and
-	// carries what it accepts (sizes, seconds, frame rate, step cap,
-	// concurrency, the org's jobs-in-flight limit, GPUs) as compact JSON
-	// (videos.Limits). Atlas renders it per deployment from the model catalog
-	// on the same anti-spoof middleware as HeaderServedModel; an empty value
-	// removes a client forgery. Read through the trusted-header registry.
-	// Present: the route serves /v1/videos only (handed to phoebe-videos).
-	// Absent: the route serves no /v1/videos path.
-	HeaderVideoLimits = "X-Saturn-Video-Limits"
-
-	// HeaderOrgHost marks a request that arrived on an org host,
-	// <label>-inference.<domain> (issue #71, tenant-domains design 4.1): the
-	// route that serves one org's dedicated endpoints and their videos. Only
-	// the saturn-k8s tf-org-hosts route's header Middleware sets it, after
-	// Atlas's /api/auth/org-host/check ForwardAuth has pinned the host's org
-	// (HeaderOrgID). Every other Token Factory route blanks it. Read strictly
-	// through the trusted-header registry: only the exact value "true" marks
-	// an org-host request. On such a request the body model= picks the
-	// endpoint, and phoebe resolves it against the org's dedicated rows in
-	// the served-model registry; no per-route header is honoured.
-	HeaderOrgHost = "X-Saturn-Org-Host"
-
-	// HeaderEndpointScope carries the one dedicated endpoint (deployment id)
-	// a key narrowed to one endpoint may reach on an org host. Stamped only
-	// by the org-host ForwardAuth (authResponseHeaders), blanked on every
-	// other route. Present: the resolved endpoint must be exactly this one,
-	// or the request is refused (403 model_not_authorized). A present but
-	// empty or malformed value refuses.
-	HeaderEndpointScope = "X-Saturn-Endpoint-Scope"
 )
 
 // Identity is the trusted, pre-resolved caller identity for a request. Phoebe
@@ -296,17 +266,6 @@ type Identity struct {
 	// (parseTrustedGroupScopes); Identity carries the envelope verbatim,
 	// exactly like the eight scoped rate-limit fields above.
 	GroupScopes string
-	// VideoLimits is the raw, trusted X-Saturn-Video-Limits value; non-empty
-	// only on a video generation endpoint's route. Parsed by phoebe-videos.
-	VideoLimits string
-	// OrgHost reports the request arrived on an org host (HeaderOrgHost ==
-	// "true"). The org comes from the edge (OrgID); phoebe resolves the
-	// endpoint from the registry and fills the routing and billing fields.
-	OrgHost bool
-	// EndpointScopePresent and EndpointScope carry HeaderEndpointScope.
-	// Present with any value other than one endpoint id refuses.
-	EndpointScopePresent bool
-	EndpointScope        string
 }
 
 // The two serving modes, spelled exactly as they are stored in billing_event and
@@ -328,7 +287,7 @@ func ValidServingMode(s string) bool {
 //
 // The R3 envelope reads (gateway mark, org, owner, serving mode, served
 // model, every rate-limit policy header, and the group scope envelope —
-// the pinned 17) resolve through the trusted-header registry: a header
+// the pinned 15) resolve through the trusted-header registry: a header
 // outside the active set is treated
 // as ABSENT, never read for a trust decision. The remaining identity headers
 // are read directly (ratified edge contract, outside the R3 gate). The proxy
@@ -366,10 +325,6 @@ func FromRequest(r *http.Request) Identity {
 		OwnerRateLimitUncachedPromptTokens: trustedHeaderValue(r, HeaderOwnerRateLimitUncachedPromptTokens),
 		OwnerRateLimitGeneratedTokens:      trustedHeaderValue(r, HeaderOwnerRateLimitGeneratedTokens),
 		GroupScopes:                        trustedHeaderValue(r, HeaderGroupScopes),
-		VideoLimits:                        trustedHeaderValue(r, HeaderVideoLimits),
-		OrgHost:                            trustedHeaderValue(r, HeaderOrgHost) == "true",
-		EndpointScopePresent:               trustedHeaderPresent(r, HeaderEndpointScope),
-		EndpointScope:                      trustedHeaderValue(r, HeaderEndpointScope),
 	}
 }
 

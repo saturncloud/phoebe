@@ -4,8 +4,7 @@
 // wire-conventions.md).
 //
 // The install sends QUANTITIES, never money (design D1): the manager owns every
-// price and rates each hour as of that hour. phoebe produces kinds "token" and
-// "video" (video generation, video-models-design.md section 7.3, video.go).
+// price and rates each hour as of that hour. phoebe produces kind "token" only.
 //
 // One request is the COMPLETE set of records for one hour and the listed kinds
 // from this install. Records of that (install, hour, kind) scope that are absent
@@ -32,13 +31,10 @@ import (
 // Path is the manager route. The base URL is configured per install.
 const Path = "/customer/metered-usage"
 
-// KindToken and KindVideo are the kinds phoebe produces. A request phoebe
-// sends lists only these, so phoebe's delete-by-absence can never reach the
-// compute or storage records other producers send for the same hour.
-const (
-	KindToken = "token"
-	KindVideo = "video"
-)
+// KindToken is the only kind phoebe produces. Every request phoebe sends lists
+// exactly this kind, so phoebe's delete-by-absence can never reach the compute,
+// storage or seats records other producers send for the same hour.
+const KindToken = "token"
 
 // Serving modes: a closed enum on the wire (wire-conventions.md).
 const (
@@ -78,13 +74,9 @@ func FormatWindowStart(t time.Time) string {
 type Request struct {
 	WindowStart string   `json:"window_start"`
 	Kinds       []string `json:"kinds"`
-	// Records are the token records. Records must be non-nil: an empty hour
-	// marshals to [], which tells the manager the hour has no usage of the
-	// listed kinds (delete-by-absence), never to null.
+	// Records must be non-nil: an empty hour marshals to [], which tells the
+	// manager the hour has no token usage (delete-by-absence), never to null.
 	Records []Record `json:"records"`
-	// VideoRecords are the kind "video" records. On the wire they follow the
-	// token records in the same "records" list (see MarshalJSON).
-	VideoRecords []VideoRecord `json:"-"`
 	// Held lists usage_ids the manager must keep although they are absent.
 	// phoebe sends [] (it withholds a whole hour instead; see cmd/token-push).
 	Held []string `json:"held"`
@@ -187,18 +179,12 @@ func (a TokenAttributes) attributePairs() [][2]string {
 // duplicates. Any attribute change (a region relabel, for instance) yields a
 // new id; the old record is then deleted by absence and the new one inserted.
 func TokenUsageID(windowStart, orgID, ownerType, ownerID, resourceID string, attrs TokenAttributes) string {
-	return usageID(KindToken, windowStart, orgID, ownerType, ownerID, resourceID, attrs.attributePairs())
-}
-
-// usageID is the wire-conventions hash for any kind whose attributes are all
-// strings.
-func usageID(kind, windowStart, orgID, ownerType, ownerID, resourceID string, attrs [][2]string) string {
 	var b strings.Builder
-	for _, part := range []string{kind, windowStart, orgID, ownerType, ownerID, resourceID} {
+	for _, part := range []string{KindToken, windowStart, orgID, ownerType, ownerID, resourceID} {
 		b.WriteString(part)
 		b.WriteByte('|')
 	}
-	writeSortedStringObject(&b, attrs)
+	writeSortedStringObject(&b, attrs.attributePairs())
 	sum := sha256.Sum256([]byte(b.String()))
 	return hex.EncodeToString(sum[:])
 }
